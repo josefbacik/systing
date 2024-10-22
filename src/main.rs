@@ -3,6 +3,7 @@ use std::mem::MaybeUninit;
 use std::os::unix::fs::MetadataExt;
 use std::str;
 use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -14,6 +15,8 @@ use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::Skel;
 use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::MapCore;
+use libbpf_rs::RingBufferBuilder;
+
 use plain::Plain;
 
 mod systing {
@@ -26,6 +29,7 @@ mod systing {
 use systing::*;
 
 unsafe impl Plain for systing::types::task_stat {}
+unsafe impl Plain for systing::types::preempt_event {}
 
 #[derive(Debug, Parser)]
 struct Command {
@@ -54,9 +58,16 @@ fn bump_memlock_rlimit() -> Result<()> {
     Ok(())
 }
 
+struct PreemptStat {
+    pid: u32,
+    tgid: u32,
+    count: u64,
+}
+
 struct Process {
     pid: u32,
     stat: systing::types::task_stat,
+    preempt_stats: Vec<PreemptStat>,
     threads: Vec<Process>,
 }
 
@@ -219,6 +230,32 @@ fn main() -> Result<()> {
 
     skel.attach()?;
 
+    // Start the ring buffer, start a thread to poll for the events and add them to the
+    // preempt_events vector.
+    let preempt_events = Arc::new(Mutex::new(Vec::new()));
+    let preempt_clone = Arc::clone(&preempt_events);
+    let mut builder = RingBufferBuilder::new();
+    builder
+        .add(&skel.maps.events, move |data: &[u8]| {
+            let mut event = systing::types::preempt_event::default();
+            plain::copy_from_bytes(&mut event, data).expect("Data buffer was too short");
+            preempt_clone.lock().unwrap().push(event);
+            0
+        })
+        .expect("Failed to add ring buffer");
+    let ring = builder.build().expect("Failed to build ring buffer");
+
+    let t = thread::spawn(move || -> i32 {
+        loop {
+            let res = ring.poll(Duration::from_millis(100));
+            if res.is_err() {
+                break;
+            }
+        }
+        0
+    });
+
+    // Wait for the duration to expire or for a Ctrl-C signal.
     if opts.duration > 0 {
         thread::sleep(Duration::from_secs(opts.duration));
     } else {
@@ -228,6 +265,8 @@ fn main() -> Result<()> {
         println!("Press Ctrl-C to stop");
         rx.recv().expect("Could not receive signal on channel.");
     }
+
+    t.join().expect("Failed to join thread");
 
     let mut processes = HashMap::new();
     for rawkey in skel.maps.stats.keys() {
@@ -254,6 +293,7 @@ fn main() -> Result<()> {
             let process = Process {
                 pid,
                 stat: value,
+                preempt_stats: Vec::new(),
                 threads: Vec::new(),
             };
 
@@ -265,6 +305,7 @@ fn main() -> Result<()> {
             let process = Process {
                 pid: tgid,
                 stat: systing::types::task_stat::default(),
+                preempt_stats: Vec::new(),
                 threads: Vec::new(),
             };
 
@@ -273,6 +314,7 @@ fn main() -> Result<()> {
         let process = Process {
             pid,
             stat: value,
+            preempt_stats: Vec::new(),
             threads: Vec::new(),
         };
         let leader = processes.get_mut(&tgid).unwrap();
