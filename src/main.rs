@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ffi::CStr;
 use std::mem::MaybeUninit;
 use std::os::unix::fs::MetadataExt;
 use std::sync::mpsc::channel;
@@ -7,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use plain::Plain;
 use anyhow::bail;
 use anyhow::Result;
 use clap::Parser;
@@ -17,8 +17,6 @@ use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::MapCore;
 use libbpf_rs::RingBufferBuilder;
 
-use plain::Plain;
-
 mod systing {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -26,7 +24,9 @@ mod systing {
     ));
 }
 
+mod process;
 use systing::*;
+use process::{PreemptEvent, Process};
 
 unsafe impl Plain for systing::types::task_stat {}
 unsafe impl Plain for systing::types::preempt_event {}
@@ -58,49 +58,8 @@ fn bump_memlock_rlimit() -> Result<()> {
     Ok(())
 }
 
-struct PreemptEvent {
-    preempt_pid: u32,
-    preempt_tgid: u32,
-    cgid: u64,
-    comm: String,
-    count: u64,
-}
-
-struct Process {
-    pid: u32,
-    stat: systing::types::task_stat,
-    threads: Vec<Process>,
-    preempt_events: Vec<PreemptEvent>,
-}
-
-fn pid_comm(pid: u32) -> Result<String> {
-    let path = format!("/proc/{}/comm", pid);
-    let comm = std::fs::read_to_string(path);
-    if comm.is_err() {
-        return Ok("<unknown>".to_string());
-    }
-    Ok(comm.unwrap().trim().to_string())
-}
-
-fn preempt_event_comm(event: &systing::types::preempt_event) -> Result<String> {
-    let comm_cstr = CStr::from_bytes_until_nul(&event.comm).unwrap();
-    if comm_cstr.to_bytes().starts_with(&[0]) {
-        return pid_comm(event.preempt_tgidpid as u32);
-    }
-    Ok(comm_cstr.to_string_lossy().to_string())
-}
-
-fn process_comm(process: &Process) -> Result<String> {
-    let comm_cstr = CStr::from_bytes_until_nul(&process.stat.comm).unwrap();
-    if comm_cstr.to_bytes().starts_with(&[0]) {
-        return pid_comm(process.pid);
-    }
-    Ok(comm_cstr.to_string_lossy().to_string())
-}
-
 fn dump_all_results(process_vec: Vec<Process>) -> Result<()> {
     for process in process_vec.iter() {
-        let comm = process_comm(process)?;
         let total_time: u64 = process.stat.run_time
             + process.stat.preempt_time
             + process.stat.queue_time
@@ -118,7 +77,7 @@ fn dump_all_results(process_vec: Vec<Process>) -> Result<()> {
 
         println!(
             "{} pid {} cgid {} runtime {}({}% total time, {}% runtime) sleeptime {}({}%) waittime {}({}%) preempttime {}({}% total time, {}% runtime) queuetime {}({}% total time, {}% runtime) irq time {}({}% total time, {}% runtime) softirq time {}({}% total time, {}% runtime)",
-            comm.trim(),
+            process.comm(),
             process.pid,
             process.stat.cgid,
             process.stat.run_time,
@@ -165,7 +124,7 @@ fn dump_all_results(process_vec: Vec<Process>) -> Result<()> {
                 + 1;
             println!(
                 "\t{} pid {} cgid {} runtime {}({}% total time, {}% runtime) sleeptime {}({}%) waittime {}({}%) preempttime {}({}% total time, {}% runtime) queuetime {}({}% total time, {}% runtime) irq time {}({}% total time, {}% runtime) softirq time {}({}% total time, {}% runtime)",
-                comm.trim(),
+                thread.comm(),
                 thread.pid,
                 thread.stat.cgid,
                 thread.stat.run_time,
@@ -249,7 +208,7 @@ fn summarize_results(process_vec: Vec<Process>) -> Result<()> {
 
         println!(
             "{} pid {} threads {} runtime {}({}% total time, {}% runtime) sleeptime {}({}%) waittime {}({}%) preempttime {}({}% total time, {}% runtime) queuetime {}({}% total time, {}% runtime) irq time {}({}% total time, {}% runtime) softirq time {}({}% total time, {}% runtime)",
-            process_comm(process)?,
+            process.comm(),
             process.pid,
             total_threads,
             total_runtime,
@@ -381,43 +340,24 @@ fn main() -> Result<()> {
             continue;
         } else if pid == tgid {
             // This is the tg leader, insert it and carry on.
-            let process = Process {
-                pid,
-                stat: value,
-                threads: Vec::new(),
-                preempt_events: Vec::new(),
-            };
-
+            let process = Process::with_stat(pid, value);
             processes.insert(pid, process);
             continue;
         } else if !processes.contains_key(&tgid) {
             // We found a thread before the process, so we need to create a blank process to update
             // later.
-            let process = Process {
-                pid: tgid,
-                stat: systing::types::task_stat::default(),
-                threads: Vec::new(),
-                preempt_events: Vec::new(),
-            };
-
+            let process = Process::new(tgid);
             processes.insert(tgid, process);
         }
-        let process = Process {
-            pid,
-            stat: value,
-            threads: Vec::new(),
-            preempt_events: Vec::new(),
-        };
+        let process = Process::with_stat(pid, value);
         let leader = processes.get_mut(&tgid).unwrap();
-        leader.threads.push(process);
+        leader.add_thread(process);
     }
 
     // Now we need to go through the preempt events and add them to the process or thread.
     for event in preempt_events.lock().unwrap().iter() {
         let pid = event.tgidpid as u32;
         let tgid: u32 = (event.tgidpid >> 32) as u32;
-        let preempt_pid = event.preempt_tgidpid as u32;
-        let preempt_tgid: u32 = (event.preempt_tgidpid >> 32) as u32;
 
         if !processes.contains_key(&tgid) {
             continue;
@@ -435,13 +375,7 @@ fn main() -> Result<()> {
                 }
             }
             if !found {
-                process.preempt_events.push(PreemptEvent {
-                    preempt_pid,
-                    preempt_tgid,
-                    comm: preempt_event_comm(event)?,
-                    cgid: event.cgid,
-                    count: 1,
-                });
+                process.preempt_events.push(PreemptEvent::with_stat(event));
             }
         } else {
             for thread in process.threads.iter_mut() {
@@ -456,13 +390,7 @@ fn main() -> Result<()> {
                     }
 
                     if !found {
-                        thread.preempt_events.push(PreemptEvent {
-                            preempt_pid,
-                            preempt_tgid,
-                            comm: preempt_event_comm(event)?,
-                            cgid: event.cgid,
-                            count: 1,
-                        });
+                        thread.preempt_events.push(PreemptEvent::new(event));
                     }
                 }
             }
