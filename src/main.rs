@@ -1,9 +1,12 @@
 use anyhow::bail;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use tracing::subscriber::set_global_default as set_global_subscriber;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt::time::SystemTime;
+use tracing_subscriber::FmtSubscriber;
 
 mod cmds;
-mod kallsyms;
 
 #[derive(Debug, Parser)]
 struct Command {
@@ -62,6 +65,12 @@ fn bump_memlock_rlimit() -> Result<()> {
 
 
 fn main() -> Result<()> {
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(LevelFilter::TRACE)
+        .with_timer(SystemTime)
+        .finish();
+    set_global_subscriber(subscriber).expect("Failed to set tracing subscriber");
+
     let opts = Command::parse();
     bump_memlock_rlimit()?;
 
