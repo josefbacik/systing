@@ -75,8 +75,8 @@ int handle__sched_wakup(u64 *ctx)
 			      | SKIP_STACK_DEPTH);
 	__builtin_memcpy(&event->wakee_kernel_stack, &value->kernel_stack,
 			 sizeof(event->wakee_kernel_stack));
-	__builtin_memcpy(&event->waker_user_stack, &value->user_stack,
-			 sizeof(event->waker_user_stack));
+	__builtin_memcpy(&event->wakee_user_stack, &value->user_stack,
+			 sizeof(event->wakee_user_stack));
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
