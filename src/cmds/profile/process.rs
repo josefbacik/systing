@@ -147,10 +147,11 @@ impl Process {
             }
             pevents.sort_by(|a, b| b.count.cmp(&a.count));
             println!("  Run start time: {}", r.start_time);
+            print!("  ");
             for stat in TotalProcessStat::iter() {
                 print!(" {}: {}", stat, r.total_stat_str(&stat));
             }
-
+            println!("");
             for event in pevents.iter() {
                 println!(
                     "\tPreempted by {}({}) {} times",
@@ -171,9 +172,10 @@ impl Process {
             self.threads.len()
         );
         for r in self.runs.iter() {
-            println!("{}  Run start time: {}", indent, r.start_time);
+            println!("{} Run start time: {}", indent, r.start_time);
+            print!("{} ", indent);
             for stat in ProcessStat::iter() {
-                print!("{}{}: {}", indent, stat, r.stat_str(&stat));
+                print!(" {}: {}", stat, r.stat_str(&stat));
             }
             println!("");
             for event in r.preempt_events.iter() {

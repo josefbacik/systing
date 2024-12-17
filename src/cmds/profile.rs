@@ -222,6 +222,8 @@ pub fn profile_sched(opts: ProfileSchedOpts) -> Result<()> {
     });
 
     for process in process_vec.iter_mut() {
+        // In case we didn't get any data for a process, we need to update the comm.
+        process.update_comm(process.pid, systing::types::task_stat::default());
         process.sort_runs();
         process.sort_preempt_events();
     }
