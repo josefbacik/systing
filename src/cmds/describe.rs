@@ -15,6 +15,7 @@ use blazesym::{Addr, Pid};
 use inferno::flamegraph::Options;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::RingBufferBuilder;
+use libbpf_rs::Iter;
 use petgraph::graphmap::DiGraphMap;
 use plain::Plain;
 
@@ -110,21 +111,28 @@ where
     ret
 }
 
+struct SymbolizerCache<'a> {
+    symbolizer: Symbolizer,
+    kernel_src: Source<'a>,
+    src_cache: HashMap::<u32, Source<'a>>,
+}
+
 enum StackType {
-    WakerKernel,
-    WakeeKernel,
-    WakerUser,
-    WakeeUser,
+    Kernel,
+    User,
+}
+
+struct Stack {
+    kernel_stack: Vec<Addr>,
+    user_stack: Vec<Addr>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct WakeEventKey {
     waker: u64,
     wakee: u64,
-    waker_kernel_stack: Vec<Addr>,
-    wakee_kernel_stack: Vec<Addr>,
-    waker_user_stack: Vec<Addr>,
-    wakee_user_stack: Vec<Addr>,
+    waker_stack: Stack,
+    wakee_stack: Stack,
 }
 
 struct WakeEventValue {
@@ -135,6 +143,68 @@ struct WakeEventValue {
 struct WakeEvent {
     key: WakeEventKey,
     value: WakeEventValue,
+}
+
+impl<'a> SymbolizerCache<'a> {
+    pub fn new() -> Self {
+        SymbolizerCache {
+            symbolizer: Symbolizer::new(),
+            kernel_src: Source::Kernel(Kernel::default()),
+            src_cache: HashMap::new(),
+        }
+    }
+
+    pub fn symbolize_stack(
+        &mut self,
+        pid: u32,
+        stack: &Stack,
+        stack_type: StackType,
+    ) -> Result<Vec<String>, Error> {
+        let src = match stack_type {
+            StackType::Kernel => &self.kernel_src,
+            StackType::User => {
+                if !self.src_cache.contains_key(&pid) {
+                    self.src_cache
+                        .insert(pid, Source::Process(Process::new(Pid::from(pid))));
+                }
+                self.src_cache.get(&pid).unwrap()
+            }
+        };
+        let raw_stack = match stack_type {
+            StackType::Kernel => &stack.kernel_stack,
+            StackType::User => &stack.user_stack,
+        };
+        match self.symbolizer.symbolize(src, Input::AbsAddr(raw_stack)) {
+            Ok(syms) => Ok(print_symbols(raw_stack.iter().copied().zip(syms))),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl Stack {
+    pub fn new(kernel_stack: Vec<Addr>, user_stack: Vec<Addr>) -> Self {
+        Stack {
+            kernel_stack,
+            user_stack,
+        }
+    }
+
+    pub fn symbolize(
+        &self,
+        symbolizer: &Symbolizer,
+        src: &Source,
+        stack_type: StackType,
+    ) -> Result<Vec<String>, Error> {
+        let stack = match stack_type {
+            StackType::Kernel => &self.kernel_stack,
+            StackType::User => &self.user_stack,
+        };
+
+        match symbolizer.symbolize(src, Input::AbsAddr(stack)) {
+            Ok(syms) => Ok(print_symbols(stack.iter().copied().zip(syms))),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 impl WakeEventKey {
@@ -229,9 +299,7 @@ impl ProcessEvents {
 
     pub fn write_flamegraph(
         &self,
-        symbolizer: &Symbolizer,
-        src_cache: &mut HashMap<u32, Source>,
-        kernel_src: &Source,
+        src_cache: &mut SymbolizerCache,
         w: &mut dyn Write,
     ) {
         let mut opts = Options::default();
@@ -249,37 +317,21 @@ impl ProcessEvents {
             let waker_pid = key.waker as u32;
             let wakee_pid = key.wakee as u32;
 
-            if !src_cache.contains_key(&waker_pid) {
-                src_cache.insert(
-                    waker_pid,
-                    Source::Process(Process::new(Pid::from(waker_pid))),
-                );
-            }
-            if !src_cache.contains_key(&wakee_pid) {
-                src_cache.insert(
-                    wakee_pid,
-                    Source::Process(Process::new(Pid::from(wakee_pid))),
-                );
-            }
-
-            let waker_src = src_cache.get(&(key.waker as u32)).unwrap();
-            let wakee_src = src_cache.get(&(key.wakee as u32)).unwrap();
-
             syms.extend(
-                key.symbolize_stack(symbolizer, wakee_src, StackType::WakeeUser)
+                src_cache.symbolize_stack(wakee_pid, &key.wakee_stack, StackType::Kernel)
                     .unwrap_or(Vec::new()),
             );
             syms.extend(
-                key.symbolize_stack(symbolizer, kernel_src, StackType::WakeeKernel)
+                src_cache.symbolize_stack(wakee_pid, &key.wakee_stack, StackType::Kernel)
                     .unwrap_or(Vec::new()),
             );
             syms.push(format!("{}_{}", pid_comm(waker_pid), waker_pid).to_string());
             syms.extend(
-                key.symbolize_stack(symbolizer, kernel_src, StackType::WakerKernel)
+                src_cache.symbolize_stack(waker_pid, &key.waker_stack, StackType::Kernel)
                     .unwrap_or(Vec::new()),
             );
             syms.extend(
-                key.symbolize_stack(symbolizer, waker_src, StackType::WakerUser)
+                src_cache.symbolize_stack(waker_pid, &key.waker_stack, StackType::User)
                     .unwrap_or(Vec::new()),
             );
             lines.push(format!("{} {}", syms.join(";"), value.duration_us));
@@ -309,7 +361,8 @@ impl WakeEvent {
         println!("  Waker kernel stack:");
         match self
             .key
-            .symbolize_stack(symbolizer, kernel_src, StackType::WakerKernel)
+            .waker_stack
+            .symbolize(symbolizer, kernel_src, StackType::Kernel)
         {
             Ok(syms) => println!("{}", syms.join("\n")),
             Err(e) => eprintln!("Failed to symbolize waker kernel stack: {}", e),
@@ -317,7 +370,8 @@ impl WakeEvent {
 
         match self
             .key
-            .symbolize_stack(symbolizer, waker_src, StackType::WakerUser)
+            .waker_stack
+            .symbolize(symbolizer, waker_src, StackType::User)
         {
             Ok(syms) => {
                 if !syms.is_empty() {
@@ -331,7 +385,8 @@ impl WakeEvent {
         println!("  Wakee kernel stack:");
         match self
             .key
-            .symbolize_stack(symbolizer, kernel_src, StackType::WakeeKernel)
+            .wakee_stack
+            .symbolize(symbolizer, kernel_src, StackType::Kernel)
         {
             Ok(syms) => println!("{}", syms.join("\n")),
             Err(e) => eprintln!("Failed to symbolize wakee kernel stack: {}", e),
@@ -434,15 +489,13 @@ fn print_stdout(process_events_vec: Vec<ProcessEvents>) -> Result<()> {
 }
 
 fn generate_flamegraphs(process_events_vec: Vec<ProcessEvents>) -> Result<()> {
-    let mut src_cache = HashMap::<u32, Source>::new();
-    let symbolizer = Symbolizer::new();
-    let kernel_src = Source::Kernel(Kernel::default());
+    let mut src_cache = SymbolizerCache::new();
     for process_events in process_events_vec {
         let mut file = std::fs::File::create(format!(
             "systing-describe/flamegraph-{}.svg",
             process_events.pidtgid as u32
         ))?;
-        process_events.write_flamegraph(&symbolizer, &mut src_cache, &kernel_src, &mut file);
+        process_events.write_flamegraph(&mut src_cache, &mut file);
     }
     Ok(())
 }

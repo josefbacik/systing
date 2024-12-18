@@ -109,9 +109,10 @@ int handle__sched_switch(u64 *ctx)
 #define TASK_STATE_MASK 3
 
 SEC("iter/task")
-int dump_task(struct task_struct *task)
+int dump_task(struct bpf_iter__task *ctx)
 {
 	struct seq_file *seq = ctx->meta->seq;
+	struct task_struct *task = ctx->task;
 
 	if (!task)
 		return 0;
@@ -127,7 +128,7 @@ int dump_task(struct task_struct *task)
 	u64 key = (u64)task->tgid << 32 | task->pid;
 	struct wakee_stack stack = {
 		.start_ns = key,
-	}
+	};
 	bpf_get_stack(NULL, &stack.kernel_stack, sizeof(stack.kernel_stack),
 		      SKIP_STACK_DEPTH);
 	bpf_get_stack(NULL, &stack.user_stack, sizeof(stack.user_stack), BPF_F_USER_STACK);
