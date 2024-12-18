@@ -106,4 +106,34 @@ int handle__sched_switch(u64 *ctx)
 	return 0;
 }
 
+#define TASK_STATE_MASK 3
+
+SEC("iter/task")
+int dump_task(struct bpf_iter__task *ctx)
+{
+	struct seq_file *seq = ctx->meta->seq;
+	struct task_struct *task = ctx->task;
+
+	if (!task)
+		return 0;
+
+	/* We only care about running tasks. */
+	if (task->__state & TASK_STATE_MASK)
+		return 0;
+
+	if (tool_config.tgid && task->tgid != tool_config.tgid)
+		return 0;
+
+	/* We're going to abuse the wakee_stack for this. */
+	u64 key = (u64)task->tgid << 32 | task->pid;
+	struct wakee_stack stack = {
+		.start_ns = key,
+	};
+	bpf_get_stack(NULL, &stack.kernel_stack, sizeof(stack.kernel_stack),
+		      SKIP_STACK_DEPTH);
+	bpf_get_stack(NULL, &stack.user_stack, sizeof(stack.user_stack), BPF_F_USER_STACK);
+	bpf_seq_write(seq, &stack, sizeof(stack));
+	return 0;
+}
+
 char LICENSE[] SEC("license") = "GPL";
