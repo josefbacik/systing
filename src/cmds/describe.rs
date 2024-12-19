@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::io::Read;
 use std::io::Write;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +15,7 @@ use blazesym::symbolize::{CodeInfo, Input, Kernel, Process, Source, Sym, Symboli
 use blazesym::{Addr, Pid};
 use inferno::flamegraph::Options;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
+use libbpf_rs::Iter;
 use libbpf_rs::RingBufferBuilder;
 use petgraph::graphmap::DiGraphMap;
 use plain::Plain;
@@ -23,6 +25,7 @@ mod systing {
 }
 
 unsafe impl Plain for systing::types::wake_event {}
+unsafe impl Plain for systing::types::wakee_stack {}
 
 const ADDR_WIDTH: usize = 16;
 
@@ -128,6 +131,12 @@ struct Stack {
 }
 
 #[derive(Debug, Hash, Eq, PartialEq)]
+struct SampleKey {
+    pid: u32,
+    stack: Stack,
+}
+
+#[derive(Debug, Hash, Eq, PartialEq)]
 struct WakeEventKey {
     waker: u64,
     wakee: u64,
@@ -230,6 +239,29 @@ impl WakeEventKey {
     }
 }
 
+struct SampleEvent {
+    events: HashMap<SampleKey, u64>,
+}
+
+impl SampleEvent {
+    pub fn new() -> Self {
+        SampleEvent {
+            events: HashMap::new(),
+        }
+    }
+
+    pub fn add_event(&mut self, key: SampleKey) {
+        match self.events.get_mut(&key) {
+            Some(ref mut count) => {
+                **count += 1;
+            }
+            None => {
+                self.events.insert(key, 1);
+            }
+        };
+    }
+}
+
 struct ProcessEvents {
     pidtgid: u64,
     duration_us: u64,
@@ -265,11 +297,11 @@ impl ProcessEvents {
         };
     }
 
-    pub fn write_flamegraph(&self, src_cache: &mut SymbolizerCache, w: &mut dyn Write) {
+    pub fn write_wakers_flamegraph(&self, src_cache: &mut SymbolizerCache, w: &mut dyn Write) {
         let mut opts = Options::default();
         opts.min_width = 0.1;
         opts.title = format!(
-            "Process: tgid {} pid {} comm {}",
+            "Process: tgid {} pid {} comm {} Off-CPU Flamegraph",
             self.pidtgid >> 32,
             self.pidtgid as u32,
             pid_comm(self.pidtgid as u32)
@@ -279,18 +311,7 @@ impl ProcessEvents {
         for (key, value) in self.events.iter() {
             let mut syms = Vec::new();
             let waker_pid = key.waker as u32;
-            let wakee_pid = key.wakee as u32;
 
-            syms.extend(
-                src_cache
-                    .symbolize_stack(wakee_pid, &key.wakee_stack, StackType::Kernel)
-                    .unwrap_or(Vec::new()),
-            );
-            syms.extend(
-                src_cache
-                    .symbolize_stack(wakee_pid, &key.wakee_stack, StackType::Kernel)
-                    .unwrap_or(Vec::new()),
-            );
             syms.push(format!("{}_{}", pid_comm(waker_pid), waker_pid).to_string());
             syms.extend(
                 src_cache
@@ -300,6 +321,36 @@ impl ProcessEvents {
             syms.extend(
                 src_cache
                     .symbolize_stack(waker_pid, &key.waker_stack, StackType::User)
+                    .unwrap_or(Vec::new()),
+            );
+            lines.push(format!("{} {}", syms.join(";"), value.count));
+        }
+        inferno::flamegraph::from_lines(&mut opts, lines.iter().map(|x| x.as_str()), w).unwrap();
+    }
+
+    pub fn write_offcpu_flamegraph(&self, src_cache: &mut SymbolizerCache, w: &mut dyn Write) {
+        let mut opts = Options::default();
+        opts.min_width = 0.1;
+        opts.title = format!(
+            "Process: tgid {} pid {} comm {} Off-CPU Flamegraph",
+            self.pidtgid >> 32,
+            self.pidtgid as u32,
+            pid_comm(self.pidtgid as u32)
+        );
+
+        let mut lines = Vec::new();
+        for (key, value) in self.events.iter() {
+            let mut syms = Vec::new();
+            let wakee_pid = key.wakee as u32;
+
+            syms.extend(
+                src_cache
+                    .symbolize_stack(wakee_pid, &key.wakee_stack, StackType::Kernel)
+                    .unwrap_or(Vec::new()),
+            );
+            syms.extend(
+                src_cache
+                    .symbolize_stack(wakee_pid, &key.wakee_stack, StackType::User)
                     .unwrap_or(Vec::new()),
             );
             lines.push(format!("{} {}", syms.join(";"), value.duration_us));
@@ -434,14 +485,89 @@ fn print_stdout(process_events_vec: Vec<ProcessEvents>) -> Result<()> {
     Ok(())
 }
 
-fn generate_flamegraphs(process_events_vec: Vec<ProcessEvents>) -> Result<()> {
+fn write_latency_flamegraph(
+    events: ProcessEvents,
+    samples: &SampleEvent,
+    src_cache: &mut SymbolizerCache,
+    w: &mut dyn Write,
+) -> Result<()> {
+    let mut opts = Options::default();
+    opts.min_width = 0.1;
+    opts.title = format!(
+        "Process: tgid {} pid {} comm {} Off-CPU Flamegraph",
+        events.pidtgid >> 32,
+        events.pidtgid as u32,
+        pid_comm(events.pidtgid as u32)
+    );
+
+    let mut lines = Vec::new();
+    for (key, value) in events.events.iter() {
+        let mut syms = Vec::new();
+        let wakee_pid = key.wakee as u32;
+
+        syms.extend(
+            src_cache
+                .symbolize_stack(wakee_pid, &key.wakee_stack, StackType::Kernel)
+                .unwrap_or(Vec::new()),
+        );
+        syms.extend(
+            src_cache
+                .symbolize_stack(wakee_pid, &key.wakee_stack, StackType::User)
+                .unwrap_or(Vec::new()),
+        );
+        lines.push(format!("{} {}", syms.join(";"), value.duration_us / 1000));
+    }
+
+    for (key, value) in samples.events.iter() {
+        let mut syms = Vec::new();
+        let wakee_pid = key.pid;
+
+        syms.extend(
+            src_cache
+                .symbolize_stack(wakee_pid, &key.stack, StackType::Kernel)
+                .unwrap_or(Vec::new()),
+        );
+        syms.extend(
+            src_cache
+                .symbolize_stack(wakee_pid, &key.stack, StackType::User)
+                .unwrap_or(Vec::new()),
+        );
+        lines.push(format!("{} {}", syms.join(";"), value));
+    }
+    inferno::flamegraph::from_lines(&mut opts, lines.iter().map(|x| x.as_str()), w).unwrap();
+    Ok(())
+}
+
+fn generate_flamegraphs(
+    process_events_vec: Vec<ProcessEvents>,
+    samples_hash: HashMap<u32, SampleEvent>,
+) -> Result<()> {
     let mut src_cache = SymbolizerCache::new();
+    let empty_sample = SampleEvent::new();
     for process_events in process_events_vec {
+        let pid = process_events.pidtgid as u32;
         let mut file = std::fs::File::create(format!(
-            "systing-describe/flamegraph-{}.svg",
+            "systing-describe/flamegraph-{}-offcpu.svg",
             process_events.pidtgid as u32
         ))?;
-        process_events.write_flamegraph(&mut src_cache, &mut file);
+        process_events.write_offcpu_flamegraph(&mut src_cache, &mut file);
+        let mut file = std::fs::File::create(format!(
+            "systing-describe/flamegraph-{}-wakers.svg",
+            process_events.pidtgid as u32
+        ))?;
+        process_events.write_wakers_flamegraph(&mut src_cache, &mut file);
+        let mut file = std::fs::File::create(format!(
+            "systing-describe/flamegraph-{}-latency.svg",
+            process_events.pidtgid as u32
+        ))?;
+        let samples = match samples_hash.get(&pid) {
+            Some(samples) => samples,
+            None => {
+                println!("No samples found for pid {}", pid);
+                &empty_sample
+            }
+        };
+        write_latency_flamegraph(process_events, samples, &mut src_cache, &mut file)?;
     }
     Ok(())
 }
@@ -498,6 +624,52 @@ pub fn describe(opts: DescribeOpts) -> Result<()> {
         0
     });
 
+    let task_link = Arc::new(skel.links.dump_task.as_ref().unwrap());
+    let task_link_clone = task_link.clone();
+    let samples = Arc::new(Mutex::new(HashMap::<u32, SampleEvent>::new()));
+    let samples_clone = samples.clone();
+    let samples_thread_done = thread_done.clone();
+    let sample_thread = thread::spawn(move || {
+        let delay = Duration::from_millis(100);
+        while !samples_thread_done.load(Ordering::Relaxed) {
+            thread::sleep(delay);
+            let mut iter = Iter::new(*task_link_clone).expect("Failed to create iterator");
+            let mut buf = Vec::new();
+            let bytes_read = iter
+                .read_to_end(&mut buf)
+                .expect("Failed to read from iterator");
+            if bytes_read == 0 {
+                println!("No data read from iterator");
+                continue;
+            }
+
+            println!("Read {} bytes from iterator", bytes_read);
+            let items: &[systing::types::wakee_stack] =
+                plain::slice_from_bytes(&buf).expect("Data buffer was too short");
+            let mut my_samples = samples_clone.lock().unwrap();
+            for item in items {
+                let pid = item.start_ns as u32;
+                let key = SampleKey {
+                    pid,
+                    stack: Stack::new(
+                        item.kernel_stack.iter().copied().collect(),
+                        item.user_stack.iter().copied().collect(),
+                    ),
+                };
+                match my_samples.get_mut(&key.pid) {
+                    Some(ref mut sample) => {
+                        sample.add_event(key);
+                    }
+                    None => {
+                        let mut sample = SampleEvent::new();
+                        sample.add_event(key);
+                        my_samples.insert(pid, sample);
+                    }
+                };
+            }
+        }
+    });
+
     if opts.duration > 0 {
         thread::sleep(Duration::from_secs(opts.duration));
     } else {
@@ -510,6 +682,7 @@ pub fn describe(opts: DescribeOpts) -> Result<()> {
 
     thread_done.store(true, Ordering::Relaxed);
     t.join().expect("Failed to join thread");
+    sample_thread.join().expect("Failed to join thread");
 
     let mut process_events_vec: Vec<ProcessEvents> = Vec::new();
     let mut graph = DiGraphMap::new();
@@ -537,14 +710,15 @@ pub fn describe(opts: DescribeOpts) -> Result<()> {
             }
         }
     }
-    process_events_vec.sort_by_key(|k| k.duration_us);
 
+    let samples_hash = std::mem::take(&mut *samples.lock().unwrap());
     std::fs::create_dir_all("systing-describe")?;
     print_graphviz(pids, graph)?;
     if opts.raw_output {
+        process_events_vec.sort_by_key(|k| k.duration_us);
         print_stdout(process_events_vec)?;
     } else {
-        generate_flamegraphs(process_events_vec)?;
+        generate_flamegraphs(process_events_vec, samples_hash)?;
     }
 
     Ok(())

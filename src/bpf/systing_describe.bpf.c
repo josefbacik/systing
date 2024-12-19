@@ -29,9 +29,10 @@ struct wake_event {
 
 /*
  * Dummy instance to get skeleton to generate definition for
- * `struct wake_event`
+ * `struct wake_event` and `struct wakee_stack`.
  */
 struct wake_event _event = {0};
+struct wakee_stack _stack = {0};
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -114,24 +115,33 @@ int dump_task(struct bpf_iter__task *ctx)
 	struct seq_file *seq = ctx->meta->seq;
 	struct task_struct *task = ctx->task;
 
-	if (!task)
+	if (!task) {
+		const char fmt[] = "task is NULL";
+		bpf_trace_printk(fmt, sizeof(fmt));
 		return 0;
+	}
+
+	if (tool_config.tgid && task->tgid != tool_config.tgid) {
+		const char fmt[] = "task %d:%d is not in the target tgid";
+		bpf_trace_printk(fmt, sizeof(fmt), task->tgid, task->pid);
+		return 0;
+	}
 
 	/* We only care about running tasks. */
-	if (task->__state & TASK_STATE_MASK)
+	if (task->__state & TASK_STATE_MASK) {
+		const char fmt[] = "task %d is not running";
+		bpf_trace_printk(fmt, sizeof(fmt), task->pid);
 		return 0;
-
-	if (tool_config.tgid && task->tgid != tool_config.tgid)
-		return 0;
+	}
 
 	/* We're going to abuse the wakee_stack for this. */
 	u64 key = (u64)task->tgid << 32 | task->pid;
 	struct wakee_stack stack = {
 		.start_ns = key,
 	};
-	bpf_get_stack(NULL, &stack.kernel_stack, sizeof(stack.kernel_stack),
+	bpf_get_task_stack(task, &stack.kernel_stack, sizeof(stack.kernel_stack),
 		      SKIP_STACK_DEPTH);
-	bpf_get_stack(NULL, &stack.user_stack, sizeof(stack.user_stack), BPF_F_USER_STACK);
+	bpf_get_task_stack(task, &stack.user_stack, sizeof(stack.user_stack), BPF_F_USER_STACK);
 	bpf_seq_write(seq, &stack, sizeof(stack));
 	return 0;
 }
