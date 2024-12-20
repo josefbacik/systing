@@ -123,8 +123,8 @@ int sample_process(void *ctx)
 	event->waker_tgidpid = (u64)-1;
 	event->wakee_tgidpid = (u64)task->tgid << 32 | task->pid;
 	event->sleep_time_us = 0;
-	bpf_get_stack(ctx, &event->wakee_kernel_stack, sizeof(event->wakee_kernel_stack), 0);
-	bpf_get_stack(ctx, &event->wakee_user_stack, sizeof(event->wakee_user_stack), BPF_F_USER_STACK);
+	bpf_get_task_stack(task, &event->wakee_kernel_stack, sizeof(event->wakee_kernel_stack), SKIP_STACK_DEPTH);
+	bpf_get_task_stack(task, &event->wakee_user_stack, sizeof(event->wakee_user_stack), BPF_F_USER_STACK);
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }

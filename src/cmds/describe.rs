@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::io;
-use std::io::Write;
 use std::mem;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -287,7 +286,7 @@ impl ProcessEvents {
         };
     }
 
-    pub fn write_wakers_flamegraph(&self, src_cache: &mut SymbolizerCache, w: &mut dyn Write) {
+    pub fn write_wakers_flamegraph(&self, src_cache: &mut SymbolizerCache) -> Result<()> {
         let mut opts = Options::default();
         opts.min_width = 0.1;
         opts.title = format!(
@@ -319,10 +318,17 @@ impl ProcessEvents {
             );
             lines.push(format!("{} {}", syms.join(";"), value.count));
         }
-        inferno::flamegraph::from_lines(&mut opts, lines.iter().map(|x| x.as_str()), w).unwrap();
+        if lines.len() > 0 {
+            let mut file = std::fs::File::create(format!(
+                "systing-describe/flamegraph-{}-wakers.svg",
+                self.pidtgid as u32
+            ))?;
+            inferno::flamegraph::from_lines(&mut opts, lines.iter().map(|x| x.as_str()), &mut file)?;
+        }
+        Ok(())
     }
 
-    pub fn write_offcpu_flamegraph(&self, src_cache: &mut SymbolizerCache, w: &mut dyn Write) {
+    pub fn write_offcpu_flamegraph(&self, src_cache: &mut SymbolizerCache) -> Result<()> {
         let mut opts = Options::default();
         opts.min_width = 0.1;
         opts.title = format!(
@@ -353,10 +359,17 @@ impl ProcessEvents {
             );
             lines.push(format!("{} {}", syms.join(";"), value.duration_us));
         }
-        inferno::flamegraph::from_lines(&mut opts, lines.iter().map(|x| x.as_str()), w).unwrap();
+        if lines.len() > 0 {
+            let mut file = std::fs::File::create(format!(
+                "systing-describe/flamegraph-{}-offcpu.svg",
+                self.pidtgid as u32
+            ))?;
+            inferno::flamegraph::from_lines(&mut opts, lines.iter().map(|x| x.as_str()), &mut file)?;
+        }
+        Ok(())
     }
 
-    fn write_latency_flamegraph(&self, src_cache: &mut SymbolizerCache, w: &mut dyn Write) {
+    fn write_latency_flamegraph(&self, src_cache: &mut SymbolizerCache) -> Result<()> {
         let mut opts = Options::default();
         let pid = self.pidtgid as u32;
         opts.min_width = 0.1;
@@ -403,7 +416,14 @@ impl ProcessEvents {
             "{}: max_samples: {}, max_sleep_samples: {}",
             self.pidtgid as u32, max_samples, max_sleep_samples
         );
-        inferno::flamegraph::from_lines(&mut opts, lines.iter().map(|x| x.as_str()), w).unwrap();
+        if lines.len() > 0 {
+            let mut file = std::fs::File::create(format!(
+                "systing-describe/flamegraph-{}-latency.svg",
+                pid
+            ))?;
+            inferno::flamegraph::from_lines(&mut opts, lines.iter().map(|x| x.as_str()), &mut file).unwrap();
+        }
+        Ok(())
     }
 }
 
@@ -529,28 +549,6 @@ fn print_stdout(process_events_vec: Vec<ProcessEvents>) -> Result<()> {
 
             event.print(&mut src_cache);
         }
-    }
-    Ok(())
-}
-
-fn generate_flamegraphs(process_events_vec: Vec<ProcessEvents>) -> Result<()> {
-    let mut src_cache = SymbolizerCache::new();
-    for process_events in process_events_vec {
-        let mut file = std::fs::File::create(format!(
-            "systing-describe/flamegraph-{}-offcpu.svg",
-            process_events.pidtgid as u32
-        ))?;
-        process_events.write_offcpu_flamegraph(&mut src_cache, &mut file);
-        let mut file = std::fs::File::create(format!(
-            "systing-describe/flamegraph-{}-wakers.svg",
-            process_events.pidtgid as u32
-        ))?;
-        process_events.write_wakers_flamegraph(&mut src_cache, &mut file);
-        let mut file = std::fs::File::create(format!(
-            "systing-describe/flamegraph-{}-latency.svg",
-            process_events.pidtgid as u32
-        ))?;
-        process_events.write_latency_flamegraph(&mut src_cache, &mut file);
     }
     Ok(())
 }
@@ -715,7 +713,12 @@ pub fn describe(opts: DescribeOpts) -> Result<()> {
         process_events_vec.sort_by_key(|k| k.duration_us);
         print_stdout(process_events_vec)?;
     } else {
-        generate_flamegraphs(process_events_vec)?;
+        let mut src_cache = SymbolizerCache::new();
+        for process_events in process_events_vec {
+            process_events.write_offcpu_flamegraph(&mut src_cache)?;
+            process_events.write_wakers_flamegraph(&mut src_cache)?;
+            process_events.write_latency_flamegraph(&mut src_cache)?;
+        }
     }
 
     for pefd in pefds {
