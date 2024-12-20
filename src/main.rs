@@ -28,6 +28,8 @@ pub struct DescribeOpts {
     raw_output: bool,
     #[arg(short, long, default_value = "0")]
     duration: u64,
+    #[arg(short, long)]
+    sw_event: bool,
 }
 
 #[derive(Debug, Args)]

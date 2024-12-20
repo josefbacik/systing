@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::io::Read;
+use std::io;
 use std::io::Write;
+use std::mem;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
@@ -15,14 +16,17 @@ use blazesym::symbolize::{CodeInfo, Input, Kernel, Process, Source, Sym, Symboli
 use blazesym::{Addr, Pid};
 use inferno::flamegraph::Options;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::Iter;
+use libbpf_rs::ErrorExt;
 use libbpf_rs::RingBufferBuilder;
+use nix::unistd::close;
 use petgraph::graphmap::DiGraphMap;
 use plain::Plain;
 
 mod systing {
     include!(concat!(env!("OUT_DIR"), "/systing_describe.skel.rs"));
 }
+
+mod syscall;
 
 unsafe impl Plain for systing::types::wake_event {}
 unsafe impl Plain for systing::types::wakee_stack {}
@@ -124,34 +128,35 @@ enum StackType {
     User,
 }
 
-#[derive(Debug, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
 struct Stack {
     kernel_stack: Vec<Addr>,
     user_stack: Vec<Addr>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq)]
-struct SampleKey {
-    pid: u32,
-    stack: Stack,
+enum EventKeyType {
+    WakeEvent,
+    SampleEvent,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq)]
-struct WakeEventKey {
+struct EventKey {
+    event_type: EventKeyType,
     waker: u64,
     wakee: u64,
     waker_stack: Stack,
     wakee_stack: Stack,
 }
 
-struct WakeEventValue {
+struct EventValue {
     count: u64,
     duration_us: u64,
 }
 
-struct WakeEvent {
-    key: WakeEventKey,
-    value: WakeEventValue,
+struct Event {
+    key: EventKey,
+    value: EventValue,
 }
 
 impl<'a> SymbolizerCache<'a> {
@@ -199,7 +204,7 @@ impl Stack {
     }
 }
 
-impl WakeEventKey {
+impl EventKey {
     pub fn new(event: systing::types::wake_event) -> Self {
         // The waker can be the kernel, to avoid the overhead of memsetting the whole stack we use
         // a magic number for the first element so we can just zero out the stack.
@@ -208,17 +213,23 @@ impl WakeEventKey {
             _ => event
                 .waker_user_stack
                 .into_iter()
+                .rev()
                 .filter(|x| *x > 0)
                 .collect(),
         };
-
-        WakeEventKey {
+        let my_event_type = match event.waker_tgidpid {
+            u64::MAX => EventKeyType::SampleEvent,
+            _ => EventKeyType::WakeEvent,
+        };
+        EventKey {
+            event_type: my_event_type,
             waker: event.waker_tgidpid,
             wakee: event.wakee_tgidpid,
             waker_stack: Stack::new(
                 event
                     .waker_kernel_stack
                     .into_iter()
+                    .rev()
                     .filter(|x| *x > 0)
                     .collect(),
                 waker_stack,
@@ -227,11 +238,13 @@ impl WakeEventKey {
                 event
                     .wakee_kernel_stack
                     .into_iter()
+                    .rev()
                     .filter(|x| *x > 0)
                     .collect(),
                 event
                     .wakee_user_stack
                     .into_iter()
+                    .rev()
                     .filter(|x| *x > 0)
                     .collect(),
             ),
@@ -239,33 +252,10 @@ impl WakeEventKey {
     }
 }
 
-struct SampleEvent {
-    events: HashMap<SampleKey, u64>,
-}
-
-impl SampleEvent {
-    pub fn new() -> Self {
-        SampleEvent {
-            events: HashMap::new(),
-        }
-    }
-
-    pub fn add_event(&mut self, key: SampleKey) {
-        match self.events.get_mut(&key) {
-            Some(ref mut count) => {
-                **count += 1;
-            }
-            None => {
-                self.events.insert(key, 1);
-            }
-        };
-    }
-}
-
 struct ProcessEvents {
     pidtgid: u64,
     duration_us: u64,
-    events: HashMap<WakeEventKey, WakeEventValue>,
+    events: HashMap<EventKey, EventValue>,
 }
 
 impl ProcessEvents {
@@ -278,7 +268,7 @@ impl ProcessEvents {
     }
 
     pub fn add_event(&mut self, event: systing::types::wake_event) {
-        let key = WakeEventKey::new(event);
+        let key = EventKey::new(event);
         self.duration_us += event.sleep_time_us;
         match self.events.get_mut(&key) {
             Some(ref mut value) => {
@@ -288,7 +278,7 @@ impl ProcessEvents {
             None => {
                 self.events.insert(
                     key,
-                    WakeEventValue {
+                    EventValue {
                         count: 1,
                         duration_us: event.sleep_time_us,
                     },
@@ -308,19 +298,23 @@ impl ProcessEvents {
         );
 
         let mut lines = Vec::new();
-        for (key, value) in self.events.iter() {
+        for (key, value) in self
+            .events
+            .iter()
+            .filter(|(key, _)| key.event_type == EventKeyType::WakeEvent)
+        {
             let mut syms = Vec::new();
             let waker_pid = key.waker as u32;
 
             syms.push(format!("{}_{}", pid_comm(waker_pid), waker_pid).to_string());
             syms.extend(
                 src_cache
-                    .symbolize_stack(waker_pid, &key.waker_stack, StackType::Kernel)
+                    .symbolize_stack(waker_pid, &key.waker_stack, StackType::User)
                     .unwrap_or(Vec::new()),
             );
             syms.extend(
                 src_cache
-                    .symbolize_stack(waker_pid, &key.waker_stack, StackType::User)
+                    .symbolize_stack(waker_pid, &key.waker_stack, StackType::Kernel)
                     .unwrap_or(Vec::new()),
             );
             lines.push(format!("{} {}", syms.join(";"), value.count));
@@ -339,30 +333,84 @@ impl ProcessEvents {
         );
 
         let mut lines = Vec::new();
-        for (key, value) in self.events.iter() {
+        for (key, value) in self
+            .events
+            .iter()
+            .filter(|(key, _)| key.event_type == EventKeyType::WakeEvent)
+        {
             let mut syms = Vec::new();
             let wakee_pid = key.wakee as u32;
 
             syms.extend(
                 src_cache
-                    .symbolize_stack(wakee_pid, &key.wakee_stack, StackType::Kernel)
+                    .symbolize_stack(wakee_pid, &key.wakee_stack, StackType::User)
                     .unwrap_or(Vec::new()),
             );
             syms.extend(
                 src_cache
-                    .symbolize_stack(wakee_pid, &key.wakee_stack, StackType::User)
+                    .symbolize_stack(wakee_pid, &key.wakee_stack, StackType::Kernel)
                     .unwrap_or(Vec::new()),
             );
             lines.push(format!("{} {}", syms.join(";"), value.duration_us));
         }
         inferno::flamegraph::from_lines(&mut opts, lines.iter().map(|x| x.as_str()), w).unwrap();
     }
+
+    fn write_latency_flamegraph(&self, src_cache: &mut SymbolizerCache, w: &mut dyn Write) {
+        let mut opts = Options::default();
+        let pid = self.pidtgid as u32;
+        opts.min_width = 0.1;
+        opts.title = format!(
+            "Process: tgid {} pid {} comm {} Off-CPU Flamegraph",
+            self.pidtgid >> 32,
+            pid,
+            pid_comm(pid as u32)
+        );
+
+        let mut lines = Vec::new();
+        let mut max_samples = 0;
+        let mut max_sleep_samples = 0;
+        let mut stacks = HashMap::<Stack, u64>::new();
+        for (key, value) in self.events.iter() {
+            let count = stacks.entry(key.wakee_stack.clone()).or_insert(0);
+            match key.event_type {
+                EventKeyType::WakeEvent => {
+                    *count += value.duration_us / 1000;
+                    max_sleep_samples = max_sleep_samples.max(value.duration_us / 1000);
+                }
+                EventKeyType::SampleEvent => {
+                    *count += value.count;
+                    max_samples = max_samples.max(value.count);
+                }
+            };
+        }
+        for (key, value) in stacks {
+            let mut syms = Vec::new();
+
+            syms.extend(
+                src_cache
+                    .symbolize_stack(pid, &key, StackType::User)
+                    .unwrap_or(Vec::new()),
+            );
+            syms.extend(
+                src_cache
+                    .symbolize_stack(pid, &key, StackType::Kernel)
+                    .unwrap_or(Vec::new()),
+            );
+            lines.push(format!("{} {}", syms.join(";"), value));
+        }
+        println!(
+            "{}: max_samples: {}, max_sleep_samples: {}",
+            self.pidtgid as u32, max_samples, max_sleep_samples
+        );
+        inferno::flamegraph::from_lines(&mut opts, lines.iter().map(|x| x.as_str()), w).unwrap();
+    }
 }
 
-impl WakeEvent {
+impl Event {
     pub fn print(&self, src_cache: &mut SymbolizerCache) {
         println!(
-            "  Waker: tgid {} pid {} comm {}",
+            "  r: tgid {} pid {} comm {}",
             self.key.waker >> 32,
             self.key.waker as u32,
             pid_comm(self.key.waker as u32)
@@ -371,7 +419,7 @@ impl WakeEvent {
             "  Count: {}, Duration: {}",
             self.value.count, self.value.duration_us
         );
-        println!("  Waker kernel stack:");
+        println!("  r kernel stack:");
         match src_cache.symbolize_stack(
             self.key.waker as u32,
             &self.key.waker_stack,
@@ -388,14 +436,14 @@ impl WakeEvent {
         ) {
             Ok(syms) => {
                 if !syms.is_empty() {
-                    println!("  Waker user stack:");
+                    println!("  r user stack:");
                     println!("{}", syms.join("\n"));
                 }
             }
             Err(e) => eprintln!("Failed to symbolize waker user stack: {}", e),
         };
 
-        println!("  Wakee kernel stack:");
+        println!("  e kernel stack:");
         match src_cache.symbolize_stack(
             self.key.wakee as u32,
             &self.key.wakee_stack,
@@ -412,7 +460,7 @@ impl WakeEvent {
         ) {
             Ok(syms) => {
                 if !syms.is_empty() {
-                    println!("  Wakee user stack:");
+                    println!("  e user stack:");
                     println!("{}", syms.join("\n"));
                 }
             }
@@ -460,10 +508,10 @@ fn print_stdout(process_events_vec: Vec<ProcessEvents>) -> Result<()> {
     let mut src_cache = SymbolizerCache::new();
 
     for process_events in process_events_vec {
-        let mut events_vec: Vec<WakeEvent> = process_events
+        let mut events_vec: Vec<Event> = process_events
             .events
             .into_iter()
-            .map(|(key, value)| WakeEvent { key, value })
+            .map(|(key, value)| Event { key, value })
             .collect();
         events_vec.sort_by_key(|k| (k.value.duration_us, k.value.count));
         let mut first = true;
@@ -485,67 +533,9 @@ fn print_stdout(process_events_vec: Vec<ProcessEvents>) -> Result<()> {
     Ok(())
 }
 
-fn write_latency_flamegraph(
-    events: ProcessEvents,
-    samples: &SampleEvent,
-    src_cache: &mut SymbolizerCache,
-    w: &mut dyn Write,
-) -> Result<()> {
-    let mut opts = Options::default();
-    opts.min_width = 0.1;
-    opts.title = format!(
-        "Process: tgid {} pid {} comm {} Off-CPU Flamegraph",
-        events.pidtgid >> 32,
-        events.pidtgid as u32,
-        pid_comm(events.pidtgid as u32)
-    );
-
-    let mut lines = Vec::new();
-    for (key, value) in events.events.iter() {
-        let mut syms = Vec::new();
-        let wakee_pid = key.wakee as u32;
-
-        syms.extend(
-            src_cache
-                .symbolize_stack(wakee_pid, &key.wakee_stack, StackType::Kernel)
-                .unwrap_or(Vec::new()),
-        );
-        syms.extend(
-            src_cache
-                .symbolize_stack(wakee_pid, &key.wakee_stack, StackType::User)
-                .unwrap_or(Vec::new()),
-        );
-        lines.push(format!("{} {}", syms.join(";"), value.duration_us / 1000));
-    }
-
-    for (key, value) in samples.events.iter() {
-        let mut syms = Vec::new();
-        let wakee_pid = key.pid;
-
-        syms.extend(
-            src_cache
-                .symbolize_stack(wakee_pid, &key.stack, StackType::Kernel)
-                .unwrap_or(Vec::new()),
-        );
-        syms.extend(
-            src_cache
-                .symbolize_stack(wakee_pid, &key.stack, StackType::User)
-                .unwrap_or(Vec::new()),
-        );
-        lines.push(format!("{} {}", syms.join(";"), value));
-    }
-    inferno::flamegraph::from_lines(&mut opts, lines.iter().map(|x| x.as_str()), w).unwrap();
-    Ok(())
-}
-
-fn generate_flamegraphs(
-    process_events_vec: Vec<ProcessEvents>,
-    samples_hash: HashMap<u32, SampleEvent>,
-) -> Result<()> {
+fn generate_flamegraphs(process_events_vec: Vec<ProcessEvents>) -> Result<()> {
     let mut src_cache = SymbolizerCache::new();
-    let empty_sample = SampleEvent::new();
     for process_events in process_events_vec {
-        let pid = process_events.pidtgid as u32;
         let mut file = std::fs::File::create(format!(
             "systing-describe/flamegraph-{}-offcpu.svg",
             process_events.pidtgid as u32
@@ -560,16 +550,64 @@ fn generate_flamegraphs(
             "systing-describe/flamegraph-{}-latency.svg",
             process_events.pidtgid as u32
         ))?;
-        let samples = match samples_hash.get(&pid) {
-            Some(samples) => samples,
-            None => {
-                println!("No samples found for pid {}", pid);
-                &empty_sample
-            }
-        };
-        write_latency_flamegraph(process_events, samples, &mut src_cache, &mut file)?;
+        process_events.write_latency_flamegraph(&mut src_cache, &mut file);
     }
     Ok(())
+}
+
+fn init_perf_monitor(freq: u64, sw_event: bool) -> Result<Vec<i32>, libbpf_rs::Error> {
+    let nprocs = libbpf_rs::num_possible_cpus().unwrap();
+    let pid = -1;
+    let buf: Vec<u8> = vec![0; mem::size_of::<syscall::perf_event_attr>()];
+    let mut attr = unsafe {
+        Box::<syscall::perf_event_attr>::from_raw(
+            buf.leak().as_mut_ptr() as *mut syscall::perf_event_attr
+        )
+    };
+    attr._type = if sw_event {
+        syscall::PERF_TYPE_SOFTWARE
+    } else {
+        syscall::PERF_TYPE_HARDWARE
+    };
+    attr.size = mem::size_of::<syscall::perf_event_attr>() as u32;
+    attr.config = if sw_event {
+        syscall::PERF_COUNT_SW_CPU_CLOCK
+    } else {
+        syscall::PERF_COUNT_HW_CPU_CYCLES
+    };
+    attr.sample.sample_freq = freq;
+    attr.flags = 1 << 10; // freq = 1i
+    let mut pidfds = Vec::new();
+    for cpu in 0..nprocs {
+        let fd = syscall::perf_event_open(attr.as_ref(), pid, cpu as i32, -1, 0) as i32;
+        if fd == -1 {
+            let os_error = io::Error::last_os_error();
+            let mut error_context = "Failed to open perf event.";
+
+            if let Some(libc::ENODEV) = os_error.raw_os_error() {
+                // Sometimes available cpus < num_cpus, so we just break here.
+                break;
+            }
+
+            if !sw_event && os_error.kind() == io::ErrorKind::NotFound {
+                error_context = "Failed to open perf event.\n\
+                                Try running the profile example with the `--sw-event` option.";
+            }
+            return Err(libbpf_rs::Error::from(os_error)).context(error_context);
+        }
+        pidfds.push(fd);
+    }
+    Ok(pidfds)
+}
+
+fn attach_perf_event(
+    pefds: &[i32],
+    prog: &libbpf_rs::ProgramMut,
+) -> Vec<Result<libbpf_rs::Link, libbpf_rs::Error>> {
+    pefds
+        .iter()
+        .map(|pefd| prog.attach_perf_event(*pefd))
+        .collect()
 }
 
 pub fn describe(opts: DescribeOpts) -> Result<()> {
@@ -583,6 +621,9 @@ pub fn describe(opts: DescribeOpts) -> Result<()> {
 
     open_skel.maps.rodata_data.tool_config.tgid = opts.pid;
     let mut skel = open_skel.load()?;
+
+    let pefds = init_perf_monitor(1000, opts.sw_event)?;
+    let _links = attach_perf_event(&pefds, &skel.progs.sample_process);
     skel.attach()?;
 
     let events = Arc::new(Mutex::new(HashMap::<u64, ProcessEvents>::new()));
@@ -624,52 +665,6 @@ pub fn describe(opts: DescribeOpts) -> Result<()> {
         0
     });
 
-    let task_link = Arc::new(skel.links.dump_task.as_ref().unwrap());
-    let task_link_clone = task_link.clone();
-    let samples = Arc::new(Mutex::new(HashMap::<u32, SampleEvent>::new()));
-    let samples_clone = samples.clone();
-    let samples_thread_done = thread_done.clone();
-    let sample_thread = thread::spawn(move || {
-        let delay = Duration::from_millis(100);
-        while !samples_thread_done.load(Ordering::Relaxed) {
-            thread::sleep(delay);
-            let mut iter = Iter::new(*task_link_clone).expect("Failed to create iterator");
-            let mut buf = Vec::new();
-            let bytes_read = iter
-                .read_to_end(&mut buf)
-                .expect("Failed to read from iterator");
-            if bytes_read == 0 {
-                println!("No data read from iterator");
-                continue;
-            }
-
-            println!("Read {} bytes from iterator", bytes_read);
-            let items: &[systing::types::wakee_stack] =
-                plain::slice_from_bytes(&buf).expect("Data buffer was too short");
-            let mut my_samples = samples_clone.lock().unwrap();
-            for item in items {
-                let pid = item.start_ns as u32;
-                let key = SampleKey {
-                    pid,
-                    stack: Stack::new(
-                        item.kernel_stack.iter().copied().collect(),
-                        item.user_stack.iter().copied().collect(),
-                    ),
-                };
-                match my_samples.get_mut(&key.pid) {
-                    Some(ref mut sample) => {
-                        sample.add_event(key);
-                    }
-                    None => {
-                        let mut sample = SampleEvent::new();
-                        sample.add_event(key);
-                        my_samples.insert(pid, sample);
-                    }
-                };
-            }
-        }
-    });
-
     if opts.duration > 0 {
         thread::sleep(Duration::from_secs(opts.duration));
     } else {
@@ -682,7 +677,6 @@ pub fn describe(opts: DescribeOpts) -> Result<()> {
 
     thread_done.store(true, Ordering::Relaxed);
     t.join().expect("Failed to join thread");
-    sample_thread.join().expect("Failed to join thread");
 
     let mut process_events_vec: Vec<ProcessEvents> = Vec::new();
     let mut graph = DiGraphMap::new();
@@ -691,7 +685,11 @@ pub fn describe(opts: DescribeOpts) -> Result<()> {
         let events_hash = std::mem::take(&mut *events.lock().unwrap());
         for (pidtgid, process_events) in events_hash {
             let mut edges = HashMap::<u64, u64>::new();
-            for (key, value) in process_events.events.iter() {
+            for (key, value) in process_events
+                .events
+                .iter()
+                .filter(|(key, _)| key.event_type == EventKeyType::WakeEvent)
+            {
                 if edges.contains_key(&key.waker) {
                     *edges.get_mut(&key.waker).unwrap() += value.duration_us;
                 } else {
@@ -711,15 +709,20 @@ pub fn describe(opts: DescribeOpts) -> Result<()> {
         }
     }
 
-    let samples_hash = std::mem::take(&mut *samples.lock().unwrap());
     std::fs::create_dir_all("systing-describe")?;
     print_graphviz(pids, graph)?;
     if opts.raw_output {
         process_events_vec.sort_by_key(|k| k.duration_us);
         print_stdout(process_events_vec)?;
     } else {
-        generate_flamegraphs(process_events_vec, samples_hash)?;
+        generate_flamegraphs(process_events_vec)?;
     }
 
+    for pefd in pefds {
+        close(pefd)
+            .map_err(io::Error::from)
+            .map_err(libbpf_rs::Error::from)
+            .context("failed to close perf event")?;
+    }
     Ok(())
 }
