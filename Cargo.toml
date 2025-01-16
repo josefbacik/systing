@@ -25,6 +25,7 @@ petgraph = "0.6.5"
 plain = "0.2"
 strum = "0.26.3"
 strum_macros = "0.26.4"
+timeline-svg = { version = "0.1.0", path = "/home/josef/timeline-svg" }
 tui-realm-stdlib = "2.0.1"
 tui-realm-treeview = "2.0.0"
 tuirealm = "2.0.3"

@@ -23,10 +23,10 @@ const volatile struct {
 
 enum event_type {
 	EVENT_TASK_SLEEP,
-	EVENT_TASK_START,
-	EVENT_INTERRUPT,
-	EVENT_WAKE_TASK,
-	EVENT_MAX,
+	EVENT_TASK_WAKEUP,
+	EVENT_TASK_RUN,
+	EVENT_IRQ,
+	EVENT_SOFTIRQ,
 };
 
 struct task_event {
@@ -36,15 +36,21 @@ struct task_event {
 	u64 cpu;
 
 	/*
-	 * For the EVENT_WAKE_TASK this is the target CPU for the wakee.
+	 * For EVENT_WAKE_TASK, this is the CPU that the task was woken from.
 	 */
-	u64 target_cpu;
+	u64 waker_cpu;
 
 	/*
-	 * For EVENT_WAKE_TASK, this is the tgidpid of the wakee.
-	 * For EVENT_TASK_SLEEP, this is the state of the task.
+	 * For EVENT_WAKE_TASK, this is the tgidpid of the waker.
 	 */
-	u64 state;
+	u64 waker_tgidpid;
+
+	/*
+	 * For EVENT_TASK_SLEEP, this is the state of the task.
+	 * For EVENT_TASK_WAKEUP, this is wakeup TS.
+	 * For EVENT_*IRQ, this is the start time of the event.
+	 */
+	u64 extra;
 	u8 comm[TASK_COMM_LEN];
 };
 
@@ -59,6 +65,7 @@ struct wake_event {
  * `struct task_event`
  */
 struct task_event _event = {0};
+enum event_type _event_type = EVENT_TASK_SLEEP;
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -75,6 +82,13 @@ struct {
 } wakeups SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, u64);
+	__uint(max_entries, 10240);
+} irq_events SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 10 * 1024 * 1024 /* 10Mib */);
 } events SEC(".maps");
@@ -87,102 +101,25 @@ u64 task_cg_id(struct task_struct *task)
 }
 
 static __always_inline
+u64 task_key(struct task_struct *task)
+{
+	return ((u64)task->tgid << 32) | task->pid;
+}
+
+static __always_inline
 bool trace_task(struct task_struct *task)
 {
 	if (tool_config.tgid && task->tgid != tool_config.tgid)
 		return false;
 	if (task->tgid == 0)
 		return false;
-	if (tool_config.filter_cgroup) {
-		u64 cgid = task_cg_id(task);
-		if (bpf_map_lookup_elem(&cgroups, &cgid) == NULL)
-			return false;
-	}
+//	if (tool_config.filter_cgroup) {
+//		u64 cgid = task_cg_id(task);
+//		if (bpf_map_lookup_elem(&cgroups, &cgid) == NULL)
+//			return false;
+//	}
 	return true;
 }
-
-static __always_inline
-int trace_enqueue(struct task_struct *tsk, u33 state, bool preempt)
-{
-	u64 key = task_key(tsk);
-	u32 tgid = tsk->tgid;
-	struct task_state_value value;
-
-	if (bpf_map_lookup_elem(&ignore_pids, &tgid))
-		return 0;
-	if (tool_config.tgid && tsk->tgid != tool_config.tgid)
-		return 0;
-	if (tsk->tgid == 0)
-		return 0;
-	if (tool_config.filter_cgroup) {
-		u64 cgid = task_cg_id(tsk);
-		if (bpf_map_lookup_elem(&cgroups, &cgid) == NULL)
-			return 0;
-	}
-	value.ts = bpf_ktime_get_ns();
-	value.state = state;
-	value.preempt = preempt;
-	bpf_map_update_elem(&start, &key, &value, BPF_ANY);
-	return 0;
-}
-
-static struct task_stat zero_stat = {};
-
-static __always_inline
-void update_counter(struct task_struct *task, u64 delta, enum stat_type type)
-{
-	u64 key = task_stat_key(task);
-	struct task_stat *stat;
-
-	stat = bpf_map_lookup_elem(&stats, &key);
-	if (!stat) {
-		bpf_map_update_elem(&stats, &key, &zero_stat, BPF_ANY);
-
-		stat = bpf_map_lookup_elem(&stats, &key);
-		if (!stat)
-			return;
-		stat->cgid = task_cg_id(task);
-
-		/*
-		 * If we aggregate stats just leave the comm blank so that we
-		 * pull the comm of the leader process and not whichever thread
-		 * happens to get caught first.
-		 */
-		if (!tool_config.aggregate)
-			bpf_probe_read_kernel_str(stat->comm, sizeof(stat->comm),
-						  task->comm);
-	}
-
-	switch (type) {
-	case STAT_SLEEP_TIME:
-		__sync_fetch_and_add(&stat->sleep_time, delta);
-		break;
-	case STAT_PREEMPT_TIME:
-		__sync_fetch_and_add(&stat->preempt_time, delta);
-		break;
-	case STAT_RUN_TIME:
-		__sync_fetch_and_add(&stat->run_time, delta);
-		break;
-	case STAT_WAIT_TIME:
-		__sync_fetch_and_add(&stat->wait_time, delta);
-		break;
-	case STAT_QUEUE_TIME:
-		__sync_fetch_and_add(&stat->queue_time, delta);
-		break;
-	case STAT_IRQ_TIME:
-		__sync_fetch_and_add(&stat->irq_time, delta);
-		break;
-	case STAT_SOFTIRQ_TIME:
-		__sync_fetch_and_add(&stat->softirq_time, delta);
-		break;
-	case STAT_WAKING_TIME:
-		__sync_fetch_and_add(&stat->waking_time, delta);
-		break;
-	default:
-		break;
-	}
-}
-
 
 static __always_inline
 int trace_irq_enter(void)
@@ -192,17 +129,8 @@ int trace_irq_enter(void)
 	u64 start;
 	u32 tgid = tsk->tgid;
 
-	if (bpf_map_lookup_elem(&ignore_pids, &tgid))
+	if (!trace_task(tsk))
 		return 0;
-	if (tool_config.tgid && tsk->tgid != tool_config.tgid)
-		return 0;
-	if (tsk->tgid == 0)
-		return 0;
-	if (tool_config.filter_cgroup) {
-		u64 cgid = task_cg_id(tsk);
-		if (bpf_map_lookup_elem(&cgroups, &cgid) == NULL)
-			return 0;
-	}
 	start = bpf_ktime_get_ns();
 	bpf_map_update_elem(&irq_events, &key, &start, BPF_ANY);
 	return 0;
@@ -213,39 +141,26 @@ int trace_irq_exit(bool softirq)
 {
 	struct task_struct *tsk = (struct task_struct *)bpf_get_current_task_btf();
 	struct task_stat *stat;
-	u64 *start_ns;
 	u64 key = task_key(tsk);
-	u64 delta;
+	struct task_event *event;
+	u64 *start_ns;
 
 	start_ns = bpf_map_lookup_elem(&irq_events, &key);
 	if (!start_ns)
 		return 0;
-	delta = bpf_ktime_get_ns() - *start_ns;
-	update_counter(tsk, delta, softirq ? STAT_SOFTIRQ_TIME : STAT_IRQ_TIME);
+
+	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	if (!event)
+		return 0;
+	event->ts = bpf_ktime_get_ns();
+	event->type = softirq ? EVENT_SOFTIRQ : EVENT_IRQ;
+	event->tgidpid = key;
+	event->cpu = bpf_get_smp_processor_id();
+	event->extra = *start_ns;
+	bpf_probe_read_kernel_str(event->comm, sizeof(event->comm), tsk->comm);
+	bpf_ringbuf_submit(event, 0);
 	bpf_map_delete_elem(&irq_events, &key);
 	return 0;
-}
-
-SEC("tp_btf/sched_wakeup")
-int handle__sched_wakeup(u64 *ctx)
-{
-	/* TP_PROTO(struct task_struct *p) */
-	struct task_struct *task = (struct task_struct *)ctx[0];
-	u64 key = task_key(task);
-	struct task_state_value *value;
-
-	value = bpf_map_lookup_elem(&start, &key);
-	if (value) {
-		u64 delta = bpf_ktime_get_ns() - value->ts;
-		switch (value->state) {
-		case TASK_WAKING:
-			update_counter(task, delta, STAT_WAKING_TIME);
-			break;
-		default:
-			break;
-		}
-	}
-	return trace_enqueue(task, TASK_RUNNING, false);
 }
 
 SEC("tp_btf/sched_wakeup_new")
@@ -253,7 +168,19 @@ int handle__sched_wakeup_new(u64 *ctx)
 {
 	/* TP_PROTO(struct task_struct *p) */
 	struct task_struct *task = (void *)ctx[0];
-	return trace_enqueue(task, TASK_RUNNING, false);
+	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(cur))
+		return 0;
+
+	struct wake_event e = {
+		.ts = bpf_ktime_get_ns(),
+		.tgidpid = task_key(cur),
+		.cpu = bpf_get_smp_processor_id(),
+	};
+	u64 key = task_key(task);
+	bpf_map_update_elem(&wakeups, &key, &e, BPF_ANY);
+	return 0;
 }
 
 SEC("tp_btf/sched_switch")
@@ -271,55 +198,46 @@ int handle__sched_switch(u64 *ctx)
 	u64 ts = bpf_ktime_get_ns();
 	struct task_event *event;
 
+	if (trace_task(prev)) {
+		event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+		if (!event)
+			return 0;
+
+		event->ts = ts;
+		event->type = EVENT_TASK_SLEEP;
+		event->tgidpid = task_key(prev);
+		event->cpu = bpf_get_smp_processor_id();
+		event->extra = prev_state;
+		bpf_probe_read_kernel_str(event->comm, sizeof(event->comm),
+					  prev->comm);
+		bpf_ringbuf_submit(event, 0);
+	}
+
+	if (!trace_task(next))
+		return 0;
+
 	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
 	if (!event)
 		return 0;
 
-	event->ts = ts;
-	event->type = EVENT_TASK_SLEEP;
-	event->tgidpid = task_key(prev);
-	event->cpu = bpf_get_smp_processor_id();
-	event->state = prev_state;
-	bpf_probe_read_kernel_str(event->comm, sizeof(event->comm), prev->comm);
-	bpf_ringbuf_submit(event, 0);
-
-	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
-	if (!event)
-		return 0;
-
-	struct wake_event *wake_event;
-	value = bpf_map_lookup_elem(&start, &key);
-	if (value) {
-		u64 delta = ts - value->ts;
-		update_counter(prev, delta, STAT_RUN_TIME);
-	}
-	trace_enqueue(prev, prev_state, prev_state == TASK_RUNNING);
-
-	/* Don't record preempt events for idle threads. */
-	if (prev_state == TASK_RUNNING && next->tgid != 0 && prev->tgid != 0) {
-		struct preempt_event *e;
-
-		e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-		if (e) {
-			e->tgidpid = task_key(prev);
-			e->cgid = task_cg_id(next);
-			e->preempt_tgidpid = task_key(next);
-			bpf_probe_read_kernel_str(e->comm, sizeof(e->comm),
-						  next->comm);
-			bpf_ringbuf_submit(e, 0);
-		}
-	}
-
+	struct wake_event *value;
 	key = task_key(next);
-	value = bpf_map_lookup_elem(&start, &key);
-	if (value && value->state == TASK_RUNNING) {
-		u64 delta = ts - value->ts;
-		if (value->preempt)
-			update_counter(next, delta, STAT_PREEMPT_TIME);
-		else
-			update_counter(next, delta, STAT_QUEUE_TIME);
+	value = bpf_map_lookup_elem(&wakeups, &key);
+	if (value) {
+		event->type = EVENT_TASK_WAKEUP;
+		event->extra = value->ts;
+		event->waker_cpu = value->cpu;
+		event->waker_tgidpid = value->tgidpid;
+		bpf_map_delete_elem(&wakeups, &key);
+	} else {
+		event->type = EVENT_TASK_RUN;
+		event->extra = 0;
 	}
-	trace_enqueue(next, next_state, false);
+	event->ts = ts;
+	event->tgidpid = key;
+	event->cpu = bpf_get_smp_processor_id();
+	bpf_probe_read_kernel_str(event->comm, sizeof(event->comm), next->comm);
+	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
 

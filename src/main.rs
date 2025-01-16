@@ -16,6 +16,8 @@ enum SubCommand {
     ProfileSched(ProfileSchedOpts),
     #[clap(name = "describe")]
     Describe(DescribeOpts),
+    #[clap(name = "system")]
+    System(SystemOpts),
 }
 
 #[derive(Debug, Args)]
@@ -52,6 +54,16 @@ pub struct ProfileSchedOpts {
     aggregate: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct SystemOpts {
+    #[arg(short, long)]
+    verbose: bool,
+    #[arg(short, long, default_value = "0")]
+    pid: u32,
+    #[arg(short, long)]
+    duration: u64,
+}
+
 fn bump_memlock_rlimit() -> Result<()> {
     let rlimit = libc::rlimit {
         rlim_cur: 128 << 20,
@@ -73,5 +85,6 @@ fn main() -> Result<()> {
     match opts.subcmd {
         SubCommand::ProfileSched(opts) => cmds::profile::profile_sched(opts),
         SubCommand::Describe(opts) => cmds::describe::describe(opts),
+        SubCommand::System(opts) => cmds::system::system(opts),
     }
 }
