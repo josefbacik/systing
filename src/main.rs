@@ -2,6 +2,7 @@ use anyhow::bail;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
+pub mod perfetto;
 mod cmds;
 
 #[derive(Debug, Parser)]

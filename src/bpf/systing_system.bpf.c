@@ -22,50 +22,43 @@ const volatile struct {
 } tool_config = {};
 
 enum event_type {
-	EVENT_TASK_SLEEP,
-	EVENT_TASK_WAKEUP,
-	EVENT_TASK_RUN,
-	EVENT_IRQ,
-	EVENT_SOFTIRQ,
+	SCHED_SWITCH,
+	SCHED_WAKING,
+	SCHED_WAKEUP_NEW,
+	SCHED_WAKEUP,
 };
 
+/*
+ * sched_switch is the largest event, for the smaller events we just use prev_*
+ * for the values, and things are left uninitialized.
+ */
 struct task_event {
-	u64 ts;
 	enum event_type type;
-	u64 tgidpid;
-	u64 cpu;
-
-	/*
-	 * For EVENT_WAKE_TASK, this is the CPU that the task was woken from.
-	 */
-	u64 waker_cpu;
-
-	/*
-	 * For EVENT_WAKE_TASK, this is the tgidpid of the waker.
-	 */
-	u64 waker_tgidpid;
-
-	/*
-	 * For EVENT_TASK_SLEEP, this is the state of the task.
-	 * For EVENT_TASK_WAKEUP, this is wakeup TS.
-	 * For EVENT_*IRQ, this is the start time of the event.
-	 */
-	u64 extra;
-	u8 comm[TASK_COMM_LEN];
-};
-
-struct wake_event {
+	u32 cpu;
 	u64 ts;
-	u64 tgidpid;
-	u64 cpu;
+	u64 latency;
+	u64 prev_tgidpid;
+	u64 next_tgidpid;
+	u64 prev_state;
+	u32 target_cpu;
+	u32 next_prio;
+	u32 prev_prio;
+	u8 prev_comm[TASK_COMM_LEN];
+	u8 next_comm[TASK_COMM_LEN];
 };
-
 /*
  * Dummy instance to get skeleton to generate definition for
  * `struct task_event`
  */
 struct task_event _event = {0};
-enum event_type _event_type = EVENT_TASK_SLEEP;
+enum event_type _type = SCHED_SWITCH;
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, u64);
+	__uint(max_entries, 10240);
+} wake_ts SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -77,21 +70,24 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, u64);
-	__type(value, struct wake_event);
-	__uint(max_entries, 10240);
-} wakeups SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, u64);
 	__type(value, u64);
 	__uint(max_entries, 10240);
 } irq_events SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 10 * 1024 * 1024 /* 10Mib */);
+	__uint(max_entries, 20 * 1024 * 1024 /* 10Mib */);
 } events SEC(".maps");
+
+static __always_inline
+u32 task_cpu(struct task_struct *task)
+{
+	if (bpf_core_field_exists(task->thread_info)) {
+		return task->thread_info.cpu;
+	}
+	struct thread_info *ti = task->stack;
+	return ti->cpu;
+}
 
 static __always_inline
 u64 task_cg_id(struct task_struct *task)
@@ -124,6 +120,7 @@ bool trace_task(struct task_struct *task)
 static __always_inline
 int trace_irq_enter(void)
 {
+	/*
 	struct task_struct *tsk = (struct task_struct *)bpf_get_current_task_btf();
 	u64 key = task_key(tsk);
 	u64 start;
@@ -133,12 +130,14 @@ int trace_irq_enter(void)
 		return 0;
 	start = bpf_ktime_get_ns();
 	bpf_map_update_elem(&irq_events, &key, &start, BPF_ANY);
+	*/
 	return 0;
 }
 
 static __always_inline
 int trace_irq_exit(bool softirq)
 {
+	/*
 	struct task_struct *tsk = (struct task_struct *)bpf_get_current_task_btf();
 	struct task_stat *stat;
 	u64 key = task_key(tsk);
@@ -160,7 +159,49 @@ int trace_irq_exit(bool softirq)
 	bpf_probe_read_kernel_str(event->comm, sizeof(event->comm), tsk->comm);
 	bpf_ringbuf_submit(event, 0);
 	bpf_map_delete_elem(&irq_events, &key);
+	*/
 	return 0;
+}
+
+static __always_inline
+int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
+		  enum event_type type)
+{
+	struct task_event *event;
+	u64 ts = bpf_ktime_get_ns();
+	u64 key = task_key(wakee);
+
+	if (type == SCHED_WAKING || type == SCHED_WAKEUP_NEW)
+		bpf_map_update_elem(&wake_ts, &key, &ts, BPF_ANY);
+
+	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	if (!event)
+		return 0;
+	event->ts = ts;
+	event->type = type;
+	event->cpu = bpf_get_smp_processor_id();
+	event->prev_tgidpid = task_key(waker);
+	event->next_tgidpid = key;
+	event->next_prio = wakee->prio;
+	event->target_cpu = task_cpu(wakee);
+	bpf_probe_read_kernel_str(event->next_comm, sizeof(event->next_comm),
+				  wakee->comm);
+	bpf_probe_read_kernel_str(event->prev_comm, sizeof(event->prev_comm),
+				  waker->comm);
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
+SEC("tp_btf/sched_wakeup")
+int handle__sched_wakeup(u64 *ctx)
+{
+	/* TP_PROTO(struct task_struct *p, int success) */
+	struct task_struct *task = (struct task_struct *)ctx[0];
+	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(cur))
+		return 0;
+	return handle_wakeup(cur, task, SCHED_WAKEUP);
 }
 
 SEC("tp_btf/sched_wakeup_new")
@@ -172,15 +213,7 @@ int handle__sched_wakeup_new(u64 *ctx)
 
 	if (!trace_task(cur))
 		return 0;
-
-	struct wake_event e = {
-		.ts = bpf_ktime_get_ns(),
-		.tgidpid = task_key(cur),
-		.cpu = bpf_get_smp_processor_id(),
-	};
-	u64 key = task_key(task);
-	bpf_map_update_elem(&wakeups, &key, &e, BPF_ANY);
-	return 0;
+	return handle_wakeup(cur, task, SCHED_WAKEUP_NEW);
 }
 
 SEC("tp_btf/sched_switch")
@@ -192,51 +225,38 @@ int handle__sched_switch(u64 *ctx)
 	 */
 	struct task_struct *prev = (struct task_struct *)ctx[1];
 	struct task_struct *next = (struct task_struct *)ctx[2];
-	int prev_state = prev->__state & TASK_STATE_MASK;
-	int next_state = next->__state & TASK_STATE_MASK;
-	u64 key = task_key(prev);
-	u64 ts = bpf_ktime_get_ns();
 	struct task_event *event;
+	u64 next_key = task_key(next);
+	u64 ts = bpf_ktime_get_ns();
+	u64 *start_ns;
 
-	if (trace_task(prev)) {
-		event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
-		if (!event)
-			return 0;
-
-		event->ts = ts;
-		event->type = EVENT_TASK_SLEEP;
-		event->tgidpid = task_key(prev);
-		event->cpu = bpf_get_smp_processor_id();
-		event->extra = prev_state;
-		bpf_probe_read_kernel_str(event->comm, sizeof(event->comm),
-					  prev->comm);
-		bpf_ringbuf_submit(event, 0);
-	}
-
-	if (!trace_task(next))
+	if (!trace_task(prev) && !trace_task(next))
 		return 0;
 
 	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
 	if (!event)
 		return 0;
 
-	struct wake_event *value;
-	key = task_key(next);
-	value = bpf_map_lookup_elem(&wakeups, &key);
-	if (value) {
-		event->type = EVENT_TASK_WAKEUP;
-		event->extra = value->ts;
-		event->waker_cpu = value->cpu;
-		event->waker_tgidpid = value->tgidpid;
-		bpf_map_delete_elem(&wakeups, &key);
+	start_ns = bpf_map_lookup_elem(&wake_ts, &next_key);
+	if (start_ns) {
+		event->latency = ts - *start_ns;
+		bpf_map_delete_elem(&wake_ts, &next_key);
 	} else {
-		event->type = EVENT_TASK_RUN;
-		event->extra = 0;
+		event->latency = 0;
 	}
+
 	event->ts = ts;
-	event->tgidpid = key;
+	event->type = SCHED_SWITCH;
 	event->cpu = bpf_get_smp_processor_id();
-	bpf_probe_read_kernel_str(event->comm, sizeof(event->comm), next->comm);
+	event->prev_tgidpid = task_key(prev);
+	event->prev_state = prev->__state;
+	event->next_tgidpid = task_key(next);
+	event->next_prio = next->prio;
+	event->prev_prio = prev->prio;
+	bpf_probe_read_kernel_str(event->prev_comm, sizeof(event->prev_comm),
+				  prev->comm);
+	bpf_probe_read_kernel_str(event->next_comm, sizeof(event->next_comm),
+				  next->comm);
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
@@ -250,28 +270,37 @@ int handle__sched_waking(u64 *ctx)
 
 	if (!trace_task(cur))
 		return 0;
-
-	struct wake_event e = {
-		.ts = bpf_ktime_get_ns(),
-		.tgidpid = task_key(cur),
-		.cpu = bpf_get_smp_processor_id(),
-	};
-	u64 key = task_key(task);
-	bpf_map_update_elem(&wakeups, &key, &e, BPF_ANY);
-	return 0;
+	return handle_wakeup(cur, task, SCHED_WAKING);
 }
 
 SEC("tp_btf/irq_handler_entry")
 int handle__irq_handler_entry(u64 *ctx)
 {
+#if 0
 	/* TP_PROTO(int irq, struct irqaction *action) */
-	return trace_irq_enter();
+	int irq = ctx[0];
+	struct irqaction *action = (void *)ctx[1];
+	struct task_event *event;
+	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	if (!event)
+		return 0;
+	event->ts = bpf_ktime_get_ns();
+	event->type = IRQ_ENTRY;
+	event->cpu = bpf_get_smp_processor_id();
+	event->target_cpu = irq;
+	bpf_probe_read_kernel_str(event->prev_comm, sizeof(event->comm), action->name);
+	bpf_ringbuf_submit(event, 0);
+#endif
+	return 0;
 }
 
 SEC("tp_btf/irq_handler_exit")
 int handle__irq_handler_exit(u64 *ctx)
 {
 	/* TP_PROTO(int irq, struct irqaction *action, int ret) */
+	int irq = ctx[0];
+	struct task_event *event;
+
 	return trace_irq_exit(false);
 }
 
