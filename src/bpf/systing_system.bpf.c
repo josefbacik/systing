@@ -239,7 +239,10 @@ int handle__sched_switch(u64 *ctx)
 
 	start_ns = bpf_map_lookup_elem(&wake_ts, &next_key);
 	if (start_ns) {
-		event->latency = ts - *start_ns;
+		if (ts > *start_ns)
+			event->latency = ts - *start_ns;
+		else
+			event->latency = 0;
 		bpf_map_delete_elem(&wake_ts, &next_key);
 	} else {
 		event->latency = 0;
