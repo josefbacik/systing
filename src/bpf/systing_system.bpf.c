@@ -199,7 +199,7 @@ int handle__sched_wakeup(u64 *ctx)
 	struct task_struct *task = (struct task_struct *)ctx[0];
 	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
 
-	if (!trace_task(cur))
+	if (!trace_task(cur) && !trace_task(task))
 		return 0;
 	return handle_wakeup(cur, task, SCHED_WAKEUP);
 }
@@ -211,7 +211,7 @@ int handle__sched_wakeup_new(u64 *ctx)
 	struct task_struct *task = (void *)ctx[0];
 	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
 
-	if (!trace_task(cur))
+	if (!trace_task(cur) && !trace_task(task))
 		return 0;
 	return handle_wakeup(cur, task, SCHED_WAKEUP_NEW);
 }
@@ -268,7 +268,7 @@ int handle__sched_waking(u64 *ctx)
 	struct task_struct *task = (struct task_struct *)ctx[0];
 	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
 
-	if (!trace_task(cur))
+	if (!trace_task(cur) && !trace_task(task))
 		return 0;
 	return handle_wakeup(cur, task, SCHED_WAKING);
 }
