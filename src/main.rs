@@ -62,6 +62,8 @@ pub struct SystemOpts {
     #[arg(short, long, default_value = "0")]
     pid: u32,
     #[arg(short, long)]
+    cgroup: Vec<String>,
+    #[arg(short, long)]
     duration: u64,
 }
 

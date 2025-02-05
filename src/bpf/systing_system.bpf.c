@@ -109,11 +109,11 @@ bool trace_task(struct task_struct *task)
 		return false;
 	if (task->tgid == 0)
 		return false;
-//	if (tool_config.filter_cgroup) {
-//		u64 cgid = task_cg_id(task);
-//		if (bpf_map_lookup_elem(&cgroups, &cgid) == NULL)
-//			return false;
-//	}
+	if (tool_config.filter_cgroup) {
+		u64 cgid = task_cg_id(task);
+		if (bpf_map_lookup_elem(&cgroups, &cgid) == NULL)
+			return false;
+	}
 	return true;
 }
 

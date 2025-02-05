@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::CStr;
 use std::io::Write;
 use std::mem::MaybeUninit;
+use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
@@ -12,7 +13,7 @@ use crate::SystemOpts;
 
 use anyhow::Result;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::RingBufferBuilder;
+use libbpf_rs::{MapCore, RingBufferBuilder};
 use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
 use perfetto_protos::ftrace_event::FtraceEvent;
@@ -133,8 +134,20 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         let mut open_object = MaybeUninit::uninit();
         let open_skel = skel_builder.open(&mut open_object)?;
 
+        if opts.cgroup.len() > 0 {
+            open_skel.maps.rodata_data.tool_config.filter_cgroup = 1;
+        }
+
         open_skel.maps.rodata_data.tool_config.tgid = opts.pid;
         let mut skel = open_skel.load()?;
+        for cgroup in opts.cgroup.iter() {
+            let metadata = std::fs::metadata(cgroup)?;
+            let cgropuid = metadata.ino().to_ne_bytes();
+            let val = (1 as u8).to_ne_bytes();
+            skel.maps
+                .cgroups
+                .update(&cgropuid, &val, libbpf_rs::MapFlags::ANY)?;
+        }
 
         let thread_done_clone = thread_done.clone();
         let cpu_events_clone = cpu_events.clone();
