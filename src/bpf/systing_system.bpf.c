@@ -240,7 +240,7 @@ int handle__sched_wakeup_new(u64 *ctx)
 	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
 
 	if (!trace_task(cur) && !trace_task(task))
-		return handle_missed_event();
+		return 0;
 	return handle_wakeup(cur, task, SCHED_WAKEUP_NEW);
 }
 
