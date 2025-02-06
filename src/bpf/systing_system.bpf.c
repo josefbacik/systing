@@ -16,6 +16,8 @@
 
 #define TASK_COMM_LEN 16
 
+#define PF_WQ_WORKER                   0x00000020
+
 const volatile struct {
 	gid_t tgid;
 	u32 filter_cgroup;
@@ -146,6 +148,19 @@ int handle_missed_event(void)
 }
 
 static __always_inline
+void record_task_name(struct task_struct *task, u8 *comm)
+{
+	if (task->flags & PF_WQ_WORKER) {
+		struct kthread *k = bpf_core_cast(task->worker_private, struct kthread);
+		struct worker *worker = bpf_core_cast(k->data, struct worker);
+
+		bpf_probe_read_kernel_str(comm, TASK_COMM_LEN, worker->desc);
+	} else {
+		bpf_probe_read_kernel_str(comm, TASK_COMM_LEN, task->comm);
+	}
+}
+
+static __always_inline
 int trace_irq_enter(void)
 {
 	/*
@@ -212,10 +227,8 @@ int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 	event->next_tgidpid = key;
 	event->next_prio = wakee->prio;
 	event->target_cpu = task_cpu(wakee);
-	bpf_probe_read_kernel_str(event->next_comm, sizeof(event->next_comm),
-				  wakee->comm);
-	bpf_probe_read_kernel_str(event->prev_comm, sizeof(event->prev_comm),
-				  waker->comm);
+	record_task_name(wakee, event->next_comm);
+	record_task_name(waker, event->prev_comm);
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
@@ -282,10 +295,8 @@ int handle__sched_switch(u64 *ctx)
 	event->next_tgidpid = task_key(next);
 	event->next_prio = next->prio;
 	event->prev_prio = prev->prio;
-	bpf_probe_read_kernel_str(event->prev_comm, sizeof(event->prev_comm),
-				  prev->comm);
-	bpf_probe_read_kernel_str(event->next_comm, sizeof(event->next_comm),
-				  next->comm);
+	record_task_name(prev, event->prev_comm);
+	record_task_name(next, event->next_comm);
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
