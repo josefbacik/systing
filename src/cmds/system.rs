@@ -142,11 +142,11 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         let mut skel = open_skel.load()?;
         for cgroup in opts.cgroup.iter() {
             let metadata = std::fs::metadata(cgroup)?;
-            let cgropuid = metadata.ino().to_ne_bytes();
+            let cgroupid = metadata.ino().to_ne_bytes();
             let val = (1 as u8).to_ne_bytes();
             skel.maps
                 .cgroups
-                .update(&cgropuid, &val, libbpf_rs::MapFlags::ANY)?;
+                .update(&cgroupid, &val, libbpf_rs::MapFlags::ANY)?;
         }
 
         let thread_done_clone = thread_done.clone();
