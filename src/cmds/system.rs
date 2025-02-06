@@ -164,7 +164,8 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             let mut event = systing::types::task_event::default();
             plain::copy_from_bytes(&mut event, data).expect("Data buffer was too short");
 
-            {
+            // We don't want to track wakeup events, they're not interesting for this analysis.
+            if event.r#type != systing::types::event_type::SCHED_WAKEUP {
                 let ftrace_event = FtraceEvent::from_task_event(&event);
                 let mut events = cpu_events_clone.lock().unwrap();
                 let cpu_event = events.entry(event.cpu).or_insert_with(BTreeMap::new);
