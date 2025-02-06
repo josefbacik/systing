@@ -83,7 +83,7 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 20 * 1024 * 1024 /* 10Mib */);
+	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
 } events SEC(".maps");
 
 static __always_inline

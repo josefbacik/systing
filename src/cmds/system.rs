@@ -314,7 +314,6 @@ pub fn system(opts: SystemOpts) -> Result<()> {
     let events = std::mem::take(&mut *cpu_events.lock().unwrap());
     let mut trace = Trace::default();
     for (cpu, events) in events {
-        println!("doing cpu {}", cpu);
         let mut event_bundle = FtraceEventBundle::default();
         event_bundle.set_cpu(cpu);
         event_bundle.event = events.into_values().collect();
