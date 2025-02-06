@@ -57,6 +57,13 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, u64);
 	__type(value, u64);
+	__uint(max_entries, 1);
+} missed_events SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, u64);
 	__uint(max_entries, 10240);
 } wake_ts SEC(".maps");
 
@@ -118,6 +125,27 @@ bool trace_task(struct task_struct *task)
 }
 
 static __always_inline
+int handle_missed_event(void)
+{
+	u64 key = 0;
+	u64 *missed = bpf_map_lookup_elem(&missed_events, &key);
+	if (!missed) {
+		u64 one = 1;
+		int ret = bpf_map_update_elem(&missed_events, &key, &one,
+					      BPF_NOEXIST);
+		if (ret) {
+			missed = bpf_map_lookup_elem(&missed_events, &key);
+			if (!missed)
+				return 0;
+			__sync_fetch_and_add(missed, 1);
+		}
+		return 0;
+	}
+	__sync_fetch_and_add(missed, 1);
+	return 0;
+}
+
+static __always_inline
 int trace_irq_enter(void)
 {
 	/*
@@ -176,7 +204,7 @@ int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 
 	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
 	if (!event)
-		return 0;
+		return handle_missed_event();
 	event->ts = ts;
 	event->type = type;
 	event->cpu = bpf_get_smp_processor_id();
@@ -212,7 +240,7 @@ int handle__sched_wakeup_new(u64 *ctx)
 	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
 
 	if (!trace_task(cur) && !trace_task(task))
-		return 0;
+		return handle_missed_event();
 	return handle_wakeup(cur, task, SCHED_WAKEUP_NEW);
 }
 
@@ -235,7 +263,7 @@ int handle__sched_switch(u64 *ctx)
 
 	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
 	if (!event)
-		return 0;
+		return handle_missed_event();
 
 	start_ns = bpf_map_lookup_elem(&wake_ts, &next_key);
 	if (start_ns) {

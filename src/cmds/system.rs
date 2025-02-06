@@ -124,6 +124,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
     let cpu_latencies = Arc::new(Mutex::new(HashMap::<u32, Vec<LatencyCounter>>::new()));
     let process_latencies = Arc::new(Mutex::new(HashMap::<u32, Vec<LatencyCounter>>::new()));
     let thread_done = Arc::new(AtomicBool::new(false));
+    let mut missed_events: u64 = 0;
 
     {
         let mut skel_builder = systing::SystingSystemSkelBuilder::default();
@@ -296,7 +297,17 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         println!("Stopping...");
         thread_done.store(true, Ordering::Relaxed);
         t.join().expect("Failed to join thread");
-        println!("Stopped");
+
+        let missed_events_key = 0_u64.to_ne_bytes();
+        let results = skel
+            .maps
+            .missed_events
+            .lookup(&missed_events_key, libbpf_rs::MapFlags::ANY)?;
+        if let Some(results) = results {
+            plain::copy_from_bytes(&mut missed_events, &results)
+                .expect("Data buffer was too short");
+        }
+        println!("Stopped: missed events: {}", missed_events);
     }
 
     // Pull all the scheduling events.
