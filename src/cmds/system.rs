@@ -41,13 +41,13 @@ mod systing {
 unsafe impl Plain for systing::types::task_event {}
 
 struct RunqueueCounter {
-    pub ts: u64,
-    pub count: u32,
+    ts: u64,
+    count: u32,
 }
 
 struct LatencyCounter {
-    pub ts: u64,
-    pub latency: u64,
+    ts: u64,
+    latency: u64,
 }
 
 trait ToTrackEvent {
@@ -57,13 +57,13 @@ trait ToTrackEvent {
 
 #[derive(Default)]
 struct EventRecorder {
-    pub events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
-    pub threads: HashMap<i32, Thread>,
-    pub processes: HashMap<i32, Process>,
-    pub runqueue: HashMap<i32, Vec<RunqueueCounter>>,
-    pub cpu_latencies: HashMap<u32, Vec<LatencyCounter>>,
-    pub process_latencies: HashMap<u32, Vec<LatencyCounter>>,
-    pub rq_counters: HashMap<i32, u32>,
+    events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
+    threads: HashMap<i32, Thread>,
+    processes: HashMap<i32, Process>,
+    runqueue: HashMap<i32, Vec<RunqueueCounter>>,
+    cpu_latencies: HashMap<u32, Vec<LatencyCounter>>,
+    process_latencies: HashMap<u32, Vec<LatencyCounter>>,
+    rq_counters: HashMap<i32, u32>,
 }
 
 trait TaskEventBuilder {
@@ -163,7 +163,7 @@ impl ToTrackEvent for LatencyCounter {
 }
 
 impl EventRecorder {
-    pub fn record_event(&mut self, event: &systing::types::task_event) {
+    fn record_event(&mut self, event: &systing::types::task_event) {
         // We don't want to track wakeup events, they're not interesting for this analysis.
         if event.r#type != systing::types::event_type::SCHED_WAKEUP {
             let ftrace_event = FtraceEvent::from_task_event(&event);
@@ -267,7 +267,7 @@ impl EventRecorder {
         packet
     }
 
-    pub fn generate_trace(&self) -> Trace {
+    fn generate_trace(&self) -> Trace {
         // Pull all the scheduling events.
         let mut trace = Trace::default();
         for (cpu, events) in self.events.iter() {
