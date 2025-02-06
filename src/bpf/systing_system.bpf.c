@@ -256,28 +256,26 @@ int handle__sched_switch(u64 *ctx)
 	struct task_event *event;
 	u64 next_key = task_key(next);
 	u64 ts = bpf_ktime_get_ns();
+	u64 latency = 0;
 	u64 *start_ns;
 
 	if (!trace_task(prev) && !trace_task(next))
 		return 0;
 
+	start_ns = bpf_map_lookup_elem(&wake_ts, &next_key);
+	if (start_ns) {
+		if (ts > *start_ns)
+			latency = ts - *start_ns;
+		bpf_map_delete_elem(&wake_ts, &next_key);
+	}
+
 	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
 	if (!event)
 		return handle_missed_event();
 
-	start_ns = bpf_map_lookup_elem(&wake_ts, &next_key);
-	if (start_ns) {
-		if (ts > *start_ns)
-			event->latency = ts - *start_ns;
-		else
-			event->latency = 0;
-		bpf_map_delete_elem(&wake_ts, &next_key);
-	} else {
-		event->latency = 0;
-	}
-
 	event->ts = ts;
 	event->type = SCHED_SWITCH;
+	event->latency = latency;
 	event->cpu = bpf_get_smp_processor_id();
 	event->prev_tgidpid = task_key(prev);
 	event->prev_state = prev->__state;
