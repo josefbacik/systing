@@ -50,6 +50,11 @@ struct LatencyCounter {
     pub latency: u64,
 }
 
+trait ToTrackEvent {
+    fn to_track_event(&self, track_uuid: u64) -> TrackEvent;
+    fn ts(&self) -> u64;
+}
+
 #[derive(Default)]
 struct EventRecorder {
     pub events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
@@ -124,6 +129,36 @@ impl TaskEventBuilder for SchedWakeupNewFtraceEvent {
         sched_wakeup_new.set_prio(event.next_prio as i32);
         sched_wakeup_new.set_target_cpu(event.target_cpu as i32);
         sched_wakeup_new
+    }
+}
+
+impl ToTrackEvent for RunqueueCounter {
+    fn to_track_event(&self, track_uuid: u64) -> TrackEvent {
+        let mut track_event = TrackEvent::default();
+        track_event.set_timestamp_absolute_us((self.ts / 1000) as i64);
+        track_event.set_type(Type::TYPE_COUNTER);
+        track_event.set_counter_value(self.count as i64);
+        track_event.set_track_uuid(track_uuid);
+        track_event
+    }
+
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+}
+
+impl ToTrackEvent for LatencyCounter {
+    fn to_track_event(&self, track_uuid: u64) -> TrackEvent {
+        let mut track_event = TrackEvent::default();
+        track_event.set_timestamp_absolute_us((self.ts / 1000) as i64);
+        track_event.set_type(Type::TYPE_COUNTER);
+        track_event.set_counter_value(self.latency as i64);
+        track_event.set_track_uuid(track_uuid);
+        track_event
+    }
+
+    fn ts(&self) -> u64 {
+        self.ts
     }
 }
 
@@ -222,6 +257,16 @@ impl EventRecorder {
         }
     }
 
+    fn trace_packet(&self, counter: &impl ToTrackEvent, track_uuid: u64, seq: u32) -> TracePacket {
+        let track_event = counter.to_track_event(track_uuid);
+
+        let mut packet = TracePacket::default();
+        packet.set_timestamp(counter.ts());
+        packet.set_track_event(track_event);
+        packet.set_trusted_packet_sequence_id(seq);
+        packet
+    }
+
     pub fn generate_trace(&self) -> Trace {
         // Pull all the scheduling events.
         let mut trace = Trace::default();
@@ -254,17 +299,7 @@ impl EventRecorder {
 
             let seq = rng.next_u32();
             for event in runqueue.iter() {
-                let mut track_event = TrackEvent::default();
-                track_event.set_timestamp_absolute_us((event.ts / 1000) as i64);
-                track_event.set_type(Type::TYPE_COUNTER);
-                track_event.set_counter_value(event.count as i64);
-                track_event.set_track_uuid(desc_uuid);
-
-                let mut packet = TracePacket::default();
-                packet.set_timestamp(event.ts);
-                packet.set_trusted_packet_sequence_id(seq);
-                packet.set_track_event(track_event);
-                trace.packet.push(packet);
+                trace.packet.push(self.trace_packet(event, desc_uuid, seq));
             }
         }
 
@@ -287,17 +322,7 @@ impl EventRecorder {
 
             let seq = rng.next_u32();
             for event in events.iter() {
-                let mut track_event = TrackEvent::default();
-                track_event.set_timestamp_absolute_us((event.ts / 1000) as i64);
-                track_event.set_type(Type::TYPE_COUNTER);
-                track_event.set_counter_value(event.latency as i64);
-                track_event.set_track_uuid(desc_uuid);
-
-                let mut packet = TracePacket::default();
-                packet.set_timestamp(event.ts);
-                packet.set_trusted_packet_sequence_id(seq);
-                packet.set_track_event(track_event);
-                trace.packet.push(packet);
+                trace.packet.push(self.trace_packet(event, desc_uuid, seq));
             }
         }
 
@@ -334,17 +359,7 @@ impl EventRecorder {
 
             let seq = rng.next_u32();
             for event in events.iter() {
-                let mut track_event = TrackEvent::default();
-                track_event.set_timestamp_absolute_us((event.ts / 1000) as i64);
-                track_event.set_type(Type::TYPE_COUNTER);
-                track_event.set_counter_value(event.latency as i64);
-                track_event.set_track_uuid(desc_uuid);
-
-                let mut packet = TracePacket::default();
-                packet.set_timestamp(event.ts);
-                packet.set_trusted_packet_sequence_id(seq);
-                packet.set_track_event(track_event);
-                trace.packet.push(packet);
+                trace.packet.push(self.trace_packet(event, desc_uuid, seq));
             }
         }
 
