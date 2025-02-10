@@ -10,9 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::DescribeOpts;
-use anyhow::{Error, Result};
-use blazesym::symbolize::{CodeInfo, Input, Kernel, Process, Source, Sym, Symbolized, Symbolizer};
-use blazesym::{Addr, Pid};
+use anyhow::Result;
 use inferno::flamegraph::Options;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::ErrorExt;
@@ -20,6 +18,8 @@ use libbpf_rs::RingBufferBuilder;
 use nix::unistd::close;
 use petgraph::graphmap::DiGraphMap;
 use plain::Plain;
+
+use crate::symbolize::{Stack, SymbolizerCache};
 
 mod systing {
     include!(concat!(env!("OUT_DIR"), "/systing_describe.skel.rs"));
@@ -29,11 +29,6 @@ mod syscall;
 
 unsafe impl Plain for systing::types::wake_event {}
 unsafe impl Plain for systing::types::wakee_stack {}
-
-const ADDR_WIDTH: usize = 16;
-const KERNEL_THREAD_STACK_STUB: u64 = 1234;
-const PREEMPT_EVENT_STACK_STUB: u64 = 5678;
-const MAX_STACK_DEPTH: usize = 24;
 
 // We set the perf frequency to 1000 Hz, which means 1ms ~= 1 sample, since all times are measured
 // in ns we need to divide the duration by 1_000_000 to convert to a sample count.
@@ -46,98 +41,6 @@ fn pid_comm(pid: u32) -> String {
         return "<unknown>".to_string();
     }
     comm.unwrap().trim().to_string()
-}
-
-fn print_frame(
-    name: &str,
-    addr_info: Option<(Addr, Addr, usize)>,
-    code_info: &Option<CodeInfo>,
-) -> String {
-    let code_info = code_info.as_ref().map(|code_info| {
-        let path = code_info.to_path();
-        let path = path.display();
-
-        match (code_info.line, code_info.column) {
-            (Some(line), Some(col)) => format!(" {path}:{line}:{col}"),
-            (Some(line), None) => format!(" {path}:{line}"),
-            (None, _) => format!(" {path}"),
-        }
-    });
-
-    if let Some((input_addr, addr, offset)) = addr_info {
-        // If we have various address information bits we have a new symbol.
-        format!(
-            "  {input_addr:#0width$x}: {name} @ {addr:#x}+{offset:#x}{code_info}",
-            code_info = code_info.as_deref().unwrap_or(""),
-            width = ADDR_WIDTH
-        )
-        .to_string()
-    } else {
-        // Otherwise we are dealing with an inlined call.
-        format!(
-            "  {:width$}  {name}{code_info} [inlined]",
-            " ",
-            code_info = code_info
-                .map(|info| format!(" @{info}"))
-                .as_deref()
-                .unwrap_or(""),
-            width = ADDR_WIDTH
-        )
-        .to_string()
-    }
-}
-
-fn print_symbols<'a, I>(syms: I) -> Vec<String>
-where
-    I: IntoIterator<Item = (Addr, Symbolized<'a>)>,
-{
-    let mut ret = Vec::new();
-    for (input_addr, sym) in syms {
-        match sym {
-            Symbolized::Sym(Sym {
-                addr,
-                name,
-                offset,
-                code_info,
-                inlined,
-                ..
-            }) => {
-                ret.push(print_frame(
-                    &name,
-                    Some((input_addr, addr, offset)),
-                    &code_info,
-                ));
-                for inline in inlined {
-                    ret.push(print_frame(&inline.name, None, &inline.code_info));
-                }
-            }
-            Symbolized::Unknown(e) => {
-                ret.push(format!(
-                    "  {input_addr:#0width$x}: <unknown: {e}>",
-                    width = ADDR_WIDTH,
-                    e = e
-                ));
-            }
-        }
-    }
-    ret
-}
-
-struct SymbolizerCache<'a> {
-    symbolizer: Symbolizer,
-    kernel_src: Source<'a>,
-    src_cache: HashMap<u32, Source<'a>>,
-}
-
-enum StackType {
-    Kernel,
-    User,
-}
-
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-struct Stack {
-    kernel_stack: Vec<Addr>,
-    user_stack: Vec<Addr>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq)]
@@ -165,87 +68,22 @@ struct Event {
     value: EventValue,
 }
 
-impl<'a> SymbolizerCache<'a> {
-    pub fn new() -> Self {
-        SymbolizerCache {
-            symbolizer: Symbolizer::new(),
-            kernel_src: Source::Kernel(Kernel::default()),
-            src_cache: HashMap::new(),
-        }
-    }
-
-    pub fn symbolize_stack(
-        &mut self,
-        pid: u32,
-        stack: &Stack,
-        stack_type: StackType,
-    ) -> Result<Vec<String>, Error> {
-        let src = match stack_type {
-            StackType::Kernel => &self.kernel_src,
-            StackType::User => {
-                if !self.src_cache.contains_key(&pid) {
-                    self.src_cache
-                        .insert(pid, Source::Process(Process::new(Pid::from(pid))));
-                }
-                self.src_cache.get(&pid).unwrap()
-            }
-        };
-        let raw_stack = match stack_type {
-            StackType::Kernel => &stack.kernel_stack,
-            StackType::User => &stack.user_stack,
-        };
-
-        if !raw_stack.is_empty() && raw_stack[0] == PREEMPT_EVENT_STACK_STUB {
-            return Ok(vec!["preempt".to_string()]);
-        }
-
-        match self.symbolizer.symbolize(src, Input::AbsAddr(raw_stack)) {
-            Ok(syms) => Ok(print_symbols(raw_stack.iter().copied().zip(syms))),
-            Err(e) => Err(e.into()),
-        }
-    }
-}
-
-impl Stack {
-    pub fn new(kernel_stack: [u64; MAX_STACK_DEPTH], user_stack: [u64; MAX_STACK_DEPTH]) -> Self {
-        let my_kernel_stack = match kernel_stack[0] {
-            PREEMPT_EVENT_STACK_STUB => vec![],
-            _ => kernel_stack
-                .iter()
-                .rev()
-                .filter(|x| **x > 0)
-                .copied()
-                .collect(),
-        };
-        let my_user_stack = match user_stack[0] {
-            KERNEL_THREAD_STACK_STUB => vec![],
-            PREEMPT_EVENT_STACK_STUB => vec![PREEMPT_EVENT_STACK_STUB],
-            _ => user_stack
-                .iter()
-                .rev()
-                .filter(|x| **x > 0)
-                .copied()
-                .collect(),
-        };
-        Stack {
-            kernel_stack: my_kernel_stack,
-            user_stack: my_user_stack,
-        }
-    }
-}
-
 impl EventKey {
     pub fn new(event: systing::types::wake_event) -> Self {
         let my_event_type = match event.waker_tgidpid {
             u64::MAX => EventKeyType::SampleEvent,
             _ => EventKeyType::WakeEvent,
         };
+        let waker_k_stack = Vec::from(event.waker_kernel_stack);
+        let wakee_k_stack = Vec::from(event.wakee_kernel_stack);
+        let waker_u_stack = Vec::from(event.waker_user_stack);
+        let wakee_u_stack = Vec::from(event.wakee_user_stack);
         EventKey {
             event_type: my_event_type,
             waker: event.waker_tgidpid,
             wakee: event.wakee_tgidpid,
-            waker_stack: Stack::new(event.waker_kernel_stack, event.waker_user_stack),
-            wakee_stack: Stack::new(event.wakee_kernel_stack, event.wakee_user_stack),
+            waker_stack: Stack::new(&waker_k_stack, &waker_u_stack),
+            wakee_stack: Stack::new(&wakee_k_stack, &wakee_u_stack),
         }
     }
 }
@@ -307,12 +145,7 @@ impl ProcessEvents {
             syms.push(format!("{}_{}", pid_comm(waker_pid), waker_pid).to_string());
             syms.extend(
                 src_cache
-                    .symbolize_stack(waker_pid, &key.waker_stack, StackType::User)
-                    .unwrap_or(Vec::new()),
-            );
-            syms.extend(
-                src_cache
-                    .symbolize_stack(waker_pid, &key.waker_stack, StackType::Kernel)
+                    .symbolize_stack(waker_pid, &key.waker_stack)
                     .unwrap_or(Vec::new()),
             );
             lines.push(format!("{} {}", syms.join(";"), value.count));
@@ -347,19 +180,10 @@ impl ProcessEvents {
             .iter()
             .filter(|(key, _)| key.event_type == EventKeyType::WakeEvent)
         {
-            let mut syms = Vec::new();
             let wakee_pid = key.wakee as u32;
-
-            syms.extend(
-                src_cache
-                    .symbolize_stack(wakee_pid, &key.wakee_stack, StackType::User)
-                    .unwrap_or(Vec::new()),
-            );
-            syms.extend(
-                src_cache
-                    .symbolize_stack(wakee_pid, &key.wakee_stack, StackType::Kernel)
-                    .unwrap_or(Vec::new()),
-            );
+            let syms = src_cache
+                .symbolize_stack(wakee_pid, &key.wakee_stack)
+                .unwrap_or(Vec::new());
             lines.push(format!("{} {}", syms.join(";"), value.duration_ns));
         }
         if lines.len() > 0 {
@@ -406,18 +230,7 @@ impl ProcessEvents {
         }
 
         for (key, value) in stacks {
-            let mut syms = Vec::new();
-
-            syms.extend(
-                src_cache
-                    .symbolize_stack(pid, &key, StackType::User)
-                    .unwrap_or(Vec::new()),
-            );
-            syms.extend(
-                src_cache
-                    .symbolize_stack(pid, &key, StackType::Kernel)
-                    .unwrap_or(Vec::new()),
-            );
+            let syms = src_cache.symbolize_stack(pid, &key).unwrap_or(Vec::new());
             lines.push(format!("{} {}", syms.join(";"), value));
         }
         if lines.len() > 0 {
@@ -442,52 +255,16 @@ impl Event {
             "  Count: {}, Duration: {}",
             self.value.count, self.value.duration_ns
         );
-        println!("  r kernel stack:");
-        match src_cache.symbolize_stack(
-            self.key.waker as u32,
-            &self.key.waker_stack,
-            StackType::Kernel,
-        ) {
+        println!("  r stack:");
+        match src_cache.symbolize_stack(self.key.waker as u32, &self.key.waker_stack) {
             Ok(syms) => println!("{}", syms.join("\n")),
-            Err(e) => eprintln!("Failed to symbolize waker kernel stack: {}", e),
+            Err(e) => eprintln!("Failed to symbolize waker stack: {}", e),
         };
 
-        match src_cache.symbolize_stack(
-            self.key.waker as u32,
-            &self.key.waker_stack,
-            StackType::User,
-        ) {
-            Ok(syms) => {
-                if !syms.is_empty() {
-                    println!("  r user stack:");
-                    println!("{}", syms.join("\n"));
-                }
-            }
-            Err(e) => eprintln!("Failed to symbolize waker user stack: {}", e),
-        };
-
-        println!("  e kernel stack:");
-        match src_cache.symbolize_stack(
-            self.key.wakee as u32,
-            &self.key.wakee_stack,
-            StackType::Kernel,
-        ) {
+        println!("  e stack:");
+        match src_cache.symbolize_stack(self.key.wakee as u32, &self.key.wakee_stack) {
             Ok(syms) => println!("{}", syms.join("\n")),
-            Err(e) => eprintln!("Failed to symbolize wakee kernel stack: {}", e),
-        };
-
-        match src_cache.symbolize_stack(
-            self.key.wakee as u32,
-            &self.key.wakee_stack,
-            StackType::User,
-        ) {
-            Ok(syms) => {
-                if !syms.is_empty() {
-                    println!("  e user stack:");
-                    println!("{}", syms.join("\n"));
-                }
-            }
-            Err(e) => eprintln!("Failed to symbolize wakee user stack: {}", e),
+            Err(e) => eprintln!("Failed to symbolize wakee stack: {}", e),
         };
         println!();
     }

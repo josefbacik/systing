@@ -3,6 +3,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 pub mod perfetto;
+pub mod symbolize;
 mod cmds;
 
 #[derive(Debug, Parser)]
