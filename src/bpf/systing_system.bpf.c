@@ -16,7 +16,11 @@
 
 #define TASK_COMM_LEN 16
 
-#define PF_WQ_WORKER                   0x00000020
+#define PF_WQ_WORKER 0x00000020
+#define PF_KTHREAD 0x00200000
+
+#define MAX_STACK_DEPTH 36
+#define MAX_STACK_DEPTH_BYTES (MAX_STACK_DEPTH * sizeof(u64))
 
 const volatile struct {
 	gid_t tgid;
@@ -45,8 +49,12 @@ struct task_event {
 	u32 target_cpu;
 	u32 next_prio;
 	u32 prev_prio;
+	u64 kernel_stack_length;
+	u64 user_stack_length;
 	u8 prev_comm[TASK_COMM_LEN];
 	u8 next_comm[TASK_COMM_LEN];
+	u64 kernel_stack[MAX_STACK_DEPTH];
+	u64 user_stack[MAX_STACK_DEPTH];
 };
 /*
  * Dummy instance to get skeleton to generate definition for
@@ -227,6 +235,8 @@ int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 	event->next_tgidpid = key;
 	event->next_prio = wakee->prio;
 	event->target_cpu = task_cpu(wakee);
+	event->kernel_stack_length = 0;
+	event->user_stack_length = 0;
 	record_task_name(wakee, event->next_comm);
 	record_task_name(waker, event->prev_comm);
 	bpf_ringbuf_submit(event, 0);
@@ -295,8 +305,24 @@ int handle__sched_switch(u64 *ctx)
 	event->next_tgidpid = task_key(next);
 	event->next_prio = next->prio;
 	event->prev_prio = prev->prio;
+	event->kernel_stack_length = 0;
+	event->user_stack_length = 0;
 	record_task_name(prev, event->prev_comm);
 	record_task_name(next, event->next_comm);
+
+	/* Record the blocked stack trace. */
+	if (prev->__state & TASK_UNINTERRUPTIBLE) {
+		u64 len = 0;
+		if (!(prev->flags & PF_KTHREAD)) {
+			len = bpf_get_stack(ctx, &event->user_stack,
+					    sizeof(event->user_stack),
+					    BPF_F_USER_STACK);
+			event->user_stack_length = len / sizeof(u64);
+		}
+		len = bpf_get_stack(ctx, &event->kernel_stack,
+				    sizeof(event->kernel_stack), 0);
+		event->kernel_stack_length = len / sizeof(u64);
+	}
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }

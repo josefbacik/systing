@@ -95,6 +95,12 @@ where
     ret
 }
 
+impl Default for SymbolizerCache<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a> SymbolizerCache<'a> {
     pub fn new() -> Self {
         SymbolizerCache {
@@ -138,7 +144,17 @@ impl<'a> SymbolizerCache<'a> {
 
 impl Stack {
     pub fn new(kernel_stack: &Vec<u64>, user_stack: &Vec<u64>) -> Self {
-        let my_kernel_stack = match kernel_stack[0] {
+        let first_kernel_element = if kernel_stack.is_empty() {
+            0
+        } else {
+            kernel_stack[0]
+        };
+        let first_user_element = if user_stack.is_empty() {
+            0
+        } else {
+            user_stack[0]
+        };
+        let my_kernel_stack = match first_kernel_element {
             PREEMPT_EVENT_STACK_STUB => vec![],
             _ => kernel_stack
                 .iter()
@@ -147,7 +163,7 @@ impl Stack {
                 .copied()
                 .collect(),
         };
-        let my_user_stack = match user_stack[0] {
+        let my_user_stack = match first_user_element {
             KERNEL_THREAD_STACK_STUB => vec![],
             PREEMPT_EVENT_STACK_STUB => vec![PREEMPT_EVENT_STACK_STUB],
             _ => user_stack

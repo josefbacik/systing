@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CStr;
 use std::io::Write;
 use std::mem::MaybeUninit;
@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crate::symbolize::{Stack, SymbolizerCache};
 use crate::SystemOpts;
 
 use anyhow::Result;
@@ -18,12 +19,15 @@ use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
 use perfetto_protos::ftrace_event::FtraceEvent;
 use perfetto_protos::ftrace_event_bundle::FtraceEventBundle;
+use perfetto_protos::interned_data::InternedData;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
 use perfetto_protos::process_tree::process_tree::{Process, Thread};
 use perfetto_protos::process_tree::ProcessTree;
+use perfetto_protos::profile_common::InternedString;
 use perfetto_protos::sched::{
     SchedSwitchFtraceEvent, SchedWakeupNewFtraceEvent, SchedWakingFtraceEvent,
 };
+use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace::Trace;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
@@ -40,30 +44,72 @@ mod systing {
 
 unsafe impl Plain for systing::types::task_event {}
 
-struct RunqueueCounter {
+struct TrackCounter {
     ts: u64,
-    count: u32,
+    count: i64,
 }
 
-struct LatencyCounter {
-    ts: u64,
-    latency: u64,
+#[derive(Clone)]
+struct SleepStack {
+    pid: i32,
+    ts_start: u64,
+    ts_end: u64,
+    stack: Stack,
 }
 
-trait ToTrackEvent {
-    fn to_track_event(&self, track_uuid: u64) -> TrackEvent;
-    fn ts(&self) -> u64;
+struct LocalInternedString {
+    iid: u64,
+    val: String,
 }
 
 #[derive(Default)]
-struct EventRecorder {
+struct EventRecorder<'a> {
     events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
-    threads: HashMap<i32, Thread>,
-    processes: HashMap<i32, Process>,
-    runqueue: HashMap<i32, Vec<RunqueueCounter>>,
-    cpu_latencies: HashMap<u32, Vec<LatencyCounter>>,
-    process_latencies: HashMap<u32, Vec<LatencyCounter>>,
-    rq_counters: HashMap<i32, u32>,
+    threads: HashMap<u64, Thread>,
+    processes: HashMap<u64, Process>,
+    sleepers: HashMap<i32, Vec<SleepStack>>,
+    pending_wakeups: HashMap<u64, SleepStack>,
+    runqueue: HashMap<i32, Vec<TrackCounter>>,
+    cpu_latencies: HashMap<u32, Vec<TrackCounter>>,
+    process_latencies: HashMap<u64, Vec<TrackCounter>>,
+    rq_counters: HashMap<i32, i64>,
+    symbolizer: SymbolizerCache<'a>,
+    pids: HashSet<i32>,
+    last_ts: u64,
+}
+
+fn generate_interned_data<'a, I>(iter: I) -> Vec<TracePacket>
+where
+    I: IntoIterator<Item = &'a LocalInternedString>,
+{
+    let mut packets = Vec::new();
+    for local_is in iter {
+        let mut interned_data = InternedData::default();
+        let mut interned_string = InternedString::default();
+        interned_string.set_iid(local_is.iid);
+        interned_string.set_str(local_is.val.clone().into_bytes());
+        interned_data.function_names = vec![interned_string].into();
+        let mut packet = TracePacket::default();
+        packet.interned_data = Some(interned_data).into();
+        packets.push(packet);
+    }
+    packets
+}
+
+fn generate_thread_track_descriptor(pidtgid: u64, uuid: u64, name: String) -> TrackDescriptor {
+    let pid = pidtgid as i32;
+    let tgid = (pidtgid >> 32) as i32;
+
+    let mut desc = TrackDescriptor::default();
+    desc.set_name(name);
+    desc.set_uuid(uuid);
+
+    let mut thread_desc = ThreadDescriptor::default();
+    thread_desc.set_pid(tgid);
+    thread_desc.set_tid(pid);
+    desc.thread = Some(thread_desc).into();
+
+    desc
 }
 
 trait TaskEventBuilder {
@@ -132,43 +178,78 @@ impl TaskEventBuilder for SchedWakeupNewFtraceEvent {
     }
 }
 
-impl ToTrackEvent for RunqueueCounter {
-    fn to_track_event(&self, track_uuid: u64) -> TrackEvent {
+impl TrackCounter {
+    fn to_track_event(&self, track_uuid: u64, seq: u32) -> TracePacket {
+        let mut packet = TracePacket::default();
         let mut track_event = TrackEvent::default();
         track_event.set_timestamp_absolute_us((self.ts / 1000) as i64);
         track_event.set_type(Type::TYPE_COUNTER);
-        track_event.set_counter_value(self.count as i64);
+        track_event.set_counter_value(self.count);
+        track_event.set_track_uuid(track_uuid);
+
+        packet.set_track_event(track_event);
+        packet.set_timestamp(self.ts);
+        packet.set_trusted_packet_sequence_id(seq);
+        packet
+    }
+}
+
+impl SleepStack {
+    fn start_track_event(&self, iid: u64, track_uuid: u64) -> TrackEvent {
+        let mut track_event = TrackEvent::default();
+        track_event.set_timestamp_absolute_us((self.ts_start / 1000) as i64);
+        track_event.set_type(Type::TYPE_SLICE_BEGIN);
+        track_event.set_track_uuid(track_uuid);
+        track_event.set_name_iid(iid);
+        track_event
+    }
+
+    fn end_track_event(&self, track_uuid: u64) -> TrackEvent {
+        let mut track_event = TrackEvent::default();
+        track_event.set_timestamp_absolute_us((self.ts_end / 1000) as i64);
+        track_event.set_type(Type::TYPE_SLICE_END);
         track_event.set_track_uuid(track_uuid);
         track_event
     }
 
-    fn ts(&self) -> u64 {
-        self.ts
+    fn to_trace_packets(&self, iid: u64, track_uuid: u64, seq: u32) -> Vec<TracePacket> {
+        let mut packets = Vec::new();
+
+        let mut packet = TracePacket::default();
+        packet.set_timestamp(self.ts_start);
+        packet.set_track_event(self.start_track_event(iid, track_uuid));
+        packet.set_trusted_packet_sequence_id(seq);
+        packets.push(packet);
+
+        let mut packet = TracePacket::default();
+        packet.set_timestamp(self.ts_end);
+        packet.set_track_event(self.end_track_event(track_uuid));
+        packet.set_trusted_packet_sequence_id(seq);
+        packets.push(packet);
+        packets
     }
 }
 
-impl ToTrackEvent for LatencyCounter {
-    fn to_track_event(&self, track_uuid: u64) -> TrackEvent {
-        let mut track_event = TrackEvent::default();
-        track_event.set_timestamp_absolute_us((self.ts / 1000) as i64);
-        track_event.set_type(Type::TYPE_COUNTER);
-        track_event.set_counter_value(self.latency as i64);
-        track_event.set_track_uuid(track_uuid);
-        track_event
-    }
-
-    fn ts(&self) -> u64 {
-        self.ts
-    }
-}
-
-impl EventRecorder {
+impl<'a> EventRecorder<'a> {
     fn record_event(&mut self, event: &systing::types::task_event) {
         // We don't want to track wakeup events, they're not interesting for this analysis.
         if event.r#type != systing::types::event_type::SCHED_WAKEUP {
             let ftrace_event = FtraceEvent::from_task_event(&event);
             let cpu_event = self.events.entry(event.cpu).or_insert_with(BTreeMap::new);
             cpu_event.insert(event.ts, ftrace_event);
+        }
+
+        if event.user_stack_length > 0 || event.kernel_stack_length > 0 {
+            let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
+            let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
+            let stack_key = event.prev_tgidpid;
+            let stack = SleepStack {
+                pid: event.prev_tgidpid as i32,
+                ts_start: event.ts,
+                ts_end: 0,
+                stack: Stack::new(&kstack_vec, &ustack_vec),
+            };
+            self.pending_wakeups.insert(stack_key, stack);
         }
 
         // We want to keep a running count of the per-cpu runqueue size. We could do this
@@ -196,7 +277,7 @@ impl EventRecorder {
                 *count += 1;
             }
 
-            rq.push(RunqueueCounter {
+            rq.push(TrackCounter {
                 ts: event.ts,
                 count: *count,
             });
@@ -208,25 +289,28 @@ impl EventRecorder {
             let lat = self.cpu_latencies.entry(cpu).or_insert_with(Vec::new);
             let plat = self
                 .process_latencies
-                .entry((event.next_tgidpid >> 32) as u32)
+                .entry(event.next_tgidpid)
                 .or_insert_with(Vec::new);
 
-            plat.push(LatencyCounter {
+            plat.push(TrackCounter {
                 ts: event.ts,
-                latency: event.latency,
+                count: event.latency as i64,
             });
 
-            lat.push(LatencyCounter {
+            lat.push(TrackCounter {
                 ts: event.ts,
-                latency: event.latency,
+                count: event.latency as i64,
             });
         }
 
         let tgid = (event.prev_tgidpid >> 32) as i32;
         let pid = event.prev_tgidpid as i32;
         if pid != tgid {
-            if !self.threads.contains_key(&pid) {
-                let thread_entry = self.threads.entry(pid).or_insert_with(Thread::default);
+            if !self.threads.contains_key(&event.prev_tgidpid) {
+                let thread_entry = self
+                    .threads
+                    .entry(event.prev_tgidpid)
+                    .or_insert_with(Thread::default);
                 let comm = CStr::from_bytes_until_nul(&event.prev_comm).unwrap();
                 thread_entry.set_tid(pid);
                 thread_entry.set_tgid(tgid);
@@ -234,16 +318,22 @@ impl EventRecorder {
             }
         }
 
-        if !self.processes.contains_key(&tgid) {
-            let process_entry = self.processes.entry(tgid).or_insert_with(Process::default);
+        if !self.processes.contains_key(&event.prev_tgidpid) {
+            let process_entry = self
+                .processes
+                .entry(event.prev_tgidpid)
+                .or_insert_with(Process::default);
             process_entry.set_pid(tgid);
         }
 
         let pid = event.next_tgidpid as i32;
         let tgid = (event.next_tgidpid >> 32) as i32;
         if pid != tgid {
-            if !self.threads.contains_key(&pid) {
-                let thread_entry = self.threads.entry(pid).or_insert_with(Thread::default);
+            if !self.threads.contains_key(&event.next_tgidpid) {
+                let thread_entry = self
+                    .threads
+                    .entry(event.next_tgidpid)
+                    .or_insert_with(Thread::default);
                 let comm = CStr::from_bytes_until_nul(&event.next_comm).unwrap();
                 thread_entry.set_tid(pid);
                 thread_entry.set_tgid(tgid);
@@ -251,25 +341,48 @@ impl EventRecorder {
             }
         }
 
-        if !self.processes.contains_key(&tgid) {
-            let process_entry = self.processes.entry(tgid).or_insert_with(Process::default);
+        if !self.processes.contains_key(&event.next_tgidpid) {
+            let process_entry = self
+                .processes
+                .entry(event.next_tgidpid)
+                .or_insert_with(Process::default);
             process_entry.set_pid(tgid);
         }
+
+        if self.pending_wakeups.contains_key(&event.next_tgidpid) {
+            let mut stack = self.pending_wakeups.remove(&event.next_tgidpid).unwrap();
+            let stacks = self.sleepers.entry(stack.pid).or_insert_with(Vec::new);
+            stack.ts_end = event.ts;
+            stacks.push(stack);
+        }
+        self.last_ts = event.ts;
     }
 
-    fn trace_packet(&self, counter: &impl ToTrackEvent, track_uuid: u64, seq: u32) -> TracePacket {
-        let track_event = counter.to_track_event(track_uuid);
-
-        let mut packet = TracePacket::default();
-        packet.set_timestamp(counter.ts());
-        packet.set_track_event(track_event);
-        packet.set_trusted_packet_sequence_id(seq);
-        packet
+    fn wake_all_pending_wakeups(&mut self) {
+        for (_, stack) in self.pending_wakeups.iter_mut() {
+            let stacks = self.sleepers.entry(stack.pid).or_insert_with(Vec::new);
+            stack.ts_end = self.last_ts;
+            stacks.push(stack.clone());
+        }
+        self.pending_wakeups.clear();
     }
 
-    fn generate_trace(&self) -> Trace {
-        // Pull all the scheduling events.
+    fn generate_trace(&mut self) -> Trace {
         let mut trace = Trace::default();
+        let mut rng = rand::rng();
+
+        // Pull all the threads and populate the processes
+        let mut process_tree = ProcessTree::default();
+        process_tree.threads = self.threads.values().cloned().collect();
+        process_tree.processes = self.processes.values().cloned().collect();
+        for process in process_tree.processes.iter_mut() {
+            crate::perfetto::profetto_fill_process(process);
+        }
+        let mut packet = TracePacket::default();
+        packet.set_process_tree(process_tree);
+        trace.packet.push(packet);
+
+        // Pull all the scheduling events.
         for (cpu, events) in self.events.iter() {
             let mut event_bundle = FtraceEventBundle::default();
             event_bundle.set_cpu(*cpu);
@@ -280,7 +393,6 @@ impl EventRecorder {
         }
 
         // Populate the per-cpu runqueue sizes
-        let mut rng = rand::rng();
         for (cpu, runqueue) in self.runqueue.iter() {
             let desc_uuid = rng.next_u64();
 
@@ -299,7 +411,7 @@ impl EventRecorder {
 
             let seq = rng.next_u32();
             for event in runqueue.iter() {
-                trace.packet.push(self.trace_packet(event, desc_uuid, seq));
+                trace.packet.push(event.to_track_event(desc_uuid, seq));
             }
         }
 
@@ -322,35 +434,24 @@ impl EventRecorder {
 
             let seq = rng.next_u32();
             for event in events.iter() {
-                trace.packet.push(self.trace_packet(event, desc_uuid, seq));
+                trace.packet.push(event.to_track_event(desc_uuid, seq));
             }
         }
 
         // Populate the per-process latencies
-        for (pid, events) in self.process_latencies.iter() {
-            let process_uuid = rng.next_u64();
+        for (pidtgid, events) in self.process_latencies.iter() {
             let desc_uuid = rng.next_u64();
 
-            let mut process_desc = ProcessDescriptor::default();
-            process_desc.set_pid(*pid as i32);
-
-            let mut desc = TrackDescriptor::default();
-            desc.set_name("Scheduler Latency".to_string());
-            desc.set_uuid(process_uuid);
-            desc.process = Some(process_desc).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            trace.packet.push(packet);
+            let mut desc = generate_thread_track_descriptor(
+                *pidtgid,
+                desc_uuid,
+                "Wakeup Latency".to_string(),
+            );
 
             let mut counter_desc = CounterDescriptor::default();
             counter_desc.set_unit(Unit::UNIT_TIME_NS);
             counter_desc.set_is_incremental(false);
 
-            let mut desc = TrackDescriptor::default();
-            desc.set_name("Wakeup Latency".to_string());
-            desc.set_uuid(desc_uuid);
-            desc.set_parent_uuid(process_uuid);
             desc.counter = Some(counter_desc).into();
 
             let mut packet = TracePacket::default();
@@ -359,20 +460,65 @@ impl EventRecorder {
 
             let seq = rng.next_u32();
             for event in events.iter() {
-                trace.packet.push(self.trace_packet(event, desc_uuid, seq));
+                trace.packet.push(event.to_track_event(desc_uuid, seq));
             }
         }
 
-        // Pull all the threads and populate the processes
-        let mut process_tree = ProcessTree::default();
-        process_tree.threads = self.threads.values().cloned().collect();
-        process_tree.processes = self.processes.values().cloned().collect();
-        for process in process_tree.processes.iter_mut() {
-            crate::perfetto::profetto_fill_process(process);
+/*
+        // Resolve the stacks, generate the interned data for them, and populate the trace.
+        for (pid, stacks) in self.sleepers.iter() {
+            // Collect into a HashSet to dedup the stacks, and then iterate that to symbolize the
+            // stacks and generate the interned data.
+            let interned_stacks: HashMap<Stack, LocalInternedString> = stacks
+                .iter()
+                .map(|stack| stack.stack.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .map(|stack| {
+                    let symbols = match self.symbolizer.symbolize_stack(*pid as u32, &stack) {
+                        Ok(s) => s.join(";"),
+                        Err(_) => "<unknown>".to_string(),
+                    };
+                    let local_is = LocalInternedString {
+                        iid: rng.next_u64(),
+                        val: symbols,
+                    };
+                    (stack, local_is)
+                })
+                .collect();
+
+            // Generate the interned data packets for the stacks.
+            trace.packet.extend(generate_interned_data(interned_stacks.values()));
+
+            for stack in stacks.iter() {
+                let stack_uuid = rng.next_u64();
+                let mut packets = Vec::new();
+                for (stack, local_is) in interned_stacks.iter() {
+                    if stack == &stack.stack {
+                        let mut desc = TrackDescriptor::default();
+                        desc.set_name(format!("Sleep Stack {}", pid));
+                        desc.set_uuid(stack_uuid);
+
+                        let mut packet = TracePacket::default();
+                        packet.set_track_descriptor(desc);
+                        trace.packet.push(packet);
+
+                        let mut packet = TracePacket::default();
+                        packet.set_timestamp(stack.ts_start);
+                        packet.set_track_event(stack.stack.start_track_event(stack_uuid));
+                        packet.set_trusted_packet_sequence_id(rng.next_u32());
+                        trace.packet.push(packet);
+
+                        let mut packet = TracePacket::default();
+                        packet.set_timestamp(stack.ts_end);
+                        packet.set_track_event(stack.stack.end_track_event(stack_uuid));
+                        packet.set_trusted_packet_sequence_id(rng.next_u32());
+                        trace.packet.push(packet);
+                    }
+                }
+            }
         }
-        let mut packet = TracePacket::default();
-        packet.set_process_tree(process_tree);
-        trace.packet.push(packet);
+*/
         trace
     }
 }
@@ -459,7 +605,9 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         println!("Stopped: missed events: {}", missed_events);
     }
 
-    let my_recorder = std::mem::take(&mut *recorder.lock().unwrap());
+    let mut my_recorder = std::mem::take(&mut *recorder.lock().unwrap());
+    my_recorder.wake_all_pending_wakeups();
+
     let trace = my_recorder.generate_trace();
     let bytes = trace.write_to_bytes()?;
     let mut file = std::fs::File::create("trace.pb")?;

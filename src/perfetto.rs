@@ -3,18 +3,6 @@ use regex::Regex;
 
 pub fn profetto_fill_process(process: &mut Process) {
     let pid = process.pid();
-    let cmdline = std::fs::read_to_string(format!("/proc/{}/cmdline", pid));
-    if cmdline.is_err() {
-        // Could not read cmdline for process, it's probably exited
-        process.cmdline = vec!["unknown".to_string()];
-        return;
-    }
-    process.cmdline = cmdline
-        .unwrap()
-        .split('\0')
-        .map(|s| s.to_string())
-        .collect();
-
     let status = std::fs::read_to_string(format!("/proc/{}/status", pid));
     if status.is_err() {
         return;
