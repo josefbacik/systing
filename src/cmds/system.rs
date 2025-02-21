@@ -15,24 +15,26 @@ use crate::SystemOpts;
 use anyhow::Result;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{MapCore, RingBufferBuilder};
+use libc;
+use perfetto_protos::builtin_clock::BuiltinClock;
+use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
+use perfetto_protos::clock_snapshot::ClockSnapshot;
 use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
 use perfetto_protos::ftrace_event::FtraceEvent;
 use perfetto_protos::ftrace_event_bundle::FtraceEventBundle;
 use perfetto_protos::interned_data::InternedData;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
-use perfetto_protos::process_tree::process_tree::{Process, Thread};
-use perfetto_protos::process_tree::ProcessTree;
-use perfetto_protos::profile_common::InternedString;
 use perfetto_protos::sched::{
     SchedSwitchFtraceEvent, SchedWakeupNewFtraceEvent, SchedWakingFtraceEvent,
 };
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace::Trace;
+use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
 use perfetto_protos::track_event::track_event::Type;
-use perfetto_protos::track_event::TrackEvent;
+use perfetto_protos::track_event::{EventName, TrackEvent};
 use rand::RngCore;
 
 use plain::Plain;
@@ -51,7 +53,7 @@ struct TrackCounter {
 
 #[derive(Clone)]
 struct SleepStack {
-    pid: i32,
+    tgidpid: u64,
     ts_start: u64,
     ts_end: u64,
     stack: Stack,
@@ -64,52 +66,48 @@ struct LocalInternedString {
 
 #[derive(Default)]
 struct EventRecorder<'a> {
+    clock_snapshot: ClockSnapshot,
     events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
-    threads: HashMap<u64, Thread>,
-    processes: HashMap<u64, Process>,
-    sleepers: HashMap<i32, Vec<SleepStack>>,
+    threads: HashMap<u64, ThreadDescriptor>,
+    processes: HashMap<u64, ProcessDescriptor>,
+    sleepers: HashMap<u64, Vec<SleepStack>>,
     pending_wakeups: HashMap<u64, SleepStack>,
     runqueue: HashMap<i32, Vec<TrackCounter>>,
     cpu_latencies: HashMap<u32, Vec<TrackCounter>>,
     process_latencies: HashMap<u64, Vec<TrackCounter>>,
     rq_counters: HashMap<i32, i64>,
     symbolizer: SymbolizerCache<'a>,
-    pids: HashSet<i32>,
+    start_ts: u64,
     last_ts: u64,
 }
 
-fn generate_interned_data<'a, I>(iter: I) -> Vec<TracePacket>
+fn get_clock_value(clock_id: libc::c_int) -> u64 {
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { libc::clock_gettime(clock_id, &mut ts) } != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64 * 1_000_000_000) + ts.tv_nsec as u64
+}
+
+fn generate_interned_data<'a, I>(iter: I, seq: u32) -> TracePacket
 where
     I: IntoIterator<Item = &'a LocalInternedString>,
 {
-    let mut packets = Vec::new();
+    let mut packet = TracePacket::default();
+    let mut interned_data = InternedData::default();
     for local_is in iter {
-        let mut interned_data = InternedData::default();
-        let mut interned_string = InternedString::default();
-        interned_string.set_iid(local_is.iid);
-        interned_string.set_str(local_is.val.clone().into_bytes());
-        interned_data.function_names = vec![interned_string].into();
-        let mut packet = TracePacket::default();
-        packet.interned_data = Some(interned_data).into();
-        packets.push(packet);
+        let mut event_name = EventName::default();
+        event_name.set_iid(local_is.iid);
+        event_name.set_name(local_is.val.clone());
+        interned_data.event_names.push(event_name);
     }
-    packets
-}
-
-fn generate_thread_track_descriptor(pidtgid: u64, uuid: u64, name: String) -> TrackDescriptor {
-    let pid = pidtgid as i32;
-    let tgid = (pidtgid >> 32) as i32;
-
-    let mut desc = TrackDescriptor::default();
-    desc.set_name(name);
-    desc.set_uuid(uuid);
-
-    let mut thread_desc = ThreadDescriptor::default();
-    thread_desc.set_pid(tgid);
-    thread_desc.set_tid(pid);
-    desc.thread = Some(thread_desc).into();
-
-    desc
+    packet.interned_data = Some(interned_data).into();
+    packet.set_trusted_packet_sequence_id(seq);
+    packet.set_sequence_flags(
+        SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
+            | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
+    );
+    packet
 }
 
 trait TaskEventBuilder {
@@ -182,7 +180,6 @@ impl TrackCounter {
     fn to_track_event(&self, track_uuid: u64, seq: u32) -> TracePacket {
         let mut packet = TracePacket::default();
         let mut track_event = TrackEvent::default();
-        track_event.set_timestamp_absolute_us((self.ts / 1000) as i64);
         track_event.set_type(Type::TYPE_COUNTER);
         track_event.set_counter_value(self.count);
         track_event.set_track_uuid(track_uuid);
@@ -197,7 +194,6 @@ impl TrackCounter {
 impl SleepStack {
     fn start_track_event(&self, iid: u64, track_uuid: u64) -> TrackEvent {
         let mut track_event = TrackEvent::default();
-        track_event.set_timestamp_absolute_us((self.ts_start / 1000) as i64);
         track_event.set_type(Type::TYPE_SLICE_BEGIN);
         track_event.set_track_uuid(track_uuid);
         track_event.set_name_iid(iid);
@@ -206,7 +202,6 @@ impl SleepStack {
 
     fn end_track_event(&self, track_uuid: u64) -> TrackEvent {
         let mut track_event = TrackEvent::default();
-        track_event.set_timestamp_absolute_us((self.ts_end / 1000) as i64);
         track_event.set_type(Type::TYPE_SLICE_END);
         track_event.set_track_uuid(track_uuid);
         track_event
@@ -218,6 +213,7 @@ impl SleepStack {
         let mut packet = TracePacket::default();
         packet.set_timestamp(self.ts_start);
         packet.set_track_event(self.start_track_event(iid, track_uuid));
+        packet.set_sequence_flags(SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32);
         packet.set_trusted_packet_sequence_id(seq);
         packets.push(packet);
 
@@ -232,6 +228,10 @@ impl SleepStack {
 
 impl<'a> EventRecorder<'a> {
     fn record_event(&mut self, event: &systing::types::task_event) {
+        if self.start_ts == 0 {
+            self.start_ts = event.ts;
+        }
+
         // We don't want to track wakeup events, they're not interesting for this analysis.
         if event.r#type != systing::types::event_type::SCHED_WAKEUP {
             let ftrace_event = FtraceEvent::from_task_event(&event);
@@ -244,7 +244,7 @@ impl<'a> EventRecorder<'a> {
             let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
             let stack_key = event.prev_tgidpid;
             let stack = SleepStack {
-                pid: event.prev_tgidpid as i32,
+                tgidpid: event.prev_tgidpid,
                 ts_start: event.ts,
                 ts_end: 0,
                 stack: Stack::new(&kstack_vec, &ustack_vec),
@@ -305,53 +305,57 @@ impl<'a> EventRecorder<'a> {
 
         let tgid = (event.prev_tgidpid >> 32) as i32;
         let pid = event.prev_tgidpid as i32;
-        if pid != tgid {
+        if pid == tgid {
+            if !self.processes.contains_key(&event.prev_tgidpid) {
+                let process_entry = self
+                    .processes
+                    .entry(event.prev_tgidpid)
+                    .or_insert_with(ProcessDescriptor::default);
+                let comm = CStr::from_bytes_until_nul(&event.prev_comm).unwrap();
+                process_entry.set_pid(tgid);
+                process_entry.set_process_name(comm.to_str().unwrap().to_string());
+            }
+        } else {
             if !self.threads.contains_key(&event.prev_tgidpid) {
                 let thread_entry = self
                     .threads
                     .entry(event.prev_tgidpid)
-                    .or_insert_with(Thread::default);
+                    .or_insert_with(ThreadDescriptor::default);
                 let comm = CStr::from_bytes_until_nul(&event.prev_comm).unwrap();
                 thread_entry.set_tid(pid);
-                thread_entry.set_tgid(tgid);
-                thread_entry.set_name(comm.to_str().unwrap().to_string());
+                thread_entry.set_pid(tgid);
+                thread_entry.set_thread_name(comm.to_str().unwrap().to_string());
             }
-        }
-
-        if !self.processes.contains_key(&event.prev_tgidpid) {
-            let process_entry = self
-                .processes
-                .entry(event.prev_tgidpid)
-                .or_insert_with(Process::default);
-            process_entry.set_pid(tgid);
         }
 
         let pid = event.next_tgidpid as i32;
         let tgid = (event.next_tgidpid >> 32) as i32;
-        if pid != tgid {
+        if pid == tgid {
+            if !self.processes.contains_key(&event.next_tgidpid) {
+                let process_entry = self
+                    .processes
+                    .entry(event.next_tgidpid)
+                    .or_insert_with(ProcessDescriptor::default);
+                let comm = CStr::from_bytes_until_nul(&event.next_comm).unwrap();
+                process_entry.set_pid(tgid);
+                process_entry.set_process_name(comm.to_str().unwrap().to_string());
+            }
+        } else {
             if !self.threads.contains_key(&event.next_tgidpid) {
                 let thread_entry = self
                     .threads
                     .entry(event.next_tgidpid)
-                    .or_insert_with(Thread::default);
+                    .or_insert_with(ThreadDescriptor::default);
                 let comm = CStr::from_bytes_until_nul(&event.next_comm).unwrap();
                 thread_entry.set_tid(pid);
-                thread_entry.set_tgid(tgid);
-                thread_entry.set_name(comm.to_str().unwrap().to_string());
+                thread_entry.set_pid(tgid);
+                thread_entry.set_thread_name(comm.to_str().unwrap().to_string());
             }
-        }
-
-        if !self.processes.contains_key(&event.next_tgidpid) {
-            let process_entry = self
-                .processes
-                .entry(event.next_tgidpid)
-                .or_insert_with(Process::default);
-            process_entry.set_pid(tgid);
         }
 
         if self.pending_wakeups.contains_key(&event.next_tgidpid) {
             let mut stack = self.pending_wakeups.remove(&event.next_tgidpid).unwrap();
-            let stacks = self.sleepers.entry(stack.pid).or_insert_with(Vec::new);
+            let stacks = self.sleepers.entry(stack.tgidpid).or_insert_with(Vec::new);
             stack.ts_end = event.ts;
             stacks.push(stack);
         }
@@ -360,7 +364,7 @@ impl<'a> EventRecorder<'a> {
 
     fn wake_all_pending_wakeups(&mut self) {
         for (_, stack) in self.pending_wakeups.iter_mut() {
-            let stacks = self.sleepers.entry(stack.pid).or_insert_with(Vec::new);
+            let stacks = self.sleepers.entry(stack.tgidpid).or_insert_with(Vec::new);
             stack.ts_end = self.last_ts;
             stacks.push(stack.clone());
         }
@@ -370,17 +374,42 @@ impl<'a> EventRecorder<'a> {
     fn generate_trace(&mut self) -> Trace {
         let mut trace = Trace::default();
         let mut rng = rand::rng();
+        let mut pid_uuids = HashMap::new();
+        let mut thread_uuids = HashMap::new();
 
-        // Pull all the threads and populate the processes
-        let mut process_tree = ProcessTree::default();
-        process_tree.threads = self.threads.values().cloned().collect();
-        process_tree.processes = self.processes.values().cloned().collect();
-        for process in process_tree.processes.iter_mut() {
-            crate::perfetto::profetto_fill_process(process);
-        }
+        // First emit the clock snapshot
         let mut packet = TracePacket::default();
-        packet.set_process_tree(process_tree);
+        packet.set_clock_snapshot(self.clock_snapshot.clone());
+        packet.set_trusted_packet_sequence_id(rng.next_u32());
         trace.packet.push(packet);
+
+        println!("start_ts is {}", self.start_ts);
+        // Ppopulate all the process tracks
+        for (_, process) in self.processes.iter() {
+            let uuid = rng.next_u64();
+            pid_uuids.insert(process.pid(), uuid);
+
+            let mut desc = TrackDescriptor::default();
+            desc.set_uuid(uuid);
+            desc.process = Some(process.clone()).into();
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            trace.packet.push(packet);
+        }
+
+        for (_, thread) in self.threads.iter() {
+            let uuid = rng.next_u64();
+            thread_uuids.insert(thread.tid(), uuid);
+
+            let mut desc = TrackDescriptor::default();
+            desc.set_uuid(uuid);
+            desc.thread = Some(thread.clone()).into();
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            trace.packet.push(packet);
+        }
 
         // Pull all the scheduling events.
         for (cpu, events) in self.events.iter() {
@@ -440,18 +469,24 @@ impl<'a> EventRecorder<'a> {
 
         // Populate the per-process latencies
         for (pidtgid, events) in self.process_latencies.iter() {
-            let desc_uuid = rng.next_u64();
+            let pid = *pidtgid as i32;
+            let tgid = (*pidtgid >> 32) as i32;
 
-            let mut desc = generate_thread_track_descriptor(
-                *pidtgid,
-                desc_uuid,
-                "Wakeup Latency".to_string(),
-            );
+            let desc_uuid = rng.next_u64();
+            let uuid = if pid == tgid {
+                *pid_uuids.get(&tgid).unwrap()
+            } else {
+                *thread_uuids.get(&pid).unwrap()
+            };
 
             let mut counter_desc = CounterDescriptor::default();
             counter_desc.set_unit(Unit::UNIT_TIME_NS);
             counter_desc.set_is_incremental(false);
 
+            let mut desc = TrackDescriptor::default();
+            desc.set_name("Wake latency".to_string());
+            desc.set_uuid(desc_uuid);
+            desc.set_parent_uuid(uuid);
             desc.counter = Some(counter_desc).into();
 
             let mut packet = TracePacket::default();
@@ -464,9 +499,11 @@ impl<'a> EventRecorder<'a> {
             }
         }
 
-/*
         // Resolve the stacks, generate the interned data for them, and populate the trace.
-        for (pid, stacks) in self.sleepers.iter() {
+        for (tgidpid, stacks) in self.sleepers.iter() {
+            let pid = *tgidpid as i32;
+            let tgid = (*tgidpid >> 32) as i32;
+
             // Collect into a HashSet to dedup the stacks, and then iterate that to symbolize the
             // stacks and generate the interned data.
             let interned_stacks: HashMap<Stack, LocalInternedString> = stacks
@@ -475,7 +512,7 @@ impl<'a> EventRecorder<'a> {
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .map(|stack| {
-                    let symbols = match self.symbolizer.symbolize_stack(*pid as u32, &stack) {
+                    let symbols = match self.symbolizer.symbolize_stack(pid as u32, &stack) {
                         Ok(s) => s.join(";"),
                         Err(_) => "<unknown>".to_string(),
                     };
@@ -487,39 +524,72 @@ impl<'a> EventRecorder<'a> {
                 })
                 .collect();
 
+            let desc_uuid = rng.next_u64();
+            let uuid = if pid == tgid {
+                *pid_uuids.get(&tgid).unwrap()
+            } else {
+                *thread_uuids.get(&pid).unwrap()
+            };
+
+            let seq = rng.next_u32();
+            let mut desc = TrackDescriptor::default();
+            desc.set_uuid(desc_uuid);
+            desc.set_parent_uuid(uuid);
+            desc.set_name("Sleep Stack".to_string());
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packet.set_trusted_packet_sequence_id(seq);
+            trace.packet.push(packet);
+
             // Generate the interned data packets for the stacks.
-            trace.packet.extend(generate_interned_data(interned_stacks.values()));
-
+            trace
+                .packet
+                .push(generate_interned_data(interned_stacks.values(), seq));
             for stack in stacks.iter() {
-                let stack_uuid = rng.next_u64();
-                let mut packets = Vec::new();
-                for (stack, local_is) in interned_stacks.iter() {
-                    if stack == &stack.stack {
-                        let mut desc = TrackDescriptor::default();
-                        desc.set_name(format!("Sleep Stack {}", pid));
-                        desc.set_uuid(stack_uuid);
-
-                        let mut packet = TracePacket::default();
-                        packet.set_track_descriptor(desc);
-                        trace.packet.push(packet);
-
-                        let mut packet = TracePacket::default();
-                        packet.set_timestamp(stack.ts_start);
-                        packet.set_track_event(stack.stack.start_track_event(stack_uuid));
-                        packet.set_trusted_packet_sequence_id(rng.next_u32());
-                        trace.packet.push(packet);
-
-                        let mut packet = TracePacket::default();
-                        packet.set_timestamp(stack.ts_end);
-                        packet.set_track_event(stack.stack.end_track_event(stack_uuid));
-                        packet.set_trusted_packet_sequence_id(rng.next_u32());
-                        trace.packet.push(packet);
-                    }
-                }
+                let iid = interned_stacks.get(&stack.stack).unwrap().iid;
+                trace
+                    .packet
+                    .extend(stack.to_trace_packets(iid, desc_uuid, seq));
             }
         }
-*/
         trace
+    }
+
+    fn snapshot_clocks(&mut self) {
+        self.clock_snapshot
+            .set_primary_trace_clock(BuiltinClock::BUILTIN_CLOCK_MONOTONIC);
+
+        let mut clock = Clock::default();
+        println!("MONOTONIC: {}", get_clock_value(libc::CLOCK_MONOTONIC));
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC));
+        self.clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_BOOTTIME as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_BOOTTIME));
+        self.clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_REALTIME as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_REALTIME));
+        self.clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_REALTIME_COARSE as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_REALTIME_COARSE));
+        self.clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC_COARSE as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC_COARSE));
+        self.clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC_RAW as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC_RAW));
+        self.clock_snapshot.clocks.push(clock);
     }
 }
 
@@ -528,6 +598,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
     let thread_done = Arc::new(AtomicBool::new(false));
     let mut missed_events: u64 = 0;
 
+    recorder.lock().unwrap().snapshot_clocks();
     {
         let mut skel_builder = systing::SystingSystemSkelBuilder::default();
         if opts.verbose {

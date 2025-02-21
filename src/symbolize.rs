@@ -110,13 +110,12 @@ impl<'a> SymbolizerCache<'a> {
         }
     }
 
-    pub fn symbolize_stack(
-        &mut self,
-        pid: u32,
-        stack: &Stack,
-    ) -> Result<Vec<String>, Error> {
+    pub fn symbolize_stack(&mut self, pid: u32, stack: &Stack) -> Result<Vec<String>, Error> {
         let kernel_src = &self.kernel_src;
-        let user_src = self.src_cache.entry(pid).or_insert(Source::Process(Process::new(Pid::from(pid))));
+        let user_src = self
+            .src_cache
+            .entry(pid)
+            .or_insert(Source::Process(Process::new(Pid::from(pid))));
 
         let user_stack = &stack.user_stack;
         let kernel_stack = &stack.kernel_stack;
@@ -126,19 +125,39 @@ impl<'a> SymbolizerCache<'a> {
         }
 
         let mut symbols = Vec::<String>::new();
-        match self.symbolizer.symbolize(user_src, Input::AbsAddr(user_stack)) {
-            Ok(syms) => {
-                symbols.extend(print_symbols(user_stack.iter().copied().zip(syms)));
+        let mut saved_error = Ok(());
+        if !user_stack.is_empty() {
+            match self
+                .symbolizer
+                .symbolize(user_src, Input::AbsAddr(user_stack))
+            {
+                Ok(syms) => {
+                    symbols.extend(print_symbols(user_stack.iter().copied().zip(syms)));
+                }
+                Err(e) => {
+                    saved_error = Err(e);
+                }
             }
-            Err(e) => return Err(e.into()),
         }
-        match self.symbolizer.symbolize(kernel_src, Input::AbsAddr(kernel_stack)) {
+        match self
+            .symbolizer
+            .symbolize(kernel_src, Input::AbsAddr(kernel_stack))
+        {
             Ok(syms) => {
                 symbols.extend(print_symbols(kernel_stack.iter().copied().zip(syms)));
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                saved_error = Err(e);
+            }
         }
-        Ok(symbols)
+        if symbols.is_empty() {
+            match saved_error {
+                Ok(_) => Ok(vec!["<no symbols>".to_string()]),
+                Err(e) => Err(e.into()),
+            }
+        } else {
+            Ok(symbols)
+        }
     }
 }
 

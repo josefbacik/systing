@@ -20,7 +20,7 @@
 #define PF_KTHREAD 0x00200000
 
 #define MAX_STACK_DEPTH 36
-#define MAX_STACK_DEPTH_BYTES (MAX_STACK_DEPTH * sizeof(u64))
+#define SKIP_STACK_DEPTH 3
 
 const volatile struct {
 	gid_t tgid;
@@ -320,7 +320,8 @@ int handle__sched_switch(u64 *ctx)
 			event->user_stack_length = len / sizeof(u64);
 		}
 		len = bpf_get_stack(ctx, &event->kernel_stack,
-				    sizeof(event->kernel_stack), 0);
+				    sizeof(event->kernel_stack),
+				    SKIP_STACK_DEPTH);
 		event->kernel_stack_length = len / sizeof(u64);
 	}
 	bpf_ringbuf_submit(event, 0);
