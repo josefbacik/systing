@@ -77,7 +77,6 @@ struct EventRecorder<'a> {
     process_latencies: HashMap<u64, Vec<TrackCounter>>,
     rq_counters: HashMap<i32, i64>,
     symbolizer: SymbolizerCache<'a>,
-    start_ts: u64,
     last_ts: u64,
 }
 
@@ -228,10 +227,6 @@ impl SleepStack {
 
 impl<'a> EventRecorder<'a> {
     fn record_event(&mut self, event: &systing::types::task_event) {
-        if self.start_ts == 0 {
-            self.start_ts = event.ts;
-        }
-
         // We don't want to track wakeup events, they're not interesting for this analysis.
         if event.r#type != systing::types::event_type::SCHED_WAKEUP {
             let ftrace_event = FtraceEvent::from_task_event(&event);
@@ -383,7 +378,6 @@ impl<'a> EventRecorder<'a> {
         packet.set_trusted_packet_sequence_id(rng.next_u32());
         trace.packet.push(packet);
 
-        println!("start_ts is {}", self.start_ts);
         // Ppopulate all the process tracks
         for (_, process) in self.processes.iter() {
             let uuid = rng.next_u64();
@@ -561,7 +555,6 @@ impl<'a> EventRecorder<'a> {
             .set_primary_trace_clock(BuiltinClock::BUILTIN_CLOCK_MONOTONIC);
 
         let mut clock = Clock::default();
-        println!("MONOTONIC: {}", get_clock_value(libc::CLOCK_MONOTONIC));
         clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC as u32);
         clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC));
         self.clock_snapshot.clocks.push(clock);
