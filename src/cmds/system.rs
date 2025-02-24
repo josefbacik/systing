@@ -675,12 +675,13 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         let event_recorder = recorder.clone();
         let thread_done_clone = thread_done.clone();
         let mut builder = RingBufferBuilder::new();
+        let builder_thread_done = thread_done.clone();
 
         builder.add(&skel.maps.events, move |data: &[u8]| {
             let mut event = systing::types::task_event::default();
             plain::copy_from_bytes(&mut event, data).expect("Data buffer was too short");
             event_recorder.lock().unwrap().record_event(&event);
-            0
+            builder_thread_done.load(Ordering::Relaxed) as i32
         })?;
 
         let ring = builder.build()?;
