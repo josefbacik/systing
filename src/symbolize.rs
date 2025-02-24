@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use anyhow::Error;
-use blazesym::symbolize::{CodeInfo, Input, Kernel, Process, Source, Sym, Symbolized, Symbolizer};
+use blazesym::symbolize::{
+    CodeInfo, Input, Kernel, Process, Reason, Source, Sym, Symbolized, Symbolizer,
+};
 use blazesym::{Addr, Pid};
 
 const ADDR_WIDTH: usize = 16;
@@ -16,8 +18,8 @@ pub struct SymbolizerCache<'a> {
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Stack {
-    kernel_stack: Vec<Addr>,
-    user_stack: Vec<Addr>,
+    pub kernel_stack: Vec<Addr>,
+    pub user_stack: Vec<Addr>,
 }
 
 fn print_frame(
@@ -110,13 +112,31 @@ impl<'a> SymbolizerCache<'a> {
         }
     }
 
-    pub fn symbolize_stack(&mut self, pid: u32, stack: &Stack) -> Result<Vec<String>, Error> {
-        let kernel_src = &self.kernel_src;
+    pub fn symbolize_user_stack(
+        &mut self,
+        pid: u32,
+        stack: &Stack,
+    ) -> Result<Vec<Symbolized>, blazesym::Error> {
         let user_src = self
             .src_cache
             .entry(pid)
             .or_insert(Source::Process(Process::new(Pid::from(pid))));
 
+        let user_stack = &stack.user_stack;
+        self.symbolizer
+            .symbolize(user_src, Input::AbsAddr(user_stack))
+    }
+
+    pub fn symbolize_kernel_stack(
+        &mut self,
+        stack: &Stack,
+    ) -> Result<Vec<Symbolized>, blazesym::Error> {
+        let kernel_stack = &stack.kernel_stack;
+        self.symbolizer
+            .symbolize(&self.kernel_src, Input::AbsAddr(kernel_stack))
+    }
+
+    pub fn symbolize_stack(&mut self, pid: u32, stack: &Stack) -> Result<Vec<String>, Error> {
         let user_stack = &stack.user_stack;
         let kernel_stack = &stack.kernel_stack;
 
@@ -127,10 +147,7 @@ impl<'a> SymbolizerCache<'a> {
         let mut symbols = Vec::<String>::new();
         let mut saved_error = Ok(());
         if !user_stack.is_empty() {
-            match self
-                .symbolizer
-                .symbolize(user_src, Input::AbsAddr(user_stack))
-            {
+            match self.symbolize_user_stack(pid, stack) {
                 Ok(syms) => {
                     symbols.extend(print_symbols(user_stack.iter().copied().zip(syms)));
                 }
@@ -139,10 +156,8 @@ impl<'a> SymbolizerCache<'a> {
                 }
             }
         }
-        match self
-            .symbolizer
-            .symbolize(kernel_src, Input::AbsAddr(kernel_stack))
-        {
+
+        match self.symbolize_kernel_stack(stack) {
             Ok(syms) => {
                 symbols.extend(print_symbols(kernel_stack.iter().copied().zip(syms)));
             }

@@ -13,6 +13,8 @@ use crate::symbolize::{Stack, SymbolizerCache};
 use crate::SystemOpts;
 
 use anyhow::Result;
+use blazesym::symbolize::{CodeInfo, Input, Kernel, Process, Source, Sym, Symbolized, Symbolizer};
+use blazesym::Addr;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{MapCore, RingBufferBuilder};
 use libc;
@@ -25,6 +27,8 @@ use perfetto_protos::ftrace_event::FtraceEvent;
 use perfetto_protos::ftrace_event_bundle::FtraceEventBundle;
 use perfetto_protos::interned_data::InternedData;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
+use perfetto_protos::profile_common::{Callstack, Frame, InternedString, Mapping};
+use perfetto_protos::profile_packet::PerfSample;
 use perfetto_protos::sched::{
     SchedSwitchFtraceEvent, SchedWakeupNewFtraceEvent, SchedWakingFtraceEvent,
 };
@@ -62,6 +66,12 @@ struct SleepStack {
 struct LocalInternedString {
     iid: u64,
     val: String,
+}
+
+#[derive(Default)]
+struct LocalFrame {
+    frame: Frame,
+    mapping: Mapping,
 }
 
 #[derive(Default)]
@@ -107,6 +117,74 @@ where
             | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
     );
     packet
+}
+
+fn resolve_symbols<'a, I, R>(
+    frame_map: &mut HashMap<u64, LocalFrame>,
+    func_map: &mut HashMap<String, InternedString>,
+    rng: &mut R,
+    syms: I,
+) where
+    I: IntoIterator<Item = (Addr, Symbolized<'a>)>,
+    R: rand::Rng + ?Sized,
+{
+    for (input_addr, sym) in syms {
+        if frame_map.contains_key(&input_addr) {
+            continue;
+        }
+        match sym {
+            Symbolized::Sym(Sym {
+                addr,
+                name,
+                offset,
+                code_info,
+                inlined,
+                ..
+            }) => {
+                let mut frame = Frame::default();
+                let my_func = func_map.entry(name.to_string()).or_insert_with(|| {
+                    let mut interned_str = InternedString::default();
+                    interned_str.set_iid(rng.next_u64());
+                    interned_str.set_str(name.to_string().into_bytes());
+                    interned_str
+                });
+                frame.set_iid(rng.next_u64());
+                frame.set_function_name_id(my_func.iid());
+                frame.set_rel_pc(offset as u64);
+
+                let mut mapping = Mapping::default();
+                mapping.set_iid(rng.next_u64());
+                mapping.set_exact_offset(input_addr);
+                mapping.set_start_offset(addr);
+
+                frame.set_mapping_id(mapping.iid());
+                let frame = LocalFrame { frame, mapping };
+                frame_map.insert(input_addr, frame);
+            }
+            Symbolized::Unknown(e) => {
+                let name = format!("<unknown: {e}>");
+                let mut frame = Frame::default();
+                let my_func = func_map.entry(name.to_string()).or_insert_with(|| {
+                    let mut interned_str = InternedString::default();
+                    interned_str.set_iid(rng.next_u64());
+                    interned_str.set_str(name.into_bytes());
+                    interned_str
+                });
+                frame.set_iid(rng.next_u64());
+                frame.set_function_name_id(my_func.iid());
+                frame.set_rel_pc(0);
+
+                let mut mapping = Mapping::default();
+                mapping.set_iid(rng.next_u64());
+                mapping.set_exact_offset(input_addr);
+                mapping.set_start_offset(0);
+
+                frame.set_mapping_id(mapping.iid());
+                let frame = LocalFrame { frame, mapping };
+                frame_map.insert(input_addr, frame);
+            }
+        }
+    }
 }
 
 trait TaskEventBuilder {
@@ -498,53 +576,91 @@ impl<'a> EventRecorder<'a> {
             let pid = *tgidpid as i32;
             let tgid = (*tgidpid >> 32) as i32;
 
+            // We have to symbolize all of the addresses in the stacks and fill
+            // out the hashmap with all of the frames.
+            let mut frame_map = HashMap::new();
+            let mut func_name_map = HashMap::new();
+            for stack in stacks.iter() {
+                let raw_stack = &stack.stack;
+                match self.symbolizer.symbolize_user_stack(pid as u32, raw_stack) {
+                    Ok(syms) => resolve_symbols(
+                        &mut frame_map,
+                        &mut func_name_map,
+                        &mut rng,
+                        raw_stack.user_stack.iter().copied().zip(syms),
+                    ),
+                    Err(_) => {
+                        println!("Failed to symbolize user stack");
+                    }
+                }
+                match self.symbolizer.symbolize_kernel_stack(raw_stack) {
+                    Ok(syms) => resolve_symbols(
+                        &mut frame_map,
+                        &mut func_name_map,
+                        &mut rng,
+                        raw_stack.kernel_stack.iter().copied().zip(syms),
+                    ),
+                    Err(_) => {
+                        println!("Failed to symbolize kernel stack");
+                    }
+                }
+            }
+
             // Collect into a HashSet to dedup the stacks, and then iterate that to symbolize the
             // stacks and generate the interned data.
-            let interned_stacks: HashMap<Stack, LocalInternedString> = stacks
+            let interned_stacks: HashMap<Stack, Callstack> = stacks
                 .iter()
                 .map(|stack| stack.stack.clone())
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .map(|stack| {
-                    let symbols = match self.symbolizer.symbolize_stack(pid as u32, &stack) {
-                        Ok(s) => s.join(";"),
-                        Err(_) => "<unknown>".to_string(),
-                    };
-                    let local_is = LocalInternedString {
-                        iid: rng.next_u64(),
-                        val: symbols,
-                    };
-                    (stack, local_is)
+                    let mut callstack = Callstack::default();
+                    callstack.set_iid(rng.next_u64());
+                    callstack.frame_ids = stack
+                        .user_stack
+                        .iter()
+                        .chain(stack.kernel_stack.iter())
+                        .map(|addr| {
+                            let frame = frame_map.get(&addr).unwrap();
+                            frame.frame.iid()
+                        })
+                        .collect();
+                    (stack, callstack)
                 })
                 .collect();
 
-            let desc_uuid = rng.next_u64();
-            let uuid = if pid == tgid {
-                *pid_uuids.get(&tgid).unwrap()
-            } else {
-                *thread_uuids.get(&pid).unwrap()
-            };
-
             let seq = rng.next_u32();
-            let mut desc = TrackDescriptor::default();
-            desc.set_uuid(desc_uuid);
-            desc.set_parent_uuid(uuid);
-            desc.set_name("Sleep Stack".to_string());
-
             let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
+            let mut interned_data = InternedData::default();
+            interned_data.callstacks = interned_stacks.values().cloned().collect();
+            interned_data.function_names = func_name_map.values().cloned().collect();
+            interned_data.frames = frame_map
+                .values()
+                .map(|frame| frame.frame.clone())
+                .collect();
+            interned_data.mappings = frame_map
+                .values()
+                .map(|frame| frame.mapping.clone())
+                .collect();
+            packet.interned_data = Some(interned_data).into();
             packet.set_trusted_packet_sequence_id(seq);
+            packet.set_sequence_flags(
+                SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
+                    | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
+            );
             trace.packet.push(packet);
 
-            // Generate the interned data packets for the stacks.
-            trace
-                .packet
-                .push(generate_interned_data(interned_stacks.values(), seq));
             for stack in stacks.iter() {
-                let iid = interned_stacks.get(&stack.stack).unwrap().iid;
-                trace
-                    .packet
-                    .extend(stack.to_trace_packets(iid, desc_uuid, seq));
+                let mut packet = TracePacket::default();
+                packet.set_timestamp(stack.ts_start);
+
+                let mut sample = PerfSample::default();
+                sample.set_callstack_iid(interned_stacks.get(&stack.stack).unwrap().iid());
+                sample.set_pid(tgid as u32);
+                sample.set_tid(pid as u32);
+                packet.set_perf_sample(sample);
+                packet.set_trusted_packet_sequence_id(seq);
+                trace.packet.push(packet);
             }
         }
         trace
