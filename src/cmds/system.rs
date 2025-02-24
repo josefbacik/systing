@@ -92,7 +92,7 @@ fn get_clock_value(clock_id: libc::c_int) -> u64 {
     (ts.tv_sec as u64 * 1_000_000_000) + ts.tv_nsec as u64
 }
 
-fn silly_function<'a, I, R>(
+fn stack_to_frames_mapping<'a, I, R>(
     symbolizer: &mut Symbolizer,
     frame_map: &mut HashMap<u64, LocalFrame>,
     func_map: &mut HashMap<String, InternedString>,
@@ -528,7 +528,7 @@ impl EventRecorder {
             let mut func_name_map = HashMap::new();
             for stack in stacks.iter() {
                 let raw_stack = &stack.stack;
-                silly_function(
+                stack_to_frames_mapping(
                     &mut symbolizer,
                     &mut frame_map,
                     &mut func_name_map,
@@ -536,7 +536,7 @@ impl EventRecorder {
                     &mut rng,
                     raw_stack.user_stack.iter(),
                 );
-                silly_function(
+                stack_to_frames_mapping(
                     &mut symbolizer,
                     &mut frame_map,
                     &mut func_name_map,
