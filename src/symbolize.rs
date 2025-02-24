@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::Error;
-use blazesym::symbolize::{
-    CodeInfo, Input, Kernel, Process, Reason, Source, Sym, Symbolized, Symbolizer,
-};
+use blazesym::symbolize::{CodeInfo, Input, Kernel, Process, Source, Sym, Symbolized, Symbolizer};
 use blazesym::{Addr, Pid};
 
 const ADDR_WIDTH: usize = 16;

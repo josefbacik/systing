@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::symbolize::{Stack, SymbolizerCache};
+use crate::symbolize::Stack;
 use crate::SystemOpts;
 
 use anyhow::Result;
-use blazesym::symbolize::{CodeInfo, Input, Kernel, Process, Source, Sym, Symbolized, Symbolizer};
-use blazesym::Addr;
+use blazesym::symbolize::{Input, Kernel, Process, Source, Sym, Symbolized, Symbolizer};
+use blazesym::Pid;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{MapCore, RingBufferBuilder};
 use libc;
@@ -38,7 +38,7 @@ use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
 use perfetto_protos::track_event::track_event::Type;
-use perfetto_protos::track_event::{EventName, TrackEvent};
+use perfetto_protos::track_event::TrackEvent;
 use rand::RngCore;
 
 use plain::Plain;
@@ -63,11 +63,6 @@ struct SleepStack {
     stack: Stack,
 }
 
-struct LocalInternedString {
-    iid: u64,
-    val: String,
-}
-
 #[derive(Default)]
 struct LocalFrame {
     frame: Frame,
@@ -75,7 +70,7 @@ struct LocalFrame {
 }
 
 #[derive(Default)]
-struct EventRecorder<'a> {
+struct EventRecorder {
     clock_snapshot: ClockSnapshot,
     events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
     threads: HashMap<u64, ThreadDescriptor>,
@@ -86,7 +81,6 @@ struct EventRecorder<'a> {
     cpu_latencies: HashMap<u32, Vec<TrackCounter>>,
     process_latencies: HashMap<u64, Vec<TrackCounter>>,
     rq_counters: HashMap<i32, i64>,
-    symbolizer: SymbolizerCache<'a>,
     last_ts: u64,
 }
 
@@ -98,49 +92,29 @@ fn get_clock_value(clock_id: libc::c_int) -> u64 {
     (ts.tv_sec as u64 * 1_000_000_000) + ts.tv_nsec as u64
 }
 
-fn generate_interned_data<'a, I>(iter: I, seq: u32) -> TracePacket
-where
-    I: IntoIterator<Item = &'a LocalInternedString>,
-{
-    let mut packet = TracePacket::default();
-    let mut interned_data = InternedData::default();
-    for local_is in iter {
-        let mut event_name = EventName::default();
-        event_name.set_iid(local_is.iid);
-        event_name.set_name(local_is.val.clone());
-        interned_data.event_names.push(event_name);
-    }
-    packet.interned_data = Some(interned_data).into();
-    packet.set_trusted_packet_sequence_id(seq);
-    packet.set_sequence_flags(
-        SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
-            | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
-    );
-    packet
-}
-
-fn resolve_symbols<'a, I, R>(
+fn silly_function<'a, I, R>(
+    symbolizer: &mut Symbolizer,
     frame_map: &mut HashMap<u64, LocalFrame>,
     func_map: &mut HashMap<String, InternedString>,
+    source: &Source<'a>,
     rng: &mut R,
-    syms: I,
+    stack: I,
 ) where
-    I: IntoIterator<Item = (Addr, Symbolized<'a>)>,
+    I: IntoIterator<Item = &'a u64>,
     R: rand::Rng + ?Sized,
 {
-    for (input_addr, sym) in syms {
-        if frame_map.contains_key(&input_addr) {
+    for input_addr in stack {
+        if frame_map.contains_key(input_addr) {
             continue;
         }
-        match sym {
-            Symbolized::Sym(Sym {
+
+        match symbolizer.symbolize_single(source, Input::AbsAddr(*input_addr)) {
+            Ok(Symbolized::Sym(Sym {
                 addr,
                 name,
                 offset,
-                code_info,
-                inlined,
                 ..
-            }) => {
+            })) => {
                 let mut frame = Frame::default();
                 let my_func = func_map.entry(name.to_string()).or_insert_with(|| {
                     let mut interned_str = InternedString::default();
@@ -154,15 +128,15 @@ fn resolve_symbols<'a, I, R>(
 
                 let mut mapping = Mapping::default();
                 mapping.set_iid(rng.next_u64());
-                mapping.set_exact_offset(input_addr);
+                mapping.set_exact_offset(*input_addr);
                 mapping.set_start_offset(addr);
 
                 frame.set_mapping_id(mapping.iid());
                 let frame = LocalFrame { frame, mapping };
-                frame_map.insert(input_addr, frame);
+                frame_map.insert(*input_addr, frame);
             }
-            Symbolized::Unknown(e) => {
-                let name = format!("<unknown: {e}>");
+            _ => {
+                let name = format!("<unknown>");
                 let mut frame = Frame::default();
                 let my_func = func_map.entry(name.to_string()).or_insert_with(|| {
                     let mut interned_str = InternedString::default();
@@ -176,12 +150,12 @@ fn resolve_symbols<'a, I, R>(
 
                 let mut mapping = Mapping::default();
                 mapping.set_iid(rng.next_u64());
-                mapping.set_exact_offset(input_addr);
+                mapping.set_exact_offset(*input_addr);
                 mapping.set_start_offset(0);
 
                 frame.set_mapping_id(mapping.iid());
                 let frame = LocalFrame { frame, mapping };
-                frame_map.insert(input_addr, frame);
+                frame_map.insert(*input_addr, frame);
             }
         }
     }
@@ -268,42 +242,7 @@ impl TrackCounter {
     }
 }
 
-impl SleepStack {
-    fn start_track_event(&self, iid: u64, track_uuid: u64) -> TrackEvent {
-        let mut track_event = TrackEvent::default();
-        track_event.set_type(Type::TYPE_SLICE_BEGIN);
-        track_event.set_track_uuid(track_uuid);
-        track_event.set_name_iid(iid);
-        track_event
-    }
-
-    fn end_track_event(&self, track_uuid: u64) -> TrackEvent {
-        let mut track_event = TrackEvent::default();
-        track_event.set_type(Type::TYPE_SLICE_END);
-        track_event.set_track_uuid(track_uuid);
-        track_event
-    }
-
-    fn to_trace_packets(&self, iid: u64, track_uuid: u64, seq: u32) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
-
-        let mut packet = TracePacket::default();
-        packet.set_timestamp(self.ts_start);
-        packet.set_track_event(self.start_track_event(iid, track_uuid));
-        packet.set_sequence_flags(SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32);
-        packet.set_trusted_packet_sequence_id(seq);
-        packets.push(packet);
-
-        let mut packet = TracePacket::default();
-        packet.set_timestamp(self.ts_end);
-        packet.set_track_event(self.end_track_event(track_uuid));
-        packet.set_trusted_packet_sequence_id(seq);
-        packets.push(packet);
-        packets
-    }
-}
-
-impl<'a> EventRecorder<'a> {
+impl EventRecorder {
     fn record_event(&mut self, event: &systing::types::task_event) {
         // We don't want to track wakeup events, they're not interesting for this analysis.
         if event.r#type != systing::types::event_type::SCHED_WAKEUP {
@@ -572,9 +511,16 @@ impl<'a> EventRecorder<'a> {
         }
 
         // Resolve the stacks, generate the interned data for them, and populate the trace.
+        let mut src_cache: HashMap<i32, Source> = HashMap::new();
+        let kernel_src = Source::Kernel(Kernel::default());
+        let mut symbolizer = Symbolizer::new();
+
         for (tgidpid, stacks) in self.sleepers.iter() {
             let pid = *tgidpid as i32;
             let tgid = (*tgidpid >> 32) as i32;
+            let user_src = src_cache
+                .entry(tgid)
+                .or_insert(Source::Process(Process::new(Pid::from(pid as u32))));
 
             // We have to symbolize all of the addresses in the stacks and fill
             // out the hashmap with all of the frames.
@@ -582,28 +528,22 @@ impl<'a> EventRecorder<'a> {
             let mut func_name_map = HashMap::new();
             for stack in stacks.iter() {
                 let raw_stack = &stack.stack;
-                match self.symbolizer.symbolize_user_stack(pid as u32, raw_stack) {
-                    Ok(syms) => resolve_symbols(
-                        &mut frame_map,
-                        &mut func_name_map,
-                        &mut rng,
-                        raw_stack.user_stack.iter().copied().zip(syms),
-                    ),
-                    Err(_) => {
-                        println!("Failed to symbolize user stack");
-                    }
-                }
-                match self.symbolizer.symbolize_kernel_stack(raw_stack) {
-                    Ok(syms) => resolve_symbols(
-                        &mut frame_map,
-                        &mut func_name_map,
-                        &mut rng,
-                        raw_stack.kernel_stack.iter().copied().zip(syms),
-                    ),
-                    Err(_) => {
-                        println!("Failed to symbolize kernel stack");
-                    }
-                }
+                silly_function(
+                    &mut symbolizer,
+                    &mut frame_map,
+                    &mut func_name_map,
+                    &user_src,
+                    &mut rng,
+                    raw_stack.user_stack.iter(),
+                );
+                silly_function(
+                    &mut symbolizer,
+                    &mut frame_map,
+                    &mut func_name_map,
+                    &kernel_src,
+                    &mut rng,
+                    raw_stack.kernel_stack.iter(),
+                );
             }
 
             // Collect into a HashSet to dedup the stacks, and then iterate that to symbolize the
