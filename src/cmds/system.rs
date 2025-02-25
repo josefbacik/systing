@@ -698,17 +698,17 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             ringbuf_tx.clone(),
         )?);
         rings.push(create_ring(
-            &skel.maps.node0_events,
+            &skel.maps.node1_events,
             thread_done.clone(),
             ringbuf_tx.clone(),
         )?);
         rings.push(create_ring(
-            &skel.maps.node0_events,
+            &skel.maps.node2_events,
             thread_done.clone(),
             ringbuf_tx.clone(),
         )?);
         rings.push(create_ring(
-            &skel.maps.node0_events,
+            &skel.maps.node3_events,
             thread_done.clone(),
             ringbuf_tx.clone(),
         )?);
