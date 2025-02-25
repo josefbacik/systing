@@ -21,6 +21,7 @@
 
 #define MAX_STACK_DEPTH 36
 #define SKIP_STACK_DEPTH 3
+#define NR_RINGBUFS 4
 
 const volatile struct {
 	gid_t tgid;
@@ -91,10 +92,55 @@ struct {
 	__uint(max_entries, 10240);
 } irq_events SEC(".maps");
 
-struct {
+struct ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
-} events SEC(".maps");
+} node0_events SEC(".maps"), node1_events SEC(".maps"), node2_events SEC(".maps"),
+  node3_events SEC(".maps");
+
+/*
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS);
+	__type(key, u32);
+	__array(values, struct ringbuf_map);
+} ringbufs SEC(".maps") = {
+	.values = {
+		&node0_events,
+		&node1_events,
+		&node2_events,
+		&node3_events,
+		&node4_events,
+		&node5_events,
+		&node6_events,
+		&node7_events,
+	},
+};
+*/
+
+static __always_inline
+struct task_event *reserve_task_event(void)
+{
+	u32 node = bpf_get_numa_node_id();
+	node %= NR_RINGBUFS;
+	switch (node) {
+	case 0:
+		return bpf_ringbuf_reserve(&node0_events, sizeof(struct task_event), 0);
+	case 1:
+		return bpf_ringbuf_reserve(&node1_events, sizeof(struct task_event), 0);
+	case 2:
+		return bpf_ringbuf_reserve(&node2_events, sizeof(struct task_event), 0);
+	case 3:
+		return bpf_ringbuf_reserve(&node3_events, sizeof(struct task_event), 0);
+	}
+	return NULL;
+/*
+	struct ringbuf_map *ringbuf = bpf_map_lookup_elem(&ringbufs, &node);
+	if (!ringbuf)
+		return NULL;
+	return bpf_ringbuf_reserve(ringbuf, sizeof(struct task_event), 0);
+*/
+}
 
 static __always_inline
 u32 task_cpu(struct task_struct *task)
@@ -225,7 +271,7 @@ int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 	if (type == SCHED_WAKING || type == SCHED_WAKEUP_NEW)
 		bpf_map_update_elem(&wake_ts, &key, &ts, BPF_ANY);
 
-	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	event = reserve_task_event();
 	if (!event)
 		return handle_missed_event();
 	event->ts = ts;
@@ -292,7 +338,7 @@ int handle__sched_switch(u64 *ctx)
 		bpf_map_delete_elem(&wake_ts, &next_key);
 	}
 
-	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	event = reserve_task_event();
 	if (!event)
 		return handle_missed_event();
 

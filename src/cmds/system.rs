@@ -4,7 +4,7 @@ use std::io::Write;
 use std::mem::MaybeUninit;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -110,10 +110,7 @@ fn stack_to_frames_mapping<'a, I, R>(
 
         match symbolizer.symbolize_single(source, Input::AbsAddr(*input_addr)) {
             Ok(Symbolized::Sym(Sym {
-                addr,
-                name,
-                offset,
-                ..
+                addr, name, offset, ..
             })) => {
                 let mut frame = Frame::default();
                 let my_func = func_map.entry(name.to_string()).or_insert_with(|| {
@@ -642,6 +639,25 @@ impl EventRecorder {
     }
 }
 
+fn create_ring<'a>(
+    map: &dyn libbpf_rs::MapCore,
+    thread_done: Arc<AtomicBool>,
+    tx: Sender<systing::types::task_event>,
+) -> Result<libbpf_rs::RingBuffer<'a>, libbpf_rs::Error> {
+    let mut builder = RingBufferBuilder::new();
+    builder.add(map, move |data: &[u8]| {
+        let mut event = systing::types::task_event::default();
+        plain::copy_from_bytes(&mut event, data).expect("Data buffer was too short");
+        tx.send(event).expect("Could not send event on channel.");
+        if thread_done.load(Ordering::SeqCst) {
+            -1
+        } else {
+            0
+        }
+    })?;
+    builder.build()
+}
+
 pub fn system(opts: SystemOpts) -> Result<()> {
     let recorder = Arc::new(Mutex::new(EventRecorder::default()));
     let thread_done = Arc::new(AtomicBool::new(false));
@@ -672,37 +688,65 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                 .update(&cgroupid, &val, libbpf_rs::MapFlags::ANY)?;
         }
 
+        let mut rings = Vec::new();
         let event_recorder = recorder.clone();
-        let thread_done_clone = thread_done.clone();
-        let mut builder = RingBufferBuilder::new();
-        let builder_thread_done = thread_done.clone();
+        let (ringbuf_tx, ringbuf_rx) = channel();
 
-        builder.add(&skel.maps.events, move |data: &[u8]| {
-            let mut event = systing::types::task_event::default();
-            plain::copy_from_bytes(&mut event, data).expect("Data buffer was too short");
-            event_recorder.lock().unwrap().record_event(&event);
-            if builder_thread_done.load(Ordering::Relaxed) {
-                -1
-            } else {
-                0
-            }
-        })?;
+        rings.push(create_ring(
+            &skel.maps.node0_events,
+            thread_done.clone(),
+            ringbuf_tx.clone(),
+        )?);
+        rings.push(create_ring(
+            &skel.maps.node0_events,
+            thread_done.clone(),
+            ringbuf_tx.clone(),
+        )?);
+        rings.push(create_ring(
+            &skel.maps.node0_events,
+            thread_done.clone(),
+            ringbuf_tx.clone(),
+        )?);
+        rings.push(create_ring(
+            &skel.maps.node0_events,
+            thread_done.clone(),
+            ringbuf_tx.clone(),
+        )?);
 
-        let ring = builder.build()?;
-        skel.attach()?;
-
-        let t = thread::spawn(move || {
+        let mut threads = Vec::new();
+        let recv_thread_done = thread_done.clone();
+        threads.push(thread::spawn(move || {
             loop {
-                if thread_done_clone.load(Ordering::Relaxed) {
+                if recv_thread_done.load(Ordering::SeqCst) {
                     break;
                 }
-                let res = ring.poll(Duration::from_millis(100));
+                let res = ringbuf_rx.recv();
                 if res.is_err() {
                     break;
                 }
+                let event = res.unwrap();
+                event_recorder.lock().unwrap().record_event(&event);
             }
             0
-        });
+        }));
+
+        skel.attach()?;
+
+        for ring in rings {
+            let thread_done_clone = thread_done.clone();
+            threads.push(thread::spawn(move || {
+                loop {
+                    if thread_done_clone.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let res = ring.poll(Duration::from_millis(100));
+                    if res.is_err() {
+                        break;
+                    }
+                }
+                0
+            }));
+        }
 
         if opts.duration > 0 {
             thread::sleep(Duration::from_secs(opts.duration));
@@ -715,8 +759,10 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         }
 
         println!("Stopping...");
-        thread_done.store(true, Ordering::Relaxed);
-        t.join().expect("Failed to join thread");
+        thread_done.store(true, Ordering::SeqCst);
+        for thread in threads {
+            thread.join().expect("Failed to join thread");
+        }
 
         let missed_events_key = 0_u64.to_ne_bytes();
         let results = skel
