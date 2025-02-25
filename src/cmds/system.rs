@@ -714,10 +714,11 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         )?);
 
         let mut threads = Vec::new();
-        let recv_thread_done = thread_done.clone();
-        threads.push(thread::spawn(move || {
+        let recv_thread_done = Arc::new(AtomicBool::new(false));
+        let recv_thread_done_clone = recv_thread_done.clone();
+        let recv_thread = thread::spawn(move || {
             loop {
-                if recv_thread_done.load(Ordering::SeqCst) {
+                if recv_thread_done_clone.load(Ordering::SeqCst) {
                     break;
                 }
                 let res = ringbuf_rx.recv();
@@ -728,7 +729,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                 event_recorder.lock().unwrap().record_event(&event);
             }
             0
-        }));
+        });
 
         skel.attach()?;
 
@@ -763,6 +764,9 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         for thread in threads {
             thread.join().expect("Failed to join thread");
         }
+        println!("Stopping receiver thread...");
+        recv_thread_done.store(true, Ordering::SeqCst);
+        recv_thread.join().expect("Failed to join receiver thread");
 
         let missed_events_key = 0_u64.to_ne_bytes();
         let results = skel
