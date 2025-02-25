@@ -681,7 +681,11 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             let mut event = systing::types::task_event::default();
             plain::copy_from_bytes(&mut event, data).expect("Data buffer was too short");
             event_recorder.lock().unwrap().record_event(&event);
-            builder_thread_done.load(Ordering::Relaxed) as i32
+            if builder_thread_done.load(Ordering::Relaxed) {
+                -1
+            } else {
+                0
+            }
         })?;
 
         let ring = builder.build()?;
