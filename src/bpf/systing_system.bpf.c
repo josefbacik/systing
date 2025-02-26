@@ -63,6 +63,7 @@ struct task_event {
  */
 struct task_event _event = {0};
 enum event_type _type = SCHED_SWITCH;
+bool tracing_enabled = true;
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -168,6 +169,8 @@ u64 task_key(struct task_struct *task)
 static __always_inline
 bool trace_task(struct task_struct *task)
 {
+	if (!tracing_enabled)
+		return false;
 	if (tool_config.tgid && task->tgid != tool_config.tgid)
 		return false;
 	if (task->tgid == 0)

@@ -641,7 +641,6 @@ impl EventRecorder {
 
 fn create_ring<'a>(
     map: &dyn libbpf_rs::MapCore,
-    thread_done: Arc<AtomicBool>,
     tx: Sender<systing::types::task_event>,
 ) -> Result<libbpf_rs::RingBuffer<'a>, libbpf_rs::Error> {
     let mut builder = RingBufferBuilder::new();
@@ -649,18 +648,13 @@ fn create_ring<'a>(
         let mut event = systing::types::task_event::default();
         plain::copy_from_bytes(&mut event, data).expect("Data buffer was too short");
         tx.send(event).expect("Could not send event on channel.");
-        if thread_done.load(Ordering::SeqCst) {
-            -1
-        } else {
-            0
-        }
+        0
     })?;
     builder.build()
 }
 
 pub fn system(opts: SystemOpts) -> Result<()> {
     let recorder = Arc::new(Mutex::new(EventRecorder::default()));
-    let thread_done = Arc::new(AtomicBool::new(false));
 
     recorder.lock().unwrap().snapshot_clocks();
     {
@@ -695,22 +689,18 @@ pub fn system(opts: SystemOpts) -> Result<()> {
 
         rings.push(create_ring(
             &skel.maps.node0_events,
-            thread_done.clone(),
             ringbuf_tx.clone(),
         )?);
         rings.push(create_ring(
             &skel.maps.node1_events,
-            thread_done.clone(),
             ringbuf_tx.clone(),
         )?);
         rings.push(create_ring(
             &skel.maps.node2_events,
-            thread_done.clone(),
             ringbuf_tx.clone(),
         )?);
         rings.push(create_ring(
             &skel.maps.node3_events,
-            thread_done.clone(),
             ringbuf_tx.clone(),
         )?);
 
@@ -719,7 +709,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         let recv_thread_done_clone = recv_thread_done.clone();
         let recv_thread = thread::spawn(move || {
             loop {
-                if recv_thread_done_clone.load(Ordering::SeqCst) {
+                if recv_thread_done_clone.load(Ordering::Relaxed) {
                     break;
                 }
                 let res = ringbuf_rx.recv();
@@ -734,11 +724,12 @@ pub fn system(opts: SystemOpts) -> Result<()> {
 
         skel.attach()?;
 
+        let thread_done = Arc::new(AtomicBool::new(false));
         for ring in rings {
             let thread_done_clone = thread_done.clone();
             threads.push(thread::spawn(move || {
                 loop {
-                    if thread_done_clone.load(Ordering::SeqCst) {
+                    if thread_done_clone.load(Ordering::Relaxed) {
                         break;
                     }
                     let res = ring.poll(Duration::from_millis(100));
@@ -761,12 +752,13 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         }
 
         println!("Stopping...");
-        thread_done.store(true, Ordering::SeqCst);
+        skel.maps.data_data.tracing_enabled = false;
+        thread_done.store(true, Ordering::Relaxed);
         for thread in threads {
             thread.join().expect("Failed to join thread");
         }
         println!("Stopping receiver thread...");
-        recv_thread_done.store(true, Ordering::SeqCst);
+        recv_thread_done.store(true, Ordering::Relaxed);
         recv_thread.join().expect("Failed to join receiver thread");
 
         for i in 0..nr_cpus {
