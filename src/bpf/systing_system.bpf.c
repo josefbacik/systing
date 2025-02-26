@@ -218,7 +218,7 @@ int trace_irq_enter(void)
 
 	if (!trace_task(tsk))
 		return 0;
-	start = bpf_ktime_get_ns();
+	start = bpf_ktime_get_boot_ns();
 	bpf_map_update_elem(&irq_events, &key, &start, BPF_ANY);
 	*/
 	return 0;
@@ -241,7 +241,7 @@ int trace_irq_exit(bool softirq)
 	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
 	if (!event)
 		return 0;
-	event->ts = bpf_ktime_get_ns();
+	event->ts = bpf_ktime_get_boot_ns();
 	event->type = softirq ? EVENT_SOFTIRQ : EVENT_IRQ;
 	event->tgidpid = key;
 	event->cpu = bpf_get_smp_processor_id();
@@ -258,7 +258,7 @@ int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 		  enum event_type type)
 {
 	struct task_event *event;
-	u64 ts = bpf_ktime_get_ns();
+	u64 ts = bpf_ktime_get_boot_ns();
 	u64 key = task_key(wakee);
 
 	if (type == SCHED_WAKING || type == SCHED_WAKEUP_NEW)
@@ -317,7 +317,7 @@ int handle__sched_switch(u64 *ctx)
 	struct task_struct *next = (struct task_struct *)ctx[2];
 	struct task_event *event;
 	u64 next_key = task_key(next);
-	u64 ts = bpf_ktime_get_ns();
+	u64 ts = bpf_ktime_get_boot_ns();
 	u64 latency = 0;
 	u64 *start_ns;
 
@@ -390,7 +390,7 @@ int handle__irq_handler_entry(u64 *ctx)
 	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
 	if (!event)
 		return 0;
-	event->ts = bpf_ktime_get_ns();
+	event->ts = bpf_ktime_get_boot_ns();
 	event->type = IRQ_ENTRY;
 	event->cpu = bpf_get_smp_processor_id();
 	event->target_cpu = irq;

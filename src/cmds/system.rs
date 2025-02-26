@@ -642,7 +642,7 @@ impl EventRecorder {
 
     fn snapshot_clocks(&mut self) {
         self.clock_snapshot
-            .set_primary_trace_clock(BuiltinClock::BUILTIN_CLOCK_MONOTONIC);
+            .set_primary_trace_clock(BuiltinClock::BUILTIN_CLOCK_BOOTTIME);
 
         let mut clock = Clock::default();
         clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC as u32);
