@@ -661,7 +661,6 @@ fn create_ring<'a>(
 pub fn system(opts: SystemOpts) -> Result<()> {
     let recorder = Arc::new(Mutex::new(EventRecorder::default()));
     let thread_done = Arc::new(AtomicBool::new(false));
-    let mut missed_events: u64 = 0;
 
     recorder.lock().unwrap().snapshot_clocks();
     {
@@ -768,15 +767,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         recv_thread_done.store(true, Ordering::SeqCst);
         recv_thread.join().expect("Failed to join receiver thread");
 
-        let missed_events_key = 0_u64.to_ne_bytes();
-        let results = skel
-            .maps
-            .missed_events
-            .lookup(&missed_events_key, libbpf_rs::MapFlags::ANY)?;
-        if let Some(results) = results {
-            plain::copy_from_bytes(&mut missed_events, &results)
-                .expect("Data buffer was too short");
-        }
+        let missed_events = skel.maps.bss_data.missed_events;
         println!("Stopped: missed events: {}", missed_events);
     }
 

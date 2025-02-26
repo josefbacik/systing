@@ -63,13 +63,7 @@ struct task_event {
  */
 struct task_event _event = {0};
 enum event_type _type = SCHED_SWITCH;
-
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, u64);
-	__type(value, u64);
-	__uint(max_entries, 1);
-} missed_events SEC(".maps");
+u64 missed_events = 0;
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -183,21 +177,7 @@ bool trace_task(struct task_struct *task)
 static __always_inline
 int handle_missed_event(void)
 {
-	u64 key = 0;
-	u64 *missed = bpf_map_lookup_elem(&missed_events, &key);
-	if (!missed) {
-		u64 one = 1;
-		int ret = bpf_map_update_elem(&missed_events, &key, &one,
-					      BPF_NOEXIST);
-		if (ret) {
-			missed = bpf_map_lookup_elem(&missed_events, &key);
-			if (!missed)
-				return 0;
-			__sync_fetch_and_add(missed, 1);
-		}
-		return 0;
-	}
-	__sync_fetch_and_add(missed, 1);
+	__sync_fetch_and_add(&missed_events, 1);
 	return 0;
 }
 
