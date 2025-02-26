@@ -87,7 +87,7 @@ struct {
 } irq_events SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
 	__type(value, u64);
 	__uint(max_entries, 1);
@@ -186,14 +186,11 @@ bool trace_task(struct task_struct *task)
 static __always_inline
 int handle_missed_event(void)
 {
-	u32 cpu = bpf_get_smp_processor_id();
-	u64 init_value = 1;
+	u32 index = 0;
 
-	u64 *value = bpf_map_lookup_elem(&missed_events, &cpu);
+	u64 *value = bpf_map_lookup_elem(&missed_events, &index);
 	if (value)
-		__sync_fetch_and_add(value, 1);
-	else
-		bpf_map_update_elem(&missed_events, &cpu, &init_value, BPF_ANY);
+		*value += 1;
 	return 0;
 }
 

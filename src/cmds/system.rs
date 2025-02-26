@@ -761,21 +761,19 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         recv_thread_done.store(true, Ordering::Relaxed);
         recv_thread.join().expect("Failed to join receiver thread");
 
-        for i in 0..nr_cpus {
-            let key = i.to_ne_bytes();
-            let results = skel
-                .maps
-                .missed_events
-                .lookup(&key, libbpf_rs::MapFlags::ANY)
-                .unwrap();
-            let mut missed_events: u64 = 0;
-            match results {
-                Some(val) => {
+        let index = (0 as u32).to_ne_bytes();
+        let result = skel.maps.missed_events.lookup_percpu(&index, libbpf_rs::MapFlags::ANY);
+        match result {
+            Ok(results) => {
+                let mut cpu = 0;
+                for val in results.unwrap() {
+                    let mut missed_events: u64 = 0;
                     plain::copy_from_bytes(&mut missed_events, &val).unwrap();
+                    println!("CPU {}: missed events: {}", cpu, missed_events);
+                    cpu += 1;
                 }
-                _ => {}
             }
-            println!("CPU {}: missed events: {}", i, missed_events);
+            _ => {}
         }
     }
 
