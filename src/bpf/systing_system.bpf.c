@@ -63,7 +63,6 @@ struct task_event {
  */
 struct task_event _event = {0};
 enum event_type _type = SCHED_SWITCH;
-u64 missed_events = 0;
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -85,6 +84,13 @@ struct {
 	__type(value, u64);
 	__uint(max_entries, 10240);
 } irq_events SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, u64);
+	__uint(max_entries, 1);
+} missed_events SEC(".maps");
 
 struct ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -177,7 +183,14 @@ bool trace_task(struct task_struct *task)
 static __always_inline
 int handle_missed_event(void)
 {
-	__sync_fetch_and_add(&missed_events, 1);
+	u32 cpu = bpf_get_smp_processor_id();
+	u64 init_value = 1;
+
+	u64 *value = bpf_map_lookup_elem(&missed_events, &cpu);
+	if (value)
+		__sync_fetch_and_add(value, 1);
+	else
+		bpf_map_update_elem(&missed_events, &cpu, &init_value, BPF_ANY);
 	return 0;
 }
 

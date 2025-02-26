@@ -670,12 +670,14 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         }
 
         let mut open_object = MaybeUninit::uninit();
-        let open_skel = skel_builder.open(&mut open_object)?;
+        let mut open_skel = skel_builder.open(&mut open_object)?;
 
         if opts.cgroup.len() > 0 {
             open_skel.maps.rodata_data.tool_config.filter_cgroup = 1;
         }
 
+        let nr_cpus = thread::available_parallelism()?.get() as u32;
+        open_skel.maps.missed_events.set_max_entries(nr_cpus)?;
         open_skel.maps.rodata_data.tool_config.tgid = opts.pid;
         let mut skel = open_skel.load()?;
         for cgroup in opts.cgroup.iter() {
@@ -767,8 +769,22 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         recv_thread_done.store(true, Ordering::SeqCst);
         recv_thread.join().expect("Failed to join receiver thread");
 
-        let missed_events = skel.maps.bss_data.missed_events;
-        println!("Stopped: missed events: {}", missed_events);
+        for i in 0..nr_cpus {
+            let key = i.to_ne_bytes();
+            let results = skel
+                .maps
+                .missed_events
+                .lookup(&key, libbpf_rs::MapFlags::ANY)
+                .unwrap();
+            let mut missed_events: u64 = 0;
+            match results {
+                Some(val) => {
+                    plain::copy_from_bytes(&mut missed_events, &val).unwrap();
+                }
+                _ => {}
+            }
+            println!("CPU {}: missed events: {}", i, missed_events);
+        }
     }
 
     let mut my_recorder = std::mem::take(&mut *recorder.lock().unwrap());
