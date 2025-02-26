@@ -24,14 +24,13 @@ use perfetto_protos::clock_snapshot::ClockSnapshot;
 use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
 use perfetto_protos::ftrace_event::FtraceEvent;
+use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
 use perfetto_protos::ftrace_event_bundle::FtraceEventBundle;
 use perfetto_protos::interned_data::InternedData;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
 use perfetto_protos::profile_common::{Callstack, Frame, InternedString, Mapping};
 use perfetto_protos::profile_packet::PerfSample;
-use perfetto_protos::sched::{
-    SchedSwitchFtraceEvent, SchedWakeupNewFtraceEvent, SchedWakingFtraceEvent,
-};
+use perfetto_protos::sched::SchedWakeupNewFtraceEvent;
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace::Trace;
 use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
@@ -70,9 +69,18 @@ struct LocalFrame {
 }
 
 #[derive(Default)]
+struct LocalCompactSched {
+    compact_sched: CompactSched,
+    comm_mapping: HashMap<String, u32>,
+    last_waking_ts: u64,
+    last_switch_ts: u64,
+}
+
+#[derive(Default)]
 struct EventRecorder {
     clock_snapshot: ClockSnapshot,
     events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
+    compact_sched: HashMap<u32, LocalCompactSched>,
     threads: HashMap<u64, ThreadDescriptor>,
     processes: HashMap<u64, ProcessDescriptor>,
     sleepers: HashMap<u64, Vec<SleepStack>>,
@@ -168,12 +176,6 @@ impl TaskEventBuilder for FtraceEvent {
         ftrace_event.set_pid(event.prev_tgidpid as u32);
         ftrace_event.set_timestamp(event.ts);
         match event.r#type {
-            systing::types::event_type::SCHED_SWITCH => {
-                ftrace_event.set_sched_switch(SchedSwitchFtraceEvent::from_task_event(event));
-            }
-            systing::types::event_type::SCHED_WAKING => {
-                ftrace_event.set_sched_waking(SchedWakingFtraceEvent::from_task_event(event));
-            }
             systing::types::event_type::SCHED_WAKEUP_NEW => {
                 ftrace_event
                     .set_sched_wakeup_new(SchedWakeupNewFtraceEvent::from_task_event(event));
@@ -181,34 +183,6 @@ impl TaskEventBuilder for FtraceEvent {
             _ => {}
         }
         ftrace_event
-    }
-}
-
-impl TaskEventBuilder for SchedSwitchFtraceEvent {
-    fn from_task_event(event: &systing::types::task_event) -> Self {
-        let prev_comm_cstr = CStr::from_bytes_until_nul(&event.prev_comm).unwrap();
-        let next_comm_cstr = CStr::from_bytes_until_nul(&event.next_comm).unwrap();
-        let mut sched_switch = SchedSwitchFtraceEvent::default();
-        sched_switch.set_prev_pid(event.prev_tgidpid as i32);
-        sched_switch.set_next_pid(event.next_tgidpid as i32);
-        sched_switch.set_prev_comm(prev_comm_cstr.to_str().unwrap().to_string());
-        sched_switch.set_next_comm(next_comm_cstr.to_str().unwrap().to_string());
-        sched_switch.set_prev_prio(event.prev_prio as i32);
-        sched_switch.set_next_prio(event.next_prio as i32);
-        sched_switch.set_prev_state(event.prev_state as i64);
-        sched_switch
-    }
-}
-
-impl TaskEventBuilder for SchedWakingFtraceEvent {
-    fn from_task_event(event: &systing::types::task_event) -> Self {
-        let comm_cstr = CStr::from_bytes_until_nul(&event.next_comm).unwrap();
-        let mut sched_waking = SchedWakingFtraceEvent::default();
-        sched_waking.set_pid(event.next_tgidpid as i32);
-        sched_waking.set_comm(comm_cstr.to_str().unwrap().to_string());
-        sched_waking.set_prio(event.next_prio as i32);
-        sched_waking.set_target_cpu(event.target_cpu as i32);
-        sched_waking
     }
 }
 
@@ -239,10 +213,63 @@ impl TrackCounter {
     }
 }
 
+impl LocalCompactSched {
+    fn add_task_event(&mut self, event: &systing::types::task_event) {
+        let comm = CStr::from_bytes_until_nul(&event.next_comm)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let index = self.comm_mapping.entry(comm.clone()).or_insert({
+            self.compact_sched.intern_table.push(comm);
+            (self.compact_sched.intern_table.len() as u32) - 1
+        });
+        if event.r#type == systing::types::event_type::SCHED_WAKING {
+            self.compact_sched
+                .waking_timestamp
+                .push(event.ts - self.last_waking_ts);
+            self.last_waking_ts = event.ts;
+            self.compact_sched
+                .waking_pid
+                .push(event.next_tgidpid as i32);
+            self.compact_sched
+                .waking_target_cpu
+                .push(event.target_cpu as i32);
+            self.compact_sched.waking_prio.push(event.next_prio as i32);
+            self.compact_sched.waking_comm_index.push(*index);
+            self.compact_sched.waking_common_flags.push(1);
+        } else {
+            self.compact_sched
+                .switch_timestamp
+                .push(event.ts - self.last_switch_ts);
+            self.last_switch_ts = event.ts;
+            self.compact_sched
+                .switch_prev_state
+                .push(event.prev_state as i64);
+            self.compact_sched
+                .switch_next_pid
+                .push(event.next_tgidpid as i32);
+            self.compact_sched
+                .switch_next_prio
+                .push(event.next_prio as i32);
+            self.compact_sched.switch_next_comm_index.push(*index);
+        }
+    }
+}
+
 impl EventRecorder {
     fn record_event(&mut self, event: &systing::types::task_event) {
-        // We don't want to track wakeup events, they're not interesting for this analysis.
-        if event.r#type != systing::types::event_type::SCHED_WAKEUP {
+        // SCHED_SWITCH and SCHED_WAKING are handled in compact sched events.
+        // We skip SCHED_WAKEUP because we're just using that for runqueue tracking.
+        if event.r#type == systing::types::event_type::SCHED_SWITCH
+            || event.r#type == systing::types::event_type::SCHED_WAKING
+        {
+            let compact_sched = self
+                .compact_sched
+                .entry(event.cpu)
+                .or_insert_with(LocalCompactSched::default);
+            compact_sched.add_task_event(event);
+        } else if event.r#type != systing::types::event_type::SCHED_WAKEUP {
             let ftrace_event = FtraceEvent::from_task_event(&event);
             let cpu_event = self.events.entry(event.cpu).or_insert_with(BTreeMap::new);
             cpu_event.insert(event.ts, ftrace_event);
@@ -416,6 +443,16 @@ impl EventRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
+            trace.packet.push(packet);
+        }
+
+        // Pull all the compact scheduling events
+        for (cpu, compact_sched) in self.compact_sched.iter() {
+            let mut event_bundle = FtraceEventBundle::default();
+            event_bundle.set_cpu(*cpu);
+            event_bundle.compact_sched = Some(compact_sched.compact_sched.clone()).into();
+            let mut packet = TracePacket::default();
+            packet.set_ftrace_events(event_bundle);
             trace.packet.push(packet);
         }
 
@@ -687,22 +724,10 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         let event_recorder = recorder.clone();
         let (ringbuf_tx, ringbuf_rx) = channel();
 
-        rings.push(create_ring(
-            &skel.maps.node0_events,
-            ringbuf_tx.clone(),
-        )?);
-        rings.push(create_ring(
-            &skel.maps.node1_events,
-            ringbuf_tx.clone(),
-        )?);
-        rings.push(create_ring(
-            &skel.maps.node2_events,
-            ringbuf_tx.clone(),
-        )?);
-        rings.push(create_ring(
-            &skel.maps.node3_events,
-            ringbuf_tx.clone(),
-        )?);
+        rings.push(create_ring(&skel.maps.node0_events, ringbuf_tx.clone())?);
+        rings.push(create_ring(&skel.maps.node1_events, ringbuf_tx.clone())?);
+        rings.push(create_ring(&skel.maps.node2_events, ringbuf_tx.clone())?);
+        rings.push(create_ring(&skel.maps.node3_events, ringbuf_tx.clone())?);
 
         let mut threads = Vec::new();
         let recv_thread_done = Arc::new(AtomicBool::new(false));
@@ -762,7 +787,10 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         recv_thread.join().expect("Failed to join receiver thread");
 
         let index = (0 as u32).to_ne_bytes();
-        let result = skel.maps.missed_events.lookup_percpu(&index, libbpf_rs::MapFlags::ANY);
+        let result = skel
+            .maps
+            .missed_events
+            .lookup_percpu(&index, libbpf_rs::MapFlags::ANY);
         match result {
             Ok(results) => {
                 let mut cpu = 0;
