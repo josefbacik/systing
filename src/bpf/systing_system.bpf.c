@@ -21,7 +21,7 @@
 
 #define MAX_STACK_DEPTH 36
 #define SKIP_STACK_DEPTH 3
-#define NR_RINGBUFS 4
+#define NR_RINGBUFS 8
 
 const volatile struct {
 	gid_t tgid;
@@ -98,9 +98,9 @@ struct ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
 } node0_events SEC(".maps"), node1_events SEC(".maps"), node2_events SEC(".maps"),
-  node3_events SEC(".maps");
+  node3_events SEC(".maps"), node4_events SEC(".maps"), node5_events SEC(".maps"),
+  node6_events SEC(".maps"), node7_events SEC(".maps");
 
-/*
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
 	__uint(max_entries, NR_RINGBUFS);
@@ -118,30 +118,17 @@ struct {
 		&node7_events,
 	},
 };
-*/
 
 static __always_inline
 struct task_event *reserve_task_event(void)
 {
-	u32 node = bpf_get_numa_node_id();
-	node %= NR_RINGBUFS;
-	switch (node) {
-	case 0:
-		return bpf_ringbuf_reserve(&node0_events, sizeof(struct task_event), 0);
-	case 1:
-		return bpf_ringbuf_reserve(&node1_events, sizeof(struct task_event), 0);
-	case 2:
-		return bpf_ringbuf_reserve(&node2_events, sizeof(struct task_event), 0);
-	case 3:
-		return bpf_ringbuf_reserve(&node3_events, sizeof(struct task_event), 0);
-	}
-	return NULL;
-/*
-	struct ringbuf_map *ringbuf = bpf_map_lookup_elem(&ringbufs, &node);
-	if (!ringbuf)
+	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&ringbufs, &node);
+	if (!rb)
 		return NULL;
-	return bpf_ringbuf_reserve(ringbuf, sizeof(struct task_event), 0);
-*/
+	return bpf_ringbuf_reserve(rb, sizeof(struct task_event), 0);
 }
 
 static __always_inline

@@ -732,6 +732,10 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         rings.push(create_ring(&skel.maps.node1_events, ringbuf_tx.clone())?);
         rings.push(create_ring(&skel.maps.node2_events, ringbuf_tx.clone())?);
         rings.push(create_ring(&skel.maps.node3_events, ringbuf_tx.clone())?);
+        rings.push(create_ring(&skel.maps.node4_events, ringbuf_tx.clone())?);
+        rings.push(create_ring(&skel.maps.node5_events, ringbuf_tx.clone())?);
+        rings.push(create_ring(&skel.maps.node6_events, ringbuf_tx.clone())?);
+        rings.push(create_ring(&skel.maps.node7_events, ringbuf_tx.clone())?);
 
         // Drop our ringbuf_tx so that when the tx threads exit the recv thread will exit once it's
         // done processing all of the pending events.
