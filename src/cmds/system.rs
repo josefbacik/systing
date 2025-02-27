@@ -554,7 +554,7 @@ impl EventRecorder {
             let tgid = (*tgidpid >> 32) as i32;
             let user_src = src_cache
                 .entry(tgid)
-                .or_insert(Source::Process(Process::new(Pid::from(pid as u32))));
+                .or_insert(Source::Process(Process::new(Pid::from(tgid as u32))));
 
             // We have to symbolize all of the addresses in the stacks and fill
             // out the hashmap with all of the frames.
