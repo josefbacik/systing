@@ -64,11 +64,11 @@ pub struct SystemOpts {
     pid: u32,
     #[arg(short, long)]
     cgroup: Vec<String>,
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "0")]
     duration: u64,
     #[arg(short, long)]
     no_stack_traces: bool,
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "0")]
     ringbuf_size_mib: u32,
 }
 
