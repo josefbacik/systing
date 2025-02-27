@@ -711,14 +711,13 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         }
         if opts.ringbuf_size_mib > 0 {
             let size = opts.ringbuf_size_mib * 1024 * 1024;
-            open_skel.maps.node0_events.set_max_entries(size)?;
-            open_skel.maps.node1_events.set_max_entries(size)?;
-            open_skel.maps.node2_events.set_max_entries(size)?;
-            open_skel.maps.node3_events.set_max_entries(size)?;
-            open_skel.maps.node4_events.set_max_entries(size)?;
-            open_skel.maps.node5_events.set_max_entries(size)?;
-            open_skel.maps.node6_events.set_max_entries(size)?;
-            open_skel.maps.node7_events.set_max_entries(size)?;
+            let object = open_skel.open_object_mut();
+            for mut map in object.maps_mut() {
+                let name = map.name().to_str().unwrap();
+                if name.starts_with("node") {
+                    map.set_max_entries(size)?;
+                }
+            }
         }
 
         let nr_cpus = thread::available_parallelism()?.get() as u32;
@@ -739,14 +738,14 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         let event_recorder = recorder.clone();
         let (ringbuf_tx, ringbuf_rx) = channel();
 
-        rings.push(create_ring(&skel.maps.node0_events, ringbuf_tx.clone())?);
-        rings.push(create_ring(&skel.maps.node1_events, ringbuf_tx.clone())?);
-        rings.push(create_ring(&skel.maps.node2_events, ringbuf_tx.clone())?);
-        rings.push(create_ring(&skel.maps.node3_events, ringbuf_tx.clone())?);
-        rings.push(create_ring(&skel.maps.node4_events, ringbuf_tx.clone())?);
-        rings.push(create_ring(&skel.maps.node5_events, ringbuf_tx.clone())?);
-        rings.push(create_ring(&skel.maps.node6_events, ringbuf_tx.clone())?);
-        rings.push(create_ring(&skel.maps.node7_events, ringbuf_tx.clone())?);
+        let object = skel.object();
+        for map in object.maps() {
+            let name = map.name().to_str().unwrap();
+            if name.starts_with("node") {
+                let ring = create_ring(&map, ringbuf_tx.clone())?;
+                rings.push(ring);
+            }
+        }
 
         // Drop our ringbuf_tx so that when the tx threads exit the recv thread will exit once it's
         // done processing all of the pending events.
