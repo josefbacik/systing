@@ -729,14 +729,12 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         rings.push(create_ring(&skel.maps.node2_events, ringbuf_tx.clone())?);
         rings.push(create_ring(&skel.maps.node3_events, ringbuf_tx.clone())?);
 
-        let mut threads = Vec::new();
-        let recv_thread_done = Arc::new(AtomicBool::new(false));
-        let recv_thread_done_clone = recv_thread_done.clone();
+        // Drop our ringbuf_tx so that when the tx threads exit the recv thread will exit once it's
+        // done processing all of the pending events.
+        drop(ringbuf_tx);
+
         let recv_thread = thread::spawn(move || {
             loop {
-                if recv_thread_done_clone.load(Ordering::Relaxed) {
-                    break;
-                }
                 let res = ringbuf_rx.recv();
                 if res.is_err() {
                     break;
@@ -749,12 +747,15 @@ pub fn system(opts: SystemOpts) -> Result<()> {
 
         skel.attach()?;
 
+        let mut threads = Vec::new();
         let thread_done = Arc::new(AtomicBool::new(false));
         for ring in rings {
             let thread_done_clone = thread_done.clone();
             threads.push(thread::spawn(move || {
                 loop {
                     if thread_done_clone.load(Ordering::Relaxed) {
+                        // Flush whatever is left in the ringbuf
+                        let _ = ring.consume();
                         break;
                     }
                     let res = ring.poll(Duration::from_millis(100));
@@ -783,7 +784,6 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             thread.join().expect("Failed to join thread");
         }
         println!("Stopping receiver thread...");
-        recv_thread_done.store(true, Ordering::Relaxed);
         recv_thread.join().expect("Failed to join receiver thread");
 
         let index = (0 as u32).to_ne_bytes();
