@@ -26,6 +26,7 @@
 const volatile struct {
 	gid_t tgid;
 	u32 filter_cgroup;
+	u32 no_stack_traces;
 } tool_config = {};
 
 enum event_type {
@@ -350,7 +351,8 @@ int handle__sched_switch(u64 *ctx)
 	record_task_name(next, event->next_comm);
 
 	/* Record the blocked stack trace. */
-	if (prev->__state & TASK_UNINTERRUPTIBLE) {
+	if (!tool_config.no_stack_traces &&
+	    prev->__state & TASK_UNINTERRUPTIBLE) {
 		u64 len = 0;
 		if (!(prev->flags & PF_KTHREAD)) {
 			len = bpf_get_stack(ctx, &event->user_stack,

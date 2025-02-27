@@ -66,6 +66,8 @@ pub struct SystemOpts {
     cgroup: Vec<String>,
     #[arg(short, long)]
     duration: u64,
+    #[arg(short, long)]
+    no_stack_traces: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {

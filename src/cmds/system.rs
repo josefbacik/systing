@@ -706,10 +706,14 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         if opts.cgroup.len() > 0 {
             open_skel.maps.rodata_data.tool_config.filter_cgroup = 1;
         }
+        if opts.no_stack_traces {
+            open_skel.maps.rodata_data.tool_config.no_stack_traces = 1;
+        }
 
         let nr_cpus = thread::available_parallelism()?.get() as u32;
         open_skel.maps.missed_events.set_max_entries(nr_cpus)?;
         open_skel.maps.rodata_data.tool_config.tgid = opts.pid;
+
         let mut skel = open_skel.load()?;
         for cgroup in opts.cgroup.iter() {
             let metadata = std::fs::metadata(cgroup)?;

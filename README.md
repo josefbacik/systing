@@ -9,7 +9,7 @@ development efforts are focused.
 
 ## TODO FOR SYSTEM
 - [ ] Separate the stack traces out into their own NUMA node bound ringbufs.
-- [ ] Add an option to disable the stack traces.
+- [X] Add an option to disable the stack traces.
 - [ ] Build a `perfetto` plugin to replicate the `runqueue` and `wake latency`
   tracks, then remove those tracks to slim down the trace file size.
 - [ ] Figure out something better to do about cgroup and PID based tracing so it
