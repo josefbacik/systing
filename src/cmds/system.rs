@@ -709,6 +709,17 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         if opts.no_stack_traces {
             open_skel.maps.rodata_data.tool_config.no_stack_traces = 1;
         }
+        if opts.ringbuf_size_mib > 0 {
+            let size = opts.ringbuf_size_mib * 1024 * 1024;
+            open_skel.maps.node0_events.set_max_entries(size)?;
+            open_skel.maps.node1_events.set_max_entries(size)?;
+            open_skel.maps.node2_events.set_max_entries(size)?;
+            open_skel.maps.node3_events.set_max_entries(size)?;
+            open_skel.maps.node4_events.set_max_entries(size)?;
+            open_skel.maps.node5_events.set_max_entries(size)?;
+            open_skel.maps.node6_events.set_max_entries(size)?;
+            open_skel.maps.node7_events.set_max_entries(size)?;
+        }
 
         let nr_cpus = thread::available_parallelism()?.get() as u32;
         open_skel.maps.missed_events.set_max_entries(nr_cpus)?;

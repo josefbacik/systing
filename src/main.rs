@@ -68,6 +68,8 @@ pub struct SystemOpts {
     duration: u64,
     #[arg(short, long)]
     no_stack_traces: bool,
+    #[arg(short, long)]
+    ringbuf_size_mib: u32,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
