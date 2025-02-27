@@ -1,4 +1,35 @@
-To build, ensure you have installed bpftool. This only builds on linux
+# Systing
+
+To build, ensure you have installed bpftool. This only builds on linux.
+
+This currently is a playground tool for me to figure out what set of tools I
+need in order to debug large scale applications.  There's half done things, bad
+habits, half done tools.  Currently the `system` sub command is where most of my
+development efforts are focused.
+
+## TODO FOR SYSTEM
+- [ ] Separate the stack traces out into their own NUMA node bound ringbufs.
+- [ ] Add an option to disable the stack traces.
+- [ ] Build a `perfetto` plugin to replicate the `runqueue` and `wake latency`
+  tracks, then remove those tracks to slim down the trace file size.
+- [ ] Figure out something better to do about cgroup and PID based tracing so it
+  doesn't leave ghost tasks.
+- [ ] Add IRQ events.
+- [ ] Add normal perf sample events to trace CPU time as well.
+- [ ] Add a way to trace arbitrary tracepoints.
+
+## System
+
+This tool traces all the scheduling events on the system, cgroup, or process and
+generates a [Perfetto](https://perfetto.dev/) trace.  This can be uploaded to a
+local perfetto instance for further analysis, or you can use the public one
+[here](https://ui.perfetto.dev/).
+
+NOTE: With cgroup and process tracing, you will see other processes that appear
+to not end, this is because the tool is tracing the scheduling events captures
+the process going off the CPU or going on the CPU in addition to the process
+being traced, so you will miss events for the unwanted process leaving the CPU.
+Perfetto handles this appropriately, but it looks odd.
 
 ## Profile
 
