@@ -709,6 +709,9 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         if opts.no_stack_traces {
             open_skel.maps.rodata_data.tool_config.no_stack_traces = 1;
         }
+        if opts.pid.len() > 0 {
+            open_skel.maps.rodata_data.tool_config.filter_pid = 1;
+        }
         if opts.ringbuf_size_mib > 0 {
             let size = opts.ringbuf_size_mib * 1024 * 1024;
             let object = open_skel.open_object_mut();
@@ -722,7 +725,6 @@ pub fn system(opts: SystemOpts) -> Result<()> {
 
         let nr_cpus = thread::available_parallelism()?.get() as u32;
         open_skel.maps.missed_events.set_max_entries(nr_cpus)?;
-        open_skel.maps.rodata_data.tool_config.tgid = opts.pid;
 
         let mut skel = open_skel.load()?;
         for cgroup in opts.cgroup.iter() {
@@ -732,6 +734,13 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             skel.maps
                 .cgroups
                 .update(&cgroupid, &val, libbpf_rs::MapFlags::ANY)?;
+        }
+
+        for pid in opts.pid.iter() {
+            let val = (1 as u8).to_ne_bytes();
+            skel.maps
+                .pids
+                .update(&pid.to_ne_bytes(), &val, libbpf_rs::MapFlags::ANY)?;
         }
 
         let mut rings = Vec::new();

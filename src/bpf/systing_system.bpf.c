@@ -24,7 +24,7 @@
 #define NR_RINGBUFS 8
 
 const volatile struct {
-	gid_t tgid;
+	u32 filter_pid;
 	u32 filter_cgroup;
 	u32 no_stack_traces;
 } tool_config = {};
@@ -79,6 +79,13 @@ struct {
 	__type(value, u8);
 	__uint(max_entries, 10240);
 } cgroups SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u32);
+	__type(value, u8);
+	__uint(max_entries, 10240);
+} pids SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -159,10 +166,13 @@ bool trace_task(struct task_struct *task)
 {
 	if (!tracing_enabled)
 		return false;
-	if (tool_config.tgid && task->tgid != tool_config.tgid)
-		return false;
 	if (task->tgid == 0)
 		return false;
+	if (tool_config.filter_pid) {
+		u32 pid = task->tgid;
+		if (bpf_map_lookup_elem(&pids, &pid) == NULL)
+			return false;
+	}
 	if (tool_config.filter_cgroup) {
 		u64 cgid = task_cg_id(task);
 		if (bpf_map_lookup_elem(&cgroups, &cgid) == NULL)

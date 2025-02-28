@@ -60,8 +60,8 @@ pub struct ProfileSchedOpts {
 pub struct SystemOpts {
     #[arg(short, long)]
     verbose: bool,
-    #[arg(short, long, default_value = "0")]
-    pid: u32,
+    #[arg(short, long)]
+    pid: Vec<u32>,
     #[arg(short, long)]
     cgroup: Vec<String>,
     #[arg(short, long, default_value = "0")]
