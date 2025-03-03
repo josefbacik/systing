@@ -17,6 +17,8 @@ development efforts are focused.
 - [ ] Add IRQ events.
 - [ ] Add normal perf sample events to trace CPU time as well.
 - [ ] Add a way to trace arbitrary tracepoints.
+    - [ ] Add a way to trace tracepoints in the kernel.
+    - [X] Add a way to trace tracepoints in userspace.
 
 ## System
 
@@ -30,6 +32,19 @@ to not end, this is because the tool is tracing the scheduling events captures
 the process going off the CPU or going on the CPU in addition to the process
 being traced, so you will miss events for the unwanted process leaving the CPU.
 Perfetto handles this appropriately, but it looks odd.
+
+`--trace-event` - This will add an `instant` track event for each event that
+this tool captures.  The format is "<trace type>:<optional
+info>:<class>:<name>".
+
+User space tracepoints (USDT) are currently the only ones supported, and you
+must specify the path to the executable/library that contains the tracepoint.
+`-p` must also be specified.  For example, if you want to trace when `qemu` does
+a v9fs create, you would run the following
+
+```
+systing system -p <PID of qemu> --trace-event "usdt:/usr/bin/qemu-system-x86_64:qemu:v9fs_create"
+````
 
 ## Profile
 

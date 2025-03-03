@@ -70,6 +70,8 @@ pub struct SystemOpts {
     no_stack_traces: bool,
     #[arg(short, long, default_value = "0")]
     ringbuf_size_mib: u32,
+    #[arg(short, long)]
+    trace_event: Vec<String>,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {

@@ -1,6 +1,7 @@
 #include "vmlinux.h"
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/usdt.bpf.h>
 
 #define TASK_RUNNING 0
 #define TASK_INTERRUPTIBLE 1
@@ -58,11 +59,20 @@ struct task_event {
 	u64 kernel_stack[MAX_STACK_DEPTH];
 	u64 user_stack[MAX_STACK_DEPTH];
 };
+
+struct usdt_event {
+	u32 cpu;
+	u64 ts;
+	u64 tgidpid;
+	u64 cookie;
+};
+
 /*
  * Dummy instance to get skeleton to generate definition for
  * `struct task_event`
  */
 struct task_event _event = {0};
+struct usdt_event _usdt_event = {0};
 enum event_type _type = SCHED_SWITCH;
 bool tracing_enabled = true;
 
@@ -104,9 +114,18 @@ struct {
 struct ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
-} node0_events SEC(".maps"), node1_events SEC(".maps"), node2_events SEC(".maps"),
-  node3_events SEC(".maps"), node4_events SEC(".maps"), node5_events SEC(".maps"),
-  node6_events SEC(".maps"), node7_events SEC(".maps");
+} ringbuf_events_node0 SEC(".maps"), ringbuf_events_node1 SEC(".maps"),
+  ringbuf_events_node2 SEC(".maps"), ringbuf_events_node3 SEC(".maps"),
+  ringbuf_events_node4 SEC(".maps"), ringbuf_events_node5 SEC(".maps"),
+  ringbuf_events_node6 SEC(".maps"), ringbuf_events_node7 SEC(".maps");
+
+struct usdt_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
+} ringbuf_usdt_events_node0 SEC(".maps"), ringbuf_usdt_events_node1 SEC(".maps"),
+  ringbuf_usdt_events_node2 SEC(".maps"), ringbuf_usdt_events_node3 SEC(".maps"),
+  ringbuf_usdt_events_node4 SEC(".maps"), ringbuf_usdt_events_node5 SEC(".maps"),
+  ringbuf_usdt_events_node6 SEC(".maps"), ringbuf_usdt_events_node7 SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
@@ -115,14 +134,32 @@ struct {
 	__array(values, struct ringbuf_map);
 } ringbufs SEC(".maps") = {
 	.values = {
-		&node0_events,
-		&node1_events,
-		&node2_events,
-		&node3_events,
-		&node4_events,
-		&node5_events,
-		&node6_events,
-		&node7_events,
+		&ringbuf_events_node0,
+		&ringbuf_events_node1,
+		&ringbuf_events_node2,
+		&ringbuf_events_node3,
+		&ringbuf_events_node4,
+		&ringbuf_events_node5,
+		&ringbuf_events_node6,
+		&ringbuf_events_node7,
+	},
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS);
+	__type(key, u32);
+	__array(values, struct usdt_ringbuf_map);
+} usdt_ringbufs SEC(".maps") = {
+	.values = {
+		&ringbuf_usdt_events_node0,
+		&ringbuf_usdt_events_node1,
+		&ringbuf_usdt_events_node2,
+		&ringbuf_usdt_events_node3,
+		&ringbuf_usdt_events_node4,
+		&ringbuf_usdt_events_node5,
+		&ringbuf_usdt_events_node6,
+		&ringbuf_usdt_events_node7,
 	},
 };
 
@@ -136,6 +173,18 @@ struct task_event *reserve_task_event(void)
 	if (!rb)
 		return NULL;
 	return bpf_ringbuf_reserve(rb, sizeof(struct task_event), 0);
+}
+
+static __always_inline
+struct usdt_event *reserve_usdt_event(void)
+{
+	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&usdt_ringbufs, &node);
+	if (!rb)
+		return NULL;
+	return bpf_ringbuf_reserve(rb, sizeof(struct usdt_event), 0);
 }
 
 static __always_inline
@@ -423,5 +472,23 @@ int handle__softirq_exit(u64 *ctx)
 	return trace_irq_exit(true);
 }
 
-char LICENSE[] SEC("license") = "GPL";
+SEC("usdt")
+int handle__usdt(u64 *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 
+	if (!trace_task(task))
+		return 0;
+
+	struct usdt_event *event = reserve_usdt_event();
+	if (!event)
+		return handle_missed_event();
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	event->tgidpid = task_key(task);
+	event->cookie = bpf_usdt_cookie(ctx);
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";

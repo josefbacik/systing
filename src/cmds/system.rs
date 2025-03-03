@@ -16,7 +16,7 @@ use anyhow::Result;
 use blazesym::symbolize::{Input, Kernel, Process, Source, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{MapCore, RingBufferBuilder};
+use libbpf_rs::{MapCore, RingBufferBuilder, UsdtOpts};
 use libc;
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
@@ -47,11 +47,20 @@ mod systing {
     include!(concat!(env!("OUT_DIR"), "/systing_system.skel.rs"));
 }
 
-unsafe impl Plain for systing::types::task_event {}
+use systing::types::task_event;
+use systing::types::usdt_event;
+
+unsafe impl Plain for task_event {}
+unsafe impl Plain for usdt_event {}
 
 struct TrackCounter {
     ts: u64,
     count: i64,
+}
+
+struct TrackInstant {
+    ts: u64,
+    name: String,
 }
 
 #[derive(Clone)]
@@ -76,6 +85,14 @@ struct LocalCompactSched {
     last_switch_ts: u64,
 }
 
+#[derive(Clone)]
+struct UsdtProbe {
+    cookie: u64,
+    path: String,
+    provider: String,
+    name: String,
+}
+
 #[derive(Default)]
 struct EventRecorder {
     clock_snapshot: ClockSnapshot,
@@ -89,6 +106,8 @@ struct EventRecorder {
     cpu_latencies: HashMap<u32, Vec<TrackCounter>>,
     process_latencies: HashMap<u64, Vec<TrackCounter>>,
     rq_counters: HashMap<i32, i64>,
+    usdt_cookies: HashMap<u64, UsdtProbe>,
+    usdt_events: HashMap<u64, Vec<TrackInstant>>,
     last_ts: u64,
 }
 
@@ -167,11 +186,11 @@ fn stack_to_frames_mapping<'a, I, R>(
 }
 
 trait TaskEventBuilder {
-    fn from_task_event(event: &systing::types::task_event) -> Self;
+    fn from_task_event(event: &task_event) -> Self;
 }
 
 impl TaskEventBuilder for FtraceEvent {
-    fn from_task_event(event: &systing::types::task_event) -> Self {
+    fn from_task_event(event: &task_event) -> Self {
         let mut ftrace_event = FtraceEvent::default();
         ftrace_event.set_pid(event.prev_tgidpid as u32);
         ftrace_event.set_timestamp(event.ts);
@@ -187,7 +206,7 @@ impl TaskEventBuilder for FtraceEvent {
 }
 
 impl TaskEventBuilder for SchedWakeupNewFtraceEvent {
-    fn from_task_event(event: &systing::types::task_event) -> Self {
+    fn from_task_event(event: &task_event) -> Self {
         let comm_cstr = CStr::from_bytes_until_nul(&event.next_comm).unwrap();
         let mut sched_wakeup_new = SchedWakeupNewFtraceEvent::default();
         sched_wakeup_new.set_pid(event.next_tgidpid as i32);
@@ -214,7 +233,7 @@ impl TrackCounter {
 }
 
 impl LocalCompactSched {
-    fn add_task_event(&mut self, event: &systing::types::task_event) {
+    fn add_task_event(&mut self, event: &task_event) {
         let comm = CStr::from_bytes_until_nul(&event.next_comm)
             .unwrap()
             .to_str()
@@ -258,7 +277,7 @@ impl LocalCompactSched {
 }
 
 impl EventRecorder {
-    fn record_event(&mut self, event: &systing::types::task_event) {
+    fn record_event(&mut self, event: &task_event) {
         // SCHED_SWITCH and SCHED_WAKING are handled in compact sched events.
         // We skip SCHED_WAKEUP because we're just using that for runqueue tracking.
         if event.r#type == systing::types::event_type::SCHED_SWITCH
@@ -396,6 +415,18 @@ impl EventRecorder {
             stacks.push(stack);
         }
         self.last_ts = event.ts;
+    }
+
+    fn record_usdt_event(&mut self, event: &usdt_event) {
+        let usdt = self.usdt_cookies.get(&event.cookie).unwrap();
+        let entry = self
+            .usdt_events
+            .entry(event.tgidpid)
+            .or_insert_with(Vec::new);
+        entry.push(TrackInstant {
+            ts: event.ts,
+            name: format!("{}:{}:{}", usdt.path, usdt.provider, usdt.name),
+        });
     }
 
     fn wake_all_pending_wakeups(&mut self) {
@@ -544,6 +575,42 @@ impl EventRecorder {
             }
         }
 
+        // Populate the USDT events
+        for (pidtgid, events) in self.usdt_events.iter() {
+            let pid = *pidtgid as i32;
+            let tgid = (*pidtgid >> 32) as i32;
+
+            let uuid = if pid == tgid {
+                *pid_uuids.get(&tgid).unwrap()
+            } else {
+                *thread_uuids.get(&pid).unwrap()
+            };
+
+            let desc_uuid = rng.next_u64();
+            let mut desc = TrackDescriptor::default();
+            desc.set_name("USDT events".to_string());
+            desc.set_uuid(desc_uuid);
+            desc.set_parent_uuid(uuid);
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            trace.packet.push(packet);
+
+            let seq = rng.next_u32();
+            for event in events.iter() {
+                let mut tevent = TrackEvent::default();
+                tevent.set_type(Type::TYPE_INSTANT);
+                tevent.set_name(event.name.clone());
+                tevent.set_track_uuid(desc_uuid);
+
+                let mut packet = TracePacket::default();
+                packet.set_timestamp(event.ts);
+                packet.set_track_event(tevent);
+                packet.set_trusted_packet_sequence_id(seq);
+                trace.packet.push(packet);
+            }
+        }
+
         // Resolve the stacks, generate the interned data for them, and populate the trace.
         let mut src_cache: HashMap<i32, Source> = HashMap::new();
         let kernel_src = Source::Kernel(Kernel::default());
@@ -676,13 +743,16 @@ impl EventRecorder {
     }
 }
 
-fn create_ring<'a>(
+fn create_ring<'a, T>(
     map: &dyn libbpf_rs::MapCore,
-    tx: Sender<systing::types::task_event>,
-) -> Result<libbpf_rs::RingBuffer<'a>, libbpf_rs::Error> {
+    tx: Sender<T>,
+) -> Result<libbpf_rs::RingBuffer<'a>, libbpf_rs::Error>
+where
+    T: Default + Plain + 'a,
+{
     let mut builder = RingBufferBuilder::new();
     builder.add(map, move |data: &[u8]| {
-        let mut event = systing::types::task_event::default();
+        let mut event = T::default();
         plain::copy_from_bytes(&mut event, data).expect("Data buffer was too short");
         tx.send(event).expect("Could not send event on channel.");
         0
@@ -723,6 +793,38 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             }
         }
 
+        let mut rng = rand::rng();
+        let mut usdts: Vec<UsdtProbe> = Vec::new();
+        for tracepoint in opts.trace_event.iter() {
+            let parts = tracepoint.split(':').collect::<Vec<&str>>();
+            match parts[0] {
+                "usdt" => {
+                    if parts.len() != 4 {
+                        Err(anyhow::anyhow!("Invalid USDT probe format"))?;
+                    }
+                    let usdt = UsdtProbe {
+                        cookie: rng.next_u64(),
+                        path: parts[1].to_string(),
+                        provider: parts[2].to_string(),
+                        name: parts[3].to_string(),
+                    };
+                    usdts.push(usdt.clone());
+                    recorder
+                        .lock()
+                        .unwrap()
+                        .usdt_cookies
+                        .insert(usdt.cookie, usdt);
+                }
+                _ => {
+                    Err(anyhow::anyhow!("Invalid probe type"))?;
+                }
+            }
+        }
+
+        if usdts.len() > 0 && opts.pid.len() == 0 {
+            Err(anyhow::anyhow!("USDT probes require a PID to attach to"))?;
+        }
+
         let nr_cpus = thread::available_parallelism()?.get() as u32;
         open_skel.maps.missed_events.set_max_entries(nr_cpus)?;
 
@@ -744,25 +846,30 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         }
 
         let mut rings = Vec::new();
-        let event_recorder = recorder.clone();
-        let (ringbuf_tx, ringbuf_rx) = channel();
+        let (event_tx, event_rx) = channel();
+        let (usdt_tx, usdt_rx) = channel();
 
         let object = skel.object();
         for map in object.maps() {
             let name = map.name().to_str().unwrap();
-            if name.starts_with("node") {
-                let ring = create_ring(&map, ringbuf_tx.clone())?;
+            if name.starts_with("ringbuf_events") {
+                let ring = create_ring::<task_event>(&map, event_tx.clone())?;
+                rings.push(ring);
+            } else if name.starts_with("ringbuf_usdt") {
+                let ring = create_ring::<usdt_event>(&map, usdt_tx.clone())?;
                 rings.push(ring);
             }
         }
 
-        // Drop our ringbuf_tx so that when the tx threads exit the recv thread will exit once it's
-        // done processing all of the pending events.
-        drop(ringbuf_tx);
+        // Drop the extra tx references
+        drop(event_tx);
+        drop(usdt_tx);
 
-        let recv_thread = thread::spawn(move || {
+        let mut recv_threads = Vec::new();
+        let event_recorder = recorder.clone();
+        recv_threads.push(thread::spawn(move || {
             loop {
-                let res = ringbuf_rx.recv();
+                let res = event_rx.recv();
                 if res.is_err() {
                     break;
                 }
@@ -770,9 +877,39 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                 event_recorder.lock().unwrap().record_event(&event);
             }
             0
-        });
+        }));
+        let event_recorder = recorder.clone();
+        recv_threads.push(thread::spawn(move || {
+            loop {
+                let res = usdt_rx.recv();
+                if res.is_err() {
+                    break;
+                }
+                let event = res.unwrap();
+                event_recorder.lock().unwrap().record_usdt_event(&event);
+            }
+            0
+        }));
 
         skel.attach()?;
+
+        // Attach any usdt's that we may have
+        let mut usdt_links = Vec::new();
+        for usdt in usdts {
+            for pid in opts.pid.iter() {
+                let link = skel.progs.handle__usdt.attach_usdt_with_opts(
+                    *pid as i32,
+                    &usdt.path,
+                    &usdt.provider,
+                    &usdt.name,
+                    UsdtOpts {
+                        cookie: usdt.cookie,
+                        ..Default::default()
+                    },
+                )?;
+                usdt_links.push(link);
+            }
+        }
 
         let mut threads = Vec::new();
         let thread_done = Arc::new(AtomicBool::new(false));
@@ -810,8 +947,10 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         for thread in threads {
             thread.join().expect("Failed to join thread");
         }
-        println!("Stopping receiver thread...");
-        recv_thread.join().expect("Failed to join receiver thread");
+        println!("Stopping receiver threads...");
+        for thread in recv_threads {
+            thread.join().expect("Failed to join receiver thread");
+        }
 
         let index = (0 as u32).to_ne_bytes();
         let result = skel
@@ -832,6 +971,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         }
     }
 
+    println!("Generating trace...");
     let mut my_recorder = std::mem::take(&mut *recorder.lock().unwrap());
     my_recorder.wake_all_pending_wakeups();
 
