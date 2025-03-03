@@ -19,6 +19,10 @@ development efforts are focused.
 - [ ] Add a way to trace arbitrary tracepoints.
     - [ ] Add a way to trace tracepoints in the kernel.
     - [X] Add a way to trace tracepoints in userspace.
+- [ ] Determine the number of NUMA nodes on the system and set the extra ringbuf
+  sizes to 0 to avoid the memory overhead.
+- [ ] If there are no USDT's, set the ringbuf sizes to 0 to avoid the memory
+  overhead.
 
 ## System
 
