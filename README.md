@@ -15,7 +15,7 @@ development efforts are focused.
 - [ ] Figure out something better to do about cgroup and PID based tracing so it
   doesn't leave ghost tasks.
 - [ ] Add IRQ events.
-- [ ] Add normal perf sample events to trace CPU time as well.
+- [X] Add normal perf sample events to trace CPU time as well.
 - [ ] Add a way to trace arbitrary tracepoints.
     - [ ] Add a way to trace tracepoints in the kernel.
     - [X] Add a way to trace tracepoints in userspace.
