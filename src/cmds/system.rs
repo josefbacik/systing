@@ -47,11 +47,13 @@ mod systing {
     include!(concat!(env!("OUT_DIR"), "/systing_system.skel.rs"));
 }
 
+use systing::types::stack_event;
 use systing::types::task_event;
 use systing::types::usdt_event;
 
 unsafe impl Plain for task_event {}
 unsafe impl Plain for usdt_event {}
+unsafe impl Plain for stack_event {}
 
 struct TrackCounter {
     ts: u64,
@@ -65,9 +67,7 @@ struct TrackInstant {
 
 #[derive(Clone)]
 struct SleepStack {
-    tgidpid: u64,
     ts_start: u64,
-    ts_end: u64,
     stack: Stack,
 }
 
@@ -101,7 +101,6 @@ struct EventRecorder {
     threads: HashMap<u64, ThreadDescriptor>,
     processes: HashMap<u64, ProcessDescriptor>,
     sleepers: HashMap<u64, Vec<SleepStack>>,
-    pending_wakeups: HashMap<u64, SleepStack>,
     runqueue: HashMap<i32, Vec<TrackCounter>>,
     cpu_latencies: HashMap<u32, Vec<TrackCounter>>,
     process_latencies: HashMap<u64, Vec<TrackCounter>>,
@@ -294,19 +293,6 @@ impl EventRecorder {
             cpu_event.insert(event.ts, ftrace_event);
         }
 
-        if event.user_stack_length > 0 || event.kernel_stack_length > 0 {
-            let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
-            let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
-            let stack_key = event.prev_tgidpid;
-            let stack = SleepStack {
-                tgidpid: event.prev_tgidpid,
-                ts_start: event.ts,
-                ts_end: 0,
-                stack: Stack::new(&kstack_vec, &ustack_vec),
-            };
-            self.pending_wakeups.insert(stack_key, stack);
-        }
-
         // We want to keep a running count of the per-cpu runqueue size. We could do this
         // inside of BPF, but that's a map lookup and runnning counter, so we'll just keep the
         // complexity here instead of adding it to the BPF hook.
@@ -408,12 +394,6 @@ impl EventRecorder {
             }
         }
 
-        if self.pending_wakeups.contains_key(&event.next_tgidpid) {
-            let mut stack = self.pending_wakeups.remove(&event.next_tgidpid).unwrap();
-            let stacks = self.sleepers.entry(stack.tgidpid).or_insert_with(Vec::new);
-            stack.ts_end = event.ts;
-            stacks.push(stack);
-        }
         self.last_ts = event.ts;
     }
 
@@ -435,7 +415,6 @@ impl EventRecorder {
                     let bytes = arg0_str.to_bytes();
                     if bytes.len() > 0 && !bytes.starts_with(&[0]) {
                         extra = format!(":{}", arg0_str.to_string_lossy());
-                        println!("extra is {}", extra);
                     }
                 }
             }
@@ -453,13 +432,18 @@ impl EventRecorder {
         });
     }
 
-    fn wake_all_pending_wakeups(&mut self) {
-        for (_, stack) in self.pending_wakeups.iter_mut() {
-            let stacks = self.sleepers.entry(stack.tgidpid).or_insert_with(Vec::new);
-            stack.ts_end = self.last_ts;
-            stacks.push(stack.clone());
+    fn record_stack_event(&mut self, event: &stack_event) {
+        if event.user_stack_length > 0 || event.kernel_stack_length > 0 {
+            let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
+            let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
+            let stack_key = event.tgidpid;
+            let stack = SleepStack {
+                ts_start: event.ts,
+                stack: Stack::new(&kstack_vec, &ustack_vec),
+            };
+            let stacks = self.sleepers.entry(stack_key).or_insert_with(Vec::new);
+            stacks.push(stack);
         }
-        self.pending_wakeups.clear();
     }
 
     fn generate_trace(&mut self) -> Trace {
@@ -872,6 +856,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         let mut rings = Vec::new();
         let (event_tx, event_rx) = channel();
         let (usdt_tx, usdt_rx) = channel();
+        let (stack_tx, stack_rx) = channel();
 
         let object = skel.object();
         for map in object.maps() {
@@ -882,12 +867,16 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             } else if name.starts_with("ringbuf_usdt") {
                 let ring = create_ring::<usdt_event>(&map, usdt_tx.clone())?;
                 rings.push(ring);
+            } else if name.starts_with("ringbuf_stack") {
+                let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
+                rings.push(ring);
             }
         }
 
         // Drop the extra tx references
         drop(event_tx);
         drop(usdt_tx);
+        drop(stack_tx);
 
         let mut recv_threads = Vec::new();
         let event_recorder = recorder.clone();
@@ -911,6 +900,18 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                 }
                 let event = res.unwrap();
                 event_recorder.lock().unwrap().record_usdt_event(&event);
+            }
+            0
+        }));
+        let event_recorder = recorder.clone();
+        recv_threads.push(thread::spawn(move || {
+            loop {
+                let res = stack_rx.recv();
+                if res.is_err() {
+                    break;
+                }
+                let event = res.unwrap();
+                event_recorder.lock().unwrap().record_stack_event(&event);
             }
             0
         }));
@@ -1000,7 +1001,6 @@ pub fn system(opts: SystemOpts) -> Result<()> {
 
     println!("Generating trace...");
     let mut my_recorder = std::mem::take(&mut *recorder.lock().unwrap());
-    my_recorder.wake_all_pending_wakeups();
 
     let trace = my_recorder.generate_trace();
     let bytes = trace.write_to_bytes()?;

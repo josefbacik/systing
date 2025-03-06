@@ -8,7 +8,7 @@ habits, half done tools.  Currently the `system` sub command is where most of my
 development efforts are focused.
 
 ## TODO FOR SYSTEM
-- [ ] Separate the stack traces out into their own NUMA node bound ringbufs.
+- [X] Separate the stack traces out into their own NUMA node bound ringbufs.
 - [X] Add an option to disable the stack traces.
 - [ ] Build a `perfetto` plugin to replicate the `runqueue` and `wake latency`
   tracks, then remove those tracks to slim down the trace file size.
@@ -25,6 +25,8 @@ development efforts are focused.
   overhead.
 - [ ] Separate out the USDT recorder into it's own object so there's no lock
   contention between the event recorder and the USDT recorder.
+- [ ] Separate out the stack recorder into it's own object so there's no lock
+  contention between the different recorders.
 
 ## System
 
@@ -41,15 +43,19 @@ Perfetto handles this appropriately, but it looks odd.
 
 `--trace-event` - This will add an `instant` track event for each event that
 this tool captures.  The format is "<trace type>:<optional
-info>:<class>:<name>".
+info>:<class>:<name>".  This is most easily obtained by running
+
+```
+bpftrace -lp <pid of desired program> | grep <name of usdt>
+```
 
 User space tracepoints (USDT) are currently the only ones supported, and you
 must specify the path to the executable/library that contains the tracepoint.
-`-p` must also be specified.  For example, if you want to trace when `qemu` does
-a v9fs create, you would run the following
+`--trace-event-pid` must also be specified.  For example, if you want to trace
+when `qemu` does a v9fs create, you would run the following
 
 ```
-systing system -p <PID of qemu> --trace-event "usdt:/usr/bin/qemu-system-x86_64:qemu:v9fs_create"
+systing system --trace-event-pid <PID of qemu> --trace-event "usdt:/usr/bin/qemu-system-x86_64:qemu:v9fs_create"
 ````
 
 ## Profile

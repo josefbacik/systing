@@ -37,6 +37,11 @@ enum event_type {
 	SCHED_WAKEUP,
 };
 
+enum stack_event_type {
+	STACK_SLEEP,
+	STACK_SLEEP_WAKEUP,
+};
+
 /*
  * sched_switch is the largest event, for the smaller events we just use prev_*
  * for the values, and things are left uninitialized.
@@ -52,12 +57,8 @@ struct task_event {
 	u32 target_cpu;
 	u32 next_prio;
 	u32 prev_prio;
-	u64 kernel_stack_length;
-	u64 user_stack_length;
 	u8 prev_comm[TASK_COMM_LEN];
 	u8 next_comm[TASK_COMM_LEN];
-	u64 kernel_stack[MAX_STACK_DEPTH];
-	u64 user_stack[MAX_STACK_DEPTH];
 };
 
 enum usdt_arg_type {
@@ -76,14 +77,27 @@ struct usdt_event {
 	u8 usdt_arg0[ARG0_SIZE];
 };
 
+struct stack_event {
+	enum stack_event_type stack_event_type;
+	u64 ts;
+	u32 cpu;
+	u64 tgidpid;
+	u64 kernel_stack_length;
+	u64 user_stack_length;
+	u64 kernel_stack[MAX_STACK_DEPTH];
+	u64 user_stack[MAX_STACK_DEPTH];
+};
+
 /*
  * Dummy instance to get skeleton to generate definition for
  * `struct task_event`
  */
 struct task_event _event = {0};
 struct usdt_event _usdt_event = {0};
+struct stack_event _stack_event = {0};
 enum event_type _type = SCHED_SWITCH;
 enum usdt_arg_type _usdt_type = ARG_NONE;
+enum stack_event_type _stack_type = STACK_SLEEP;
 bool tracing_enabled = true;
 
 struct {
@@ -137,6 +151,14 @@ struct usdt_ringbuf_map {
   ringbuf_usdt_events_node4 SEC(".maps"), ringbuf_usdt_events_node5 SEC(".maps"),
   ringbuf_usdt_events_node6 SEC(".maps"), ringbuf_usdt_events_node7 SEC(".maps");
 
+struct stack_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
+} ringbuf_stack_events_node0 SEC(".maps"), ringbuf_stack_events_node1 SEC(".maps"),
+  ringbuf_stack_events_node2 SEC(".maps"), ringbuf_stack_events_node3 SEC(".maps"),
+  ringbuf_stack_events_node4 SEC(".maps"), ringbuf_stack_events_node5 SEC(".maps"),
+  ringbuf_stack_events_node6 SEC(".maps"), ringbuf_stack_events_node7 SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
 	__uint(max_entries, NR_RINGBUFS);
@@ -173,6 +195,24 @@ struct {
 	},
 };
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS);
+	__type(key, u32);
+	__array(values, struct stack_ringbuf_map);
+} stack_ringbufs SEC(".maps") = {
+	.values = {
+		&ringbuf_stack_events_node0,
+		&ringbuf_stack_events_node1,
+		&ringbuf_stack_events_node2,
+		&ringbuf_stack_events_node3,
+		&ringbuf_stack_events_node4,
+		&ringbuf_stack_events_node5,
+		&ringbuf_stack_events_node6,
+		&ringbuf_stack_events_node7,
+	},
+};
+
 static __always_inline
 struct task_event *reserve_task_event(void)
 {
@@ -195,6 +235,18 @@ struct usdt_event *reserve_usdt_event(void)
 	if (!rb)
 		return NULL;
 	return bpf_ringbuf_reserve(rb, sizeof(struct usdt_event), 0);
+}
+
+static __always_inline
+struct stack_event *reserve_stack_event(void)
+{
+	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&stack_ringbufs, &node);
+	if (!rb)
+		return NULL;
+	return bpf_ringbuf_reserve(rb, sizeof(struct stack_event), 0);
 }
 
 static __always_inline
@@ -265,6 +317,44 @@ void record_task_name(struct task_struct *task, u8 *comm)
 }
 
 static __always_inline
+void emit_stack_event(void *ctx,struct task_struct *task, enum stack_event_type type)
+{
+	struct stack_event *event;
+	u64 len = 0;
+
+	if (tool_config.no_stack_traces)
+		return;
+
+	if (!trace_task(task))
+		return;
+
+	event = reserve_stack_event();
+	if (!event) {
+		handle_missed_event();
+		return;
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	event->tgidpid = task_key(task);
+	event->stack_event_type = type;
+
+	if (!(task->flags & PF_KTHREAD)) {
+		len = bpf_get_stack(ctx, &event->user_stack,
+				    sizeof(event->user_stack),
+				    BPF_F_USER_STACK);
+		event->user_stack_length = len / sizeof(u64);
+	} else {
+		event->user_stack_length = 0;
+	}
+
+	len = bpf_get_stack(ctx, &event->kernel_stack,
+			    sizeof(event->kernel_stack), SKIP_STACK_DEPTH);
+	event->kernel_stack_length = len / sizeof(u64);
+	bpf_ringbuf_submit(event, 0);
+}
+
+static __always_inline
 int trace_irq_enter(void)
 {
 	/*
@@ -331,8 +421,6 @@ int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 	event->next_tgidpid = key;
 	event->next_prio = wakee->prio;
 	event->target_cpu = task_cpu(wakee);
-	event->kernel_stack_length = 0;
-	event->user_stack_length = 0;
 	record_task_name(wakee, event->next_comm);
 	record_task_name(waker, event->prev_comm);
 	bpf_ringbuf_submit(event, 0);
@@ -401,27 +489,13 @@ int handle__sched_switch(u64 *ctx)
 	event->next_tgidpid = task_key(next);
 	event->next_prio = next->prio;
 	event->prev_prio = prev->prio;
-	event->kernel_stack_length = 0;
-	event->user_stack_length = 0;
 	record_task_name(prev, event->prev_comm);
 	record_task_name(next, event->next_comm);
+	bpf_ringbuf_submit(event, 0);
 
 	/* Record the blocked stack trace. */
-	if (!tool_config.no_stack_traces &&
-	    prev->__state & TASK_UNINTERRUPTIBLE) {
-		u64 len = 0;
-		if (!(prev->flags & PF_KTHREAD)) {
-			len = bpf_get_stack(ctx, &event->user_stack,
-					    sizeof(event->user_stack),
-					    BPF_F_USER_STACK);
-			event->user_stack_length = len / sizeof(u64);
-		}
-		len = bpf_get_stack(ctx, &event->kernel_stack,
-				    sizeof(event->kernel_stack),
-				    SKIP_STACK_DEPTH);
-		event->kernel_stack_length = len / sizeof(u64);
-	}
-	bpf_ringbuf_submit(event, 0);
+	if (prev->__state & TASK_UNINTERRUPTIBLE)
+		emit_stack_event(ctx, prev, STACK_SLEEP);
 	return 0;
 }
 
