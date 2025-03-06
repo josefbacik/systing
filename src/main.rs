@@ -68,10 +68,12 @@ pub struct SystemOpts {
     duration: u64,
     #[arg(short, long)]
     no_stack_traces: bool,
-    #[arg(short, long, default_value = "0")]
+    #[arg(long, default_value = "0")]
     ringbuf_size_mib: u32,
-    #[arg(short, long)]
+    #[arg(long)]
     trace_event: Vec<String>,
+    #[arg(long)]
+    trace_event_pid: Vec<u32>,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {

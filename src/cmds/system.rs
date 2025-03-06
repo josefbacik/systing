@@ -418,6 +418,30 @@ impl EventRecorder {
     }
 
     fn record_usdt_event(&mut self, event: &usdt_event) {
+        let mut extra = "".to_string();
+
+        // Capture arg0 if there is one.
+        match event.arg_type {
+            systing::types::usdt_arg_type::ARG_LONG => {
+                let mut bytes: [u8; 8] = [0; 8];
+                let _ = bytes.copy_from_bytes(&event.usdt_arg0[..8]);
+                let val = u64::from_ne_bytes(bytes);
+                extra = format!(":{}", val);
+            }
+            systing::types::usdt_arg_type::ARG_STRING => {
+                let arg0_str = CStr::from_bytes_until_nul(&event.usdt_arg0);
+                if !arg0_str.is_err() {
+                    let arg0_str = arg0_str.unwrap();
+                    let bytes = arg0_str.to_bytes();
+                    if bytes.len() > 0 && !bytes.starts_with(&[0]) {
+                        extra = format!(":{}", arg0_str.to_string_lossy());
+                        println!("extra is {}", extra);
+                    }
+                }
+            }
+            _ => {}
+        }
+
         let usdt = self.usdt_cookies.get(&event.cookie).unwrap();
         let entry = self
             .usdt_events
@@ -425,7 +449,7 @@ impl EventRecorder {
             .or_insert_with(Vec::new);
         entry.push(TrackInstant {
             ts: event.ts,
-            name: format!("{}:{}:{}", usdt.path, usdt.provider, usdt.name),
+            name: format!("{}:{}:{}{}", usdt.path, usdt.provider, usdt.name, extra),
         });
     }
 
@@ -821,7 +845,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             }
         }
 
-        if usdts.len() > 0 && opts.pid.len() == 0 {
+        if usdts.len() > 0 && opts.trace_event_pid.len() == 0 {
             Err(anyhow::anyhow!("USDT probes require a PID to attach to"))?;
         }
 
@@ -896,7 +920,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         // Attach any usdt's that we may have
         let mut usdt_links = Vec::new();
         for usdt in usdts {
-            for pid in opts.pid.iter() {
+            for pid in opts.trace_event_pid.iter() {
                 let link = skel.progs.handle__usdt.attach_usdt_with_opts(
                     *pid as i32,
                     &usdt.path,
@@ -906,7 +930,10 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                         cookie: usdt.cookie,
                         ..Default::default()
                     },
-                )?;
+                );
+                if link.is_err() {
+                    Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+                }
                 usdt_links.push(link);
             }
         }

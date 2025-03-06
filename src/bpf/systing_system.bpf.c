@@ -60,11 +60,20 @@ struct task_event {
 	u64 user_stack[MAX_STACK_DEPTH];
 };
 
+enum usdt_arg_type {
+	ARG_NONE,
+	ARG_LONG,
+	ARG_STRING,
+};
+
+#define ARG0_SIZE 64
 struct usdt_event {
 	u32 cpu;
+	enum usdt_arg_type arg_type;
 	u64 ts;
 	u64 tgidpid;
 	u64 cookie;
+	u8 usdt_arg0[ARG0_SIZE];
 };
 
 /*
@@ -74,6 +83,7 @@ struct usdt_event {
 struct task_event _event = {0};
 struct usdt_event _usdt_event = {0};
 enum event_type _type = SCHED_SWITCH;
+enum usdt_arg_type _usdt_type = ARG_NONE;
 bool tracing_enabled = true;
 
 struct {
@@ -487,6 +497,29 @@ int handle__usdt(u64 *ctx)
 	event->cpu = bpf_get_smp_processor_id();
 	event->tgidpid = task_key(task);
 	event->cookie = bpf_usdt_cookie(ctx);
+	event->usdt_arg0[0] = 0;
+	event->arg_type = ARG_NONE;
+
+	/*
+	 * We don't have an easy way to tell what kind of argument arg0 is, so
+	 * we try to read it as if it's a pointer to something, like a string.
+	 * If it fails then we'll just pass the raw value.
+	 */
+	u64 *val = NULL;
+	bpf_usdt_arg(ctx, 0, &val);
+	if (val) {
+		int ret = bpf_probe_read_user_str(&event->usdt_arg0,
+						  sizeof(event->usdt_arg0),
+						  val);
+		if (ret > 0) {
+			event->arg_type = ARG_STRING;
+		} else {
+			u64 realval;
+			bpf_usdt_arg(ctx, 0, &realval);
+			__builtin_memcpy(&event->usdt_arg0, &realval, sizeof(u64));
+			event->arg_type = ARG_LONG;
+		}
+	}
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
