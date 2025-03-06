@@ -39,7 +39,7 @@ enum event_type {
 
 enum stack_event_type {
 	STACK_SLEEP,
-	STACK_SLEEP_WAKEUP,
+	STACK_RUNNING,
 };
 
 /*
@@ -320,7 +320,7 @@ static __always_inline
 void emit_stack_event(void *ctx,struct task_struct *task, enum stack_event_type type)
 {
 	struct stack_event *event;
-	u64 len = 0;
+	long len = 0;
 
 	if (tool_config.no_stack_traces)
 		return;
@@ -343,14 +343,20 @@ void emit_stack_event(void *ctx,struct task_struct *task, enum stack_event_type 
 		len = bpf_get_stack(ctx, &event->user_stack,
 				    sizeof(event->user_stack),
 				    BPF_F_USER_STACK);
-		event->user_stack_length = len / sizeof(u64);
+		if (len > 0)
+			event->user_stack_length = len / sizeof(u64);
+		else
+			event->user_stack_length = 0;
 	} else {
 		event->user_stack_length = 0;
 	}
 
 	len = bpf_get_stack(ctx, &event->kernel_stack,
 			    sizeof(event->kernel_stack), SKIP_STACK_DEPTH);
-	event->kernel_stack_length = len / sizeof(u64);
+	if (len > 0)
+		event->kernel_stack_length = len / sizeof(u64);
+	else
+		event->kernel_stack_length = 0;
 	bpf_ringbuf_submit(event, 0);
 }
 
@@ -595,6 +601,14 @@ int handle__usdt(u64 *ctx)
 		}
 	}
 	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
+SEC("perf_event")
+int handle__perf_event(void *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	emit_stack_event(ctx, task, STACK_RUNNING);
 	return 0;
 }
 

@@ -10,6 +10,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::DescribeOpts;
+use crate::syscall;
+
 use anyhow::Result;
 use inferno::flamegraph::Options;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
@@ -24,8 +26,6 @@ use crate::symbolize::{Stack, SymbolizerCache};
 mod systing {
     include!(concat!(env!("OUT_DIR"), "/systing_describe.skel.rs"));
 }
-
-mod syscall;
 
 unsafe impl Plain for systing::types::wake_event {}
 unsafe impl Plain for systing::types::wakee_stack {}

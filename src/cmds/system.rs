@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CStr;
+use std::io;
 use std::io::Write;
+use std::mem;
 use std::mem::MaybeUninit;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,13 +12,14 @@ use std::thread;
 use std::time::Duration;
 
 use crate::symbolize::Stack;
+use crate::syscall;
 use crate::SystemOpts;
 
 use anyhow::Result;
 use blazesym::symbolize::{Input, Kernel, Process, Source, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{MapCore, RingBufferBuilder, UsdtOpts};
+use libbpf_rs::{ErrorExt, MapCore, RingBufferBuilder, UsdtOpts};
 use libc;
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
@@ -768,6 +771,60 @@ where
     builder.build()
 }
 
+fn init_perf_monitor(freq: u64, sw_event: bool) -> Result<Vec<i32>, libbpf_rs::Error> {
+    let nprocs = libbpf_rs::num_possible_cpus().unwrap();
+    let buf: Vec<u8> = vec![0; mem::size_of::<syscall::perf_event_attr>()];
+    let mut attr = unsafe {
+        Box::<syscall::perf_event_attr>::from_raw(
+            buf.leak().as_mut_ptr() as *mut syscall::perf_event_attr
+        )
+    };
+    attr._type = if sw_event {
+        syscall::PERF_TYPE_SOFTWARE
+    } else {
+        syscall::PERF_TYPE_HARDWARE
+    };
+    attr.size = mem::size_of::<syscall::perf_event_attr>() as u32;
+    attr.config = if sw_event {
+        syscall::PERF_COUNT_SW_CPU_CLOCK
+    } else {
+        syscall::PERF_COUNT_HW_CPU_CYCLES
+    };
+    attr.sample.sample_freq = freq;
+    attr.flags = 1 << 10; // freq = 1i
+    let mut pidfds = Vec::new();
+    for cpu in 0..nprocs {
+        let fd = syscall::perf_event_open(attr.as_ref(), -1, cpu as i32, -1, 0) as i32;
+        if fd == -1 {
+            let os_error = io::Error::last_os_error();
+            let mut error_context = "Failed to open perf event.";
+
+            if let Some(libc::ENODEV) = os_error.raw_os_error() {
+                // Sometimes available cpus < num_cpus, so we just break here.
+                break;
+            }
+
+            if !sw_event && os_error.kind() == io::ErrorKind::NotFound {
+                error_context = "Failed to open perf event.\n\
+                                Try running the profile example with the `--sw-event` option.";
+            }
+            return Err(libbpf_rs::Error::from(os_error)).context(error_context);
+        }
+        pidfds.push(fd);
+    }
+    Ok(pidfds)
+}
+
+fn attach_perf_event(
+    pefds: &[i32],
+    prog: &libbpf_rs::ProgramMut,
+) -> Vec<Result<libbpf_rs::Link, libbpf_rs::Error>> {
+    pefds
+        .iter()
+        .map(|pefd| prog.attach_perf_event(*pefd))
+        .collect()
+}
+
 pub fn system(opts: SystemOpts) -> Result<()> {
     let recorder = Arc::new(Mutex::new(EventRecorder::default()));
 
@@ -916,6 +973,8 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             0
         }));
 
+        let pefds = init_perf_monitor(1000, opts.sw_event)?;
+        let _links = attach_perf_event(&pefds, &skel.progs.handle__perf_event);
         skel.attach()?;
 
         // Attach any usdt's that we may have

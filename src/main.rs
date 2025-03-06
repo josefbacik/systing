@@ -4,6 +4,7 @@ use clap::{Args, Parser, Subcommand};
 
 pub mod perfetto;
 pub mod symbolize;
+pub mod syscall;
 mod cmds;
 
 #[derive(Debug, Parser)]
@@ -74,6 +75,8 @@ pub struct SystemOpts {
     trace_event: Vec<String>,
     #[arg(long)]
     trace_event_pid: Vec<u32>,
+    #[arg(short, long)]
+    sw_event: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
