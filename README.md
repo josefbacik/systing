@@ -23,9 +23,9 @@ development efforts are focused.
   sizes to 0 to avoid the memory overhead.
 - [ ] If there are no USDT's, set the ringbuf sizes to 0 to avoid the memory
   overhead.
-- [ ] Separate out the USDT recorder into it's own object so there's no lock
+- [X] Separate out the USDT recorder into it's own object so there's no lock
   contention between the event recorder and the USDT recorder.
-- [ ] Separate out the stack recorder into it's own object so there's no lock
+- [X] Separate out the stack recorder into it's own object so there's no lock
   contention between the different recorders.
 
 ## System

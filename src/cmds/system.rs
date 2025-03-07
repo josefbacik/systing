@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CStr;
 use std::io;
-use std::io::Write;
 use std::mem;
 use std::mem::MaybeUninit;
 use std::os::unix::fs::MetadataExt;
@@ -69,7 +68,7 @@ struct TrackInstant {
 }
 
 #[derive(Clone)]
-struct SleepStack {
+struct StackEvent {
     tgidpid: u64,
     ts_start: u64,
     stack: Stack,
@@ -104,14 +103,28 @@ struct EventRecorder {
     compact_sched: HashMap<u32, LocalCompactSched>,
     threads: HashMap<u64, ThreadDescriptor>,
     processes: HashMap<u64, ProcessDescriptor>,
-    sleepers: HashMap<i32, Vec<SleepStack>>,
     runqueue: HashMap<i32, Vec<TrackCounter>>,
     cpu_latencies: HashMap<u32, Vec<TrackCounter>>,
     process_latencies: HashMap<u64, Vec<TrackCounter>>,
     rq_counters: HashMap<i32, i64>,
+}
+
+#[derive(Default)]
+struct UsdtRecorder {
     usdt_cookies: HashMap<u64, UsdtProbe>,
     usdt_events: HashMap<u64, Vec<TrackInstant>>,
-    last_ts: u64,
+}
+
+#[derive(Default)]
+struct StackRecorder {
+    stacks: HashMap<i32, Vec<StackEvent>>,
+}
+
+#[derive(Default)]
+struct SessionRecorder {
+    event_recorder: Mutex<EventRecorder>,
+    usdt_recorder: Mutex<UsdtRecorder>,
+    stack_recorder: Mutex<StackRecorder>,
 }
 
 fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -122,16 +135,15 @@ fn get_clock_value(clock_id: libc::c_int) -> u64 {
     (ts.tv_sec as u64 * 1_000_000_000) + ts.tv_nsec as u64
 }
 
-fn stack_to_frames_mapping<'a, I, R>(
+fn stack_to_frames_mapping<'a, I>(
     symbolizer: &mut Symbolizer,
     frame_map: &mut HashMap<u64, LocalFrame>,
     func_map: &mut HashMap<String, InternedString>,
     source: &Source<'a>,
-    rng: &mut R,
+    rng: &mut dyn rand::RngCore,
     stack: I,
 ) where
     I: IntoIterator<Item = &'a u64>,
-    R: rand::Rng + ?Sized,
 {
     for input_addr in stack {
         if frame_map.contains_key(input_addr) {
@@ -397,71 +409,21 @@ impl EventRecorder {
                 thread_entry.set_thread_name(comm.to_str().unwrap().to_string());
             }
         }
-
-        self.last_ts = event.ts;
     }
 
-    fn record_usdt_event(&mut self, event: &usdt_event) {
-        let mut extra = "".to_string();
-
-        // Capture arg0 if there is one.
-        match event.arg_type {
-            systing::types::usdt_arg_type::ARG_LONG => {
-                let mut bytes: [u8; 8] = [0; 8];
-                let _ = bytes.copy_from_bytes(&event.usdt_arg0[..8]);
-                let val = u64::from_ne_bytes(bytes);
-                extra = format!(":{}", val);
-            }
-            systing::types::usdt_arg_type::ARG_STRING => {
-                let arg0_str = CStr::from_bytes_until_nul(&event.usdt_arg0);
-                if !arg0_str.is_err() {
-                    let arg0_str = arg0_str.unwrap();
-                    let bytes = arg0_str.to_bytes();
-                    if bytes.len() > 0 && !bytes.starts_with(&[0]) {
-                        extra = format!(":{}", arg0_str.to_string_lossy());
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        let usdt = self.usdt_cookies.get(&event.cookie).unwrap();
-        let entry = self
-            .usdt_events
-            .entry(event.tgidpid)
-            .or_insert_with(Vec::new);
-        entry.push(TrackInstant {
-            ts: event.ts,
-            name: format!("{}:{}:{}{}", usdt.path, usdt.provider, usdt.name, extra),
-        });
-    }
-
-    fn record_stack_event(&mut self, event: &stack_event) {
-        if event.user_stack_length > 0 || event.kernel_stack_length > 0 {
-            let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
-            let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
-            let stack_key = (event.tgidpid >> 32) as i32;
-            let stack = SleepStack {
-                tgidpid: event.tgidpid,
-                ts_start: event.ts,
-                stack: Stack::new(&kstack_vec, &ustack_vec),
-            };
-            let stacks = self.sleepers.entry(stack_key).or_insert_with(Vec::new);
-            stacks.push(stack);
-        }
-    }
-
-    fn generate_trace(&mut self) -> Trace {
-        let mut trace = Trace::default();
-        let mut rng = rand::rng();
-        let mut pid_uuids = HashMap::new();
-        let mut thread_uuids = HashMap::new();
+    fn generate_trace(
+        &self,
+        pid_uuids: &mut HashMap<i32, u64>,
+        thread_uuids: &mut HashMap<i32, u64>,
+        rng: &mut dyn rand::RngCore,
+    ) -> Vec<TracePacket> {
+        let mut packets = Vec::new();
 
         // First emit the clock snapshot
         let mut packet = TracePacket::default();
         packet.set_clock_snapshot(self.clock_snapshot.clone());
         packet.set_trusted_packet_sequence_id(rng.next_u32());
-        trace.packet.push(packet);
+        packets.push(packet);
 
         // Ppopulate all the process tracks
         for (_, process) in self.processes.iter() {
@@ -474,7 +436,7 @@ impl EventRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
-            trace.packet.push(packet);
+            packets.push(packet);
         }
 
         for (_, thread) in self.threads.iter() {
@@ -487,7 +449,7 @@ impl EventRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
-            trace.packet.push(packet);
+            packets.push(packet);
         }
 
         // Pull all the compact scheduling events
@@ -497,7 +459,7 @@ impl EventRecorder {
             event_bundle.compact_sched = Some(compact_sched.compact_sched.clone()).into();
             let mut packet = TracePacket::default();
             packet.set_ftrace_events(event_bundle);
-            trace.packet.push(packet);
+            packets.push(packet);
         }
 
         // Pull all the scheduling events.
@@ -507,7 +469,7 @@ impl EventRecorder {
             event_bundle.event = events.values().cloned().collect();
             let mut packet = TracePacket::default();
             packet.set_ftrace_events(event_bundle);
-            trace.packet.push(packet);
+            packets.push(packet);
         }
 
         // Populate the per-cpu runqueue sizes
@@ -525,11 +487,11 @@ impl EventRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
-            trace.packet.push(packet);
+            packets.push(packet);
 
             let seq = rng.next_u32();
             for event in runqueue.iter() {
-                trace.packet.push(event.to_track_event(desc_uuid, seq));
+                packets.push(event.to_track_event(desc_uuid, seq));
             }
         }
 
@@ -548,11 +510,11 @@ impl EventRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
-            trace.packet.push(packet);
+            packets.push(packet);
 
             let seq = rng.next_u32();
             for event in events.iter() {
-                trace.packet.push(event.to_track_event(desc_uuid, seq));
+                packets.push(event.to_track_event(desc_uuid, seq));
             }
         }
 
@@ -580,56 +542,77 @@ impl EventRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
-            trace.packet.push(packet);
+            packets.push(packet);
 
             let seq = rng.next_u32();
             for event in events.iter() {
-                trace.packet.push(event.to_track_event(desc_uuid, seq));
+                packets.push(event.to_track_event(desc_uuid, seq));
             }
         }
+        packets
+    }
 
-        // Populate the USDT events
-        for (pidtgid, events) in self.usdt_events.iter() {
-            let pid = *pidtgid as i32;
-            let tgid = (*pidtgid >> 32) as i32;
+    fn snapshot_clocks(&mut self) {
+        self.clock_snapshot
+            .set_primary_trace_clock(BuiltinClock::BUILTIN_CLOCK_BOOTTIME);
 
-            let uuid = if pid == tgid {
-                *pid_uuids.get(&tgid).unwrap()
-            } else {
-                *thread_uuids.get(&pid).unwrap()
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC));
+        self.clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_BOOTTIME as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_BOOTTIME));
+        self.clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_REALTIME as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_REALTIME));
+        self.clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_REALTIME_COARSE as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_REALTIME_COARSE));
+        self.clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC_COARSE as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC_COARSE));
+        self.clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC_RAW as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC_RAW));
+        self.clock_snapshot.clocks.push(clock);
+    }
+}
+
+impl StackRecorder {
+    fn record_stack_event(&mut self, event: &stack_event) {
+        if event.user_stack_length > 0 || event.kernel_stack_length > 0 {
+            let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
+            let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
+            let stack_key = (event.tgidpid >> 32) as i32;
+            let stack = StackEvent {
+                tgidpid: event.tgidpid,
+                ts_start: event.ts,
+                stack: Stack::new(&kstack_vec, &ustack_vec),
             };
-
-            let desc_uuid = rng.next_u64();
-            let mut desc = TrackDescriptor::default();
-            desc.set_name("USDT events".to_string());
-            desc.set_uuid(desc_uuid);
-            desc.set_parent_uuid(uuid);
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            trace.packet.push(packet);
-
-            let seq = rng.next_u32();
-            for event in events.iter() {
-                let mut tevent = TrackEvent::default();
-                tevent.set_type(Type::TYPE_INSTANT);
-                tevent.set_name(event.name.clone());
-                tevent.set_track_uuid(desc_uuid);
-
-                let mut packet = TracePacket::default();
-                packet.set_timestamp(event.ts);
-                packet.set_track_event(tevent);
-                packet.set_trusted_packet_sequence_id(seq);
-                trace.packet.push(packet);
-            }
+            let stacks = self.stacks.entry(stack_key).or_insert_with(Vec::new);
+            stacks.push(stack);
         }
+    }
+
+    fn generate_trace(&self, rng: &mut dyn rand::RngCore) -> Vec<TracePacket> {
+        let mut packets = Vec::new();
 
         // Resolve the stacks, generate the interned data for them, and populate the trace.
         let mut src_cache: HashMap<i32, Source> = HashMap::new();
         let kernel_src = Source::Kernel(Kernel::default());
         let mut symbolizer = Symbolizer::new();
 
-        for (tgid, stacks) in self.sleepers.iter() {
+        for (tgid, stacks) in self.stacks.iter() {
             let user_src = src_cache
                 .entry(*tgid)
                 .or_insert(Source::Process(Process::new(Pid::from(*tgid as u32))));
@@ -645,7 +628,7 @@ impl EventRecorder {
                     &mut frame_map,
                     &mut func_name_map,
                     &user_src,
-                    &mut rng,
+                    rng,
                     raw_stack.user_stack.iter(),
                 );
                 stack_to_frames_mapping(
@@ -653,7 +636,7 @@ impl EventRecorder {
                     &mut frame_map,
                     &mut func_name_map,
                     &kernel_src,
-                    &mut rng,
+                    rng,
                     raw_stack.kernel_stack.iter(),
                 );
             }
@@ -700,7 +683,7 @@ impl EventRecorder {
                 SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
                     | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
             );
-            trace.packet.push(packet);
+            packets.push(packet);
 
             for stack in stacks.iter() {
                 let pid = stack.tgidpid as u32;
@@ -714,45 +697,93 @@ impl EventRecorder {
                 sample.set_tid(pid);
                 packet.set_perf_sample(sample);
                 packet.set_trusted_packet_sequence_id(seq);
-                trace.packet.push(packet);
+                packets.push(packet);
             }
         }
-        trace
+        packets
+    }
+}
+
+impl UsdtRecorder {
+    fn record_usdt_event(&mut self, event: &usdt_event) {
+        let mut extra = "".to_string();
+
+        // Capture arg0 if there is one.
+        match event.arg_type {
+            systing::types::usdt_arg_type::ARG_LONG => {
+                let mut bytes: [u8; 8] = [0; 8];
+                let _ = bytes.copy_from_bytes(&event.usdt_arg0[..8]);
+                let val = u64::from_ne_bytes(bytes);
+                extra = format!(":{}", val);
+            }
+            systing::types::usdt_arg_type::ARG_STRING => {
+                let arg0_str = CStr::from_bytes_until_nul(&event.usdt_arg0);
+                if !arg0_str.is_err() {
+                    let arg0_str = arg0_str.unwrap();
+                    let bytes = arg0_str.to_bytes();
+                    if bytes.len() > 0 && !bytes.starts_with(&[0]) {
+                        extra = format!(":{}", arg0_str.to_string_lossy());
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let usdt = self.usdt_cookies.get(&event.cookie).unwrap();
+        let entry = self
+            .usdt_events
+            .entry(event.tgidpid)
+            .or_insert_with(Vec::new);
+        entry.push(TrackInstant {
+            ts: event.ts,
+            name: format!("{}:{}:{}{}", usdt.path, usdt.provider, usdt.name, extra),
+        });
     }
 
-    fn snapshot_clocks(&mut self) {
-        self.clock_snapshot
-            .set_primary_trace_clock(BuiltinClock::BUILTIN_CLOCK_BOOTTIME);
+    fn generate_trace(
+        &self,
+        pid_uuids: &HashMap<i32, u64>,
+        thread_uuids: &HashMap<i32, u64>,
+        rng: &mut dyn rand::RngCore,
+    ) -> Vec<TracePacket> {
+        let mut packets = Vec::new();
 
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC));
-        self.clock_snapshot.clocks.push(clock);
+        // Populate the USDT events
+        for (pidtgid, events) in self.usdt_events.iter() {
+            let pid = *pidtgid as i32;
+            let tgid = (*pidtgid >> 32) as i32;
 
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_BOOTTIME as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_BOOTTIME));
-        self.clock_snapshot.clocks.push(clock);
+            let uuid = if pid == tgid {
+                *pid_uuids.get(&tgid).unwrap()
+            } else {
+                *thread_uuids.get(&pid).unwrap()
+            };
 
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_REALTIME as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_REALTIME));
-        self.clock_snapshot.clocks.push(clock);
+            let desc_uuid = rng.next_u64();
+            let mut desc = TrackDescriptor::default();
+            desc.set_name("USDT events".to_string());
+            desc.set_uuid(desc_uuid);
+            desc.set_parent_uuid(uuid);
 
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_REALTIME_COARSE as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_REALTIME_COARSE));
-        self.clock_snapshot.clocks.push(clock);
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packets.push(packet);
 
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC_COARSE as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC_COARSE));
-        self.clock_snapshot.clocks.push(clock);
+            let seq = rng.next_u32();
+            for event in events.iter() {
+                let mut tevent = TrackEvent::default();
+                tevent.set_type(Type::TYPE_INSTANT);
+                tevent.set_name(event.name.clone());
+                tevent.set_track_uuid(desc_uuid);
 
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC_RAW as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC_RAW));
-        self.clock_snapshot.clocks.push(clock);
+                let mut packet = TracePacket::default();
+                packet.set_timestamp(event.ts);
+                packet.set_track_event(tevent);
+                packet.set_trusted_packet_sequence_id(seq);
+                packets.push(packet);
+            }
+        }
+        packets
     }
 }
 
@@ -828,9 +859,9 @@ fn attach_perf_event(
 }
 
 pub fn system(opts: SystemOpts) -> Result<()> {
-    let recorder = Arc::new(Mutex::new(EventRecorder::default()));
+    let recorder = Arc::new(SessionRecorder::default());
 
-    recorder.lock().unwrap().snapshot_clocks();
+    recorder.event_recorder.lock().unwrap().snapshot_clocks();
     {
         let mut skel_builder = systing::SystingSystemSkelBuilder::default();
         if opts.verbose {
@@ -877,6 +908,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                     };
                     usdts.push(usdt.clone());
                     recorder
+                        .usdt_recorder
                         .lock()
                         .unwrap()
                         .usdt_cookies
@@ -938,7 +970,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         drop(stack_tx);
 
         let mut recv_threads = Vec::new();
-        let event_recorder = recorder.clone();
+        let session_recorder = recorder.clone();
         recv_threads.push(thread::spawn(move || {
             loop {
                 let res = event_rx.recv();
@@ -946,11 +978,15 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                     break;
                 }
                 let event = res.unwrap();
-                event_recorder.lock().unwrap().record_event(&event);
+                session_recorder
+                    .event_recorder
+                    .lock()
+                    .unwrap()
+                    .record_event(&event);
             }
             0
         }));
-        let event_recorder = recorder.clone();
+        let session_recorder = recorder.clone();
         recv_threads.push(thread::spawn(move || {
             loop {
                 let res = usdt_rx.recv();
@@ -958,11 +994,15 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                     break;
                 }
                 let event = res.unwrap();
-                event_recorder.lock().unwrap().record_usdt_event(&event);
+                session_recorder
+                    .usdt_recorder
+                    .lock()
+                    .unwrap()
+                    .record_usdt_event(&event);
             }
             0
         }));
-        let event_recorder = recorder.clone();
+        let session_recorder = recorder.clone();
         recv_threads.push(thread::spawn(move || {
             loop {
                 let res = stack_rx.recv();
@@ -970,7 +1010,11 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                     break;
                 }
                 let event = res.unwrap();
-                event_recorder.lock().unwrap().record_stack_event(&event);
+                session_recorder
+                    .stack_recorder
+                    .lock()
+                    .unwrap()
+                    .record_stack_event(&event);
             }
             0
         }));
@@ -1061,11 +1105,32 @@ pub fn system(opts: SystemOpts) -> Result<()> {
     }
 
     println!("Generating trace...");
-    let mut my_recorder = std::mem::take(&mut *recorder.lock().unwrap());
-
-    let trace = my_recorder.generate_trace();
-    let bytes = trace.write_to_bytes()?;
+    let mut trace = Trace::default();
+    let mut pid_uuids = HashMap::new();
+    let mut thread_uuids = HashMap::new();
+    let mut rng = rand::rng();
+    trace
+        .packet
+        .extend(recorder.event_recorder.lock().unwrap().generate_trace(
+            &mut pid_uuids,
+            &mut thread_uuids,
+            &mut rng,
+        ));
+    trace.packet.extend(
+        recorder
+            .stack_recorder
+            .lock()
+            .unwrap()
+            .generate_trace(&mut rng),
+    );
+    trace
+        .packet
+        .extend(recorder.usdt_recorder.lock().unwrap().generate_trace(
+            &pid_uuids,
+            &thread_uuids,
+            &mut rng,
+        ));
     let mut file = std::fs::File::create("trace.pb")?;
-    file.write_all(&bytes)?;
+    trace.write_to_writer(&mut file)?;
     Ok(())
 }
