@@ -70,6 +70,7 @@ struct TrackInstant {
 
 #[derive(Clone)]
 struct SleepStack {
+    tgidpid: u64,
     ts_start: u64,
     stack: Stack,
 }
@@ -103,7 +104,7 @@ struct EventRecorder {
     compact_sched: HashMap<u32, LocalCompactSched>,
     threads: HashMap<u64, ThreadDescriptor>,
     processes: HashMap<u64, ProcessDescriptor>,
-    sleepers: HashMap<u64, Vec<SleepStack>>,
+    sleepers: HashMap<i32, Vec<SleepStack>>,
     runqueue: HashMap<i32, Vec<TrackCounter>>,
     cpu_latencies: HashMap<u32, Vec<TrackCounter>>,
     process_latencies: HashMap<u64, Vec<TrackCounter>>,
@@ -439,8 +440,9 @@ impl EventRecorder {
         if event.user_stack_length > 0 || event.kernel_stack_length > 0 {
             let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
             let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
-            let stack_key = event.tgidpid;
+            let stack_key = (event.tgidpid >> 32) as i32;
             let stack = SleepStack {
+                tgidpid: event.tgidpid,
                 ts_start: event.ts,
                 stack: Stack::new(&kstack_vec, &ustack_vec),
             };
@@ -627,12 +629,10 @@ impl EventRecorder {
         let kernel_src = Source::Kernel(Kernel::default());
         let mut symbolizer = Symbolizer::new();
 
-        for (tgidpid, stacks) in self.sleepers.iter() {
-            let pid = *tgidpid as i32;
-            let tgid = (*tgidpid >> 32) as i32;
+        for (tgid, stacks) in self.sleepers.iter() {
             let user_src = src_cache
-                .entry(tgid)
-                .or_insert(Source::Process(Process::new(Pid::from(tgid as u32))));
+                .entry(*tgid)
+                .or_insert(Source::Process(Process::new(Pid::from(*tgid as u32))));
 
             // We have to symbolize all of the addresses in the stacks and fill
             // out the hashmap with all of the frames.
@@ -703,13 +703,15 @@ impl EventRecorder {
             trace.packet.push(packet);
 
             for stack in stacks.iter() {
+                let pid = stack.tgidpid as u32;
+                let tgid = (stack.tgidpid >> 32) as u32;
                 let mut packet = TracePacket::default();
                 packet.set_timestamp(stack.ts_start);
 
                 let mut sample = PerfSample::default();
                 sample.set_callstack_iid(interned_stacks.get(&stack.stack).unwrap().iid());
-                sample.set_pid(tgid as u32);
-                sample.set_tid(pid as u32);
+                sample.set_pid(tgid);
+                sample.set_tid(pid);
                 packet.set_perf_sample(sample);
                 packet.set_trusted_packet_sequence_id(seq);
                 trace.packet.push(packet);
