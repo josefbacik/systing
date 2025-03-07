@@ -858,6 +858,26 @@ fn attach_perf_event(
         .collect()
 }
 
+fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
+    let index = index.to_ne_bytes();
+    let result = skel
+        .maps
+        .missed_events
+        .lookup_percpu(&index, libbpf_rs::MapFlags::ANY);
+    let mut missed = 0;
+    match result {
+        Ok(results) => {
+            for val in results.unwrap() {
+                let mut missed_events: u64 = 0;
+                plain::copy_from_bytes(&mut missed_events, &val).unwrap();
+                missed += missed_events;
+            }
+        }
+        _ => {}
+    }
+    missed
+}
+
 pub fn system(opts: SystemOpts) -> Result<()> {
     let recorder = Arc::new(SessionRecorder::default());
 
@@ -1085,23 +1105,9 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             thread.join().expect("Failed to join receiver thread");
         }
 
-        let index = (0 as u32).to_ne_bytes();
-        let result = skel
-            .maps
-            .missed_events
-            .lookup_percpu(&index, libbpf_rs::MapFlags::ANY);
-        match result {
-            Ok(results) => {
-                let mut cpu = 0;
-                for val in results.unwrap() {
-                    let mut missed_events: u64 = 0;
-                    plain::copy_from_bytes(&mut missed_events, &val).unwrap();
-                    println!("CPU {}: missed events: {}", cpu, missed_events);
-                    cpu += 1;
-                }
-            }
-            _ => {}
-        }
+        println!("Missed sched events: {}", dump_missed_events(&skel, 0));
+        println!("Missed stack events: {}", dump_missed_events(&skel, 1));
+        println!("Missed USDT events: {}", dump_missed_events(&skel, 2));
     }
 
     println!("Generating trace...");

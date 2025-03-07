@@ -128,11 +128,14 @@ struct {
 	__uint(max_entries, 10240);
 } irq_events SEC(".maps");
 
+#define MISSED_SCHED_EVENT 0
+#define MISSED_STACK_EVENT 1
+#define MISSED_USDT_EVENT 2
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
 	__type(value, u64);
-	__uint(max_entries, 1);
+	__uint(max_entries, 3);
 } missed_events SEC(".maps");
 
 struct ringbuf_map {
@@ -293,10 +296,8 @@ bool trace_task(struct task_struct *task)
 }
 
 static __always_inline
-int handle_missed_event(void)
+int handle_missed_event(u32 index)
 {
-	u32 index = 0;
-
 	u64 *value = bpf_map_lookup_elem(&missed_events, &index);
 	if (value)
 		*value += 1;
@@ -330,7 +331,7 @@ void emit_stack_event(void *ctx,struct task_struct *task, enum stack_event_type 
 
 	event = reserve_stack_event();
 	if (!event) {
-		handle_missed_event();
+		handle_missed_event(MISSED_STACK_EVENT);
 		return;
 	}
 
@@ -419,7 +420,7 @@ int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 
 	event = reserve_task_event();
 	if (!event)
-		return handle_missed_event();
+		return handle_missed_event(MISSED_SCHED_EVENT);
 	event->ts = ts;
 	event->type = type;
 	event->cpu = bpf_get_smp_processor_id();
@@ -484,7 +485,7 @@ int handle__sched_switch(u64 *ctx)
 
 	event = reserve_task_event();
 	if (!event)
-		return handle_missed_event();
+		return handle_missed_event(MISSED_SCHED_EVENT);
 
 	event->ts = ts;
 	event->type = SCHED_SWITCH;
@@ -572,7 +573,7 @@ int handle__usdt(u64 *ctx)
 
 	struct usdt_event *event = reserve_usdt_event();
 	if (!event)
-		return handle_missed_event();
+		return handle_missed_event(MISSED_USDT_EVENT);
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	event->tgidpid = task_key(task);
