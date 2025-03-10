@@ -14,7 +14,7 @@ development efforts are focused.
   tracks, then remove those tracks to slim down the trace file size.
 - [ ] Figure out something better to do about cgroup and PID based tracing so it
   doesn't leave ghost tasks.
-- [ ] Add IRQ events.
+- [X] Add IRQ events.
 - [X] Add normal perf sample events to trace CPU time as well.
 - [ ] Add a way to trace arbitrary tracepoints.
     - [ ] Add a way to trace tracepoints in the kernel.

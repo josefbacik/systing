@@ -35,6 +35,10 @@ enum event_type {
 	SCHED_WAKING,
 	SCHED_WAKEUP_NEW,
 	SCHED_WAKEUP,
+	SCHED_SOFTIRQ_ENTER,
+	SCHED_SOFTIRQ_EXIT,
+	SCHED_IRQ_ENTER,
+	SCHED_IRQ_EXIT,
 };
 
 enum stack_event_type {
@@ -86,6 +90,20 @@ struct stack_event {
 	u64 user_stack_length;
 	u64 kernel_stack[MAX_STACK_DEPTH];
 	u64 user_stack[MAX_STACK_DEPTH];
+};
+
+enum irq_event_type {
+	EVENT_IRQ,
+	EVENT_SOFTIRQ,
+};
+
+struct irq_event {
+	u64 ts;
+	enum irq_event_type type;
+	u32 cpu;
+	u32 irq;
+	u32 target_cpu;
+	u8 comm[TASK_COMM_LEN];
 };
 
 /*
@@ -362,48 +380,50 @@ void emit_stack_event(void *ctx,struct task_struct *task, enum stack_event_type 
 }
 
 static __always_inline
-int trace_irq_enter(void)
+int trace_irq_event(struct irqaction *action, int irq, int ret, bool enter)
 {
-	/*
 	struct task_struct *tsk = (struct task_struct *)bpf_get_current_task_btf();
-	u64 key = task_key(tsk);
-	u64 start;
-	u32 tgid = tsk->tgid;
 
 	if (!trace_task(tsk))
 		return 0;
-	start = bpf_ktime_get_boot_ns();
-	bpf_map_update_elem(&irq_events, &key, &start, BPF_ANY);
-	*/
+
+	struct task_event *event;
+	event = reserve_task_event();
+	if (!event)
+		return handle_missed_event(MISSED_SCHED_EVENT);
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	event->prev_tgidpid = task_key(tsk);
+	event->target_cpu = irq;
+	if (enter) {
+		event->type = SCHED_IRQ_ENTER;
+		bpf_probe_read_kernel_str(event->prev_comm, TASK_COMM_LEN, action->name);
+	} else {
+		event->type = SCHED_IRQ_EXIT;
+		event->next_prio = ret;
+	}
+	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
 
 static __always_inline
-int trace_irq_exit(bool softirq)
+int trace_softirq_event(unsigned int vec_nr, bool enter)
 {
-	/*
 	struct task_struct *tsk = (struct task_struct *)bpf_get_current_task_btf();
-	struct task_stat *stat;
-	u64 key = task_key(tsk);
+
+	if (!trace_task(tsk))
+		return 0;
+
 	struct task_event *event;
-	u64 *start_ns;
-
-	start_ns = bpf_map_lookup_elem(&irq_events, &key);
-	if (!start_ns)
-		return 0;
-
-	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+	event = reserve_task_event();
 	if (!event)
-		return 0;
+		return handle_missed_event(MISSED_SCHED_EVENT);
 	event->ts = bpf_ktime_get_boot_ns();
-	event->type = softirq ? EVENT_SOFTIRQ : EVENT_IRQ;
-	event->tgidpid = key;
 	event->cpu = bpf_get_smp_processor_id();
-	event->extra = *start_ns;
-	bpf_probe_read_kernel_str(event->comm, sizeof(event->comm), tsk->comm);
+	event->prev_tgidpid = task_key(tsk);
+	event->target_cpu = vec_nr;
+	event->type = enter ? SCHED_SOFTIRQ_ENTER : SCHED_SOFTIRQ_EXIT;
 	bpf_ringbuf_submit(event, 0);
-	bpf_map_delete_elem(&irq_events, &key);
-	*/
 	return 0;
 }
 
@@ -521,22 +541,11 @@ int handle__sched_waking(u64 *ctx)
 SEC("tp_btf/irq_handler_entry")
 int handle__irq_handler_entry(u64 *ctx)
 {
-#if 0
 	/* TP_PROTO(int irq, struct irqaction *action) */
 	int irq = ctx[0];
-	struct irqaction *action = (void *)ctx[1];
-	struct task_event *event;
-	event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
-	if (!event)
-		return 0;
-	event->ts = bpf_ktime_get_boot_ns();
-	event->type = IRQ_ENTRY;
-	event->cpu = bpf_get_smp_processor_id();
-	event->target_cpu = irq;
-	bpf_probe_read_kernel_str(event->prev_comm, sizeof(event->comm), action->name);
-	bpf_ringbuf_submit(event, 0);
-#endif
-	return 0;
+	struct irqaction *action = (struct irqaction *)ctx[1];
+
+	return trace_irq_event(action, irq, 0, true);
 }
 
 SEC("tp_btf/irq_handler_exit")
@@ -544,23 +553,26 @@ int handle__irq_handler_exit(u64 *ctx)
 {
 	/* TP_PROTO(int irq, struct irqaction *action, int ret) */
 	int irq = ctx[0];
-	struct task_event *event;
+	struct irqaction *action = (struct irqaction *)ctx[1];
+	int ret = ctx[2];
 
-	return trace_irq_exit(false);
+	return trace_irq_event(action, irq, ret, false);
 }
 
 SEC("tp_btf/softirq_entry")
 int handle__softirq_entry(u64 *ctx)
 {
 	/* TP_PROTO(unsigned int vec_nr) */
-	return trace_irq_enter();
+	unsigned int vec_nr = ctx[0];
+	return trace_softirq_event(vec_nr, true);
 }
 
 SEC("tp_btf/softirq_exit")
 int handle__softirq_exit(u64 *ctx)
 {
 	/* TP_PROTO(unsigned int vec_nr) */
-	return trace_irq_exit(true);
+	unsigned int vec_nr = ctx[0];
+	return trace_softirq_event(vec_nr, false);
 }
 
 SEC("usdt")

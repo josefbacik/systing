@@ -29,6 +29,10 @@ use perfetto_protos::ftrace_event::FtraceEvent;
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
 use perfetto_protos::ftrace_event_bundle::FtraceEventBundle;
 use perfetto_protos::interned_data::InternedData;
+use perfetto_protos::irq::{
+    IrqHandlerEntryFtraceEvent, IrqHandlerExitFtraceEvent, SoftirqEntryFtraceEvent,
+    SoftirqExitFtraceEvent,
+};
 use perfetto_protos::process_descriptor::ProcessDescriptor;
 use perfetto_protos::profile_common::{Callstack, Frame, InternedString, Mapping};
 use perfetto_protos::profile_packet::PerfSample;
@@ -49,6 +53,7 @@ mod systing {
     include!(concat!(env!("OUT_DIR"), "/systing_system.skel.rs"));
 }
 
+use systing::types::event_type;
 use systing::types::stack_event;
 use systing::types::task_event;
 use systing::types::usdt_event;
@@ -210,9 +215,23 @@ impl TaskEventBuilder for FtraceEvent {
         ftrace_event.set_pid(event.prev_tgidpid as u32);
         ftrace_event.set_timestamp(event.ts);
         match event.r#type {
-            systing::types::event_type::SCHED_WAKEUP_NEW => {
+            event_type::SCHED_WAKEUP_NEW => {
                 ftrace_event
                     .set_sched_wakeup_new(SchedWakeupNewFtraceEvent::from_task_event(event));
+            }
+            event_type::SCHED_IRQ_EXIT => {
+                ftrace_event
+                    .set_irq_handler_exit(IrqHandlerExitFtraceEvent::from_task_event(event));
+            }
+            event_type::SCHED_IRQ_ENTER => {
+                ftrace_event
+                    .set_irq_handler_entry(IrqHandlerEntryFtraceEvent::from_task_event(event));
+            }
+            event_type::SCHED_SOFTIRQ_EXIT => {
+                ftrace_event.set_softirq_exit(SoftirqExitFtraceEvent::from_task_event(event));
+            }
+            event_type::SCHED_SOFTIRQ_ENTER => {
+                ftrace_event.set_softirq_entry(SoftirqEntryFtraceEvent::from_task_event(event));
             }
             _ => {}
         }
@@ -229,6 +248,41 @@ impl TaskEventBuilder for SchedWakeupNewFtraceEvent {
         sched_wakeup_new.set_prio(event.next_prio as i32);
         sched_wakeup_new.set_target_cpu(event.target_cpu as i32);
         sched_wakeup_new
+    }
+}
+
+impl TaskEventBuilder for IrqHandlerExitFtraceEvent {
+    fn from_task_event(event: &task_event) -> Self {
+        let mut irq_handler_exit = IrqHandlerExitFtraceEvent::default();
+        irq_handler_exit.set_irq(event.target_cpu as i32);
+        irq_handler_exit.set_ret(event.next_prio as i32);
+        irq_handler_exit
+    }
+}
+
+impl TaskEventBuilder for IrqHandlerEntryFtraceEvent {
+    fn from_task_event(event: &task_event) -> Self {
+        let mut irq_handler_entry = IrqHandlerEntryFtraceEvent::default();
+        let name_cstr = CStr::from_bytes_until_nul(&event.prev_comm).unwrap();
+        irq_handler_entry.set_name(name_cstr.to_str().unwrap().to_string());
+        irq_handler_entry.set_irq(event.target_cpu as i32);
+        irq_handler_entry
+    }
+}
+
+impl TaskEventBuilder for SoftirqExitFtraceEvent {
+    fn from_task_event(event: &task_event) -> Self {
+        let mut softirq_exit = SoftirqExitFtraceEvent::default();
+        softirq_exit.set_vec(event.target_cpu);
+        softirq_exit
+    }
+}
+
+impl TaskEventBuilder for SoftirqEntryFtraceEvent {
+    fn from_task_event(event: &task_event) -> Self {
+        let mut softirq_entry = SoftirqEntryFtraceEvent::default();
+        softirq_entry.set_vec(event.target_cpu);
+        softirq_entry
     }
 }
 
@@ -258,7 +312,7 @@ impl LocalCompactSched {
             self.compact_sched.intern_table.push(comm);
             (self.compact_sched.intern_table.len() as u32) - 1
         });
-        if event.r#type == systing::types::event_type::SCHED_WAKING {
+        if event.r#type == event_type::SCHED_WAKING {
             self.compact_sched
                 .waking_timestamp
                 .push(event.ts - self.last_waking_ts);
@@ -295,15 +349,15 @@ impl EventRecorder {
     fn record_event(&mut self, event: &task_event) {
         // SCHED_SWITCH and SCHED_WAKING are handled in compact sched events.
         // We skip SCHED_WAKEUP because we're just using that for runqueue tracking.
-        if event.r#type == systing::types::event_type::SCHED_SWITCH
-            || event.r#type == systing::types::event_type::SCHED_WAKING
+        if event.r#type == event_type::SCHED_SWITCH
+            || event.r#type == event_type::SCHED_WAKING
         {
             let compact_sched = self
                 .compact_sched
                 .entry(event.cpu)
                 .or_insert_with(LocalCompactSched::default);
             compact_sched.add_task_event(event);
-        } else if event.r#type != systing::types::event_type::SCHED_WAKEUP {
+        } else if event.r#type != event_type::SCHED_WAKEUP {
             let ftrace_event = FtraceEvent::from_task_event(&event);
             let cpu_event = self.events.entry(event.cpu).or_insert_with(BTreeMap::new);
             cpu_event.insert(event.ts, ftrace_event);
@@ -312,11 +366,11 @@ impl EventRecorder {
         // We want to keep a running count of the per-cpu runqueue size. We could do this
         // inside of BPF, but that's a map lookup and runnning counter, so we'll just keep the
         // complexity here instead of adding it to the BPF hook.
-        if event.r#type == systing::types::event_type::SCHED_SWITCH
-            || event.r#type == systing::types::event_type::SCHED_WAKEUP
-            || event.r#type == systing::types::event_type::SCHED_WAKEUP_NEW
+        if event.r#type == event_type::SCHED_SWITCH
+            || event.r#type == event_type::SCHED_WAKEUP
+            || event.r#type == event_type::SCHED_WAKEUP_NEW
         {
-            let cpu = if event.r#type == systing::types::event_type::SCHED_SWITCH {
+            let cpu = if event.r#type == event_type::SCHED_SWITCH {
                 event.cpu as i32
             } else {
                 event.target_cpu as i32
@@ -324,7 +378,7 @@ impl EventRecorder {
             let rq = self.runqueue.entry(cpu).or_insert_with(Vec::new);
             let count = self.rq_counters.entry(cpu).or_insert(0);
 
-            if event.r#type == systing::types::event_type::SCHED_SWITCH {
+            if event.r#type == event_type::SCHED_SWITCH {
                 // If we haven't seen a wakeup event yet we could have a runqueue size of 0, so
                 // we need to make sure we don't go negative.
                 if *count > 0 {
@@ -341,7 +395,7 @@ impl EventRecorder {
         }
 
         // SCHED_SWITCH is going to have latency for this CPU and TGIDPID
-        if event.r#type == systing::types::event_type::SCHED_SWITCH && event.latency > 0 {
+        if event.r#type == event_type::SCHED_SWITCH && event.latency > 0 {
             let cpu = event.cpu;
             let lat = self.cpu_latencies.entry(cpu).or_insert_with(Vec::new);
             let plat = self
