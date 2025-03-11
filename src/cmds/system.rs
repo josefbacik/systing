@@ -349,9 +349,7 @@ impl EventRecorder {
     fn record_event(&mut self, event: &task_event) {
         // SCHED_SWITCH and SCHED_WAKING are handled in compact sched events.
         // We skip SCHED_WAKEUP because we're just using that for runqueue tracking.
-        if event.r#type == event_type::SCHED_SWITCH
-            || event.r#type == event_type::SCHED_WAKING
-        {
+        if event.r#type == event_type::SCHED_SWITCH || event.r#type == event_type::SCHED_WAKING {
             let compact_sched = self
                 .compact_sched
                 .entry(event.cpu)
@@ -412,6 +410,14 @@ impl EventRecorder {
                 ts: event.ts,
                 count: event.latency as i64,
             });
+        }
+
+        if event.r#type == event_type::SCHED_SOFTIRQ_EXIT
+            || event.r#type == event_type::SCHED_IRQ_EXIT
+            || event.r#type == event_type::SCHED_IRQ_ENTER
+            || event.r#type == event_type::SCHED_SOFTIRQ_ENTER
+        {
+            return;
         }
 
         let tgid = (event.prev_tgidpid >> 32) as i32;
