@@ -46,6 +46,11 @@ enum stack_event_type {
 	STACK_RUNNING,
 };
 
+enum cache_event_type {
+	CACHE_MISS,
+	CACHE_HIT,
+};
+
 /*
  * sched_switch is the largest event, for the smaller events we just use prev_*
  * for the values, and things are left uninitialized.
@@ -106,6 +111,14 @@ struct irq_event {
 	u8 comm[TASK_COMM_LEN];
 };
 
+struct cache_counter_event {
+	u64 ts;
+	u64 tgidpid;
+	u64 value;
+	enum cache_event_type type;
+	u32 cpu;
+};
+
 /*
  * Dummy instance to get skeleton to generate definition for
  * `struct task_event`
@@ -113,9 +126,11 @@ struct irq_event {
 struct task_event _event = {0};
 struct usdt_event _usdt_event = {0};
 struct stack_event _stack_event = {0};
+struct cache_counter_event _cache_counter_event = {0};
 enum event_type _type = SCHED_SWITCH;
 enum usdt_arg_type _usdt_type = ARG_NONE;
 enum stack_event_type _stack_type = STACK_SLEEP;
+enum cache_event_type _cache_type = CACHE_MISS;
 bool tracing_enabled = true;
 
 struct {
@@ -149,11 +164,12 @@ struct {
 #define MISSED_SCHED_EVENT 0
 #define MISSED_STACK_EVENT 1
 #define MISSED_USDT_EVENT 2
+#define MISSED_CACHE_EVENT 3
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
 	__type(value, u64);
-	__uint(max_entries, 3);
+	__uint(max_entries, 4);
 } missed_events SEC(".maps");
 
 struct ringbuf_map {
@@ -179,6 +195,18 @@ struct stack_ringbuf_map {
   ringbuf_stack_events_node2 SEC(".maps"), ringbuf_stack_events_node3 SEC(".maps"),
   ringbuf_stack_events_node4 SEC(".maps"), ringbuf_stack_events_node5 SEC(".maps"),
   ringbuf_stack_events_node6 SEC(".maps"), ringbuf_stack_events_node7 SEC(".maps");
+
+struct cache_counter_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
+} ringbuf_cache_counter_events_node0 SEC(".maps"),
+	ringbuf_cache_counter_events_node1 SEC(".maps"),
+	ringbuf_cache_counter_events_node2 SEC(".maps"),
+	ringbuf_cache_counter_events_node3 SEC(".maps"),
+	ringbuf_cache_counter_events_node4 SEC(".maps"),
+	ringbuf_cache_counter_events_node5 SEC(".maps"),
+	ringbuf_cache_counter_events_node6 SEC(".maps"),
+	ringbuf_cache_counter_events_node7 SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
@@ -234,6 +262,24 @@ struct {
 	},
 };
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS);
+	__type(key, u32);
+	__array(values, struct cache_counter_ringbuf_map);
+} cache_counter_ringbufs SEC(".maps") = {
+	.values = {
+		&ringbuf_cache_counter_events_node0,
+		&ringbuf_cache_counter_events_node1,
+		&ringbuf_cache_counter_events_node2,
+		&ringbuf_cache_counter_events_node3,
+		&ringbuf_cache_counter_events_node4,
+		&ringbuf_cache_counter_events_node5,
+		&ringbuf_cache_counter_events_node6,
+		&ringbuf_cache_counter_events_node7,
+	},
+};
+
 static __always_inline
 struct task_event *reserve_task_event(void)
 {
@@ -268,6 +314,18 @@ struct stack_event *reserve_stack_event(void)
 	if (!rb)
 		return NULL;
 	return bpf_ringbuf_reserve(rb, sizeof(struct stack_event), 0);
+}
+
+static __always_inline
+struct cache_counter_event *reserve_cache_counter_event(void)
+{
+	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&cache_counter_ringbufs, &node);
+	if (!rb)
+		return NULL;
+	return bpf_ringbuf_reserve(rb, sizeof(struct cache_counter_event), 0);
 }
 
 static __always_inline
@@ -618,11 +676,42 @@ int handle__usdt(u64 *ctx)
 }
 
 SEC("perf_event")
-int handle__perf_event(void *ctx)
+int handle__perf_event_clock(void *ctx)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	emit_stack_event(ctx, task, STACK_RUNNING);
 	return 0;
+}
+
+static __always_inline
+int handle_cache_event(struct bpf_perf_event_data *ctx, enum cache_event_type type)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	struct cache_counter_event *event = reserve_cache_counter_event();
+	if (!event)
+		return handle_missed_event(MISSED_CACHE_EVENT);
+	event->ts = bpf_ktime_get_boot_ns();
+	event->tgidpid = task_key(task);
+	event->cpu = bpf_get_smp_processor_id();
+	event->type = type;
+	event->value = ctx->sample_period;
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
+SEC("perf_event")
+int handle__perf_event_cache_miss(struct bpf_perf_event_data *ctx)
+{
+	return handle_cache_event(ctx, CACHE_MISS);
+}
+
+SEC("perf_event")
+int handle__perf_event_cache_hit(struct bpf_perf_event_data *ctx)
+{
+	return handle_cache_event(ctx, CACHE_HIT);
 }
 
 char LICENSE[] SEC("license") = "GPL";

@@ -2,10 +2,10 @@ use anyhow::bail;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
+mod cmds;
 pub mod perfetto;
 pub mod symbolize;
 pub mod syscall;
-mod cmds;
 
 #[derive(Debug, Parser)]
 struct Command {
@@ -77,6 +77,8 @@ pub struct SystemOpts {
     trace_event_pid: Vec<u32>,
     #[arg(short, long)]
     sw_event: bool,
+    #[arg(long)]
+    cache_stats: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -91,7 +93,6 @@ fn bump_memlock_rlimit() -> Result<()> {
 
     Ok(())
 }
-
 
 fn main() -> Result<()> {
     let opts = Command::parse();

@@ -53,6 +53,8 @@ mod systing {
     include!(concat!(env!("OUT_DIR"), "/systing_system.skel.rs"));
 }
 
+use systing::types::cache_counter_event;
+use systing::types::cache_event_type;
 use systing::types::event_type;
 use systing::types::stack_event;
 use systing::types::task_event;
@@ -61,6 +63,7 @@ use systing::types::usdt_event;
 unsafe impl Plain for task_event {}
 unsafe impl Plain for usdt_event {}
 unsafe impl Plain for stack_event {}
+unsafe impl Plain for cache_counter_event {}
 
 struct TrackCounter {
     ts: u64,
@@ -126,10 +129,17 @@ struct StackRecorder {
 }
 
 #[derive(Default)]
+struct CacheCounterRecorder {
+    hits: HashMap<u64, Vec<TrackCounter>>,
+    misses: HashMap<u64, Vec<TrackCounter>>,
+}
+
+#[derive(Default)]
 struct SessionRecorder {
     event_recorder: Mutex<EventRecorder>,
     usdt_recorder: Mutex<UsdtRecorder>,
     stack_recorder: Mutex<StackRecorder>,
+    cache_counter_recorder: Mutex<CacheCounterRecorder>,
 }
 
 fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -847,6 +857,96 @@ impl UsdtRecorder {
     }
 }
 
+impl CacheCounterRecorder {
+    fn record_cache_counter_event(&mut self, event: &cache_counter_event) {
+        let entry = if event.r#type == cache_event_type::CACHE_HIT {
+            self.hits.entry(event.tgidpid).or_insert_with(Vec::new)
+        } else {
+            self.misses.entry(event.tgidpid).or_insert_with(Vec::new)
+        };
+        entry.push(TrackCounter {
+            ts: event.ts,
+            count: event.value as i64,
+        });
+    }
+
+    fn generate_trace(
+        &self,
+        pid_uuids: &HashMap<i32, u64>,
+        thread_uuids: &HashMap<i32, u64>,
+        rng: &mut dyn rand::RngCore,
+    ) -> Vec<TracePacket> {
+        let mut packets = Vec::new();
+
+        // Populate the cache counter events
+        for (tgidpid, counters) in self.hits.iter() {
+            let pid = *tgidpid as i32;
+            let tgid = (*tgidpid >> 32) as i32;
+
+            let desc_uuid = rng.next_u64();
+            let uuid = if pid == tgid {
+                *pid_uuids.get(&tgid).unwrap()
+            } else {
+                *thread_uuids.get(&pid).unwrap()
+            };
+
+            let mut desc = TrackDescriptor::default();
+            desc.set_name("Cache hit".to_string());
+            desc.set_uuid(desc_uuid);
+            desc.set_parent_uuid(uuid);
+
+            let mut counter_desc = CounterDescriptor::default();
+            counter_desc.set_unit(Unit::UNIT_COUNT);
+            counter_desc.set_is_incremental(false);
+
+            desc.counter = Some(counter_desc).into();
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packets.push(packet);
+
+            let seq = rng.next_u32();
+            for event in counters.iter() {
+                packets.push(event.to_track_event(desc_uuid, seq));
+            }
+        }
+
+        for (tgidpid, counters) in self.misses.iter() {
+            let pid = *tgidpid as i32;
+            let tgid = (*tgidpid >> 32) as i32;
+
+            let desc_uuid = rng.next_u64();
+            let uuid = if pid == tgid {
+                *pid_uuids.get(&tgid).unwrap()
+            } else {
+                *thread_uuids.get(&pid).unwrap()
+            };
+
+            let mut desc = TrackDescriptor::default();
+            desc.set_name("Cache miss".to_string());
+            desc.set_uuid(desc_uuid);
+            desc.set_parent_uuid(uuid);
+
+            let mut counter_desc = CounterDescriptor::default();
+            counter_desc.set_unit(Unit::UNIT_COUNT);
+            counter_desc.set_is_incremental(false);
+
+            desc.counter = Some(counter_desc).into();
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packets.push(packet);
+
+            let seq = rng.next_u32();
+            for event in counters.iter() {
+                packets.push(event.to_track_event(desc_uuid, seq));
+            }
+        }
+
+        packets
+    }
+}
+
 fn create_ring<'a, T>(
     map: &dyn libbpf_rs::MapCore,
     tx: Sender<T>,
@@ -864,7 +964,11 @@ where
     builder.build()
 }
 
-fn init_perf_monitor(freq: u64, sw_event: bool) -> Result<Vec<i32>, libbpf_rs::Error> {
+fn init_perf_monitor(
+    freq: u64,
+    perf_event_type: u32,
+    event: u64,
+) -> Result<Vec<i32>, libbpf_rs::Error> {
     let nprocs = libbpf_rs::num_possible_cpus().unwrap();
     let buf: Vec<u8> = vec![0; mem::size_of::<syscall::perf_event_attr>()];
     let mut attr = unsafe {
@@ -872,17 +976,9 @@ fn init_perf_monitor(freq: u64, sw_event: bool) -> Result<Vec<i32>, libbpf_rs::E
             buf.leak().as_mut_ptr() as *mut syscall::perf_event_attr
         )
     };
-    attr._type = if sw_event {
-        syscall::PERF_TYPE_SOFTWARE
-    } else {
-        syscall::PERF_TYPE_HARDWARE
-    };
+    attr._type = perf_event_type;
     attr.size = mem::size_of::<syscall::perf_event_attr>() as u32;
-    attr.config = if sw_event {
-        syscall::PERF_COUNT_SW_CPU_CLOCK
-    } else {
-        syscall::PERF_COUNT_HW_CPU_CYCLES
-    };
+    attr.config = event;
     attr.sample.sample_freq = freq;
     attr.flags = 1 << 10; // freq = 1i
     let mut pidfds = Vec::new();
@@ -897,7 +993,7 @@ fn init_perf_monitor(freq: u64, sw_event: bool) -> Result<Vec<i32>, libbpf_rs::E
                 break;
             }
 
-            if !sw_event && os_error.kind() == io::ErrorKind::NotFound {
+            if os_error.kind() == io::ErrorKind::NotFound {
                 error_context = "Failed to open perf event.\n\
                                 Try running the profile example with the `--sw-event` option.";
             }
@@ -939,8 +1035,13 @@ fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
 }
 
 pub fn system(opts: SystemOpts) -> Result<()> {
-    let recorder = Arc::new(SessionRecorder::default());
+    if opts.cache_stats && opts.sw_event {
+        Err(anyhow::anyhow!(
+            "Cache stats are not supported with software events"
+        ))?;
+    }
 
+    let recorder = Arc::new(SessionRecorder::default());
     recorder.event_recorder.lock().unwrap().snapshot_clocks();
     {
         let mut skel_builder = systing::SystingSystemSkelBuilder::default();
@@ -1028,6 +1129,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         let (event_tx, event_rx) = channel();
         let (usdt_tx, usdt_rx) = channel();
         let (stack_tx, stack_rx) = channel();
+        let (cache_tx, cache_rx) = channel();
 
         let object = skel.object();
         for map in object.maps() {
@@ -1041,6 +1143,11 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             } else if name.starts_with("ringbuf_stack") {
                 let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
                 rings.push(ring);
+            } else if name.starts_with("ringbuf_cache_counter") {
+                if opts.cache_stats {
+                    let ring = create_ring::<cache_counter_event>(&map, cache_tx.clone())?;
+                    rings.push(ring);
+                }
             }
         }
 
@@ -1048,6 +1155,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         drop(event_tx);
         drop(usdt_tx);
         drop(stack_tx);
+        drop(cache_tx);
 
         let mut recv_threads = Vec::new();
         let session_recorder = recorder.clone();
@@ -1098,9 +1206,63 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             }
             0
         }));
+        if opts.cache_stats {
+            let session_recorder = recorder.clone();
+            recv_threads.push(thread::spawn(move || {
+                loop {
+                    let res = cache_rx.recv();
+                    if res.is_err() {
+                        break;
+                    }
+                    let event = res.unwrap();
+                    session_recorder
+                        .cache_counter_recorder
+                        .lock()
+                        .unwrap()
+                        .record_cache_counter_event(&event);
+                }
+                0
+            }));
+        } else {
+            drop(cache_rx);
+        }
 
-        let pefds = init_perf_monitor(1000, opts.sw_event)?;
-        let _links = attach_perf_event(&pefds, &skel.progs.handle__perf_event);
+        let pefds = if opts.sw_event {
+            init_perf_monitor(
+                1000,
+                syscall::PERF_TYPE_SOFTWARE,
+                syscall::PERF_COUNT_SW_CPU_CLOCK,
+            )?
+        } else {
+            init_perf_monitor(
+                1000,
+                syscall::PERF_TYPE_HARDWARE,
+                syscall::PERF_COUNT_HW_CPU_CYCLES,
+            )?
+        };
+        let _links = attach_perf_event(&pefds, &skel.progs.handle__perf_event_clock);
+        let cache_hit_fds = if opts.cache_stats {
+            init_perf_monitor(
+                1000,
+                syscall::PERF_TYPE_HARDWARE,
+                syscall::PERF_COUNT_HW_CACHE_REFERENCES,
+            )?
+        } else {
+            Vec::new()
+        };
+        let _cache_hit_links =
+            attach_perf_event(&cache_hit_fds, &skel.progs.handle__perf_event_cache_hit);
+        let cache_miss_fds = if opts.cache_stats {
+            init_perf_monitor(
+                1000,
+                syscall::PERF_TYPE_HARDWARE,
+                syscall::PERF_COUNT_HW_CACHE_MISSES,
+            )?
+        } else {
+            Vec::new()
+        };
+        let _cache_miss_links =
+            attach_perf_event(&cache_miss_fds, &skel.progs.handle__perf_event_cache_miss);
         skel.attach()?;
 
         // Attach any usdt's that we may have
@@ -1168,6 +1330,9 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         println!("Missed sched events: {}", dump_missed_events(&skel, 0));
         println!("Missed stack events: {}", dump_missed_events(&skel, 1));
         println!("Missed USDT events: {}", dump_missed_events(&skel, 2));
+        if opts.cache_stats {
+            println!("Missed cache events: {}", dump_missed_events(&skel, 3));
+        }
     }
 
     println!("Generating trace...");
@@ -1196,6 +1361,13 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             &thread_uuids,
             &mut rng,
         ));
+    trace.packet.extend(
+        recorder
+            .cache_counter_recorder
+            .lock()
+            .unwrap()
+            .generate_trace(&pid_uuids, &thread_uuids, &mut rng),
+    );
     let mut file = std::fs::File::create("trace.pb")?;
     trace.write_to_writer(&mut file)?;
     Ok(())

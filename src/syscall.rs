@@ -29,6 +29,7 @@ pub union bp_2_un {
 }
 
 #[repr(C)]
+#[allow(non_camel_case_types)]
 pub struct perf_event_attr {
     pub _type: u32,
     pub size: u32,
@@ -55,7 +56,11 @@ pub struct perf_event_attr {
 
 pub const PERF_TYPE_HARDWARE: u32 = 0;
 pub const PERF_TYPE_SOFTWARE: u32 = 1;
+
 pub const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
+pub const PERF_COUNT_HW_CACHE_REFERENCES: u64 = 2;
+pub const PERF_COUNT_HW_CACHE_MISSES: u64 = 3;
+
 pub const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
 
 extern "C" {
