@@ -115,6 +115,8 @@ struct EventRecorder {
     cpu_latencies: HashMap<u32, Vec<TrackCounter>>,
     process_latencies: HashMap<u64, Vec<TrackCounter>>,
     rq_counters: HashMap<i32, i64>,
+    cpu_sched_stats: bool,
+    process_sched_stats: bool,
 }
 
 #[derive(Default)]
@@ -374,9 +376,10 @@ impl EventRecorder {
         // We want to keep a running count of the per-cpu runqueue size. We could do this
         // inside of BPF, but that's a map lookup and runnning counter, so we'll just keep the
         // complexity here instead of adding it to the BPF hook.
-        if event.r#type == event_type::SCHED_SWITCH
-            || event.r#type == event_type::SCHED_WAKEUP
-            || event.r#type == event_type::SCHED_WAKEUP_NEW
+        if self.cpu_sched_stats
+            && (event.r#type == event_type::SCHED_SWITCH
+                || event.r#type == event_type::SCHED_WAKEUP
+                || event.r#type == event_type::SCHED_WAKEUP_NEW)
         {
             let cpu = if event.r#type == event_type::SCHED_SWITCH {
                 event.cpu as i32
@@ -403,7 +406,8 @@ impl EventRecorder {
         }
 
         // SCHED_SWITCH is going to have latency for this CPU and TGIDPID
-        if event.r#type == event_type::SCHED_SWITCH && event.latency > 0 {
+        if self.process_sched_stats && event.r#type == event_type::SCHED_SWITCH && event.latency > 0
+        {
             let cpu = event.cpu;
             let lat = self.cpu_latencies.entry(cpu).or_insert_with(Vec::new);
             let plat = self
@@ -1070,6 +1074,12 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                     map.set_max_entries(size)?;
                 }
             }
+        }
+        if opts.process_sched_stats {
+            recorder.event_recorder.lock().unwrap().process_sched_stats = true;
+        }
+        if opts.cpu_sched_stats {
+            recorder.event_recorder.lock().unwrap().cpu_sched_stats = true;
         }
 
         let mut rng = rand::rng();
