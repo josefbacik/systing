@@ -39,6 +39,7 @@ enum event_type {
 	SCHED_SOFTIRQ_EXIT,
 	SCHED_IRQ_ENTER,
 	SCHED_IRQ_EXIT,
+	SCHED_PROCESS_EXIT,
 };
 
 enum stack_event_type {
@@ -570,6 +571,28 @@ int BPF_PROG(systing_sched_waking, struct task_struct *task)
 	if (!trace_task(cur) && !trace_task(task))
 		return 0;
 	return handle_wakeup(cur, task, SCHED_WAKING);
+}
+
+SEC("tp_btf/sched_process_exit")
+int BPF_PROG(systing_sched_process_exit, struct task_struct *task)
+{
+	struct task_event *event;
+	u64 ts = bpf_ktime_get_boot_ns();
+
+	if (!trace_task(task))
+		return 0;
+
+	event = reserve_task_event();
+	if (!event)
+		return handle_missed_event(MISSED_SCHED_EVENT);
+	event->ts = ts;
+	event->type = SCHED_PROCESS_EXIT;
+	event->cpu = bpf_get_smp_processor_id();
+	event->prev_tgidpid = task_key(task);
+	event->prev_prio = task->prio;
+	record_task_name(task, event->prev_comm);
+	bpf_ringbuf_submit(event, 0);
+	return 0;
 }
 
 SEC("tp_btf/irq_handler_entry")

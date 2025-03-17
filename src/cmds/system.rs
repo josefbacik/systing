@@ -36,7 +36,7 @@ use perfetto_protos::irq::{
 use perfetto_protos::process_descriptor::ProcessDescriptor;
 use perfetto_protos::profile_common::{Callstack, Frame, InternedString, Mapping};
 use perfetto_protos::profile_packet::PerfSample;
-use perfetto_protos::sched::SchedWakeupNewFtraceEvent;
+use perfetto_protos::sched::{SchedProcessExitFtraceEvent, SchedWakeupNewFtraceEvent};
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace::Trace;
 use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
@@ -245,6 +245,10 @@ impl TaskEventBuilder for FtraceEvent {
             event_type::SCHED_SOFTIRQ_ENTER => {
                 ftrace_event.set_softirq_entry(SoftirqEntryFtraceEvent::from_task_event(event));
             }
+            event_type::SCHED_PROCESS_EXIT => {
+                ftrace_event
+                    .set_sched_process_exit(SchedProcessExitFtraceEvent::from_task_event(event));
+            }
             _ => {}
         }
         ftrace_event
@@ -295,6 +299,20 @@ impl TaskEventBuilder for SoftirqEntryFtraceEvent {
         let mut softirq_entry = SoftirqEntryFtraceEvent::default();
         softirq_entry.set_vec(event.target_cpu);
         softirq_entry
+    }
+}
+
+impl TaskEventBuilder for SchedProcessExitFtraceEvent {
+    fn from_task_event(event: &task_event) -> Self {
+        let pid = event.prev_tgidpid as i32;
+        let tgid = (event.prev_tgidpid >> 32) as i32;
+        let name_cstr = CStr::from_bytes_until_nul(&event.prev_comm).unwrap();
+        let mut sched_process_exit = SchedProcessExitFtraceEvent::default();
+        sched_process_exit.set_pid(pid);
+        sched_process_exit.set_tgid(tgid);
+        sched_process_exit.set_prio(event.prev_prio as i32);
+        sched_process_exit.set_comm(name_cstr.to_str().unwrap().to_string());
+        sched_process_exit
     }
 }
 
@@ -457,6 +475,10 @@ impl EventRecorder {
                 thread_entry.set_pid(tgid);
                 thread_entry.set_thread_name(comm.to_str().unwrap().to_string());
             }
+        }
+
+        if event.r#type == event_type::SCHED_PROCESS_EXIT {
+            return;
         }
 
         let pid = event.next_tgidpid as i32;
