@@ -1142,21 +1142,21 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         let (cache_tx, cache_rx) = channel();
 
         let object = skel.object();
-        for map in object.maps() {
+        for (i, map) in object.maps().enumerate() {
             let name = map.name().to_str().unwrap();
             if name.starts_with("ringbuf_events") {
                 let ring = create_ring::<task_event>(&map, event_tx.clone())?;
-                rings.push(ring);
+                rings.push((format!("events_{}", i).to_string(), ring));
             } else if name.starts_with("ringbuf_usdt") {
                 let ring = create_ring::<usdt_event>(&map, usdt_tx.clone())?;
-                rings.push(ring);
+                rings.push((name.to_string(), ring));
             } else if name.starts_with("ringbuf_stack") {
                 let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
-                rings.push(ring);
+                rings.push((name.to_string(), ring));
             } else if name.starts_with("ringbuf_cache_counter") {
                 if opts.cache_stats {
                     let ring = create_ring::<cache_counter_event>(&map, cache_tx.clone())?;
-                    rings.push(ring);
+                    rings.push((name.to_string(), ring));
                 }
             }
         }
@@ -1169,70 +1169,86 @@ pub fn system(opts: SystemOpts) -> Result<()> {
 
         let mut recv_threads = Vec::new();
         let session_recorder = recorder.clone();
-        recv_threads.push(thread::spawn(move || {
-            loop {
-                let res = event_rx.recv();
-                if res.is_err() {
-                    break;
-                }
-                let event = res.unwrap();
-                session_recorder
-                    .event_recorder
-                    .lock()
-                    .unwrap()
-                    .record_event(&event);
-            }
-            0
-        }));
+        recv_threads.push(
+            thread::Builder::new()
+                .name("sched_recorder".to_string())
+                .spawn(move || {
+                    loop {
+                        let res = event_rx.recv();
+                        if res.is_err() {
+                            break;
+                        }
+                        let event = res.unwrap();
+                        session_recorder
+                            .event_recorder
+                            .lock()
+                            .unwrap()
+                            .record_event(&event);
+                    }
+                    0
+                })?,
+        );
         let session_recorder = recorder.clone();
-        recv_threads.push(thread::spawn(move || {
-            loop {
-                let res = usdt_rx.recv();
-                if res.is_err() {
-                    break;
-                }
-                let event = res.unwrap();
-                session_recorder
-                    .usdt_recorder
-                    .lock()
-                    .unwrap()
-                    .record_usdt_event(&event);
-            }
-            0
-        }));
+        recv_threads.push(
+            thread::Builder::new()
+                .name("usdt_recorder".to_string())
+                .spawn(move || {
+                    loop {
+                        let res = usdt_rx.recv();
+                        if res.is_err() {
+                            break;
+                        }
+                        let event = res.unwrap();
+                        session_recorder
+                            .usdt_recorder
+                            .lock()
+                            .unwrap()
+                            .record_usdt_event(&event);
+                    }
+                    0
+                })?,
+        );
         let session_recorder = recorder.clone();
-        recv_threads.push(thread::spawn(move || {
-            loop {
-                let res = stack_rx.recv();
-                if res.is_err() {
-                    break;
-                }
-                let event = res.unwrap();
-                session_recorder
-                    .stack_recorder
-                    .lock()
-                    .unwrap()
-                    .record_stack_event(&event);
-            }
-            0
-        }));
+        recv_threads.push(
+            thread::Builder::new()
+                .name("stack_recorder".to_string())
+                .spawn(move || {
+                    loop {
+                        let res = stack_rx.recv();
+                        if res.is_err() {
+                            break;
+                        }
+                        let event = res.unwrap();
+                        session_recorder
+                            .stack_recorder
+                            .lock()
+                            .unwrap()
+                            .record_stack_event(&event);
+                    }
+                    0
+                })?,
+        );
         if opts.cache_stats {
             let session_recorder = recorder.clone();
-            recv_threads.push(thread::spawn(move || {
-                loop {
-                    let res = cache_rx.recv();
-                    if res.is_err() {
-                        break;
-                    }
-                    let event = res.unwrap();
-                    session_recorder
-                        .cache_counter_recorder
-                        .lock()
-                        .unwrap()
-                        .record_cache_counter_event(&event);
-                }
-                0
-            }));
+            recv_threads.push(
+                thread::Builder::new()
+                    .name("cache_recorder".to_string())
+                    .spawn(move || {
+                        loop {
+                            let res = cache_rx.recv();
+                            if res.is_err() {
+                                break;
+                            }
+                            let event = res.unwrap();
+                            session_recorder
+                                .cache_counter_recorder
+                                .lock()
+                                .unwrap()
+                                .record_cache_counter_event(&event);
+                        }
+                        0
+                    })?,
+            );
         } else {
             drop(cache_rx);
         }
@@ -1298,9 +1314,9 @@ pub fn system(opts: SystemOpts) -> Result<()> {
 
         let mut threads = Vec::new();
         let thread_done = Arc::new(AtomicBool::new(false));
-        for ring in rings {
+        for (name, ring) in rings {
             let thread_done_clone = thread_done.clone();
-            threads.push(thread::spawn(move || {
+            threads.push(thread::Builder::new().name(name).spawn(move || {
                 loop {
                     if thread_done_clone.load(Ordering::Relaxed) {
                         // Flush whatever is left in the ringbuf
@@ -1313,7 +1329,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                     }
                 }
                 0
-            }));
+            })?);
         }
 
         if opts.duration > 0 {
