@@ -1250,7 +1250,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                 syscall::PERF_COUNT_HW_CPU_CYCLES,
             )?
         };
-        let _links = attach_perf_event(&pefds, &skel.progs.handle__perf_event_clock);
+        let _links = attach_perf_event(&pefds, &skel.progs.systing_perf_event_clock);
         let cache_hit_fds = if opts.cache_stats {
             init_perf_monitor(
                 1000,
@@ -1261,7 +1261,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             Vec::new()
         };
         let _cache_hit_links =
-            attach_perf_event(&cache_hit_fds, &skel.progs.handle__perf_event_cache_hit);
+            attach_perf_event(&cache_hit_fds, &skel.progs.systing_perf_event_cache_hit);
         let cache_miss_fds = if opts.cache_stats {
             init_perf_monitor(
                 1000,
@@ -1272,14 +1272,14 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             Vec::new()
         };
         let _cache_miss_links =
-            attach_perf_event(&cache_miss_fds, &skel.progs.handle__perf_event_cache_miss);
+            attach_perf_event(&cache_miss_fds, &skel.progs.systing_perf_event_cache_miss);
         skel.attach()?;
 
         // Attach any usdt's that we may have
         let mut usdt_links = Vec::new();
         for usdt in usdts {
             for pid in opts.trace_event_pid.iter() {
-                let link = skel.progs.handle__usdt.attach_usdt_with_opts(
+                let link = skel.progs.systing_usdt.attach_usdt_with_opts(
                     *pid as i32,
                     &usdt.path,
                     &usdt.provider,

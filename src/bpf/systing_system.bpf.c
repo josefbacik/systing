@@ -500,7 +500,7 @@ static int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 }
 
 SEC("tp_btf/sched_wakeup")
-int handle__sched_wakeup(u64 *ctx)
+int systing_sched_wakeup(u64 *ctx)
 {
 	/* TP_PROTO(struct task_struct *p, int success) */
 	struct task_struct *task = (struct task_struct *)ctx[0];
@@ -512,7 +512,7 @@ int handle__sched_wakeup(u64 *ctx)
 }
 
 SEC("tp_btf/sched_wakeup_new")
-int handle__sched_wakeup_new(u64 *ctx)
+int systing_sched_wakeup_new(u64 *ctx)
 {
 	/* TP_PROTO(struct task_struct *p) */
 	struct task_struct *task = (void *)ctx[0];
@@ -524,7 +524,7 @@ int handle__sched_wakeup_new(u64 *ctx)
 }
 
 SEC("tp_btf/sched_switch")
-int handle__sched_switch(u64 *ctx)
+int systing_sched_switch(u64 *ctx)
 {
 	/*
 	 * TP_PROTO(bool preempt, struct task_struct *prev,
@@ -572,7 +572,7 @@ int handle__sched_switch(u64 *ctx)
 }
 
 SEC("tp_btf/sched_waking")
-int handle__sched_waking(u64 *ctx)
+int systing_sched_waking(u64 *ctx)
 {
 	/* TP_PROTO(struct task_struct *p) */
 	struct task_struct *task = (struct task_struct *)ctx[0];
@@ -584,7 +584,7 @@ int handle__sched_waking(u64 *ctx)
 }
 
 SEC("tp_btf/irq_handler_entry")
-int handle__irq_handler_entry(u64 *ctx)
+int systing_irq_handler_entry(u64 *ctx)
 {
 	/* TP_PROTO(int irq, struct irqaction *action) */
 	int irq = ctx[0];
@@ -594,7 +594,7 @@ int handle__irq_handler_entry(u64 *ctx)
 }
 
 SEC("tp_btf/irq_handler_exit")
-int handle__irq_handler_exit(u64 *ctx)
+int systing_irq_handler_exit(u64 *ctx)
 {
 	/* TP_PROTO(int irq, struct irqaction *action, int ret) */
 	int irq = ctx[0];
@@ -605,7 +605,7 @@ int handle__irq_handler_exit(u64 *ctx)
 }
 
 SEC("tp_btf/softirq_entry")
-int handle__softirq_entry(u64 *ctx)
+int systing_softirq_entry(u64 *ctx)
 {
 	/* TP_PROTO(unsigned int vec_nr) */
 	unsigned int vec_nr = ctx[0];
@@ -613,7 +613,7 @@ int handle__softirq_entry(u64 *ctx)
 }
 
 SEC("tp_btf/softirq_exit")
-int handle__softirq_exit(u64 *ctx)
+int systing_softirq_exit(u64 *ctx)
 {
 	/* TP_PROTO(unsigned int vec_nr) */
 	unsigned int vec_nr = ctx[0];
@@ -621,7 +621,7 @@ int handle__softirq_exit(u64 *ctx)
 }
 
 SEC("usdt")
-int handle__usdt(u64 *ctx)
+int systing_usdt(u64 *ctx)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 
@@ -663,7 +663,7 @@ int handle__usdt(u64 *ctx)
 }
 
 SEC("perf_event")
-int handle__perf_event_clock(void *ctx)
+int systing_perf_event_clock(void *ctx)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	emit_stack_event(ctx, task, STACK_RUNNING);
@@ -689,13 +689,13 @@ static int handle_cache_event(struct bpf_perf_event_data *ctx, enum cache_event_
 }
 
 SEC("perf_event")
-int handle__perf_event_cache_miss(struct bpf_perf_event_data *ctx)
+int systing_perf_event_cache_miss(struct bpf_perf_event_data *ctx)
 {
 	return handle_cache_event(ctx, CACHE_MISS);
 }
 
 SEC("perf_event")
-int handle__perf_event_cache_hit(struct bpf_perf_event_data *ctx)
+int systing_perf_event_cache_hit(struct bpf_perf_event_data *ctx)
 {
 	return handle_cache_event(ctx, CACHE_HIT);
 }
