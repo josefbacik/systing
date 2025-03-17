@@ -280,8 +280,7 @@ struct {
 	},
 };
 
-static __always_inline
-struct task_event *reserve_task_event(void)
+static struct task_event *reserve_task_event(void)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
 	void *rb;
@@ -292,8 +291,7 @@ struct task_event *reserve_task_event(void)
 	return bpf_ringbuf_reserve(rb, sizeof(struct task_event), 0);
 }
 
-static __always_inline
-struct usdt_event *reserve_usdt_event(void)
+static struct usdt_event *reserve_usdt_event(void)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
 	void *rb;
@@ -304,8 +302,7 @@ struct usdt_event *reserve_usdt_event(void)
 	return bpf_ringbuf_reserve(rb, sizeof(struct usdt_event), 0);
 }
 
-static __always_inline
-struct stack_event *reserve_stack_event(void)
+static struct stack_event *reserve_stack_event(void)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
 	void *rb;
@@ -316,8 +313,7 @@ struct stack_event *reserve_stack_event(void)
 	return bpf_ringbuf_reserve(rb, sizeof(struct stack_event), 0);
 }
 
-static __always_inline
-struct cache_counter_event *reserve_cache_counter_event(void)
+static struct cache_counter_event *reserve_cache_counter_event(void)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
 	void *rb;
@@ -328,8 +324,7 @@ struct cache_counter_event *reserve_cache_counter_event(void)
 	return bpf_ringbuf_reserve(rb, sizeof(struct cache_counter_event), 0);
 }
 
-static __always_inline
-u32 task_cpu(struct task_struct *task)
+static u32 task_cpu(struct task_struct *task)
 {
 	if (bpf_core_field_exists(task->thread_info)) {
 		return task->thread_info.cpu;
@@ -338,21 +333,18 @@ u32 task_cpu(struct task_struct *task)
 	return ti->cpu;
 }
 
-static __always_inline
-u64 task_cg_id(struct task_struct *task)
+static u64 task_cg_id(struct task_struct *task)
 {
 	struct cgroup *cgrp = task->cgroups->dfl_cgrp;
 	return cgrp->kn->id;
 }
 
-static __always_inline
-u64 task_key(struct task_struct *task)
+static u64 task_key(struct task_struct *task)
 {
 	return ((u64)task->tgid << 32) | task->pid;
 }
 
-static __always_inline
-bool trace_task(struct task_struct *task)
+static bool trace_task(struct task_struct *task)
 {
 	if (!tracing_enabled)
 		return false;
@@ -371,8 +363,7 @@ bool trace_task(struct task_struct *task)
 	return true;
 }
 
-static __always_inline
-int handle_missed_event(u32 index)
+static int handle_missed_event(u32 index)
 {
 	u64 *value = bpf_map_lookup_elem(&missed_events, &index);
 	if (value)
@@ -380,8 +371,7 @@ int handle_missed_event(u32 index)
 	return 0;
 }
 
-static __always_inline
-void record_task_name(struct task_struct *task, u8 *comm)
+static void record_task_name(struct task_struct *task, u8 *comm)
 {
 	if (task->flags & PF_WQ_WORKER) {
 		struct kthread *k = bpf_core_cast(task->worker_private, struct kthread);
@@ -393,8 +383,8 @@ void record_task_name(struct task_struct *task, u8 *comm)
 	}
 }
 
-static __always_inline
-void emit_stack_event(void *ctx,struct task_struct *task, enum stack_event_type type)
+static void emit_stack_event(void *ctx,struct task_struct *task,
+			     enum stack_event_type type)
 {
 	struct stack_event *event;
 	long len = 0;
@@ -437,8 +427,7 @@ void emit_stack_event(void *ctx,struct task_struct *task, enum stack_event_type 
 	bpf_ringbuf_submit(event, 0);
 }
 
-static __always_inline
-int trace_irq_event(struct irqaction *action, int irq, int ret, bool enter)
+static int trace_irq_event(struct irqaction *action, int irq, int ret, bool enter)
 {
 	struct task_struct *tsk = (struct task_struct *)bpf_get_current_task_btf();
 
@@ -464,8 +453,7 @@ int trace_irq_event(struct irqaction *action, int irq, int ret, bool enter)
 	return 0;
 }
 
-static __always_inline
-int trace_softirq_event(unsigned int vec_nr, bool enter)
+static int trace_softirq_event(unsigned int vec_nr, bool enter)
 {
 	struct task_struct *tsk = (struct task_struct *)bpf_get_current_task_btf();
 
@@ -485,9 +473,8 @@ int trace_softirq_event(unsigned int vec_nr, bool enter)
 	return 0;
 }
 
-static __always_inline
-int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
-		  enum event_type type)
+static int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
+			 enum event_type type)
 {
 	struct task_event *event;
 	u64 ts = bpf_ktime_get_boot_ns();
@@ -683,8 +670,7 @@ int handle__perf_event_clock(void *ctx)
 	return 0;
 }
 
-static __always_inline
-int handle_cache_event(struct bpf_perf_event_data *ctx, enum cache_event_type type)
+static int handle_cache_event(struct bpf_perf_event_data *ctx, enum cache_event_type type)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	if (!trace_task(task))
