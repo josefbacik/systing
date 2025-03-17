@@ -500,10 +500,8 @@ static int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 }
 
 SEC("tp_btf/sched_wakeup")
-int systing_sched_wakeup(u64 *ctx)
+int BPF_PROG(systing_sched_wakeup, struct task_struct *task, int success)
 {
-	/* TP_PROTO(struct task_struct *p, int success) */
-	struct task_struct *task = (struct task_struct *)ctx[0];
 	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
 
 	if (!trace_task(cur) && !trace_task(task))
@@ -512,10 +510,8 @@ int systing_sched_wakeup(u64 *ctx)
 }
 
 SEC("tp_btf/sched_wakeup_new")
-int systing_sched_wakeup_new(u64 *ctx)
+int BPF_PROG(systing_sched_wakeup_new, struct task_struct *task)
 {
-	/* TP_PROTO(struct task_struct *p) */
-	struct task_struct *task = (void *)ctx[0];
 	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
 
 	if (!trace_task(cur) && !trace_task(task))
@@ -524,14 +520,9 @@ int systing_sched_wakeup_new(u64 *ctx)
 }
 
 SEC("tp_btf/sched_switch")
-int systing_sched_switch(u64 *ctx)
+int BPF_PROG(systing_sched_switch, bool preempt, struct task_struct *prev,
+	     struct task_struct *next)
 {
-	/*
-	 * TP_PROTO(bool preempt, struct task_struct *prev,
-	 *	    struct task_struct *next)
-	 */
-	struct task_struct *prev = (struct task_struct *)ctx[1];
-	struct task_struct *next = (struct task_struct *)ctx[2];
 	struct task_event *event;
 	u64 next_key = task_key(next);
 	u64 ts = bpf_ktime_get_boot_ns();
@@ -572,10 +563,8 @@ int systing_sched_switch(u64 *ctx)
 }
 
 SEC("tp_btf/sched_waking")
-int systing_sched_waking(u64 *ctx)
+int BPF_PROG(systing_sched_waking, struct task_struct *task)
 {
-	/* TP_PROTO(struct task_struct *p) */
-	struct task_struct *task = (struct task_struct *)ctx[0];
 	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
 
 	if (!trace_task(cur) && !trace_task(task))
@@ -584,39 +573,26 @@ int systing_sched_waking(u64 *ctx)
 }
 
 SEC("tp_btf/irq_handler_entry")
-int systing_irq_handler_entry(u64 *ctx)
+int BPF_PROG(systing_irq_handler_entry, int irq, struct irqaction *action)
 {
-	/* TP_PROTO(int irq, struct irqaction *action) */
-	int irq = ctx[0];
-	struct irqaction *action = (struct irqaction *)ctx[1];
-
 	return trace_irq_event(action, irq, 0, true);
 }
 
 SEC("tp_btf/irq_handler_exit")
-int systing_irq_handler_exit(u64 *ctx)
+int BPF_PROG(systing_irq_handler_exit, int irq, struct irqaction *action, int ret)
 {
-	/* TP_PROTO(int irq, struct irqaction *action, int ret) */
-	int irq = ctx[0];
-	struct irqaction *action = (struct irqaction *)ctx[1];
-	int ret = ctx[2];
-
 	return trace_irq_event(action, irq, ret, false);
 }
 
 SEC("tp_btf/softirq_entry")
-int systing_softirq_entry(u64 *ctx)
+int BPF_PROG(systing_softirq_entry, unsigned int vec_nr)
 {
-	/* TP_PROTO(unsigned int vec_nr) */
-	unsigned int vec_nr = ctx[0];
 	return trace_softirq_event(vec_nr, true);
 }
 
 SEC("tp_btf/softirq_exit")
-int systing_softirq_exit(u64 *ctx)
+int BPF_PROG(systing_softirq_exit, unsigned int vec_nr)
 {
-	/* TP_PROTO(unsigned int vec_nr) */
-	unsigned int vec_nr = ctx[0];
 	return trace_softirq_event(vec_nr, false);
 }
 
