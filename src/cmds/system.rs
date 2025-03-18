@@ -54,9 +54,9 @@ mod systing {
     include!(concat!(env!("OUT_DIR"), "/systing_system.skel.rs"));
 }
 
-use systing::types::cache_counter_event;
-use systing::types::cache_event_type;
 use systing::types::event_type;
+use systing::types::perf_counter_event;
+use systing::types::perf_counter_type;
 use systing::types::stack_event;
 use systing::types::task_event;
 use systing::types::usdt_event;
@@ -64,7 +64,7 @@ use systing::types::usdt_event;
 unsafe impl Plain for task_event {}
 unsafe impl Plain for usdt_event {}
 unsafe impl Plain for stack_event {}
-unsafe impl Plain for cache_counter_event {}
+unsafe impl Plain for perf_counter_event {}
 
 struct TrackCounter {
     ts: u64,
@@ -132,9 +132,11 @@ struct StackRecorder {
 }
 
 #[derive(Default)]
-struct CacheCounterRecorder {
-    hits: HashMap<u64, Vec<TrackCounter>>,
-    misses: HashMap<u64, Vec<TrackCounter>>,
+struct PerfCounterRecorder {
+    cache_hits: HashMap<u64, Vec<TrackCounter>>,
+    cache_misses: HashMap<u64, Vec<TrackCounter>>,
+    frontend_stalls: HashMap<u64, Vec<TrackCounter>>,
+    backend_stalls: HashMap<u64, Vec<TrackCounter>>,
 }
 
 #[derive(Default)]
@@ -147,7 +149,7 @@ struct SessionRecorder {
     event_recorder: Mutex<EventRecorder>,
     usdt_recorder: Mutex<UsdtRecorder>,
     stack_recorder: Mutex<StackRecorder>,
-    cache_counter_recorder: Mutex<CacheCounterRecorder>,
+    perf_counter_recorder: Mutex<PerfCounterRecorder>,
     sysinfo_recorder: Mutex<SysinfoRecorder>,
 }
 
@@ -222,6 +224,37 @@ fn stack_to_frames_mapping<'a, I>(
             }
         }
     }
+}
+
+fn generate_pidtgid_track_descriptor(
+    pid_uuids: &HashMap<i32, u64>,
+    thread_uuids: &HashMap<i32, u64>,
+    tgidpid: &u64,
+    name: String,
+    desc_uuid: u64,
+) -> TracePacket {
+    let pid = *tgidpid as i32;
+    let tgid = (*tgidpid >> 32) as i32;
+
+    let uuid = if pid == tgid {
+        *pid_uuids.get(&tgid).unwrap()
+    } else {
+        *thread_uuids.get(&pid).unwrap()
+    };
+
+    let mut desc = TrackDescriptor::default();
+    desc.set_name(name);
+    desc.set_uuid(desc_uuid);
+    desc.set_parent_uuid(uuid);
+
+    let mut counter_desc = CounterDescriptor::default();
+    counter_desc.set_unit(Unit::UNIT_COUNT);
+    counter_desc.set_is_incremental(false);
+    desc.counter = Some(counter_desc).into();
+
+    let mut packet = TracePacket::default();
+    packet.set_track_descriptor(desc);
+    packet
 }
 
 trait TaskEventBuilder {
@@ -623,29 +656,14 @@ impl EventRecorder {
 
         // Populate the per-process latencies
         for (pidtgid, events) in self.process_latencies.iter() {
-            let pid = *pidtgid as i32;
-            let tgid = (*pidtgid >> 32) as i32;
-
             let desc_uuid = rng.next_u64();
-            let uuid = if pid == tgid {
-                *pid_uuids.get(&tgid).unwrap()
-            } else {
-                *thread_uuids.get(&pid).unwrap()
-            };
-
-            let mut counter_desc = CounterDescriptor::default();
-            counter_desc.set_unit(Unit::UNIT_TIME_NS);
-            counter_desc.set_is_incremental(false);
-
-            let mut desc = TrackDescriptor::default();
-            desc.set_name("Wake latency".to_string());
-            desc.set_uuid(desc_uuid);
-            desc.set_parent_uuid(uuid);
-            desc.counter = Some(counter_desc).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            packets.push(packet);
+            packets.push(generate_pidtgid_track_descriptor(
+                pid_uuids,
+                thread_uuids,
+                pidtgid,
+                "Wake latency".to_string(),
+                desc_uuid,
+            ));
 
             let seq = rng.next_u32();
             for event in events.iter() {
@@ -853,24 +871,14 @@ impl UsdtRecorder {
 
         // Populate the USDT events
         for (pidtgid, events) in self.usdt_events.iter() {
-            let pid = *pidtgid as i32;
-            let tgid = (*pidtgid >> 32) as i32;
-
-            let uuid = if pid == tgid {
-                *pid_uuids.get(&tgid).unwrap()
-            } else {
-                *thread_uuids.get(&pid).unwrap()
-            };
-
             let desc_uuid = rng.next_u64();
-            let mut desc = TrackDescriptor::default();
-            desc.set_name("USDT events".to_string());
-            desc.set_uuid(desc_uuid);
-            desc.set_parent_uuid(uuid);
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            packets.push(packet);
+            packets.push(generate_pidtgid_track_descriptor(
+                pid_uuids,
+                thread_uuids,
+                pidtgid,
+                "USDT events".to_string(),
+                desc_uuid,
+            ));
 
             let seq = rng.next_u32();
             for event in events.iter() {
@@ -890,12 +898,26 @@ impl UsdtRecorder {
     }
 }
 
-impl CacheCounterRecorder {
-    fn record_cache_counter_event(&mut self, event: &cache_counter_event) {
-        let entry = if event.r#type == cache_event_type::CACHE_HIT {
-            self.hits.entry(event.tgidpid).or_insert_with(Vec::new)
-        } else {
-            self.misses.entry(event.tgidpid).or_insert_with(Vec::new)
+impl PerfCounterRecorder {
+    fn record_perf_counter_event(&mut self, event: &perf_counter_event) {
+        let entry = match event.r#type {
+            perf_counter_type::PERF_COUNTER_CACHE_HIT => self
+                .cache_hits
+                .entry(event.tgidpid)
+                .or_insert_with(Vec::new),
+            perf_counter_type::PERF_COUNTER_CACHE_MISS => self
+                .cache_misses
+                .entry(event.tgidpid)
+                .or_insert_with(Vec::new),
+            perf_counter_type::PERF_COUNTER_FRONTEND_STALL => self
+                .frontend_stalls
+                .entry(event.tgidpid)
+                .or_insert_with(Vec::new),
+            perf_counter_type::PERF_COUNTER_BACKEND_STALL => self
+                .backend_stalls
+                .entry(event.tgidpid)
+                .or_insert_with(Vec::new),
+            _ => return,
         };
         entry.push(TrackCounter {
             ts: event.ts,
@@ -912,31 +934,15 @@ impl CacheCounterRecorder {
         let mut packets = Vec::new();
 
         // Populate the cache counter events
-        for (tgidpid, counters) in self.hits.iter() {
-            let pid = *tgidpid as i32;
-            let tgid = (*tgidpid >> 32) as i32;
-
+        for (tgidpid, counters) in self.cache_hits.iter() {
             let desc_uuid = rng.next_u64();
-            let uuid = if pid == tgid {
-                *pid_uuids.get(&tgid).unwrap()
-            } else {
-                *thread_uuids.get(&pid).unwrap()
-            };
-
-            let mut desc = TrackDescriptor::default();
-            desc.set_name("Cache hit".to_string());
-            desc.set_uuid(desc_uuid);
-            desc.set_parent_uuid(uuid);
-
-            let mut counter_desc = CounterDescriptor::default();
-            counter_desc.set_unit(Unit::UNIT_COUNT);
-            counter_desc.set_is_incremental(false);
-
-            desc.counter = Some(counter_desc).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            packets.push(packet);
+            packets.push(generate_pidtgid_track_descriptor(
+                pid_uuids,
+                thread_uuids,
+                tgidpid,
+                "Cache hit".to_string(),
+                desc_uuid,
+            ));
 
             let seq = rng.next_u32();
             for event in counters.iter() {
@@ -944,31 +950,47 @@ impl CacheCounterRecorder {
             }
         }
 
-        for (tgidpid, counters) in self.misses.iter() {
-            let pid = *tgidpid as i32;
-            let tgid = (*tgidpid >> 32) as i32;
-
+        for (tgidpid, counters) in self.cache_misses.iter() {
             let desc_uuid = rng.next_u64();
-            let uuid = if pid == tgid {
-                *pid_uuids.get(&tgid).unwrap()
-            } else {
-                *thread_uuids.get(&pid).unwrap()
-            };
+            packets.push(generate_pidtgid_track_descriptor(
+                pid_uuids,
+                thread_uuids,
+                tgidpid,
+                "Cache miss".to_string(),
+                desc_uuid,
+            ));
 
-            let mut desc = TrackDescriptor::default();
-            desc.set_name("Cache miss".to_string());
-            desc.set_uuid(desc_uuid);
-            desc.set_parent_uuid(uuid);
+            let seq = rng.next_u32();
+            for event in counters.iter() {
+                packets.push(event.to_track_event(desc_uuid, seq));
+            }
+        }
 
-            let mut counter_desc = CounterDescriptor::default();
-            counter_desc.set_unit(Unit::UNIT_COUNT);
-            counter_desc.set_is_incremental(false);
+        for (tgidpid, counters) in self.frontend_stalls.iter() {
+            let desc_uuid = rng.next_u64();
+            packets.push(generate_pidtgid_track_descriptor(
+                pid_uuids,
+                thread_uuids,
+                tgidpid,
+                "Frontend stall".to_string(),
+                desc_uuid,
+            ));
 
-            desc.counter = Some(counter_desc).into();
+            let seq = rng.next_u32();
+            for event in counters.iter() {
+                packets.push(event.to_track_event(desc_uuid, seq));
+            }
+        }
 
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            packets.push(packet);
+        for (tgidpid, counters) in self.backend_stalls.iter() {
+            let desc_uuid = rng.next_u64();
+            packets.push(generate_pidtgid_track_descriptor(
+                pid_uuids,
+                thread_uuids,
+                tgidpid,
+                "Backend stall".to_string(),
+                desc_uuid,
+            ));
 
             let seq = rng.next_u32();
             for event in counters.iter() {
@@ -992,10 +1014,7 @@ impl SysinfoRecorder {
         }
     }
 
-    fn generate_trace(
-        &self,
-        rng: &mut dyn rand::RngCore,
-    ) -> Vec<TracePacket> {
+    fn generate_trace(&self, rng: &mut dyn rand::RngCore) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
         // Populate the sysinfo events
@@ -1112,7 +1131,8 @@ fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
 }
 
 pub fn system(opts: SystemOpts) -> Result<()> {
-    if opts.cache_stats && opts.sw_event {
+    let record_perf_events = opts.cache_stats || opts.stall_stats;
+    if record_perf_events && opts.sw_event {
         Err(anyhow::anyhow!(
             "Cache stats are not supported with software events"
         ))?;
@@ -1226,9 +1246,9 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             } else if name.starts_with("ringbuf_stack") {
                 let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
                 rings.push((name.to_string(), ring));
-            } else if name.starts_with("ringbuf_cache_counter") {
-                if opts.cache_stats {
-                    let ring = create_ring::<cache_counter_event>(&map, cache_tx.clone())?;
+            } else if name.starts_with("ringbuf_perf_counter") {
+                if record_perf_events {
+                    let ring = create_ring::<perf_counter_event>(&map, cache_tx.clone())?;
                     rings.push((name.to_string(), ring));
                 }
             }
@@ -1301,11 +1321,11 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                     0
                 })?,
         );
-        if opts.cache_stats {
+        if record_perf_events {
             let session_recorder = recorder.clone();
             recv_threads.push(
                 thread::Builder::new()
-                    .name("cache_recorder".to_string())
+                    .name("perf_counter_recorder".to_string())
                     .spawn(move || {
                         loop {
                             let res = cache_rx.recv();
@@ -1314,10 +1334,10 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                             }
                             let event = res.unwrap();
                             session_recorder
-                                .cache_counter_recorder
+                                .perf_counter_recorder
                                 .lock()
                                 .unwrap()
-                                .record_cache_counter_event(&event);
+                                .record_perf_counter_event(&event);
                         }
                         0
                     })?,
@@ -1362,6 +1382,32 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         };
         let _cache_miss_links =
             attach_perf_event(&cache_miss_fds, &skel.progs.systing_perf_event_cache_miss);
+        let frontend_stall_fds = if opts.stall_stats {
+            init_perf_monitor(
+                1000,
+                syscall::PERF_TYPE_HARDWARE,
+                syscall::PERF_COUNT_HW_STALLED_CYCLES_FRONTEND,
+            )?
+        } else {
+            Vec::new()
+        };
+        let _frontend_stall_links = attach_perf_event(
+            &frontend_stall_fds,
+            &skel.progs.systing_perf_event_frontend_stall,
+        );
+        let backend_stall_fds = if opts.stall_stats {
+            init_perf_monitor(
+                1000,
+                syscall::PERF_TYPE_HARDWARE,
+                syscall::PERF_COUNT_HW_STALLED_CYCLES_BACKEND,
+            )?
+        } else {
+            Vec::new()
+        };
+        let _backend_stall_links = attach_perf_event(
+            &backend_stall_fds,
+            &skel.progs.systing_perf_event_backend_stall,
+        );
         skel.attach()?;
 
         // Attach any usdt's that we may have
@@ -1459,7 +1505,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         println!("Missed sched events: {}", dump_missed_events(&skel, 0));
         println!("Missed stack events: {}", dump_missed_events(&skel, 1));
         println!("Missed USDT events: {}", dump_missed_events(&skel, 2));
-        if opts.cache_stats {
+        if record_perf_events {
             println!("Missed cache events: {}", dump_missed_events(&skel, 3));
         }
     }
@@ -1492,7 +1538,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         ));
     trace.packet.extend(
         recorder
-            .cache_counter_recorder
+            .perf_counter_recorder
             .lock()
             .unwrap()
             .generate_trace(&pid_uuids, &thread_uuids, &mut rng),

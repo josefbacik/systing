@@ -85,6 +85,8 @@ pub struct SystemOpts {
     cpu_sched_stats: bool,
     #[arg(long)]
     cpu_frequency: bool,
+    #[arg(long)]
+    stall_stats: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {

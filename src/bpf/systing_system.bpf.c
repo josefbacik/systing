@@ -47,9 +47,11 @@ enum stack_event_type {
 	STACK_RUNNING,
 };
 
-enum cache_event_type {
-	CACHE_MISS,
-	CACHE_HIT,
+enum perf_counter_type {
+	PERF_COUNTER_CACHE_MISS,
+	PERF_COUNTER_CACHE_HIT,
+	PERF_COUNTER_BACKEND_STALL,
+	PERF_COUNTER_FRONTEND_STALL,
 };
 
 /*
@@ -112,11 +114,11 @@ struct irq_event {
 	u8 comm[TASK_COMM_LEN];
 };
 
-struct cache_counter_event {
+struct perf_counter_event {
 	u64 ts;
 	u64 tgidpid;
 	u64 value;
-	enum cache_event_type type;
+	enum perf_counter_type type;
 	u32 cpu;
 };
 
@@ -127,11 +129,11 @@ struct cache_counter_event {
 struct task_event _event = {0};
 struct usdt_event _usdt_event = {0};
 struct stack_event _stack_event = {0};
-struct cache_counter_event _cache_counter_event = {0};
+struct perf_counter_event _perf_counter_event = {0};
 enum event_type _type = SCHED_SWITCH;
 enum usdt_arg_type _usdt_type = ARG_NONE;
 enum stack_event_type _stack_type = STACK_SLEEP;
-enum cache_event_type _cache_type = CACHE_MISS;
+enum perf_counter_type _cache_type = PERF_COUNTER_CACHE_MISS;
 bool tracing_enabled = true;
 
 struct {
@@ -197,17 +199,17 @@ struct stack_ringbuf_map {
   ringbuf_stack_events_node4 SEC(".maps"), ringbuf_stack_events_node5 SEC(".maps"),
   ringbuf_stack_events_node6 SEC(".maps"), ringbuf_stack_events_node7 SEC(".maps");
 
-struct cache_counter_ringbuf_map {
+struct perf_counter_ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
-} ringbuf_cache_counter_events_node0 SEC(".maps"),
-	ringbuf_cache_counter_events_node1 SEC(".maps"),
-	ringbuf_cache_counter_events_node2 SEC(".maps"),
-	ringbuf_cache_counter_events_node3 SEC(".maps"),
-	ringbuf_cache_counter_events_node4 SEC(".maps"),
-	ringbuf_cache_counter_events_node5 SEC(".maps"),
-	ringbuf_cache_counter_events_node6 SEC(".maps"),
-	ringbuf_cache_counter_events_node7 SEC(".maps");
+} ringbuf_perf_counter_events_node0 SEC(".maps"),
+	ringbuf_perf_counter_events_node1 SEC(".maps"),
+	ringbuf_perf_counter_events_node2 SEC(".maps"),
+	ringbuf_perf_counter_events_node3 SEC(".maps"),
+	ringbuf_perf_counter_events_node4 SEC(".maps"),
+	ringbuf_perf_counter_events_node5 SEC(".maps"),
+	ringbuf_perf_counter_events_node6 SEC(".maps"),
+	ringbuf_perf_counter_events_node7 SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
@@ -267,17 +269,17 @@ struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
 	__uint(max_entries, NR_RINGBUFS);
 	__type(key, u32);
-	__array(values, struct cache_counter_ringbuf_map);
-} cache_counter_ringbufs SEC(".maps") = {
+	__array(values, struct perf_counter_ringbuf_map);
+} perf_counter_ringbufs SEC(".maps") = {
 	.values = {
-		&ringbuf_cache_counter_events_node0,
-		&ringbuf_cache_counter_events_node1,
-		&ringbuf_cache_counter_events_node2,
-		&ringbuf_cache_counter_events_node3,
-		&ringbuf_cache_counter_events_node4,
-		&ringbuf_cache_counter_events_node5,
-		&ringbuf_cache_counter_events_node6,
-		&ringbuf_cache_counter_events_node7,
+		&ringbuf_perf_counter_events_node0,
+		&ringbuf_perf_counter_events_node1,
+		&ringbuf_perf_counter_events_node2,
+		&ringbuf_perf_counter_events_node3,
+		&ringbuf_perf_counter_events_node4,
+		&ringbuf_perf_counter_events_node5,
+		&ringbuf_perf_counter_events_node6,
+		&ringbuf_perf_counter_events_node7,
 	},
 };
 
@@ -314,15 +316,15 @@ static struct stack_event *reserve_stack_event(void)
 	return bpf_ringbuf_reserve(rb, sizeof(struct stack_event), 0);
 }
 
-static struct cache_counter_event *reserve_cache_counter_event(void)
+static struct perf_counter_event *reserve_perf_counter_event(void)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
 	void *rb;
 
-	rb = bpf_map_lookup_elem(&cache_counter_ringbufs, &node);
+	rb = bpf_map_lookup_elem(&perf_counter_ringbufs, &node);
 	if (!rb)
 		return NULL;
-	return bpf_ringbuf_reserve(rb, sizeof(struct cache_counter_event), 0);
+	return bpf_ringbuf_reserve(rb, sizeof(struct perf_counter_event), 0);
 }
 
 static u32 task_cpu(struct task_struct *task)
@@ -669,13 +671,14 @@ int systing_perf_event_clock(void *ctx)
 	return 0;
 }
 
-static int handle_cache_event(struct bpf_perf_event_data *ctx, enum cache_event_type type)
+static int handle_perf_event(struct bpf_perf_event_data *ctx,
+			     enum perf_counter_type type)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	if (!trace_task(task))
 		return 0;
 
-	struct cache_counter_event *event = reserve_cache_counter_event();
+	struct perf_counter_event *event = reserve_perf_counter_event();
 	if (!event)
 		return handle_missed_event(MISSED_CACHE_EVENT);
 	event->ts = bpf_ktime_get_boot_ns();
@@ -690,13 +693,25 @@ static int handle_cache_event(struct bpf_perf_event_data *ctx, enum cache_event_
 SEC("perf_event")
 int systing_perf_event_cache_miss(struct bpf_perf_event_data *ctx)
 {
-	return handle_cache_event(ctx, CACHE_MISS);
+	return handle_perf_event(ctx, PERF_COUNTER_CACHE_MISS);
 }
 
 SEC("perf_event")
 int systing_perf_event_cache_hit(struct bpf_perf_event_data *ctx)
 {
-	return handle_cache_event(ctx, CACHE_HIT);
+	return handle_perf_event(ctx, PERF_COUNTER_CACHE_HIT);
+}
+
+SEC("perf_event")
+int systing_perf_event_backend_stall(struct bpf_perf_event_data *ctx)
+{
+	return handle_perf_event(ctx, PERF_COUNTER_BACKEND_STALL);
+}
+
+SEC("perf_event")
+int systing_perf_event_frontend_stall(struct bpf_perf_event_data *ctx)
+{
+	return handle_perf_event(ctx, PERF_COUNTER_FRONTEND_STALL);
 }
 
 char LICENSE[] SEC("license") = "GPL";
