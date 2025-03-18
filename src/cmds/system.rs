@@ -45,6 +45,7 @@ use perfetto_protos::track_descriptor::TrackDescriptor;
 use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::TrackEvent;
 use rand::RngCore;
+use sysinfo::System;
 
 use plain::Plain;
 use protobuf::Message;
@@ -137,11 +138,17 @@ struct CacheCounterRecorder {
 }
 
 #[derive(Default)]
+struct SysinfoRecorder {
+    frequency: HashMap<u32, Vec<TrackCounter>>,
+}
+
+#[derive(Default)]
 struct SessionRecorder {
     event_recorder: Mutex<EventRecorder>,
     usdt_recorder: Mutex<UsdtRecorder>,
     stack_recorder: Mutex<StackRecorder>,
     cache_counter_recorder: Mutex<CacheCounterRecorder>,
+    sysinfo_recorder: Mutex<SysinfoRecorder>,
 }
 
 fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -973,6 +980,50 @@ impl CacheCounterRecorder {
     }
 }
 
+impl SysinfoRecorder {
+    fn record_cpu_frequency(&mut self, sys: &System) {
+        let ts = get_clock_value(libc::CLOCK_BOOTTIME);
+        for (i, cpu) in sys.cpus().iter().enumerate() {
+            let freq = self.frequency.entry(i as u32).or_insert_with(Vec::new);
+            freq.push(TrackCounter {
+                ts,
+                count: cpu.frequency() as i64,
+            });
+        }
+    }
+
+    fn generate_trace(
+        &self,
+        rng: &mut dyn rand::RngCore,
+    ) -> Vec<TracePacket> {
+        let mut packets = Vec::new();
+
+        // Populate the sysinfo events
+        for (cpu, events) in self.frequency.iter() {
+            let desc_uuid = rng.next_u64();
+
+            let mut counter_desc = CounterDescriptor::default();
+            counter_desc.set_unit(Unit::UNIT_COUNT);
+            counter_desc.set_is_incremental(false);
+
+            let mut desc = TrackDescriptor::default();
+            desc.set_name(format!("CPU {} frequency", cpu).to_string());
+            desc.set_uuid(desc_uuid);
+            desc.counter = Some(counter_desc).into();
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packets.push(packet);
+
+            let seq = rng.next_u32();
+            for event in events.iter() {
+                packets.push(event.to_track_event(desc_uuid, seq));
+            }
+        }
+        packets
+    }
+}
+
 fn create_ring<'a, T>(
     map: &dyn libbpf_rs::MapCore,
     tx: Sender<T>,
@@ -1354,6 +1405,36 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             })?);
         }
 
+        // Start the sysinfo recorder if it's enabled
+        if opts.cpu_frequency {
+            let thread_done_clone = thread_done.clone();
+            let sysinfo_recorder = recorder.clone();
+            threads.push(
+                thread::Builder::new()
+                    .name("sysinfo_recorder".to_string())
+                    .spawn(move || {
+                        let mut sys = sysinfo::System::new_with_specifics(
+                            sysinfo::RefreshKind::nothing()
+                                .with_cpu(sysinfo::CpuRefreshKind::nothing().with_frequency()),
+                        );
+
+                        loop {
+                            if thread_done_clone.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            sys.refresh_cpu_frequency();
+                            sysinfo_recorder
+                                .sysinfo_recorder
+                                .lock()
+                                .unwrap()
+                                .record_cpu_frequency(&sys);
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                        0
+                    })?,
+            );
+        }
+
         if opts.duration > 0 {
             thread::sleep(Duration::from_secs(opts.duration));
         } else {
@@ -1415,6 +1496,13 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             .lock()
             .unwrap()
             .generate_trace(&pid_uuids, &thread_uuids, &mut rng),
+    );
+    trace.packet.extend(
+        recorder
+            .sysinfo_recorder
+            .lock()
+            .unwrap()
+            .generate_trace(&mut rng),
     );
     let mut file = std::fs::File::create("trace.pb")?;
     trace.write_to_writer(&mut file)?;
