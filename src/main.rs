@@ -6,6 +6,7 @@ mod cmds;
 pub mod perfetto;
 pub mod symbolize;
 pub mod syscall;
+pub mod events;
 
 #[derive(Debug, Parser)]
 struct Command {

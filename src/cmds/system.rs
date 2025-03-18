@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crate::events::PerfCounters;
 use crate::symbolize::Stack;
 use crate::syscall;
 use crate::SystemOpts;
@@ -1138,6 +1139,28 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         ))?;
     }
 
+    let mut counters = PerfCounters::new();
+    counters.discover()?;
+
+    for event in counters.events() {
+        let mut first: i32 = -1;
+        let mut last = 0;
+        let mut cpustring = String::new();
+        for cpu in event.cpus.iter() {
+            if first == -1 {
+                first = *cpu as i32;
+            } else if *cpu != last + 1 {
+                cpustring += &format!("{}-{},", first, last);
+                first = *cpu as i32;
+            }
+            last = *cpu;
+        }
+        cpustring += &format!("{}-{}", first, last);
+        println!(
+            "Event: {}, type {}, config {:#x}, cpus {}",
+            event.name, event.event_type, event.event_config, cpustring
+        );
+    }
     let recorder = Arc::new(SessionRecorder::default());
     recorder.event_recorder.lock().unwrap().snapshot_clocks();
     {
