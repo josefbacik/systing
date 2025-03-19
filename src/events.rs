@@ -1,9 +1,9 @@
+use regex::Regex;
 use std::fs;
 use std::io;
 use std::path::Path;
-use regex::Regex;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct PerfHwEvent {
     pub name: String,
     pub event_type: u32,
@@ -91,9 +91,7 @@ fn visit_dirs(dir: &Path, counters: &mut PerfCounters, toplevel: bool) -> io::Re
 
 impl PerfCounters {
     pub fn new() -> Self {
-        PerfCounters {
-            events: Vec::new(),
-        }
+        PerfCounters { events: Vec::new() }
     }
 
     pub fn discover(&mut self) -> io::Result<()> {

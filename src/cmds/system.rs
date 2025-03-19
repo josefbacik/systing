@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::events::PerfCounters;
+use crate::events::{PerfCounters, PerfHwEvent};
 use crate::symbolize::Stack;
 use crate::syscall;
 use crate::SystemOpts;
@@ -57,7 +57,6 @@ mod systing {
 
 use systing::types::event_type;
 use systing::types::perf_counter_event;
-use systing::types::perf_counter_type;
 use systing::types::stack_event;
 use systing::types::task_event;
 use systing::types::usdt_event;
@@ -132,12 +131,16 @@ struct StackRecorder {
     stacks: HashMap<i32, Vec<StackEvent>>,
 }
 
+#[derive(Default, PartialEq, Eq, Hash)]
+struct PerfCounterKey {
+    tgidpid: u64,
+    cookie: u64,
+}
+
 #[derive(Default)]
 struct PerfCounterRecorder {
-    cache_hits: HashMap<u64, Vec<TrackCounter>>,
-    cache_misses: HashMap<u64, Vec<TrackCounter>>,
-    frontend_stalls: HashMap<u64, Vec<TrackCounter>>,
-    backend_stalls: HashMap<u64, Vec<TrackCounter>>,
+    perf_cookies: HashMap<u64, PerfHwEvent>,
+    perf_events: HashMap<PerfCounterKey, Vec<TrackCounter>>,
 }
 
 #[derive(Default)]
@@ -901,25 +904,11 @@ impl UsdtRecorder {
 
 impl PerfCounterRecorder {
     fn record_perf_counter_event(&mut self, event: &perf_counter_event) {
-        let entry = match event.r#type {
-            perf_counter_type::PERF_COUNTER_CACHE_HIT => self
-                .cache_hits
-                .entry(event.tgidpid)
-                .or_insert_with(Vec::new),
-            perf_counter_type::PERF_COUNTER_CACHE_MISS => self
-                .cache_misses
-                .entry(event.tgidpid)
-                .or_insert_with(Vec::new),
-            perf_counter_type::PERF_COUNTER_FRONTEND_STALL => self
-                .frontend_stalls
-                .entry(event.tgidpid)
-                .or_insert_with(Vec::new),
-            perf_counter_type::PERF_COUNTER_BACKEND_STALL => self
-                .backend_stalls
-                .entry(event.tgidpid)
-                .or_insert_with(Vec::new),
-            _ => return,
+        let key = PerfCounterKey {
+            tgidpid: event.tgidpid,
+            cookie: event.cookie,
         };
+        let entry = self.perf_events.entry(key).or_insert_with(Vec::new);
         entry.push(TrackCounter {
             ts: event.ts,
             count: event.value as i64,
@@ -935,61 +924,14 @@ impl PerfCounterRecorder {
         let mut packets = Vec::new();
 
         // Populate the cache counter events
-        for (tgidpid, counters) in self.cache_hits.iter() {
+        for (key, counters) in self.perf_events.iter() {
             let desc_uuid = rng.next_u64();
+            let track_name = self.perf_cookies.get(&key.cookie).unwrap().name.clone();
             packets.push(generate_pidtgid_track_descriptor(
                 pid_uuids,
                 thread_uuids,
-                tgidpid,
-                "Cache hit".to_string(),
-                desc_uuid,
-            ));
-
-            let seq = rng.next_u32();
-            for event in counters.iter() {
-                packets.push(event.to_track_event(desc_uuid, seq));
-            }
-        }
-
-        for (tgidpid, counters) in self.cache_misses.iter() {
-            let desc_uuid = rng.next_u64();
-            packets.push(generate_pidtgid_track_descriptor(
-                pid_uuids,
-                thread_uuids,
-                tgidpid,
-                "Cache miss".to_string(),
-                desc_uuid,
-            ));
-
-            let seq = rng.next_u32();
-            for event in counters.iter() {
-                packets.push(event.to_track_event(desc_uuid, seq));
-            }
-        }
-
-        for (tgidpid, counters) in self.frontend_stalls.iter() {
-            let desc_uuid = rng.next_u64();
-            packets.push(generate_pidtgid_track_descriptor(
-                pid_uuids,
-                thread_uuids,
-                tgidpid,
-                "Frontend stall".to_string(),
-                desc_uuid,
-            ));
-
-            let seq = rng.next_u32();
-            for event in counters.iter() {
-                packets.push(event.to_track_event(desc_uuid, seq));
-            }
-        }
-
-        for (tgidpid, counters) in self.backend_stalls.iter() {
-            let desc_uuid = rng.next_u64();
-            packets.push(generate_pidtgid_track_descriptor(
-                pid_uuids,
-                thread_uuids,
-                tgidpid,
-                "Backend stall".to_string(),
+                &key.tgidpid,
+                track_name,
                 desc_uuid,
             ));
 
@@ -1132,15 +1074,12 @@ fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
 }
 
 pub fn system(opts: SystemOpts) -> Result<()> {
-    let record_perf_events = opts.cache_stats || opts.stall_stats;
-    if record_perf_events && opts.sw_event {
-        Err(anyhow::anyhow!(
-            "Cache stats are not supported with software events"
-        ))?;
-    }
+    let record_perf_events = opts.perf_counter.len() > 0;
 
     let mut counters = PerfCounters::new();
-    counters.discover()?;
+    if record_perf_events {
+        counters.discover()?;
+    }
 
     for event in counters.events() {
         let mut first: i32 = -1;
@@ -1229,6 +1168,17 @@ pub fn system(opts: SystemOpts) -> Result<()> {
 
         if usdts.len() > 0 && opts.trace_event_pid.len() == 0 {
             Err(anyhow::anyhow!("USDT probes require a PID to attach to"))?;
+        }
+
+        let mut perf_counters = Vec::new();
+        for counter in opts.perf_counter.iter() {
+            let hwevent = counters.events().find(|e| e.name == *counter);
+            if hwevent.is_none() {
+                Err(anyhow::anyhow!("Invalid perf counter"))?;
+            }
+            let cookie = rng.next_u64();
+            recorder.perf_counter_recorder.lock().unwrap().perf_cookies.insert(
+                cookie, hwevent.unwrap().clone());
         }
 
         let nr_cpus = thread::available_parallelism()?.get() as u32;
