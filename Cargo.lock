@@ -1649,6 +1649,7 @@ dependencies = [
  "inferno",
  "libbpf-cargo",
  "libbpf-rs",
+ "libbpf-sys",
  "libc",
  "nix",
  "perf-event-open-sys",

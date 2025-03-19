@@ -79,15 +79,13 @@ pub struct SystemOpts {
     #[arg(short, long)]
     sw_event: bool,
     #[arg(long)]
-    cache_stats: bool,
-    #[arg(long)]
     process_sched_stats: bool,
     #[arg(long)]
     cpu_sched_stats: bool,
     #[arg(long)]
     cpu_frequency: bool,
     #[arg(long)]
-    stall_stats: bool,
+    perf_counter:Vec<String>,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {

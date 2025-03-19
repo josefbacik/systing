@@ -47,13 +47,6 @@ enum stack_event_type {
 	STACK_RUNNING,
 };
 
-enum perf_counter_type {
-	PERF_COUNTER_CACHE_MISS,
-	PERF_COUNTER_CACHE_HIT,
-	PERF_COUNTER_BACKEND_STALL,
-	PERF_COUNTER_FRONTEND_STALL,
-};
-
 /*
  * sched_switch is the largest event, for the smaller events we just use prev_*
  * for the values, and things are left uninitialized.
@@ -117,8 +110,8 @@ struct irq_event {
 struct perf_counter_event {
 	u64 ts;
 	u64 tgidpid;
+	u64 cookie;
 	u64 value;
-	enum perf_counter_type type;
 	u32 cpu;
 };
 
@@ -133,7 +126,6 @@ struct perf_counter_event _perf_counter_event = {0};
 enum event_type _type = SCHED_SWITCH;
 enum usdt_arg_type _usdt_type = ARG_NONE;
 enum stack_event_type _stack_type = STACK_SLEEP;
-enum perf_counter_type _cache_type = PERF_COUNTER_CACHE_MISS;
 bool tracing_enabled = true;
 
 struct {
@@ -671,8 +663,8 @@ int systing_perf_event_clock(void *ctx)
 	return 0;
 }
 
-static int handle_perf_event(struct bpf_perf_event_data *ctx,
-			     enum perf_counter_type type)
+SEC("perf_event")
+int systing_perf_event_counter(struct bpf_perf_event_data *ctx)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	if (!trace_task(task))
@@ -684,34 +676,10 @@ static int handle_perf_event(struct bpf_perf_event_data *ctx,
 	event->ts = bpf_ktime_get_boot_ns();
 	event->tgidpid = task_key(task);
 	event->cpu = bpf_get_smp_processor_id();
-	event->type = type;
+	event->cookie = bpf_get_attach_cookie(ctx);
 	event->value = ctx->sample_period;
 	bpf_ringbuf_submit(event, 0);
 	return 0;
-}
-
-SEC("perf_event")
-int systing_perf_event_cache_miss(struct bpf_perf_event_data *ctx)
-{
-	return handle_perf_event(ctx, PERF_COUNTER_CACHE_MISS);
-}
-
-SEC("perf_event")
-int systing_perf_event_cache_hit(struct bpf_perf_event_data *ctx)
-{
-	return handle_perf_event(ctx, PERF_COUNTER_CACHE_HIT);
-}
-
-SEC("perf_event")
-int systing_perf_event_backend_stall(struct bpf_perf_event_data *ctx)
-{
-	return handle_perf_event(ctx, PERF_COUNTER_BACKEND_STALL);
-}
-
-SEC("perf_event")
-int systing_perf_event_frontend_stall(struct bpf_perf_event_data *ctx)
-{
-	return handle_perf_event(ctx, PERF_COUNTER_FRONTEND_STALL);
 }
 
 char LICENSE[] SEC("license") = "GPL";
