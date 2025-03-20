@@ -1429,7 +1429,14 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         }
 
         for (cookie, hwevent) in perf_counters {
-            let pefds = init_perf_monitor(1000, &hwevent)?;
+            let pefds = init_perf_monitor(1000, &hwevent);
+            if pefds.is_err() {
+                Err(anyhow::anyhow!(
+                    "Failed to initialize perf event {}",
+                    hwevent.name
+                ))?;
+            }
+            let pefds = pefds.unwrap();
             let links = attach_perf_event(&pefds, &skel.progs.systing_perf_event_counter, cookie);
             perf_fds.extend(pefds);
             perf_links.extend(links);
