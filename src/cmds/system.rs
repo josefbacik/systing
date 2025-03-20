@@ -239,7 +239,7 @@ fn generate_pidtgid_track_descriptor(
     tgidpid: &u64,
     name: String,
     desc_uuid: u64,
-) -> TracePacket {
+) -> TrackDescriptor {
     let pid = *tgidpid as i32;
     let tgid = (*tgidpid >> 32) as i32;
 
@@ -254,14 +254,7 @@ fn generate_pidtgid_track_descriptor(
     desc.set_uuid(desc_uuid);
     desc.set_parent_uuid(uuid);
 
-    let mut counter_desc = CounterDescriptor::default();
-    counter_desc.set_unit(Unit::UNIT_COUNT);
-    counter_desc.set_is_incremental(false);
-    desc.counter = Some(counter_desc).into();
-
-    let mut packet = TracePacket::default();
-    packet.set_track_descriptor(desc);
-    packet
+    desc
 }
 
 impl From<&task_info> for ProcessDescriptor {
@@ -292,16 +285,13 @@ impl From<&task_event> for FtraceEvent {
         ftrace_event.set_timestamp(event.ts);
         match event.r#type {
             event_type::SCHED_WAKEUP_NEW => {
-                ftrace_event
-                    .set_sched_wakeup_new(SchedWakeupNewFtraceEvent::from(event));
+                ftrace_event.set_sched_wakeup_new(SchedWakeupNewFtraceEvent::from(event));
             }
             event_type::SCHED_IRQ_EXIT => {
-                ftrace_event
-                    .set_irq_handler_exit(IrqHandlerExitFtraceEvent::from(event));
+                ftrace_event.set_irq_handler_exit(IrqHandlerExitFtraceEvent::from(event));
             }
             event_type::SCHED_IRQ_ENTER => {
-                ftrace_event
-                    .set_irq_handler_entry(IrqHandlerEntryFtraceEvent::from(event));
+                ftrace_event.set_irq_handler_entry(IrqHandlerEntryFtraceEvent::from(event));
             }
             event_type::SCHED_SOFTIRQ_EXIT => {
                 ftrace_event.set_softirq_exit(SoftirqExitFtraceEvent::from(event));
@@ -310,8 +300,7 @@ impl From<&task_event> for FtraceEvent {
                 ftrace_event.set_softirq_entry(SoftirqEntryFtraceEvent::from(event));
             }
             event_type::SCHED_PROCESS_EXIT => {
-                ftrace_event
-                    .set_sched_process_exit(SchedProcessExitFtraceEvent::from(event));
+                ftrace_event.set_sched_process_exit(SchedProcessExitFtraceEvent::from(event));
             }
             _ => {}
         }
@@ -586,13 +575,23 @@ impl EventRecorder {
         // Populate the per-process latencies
         for (pidtgid, events) in self.process_latencies.iter() {
             let desc_uuid = rng.next_u64();
-            packets.push(generate_pidtgid_track_descriptor(
+
+            let mut counter_desc = CounterDescriptor::default();
+            counter_desc.set_unit(Unit::UNIT_TIME_NS);
+            counter_desc.set_is_incremental(false);
+
+            let mut desc = generate_pidtgid_track_descriptor(
                 pid_uuids,
                 thread_uuids,
                 pidtgid,
                 "Wake latency".to_string(),
                 desc_uuid,
-            ));
+            );
+            desc.counter = Some(counter_desc).into();
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packets.push(packet);
 
             let seq = rng.next_u32();
             for event in events.iter() {
@@ -766,13 +765,16 @@ impl UsdtRecorder {
         // Populate the USDT events
         for (pidtgid, events) in self.usdt_events.iter() {
             let desc_uuid = rng.next_u64();
-            packets.push(generate_pidtgid_track_descriptor(
+            let desc = generate_pidtgid_track_descriptor(
                 pid_uuids,
                 thread_uuids,
                 pidtgid,
                 "USDT events".to_string(),
                 desc_uuid,
-            ));
+            );
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packets.push(packet);
 
             let seq = rng.next_u32();
             for event in events.iter() {
@@ -817,13 +819,21 @@ impl PerfCounterRecorder {
         for (key, counters) in self.perf_events.iter() {
             let desc_uuid = rng.next_u64();
             let track_name = self.perf_cookies.get(&key.cookie).unwrap().name.clone();
-            packets.push(generate_pidtgid_track_descriptor(
+            let mut desc = generate_pidtgid_track_descriptor(
                 pid_uuids,
                 thread_uuids,
                 &key.tgidpid,
                 track_name,
                 desc_uuid,
-            ));
+            );
+            let mut counter_desc = CounterDescriptor::default();
+            counter_desc.set_unit(Unit::UNIT_COUNT);
+            counter_desc.set_is_incremental(false);
+            desc.counter = Some(counter_desc).into();
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packets.push(packet);
 
             let seq = rng.next_u32();
             for event in counters.iter() {
