@@ -18,9 +18,10 @@ use crate::SystemOpts;
 use anyhow::Result;
 use blazesym::symbolize::{Input, Kernel, Process, Source, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
-use libbpf_rs::AsRawLibbpf;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{Link,ErrorExt, MapCore, RingBufferBuilder, UsdtOpts};
+use libbpf_rs::AsRawLibbpf;
+use libbpf_rs::{ErrorExt, Link, MapCore, RingBufferBuilder, UsdtOpts};
+use libbpf_sys;
 use libc;
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
@@ -48,7 +49,6 @@ use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::TrackEvent;
 use rand::RngCore;
 use sysinfo::System;
-use libbpf_sys;
 
 use plain::Plain;
 use protobuf::Message;
@@ -61,6 +61,7 @@ use systing::types::event_type;
 use systing::types::perf_counter_event;
 use systing::types::stack_event;
 use systing::types::task_event;
+use systing::types::task_info;
 use systing::types::usdt_event;
 
 unsafe impl Plain for task_event {}
@@ -261,6 +262,27 @@ fn generate_pidtgid_track_descriptor(
     let mut packet = TracePacket::default();
     packet.set_track_descriptor(desc);
     packet
+}
+
+impl From<task_info> for ProcessDescriptor {
+    fn from(task: task_info) -> Self {
+        let comm = CStr::from_bytes_until_nul(&task.comm).unwrap();
+        let mut process = ProcessDescriptor::default();
+        process.set_pid(task.tgidpid as i32);
+        process.set_process_name(comm.to_str().unwrap().to_string());
+        process
+    }
+}
+
+impl From<task_info> for ThreadDescriptor {
+    fn from(task: task_info) -> Self {
+        let comm = CStr::from_bytes_until_nul(&task.comm).unwrap();
+        let mut thread = ThreadDescriptor::default();
+        thread.set_tid(task.tgidpid as i32);
+        thread.set_pid((task.tgidpid >> 32) as i32);
+        thread.set_thread_name(comm.to_str().unwrap().to_string());
+        thread
+    }
 }
 
 trait TaskEventBuilder {
@@ -502,24 +524,13 @@ impl EventRecorder {
         let pid = event.prev.tgidpid as i32;
         if pid == tgid {
             if !self.processes.contains_key(&event.prev.tgidpid) {
-                let process_entry = self
-                    .processes
-                    .entry(event.prev.tgidpid)
-                    .or_insert_with(ProcessDescriptor::default);
-                let comm = CStr::from_bytes_until_nul(&event.prev.comm).unwrap();
-                process_entry.set_pid(tgid);
-                process_entry.set_process_name(comm.to_str().unwrap().to_string());
+                self.processes
+                    .insert(event.prev.tgidpid, ProcessDescriptor::from(event.prev));
             }
         } else {
             if !self.threads.contains_key(&event.prev.tgidpid) {
-                let thread_entry = self
-                    .threads
-                    .entry(event.prev.tgidpid)
-                    .or_insert_with(ThreadDescriptor::default);
-                let comm = CStr::from_bytes_until_nul(&event.prev.comm).unwrap();
-                thread_entry.set_tid(pid);
-                thread_entry.set_pid(tgid);
-                thread_entry.set_thread_name(comm.to_str().unwrap().to_string());
+                self.threads
+                    .insert(event.prev.tgidpid, ThreadDescriptor::from(event.prev));
             }
         }
 
@@ -531,24 +542,13 @@ impl EventRecorder {
         let tgid = (event.next.tgidpid >> 32) as i32;
         if pid == tgid {
             if !self.processes.contains_key(&event.next.tgidpid) {
-                let process_entry = self
-                    .processes
-                    .entry(event.next.tgidpid)
-                    .or_insert_with(ProcessDescriptor::default);
-                let comm = CStr::from_bytes_until_nul(&event.next.comm).unwrap();
-                process_entry.set_pid(tgid);
-                process_entry.set_process_name(comm.to_str().unwrap().to_string());
+                self.processes
+                    .insert(event.next.tgidpid, ProcessDescriptor::from(event.next));
             }
         } else {
             if !self.threads.contains_key(&event.next.tgidpid) {
-                let thread_entry = self
-                    .threads
-                    .entry(event.next.tgidpid)
-                    .or_insert_with(ThreadDescriptor::default);
-                let comm = CStr::from_bytes_until_nul(&event.next.comm).unwrap();
-                thread_entry.set_tid(pid);
-                thread_entry.set_pid(tgid);
-                thread_entry.set_thread_name(comm.to_str().unwrap().to_string());
+                self.threads
+                    .insert(event.next.tgidpid, ThreadDescriptor::from(event.next));
             }
         }
     }
@@ -1005,10 +1005,7 @@ where
     builder.build()
 }
 
-fn init_perf_monitor(
-    freq: u64,
-    hwevent: &PerfHwEvent,
-) -> Result<Vec<i32>, libbpf_rs::Error> {
+fn init_perf_monitor(freq: u64, hwevent: &PerfHwEvent) -> Result<Vec<i32>, libbpf_rs::Error> {
     let nprocs = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let buf: Vec<u8> = vec![0; mem::size_of::<syscall::perf_event_attr>()];
     let mut attr = unsafe {
