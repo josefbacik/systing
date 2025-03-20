@@ -1397,6 +1397,27 @@ pub fn system(opts: SystemOpts) -> Result<()> {
 
         let mut perf_fds = Vec::new();
         let mut perf_links = Vec::new();
+        {
+            let event = PerfHwEvent {
+                name: "clock".to_string(),
+                event_type: if opts.sw_event {
+                    syscall::PERF_TYPE_SOFTWARE
+                } else {
+                    syscall::PERF_TYPE_HARDWARE
+                },
+                event_config: if opts.sw_event {
+                    syscall::PERF_COUNT_SW_CPU_CLOCK
+                } else {
+                    syscall::PERF_COUNT_HW_CPU_CYCLES
+                },
+                cpus: Vec::new(),
+            };
+            let pefds = init_perf_monitor(1000, &event)?;
+            let links = attach_perf_event(&pefds, &skel.progs.systing_perf_event_clock, 0);
+            perf_fds.extend(pefds);
+            perf_links.extend(links);
+        }
+
         for (cookie, hwevent) in perf_counters {
             let pefds = init_perf_monitor(1000, &hwevent)?;
             let links = attach_perf_event(&pefds, &skel.progs.systing_perf_event_counter, cookie);
