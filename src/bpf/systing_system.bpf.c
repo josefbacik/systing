@@ -47,6 +47,11 @@ enum stack_event_type {
 	STACK_RUNNING,
 };
 
+struct task_info {
+	u64 tgidpid;
+	u8 comm[TASK_COMM_LEN];
+};
+
 /*
  * sched_switch is the largest event, for the smaller events we just use prev_*
  * for the values, and things are left uninitialized.
@@ -56,14 +61,12 @@ struct task_event {
 	u32 cpu;
 	u64 ts;
 	u64 latency;
-	u64 prev_tgidpid;
-	u64 next_tgidpid;
 	u64 prev_state;
 	u32 target_cpu;
 	u32 next_prio;
 	u32 prev_prio;
-	u8 prev_comm[TASK_COMM_LEN];
-	u8 next_comm[TASK_COMM_LEN];
+	struct task_info prev;
+	struct task_info next;
 };
 
 enum usdt_arg_type {
@@ -77,8 +80,8 @@ struct usdt_event {
 	u32 cpu;
 	enum usdt_arg_type arg_type;
 	u64 ts;
-	u64 tgidpid;
 	u64 cookie;
+	struct task_info task;
 	u8 usdt_arg0[ARG0_SIZE];
 };
 
@@ -86,7 +89,7 @@ struct stack_event {
 	enum stack_event_type stack_event_type;
 	u64 ts;
 	u32 cpu;
-	u64 tgidpid;
+	struct task_info task;
 	u64 kernel_stack_length;
 	u64 user_stack_length;
 	u64 kernel_stack[MAX_STACK_DEPTH];
@@ -95,9 +98,9 @@ struct stack_event {
 
 struct perf_counter_event {
 	u64 ts;
-	u64 tgidpid;
 	u64 cookie;
 	u64 value;
+	struct task_info task;
 	u32 cpu;
 };
 
@@ -109,6 +112,7 @@ struct task_event _event = {0};
 struct usdt_event _usdt_event = {0};
 struct stack_event _stack_event = {0};
 struct perf_counter_event _perf_counter_event = {0};
+struct task_info _task_info = {0};
 enum event_type _type = SCHED_SWITCH;
 enum usdt_arg_type _usdt_type = ARG_NONE;
 enum stack_event_type _stack_type = STACK_SLEEP;
@@ -352,15 +356,19 @@ static int handle_missed_event(u32 index)
 	return 0;
 }
 
-static void record_task_name(struct task_struct *task, u8 *comm)
+static void record_task_info(struct task_info *info, struct task_struct *task)
 {
+	info->tgidpid = task_key(task);
 	if (task->flags & PF_WQ_WORKER) {
-		struct kthread *k = bpf_core_cast(task->worker_private, struct kthread);
+		struct kthread *k = bpf_core_cast(task->worker_private,
+						  struct kthread);
 		struct worker *worker = bpf_core_cast(k->data, struct worker);
 
-		bpf_probe_read_kernel_str(comm, TASK_COMM_LEN, worker->desc);
+		bpf_probe_read_kernel_str(info->comm, TASK_COMM_LEN,
+					  worker->desc);
 	} else {
-		bpf_probe_read_kernel_str(comm, TASK_COMM_LEN, task->comm);
+		bpf_probe_read_kernel_str(info->comm, TASK_COMM_LEN,
+					  task->comm);
 	}
 }
 
@@ -384,7 +392,7 @@ static void emit_stack_event(void *ctx,struct task_struct *task,
 
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
-	event->tgidpid = task_key(task);
+	record_task_info(&event->task, task);
 	event->stack_event_type = type;
 
 	if (!(task->flags & PF_KTHREAD)) {
@@ -421,11 +429,12 @@ static int trace_irq_event(struct irqaction *action, int irq, int ret, bool ente
 		return handle_missed_event(MISSED_SCHED_EVENT);
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
-	event->prev_tgidpid = task_key(tsk);
+	record_task_info(&event->prev, tsk);
 	event->target_cpu = irq;
 	if (enter) {
 		event->type = SCHED_IRQ_ENTER;
-		bpf_probe_read_kernel_str(event->prev_comm, TASK_COMM_LEN, action->name);
+		bpf_probe_read_kernel_str(event->prev.comm, TASK_COMM_LEN,
+					  action->name);
 	} else {
 		event->type = SCHED_IRQ_EXIT;
 		event->next_prio = ret;
@@ -447,7 +456,7 @@ static int trace_softirq_event(unsigned int vec_nr, bool enter)
 		return handle_missed_event(MISSED_SCHED_EVENT);
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
-	event->prev_tgidpid = task_key(tsk);
+	record_task_info(&event->prev, tsk);
 	event->target_cpu = vec_nr;
 	event->type = enter ? SCHED_SOFTIRQ_ENTER : SCHED_SOFTIRQ_EXIT;
 	bpf_ringbuf_submit(event, 0);
@@ -470,12 +479,10 @@ static int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 	event->ts = ts;
 	event->type = type;
 	event->cpu = bpf_get_smp_processor_id();
-	event->prev_tgidpid = task_key(waker);
-	event->next_tgidpid = key;
 	event->next_prio = wakee->prio;
 	event->target_cpu = task_cpu(wakee);
-	record_task_name(wakee, event->next_comm);
-	record_task_name(waker, event->prev_comm);
+	record_task_info(&event->prev, waker);
+	record_task_info(&event->next, wakee);
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
@@ -528,13 +535,11 @@ int BPF_PROG(systing_sched_switch, bool preempt, struct task_struct *prev,
 	event->type = SCHED_SWITCH;
 	event->latency = latency;
 	event->cpu = bpf_get_smp_processor_id();
-	event->prev_tgidpid = task_key(prev);
+	record_task_info(&event->next, next);
+	record_task_info(&event->prev, prev);
 	event->prev_state = prev->__state;
-	event->next_tgidpid = task_key(next);
 	event->next_prio = next->prio;
 	event->prev_prio = prev->prio;
-	record_task_name(prev, event->prev_comm);
-	record_task_name(next, event->next_comm);
 	bpf_ringbuf_submit(event, 0);
 
 	/* Record the blocked stack trace. */
@@ -568,9 +573,8 @@ int BPF_PROG(systing_sched_process_exit, struct task_struct *task)
 	event->ts = ts;
 	event->type = SCHED_PROCESS_EXIT;
 	event->cpu = bpf_get_smp_processor_id();
-	event->prev_tgidpid = task_key(task);
+	record_task_info(&event->prev, task);
 	event->prev_prio = task->prio;
-	record_task_name(task, event->prev_comm);
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
@@ -612,7 +616,7 @@ int systing_usdt(u64 *ctx)
 		return handle_missed_event(MISSED_USDT_EVENT);
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
-	event->tgidpid = task_key(task);
+	record_task_info(&event->task, task);
 	event->cookie = bpf_usdt_cookie(ctx);
 	event->usdt_arg0[0] = 0;
 	event->arg_type = ARG_NONE;
@@ -660,7 +664,7 @@ int systing_perf_event_counter(struct bpf_perf_event_data *ctx)
 	if (!event)
 		return handle_missed_event(MISSED_CACHE_EVENT);
 	event->ts = bpf_ktime_get_boot_ns();
-	event->tgidpid = task_key(task);
+	record_task_info(&event->task, task);
 	event->cpu = bpf_get_smp_processor_id();
 	event->cookie = bpf_get_attach_cookie(ctx);
 	event->value = ctx->sample_period;

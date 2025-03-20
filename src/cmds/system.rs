@@ -270,7 +270,7 @@ trait TaskEventBuilder {
 impl TaskEventBuilder for FtraceEvent {
     fn from_task_event(event: &task_event) -> Self {
         let mut ftrace_event = FtraceEvent::default();
-        ftrace_event.set_pid(event.prev_tgidpid as u32);
+        ftrace_event.set_pid(event.prev.tgidpid as u32);
         ftrace_event.set_timestamp(event.ts);
         match event.r#type {
             event_type::SCHED_WAKEUP_NEW => {
@@ -303,9 +303,9 @@ impl TaskEventBuilder for FtraceEvent {
 
 impl TaskEventBuilder for SchedWakeupNewFtraceEvent {
     fn from_task_event(event: &task_event) -> Self {
-        let comm_cstr = CStr::from_bytes_until_nul(&event.next_comm).unwrap();
+        let comm_cstr = CStr::from_bytes_until_nul(&event.next.comm).unwrap();
         let mut sched_wakeup_new = SchedWakeupNewFtraceEvent::default();
-        sched_wakeup_new.set_pid(event.next_tgidpid as i32);
+        sched_wakeup_new.set_pid(event.next.tgidpid as i32);
         sched_wakeup_new.set_comm(comm_cstr.to_str().unwrap().to_string());
         sched_wakeup_new.set_prio(event.next_prio as i32);
         sched_wakeup_new.set_target_cpu(event.target_cpu as i32);
@@ -325,7 +325,7 @@ impl TaskEventBuilder for IrqHandlerExitFtraceEvent {
 impl TaskEventBuilder for IrqHandlerEntryFtraceEvent {
     fn from_task_event(event: &task_event) -> Self {
         let mut irq_handler_entry = IrqHandlerEntryFtraceEvent::default();
-        let name_cstr = CStr::from_bytes_until_nul(&event.prev_comm).unwrap();
+        let name_cstr = CStr::from_bytes_until_nul(&event.prev.comm).unwrap();
         irq_handler_entry.set_name(name_cstr.to_str().unwrap().to_string());
         irq_handler_entry.set_irq(event.target_cpu as i32);
         irq_handler_entry
@@ -350,9 +350,9 @@ impl TaskEventBuilder for SoftirqEntryFtraceEvent {
 
 impl TaskEventBuilder for SchedProcessExitFtraceEvent {
     fn from_task_event(event: &task_event) -> Self {
-        let pid = event.prev_tgidpid as i32;
-        let tgid = (event.prev_tgidpid >> 32) as i32;
-        let name_cstr = CStr::from_bytes_until_nul(&event.prev_comm).unwrap();
+        let pid = event.prev.tgidpid as i32;
+        let tgid = (event.prev.tgidpid >> 32) as i32;
+        let name_cstr = CStr::from_bytes_until_nul(&event.prev.comm).unwrap();
         let mut sched_process_exit = SchedProcessExitFtraceEvent::default();
         sched_process_exit.set_pid(pid);
         sched_process_exit.set_tgid(tgid);
@@ -379,7 +379,7 @@ impl TrackCounter {
 
 impl LocalCompactSched {
     fn add_task_event(&mut self, event: &task_event) {
-        let comm = CStr::from_bytes_until_nul(&event.next_comm)
+        let comm = CStr::from_bytes_until_nul(&event.next.comm)
             .unwrap()
             .to_str()
             .unwrap()
@@ -395,7 +395,7 @@ impl LocalCompactSched {
             self.last_waking_ts = event.ts;
             self.compact_sched
                 .waking_pid
-                .push(event.next_tgidpid as i32);
+                .push(event.next.tgidpid as i32);
             self.compact_sched
                 .waking_target_cpu
                 .push(event.target_cpu as i32);
@@ -412,7 +412,7 @@ impl LocalCompactSched {
                 .push(event.prev_state as i64);
             self.compact_sched
                 .switch_next_pid
-                .push(event.next_tgidpid as i32);
+                .push(event.next.tgidpid as i32);
             self.compact_sched
                 .switch_next_prio
                 .push(event.next_prio as i32);
@@ -476,7 +476,7 @@ impl EventRecorder {
             let lat = self.cpu_latencies.entry(cpu).or_insert_with(Vec::new);
             let plat = self
                 .process_latencies
-                .entry(event.next_tgidpid)
+                .entry(event.next.tgidpid)
                 .or_insert_with(Vec::new);
 
             plat.push(TrackCounter {
@@ -498,25 +498,25 @@ impl EventRecorder {
             return;
         }
 
-        let tgid = (event.prev_tgidpid >> 32) as i32;
-        let pid = event.prev_tgidpid as i32;
+        let tgid = (event.prev.tgidpid >> 32) as i32;
+        let pid = event.prev.tgidpid as i32;
         if pid == tgid {
-            if !self.processes.contains_key(&event.prev_tgidpid) {
+            if !self.processes.contains_key(&event.prev.tgidpid) {
                 let process_entry = self
                     .processes
-                    .entry(event.prev_tgidpid)
+                    .entry(event.prev.tgidpid)
                     .or_insert_with(ProcessDescriptor::default);
-                let comm = CStr::from_bytes_until_nul(&event.prev_comm).unwrap();
+                let comm = CStr::from_bytes_until_nul(&event.prev.comm).unwrap();
                 process_entry.set_pid(tgid);
                 process_entry.set_process_name(comm.to_str().unwrap().to_string());
             }
         } else {
-            if !self.threads.contains_key(&event.prev_tgidpid) {
+            if !self.threads.contains_key(&event.prev.tgidpid) {
                 let thread_entry = self
                     .threads
-                    .entry(event.prev_tgidpid)
+                    .entry(event.prev.tgidpid)
                     .or_insert_with(ThreadDescriptor::default);
-                let comm = CStr::from_bytes_until_nul(&event.prev_comm).unwrap();
+                let comm = CStr::from_bytes_until_nul(&event.prev.comm).unwrap();
                 thread_entry.set_tid(pid);
                 thread_entry.set_pid(tgid);
                 thread_entry.set_thread_name(comm.to_str().unwrap().to_string());
@@ -527,25 +527,25 @@ impl EventRecorder {
             return;
         }
 
-        let pid = event.next_tgidpid as i32;
-        let tgid = (event.next_tgidpid >> 32) as i32;
+        let pid = event.next.tgidpid as i32;
+        let tgid = (event.next.tgidpid >> 32) as i32;
         if pid == tgid {
-            if !self.processes.contains_key(&event.next_tgidpid) {
+            if !self.processes.contains_key(&event.next.tgidpid) {
                 let process_entry = self
                     .processes
-                    .entry(event.next_tgidpid)
+                    .entry(event.next.tgidpid)
                     .or_insert_with(ProcessDescriptor::default);
-                let comm = CStr::from_bytes_until_nul(&event.next_comm).unwrap();
+                let comm = CStr::from_bytes_until_nul(&event.next.comm).unwrap();
                 process_entry.set_pid(tgid);
                 process_entry.set_process_name(comm.to_str().unwrap().to_string());
             }
         } else {
-            if !self.threads.contains_key(&event.next_tgidpid) {
+            if !self.threads.contains_key(&event.next.tgidpid) {
                 let thread_entry = self
                     .threads
-                    .entry(event.next_tgidpid)
+                    .entry(event.next.tgidpid)
                     .or_insert_with(ThreadDescriptor::default);
-                let comm = CStr::from_bytes_until_nul(&event.next_comm).unwrap();
+                let comm = CStr::from_bytes_until_nul(&event.next.comm).unwrap();
                 thread_entry.set_tid(pid);
                 thread_entry.set_pid(tgid);
                 thread_entry.set_thread_name(comm.to_str().unwrap().to_string());
@@ -720,9 +720,9 @@ impl StackRecorder {
         if event.user_stack_length > 0 || event.kernel_stack_length > 0 {
             let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
             let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
-            let stack_key = (event.tgidpid >> 32) as i32;
+            let stack_key = (event.task.tgidpid >> 32) as i32;
             let stack = StackEvent {
-                tgidpid: event.tgidpid,
+                tgidpid: event.task.tgidpid,
                 ts_start: event.ts,
                 stack: Stack::new(&kstack_vec, &ustack_vec),
             };
@@ -859,7 +859,7 @@ impl UsdtRecorder {
         let usdt = self.usdt_cookies.get(&event.cookie).unwrap();
         let entry = self
             .usdt_events
-            .entry(event.tgidpid)
+            .entry(event.task.tgidpid)
             .or_insert_with(Vec::new);
         entry.push(TrackInstant {
             ts: event.ts,
@@ -907,7 +907,7 @@ impl UsdtRecorder {
 impl PerfCounterRecorder {
     fn record_perf_counter_event(&mut self, event: &perf_counter_event) {
         let key = PerfCounterKey {
-            tgidpid: event.tgidpid,
+            tgidpid: event.task.tgidpid,
             cookie: event.cookie,
         };
         let entry = self.perf_events.entry(key).or_insert_with(Vec::new);
