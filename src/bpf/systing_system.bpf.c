@@ -433,7 +433,7 @@ static int trace_irq_event(struct irqaction *action, int irq, int ret, bool ente
 	event->target_cpu = irq;
 	if (enter) {
 		event->type = SCHED_IRQ_ENTER;
-		bpf_probe_read_kernel_str(event->prev.comm, TASK_COMM_LEN,
+		bpf_probe_read_kernel_str(event->next.comm, TASK_COMM_LEN,
 					  action->name);
 	} else {
 		event->type = SCHED_IRQ_EXIT;

@@ -6,7 +6,7 @@ use std::mem::MaybeUninit;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -110,11 +110,8 @@ struct UsdtProbe {
 
 #[derive(Default)]
 struct EventRecorder {
-    clock_snapshot: ClockSnapshot,
     events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
     compact_sched: HashMap<u32, LocalCompactSched>,
-    threads: HashMap<u64, ThreadDescriptor>,
-    processes: HashMap<u64, ProcessDescriptor>,
     runqueue: HashMap<i32, Vec<TrackCounter>>,
     cpu_latencies: HashMap<u32, Vec<TrackCounter>>,
     process_latencies: HashMap<u64, Vec<TrackCounter>>,
@@ -153,11 +150,14 @@ struct SysinfoRecorder {
 
 #[derive(Default)]
 struct SessionRecorder {
+    clock_snapshot: Mutex<ClockSnapshot>,
     event_recorder: Mutex<EventRecorder>,
     usdt_recorder: Mutex<UsdtRecorder>,
     stack_recorder: Mutex<StackRecorder>,
     perf_counter_recorder: Mutex<PerfCounterRecorder>,
     sysinfo_recorder: Mutex<SysinfoRecorder>,
+    processes: RwLock<HashMap<u64, ProcessDescriptor>>,
+    threads: RwLock<HashMap<u64, ThreadDescriptor>>,
 }
 
 fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -264,8 +264,8 @@ fn generate_pidtgid_track_descriptor(
     packet
 }
 
-impl From<task_info> for ProcessDescriptor {
-    fn from(task: task_info) -> Self {
+impl From<&task_info> for ProcessDescriptor {
+    fn from(task: &task_info) -> Self {
         let comm = CStr::from_bytes_until_nul(&task.comm).unwrap();
         let mut process = ProcessDescriptor::default();
         process.set_pid(task.tgidpid as i32);
@@ -274,8 +274,8 @@ impl From<task_info> for ProcessDescriptor {
     }
 }
 
-impl From<task_info> for ThreadDescriptor {
-    fn from(task: task_info) -> Self {
+impl From<&task_info> for ThreadDescriptor {
+    fn from(task: &task_info) -> Self {
         let comm = CStr::from_bytes_until_nul(&task.comm).unwrap();
         let mut thread = ThreadDescriptor::default();
         thread.set_tid(task.tgidpid as i32);
@@ -347,7 +347,7 @@ impl TaskEventBuilder for IrqHandlerExitFtraceEvent {
 impl TaskEventBuilder for IrqHandlerEntryFtraceEvent {
     fn from_task_event(event: &task_event) -> Self {
         let mut irq_handler_entry = IrqHandlerEntryFtraceEvent::default();
-        let name_cstr = CStr::from_bytes_until_nul(&event.prev.comm).unwrap();
+        let name_cstr = CStr::from_bytes_until_nul(&event.next.comm).unwrap();
         irq_handler_entry.set_name(name_cstr.to_str().unwrap().to_string());
         irq_handler_entry.set_irq(event.target_cpu as i32);
         irq_handler_entry
@@ -511,88 +511,15 @@ impl EventRecorder {
                 count: event.latency as i64,
             });
         }
-
-        if event.r#type == event_type::SCHED_SOFTIRQ_EXIT
-            || event.r#type == event_type::SCHED_IRQ_EXIT
-            || event.r#type == event_type::SCHED_IRQ_ENTER
-            || event.r#type == event_type::SCHED_SOFTIRQ_ENTER
-        {
-            return;
-        }
-
-        let tgid = (event.prev.tgidpid >> 32) as i32;
-        let pid = event.prev.tgidpid as i32;
-        if pid == tgid {
-            if !self.processes.contains_key(&event.prev.tgidpid) {
-                self.processes
-                    .insert(event.prev.tgidpid, ProcessDescriptor::from(event.prev));
-            }
-        } else {
-            if !self.threads.contains_key(&event.prev.tgidpid) {
-                self.threads
-                    .insert(event.prev.tgidpid, ThreadDescriptor::from(event.prev));
-            }
-        }
-
-        if event.r#type == event_type::SCHED_PROCESS_EXIT {
-            return;
-        }
-
-        let pid = event.next.tgidpid as i32;
-        let tgid = (event.next.tgidpid >> 32) as i32;
-        if pid == tgid {
-            if !self.processes.contains_key(&event.next.tgidpid) {
-                self.processes
-                    .insert(event.next.tgidpid, ProcessDescriptor::from(event.next));
-            }
-        } else {
-            if !self.threads.contains_key(&event.next.tgidpid) {
-                self.threads
-                    .insert(event.next.tgidpid, ThreadDescriptor::from(event.next));
-            }
-        }
     }
 
     fn generate_trace(
         &self,
-        pid_uuids: &mut HashMap<i32, u64>,
-        thread_uuids: &mut HashMap<i32, u64>,
+        pid_uuids: &HashMap<i32, u64>,
+        thread_uuids: &HashMap<i32, u64>,
         rng: &mut dyn rand::RngCore,
     ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
-
-        // First emit the clock snapshot
-        let mut packet = TracePacket::default();
-        packet.set_clock_snapshot(self.clock_snapshot.clone());
-        packet.set_trusted_packet_sequence_id(rng.next_u32());
-        packets.push(packet);
-
-        // Ppopulate all the process tracks
-        for (_, process) in self.processes.iter() {
-            let uuid = rng.next_u64();
-            pid_uuids.insert(process.pid(), uuid);
-
-            let mut desc = TrackDescriptor::default();
-            desc.set_uuid(uuid);
-            desc.process = Some(process.clone()).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            packets.push(packet);
-        }
-
-        for (_, thread) in self.threads.iter() {
-            let uuid = rng.next_u64();
-            thread_uuids.insert(thread.tid(), uuid);
-
-            let mut desc = TrackDescriptor::default();
-            desc.set_uuid(uuid);
-            desc.thread = Some(thread.clone()).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            packets.push(packet);
-        }
 
         // Pull all the compact scheduling events
         for (cpu, compact_sched) in self.compact_sched.iter() {
@@ -677,41 +604,6 @@ impl EventRecorder {
             }
         }
         packets
-    }
-
-    fn snapshot_clocks(&mut self) {
-        self.clock_snapshot
-            .set_primary_trace_clock(BuiltinClock::BUILTIN_CLOCK_BOOTTIME);
-
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC));
-        self.clock_snapshot.clocks.push(clock);
-
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_BOOTTIME as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_BOOTTIME));
-        self.clock_snapshot.clocks.push(clock);
-
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_REALTIME as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_REALTIME));
-        self.clock_snapshot.clocks.push(clock);
-
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_REALTIME_COARSE as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_REALTIME_COARSE));
-        self.clock_snapshot.clocks.push(clock);
-
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC_COARSE as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC_COARSE));
-        self.clock_snapshot.clocks.push(clock);
-
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC_RAW as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC_RAW));
-        self.clock_snapshot.clocks.push(clock);
     }
 }
 
@@ -988,6 +880,137 @@ impl SysinfoRecorder {
     }
 }
 
+impl SessionRecorder {
+    fn snapshot_clocks(&self) {
+        let mut clock_snapshot = self.clock_snapshot.lock().unwrap();
+        clock_snapshot.set_primary_trace_clock(BuiltinClock::BUILTIN_CLOCK_BOOTTIME);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC));
+        clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_BOOTTIME as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_BOOTTIME));
+        clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_REALTIME as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_REALTIME));
+        clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_REALTIME_COARSE as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_REALTIME_COARSE));
+        clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC_COARSE as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC_COARSE));
+        clock_snapshot.clocks.push(clock);
+
+        let mut clock = Clock::default();
+        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC_RAW as u32);
+        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC_RAW));
+        clock_snapshot.clocks.push(clock);
+    }
+
+    fn generate_trace(&self) -> Vec<TracePacket> {
+        let mut packets = Vec::new();
+        let mut rng = rand::rng();
+        let mut pid_uuids = HashMap::new();
+        let mut thread_uuids = HashMap::new();
+
+        // First emit the clock snapshot
+        let mut packet = TracePacket::default();
+        packet.set_clock_snapshot(self.clock_snapshot.lock().unwrap().clone());
+        packet.set_trusted_packet_sequence_id(rng.next_u32());
+        packets.push(packet);
+
+        // Ppopulate all the process tracks
+        for (_, process) in self.processes.read().unwrap().iter() {
+            let uuid = rng.next_u64();
+            pid_uuids.insert(process.pid(), uuid);
+
+            let mut desc = TrackDescriptor::default();
+            desc.set_uuid(uuid);
+            desc.process = Some(process.clone()).into();
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packets.push(packet);
+        }
+
+        for (_, thread) in self.threads.read().unwrap().iter() {
+            let uuid = rng.next_u64();
+            thread_uuids.insert(thread.tid(), uuid);
+
+            let mut desc = TrackDescriptor::default();
+            desc.set_uuid(uuid);
+            desc.thread = Some(thread.clone()).into();
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packets.push(packet);
+        }
+
+        // Generate the trace for all the event recorders
+        packets.extend(self.event_recorder.lock().unwrap().generate_trace(
+            &pid_uuids,
+            &thread_uuids,
+            &mut rng,
+        ));
+        packets.extend(self.usdt_recorder.lock().unwrap().generate_trace(
+            &pid_uuids,
+            &thread_uuids,
+            &mut rng,
+        ));
+        packets.extend(self.stack_recorder.lock().unwrap().generate_trace(&mut rng));
+        packets.extend(self.perf_counter_recorder.lock().unwrap().generate_trace(
+            &pid_uuids,
+            &thread_uuids,
+            &mut rng,
+        ));
+        packets.extend(
+            self.sysinfo_recorder
+                .lock()
+                .unwrap()
+                .generate_trace(&mut rng),
+        );
+        packets
+    }
+}
+
+fn maybe_record_task(info: &task_info, session_recorder: &Arc<SessionRecorder>) {
+    let pid = info.tgidpid as i32;
+    let tgid = (info.tgidpid >> 32) as i32;
+    if pid == tgid
+        && !session_recorder
+            .processes
+            .read()
+            .unwrap()
+            .contains_key(&info.tgidpid)
+    {
+        session_recorder
+            .processes
+            .write()
+            .unwrap()
+            .insert(info.tgidpid, ProcessDescriptor::from(info));
+    } else if !session_recorder
+        .threads
+        .read()
+        .unwrap()
+        .contains_key(&info.tgidpid)
+    {
+        session_recorder
+            .threads
+            .write()
+            .unwrap()
+            .insert(info.tgidpid, ThreadDescriptor::from(info));
+    }
+}
+
 fn create_ring<'a, T>(
     map: &dyn libbpf_rs::MapCore,
     tx: Sender<T>,
@@ -1140,7 +1163,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         );
     }
     let recorder = Arc::new(SessionRecorder::default());
-    recorder.event_recorder.lock().unwrap().snapshot_clocks();
+    recorder.snapshot_clocks();
     {
         let mut skel_builder = systing::SystingSystemSkelBuilder::default();
         if opts.verbose {
@@ -1294,6 +1317,16 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                             .lock()
                             .unwrap()
                             .record_event(&event);
+                        maybe_record_task(&event.prev, &session_recorder);
+                        match event.r#type {
+                            event_type::SCHED_SWITCH
+                            | event_type::SCHED_WAKING
+                            | event_type::SCHED_WAKEUP
+                            | event_type::SCHED_WAKEUP_NEW => {
+                                maybe_record_task(&event.next, &session_recorder);
+                            }
+                            _ => {}
+                        }
                     }
                     0
                 })?,
@@ -1314,6 +1347,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                             .lock()
                             .unwrap()
                             .record_usdt_event(&event);
+                        maybe_record_task(&event.task, &session_recorder);
                     }
                     0
                 })?,
@@ -1334,6 +1368,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                             .lock()
                             .unwrap()
                             .record_stack_event(&event);
+                        maybe_record_task(&event.task, &session_recorder);
                     }
                     0
                 })?,
@@ -1355,6 +1390,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                                 .lock()
                                 .unwrap()
                                 .record_perf_counter_event(&event);
+                            maybe_record_task(&event.task, &session_recorder);
                         }
                         0
                     })?,
@@ -1475,44 +1511,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
 
     println!("Generating trace...");
     let mut trace = Trace::default();
-    let mut pid_uuids = HashMap::new();
-    let mut thread_uuids = HashMap::new();
-    let mut rng = rand::rng();
-    trace
-        .packet
-        .extend(recorder.event_recorder.lock().unwrap().generate_trace(
-            &mut pid_uuids,
-            &mut thread_uuids,
-            &mut rng,
-        ));
-    trace.packet.extend(
-        recorder
-            .stack_recorder
-            .lock()
-            .unwrap()
-            .generate_trace(&mut rng),
-    );
-    trace
-        .packet
-        .extend(recorder.usdt_recorder.lock().unwrap().generate_trace(
-            &pid_uuids,
-            &thread_uuids,
-            &mut rng,
-        ));
-    trace.packet.extend(
-        recorder
-            .perf_counter_recorder
-            .lock()
-            .unwrap()
-            .generate_trace(&pid_uuids, &thread_uuids, &mut rng),
-    );
-    trace.packet.extend(
-        recorder
-            .sysinfo_recorder
-            .lock()
-            .unwrap()
-            .generate_trace(&mut rng),
-    );
+    trace.packet.extend(recorder.generate_trace());
     let mut file = std::fs::File::create("trace.pb")?;
     trace.write_to_writer(&mut file)?;
     Ok(())
