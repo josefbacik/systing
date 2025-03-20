@@ -285,37 +285,33 @@ impl From<&task_info> for ThreadDescriptor {
     }
 }
 
-trait TaskEventBuilder {
-    fn from_task_event(event: &task_event) -> Self;
-}
-
-impl TaskEventBuilder for FtraceEvent {
-    fn from_task_event(event: &task_event) -> Self {
+impl From<&task_event> for FtraceEvent {
+    fn from(event: &task_event) -> Self {
         let mut ftrace_event = FtraceEvent::default();
         ftrace_event.set_pid(event.prev.tgidpid as u32);
         ftrace_event.set_timestamp(event.ts);
         match event.r#type {
             event_type::SCHED_WAKEUP_NEW => {
                 ftrace_event
-                    .set_sched_wakeup_new(SchedWakeupNewFtraceEvent::from_task_event(event));
+                    .set_sched_wakeup_new(SchedWakeupNewFtraceEvent::from(event));
             }
             event_type::SCHED_IRQ_EXIT => {
                 ftrace_event
-                    .set_irq_handler_exit(IrqHandlerExitFtraceEvent::from_task_event(event));
+                    .set_irq_handler_exit(IrqHandlerExitFtraceEvent::from(event));
             }
             event_type::SCHED_IRQ_ENTER => {
                 ftrace_event
-                    .set_irq_handler_entry(IrqHandlerEntryFtraceEvent::from_task_event(event));
+                    .set_irq_handler_entry(IrqHandlerEntryFtraceEvent::from(event));
             }
             event_type::SCHED_SOFTIRQ_EXIT => {
-                ftrace_event.set_softirq_exit(SoftirqExitFtraceEvent::from_task_event(event));
+                ftrace_event.set_softirq_exit(SoftirqExitFtraceEvent::from(event));
             }
             event_type::SCHED_SOFTIRQ_ENTER => {
-                ftrace_event.set_softirq_entry(SoftirqEntryFtraceEvent::from_task_event(event));
+                ftrace_event.set_softirq_entry(SoftirqEntryFtraceEvent::from(event));
             }
             event_type::SCHED_PROCESS_EXIT => {
                 ftrace_event
-                    .set_sched_process_exit(SchedProcessExitFtraceEvent::from_task_event(event));
+                    .set_sched_process_exit(SchedProcessExitFtraceEvent::from(event));
             }
             _ => {}
         }
@@ -323,8 +319,8 @@ impl TaskEventBuilder for FtraceEvent {
     }
 }
 
-impl TaskEventBuilder for SchedWakeupNewFtraceEvent {
-    fn from_task_event(event: &task_event) -> Self {
+impl From<&task_event> for SchedWakeupNewFtraceEvent {
+    fn from(event: &task_event) -> Self {
         let comm_cstr = CStr::from_bytes_until_nul(&event.next.comm).unwrap();
         let mut sched_wakeup_new = SchedWakeupNewFtraceEvent::default();
         sched_wakeup_new.set_pid(event.next.tgidpid as i32);
@@ -335,8 +331,8 @@ impl TaskEventBuilder for SchedWakeupNewFtraceEvent {
     }
 }
 
-impl TaskEventBuilder for IrqHandlerExitFtraceEvent {
-    fn from_task_event(event: &task_event) -> Self {
+impl From<&task_event> for IrqHandlerExitFtraceEvent {
+    fn from(event: &task_event) -> Self {
         let mut irq_handler_exit = IrqHandlerExitFtraceEvent::default();
         irq_handler_exit.set_irq(event.target_cpu as i32);
         irq_handler_exit.set_ret(event.next_prio as i32);
@@ -344,8 +340,8 @@ impl TaskEventBuilder for IrqHandlerExitFtraceEvent {
     }
 }
 
-impl TaskEventBuilder for IrqHandlerEntryFtraceEvent {
-    fn from_task_event(event: &task_event) -> Self {
+impl From<&task_event> for IrqHandlerEntryFtraceEvent {
+    fn from(event: &task_event) -> Self {
         let mut irq_handler_entry = IrqHandlerEntryFtraceEvent::default();
         let name_cstr = CStr::from_bytes_until_nul(&event.next.comm).unwrap();
         irq_handler_entry.set_name(name_cstr.to_str().unwrap().to_string());
@@ -354,24 +350,24 @@ impl TaskEventBuilder for IrqHandlerEntryFtraceEvent {
     }
 }
 
-impl TaskEventBuilder for SoftirqExitFtraceEvent {
-    fn from_task_event(event: &task_event) -> Self {
+impl From<&task_event> for SoftirqExitFtraceEvent {
+    fn from(event: &task_event) -> Self {
         let mut softirq_exit = SoftirqExitFtraceEvent::default();
         softirq_exit.set_vec(event.target_cpu);
         softirq_exit
     }
 }
 
-impl TaskEventBuilder for SoftirqEntryFtraceEvent {
-    fn from_task_event(event: &task_event) -> Self {
+impl From<&task_event> for SoftirqEntryFtraceEvent {
+    fn from(event: &task_event) -> Self {
         let mut softirq_entry = SoftirqEntryFtraceEvent::default();
         softirq_entry.set_vec(event.target_cpu);
         softirq_entry
     }
 }
 
-impl TaskEventBuilder for SchedProcessExitFtraceEvent {
-    fn from_task_event(event: &task_event) -> Self {
+impl From<&task_event> for SchedProcessExitFtraceEvent {
+    fn from(event: &task_event) -> Self {
         let pid = event.prev.tgidpid as i32;
         let tgid = (event.prev.tgidpid >> 32) as i32;
         let name_cstr = CStr::from_bytes_until_nul(&event.prev.comm).unwrap();
@@ -454,7 +450,7 @@ impl EventRecorder {
                 .or_insert_with(LocalCompactSched::default);
             compact_sched.add_task_event(event);
         } else if event.r#type != event_type::SCHED_WAKEUP {
-            let ftrace_event = FtraceEvent::from_task_event(&event);
+            let ftrace_event = FtraceEvent::from(event);
             let cpu_event = self.events.entry(event.cpu).or_insert_with(BTreeMap::new);
             cpu_event.insert(event.ts, ftrace_event);
         }
