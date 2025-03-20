@@ -93,20 +93,6 @@ struct stack_event {
 	u64 user_stack[MAX_STACK_DEPTH];
 };
 
-enum irq_event_type {
-	EVENT_IRQ,
-	EVENT_SOFTIRQ,
-};
-
-struct irq_event {
-	u64 ts;
-	enum irq_event_type type;
-	u32 cpu;
-	u32 irq;
-	u32 target_cpu;
-	u8 comm[TASK_COMM_LEN];
-};
-
 struct perf_counter_event {
 	u64 ts;
 	u64 tgidpid;
