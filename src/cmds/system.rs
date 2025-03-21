@@ -1034,7 +1034,11 @@ where
     builder.build()
 }
 
-fn init_perf_monitor(freq: u64, hwevent: &PerfHwEvent) -> Result<Vec<i32>, libbpf_rs::Error> {
+fn init_perf_monitor(
+    freq: u64,
+    hwevent: &PerfHwEvent,
+    slots_fds: Option<&Vec<i32>>,
+) -> Result<Vec<i32>, libbpf_rs::Error> {
     let nprocs = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let buf: Vec<u8> = vec![0; mem::size_of::<syscall::perf_event_attr>()];
     let mut attr = unsafe {
@@ -1045,16 +1049,29 @@ fn init_perf_monitor(freq: u64, hwevent: &PerfHwEvent) -> Result<Vec<i32>, libbp
     attr._type = hwevent.event_type;
     attr.size = mem::size_of::<syscall::perf_event_attr>() as u32;
     attr.config = hwevent.event_config;
-    attr.sample.sample_freq = freq;
-    attr.flags = 1 << 10; // freq = 1i
+    if freq > 0 {
+        attr.sample.sample_freq = freq;
+        attr.flags = 1 << 10; // freq = 1i
+    }
     let mut pidfds = Vec::new();
     let cpus = if hwevent.cpus.is_empty() {
         (0..nprocs).collect::<Vec<u32>>()
     } else {
         hwevent.cpus.clone()
     };
+    let need_slots = hwevent.name.starts_with("topdown");
     for cpu in cpus {
-        let fd = syscall::perf_event_open(attr.as_ref(), -1, cpu as i32, -1, 0) as i32;
+        let group_fd = if need_slots {
+            // Should be set but just in case
+            if let Some(slots_fds) = slots_fds {
+                slots_fds[cpu as usize]
+            } else {
+                -1
+            }
+        } else {
+            -1
+        };
+        let fd = syscall::perf_event_open(attr.as_ref(), -1, cpu as i32, group_fd, 0) as i32;
         if fd == -1 {
             let os_error = io::Error::last_os_error();
             let mut error_context = "Failed to open perf event.";
@@ -1239,19 +1256,24 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         }
 
         let mut perf_counters = Vec::new();
+        let mut need_slots = false;
         for counter in opts.perf_counter.iter() {
             let hwevent = counters.events().find(|e| e.name == *counter);
             if hwevent.is_none() {
                 Err(anyhow::anyhow!("Invalid perf counter"))?;
             }
             let cookie = rng.next_u64();
+            let hwevent = hwevent.unwrap();
             recorder
                 .perf_counter_recorder
                 .lock()
                 .unwrap()
                 .perf_cookies
-                .insert(cookie, hwevent.unwrap().clone());
-            perf_counters.push((cookie, hwevent.unwrap().clone()));
+                .insert(cookie, hwevent.clone());
+            if !need_slots && hwevent.name.starts_with("topdown") {
+                need_slots = true;
+            }
+            perf_counters.push((cookie, hwevent.clone()));
         }
 
         let nr_cpus = thread::available_parallelism()?.get() as u32;
@@ -1422,14 +1444,23 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                 },
                 cpus: Vec::new(),
             };
-            let pefds = init_perf_monitor(1000, &event)?;
+            let pefds = init_perf_monitor(1000, &event, None)?;
             let links = attach_perf_event(&pefds, &skel.progs.systing_perf_event_clock, 0);
             perf_fds.extend(pefds);
             perf_links.extend(links);
         }
 
+        let mut slot_fds = Vec::new();
+        if need_slots {
+            let slot_hwevent = counters.events().find(|e| e.name == "slots");
+            if slot_hwevent.is_none() {
+                Err(anyhow::anyhow!("Failed to find slot event"))?;
+            }
+            let pefds = init_perf_monitor(0, &slot_hwevent.unwrap(), None)?;
+            slot_fds.extend(pefds);
+        }
         for (cookie, hwevent) in perf_counters {
-            let pefds = init_perf_monitor(1000, &hwevent);
+            let pefds = init_perf_monitor(1000, &hwevent, Some(&slot_fds));
             if pefds.is_err() {
                 Err(anyhow::anyhow!(
                     "Failed to initialize perf event {}",
