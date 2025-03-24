@@ -28,6 +28,8 @@ const volatile struct {
 	u32 filter_pid;
 	u32 filter_cgroup;
 	u32 no_stack_traces;
+	u32 num_perf_counters;
+	u32 num_cpus;
 } tool_config = {};
 
 enum event_type {
@@ -98,10 +100,10 @@ struct stack_event {
 
 struct perf_counter_event {
 	u64 ts;
-	u64 cookie;
-	u64 value;
 	struct task_info task;
+	struct bpf_perf_event_value value;
 	u32 cpu;
+	u32 counter_num;
 };
 
 /*
@@ -117,6 +119,13 @@ enum event_type _type = SCHED_SWITCH;
 enum usdt_arg_type _usdt_type = ARG_NONE;
 enum stack_event_type _stack_type = STACK_SLEEP;
 bool tracing_enabled = true;
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__type(key, u32);
+	__type(value, u32);
+	__uint(max_entries, 10240);
+} perf_counters SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -645,30 +654,50 @@ int systing_usdt(u64 *ctx)
 	return 0;
 }
 
+static void read_counters(void *ctx, struct task_struct *task)
+{
+	u32 key, cpu = bpf_get_smp_processor_id();
+
+	if (!trace_task(task))
+		return;
+
+	u64 ts = bpf_ktime_get_boot_ns();
+	key = cpu;
+
+	for (int i = 0; i < tool_config.num_perf_counters; i++) {
+		int err;
+
+		struct perf_counter_event *event = reserve_perf_counter_event();
+		if (!event) {
+			handle_missed_event(MISSED_CACHE_EVENT);
+			continue;
+		}
+
+		err = bpf_perf_event_read_value(&perf_counters, key, (void *)&event->value,
+						sizeof(event->value));
+		if (err) {
+			bpf_ringbuf_discard(event, 0);
+			continue;
+		}
+		if (event->value.counter == 0) {
+			bpf_ringbuf_discard(event, 0);
+			continue;
+		}
+		event->ts = ts;
+		event->cpu = cpu;
+		event->counter_num = i;
+		record_task_info(&event->task, task);
+		bpf_ringbuf_submit(event, 0);
+		key += tool_config.num_cpus;
+	}
+}
+
 SEC("perf_event")
 int systing_perf_event_clock(void *ctx)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	emit_stack_event(ctx, task, STACK_RUNNING);
-	return 0;
-}
-
-SEC("perf_event")
-int systing_perf_event_counter(struct bpf_perf_event_data *ctx)
-{
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
-	if (!trace_task(task))
-		return 0;
-
-	struct perf_counter_event *event = reserve_perf_counter_event();
-	if (!event)
-		return handle_missed_event(MISSED_CACHE_EVENT);
-	event->ts = bpf_ktime_get_boot_ns();
-	record_task_info(&event->task, task);
-	event->cpu = bpf_get_smp_processor_id();
-	event->cookie = bpf_get_attach_cookie(ctx);
-	event->value = ctx->sample_period;
-	bpf_ringbuf_submit(event, 0);
+	read_counters(ctx, task);
 	return 0;
 }
 
