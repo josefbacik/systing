@@ -166,6 +166,13 @@ struct {
 	__uint(max_entries, 4);
 } missed_events SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, u64);
+	__uint(max_entries, 1);
+} last_perf_counter_value SEC(".maps");
+
 struct ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
@@ -664,7 +671,7 @@ static void read_counters(void *ctx, struct task_struct *task)
 	u64 ts = bpf_ktime_get_boot_ns();
 	key = cpu;
 
-	for (int i = 0; i < tool_config.num_perf_counters; i++) {
+	for (int i = 0; i < tool_config.num_perf_counters; i++, key += tool_config.num_cpus) {
 		int err;
 
 		struct perf_counter_event *event = reserve_perf_counter_event();
@@ -683,12 +690,18 @@ static void read_counters(void *ctx, struct task_struct *task)
 			bpf_ringbuf_discard(event, 0);
 			continue;
 		}
+		u32 index = i;
+		u64 *last_value = bpf_map_lookup_elem(&last_perf_counter_value, &index);
+		if (last_value) {
+			u64 old_value = event->value.counter;
+			event->value.counter -= *last_value;
+			*last_value = old_value;
+		}
 		event->ts = ts;
 		event->cpu = cpu;
 		event->counter_num = i;
 		record_task_info(&event->task, task);
 		bpf_ringbuf_submit(event, 0);
-		key += tool_config.num_cpus;
 	}
 }
 

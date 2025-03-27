@@ -10,7 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::DescribeOpts;
-use crate::syscall;
+use crate::perf;
 
 use anyhow::Result;
 use inferno::flamegraph::Options;
@@ -335,28 +335,28 @@ fn print_stdout(process_events_vec: Vec<ProcessEvents>) -> Result<()> {
 
 fn init_perf_monitor(freq: u64, sw_event: bool) -> Result<Vec<i32>, libbpf_rs::Error> {
     let nprocs = libbpf_rs::num_possible_cpus().unwrap();
-    let buf: Vec<u8> = vec![0; mem::size_of::<syscall::perf_event_attr>()];
+    let buf: Vec<u8> = vec![0; mem::size_of::<perf::perf_event_attr>()];
     let mut attr = unsafe {
-        Box::<syscall::perf_event_attr>::from_raw(
-            buf.leak().as_mut_ptr() as *mut syscall::perf_event_attr
+        Box::<perf::perf_event_attr>::from_raw(
+            buf.leak().as_mut_ptr() as *mut perf::perf_event_attr
         )
     };
     attr._type = if sw_event {
-        syscall::PERF_TYPE_SOFTWARE
+        perf::PERF_TYPE_SOFTWARE
     } else {
-        syscall::PERF_TYPE_HARDWARE
+        perf::PERF_TYPE_HARDWARE
     };
-    attr.size = mem::size_of::<syscall::perf_event_attr>() as u32;
+    attr.size = mem::size_of::<perf::perf_event_attr>() as u32;
     attr.config = if sw_event {
-        syscall::PERF_COUNT_SW_CPU_CLOCK
+        perf::PERF_COUNT_SW_CPU_CLOCK
     } else {
-        syscall::PERF_COUNT_HW_CPU_CYCLES
+        perf::PERF_COUNT_HW_CPU_CYCLES
     };
     attr.sample.sample_freq = freq;
-    attr.flags = 1 << 10; // freq = 1i
+    attr.flags.set_freq(1);
     let mut pidfds = Vec::new();
     for cpu in 0..nprocs {
-        let fd = syscall::perf_event_open(attr.as_ref(), -1, cpu as i32, -1, 0) as i32;
+        let fd = perf::perf_event_open(attr.as_ref(), -1, cpu as i32, -1, 0) as i32;
         if fd == -1 {
             let os_error = io::Error::last_os_error();
             let mut error_context = "Failed to open perf event.";

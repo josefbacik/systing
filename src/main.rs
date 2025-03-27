@@ -3,9 +3,8 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 mod cmds;
-pub mod perfetto;
 pub mod symbolize;
-pub mod syscall;
+pub mod perf;
 pub mod events;
 
 #[derive(Debug, Parser)]

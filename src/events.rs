@@ -5,28 +5,19 @@ use std::path::Path;
 
 use anyhow::Result;
 use libbpf_rs;
-use nix::ioctl_none;
 
-#[derive(Default, Clone)]
+#[derive(Default, Debug, Clone)]
 pub struct PerfHwEvent {
     pub name: String,
     pub event_type: u32,
     pub event_config: u64,
-    pub flags: u64,
+    pub disabled: bool,
     pub cpus: Vec<u32>,
 }
 
 pub struct PerfCounters {
-    pub events: HashMap<String, Vec<PerfHwEvent>>,
+    events: HashMap<String, Vec<PerfHwEvent>>,
 }
-
-const PERF_EVENT_MAGIC: u8 = b'$';
-const PERF_EVENT_IOC_ENABLE: u8 = 0;
-ioctl_none!(
-    perf_event_ioc_enable,
-    PERF_EVENT_MAGIC,
-    PERF_EVENT_IOC_ENABLE
-);
 
 fn visit_events(dir: &Path, events: &mut Vec<PerfHwEvent>) -> Result<()> {
     for entry in fs::read_dir(dir)? {
@@ -54,7 +45,7 @@ fn visit_events(dir: &Path, events: &mut Vec<PerfHwEvent>) -> Result<()> {
 
         // Slots events should be disabled
         if hwevent.name == "slots" {
-            hwevent.flags = 1 << 0; // disabled
+            hwevent.disabled = true;
         }
         events.push(hwevent);
     }
@@ -129,5 +120,34 @@ impl PerfCounters {
         let path = Path::new("/sys/bus/event_source/devices");
         visit_dirs(path, self, true)?;
         Ok(())
+    }
+
+    pub fn event(&self, name: &str) -> Option<Vec<PerfHwEvent>> {
+        let result = self.events.get(name);
+        if result.is_some() {
+            return Some(result.unwrap().clone());
+        }
+
+        if !name.contains("*") {
+            return None;
+        }
+
+        let pattern = name.replace('*', ".*");
+        let re = Regex::new(pattern.as_str());
+        if re.is_err() {
+            return None;
+        }
+        let re = re.unwrap();
+
+        let mut result = Vec::new();
+        for (key, value) in &self.events {
+            if re.is_match(key) {
+                result.extend(value.iter().cloned());
+            }
+        }
+        if result.len() > 0 {
+            return Some(result);
+        }
+        None
     }
 }
