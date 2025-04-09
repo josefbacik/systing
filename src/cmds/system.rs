@@ -1447,6 +1447,9 @@ pub fn system(opts: SystemOpts) -> Result<()> {
                 let pefds = init_perf_monitor(event, None, 0)?;
                 for (i, cpu) in event.cpus.iter().enumerate() {
                     slot_fds[*cpu as usize] = pefds[i];
+                    unsafe {
+                        crate::perf::perf_event_ioc_enable(pefds[i])?;
+                    }
                 }
             }
         }
