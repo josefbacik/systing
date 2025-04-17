@@ -1,6 +1,15 @@
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Error, ErrorKind};
+use std::mem;
+use std::os::fd::{AsRawFd, FromRawFd};
+
 use bitfield::bitfield;
 use libc;
+use nix::errno::Errno;
 use nix::ioctl_none;
+
+use crate::events::PerfHwEvent;
 
 #[repr(C)]
 pub union sample_un {
@@ -121,8 +130,8 @@ pub fn perf_event_open(
     cpu: libc::c_int,
     group_fd: libc::c_int,
     flags: libc::c_ulong,
-) -> libc::c_long {
-    unsafe {
+) -> Result<PerfEventFile, Error> {
+    let fd = unsafe {
         syscall(
             libc::SYS_perf_event_open,
             hw_event as *const perf_event_attr,
@@ -131,13 +140,200 @@ pub fn perf_event_open(
             group_fd,
             flags,
         )
+    } as i32;
+
+    if fd < 0 {
+        return Err(Error::last_os_error());
     }
+
+    Ok(PerfEventFile {
+        file: unsafe { File::from_raw_fd(fd) },
+        need_disable: false,
+    })
 }
 
 const PERF_EVENT_MAGIC: u8 = b'$';
 const PERF_EVENT_IOC_ENABLE: u8 = 0;
+const PERF_EVENT_IOC_DISABLE: u8 = 1;
 ioctl_none!(
     perf_event_ioc_enable,
     PERF_EVENT_MAGIC,
     PERF_EVENT_IOC_ENABLE
 );
+ioctl_none!(
+    perf_event_ioc_disable,
+    PERF_EVENT_MAGIC,
+    PERF_EVENT_IOC_DISABLE
+);
+
+pub struct PerfEventFile {
+    file: File,
+    need_disable: bool,
+}
+
+pub struct PerfOpenEvents {
+    hwevents: Vec<PerfHwEvent>,
+    events: HashMap<u32, PerfEventFile>,
+}
+
+impl PerfOpenEvents {
+    pub fn new() -> Self {
+        PerfOpenEvents {
+            hwevents: Vec::new(),
+            events: HashMap::new(),
+        }
+    }
+
+    pub fn get(&self, cpu: u32) -> Option<&PerfEventFile> {
+        self.events.get(&cpu)
+    }
+
+    pub fn add_hw_event(&mut self, hwevent: PerfHwEvent) -> Result<(), Error> {
+        // Make sure this has CPU's set
+        if hwevent.cpus.len() == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "No CPUs specified for event",
+            ));
+        }
+
+        // Make sure the added hwevent doesn't overlapp cpu's with existing ones
+        for event in self.hwevents.iter() {
+            if event.cpus.iter().any(|&cpu| hwevent.cpus.contains(&cpu)) {
+                return Err(Error::new(
+                    ErrorKind::AlreadyExists,
+                    "CPU overlap with existing events",
+                ));
+            }
+        }
+        self.hwevents.push(hwevent);
+        Ok(())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &PerfEventFile> {
+        self.events.values()
+    }
+
+    pub fn open_events(
+        &mut self,
+        slots_files: Option<&PerfOpenEvents>,
+        freq: u64,
+    ) -> Result<(), Error> {
+        if self.events.len() > 0 {
+            return Ok(());
+        }
+        for hwevent in self.hwevents.iter() {
+            let buf: Vec<u8> = vec![0; mem::size_of::<perf_event_attr>()];
+            let mut attr = unsafe {
+                Box::<perf_event_attr>::from_raw(buf.leak().as_mut_ptr() as *mut perf_event_attr)
+            };
+            attr._type = hwevent.event_type;
+            attr.size = mem::size_of::<perf_event_attr>() as u32;
+            attr.config = hwevent.event_config;
+            if freq > 0 {
+                attr.sample.sample_freq = freq;
+                attr.flags.set_freq(1);
+            }
+            if hwevent.disabled {
+                attr.flags.set_disabled(1);
+            }
+            for cpu in hwevent.cpus.iter() {
+                let group_fd = if hwevent.need_slots {
+                    if let Some(slots_files) = slots_files {
+                        let slot_file = slots_files.get(*cpu);
+                        if slot_file.is_none() {
+                            return Err(Error::new(ErrorKind::NotFound, "Slot file not found"));
+                        }
+                        slot_file.unwrap().as_raw_fd()
+                    } else {
+                        -1
+                    }
+                } else {
+                    -1
+                };
+                let res = perf_event_open(attr.as_ref(), -1, *cpu as i32, group_fd, 0);
+                match res {
+                    Ok(file) => {
+                        self.events.insert(*cpu, file);
+                    }
+                    Err(err) => {
+                        let mut error_context = "Failed to open perf event.";
+
+                        if let Some(libc::ENODEV) = err.raw_os_error() {
+                            // Sometimes available cpus < num_cpus, so we just break here.
+                            break;
+                        }
+
+                        if err.kind() == ErrorKind::NotFound {
+                            error_context = "Failed to open perf event.\n\
+                                Try running the profile example with the `--sw-event` option.";
+                        }
+                        return Err(Error::new(err.kind(), error_context));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn enable(&mut self) -> Result<(), Error> {
+        for (_, file) in self.events.iter_mut() {
+            file.enable()?;
+        }
+        Ok(())
+    }
+}
+
+impl<'h> IntoIterator for &'h PerfOpenEvents {
+    type Item = (&'h u32, &'h PerfEventFile);
+    type IntoIter = std::collections::hash_map::Iter<'h, u32, PerfEventFile>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.events.iter()
+    }
+}
+
+impl PerfEventFile {
+    pub fn enable(&mut self) -> Result<(), Error> {
+        let ret = unsafe { perf_event_ioc_enable(self.file.as_raw_fd()) };
+        match ret {
+            Ok(_) => {
+                self.need_disable = true;
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+    }
+
+    pub fn disable(&self) -> Result<(), Error> {
+        let ret = unsafe { perf_event_ioc_disable(self.file.as_raw_fd()) };
+        match ret {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if e == Errno::ENOTTY {
+                    return Ok(());
+                }
+                Err(e.into())
+            }
+        }
+    }
+}
+
+impl AsRawFd for PerfEventFile {
+    fn as_raw_fd(&self) -> i32 {
+        self.file.as_raw_fd()
+    }
+}
+
+impl Drop for PerfEventFile {
+    fn drop(&mut self) {
+        if !self.need_disable {
+            return;
+        }
+        unsafe {
+            perf_event_ioc_disable(self.file.as_raw_fd()).unwrap();
+        }
+    }
+}

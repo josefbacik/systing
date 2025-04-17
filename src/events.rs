@@ -12,6 +12,7 @@ pub struct PerfHwEvent {
     pub event_type: u32,
     pub event_config: u64,
     pub disabled: bool,
+    pub need_slots: bool,
     pub cpus: Vec<u32>,
 }
 
@@ -46,6 +47,11 @@ fn visit_events(dir: &Path, events: &mut Vec<PerfHwEvent>) -> Result<()> {
         // Slots events should be disabled
         if hwevent.name == "slots" {
             hwevent.disabled = true;
+        }
+
+        // Topdown events need slots
+        if hwevent.name.starts_with("topdown") {
+            hwevent.need_slots = true;
         }
         events.push(hwevent);
     }
