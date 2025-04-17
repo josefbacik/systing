@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CStr;
-use std::io;
 use std::mem;
 use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use crate::events::{PerfCounters, PerfHwEvent};
 use crate::perf;
+use crate::perf::PerfOpenEvents;
 use crate::symbolize::Stack;
 use crate::SystemOpts;
 
@@ -20,7 +21,7 @@ use blazesym::symbolize::{Input, Kernel, Process, Source, Sym, Symbolized, Symbo
 use blazesym::Pid;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::AsRawLibbpf;
-use libbpf_rs::{ErrorExt, Link, MapCore, RingBufferBuilder, UsdtOpts};
+use libbpf_rs::{Link, MapCore, RingBufferBuilder, UsdtOpts};
 use libbpf_sys;
 use libc;
 use perfetto_protos::builtin_clock::BuiltinClock;
@@ -1027,53 +1028,6 @@ where
     builder.build()
 }
 
-fn init_perf_monitor(
-    hwevent: &PerfHwEvent,
-    slots_fds: Option<&Vec<i32>>,
-    freq: u64,
-) -> Result<Vec<i32>, libbpf_rs::Error> {
-    let buf: Vec<u8> = vec![0; mem::size_of::<perf::perf_event_attr>()];
-    let mut attr = unsafe {
-        Box::<perf::perf_event_attr>::from_raw(buf.leak().as_mut_ptr() as *mut perf::perf_event_attr)
-    };
-    attr._type = hwevent.event_type;
-    attr.size = mem::size_of::<perf::perf_event_attr>() as u32;
-    attr.config = hwevent.event_config;
-    if freq > 0 {
-        attr.sample.sample_freq = freq;
-        attr.flags.set_freq(1);
-    }
-    if hwevent.disabled {
-        attr.flags.set_disabled(1);
-    }
-    let mut pidfds = Vec::new();
-    for cpu in hwevent.cpus.iter() {
-        let group_fd = if let Some(slots_fds) = slots_fds {
-            slots_fds[*cpu as usize]
-        } else {
-            -1
-        };
-        let fd = perf::perf_event_open(attr.as_ref(), -1, *cpu as i32, group_fd, 0) as i32;
-        if fd == -1 {
-            let os_error = io::Error::last_os_error();
-            let mut error_context = "Failed to open perf event.";
-
-            if let Some(libc::ENODEV) = os_error.raw_os_error() {
-                // Sometimes available cpus < num_cpus, so we just break here.
-                break;
-            }
-
-            if os_error.kind() == io::ErrorKind::NotFound {
-                error_context = "Failed to open perf event.\n\
-                                Try running the profile example with the `--sw-event` option.";
-            }
-            return Err(libbpf_rs::Error::from(os_error)).context(error_context);
-        }
-        pidfds.push(fd);
-    }
-    Ok(pidfds)
-}
-
 // We're just doing this until the libbpf-rs crate gets updated with my patch.
 trait LibbpfPerfOptions {
     fn attach_perf_event_with_opts(
@@ -1110,14 +1064,16 @@ impl LibbpfPerfOptions for libbpf_rs::ProgramMut<'_> {
 }
 
 fn attach_perf_event(
-    pefds: &[i32],
+    files: PerfOpenEvents,
     prog: &libbpf_rs::ProgramMut,
     cookie: u64,
-) -> Vec<Result<libbpf_rs::Link, libbpf_rs::Error>> {
-    pefds
-        .iter()
-        .map(|pefd| prog.attach_perf_event_with_opts(*pefd, cookie))
-        .collect()
+) -> Result<Vec<libbpf_rs::Link>, libbpf_rs::Error> {
+    let mut res = Vec::new();
+    for (_, file) in files {
+        let link = prog.attach_perf_event_with_opts(file.into_raw_fd(), cookie)?;
+        res.push(link);
+    }
+    Ok(res)
 }
 
 fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
@@ -1142,24 +1098,23 @@ fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
 
 pub fn system(opts: SystemOpts) -> Result<()> {
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
-    let mut perf_counters = Vec::new();
     let mut perf_counter_names = Vec::new();
     let mut counters = PerfCounters::new();
 
     if opts.perf_counter.len() > 0 {
         counters.discover()?;
 
+        // We can do things like topdown* to get all of the topdown counters, so we have to loop
+        // through all of our options and populate the actual counter names that we want
         for counter in opts.perf_counter.iter() {
             let events = counters.event(counter);
             if events.is_none() {
                 Err(anyhow::anyhow!("Invalid perf counter"))?;
             }
-            perf_counters.extend(events.unwrap());
-        }
-
-        for perf_counters in perf_counters.iter() {
-            if !perf_counter_names.contains(&perf_counters.name) {
-                perf_counter_names.push(perf_counters.name.clone());
+            for event in events.unwrap() {
+                if !perf_counter_names.contains(&event.name) {
+                    perf_counter_names.push(event.name.clone());
+                }
             }
         }
     }
@@ -1411,32 +1366,27 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             drop(cache_rx);
         }
 
-        let mut perf_fds = Vec::new();
-        let mut perf_links = Vec::new();
+        let mut clock_files = PerfOpenEvents::new();
+        clock_files.add_hw_event(PerfHwEvent {
+            name: "clock".to_string(),
+            event_type: if opts.sw_event {
+                perf::PERF_TYPE_SOFTWARE
+            } else {
+                perf::PERF_TYPE_HARDWARE
+            },
+            event_config: if opts.sw_event {
+                perf::PERF_COUNT_SW_CPU_CLOCK
+            } else {
+                perf::PERF_COUNT_HW_CPU_CYCLES
+            },
+            disabled: false,
+            need_slots: false,
+            cpus: (0..num_cpus).collect(),
+        })?;
+        clock_files.open_events(None, 1000)?;
+        let _links = attach_perf_event(clock_files, &skel.progs.systing_perf_event_clock, 0)?;
 
-        let mut slot_fds = vec![-1; num_cpus as usize];
-        {
-            let event = PerfHwEvent {
-                name: "clock".to_string(),
-                event_type: if opts.sw_event {
-                    perf::PERF_TYPE_SOFTWARE
-                } else {
-                    perf::PERF_TYPE_HARDWARE
-                },
-                event_config: if opts.sw_event {
-                    perf::PERF_COUNT_SW_CPU_CLOCK
-                } else {
-                    perf::PERF_COUNT_HW_CPU_CYCLES
-                },
-                disabled: false,
-                cpus: (0..num_cpus).collect(),
-            };
-            let pefds = init_perf_monitor(&event, None, 1000)?;
-            let links = attach_perf_event(&pefds, &skel.progs.systing_perf_event_clock, 0);
-            perf_fds.extend(pefds);
-            perf_links.extend(links);
-        }
-
+        let mut slots_files = PerfOpenEvents::new();
         if need_slots {
             let slot_hwevents = counters.event("slots");
             if slot_hwevents.is_none() {
@@ -1444,42 +1394,33 @@ pub fn system(opts: SystemOpts) -> Result<()> {
             }
             let slot_hwevents = slot_hwevents.unwrap();
             for event in slot_hwevents.iter() {
-                let pefds = init_perf_monitor(event, None, 0)?;
-                for (i, cpu) in event.cpus.iter().enumerate() {
-                    slot_fds[*cpu as usize] = pefds[i];
-                    unsafe {
-                        crate::perf::perf_event_ioc_enable(pefds[i])?;
-                    }
-                }
+                slots_files.add_hw_event(event.clone())?;
             }
+            slots_files.open_events(None, 0)?;
+            slots_files.enable()?;
         }
 
-        for hwevent in perf_counters.iter() {
-            let pefds = init_perf_monitor(hwevent, Some(&slot_fds), 0);
-            if pefds.is_err() {
-                Err(anyhow::anyhow!(
-                    "Failed to initialize perf event {}",
-                    hwevent.name
-                ))?;
+        let mut events_files = Vec::new();
+        for (index, event_name) in perf_counter_names.iter().enumerate() {
+            let mut event_files = PerfOpenEvents::new();
+            let hwevents = counters.event(event_name).unwrap();
+
+            for hwevent in hwevents {
+                event_files.add_hw_event(hwevent)?;
             }
-            let index = perf_counter_names
-                .iter()
-                .position(|x| *x == hwevent.name)
-                .unwrap();
-            let pefds = pefds.unwrap();
+            event_files.open_events(Some(&slots_files), 0)?;
+
             let floor = index * num_cpus as usize;
-            for (i, cpu) in hwevent.cpus.iter().enumerate() {
+            for (cpu, file) in &event_files {
                 let key: u32 = (floor + *cpu as usize).try_into().unwrap();
                 let key_val = key.to_ne_bytes();
-                let fd_val = pefds[i].to_ne_bytes();
+                let fd_val = file.as_raw_fd().to_ne_bytes();
                 skel.maps
                     .perf_counters
                     .update(&key_val, &fd_val, libbpf_rs::MapFlags::ANY)?;
-                unsafe {
-                    crate::perf::perf_event_ioc_enable(pefds[i])?;
-                }
             }
-            perf_fds.extend(pefds);
+            event_files.enable()?;
+            events_files.push(event_files);
         }
         skel.attach()?;
 
@@ -1578,7 +1519,7 @@ pub fn system(opts: SystemOpts) -> Result<()> {
         println!("Missed sched events: {}", dump_missed_events(&skel, 0));
         println!("Missed stack events: {}", dump_missed_events(&skel, 1));
         println!("Missed USDT events: {}", dump_missed_events(&skel, 2));
-        if perf_counters.len() > 0 {
+        if opts.perf_counter.len() > 0 {
             println!("Missed perf events: {}", dump_missed_events(&skel, 3));
         }
     }

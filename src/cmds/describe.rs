@@ -1,23 +1,22 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::io;
-use std::mem;
 use std::mem::MaybeUninit;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::DescribeOpts;
+use crate::events::PerfHwEvent;
 use crate::perf;
+use crate::perf::PerfOpenEvents;
+use crate::DescribeOpts;
 
 use anyhow::Result;
 use inferno::flamegraph::Options;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::ErrorExt;
 use libbpf_rs::RingBufferBuilder;
-use nix::unistd::close;
 use petgraph::graphmap::DiGraphMap;
 use plain::Plain;
 
@@ -333,61 +332,20 @@ fn print_stdout(process_events_vec: Vec<ProcessEvents>) -> Result<()> {
     Ok(())
 }
 
-fn init_perf_monitor(freq: u64, sw_event: bool) -> Result<Vec<i32>, libbpf_rs::Error> {
-    let nprocs = libbpf_rs::num_possible_cpus().unwrap();
-    let buf: Vec<u8> = vec![0; mem::size_of::<perf::perf_event_attr>()];
-    let mut attr = unsafe {
-        Box::<perf::perf_event_attr>::from_raw(
-            buf.leak().as_mut_ptr() as *mut perf::perf_event_attr
-        )
-    };
-    attr._type = if sw_event {
-        perf::PERF_TYPE_SOFTWARE
-    } else {
-        perf::PERF_TYPE_HARDWARE
-    };
-    attr.size = mem::size_of::<perf::perf_event_attr>() as u32;
-    attr.config = if sw_event {
-        perf::PERF_COUNT_SW_CPU_CLOCK
-    } else {
-        perf::PERF_COUNT_HW_CPU_CYCLES
-    };
-    attr.sample.sample_freq = freq;
-    attr.flags.set_freq(1);
-    let mut pidfds = Vec::new();
-    for cpu in 0..nprocs {
-        let fd = perf::perf_event_open(attr.as_ref(), -1, cpu as i32, -1, 0) as i32;
-        if fd == -1 {
-            let os_error = io::Error::last_os_error();
-            let mut error_context = "Failed to open perf event.";
-
-            if let Some(libc::ENODEV) = os_error.raw_os_error() {
-                // Sometimes available cpus < num_cpus, so we just break here.
-                break;
-            }
-
-            if !sw_event && os_error.kind() == io::ErrorKind::NotFound {
-                error_context = "Failed to open perf event.\n\
-                                Try running the profile example with the `--sw-event` option.";
-            }
-            return Err(libbpf_rs::Error::from(os_error)).context(error_context);
-        }
-        pidfds.push(fd);
-    }
-    Ok(pidfds)
-}
-
 fn attach_perf_event(
-    pefds: &[i32],
+    files: &PerfOpenEvents,
     prog: &libbpf_rs::ProgramMut,
-) -> Vec<Result<libbpf_rs::Link, libbpf_rs::Error>> {
-    pefds
-        .iter()
-        .map(|pefd| prog.attach_perf_event(*pefd))
-        .collect()
+) -> Result<Vec<libbpf_rs::Link>, libbpf_rs::Error> {
+    let mut res = Vec::new();
+    for (_, file) in files {
+        let link = prog.attach_perf_event(file.as_raw_fd())?;
+        res.push(link);
+    }
+    Ok(res)
 }
 
 pub fn describe(opts: DescribeOpts) -> Result<()> {
+    let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut skel_builder = systing::SystingDescribeSkelBuilder::default();
     if opts.verbose {
         skel_builder.obj_builder.debug(true);
@@ -399,8 +357,26 @@ pub fn describe(opts: DescribeOpts) -> Result<()> {
     open_skel.maps.rodata_data.tool_config.tgid = opts.pid;
     let mut skel = open_skel.load()?;
 
-    let pefds = init_perf_monitor(1000, opts.sw_event)?;
-    let _links = attach_perf_event(&pefds, &skel.progs.sample_process);
+    let mut clock_files = PerfOpenEvents::new();
+    clock_files.add_hw_event(PerfHwEvent {
+        name: "clock".to_string(),
+        event_type: if opts.sw_event {
+            perf::PERF_TYPE_SOFTWARE
+        } else {
+            perf::PERF_TYPE_HARDWARE
+        },
+        event_config: if opts.sw_event {
+            perf::PERF_COUNT_SW_CPU_CLOCK
+        } else {
+            perf::PERF_COUNT_HW_CPU_CYCLES
+        },
+        disabled: false,
+        need_slots: false,
+        cpus: (0..num_cpus as u32).collect(),
+    })?;
+    clock_files.open_events(None, 1000)?;
+
+    let _links = attach_perf_event(&clock_files, &skel.progs.sample_process)?;
     skel.attach()?;
 
     let events = Arc::new(Mutex::new(HashMap::<u64, ProcessEvents>::new()));
@@ -500,11 +476,5 @@ pub fn describe(opts: DescribeOpts) -> Result<()> {
         }
     }
 
-    for pefd in pefds {
-        close(pefd)
-            .map_err(io::Error::from)
-            .map_err(libbpf_rs::Error::from)
-            .context("failed to close perf event")?;
-    }
     Ok(())
 }

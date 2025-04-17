@@ -12,6 +12,7 @@ pub struct PerfHwEvent {
     pub event_type: u32,
     pub event_config: u64,
     pub disabled: bool,
+    pub need_slots: bool,
     pub cpus: Vec<u32>,
 }
 
@@ -20,9 +21,22 @@ pub struct PerfCounters {
 }
 
 fn visit_events(dir: &Path, events: &mut Vec<PerfHwEvent>) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
+    let entries = fs::read_dir(dir)?
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+
+    // Some of the topdown metrics exposted by Intel Atom don't have a slots entry, so we have to
+    // check and see if there's a slots file in this events directory to decide if any topdown
+    // metrics require a slots fd.
+    let need_slots = match entries.iter().find(|entry| {
+        let filename = entry.file_name().unwrap().to_str().unwrap();
+        filename == "slots"
+    }) {
+        Some(_) => true,
+        None => false,
+    };
+
+    for path in entries {
         let buf = fs::read_to_string(&path)?;
         let event_re = Regex::new(r"event=0x([0-9a-fA-F]+)").unwrap();
         let umask_re = Regex::new(r"umask=0x([0-9a-fA-F]+)").unwrap();
@@ -46,6 +60,11 @@ fn visit_events(dir: &Path, events: &mut Vec<PerfHwEvent>) -> Result<()> {
         // Slots events should be disabled
         if hwevent.name == "slots" {
             hwevent.disabled = true;
+        }
+
+        // Topdown events need slots
+        if hwevent.name.starts_with("topdown") {
+            hwevent.need_slots = need_slots;
         }
         events.push(hwevent);
     }
