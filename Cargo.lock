@@ -1042,15 +1042,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
-name = "perf-event-open-sys"
-version = "4.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c44fb1c7651a45a3652c4afc6e754e40b3d6e6556f1487e2b230bfc4f33c2a8"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "perfetto_protos"
 version = "0.48.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1673,7 +1664,6 @@ dependencies = [
  "libbpf-sys",
  "libc",
  "nix",
- "perf-event-open-sys",
  "perfetto_protos",
  "petgraph",
  "plain",
