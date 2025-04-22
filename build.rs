@@ -4,9 +4,7 @@ use std::path::{Path, PathBuf};
 
 use libbpf_cargo::SkeletonBuilder;
 
-const SRC: [&'static str; 3] = [
-    "src/bpf/systing_profile.bpf.c",
-    "src/bpf/systing_describe.bpf.c",
+const SRC: [&'static str; 1] = [
     "src/bpf/systing_system.bpf.c",
 ];
 
