@@ -95,7 +95,7 @@ If you are having too many missed events you can increase this size.
 NOTE: You will always have missed events for perf events, this is normal.
 Only increase this if you are having misseed sched events, as that affects the trace quality.
 
-=== *--sw-event"
+=== *--sw-event*
 
 If recording inside of a VM, this can be specified to enable the software events necessary to record stack traces.
 
