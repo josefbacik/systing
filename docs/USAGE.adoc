@@ -1,0 +1,120 @@
+= systing(8)
+:doctype: manpage
+:toc: true
+:toclevels: 1
+
+///
+Style guide:
+- one sentence per line
+///
+
+== Name
+
+systing - a tracing tool for generating perfetto traces
+
+== Synopsis
+
+*systing* [_OPTIONS_]
+
+== Description
+
+systing is a tracing tool for generating perfetto traces of the system.
+It was written with the intention of being a simple and easy to use tool for generating https://perfetto.dev[Perfetto] traces with the least amount of configuration possible.
+It is opinionated about what is the most useful information to get out of the system for doing low level system performance investigations.
+
+== Examples
+
+Trace all the scheduling events and stack traces for all threads in the system for 60 seconds:
+---
+# systing --duration 60
+---
+
+Trace only a qemu process and record every time it calls `v9fs_create`
+---
+# systing --duration 60 --trace-event "usdt:/usr/bin/qemu-system-x86_64:qemu:v9fs_create" --trace-event-pid <pid>
+---
+
+== Options
+
+=== *--cgroup* _PATH_
+
+Record only processes that belong to this cgroup.
+This can be specified multiple times to record multiple cgroups.
+
+With this option we will still record processes that are not in the cgroup but that wakeup a process in our cgroup.
+This creates odd artifacts in the scheduler tracks but is useful for debugging.
+
+=== *--cpu-frequency*
+
+Record the CPU frequency of every CPU in the system.
+When this is enabled systing will record the CPU frequency of every CPU in the system every 100ms.
+This will be added a global track per-CPU in the trace.
+
+=== *--cpu-sched-stats*
+
+Record individual CPU scheduling statistics per CPU and per thread.
+This generates a lot of data and is not recommended for long traces.
+This will generate 2 tracks in the global track for each CPU in the system.
+The first will contain the number of entities in the runqueue for each CPU at the given timestamp.
+The second is the current wakeup latency for this CPU at the given timestamp.
+
+=== *--duration*
+
+Specifies the duration of the trace in seconds.
+
+=== *--no-stack-traces*
+
+Do not record stack traces for the threads in the system.
+This disables the perf style stack traces as well as the uninterruptible sleep stack traces.
+
+=== *--perf-counter* _COUNTERNAME_
+
+Record a perf counter for the given process.
+This can be specified multiple times to record multiple perf counters.
+This also accepts a glob pattern to match multiple perf counters.
+The perf counters are global tracks and recorded per CPU, so if you wish to view the counters for a particlar section of a thread runtime you must find the CPU that thread is on at the given time and look for the counters on the track for that CPU.
+
+=== *--pid* _PID_
+
+Record only the process with the given PID.
+Similar to cgroup, we will record any process that wakes up our PID, which may result in odd artifacts in the scheduler tracks.
+This can be specified multiple times to record multiple PIDs.
+
+=== *--process-sched-stats*
+
+Record individual process scheduling statistics per CPU and per thread.
+This is similar to *--cpu-sched-stats* but for each thread in the system.
+This generates a lot of data and is not recommended for long traces.
+This will generate a single track per thread that shows that threads current scheudling wakeup latency.
+
+=== *--ringbuf-size-mb* _SIZE_
+
+Specifies the size of the ring buffer in megabytes.
+The default is 50Mib.
+If you are having too many missed events you can increase this size.
+NOTE: You will always have missed events for perf events, this is normal.
+Only increase this if you are having misseed sched events, as that affects the trace quality.
+
+=== *--sw-event"
+
+If recording inside of a VM, this can be specified to enable the software events necessary to record stack traces.
+
+=== *--trace-event* _EVENT_
+
+This is a special option that takes a format similar to https://bpftrace.org[`bpftrace`].
+Currently the supported events are only `usdt`, `uprobe`, and `uretprobe`.
+If using the userspace related events you must also specify *--trace-event-pid* to specify the PID of the process you want to trace.
+The following is an exhaustive list of the supported formats
+
+* `usdt:/path/to/executable:tracepoint_name:tracepoint_class`
+* `uprobe:/path/to/executable:function_name`
+* `uprobe:/path/to/executable:offset`
+* `uprobe:/path/to/executable:function_name+offset`
+* `uretprobe:/path/to/executable:function_name`
+* `uretprobe:/path/to/executable:offset`
+* `uretprobe:/path/to/executable:function_name+offset`
+
+=== *--trace-event-pid* _PID_
+
+This is to be paired with *--trace-event-pid*.
+Any _PID_ specified here will have any of the userspace trace events specified applied to it.

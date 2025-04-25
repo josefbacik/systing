@@ -8,28 +8,21 @@ problems.  That code can be found in the `old-systing` branch.
 
 The current iteration is just a single command, `systing`.
 
-## TODO FOR SYSTEM
-- [X] Separate the stack traces out into their own NUMA node bound ringbufs.
-- [X] Add an option to disable the stack traces.
-- [ ] Build a `perfetto` plugin to replicate the `runqueue` and `wake latency`
-  tracks, then remove those tracks to slim down the trace file size.
-- [ ] Figure out something better to do about cgroup and PID based tracing so it
-  doesn't leave ghost tasks.
-- [X] Add IRQ events.
-- [X] Add normal perf sample events to trace CPU time as well.
-- [ ] Add a way to trace arbitrary tracepoints.
-    - [ ] Add a way to trace tracepoints in the kernel.
-    - [X] Add a way to trace tracepoints in userspace.
-- [ ] Determine the number of NUMA nodes on the system and set the extra ringbuf
-  sizes to 0 to avoid the memory overhead.
-- [ ] If there are no USDT's, set the ringbuf sizes to 0 to avoid the memory
-  overhead.
-- [X] Separate out the USDT recorder into it's own object so there's no lock
-  contention between the event recorder and the USDT recorder.
-- [X] Separate out the stack recorder into it's own object so there's no lock
-  contention between the different recorders.
+## Quick start
+
+To build, ensure you have installed bpftool. This only builds on linux.
+
+```bash
+cargo build
+sudo ./target/debug/systing --duration 60
+```
+
+This will generate a `trace.pb` file which can be uploaded to a
+[Perfetto](https://perfetto.dev/) instance for further analysis.
 
 ## Usage
+
+Detailed options can be found [here](docs/USAGE.adoc).
 
 This tool traces all the scheduling events on the system, cgroup, or process and
 generates a [Perfetto](https://perfetto.dev/) trace.  This can be uploaded to a
@@ -50,10 +43,19 @@ info>:<class>:<name>".  This is most easily obtained by running
 bpftrace -lp <pid of desired program> | grep <name of usdt>
 ```
 
-User space tracepoints (USDT) are currently the only ones supported, and you
-must specify the path to the executable/library that contains the tracepoint.
-`--trace-event-pid` must also be specified.  For example, if you want to trace
-when `qemu` does a v9fs create, you would run the following
+The currently allowed formats are
+
+- `usdt:/path/to/executable:tracepoint_name:tracepoint_class`
+- `uprobe:/path/to/executable:function_name`
+- `uprobe:/path/to/executable:offset`
+- `uprobe:/path/to/executable:function_name+offset`
+- `uretprobe:/path/to/executable:function_name`
+- `uretprobe:/path/to/executable:offset`
+- `uretprobe:/path/to/executable:function_name+offset`
+
+For all `usdt` and `u*probe` events you *must* specify `--trace-event-pid` to to
+indicate which PID's you wish to record the events for. For example, if you want
+to trace when `qemu` does a v9fs create, you would run the following
 
 ```
 systing --trace-event-pid <PID of qemu> --trace-event "usdt:/usr/bin/qemu-system-x86_64:qemu:v9fs_create"

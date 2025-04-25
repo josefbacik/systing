@@ -71,7 +71,7 @@ struct task_event {
 	struct task_info next;
 };
 
-enum usdt_arg_type {
+enum arg_type {
 	ARG_NONE,
 	ARG_LONG,
 	ARG_STRING,
@@ -80,11 +80,20 @@ enum usdt_arg_type {
 #define ARG0_SIZE 64
 struct usdt_event {
 	u32 cpu;
-	enum usdt_arg_type arg_type;
+	enum arg_type arg_type;
 	u64 ts;
 	u64 cookie;
 	struct task_info task;
 	u8 usdt_arg0[ARG0_SIZE];
+};
+
+struct uprobe_event {
+	u32 cpu;
+	enum arg_type arg_type;
+	u64 ts;
+	u64 cookie;
+	struct task_info task;
+	u8 arg0[ARG0_SIZE];
 };
 
 struct stack_event {
@@ -115,8 +124,9 @@ struct usdt_event _usdt_event = {0};
 struct stack_event _stack_event = {0};
 struct perf_counter_event _perf_counter_event = {0};
 struct task_info _task_info = {0};
+struct uprobe_event _uprobe_event = {0};
 enum event_type _type = SCHED_SWITCH;
-enum usdt_arg_type _usdt_type = ARG_NONE;
+enum arg_type _arg_type = ARG_NONE;
 enum stack_event_type _stack_type = STACK_SLEEP;
 bool tracing_enabled = true;
 
@@ -159,11 +169,13 @@ struct {
 #define MISSED_STACK_EVENT 1
 #define MISSED_USDT_EVENT 2
 #define MISSED_CACHE_EVENT 3
+#define MISSED_UPROBE_EVENT 4
+#define MISSED_EVENT_MAX 5
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
 	__type(value, u64);
-	__uint(max_entries, 4);
+	__uint(max_entries, MISSED_EVENT_MAX);
 } missed_events SEC(".maps");
 
 struct {
@@ -196,6 +208,14 @@ struct stack_ringbuf_map {
   ringbuf_stack_events_node2 SEC(".maps"), ringbuf_stack_events_node3 SEC(".maps"),
   ringbuf_stack_events_node4 SEC(".maps"), ringbuf_stack_events_node5 SEC(".maps"),
   ringbuf_stack_events_node6 SEC(".maps"), ringbuf_stack_events_node7 SEC(".maps");
+
+struct uprobe_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
+} ringbuf_uprobe_events_node0 SEC(".maps"), ringbuf_uprobe_events_node1 SEC(".maps"),
+  ringbuf_uprobe_events_node2 SEC(".maps"), ringbuf_uprobe_events_node3 SEC(".maps"),
+  ringbuf_uprobe_events_node4 SEC(".maps"), ringbuf_uprobe_events_node5 SEC(".maps"),
+  ringbuf_uprobe_events_node6 SEC(".maps"), ringbuf_uprobe_events_node7 SEC(".maps");
 
 struct perf_counter_ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -281,6 +301,24 @@ struct {
 	},
 };
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS);
+	__type(key, u32);
+	__array(values, struct uprobe_ringbuf_map);
+} uprobe_ringbufs SEC(".maps") = {
+	.values = {
+		&ringbuf_uprobe_events_node0,
+		&ringbuf_uprobe_events_node1,
+		&ringbuf_uprobe_events_node2,
+		&ringbuf_uprobe_events_node3,
+		&ringbuf_uprobe_events_node4,
+		&ringbuf_uprobe_events_node5,
+		&ringbuf_uprobe_events_node6,
+		&ringbuf_uprobe_events_node7,
+	},
+};
+
 static struct task_event *reserve_task_event(void)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
@@ -323,6 +361,17 @@ static struct perf_counter_event *reserve_perf_counter_event(void)
 	if (!rb)
 		return NULL;
 	return bpf_ringbuf_reserve(rb, sizeof(struct perf_counter_event), 0);
+}
+
+static struct uprobe_event *reserve_uprobe_event(void)
+{
+	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&uprobe_ringbufs, &node);
+	if (!rb)
+		return NULL;
+	return bpf_ringbuf_reserve(rb, sizeof(struct uprobe_event), 0);
 }
 
 static u32 task_cpu(struct task_struct *task)
@@ -620,7 +669,7 @@ int BPF_PROG(systing_softirq_exit, unsigned int vec_nr)
 }
 
 SEC("usdt")
-int systing_usdt(u64 *ctx)
+int systing_usdt(struct pt_regs *ctx)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 
@@ -642,18 +691,16 @@ int systing_usdt(u64 *ctx)
 	 * we try to read it as if it's a pointer to something, like a string.
 	 * If it fails then we'll just pass the raw value.
 	 */
-	u64 *val = NULL;
+	long val = 0;
 	bpf_usdt_arg(ctx, 0, &val);
 	if (val) {
 		int ret = bpf_probe_read_user_str(&event->usdt_arg0,
 						  sizeof(event->usdt_arg0),
-						  val);
+						  (long *)val);
 		if (ret > 0) {
 			event->arg_type = ARG_STRING;
 		} else {
-			u64 realval;
-			bpf_usdt_arg(ctx, 0, &realval);
-			__builtin_memcpy(&event->usdt_arg0, &realval, sizeof(u64));
+			__builtin_memcpy(&event->usdt_arg0, &val, sizeof(long));
 			event->arg_type = ARG_LONG;
 		}
 	}
@@ -711,6 +758,41 @@ int systing_perf_event_clock(void *ctx)
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	emit_stack_event(ctx, task, STACK_RUNNING);
 	read_counters(ctx, task);
+	return 0;
+}
+
+SEC("uprobe")
+int systing_uprobe(struct pt_regs *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	struct uprobe_event *event = reserve_uprobe_event();
+	if (!event)
+		return handle_missed_event(MISSED_UPROBE_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->cookie = bpf_get_attach_cookie(ctx);
+	event->arg0[0] = 0;
+	event->arg_type = ARG_NONE;
+
+	u64 arg = PT_REGS_PARM1_CORE(ctx);
+	if (arg) {
+		int ret = bpf_probe_read_user_str(&event->arg0,
+						  sizeof(event->arg0),
+						  (void *)arg);
+		if (ret > 0) {
+			event->arg_type = ARG_STRING;
+		} else {
+			__builtin_memcpy(&event->arg0, &arg, sizeof(u64));
+			event->arg_type = ARG_LONG;
+		}
+	}
+	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
 

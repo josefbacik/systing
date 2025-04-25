@@ -4,6 +4,7 @@ pub mod symbolize;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CStr;
+use std::fmt;
 use std::mem;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, IntoRawFd};
@@ -26,7 +27,7 @@ use blazesym::symbolize::{Input, Kernel, Process, Source, Sym, Symbolized, Symbo
 use blazesym::Pid;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::AsRawLibbpf;
-use libbpf_rs::{Link, MapCore, RingBufferBuilder, UsdtOpts};
+use libbpf_rs::{Link, MapCore, RingBufferBuilder, UprobeOpts, UsdtOpts};
 use libbpf_sys;
 use libc;
 use perfetto_protos::builtin_clock::BuiltinClock;
@@ -111,12 +112,14 @@ use systing::types::perf_counter_event;
 use systing::types::stack_event;
 use systing::types::task_event;
 use systing::types::task_info;
+use systing::types::uprobe_event;
 use systing::types::usdt_event;
 
 unsafe impl Plain for task_event {}
 unsafe impl Plain for usdt_event {}
 unsafe impl Plain for stack_event {}
 unsafe impl Plain for perf_counter_event {}
+unsafe impl Plain for uprobe_event {}
 
 struct TrackCounter {
     ts: u64,
@@ -157,6 +160,15 @@ struct UsdtProbe {
     name: String,
 }
 
+#[derive(Clone, Default)]
+struct UProbe {
+    cookie: u64,
+    path: String,
+    offset: u64,
+    func_name: String,
+    retprobe: bool,
+}
+
 #[derive(Default)]
 struct EventRecorder {
     events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
@@ -173,6 +185,12 @@ struct EventRecorder {
 struct UsdtRecorder {
     usdt_cookies: HashMap<u64, UsdtProbe>,
     usdt_events: HashMap<u64, Vec<TrackInstant>>,
+}
+
+#[derive(Default)]
+struct UprobeRecorder {
+    uprobes: HashMap<u64, UProbe>,
+    uprobe_events: HashMap<u64, Vec<TrackInstant>>,
 }
 
 #[derive(Default)]
@@ -205,6 +223,7 @@ struct SessionRecorder {
     stack_recorder: Mutex<StackRecorder>,
     perf_counter_recorder: Mutex<PerfCounterRecorder>,
     sysinfo_recorder: Mutex<SysinfoRecorder>,
+    uprobe_recorder: Mutex<UprobeRecorder>,
     processes: RwLock<HashMap<u64, ProcessDescriptor>>,
     threads: RwLock<HashMap<u64, ThreadDescriptor>>,
 }
@@ -773,13 +792,13 @@ impl UsdtRecorder {
 
         // Capture arg0 if there is one.
         match event.arg_type {
-            systing::types::usdt_arg_type::ARG_LONG => {
+            systing::types::arg_type::ARG_LONG => {
                 let mut bytes: [u8; 8] = [0; 8];
                 let _ = bytes.copy_from_bytes(&event.usdt_arg0[..8]);
                 let val = u64::from_ne_bytes(bytes);
                 extra = format!(":{}", val);
             }
-            systing::types::usdt_arg_type::ARG_STRING => {
+            systing::types::arg_type::ARG_STRING => {
                 let arg0_str = CStr::from_bytes_until_nul(&event.usdt_arg0);
                 if !arg0_str.is_err() {
                     let arg0_str = arg0_str.unwrap();
@@ -1026,7 +1045,107 @@ impl SessionRecorder {
                 .unwrap()
                 .generate_trace(&mut rng),
         );
+        packets.extend(self.uprobe_recorder.lock().unwrap().generate_trace(
+            &pid_uuids,
+            &thread_uuids,
+            &mut rng,
+        ));
         packets
+    }
+}
+
+impl UprobeRecorder {
+    fn record_uprobe_event(&mut self, event: &uprobe_event) {
+        let mut extra = "".to_string();
+
+        // Capture arg0 if there is one.
+        match event.arg_type {
+            systing::types::arg_type::ARG_LONG => {
+                let mut bytes: [u8; 8] = [0; 8];
+                let _ = bytes.copy_from_bytes(&event.arg0[..8]);
+                let val = u64::from_ne_bytes(bytes);
+                extra = format!(":{}", val);
+            }
+            systing::types::arg_type::ARG_STRING => {
+                let arg0_str = CStr::from_bytes_until_nul(&event.arg0);
+                if !arg0_str.is_err() {
+                    let arg0_str = arg0_str.unwrap();
+                    let bytes = arg0_str.to_bytes();
+                    if bytes.len() > 0 && !bytes.starts_with(&[0]) {
+                        extra = format!(":{}", arg0_str.to_string_lossy());
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let uprobe = self.uprobes.get(&event.cookie).unwrap();
+        let entry = self
+            .uprobe_events
+            .entry(event.task.tgidpid)
+            .or_insert_with(Vec::new);
+        entry.push(TrackInstant {
+            ts: event.ts,
+            name: format!("{}{}", uprobe, extra),
+        });
+    }
+
+    fn generate_trace(
+        &self,
+        pid_uuids: &HashMap<i32, u64>,
+        thread_uuids: &HashMap<i32, u64>,
+        rng: &mut dyn rand::RngCore,
+    ) -> Vec<TracePacket> {
+        let mut packets = Vec::new();
+
+        // Populate the USDT events
+        for (pidtgid, events) in self.uprobe_events.iter() {
+            let desc_uuid = rng.next_u64();
+            let desc = generate_pidtgid_track_descriptor(
+                pid_uuids,
+                thread_uuids,
+                pidtgid,
+                "UProbe events".to_string(),
+                desc_uuid,
+            );
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packets.push(packet);
+
+            let seq = rng.next_u32();
+            for event in events.iter() {
+                let mut tevent = TrackEvent::default();
+                tevent.set_type(Type::TYPE_INSTANT);
+                tevent.set_name(event.name.clone());
+                tevent.set_track_uuid(desc_uuid);
+
+                let mut packet = TracePacket::default();
+                packet.set_timestamp(event.ts);
+                packet.set_track_event(tevent);
+                packet.set_trusted_packet_sequence_id(seq);
+                packets.push(packet);
+            }
+        }
+        packets
+    }
+}
+
+impl fmt::Display for UProbe {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = if self.retprobe { "uretprobe" } else { "uprobe" };
+        if self.func_name != "" {
+            if self.offset != 0 {
+                write!(f, "{}:{}+0x{:x}", name, self.func_name, self.offset,)
+            } else {
+                write!(f, "{}:{}", name, self.func_name)
+            }
+        } else {
+            if self.offset != 0 {
+                write!(f, "{}:0x{:x}", name, self.offset)
+            } else {
+                write!(f, "{}", name)
+            }
+        }
     }
 }
 
@@ -1207,6 +1326,7 @@ fn system(opts: Command) -> Result<()> {
 
         let mut rng = rand::rng();
         let mut usdts: Vec<UsdtProbe> = Vec::new();
+        let mut uprobes: Vec<UProbe> = Vec::new();
         for tracepoint in opts.trace_event.iter() {
             let parts = tracepoint.split(':').collect::<Vec<&str>>();
             match parts[0] {
@@ -1227,6 +1347,47 @@ fn system(opts: Command) -> Result<()> {
                         .unwrap()
                         .usdt_cookies
                         .insert(usdt.cookie, usdt);
+                }
+                "uprobe" | "uretprobe" => {
+                    // Format is
+                    // uprobe:<path>:<offset>
+                    // uprobe:<path>:<symbol>
+                    // uprobe:<path>:<symbol>+<offset>
+                    // uretprobe:<path>:<offset>
+                    // uretprobe:<path>:<symbol>
+                    // uretprobe:<path>:<symbol>+<offset>
+                    if parts.len() != 3 {
+                        Err(anyhow::anyhow!("Invalid uprobes format"))?;
+                    }
+                    let mut probe = UProbe::default();
+                    probe.cookie = rng.next_u64();
+                    probe.path = parts[1].to_string();
+                    probe.retprobe = parts[0] == "uretprobe";
+
+                    match parts[2].parse::<u64>() {
+                        Ok(val) => {
+                            probe.offset = val;
+                        }
+                        Err(_) => {
+                            let symbol = parts[2].to_string();
+                            let mut symbol_parts = symbol.split('+');
+                            let symbol = symbol_parts.next().unwrap();
+                            let offset = symbol_parts.next();
+                            if offset.is_some() {
+                                probe.offset = offset.unwrap().parse::<u64>()?;
+                            } else {
+                                probe.offset = 0;
+                            }
+                            probe.func_name = symbol.to_string();
+                        }
+                    }
+                    uprobes.push(probe.clone());
+                    recorder
+                        .uprobe_recorder
+                        .lock()
+                        .unwrap()
+                        .uprobes
+                        .insert(probe.cookie, probe);
                 }
                 _ => {
                     Err(anyhow::anyhow!("Invalid probe type"))?;
@@ -1288,6 +1449,7 @@ fn system(opts: Command) -> Result<()> {
         let (usdt_tx, usdt_rx) = channel();
         let (stack_tx, stack_rx) = channel();
         let (cache_tx, cache_rx) = channel();
+        let (uprobe_tx, uprobe_rx) = channel();
 
         let object = skel.object();
         for (i, map) in object.maps().enumerate() {
@@ -1306,6 +1468,9 @@ fn system(opts: Command) -> Result<()> {
                     let ring = create_ring::<perf_counter_event>(&map, cache_tx.clone())?;
                     rings.push((name.to_string(), ring));
                 }
+            } else if name.starts_with("ringbuf_uprobe") {
+                let ring = create_ring::<uprobe_event>(&map, uprobe_tx.clone())?;
+                rings.push((name.to_string(), ring));
             }
         }
 
@@ -1314,6 +1479,7 @@ fn system(opts: Command) -> Result<()> {
         drop(usdt_tx);
         drop(stack_tx);
         drop(cache_tx);
+        drop(uprobe_tx);
 
         let mut recv_threads = Vec::new();
         let session_recorder = recorder.clone();
@@ -1383,6 +1549,27 @@ fn system(opts: Command) -> Result<()> {
                             .lock()
                             .unwrap()
                             .record_stack_event(&event);
+                        maybe_record_task(&event.task, &session_recorder);
+                    }
+                    0
+                })?,
+        );
+        let session_recorder = recorder.clone();
+        recv_threads.push(
+            thread::Builder::new()
+                .name("uprobe_recorder".to_string())
+                .spawn(move || {
+                    loop {
+                        let res = uprobe_rx.recv();
+                        if res.is_err() {
+                            break;
+                        }
+                        let event = res.unwrap();
+                        session_recorder
+                            .uprobe_recorder
+                            .lock()
+                            .unwrap()
+                            .record_uprobe_event(&event);
                         maybe_record_task(&event.task, &session_recorder);
                     }
                     0
@@ -1493,6 +1680,28 @@ fn system(opts: Command) -> Result<()> {
             }
         }
 
+        // Attach any uprobes that we may have
+        let mut uprobe_links = Vec::new();
+        for uprobe in uprobes {
+            for pid in opts.trace_event_pid.iter() {
+                let link = skel.progs.systing_uprobe.attach_uprobe_with_opts(
+                    *pid as i32,
+                    &uprobe.path,
+                    uprobe.offset as usize,
+                    UprobeOpts {
+                        cookie: uprobe.cookie,
+                        retprobe: uprobe.retprobe,
+                        func_name: uprobe.func_name.clone(),
+                        ..Default::default()
+                    },
+                );
+                if link.is_err() {
+                    Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+                }
+                uprobe_links.push(link);
+            }
+        }
+
         let mut threads = Vec::new();
         let thread_done = Arc::new(AtomicBool::new(false));
         for (name, ring) in rings {
@@ -1570,6 +1779,7 @@ fn system(opts: Command) -> Result<()> {
         if opts.perf_counter.len() > 0 {
             println!("Missed perf events: {}", dump_missed_events(&skel, 3));
         }
+        println!("Missed Uprobes events: {}", dump_missed_events(&skel, 4));
     }
 
     println!("Generating trace...");
