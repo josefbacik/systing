@@ -24,12 +24,12 @@ It is opinionated about what is the most useful information to get out of the sy
 
 == Examples
 
-Trace all the scheduling events and stack traces for all threads in the system for 60 seconds:
+Trace all the scheduling events and stack traces for all threads in the system for 60 seconds::
 ---
 # systing --duration 60
 ---
 
-Trace only a qemu process and record every time it calls `v9fs_create`
+Trace only a qemu process and record every time it calls `v9fs_create`::
 ---
 # systing --duration 60 --trace-event "usdt:/usr/bin/qemu-system-x86_64:qemu:v9fs_create" --trace-event-pid <pid>
 ---
