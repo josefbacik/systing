@@ -30,6 +30,7 @@ const volatile struct {
 	u32 no_stack_traces;
 	u32 num_perf_counters;
 	u32 num_cpus;
+	u32 my_tgid;
 } tool_config = {};
 
 enum event_type {
@@ -399,6 +400,8 @@ static bool trace_task(struct task_struct *task)
 	if (!tracing_enabled)
 		return false;
 	if (task->tgid == 0)
+		return false;
+	if (task->tgid == tool_config.my_tgid)
 		return false;
 	if (tool_config.filter_pid) {
 		u32 pid = task->tgid;

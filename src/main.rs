@@ -9,6 +9,7 @@ use std::mem;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::fs::MetadataExt;
+use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1298,6 +1299,7 @@ fn system(opts: Command) -> Result<()> {
         let mut open_skel = skel_builder.open(&mut open_object)?;
 
         open_skel.maps.rodata_data.tool_config.num_cpus = num_cpus;
+        open_skel.maps.rodata_data.tool_config.my_tgid = process::id() as u32;
         if opts.cgroup.len() > 0 {
             open_skel.maps.rodata_data.tool_config.filter_cgroup = 1;
         }
