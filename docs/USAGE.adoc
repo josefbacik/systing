@@ -62,6 +62,14 @@ The second is the current wakeup latency for this CPU at the given timestamp.
 
 Specifies the duration of the trace in seconds.
 
+=== *--no-cpu-stack-traces*
+
+Do not record the `perf` style stack traces for tasks while they're running.
+
+=== *--no-sleep-stack-traces*
+
+Do not record stack traces when the task is in an uninterruptible sleep state.
+
 === *--no-stack-traces*
 
 Do not record stack traces for the threads in the system.

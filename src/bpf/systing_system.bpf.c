@@ -28,6 +28,8 @@ const volatile struct {
 	u32 filter_pid;
 	u32 filter_cgroup;
 	u32 no_stack_traces;
+	u32 no_cpu_stack_traces;
+	u32 no_sleep_stack_traces;
 	u32 num_perf_counters;
 	u32 num_cpus;
 	u32 my_tgid;
@@ -611,7 +613,7 @@ int BPF_PROG(systing_sched_switch, bool preempt, struct task_struct *prev,
 	bpf_ringbuf_submit(event, 0);
 
 	/* Record the blocked stack trace. */
-	if (prev->__state & TASK_UNINTERRUPTIBLE)
+	if (!tool_config.no_sleep_stack_traces && prev->__state & TASK_UNINTERRUPTIBLE)
 		emit_stack_event(ctx, prev, STACK_SLEEP);
 	return 0;
 }
@@ -759,7 +761,8 @@ SEC("perf_event")
 int systing_perf_event_clock(void *ctx)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
-	emit_stack_event(ctx, task, STACK_RUNNING);
+	if (!tool_config.no_cpu_stack_traces)
+		emit_stack_event(ctx, task, STACK_RUNNING);
 	read_counters(ctx, task);
 	return 0;
 }

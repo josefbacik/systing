@@ -89,6 +89,10 @@ struct Command {
     cpu_frequency: bool,
     #[arg(long)]
     perf_counter: Vec<String>,
+    #[arg(long)]
+    no_cpu_stack_traces: bool,
+    #[arg(long)]
+    no_sleep_stack_traces: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -1300,6 +1304,8 @@ fn system(opts: Command) -> Result<()> {
 
         open_skel.maps.rodata_data.tool_config.num_cpus = num_cpus;
         open_skel.maps.rodata_data.tool_config.my_tgid = process::id() as u32;
+        open_skel.maps.rodata_data.tool_config.no_cpu_stack_traces = opts.no_cpu_stack_traces as u32;
+        open_skel.maps.rodata_data.tool_config.no_sleep_stack_traces = opts.no_sleep_stack_traces as u32;
         if opts.cgroup.len() > 0 {
             open_skel.maps.rodata_data.tool_config.filter_cgroup = 1;
         }
