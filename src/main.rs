@@ -24,7 +24,8 @@ use anyhow::bail;
 use anyhow::Result;
 use clap::Parser;
 
-use blazesym::symbolize::{Input, Kernel, Process, Source, Sym, Symbolized, Symbolizer};
+use blazesym::symbolize::source::{Kernel, Process, Source};
+use blazesym::symbolize::{Input, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::AsRawLibbpf;
@@ -1304,8 +1305,10 @@ fn system(opts: Command) -> Result<()> {
 
         open_skel.maps.rodata_data.tool_config.num_cpus = num_cpus;
         open_skel.maps.rodata_data.tool_config.my_tgid = process::id() as u32;
-        open_skel.maps.rodata_data.tool_config.no_cpu_stack_traces = opts.no_cpu_stack_traces as u32;
-        open_skel.maps.rodata_data.tool_config.no_sleep_stack_traces = opts.no_sleep_stack_traces as u32;
+        open_skel.maps.rodata_data.tool_config.no_cpu_stack_traces =
+            opts.no_cpu_stack_traces as u32;
+        open_skel.maps.rodata_data.tool_config.no_sleep_stack_traces =
+            opts.no_sleep_stack_traces as u32;
         if opts.cgroup.len() > 0 {
             open_skel.maps.rodata_data.tool_config.filter_cgroup = 1;
         }
