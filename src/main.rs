@@ -323,6 +323,8 @@ fn generate_stack_packets(
     let kernel_src = Source::Kernel(Kernel::default());
     let mut symbolizer = Symbolizer::builder().enable_code_info(false).build();
 
+    let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(tgid.into())));
+
     // We have to symbolize all of the addresses in the stacks and fill
     // out the hashmap with all of the frames.
     let mut frame_map = HashMap::new();
