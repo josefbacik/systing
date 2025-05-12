@@ -321,7 +321,7 @@ fn generate_stack_packets(
 ) {
     let user_src = Source::Process(Process::new(Pid::from(tgid)));
     let kernel_src = Source::Kernel(Kernel::default());
-    let mut symbolizer = Symbolizer::new();
+    let mut symbolizer = Symbolizer::builder().enable_code_info(false).build();
 
     // We have to symbolize all of the addresses in the stacks and fill
     // out the hashmap with all of the frames.
