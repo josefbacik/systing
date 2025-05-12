@@ -313,6 +313,102 @@ fn stack_to_frames_mapping<'a, I>(
     }
 }
 
+fn generate_stack_packets(
+    tgid: u32,
+    stacks: Vec<StackEvent>,
+    id_counter: &mut Arc<AtomicUsize>,
+) -> Vec<TracePacket> {
+    let mut packets = Vec::new();
+    let user_src = Source::Process(Process::new(Pid::from(tgid)));
+    let kernel_src = Source::Kernel(Kernel::default());
+    let mut symbolizer = Symbolizer::new();
+
+    // We have to symbolize all of the addresses in the stacks and fill
+    // out the hashmap with all of the frames.
+    let mut frame_map = HashMap::new();
+    let mut func_name_map = HashMap::new();
+    for stack in stacks.iter() {
+        let raw_stack = &stack.stack;
+        stack_to_frames_mapping(
+            &mut symbolizer,
+            &mut frame_map,
+            &mut func_name_map,
+            &user_src,
+            id_counter,
+            raw_stack.user_stack.iter(),
+        );
+        stack_to_frames_mapping(
+            &mut symbolizer,
+            &mut frame_map,
+            &mut func_name_map,
+            &kernel_src,
+            id_counter,
+            raw_stack.kernel_stack.iter(),
+        );
+    }
+
+    // Collect into a HashSet to dedup the stacks, and then iterate that to symbolize the
+    // stacks and generate the interned data.
+    let interned_stacks: HashMap<Stack, Callstack> = stacks
+        .iter()
+        .map(|stack| stack.stack.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|stack| {
+            let mut callstack = Callstack::default();
+            let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+            callstack.set_iid(iid);
+            callstack.frame_ids = stack
+                .user_stack
+                .iter()
+                .chain(stack.kernel_stack.iter())
+                .map(|addr| {
+                    let frame = frame_map.get(&addr).unwrap();
+                    frame.frame.iid()
+                })
+                .collect();
+            (stack, callstack)
+        })
+        .collect();
+
+    let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
+    let mut packet = TracePacket::default();
+    let mut interned_data = InternedData::default();
+    interned_data.callstacks = interned_stacks.values().cloned().collect();
+    interned_data.function_names = func_name_map.values().cloned().collect();
+    interned_data.frames = frame_map
+        .values()
+        .map(|frame| frame.frame.clone())
+        .collect();
+    interned_data.mappings = frame_map
+        .values()
+        .map(|frame| frame.mapping.clone())
+        .collect();
+    packet.interned_data = Some(interned_data).into();
+    packet.set_trusted_packet_sequence_id(seq);
+    packet.set_sequence_flags(
+        SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
+            | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
+    );
+    packets.push(packet);
+
+    for stack in stacks.iter() {
+        let pid = stack.tgidpid as u32;
+        let tgid = (stack.tgidpid >> 32) as u32;
+        let mut packet = TracePacket::default();
+        packet.set_timestamp(stack.ts_start);
+
+        let mut sample = PerfSample::default();
+        sample.set_callstack_iid(interned_stacks.get(&stack.stack).unwrap().iid());
+        sample.set_pid(tgid);
+        sample.set_tid(pid);
+        packet.set_perf_sample(sample);
+        packet.set_trusted_packet_sequence_id(seq);
+        packets.push(packet);
+    }
+    packets
+}
+
 fn generate_pidtgid_track_descriptor(
     pid_uuids: &HashMap<i32, u64>,
     thread_uuids: &HashMap<i32, u64>,
@@ -699,98 +795,25 @@ impl StackRecorder {
     }
 
     fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
+        use workerpool::thunk::{Thunk, ThunkWorker};
+        use workerpool::Pool;
+
         let mut packets = Vec::new();
+        let pool = Pool::<ThunkWorker<Vec<TracePacket>>>::new(4);
 
         // Resolve the stacks, generate the interned data for them, and populate the trace.
-        let kernel_src = Source::Kernel(Kernel::default());
-        let mut symbolizer = Symbolizer::new();
-
+        let (tx, rx) = channel();
         for (tgid, stacks) in self.stacks.iter() {
-            let user_src = Source::Process(Process::new(Pid::from(*tgid as u32)));
-
-            // We have to symbolize all of the addresses in the stacks and fill
-            // out the hashmap with all of the frames.
-            let mut frame_map = HashMap::new();
-            let mut func_name_map = HashMap::new();
-            for stack in stacks.iter() {
-                let raw_stack = &stack.stack;
-                stack_to_frames_mapping(
-                    &mut symbolizer,
-                    &mut frame_map,
-                    &mut func_name_map,
-                    &user_src,
-                    id_counter,
-                    raw_stack.user_stack.iter(),
-                );
-                stack_to_frames_mapping(
-                    &mut symbolizer,
-                    &mut frame_map,
-                    &mut func_name_map,
-                    &kernel_src,
-                    id_counter,
-                    raw_stack.kernel_stack.iter(),
-                );
-            }
-
-            // Collect into a HashSet to dedup the stacks, and then iterate that to symbolize the
-            // stacks and generate the interned data.
-            let interned_stacks: HashMap<Stack, Callstack> = stacks
-                .iter()
-                .map(|stack| stack.stack.clone())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .map(|stack| {
-                    let mut callstack = Callstack::default();
-                    let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-                    callstack.set_iid(iid);
-                    callstack.frame_ids = stack
-                        .user_stack
-                        .iter()
-                        .chain(stack.kernel_stack.iter())
-                        .map(|addr| {
-                            let frame = frame_map.get(&addr).unwrap();
-                            frame.frame.iid()
-                        })
-                        .collect();
-                    (stack, callstack)
-                })
-                .collect();
-
-            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-            let mut packet = TracePacket::default();
-            let mut interned_data = InternedData::default();
-            interned_data.callstacks = interned_stacks.values().cloned().collect();
-            interned_data.function_names = func_name_map.values().cloned().collect();
-            interned_data.frames = frame_map
-                .values()
-                .map(|frame| frame.frame.clone())
-                .collect();
-            interned_data.mappings = frame_map
-                .values()
-                .map(|frame| frame.mapping.clone())
-                .collect();
-            packet.interned_data = Some(interned_data).into();
-            packet.set_trusted_packet_sequence_id(seq);
-            packet.set_sequence_flags(
-                SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
-                    | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
-            );
-            packets.push(packet);
-
-            for stack in stacks.iter() {
-                let pid = stack.tgidpid as u32;
-                let tgid = (stack.tgidpid >> 32) as u32;
-                let mut packet = TracePacket::default();
-                packet.set_timestamp(stack.ts_start);
-
-                let mut sample = PerfSample::default();
-                sample.set_callstack_iid(interned_stacks.get(&stack.stack).unwrap().iid());
-                sample.set_pid(tgid);
-                sample.set_tid(pid);
-                packet.set_perf_sample(sample);
-                packet.set_trusted_packet_sequence_id(seq);
-                packets.push(packet);
-            }
+            let mut id_counter = id_counter.clone();
+            let stacks = stacks.clone();
+            let tgid = *tgid as u32;
+            pool.execute_to(tx.clone(), Thunk::of(move || {
+                generate_stack_packets(tgid, stacks, &mut id_counter)
+            }));
+        }
+        drop(tx);
+        while let Ok(thread_packets) = rx.recv() {
+            packets.extend(thread_packets);
         }
         packets
     }
