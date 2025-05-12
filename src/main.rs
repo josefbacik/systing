@@ -10,7 +10,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -247,7 +247,7 @@ fn stack_to_frames_mapping<'a, I>(
     frame_map: &mut HashMap<u64, LocalFrame>,
     func_map: &mut HashMap<String, InternedString>,
     source: &Source<'a>,
-    rng: &mut dyn rand::RngCore,
+    id_counter: &mut Arc<AtomicUsize>,
     stack: I,
 ) where
     I: IntoIterator<Item = &'a u64>,
@@ -264,16 +264,19 @@ fn stack_to_frames_mapping<'a, I>(
                 let mut frame = Frame::default();
                 let my_func = func_map.entry(name.to_string()).or_insert_with(|| {
                     let mut interned_str = InternedString::default();
-                    interned_str.set_iid(rng.next_u64());
+                    let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+                    interned_str.set_iid(iid);
                     interned_str.set_str(name.to_string().into_bytes());
                     interned_str
                 });
-                frame.set_iid(rng.next_u64());
+                let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+                frame.set_iid(iid);
                 frame.set_function_name_id(my_func.iid());
                 frame.set_rel_pc(offset as u64);
 
                 let mut mapping = Mapping::default();
-                mapping.set_iid(rng.next_u64());
+                let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+                mapping.set_iid(iid);
                 mapping.set_exact_offset(*input_addr);
                 mapping.set_start_offset(addr);
 
@@ -286,16 +289,19 @@ fn stack_to_frames_mapping<'a, I>(
                 let mut frame = Frame::default();
                 let my_func = func_map.entry(name.to_string()).or_insert_with(|| {
                     let mut interned_str = InternedString::default();
-                    interned_str.set_iid(rng.next_u64());
+                    let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+                    interned_str.set_iid(iid);
                     interned_str.set_str(name.into_bytes());
                     interned_str
                 });
-                frame.set_iid(rng.next_u64());
+                let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+                frame.set_iid(iid);
                 frame.set_function_name_id(my_func.iid());
                 frame.set_rel_pc(0);
 
                 let mut mapping = Mapping::default();
-                mapping.set_iid(rng.next_u64());
+                let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+                mapping.set_iid(iid);
                 mapping.set_exact_offset(*input_addr);
                 mapping.set_start_offset(0);
 
@@ -576,7 +582,7 @@ impl EventRecorder {
         &self,
         pid_uuids: &HashMap<i32, u64>,
         thread_uuids: &HashMap<i32, u64>,
-        rng: &mut dyn rand::RngCore,
+        id_counter: &mut Arc<AtomicUsize>,
     ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
@@ -602,7 +608,7 @@ impl EventRecorder {
 
         // Populate the per-cpu runqueue sizes
         for (cpu, runqueue) in self.runqueue.iter() {
-            let desc_uuid = rng.next_u64();
+            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
             let mut counter_desc = CounterDescriptor::default();
             counter_desc.set_unit(Unit::UNIT_COUNT);
@@ -617,7 +623,7 @@ impl EventRecorder {
             packet.set_track_descriptor(desc);
             packets.push(packet);
 
-            let seq = rng.next_u32();
+            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
             for event in runqueue.iter() {
                 packets.push(event.to_track_event(desc_uuid, seq));
             }
@@ -625,7 +631,7 @@ impl EventRecorder {
 
         // Populate the per-cpu latencies
         for (cpu, events) in self.cpu_latencies.iter() {
-            let desc_uuid = rng.next_u64();
+            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
             let mut counter_desc = CounterDescriptor::default();
             counter_desc.set_unit(Unit::UNIT_TIME_NS);
@@ -640,7 +646,7 @@ impl EventRecorder {
             packet.set_track_descriptor(desc);
             packets.push(packet);
 
-            let seq = rng.next_u32();
+            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
             for event in events.iter() {
                 packets.push(event.to_track_event(desc_uuid, seq));
             }
@@ -648,7 +654,7 @@ impl EventRecorder {
 
         // Populate the per-process latencies
         for (pidtgid, events) in self.process_latencies.iter() {
-            let desc_uuid = rng.next_u64();
+            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
             let mut counter_desc = CounterDescriptor::default();
             counter_desc.set_unit(Unit::UNIT_TIME_NS);
@@ -667,7 +673,7 @@ impl EventRecorder {
             packet.set_track_descriptor(desc);
             packets.push(packet);
 
-            let seq = rng.next_u32();
+            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
             for event in events.iter() {
                 packets.push(event.to_track_event(desc_uuid, seq));
             }
@@ -692,7 +698,7 @@ impl StackRecorder {
         }
     }
 
-    fn generate_trace(&self, rng: &mut dyn rand::RngCore) -> Vec<TracePacket> {
+    fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
         // Resolve the stacks, generate the interned data for them, and populate the trace.
@@ -713,7 +719,7 @@ impl StackRecorder {
                     &mut frame_map,
                     &mut func_name_map,
                     &user_src,
-                    rng,
+                    id_counter,
                     raw_stack.user_stack.iter(),
                 );
                 stack_to_frames_mapping(
@@ -721,7 +727,7 @@ impl StackRecorder {
                     &mut frame_map,
                     &mut func_name_map,
                     &kernel_src,
-                    rng,
+                    id_counter,
                     raw_stack.kernel_stack.iter(),
                 );
             }
@@ -735,7 +741,8 @@ impl StackRecorder {
                 .into_iter()
                 .map(|stack| {
                     let mut callstack = Callstack::default();
-                    callstack.set_iid(rng.next_u64());
+                    let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+                    callstack.set_iid(iid);
                     callstack.frame_ids = stack
                         .user_stack
                         .iter()
@@ -749,7 +756,7 @@ impl StackRecorder {
                 })
                 .collect();
 
-            let seq = rng.next_u32();
+            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
             let mut packet = TracePacket::default();
             let mut interned_data = InternedData::default();
             interned_data.callstacks = interned_stacks.values().cloned().collect();
@@ -829,13 +836,13 @@ impl UsdtRecorder {
         &self,
         pid_uuids: &HashMap<i32, u64>,
         thread_uuids: &HashMap<i32, u64>,
-        rng: &mut dyn rand::RngCore,
+        id_counter: &mut Arc<AtomicUsize>,
     ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
         // Populate the USDT events
         for (pidtgid, events) in self.usdt_events.iter() {
-            let desc_uuid = rng.next_u64();
+            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             let desc = generate_pidtgid_track_descriptor(
                 pid_uuids,
                 thread_uuids,
@@ -847,7 +854,7 @@ impl UsdtRecorder {
             packet.set_track_descriptor(desc);
             packets.push(packet);
 
-            let seq = rng.next_u32();
+            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
             for event in events.iter() {
                 let mut tevent = TrackEvent::default();
                 tevent.set_type(Type::TYPE_INSTANT);
@@ -878,12 +885,12 @@ impl PerfCounterRecorder {
         });
     }
 
-    fn generate_trace(&self, rng: &mut dyn rand::RngCore) -> Vec<TracePacket> {
+    fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
         // Populate the cache counter events
         for (key, counters) in self.perf_events.iter() {
-            let desc_uuid = rng.next_u64();
+            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             let track_name = format!("{}_{}", self.perf_counters[key.index], key.cpu);
             let mut desc = TrackDescriptor::default();
             desc.set_name(track_name);
@@ -898,7 +905,7 @@ impl PerfCounterRecorder {
             packet.set_track_descriptor(desc);
             packets.push(packet);
 
-            let seq = rng.next_u32();
+            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
             for event in counters.iter() {
                 packets.push(event.to_track_event(desc_uuid, seq));
             }
@@ -920,12 +927,12 @@ impl SysinfoRecorder {
         }
     }
 
-    fn generate_trace(&self, rng: &mut dyn rand::RngCore) -> Vec<TracePacket> {
+    fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
         // Populate the sysinfo events
         for (cpu, events) in self.frequency.iter() {
-            let desc_uuid = rng.next_u64();
+            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
             let mut counter_desc = CounterDescriptor::default();
             counter_desc.set_unit(Unit::UNIT_COUNT);
@@ -940,7 +947,7 @@ impl SysinfoRecorder {
             packet.set_track_descriptor(desc);
             packets.push(packet);
 
-            let seq = rng.next_u32();
+            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
             for event in events.iter() {
                 packets.push(event.to_track_event(desc_uuid, seq));
             }
@@ -987,19 +994,19 @@ impl SessionRecorder {
 
     fn generate_trace(&self) -> Vec<TracePacket> {
         let mut packets = Vec::new();
-        let mut rng = rand::rng();
+        let mut id_counter = Arc::new(AtomicUsize::new(0));
         let mut pid_uuids = HashMap::new();
         let mut thread_uuids = HashMap::new();
 
         // First emit the clock snapshot
         let mut packet = TracePacket::default();
         packet.set_clock_snapshot(self.clock_snapshot.lock().unwrap().clone());
-        packet.set_trusted_packet_sequence_id(rng.next_u32());
+        packet.set_trusted_packet_sequence_id(id_counter.fetch_add(1, Ordering::Relaxed) as u32);
         packets.push(packet);
 
         // Ppopulate all the process tracks
         for (_, process) in self.processes.read().unwrap().iter() {
-            let uuid = rng.next_u64();
+            let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             pid_uuids.insert(process.pid(), uuid);
 
             let mut desc = TrackDescriptor::default();
@@ -1012,7 +1019,7 @@ impl SessionRecorder {
         }
 
         for (_, thread) in self.threads.read().unwrap().iter() {
-            let uuid = rng.next_u64();
+            let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             thread_uuids.insert(thread.tid(), uuid);
 
             let mut desc = TrackDescriptor::default();
@@ -1028,30 +1035,35 @@ impl SessionRecorder {
         packets.extend(self.event_recorder.lock().unwrap().generate_trace(
             &pid_uuids,
             &thread_uuids,
-            &mut rng,
+            &mut id_counter,
         ));
         packets.extend(self.usdt_recorder.lock().unwrap().generate_trace(
             &pid_uuids,
             &thread_uuids,
-            &mut rng,
+            &mut id_counter,
         ));
-        packets.extend(self.stack_recorder.lock().unwrap().generate_trace(&mut rng));
+        packets.extend(
+            self.stack_recorder
+                .lock()
+                .unwrap()
+                .generate_trace(&mut id_counter),
+        );
         packets.extend(
             self.perf_counter_recorder
                 .lock()
                 .unwrap()
-                .generate_trace(&mut rng),
+                .generate_trace(&mut id_counter),
         );
         packets.extend(
             self.sysinfo_recorder
                 .lock()
                 .unwrap()
-                .generate_trace(&mut rng),
+                .generate_trace(&mut id_counter),
         );
         packets.extend(self.uprobe_recorder.lock().unwrap().generate_trace(
             &pid_uuids,
             &thread_uuids,
-            &mut rng,
+            &mut id_counter,
         ));
         packets
     }
@@ -1097,13 +1109,13 @@ impl UprobeRecorder {
         &self,
         pid_uuids: &HashMap<i32, u64>,
         thread_uuids: &HashMap<i32, u64>,
-        rng: &mut dyn rand::RngCore,
+        id_counter: &mut Arc<AtomicUsize>,
     ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
         // Populate the USDT events
         for (pidtgid, events) in self.uprobe_events.iter() {
-            let desc_uuid = rng.next_u64();
+            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             let desc = generate_pidtgid_track_descriptor(
                 pid_uuids,
                 thread_uuids,
@@ -1115,7 +1127,7 @@ impl UprobeRecorder {
             packet.set_track_descriptor(desc);
             packets.push(packet);
 
-            let seq = rng.next_u32();
+            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
             for event in events.iter() {
                 let mut tevent = TrackEvent::default();
                 tevent.set_type(Type::TYPE_INSTANT);
