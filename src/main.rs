@@ -25,7 +25,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use blazesym::symbolize::source::{Kernel, Process, Source};
-use blazesym::symbolize::{Input, Sym, Symbolized, Symbolizer};
+use blazesym::symbolize::{cache, Input, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::AsRawLibbpf;
@@ -314,11 +314,11 @@ fn stack_to_frames_mapping<'a, I>(
 }
 
 fn generate_stack_packets(
+    packets: &mut Arc<Mutex<Vec<TracePacket>>>,
     tgid: u32,
     stacks: Vec<StackEvent>,
     id_counter: &mut Arc<AtomicUsize>,
-) -> Vec<TracePacket> {
-    let mut packets = Vec::new();
+) {
     let user_src = Source::Process(Process::new(Pid::from(tgid)));
     let kernel_src = Source::Kernel(Kernel::default());
     let mut symbolizer = Symbolizer::new();
@@ -390,7 +390,7 @@ fn generate_stack_packets(
         SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
             | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
     );
-    packets.push(packet);
+    packets.lock().unwrap().push(packet);
 
     for stack in stacks.iter() {
         let pid = stack.tgidpid as u32;
@@ -404,9 +404,8 @@ fn generate_stack_packets(
         sample.set_tid(pid);
         packet.set_perf_sample(sample);
         packet.set_trusted_packet_sequence_id(seq);
-        packets.push(packet);
+        packets.lock().unwrap().push(packet);
     }
-    packets
 }
 
 fn generate_pidtgid_track_descriptor(
@@ -798,23 +797,21 @@ impl StackRecorder {
         use workerpool::thunk::{Thunk, ThunkWorker};
         use workerpool::Pool;
 
-        let mut packets = Vec::new();
-        let pool = Pool::<ThunkWorker<Vec<TracePacket>>>::new(4);
+        let packets = Arc::new(Mutex::new(Vec::new()));
+        let pool = Pool::<ThunkWorker<()>>::new(4);
 
         // Resolve the stacks, generate the interned data for them, and populate the trace.
-        let (tx, rx) = channel();
         for (tgid, stacks) in self.stacks.iter() {
             let mut id_counter = id_counter.clone();
             let stacks = stacks.clone();
             let tgid = *tgid as u32;
-            pool.execute_to(tx.clone(), Thunk::of(move || {
-                generate_stack_packets(tgid, stacks, &mut id_counter)
+            let mut packets = packets.clone();
+            pool.execute(Thunk::of(move || {
+                generate_stack_packets(&mut packets, tgid, stacks, &mut id_counter)
             }));
         }
-        drop(tx);
-        while let Ok(thread_packets) = rx.recv() {
-            packets.extend(thread_packets);
-        }
+        pool.join();
+        let packets = mem::take(&mut *packets.lock().unwrap());
         packets
     }
 }
