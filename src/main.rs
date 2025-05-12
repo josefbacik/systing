@@ -696,14 +696,11 @@ impl StackRecorder {
         let mut packets = Vec::new();
 
         // Resolve the stacks, generate the interned data for them, and populate the trace.
-        let mut src_cache: HashMap<i32, Source> = HashMap::new();
         let kernel_src = Source::Kernel(Kernel::default());
         let mut symbolizer = Symbolizer::new();
 
         for (tgid, stacks) in self.stacks.iter() {
-            let user_src = src_cache
-                .entry(*tgid)
-                .or_insert(Source::Process(Process::new(Pid::from(*tgid as u32))));
+            let user_src = Source::Process(Process::new(Pid::from(*tgid as u32)));
 
             // We have to symbolize all of the addresses in the stacks and fill
             // out the hashmap with all of the frames.
