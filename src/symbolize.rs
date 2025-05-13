@@ -1,6 +1,8 @@
 use blazesym::symbolize::{CodeInfo, Sym, Symbolized};
 use blazesym::Addr;
 
+use crate::py_addr::PyAddr;
+
 const ADDR_WIDTH: usize = 16;
 pub const KERNEL_THREAD_STACK_STUB: u64 = 1234;
 pub const PREEMPT_EVENT_STACK_STUB: u64 = 5678;
@@ -9,6 +11,7 @@ pub const PREEMPT_EVENT_STACK_STUB: u64 = 5678;
 pub struct Stack {
     pub kernel_stack: Vec<Addr>,
     pub user_stack: Vec<Addr>,
+    pub py_stack: Vec<PyAddr>,
 }
 
 fn print_frame(
@@ -87,7 +90,8 @@ where
 }
 
 impl Stack {
-    pub fn new(kernel_stack: &[u64], user_stack: &[u64]) -> Self {
+    pub fn new(kernel_stack: &[u64], user_stack: &[u64], py_stack: &Vec<PyAddr>) -> Self {
+        // JMW - why did other params move from Vex to []?
         let first_kernel_element = if kernel_stack.is_empty() {
             0
         } else {
@@ -120,6 +124,7 @@ impl Stack {
         Stack {
             kernel_stack: my_kernel_stack,
             user_stack: my_user_stack,
+            py_stack: py_stack.to_vec(),
         }
     }
 }

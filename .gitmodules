@@ -1,0 +1,3 @@
+[submodule "strobelight-libs"]
+	path = strobelight-libs
+	url = https://github.com/facebookincubator/strobelight-libs.git

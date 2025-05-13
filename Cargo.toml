@@ -8,6 +8,8 @@ description = "A libbpf based tracer to figure out what an application is doing"
 
 [build-dependencies]
 libbpf-cargo = "0.25.0-beta"
+bindgen = { version = "0.71.1" }
+pkg-config = "0.3.32"
 
 [dependencies]
 anyhow = "1.0"

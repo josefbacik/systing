@@ -3,6 +3,9 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/usdt.bpf.h>
 
+#include "strobelight/bpf_lib/common/common.h"
+#include "strobelight/bpf_lib/python/pystacks/pystacks.bpf.h"
+
 #define TASK_RUNNING 0
 #define TASK_INTERRUPTIBLE 1
 #define TASK_UNINTERRUPTIBLE 2
@@ -33,6 +36,7 @@ const volatile struct {
 	u32 num_perf_counters;
 	u32 num_cpus;
 	u32 my_tgid;
+  u32 collect_pystacks;
 } tool_config = {};
 
 enum event_type {
@@ -104,6 +108,7 @@ struct stack_event {
 	u64 user_stack_length;
 	u64 kernel_stack[MAX_STACK_DEPTH];
 	u64 user_stack[MAX_STACK_DEPTH];
+  struct pystacks_message py_msg_buffer;
 };
 
 struct perf_counter_event {
@@ -428,6 +433,11 @@ static void emit_stack_event(void *ctx,struct task_struct *task,
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
+
+	if (tool_config.collect_pystacks) {
+    pystacks_read_stacks(ctx, NULL, &event->py_msg_buffer);
+  }
+
 	event->stack_event_type = type;
 
 	if (!(task->flags & PF_KTHREAD)) {
