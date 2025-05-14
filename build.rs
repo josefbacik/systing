@@ -8,25 +8,32 @@ const SRC: [&'static str; 1] = [
     "src/bpf/systing_system.bpf.c",
 ];
 
+#[cfg(not(feature = "generate-vmlinux-header"))]
+fn generate_vmlinux_header() {}
+
+#[cfg(feature = "generate-vmlinux-header")]
+fn generate_vmlinux_header() {
+    let vmlinux_path = PathBuf::from("src/bpf/").join("vmlinux.h");
+
+    let bpftool_output = std::process::Command::new("bpftool")
+            .args([
+                "btf",
+                "dump",
+                "file",
+                "/sys/kernel/btf/vmlinux",
+                "format",
+                "c",
+            ])
+            .output()
+            .expect("Failed to execute bpftool");
+    std::fs::write(&vmlinux_path, bpftool_output.stdout).expect("Failed to write vmlinux.h");
+}
+
 fn main() {
     let out_dir =
         PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set in build script"));
 
-    let vmlinux_path = out_dir.join("vmlinux.h");
-
-    let bpftool_output = std::process::Command::new("bpftool")
-        .args([
-            "btf",
-            "dump",
-            "file",
-            "/sys/kernel/btf/vmlinux",
-            "format",
-            "c",
-        ])
-        .output()
-        .expect("Failed to execute bpftool");
-
-    std::fs::write(&vmlinux_path, bpftool_output.stdout).expect("Failed to write vmlinux.h");
+    generate_vmlinux_header();
 
     let include_arg = format!("-I{}", out_dir.display());
     for src in SRC {
