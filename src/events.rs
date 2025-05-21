@@ -1,172 +1,230 @@
-use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::fmt;
 
 use anyhow::Result;
-use libbpf_rs;
+use serde::Deserialize;
+use serde_json;
 
-#[derive(Default, Debug, Clone)]
-pub struct PerfHwEvent {
+#[derive(Clone, Default)]
+pub struct UsdtProbeEvent {
+    pub cookie: u64,
+    pub path: String,
+    pub provider: String,
     pub name: String,
-    pub event_type: u32,
-    pub event_config: u64,
-    pub disabled: bool,
-    pub need_slots: bool,
-    pub cpus: Vec<u32>,
 }
 
-pub struct PerfCounters {
-    events: HashMap<String, Vec<PerfHwEvent>>,
+#[derive(Clone, Default)]
+pub struct UProbeEvent {
+    pub cookie: u64,
+    pub path: String,
+    pub offset: u64,
+    pub func_name: String,
+    pub retprobe: bool,
 }
 
-fn visit_events(dir: &Path, events: &mut Vec<PerfHwEvent>) -> Result<()> {
-    let entries = fs::read_dir(dir)?
-        .map(|entry| entry.unwrap().path())
-        .collect::<Vec<_>>();
-
-    // Some of the topdown metrics exposted by Intel Atom don't have a slots entry, so we have to
-    // check and see if there's a slots file in this events directory to decide if any topdown
-    // metrics require a slots fd.
-    let need_slots = match entries.iter().find(|entry| {
-        let filename = entry.file_name().unwrap().to_str().unwrap();
-        filename == "slots"
-    }) {
-        Some(_) => true,
-        None => false,
-    };
-
-    for path in entries {
-        let buf = fs::read_to_string(&path)?;
-        let event_re = Regex::new(r"event=0x([0-9a-fA-F]+)").unwrap();
-        let umask_re = Regex::new(r"umask=0x([0-9a-fA-F]+)").unwrap();
-        let event = event_re.captures(&buf);
-        let umask = umask_re.captures(&buf);
-        let mut hwevent = PerfHwEvent::default();
-
-        hwevent.name = path.file_name().unwrap().to_str().unwrap().to_string();
-
-        if event.is_some() {
-            let event = event.unwrap();
-            let event = u64::from_str_radix(&event[1], 16).unwrap();
-            hwevent.event_config = event;
-        }
-        if umask.is_some() {
-            let umask = umask.unwrap();
-            let umask = u64::from_str_radix(&umask[1], 16).unwrap();
-            hwevent.event_config |= umask << 8;
-        }
-
-        // Slots events should be disabled
-        if hwevent.name == "slots" {
-            hwevent.disabled = true;
-        }
-
-        // Topdown events need slots
-        if hwevent.name.starts_with("topdown") {
-            hwevent.need_slots = need_slots;
-        }
-        events.push(hwevent);
-    }
-    Ok(())
+#[derive(Default)]
+pub enum EventProbe {
+    UProbe(UProbeEvent),
+    Usdt(UsdtProbeEvent),
+    #[default]
+    Undefined,
 }
 
-fn visit_dirs(dir: &Path, counters: &mut PerfCounters, toplevel: bool) -> Result<()> {
-    if dir.is_dir() {
-        let mut event_type: u32 = 0;
-        let mut cpus: Vec<u32> = Vec::new();
-        let mut events: Vec<PerfHwEvent> = Vec::new();
-        let cpus_re = Regex::new(r"(\d+)-(\d+)").unwrap();
+#[derive(Default)]
+pub enum EventKeyType {
+    String,
+    #[default]
+    Long,
+}
 
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let filename = path.file_name().unwrap().to_str().unwrap();
-            if path.is_dir() {
-                if toplevel && filename.starts_with("cpu") {
-                    visit_dirs(&path, counters, false)?;
-                } else if filename == "events" {
-                    visit_events(&path, &mut events)?;
+#[derive(Default)]
+pub struct SystingEvent {
+    pub name: String,
+    pub event: EventProbe,
+    pub key_index: u8,
+    pub key_type: EventKeyType,
+}
+
+#[derive(Default)]
+pub struct SystingEventsConfig {
+    pub events: HashMap<String, SystingEvent>,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct SystingJSONTrackConfig {
+    events: Vec<SystingJSONEvent>,
+    tracks: Vec<SystingTrack>,
+}
+
+#[derive(Deserialize, Debug)]
+struct SystingJSONEvent {
+    name: String,
+    event: String,
+    key_index: Option<u8>,
+    key_type: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct SystingTrack {
+    track_name: String,
+    ranges: Option<Vec<SystingRange>>,
+    instant: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct SystingRange {
+    name: String,
+    start: String,
+    end: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct SystingInstant {
+    name: String,
+    event: String,
+}
+
+impl UProbeEvent {
+    fn from_parts(parts: Vec<&str>, rng: &mut dyn rand::RngCore) -> Result<Self, anyhow::Error> {
+        // Format is
+        // uprobe:<path>:<offset>
+        // uprobe:<path>:<symbol>
+        // uprobe:<path>:<symbol>+<offset>
+        // uretprobe:<path>:<offset>
+        // uretprobe:<path>:<symbol>
+        // uretprobe:<path>:<symbol>+<offset>
+        if parts.len() != 3 {
+            return Err(anyhow::anyhow!(
+                "Invalid uprobe format: {}",
+                parts.join(":")
+            ));
+        }
+        let mut probe = UProbeEvent::default();
+        probe.path = parts[1].to_string();
+        probe.retprobe = parts[0] == "uretprobe";
+        probe.cookie = rng.next_u64();
+
+        match parts[2].parse::<u64>() {
+            Ok(val) => {
+                probe.offset = val;
+            }
+            Err(_) => {
+                let symbol = parts[2].to_string();
+                let mut symbol_parts = symbol.split('+');
+                let symbol = symbol_parts.next().unwrap();
+                let offset = symbol_parts.next();
+                if offset.is_some() {
+                    probe.offset = offset.unwrap().parse::<u64>()?;
+                } else {
+                    probe.offset = 0;
                 }
-            } else {
-                match filename {
-                    "type" => {
-                        let buf = fs::read_to_string(&path)?;
-                        event_type = buf.trim().parse().unwrap();
-                    }
-                    "cpus" => {
-                        let buf = fs::read_to_string(&path)?;
-                        for cap in cpus_re.captures_iter(&buf) {
-                            let start = cap[1].parse().unwrap();
-                            let end = cap[2].parse().unwrap();
-                            for cpu in start..=end {
-                                cpus.push(cpu);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+                probe.func_name = symbol.to_string();
             }
         }
-        if cpus.len() == 0 {
-            let num_cpus = libbpf_rs::num_possible_cpus()?;
-            cpus = (0..num_cpus as u32).collect();
-        }
-        for mut event in events {
-            event.event_type = event_type;
-            event.cpus = cpus.clone();
-            let entry = counters
-                .events
-                .entry(event.name.clone())
-                .or_insert(Vec::new());
-            entry.push(event);
-        }
+        Ok(probe)
     }
-    Ok(())
 }
 
-impl PerfCounters {
-    pub fn new() -> Self {
-        PerfCounters {
-            events: HashMap::new(),
+impl fmt::Display for UProbeEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = if self.retprobe { "uretprobe" } else { "uprobe" };
+        if self.func_name != "" {
+            if self.offset != 0 {
+                write!(f, "{}:{}+0x{:x}", name, self.func_name, self.offset,)
+            } else {
+                write!(f, "{}:{}", name, self.func_name)
+            }
+        } else {
+            if self.offset != 0 {
+                write!(f, "{}:0x{:x}", name, self.offset)
+            } else {
+                write!(f, "{}", name)
+            }
         }
     }
+}
 
-    pub fn discover(&mut self) -> Result<()> {
-        if self.events.len() > 0 {
-            return Ok(());
+impl UsdtProbeEvent {
+    fn from_parts(parts: Vec<&str>, rng: &mut dyn rand::RngCore) -> Result<Self, anyhow::Error> {
+        // Format is
+        // usdt:<path>:<provider>:<name>
+        if parts.len() != 4 {
+            Err(anyhow::anyhow!("Invalid USDT probe format"))?;
         }
-        let path = Path::new("/sys/bus/event_source/devices");
-        visit_dirs(path, self, true)?;
+        let usdt = UsdtProbeEvent {
+            path: parts[1].to_string(),
+            provider: parts[2].to_string(),
+            name: parts[3].to_string(),
+            cookie: rng.next_u64(),
+        };
+        Ok(usdt)
+    }
+}
+
+impl SystingEventsConfig {
+    pub fn add_event_from_str(&mut self, event: &str, rng: &mut dyn rand::RngCore) -> Result<()> {
+        let parts = event.split(':').collect::<Vec<&str>>();
+        let mut systing_event = SystingEvent::default();
+        systing_event.key_index = u8::MAX;
+        match parts[0] {
+            "usdt" => {
+                let usdt = UsdtProbeEvent::from_parts(parts, rng)?;
+                systing_event.name = format!("{}:{}", usdt.provider, usdt.name);
+                systing_event.event = EventProbe::Usdt(usdt);
+            }
+            "uprobe" => {
+                let uprobe = UProbeEvent::from_parts(parts, rng)?;
+                systing_event.name = uprobe.func_name.clone();
+                systing_event.event = EventProbe::UProbe(uprobe);
+            }
+            _ => {
+                return Err(anyhow::anyhow!("Invalid event type: {}", parts[0]));
+            }
+        }
+        self.events.insert(systing_event.name.clone(), systing_event);
         Ok(())
     }
 
-    pub fn event(&self, name: &str) -> Option<Vec<PerfHwEvent>> {
-        let result = self.events.get(name);
-        if result.is_some() {
-            return Some(result.unwrap().clone());
-        }
+    fn add_event_from_json(
+        &mut self,
+        event: &SystingJSONEvent,
+        rng: &mut dyn rand::RngCore,
+    ) -> Result<()> {
+        let key_type = match event.key_type.as_deref() {
+            Some("string") => EventKeyType::String,
+            Some("long") => EventKeyType::Long,
+            _ => EventKeyType::default(),
+        };
+        let key_index = event.key_index.unwrap_or(u8::MAX);
+        let parts = event.event.split(':').collect::<Vec<&str>>();
+        let event = SystingEvent {
+            name: event.name.clone(),
+            key_index,
+            key_type,
+            event: match parts[0] {
+                "usdt" => EventProbe::Usdt(UsdtProbeEvent::from_parts(parts, rng)?),
+                "uprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts, rng)?),
+                _ => return Err(anyhow::anyhow!("Invalid event type")),
+            },
+        };
+        self.events.insert(event.name.clone(), event);
+        Ok(())
+    }
 
-        if !name.contains("*") {
-            return None;
-        }
+    pub fn load_config(&mut self, config: &str, rng: &mut dyn rand::RngCore) -> Result<()> {
+        let path = Path::new(config);
+        let buf = fs::read_to_string(path)?;
 
-        let pattern = name.replace('*', ".*");
-        let re = Regex::new(pattern.as_str());
-        if re.is_err() {
-            return None;
+        let config: SystingJSONTrackConfig = serde_json::from_str(&buf)?;
+        for event in config.events.iter() {
+            self.add_event_from_json(&event, rng)?;
         }
-        let re = re.unwrap();
-
-        let mut result = Vec::new();
-        for (key, value) in &self.events {
-            if re.is_match(key) {
-                result.extend(value.iter().cloned());
-            }
-        }
-        if result.len() > 0 {
-            return Some(result);
-        }
-        None
+        Ok(())
     }
 }

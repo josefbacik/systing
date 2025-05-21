@@ -80,14 +80,19 @@ enum arg_type {
 	ARG_STRING,
 };
 
-#define ARG0_SIZE 64
+struct arg_desc {
+	enum arg_type arg_type;
+	int arg_index;
+};
+
+#define ARG_SIZE 64
 struct usdt_event {
 	u32 cpu;
 	enum arg_type arg_type;
 	u64 ts;
 	u64 cookie;
 	struct task_info task;
-	u8 usdt_arg0[ARG0_SIZE];
+	u8 usdt_arg[ARG_SIZE];
 };
 
 struct uprobe_event {
@@ -96,7 +101,7 @@ struct uprobe_event {
 	u64 ts;
 	u64 cookie;
 	struct task_info task;
-	u8 arg0[ARG0_SIZE];
+	u8 arg[ARG_SIZE];
 };
 
 struct stack_event {
@@ -128,6 +133,7 @@ struct stack_event _stack_event = {0};
 struct perf_counter_event _perf_counter_event = {0};
 struct task_info _task_info = {0};
 struct uprobe_event _uprobe_event = {0};
+struct arg_desc _arg_desc = {0};
 enum event_type _type = SCHED_SWITCH;
 enum arg_type _arg_type = ARG_NONE;
 enum stack_event_type _stack_type = STACK_SLEEP;
@@ -167,6 +173,13 @@ struct {
 	__type(value, u64);
 	__uint(max_entries, 10240);
 } irq_events SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, struct arg_desc);
+	__uint(max_entries, 10240);
+} event_key_types SEC(".maps");
 
 #define MISSED_SCHED_EVENT 0
 #define MISSED_STACK_EVENT 1
@@ -681,32 +694,31 @@ int systing_usdt(struct pt_regs *ctx)
 	if (!trace_task(task))
 		return 0;
 
+	u64 cookie = bpf_usdt_cookie(ctx);
+
 	struct usdt_event *event = reserve_usdt_event();
 	if (!event)
 		return handle_missed_event(MISSED_USDT_EVENT);
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
-	event->cookie = bpf_usdt_cookie(ctx);
-	event->usdt_arg0[0] = 0;
+	event->cookie = cookie;
+	event->usdt_arg[0] = 0;
 	event->arg_type = ARG_NONE;
 
-	/*
-	 * We don't have an easy way to tell what kind of argument arg0 is, so
-	 * we try to read it as if it's a pointer to something, like a string.
-	 * If it fails then we'll just pass the raw value.
-	 */
-	long val = 0;
-	bpf_usdt_arg(ctx, 0, &val);
-	if (val) {
-		int ret = bpf_probe_read_user_str(&event->usdt_arg0,
-						  sizeof(event->usdt_arg0),
-						  (long *)val);
-		if (ret > 0) {
-			event->arg_type = ARG_STRING;
-		} else {
-			__builtin_memcpy(&event->usdt_arg0, &val, sizeof(long));
-			event->arg_type = ARG_LONG;
+	struct arg_desc *desc = bpf_map_lookup_elem(&event_key_types, &cookie);
+	if (desc) {
+		long val = 0;
+		bpf_usdt_arg(ctx, desc->arg_index, &val);
+		if (val) {
+			if (desc->arg_type == ARG_STRING) {
+				bpf_probe_read_user_str(&event->usdt_arg,
+							sizeof(event->usdt_arg), (long *)val);
+				event->arg_type = ARG_STRING;
+			} else {
+				__builtin_memcpy(&event->usdt_arg, &val, sizeof(long));
+				event->arg_type = ARG_LONG;
+			}
 		}
 	}
 	bpf_ringbuf_submit(event, 0);
@@ -775,6 +787,7 @@ int systing_uprobe(struct pt_regs *ctx)
 	if (!trace_task(task))
 		return 0;
 
+	u64 cookie = bpf_get_attach_cookie(ctx);
 	struct uprobe_event *event = reserve_uprobe_event();
 	if (!event)
 		return handle_missed_event(MISSED_UPROBE_EVENT);
@@ -782,19 +795,31 @@ int systing_uprobe(struct pt_regs *ctx)
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
-	event->cookie = bpf_get_attach_cookie(ctx);
-	event->arg0[0] = 0;
+	event->cookie = cookie;
+	event->arg[0] = 0;
 	event->arg_type = ARG_NONE;
 
-	u64 arg = PT_REGS_PARM1_CORE(ctx);
-	if (arg) {
-		int ret = bpf_probe_read_user_str(&event->arg0,
-						  sizeof(event->arg0),
-						  (void *)arg);
-		if (ret > 0) {
+	struct arg_desc *desc = bpf_map_lookup_elem(&event_key_types, &cookie);
+	if (desc) {
+		u64 arg = 0;
+		if (desc->arg_index == 0) {
+			arg = PT_REGS_PARM1_CORE(ctx);
+		} else if (desc->arg_index == 1) {
+			arg = PT_REGS_PARM2_CORE(ctx);
+		} else if (desc->arg_index == 2) {
+			arg = PT_REGS_PARM3_CORE(ctx);
+		} else if (desc->arg_index == 3) {
+			arg = PT_REGS_PARM4_CORE(ctx);
+		} else if (desc->arg_index == 4) {
+			arg = PT_REGS_PARM5_CORE(ctx);
+		} else if (desc->arg_index == 5) {
+			arg = PT_REGS_PARM6_CORE(ctx);
+		}
+		if (desc->arg_type == ARG_STRING) {
+			bpf_probe_read_user_str(&event->arg, sizeof(event->arg), (void *)arg);
 			event->arg_type = ARG_STRING;
-		} else {
-			__builtin_memcpy(&event->arg0, &arg, sizeof(u64));
+		} else if (desc->arg_type == ARG_LONG) {
+			__builtin_memcpy(&event->arg, &arg, sizeof(u64));
 			event->arg_type = ARG_LONG;
 		}
 	}

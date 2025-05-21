@@ -4,7 +4,6 @@ pub mod symbolize;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CStr;
-use std::fmt;
 use std::mem;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, IntoRawFd};
@@ -16,8 +15,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::events::{PerfCounters, PerfHwEvent};
-use crate::perf::PerfOpenEvents;
+use crate::events::{EventProbe, SystingEventsConfig, UProbeEvent, UsdtProbeEvent};
+use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::symbolize::Stack;
 
 use anyhow::bail;
@@ -56,7 +55,6 @@ use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
 use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::TrackEvent;
-use rand::RngCore;
 use sysinfo::System;
 
 use plain::Plain;
@@ -158,23 +156,6 @@ struct LocalCompactSched {
     last_switch_ts: u64,
 }
 
-#[derive(Clone)]
-struct UsdtProbe {
-    cookie: u64,
-    path: String,
-    provider: String,
-    name: String,
-}
-
-#[derive(Clone, Default)]
-struct UProbe {
-    cookie: u64,
-    path: String,
-    offset: u64,
-    func_name: String,
-    retprobe: bool,
-}
-
 #[derive(Default)]
 struct EventRecorder {
     events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
@@ -189,13 +170,13 @@ struct EventRecorder {
 
 #[derive(Default)]
 struct UsdtRecorder {
-    usdt_cookies: HashMap<u64, UsdtProbe>,
+    usdt_cookies: HashMap<u64, UsdtProbeEvent>,
     usdt_events: HashMap<u64, Vec<TrackInstant>>,
 }
 
 #[derive(Default)]
 struct UprobeRecorder {
-    uprobes: HashMap<u64, UProbe>,
+    uprobes: HashMap<u64, UProbeEvent>,
     uprobe_events: HashMap<u64, Vec<TrackInstant>>,
 }
 
@@ -311,15 +292,7 @@ fn stack_to_frames_mapping<'a, I>(
 
                 for inline in inlined {
                     let name = format!("{} (inlined)", inline.name);
-                    add_frame(
-                        frame_map,
-                        func_map,
-                        id_counter,
-                        *input_addr,
-                        addr,
-                        0,
-                        name,
-                    );
+                    add_frame(frame_map, func_map, id_counter, *input_addr, addr, 0, name);
                 }
             }
             _ => {
@@ -866,21 +839,21 @@ impl UsdtRecorder {
     fn record_usdt_event(&mut self, event: &usdt_event) {
         let mut extra = "".to_string();
 
-        // Capture arg0 if there is one.
+        // Capture the arg if there is one.
         match event.arg_type {
             systing::types::arg_type::ARG_LONG => {
                 let mut bytes: [u8; 8] = [0; 8];
-                let _ = bytes.copy_from_bytes(&event.usdt_arg0[..8]);
+                let _ = bytes.copy_from_bytes(&event.usdt_arg[..8]);
                 let val = u64::from_ne_bytes(bytes);
                 extra = format!(":{}", val);
             }
             systing::types::arg_type::ARG_STRING => {
-                let arg0_str = CStr::from_bytes_until_nul(&event.usdt_arg0);
-                if !arg0_str.is_err() {
-                    let arg0_str = arg0_str.unwrap();
-                    let bytes = arg0_str.to_bytes();
+                let arg_str = CStr::from_bytes_until_nul(&event.usdt_arg);
+                if !arg_str.is_err() {
+                    let arg_str = arg_str.unwrap();
+                    let bytes = arg_str.to_bytes();
                     if bytes.len() > 0 && !bytes.starts_with(&[0]) {
-                        extra = format!(":{}", arg0_str.to_string_lossy());
+                        extra = format!(":{}", arg_str.to_string_lossy());
                     }
                 }
             }
@@ -1139,21 +1112,21 @@ impl UprobeRecorder {
     fn record_uprobe_event(&mut self, event: &uprobe_event) {
         let mut extra = "".to_string();
 
-        // Capture arg0 if there is one.
+        // Capture arg if there is one.
         match event.arg_type {
             systing::types::arg_type::ARG_LONG => {
                 let mut bytes: [u8; 8] = [0; 8];
-                let _ = bytes.copy_from_bytes(&event.arg0[..8]);
+                let _ = bytes.copy_from_bytes(&event.arg[..8]);
                 let val = u64::from_ne_bytes(bytes);
                 extra = format!(":{}", val);
             }
             systing::types::arg_type::ARG_STRING => {
-                let arg0_str = CStr::from_bytes_until_nul(&event.arg0);
-                if !arg0_str.is_err() {
-                    let arg0_str = arg0_str.unwrap();
-                    let bytes = arg0_str.to_bytes();
+                let arg_str = CStr::from_bytes_until_nul(&event.arg);
+                if !arg_str.is_err() {
+                    let arg_str = arg_str.unwrap();
+                    let bytes = arg_str.to_bytes();
                     if bytes.len() > 0 && !bytes.starts_with(&[0]) {
-                        extra = format!(":{}", arg0_str.to_string_lossy());
+                        extra = format!(":{}", arg_str.to_string_lossy());
                     }
                 }
             }
@@ -1208,25 +1181,6 @@ impl UprobeRecorder {
             }
         }
         packets
-    }
-}
-
-impl fmt::Display for UProbe {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = if self.retprobe { "uretprobe" } else { "uprobe" };
-        if self.func_name != "" {
-            if self.offset != 0 {
-                write!(f, "{}:{}+0x{:x}", name, self.func_name, self.offset,)
-            } else {
-                write!(f, "{}:{}", name, self.func_name)
-            }
-        } else {
-            if self.offset != 0 {
-                write!(f, "{}:0x{:x}", name, self.offset)
-            } else {
-                write!(f, "{}", name)
-            }
-        }
     }
 }
 
@@ -1368,6 +1322,8 @@ fn system(opts: Command) -> Result<()> {
     }
 
     let recorder = Arc::new(SessionRecorder::default());
+    let mut systing_events_config = SystingEventsConfig::default();
+
     recorder.snapshot_clocks();
     {
         let mut skel_builder = systing::SystingSystemSkelBuilder::default();
@@ -1411,78 +1367,26 @@ fn system(opts: Command) -> Result<()> {
         }
 
         let mut rng = rand::rng();
-        let mut usdts: Vec<UsdtProbe> = Vec::new();
-        let mut uprobes: Vec<UProbe> = Vec::new();
         for tracepoint in opts.trace_event.iter() {
-            let parts = tracepoint.split(':').collect::<Vec<&str>>();
-            match parts[0] {
-                "usdt" => {
-                    if parts.len() != 4 {
-                        Err(anyhow::anyhow!("Invalid USDT probe format"))?;
-                    }
-                    let usdt = UsdtProbe {
-                        cookie: rng.next_u64(),
-                        path: parts[1].to_string(),
-                        provider: parts[2].to_string(),
-                        name: parts[3].to_string(),
-                    };
-                    usdts.push(usdt.clone());
-                    recorder
-                        .usdt_recorder
-                        .lock()
-                        .unwrap()
-                        .usdt_cookies
-                        .insert(usdt.cookie, usdt);
-                }
-                "uprobe" | "uretprobe" => {
-                    // Format is
-                    // uprobe:<path>:<offset>
-                    // uprobe:<path>:<symbol>
-                    // uprobe:<path>:<symbol>+<offset>
-                    // uretprobe:<path>:<offset>
-                    // uretprobe:<path>:<symbol>
-                    // uretprobe:<path>:<symbol>+<offset>
-                    if parts.len() != 3 {
-                        Err(anyhow::anyhow!("Invalid uprobes format"))?;
-                    }
-                    let mut probe = UProbe::default();
-                    probe.cookie = rng.next_u64();
-                    probe.path = parts[1].to_string();
-                    probe.retprobe = parts[0] == "uretprobe";
-
-                    match parts[2].parse::<u64>() {
-                        Ok(val) => {
-                            probe.offset = val;
-                        }
-                        Err(_) => {
-                            let symbol = parts[2].to_string();
-                            let mut symbol_parts = symbol.split('+');
-                            let symbol = symbol_parts.next().unwrap();
-                            let offset = symbol_parts.next();
-                            if offset.is_some() {
-                                probe.offset = offset.unwrap().parse::<u64>()?;
-                            } else {
-                                probe.offset = 0;
-                            }
-                            probe.func_name = symbol.to_string();
-                        }
-                    }
-                    uprobes.push(probe.clone());
-                    recorder
-                        .uprobe_recorder
-                        .lock()
-                        .unwrap()
-                        .uprobes
-                        .insert(probe.cookie, probe);
-                }
-                _ => {
-                    Err(anyhow::anyhow!("Invalid probe type"))?;
-                }
-            }
+            systing_events_config.add_event_from_str(tracepoint, &mut rng)?;
         }
 
-        if usdts.len() > 0 && opts.trace_event_pid.len() == 0 {
-            Err(anyhow::anyhow!("USDT probes require a PID to attach to"))?;
+        if opts.trace_event_pid.len() == 0 {
+            for (_, event) in &systing_events_config.events {
+                match event.event {
+                    EventProbe::Usdt(_) => {
+                        Err(anyhow::anyhow!(
+                            "USDT events must be specified with --trace-event-pid"
+                        ))?;
+                    }
+                    EventProbe::UProbe(_) => {
+                        Err(anyhow::anyhow!(
+                            "UPROBE events must be specified with --trace-event-pid"
+                        ))?;
+                    }
+                    _ => {}
+                }
+            }
         }
 
         let mut need_slots = false;
@@ -1747,44 +1651,59 @@ fn system(opts: Command) -> Result<()> {
 
         // Attach any usdt's that we may have
         let mut usdt_links = Vec::new();
-        for usdt in usdts {
-            for pid in opts.trace_event_pid.iter() {
-                let link = skel.progs.systing_usdt.attach_usdt_with_opts(
-                    *pid as i32,
-                    &usdt.path,
-                    &usdt.provider,
-                    &usdt.name,
-                    UsdtOpts {
-                        cookie: usdt.cookie,
-                        ..Default::default()
-                    },
-                );
-                if link.is_err() {
-                    Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
-                }
-                usdt_links.push(link);
-            }
-        }
-
-        // Attach any uprobes that we may have
         let mut uprobe_links = Vec::new();
-        for uprobe in uprobes {
-            for pid in opts.trace_event_pid.iter() {
-                let link = skel.progs.systing_uprobe.attach_uprobe_with_opts(
-                    *pid as i32,
-                    &uprobe.path,
-                    uprobe.offset as usize,
-                    UprobeOpts {
-                        cookie: uprobe.cookie,
-                        retprobe: uprobe.retprobe,
-                        func_name: uprobe.func_name.clone(),
-                        ..Default::default()
-                    },
-                );
-                if link.is_err() {
-                    Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+        for (_, event) in &systing_events_config.events {
+            match &event.event {
+                EventProbe::Usdt(usdt) => {
+                    recorder
+                        .usdt_recorder
+                        .lock()
+                        .unwrap()
+                        .usdt_cookies
+                        .insert(usdt.cookie, usdt.clone());
+                    for pid in opts.trace_event_pid.iter() {
+                        let link = skel.progs.systing_usdt.attach_usdt_with_opts(
+                            *pid as i32,
+                            &usdt.path,
+                            &usdt.provider,
+                            &usdt.name,
+                            UsdtOpts {
+                                cookie: usdt.cookie,
+                                ..Default::default()
+                            },
+                        );
+                        if link.is_err() {
+                            Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+                        }
+                        usdt_links.push(link);
+                    }
                 }
-                uprobe_links.push(link);
+                EventProbe::UProbe(uprobe) => {
+                    recorder
+                        .uprobe_recorder
+                        .lock()
+                        .unwrap()
+                        .uprobes
+                        .insert(uprobe.cookie, uprobe.clone());
+                    for pid in opts.trace_event_pid.iter() {
+                        let link = skel.progs.systing_uprobe.attach_uprobe_with_opts(
+                            *pid as i32,
+                            &uprobe.path,
+                            uprobe.offset as usize,
+                            UprobeOpts {
+                                cookie: uprobe.cookie,
+                                retprobe: uprobe.retprobe,
+                                func_name: uprobe.func_name.clone(),
+                                ..Default::default()
+                            },
+                        );
+                        if link.is_err() {
+                            Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+                        }
+                        uprobe_links.push(link);
+                    }
+                }
+                _ => {}
             }
         }
 
