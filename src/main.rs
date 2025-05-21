@@ -242,9 +242,43 @@ fn get_clock_value(clock_id: libc::c_int) -> u64 {
     (ts.tv_sec as u64 * 1_000_000_000) + ts.tv_nsec as u64
 }
 
+fn add_frame(
+    frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+    func_map: &mut HashMap<String, InternedString>,
+    id_counter: &mut Arc<AtomicUsize>,
+    input_addr: u64,
+    start_addr: u64,
+    offset: u64,
+    name: String,
+) {
+    let mut frame = Frame::default();
+    let my_func = func_map.entry(name.to_string()).or_insert_with(|| {
+        let mut interned_str = InternedString::default();
+        let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        interned_str.set_iid(iid);
+        interned_str.set_str(name.into_bytes());
+        interned_str
+    });
+    let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+    frame.set_iid(iid);
+    frame.set_function_name_id(my_func.iid());
+    frame.set_rel_pc(offset);
+
+    let mut mapping = Mapping::default();
+    let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+    mapping.set_iid(iid);
+    mapping.set_exact_offset(input_addr);
+    mapping.set_start_offset(start_addr);
+
+    frame.set_mapping_id(mapping.iid());
+    let frame = LocalFrame { frame, mapping };
+    let frame_vec = frame_map.entry(input_addr).or_insert_with(Vec::new);
+    frame_vec.push(frame);
+}
+
 fn stack_to_frames_mapping<'a, I>(
     symbolizer: &mut Symbolizer,
-    frame_map: &mut HashMap<u64, LocalFrame>,
+    frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
     func_map: &mut HashMap<String, InternedString>,
     source: &Source<'a>,
     id_counter: &mut Arc<AtomicUsize>,
@@ -259,55 +293,46 @@ fn stack_to_frames_mapping<'a, I>(
 
         match symbolizer.symbolize_single(source, Input::AbsAddr(*input_addr)) {
             Ok(Symbolized::Sym(Sym {
-                addr, name, offset, ..
+                addr,
+                name,
+                offset,
+                inlined,
+                ..
             })) => {
-                let mut frame = Frame::default();
-                let my_func = func_map.entry(name.to_string()).or_insert_with(|| {
-                    let mut interned_str = InternedString::default();
-                    let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-                    interned_str.set_iid(iid);
-                    interned_str.set_str(name.to_string().into_bytes());
-                    interned_str
-                });
-                let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-                frame.set_iid(iid);
-                frame.set_function_name_id(my_func.iid());
-                frame.set_rel_pc(offset as u64);
+                add_frame(
+                    frame_map,
+                    func_map,
+                    id_counter,
+                    *input_addr,
+                    addr,
+                    offset as u64,
+                    name.to_string(),
+                );
 
-                let mut mapping = Mapping::default();
-                let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-                mapping.set_iid(iid);
-                mapping.set_exact_offset(*input_addr);
-                mapping.set_start_offset(addr);
-
-                frame.set_mapping_id(mapping.iid());
-                let frame = LocalFrame { frame, mapping };
-                frame_map.insert(*input_addr, frame);
+                for inline in inlined {
+                    let name = format!("{} (inlined)", inline.name);
+                    add_frame(
+                        frame_map,
+                        func_map,
+                        id_counter,
+                        *input_addr,
+                        addr,
+                        0,
+                        name,
+                    );
+                }
             }
             _ => {
                 let name = format!("<unknown>");
-                let mut frame = Frame::default();
-                let my_func = func_map.entry(name.to_string()).or_insert_with(|| {
-                    let mut interned_str = InternedString::default();
-                    let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-                    interned_str.set_iid(iid);
-                    interned_str.set_str(name.into_bytes());
-                    interned_str
-                });
-                let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-                frame.set_iid(iid);
-                frame.set_function_name_id(my_func.iid());
-                frame.set_rel_pc(0);
-
-                let mut mapping = Mapping::default();
-                let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-                mapping.set_iid(iid);
-                mapping.set_exact_offset(*input_addr);
-                mapping.set_start_offset(0);
-
-                frame.set_mapping_id(mapping.iid());
-                let frame = LocalFrame { frame, mapping };
-                frame_map.insert(*input_addr, frame);
+                add_frame(
+                    frame_map,
+                    func_map,
+                    id_counter,
+                    *input_addr,
+                    *input_addr,
+                    0,
+                    name.clone(),
+                );
             }
         }
     }
@@ -321,7 +346,10 @@ fn generate_stack_packets(
 ) {
     let user_src = Source::Process(Process::new(Pid::from(tgid)));
     let kernel_src = Source::Kernel(Kernel::default());
-    let mut symbolizer = Symbolizer::builder().enable_code_info(false).build();
+    let mut symbolizer = Symbolizer::builder()
+        .enable_code_info(true)
+        .enable_inlined_fns(true)
+        .build();
 
     let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(tgid.into())));
 
@@ -365,9 +393,13 @@ fn generate_stack_packets(
                 .iter()
                 .chain(stack.kernel_stack.iter())
                 .map(|addr| {
-                    let frame = frame_map.get(&addr).unwrap();
-                    frame.frame.iid()
+                    let frame_vec = frame_map.get(&addr).unwrap();
+                    frame_vec
+                        .iter()
+                        .map(|frame| frame.frame.iid())
+                        .collect::<Vec<u64>>()
                 })
+                .flatten()
                 .collect();
             (stack, callstack)
         })
@@ -380,11 +412,23 @@ fn generate_stack_packets(
     interned_data.function_names = func_name_map.values().cloned().collect();
     interned_data.frames = frame_map
         .values()
-        .map(|frame| frame.frame.clone())
+        .map(|frame_vec| {
+            frame_vec
+                .iter()
+                .map(|frame| frame.frame.clone())
+                .collect::<Vec<Frame>>()
+        })
+        .flatten()
         .collect();
     interned_data.mappings = frame_map
         .values()
-        .map(|frame| frame.mapping.clone())
+        .map(|frame_vec| {
+            frame_vec
+                .iter()
+                .map(|frame| frame.mapping.clone())
+                .collect::<Vec<Mapping>>()
+        })
+        .flatten()
         .collect();
     packet.interned_data = Some(interned_data).into();
     packet.set_trusted_packet_sequence_id(seq);
