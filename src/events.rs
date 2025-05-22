@@ -22,6 +22,12 @@ struct TrackInstant {
 pub struct SystingProbeRecorder {
     pub cookies: HashMap<u64, SystingEvent>,
     events: HashMap<u64, Vec<TrackInstant>>,
+
+    // Configuration members
+    pub config_events: HashMap<String, SystingEvent>,
+    start_events: HashMap<String, String>,
+    stop_events: HashMap<String, String>,
+    instant_events: HashMap<String, String>,
 }
 
 #[derive(Clone, Default)]
@@ -61,16 +67,6 @@ pub struct SystingEvent {
     pub event: EventProbe,
     pub key_index: u8,
     pub key_type: EventKeyType,
-}
-
-#[derive(Default)]
-pub struct SystingEventsConfig {
-    pub events: HashMap<String, SystingEvent>,
-
-    // Map the events to the range/instant names
-    pub start_events: HashMap<String, String>,
-    pub stop_events: HashMap<String, String>,
-    pub instant_events: HashMap<String, String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -200,96 +196,6 @@ impl fmt::Display for SystingEvent {
     }
 }
 
-impl SystingEventsConfig {
-    pub fn add_event_from_str(&mut self, event: &str, rng: &mut dyn rand::RngCore) -> Result<()> {
-        let parts = event.split(':').collect::<Vec<&str>>();
-        let mut systing_event = SystingEvent::default();
-        systing_event.key_index = u8::MAX;
-        systing_event.cookie = rng.next_u64();
-        match parts[0] {
-            "usdt" => {
-                let usdt = UsdtProbeEvent::from_parts(parts)?;
-                systing_event.name = format!("{}:{}", usdt.provider, usdt.name);
-                systing_event.event = EventProbe::Usdt(usdt);
-            }
-            "uprobe" => {
-                let uprobe = UProbeEvent::from_parts(parts)?;
-                systing_event.name = uprobe.func_name.clone();
-                systing_event.event = EventProbe::UProbe(uprobe);
-            }
-            _ => {
-                return Err(anyhow::anyhow!("Invalid event type: {}", parts[0]));
-            }
-        }
-        self.events
-            .insert(systing_event.name.clone(), systing_event);
-        Ok(())
-    }
-
-    fn add_event_from_json(
-        &mut self,
-        event: &SystingJSONEvent,
-        rng: &mut dyn rand::RngCore,
-    ) -> Result<()> {
-        let key_type = match event.key_type.as_deref() {
-            Some("string") => EventKeyType::String,
-            Some("long") => EventKeyType::Long,
-            _ => EventKeyType::default(),
-        };
-        let key_index = event.key_index.unwrap_or(u8::MAX);
-        let parts = event.event.split(':').collect::<Vec<&str>>();
-        let event = SystingEvent {
-            name: event.name.clone(),
-            cookie: rng.next_u64(),
-            key_index,
-            key_type,
-            event: match parts[0] {
-                "usdt" => EventProbe::Usdt(UsdtProbeEvent::from_parts(parts)?),
-                "uprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
-                _ => return Err(anyhow::anyhow!("Invalid event type")),
-            },
-        };
-        self.events.insert(event.name.clone(), event);
-        Ok(())
-    }
-
-    pub fn load_config(&mut self, config: &str, rng: &mut dyn rand::RngCore) -> Result<()> {
-        let path = Path::new(config);
-        let buf = fs::read_to_string(path)?;
-
-        let config: SystingJSONTrackConfig = serde_json::from_str(&buf)?;
-        for event in config.events.iter() {
-            self.add_event_from_json(&event, rng)?;
-        }
-
-        for track in config.tracks {
-            let track_name = track.track_name.clone();
-            if let Some(ranges) = &track.ranges {
-                for range in ranges.iter() {
-                    let start_event = range.start.clone();
-                    let end_event = range.end.clone();
-                    if self.start_events.contains_key(&start_event) {
-                        Err(anyhow::anyhow!(
-                            "Start event {} already exists",
-                            start_event
-                        ))?;
-                    }
-                    if self.stop_events.contains_key(&end_event) {
-                        Err(anyhow::anyhow!("Stop event {} already exists", end_event))?;
-                    }
-                    self.start_events.insert(start_event, track_name.clone());
-                    self.stop_events.insert(end_event, track_name.clone());
-                }
-            }
-            if let Some(instant) = &track.instant {
-                self.instant_events
-                    .insert(instant.name.clone(), track_name.clone());
-            }
-        }
-        Ok(())
-    }
-}
-
 impl SystingProbeRecorder {
     pub fn handle_event(&mut self, tgidpid: u64, cookie: u64, ts: u64, extra: String) {
         let systing_event = self.cookies.get(&cookie).unwrap();
@@ -337,5 +243,95 @@ impl SystingProbeRecorder {
             }
         }
         packets
+    }
+
+    pub fn add_event_from_str(&mut self, event: &str, rng: &mut dyn rand::RngCore) -> Result<()> {
+        let parts = event.split(':').collect::<Vec<&str>>();
+        let mut systing_event = SystingEvent::default();
+        systing_event.key_index = u8::MAX;
+        systing_event.cookie = rng.next_u64();
+        match parts[0] {
+            "usdt" => {
+                let usdt = UsdtProbeEvent::from_parts(parts)?;
+                systing_event.name = format!("{}:{}", usdt.provider, usdt.name);
+                systing_event.event = EventProbe::Usdt(usdt);
+            }
+            "uprobe" => {
+                let uprobe = UProbeEvent::from_parts(parts)?;
+                systing_event.name = uprobe.func_name.clone();
+                systing_event.event = EventProbe::UProbe(uprobe);
+            }
+            _ => {
+                return Err(anyhow::anyhow!("Invalid event type: {}", parts[0]));
+            }
+        }
+        self.cookies.insert(systing_event.cookie, systing_event.clone());
+        self.config_events
+            .insert(systing_event.name.clone(), systing_event);
+        Ok(())
+    }
+
+    fn add_event_from_json(
+        &mut self,
+        event: &SystingJSONEvent,
+        rng: &mut dyn rand::RngCore,
+    ) -> Result<()> {
+        let key_type = match event.key_type.as_deref() {
+            Some("string") => EventKeyType::String,
+            Some("long") => EventKeyType::Long,
+            _ => EventKeyType::default(),
+        };
+        let key_index = event.key_index.unwrap_or(u8::MAX);
+        let parts = event.event.split(':').collect::<Vec<&str>>();
+        let event = SystingEvent {
+            name: event.name.clone(),
+            cookie: rng.next_u64(),
+            key_index,
+            key_type,
+            event: match parts[0] {
+                "usdt" => EventProbe::Usdt(UsdtProbeEvent::from_parts(parts)?),
+                "uprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
+                _ => return Err(anyhow::anyhow!("Invalid event type")),
+            },
+        };
+        self.cookies.insert(event.cookie, event.clone());
+        self.config_events.insert(event.name.clone(), event);
+        Ok(())
+    }
+
+    pub fn load_config(&mut self, config: &str, rng: &mut dyn rand::RngCore) -> Result<()> {
+        let path = Path::new(config);
+        let buf = fs::read_to_string(path)?;
+
+        let config: SystingJSONTrackConfig = serde_json::from_str(&buf)?;
+        for event in config.events.iter() {
+            self.add_event_from_json(&event, rng)?;
+        }
+
+        for track in config.tracks {
+            let track_name = track.track_name.clone();
+            if let Some(ranges) = &track.ranges {
+                for range in ranges.iter() {
+                    let start_event = range.start.clone();
+                    let end_event = range.end.clone();
+                    if self.start_events.contains_key(&start_event) {
+                        Err(anyhow::anyhow!(
+                            "Start event {} already exists",
+                            start_event
+                        ))?;
+                    }
+                    if self.stop_events.contains_key(&end_event) {
+                        Err(anyhow::anyhow!("Stop event {} already exists", end_event))?;
+                    }
+                    self.start_events.insert(start_event, track_name.clone());
+                    self.stop_events.insert(end_event, track_name.clone());
+                }
+            }
+            if let Some(instant) = &track.instant {
+                self.instant_events
+                    .insert(instant.name.clone(), track_name.clone());
+            }
+        }
+        Ok(())
     }
 }

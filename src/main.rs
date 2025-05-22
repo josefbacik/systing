@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::events::{EventProbe, SystingEventsConfig, SystingProbeRecorder};
+use crate::events::{EventProbe, SystingProbeRecorder};
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::symbolize::Stack;
 
@@ -1164,7 +1164,6 @@ fn system(opts: Command) -> Result<()> {
     }
 
     let recorder = Arc::new(SessionRecorder::default());
-    let mut systing_events_config = SystingEventsConfig::default();
 
     recorder.snapshot_clocks();
     {
@@ -1208,29 +1207,32 @@ fn system(opts: Command) -> Result<()> {
             recorder.event_recorder.lock().unwrap().cpu_sched_stats = true;
         }
 
-        let mut rng = rand::rng();
-        for tracepoint in opts.trace_event.iter() {
-            systing_events_config.add_event_from_str(tracepoint, &mut rng)?;
-        }
+        {
+            let mut probe_recorder = recorder.probe_recorder.lock().unwrap();
+            let mut rng = rand::rng();
+            for tracepoint in opts.trace_event.iter() {
+                probe_recorder.add_event_from_str(tracepoint, &mut rng)?;
+            }
 
-        for config in opts.trace_event_config.iter() {
-            systing_events_config.load_config(config, &mut rng)?;
-        }
+            for config in opts.trace_event_config.iter() {
+                probe_recorder.load_config(config, &mut rng)?;
+            }
 
-        if opts.trace_event_pid.len() == 0 {
-            for (_, event) in &systing_events_config.events {
-                match event.event {
-                    EventProbe::Usdt(_) => {
-                        Err(anyhow::anyhow!(
-                            "USDT events must be specified with --trace-event-pid"
-                        ))?;
+            if opts.trace_event_pid.len() == 0 {
+                for (_, event) in &probe_recorder.config_events {
+                    match event.event {
+                        EventProbe::Usdt(_) => {
+                            Err(anyhow::anyhow!(
+                                "USDT events must be specified with --trace-event-pid"
+                            ))?;
+                        }
+                        EventProbe::UProbe(_) => {
+                            Err(anyhow::anyhow!(
+                                "UPROBE events must be specified with --trace-event-pid"
+                            ))?;
+                        }
+                        _ => {}
                     }
-                    EventProbe::UProbe(_) => {
-                        Err(anyhow::anyhow!(
-                            "UPROBE events must be specified with --trace-event-pid"
-                        ))?;
-                    }
-                    _ => {}
                 }
             }
         }
@@ -1471,52 +1473,49 @@ fn system(opts: Command) -> Result<()> {
 
         // Attach any usdt's that we may have
         let mut probe_links = Vec::new();
-        for (_, event) in &systing_events_config.events {
-            recorder
-                .probe_recorder
-                .lock()
-                .unwrap()
-                .cookies
-                .insert(event.cookie, event.clone());
-            match &event.event {
-                EventProbe::Usdt(usdt) => {
-                    for pid in opts.trace_event_pid.iter() {
-                        let link = skel.progs.systing_usdt.attach_usdt_with_opts(
-                            *pid as i32,
-                            &usdt.path,
-                            &usdt.provider,
-                            &usdt.name,
-                            UsdtOpts {
-                                cookie: event.cookie,
-                                ..Default::default()
-                            },
-                        );
-                        if link.is_err() {
-                            Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+        {
+            let probe_recorder = recorder.probe_recorder.lock().unwrap();
+            for (_, event) in &probe_recorder.config_events {
+                match &event.event {
+                    EventProbe::Usdt(usdt) => {
+                        for pid in opts.trace_event_pid.iter() {
+                            let link = skel.progs.systing_usdt.attach_usdt_with_opts(
+                                *pid as i32,
+                                &usdt.path,
+                                &usdt.provider,
+                                &usdt.name,
+                                UsdtOpts {
+                                    cookie: event.cookie,
+                                    ..Default::default()
+                                },
+                            );
+                            if link.is_err() {
+                                Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+                            }
+                            probe_links.push(link);
                         }
-                        probe_links.push(link);
                     }
-                }
-                EventProbe::UProbe(uprobe) => {
-                    for pid in opts.trace_event_pid.iter() {
-                        let link = skel.progs.systing_uprobe.attach_uprobe_with_opts(
-                            *pid as i32,
-                            &uprobe.path,
-                            uprobe.offset as usize,
-                            UprobeOpts {
-                                cookie: event.cookie,
-                                retprobe: uprobe.retprobe,
-                                func_name: uprobe.func_name.clone(),
-                                ..Default::default()
-                            },
-                        );
-                        if link.is_err() {
-                            Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+                    EventProbe::UProbe(uprobe) => {
+                        for pid in opts.trace_event_pid.iter() {
+                            let link = skel.progs.systing_uprobe.attach_uprobe_with_opts(
+                                *pid as i32,
+                                &uprobe.path,
+                                uprobe.offset as usize,
+                                UprobeOpts {
+                                    cookie: event.cookie,
+                                    retprobe: uprobe.retprobe,
+                                    func_name: uprobe.func_name.clone(),
+                                    ..Default::default()
+                                },
+                            );
+                            if link.is_err() {
+                                Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+                            }
+                            probe_links.push(link);
                         }
-                        probe_links.push(link);
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
