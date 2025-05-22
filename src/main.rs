@@ -1,5 +1,6 @@
 pub mod events;
 pub mod perf;
+pub mod perfetto;
 pub mod symbolize;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -15,7 +16,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::events::{EventProbe, SystingEventsConfig, SystingEvent};
+use crate::events::{EventProbe, SystingEventsConfig, SystingProbeRecorder};
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::symbolize::Stack;
 
@@ -119,10 +120,10 @@ pub trait SystingRecordEvent<T> {
 
 use systing::types::event_type;
 use systing::types::perf_counter_event;
+use systing::types::probe_event;
 use systing::types::stack_event;
 use systing::types::task_event;
 use systing::types::task_info;
-use systing::types::probe_event;
 
 unsafe impl Plain for task_event {}
 unsafe impl Plain for stack_event {}
@@ -132,11 +133,6 @@ unsafe impl Plain for probe_event {}
 struct TrackCounter {
     ts: u64,
     count: i64,
-}
-
-struct TrackInstant {
-    ts: u64,
-    name: String,
 }
 
 #[derive(Clone)]
@@ -170,12 +166,6 @@ struct EventRecorder {
     rq_counters: HashMap<i32, i64>,
     cpu_sched_stats: bool,
     process_sched_stats: bool,
-}
-
-#[derive(Default)]
-struct SystingProbeRecorder {
-    cookies: HashMap<u64, SystingEvent>,
-    events: HashMap<u64, Vec<TrackInstant>>,
 }
 
 #[derive(Default)]
@@ -422,30 +412,6 @@ fn generate_stack_packets(
         packet.set_trusted_packet_sequence_id(seq);
         packets.lock().unwrap().push(packet);
     }
-}
-
-fn generate_pidtgid_track_descriptor(
-    pid_uuids: &HashMap<i32, u64>,
-    thread_uuids: &HashMap<i32, u64>,
-    tgidpid: &u64,
-    name: String,
-    desc_uuid: u64,
-) -> TrackDescriptor {
-    let pid = *tgidpid as i32;
-    let tgid = (*tgidpid >> 32) as i32;
-
-    let uuid = if pid == tgid {
-        *pid_uuids.get(&tgid).unwrap()
-    } else {
-        *thread_uuids.get(&pid).unwrap()
-    };
-
-    let mut desc = TrackDescriptor::default();
-    desc.set_name(name);
-    desc.set_uuid(desc_uuid);
-    desc.set_parent_uuid(uuid);
-
-    desc
 }
 
 impl From<&task_info> for ProcessDescriptor {
@@ -773,7 +739,7 @@ impl EventRecorder {
             counter_desc.set_unit(Unit::UNIT_TIME_NS);
             counter_desc.set_is_incremental(false);
 
-            let mut desc = generate_pidtgid_track_descriptor(
+            let mut desc = crate::perfetto::generate_pidtgid_track_descriptor(
                 pid_uuids,
                 thread_uuids,
                 pidtgid,
@@ -874,57 +840,7 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
             }
             _ => {}
         }
-
-        let systing_event = self.cookies.get(&event.cookie).unwrap();
-        let entry = self
-            .events
-            .entry(event.task.tgidpid)
-            .or_insert_with(Vec::new);
-        entry.push(TrackInstant {
-            ts: event.ts,
-            name: format!("{}{}", systing_event, extra),
-        });
-    }
-}
-
-impl SystingProbeRecorder {
-    fn generate_trace(
-        &self,
-        pid_uuids: &HashMap<i32, u64>,
-        thread_uuids: &HashMap<i32, u64>,
-        id_counter: &mut Arc<AtomicUsize>,
-    ) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
-
-        // Populate the USDT events
-        for (pidtgid, events) in self.events.iter() {
-            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            let desc = generate_pidtgid_track_descriptor(
-                pid_uuids,
-                thread_uuids,
-                pidtgid,
-                "Probe events".to_string(),
-                desc_uuid,
-            );
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            packets.push(packet);
-
-            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-            for event in events.iter() {
-                let mut tevent = TrackEvent::default();
-                tevent.set_type(Type::TYPE_INSTANT);
-                tevent.set_name(event.name.clone());
-                tevent.set_track_uuid(desc_uuid);
-
-                let mut packet = TracePacket::default();
-                packet.set_timestamp(event.ts);
-                packet.set_track_event(tevent);
-                packet.set_trusted_packet_sequence_id(seq);
-                packets.push(packet);
-            }
-        }
-        packets
+        self.handle_event(event.task.tgidpid, event.cookie, event.ts, extra);
     }
 }
 
@@ -1556,8 +1472,8 @@ fn system(opts: Command) -> Result<()> {
         // Attach any usdt's that we may have
         let mut probe_links = Vec::new();
         for (_, event) in &systing_events_config.events {
-            recorder.
-                probe_recorder
+            recorder
+                .probe_recorder
                 .lock()
                 .unwrap()
                 .cookies

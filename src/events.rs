@@ -2,10 +2,27 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json;
+
+use perfetto_protos::trace_packet::TracePacket;
+use perfetto_protos::track_event::track_event::Type;
+use perfetto_protos::track_event::TrackEvent;
+
+struct TrackInstant {
+    ts: u64,
+    name: String,
+}
+
+#[derive(Default)]
+pub struct SystingProbeRecorder {
+    pub cookies: HashMap<u64, SystingEvent>,
+    events: HashMap<u64, Vec<TrackInstant>>,
+}
 
 #[derive(Clone, Default)]
 pub struct UsdtProbeEvent {
@@ -258,19 +275,67 @@ impl SystingEventsConfig {
                         ))?;
                     }
                     if self.stop_events.contains_key(&end_event) {
-                        Err(anyhow::anyhow!(
-                            "Stop event {} already exists",
-                            end_event
-                        ))?;
+                        Err(anyhow::anyhow!("Stop event {} already exists", end_event))?;
                     }
                     self.start_events.insert(start_event, track_name.clone());
                     self.stop_events.insert(end_event, track_name.clone());
                 }
             }
             if let Some(instant) = &track.instant {
-                self.instant_events.insert(instant.name.clone(), track_name.clone());
+                self.instant_events
+                    .insert(instant.name.clone(), track_name.clone());
             }
         }
         Ok(())
+    }
+}
+
+impl SystingProbeRecorder {
+    pub fn handle_event(&mut self, tgidpid: u64, cookie: u64, ts: u64, extra: String) {
+        let systing_event = self.cookies.get(&cookie).unwrap();
+        let entry = self.events.entry(tgidpid).or_insert_with(Vec::new);
+        entry.push(TrackInstant {
+            ts,
+            name: format!("{}{}", systing_event, extra),
+        });
+    }
+
+    pub fn generate_trace(
+        &self,
+        pid_uuids: &HashMap<i32, u64>,
+        thread_uuids: &HashMap<i32, u64>,
+        id_counter: &mut Arc<AtomicUsize>,
+    ) -> Vec<TracePacket> {
+        let mut packets = Vec::new();
+
+        // Populate the USDT events
+        for (pidtgid, events) in self.events.iter() {
+            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+            let desc = crate::perfetto::generate_pidtgid_track_descriptor(
+                pid_uuids,
+                thread_uuids,
+                pidtgid,
+                "Probe events".to_string(),
+                desc_uuid,
+            );
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packets.push(packet);
+
+            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
+            for event in events.iter() {
+                let mut tevent = TrackEvent::default();
+                tevent.set_type(Type::TYPE_INSTANT);
+                tevent.set_name(event.name.clone());
+                tevent.set_track_uuid(desc_uuid);
+
+                let mut packet = TracePacket::default();
+                packet.set_timestamp(event.ts);
+                packet.set_track_event(tevent);
+                packet.set_trusted_packet_sequence_id(seq);
+                packets.push(packet);
+            }
+        }
+        packets
     }
 }
