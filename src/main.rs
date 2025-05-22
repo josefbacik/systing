@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::events::{EventProbe, SystingEventsConfig, UProbeEvent, UsdtProbeEvent};
+use crate::events::{EventProbe, SystingEventsConfig, SystingEvent};
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::symbolize::Stack;
 
@@ -92,6 +92,8 @@ struct Command {
     no_cpu_stack_traces: bool,
     #[arg(long)]
     no_sleep_stack_traces: bool,
+    #[arg(long)]
+    trace_event_config: Vec<String>,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -116,14 +118,12 @@ use systing::types::perf_counter_event;
 use systing::types::stack_event;
 use systing::types::task_event;
 use systing::types::task_info;
-use systing::types::uprobe_event;
-use systing::types::usdt_event;
+use systing::types::probe_event;
 
 unsafe impl Plain for task_event {}
-unsafe impl Plain for usdt_event {}
 unsafe impl Plain for stack_event {}
 unsafe impl Plain for perf_counter_event {}
-unsafe impl Plain for uprobe_event {}
+unsafe impl Plain for probe_event {}
 
 struct TrackCounter {
     ts: u64,
@@ -169,15 +169,9 @@ struct EventRecorder {
 }
 
 #[derive(Default)]
-struct UsdtRecorder {
-    usdt_cookies: HashMap<u64, UsdtProbeEvent>,
-    usdt_events: HashMap<u64, Vec<TrackInstant>>,
-}
-
-#[derive(Default)]
-struct UprobeRecorder {
-    uprobes: HashMap<u64, UProbeEvent>,
-    uprobe_events: HashMap<u64, Vec<TrackInstant>>,
+struct SystingProbeRecorder {
+    cookies: HashMap<u64, SystingEvent>,
+    events: HashMap<u64, Vec<TrackInstant>>,
 }
 
 #[derive(Default)]
@@ -206,11 +200,10 @@ struct SysinfoRecorder {
 struct SessionRecorder {
     clock_snapshot: Mutex<ClockSnapshot>,
     event_recorder: Mutex<EventRecorder>,
-    usdt_recorder: Mutex<UsdtRecorder>,
     stack_recorder: Mutex<StackRecorder>,
     perf_counter_recorder: Mutex<PerfCounterRecorder>,
     sysinfo_recorder: Mutex<SysinfoRecorder>,
-    uprobe_recorder: Mutex<UprobeRecorder>,
+    probe_recorder: Mutex<SystingProbeRecorder>,
     processes: RwLock<HashMap<u64, ProcessDescriptor>>,
     threads: RwLock<HashMap<u64, ThreadDescriptor>>,
 }
@@ -835,20 +828,20 @@ impl StackRecorder {
     }
 }
 
-impl UsdtRecorder {
-    fn record_usdt_event(&mut self, event: &usdt_event) {
+impl SystingProbeRecorder {
+    fn record_probe_event(&mut self, event: &probe_event) {
         let mut extra = "".to_string();
 
         // Capture the arg if there is one.
         match event.arg_type {
             systing::types::arg_type::ARG_LONG => {
                 let mut bytes: [u8; 8] = [0; 8];
-                let _ = bytes.copy_from_bytes(&event.usdt_arg[..8]);
+                let _ = bytes.copy_from_bytes(&event.arg[..8]);
                 let val = u64::from_ne_bytes(bytes);
                 extra = format!(":{}", val);
             }
             systing::types::arg_type::ARG_STRING => {
-                let arg_str = CStr::from_bytes_until_nul(&event.usdt_arg);
+                let arg_str = CStr::from_bytes_until_nul(&event.arg);
                 if !arg_str.is_err() {
                     let arg_str = arg_str.unwrap();
                     let bytes = arg_str.to_bytes();
@@ -860,14 +853,14 @@ impl UsdtRecorder {
             _ => {}
         }
 
-        let usdt = self.usdt_cookies.get(&event.cookie).unwrap();
+        let systing_event = self.cookies.get(&event.cookie).unwrap();
         let entry = self
-            .usdt_events
+            .events
             .entry(event.task.tgidpid)
             .or_insert_with(Vec::new);
         entry.push(TrackInstant {
             ts: event.ts,
-            name: format!("{}:{}:{}{}", usdt.path, usdt.provider, usdt.name, extra),
+            name: format!("{}{}", systing_event, extra),
         });
     }
 
@@ -880,13 +873,13 @@ impl UsdtRecorder {
         let mut packets = Vec::new();
 
         // Populate the USDT events
-        for (pidtgid, events) in self.usdt_events.iter() {
+        for (pidtgid, events) in self.events.iter() {
             let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             let desc = generate_pidtgid_track_descriptor(
                 pid_uuids,
                 thread_uuids,
                 pidtgid,
-                "USDT events".to_string(),
+                "Probe events".to_string(),
                 desc_uuid,
             );
             let mut packet = TracePacket::default();
@@ -1076,11 +1069,6 @@ impl SessionRecorder {
             &thread_uuids,
             &mut id_counter,
         ));
-        packets.extend(self.usdt_recorder.lock().unwrap().generate_trace(
-            &pid_uuids,
-            &thread_uuids,
-            &mut id_counter,
-        ));
         packets.extend(
             self.stack_recorder
                 .lock()
@@ -1099,87 +1087,11 @@ impl SessionRecorder {
                 .unwrap()
                 .generate_trace(&mut id_counter),
         );
-        packets.extend(self.uprobe_recorder.lock().unwrap().generate_trace(
+        packets.extend(self.probe_recorder.lock().unwrap().generate_trace(
             &pid_uuids,
             &thread_uuids,
             &mut id_counter,
         ));
-        packets
-    }
-}
-
-impl UprobeRecorder {
-    fn record_uprobe_event(&mut self, event: &uprobe_event) {
-        let mut extra = "".to_string();
-
-        // Capture arg if there is one.
-        match event.arg_type {
-            systing::types::arg_type::ARG_LONG => {
-                let mut bytes: [u8; 8] = [0; 8];
-                let _ = bytes.copy_from_bytes(&event.arg[..8]);
-                let val = u64::from_ne_bytes(bytes);
-                extra = format!(":{}", val);
-            }
-            systing::types::arg_type::ARG_STRING => {
-                let arg_str = CStr::from_bytes_until_nul(&event.arg);
-                if !arg_str.is_err() {
-                    let arg_str = arg_str.unwrap();
-                    let bytes = arg_str.to_bytes();
-                    if bytes.len() > 0 && !bytes.starts_with(&[0]) {
-                        extra = format!(":{}", arg_str.to_string_lossy());
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        let uprobe = self.uprobes.get(&event.cookie).unwrap();
-        let entry = self
-            .uprobe_events
-            .entry(event.task.tgidpid)
-            .or_insert_with(Vec::new);
-        entry.push(TrackInstant {
-            ts: event.ts,
-            name: format!("{}{}", uprobe, extra),
-        });
-    }
-
-    fn generate_trace(
-        &self,
-        pid_uuids: &HashMap<i32, u64>,
-        thread_uuids: &HashMap<i32, u64>,
-        id_counter: &mut Arc<AtomicUsize>,
-    ) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
-
-        // Populate the USDT events
-        for (pidtgid, events) in self.uprobe_events.iter() {
-            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            let desc = generate_pidtgid_track_descriptor(
-                pid_uuids,
-                thread_uuids,
-                pidtgid,
-                "UProbe events".to_string(),
-                desc_uuid,
-            );
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            packets.push(packet);
-
-            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-            for event in events.iter() {
-                let mut tevent = TrackEvent::default();
-                tevent.set_type(Type::TYPE_INSTANT);
-                tevent.set_name(event.name.clone());
-                tevent.set_track_uuid(desc_uuid);
-
-                let mut packet = TracePacket::default();
-                packet.set_timestamp(event.ts);
-                packet.set_track_event(tevent);
-                packet.set_trusted_packet_sequence_id(seq);
-                packets.push(packet);
-            }
-        }
         packets
     }
 }
@@ -1371,6 +1283,10 @@ fn system(opts: Command) -> Result<()> {
             systing_events_config.add_event_from_str(tracepoint, &mut rng)?;
         }
 
+        for config in opts.trace_event_config.iter() {
+            systing_events_config.load_config(config, &mut rng)?;
+        }
+
         if opts.trace_event_pid.len() == 0 {
             for (_, event) in &systing_events_config.events {
                 match event.event {
@@ -1436,10 +1352,9 @@ fn system(opts: Command) -> Result<()> {
 
         let mut rings = Vec::new();
         let (event_tx, event_rx) = channel();
-        let (usdt_tx, usdt_rx) = channel();
         let (stack_tx, stack_rx) = channel();
         let (cache_tx, cache_rx) = channel();
-        let (uprobe_tx, uprobe_rx) = channel();
+        let (probe_tx, probe_rx) = channel();
 
         let object = skel.object();
         for (i, map) in object.maps().enumerate() {
@@ -1447,9 +1362,6 @@ fn system(opts: Command) -> Result<()> {
             if name.starts_with("ringbuf_events") {
                 let ring = create_ring::<task_event>(&map, event_tx.clone())?;
                 rings.push((format!("events_{}", i).to_string(), ring));
-            } else if name.starts_with("ringbuf_usdt") {
-                let ring = create_ring::<usdt_event>(&map, usdt_tx.clone())?;
-                rings.push((name.to_string(), ring));
             } else if name.starts_with("ringbuf_stack") {
                 let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
                 rings.push((name.to_string(), ring));
@@ -1458,18 +1370,17 @@ fn system(opts: Command) -> Result<()> {
                     let ring = create_ring::<perf_counter_event>(&map, cache_tx.clone())?;
                     rings.push((name.to_string(), ring));
                 }
-            } else if name.starts_with("ringbuf_uprobe") {
-                let ring = create_ring::<uprobe_event>(&map, uprobe_tx.clone())?;
+            } else if name.starts_with("ringbuf_probe") {
+                let ring = create_ring::<probe_event>(&map, probe_tx.clone())?;
                 rings.push((name.to_string(), ring));
             }
         }
 
         // Drop the extra tx references
         drop(event_tx);
-        drop(usdt_tx);
         drop(stack_tx);
         drop(cache_tx);
-        drop(uprobe_tx);
+        drop(probe_tx);
 
         let mut recv_threads = Vec::new();
         let session_recorder = recorder.clone();
@@ -1505,27 +1416,6 @@ fn system(opts: Command) -> Result<()> {
         let session_recorder = recorder.clone();
         recv_threads.push(
             thread::Builder::new()
-                .name("usdt_recorder".to_string())
-                .spawn(move || {
-                    loop {
-                        let res = usdt_rx.recv();
-                        if res.is_err() {
-                            break;
-                        }
-                        let event = res.unwrap();
-                        session_recorder
-                            .usdt_recorder
-                            .lock()
-                            .unwrap()
-                            .record_usdt_event(&event);
-                        maybe_record_task(&event.task, &session_recorder);
-                    }
-                    0
-                })?,
-        );
-        let session_recorder = recorder.clone();
-        recv_threads.push(
-            thread::Builder::new()
                 .name("stack_recorder".to_string())
                 .spawn(move || {
                     loop {
@@ -1547,19 +1437,19 @@ fn system(opts: Command) -> Result<()> {
         let session_recorder = recorder.clone();
         recv_threads.push(
             thread::Builder::new()
-                .name("uprobe_recorder".to_string())
+                .name("probe_recorder".to_string())
                 .spawn(move || {
                     loop {
-                        let res = uprobe_rx.recv();
+                        let res = probe_rx.recv();
                         if res.is_err() {
                             break;
                         }
                         let event = res.unwrap();
                         session_recorder
-                            .uprobe_recorder
+                            .probe_recorder
                             .lock()
                             .unwrap()
-                            .record_uprobe_event(&event);
+                            .record_probe_event(&event);
                         maybe_record_task(&event.task, &session_recorder);
                     }
                     0
@@ -1650,17 +1540,16 @@ fn system(opts: Command) -> Result<()> {
         skel.attach()?;
 
         // Attach any usdt's that we may have
-        let mut usdt_links = Vec::new();
-        let mut uprobe_links = Vec::new();
+        let mut probe_links = Vec::new();
         for (_, event) in &systing_events_config.events {
+            recorder.
+                probe_recorder
+                .lock()
+                .unwrap()
+                .cookies
+                .insert(event.cookie, event.clone());
             match &event.event {
                 EventProbe::Usdt(usdt) => {
-                    recorder
-                        .usdt_recorder
-                        .lock()
-                        .unwrap()
-                        .usdt_cookies
-                        .insert(usdt.cookie, usdt.clone());
                     for pid in opts.trace_event_pid.iter() {
                         let link = skel.progs.systing_usdt.attach_usdt_with_opts(
                             *pid as i32,
@@ -1668,30 +1557,24 @@ fn system(opts: Command) -> Result<()> {
                             &usdt.provider,
                             &usdt.name,
                             UsdtOpts {
-                                cookie: usdt.cookie,
+                                cookie: event.cookie,
                                 ..Default::default()
                             },
                         );
                         if link.is_err() {
                             Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
                         }
-                        usdt_links.push(link);
+                        probe_links.push(link);
                     }
                 }
                 EventProbe::UProbe(uprobe) => {
-                    recorder
-                        .uprobe_recorder
-                        .lock()
-                        .unwrap()
-                        .uprobes
-                        .insert(uprobe.cookie, uprobe.clone());
                     for pid in opts.trace_event_pid.iter() {
                         let link = skel.progs.systing_uprobe.attach_uprobe_with_opts(
                             *pid as i32,
                             &uprobe.path,
                             uprobe.offset as usize,
                             UprobeOpts {
-                                cookie: uprobe.cookie,
+                                cookie: event.cookie,
                                 retprobe: uprobe.retprobe,
                                 func_name: uprobe.func_name.clone(),
                                 ..Default::default()
@@ -1700,7 +1583,7 @@ fn system(opts: Command) -> Result<()> {
                         if link.is_err() {
                             Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
                         }
-                        uprobe_links.push(link);
+                        probe_links.push(link);
                     }
                 }
                 _ => {}
@@ -1780,11 +1663,8 @@ fn system(opts: Command) -> Result<()> {
 
         println!("Missed sched events: {}", dump_missed_events(&skel, 0));
         println!("Missed stack events: {}", dump_missed_events(&skel, 1));
-        println!("Missed USDT events: {}", dump_missed_events(&skel, 2));
-        if opts.perf_counter.len() > 0 {
-            println!("Missed perf events: {}", dump_missed_events(&skel, 3));
-        }
-        println!("Missed Uprobes events: {}", dump_missed_events(&skel, 4));
+        println!("Missed probe events: {}", dump_missed_events(&skel, 2));
+        println!("Missed perf events: {}", dump_missed_events(&skel, 3));
     }
 
     println!("Generating trace...");

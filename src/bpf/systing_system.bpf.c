@@ -86,16 +86,7 @@ struct arg_desc {
 };
 
 #define ARG_SIZE 64
-struct usdt_event {
-	u32 cpu;
-	enum arg_type arg_type;
-	u64 ts;
-	u64 cookie;
-	struct task_info task;
-	u8 usdt_arg[ARG_SIZE];
-};
-
-struct uprobe_event {
+struct probe_event {
 	u32 cpu;
 	enum arg_type arg_type;
 	u64 ts;
@@ -128,11 +119,10 @@ struct perf_counter_event {
  * `struct task_event`
  */
 struct task_event _event = {0};
-struct usdt_event _usdt_event = {0};
 struct stack_event _stack_event = {0};
 struct perf_counter_event _perf_counter_event = {0};
 struct task_info _task_info = {0};
-struct uprobe_event _uprobe_event = {0};
+struct probe_event _uprobe_event = {0};
 struct arg_desc _arg_desc = {0};
 enum event_type _type = SCHED_SWITCH;
 enum arg_type _arg_type = ARG_NONE;
@@ -183,10 +173,9 @@ struct {
 
 #define MISSED_SCHED_EVENT 0
 #define MISSED_STACK_EVENT 1
-#define MISSED_USDT_EVENT 2
+#define MISSED_PROBE_EVENT 2
 #define MISSED_CACHE_EVENT 3
-#define MISSED_UPROBE_EVENT 4
-#define MISSED_EVENT_MAX 5
+#define MISSED_EVENT_MAX 4
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
@@ -209,14 +198,6 @@ struct ringbuf_map {
   ringbuf_events_node4 SEC(".maps"), ringbuf_events_node5 SEC(".maps"),
   ringbuf_events_node6 SEC(".maps"), ringbuf_events_node7 SEC(".maps");
 
-struct usdt_ringbuf_map {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
-} ringbuf_usdt_events_node0 SEC(".maps"), ringbuf_usdt_events_node1 SEC(".maps"),
-  ringbuf_usdt_events_node2 SEC(".maps"), ringbuf_usdt_events_node3 SEC(".maps"),
-  ringbuf_usdt_events_node4 SEC(".maps"), ringbuf_usdt_events_node5 SEC(".maps"),
-  ringbuf_usdt_events_node6 SEC(".maps"), ringbuf_usdt_events_node7 SEC(".maps");
-
 struct stack_ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
@@ -225,13 +206,13 @@ struct stack_ringbuf_map {
   ringbuf_stack_events_node4 SEC(".maps"), ringbuf_stack_events_node5 SEC(".maps"),
   ringbuf_stack_events_node6 SEC(".maps"), ringbuf_stack_events_node7 SEC(".maps");
 
-struct uprobe_ringbuf_map {
+struct probe_ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
-} ringbuf_uprobe_events_node0 SEC(".maps"), ringbuf_uprobe_events_node1 SEC(".maps"),
-  ringbuf_uprobe_events_node2 SEC(".maps"), ringbuf_uprobe_events_node3 SEC(".maps"),
-  ringbuf_uprobe_events_node4 SEC(".maps"), ringbuf_uprobe_events_node5 SEC(".maps"),
-  ringbuf_uprobe_events_node6 SEC(".maps"), ringbuf_uprobe_events_node7 SEC(".maps");
+} ringbuf_probe_events_node0 SEC(".maps"), ringbuf_probe_events_node1 SEC(".maps"),
+  ringbuf_probe_events_node2 SEC(".maps"), ringbuf_probe_events_node3 SEC(".maps"),
+  ringbuf_probe_events_node4 SEC(".maps"), ringbuf_probe_events_node5 SEC(".maps"),
+  ringbuf_probe_events_node6 SEC(".maps"), ringbuf_probe_events_node7 SEC(".maps");
 
 struct perf_counter_ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -260,24 +241,6 @@ struct {
 		&ringbuf_events_node5,
 		&ringbuf_events_node6,
 		&ringbuf_events_node7,
-	},
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, NR_RINGBUFS);
-	__type(key, u32);
-	__array(values, struct usdt_ringbuf_map);
-} usdt_ringbufs SEC(".maps") = {
-	.values = {
-		&ringbuf_usdt_events_node0,
-		&ringbuf_usdt_events_node1,
-		&ringbuf_usdt_events_node2,
-		&ringbuf_usdt_events_node3,
-		&ringbuf_usdt_events_node4,
-		&ringbuf_usdt_events_node5,
-		&ringbuf_usdt_events_node6,
-		&ringbuf_usdt_events_node7,
 	},
 };
 
@@ -321,17 +284,17 @@ struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
 	__uint(max_entries, NR_RINGBUFS);
 	__type(key, u32);
-	__array(values, struct uprobe_ringbuf_map);
-} uprobe_ringbufs SEC(".maps") = {
+	__array(values, struct probe_ringbuf_map);
+} probe_ringbufs SEC(".maps") = {
 	.values = {
-		&ringbuf_uprobe_events_node0,
-		&ringbuf_uprobe_events_node1,
-		&ringbuf_uprobe_events_node2,
-		&ringbuf_uprobe_events_node3,
-		&ringbuf_uprobe_events_node4,
-		&ringbuf_uprobe_events_node5,
-		&ringbuf_uprobe_events_node6,
-		&ringbuf_uprobe_events_node7,
+		&ringbuf_probe_events_node0,
+		&ringbuf_probe_events_node1,
+		&ringbuf_probe_events_node2,
+		&ringbuf_probe_events_node3,
+		&ringbuf_probe_events_node4,
+		&ringbuf_probe_events_node5,
+		&ringbuf_probe_events_node6,
+		&ringbuf_probe_events_node7,
 	},
 };
 
@@ -344,17 +307,6 @@ static struct task_event *reserve_task_event(void)
 	if (!rb)
 		return NULL;
 	return bpf_ringbuf_reserve(rb, sizeof(struct task_event), 0);
-}
-
-static struct usdt_event *reserve_usdt_event(void)
-{
-	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
-	void *rb;
-
-	rb = bpf_map_lookup_elem(&usdt_ringbufs, &node);
-	if (!rb)
-		return NULL;
-	return bpf_ringbuf_reserve(rb, sizeof(struct usdt_event), 0);
 }
 
 static struct stack_event *reserve_stack_event(void)
@@ -379,15 +331,15 @@ static struct perf_counter_event *reserve_perf_counter_event(void)
 	return bpf_ringbuf_reserve(rb, sizeof(struct perf_counter_event), 0);
 }
 
-static struct uprobe_event *reserve_uprobe_event(void)
+static struct uprobe_event *reserve_probe_event(void)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
 	void *rb;
 
-	rb = bpf_map_lookup_elem(&uprobe_ringbufs, &node);
+	rb = bpf_map_lookup_elem(&probe_ringbufs, &node);
 	if (!rb)
 		return NULL;
-	return bpf_ringbuf_reserve(rb, sizeof(struct uprobe_event), 0);
+	return bpf_ringbuf_reserve(rb, sizeof(struct probe_event), 0);
 }
 
 static u32 task_cpu(struct task_struct *task)
@@ -696,14 +648,14 @@ int systing_usdt(struct pt_regs *ctx)
 
 	u64 cookie = bpf_usdt_cookie(ctx);
 
-	struct usdt_event *event = reserve_usdt_event();
+	struct probe_event *event = reserve_probe_event();
 	if (!event)
-		return handle_missed_event(MISSED_USDT_EVENT);
+		return handle_missed_event(MISSED_PROBE_EVENT);
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
 	event->cookie = cookie;
-	event->usdt_arg[0] = 0;
+	event->arg[0] = 0;
 	event->arg_type = ARG_NONE;
 
 	struct arg_desc *desc = bpf_map_lookup_elem(&event_key_types, &cookie);
@@ -712,11 +664,11 @@ int systing_usdt(struct pt_regs *ctx)
 		bpf_usdt_arg(ctx, desc->arg_index, &val);
 		if (val) {
 			if (desc->arg_type == ARG_STRING) {
-				bpf_probe_read_user_str(&event->usdt_arg,
-							sizeof(event->usdt_arg), (long *)val);
+				bpf_probe_read_user_str(&event->arg,
+							sizeof(event->arg), (long *)val);
 				event->arg_type = ARG_STRING;
 			} else {
-				__builtin_memcpy(&event->usdt_arg, &val, sizeof(long));
+				__builtin_memcpy(&event->arg, &val, sizeof(long));
 				event->arg_type = ARG_LONG;
 			}
 		}
@@ -788,9 +740,9 @@ int systing_uprobe(struct pt_regs *ctx)
 		return 0;
 
 	u64 cookie = bpf_get_attach_cookie(ctx);
-	struct uprobe_event *event = reserve_uprobe_event();
+	struct probe_event *event = reserve_probe_event();
 	if (!event)
-		return handle_missed_event(MISSED_UPROBE_EVENT);
+		return handle_missed_event(MISSED_PROBE_EVENT);
 
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
