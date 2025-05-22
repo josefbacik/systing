@@ -113,6 +113,10 @@ mod systing {
     include!(concat!(env!("OUT_DIR"), "/systing_system.skel.rs"));
 }
 
+pub trait SystingRecordEvent<T> {
+    fn record_event(&mut self, event: &T);
+}
+
 use systing::types::event_type;
 use systing::types::perf_counter_event;
 use systing::types::stack_event;
@@ -615,7 +619,7 @@ impl LocalCompactSched {
     }
 }
 
-impl EventRecorder {
+impl SystingRecordEvent<task_event> for EventRecorder {
     fn record_event(&mut self, event: &task_event) {
         // SCHED_SWITCH and SCHED_WAKING are handled in compact sched events.
         // We skip SCHED_WAKEUP because we're just using that for runqueue tracking.
@@ -684,7 +688,9 @@ impl EventRecorder {
             });
         }
     }
+}
 
+impl EventRecorder {
     fn generate_trace(
         &self,
         pid_uuids: &HashMap<i32, u64>,
@@ -789,8 +795,8 @@ impl EventRecorder {
     }
 }
 
-impl StackRecorder {
-    fn record_stack_event(&mut self, event: &stack_event) {
+impl SystingRecordEvent<stack_event> for StackRecorder {
+    fn record_event(&mut self, event: &stack_event) {
         if event.user_stack_length > 0 || event.kernel_stack_length > 0 {
             let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
             let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
@@ -804,7 +810,9 @@ impl StackRecorder {
             stacks.push(stack);
         }
     }
+}
 
+impl StackRecorder {
     fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         use workerpool::thunk::{Thunk, ThunkWorker};
         use workerpool::Pool;
@@ -828,8 +836,22 @@ impl StackRecorder {
     }
 }
 
-impl SystingProbeRecorder {
-    fn record_probe_event(&mut self, event: &probe_event) {
+impl SystingRecordEvent<perf_counter_event> for PerfCounterRecorder {
+    fn record_event(&mut self, event: &perf_counter_event) {
+        let key = PerfCounterKey {
+            cpu: event.cpu,
+            index: event.counter_num as usize,
+        };
+        let entry = self.perf_events.entry(key).or_insert_with(Vec::new);
+        entry.push(TrackCounter {
+            ts: event.ts,
+            count: event.value.counter as i64,
+        });
+    }
+}
+
+impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
+    fn record_event(&mut self, event: &probe_event) {
         let mut extra = "".to_string();
 
         // Capture the arg if there is one.
@@ -863,7 +885,9 @@ impl SystingProbeRecorder {
             name: format!("{}{}", systing_event, extra),
         });
     }
+}
 
+impl SystingProbeRecorder {
     fn generate_trace(
         &self,
         pid_uuids: &HashMap<i32, u64>,
@@ -905,18 +929,6 @@ impl SystingProbeRecorder {
 }
 
 impl PerfCounterRecorder {
-    fn record_perf_counter_event(&mut self, event: &perf_counter_event) {
-        let key = PerfCounterKey {
-            cpu: event.cpu,
-            index: event.counter_num as usize,
-        };
-        let entry = self.perf_events.entry(key).or_insert_with(Vec::new);
-        entry.push(TrackCounter {
-            ts: event.ts,
-            count: event.value.counter as i64,
-        });
-    }
-
     fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
@@ -947,8 +959,8 @@ impl PerfCounterRecorder {
     }
 }
 
-impl SysinfoRecorder {
-    fn record_cpu_frequency(&mut self, sys: &System) {
+impl SystingRecordEvent<System> for SysinfoRecorder {
+    fn record_event(&mut self, sys: &System) {
         let ts = get_clock_value(libc::CLOCK_BOOTTIME);
         for (i, cpu) in sys.cpus().iter().enumerate() {
             let freq = self.frequency.entry(i as u32).or_insert_with(Vec::new);
@@ -958,7 +970,9 @@ impl SysinfoRecorder {
             });
         }
     }
+}
 
+impl SysinfoRecorder {
     fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
@@ -1428,7 +1442,7 @@ fn system(opts: Command) -> Result<()> {
                             .stack_recorder
                             .lock()
                             .unwrap()
-                            .record_stack_event(&event);
+                            .record_event(&event);
                         maybe_record_task(&event.task, &session_recorder);
                     }
                     0
@@ -1449,7 +1463,7 @@ fn system(opts: Command) -> Result<()> {
                             .probe_recorder
                             .lock()
                             .unwrap()
-                            .record_probe_event(&event);
+                            .record_event(&event);
                         maybe_record_task(&event.task, &session_recorder);
                     }
                     0
@@ -1471,7 +1485,7 @@ fn system(opts: Command) -> Result<()> {
                                 .perf_counter_recorder
                                 .lock()
                                 .unwrap()
-                                .record_perf_counter_event(&event);
+                                .record_event(&event);
                             maybe_record_task(&event.task, &session_recorder);
                         }
                         0
@@ -1632,7 +1646,7 @@ fn system(opts: Command) -> Result<()> {
                                 .sysinfo_recorder
                                 .lock()
                                 .unwrap()
-                                .record_cpu_frequency(&sys);
+                                .record_event(&sys);
                             thread::sleep(Duration::from_millis(100));
                         }
                         0
