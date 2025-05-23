@@ -126,3 +126,55 @@ The following is an exhaustive list of the supported formats
 
 This is to be paired with *--trace-event-pid*.
 Any _PID_ specified here will have any of the userspace trace events specified applied to it.
+
+=== *--trace-event-config* _CONFIG_
+
+This must be parid with *--trace-event-pid* if you are using a userspace trace event.
+This provides an optional configuration for complex trace event descriptions.
+The configuration is a JSON file with the following format.
+
+[source, json]
+----
+{
+  "events": [
+    {
+      "name": "tracepoint_start",
+      "event": "_EVENT_",
+      "key_index": 0,
+      "key_type": "long",
+    },
+    {
+      "name": "tracepoint_end",
+      "event": "_EVENT_",
+      "key_index": 0,
+      "key_type": "long",
+    },
+    {
+      "name": "tracepoint_instant",
+      "event": "_EVENT_",
+      "key_index": 0,
+      "key_type": "long",
+    }
+  ],
+  "tracks": [
+    {
+      "track_name": "track_name",
+      "ranges": [
+        {
+          "name": "range",
+          "start": "tracepoint_start",
+          "end": "tracepoint_end",
+        }
+      ],
+    },
+    {
+      "track_name": "instant_track",
+      "instant": {
+        "event": "tracepoint_instant",
+      }
+    }
+  ]
+}
+----
+
+Example files for real world examples can be found in the `examples` directory.

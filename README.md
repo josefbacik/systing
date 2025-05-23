@@ -60,3 +60,59 @@ to trace when `qemu` does a v9fs create, you would run the following
 ```
 systing --trace-event-pid <PID of qemu> --trace-event "usdt:/usr/bin/qemu-system-x86_64:qemu:v9fs_create"
 ````
+
+## Custom track events
+
+You can also add complex track event configurations to the trace.  Examples of
+these configuration files can be found in the examples directory.  The format is
+described in the [docs](docs/USAGE.adoc) and is a JSON file.  You can specify
+these configuration files with `--track-event-config`.
+
+The `pthread_mutex` example will add a track that shows the time spent locking
+the mutex and the time that the mutex is locked by the thread.
+
+```JSON
+{
+  "events": [
+    {
+      "name": "mutex_entry",
+      "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_entry",
+      "key_index": 0,
+      "key_type": "long"
+    },
+    {
+      "name": "mutex_acquired",
+      "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_acquired",
+      "key_index": 0,
+      "key_type": "long"
+    },
+    {
+      "name": "mutex_release",
+      "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_release",
+      "key_index": 0,
+      "key_type": "long"
+    },
+  ],
+  "tracks": [
+    {
+      "track_name": "pthread",
+      "ranges": [
+        {
+          "name": "locking",
+          "start": "mutex_entry",
+          "end": "mutex_acquired"
+        },
+        {
+          "name": "locked",
+          "start": "mutex_acquired",
+          "end": "mutex_release"
+        }
+      ]
+    },
+  ]
+}
+```
+
+This results in a track that looks like this
+
+![pthread mutex example](docs/pthread.png)

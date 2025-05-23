@@ -1,0 +1,47 @@
+{
+  "events": [
+    {
+      "name": "mutex_entry",
+      "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_entry",
+      "key_index": 0,
+      "key_type": "long"
+    },
+    {
+      "name": "mutex_acquired",
+      "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_acquired",
+      "key_index": 0,
+      "key_type": "long"
+    },
+    {
+      "name": "mutex_release",
+      "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_release",
+      "key_index": 0,
+      "key_type": "long"
+    },
+    {
+      "name": "pthread_cond_wait",
+      "event": "usdt:/usr/lib64/libc.so.6:libc:cond_wait"
+    }
+  ],
+  "tracks": [
+    {
+      "track_name": "pthread",
+      "ranges": [
+        {
+          "name": "locking",
+          "start": "mutex_entry",
+          "end": "mutex_acquired"
+        },
+        {
+          "name": "locked",
+          "start": "mutex_acquired",
+          "end": "mutex_release"
+        }
+      ]
+    },
+    {
+      "track_name": "pthread_cond_wait",
+      "instant": { "event": "pthread_cond_wait" }
+    }
+  ]
+}
