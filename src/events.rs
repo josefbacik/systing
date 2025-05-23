@@ -19,6 +19,7 @@ struct TrackInstant {
 }
 
 struct TrackRange {
+    range_name: String,
     start: u64,
     end: u64,
 }
@@ -37,10 +38,17 @@ pub struct SystingProbeRecorder {
     events: HashMap<u64, HashMap<String, Vec<TrackInstant>>>,
 
     // The recorded ranges, this is a hashmap of the tgidpid of the thread, and then a hashmap of
-    // the track name to range name, and then a vector of TrackRange's that we've recorded.
-    // IDK, I'm a kernel developer just thrilled to have a hashmap to use, I have no idea how to do
-    // this better.
-    recorded_ranges: HashMap<u64, HashMap<String, HashMap<String, Vec<TrackRange>>>>,
+    // the track name to track name, and then there's a list of TrackRange entries in there.  We
+    // keep track of the range name in here because perfetto expects that it sees all the packets
+    // for a track in chronological order, which means if we have something like
+    //
+    // range1 -> event1:event2
+    // range2 -> event2:event3
+    //
+    // We need to make sure the packets show up with
+    //
+    // [packet BEGIN range1][packet END range1][packet BEGIN range2][packet END range2]
+    recorded_ranges: HashMap<u64, HashMap<String, Vec<TrackRange>>>,
 
     // The ranges that we've recorded a start event for, the key is the tgidpid of the thread, and
     // the value is a hashmap of the track_name with a TrackRange that has the start time set.
@@ -290,10 +298,7 @@ impl SystingProbeRecorder {
                         .recorded_ranges
                         .entry(tgidpid)
                         .or_insert_with(HashMap::new);
-                    let range_hash = track_hash.entry(track_name).or_insert_with(HashMap::new);
-                    let entry = range_hash
-                        .entry(range_name.clone())
-                        .or_insert_with(Vec::new);
+                    let entry = track_hash.entry(track_name).or_insert_with(Vec::new);
                     entry.push(range);
                 }
             }
@@ -305,12 +310,20 @@ impl SystingProbeRecorder {
                 if let Some(range) = ranges.get_mut(range_name) {
                     range.start = ts;
                 } else {
-                    let range = TrackRange { start: ts, end: 0 };
+                    let range = TrackRange {
+                        range_name: range_name.clone(),
+                        start: ts,
+                        end: 0,
+                    };
                     ranges.insert(range_name.clone(), range);
                 }
             } else {
                 let mut ranges = HashMap::new();
-                let range = TrackRange { start: ts, end: 0 };
+                let range = TrackRange {
+                    range_name: range_name.clone(),
+                    start: ts,
+                    end: 0,
+                };
                 ranges.insert(range_name.clone(), range);
                 self.outstanding_ranges.insert(tgidpid, ranges);
             }
@@ -372,30 +385,28 @@ impl SystingProbeRecorder {
                 packets.push(packet);
 
                 let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-                for (range_name, track_ranges) in ranges.iter() {
-                    for range in track_ranges.iter() {
-                        let mut tevent = TrackEvent::default();
-                        tevent.set_type(Type::TYPE_SLICE_BEGIN);
-                        tevent.set_name(range_name.clone());
-                        tevent.set_track_uuid(desc_uuid);
+                for range in ranges.iter() {
+                    let mut tevent = TrackEvent::default();
+                    tevent.set_type(Type::TYPE_SLICE_BEGIN);
+                    tevent.set_name(range.range_name.clone());
+                    tevent.set_track_uuid(desc_uuid);
 
-                        let mut packet = TracePacket::default();
-                        packet.set_timestamp(range.start);
-                        packet.set_track_event(tevent);
-                        packet.set_trusted_packet_sequence_id(seq);
-                        packets.push(packet);
+                    let mut packet = TracePacket::default();
+                    packet.set_timestamp(range.start);
+                    packet.set_track_event(tevent);
+                    packet.set_trusted_packet_sequence_id(seq);
+                    packets.push(packet);
 
-                        let mut tevent = TrackEvent::default();
-                        tevent.set_type(Type::TYPE_SLICE_END);
-                        tevent.set_name(range_name.clone());
-                        tevent.set_track_uuid(desc_uuid);
+                    let mut tevent = TrackEvent::default();
+                    tevent.set_type(Type::TYPE_SLICE_END);
+                    tevent.set_name(range.range_name.clone());
+                    tevent.set_track_uuid(desc_uuid);
 
-                        let mut packet = TracePacket::default();
-                        packet.set_timestamp(range.end);
-                        packet.set_track_event(tevent);
-                        packet.set_trusted_packet_sequence_id(seq);
-                        packets.push(packet);
-                    }
+                    let mut packet = TracePacket::default();
+                    packet.set_timestamp(range.end);
+                    packet.set_track_event(tevent);
+                    packet.set_trusted_packet_sequence_id(seq);
+                    packets.push(packet);
                 }
             }
         }
@@ -1007,10 +1018,17 @@ mod tests {
         recorder.handle_event(1234, 0, 1000, String::new());
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(&HashMap::new(), &thread_uuids, &mut Arc::new(AtomicUsize::new(0)));
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[0].track_descriptor().name(), "track_name");
-        assert_eq!(packets[1].track_event().name(), "usdt:/path/to/file:provider:name");
+        assert_eq!(
+            packets[1].track_event().name(),
+            "usdt:/path/to/file:provider:name"
+        );
     }
 
     #[test]
@@ -1053,7 +1071,11 @@ mod tests {
         recorder.handle_event(1234, 1, 2000, String::new());
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(&HashMap::new(), &thread_uuids, &mut Arc::new(AtomicUsize::new(0)));
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
         assert_eq!(packets.len(), 3);
         assert_eq!(packets[0].track_descriptor().name(), "track_name");
         assert_eq!(packets[1].track_event().name(), "range_name");
@@ -1062,8 +1084,14 @@ mod tests {
         assert_eq!(packets[2].track_event().type_(), Type::TYPE_SLICE_END);
         assert_eq!(packets[1].timestamp(), 1000);
         assert_eq!(packets[2].timestamp(), 2000);
-        assert_eq!(packets[1].track_event().track_uuid(), packets[0].track_descriptor().uuid());
-        assert_eq!(packets[2].track_event().track_uuid(), packets[0].track_descriptor().uuid());
+        assert_eq!(
+            packets[1].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
+        assert_eq!(
+            packets[2].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
     }
 
     #[test]
@@ -1105,7 +1133,11 @@ mod tests {
         recorder.handle_event(1234, 0, 1000, String::new());
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(&HashMap::new(), &thread_uuids, &mut Arc::new(AtomicUsize::new(0)));
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
         assert_eq!(packets.len(), 0);
     }
 
@@ -1148,7 +1180,11 @@ mod tests {
         recorder.handle_event(1234, 1, 2000, String::new());
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(&HashMap::new(), &thread_uuids, &mut Arc::new(AtomicUsize::new(0)));
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
         assert_eq!(packets.len(), 0);
     }
 
@@ -1204,28 +1240,172 @@ mod tests {
         recorder.handle_event(1234, 2, 3000, String::new());
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(&HashMap::new(), &thread_uuids, &mut Arc::new(AtomicUsize::new(0)));
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
         assert_eq!(packets.len(), 5);
         assert_eq!(packets[0].track_descriptor().name(), "track_name");
 
         assert_eq!(packets[1].track_event().name(), "range_name");
         assert_eq!(packets[1].track_event().type_(), Type::TYPE_SLICE_BEGIN);
         assert_eq!(packets[1].timestamp(), 1000);
-        assert_eq!(packets[1].track_event().track_uuid(), packets[0].track_descriptor().uuid());
+        assert_eq!(
+            packets[1].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
 
         assert_eq!(packets[2].track_event().name(), "range_name");
         assert_eq!(packets[2].track_event().type_(), Type::TYPE_SLICE_END);
         assert_eq!(packets[2].timestamp(), 2000);
-        assert_eq!(packets[2].track_event().track_uuid(), packets[0].track_descriptor().uuid());
+        assert_eq!(
+            packets[2].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
 
         assert_eq!(packets[3].track_event().name(), "range_name2");
         assert_eq!(packets[3].track_event().type_(), Type::TYPE_SLICE_BEGIN);
         assert_eq!(packets[3].timestamp(), 2000);
-        assert_eq!(packets[3].track_event().track_uuid(), packets[0].track_descriptor().uuid());
+        assert_eq!(
+            packets[3].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
 
         assert_eq!(packets[4].track_event().name(), "range_name2");
         assert_eq!(packets[4].track_event().type_(), Type::TYPE_SLICE_END);
         assert_eq!(packets[4].timestamp(), 3000);
-        assert_eq!(packets[4].track_event().track_uuid(), packets[0].track_descriptor().uuid());
+        assert_eq!(
+            packets[4].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
+    }
+
+    #[test]
+    fn test_range_packet_multiple_ranges_multi_packet() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_name1",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                },
+                {
+                    "name": "event_name2",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                },
+                {
+                    "name": "event_name3",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "track_name",
+                    "ranges": [
+                        {
+                            "name": "range_name",
+                            "start": "event_name1",
+                            "end": "event_name2"
+                        },
+                        {
+                            "name": "range_name2",
+                            "start": "event_name2",
+                            "end": "event_name3"
+                        }
+                    ]
+                }
+            ]
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        recorder.handle_event(1234, 0, 1000, String::new());
+        recorder.handle_event(1234, 1, 2000, String::new());
+        recorder.handle_event(1234, 2, 3000, String::new());
+        recorder.handle_event(1234, 0, 4000, String::new());
+        recorder.handle_event(1234, 1, 5000, String::new());
+        recorder.handle_event(1234, 2, 6000, String::new());
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 9);
+        assert_eq!(packets[0].track_descriptor().name(), "track_name");
+
+        assert_eq!(packets[1].track_event().name(), "range_name");
+        assert_eq!(packets[1].track_event().type_(), Type::TYPE_SLICE_BEGIN);
+        assert_eq!(packets[1].timestamp(), 1000);
+        assert_eq!(
+            packets[1].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
+
+        assert_eq!(packets[2].track_event().name(), "range_name");
+        assert_eq!(packets[2].track_event().type_(), Type::TYPE_SLICE_END);
+        assert_eq!(packets[2].timestamp(), 2000);
+        assert_eq!(
+            packets[2].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
+
+        assert_eq!(packets[3].track_event().name(), "range_name2");
+        assert_eq!(packets[3].track_event().type_(), Type::TYPE_SLICE_BEGIN);
+        assert_eq!(packets[3].timestamp(), 2000);
+        assert_eq!(
+            packets[3].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
+
+        assert_eq!(packets[4].track_event().name(), "range_name2");
+        assert_eq!(packets[4].track_event().type_(), Type::TYPE_SLICE_END);
+        assert_eq!(packets[4].timestamp(), 3000);
+        assert_eq!(
+            packets[4].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
+
+        assert_eq!(packets[5].track_event().name(), "range_name");
+        assert_eq!(packets[5].track_event().type_(), Type::TYPE_SLICE_BEGIN);
+        assert_eq!(packets[5].timestamp(), 4000);
+        assert_eq!(
+            packets[5].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
+
+        assert_eq!(packets[6].track_event().name(), "range_name");
+        assert_eq!(packets[6].track_event().type_(), Type::TYPE_SLICE_END);
+        assert_eq!(packets[6].timestamp(), 5000);
+        assert_eq!(
+            packets[6].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
+
+        assert_eq!(packets[7].track_event().name(), "range_name2");
+        assert_eq!(packets[7].track_event().type_(), Type::TYPE_SLICE_BEGIN);
+        assert_eq!(packets[7].timestamp(), 5000);
+        assert_eq!(
+            packets[7].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
+
+        assert_eq!(packets[8].track_event().name(), "range_name2");
+        assert_eq!(packets[8].track_event().type_(), Type::TYPE_SLICE_END);
+        assert_eq!(packets[8].timestamp(), 6000);
+        assert_eq!(
+            packets[8].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
     }
 }
