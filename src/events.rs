@@ -424,7 +424,7 @@ impl SystingProbeRecorder {
                 systing_event.name = format!("{}:{}", usdt.provider, usdt.name);
                 systing_event.event = EventProbe::Usdt(usdt);
             }
-            "uprobe" => {
+            "uprobe" | "uretprobe" => {
                 let uprobe = UProbeEvent::from_parts(parts)?;
                 systing_event.name = uprobe.func_name.clone();
                 systing_event.event = EventProbe::UProbe(uprobe);
