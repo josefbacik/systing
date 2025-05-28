@@ -467,7 +467,7 @@ impl SystingProbeRecorder {
             key_type,
             event: match parts[0] {
                 "usdt" => EventProbe::Usdt(UsdtProbeEvent::from_parts(parts)?),
-                "uprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
+                "uprobe" | "uretprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
                 _ => return Err(anyhow::anyhow!("Invalid event type")),
             },
         };
