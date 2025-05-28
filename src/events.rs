@@ -1408,4 +1408,211 @@ mod tests {
             packets[0].track_descriptor().uuid()
         );
     }
+
+    #[test]
+    fn test_uretprobe_packet() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "uretprobe_event",
+                    "event": "uretprobe:/path/to/file:symbol",
+                    "key_index": 0,
+                    "key_type": "string"
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "uretprobe_track",
+                    "instant": {
+                        "event": "uretprobe_event"
+                    }
+                }
+            ]
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        recorder.handle_event(1234, 0, 1000, String::new());
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 2);
+        assert_eq!(
+            packets[0].track_descriptor().name(),
+            "uretprobe_track"
+        );
+        assert_eq!(
+            packets[1].track_event().name(),
+            "uretprobe:symbol"
+        );
+    }
+
+    #[test]
+    fn test_uprobe_packet() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "uprobe_event",
+                    "event": "uprobe:/path/to/file:symbol",
+                    "key_index": 0,
+                    "key_type": "string"
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "uprobe_track",
+                    "instant": {
+                        "event": "uprobe_event"
+                    }
+                }
+            ]
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        recorder.handle_event(1234, 0, 1000, String::new());
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 2);
+        assert_eq!(
+            packets[0].track_descriptor().name(),
+            "uprobe_track"
+        );
+        assert_eq!(
+            packets[1].track_event().name(),
+            "uprobe:symbol"
+        );
+    }
+
+    #[test]
+    fn test_invalid_event_type() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let result = recorder.add_event_from_str("invalid:/path/to/file:provider:name", &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Invalid event type: invalid"
+        );
+    }
+
+    #[test]
+    fn test_uprobe_variants() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "uprobe_event",
+                    "event": "uprobe:/path/to/file:symbol",
+                    "key_index": 0,
+                    "key_type": "string"
+                },
+                {
+                    "name": "uretprobe_event",
+                    "event": "uretprobe:/path/to/file:symbol",
+                    "key_index": 0,
+                    "key_type": "string"
+                },
+                {
+                    "name": "uretprobe_event_plus_offset",
+                    "event": "uretprobe:/path/to/file:symbol+64",
+                    "key_index": 0,
+                    "key_type": "string"
+                },
+                {
+                    "name": "uprobe_event_plus_offset",
+                    "event": "uprobe:/path/to/file:symbol+64",
+                    "key_index": 0,
+                    "key_type": "string"
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        assert_eq!(recorder.config_events.len(), 4);
+        assert!(recorder.config_events.contains_key("uprobe_event"));
+        assert!(recorder.config_events.contains_key("uretprobe_event"));
+        assert!(recorder.config_events.contains_key("uretprobe_event_plus_offset"));
+        assert!(recorder.config_events.contains_key("uprobe_event_plus_offset"));
+        let event = recorder.config_events.get("uprobe_event").unwrap();
+        assert!(matches!(event.event, EventProbe::UProbe(_)));
+        assert_eq!(event.name, "uprobe_event");
+        assert_eq!(event.key_index, 0);
+        assert!(matches!(event.key_type, EventKeyType::String));
+        let event = recorder.config_events.get("uretprobe_event").unwrap();
+        assert!(matches!(event.event, EventProbe::UProbe(_)));
+        assert_eq!(event.name, "uretprobe_event");
+        assert_eq!(event.key_index, 0);
+        assert!(matches!(event.key_type, EventKeyType::String));
+        let event = recorder.config_events.get("uretprobe_event_plus_offset").unwrap();
+        assert!(matches!(event.event, EventProbe::UProbe(_)));
+        assert_eq!(event.name, "uretprobe_event_plus_offset");
+        assert_eq!(event.key_index, 0);
+        assert!(matches!(event.key_type, EventKeyType::String));
+        let event = recorder.config_events.get("uprobe_event_plus_offset").unwrap();
+        assert!(matches!(event.event, EventProbe::UProbe(_)));
+        assert_eq!(event.name, "uprobe_event_plus_offset");
+        assert_eq!(event.key_index, 0);
+        assert!(matches!(event.key_type, EventKeyType::String));
+    }
+
+    #[test]
+    fn test_uprobe_variants_from_str() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let result = recorder.add_event_from_str("uprobe:/path/to/file:symbol", &mut rng);
+        assert!(result.is_ok());
+        let result = recorder.add_event_from_str("uretprobe:/path/to/file:symbol1", &mut rng);
+        assert!(result.is_ok());
+        let result = recorder.add_event_from_str("uretprobe:/path/to/file:symbol2+64", &mut rng);
+        assert!(result.is_ok());
+        let result = recorder.add_event_from_str("uprobe:/path/to/file:symbol3+64", &mut rng);
+        assert!(result.is_ok());
+
+
+        assert_eq!(recorder.config_events.len(), 4);
+        assert!(recorder.config_events.contains_key("symbol"));
+        assert!(recorder.config_events.contains_key("symbol1"));
+        assert!(recorder.config_events.contains_key("symbol2"));
+        assert!(recorder.config_events.contains_key("symbol3"));
+        let event = recorder.config_events.get("symbol").unwrap();
+        assert!(matches!(event.event, EventProbe::UProbe(_)));
+        assert_eq!(event.name, "symbol");
+        assert_eq!(event.key_index, u8::MAX);
+        assert!(matches!(event.key_type, EventKeyType::Long));
+        let event = recorder.config_events.get("symbol1").unwrap();
+        assert!(matches!(event.event, EventProbe::UProbe(_)));
+        assert_eq!(event.name, "symbol1");
+        assert_eq!(event.key_index, u8::MAX);
+        assert!(matches!(event.key_type, EventKeyType::Long));
+        let event = recorder.config_events.get("symbol2").unwrap();
+        assert!(matches!(event.event, EventProbe::UProbe(_)));
+        assert_eq!(event.name, "symbol2");
+        assert_eq!(event.key_index, u8::MAX);
+        assert!(matches!(event.key_type, EventKeyType::Long));
+        let event = recorder.config_events.get("symbol3").unwrap();
+        assert!(matches!(event.event, EventProbe::UProbe(_)));
+        assert_eq!(event.name, "symbol3");
+        assert_eq!(event.key_index, u8::MAX);
+        assert!(matches!(event.key_type, EventKeyType::Long));
+    }
 }
