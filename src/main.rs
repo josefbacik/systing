@@ -1212,6 +1212,43 @@ impl LibbpfPerfOptions for libbpf_rs::ProgramMut<'_> {
     }
 }
 
+trait LibbpfKprobeOptions {
+    fn attach_kprobe_with_opts(
+        &self,
+        retprobe: bool,
+        funcname: &str,
+        cookie: u64,
+    ) -> Result<libbpf_rs::Link, libbpf_rs::Error>;
+}
+
+impl LibbpfKprobeOptions for libbpf_rs::ProgramMut<'_> {
+    fn attach_kprobe_with_opts(
+        &self,
+        retprobe: bool,
+        funcname: &str,
+        cookie: u64,
+    ) -> Result<libbpf_rs::Link, libbpf_rs::Error> {
+        let mut opts = libbpf_sys::bpf_kprobe_opts::default();
+        opts.bpf_cookie = cookie;
+        opts.sz = mem::size_of::<libbpf_sys::bpf_kprobe_opts>() as u64;
+        opts.retprobe = retprobe;
+        let ptr = unsafe {
+            libbpf_sys::bpf_program__attach_kprobe_opts(
+                self.as_libbpf_object().as_ptr(),
+                funcname.as_ptr() as *const _,
+                &opts as *const _ as *const _,
+            )
+        };
+        let ret = unsafe { libbpf_sys::libbpf_get_error(ptr as *const _) };
+        if ret != 0 {
+            return Err(libbpf_rs::Error::from_raw_os_error(-ret as i32));
+        }
+        let ptr = unsafe { std::ptr::NonNull::new_unchecked(ptr) };
+        let link = unsafe { Link::from_ptr(ptr) };
+        Ok(link)
+    }
+}
+
 fn attach_perf_event(
     files: PerfOpenEvents,
     prog: &libbpf_rs::ProgramMut,
@@ -1669,6 +1706,20 @@ fn system(opts: Command) -> Result<()> {
                             }
                             probe_links.push(link);
                         }
+                    }
+                    EventProbe::KProbe(kprobe) => {
+                        let link = skel.progs.systing_kprobe.attach_kprobe_with_opts(
+                            kprobe.retprobe,
+                            &kprobe.func_name,
+                            event.cookie,
+                        );
+                        if link.is_err() {
+                            Err(anyhow::anyhow!(
+                                "Failed to attach kprobe {}",
+                                kprobe.func_name
+                            ))?;
+                        }
+                        probe_links.push(link);
                     }
                     _ => {}
                 }

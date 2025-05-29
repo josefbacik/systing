@@ -134,10 +134,26 @@ pub struct UProbeEvent {
     pub retprobe: bool,
 }
 
+// Format is
+// kprobe:<path>:<offset>
+// kprobe:<path>:<symbol>
+// kprobe:<path>:<symbol>+<offset>
+// kretprobe:<path>:<offset>
+// kretprobe:<path>:<symbol>
+// kretprobe:<path>:<symbol>+<offset>
+#[derive(Clone, Default)]
+pub struct KProbeEvent {
+    pub path: String,
+    pub offset: u64,
+    pub func_name: String,
+    pub retprobe: bool,
+}
+
 #[derive(Clone, Default)]
 pub enum EventProbe {
     UProbe(UProbeEvent),
     Usdt(UsdtProbeEvent),
+    KProbe(KProbeEvent),
     #[default]
     Undefined,
 }
@@ -311,6 +327,65 @@ impl fmt::Display for UProbeEvent {
     }
 }
 
+impl KProbeEvent {
+    fn from_parts(parts: Vec<&str>) -> Result<Self, anyhow::Error> {
+        // Format is
+        // kprobe:<path>:<offset>
+        // kprobe:<path>:<symbol>
+        // kprobe:<path>:<symbol>+<offset>
+        // kretprobe:<path>:<offset>
+        // kretprobe:<path>:<symbol>
+        // kretprobe:<path>:<symbol>+<offset>
+        if parts.len() != 3 {
+            return Err(anyhow::anyhow!(
+                "Invalid uprobe format: {}",
+                parts.join(":")
+            ));
+        }
+        let mut probe = KProbeEvent::default();
+        probe.path = parts[1].to_string();
+        probe.retprobe = parts[0] == "kretprobe";
+
+        match parts[2].parse::<u64>() {
+            Ok(val) => {
+                probe.offset = val;
+            }
+            Err(_) => {
+                let symbol = parts[2].to_string();
+                let mut symbol_parts = symbol.split('+');
+                let symbol = symbol_parts.next().unwrap();
+                let offset = symbol_parts.next();
+                if offset.is_some() {
+                    probe.offset = offset.unwrap().parse::<u64>()?;
+                } else {
+                    probe.offset = 0;
+                }
+                probe.func_name = symbol.to_string();
+            }
+        }
+        Ok(probe)
+    }
+}
+
+impl fmt::Display for KProbeEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = if self.retprobe { "kretprobe" } else { "kprobe" };
+        if self.func_name != "" {
+            if self.offset != 0 {
+                write!(f, "{}:{}+0x{:x}", name, self.func_name, self.offset,)
+            } else {
+                write!(f, "{}:{}", name, self.func_name)
+            }
+        } else {
+            if self.offset != 0 {
+                write!(f, "{}:0x{:x}", name, self.offset)
+            } else {
+                write!(f, "{}", name)
+            }
+        }
+    }
+}
+
 impl fmt::Display for UsdtProbeEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "usdt:{}:{}:{}", self.path, self.provider, self.name)
@@ -338,6 +413,7 @@ impl fmt::Display for SystingEvent {
         match &self.event {
             EventProbe::UProbe(uprobe) => write!(f, "{}", uprobe),
             EventProbe::Usdt(usdt) => write!(f, "{}", usdt),
+            EventProbe::KProbe(kprobe) => write!(f, "{}", kprobe),
             _ => write!(f, "Invalid event"),
         }
     }
@@ -543,6 +619,11 @@ impl SystingProbeRecorder {
                 systing_event.name = uprobe.func_name.clone();
                 systing_event.event = EventProbe::UProbe(uprobe);
             }
+            "kprobe" | "kretprobe" => {
+                let kprobe = KProbeEvent::from_parts(parts)?;
+                systing_event.name = kprobe.func_name.clone();
+                systing_event.event = EventProbe::KProbe(kprobe);
+            }
             _ => {
                 return Err(anyhow::anyhow!("Invalid event type: {}", parts[0]));
             }
@@ -582,6 +663,7 @@ impl SystingProbeRecorder {
             event: match parts[0] {
                 "usdt" => EventProbe::Usdt(UsdtProbeEvent::from_parts(parts)?),
                 "uprobe" | "uretprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
+                "kprobe" | "kretprobe" => EventProbe::KProbe(KProbeEvent::from_parts(parts)?),
                 _ => return Err(anyhow::anyhow!("Invalid event type")),
             },
         };
@@ -2125,5 +2207,95 @@ mod tests {
         };
         let ret = recorder.maybe_trigger(&event);
         assert!(ret, "Instant trigger should be activated");
+    }
+
+    #[test]
+    fn test_kprobe_packet() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "kprobe_event",
+                    "event": "kprobe:/path/to/file:symbol",
+                    "key_index": 0,
+                    "key_type": "string"
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "kprobe_track",
+                    "instant": {
+                        "event": "kprobe_event"
+                    }
+                }
+            ]
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        let event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 1000,
+            cookie: 0,
+            extra: String::new(),
+        };
+        recorder.handle_event(event);
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].track_descriptor().name(), "kprobe_track");
+        assert_eq!(packets[1].track_event().name(), "kprobe:symbol");
+    }
+
+    #[test]
+    fn test_kretprobe_packet() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "kretprobe_event",
+                    "event": "kretprobe:/path/to/file:symbol",
+                    "key_index": 0,
+                    "key_type": "string"
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "kretprobe_track",
+                    "instant": {
+                        "event": "kretprobe_event"
+                    }
+                }
+            ]
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        let event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 1000,
+            cookie: 0,
+            extra: String::new(),
+        };
+        recorder.handle_event(event);
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].track_descriptor().name(), "kretprobe_track");
+        assert_eq!(packets[1].track_event().name(), "kretprobe:symbol");
     }
 }

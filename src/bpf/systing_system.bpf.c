@@ -331,7 +331,7 @@ static struct perf_counter_event *reserve_perf_counter_event(void)
 	return bpf_ringbuf_reserve(rb, sizeof(struct perf_counter_event), 0);
 }
 
-static struct uprobe_event *reserve_probe_event(void)
+static struct probe_event *reserve_probe_event(void)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
 	void *rb;
@@ -731,18 +731,19 @@ int systing_perf_event_clock(void *ctx)
 	return 0;
 }
 
-SEC("uprobe")
-int systing_uprobe(struct pt_regs *ctx)
+static void handle_probe_event(struct pt_regs *ctx)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 
 	if (!trace_task(task))
-		return 0;
+		return;
 
 	u64 cookie = bpf_get_attach_cookie(ctx);
 	struct probe_event *event = reserve_probe_event();
-	if (!event)
-		return handle_missed_event(MISSED_PROBE_EVENT);
+	if (!event) {
+		handle_missed_event(MISSED_PROBE_EVENT);
+		return;
+	}
 
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
@@ -776,6 +777,19 @@ int systing_uprobe(struct pt_regs *ctx)
 		}
 	}
 	bpf_ringbuf_submit(event, 0);
+}
+
+SEC("uprobe")
+int systing_uprobe(struct pt_regs *ctx)
+{
+	handle_probe_event(ctx);
+	return 0;
+}
+
+SEC("kprobe")
+int systing_kprobe(struct pt_regs *ctx)
+{
+	handle_probe_event(ctx);
 	return 0;
 }
 

@@ -52,6 +52,11 @@ The currently allowed formats are
 - `uretprobe:/path/to/executable:function_name`
 - `uretprobe:/path/to/executable:offset`
 - `uretprobe:/path/to/executable:function_name+offset`
+- `kprobe:function_name`
+- `kprobe:offset`
+- `kprobe:function_name+offset`
+- `kretprobe:function_name`
+- `kretprobe:offset`
 
 For all `usdt` and `u*probe` events you *must* specify `--trace-event-pid` to to
 indicate which PID's you wish to record the events for. For example, if you want
