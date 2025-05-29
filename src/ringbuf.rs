@@ -55,6 +55,12 @@ impl<T> RingBuffer<T> {
 
     pub fn set_max_duration(&mut self, max_duration: u64) {
         self.max_duration = max_duration;
+        if self.max_duration == 0 {
+            self.buffer.clear();
+            self.start_ts = 0;
+        } else if self.buffer.is_empty() {
+            self.buffer.push(Vec::new());
+        }
     }
 
     pub fn max_duration(&self) -> u64 {
