@@ -44,6 +44,15 @@ This can be specified multiple times to record multiple cgroups.
 With this option we will still record processes that are not in the cgroup but that wakeup a process in our cgroup.
 This creates odd artifacts in the scheduler tracks but is useful for debugging.
 
+=== *--continuous* _SECONDS_
+
+Run the trace continuously in a ringbuffer that lasts _SECONDS_.
+This will not stop the trace after _SECONDS_ but will instead continue to run until the user stops it.
+This is useful for long running traces where you want to keep the trace running and only stop it when you are done.
+You can use this in conjunction with the `stop_triggers` option in the *--trace-event-config* option to stop the trace when a certain condition is met.
+
+An example usecase is when attempting to catch a rare occurring latency event.
+
 === *--cpu-frequency*
 
 Record the CPU frequency of every CPU in the system.
@@ -174,7 +183,29 @@ The configuration is a JSON file with the following format.
       }
     }
   ]
+  "stop_triggers": {
+    "thresholds": [
+      {
+        "start": "tracepoint_start",
+        "end": "tracepoint_end",
+        "duration_us": 1000
+      }
+    ],
+    "instants": [
+      {
+        "event": "tracepoint_instant"
+      }
+    ]
+  }
 }
 ----
+
+`tracks` can be optionally specified to create a custom track of events for events.
+There are two types of tracks, `ranges` and `instant`.
+`ranges` will create a track that shows the start and end of a range of events, while `instant` will create a track that shows the instant events.
+You can specify multiple `ranges` or `instants` per track.
+
+`stop_triggers` can be optionally specified to stop the trace when a certain condition is met.
+This is used in conjunction with the *--continuous* option.
 
 Example files for real world examples can be found in the `examples` directory.

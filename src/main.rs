@@ -1,6 +1,7 @@
 pub mod events;
 pub mod perf;
 pub mod perfetto;
+pub mod ringbuf;
 pub mod symbolize;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -16,8 +17,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::events::{EventProbe, SystingProbeRecorder};
+use crate::events::{EventProbe, SystingProbeEvent, SystingProbeRecorder};
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
+use crate::ringbuf::RingBuffer;
 use crate::symbolize::Stack;
 
 use anyhow::bail;
@@ -56,7 +58,6 @@ use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
 use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::TrackEvent;
-use sysinfo::System;
 
 use plain::Plain;
 use protobuf::Message;
@@ -95,6 +96,8 @@ struct Command {
     no_sleep_stack_traces: bool,
     #[arg(long)]
     trace_event_config: Vec<String>,
+    #[arg(long)]
+    continuous: u64,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -115,7 +118,11 @@ mod systing {
 }
 
 pub trait SystingRecordEvent<T> {
-    fn record_event(&mut self, event: &T);
+    fn record_event(&mut self, event: T) -> bool;
+}
+
+pub trait SystingEventTS {
+    fn ts(&self) -> u64;
 }
 
 use systing::types::event_type;
@@ -130,9 +137,46 @@ unsafe impl Plain for stack_event {}
 unsafe impl Plain for perf_counter_event {}
 unsafe impl Plain for probe_event {}
 
+impl SystingEventTS for task_event {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+}
+
+impl SystingEventTS for stack_event {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+}
+
+impl SystingEventTS for perf_counter_event {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+}
+
+impl SystingEventTS for probe_event {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+}
+
+impl SystingEventTS for SysInfoEvent {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+}
+
 struct TrackCounter {
     ts: u64,
     count: i64,
+}
+
+#[derive(Default)]
+struct SysInfoEvent {
+    cpu: u32,
+    ts: u64,
+    frequency: i64,
 }
 
 #[derive(Clone)]
@@ -158,6 +202,7 @@ struct LocalCompactSched {
 
 #[derive(Default)]
 struct EventRecorder {
+    ringbuf: RingBuffer<task_event>,
     events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
     compact_sched: HashMap<u32, LocalCompactSched>,
     runqueue: HashMap<i32, Vec<TrackCounter>>,
@@ -170,6 +215,7 @@ struct EventRecorder {
 
 #[derive(Default)]
 struct StackRecorder {
+    ringbuf: RingBuffer<stack_event>,
     stacks: HashMap<i32, Vec<StackEvent>>,
 }
 
@@ -181,12 +227,14 @@ struct PerfCounterKey {
 
 #[derive(Default)]
 struct PerfCounterRecorder {
+    ringbuf: RingBuffer<perf_counter_event>,
     perf_counters: Vec<String>,
     perf_events: HashMap<PerfCounterKey, Vec<TrackCounter>>,
 }
 
 #[derive(Default)]
 struct SysinfoRecorder {
+    ringbuf: RingBuffer<SysInfoEvent>,
     frequency: HashMap<u32, Vec<TrackCounter>>,
 }
 
@@ -586,7 +634,20 @@ impl LocalCompactSched {
 }
 
 impl SystingRecordEvent<task_event> for EventRecorder {
-    fn record_event(&mut self, event: &task_event) {
+    fn record_event(&mut self, event: task_event) -> bool {
+        if self.ringbuf.max_duration() == 0 {
+            // If the ring buffer is not enabled, we just handle the event directly.
+            self.handle_event(event);
+        } else {
+            // Otherwise, we push the event into the ring buffer.
+            self.ringbuf.push(event);
+        }
+        false
+    }
+}
+
+impl EventRecorder {
+    fn handle_event(&mut self, event: task_event) {
         // SCHED_SWITCH and SCHED_WAKING are handled in compact sched events.
         // We skip SCHED_WAKEUP because we're just using that for runqueue tracking.
         if event.r#type == event_type::SCHED_SWITCH || event.r#type == event_type::SCHED_WAKING {
@@ -594,9 +655,9 @@ impl SystingRecordEvent<task_event> for EventRecorder {
                 .compact_sched
                 .entry(event.cpu)
                 .or_insert_with(LocalCompactSched::default);
-            compact_sched.add_task_event(event);
+            compact_sched.add_task_event(&event);
         } else if event.r#type != event_type::SCHED_WAKEUP {
-            let ftrace_event = FtraceEvent::from(event);
+            let ftrace_event = FtraceEvent::from(&event);
             let cpu_event = self.events.entry(event.cpu).or_insert_with(BTreeMap::new);
             cpu_event.insert(event.ts, ftrace_event);
         }
@@ -654,9 +715,7 @@ impl SystingRecordEvent<task_event> for EventRecorder {
             });
         }
     }
-}
 
-impl EventRecorder {
     fn generate_trace(
         &self,
         pid_uuids: &HashMap<i32, u64>,
@@ -762,7 +821,20 @@ impl EventRecorder {
 }
 
 impl SystingRecordEvent<stack_event> for StackRecorder {
-    fn record_event(&mut self, event: &stack_event) {
+    fn record_event(&mut self, event: stack_event) -> bool {
+        if self.ringbuf.max_duration() == 0 {
+            // If the ring buffer is not enabled, we just handle the event directly.
+            self.handle_event(event);
+        } else {
+            // Otherwise, we push the event into the ring buffer.
+            self.ringbuf.push(event);
+        }
+        false
+    }
+}
+
+impl StackRecorder {
+    fn handle_event(&mut self, event: stack_event) {
         if event.user_stack_length > 0 || event.kernel_stack_length > 0 {
             let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
             let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
@@ -776,9 +848,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
             stacks.push(stack);
         }
     }
-}
 
-impl StackRecorder {
     fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         use workerpool::thunk::{Thunk, ThunkWorker};
         use workerpool::Pool;
@@ -803,21 +873,20 @@ impl StackRecorder {
 }
 
 impl SystingRecordEvent<perf_counter_event> for PerfCounterRecorder {
-    fn record_event(&mut self, event: &perf_counter_event) {
-        let key = PerfCounterKey {
-            cpu: event.cpu,
-            index: event.counter_num as usize,
-        };
-        let entry = self.perf_events.entry(key).or_insert_with(Vec::new);
-        entry.push(TrackCounter {
-            ts: event.ts,
-            count: event.value.counter as i64,
-        });
+    fn record_event(&mut self, event: perf_counter_event) -> bool {
+        if self.ringbuf.max_duration() == 0 {
+            // If the ring buffer is not enabled, we just handle the event directly.
+            self.handle_event(event);
+        } else {
+            // Otherwise, we push the event into the ring buffer.
+            self.ringbuf.push(event);
+        }
+        false
     }
 }
 
 impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
-    fn record_event(&mut self, event: &probe_event) {
+    fn record_event(&mut self, event: probe_event) -> bool {
         let mut extra = "".to_string();
 
         // Capture the arg if there is one.
@@ -840,11 +909,39 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
             }
             _ => {}
         }
-        self.handle_event(event.task.tgidpid, event.cookie, event.ts, extra);
+        let probe_event = SystingProbeEvent {
+            tgidpid: event.task.tgidpid,
+            cookie: event.cookie,
+            ts: event.ts,
+            extra,
+        };
+
+        // If the ring buffer is not enabled, we just handle the event directly.
+        if self.ringbuf.max_duration() == 0 {
+            self.handle_event(probe_event);
+        } else {
+            let ret = self.maybe_trigger(&probe_event);
+            // Otherwise, we push the event into the ring buffer.
+            self.ringbuf.push(probe_event);
+            return ret;
+        }
+        false
     }
 }
 
 impl PerfCounterRecorder {
+    fn handle_event(&mut self, event: perf_counter_event) {
+        let key = PerfCounterKey {
+            cpu: event.cpu,
+            index: event.counter_num as usize,
+        };
+        let entry = self.perf_events.entry(key).or_insert_with(Vec::new);
+        entry.push(TrackCounter {
+            ts: event.ts,
+            count: event.value.counter as i64,
+        });
+    }
+
     fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
@@ -875,20 +972,28 @@ impl PerfCounterRecorder {
     }
 }
 
-impl SystingRecordEvent<System> for SysinfoRecorder {
-    fn record_event(&mut self, sys: &System) {
-        let ts = get_clock_value(libc::CLOCK_BOOTTIME);
-        for (i, cpu) in sys.cpus().iter().enumerate() {
-            let freq = self.frequency.entry(i as u32).or_insert_with(Vec::new);
-            freq.push(TrackCounter {
-                ts,
-                count: cpu.frequency() as i64,
-            });
+impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
+    fn record_event(&mut self, event: SysInfoEvent) -> bool {
+        if self.ringbuf.max_duration() == 0 {
+            // If the ring buffer is not enabled, we just handle the event directly.
+            self.handle_event(event);
+        } else {
+            // Otherwise, we push the event into the ring buffer.
+            self.ringbuf.push(event);
         }
+        false
     }
 }
 
 impl SysinfoRecorder {
+    fn handle_event(&mut self, event: SysInfoEvent) {
+        let freq = self.frequency.entry(event.cpu).or_insert_with(Vec::new);
+        freq.push(TrackCounter {
+            ts: event.ts,
+            count: event.frequency,
+        });
+    }
+
     fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
@@ -1144,6 +1249,7 @@ fn system(opts: Command) -> Result<()> {
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
     let mut counters = PerfCounters::new();
+    let (stop_tx, stop_rx) = channel();
 
     if opts.perf_counter.len() > 0 {
         counters.discover()?;
@@ -1164,6 +1270,40 @@ fn system(opts: Command) -> Result<()> {
     }
 
     let recorder = Arc::new(SessionRecorder::default());
+
+    if opts.continuous > 0 {
+        let duration = Duration::from_secs(opts.continuous);
+        recorder
+            .event_recorder
+            .lock()
+            .unwrap()
+            .ringbuf
+            .set_max_duration(duration.as_nanos() as u64);
+        recorder
+            .stack_recorder
+            .lock()
+            .unwrap()
+            .ringbuf
+            .set_max_duration(duration.as_nanos() as u64);
+        recorder
+            .perf_counter_recorder
+            .lock()
+            .unwrap()
+            .ringbuf
+            .set_max_duration(duration.as_nanos() as u64);
+        recorder
+            .sysinfo_recorder
+            .lock()
+            .unwrap()
+            .ringbuf
+            .set_max_duration(duration.as_nanos() as u64);
+        recorder
+            .probe_recorder
+            .lock()
+            .unwrap()
+            .ringbuf
+            .set_max_duration(duration.as_nanos() as u64);
+    }
 
     recorder.snapshot_clocks();
     {
@@ -1316,6 +1456,7 @@ fn system(opts: Command) -> Result<()> {
 
         let mut recv_threads = Vec::new();
         let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
         recv_threads.push(
             thread::Builder::new()
                 .name("sched_recorder".to_string())
@@ -1326,11 +1467,6 @@ fn system(opts: Command) -> Result<()> {
                             break;
                         }
                         let event = res.unwrap();
-                        session_recorder
-                            .event_recorder
-                            .lock()
-                            .unwrap()
-                            .record_event(&event);
                         maybe_record_task(&event.prev, &session_recorder);
                         match event.r#type {
                             event_type::SCHED_SWITCH
@@ -1341,11 +1477,20 @@ fn system(opts: Command) -> Result<()> {
                             }
                             _ => {}
                         }
+                        let stop = session_recorder
+                            .event_recorder
+                            .lock()
+                            .unwrap()
+                            .record_event(event);
+                        if stop {
+                            my_stop_tx.send(()).expect("Failed to send stop signal");
+                        }
                     }
                     0
                 })?,
         );
         let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
         recv_threads.push(
             thread::Builder::new()
                 .name("stack_recorder".to_string())
@@ -1356,17 +1501,21 @@ fn system(opts: Command) -> Result<()> {
                             break;
                         }
                         let event = res.unwrap();
-                        session_recorder
+                        maybe_record_task(&event.task, &session_recorder);
+                        let ret = session_recorder
                             .stack_recorder
                             .lock()
                             .unwrap()
-                            .record_event(&event);
-                        maybe_record_task(&event.task, &session_recorder);
+                            .record_event(event);
+                        if ret {
+                            my_stop_tx.send(()).expect("Failed to send stop signal");
+                        }
                     }
                     0
                 })?,
         );
         let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
         recv_threads.push(
             thread::Builder::new()
                 .name("probe_recorder".to_string())
@@ -1377,18 +1526,22 @@ fn system(opts: Command) -> Result<()> {
                             break;
                         }
                         let event = res.unwrap();
-                        session_recorder
+                        maybe_record_task(&event.task, &session_recorder);
+                        let ret = session_recorder
                             .probe_recorder
                             .lock()
                             .unwrap()
-                            .record_event(&event);
-                        maybe_record_task(&event.task, &session_recorder);
+                            .record_event(event);
+                        if ret {
+                            my_stop_tx.send(()).expect("Failed to send stop signal");
+                        }
                     }
                     0
                 })?,
         );
         if perf_counter_names.len() > 0 {
             let session_recorder = recorder.clone();
+            let my_stop_tx = stop_tx.clone();
             recv_threads.push(
                 thread::Builder::new()
                     .name("perf_counter_recorder".to_string())
@@ -1399,12 +1552,15 @@ fn system(opts: Command) -> Result<()> {
                                 break;
                             }
                             let event = res.unwrap();
-                            session_recorder
+                            maybe_record_task(&event.task, &session_recorder);
+                            let ret = session_recorder
                                 .perf_counter_recorder
                                 .lock()
                                 .unwrap()
-                                .record_event(&event);
-                            maybe_record_task(&event.task, &session_recorder);
+                                .record_event(event);
+                            if ret {
+                                my_stop_tx.send(()).expect("Failed to send stop signal");
+                            }
                         }
                         0
                     })?,
@@ -1557,11 +1713,19 @@ fn system(opts: Command) -> Result<()> {
                                 break;
                             }
                             sys.refresh_cpu_frequency();
-                            sysinfo_recorder
-                                .sysinfo_recorder
-                                .lock()
-                                .unwrap()
-                                .record_event(&sys);
+                            let ts = get_clock_value(libc::CLOCK_BOOTTIME);
+                            {
+                                let mut recorder =
+                                    sysinfo_recorder.sysinfo_recorder.lock().unwrap();
+                                for (i, cpu) in sys.cpus().iter().enumerate() {
+                                    let event = SysInfoEvent {
+                                        ts,
+                                        cpu: i as u32,
+                                        frequency: cpu.frequency() as i64,
+                                    };
+                                    recorder.record_event(event);
+                                }
+                            }
                             thread::sleep(Duration::from_millis(100));
                         }
                         0
@@ -1572,11 +1736,24 @@ fn system(opts: Command) -> Result<()> {
         if opts.duration > 0 {
             thread::sleep(Duration::from_secs(opts.duration));
         } else {
-            let (tx, rx) = channel();
-            ctrlc::set_handler(move || tx.send(()).expect("Could not send signal on channel."))
-                .expect("Error setting Ctrl-C handler");
-            println!("Press Ctrl-C to stop");
-            rx.recv().expect("Could not receive signal on channel.");
+            let my_stop_tx = stop_tx.clone();
+            ctrlc::set_handler(move || {
+                my_stop_tx
+                    .send(())
+                    .expect("Could not send signal on channel.")
+            })
+            .expect("Error setting Ctrl-C handler");
+            if opts.continuous > 0 {
+                println!("Tracing in a continues loop of {} seconds", opts.continuous);
+                println!("Will stop if a trigger is specified, otherwise Ctrl-C to stop");
+            } else {
+                println!("Tracing indefinitely...");
+                println!("Press Ctrl-C to stop");
+            }
+            drop(stop_tx);
+            stop_rx
+                .recv()
+                .expect("Could not receive signal on channel.");
         }
 
         println!("Stopping...");

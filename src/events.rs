@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -12,6 +13,23 @@ use serde_json;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::TrackEvent;
+
+use crate::ringbuf::RingBuffer;
+use crate::SystingEventTS;
+
+#[derive(Default, Clone)]
+pub struct SystingProbeEvent {
+    pub tgidpid: u64,
+    pub cookie: u64,
+    pub ts: u64,
+    pub extra: String,
+}
+
+impl SystingEventTS for SystingProbeEvent {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+}
 
 struct TrackInstant {
     ts: u64,
@@ -24,10 +42,17 @@ struct TrackRange {
     end: u64,
 }
 
+struct ThresholdStopTrigger {
+    start_cookie: u64,
+    duration_us: u64,
+}
+
 // This is the main recorder struct, we keep track of the configuration for the events, as well as
 // the events we've seen so far.
 #[derive(Default)]
 pub struct SystingProbeRecorder {
+    pub ringbuf: RingBuffer<SystingProbeEvent>,
+
     // The events tied to the cookie, so we know what event we're dealing with when we get a cookie
     // from bpf.
     pub cookies: HashMap<u64, SystingEvent>,
@@ -65,6 +90,22 @@ pub struct SystingProbeRecorder {
 
     // The mapping of instant event name -> track name
     instant_events: HashMap<String, String>,
+
+    // The vector of the threshold stop trigger events
+    stop_triggers: Vec<ThresholdStopTrigger>,
+
+    // The set of cookies that are start events
+    start_triggers: HashSet<u64>,
+
+    // The map of end triggers to the index in the stop_triggers vec of their corresponding
+    // ThresholdStopTrigger
+    end_triggers: HashMap<u64, usize>,
+
+    // The set of cookies that are instant stop triggers
+    instant_triggers: HashSet<u64>,
+
+    // The map of outstanding start trigger events with their ts, indexed on tgipid
+    outstanding_triggers: HashMap<u64, HashMap<u64, u64>>,
 
     // The mapping of the range name -> track name.
     ranges: HashMap<String, String>,
@@ -130,7 +171,7 @@ pub struct SystingEvent {
 //   ],
 //   "tracks": [
 //     {
-//       "name": "track_name",
+//       "track_name": "track_name",
 //       "ranges": [
 //         {
 //           "name": "range_name",
@@ -138,11 +179,28 @@ pub struct SystingEvent {
 //           "end": "event_name"
 //         }
 //       ],
+//     },
+//     {
+//       track_name: "instant_track_name",
 //       "instant": {
-//         "name": "event_name"
+//         "event": "event_name"
 //       }
 //     }
-//   ]
+//   ],
+//   "stop_triggers": {
+//     "thresholds": [
+//       {
+//         "start": "event_name",
+//         "end": "event_name",
+//         "duration_us": 1000
+//       }
+//     ],
+//     "instants": [
+//       {
+//         "event": "event_name"
+//       }
+//     ]
+//   }
 // }
 //
 // The event names cannot be duplicated in the tracks, with the sole exception of ranges, where you
@@ -150,7 +208,8 @@ pub struct SystingEvent {
 #[derive(Deserialize, Debug)]
 struct SystingJSONTrackConfig {
     events: Vec<SystingJSONEvent>,
-    tracks: Vec<SystingTrack>,
+    tracks: Option<Vec<SystingTrack>>,
+    stop_triggers: Option<SystingJSONStopTrigger>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -166,6 +225,19 @@ struct SystingTrack {
     track_name: String,
     ranges: Option<Vec<SystingRange>>,
     instant: Option<SystingInstant>,
+}
+
+#[derive(Deserialize, Debug)]
+struct SystingJSONStopTrigger {
+    thresholds: Option<Vec<SystingThreshold>>,
+    instants: Option<Vec<SystingInstant>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct SystingThreshold {
+    start: String,
+    end: String,
+    duration_us: u64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -272,17 +344,59 @@ impl fmt::Display for SystingEvent {
 }
 
 impl SystingProbeRecorder {
-    pub fn handle_event(&mut self, tgidpid: u64, cookie: u64, ts: u64, extra: String) {
-        let systing_event = self.cookies.get(&cookie).unwrap();
+    pub fn maybe_trigger(&mut self, event: &SystingProbeEvent) -> bool {
+        // If this is an instant event we trigger immediately
+        if self.instant_triggers.contains(&event.cookie) {
+            return true;
+        }
+
+        // If this is a start event record the ts and continue
+        if self.start_triggers.contains(&event.cookie) {
+            let entry = self
+                .outstanding_triggers
+                .entry(event.tgidpid)
+                .or_insert_with(HashMap::new);
+            entry.insert(event.cookie, event.ts);
+            return false;
+        }
+
+        // If this isn't an end trigger event we're done
+        if !self.end_triggers.contains_key(&event.cookie) {
+            return false;
+        }
+
+        // If this is an end event, we need to check if we have a start trigger for it
+        if let Some(start_map) = self.outstanding_triggers.get_mut(&event.tgidpid) {
+            let trigger_index = self.end_triggers.get(&event.cookie).unwrap();
+            let trigger = &self.stop_triggers[*trigger_index];
+            if let Some(start_ts) = start_map.remove(&trigger.start_cookie) {
+                let start = Duration::from_nanos(start_ts);
+                let end = Duration::from_nanos(event.ts);
+                let threshold = Duration::from_micros(trigger.duration_us);
+                // We took longer than our threshold, we're done
+                if start + threshold <= end {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    pub fn handle_event(&mut self, event: SystingProbeEvent) {
+        let systing_event = self.cookies.get(&event.cookie).unwrap();
 
         // If this is an instant event just add it to the list of events
         if self.instant_events.contains_key(&systing_event.name) {
-            let entry = self.events.entry(tgidpid).or_insert_with(HashMap::new);
+            let entry = self
+                .events
+                .entry(event.tgidpid)
+                .or_insert_with(HashMap::new);
             let instant_track = self.instant_events.get(&systing_event.name).unwrap();
             let entry = entry.entry(instant_track.clone()).or_insert_with(Vec::new);
             entry.push(TrackInstant {
-                ts,
-                name: format!("{}{}", systing_event, extra),
+                ts: event.ts,
+                name: format!("{}{}", systing_event, event.extra),
             });
             return;
         }
@@ -290,13 +404,13 @@ impl SystingProbeRecorder {
         // First check to see if this is an end event, since we can have the same event for a start
         // event and an end event
         if let Some(range_name) = self.stop_events.get(&systing_event.name) {
-            if let Some(ranges) = self.outstanding_ranges.get_mut(&tgidpid) {
+            if let Some(ranges) = self.outstanding_ranges.get_mut(&event.tgidpid) {
                 if let Some(mut range) = ranges.remove(range_name) {
                     let track_name = self.ranges.get(range_name).unwrap().clone();
-                    range.end = ts;
+                    range.end = event.ts;
                     let track_hash = self
                         .recorded_ranges
-                        .entry(tgidpid)
+                        .entry(event.tgidpid)
                         .or_insert_with(HashMap::new);
                     let entry = track_hash.entry(track_name).or_insert_with(Vec::new);
                     entry.push(range);
@@ -306,13 +420,13 @@ impl SystingProbeRecorder {
 
         // Now handle the start event case
         if let Some(range_name) = self.start_events.get(&systing_event.name) {
-            if let Some(ranges) = self.outstanding_ranges.get_mut(&tgidpid) {
+            if let Some(ranges) = self.outstanding_ranges.get_mut(&event.tgidpid) {
                 if let Some(range) = ranges.get_mut(range_name) {
-                    range.start = ts;
+                    range.start = event.ts;
                 } else {
                     let range = TrackRange {
                         range_name: range_name.clone(),
-                        start: ts,
+                        start: event.ts,
                         end: 0,
                     };
                     ranges.insert(range_name.clone(), range);
@@ -321,11 +435,11 @@ impl SystingProbeRecorder {
                 let mut ranges = HashMap::new();
                 let range = TrackRange {
                     range_name: range_name.clone(),
-                    start: ts,
+                    start: event.ts,
                     end: 0,
                 };
                 ranges.insert(range_name.clone(), range);
-                self.outstanding_ranges.insert(tgidpid, ranges);
+                self.outstanding_ranges.insert(event.tgidpid, ranges);
             }
         }
     }
@@ -479,13 +593,82 @@ impl SystingProbeRecorder {
         Ok(())
     }
 
+    fn add_trigger(&mut self, trigger: &SystingJSONStopTrigger) -> Result<()> {
+        if let Some(thresholds) = &trigger.thresholds {
+            for t in thresholds.iter() {
+                if !self.config_events.contains_key(&t.start) {
+                    return Err(anyhow::anyhow!("Start event {} does not exist", t.start));
+                }
+                if !self.config_events.contains_key(&t.end) {
+                    return Err(anyhow::anyhow!("Stop event {} does not exist", t.end));
+                }
+                let start_event = self.config_events.get(&t.start).unwrap();
+                let stop_event = self.config_events.get(&t.end).unwrap();
+                if self.start_triggers.contains(&start_event.cookie) {
+                    return Err(anyhow::anyhow!("Start event {} already exists", t.start));
+                }
+                if self.end_triggers.contains_key(&stop_event.cookie) {
+                    return Err(anyhow::anyhow!("Stop event {} already exists", t.end));
+                }
+                self.start_triggers.insert(start_event.cookie);
+                self.stop_triggers.push(ThresholdStopTrigger {
+                    start_cookie: start_event.cookie,
+                    duration_us: t.duration_us,
+                });
+                self.end_triggers
+                    .insert(stop_event.cookie, self.stop_triggers.len() - 1);
+            }
+        } else if let Some(instants) = &trigger.instants {
+            for instant in instants.iter() {
+                if !self.config_events.contains_key(&instant.event) {
+                    return Err(anyhow::anyhow!(
+                        "Instant event {} does not exist",
+                        instant.event
+                    ));
+                }
+                let event = self.config_events.get(&instant.event).unwrap();
+                if self.instant_events.contains_key(&instant.event) {
+                    return Err(anyhow::anyhow!(
+                        "Instant event {} already exists",
+                        instant.event
+                    ));
+                }
+                if self.start_events.contains_key(&instant.event) {
+                    return Err(anyhow::anyhow!(
+                        "Start event {} already exists",
+                        instant.event
+                    ));
+                }
+                if self.stop_events.contains_key(&instant.event) {
+                    return Err(anyhow::anyhow!(
+                        "Stop event {} already exists",
+                        instant.event
+                    ));
+                }
+                if !self.instant_triggers.insert(event.cookie) {
+                    return Err(anyhow::anyhow!(
+                        "Instant trigger for event {} already exists",
+                        instant.event
+                    ));
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("Invalid trigger format"));
+        }
+        Ok(())
+    }
+
     fn load_config_from_json(&mut self, buf: &str, rng: &mut dyn rand::RngCore) -> Result<()> {
         let config: SystingJSONTrackConfig = serde_json::from_str(&buf)?;
         for event in config.events.iter() {
             self.add_event_from_json(&event, rng)?;
         }
+        if let Some(stop_triggers) = config.stop_triggers {
+            self.add_trigger(&stop_triggers)?;
+        }
 
-        for track in config.tracks {
+        let tracks = config.tracks.unwrap_or_default();
+        for track in tracks {
             let track_name = track.track_name.clone();
             if let Some(ranges) = &track.ranges {
                 for range in ranges.iter() {
@@ -1015,7 +1198,13 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        recorder.handle_event(1234, 0, 1000, String::new());
+        let event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 1000,
+            cookie: 0,
+            extra: String::new(),
+        };
+        recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
         let packets = recorder.generate_trace(
@@ -1067,8 +1256,16 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        recorder.handle_event(1234, 0, 1000, String::new());
-        recorder.handle_event(1234, 1, 2000, String::new());
+        let mut event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 1000,
+            cookie: 0,
+            extra: String::new(),
+        };
+        recorder.handle_event(event.clone());
+        event.cookie = 1;
+        event.ts = 2000;
+        recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
         let packets = recorder.generate_trace(
@@ -1130,7 +1327,13 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        recorder.handle_event(1234, 0, 1000, String::new());
+        let event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 1000,
+            cookie: 0,
+            extra: String::new(),
+        };
+        recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
         let packets = recorder.generate_trace(
@@ -1177,7 +1380,13 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        recorder.handle_event(1234, 1, 2000, String::new());
+        let event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 2000,
+            cookie: 1,
+            extra: String::new(),
+        };
+        recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
         let packets = recorder.generate_trace(
@@ -1235,9 +1444,19 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        recorder.handle_event(1234, 0, 1000, String::new());
-        recorder.handle_event(1234, 1, 2000, String::new());
-        recorder.handle_event(1234, 2, 3000, String::new());
+        let mut event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 1000,
+            cookie: 0,
+            extra: String::new(),
+        };
+        recorder.handle_event(event.clone());
+        event.cookie = 1;
+        event.ts = 2000;
+        recorder.handle_event(event.clone());
+        event.cookie = 2;
+        event.ts = 3000;
+        recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
         let packets = recorder.generate_trace(
@@ -1328,12 +1547,28 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        recorder.handle_event(1234, 0, 1000, String::new());
-        recorder.handle_event(1234, 1, 2000, String::new());
-        recorder.handle_event(1234, 2, 3000, String::new());
-        recorder.handle_event(1234, 0, 4000, String::new());
-        recorder.handle_event(1234, 1, 5000, String::new());
-        recorder.handle_event(1234, 2, 6000, String::new());
+        let mut event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 1000,
+            cookie: 0,
+            extra: String::new(),
+        };
+        recorder.handle_event(event.clone());
+        event.cookie = 1;
+        event.ts = 2000;
+        recorder.handle_event(event.clone());
+        event.cookie = 2;
+        event.ts = 3000;
+        recorder.handle_event(event.clone());
+        event.cookie = 0;
+        event.ts = 4000;
+        recorder.handle_event(event.clone());
+        event.cookie = 1;
+        event.ts = 5000;
+        recorder.handle_event(event.clone());
+        event.cookie = 2;
+        event.ts = 6000;
+        recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
         let packets = recorder.generate_trace(
@@ -1435,7 +1670,13 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        recorder.handle_event(1234, 0, 1000, String::new());
+        let event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 1000,
+            cookie: 0,
+            extra: String::new(),
+        };
+        recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
         let packets = recorder.generate_trace(
@@ -1444,14 +1685,8 @@ mod tests {
             &mut Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 2);
-        assert_eq!(
-            packets[0].track_descriptor().name(),
-            "uretprobe_track"
-        );
-        assert_eq!(
-            packets[1].track_event().name(),
-            "uretprobe:symbol"
-        );
+        assert_eq!(packets[0].track_descriptor().name(), "uretprobe_track");
+        assert_eq!(packets[1].track_event().name(), "uretprobe:symbol");
     }
 
     #[test]
@@ -1480,7 +1715,13 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        recorder.handle_event(1234, 0, 1000, String::new());
+        let event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 1000,
+            cookie: 0,
+            extra: String::new(),
+        };
+        recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
         let packets = recorder.generate_trace(
@@ -1489,14 +1730,8 @@ mod tests {
             &mut Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 2);
-        assert_eq!(
-            packets[0].track_descriptor().name(),
-            "uprobe_track"
-        );
-        assert_eq!(
-            packets[1].track_event().name(),
-            "uprobe:symbol"
-        );
+        assert_eq!(packets[0].track_descriptor().name(), "uprobe_track");
+        assert_eq!(packets[1].track_event().name(), "uprobe:symbol");
     }
 
     #[test]
@@ -1551,8 +1786,12 @@ mod tests {
         assert_eq!(recorder.config_events.len(), 4);
         assert!(recorder.config_events.contains_key("uprobe_event"));
         assert!(recorder.config_events.contains_key("uretprobe_event"));
-        assert!(recorder.config_events.contains_key("uretprobe_event_plus_offset"));
-        assert!(recorder.config_events.contains_key("uprobe_event_plus_offset"));
+        assert!(recorder
+            .config_events
+            .contains_key("uretprobe_event_plus_offset"));
+        assert!(recorder
+            .config_events
+            .contains_key("uprobe_event_plus_offset"));
         let event = recorder.config_events.get("uprobe_event").unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
         assert_eq!(event.name, "uprobe_event");
@@ -1563,12 +1802,18 @@ mod tests {
         assert_eq!(event.name, "uretprobe_event");
         assert_eq!(event.key_index, 0);
         assert!(matches!(event.key_type, EventKeyType::String));
-        let event = recorder.config_events.get("uretprobe_event_plus_offset").unwrap();
+        let event = recorder
+            .config_events
+            .get("uretprobe_event_plus_offset")
+            .unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
         assert_eq!(event.name, "uretprobe_event_plus_offset");
         assert_eq!(event.key_index, 0);
         assert!(matches!(event.key_type, EventKeyType::String));
-        let event = recorder.config_events.get("uprobe_event_plus_offset").unwrap();
+        let event = recorder
+            .config_events
+            .get("uprobe_event_plus_offset")
+            .unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
         assert_eq!(event.name, "uprobe_event_plus_offset");
         assert_eq!(event.key_index, 0);
@@ -1587,7 +1832,6 @@ mod tests {
         assert!(result.is_ok());
         let result = recorder.add_event_from_str("uprobe:/path/to/file:symbol3+64", &mut rng);
         assert!(result.is_ok());
-
 
         assert_eq!(recorder.config_events.len(), 4);
         assert!(recorder.config_events.contains_key("symbol"));
@@ -1614,5 +1858,272 @@ mod tests {
         assert_eq!(event.name, "symbol3");
         assert_eq!(event.key_index, u8::MAX);
         assert!(matches!(event.key_type, EventKeyType::Long));
+    }
+
+    #[test]
+    fn test_threshold_trigger() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "start_event",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                },
+                {
+                    "name": "stop_event",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                }
+            ],
+            "stop_triggers": {
+                "thresholds": [
+                  {
+                    "start": "start_event",
+                    "end": "stop_event",
+                    "duration_us": 1000
+                  }
+                ]
+            }
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        assert_eq!(recorder.start_triggers.len(), 1);
+        assert_eq!(recorder.end_triggers.len(), 1);
+        assert_eq!(recorder.stop_triggers.len(), 1);
+    }
+
+    #[test]
+    fn test_threshold_trigger_invalid() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "start_event",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                },
+                {
+                    "name": "stop_event",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                }
+            ],
+            "stop_triggers": {
+                "thresholds": [
+                  {
+                    "start": "invalid_start_event",
+                    "end": "stop_event",
+                    "duration_us": 1000
+                  }
+                ]
+            }
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_threshold_trigger_invalid_end() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "start_event",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                },
+                {
+                    "name": "stop_event",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                }
+            ],
+            "stop_triggers": {
+                "thresholds": [
+                  {
+                    "start": "start_event",
+                    "end": "invalid_stop_event",
+                    "duration_us": 1000
+                  }
+                ]
+            }
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_instant_trigger() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_name",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                }
+            ],
+            "stop_triggers": {
+                "instants": [
+                    {
+                        "event": "event_name"
+                    }
+                ]
+            }
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        assert_eq!(recorder.instant_triggers.len(), 1);
+    }
+
+    #[test]
+    fn test_trip_threshold() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "start_event",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                },
+                {
+                    "name": "stop_event",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                }
+            ],
+            "stop_triggers": {
+                "thresholds": [
+                  {
+                    "start": "start_event",
+                    "end": "stop_event",
+                    "duration_us": 1000
+                  }
+                ]
+            }
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        let mut event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 0,
+            cookie: 0,
+            extra: String::new(),
+        };
+        let ret = recorder.maybe_trigger(&event);
+        assert!(!ret, "Trip threshold should not be triggered yet");
+        event.cookie = 1;
+        event.ts = 2_000_000;
+        let ret = recorder.maybe_trigger(&event);
+        assert!(ret, "Trip threshold should be triggered");
+    }
+
+    #[test]
+    fn test_no_trip_threshold() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "start_event",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                },
+                {
+                    "name": "stop_event",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                }
+            ],
+            "stop_triggers": {
+                "thresholds": [
+                  {
+                    "start": "start_event",
+                    "end": "stop_event",
+                    "duration_us": 1000
+                  }
+                ]
+            }
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        let mut event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 0,
+            cookie: 0,
+            extra: String::new(),
+        };
+        let ret = recorder.maybe_trigger(&event);
+        assert!(!ret, "Trip threshold should not be triggered yet");
+        event.cookie = 1;
+        event.ts = 500_000; // Less than the threshold of 1000 microseconds
+        let ret = recorder.maybe_trigger(&event);
+        assert!(!ret, "Trip threshold should not be triggered");
+    }
+
+    #[test]
+    fn test_trip_instant() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_name",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                }
+            ],
+            "stop_triggers": {
+                "instants": [
+                    {
+                        "event": "event_name"
+                    }
+                ]
+            }
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        let event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 1000,
+            cookie: 0,
+            extra: String::new(),
+        };
+        let ret = recorder.maybe_trigger(&event);
+        assert!(ret, "Instant trigger should be activated");
     }
 }
