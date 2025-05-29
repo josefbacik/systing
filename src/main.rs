@@ -5,7 +5,7 @@ pub mod ringbuf;
 pub mod symbolize;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::mem;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, IntoRawFd};
@@ -1213,21 +1213,25 @@ impl LibbpfPerfOptions for libbpf_rs::ProgramMut<'_> {
 }
 
 trait LibbpfKprobeOptions {
-    fn attach_kprobe_with_opts(
+    fn attach_kprobe_with_opts<T: AsRef<str>>(
         &self,
         retprobe: bool,
-        funcname: &str,
+        funcname: T,
         cookie: u64,
     ) -> Result<libbpf_rs::Link, libbpf_rs::Error>;
 }
 
 impl LibbpfKprobeOptions for libbpf_rs::ProgramMut<'_> {
-    fn attach_kprobe_with_opts(
+    fn attach_kprobe_with_opts<T: AsRef<str>>(
         &self,
         retprobe: bool,
-        funcname: &str,
+        funcname: T,
         cookie: u64,
     ) -> Result<libbpf_rs::Link, libbpf_rs::Error> {
+        let func_name = CString::new(funcname.as_ref()).map_err(|_| {
+            libbpf_rs::Error::from_raw_os_error(libc::EINVAL)
+        })?;
+        let func_name_ptr = func_name.as_ptr();
         let mut opts = libbpf_sys::bpf_kprobe_opts::default();
         opts.bpf_cookie = cookie;
         opts.sz = mem::size_of::<libbpf_sys::bpf_kprobe_opts>() as u64;
@@ -1235,8 +1239,8 @@ impl LibbpfKprobeOptions for libbpf_rs::ProgramMut<'_> {
         let ptr = unsafe {
             libbpf_sys::bpf_program__attach_kprobe_opts(
                 self.as_libbpf_object().as_ptr(),
-                funcname.as_ptr() as *const _,
-                &opts as *const _ as *const _,
+                func_name_ptr,
+                &opts as *const _,
             )
         };
         let ret = unsafe { libbpf_sys::libbpf_get_error(ptr as *const _) };
