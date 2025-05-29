@@ -519,6 +519,12 @@ impl SystingProbeRecorder {
         }
     }
 
+    pub fn drain_ringbuf(&mut self) {
+        while let Some(event) = self.ringbuf.pop() {
+            self.handle_event(event);
+        }
+    }
+
     pub fn generate_trace(
         &self,
         pid_uuids: &HashMap<i32, u64>,

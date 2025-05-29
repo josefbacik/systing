@@ -716,6 +716,12 @@ impl EventRecorder {
         }
     }
 
+    fn drain_ringbuf(&mut self) {
+        while let Some(event) = self.ringbuf.pop() {
+            self.handle_event(event);
+        }
+    }
+
     fn generate_trace(
         &self,
         pid_uuids: &HashMap<i32, u64>,
@@ -849,6 +855,12 @@ impl StackRecorder {
         }
     }
 
+    fn drain_ringbuf(&mut self) {
+        while let Some(event) = self.ringbuf.pop() {
+            self.handle_event(event);
+        }
+    }
+
     fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         use workerpool::thunk::{Thunk, ThunkWorker};
         use workerpool::Pool;
@@ -942,6 +954,12 @@ impl PerfCounterRecorder {
         });
     }
 
+    fn drain_ringbuf(&mut self) {
+        while let Some(event) = self.ringbuf.pop() {
+            self.handle_event(event);
+        }
+    }
+
     fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
@@ -992,6 +1010,12 @@ impl SysinfoRecorder {
             ts: event.ts,
             count: event.frequency,
         });
+    }
+
+    fn drain_ringbuf(&mut self) {
+        while let Some(event) = self.ringbuf.pop() {
+            self.handle_event(event);
+        }
     }
 
     fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
@@ -1826,6 +1850,15 @@ fn system(opts: Command) -> Result<()> {
         println!("Missed stack events: {}", dump_missed_events(&skel, 1));
         println!("Missed probe events: {}", dump_missed_events(&skel, 2));
         println!("Missed perf events: {}", dump_missed_events(&skel, 3));
+    }
+
+    if opts.continuous > 0 {
+        println!("Draining recorder ringbuffers...");
+        recorder.event_recorder.lock().unwrap().drain_ringbuf();
+        recorder.stack_recorder.lock().unwrap().drain_ringbuf();
+        recorder.perf_counter_recorder.lock().unwrap().drain_ringbuf();
+        recorder.sysinfo_recorder.lock().unwrap().drain_ringbuf();
+        recorder.probe_recorder.lock().unwrap().drain_ringbuf();
     }
 
     println!("Generating trace...");
