@@ -330,28 +330,27 @@ impl fmt::Display for UProbeEvent {
 impl KProbeEvent {
     fn from_parts(parts: Vec<&str>) -> Result<Self, anyhow::Error> {
         // Format is
-        // kprobe:<path>:<offset>
-        // kprobe:<path>:<symbol>
-        // kprobe:<path>:<symbol>+<offset>
-        // kretprobe:<path>:<offset>
-        // kretprobe:<path>:<symbol>
-        // kretprobe:<path>:<symbol>+<offset>
-        if parts.len() != 3 {
+        // kprobe:<offset>
+        // kprobe:<symbol>
+        // kprobe::<symbol>+<offset>
+        // kretprobe:<offset>
+        // kretprobe:<symbol>
+        // kretprobe:<symbol>+<offset>
+        if parts.len() != 2 {
             return Err(anyhow::anyhow!(
-                "Invalid uprobe format: {}",
+                "Invalid kprobe format: {}",
                 parts.join(":")
             ));
         }
         let mut probe = KProbeEvent::default();
-        probe.path = parts[1].to_string();
         probe.retprobe = parts[0] == "kretprobe";
 
-        match parts[2].parse::<u64>() {
+        match parts[1].parse::<u64>() {
             Ok(val) => {
                 probe.offset = val;
             }
             Err(_) => {
-                let symbol = parts[2].to_string();
+                let symbol = parts[1].to_string();
                 let mut symbol_parts = symbol.split('+');
                 let symbol = symbol_parts.next().unwrap();
                 let offset = symbol_parts.next();
@@ -2218,7 +2217,7 @@ mod tests {
             "events": [
                 {
                     "name": "kprobe_event",
-                    "event": "kprobe:/path/to/file:symbol",
+                    "event": "kprobe:symbol",
                     "key_index": 0,
                     "key_type": "string"
                 }
@@ -2263,7 +2262,7 @@ mod tests {
             "events": [
                 {
                     "name": "kretprobe_event",
-                    "event": "kretprobe:/path/to/file:symbol",
+                    "event": "kretprobe:symbol",
                     "key_index": 0,
                     "key_type": "string"
                 }
