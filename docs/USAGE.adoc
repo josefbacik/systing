@@ -184,9 +184,11 @@ The configuration is a JSON file with the following format.
     },
     {
       "track_name": "instant_track",
-      "instant": {
-        "event": "tracepoint_instant",
-      }
+      "instants": [
+        {
+          "event": "tracepoint_instant",
+        }
+      ]
     }
   ]
   "stop_triggers": {
@@ -208,7 +210,7 @@ The configuration is a JSON file with the following format.
 
 `tracks` can be optionally specified to create a custom track of events for events.
 There are two types of tracks, `ranges` and `instant`.
-`ranges` will create a track that shows the start and end of a range of events, while `instant` will create a track that shows the instant events.
+`ranges` will create a track that shows the start and end of a range of events, while `instants` will create a track that shows the instant events.
 You can specify multiple `ranges` or `instants` per track.
 
 `stop_triggers` can be optionally specified to stop the trace when a certain condition is met.

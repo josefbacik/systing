@@ -41,7 +41,7 @@
     },
     {
       "track_name": "pthread_cond_wait",
-      "instant": { "event": "pthread_cond_wait" }
+      "instants": [ { "event": "pthread_cond_wait" } ]
     }
   ]
 }

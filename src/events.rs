@@ -231,6 +231,7 @@ pub struct SystingEvent {
 // The event names cannot be duplicated in the tracks, with the sole exception of ranges, where you
 // can have the same start and end event name, but they must be different from the instant event.
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 struct SystingJSONTrackConfig {
     events: Vec<SystingJSONEvent>,
     tracks: Option<Vec<SystingTrack>>,
@@ -238,6 +239,7 @@ struct SystingJSONTrackConfig {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 struct SystingJSONEvent {
     name: String,
     event: String,
@@ -246,19 +248,22 @@ struct SystingJSONEvent {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 struct SystingTrack {
     track_name: String,
     ranges: Option<Vec<SystingRange>>,
-    instant: Option<SystingInstant>,
+    instants: Option<Vec<SystingInstant>>,
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 struct SystingJSONStopTrigger {
     thresholds: Option<Vec<SystingThreshold>>,
     instants: Option<Vec<SystingInstant>>,
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 struct SystingThreshold {
     start: String,
     end: String,
@@ -266,6 +271,7 @@ struct SystingThreshold {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 struct SystingRange {
     name: String,
     start: String,
@@ -273,6 +279,7 @@ struct SystingRange {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 struct SystingInstant {
     event: String,
 }
@@ -835,33 +842,35 @@ impl SystingProbeRecorder {
                     self.ranges.insert(range.name.clone(), track_name.clone());
                 }
             }
-            if let Some(instant) = &track.instant {
-                if !self.config_events.contains_key(&instant.event) {
-                    Err(anyhow::anyhow!(
-                        "Instant event {} does not exist",
-                        instant.event
-                    ))?;
+            if let Some(instants) = &track.instants {
+                for instant in instants.iter() {
+                    if !self.config_events.contains_key(&instant.event) {
+                        Err(anyhow::anyhow!(
+                            "Instant event {} does not exist",
+                            instant.event
+                        ))?;
+                    }
+                    if self.instant_events.contains_key(&instant.event) {
+                        Err(anyhow::anyhow!(
+                            "Instant event {} already exists",
+                            instant.event
+                        ))?;
+                    }
+                    if self.start_events.contains_key(&instant.event) {
+                        Err(anyhow::anyhow!(
+                            "Start event {} already exists",
+                            instant.event
+                        ))?;
+                    }
+                    if self.stop_events.contains_key(&instant.event) {
+                        Err(anyhow::anyhow!(
+                            "Stop event {} already exists",
+                            instant.event
+                        ))?;
+                    }
+                    self.instant_events
+                        .insert(instant.event.clone(), track_name.clone());
                 }
-                if self.instant_events.contains_key(&instant.event) {
-                    Err(anyhow::anyhow!(
-                        "Instant event {} already exists",
-                        instant.event
-                    ))?;
-                }
-                if self.start_events.contains_key(&instant.event) {
-                    Err(anyhow::anyhow!(
-                        "Start event {} already exists",
-                        instant.event
-                    ))?;
-                }
-                if self.stop_events.contains_key(&instant.event) {
-                    Err(anyhow::anyhow!(
-                        "Stop event {} already exists",
-                        instant.event
-                    ))?;
-                }
-                self.instant_events
-                    .insert(instant.event.clone(), track_name.clone());
             }
         }
         Ok(())
@@ -1085,9 +1094,11 @@ mod tests {
                 {
                     "track_name": "track_name",
                     "ranges": [],
-                    "instant": {
+                    "instants": [
+                      {
                         "event": "event_name"
-                    }
+                      }
+                    ]
                 }
             ]
         }
@@ -1109,9 +1120,11 @@ mod tests {
                 {
                     "track_name": "track_name",
                     "ranges": [],
-                    "instant": {
+                    "instants": [
+                      {
                         "event": "invalid_event_name"
-                    }
+                      }
+                    ]
                 }
             ]
         }
@@ -1139,16 +1152,20 @@ mod tests {
                 {
                     "track_name": "track_name",
                     "ranges": [],
-                    "instant": {
+                    "instants": [
+                      {
                         "event": "event_name"
-                    }
+                      }
+                    ]
                 },
                 {
                     "track_name": "track_name_2",
                     "ranges": [],
-                    "instant": {
+                    "instants": [
+                      {
                         "event": "event_name"
-                    }
+                      }
+                    ]
                 }
             ]
         }
@@ -1188,9 +1205,11 @@ mod tests {
                             "end": "event_name2"
                         }
                     ],
-                    "instant": {
+                    "instants": [
+                      {
                         "event": "event_name1"
-                    }
+                      }
+                    ]
                 }
             ]
         }
@@ -1323,9 +1342,11 @@ mod tests {
             "tracks": [
                 {
                     "track_name": "track_name",
-                    "instant": {
+                    "instants": [
+                      {
                         "event": "event_name"
-                    }
+                      }
+                    ]
                 }
             ]
         }
@@ -1795,9 +1816,11 @@ mod tests {
             "tracks": [
                 {
                     "track_name": "uretprobe_track",
-                    "instant": {
+                    "instants": [
+                      {
                         "event": "uretprobe_event"
-                    }
+                      }
+                    ]
                 }
             ]
         }
@@ -1840,9 +1863,11 @@ mod tests {
             "tracks": [
                 {
                     "track_name": "uprobe_track",
-                    "instant": {
+                    "instants": [
+                      {
                         "event": "uprobe_event"
-                    }
+                      }
+                    ]
                 }
             ]
         }
@@ -2278,9 +2303,11 @@ mod tests {
             "tracks": [
                 {
                     "track_name": "kprobe_track",
-                    "instant": {
+                    "instants": [
+                      {
                         "event": "kprobe_event"
-                    }
+                      }
+                    ]
                 }
             ]
         }
@@ -2323,9 +2350,11 @@ mod tests {
             "tracks": [
                 {
                     "track_name": "kretprobe_track",
-                    "instant": {
+                    "instants": [
+                      {
                         "event": "kretprobe_event"
-                    }
+                      }
+                    ]
                 }
             ]
         }
@@ -2368,9 +2397,11 @@ mod tests {
             "tracks": [
                 {
                     "track_name": "tracepoint_track",
-                    "instant": {
+                    "instants": [
+                      {
                         "event": "tracepoint_event"
-                    }
+                      }
+                    ]
                 }
             ]
         }
