@@ -1835,6 +1835,10 @@ fn system(opts: Command) -> Result<()> {
                 .expect("Could not receive signal on channel.");
         }
 
+        if opts.continuous > 0 {
+            println!("Asked to stop, waiting 1 second before stopping");
+            thread::sleep(Duration::from_secs(1));
+        }
         println!("Stopping...");
         skel.maps.data_data.tracing_enabled = false;
         thread_done.store(true, Ordering::Relaxed);

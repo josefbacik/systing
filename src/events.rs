@@ -422,6 +422,11 @@ impl SystingProbeRecorder {
     pub fn maybe_trigger(&mut self, event: &SystingProbeEvent) -> bool {
         // If this is an instant event we trigger immediately
         if self.instant_triggers.contains(&event.cookie) {
+            println!(
+                "Instant event triggered on TGID {} PID {}",
+                event.tgidpid >> 32 as u32,
+                event.tgidpid as u32
+            );
             return true;
         }
 
@@ -450,6 +455,11 @@ impl SystingProbeRecorder {
                 let threshold = Duration::from_micros(trigger.duration_us);
                 // We took longer than our threshold, we're done
                 if start + threshold <= end {
+                    println!(
+                        "Threshold exceeded on TGID {} PID {}",
+                        event.tgidpid >> 32 as u32,
+                        event.tgidpid as u32
+                    );
                     return true;
                 }
             }
