@@ -793,4 +793,27 @@ int systing_kprobe(struct pt_regs *ctx)
 	return 0;
 }
 
+SEC("tracepoint")
+int systing_tracepoint(struct pt_regs *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	u64 cookie = bpf_get_attach_cookie(ctx);
+	struct probe_event *event = reserve_probe_event();
+	if (!event) {
+		handle_missed_event(MISSED_PROBE_EVENT);
+		return 0;
+	}
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->cookie = cookie;
+	event->arg[0] = 0;
+	event->arg_type = ARG_NONE;
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
 char LICENSE[] SEC("license") = "GPL";

@@ -31,7 +31,7 @@ use blazesym::symbolize::{cache, Input, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::AsRawLibbpf;
-use libbpf_rs::{Link, MapCore, RingBufferBuilder, UprobeOpts, UsdtOpts};
+use libbpf_rs::{Link, MapCore, RingBufferBuilder, UprobeOpts, UsdtOpts, TracepointOpts};
 use libbpf_sys;
 use libc;
 use perfetto_protos::builtin_clock::BuiltinClock;
@@ -1745,6 +1745,23 @@ fn system(opts: Command) -> Result<()> {
                             Err(anyhow::anyhow!(
                                 "Failed to attach kprobe {}",
                                 kprobe.func_name
+                            ))?;
+                        }
+                        probe_links.push(link);
+                    }
+                    EventProbe::Tracepoint(tracepoint) => {
+                        let link = skel.progs.systing_tracepoint.attach_tracepoint_with_opts(
+                            &tracepoint.category,
+                            &tracepoint.name,
+                            TracepointOpts {
+                                cookie: event.cookie,
+                                ..Default::default()
+                            },
+                        );
+                        if link.is_err() {
+                            Err(anyhow::anyhow!(
+                                "Failed to attach tracepoint {}",
+                                tracepoint.name
                             ))?;
                         }
                         probe_links.push(link);

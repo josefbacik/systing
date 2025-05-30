@@ -57,6 +57,7 @@ The currently allowed formats are
 - `kprobe:function_name+offset`
 - `kretprobe:function_name`
 - `kretprobe:offset`
+- `tracepoint:subsystem:tracepoint_name`
 
 For all `usdt` and `u*probe` events you *must* specify `--trace-event-pid` to to
 indicate which PID's you wish to record the events for. For example, if you want

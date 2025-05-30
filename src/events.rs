@@ -149,11 +149,20 @@ pub struct KProbeEvent {
     pub retprobe: bool,
 }
 
+// Format is
+// tracepoint:<category>:<name>
+#[derive(Clone, Default)]
+pub struct TracepointEvent {
+    pub category: String,
+    pub name: String,
+}
+
 #[derive(Clone, Default)]
 pub enum EventProbe {
     UProbe(UProbeEvent),
     Usdt(UsdtProbeEvent),
     KProbe(KProbeEvent),
+    Tracepoint(TracepointEvent),
     #[default]
     Undefined,
 }
@@ -385,6 +394,27 @@ impl fmt::Display for KProbeEvent {
     }
 }
 
+impl TracepointEvent {
+    fn from_parts(parts: Vec<&str>) -> Result<Self, anyhow::Error> {
+        // Format is
+        // tracepoint:<category>:<name>
+        if parts.len() != 3 {
+            Err(anyhow::anyhow!("Invalid tracepoint format"))?;
+        }
+        let tracepoint = TracepointEvent {
+            category: parts[1].to_string(),
+            name: parts[2].to_string(),
+        };
+        Ok(tracepoint)
+    }
+}
+
+impl fmt::Display for TracepointEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "tracepoint:{}:{}", self.category, self.name)
+    }
+}
+
 impl fmt::Display for UsdtProbeEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "usdt:{}:{}:{}", self.path, self.provider, self.name)
@@ -413,6 +443,7 @@ impl fmt::Display for SystingEvent {
             EventProbe::UProbe(uprobe) => write!(f, "{}", uprobe),
             EventProbe::Usdt(usdt) => write!(f, "{}", usdt),
             EventProbe::KProbe(kprobe) => write!(f, "{}", kprobe),
+            EventProbe::Tracepoint(tracepoint) => write!(f, "{}", tracepoint),
             _ => write!(f, "Invalid event"),
         }
     }
@@ -639,6 +670,11 @@ impl SystingProbeRecorder {
                 systing_event.name = kprobe.func_name.clone();
                 systing_event.event = EventProbe::KProbe(kprobe);
             }
+            "tracepoint" => {
+                let tracepoint = TracepointEvent::from_parts(parts)?;
+                systing_event.name = format!("{}:{}", tracepoint.category, tracepoint.name);
+                systing_event.event = EventProbe::Tracepoint(tracepoint);
+            }
             _ => {
                 return Err(anyhow::anyhow!("Invalid event type: {}", parts[0]));
             }
@@ -679,6 +715,7 @@ impl SystingProbeRecorder {
                 "usdt" => EventProbe::Usdt(UsdtProbeEvent::from_parts(parts)?),
                 "uprobe" | "uretprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
                 "kprobe" | "kretprobe" => EventProbe::KProbe(KProbeEvent::from_parts(parts)?),
+                "tracepoint" => EventProbe::Tracepoint(TracepointEvent::from_parts(parts)?),
                 _ => return Err(anyhow::anyhow!("Invalid event type")),
             },
         };
@@ -2312,5 +2349,50 @@ mod tests {
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[0].track_descriptor().name(), "kretprobe_track");
         assert_eq!(packets[1].track_event().name(), "kretprobe:symbol");
+    }
+
+    #[test]
+    fn test_tracepoint_packet() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "tracepoint_event",
+                    "event": "tracepoint:category:name",
+                    "key_index": 0,
+                    "key_type": "string"
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "tracepoint_track",
+                    "instant": {
+                        "event": "tracepoint_event"
+                    }
+                }
+            ]
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        let event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 1000,
+            cookie: 0,
+            extra: String::new(),
+        };
+        recorder.handle_event(event);
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].track_descriptor().name(), "tracepoint_track");
+        assert_eq!(packets[1].track_event().name(), "tracepoint:category:name");
     }
 }

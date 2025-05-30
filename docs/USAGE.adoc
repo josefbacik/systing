@@ -119,7 +119,7 @@ If recording inside of a VM, this can be specified to enable the software events
 === *--trace-event* _EVENT_
 
 This is a special option that takes a format similar to https://bpftrace.org[`bpftrace`].
-Currently the supported events are only `usdt`, `uprobe`, `uretprobe`, `kprobe`, and `kretprobe`.
+Currently the supported events are only `usdt`, `uprobe`, `uretprobe`, `kprobe`, `kretprobe`, and `tracepoint`.
 If using the userspace related events you must also specify *--trace-event-pid* to specify the PID of the process you want to trace.
 The following is an exhaustive list of the supported formats
 
@@ -135,6 +135,7 @@ The following is an exhaustive list of the supported formats
 * `kprobe:offset`
 * `kretprobe:kernel_function_name`
 * `kretprobe:offset`
+* `tracepoint:subystem:tracepoint_name`
 
 === *--trace-event-pid* _PID_
 
