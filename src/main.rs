@@ -596,7 +596,7 @@ impl LocalCompactSched {
             .to_str()
             .unwrap()
             .to_string();
-        let index = self.comm_mapping.entry(comm.clone()).or_insert({
+        let index = self.comm_mapping.entry(comm.clone()).or_insert_with(|| {
             self.compact_sched.intern_table.push(comm);
             (self.compact_sched.intern_table.len() as u32) - 1
         });
@@ -1158,18 +1158,19 @@ impl SessionRecorder {
 fn maybe_record_task(info: &task_info, session_recorder: &Arc<SessionRecorder>) {
     let pid = info.tgidpid as i32;
     let tgid = (info.tgidpid >> 32) as i32;
-    if pid == tgid
-        && !session_recorder
+    if pid == tgid {
+        if !session_recorder
             .processes
             .read()
             .unwrap()
             .contains_key(&info.tgidpid)
-    {
-        session_recorder
-            .processes
-            .write()
-            .unwrap()
-            .insert(info.tgidpid, ProcessDescriptor::from(info));
+        {
+            session_recorder
+                .processes
+                .write()
+                .unwrap()
+                .insert(info.tgidpid, ProcessDescriptor::from(info));
+        }
     } else if !session_recorder
         .threads
         .read()
