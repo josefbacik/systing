@@ -31,7 +31,7 @@ use blazesym::symbolize::{cache, Input, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::AsRawLibbpf;
-use libbpf_rs::{Link, MapCore, RingBufferBuilder, UprobeOpts, UsdtOpts, TracepointOpts};
+use libbpf_rs::{Link, MapCore, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts};
 use libbpf_sys;
 use libc;
 use perfetto_protos::builtin_clock::BuiltinClock;
@@ -1252,9 +1252,8 @@ impl LibbpfKprobeOptions for libbpf_rs::ProgramMut<'_> {
         funcname: T,
         cookie: u64,
     ) -> Result<libbpf_rs::Link, libbpf_rs::Error> {
-        let func_name = CString::new(funcname.as_ref()).map_err(|_| {
-            libbpf_rs::Error::from_raw_os_error(libc::EINVAL)
-        })?;
+        let func_name = CString::new(funcname.as_ref())
+            .map_err(|_| libbpf_rs::Error::from_raw_os_error(libc::EINVAL))?;
         let func_name_ptr = func_name.as_ptr();
         let mut opts = libbpf_sys::bpf_kprobe_opts::default();
         opts.bpf_cookie = cookie;
@@ -1877,7 +1876,11 @@ fn system(opts: Command) -> Result<()> {
         println!("Draining recorder ringbuffers...");
         recorder.event_recorder.lock().unwrap().drain_ringbuf();
         recorder.stack_recorder.lock().unwrap().drain_ringbuf();
-        recorder.perf_counter_recorder.lock().unwrap().drain_ringbuf();
+        recorder
+            .perf_counter_recorder
+            .lock()
+            .unwrap()
+            .drain_ringbuf();
         recorder.sysinfo_recorder.lock().unwrap().drain_ringbuf();
         recorder.probe_recorder.lock().unwrap().drain_ringbuf();
     }
