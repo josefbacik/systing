@@ -640,7 +640,7 @@ impl SystingRecordEvent<task_event> for EventRecorder {
             self.handle_event(event);
         } else {
             // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push(event);
+            self.ringbuf.push_front(event);
         }
         false
     }
@@ -717,7 +717,7 @@ impl EventRecorder {
     }
 
     fn drain_ringbuf(&mut self) {
-        while let Some(event) = self.ringbuf.pop() {
+        while let Some(event) = self.ringbuf.pop_back() {
             self.handle_event(event);
         }
     }
@@ -833,7 +833,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
             self.handle_event(event);
         } else {
             // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push(event);
+            self.ringbuf.push_front(event);
         }
         false
     }
@@ -856,7 +856,7 @@ impl StackRecorder {
     }
 
     fn drain_ringbuf(&mut self) {
-        while let Some(event) = self.ringbuf.pop() {
+        while let Some(event) = self.ringbuf.pop_back() {
             self.handle_event(event);
         }
     }
@@ -891,7 +891,7 @@ impl SystingRecordEvent<perf_counter_event> for PerfCounterRecorder {
             self.handle_event(event);
         } else {
             // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push(event);
+            self.ringbuf.push_front(event);
         }
         false
     }
@@ -934,7 +934,7 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
         } else {
             let ret = self.maybe_trigger(&probe_event);
             // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push(probe_event);
+            self.ringbuf.push_front(probe_event);
             return ret;
         }
         false
@@ -955,7 +955,7 @@ impl PerfCounterRecorder {
     }
 
     fn drain_ringbuf(&mut self) {
-        while let Some(event) = self.ringbuf.pop() {
+        while let Some(event) = self.ringbuf.pop_back() {
             self.handle_event(event);
         }
     }
@@ -997,7 +997,7 @@ impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
             self.handle_event(event);
         } else {
             // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push(event);
+            self.ringbuf.push_front(event);
         }
         false
     }
@@ -1013,7 +1013,7 @@ impl SysinfoRecorder {
     }
 
     fn drain_ringbuf(&mut self) {
-        while let Some(event) = self.ringbuf.pop() {
+        while let Some(event) = self.ringbuf.pop_back() {
             self.handle_event(event);
         }
     }

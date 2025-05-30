@@ -1,25 +1,26 @@
+use std::collections::VecDeque;
 use crate::SystingEventTS;
 
 #[derive(Default)]
 pub struct RingBuffer<T> {
-    buffer: Vec<Vec<T>>,
+    buffer: VecDeque<VecDeque<T>>,
     start_ts: u64,
     max_duration: u64,
 }
 
 impl<T> RingBuffer<T> {
-    pub fn rotate(&mut self) {
+    fn rotate(&mut self) {
         if self.max_duration == 0 {
             return;
         }
 
         if self.buffer.len() == 2 {
-            self.buffer.pop();
+            self.buffer.pop_back();
         }
-        self.buffer.push(Vec::new());
+        self.buffer.push_front(VecDeque::new());
     }
 
-    pub fn push(&mut self, item: T)
+    pub fn push_front(&mut self, item: T)
     where
         T: SystingEventTS,
     {
@@ -28,7 +29,18 @@ impl<T> RingBuffer<T> {
         }
 
         let cur_ts = item.ts();
-        if self.start_ts == 0 {
+
+        // Since the ringbuf gets events from all CPUs we can have some CPUs that get their events
+        // in at a different time, so just reset our ts if our start_ts is less than the current
+        // ts.
+        //
+        // This works out ok for the recorders because they are either recording per-cpu, so the TS
+        // is always in sync, or they're recording per process, so if the process switches CPU's
+        // the TS will still be ahead of its previous CPU's TS. (This isn't actually guaranteed but
+        // we don't want to have to think about this right now so fuck it, let it ride until we hit
+        // a machine where this ends up not being true and then we can do things like TS adjustment
+        // when we bounc CPUs.)
+        if self.start_ts == 0 || cur_ts < self.start_ts {
             self.start_ts = cur_ts;
         }
         let cur_duration = cur_ts - self.start_ts;
@@ -36,17 +48,20 @@ impl<T> RingBuffer<T> {
             self.rotate();
             self.start_ts = cur_ts;
         }
-        let first_vec = self.buffer.first_mut().unwrap();
-        first_vec.push(item);
+        let first_vec = self.buffer.front_mut().unwrap();
+        first_vec.push_front(item);
     }
 
-    pub fn pop(&mut self) -> Option<T> {
+    pub fn pop_back(&mut self) -> Option<T> {
         if self.max_duration == 0 {
             return None;
         }
 
-        if let Some(last_vec) = self.buffer.last_mut() {
-            if let Some(item) = last_vec.pop() {
+        if let Some(last_vec) = self.buffer.back_mut() {
+            if let Some(item) = last_vec.pop_back() {
+                if last_vec.is_empty() {
+                    self.buffer.pop_back();
+                }
                 return Some(item);
             }
         }
@@ -59,7 +74,7 @@ impl<T> RingBuffer<T> {
             self.buffer.clear();
             self.start_ts = 0;
         } else if self.buffer.is_empty() {
-            self.buffer.push(Vec::new());
+            self.buffer.push_front(VecDeque::new());
         }
     }
 

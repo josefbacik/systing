@@ -520,7 +520,7 @@ impl SystingProbeRecorder {
     }
 
     pub fn drain_ringbuf(&mut self) {
-        while let Some(event) = self.ringbuf.pop() {
+        while let Some(event) = self.ringbuf.pop_back() {
             self.handle_event(event);
         }
     }
