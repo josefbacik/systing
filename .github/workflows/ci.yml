@@ -8,28 +8,26 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - name: Install Deps.
-        uses: cytopia/shell-command-retry-action@v0.1.6
-        with:
-          retries: 10
-          pause: 20
-          command: |
-            export DEBIAN_FRONTEND=noninteractive &&
-            sudo apt-get install -y rustup linux-tools-common libelf-dev
-              linux-libc-dev clang libbpf-dev make pkg-config
-              --no-install-recommends &&
-            sudo ln -s /usr/include/asm-generic /usr/include/asm &&
-            rustup toolchain install stable --profile minimal
-
       - uses: actions/checkout@v4
+      
+      - name: Install Deps.
+        run: ./.github/workflows/install_deps.sh
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        uses: cytopia/shell-command-retry-action@v0.1.6
-        with:
-          retries: 3
-          pause: 3
-          command: |
-            cargo build --release
+        run: cargo build --release
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Deps.
+        run: ./.github/workflows/install_deps.sh
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test
 
