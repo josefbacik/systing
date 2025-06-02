@@ -31,3 +31,6 @@ workerpool = "1.2.1"
 
 [features]
 generate-vmlinux-header = []
+
+[profile.release]
+lto = "thin"
