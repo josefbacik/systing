@@ -5,10 +5,10 @@ pub mod ringbuf;
 pub mod symbolize;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::mem;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -30,9 +30,7 @@ use blazesym::symbolize::source::{Kernel, Process, Source};
 use blazesym::symbolize::{cache, Input, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::AsRawLibbpf;
-use libbpf_rs::{Link, MapCore, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts};
-use libbpf_sys;
+use libbpf_rs::{MapCore, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts};
 use libc;
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
@@ -1202,94 +1200,6 @@ where
     builder.build()
 }
 
-// We're just doing this until the libbpf-rs crate gets updated with my patch.
-trait LibbpfPerfOptions {
-    fn attach_perf_event_with_opts(
-        &self,
-        pefd: i32,
-        cookie: u64,
-    ) -> Result<libbpf_rs::Link, libbpf_rs::Error>;
-}
-
-impl LibbpfPerfOptions for libbpf_rs::ProgramMut<'_> {
-    fn attach_perf_event_with_opts(
-        &self,
-        pefd: i32,
-        cookie: u64,
-    ) -> Result<libbpf_rs::Link, libbpf_rs::Error> {
-        let mut opts = libbpf_sys::bpf_perf_event_opts::default();
-        opts.bpf_cookie = cookie;
-        opts.sz = mem::size_of::<libbpf_sys::bpf_perf_event_opts>() as u64;
-        let ptr = unsafe {
-            libbpf_sys::bpf_program__attach_perf_event_opts(
-                self.as_libbpf_object().as_ptr(),
-                pefd,
-                &opts as *const _ as *const _,
-            )
-        };
-        let ret = unsafe { libbpf_sys::libbpf_get_error(ptr as *const _) };
-        if ret != 0 {
-            return Err(libbpf_rs::Error::from_raw_os_error(-ret as i32));
-        }
-        let ptr = unsafe { std::ptr::NonNull::new_unchecked(ptr) };
-        let link = unsafe { Link::from_ptr(ptr) };
-        Ok(link)
-    }
-}
-
-trait LibbpfKprobeOptions {
-    fn attach_kprobe_with_opts<T: AsRef<str>>(
-        &self,
-        retprobe: bool,
-        funcname: T,
-        cookie: u64,
-    ) -> Result<libbpf_rs::Link, libbpf_rs::Error>;
-}
-
-impl LibbpfKprobeOptions for libbpf_rs::ProgramMut<'_> {
-    fn attach_kprobe_with_opts<T: AsRef<str>>(
-        &self,
-        retprobe: bool,
-        funcname: T,
-        cookie: u64,
-    ) -> Result<libbpf_rs::Link, libbpf_rs::Error> {
-        let func_name = CString::new(funcname.as_ref())
-            .map_err(|_| libbpf_rs::Error::from_raw_os_error(libc::EINVAL))?;
-        let func_name_ptr = func_name.as_ptr();
-        let mut opts = libbpf_sys::bpf_kprobe_opts::default();
-        opts.bpf_cookie = cookie;
-        opts.sz = mem::size_of::<libbpf_sys::bpf_kprobe_opts>() as u64;
-        opts.retprobe = retprobe;
-        let ptr = unsafe {
-            libbpf_sys::bpf_program__attach_kprobe_opts(
-                self.as_libbpf_object().as_ptr(),
-                func_name_ptr,
-                &opts as *const _,
-            )
-        };
-        let ret = unsafe { libbpf_sys::libbpf_get_error(ptr as *const _) };
-        if ret != 0 {
-            return Err(libbpf_rs::Error::from_raw_os_error(-ret as i32));
-        }
-        let ptr = unsafe { std::ptr::NonNull::new_unchecked(ptr) };
-        let link = unsafe { Link::from_ptr(ptr) };
-        Ok(link)
-    }
-}
-
-fn attach_perf_event(
-    files: PerfOpenEvents,
-    prog: &libbpf_rs::ProgramMut,
-    cookie: u64,
-) -> Result<Vec<libbpf_rs::Link>, libbpf_rs::Error> {
-    let mut res = Vec::new();
-    for (_, file) in files {
-        let link = prog.attach_perf_event_with_opts(file.into_raw_fd(), cookie)?;
-        res.push(link);
-    }
-    Ok(res)
-}
-
 fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
     let index = index.to_ne_bytes();
     let result = skel
@@ -1379,21 +1289,26 @@ fn system(opts: Command) -> Result<()> {
 
         let mut open_object = MaybeUninit::uninit();
         let mut open_skel = skel_builder.open(&mut open_object)?;
+        {
+            let rodata = open_skel
+                .maps
+                .rodata_data
+                .as_deref_mut()
+                .expect("'rodata' is not mmap'ed, your kernel is too old");
 
-        open_skel.maps.rodata_data.tool_config.num_cpus = num_cpus;
-        open_skel.maps.rodata_data.tool_config.my_tgid = process::id() as u32;
-        open_skel.maps.rodata_data.tool_config.no_cpu_stack_traces =
-            opts.no_cpu_stack_traces as u32;
-        open_skel.maps.rodata_data.tool_config.no_sleep_stack_traces =
-            opts.no_sleep_stack_traces as u32;
-        if opts.cgroup.len() > 0 {
-            open_skel.maps.rodata_data.tool_config.filter_cgroup = 1;
-        }
-        if opts.no_stack_traces {
-            open_skel.maps.rodata_data.tool_config.no_stack_traces = 1;
-        }
-        if opts.pid.len() > 0 {
-            open_skel.maps.rodata_data.tool_config.filter_pid = 1;
+            rodata.tool_config.num_cpus = num_cpus;
+            rodata.tool_config.my_tgid = process::id() as u32;
+            rodata.tool_config.no_cpu_stack_traces = opts.no_cpu_stack_traces as u32;
+            rodata.tool_config.no_sleep_stack_traces = opts.no_sleep_stack_traces as u32;
+            if opts.cgroup.len() > 0 {
+                rodata.tool_config.filter_cgroup = 1;
+            }
+            if opts.no_stack_traces {
+                rodata.tool_config.no_stack_traces = 1;
+            }
+            if opts.pid.len() > 0 {
+                rodata.tool_config.filter_pid = 1;
+            }
         }
         if opts.ringbuf_size_mib > 0 {
             let size = opts.ringbuf_size_mib * 1024 * 1024;
@@ -1456,7 +1371,13 @@ fn system(opts: Command) -> Result<()> {
         }
 
         let num_events = perf_counter_names.len() as u32;
-        open_skel.maps.rodata_data.tool_config.num_perf_counters = num_events;
+        open_skel
+            .maps
+            .rodata_data
+            .as_deref_mut()
+            .unwrap()
+            .tool_config
+            .num_perf_counters = num_events;
         open_skel
             .maps
             .perf_counters
@@ -1652,7 +1573,20 @@ fn system(opts: Command) -> Result<()> {
             cpus: (0..num_cpus).collect(),
         })?;
         clock_files.open_events(None, 1000)?;
-        let _links = attach_perf_event(clock_files, &skel.progs.systing_perf_event_clock, 0)?;
+        let mut perf_links = Vec::new();
+        for (_, file) in clock_files {
+            let link = skel
+                .progs
+                .systing_perf_event_clock
+                .attach_perf_event_with_opts(
+                    file.as_raw_fd(),
+                    libbpf_rs::PerfEventOpts {
+                        cookie: 0,
+                        ..Default::default()
+                    },
+                )?;
+            perf_links.push(link);
+        }
 
         let mut slots_files = PerfOpenEvents::new();
         if need_slots {
@@ -1725,7 +1659,7 @@ fn system(opts: Command) -> Result<()> {
                                 UprobeOpts {
                                     cookie: event.cookie,
                                     retprobe: uprobe.retprobe,
-                                    func_name: uprobe.func_name.clone(),
+                                    func_name: Some(uprobe.func_name.clone()),
                                     ..Default::default()
                                 },
                             );
@@ -1739,7 +1673,10 @@ fn system(opts: Command) -> Result<()> {
                         let link = skel.progs.systing_kprobe.attach_kprobe_with_opts(
                             kprobe.retprobe,
                             &kprobe.func_name,
-                            event.cookie,
+                            libbpf_rs::KprobeOpts {
+                                cookie: event.cookie,
+                                ..Default::default()
+                            },
                         );
                         if link.is_err() {
                             Err(anyhow::anyhow!(
@@ -1750,8 +1687,10 @@ fn system(opts: Command) -> Result<()> {
                         probe_links.push(link);
                     }
                     EventProbe::Tracepoint(tracepoint) => {
+                        let category =
+                            libbpf_rs::TracepointCategory::Custom(tracepoint.category.clone());
                         let link = skel.progs.systing_tracepoint.attach_tracepoint_with_opts(
-                            &tracepoint.category,
+                            category,
                             &tracepoint.name,
                             TracepointOpts {
                                 cookie: event.cookie,
@@ -1857,7 +1796,7 @@ fn system(opts: Command) -> Result<()> {
             thread::sleep(Duration::from_secs(1));
         }
         println!("Stopping...");
-        skel.maps.data_data.tracing_enabled = false;
+        skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
         thread_done.store(true, Ordering::Relaxed);
         for thread in threads {
             thread.join().expect("Failed to join thread");
