@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
 use crate::SystingEventTS;
+use std::collections::VecDeque;
 
 #[derive(Default)]
 pub struct RingBuffer<T> {

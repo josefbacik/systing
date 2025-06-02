@@ -4,9 +4,7 @@ use std::path::{Path, PathBuf};
 
 use libbpf_cargo::SkeletonBuilder;
 
-const SRC: [&'static str; 1] = [
-    "src/bpf/systing_system.bpf.c",
-];
+const SRC: [&'static str; 1] = ["src/bpf/systing_system.bpf.c"];
 
 #[cfg(not(feature = "generate-vmlinux-header"))]
 fn generate_vmlinux_header() {}
@@ -16,16 +14,16 @@ fn generate_vmlinux_header() {
     let vmlinux_path = PathBuf::from("src/bpf/").join("vmlinux.h");
 
     let bpftool_output = std::process::Command::new("bpftool")
-            .args([
-                "btf",
-                "dump",
-                "file",
-                "/sys/kernel/btf/vmlinux",
-                "format",
-                "c",
-            ])
-            .output()
-            .expect("Failed to execute bpftool");
+        .args([
+            "btf",
+            "dump",
+            "file",
+            "/sys/kernel/btf/vmlinux",
+            "format",
+            "c",
+        ])
+        .output()
+        .expect("Failed to execute bpftool");
     std::fs::write(&vmlinux_path, bpftool_output.stdout).expect("Failed to write vmlinux.h");
 }
 

@@ -1,5 +1,6 @@
 pub mod events;
 pub mod perf;
+mod perf_recorder;
 pub mod perfetto;
 pub mod ringbuf;
 pub mod symbolize;
@@ -19,9 +20,10 @@ use std::time::Duration;
 
 use crate::events::{EventProbe, SystingProbeEvent, SystingProbeRecorder};
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
+use crate::perf_recorder::{PerfCounterEvent, PerfCounterRecorder};
+use crate::perfetto::TrackCounter;
 use crate::ringbuf::RingBuffer;
 use crate::symbolize::Stack;
-use crate::perfetto::TrackCounter;
 
 use anyhow::bail;
 use anyhow::Result;
@@ -164,6 +166,17 @@ impl SystingEventTS for SysInfoEvent {
     }
 }
 
+impl From<&perf_counter_event> for PerfCounterEvent {
+    fn from(event: &perf_counter_event) -> Self {
+        PerfCounterEvent {
+            cpu: event.cpu,
+            index: event.counter_num as usize,
+            value: event.value.counter as i64,
+            ts: event.ts,
+        }
+    }
+}
+
 #[derive(Default)]
 struct SysInfoEvent {
     cpu: u32,
@@ -209,19 +222,6 @@ struct EventRecorder {
 struct StackRecorder {
     ringbuf: RingBuffer<stack_event>,
     stacks: HashMap<i32, Vec<StackEvent>>,
-}
-
-#[derive(Default, PartialEq, Eq, Hash)]
-struct PerfCounterKey {
-    cpu: u32,
-    index: usize,
-}
-
-#[derive(Default)]
-struct PerfCounterRecorder {
-    ringbuf: RingBuffer<perf_counter_event>,
-    perf_counters: Vec<String>,
-    perf_events: HashMap<PerfCounterKey, Vec<TrackCounter>>,
 }
 
 #[derive(Default)]
@@ -863,6 +863,7 @@ impl StackRecorder {
 
 impl SystingRecordEvent<perf_counter_event> for PerfCounterRecorder {
     fn record_event(&mut self, event: perf_counter_event) -> bool {
+        let event = PerfCounterEvent::from(&event);
         if self.ringbuf.max_duration() == 0 {
             // If the ring buffer is not enabled, we just handle the event directly.
             self.handle_event(event);
@@ -915,55 +916,6 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
             return ret;
         }
         false
-    }
-}
-
-impl PerfCounterRecorder {
-    fn handle_event(&mut self, event: perf_counter_event) {
-        let key = PerfCounterKey {
-            cpu: event.cpu,
-            index: event.counter_num as usize,
-        };
-        let entry = self.perf_events.entry(key).or_insert_with(Vec::new);
-        entry.push(TrackCounter {
-            ts: event.ts,
-            count: event.value.counter as i64,
-        });
-    }
-
-    fn drain_ringbuf(&mut self) {
-        while let Some(event) = self.ringbuf.pop_back() {
-            self.handle_event(event);
-        }
-    }
-
-    fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
-
-        // Populate the cache counter events
-        for (key, counters) in self.perf_events.iter() {
-            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            let track_name = format!("{}_{}", self.perf_counters[key.index], key.cpu);
-            let mut desc = TrackDescriptor::default();
-            desc.set_name(track_name);
-            desc.set_uuid(desc_uuid);
-
-            let mut counter_desc = CounterDescriptor::default();
-            counter_desc.set_unit(Unit::UNIT_COUNT);
-            counter_desc.set_is_incremental(false);
-            desc.counter = Some(counter_desc).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            packets.push(packet);
-
-            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-            for event in counters.iter() {
-                packets.push(event.to_track_event(desc_uuid, seq));
-            }
-        }
-
-        packets
     }
 }
 
