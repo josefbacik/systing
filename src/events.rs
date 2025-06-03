@@ -658,9 +658,11 @@ impl SystingProbeRecorder {
 
     pub fn add_event_from_str(&mut self, event: &str, rng: &mut dyn rand::RngCore) -> Result<()> {
         let parts = event.split(':').collect::<Vec<&str>>();
-        let mut systing_event = SystingEvent::default();
-        systing_event.key_index = u8::MAX;
-        systing_event.cookie = rng.next_u64();
+        let mut systing_event = SystingEvent {
+            key_index: u8::MAX,
+            cookie: rng.next_u64(),
+            .. Default::default()
+        };
         match parts[0] {
             "usdt" => {
                 let usdt = UsdtProbeEvent::from_parts(parts)?;
