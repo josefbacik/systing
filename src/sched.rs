@@ -38,8 +38,8 @@ pub struct SchedEventRecorder {
     cpu_latencies: HashMap<u32, Vec<TrackCounter>>,
     process_latencies: HashMap<u64, Vec<TrackCounter>>,
     rq_counters: HashMap<i32, i64>,
-    pub cpu_sched_stats: bool,
-    pub process_sched_stats: bool,
+    cpu_sched_stats: bool,
+    process_sched_stats: bool,
 }
 
 impl SchedEventRecorder {
@@ -359,5 +359,361 @@ impl LocalCompactSched {
                 .push(event.next_prio as i32);
             self.compact_sched.switch_next_comm_index.push(*index);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::systing::types::event_type;
+    use crate::systing::types::task_info;
+
+    fn copy_to_comm(comm: &mut [u8], value: &CStr) {
+        let bytes = value.to_bytes_with_nul();
+        comm[..bytes.len()].copy_from_slice(bytes);
+    }
+
+    #[test]
+    fn test_handle_event() {
+        let mut recorder = SchedEventRecorder::default();
+        let prev_comm = CStr::from_bytes_with_nul(b"prev\0").unwrap();
+        let next_comm = CStr::from_bytes_with_nul(b"next\0").unwrap();
+
+        let mut event = task_event {
+            r#type: event_type::SCHED_SWITCH,
+            ts: 1000,
+            next: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
+            prev: task_info {
+                tgidpid: 5678,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        copy_to_comm(&mut event.next.comm, &next_comm);
+        copy_to_comm(&mut event.prev.comm, &prev_comm);
+        recorder.handle_event(event);
+        assert_eq!(recorder.compact_sched.len(), 1);
+        assert!(recorder.compact_sched.contains_key(&0));
+
+        event.ts = 2000;
+        event.next.tgidpid = 5678;
+        event.prev.tgidpid = 1234;
+        copy_to_comm(&mut event.next.comm, &prev_comm);
+        copy_to_comm(&mut event.prev.comm, &next_comm);
+        recorder.handle_event(event);
+
+        assert_eq!(recorder.compact_sched.len(), 1);
+
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        thread_uuids.insert(5678, 2);
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 1);
+
+        let packet = &packets[0];
+        assert!(packet.has_ftrace_events());
+        let compact = packet.ftrace_events().compact_sched.as_ref().unwrap();
+        assert_eq!(compact.switch_timestamp.len(), 2);
+        assert_eq!(compact.switch_timestamp[0], 1000);
+        assert_eq!(compact.switch_timestamp[1], 1000);
+        assert_eq!(compact.intern_table.len(), 2);
+        assert_eq!(compact.intern_table[0], "next");
+        assert_eq!(compact.intern_table[1], "prev");
+        assert_eq!(compact.switch_next_comm_index[0], 0);
+        assert_eq!(compact.switch_next_comm_index[1], 1);
+    }
+
+    #[test]
+    fn test_wakeup_new() {
+        let mut recorder = SchedEventRecorder::default();
+        let next_comm = CStr::from_bytes_with_nul(b"next\0").unwrap();
+
+        let mut event = task_event {
+            r#type: event_type::SCHED_WAKEUP_NEW,
+            ts: 1000,
+            next: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
+            target_cpu: 0,
+            next_prio: 10,
+            ..Default::default()
+        };
+        copy_to_comm(&mut event.next.comm, &next_comm);
+        recorder.handle_event(event);
+
+        assert_eq!(recorder.compact_sched.len(), 0);
+        assert_eq!(recorder.events.len(), 1);
+        assert!(recorder.events.contains_key(&0));
+
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 1);
+
+        let packet = &packets[0];
+        assert!(packet.has_ftrace_events());
+        let events = &packet.ftrace_events().event;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sched_wakeup_new().comm(), "next");
+        assert_eq!(events[0].sched_wakeup_new().pid(), 1234);
+    }
+
+    #[test]
+    fn test_irq_handler_events() {
+        let mut recorder = SchedEventRecorder::default();
+        let next_comm = CStr::from_bytes_with_nul(b"irq_handler\0").unwrap();
+
+        let mut event = task_event {
+            r#type: event_type::SCHED_IRQ_ENTER,
+            ts: 1000,
+            target_cpu: 0,
+            next_prio: 5,
+            next: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        copy_to_comm(&mut event.next.comm, &next_comm);
+        recorder.handle_event(event);
+
+        assert_eq!(recorder.compact_sched.len(), 0);
+        assert_eq!(recorder.events.len(), 1);
+        assert!(recorder.events.contains_key(&0));
+
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 1);
+
+        let packet = &packets[0];
+        assert!(packet.has_ftrace_events());
+        let events = &packet.ftrace_events().event;
+        assert_eq!(events.len(), 1);
+        assert!(events[0].has_irq_handler_entry());
+        assert_eq!(events[0].irq_handler_entry().name(), "irq_handler");
+    }
+
+    #[test]
+    fn test_irq_exit_handler_events() {
+        let mut recorder = SchedEventRecorder::default();
+        let next_comm = CStr::from_bytes_with_nul(b"irq_handler\0").unwrap();
+
+        let mut event = task_event {
+            r#type: event_type::SCHED_IRQ_EXIT,
+            ts: 1000,
+            target_cpu: 0,
+            next_prio: 5,
+            next: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        copy_to_comm(&mut event.next.comm, &next_comm);
+        recorder.handle_event(event);
+
+        assert_eq!(recorder.compact_sched.len(), 0);
+        assert_eq!(recorder.events.len(), 1);
+        assert!(recorder.events.contains_key(&0));
+
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 1);
+
+        let packet = &packets[0];
+        assert!(packet.has_ftrace_events());
+        let events = &packet.ftrace_events().event;
+        assert_eq!(events.len(), 1);
+        assert!(events[0].has_irq_handler_exit());
+    }
+
+    #[test]
+    fn test_softirq_events() {
+        let mut recorder = SchedEventRecorder::default();
+
+        let event = task_event {
+            r#type: event_type::SCHED_SOFTIRQ_ENTER,
+            ts: 1000,
+            target_cpu: 0,
+            next_prio: 5,
+            ..Default::default()
+        };
+        recorder.handle_event(event);
+
+        assert_eq!(recorder.compact_sched.len(), 0);
+        assert_eq!(recorder.events.len(), 1);
+        assert!(recorder.events.contains_key(&0));
+
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 1);
+
+        let packet = &packets[0];
+        assert!(packet.has_ftrace_events());
+        let events = &packet.ftrace_events().event;
+        assert_eq!(events.len(), 1);
+        assert!(events[0].has_softirq_entry());
+    }
+
+    #[test]
+    fn test_softirq_exit_events() {
+        let mut recorder = SchedEventRecorder::default();
+
+        let event = task_event {
+            r#type: event_type::SCHED_SOFTIRQ_EXIT,
+            ts: 1000,
+            target_cpu: 0,
+            next_prio: 5,
+            ..Default::default()
+        };
+        recorder.handle_event(event);
+
+        assert_eq!(recorder.compact_sched.len(), 0);
+        assert_eq!(recorder.events.len(), 1);
+        assert!(recorder.events.contains_key(&0));
+
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 1);
+
+        let packet = &packets[0];
+        assert!(packet.has_ftrace_events());
+        let events = &packet.ftrace_events().event;
+        assert_eq!(events.len(), 1);
+        assert!(events[0].has_softirq_exit());
+    }
+
+    #[test]
+    fn test_process_exit_event() {
+        let mut recorder = SchedEventRecorder::default();
+        let prev_comm = CStr::from_bytes_with_nul(b"prev\0").unwrap();
+
+        let mut event = task_event {
+            r#type: event_type::SCHED_PROCESS_EXIT,
+            ts: 1000,
+            prev: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
+            prev_prio: 10,
+            ..Default::default()
+        };
+        copy_to_comm(&mut event.prev.comm, &prev_comm);
+        recorder.handle_event(event);
+
+        assert_eq!(recorder.compact_sched.len(), 0);
+        assert_eq!(recorder.events.len(), 1);
+        assert!(recorder.events.contains_key(&0));
+
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 1);
+
+        let packet = &packets[0];
+        assert!(packet.has_ftrace_events());
+        let events = &packet.ftrace_events().event;
+        assert_eq!(events.len(), 1);
+        assert!(events[0].has_sched_process_exit());
+        assert_eq!(events[0].sched_process_exit().comm(), "prev");
+    }
+
+    #[test]
+    fn test_runqueue_size_tracking() {
+        let mut recorder = SchedEventRecorder::default();
+        recorder.set_cpu_sched_stats(true);
+
+        let event = task_event {
+            r#type: event_type::SCHED_WAKEUP,
+            ts: 1000,
+            target_cpu: 0,
+            next: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
+            next_prio: 10,
+            ..Default::default()
+        };
+        recorder.handle_event(event);
+
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 2);
+        assert!(packets[0].has_track_descriptor());
+    }
+
+    #[test]
+    fn test_process_latency_tracking() {
+        let mut recorder = SchedEventRecorder::default();
+        recorder.set_process_sched_stats(true);
+
+        let event = task_event {
+            r#type: event_type::SCHED_SWITCH,
+            ts: 1000,
+            cpu: 0,
+            next: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
+            prev: task_info {
+                tgidpid: 5678,
+                ..Default::default()
+            },
+            latency: 500,
+            next_prio: 10,
+            prev_state: 0,
+            ..Default::default()
+        };
+        recorder.handle_event(event);
+
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 5);
+        assert!(packets[0].has_ftrace_events());
+        assert!(packets[1].has_track_descriptor());
+        assert_eq!(packets[2].track_event().counter_value(), 500);
+        assert!(packets[3].has_track_descriptor());
+        assert_eq!(packets[4].track_event().counter_value(), 500);
     }
 }
