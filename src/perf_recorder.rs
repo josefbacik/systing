@@ -98,3 +98,33 @@ impl PerfCounterRecorder {
         packets
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_perf_counter_recorder() {
+        let mut recorder = PerfCounterRecorder::default();
+        recorder.perf_counters.push("test_counter".to_string());
+
+        let event = PerfCounterEvent {
+            cpu: 0,
+            index: 0,
+            ts: 123456789,
+            value: 42,
+        };
+
+        recorder.handle_event(event);
+        assert_eq!(recorder.perf_events.len(), 1);
+
+        let packets = recorder.generate_trace(&mut Arc::new(AtomicUsize::new(0)));
+        assert!(!packets.is_empty());
+        assert_eq!(packets[0].track_descriptor().name(), "test_counter_0");
+        assert_eq!(packets[0].track_descriptor().counter.unit(), Unit::UNIT_COUNT);
+        assert_eq!(packets[0].track_descriptor().counter.is_incremental(), false);
+        assert_eq!(packets[1].track_event().track_uuid(), packets[0].track_descriptor().uuid());
+        assert_eq!(packets[1].timestamp(), 123456789);
+        assert_eq!(packets[1].track_event().counter_value(), 42);
+    }
+}
