@@ -23,6 +23,7 @@ pub struct PerfHwEvent {
     pub cpus: Vec<u32>,
 }
 
+#[derive(Debug, Default)]
 pub struct PerfCounters {
     events: HashMap<String, Vec<PerfHwEvent>>,
 }
@@ -483,12 +484,6 @@ fn visit_dirs(dir: &Path, counters: &mut PerfCounters, toplevel: bool) -> Result
 }
 
 impl PerfCounters {
-    pub fn new() -> Self {
-        PerfCounters {
-            events: HashMap::new(),
-        }
-    }
-
     pub fn discover(&mut self) -> Result<()> {
         if !self.events.is_empty() {
             return Ok(());

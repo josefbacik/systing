@@ -1147,7 +1147,7 @@ fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
 fn system(opts: Command) -> Result<()> {
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
-    let mut counters = PerfCounters::new();
+    let mut counters = PerfCounters::default();
     let (stop_tx, stop_rx) = channel();
 
     if !opts.perf_counter.is_empty() {
