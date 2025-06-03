@@ -394,10 +394,10 @@ fn visit_events(dir: &Path, events: &mut Vec<PerfHwEvent>) -> Result<()> {
         None => false,
     };
 
+    let event_re = Regex::new(r"event=0x([0-9a-fA-F]+)").unwrap();
+    let umask_re = Regex::new(r"umask=0x([0-9a-fA-F]+)").unwrap();
     for path in entries {
         let buf = fs::read_to_string(&path)?;
-        let event_re = Regex::new(r"event=0x([0-9a-fA-F]+)").unwrap();
-        let umask_re = Regex::new(r"umask=0x([0-9a-fA-F]+)").unwrap();
         let event = event_re.captures(&buf);
         let umask = umask_re.captures(&buf);
         let mut hwevent = PerfHwEvent::default();
@@ -473,10 +473,7 @@ fn visit_dirs(dir: &Path, counters: &mut PerfCounters, toplevel: bool) -> Result
         for mut event in events {
             event.event_type = event_type;
             event.cpus = cpus.clone();
-            let entry = counters
-                .events
-                .entry(event.name.clone())
-                .or_default();
+            let entry = counters.events.entry(event.name.clone()).or_default();
             entry.push(event);
         }
     }
