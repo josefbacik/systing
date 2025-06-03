@@ -470,10 +470,7 @@ impl SystingProbeRecorder {
 
         // If this is a start event record the ts and continue
         if self.start_triggers.contains(&event.cookie) {
-            let entry = self
-                .outstanding_triggers
-                .entry(event.tgidpid)
-                .or_insert_with(HashMap::new);
+            let entry = self.outstanding_triggers.entry(event.tgidpid).or_default();
             entry.insert(event.cookie, event.ts);
             return false;
         }
@@ -511,12 +508,9 @@ impl SystingProbeRecorder {
 
         // If this is an instant event just add it to the list of events
         if self.instant_events.contains_key(&systing_event.name) {
-            let entry = self
-                .events
-                .entry(event.tgidpid)
-                .or_insert_with(HashMap::new);
+            let entry = self.events.entry(event.tgidpid).or_default();
             let instant_track = self.instant_events.get(&systing_event.name).unwrap();
-            let entry = entry.entry(instant_track.clone()).or_insert_with(Vec::new);
+            let entry = entry.entry(instant_track.clone()).or_default();
             entry.push(TrackInstant {
                 ts: event.ts,
                 name: format!("{}{}", systing_event, event.extra),
@@ -531,11 +525,8 @@ impl SystingProbeRecorder {
                 if let Some(mut range) = ranges.remove(range_name) {
                     let track_name = self.ranges.get(range_name).unwrap().clone();
                     range.end = event.ts;
-                    let track_hash = self
-                        .recorded_ranges
-                        .entry(event.tgidpid)
-                        .or_insert_with(HashMap::new);
-                    let entry = track_hash.entry(track_name).or_insert_with(Vec::new);
+                    let track_hash = self.recorded_ranges.entry(event.tgidpid).or_default();
+                    let entry = track_hash.entry(track_name).or_default();
                     entry.push(range);
                 }
             }
@@ -661,7 +652,7 @@ impl SystingProbeRecorder {
         let mut systing_event = SystingEvent {
             key_index: u8::MAX,
             cookie: rng.next_u64(),
-            .. Default::default()
+            ..Default::default()
         };
         match parts[0] {
             "usdt" => {
