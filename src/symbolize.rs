@@ -1,19 +1,9 @@
-use std::collections::HashMap;
-
-use anyhow::Error;
-use blazesym::symbolize::source::{Kernel, Process, Source};
-use blazesym::symbolize::{CodeInfo, Input, Sym, Symbolized, Symbolizer};
-use blazesym::{Addr, Pid};
+use blazesym::symbolize::{CodeInfo, Sym, Symbolized};
+use blazesym::Addr;
 
 const ADDR_WIDTH: usize = 16;
 pub const KERNEL_THREAD_STACK_STUB: u64 = 1234;
 pub const PREEMPT_EVENT_STACK_STUB: u64 = 5678;
-
-pub struct SymbolizerCache<'a> {
-    symbolizer: Symbolizer,
-    kernel_src: Source<'a>,
-    src_cache: HashMap<u32, Source<'a>>,
-}
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Stack {
@@ -94,85 +84,6 @@ where
         }
     }
     ret
-}
-
-impl Default for SymbolizerCache<'_> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<'a> SymbolizerCache<'a> {
-    pub fn new() -> Self {
-        SymbolizerCache {
-            symbolizer: Symbolizer::new(),
-            kernel_src: Source::Kernel(Kernel::default()),
-            src_cache: HashMap::new(),
-        }
-    }
-
-    pub fn symbolize_user_stack(
-        &mut self,
-        pid: u32,
-        stack: &Stack,
-    ) -> Result<Vec<Symbolized>, blazesym::Error> {
-        let user_src = self
-            .src_cache
-            .entry(pid)
-            .or_insert(Source::Process(Process::new(Pid::from(pid))));
-
-        let user_stack = &stack.user_stack;
-        self.symbolizer
-            .symbolize(user_src, Input::AbsAddr(user_stack))
-    }
-
-    pub fn symbolize_kernel_stack(
-        &mut self,
-        stack: &Stack,
-    ) -> Result<Vec<Symbolized>, blazesym::Error> {
-        let kernel_stack = &stack.kernel_stack;
-        self.symbolizer
-            .symbolize(&self.kernel_src, Input::AbsAddr(kernel_stack))
-    }
-
-    pub fn symbolize_stack(&mut self, pid: u32, stack: &Stack) -> Result<Vec<String>, Error> {
-        let user_stack = &stack.user_stack;
-        let kernel_stack = &stack.kernel_stack;
-
-        if !user_stack.is_empty() && user_stack[0] == PREEMPT_EVENT_STACK_STUB {
-            return Ok(vec!["preempt".to_string()]);
-        }
-
-        let mut symbols = Vec::<String>::new();
-        let mut saved_error = Ok(());
-        if !user_stack.is_empty() {
-            match self.symbolize_user_stack(pid, stack) {
-                Ok(syms) => {
-                    symbols.extend(print_symbols(user_stack.iter().copied().zip(syms)));
-                }
-                Err(e) => {
-                    saved_error = Err(e);
-                }
-            }
-        }
-
-        match self.symbolize_kernel_stack(stack) {
-            Ok(syms) => {
-                symbols.extend(print_symbols(kernel_stack.iter().copied().zip(syms)));
-            }
-            Err(e) => {
-                saved_error = Err(e);
-            }
-        }
-        if symbols.is_empty() {
-            match saved_error {
-                Ok(_) => Ok(vec!["<no symbols>".to_string()]),
-                Err(e) => Err(e.into()),
-            }
-        } else {
-            Ok(symbols)
-        }
-    }
 }
 
 impl Stack {
