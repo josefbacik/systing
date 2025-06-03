@@ -462,7 +462,7 @@ impl SystingProbeRecorder {
         if self.instant_triggers.contains(&event.cookie) {
             println!(
                 "Instant event triggered on TGID {} PID {}",
-                event.tgidpid >> 32 as u32,
+                event.tgidpid >> 32_u32,
                 event.tgidpid as u32
             );
             return true;
@@ -492,7 +492,7 @@ impl SystingProbeRecorder {
                 if start + threshold <= end {
                     println!(
                         "Threshold exceeded on TGID {} PID {}",
-                        event.tgidpid >> 32 as u32,
+                        event.tgidpid >> 32_u32,
                         event.tgidpid as u32
                     );
                     return true;
