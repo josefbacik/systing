@@ -1228,7 +1228,7 @@ fn system(opts: Command) -> Result<()> {
                 .expect("'rodata' is not mmap'ed, your kernel is too old");
 
             rodata.tool_config.num_cpus = num_cpus;
-            rodata.tool_config.my_tgid = process::id() as u32;
+            rodata.tool_config.my_tgid = process::id();
             rodata.tool_config.no_cpu_stack_traces = opts.no_cpu_stack_traces as u32;
             rodata.tool_config.no_sleep_stack_traces = opts.no_sleep_stack_traces as u32;
             if !opts.cgroup.is_empty() {
