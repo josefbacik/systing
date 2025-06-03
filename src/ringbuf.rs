@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 #[derive(Default)]
 pub struct RingBuffer<T> {
     buffer: VecDeque<VecDeque<T>>,
+    start_set: bool,
     start_ts: u64,
     max_duration: u64,
 }
@@ -40,11 +41,12 @@ impl<T> RingBuffer<T> {
         // we don't want to have to think about this right now so fuck it, let it ride until we hit
         // a machine where this ends up not being true and then we can do things like TS adjustment
         // when we bounc CPUs.)
-        if self.start_ts == 0 || cur_ts < self.start_ts {
+        if !self.start_set || cur_ts < self.start_ts {
+            self.start_set = true;
             self.start_ts = cur_ts;
         }
         let cur_duration = cur_ts - self.start_ts;
-        if cur_duration > self.max_duration {
+        if cur_duration >= self.max_duration {
             self.rotate();
             self.start_ts = cur_ts;
         }
@@ -80,5 +82,47 @@ impl<T> RingBuffer<T> {
 
     pub fn max_duration(&self) -> u64 {
         self.max_duration
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+            || (self.buffer.len() == 1 && self.buffer.front().unwrap().is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct TestEvent {
+        ts: u64,
+    }
+
+    impl SystingEventTS for TestEvent {
+        fn ts(&self) -> u64 {
+            self.ts
+        }
+    }
+
+    impl TestEvent {
+        fn new(ts: u64) -> Self {
+            Self { ts }
+        }
+    }
+
+    #[test]
+    fn test_ringbuf() {
+        let mut rb = RingBuffer::<TestEvent>::default();
+        rb.set_max_duration(500);
+
+        for i in 0..20 {
+            rb.push_front(TestEvent::new(i * 100));
+        }
+
+        for i in 10..20 {
+            assert_eq!(rb.pop_back().unwrap().ts(), i * 100);
+        }
+        assert!(rb.is_empty());
     }
 }
