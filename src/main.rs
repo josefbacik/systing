@@ -94,7 +94,7 @@ struct Command {
     no_sleep_stack_traces: bool,
     #[arg(long)]
     trace_event_config: Vec<String>,
-    #[arg(long)]
+    #[arg(long, default_value = "0")]
     continuous: u64,
 }
 
