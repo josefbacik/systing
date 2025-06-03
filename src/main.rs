@@ -1025,7 +1025,7 @@ impl SessionRecorder {
         packets.push(packet);
 
         // Ppopulate all the process tracks
-        for (_, process) in self.processes.read().unwrap().iter() {
+        for process in self.processes.read().unwrap().values() {
             let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             pid_uuids.insert(process.pid(), uuid);
 
@@ -1038,7 +1038,7 @@ impl SessionRecorder {
             packets.push(packet);
         }
 
-        for (_, thread) in self.threads.read().unwrap().iter() {
+        for thread in self.threads.read().unwrap().values() {
             let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             thread_uuids.insert(thread.tid(), uuid);
 
@@ -1270,7 +1270,7 @@ fn system(opts: Command) -> Result<()> {
             }
 
             if opts.trace_event_pid.is_empty() {
-                for (_, event) in &probe_recorder.config_events {
+                for event in probe_recorder.config_events.values() {
                     match event.event {
                         EventProbe::Usdt(_) => {
                             Err(anyhow::anyhow!(
@@ -1561,7 +1561,7 @@ fn system(opts: Command) -> Result<()> {
         let mut probe_links = Vec::new();
         {
             let probe_recorder = recorder.probe_recorder.lock().unwrap();
-            for (_, event) in &probe_recorder.config_events {
+            for event in probe_recorder.config_events.values() {
                 match &event.event {
                     EventProbe::Usdt(usdt) => {
                         for pid in opts.trace_event_pid.iter() {
