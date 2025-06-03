@@ -892,7 +892,7 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
                 if !arg_str.is_err() {
                     let arg_str = arg_str.unwrap();
                     let bytes = arg_str.to_bytes();
-                    if bytes.len() > 0 && !bytes.starts_with(&[0]) {
+                    if !bytes.is_empty() && !bytes.starts_with(&[0]) {
                         extra = format!(":{}", arg_str.to_string_lossy());
                     }
                 }
@@ -1157,7 +1157,7 @@ fn system(opts: Command) -> Result<()> {
     let mut counters = PerfCounters::new();
     let (stop_tx, stop_rx) = channel();
 
-    if opts.perf_counter.len() > 0 {
+    if !opts.perf_counter.is_empty() {
         counters.discover()?;
 
         // We can do things like topdown* to get all of the topdown counters, so we have to loop
@@ -1231,13 +1231,13 @@ fn system(opts: Command) -> Result<()> {
             rodata.tool_config.my_tgid = process::id() as u32;
             rodata.tool_config.no_cpu_stack_traces = opts.no_cpu_stack_traces as u32;
             rodata.tool_config.no_sleep_stack_traces = opts.no_sleep_stack_traces as u32;
-            if opts.cgroup.len() > 0 {
+            if !opts.cgroup.is_empty() {
                 rodata.tool_config.filter_cgroup = 1;
             }
             if opts.no_stack_traces {
                 rodata.tool_config.no_stack_traces = 1;
             }
-            if opts.pid.len() > 0 {
+            if !opts.pid.is_empty() {
                 rodata.tool_config.filter_pid = 1;
             }
         }
@@ -1269,7 +1269,7 @@ fn system(opts: Command) -> Result<()> {
                 probe_recorder.load_config(config, &mut rng)?;
             }
 
-            if opts.trace_event_pid.len() == 0 {
+            if opts.trace_event_pid.is_empty() {
                 for (_, event) in &probe_recorder.config_events {
                     match event.event {
                         EventProbe::Usdt(_) => {
@@ -1355,7 +1355,7 @@ fn system(opts: Command) -> Result<()> {
                 let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
                 rings.push((name.to_string(), ring));
             } else if name.starts_with("ringbuf_perf_counter") {
-                if perf_counter_names.len() > 0 {
+                if !perf_counter_names.is_empty() {
                     let ring = create_ring::<perf_counter_event>(&map, cache_tx.clone())?;
                     rings.push((name.to_string(), ring));
                 }
@@ -1456,7 +1456,7 @@ fn system(opts: Command) -> Result<()> {
                     0
                 })?,
         );
-        if perf_counter_names.len() > 0 {
+        if !perf_counter_names.is_empty() {
             let session_recorder = recorder.clone();
             let my_stop_tx = stop_tx.clone();
             recv_threads.push(
