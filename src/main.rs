@@ -34,7 +34,6 @@ use blazesym::symbolize::{cache, Input, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{MapCore, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts};
-use libc;
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
 use perfetto_protos::clock_snapshot::ClockSnapshot;

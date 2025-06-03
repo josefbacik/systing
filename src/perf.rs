@@ -8,7 +8,6 @@ use std::path::Path;
 use anyhow::Result;
 use bitfield::bitfield;
 use libbpf_rs;
-use libc;
 use nix::errno::Errno;
 use nix::ioctl_none;
 use regex::Regex;
