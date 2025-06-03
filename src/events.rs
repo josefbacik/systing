@@ -358,8 +358,10 @@ impl KProbeEvent {
                 parts.join(":")
             ));
         }
-        let mut probe = KProbeEvent::default();
-        probe.retprobe = parts[0] == "kretprobe";
+        let mut probe = KProbeEvent {
+            retprobe: parts[0] == "kretprobe",
+            ..Default::default()
+        };
 
         match parts[1].parse::<u64>() {
             Ok(val) => {
