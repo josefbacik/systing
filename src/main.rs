@@ -393,7 +393,7 @@ fn generate_stack_packets(
                 .iter()
                 .chain(stack.kernel_stack.iter())
                 .flat_map(|addr| {
-                    let frame_vec = frame_map.get(&addr).unwrap();
+                    let frame_vec = frame_map.get(addr).unwrap();
                     frame_vec
                         .iter()
                         .map(|frame| frame.frame.iid())
