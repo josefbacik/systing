@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::perfetto::TrackCounter;
 use crate::ringbuf::RingBuffer;
-use crate::SystingEventTS;
+use crate::systing::types::perf_counter_event;
 
 use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
@@ -18,46 +18,32 @@ struct PerfCounterKey {
 }
 
 #[derive(Default)]
-pub struct PerfCounterEvent {
-    pub cpu: u32,
-    pub index: usize,
-    pub ts: u64,
-    pub value: i64,
-}
-
-#[derive(Default)]
 pub struct PerfCounterRecorder {
-    pub ringbuf: RingBuffer<PerfCounterEvent>,
+    pub ringbuf: RingBuffer<perf_counter_event>,
     pub perf_counters: Vec<String>,
     perf_events: HashMap<PerfCounterKey, Vec<TrackCounter>>,
 }
 
-impl From<&PerfCounterEvent> for TrackCounter {
-    fn from(event: &PerfCounterEvent) -> Self {
+impl From<&perf_counter_event> for TrackCounter {
+    fn from(event: &perf_counter_event) -> Self {
         TrackCounter {
             ts: event.ts,
-            count: event.value,
+            count: event.value.counter as i64,
         }
     }
 }
 
-impl From<&PerfCounterEvent> for PerfCounterKey {
-    fn from(event: &PerfCounterEvent) -> Self {
+impl From<&perf_counter_event> for PerfCounterKey {
+    fn from(event: &perf_counter_event) -> Self {
         PerfCounterKey {
             cpu: event.cpu,
-            index: event.index,
+            index: event.counter_num as usize,
         }
-    }
-}
-
-impl SystingEventTS for PerfCounterEvent {
-    fn ts(&self) -> u64 {
-        self.ts
     }
 }
 
 impl PerfCounterRecorder {
-    pub fn handle_event(&mut self, event: PerfCounterEvent) {
+    pub fn handle_event(&mut self, event: perf_counter_event) {
         let key = PerfCounterKey::from(&event);
         let entry = self.perf_events.entry(key).or_default();
         entry.push(TrackCounter::from(&event));
@@ -108,11 +94,15 @@ mod tests {
         let mut recorder = PerfCounterRecorder::default();
         recorder.perf_counters.push("test_counter".to_string());
 
-        let event = PerfCounterEvent {
+        let event = perf_counter_event {
             cpu: 0,
-            index: 0,
+            counter_num: 0,
             ts: 123456789,
-            value: 42,
+            value: crate::systing::types::bpf_perf_event_value {
+                counter: 42,
+                ..Default::default()
+            },
+            ..Default::default()
         };
 
         recorder.handle_event(event);
@@ -121,9 +111,18 @@ mod tests {
         let packets = recorder.generate_trace(&mut Arc::new(AtomicUsize::new(0)));
         assert!(!packets.is_empty());
         assert_eq!(packets[0].track_descriptor().name(), "test_counter_0");
-        assert_eq!(packets[0].track_descriptor().counter.unit(), Unit::UNIT_COUNT);
-        assert_eq!(packets[0].track_descriptor().counter.is_incremental(), false);
-        assert_eq!(packets[1].track_event().track_uuid(), packets[0].track_descriptor().uuid());
+        assert_eq!(
+            packets[0].track_descriptor().counter.unit(),
+            Unit::UNIT_COUNT
+        );
+        assert_eq!(
+            packets[0].track_descriptor().counter.is_incremental(),
+            false
+        );
+        assert_eq!(
+            packets[1].track_event().track_uuid(),
+            packets[0].track_descriptor().uuid()
+        );
         assert_eq!(packets[1].timestamp(), 123456789);
         assert_eq!(packets[1].track_event().counter_value(), 42);
     }

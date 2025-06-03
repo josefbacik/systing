@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use crate::events::{EventProbe, SystingProbeEvent, SystingProbeRecorder};
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
-use crate::perf_recorder::{PerfCounterEvent, PerfCounterRecorder};
+use crate::perf_recorder::PerfCounterRecorder;
 use crate::perfetto::TrackCounter;
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
@@ -156,17 +156,6 @@ impl SystingEventTS for probe_event {
 impl SystingEventTS for SysInfoEvent {
     fn ts(&self) -> u64 {
         self.ts
-    }
-}
-
-impl From<&perf_counter_event> for PerfCounterEvent {
-    fn from(event: &perf_counter_event) -> Self {
-        PerfCounterEvent {
-            cpu: event.cpu,
-            index: event.counter_num as usize,
-            value: event.value.counter as i64,
-            ts: event.ts,
-        }
     }
 }
 
@@ -519,7 +508,6 @@ impl StackRecorder {
 
 impl SystingRecordEvent<perf_counter_event> for PerfCounterRecorder {
     fn record_event(&mut self, event: perf_counter_event) -> bool {
-        let event = PerfCounterEvent::from(&event);
         if self.ringbuf.max_duration() == 0 {
             // If the ring buffer is not enabled, we just handle the event directly.
             self.handle_event(event);
