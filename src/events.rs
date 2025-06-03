@@ -327,7 +327,7 @@ impl UProbeEvent {
 impl fmt::Display for UProbeEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = if self.retprobe { "uretprobe" } else { "uprobe" };
-        if self.func_name != "" {
+        if !self.func_name.is_empty() {
             if self.offset != 0 {
                 write!(f, "{}:{}+0x{:x}", name, self.func_name, self.offset,)
             } else {
