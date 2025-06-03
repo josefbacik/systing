@@ -385,7 +385,7 @@ impl KProbeEvent {
 impl fmt::Display for KProbeEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = if self.retprobe { "kretprobe" } else { "kprobe" };
-        if self.func_name != "" {
+        if !self.func_name.is_empty() {
             if self.offset != 0 {
                 write!(f, "{}:{}+0x{:x}", name, self.func_name, self.offset,)
             } else {
