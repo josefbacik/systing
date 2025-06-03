@@ -476,7 +476,7 @@ fn visit_dirs(dir: &Path, counters: &mut PerfCounters, toplevel: bool) -> Result
             let entry = counters
                 .events
                 .entry(event.name.clone())
-                .or_insert(Vec::new());
+                .or_default();
             entry.push(event);
         }
     }
