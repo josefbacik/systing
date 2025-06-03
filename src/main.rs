@@ -1692,6 +1692,7 @@ fn system(opts: Command) -> Result<()> {
         }
 
         if opts.duration > 0 {
+            println!("Tracing for {} seconds", opts.duration);
             thread::sleep(Duration::from_secs(opts.duration));
         } else {
             let my_stop_tx = stop_tx.clone();
