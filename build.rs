@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use libbpf_cargo::SkeletonBuilder;
 
-const SRC: [&'static str; 1] = ["src/bpf/systing_system.bpf.c"];
+const SRC: [&str; 1] = ["src/bpf/systing_system.bpf.c"];
 
 #[cfg(not(feature = "generate-vmlinux-header"))]
 fn generate_vmlinux_header() {}
