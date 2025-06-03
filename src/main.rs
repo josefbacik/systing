@@ -280,7 +280,7 @@ fn add_frame(
 
     frame.set_mapping_id(mapping.iid());
     let frame = LocalFrame { frame, mapping };
-    let frame_vec = frame_map.entry(input_addr).or_insert_with(Vec::new);
+    let frame_vec = frame_map.entry(input_addr).or_default();
     frame_vec.push(frame);
 }
 
@@ -631,11 +631,11 @@ impl EventRecorder {
             let compact_sched = self
                 .compact_sched
                 .entry(event.cpu)
-                .or_insert_with(LocalCompactSched::default);
+                .or_default();
             compact_sched.add_task_event(&event);
         } else if event.r#type != event_type::SCHED_WAKEUP {
             let ftrace_event = FtraceEvent::from(&event);
-            let cpu_event = self.events.entry(event.cpu).or_insert_with(BTreeMap::new);
+            let cpu_event = self.events.entry(event.cpu).or_default();
             cpu_event.insert(event.ts, ftrace_event);
         }
 
@@ -652,7 +652,7 @@ impl EventRecorder {
             } else {
                 event.target_cpu as i32
             };
-            let rq = self.runqueue.entry(cpu).or_insert_with(Vec::new);
+            let rq = self.runqueue.entry(cpu).or_default();
             let count = self.rq_counters.entry(cpu).or_insert(0);
 
             if event.r#type == event_type::SCHED_SWITCH {
@@ -675,11 +675,11 @@ impl EventRecorder {
         if self.process_sched_stats && event.r#type == event_type::SCHED_SWITCH && event.latency > 0
         {
             let cpu = event.cpu;
-            let lat = self.cpu_latencies.entry(cpu).or_insert_with(Vec::new);
+            let lat = self.cpu_latencies.entry(cpu).or_default();
             let plat = self
                 .process_latencies
                 .entry(event.next.tgidpid)
-                .or_insert_with(Vec::new);
+                .or_default();
 
             plat.push(TrackCounter {
                 ts: event.ts,
@@ -827,7 +827,7 @@ impl StackRecorder {
                 ts_start: event.ts,
                 stack: Stack::new(&kstack_vec, &ustack_vec),
             };
-            let stacks = self.stacks.entry(stack_key).or_insert_with(Vec::new);
+            let stacks = self.stacks.entry(stack_key).or_default();
             stacks.push(stack);
         }
     }
@@ -934,7 +934,7 @@ impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
 
 impl SysinfoRecorder {
     fn handle_event(&mut self, event: SysInfoEvent) {
-        let freq = self.frequency.entry(event.cpu).or_insert_with(Vec::new);
+        let freq = self.frequency.entry(event.cpu).or_default();
         freq.push(TrackCounter {
             ts: event.ts,
             count: event.frequency,
