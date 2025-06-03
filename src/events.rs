@@ -335,12 +335,10 @@ impl fmt::Display for UProbeEvent {
             } else {
                 write!(f, "{}:{}", name, self.func_name)
             }
+        } else if self.offset != 0 {
+            write!(f, "{}:0x{:x}", name, self.offset)
         } else {
-            if self.offset != 0 {
-                write!(f, "{}:0x{:x}", name, self.offset)
-            } else {
-                write!(f, "{}", name)
-            }
+            write!(f, "{}", name)
         }
     }
 }
@@ -395,12 +393,10 @@ impl fmt::Display for KProbeEvent {
             } else {
                 write!(f, "{}:{}", name, self.func_name)
             }
+        } else if self.offset != 0 {
+            write!(f, "{}:0x{:x}", name, self.offset)
         } else {
-            if self.offset != 0 {
-                write!(f, "{}:0x{:x}", name, self.offset)
-            } else {
-                write!(f, "{}", name)
-            }
+            write!(f, "{}", name)
         }
     }
 }
