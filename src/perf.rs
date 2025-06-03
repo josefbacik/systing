@@ -388,11 +388,10 @@ fn visit_events(dir: &Path, events: &mut Vec<PerfHwEvent>) -> Result<()> {
     // metrics require a slots fd.
     let need_slots = entries
         .iter()
-        .find(|entry| {
+        .any(|entry| {
             let filename = entry.file_name().unwrap().to_str().unwrap();
             filename == "slots"
-        })
-        .is_some();
+        });
 
     let event_re = Regex::new(r"event=0x([0-9a-fA-F]+)").unwrap();
     let umask_re = Regex::new(r"umask=0x([0-9a-fA-F]+)").unwrap();
