@@ -1326,14 +1326,14 @@ fn system(opts: Command) -> Result<()> {
         for cgroup in opts.cgroup.iter() {
             let metadata = std::fs::metadata(cgroup)?;
             let cgroupid = metadata.ino().to_ne_bytes();
-            let val = (1 as u8).to_ne_bytes();
+            let val = (1_u8).to_ne_bytes();
             skel.maps
                 .cgroups
                 .update(&cgroupid, &val, libbpf_rs::MapFlags::ANY)?;
         }
 
         for pid in opts.pid.iter() {
-            let val = (1 as u8).to_ne_bytes();
+            let val = (1_u8).to_ne_bytes();
             skel.maps
                 .pids
                 .update(&pid.to_ne_bytes(), &val, libbpf_rs::MapFlags::ANY)?;
