@@ -9,6 +9,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Deps.
+        run: ./.github/workflows/install_deps.sh
+
       - name: Clippy Check
         run: cargo clippy -- -D warnings
 
