@@ -800,9 +800,9 @@ impl SystingProbeRecorder {
     }
 
     fn load_config_from_json(&mut self, buf: &str, rng: &mut dyn rand::RngCore) -> Result<()> {
-        let config: SystingJSONTrackConfig = serde_json::from_str(&buf)?;
+        let config: SystingJSONTrackConfig = serde_json::from_str(buf)?;
         for event in config.events.iter() {
-            self.add_event_from_json(&event, rng)?;
+            self.add_event_from_json(event, rng)?;
         }
         if let Some(stop_triggers) = config.stop_triggers {
             self.add_trigger(&stop_triggers)?;
