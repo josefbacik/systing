@@ -1138,15 +1138,12 @@ fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
         .missed_events
         .lookup_percpu(&index, libbpf_rs::MapFlags::ANY);
     let mut missed = 0;
-    match result {
-        Ok(results) => {
-            for val in results.unwrap() {
-                let mut missed_events: u64 = 0;
-                plain::copy_from_bytes(&mut missed_events, &val).unwrap();
-                missed += missed_events;
-            }
+    if let Ok(results) = result {
+        for val in results.unwrap() {
+            let mut missed_events: u64 = 0;
+            plain::copy_from_bytes(&mut missed_events, &val).unwrap();
+            missed += missed_events;
         }
-        _ => {}
     }
     missed
 }
