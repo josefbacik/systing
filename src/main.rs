@@ -1479,7 +1479,7 @@ fn system(opts: Command) -> Result<()> {
             drop(cache_rx);
         }
 
-        let mut clock_files = PerfOpenEvents::new();
+        let mut clock_files = PerfOpenEvents::default();
         clock_files.add_hw_event(PerfHwEvent {
             name: "clock".to_string(),
             event_type: if opts.sw_event {
@@ -1512,7 +1512,7 @@ fn system(opts: Command) -> Result<()> {
             perf_links.push(link);
         }
 
-        let mut slots_files = PerfOpenEvents::new();
+        let mut slots_files = PerfOpenEvents::default();
         if need_slots {
             let slot_hwevents = counters.event("slots");
             if slot_hwevents.is_none() {
@@ -1528,7 +1528,7 @@ fn system(opts: Command) -> Result<()> {
 
         let mut events_files = Vec::new();
         for (index, event_name) in perf_counter_names.iter().enumerate() {
-            let mut event_files = PerfOpenEvents::new();
+            let mut event_files = PerfOpenEvents::default();
             let hwevents = counters.event(event_name).unwrap();
 
             for hwevent in hwevents {

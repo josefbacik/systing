@@ -189,20 +189,13 @@ pub struct PerfEventFile {
     need_disable: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct PerfOpenEvents {
     hwevents: Vec<PerfHwEvent>,
     events: HashMap<u32, PerfEventFile>,
 }
 
 impl PerfOpenEvents {
-    pub fn new() -> Self {
-        PerfOpenEvents {
-            hwevents: Vec::new(),
-            events: HashMap::new(),
-        }
-    }
-
     pub fn get(&self, cpu: u32) -> Option<&PerfEventFile> {
         self.events.get(&cpu)
     }
