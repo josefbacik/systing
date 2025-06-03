@@ -323,7 +323,7 @@ fn stack_to_frames_mapping<'a, I>(
                 }
             }
             _ => {
-                let name = format!("<unknown>");
+                let name = "<unknown>".to_string();
                 add_frame(
                     frame_map,
                     func_map,
