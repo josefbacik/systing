@@ -500,8 +500,8 @@ impl PerfCounters {
 
     pub fn event(&self, name: &str) -> Option<Vec<PerfHwEvent>> {
         let result = self.events.get(name);
-        if result.is_some() {
-            return Some(result.unwrap().clone());
+        if let Some(result) = result {
+            return Some(result.clone());
         }
 
         if !name.contains("*") {
