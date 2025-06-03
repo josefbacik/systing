@@ -333,10 +333,10 @@ impl PerfEventFile {
         match ret {
             Ok(_) => {
                 self.need_disable = true;
-                return Ok(());
+                Ok(())
             }
             Err(e) => {
-                return Err(e.into());
+                Err(e.into())
             }
         }
     }
