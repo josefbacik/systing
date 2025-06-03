@@ -176,7 +176,7 @@ impl<'a> SymbolizerCache<'a> {
 }
 
 impl Stack {
-    pub fn new(kernel_stack: &Vec<u64>, user_stack: &Vec<u64>) -> Self {
+    pub fn new(kernel_stack: &[u64], user_stack: &[u64]) -> Self {
         let first_kernel_element = if kernel_stack.is_empty() {
             0
         } else {
