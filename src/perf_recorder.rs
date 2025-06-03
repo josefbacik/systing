@@ -59,7 +59,7 @@ impl SystingEventTS for PerfCounterEvent {
 impl PerfCounterRecorder {
     pub fn handle_event(&mut self, event: PerfCounterEvent) {
         let key = PerfCounterKey::from(&event);
-        let entry = self.perf_events.entry(key).or_insert_with(Vec::new);
+        let entry = self.perf_events.entry(key).or_default();
         entry.push(TrackCounter::from(&event));
     }
 
