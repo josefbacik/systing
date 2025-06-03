@@ -205,7 +205,7 @@ struct LocalCompactSched {
 }
 
 #[derive(Default)]
-struct EventRecorder {
+struct SchedEventRecorder {
     ringbuf: RingBuffer<task_event>,
     events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
     compact_sched: HashMap<u32, LocalCompactSched>,
@@ -232,7 +232,7 @@ struct SysinfoRecorder {
 #[derive(Default)]
 struct SessionRecorder {
     clock_snapshot: Mutex<ClockSnapshot>,
-    event_recorder: Mutex<EventRecorder>,
+    event_recorder: Mutex<SchedEventRecorder>,
     stack_recorder: Mutex<StackRecorder>,
     perf_counter_recorder: Mutex<PerfCounterRecorder>,
     sysinfo_recorder: Mutex<SysinfoRecorder>,
@@ -608,7 +608,7 @@ impl LocalCompactSched {
     }
 }
 
-impl SystingRecordEvent<task_event> for EventRecorder {
+impl SystingRecordEvent<task_event> for SchedEventRecorder {
     fn record_event(&mut self, event: task_event) -> bool {
         if self.ringbuf.max_duration() == 0 {
             // If the ring buffer is not enabled, we just handle the event directly.
@@ -621,7 +621,7 @@ impl SystingRecordEvent<task_event> for EventRecorder {
     }
 }
 
-impl EventRecorder {
+impl SchedEventRecorder {
     fn handle_event(&mut self, event: task_event) {
         // SCHED_SWITCH and SCHED_WAKING are handled in compact sched events.
         // We skip SCHED_WAKEUP because we're just using that for runqueue tracking.
