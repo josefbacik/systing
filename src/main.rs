@@ -406,27 +406,29 @@ fn generate_stack_packets(
 
     let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
     let mut packet = TracePacket::default();
-    let mut interned_data = InternedData::default();
-    interned_data.callstacks = interned_stacks.values().cloned().collect();
-    interned_data.function_names = func_name_map.values().cloned().collect();
-    interned_data.frames = frame_map
-        .values()
-        .flat_map(|frame_vec| {
-            frame_vec
-                .iter()
-                .map(|frame| frame.frame.clone())
-                .collect::<Vec<Frame>>()
-        })
-        .collect();
-    interned_data.mappings = frame_map
-        .values()
-        .flat_map(|frame_vec| {
-            frame_vec
-                .iter()
-                .map(|frame| frame.mapping.clone())
-                .collect::<Vec<Mapping>>()
-        })
-        .collect();
+    let interned_data = InternedData {
+        callstacks: interned_stacks.values().cloned().collect(),
+        function_names: func_name_map.values().cloned().collect(),
+        frames: frame_map
+            .values()
+            .flat_map(|frame_vec| {
+                frame_vec
+                    .iter()
+                    .map(|frame| frame.frame.clone())
+                    .collect::<Vec<Frame>>()
+            })
+            .collect(),
+        mappings: frame_map
+            .values()
+            .flat_map(|frame_vec| {
+                frame_vec
+                    .iter()
+                    .map(|frame| frame.mapping.clone())
+                    .collect::<Vec<Mapping>>()
+            })
+            .collect(),
+        ..Default::default()
+    };
     packet.interned_data = Some(interned_data).into();
     packet.set_trusted_packet_sequence_id(seq);
     packet.set_sequence_flags(
@@ -625,10 +627,7 @@ impl EventRecorder {
         // SCHED_SWITCH and SCHED_WAKING are handled in compact sched events.
         // We skip SCHED_WAKEUP because we're just using that for runqueue tracking.
         if event.r#type == event_type::SCHED_SWITCH || event.r#type == event_type::SCHED_WAKING {
-            let compact_sched = self
-                .compact_sched
-                .entry(event.cpu)
-                .or_default();
+            let compact_sched = self.compact_sched.entry(event.cpu).or_default();
             compact_sched.add_task_event(&event);
         } else if event.r#type != event_type::SCHED_WAKEUP {
             let ftrace_event = FtraceEvent::from(&event);
