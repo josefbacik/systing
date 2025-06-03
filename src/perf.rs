@@ -400,9 +400,10 @@ fn visit_events(dir: &Path, events: &mut Vec<PerfHwEvent>) -> Result<()> {
         let buf = fs::read_to_string(&path)?;
         let event = event_re.captures(&buf);
         let umask = umask_re.captures(&buf);
-        let mut hwevent = PerfHwEvent::default();
-
-        hwevent.name = path.file_name().unwrap().to_str().unwrap().to_string();
+        let mut hwevent = PerfHwEvent {
+            name: path.file_name().unwrap().to_str().unwrap().to_string(),
+            ..Default::default()
+        };
 
         if event.is_some() {
             let event = event.unwrap();
