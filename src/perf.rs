@@ -208,7 +208,7 @@ impl PerfOpenEvents {
 
     pub fn add_hw_event(&mut self, hwevent: PerfHwEvent) -> Result<(), Error> {
         // Make sure this has CPU's set
-        if hwevent.cpus.len() == 0 {
+        if hwevent.cpus.is_empty() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "No CPUs specified for event",
@@ -237,7 +237,7 @@ impl PerfOpenEvents {
         slots_files: Option<&PerfOpenEvents>,
         freq: u64,
     ) -> Result<(), Error> {
-        if self.events.len() > 0 {
+        if !self.events.is_empty() {
             return Ok(());
         }
         for hwevent in self.hwevents.iter() {
@@ -465,7 +465,7 @@ fn visit_dirs(dir: &Path, counters: &mut PerfCounters, toplevel: bool) -> Result
                 }
             }
         }
-        if cpus.len() == 0 {
+        if cpus.is_empty() {
             let num_cpus = libbpf_rs::num_possible_cpus()?;
             cpus = (0..num_cpus as u32).collect();
         }
@@ -490,7 +490,7 @@ impl PerfCounters {
     }
 
     pub fn discover(&mut self) -> Result<()> {
-        if self.events.len() > 0 {
+        if !self.events.is_empty() {
             return Ok(());
         }
         let path = Path::new("/sys/bus/event_source/devices");
@@ -521,7 +521,7 @@ impl PerfCounters {
                 result.extend(value.iter().cloned());
             }
         }
-        if result.len() > 0 {
+        if !result.is_empty() {
             return Some(result);
         }
         None
