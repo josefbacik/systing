@@ -299,9 +299,11 @@ impl UProbeEvent {
                 parts.join(":")
             ));
         }
-        let mut probe = UProbeEvent::default();
-        probe.path = parts[1].to_string();
-        probe.retprobe = parts[0] == "uretprobe";
+        let mut probe = UProbeEvent {
+            path: parts[1].to_string(),
+            retprobe: parts[0] == "uretprobe",
+            ..Default::default()
+        };
 
         match parts[2].parse::<u64>() {
             Ok(val) => {
