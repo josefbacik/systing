@@ -392,14 +392,13 @@ fn generate_stack_packets(
                 .user_stack
                 .iter()
                 .chain(stack.kernel_stack.iter())
-                .map(|addr| {
+                .flat_map(|addr| {
                     let frame_vec = frame_map.get(&addr).unwrap();
                     frame_vec
                         .iter()
                         .map(|frame| frame.frame.iid())
                         .collect::<Vec<u64>>()
                 })
-                .flatten()
                 .collect();
             (stack, callstack)
         })
@@ -412,23 +411,21 @@ fn generate_stack_packets(
     interned_data.function_names = func_name_map.values().cloned().collect();
     interned_data.frames = frame_map
         .values()
-        .map(|frame_vec| {
+        .flat_map(|frame_vec| {
             frame_vec
                 .iter()
                 .map(|frame| frame.frame.clone())
                 .collect::<Vec<Frame>>()
         })
-        .flatten()
         .collect();
     interned_data.mappings = frame_map
         .values()
-        .map(|frame_vec| {
+        .flat_map(|frame_vec| {
             frame_vec
                 .iter()
                 .map(|frame| frame.mapping.clone())
                 .collect::<Vec<Mapping>>()
         })
-        .flatten()
         .collect();
     packet.interned_data = Some(interned_data).into();
     packet.set_trusted_packet_sequence_id(seq);
