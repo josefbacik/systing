@@ -1348,9 +1348,8 @@ fn system(opts: Command) -> Result<()> {
             println!("Tracing for {} seconds", opts.duration);
             thread::sleep(Duration::from_secs(opts.duration));
         } else {
-            let my_stop_tx = stop_tx.clone();
             ctrlc::set_handler(move || {
-                my_stop_tx
+                stop_tx
                     .send(())
                     .expect("Could not send signal on channel.")
             })
@@ -1362,7 +1361,6 @@ fn system(opts: Command) -> Result<()> {
                 println!("Tracing indefinitely...");
                 println!("Press Ctrl-C to stop");
             }
-            drop(stop_tx);
             stop_rx
                 .recv()
                 .expect("Could not receive signal on channel.");
