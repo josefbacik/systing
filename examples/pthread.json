@@ -2,21 +2,15 @@
   "events": [
     {
       "name": "mutex_entry",
-      "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_entry",
-      "key_index": 0,
-      "key_type": "long"
+      "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_entry"
     },
     {
       "name": "mutex_acquired",
-      "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_acquired",
-      "key_index": 0,
-      "key_type": "long"
+      "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_acquired"
     },
     {
       "name": "mutex_release",
-      "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_release",
-      "key_index": 0,
-      "key_type": "long"
+      "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_release"
     },
     {
       "name": "pthread_cond_wait",

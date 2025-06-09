@@ -174,14 +174,19 @@ pub enum EventKeyType {
     Long,
 }
 
+#[derive(Clone, Default)]
+pub struct EventKey {
+    pub key_index: u8,
+    pub key_type: EventKeyType,
+}
+
 // Any configured event is turned into this object
 #[derive(Clone, Default)]
 pub struct SystingEvent {
     pub name: String,
     pub cookie: u64,
     pub event: EventProbe,
-    pub key_index: u8,
-    pub key_type: EventKeyType,
+    pub keys: Vec<EventKey>,
 }
 
 // The JSON config file format is
@@ -190,9 +195,16 @@ pub struct SystingEvent {
 //     {
 //       "name": "event_name",
 //       "event": "<PROBE TYPE SPECIFIC FORMAT>",
-//       "key_index": 0,
-//       "key_type": "string"
-//     }
+//       "keys": [
+//         {
+//           "key_index": 0,
+//           "key_type": "string"
+//         },
+//         {
+//           "key_index": 1,
+//           "key_type": "long"
+//         }
+//      ]
 //   ],
 //   "tracks": [
 //     {
@@ -243,8 +255,7 @@ struct SystingJSONTrackConfig {
 struct SystingJSONEvent {
     name: String,
     event: String,
-    key_index: Option<u8>,
-    key_type: Option<String>,
+    keys: Option<Vec<SystingJSONEventKey>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -282,6 +293,13 @@ struct SystingRange {
 #[serde(deny_unknown_fields)]
 struct SystingInstant {
     event: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct SystingJSONEventKey {
+    key_index: u8,
+    key_type: String,
 }
 
 impl UProbeEvent {
@@ -650,7 +668,6 @@ impl SystingProbeRecorder {
     pub fn add_event_from_str(&mut self, event: &str, rng: &mut dyn rand::RngCore) -> Result<()> {
         let parts = event.split(':').collect::<Vec<&str>>();
         let mut systing_event = SystingEvent {
-            key_index: u8::MAX,
             cookie: rng.next_u64(),
             ..Default::default()
         };
@@ -699,18 +716,25 @@ impl SystingProbeRecorder {
         event: &SystingJSONEvent,
         rng: &mut dyn rand::RngCore,
     ) -> Result<()> {
-        let key_type = match event.key_type.as_deref() {
-            Some("string") => EventKeyType::String,
-            Some("long") => EventKeyType::Long,
-            _ => EventKeyType::default(),
-        };
-        let key_index = event.key_index.unwrap_or(u8::MAX);
+        let mut keys = Vec::new();
+        if event.keys.iter().flatten().count() > 1 {
+            return Err(anyhow::anyhow!("Only one key is allowed per event: {}", event.name));
+        }
+        for key in event.keys.iter().flatten() {
+            let key_type = match key.key_type.as_str() {
+                "string" => EventKeyType::String,
+                "long" => EventKeyType::Long,
+                _ => return Err(anyhow::anyhow!("Invalid key type: {}", key.key_type)),
+            };
+            keys.push(EventKey {
+                key_index: key.key_index,
+                key_type,
+            });
+        }
         let parts = event.event.split(':').collect::<Vec<&str>>();
         let event = SystingEvent {
             name: event.name.clone(),
             cookie: rng.next_u64(),
-            key_index,
-            key_type,
             event: match parts[0] {
                 "usdt" => EventProbe::Usdt(UsdtProbeEvent::from_parts(parts)?),
                 "uprobe" | "uretprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
@@ -718,6 +742,7 @@ impl SystingProbeRecorder {
                 "tracepoint" => EventProbe::Tracepoint(TracepointEvent::from_parts(parts)?),
                 _ => return Err(anyhow::anyhow!("Invalid event type")),
             },
+            keys,
         };
         if self.config_events.contains_key(&event.name) {
             return Err(anyhow::anyhow!("Event {} already exists", event.name));
@@ -912,9 +937,7 @@ mod tests {
             "events": [
                 {
                     "name": "event_name",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "tracks": []
@@ -935,9 +958,7 @@ mod tests {
             "events": [
                 {
                     "name": "event_name",
-                    "event": "invalid:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "invalid:/path/to/file:provider:name"
                 }
             ],
             "tracks": []
@@ -956,15 +977,11 @@ mod tests {
             "events": [
                 {
                     "name": "event_name",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "event_name",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "tracks": []
@@ -983,15 +1000,11 @@ mod tests {
             "events": [
                 {
                     "name": "event_name1",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "event_name2",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "tracks": [
@@ -1078,9 +1091,7 @@ mod tests {
             "events": [
                 {
                     "name": "event_name",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "tracks": [
@@ -1136,9 +1147,7 @@ mod tests {
             "events": [
                 {
                     "name": "event_name",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "tracks": [
@@ -1177,15 +1186,11 @@ mod tests {
             "events": [
                 {
                     "name": "event_name1",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "event_name2",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "tracks": [
@@ -1221,21 +1226,15 @@ mod tests {
             "events": [
                 {
                     "name": "event_name1",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "event_name2",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "event_name3",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "tracks": [
@@ -1271,21 +1270,15 @@ mod tests {
             "events": [
                 {
                     "name": "event_name1",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "event_name2",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "event_name3",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "tracks": [
@@ -1327,9 +1320,7 @@ mod tests {
             "events": [
                 {
                     "name": "event_name",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "tracks": [
@@ -1377,15 +1368,11 @@ mod tests {
             "events": [
                 {
                     "name": "event_name1",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "event_name2",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "tracks": [
@@ -1448,15 +1435,11 @@ mod tests {
             "events": [
                 {
                     "name": "event_name1",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "event_name2",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "tracks": [
@@ -1501,15 +1484,11 @@ mod tests {
             "events": [
                 {
                     "name": "event_name1",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "event_name2",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "tracks": [
@@ -1554,21 +1533,15 @@ mod tests {
             "events": [
                 {
                     "name": "event_name1",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "event_name2",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "event_name3",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "tracks": [
@@ -1657,21 +1630,15 @@ mod tests {
             "events": [
                 {
                     "name": "event_name1",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "event_name2",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "event_name3",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "tracks": [
@@ -1801,9 +1768,7 @@ mod tests {
             "events": [
                 {
                     "name": "uretprobe_event",
-                    "event": "uretprobe:/path/to/file:symbol",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "uretprobe:/path/to/file:symbol"
                 }
             ],
             "tracks": [
@@ -1848,9 +1813,7 @@ mod tests {
             "events": [
                 {
                     "name": "uprobe_event",
-                    "event": "uprobe:/path/to/file:symbol",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "uprobe:/path/to/file:symbol"
                 }
             ],
             "tracks": [
@@ -1907,27 +1870,19 @@ mod tests {
             "events": [
                 {
                     "name": "uprobe_event",
-                    "event": "uprobe:/path/to/file:symbol",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "uprobe:/path/to/file:symbol"
                 },
                 {
                     "name": "uretprobe_event",
-                    "event": "uretprobe:/path/to/file:symbol",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "uretprobe:/path/to/file:symbol"
                 },
                 {
                     "name": "uretprobe_event_plus_offset",
-                    "event": "uretprobe:/path/to/file:symbol+64",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "uretprobe:/path/to/file:symbol+64"
                 },
                 {
                     "name": "uprobe_event_plus_offset",
-                    "event": "uprobe:/path/to/file:symbol+64",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "uprobe:/path/to/file:symbol+64"
                 }
             ],
             "tracks": []
@@ -1947,29 +1902,20 @@ mod tests {
         let event = recorder.config_events.get("uprobe_event").unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
         assert_eq!(event.name, "uprobe_event");
-        assert_eq!(event.key_index, 0);
-        assert!(matches!(event.key_type, EventKeyType::String));
         let event = recorder.config_events.get("uretprobe_event").unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
         assert_eq!(event.name, "uretprobe_event");
-        assert_eq!(event.key_index, 0);
-        assert!(matches!(event.key_type, EventKeyType::String));
         let event = recorder
             .config_events
             .get("uretprobe_event_plus_offset")
             .unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
-        assert_eq!(event.name, "uretprobe_event_plus_offset");
-        assert_eq!(event.key_index, 0);
-        assert!(matches!(event.key_type, EventKeyType::String));
         let event = recorder
             .config_events
             .get("uprobe_event_plus_offset")
             .unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
         assert_eq!(event.name, "uprobe_event_plus_offset");
-        assert_eq!(event.key_index, 0);
-        assert!(matches!(event.key_type, EventKeyType::String));
     }
 
     #[test]
@@ -1993,23 +1939,19 @@ mod tests {
         let event = recorder.config_events.get("symbol").unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
         assert_eq!(event.name, "symbol");
-        assert_eq!(event.key_index, u8::MAX);
-        assert!(matches!(event.key_type, EventKeyType::Long));
+        assert_eq!(event.keys.len(), 0);
         let event = recorder.config_events.get("symbol1").unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
         assert_eq!(event.name, "symbol1");
-        assert_eq!(event.key_index, u8::MAX);
-        assert!(matches!(event.key_type, EventKeyType::Long));
+        assert_eq!(event.keys.len(), 0);
         let event = recorder.config_events.get("symbol2").unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
         assert_eq!(event.name, "symbol2");
-        assert_eq!(event.key_index, u8::MAX);
-        assert!(matches!(event.key_type, EventKeyType::Long));
+        assert_eq!(event.keys.len(), 0);
         let event = recorder.config_events.get("symbol3").unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
         assert_eq!(event.name, "symbol3");
-        assert_eq!(event.key_index, u8::MAX);
-        assert!(matches!(event.key_type, EventKeyType::Long));
+        assert_eq!(event.keys.len(), 0);
     }
 
     #[test]
@@ -2021,15 +1963,11 @@ mod tests {
             "events": [
                 {
                     "name": "start_event",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "stop_event",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "stop_triggers": {
@@ -2059,15 +1997,11 @@ mod tests {
             "events": [
                 {
                     "name": "start_event",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "stop_event",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "stop_triggers": {
@@ -2095,15 +2029,11 @@ mod tests {
             "events": [
                 {
                     "name": "start_event",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "stop_event",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "stop_triggers": {
@@ -2131,9 +2061,7 @@ mod tests {
             "events": [
                 {
                     "name": "event_name",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "stop_triggers": {
@@ -2159,15 +2087,11 @@ mod tests {
             "events": [
                 {
                     "name": "start_event",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "stop_event",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "stop_triggers": {
@@ -2206,15 +2130,11 @@ mod tests {
             "events": [
                 {
                     "name": "start_event",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 },
                 {
                     "name": "stop_event",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "stop_triggers": {
@@ -2253,9 +2173,7 @@ mod tests {
             "events": [
                 {
                     "name": "event_name",
-                    "event": "usdt:/path/to/file:provider:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "usdt:/path/to/file:provider:name"
                 }
             ],
             "stop_triggers": {
@@ -2288,9 +2206,7 @@ mod tests {
             "events": [
                 {
                     "name": "kprobe_event",
-                    "event": "kprobe:symbol",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "kprobe:symbol"
                 }
             ],
             "tracks": [
@@ -2335,9 +2251,7 @@ mod tests {
             "events": [
                 {
                     "name": "kretprobe_event",
-                    "event": "kretprobe:symbol",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "kretprobe:symbol"
                 }
             ],
             "tracks": [
@@ -2382,9 +2296,7 @@ mod tests {
             "events": [
                 {
                     "name": "tracepoint_event",
-                    "event": "tracepoint:category:name",
-                    "key_index": 0,
-                    "key_type": "string"
+                    "event": "tracepoint:category:name"
                 }
             ],
             "tracks": [
@@ -2418,5 +2330,119 @@ mod tests {
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[0].track_descriptor().name(), "tracepoint_track");
         assert_eq!(packets[1].track_event().name(), "tracepoint:category:name");
+    }
+
+    #[test]
+    fn test_event_with_keys() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_with_string_key",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "keys": [
+                      {
+                        "key_index": 0,
+                        "key_type": "string"
+                      }
+                    ]
+                },
+                {
+                    "name": "event_with_long_key",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "keys": [
+                      {
+                        "key_index": 1,
+                        "key_type": "long"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        assert_eq!(recorder.config_events.len(), 2);
+        let event = recorder.config_events.get("event_with_string_key").unwrap();
+        assert_eq!(event.name, "event_with_string_key");
+        assert_eq!(event.keys.len(), 1);
+        assert_eq!(event.keys[0].key_index, 0);
+        assert!(matches!(event.keys[0].key_type, EventKeyType::String));
+        let event = recorder.config_events.get("event_with_long_key").unwrap();
+        assert_eq!(event.keys.len(), 1);
+        assert_eq!(event.keys[0].key_index, 1);
+        assert!(matches!(event.keys[0].key_type, EventKeyType::Long));
+    }
+
+    #[test]
+    fn test_event_bad_key_type() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_with_bad_key",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "keys": [
+                      {
+                        "key_index": 0,
+                        "key_type": "invalid_type"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Invalid key type: invalid_type"
+        );
+    }
+
+    #[test]
+    fn test_event_too_many_keys() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_with_too_many_keys",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "keys": [
+                      {
+                        "key_index": 0,
+                        "key_type": "string"
+                      },
+                      {
+                        "key_index": 1,
+                        "key_type": "long"
+                      },
+                      {
+                        "key_index": 2,
+                        "key_type": "string"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Only one key is allowed per event: event_with_too_many_keys"
+        );
     }
 }

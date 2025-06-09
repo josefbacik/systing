@@ -83,20 +83,32 @@ the mutex and the time that the mutex is locked by the thread.
     {
       "name": "mutex_entry",
       "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_entry",
-      "key_index": 0,
-      "key_type": "long"
+      "keys": [
+        {
+          "key_index": 0,
+          "key_type": "long"
+        }
+      ]
     },
     {
       "name": "mutex_acquired",
       "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_acquired",
-      "key_index": 0,
-      "key_type": "long"
+      "keys": [
+        {
+          "key_index": 0,
+          "key_type": "long"
+        }
+      ]
     },
     {
       "name": "mutex_release",
       "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_release",
-      "key_index": 0,
-      "key_type": "long"
+      "keys": [
+        {
+          "key_index": 0,
+          "key_type": "long"
+        }
+      ]
     },
   ],
   "tracks": [

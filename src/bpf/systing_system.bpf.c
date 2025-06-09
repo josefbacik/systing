@@ -731,7 +731,7 @@ int systing_perf_event_clock(void *ctx)
 	return 0;
 }
 
-static void handle_probe_event(struct pt_regs *ctx)
+static void handle_probe_event(struct pt_regs *ctx, bool kernel)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 
@@ -769,7 +769,14 @@ static void handle_probe_event(struct pt_regs *ctx)
 			arg = PT_REGS_PARM6_CORE(ctx);
 		}
 		if (desc->arg_type == ARG_STRING) {
-			bpf_probe_read_user_str(&event->arg, sizeof(event->arg), (void *)arg);
+			if (kernel)
+				bpf_probe_read_kernel_str(&event->arg,
+							  sizeof(event->arg),
+							  (void *)arg);
+			else
+				bpf_probe_read_user_str(&event->arg,
+							sizeof(event->arg),
+							(void *)arg);
 			event->arg_type = ARG_STRING;
 		} else if (desc->arg_type == ARG_LONG) {
 			__builtin_memcpy(&event->arg, &arg, sizeof(u64));
@@ -782,36 +789,65 @@ static void handle_probe_event(struct pt_regs *ctx)
 SEC("uprobe")
 int systing_uprobe(struct pt_regs *ctx)
 {
-	handle_probe_event(ctx);
+	handle_probe_event(ctx, false);
 	return 0;
 }
 
 SEC("kprobe")
 int systing_kprobe(struct pt_regs *ctx)
 {
-	handle_probe_event(ctx);
+	handle_probe_event(ctx, true);
 	return 0;
 }
 
-SEC("tracepoint")
-int systing_tracepoint(struct pt_regs *ctx)
+SEC("raw_tracepoint")
+int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
 	if (!trace_task(task))
 		return 0;
 
-	u64 cookie = bpf_get_attach_cookie(ctx);
+	u64 cookie = bpf_get_attach_cookie(args);
 	struct probe_event *event = reserve_probe_event();
 	if (!event) {
 		handle_missed_event(MISSED_PROBE_EVENT);
 		return 0;
 	}
+
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
 	event->cookie = cookie;
 	event->arg[0] = 0;
 	event->arg_type = ARG_NONE;
+
+	struct arg_desc *desc = bpf_map_lookup_elem(&event_key_types, &cookie);
+	if (desc) {
+		u64 arg = 0;
+		if (desc->arg_index == 0) {
+			bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[0]);
+		} else if (desc->arg_index == 1) {
+			bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[1]);
+		} else if (desc->arg_index == 2) {
+			bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[2]);
+		} else if (desc->arg_index == 3) {
+			bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[3]);
+		} else if (desc->arg_index == 4) {
+			bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[4]);
+		} else if (desc->arg_index == 5) {
+			bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[5]);
+		}
+		if (desc->arg_type == ARG_STRING) {
+			bpf_probe_read_kernel_str(&event->arg,
+						  sizeof(event->arg),
+						  (void *)arg);
+			event->arg_type = ARG_STRING;
+		} else if (desc->arg_type == ARG_LONG) {
+			__builtin_memcpy(&event->arg, &arg, sizeof(u64));
+			event->arg_type = ARG_LONG;
+		}
+	}
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }

@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::events::{EventProbe, SystingProbeEvent, SystingProbeRecorder};
+use crate::events::{EventKeyType, EventProbe, SystingProbeEvent, SystingProbeRecorder};
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::perfetto::TrackCounter;
@@ -35,7 +35,7 @@ use blazesym::symbolize::source::{Kernel, Process, Source};
 use blazesym::symbolize::{cache, Input, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{MapCore, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts};
+use libbpf_rs::{MapCore, RawTracepointOpts, RingBufferBuilder, UprobeOpts, UsdtOpts};
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
 use perfetto_protos::clock_snapshot::ClockSnapshot;
@@ -117,6 +117,8 @@ pub trait SystingEventTS {
     fn ts(&self) -> u64;
 }
 
+use systing::types::arg_desc;
+use systing::types::arg_type;
 use systing::types::event_type;
 use systing::types::perf_counter_event;
 use systing::types::probe_event;
@@ -128,6 +130,7 @@ unsafe impl Plain for task_event {}
 unsafe impl Plain for stack_event {}
 unsafe impl Plain for perf_counter_event {}
 unsafe impl Plain for probe_event {}
+unsafe impl Plain for arg_desc {}
 
 impl SystingEventTS for task_event {
     fn ts(&self) -> u64 {
@@ -1200,6 +1203,7 @@ fn system(opts: Command) -> Result<()> {
             event_files.enable()?;
             events_files.push(event_files);
         }
+
         skel.attach()?;
 
         // Attach any usdt's that we may have
@@ -1207,6 +1211,26 @@ fn system(opts: Command) -> Result<()> {
         {
             let probe_recorder = recorder.probe_recorder.lock().unwrap();
             for event in probe_recorder.config_events.values() {
+                for key in event.keys.iter() {
+                    let key_type = match key.key_type {
+                        EventKeyType::String => arg_type::ARG_STRING,
+                        EventKeyType::Long => arg_type::ARG_LONG,
+                    };
+
+                    let desc = arg_desc {
+                        arg_type: key_type,
+                        arg_index: key.key_index as i32,
+                    };
+
+                    // Safe because we're not padded
+                    let desc_data = unsafe { plain::as_bytes(&desc) };
+                    skel.maps.event_key_types.update(
+                        &event.cookie.to_ne_bytes(),
+                        desc_data,
+                        libbpf_rs::MapFlags::ANY,
+                    )?;
+                }
+
                 match &event.event {
                     EventProbe::Usdt(usdt) => {
                         for pid in opts.trace_event_pid.iter() {
@@ -1263,16 +1287,16 @@ fn system(opts: Command) -> Result<()> {
                         probe_links.push(link);
                     }
                     EventProbe::Tracepoint(tracepoint) => {
-                        let category =
-                            libbpf_rs::TracepointCategory::Custom(tracepoint.category.clone());
-                        let link = skel.progs.systing_tracepoint.attach_tracepoint_with_opts(
-                            category,
-                            &tracepoint.name,
-                            TracepointOpts {
-                                cookie: event.cookie,
-                                ..Default::default()
-                            },
-                        );
+                        let link = skel
+                            .progs
+                            .systing_tracepoint
+                            .attach_raw_tracepoint_with_opts(
+                                &tracepoint.name,
+                                RawTracepointOpts {
+                                    cookie: event.cookie,
+                                    ..Default::default()
+                                },
+                            );
                         if link.is_err() {
                             Err(anyhow::anyhow!(
                                 "Failed to attach tracepoint {}",
@@ -1349,9 +1373,7 @@ fn system(opts: Command) -> Result<()> {
             thread::sleep(Duration::from_secs(opts.duration));
         } else {
             ctrlc::set_handler(move || {
-                stop_tx
-                    .send(())
-                    .expect("Could not send signal on channel.")
+                stop_tx.send(()).expect("Could not send signal on channel.")
             })
             .expect("Error setting Ctrl-C handler");
             if opts.continuous > 0 {

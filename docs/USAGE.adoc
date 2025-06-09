@@ -155,20 +155,32 @@ The configuration is a JSON file with the following format.
     {
       "name": "tracepoint_start",
       "event": "_EVENT_",
-      "key_index": 0,
-      "key_type": "long",
+      "keys": [
+        {
+          "key_index": 0,
+          "key_type": "long"
+        }
+      ]
     },
     {
       "name": "tracepoint_end",
       "event": "_EVENT_",
-      "key_index": 0,
-      "key_type": "long",
+      "keys": [
+        {
+          "key_index": 0,
+          "key_type": "long"
+        }
+      ]
     },
     {
       "name": "tracepoint_instant",
       "event": "_EVENT_",
-      "key_index": 0,
-      "key_type": "long",
+      "keys": [
+        {
+          "key_index": 0,
+          "key_type": "long"
+        }
+      ]
     }
   ],
   "tracks": [
@@ -215,5 +227,10 @@ You can specify multiple `ranges` or `instants` per track.
 
 `stop_triggers` can be optionally specified to stop the trace when a certain condition is met.
 This is used in conjunction with the *--continuous* option.
+
+`keys` is an optional set of extra data to be extracted from the trace event.
+Currently only 1 is suspported.
+The value will be attached to the trace event and be visible with the event in `perfetto`.
+NOTE: For `tracepoint` events we use `raw_tracepoint`, which reads the args from the TP_EVENT definition, not what is found in /sys/kernel/debug/tracing/events/category/name/format.
 
 Example files for real world examples can be found in the `examples` directory.
