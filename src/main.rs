@@ -550,6 +550,7 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
             tgidpid: event.task.tgidpid,
             cookie: event.cookie,
             ts: event.ts,
+            cpu: event.cpu,
             extra,
         };
 
@@ -661,14 +662,23 @@ impl SessionRecorder {
 
     fn generate_trace(&self) -> Vec<TracePacket> {
         let mut packets = Vec::new();
-        let mut id_counter = Arc::new(AtomicUsize::new(0));
+        let mut id_counter = Arc::new(AtomicUsize::new(1));
         let mut pid_uuids = HashMap::new();
         let mut thread_uuids = HashMap::new();
+        let systing_desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
         // First emit the clock snapshot
         let mut packet = TracePacket::default();
         packet.set_clock_snapshot(self.clock_snapshot.lock().unwrap().clone());
         packet.set_trusted_packet_sequence_id(id_counter.fetch_add(1, Ordering::Relaxed) as u32);
+        packets.push(packet);
+
+        let mut desc = TrackDescriptor::default();
+        desc.set_uuid(systing_desc_uuid);
+        desc.set_name("Systing".to_string());
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(desc);
         packets.push(packet);
 
         // Ppopulate all the process tracks

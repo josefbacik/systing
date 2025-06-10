@@ -22,6 +22,7 @@ pub struct SystingProbeEvent {
     pub tgidpid: u64,
     pub cookie: u64,
     pub ts: u64,
+    pub cpu: u32,
     pub extra: String,
 }
 
@@ -75,9 +76,18 @@ pub struct SystingProbeRecorder {
     // [packet BEGIN range1][packet END range1][packet BEGIN range2][packet END range2]
     recorded_ranges: HashMap<u64, HashMap<String, Vec<TrackRange>>>,
 
+    // CPU instant events, this works like events, but is indexed by CPU
+    cpu_events: HashMap<u32, HashMap<String, Vec<TrackInstant>>>,
+
+    // CPU range events, this works like recorded_ranges, but is indexed by CPU
+    cpu_ranges: HashMap<u32, HashMap<String, Vec<TrackRange>>>,
+
     // The ranges that we've recorded a start event for, the key is the tgidpid of the thread, and
     // the value is a hashmap of the track_name with a TrackRange that has the start time set.
     outstanding_ranges: HashMap<u64, HashMap<String, TrackRange>>,
+
+    // These are the outstanding CPU ranges, similar to outstanding_ranges, but indexed by CPU
+    outstanding_cpu_ranges: HashMap<u32, HashMap<String, TrackRange>>,
 
     // The configured events that we've loaded from a config file or from --trace-event.
     pub config_events: HashMap<String, SystingEvent>,
@@ -187,6 +197,7 @@ pub struct SystingEvent {
     pub cookie: u64,
     pub event: EventProbe,
     pub keys: Vec<EventKey>,
+    percpu: bool,
 }
 
 // The JSON config file format is
@@ -195,6 +206,7 @@ pub struct SystingEvent {
 //     {
 //       "name": "event_name",
 //       "event": "<PROBE TYPE SPECIFIC FORMAT>",
+//       "percpu": false,
 //       "keys": [
 //         {
 //           "key_index": 0,
@@ -255,6 +267,7 @@ struct SystingJSONTrackConfig {
 struct SystingJSONEvent {
     name: String,
     event: String,
+    percpu: Option<bool>,
     keys: Option<Vec<SystingJSONEventKey>>,
 }
 
@@ -521,7 +534,62 @@ impl SystingProbeRecorder {
         false
     }
 
-    pub fn handle_event(&mut self, event: SystingProbeEvent) {
+    fn handle_cpu_event(&mut self, event: SystingProbeEvent) {
+        let systing_event = self.cookies.get(&event.cookie).unwrap();
+
+        // If this is an instant event just add it to the list of events
+        if self.instant_events.contains_key(&systing_event.name) {
+            let entry = self.cpu_events.entry(event.cpu).or_default();
+            let instant_track = self.instant_events.get(&systing_event.name).unwrap();
+            let entry = entry.entry(instant_track.clone()).or_default();
+            entry.push(TrackInstant {
+                ts: event.ts,
+                name: format!("{}{}", systing_event, event.extra),
+            });
+            return;
+        }
+
+        // First check to see if this is an end event, since we can have the same event for a start
+        // event and an end event
+        if let Some(range_name) = self.stop_events.get(&systing_event.name) {
+            if let Some(ranges) = self.outstanding_cpu_ranges.get_mut(&event.cpu) {
+                if let Some(mut range) = ranges.remove(range_name) {
+                    let track_name = self.ranges.get(range_name).unwrap().clone();
+                    range.end = event.ts;
+                    let track_hash = self.cpu_ranges.entry(event.cpu).or_default();
+                    let entry = track_hash.entry(track_name).or_default();
+                    entry.push(range);
+                }
+            }
+        }
+
+        // Now handle the start event case
+        if let Some(range_name) = self.start_events.get(&systing_event.name) {
+            if let Some(ranges) = self.outstanding_cpu_ranges.get_mut(&event.cpu) {
+                if let Some(range) = ranges.get_mut(range_name) {
+                    range.start = event.ts;
+                } else {
+                    let range = TrackRange {
+                        range_name: range_name.clone(),
+                        start: event.ts,
+                        end: 0,
+                    };
+                    ranges.insert(range_name.clone(), range);
+                }
+            } else {
+                let mut ranges = HashMap::new();
+                let range = TrackRange {
+                    range_name: range_name.clone(),
+                    start: event.ts,
+                    end: 0,
+                };
+                ranges.insert(range_name.clone(), range);
+                self.outstanding_cpu_ranges.insert(event.cpu, ranges);
+            }
+        }
+    }
+
+    fn handle_process_event(&mut self, event: SystingProbeEvent) {
         let systing_event = self.cookies.get(&event.cookie).unwrap();
 
         // If this is an instant event just add it to the list of events
@@ -573,6 +641,15 @@ impl SystingProbeRecorder {
                 ranges.insert(range_name.clone(), range);
                 self.outstanding_ranges.insert(event.tgidpid, ranges);
             }
+        }
+    }
+
+    pub fn handle_event(&mut self, event: SystingProbeEvent) {
+        let systing_event = self.cookies.get(&event.cookie).unwrap();
+        if systing_event.percpu {
+            self.handle_cpu_event(event);
+        } else {
+            self.handle_process_event(event);
         }
     }
 
@@ -662,6 +739,97 @@ impl SystingProbeRecorder {
                 }
             }
         }
+
+        // Populate the per cpu range tracks
+        let mut cpu_desc_uuids: HashMap<String, u64> = HashMap::new();
+        for (cpu, tracks) in self.cpu_ranges.iter() {
+            for (track_name, ranges) in tracks.iter() {
+                let mut descs = crate::perfetto::generate_cpu_track_descriptors(
+                    &mut cpu_desc_uuids,
+                    *cpu,
+                    track_name.clone(),
+                    id_counter,
+                );
+
+                let desc = descs.pop().unwrap();
+                let desc_uuid = desc.uuid();
+
+                if let Some(new_desc) = descs.pop() {
+                    let mut packet = TracePacket::default();
+                    packet.set_track_descriptor(new_desc);
+                    packets.push(packet);
+                }
+
+                let mut packet = TracePacket::default();
+                packet.set_track_descriptor(desc);
+                packets.push(packet);
+
+                let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
+                for range in ranges.iter() {
+                    let mut tevent = TrackEvent::default();
+                    tevent.set_type(Type::TYPE_SLICE_BEGIN);
+                    tevent.set_name(range.range_name.clone());
+                    tevent.set_track_uuid(desc_uuid);
+
+                    let mut packet = TracePacket::default();
+                    packet.set_timestamp(range.start);
+                    packet.set_track_event(tevent);
+                    packet.set_trusted_packet_sequence_id(seq);
+                    packets.push(packet);
+
+                    let mut tevent = TrackEvent::default();
+                    tevent.set_type(Type::TYPE_SLICE_END);
+                    tevent.set_name(range.range_name.clone());
+                    tevent.set_track_uuid(desc_uuid);
+
+                    let mut packet = TracePacket::default();
+                    packet.set_timestamp(range.end);
+                    packet.set_track_event(tevent);
+                    packet.set_trusted_packet_sequence_id(seq);
+                    packets.push(packet);
+                }
+            }
+        }
+
+        // Populate the instant CPU events
+        for (cpu, events) in self.cpu_events.iter() {
+            for (track_name, track_events) in events.iter() {
+                let mut descs = crate::perfetto::generate_cpu_track_descriptors(
+                    &mut cpu_desc_uuids,
+                    *cpu,
+                    track_name.clone(),
+                    id_counter,
+                );
+
+                let desc = descs.pop().unwrap();
+                let desc_uuid = desc.uuid();
+
+                if let Some(new_desc) = descs.pop() {
+                    let mut packet = TracePacket::default();
+                    packet.set_track_descriptor(new_desc);
+                    packets.push(packet);
+                }
+
+                let mut packet = TracePacket::default();
+                packet.set_track_descriptor(desc);
+                packets.push(packet);
+
+                let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
+                for event in track_events.iter() {
+                    let mut tevent = TrackEvent::default();
+                    tevent.set_type(Type::TYPE_INSTANT);
+                    tevent.set_name(event.name.clone());
+                    tevent.set_track_uuid(desc_uuid);
+
+                    let mut packet = TracePacket::default();
+                    packet.set_timestamp(event.ts);
+                    packet.set_track_event(tevent);
+                    packet.set_trusted_packet_sequence_id(seq);
+                    packets.push(packet);
+                }
+            }
+        }
+
         packets
     }
 
@@ -718,7 +886,10 @@ impl SystingProbeRecorder {
     ) -> Result<()> {
         let mut keys = Vec::new();
         if event.keys.iter().flatten().count() > 1 {
-            return Err(anyhow::anyhow!("Only one key is allowed per event: {}", event.name));
+            return Err(anyhow::anyhow!(
+                "Only one key is allowed per event: {}",
+                event.name
+            ));
         }
         for key in event.keys.iter().flatten() {
             let key_type = match key.key_type.as_str() {
@@ -743,6 +914,7 @@ impl SystingProbeRecorder {
                 _ => return Err(anyhow::anyhow!("Invalid event type")),
             },
             keys,
+            percpu: event.percpu.unwrap_or(false),
         };
         if self.config_events.contains_key(&event.name) {
             return Err(anyhow::anyhow!("Event {} already exists", event.name));
@@ -1340,8 +1512,7 @@ mod tests {
         let event = SystingProbeEvent {
             tgidpid: 1234,
             ts: 1000,
-            cookie: 0,
-            extra: String::new(),
+            ..Default::default()
         };
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
@@ -1394,8 +1565,7 @@ mod tests {
         let mut event = SystingProbeEvent {
             tgidpid: 1234,
             ts: 1000,
-            cookie: 0,
-            extra: String::new(),
+            ..Default::default()
         };
         recorder.handle_event(event.clone());
         event.cookie = 1;
@@ -1461,8 +1631,7 @@ mod tests {
         let event = SystingProbeEvent {
             tgidpid: 1234,
             ts: 1000,
-            cookie: 0,
-            extra: String::new(),
+            ..Default::default()
         };
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
@@ -1511,7 +1680,7 @@ mod tests {
             tgidpid: 1234,
             ts: 2000,
             cookie: 1,
-            extra: String::new(),
+            ..Default::default()
         };
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
@@ -1568,8 +1737,7 @@ mod tests {
         let mut event = SystingProbeEvent {
             tgidpid: 1234,
             ts: 1000,
-            cookie: 0,
-            extra: String::new(),
+            ..Default::default()
         };
         recorder.handle_event(event.clone());
         event.cookie = 1;
@@ -1665,8 +1833,7 @@ mod tests {
         let mut event = SystingProbeEvent {
             tgidpid: 1234,
             ts: 1000,
-            cookie: 0,
-            extra: String::new(),
+            ..Default::default()
         };
         recorder.handle_event(event.clone());
         event.cookie = 1;
@@ -1788,8 +1955,7 @@ mod tests {
         let event = SystingProbeEvent {
             tgidpid: 1234,
             ts: 1000,
-            cookie: 0,
-            extra: String::new(),
+            ..Default::default()
         };
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
@@ -1833,8 +1999,7 @@ mod tests {
         let event = SystingProbeEvent {
             tgidpid: 1234,
             ts: 1000,
-            cookie: 0,
-            extra: String::new(),
+            ..Default::default()
         };
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
@@ -2109,9 +2274,7 @@ mod tests {
         recorder.load_config_from_json(json, &mut rng).unwrap();
         let mut event = SystingProbeEvent {
             tgidpid: 1234,
-            ts: 0,
-            cookie: 0,
-            extra: String::new(),
+            ..Default::default()
         };
         let ret = recorder.maybe_trigger(&event);
         assert!(!ret, "Trip threshold should not be triggered yet");
@@ -2152,9 +2315,7 @@ mod tests {
         recorder.load_config_from_json(json, &mut rng).unwrap();
         let mut event = SystingProbeEvent {
             tgidpid: 1234,
-            ts: 0,
-            cookie: 0,
-            extra: String::new(),
+            ..Default::default()
         };
         let ret = recorder.maybe_trigger(&event);
         assert!(!ret, "Trip threshold should not be triggered yet");
@@ -2190,8 +2351,7 @@ mod tests {
         let event = SystingProbeEvent {
             tgidpid: 1234,
             ts: 1000,
-            cookie: 0,
-            extra: String::new(),
+            ..Default::default()
         };
         let ret = recorder.maybe_trigger(&event);
         assert!(ret, "Instant trigger should be activated");
@@ -2226,8 +2386,7 @@ mod tests {
         let event = SystingProbeEvent {
             tgidpid: 1234,
             ts: 1000,
-            cookie: 0,
-            extra: String::new(),
+            ..Default::default()
         };
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
@@ -2271,8 +2430,7 @@ mod tests {
         let event = SystingProbeEvent {
             tgidpid: 1234,
             ts: 1000,
-            cookie: 0,
-            extra: String::new(),
+            ..Default::default()
         };
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
@@ -2316,8 +2474,7 @@ mod tests {
         let event = SystingProbeEvent {
             tgidpid: 1234,
             ts: 1000,
-            cookie: 0,
-            extra: String::new(),
+            ..Default::default()
         };
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
@@ -2443,6 +2600,70 @@ mod tests {
         assert_eq!(
             result.unwrap_err().to_string(),
             "Only one key is allowed per event: event_with_too_many_keys"
+        );
+    }
+
+    #[test]
+    fn test_event_percpu() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_percpu",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "percpu": true
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "percpu_track",
+                    "instants": [
+                      {
+                        "event": "event_percpu"
+                      }
+                    ]
+                }
+            ]
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        assert_eq!(recorder.config_events.len(), 1);
+        let event = recorder.config_events.get("event_percpu").unwrap();
+        assert!(event.percpu);
+
+        let event = SystingProbeEvent {
+            tgidpid: 1234,
+            ts: 1000,
+            cpu: 1,
+            ..Default::default()
+        };
+        recorder.handle_event(event);
+        assert!(recorder.cpu_events.contains_key(&1));
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0].track_descriptor().name(), "percpu_track");
+        assert_eq!(packets[1].track_descriptor().name(), "CPU 1");
+        assert_eq!(
+            packets[0].track_descriptor().uuid(),
+            packets[1].track_descriptor().parent_uuid()
+        );
+        assert_eq!(
+            packets[2].track_event().name(),
+            "usdt:/path/to/file:provider:name"
+        );
+        assert_eq!(packets[2].track_event().type_(), Type::TYPE_INSTANT);
+        assert_eq!(packets[2].timestamp(), 1000);
+        assert_eq!(
+            packets[2].track_event().track_uuid(),
+            packets[1].track_descriptor().uuid()
         );
     }
 }

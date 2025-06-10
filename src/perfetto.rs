@@ -1,8 +1,11 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
 use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::TrackEvent;
-use std::collections::HashMap;
 
 pub struct TrackCounter {
     pub ts: u64,
@@ -31,6 +34,40 @@ pub fn generate_pidtgid_track_descriptor(
     desc.set_parent_uuid(uuid);
 
     desc
+}
+
+pub fn generate_cpu_track_descriptors(
+    desc_uuids: &mut HashMap<String, u64>,
+    cpu: u32,
+    name: String,
+    id_counter: &mut Arc<AtomicUsize>,
+) -> Vec<TrackDescriptor> {
+    let mut descs = Vec::new();
+    let parent_uuid = if let Some(uuid) = desc_uuids.get(&name) {
+        *uuid
+    } else {
+        let new_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        desc_uuids.insert(name.clone(), new_uuid);
+
+        let mut desc = TrackDescriptor::default();
+        desc.set_name(name);
+        desc.set_uuid(new_uuid);
+
+        // Set the parent UUID to 1 for the systing track
+        desc.set_parent_uuid(1);
+        descs.push(desc);
+
+        new_uuid
+    };
+
+    let mut desc = TrackDescriptor::default();
+    let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+    desc.set_name(format!("CPU {}", cpu));
+    desc.set_uuid(desc_uuid);
+    desc.set_parent_uuid(parent_uuid);
+    descs.push(desc);
+
+    descs
 }
 
 impl TrackCounter {

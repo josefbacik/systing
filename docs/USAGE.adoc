@@ -175,6 +175,7 @@ The configuration is a JSON file with the following format.
     {
       "name": "tracepoint_instant",
       "event": "_EVENT_",
+      "percpu": true,
       "keys": [
         {
           "key_index": 0,
@@ -232,5 +233,8 @@ This is used in conjunction with the *--continuous* option.
 Currently only 1 is suspported.
 The value will be attached to the trace event and be visible with the event in `perfetto`.
 NOTE: For `tracepoint` events we use `raw_tracepoint`, which reads the args from the TP_EVENT definition, not what is found in /sys/kernel/debug/tracing/events/category/name/format.
+
+`percpu` is set to true if the event is keyed to a CPU and not a specific thread.
+These events will show up under the `Systing` track in `perfetto`, each event as it's own category and then each CPU having its own track.
 
 Example files for real world examples can be found in the `examples` directory.
