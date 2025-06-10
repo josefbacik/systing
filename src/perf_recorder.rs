@@ -120,7 +120,7 @@ mod tests {
         let packets = recorder.generate_trace(&mut Arc::new(AtomicUsize::new(0)));
         assert!(!packets.is_empty());
         assert_eq!(packets[0].track_descriptor().name(), "test_counter");
-        assert_eq!(packets[0].track_descriptor().parent_uuid(), 0);
+        assert_eq!(packets[0].track_descriptor().parent_uuid(), 1);
         assert_eq!(
             packets[0].track_descriptor().uuid(),
             packets[1].track_descriptor().parent_uuid()
