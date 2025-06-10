@@ -819,11 +819,8 @@ fn system(opts: Command) -> Result<()> {
             let major = parts[0].parse::<u64>().unwrap_or(0);
             let minor = parts[1].parse::<u64>().unwrap_or(0);
 
-            if major >= 6 && minor >= 10 {
-                false
-            } else {
-                true
-            }
+            // 6.10 is when they added bpf_get_attach_cookie() to raw_tracepoint
+            !(major >= 6 && minor >= 10)
         } else {
             false
         }
