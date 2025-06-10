@@ -1,0 +1,22 @@
+{
+  "events": [
+    {
+      "name": "sched_ext_event",
+      "event": "tracepoint:sched_ext:sched_ext_event",
+      "percpu": true,
+      "keys" : [
+        {
+	  "key_index": 0,
+	  "key_type": "string"
+	}
+      ]
+    }
+  ],
+  "tracks": [
+    {
+      "track_name": "sched_ext",
+      "instants": [ { "event": "sched_ext_event" } ]
+    }
+  ]
+}
+
