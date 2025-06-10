@@ -35,7 +35,9 @@ use blazesym::symbolize::source::{Kernel, Process, Source};
 use blazesym::symbolize::{cache, Input, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{MapCore, RawTracepointOpts, RingBufferBuilder, UprobeOpts, UsdtOpts};
+use libbpf_rs::{
+    MapCore, RawTracepointOpts, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts,
+};
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
 use perfetto_protos::clock_snapshot::ClockSnapshot;
@@ -810,6 +812,24 @@ fn system(opts: Command) -> Result<()> {
     let mut perf_counter_names = Vec::new();
     let mut counters = PerfCounters::default();
     let (stop_tx, stop_rx) = channel();
+    let old_kernel = if let Some(kernel_version) = sysinfo::System::kernel_version() {
+        let parts = kernel_version.split('.').collect::<Vec<&str>>();
+
+        if parts.len() >= 2 {
+            let major = parts[0].parse::<u64>().unwrap_or(0);
+            let minor = parts[1].parse::<u64>().unwrap_or(0);
+
+            if major >= 6 && minor >= 10 {
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
     if !opts.perf_counter.is_empty() {
         counters.discover()?;
@@ -944,6 +964,15 @@ fn system(opts: Command) -> Result<()> {
                     }
                 }
             }
+        }
+
+        // If we're on an older kernel we can't use the raw_tracepoint version since it doesn't
+        // have the cookie support. Newer kernels will use the raw_tracepoint version so don't need
+        // to load the old tracepoint program.
+        if old_kernel {
+            open_skel.progs.systing_raw_tracepoint.set_autoload(false);
+        } else {
+            open_skel.progs.systing_tracepoint.set_autoload(false);
         }
 
         let mut need_slots = false;
@@ -1297,16 +1326,28 @@ fn system(opts: Command) -> Result<()> {
                         probe_links.push(link);
                     }
                     EventProbe::Tracepoint(tracepoint) => {
-                        let link = skel
-                            .progs
-                            .systing_tracepoint
-                            .attach_raw_tracepoint_with_opts(
+                        let link = if old_kernel {
+                            let category =
+                                libbpf_rs::TracepointCategory::Custom(tracepoint.category.clone());
+                            skel.progs.systing_tracepoint.attach_tracepoint_with_opts(
+                                category,
                                 &tracepoint.name,
-                                RawTracepointOpts {
+                                TracepointOpts {
                                     cookie: event.cookie,
                                     ..Default::default()
                                 },
-                            );
+                            )
+                        } else {
+                            skel.progs
+                                .systing_raw_tracepoint
+                                .attach_raw_tracepoint_with_opts(
+                                    &tracepoint.name,
+                                    RawTracepointOpts {
+                                        cookie: event.cookie,
+                                        ..Default::default()
+                                    },
+                                )
+                        };
                         if link.is_err() {
                             Err(anyhow::anyhow!(
                                 "Failed to attach tracepoint {}",

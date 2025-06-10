@@ -801,7 +801,7 @@ int systing_kprobe(struct pt_regs *ctx)
 }
 
 SEC("raw_tracepoint")
-int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
+int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 
@@ -848,6 +848,38 @@ int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
 			event->arg_type = ARG_LONG;
 		}
 	}
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
+SEC("tracepoint")
+int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 cookie = bpf_get_attach_cookie(args);
+	struct probe_event *event = reserve_probe_event();
+	if (!event) {
+		handle_missed_event(MISSED_PROBE_EVENT);
+		return 0;
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->cookie = cookie;
+	event->arg[0] = 0;
+	event->arg_type = ARG_NONE;
+
+	// To get the tracepoint arguments we'd have to figure out the memory
+	// layout of the buffer and get to the right argument, which we're not
+	// going to do here. This is only provided so we can capture tracepoints
+	// in systing, if you want arguments you need a newer kernel and then
+	// systing will use the raw_tracepoint variation where we can record the
+	// argument.
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
