@@ -36,7 +36,7 @@ const volatile struct {
 	u32 num_perf_counters;
 	u32 num_cpus;
 	u32 my_tgid;
-  u32 collect_pystacks;
+	u32 collect_pystacks;
 } tool_config = {};
 
 enum event_type {
@@ -108,7 +108,7 @@ struct stack_event {
 	u64 user_stack_length;
 	u64 kernel_stack[MAX_STACK_DEPTH];
 	u64 user_stack[MAX_STACK_DEPTH];
-  struct pystacks_message py_msg_buffer;
+	struct pystacks_message py_msg_buffer;
 };
 
 struct perf_counter_event {
@@ -435,8 +435,8 @@ static void emit_stack_event(void *ctx,struct task_struct *task,
 	record_task_info(&event->task, task);
 
 	if (tool_config.collect_pystacks) {
-    pystacks_read_stacks(ctx, NULL, &event->py_msg_buffer);
-  }
+		pystacks_read_stacks(ctx, NULL, &event->py_msg_buffer);
+	}
 
 	event->stack_event_type = type;
 

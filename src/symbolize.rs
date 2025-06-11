@@ -91,7 +91,6 @@ where
 
 impl Stack {
     pub fn new(kernel_stack: &[u64], user_stack: &[u64], py_stack: &Vec<PyAddr>) -> Self {
-        // JMW - why did other params move from Vex to []?
         let first_kernel_element = if kernel_stack.is_empty() {
             0
         } else {
