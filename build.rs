@@ -35,7 +35,7 @@ fn generate_bindings(out_dir: &PathBuf) {
             .display()
     );
     let status = std::process::Command::new("make")
-        .env("INSTALL_DIR", &out_dir)
+        .env("INSTALL_DIR", out_dir)
         .env("VMLINUX_INCLUDE", &vmlinux_include_arg)
         .arg("-C")
         .arg("strobelight-libs/strobelight/bpf_lib/python")
@@ -61,7 +61,7 @@ fn generate_bindings(out_dir: &PathBuf) {
 
     let bindings_path = PathBuf::from("src/pystacks_bindings.rs");
     bindings
-        .write_to_file(&bindings_path)
+        .write_to_file(bindings_path)
         .expect("Couldn't write bindings!");
 }
 

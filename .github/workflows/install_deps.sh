@@ -11,3 +11,4 @@ sudo ln -s /usr/include/asm-generic /usr/include/asm
 
 rustup toolchain install stable --profile minimal
 
+git submodule update --init --recursive

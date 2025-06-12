@@ -90,7 +90,7 @@ where
 }
 
 impl Stack {
-    pub fn new(kernel_stack: &[u64], user_stack: &[u64], py_stack: &Vec<PyAddr>) -> Self {
+    pub fn new(kernel_stack: &[u64], user_stack: &[u64], py_stack: &[PyAddr]) -> Self {
         let first_kernel_element = if kernel_stack.is_empty() {
             0
         } else {

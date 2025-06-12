@@ -3,6 +3,9 @@ pub mod perf;
 mod perf_recorder;
 pub mod perfetto;
 pub mod py_addr;
+#[allow(clippy::all)]
+#[allow(non_snake_case)]
+#[allow(non_camel_case_types)]
 pub mod pystacks_bindings;
 pub mod ringbuf;
 mod sched;
@@ -28,7 +31,7 @@ use crate::perfetto::TrackCounter;
 use crate::py_addr::PyAddr;
 use crate::pystacks_bindings::{
     pystacks_free, pystacks_init, pystacks_load_symbols, pystacks_symbolize_function,
-    stack_walker_frame, stack_walker_opts, stack_walker_run,
+    stack_walker_opts, stack_walker_run,
 };
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
@@ -93,7 +96,7 @@ impl StackWalkerRun {
         let len = unsafe {
             pystacks_symbolize_function(
                 self.ptr,
-                &raw const frame.addr as *const pystacks_bindings::stack_walker_frame,
+                &raw const frame.addr,
                 buff.as_mut_ptr() as *mut i8,
                 buff.len(),
             )
@@ -369,7 +372,7 @@ fn user_stack_to_python_calls(
     let python_call_iids: Vec<_> = func_map
         .iter()
         .filter(|(key, value)| key.starts_with("_PyEval_EvalFrame") && value.iid.is_some())
-        .map(|(k, value)| value.iid.unwrap())
+        .map(|(_, value)| value.iid.unwrap())
         .collect();
 
     for (key, values) in frame_map {
@@ -437,11 +440,7 @@ fn stack_to_frames_mapping<'a, I>(
     }
 }
 
-fn merge_pystacks(
-    stack: &Stack,
-    python_calls: &Vec<u64>,
-    python_stack_markers: &Vec<u64>,
-) -> Vec<u64> {
+fn merge_pystacks(stack: &Stack, python_calls: &[u64], python_stack_markers: &[u64]) -> Vec<u64> {
     let mut merged_addrs = Vec::new();
     let mut user_stack_idx = 0;
     let mut pystack_idx = stack.py_stack.len();
@@ -451,7 +450,7 @@ fn merge_pystacks(
         .iter()
         .filter(|&x| python_calls.contains(x))
         .count();
-    let py_marker_count = if python_stack_markers.len() == 0 {
+    let py_marker_count = if python_stack_markers.is_empty() {
         stack.py_stack.len()
     } else {
         stack
@@ -477,13 +476,9 @@ fn merge_pystacks(
     // drop the first N python frames. This could happen if the system stack overflows
     // the buffer used to collect it, in which case the base of the stack would be
     // missing.
-    let mut skip_py_frame = if py_marker_count > py_call_count {
-        py_marker_count - py_call_count
-    } else {
-        0
-    };
+    let mut skip_py_frame = py_marker_count.saturating_sub(py_call_count);
 
-    if python_stack_markers.len() == 0 {
+    if python_stack_markers.is_empty() {
         pystack_idx -= skip_py_frame;
     } else {
         while skip_py_frame > 0 {
@@ -502,7 +497,7 @@ fn merge_pystacks(
             // the else case below, we are incrementing past the stack marker that
             // ended the previous loop
             pystack_idx -= 1;
-            if python_stack_markers.len() == 0 {
+            if python_stack_markers.is_empty() {
                 merged_addrs.push(stack.py_stack[pystack_idx].addr.symbol_id as u64);
             } else {
                 while pystack_idx > 0
@@ -588,9 +583,8 @@ fn generate_stack_packets(
         .map(|stack| {
             let mut callstack = Callstack::default();
             let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            let mut pystack_index = 0;
             callstack.set_iid(iid);
-            callstack.frame_ids = if stack.py_stack.len() <= 0 {
+            callstack.frame_ids = if stack.py_stack.is_empty() {
                 stack
                     .user_stack
                     .iter()
@@ -725,7 +719,7 @@ impl StackRecorder {
             let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
             let stack_key = (event.task.tgidpid >> 32) as i32;
 
-            let py_stack =
+            let py_stack: Vec<PyAddr> =
                 Vec::from(&event.py_msg_buffer.buffer[..event.py_msg_buffer.stack_len as usize])
                     .iter()
                     .map(|frame| PyAddr { addr: frame.into() })
@@ -1299,7 +1293,7 @@ fn system(opts: Command) -> Result<()> {
 
         let object = skel.object();
 
-        if opts.collect_pystacks && opts.pid.len() > 0 {
+        if opts.collect_pystacks && !opts.pid.is_empty() {
             let mut pid_opts: Vec<i32> = Vec::new();
             for pid in opts.pid.iter() {
                 pid_opts.push(*pid as i32);
