@@ -1,4 +1,4 @@
-use crate::SystingEventTS;
+use crate::SystingEvent;
 use std::collections::VecDeque;
 
 #[derive(Default)]
@@ -23,7 +23,7 @@ impl<T> RingBuffer<T> {
 
     pub fn push_front(&mut self, item: T)
     where
-        T: SystingEventTS,
+        T: SystingEvent,
     {
         if self.max_duration == 0 {
             return;
@@ -99,7 +99,7 @@ mod tests {
         ts: u64,
     }
 
-    impl SystingEventTS for TestEvent {
+    impl SystingEvent for TestEvent {
         fn ts(&self) -> u64 {
             self.ts
         }
