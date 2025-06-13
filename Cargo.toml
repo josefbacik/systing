@@ -32,6 +32,7 @@ workerpool = "1.2.1"
 
 [features]
 generate-vmlinux-header = []
+pystacks = []
 
 [profile.release]
 lto = "thin"

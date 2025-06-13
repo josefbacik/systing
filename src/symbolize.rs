@@ -1,7 +1,7 @@
 use blazesym::symbolize::{CodeInfo, Sym, Symbolized};
 use blazesym::Addr;
 
-use crate::py_addr::PyAddr;
+use crate::pystacks::pystacks::PyAddr;
 
 const ADDR_WIDTH: usize = 16;
 pub const KERNEL_THREAD_STACK_STUB: u64 = 1234;
