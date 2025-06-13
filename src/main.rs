@@ -3,6 +3,7 @@ pub mod perf;
 mod perf_recorder;
 pub mod perfetto;
 pub mod py_addr;
+#[cfg(feature = "pystacks")]
 #[allow(clippy::all)]
 #[allow(non_snake_case)]
 #[allow(non_camel_case_types)]
@@ -29,6 +30,7 @@ use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::perfetto::TrackCounter;
 use crate::py_addr::PyAddr;
+#[cfg(feature = "pystacks")]
 use crate::pystacks_bindings::{
     pystacks_free, pystacks_init, pystacks_load_symbols, pystacks_symbolize_function,
     stack_walker_opts, stack_walker_run,
@@ -69,38 +71,59 @@ use protobuf::Message;
 use std::ptr::NonNull;
 
 struct StackWalkerRun {
+    #[cfg(feature = "pystacks")]
     ptr: *mut stack_walker_run,
 }
+
 impl StackWalkerRun {
     fn new() -> Self {
         StackWalkerRun {
+            #[cfg(feature = "pystacks")]
             ptr: std::ptr::null_mut(),
         }
     }
 
+    #[cfg(feature = "pystacks")]
     fn init(&mut self, bpf_object: NonNull<libbpf_sys::bpf_object>, opts: &mut stack_walker_opts) {
-        self.ptr = unsafe {
-            pystacks_init(
-                bpf_object.as_ptr() as *mut pystacks_bindings::bpf_object,
-                opts as *mut _,
-            )
-        };
+        if !self.initialized() {
+            self.ptr = unsafe {
+                pystacks_init(
+                    bpf_object.as_ptr() as *mut pystacks_bindings::bpf_object,
+                    opts as *mut _,
+                )
+            };
+        }
     }
 
+    #[cfg(not(feature = "pystacks"))]
+    fn initialized(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "pystacks")]
     fn initialized(&self) -> bool {
         !self.ptr.is_null()
     }
 
+    #[cfg(not(feature = "pystacks"))]
+    fn symbolize_function(&self, frame: &PyAddr) -> String {
+        "<unknown python>".to_string()
+    }
+
+    #[cfg(feature = "pystacks")]
     fn symbolize_function(&self, frame: &PyAddr) -> String {
         let mut buff = vec![0; 256];
-        let len = unsafe {
-            pystacks_symbolize_function(
-                self.ptr,
-                &raw const frame.addr,
-                buff.as_mut_ptr() as *mut i8,
-                buff.len(),
-            )
-        };
+        let mut len = 0;
+        if self.initialized() {
+            len = unsafe {
+                pystacks_symbolize_function(
+                    self.ptr,
+                    &raw const frame.addr,
+                    buff.as_mut_ptr() as *mut i8,
+                    buff.len(),
+                )
+            };
+        }
         if len > 0 {
             core::str::from_utf8(&buff[..len as usize])
                 .unwrap_or("<unknown python>")
@@ -110,8 +133,14 @@ impl StackWalkerRun {
         }
     }
 
+    #[cfg(not(feature = "pystacks"))]
+    fn load_symbols(&self) {}
+
+    #[cfg(feature = "pystacks")]
     fn load_symbols(&self) {
-        unsafe { pystacks_load_symbols(self.ptr) };
+        if self.initialized() {
+            unsafe { pystacks_load_symbols(self.ptr) };
+        }
     }
 }
 
@@ -122,6 +151,10 @@ impl Default for StackWalkerRun {
 }
 
 impl Drop for StackWalkerRun {
+    #[cfg(not(feature = "pystacks"))]
+    fn drop(&mut self) {}
+
+    #[cfg(feature = "pystacks")]
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             unsafe { pystacks_free(self.ptr) };
@@ -169,6 +202,7 @@ struct Command {
     trace_event_config: Vec<String>,
     #[arg(long, default_value = "0")]
     continuous: u64,
+    #[cfg(feature = "pystacks")]
     #[arg(long)]
     collect_pystacks: bool,
 }
@@ -330,6 +364,17 @@ fn add_frame(
     frame_vec.push(frame);
 }
 
+#[cfg(not(feature = "pystacks"))]
+fn pystacks_to_frames_mapping(
+    psr: &mut Arc<StackWalkerRun>,
+    frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+    func_map: &mut HashMap<String, InternedString>,
+    id_counter: &mut Arc<AtomicUsize>,
+    python_stack_markers: &mut Vec<u64>,
+    stack: &Vec<PyAddr>,
+) {}
+
+#[cfg(feature = "pystacks")]
 fn pystacks_to_frames_mapping(
     psr: &mut Arc<StackWalkerRun>,
     frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
@@ -365,6 +410,14 @@ fn pystacks_to_frames_mapping(
     }
 }
 
+#[cfg(not(feature = "pystacks"))]
+fn user_stack_to_python_calls(
+    frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+    func_map: &mut HashMap<String, InternedString>,
+    python_calls: &mut Vec<u64>,
+) {}
+
+#[cfg(feature = "pystacks")]
 fn user_stack_to_python_calls(
     frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
     func_map: &mut HashMap<String, InternedString>,
@@ -441,6 +494,12 @@ fn stack_to_frames_mapping<'a, I>(
     }
 }
 
+#[cfg(not(feature = "pystacks"))]
+fn merge_pystacks(stack: &Stack, python_calls: &[u64], python_stack_markers: &[u64]) -> Vec<u64> {
+    Vec::new()
+}
+
+#[cfg(feature = "pystacks")]
 fn merge_pystacks(stack: &Stack, python_calls: &[u64], python_stack_markers: &[u64]) -> Vec<u64> {
     let mut merged_addrs = Vec::new();
     let mut user_stack_idx = 0;
@@ -720,6 +779,10 @@ impl StackRecorder {
             let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
             let stack_key = (event.task.tgidpid >> 32) as i32;
 
+            #[cfg(not(feature = "pystacks"))]
+            let py_stack: Vec<PyAddr> = Vec::new();
+
+            #[cfg(feature = "pystacks")]
             let py_stack: Vec<PyAddr> =
                 Vec::from(&event.py_msg_buffer.buffer[..event.py_msg_buffer.stack_len as usize])
                     .iter()
@@ -735,6 +798,7 @@ impl StackRecorder {
             stacks.push(stack);
         }
 
+        #[cfg(feature = "pystacks")]
         if self.psr.initialized() && event.py_msg_buffer.stack_len > 0 {
             self.psr.load_symbols();
         }
@@ -1170,6 +1234,7 @@ fn system(opts: Command) -> Result<()> {
             if !opts.pid.is_empty() {
                 rodata.tool_config.filter_pid = 1;
             }
+            #[cfg(feature = "pystacks")]
             if opts.collect_pystacks {
                 rodata.tool_config.collect_pystacks = 1;
             }
@@ -1294,7 +1359,8 @@ fn system(opts: Command) -> Result<()> {
 
         let object = skel.object();
 
-        if opts.collect_pystacks && !opts.pid.is_empty() {
+        #[cfg(feature = "pystacks")]
+        if cfg!(feature = "pystacks") && opts.collect_pystacks && !opts.pid.is_empty() {
             let mut pid_opts: Vec<i32> = Vec::new();
             for pid in opts.pid.iter() {
                 pid_opts.push(*pid as i32);

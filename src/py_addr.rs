@@ -1,15 +1,21 @@
+#[cfg(feature = "pystacks")]
 use crate::pystacks_bindings;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone)]
 pub struct PyAddr {
+    #[cfg(feature = "pystacks")]
     pub addr: pystacks_bindings::stack_walker_frame,
 }
 unsafe impl Send for PyAddr {}
 unsafe impl Sync for PyAddr {}
 
 impl PartialEq for PyAddr {
+    #[cfg(not(feature = "pystacks"))]
+    fn eq(&self, other: &Self) -> bool {true}
+
+    #[cfg(feature = "pystacks")]
     fn eq(&self, other: &Self) -> bool {
         // Define equality based on both fields
         self.addr.symbol_id == other.addr.symbol_id && self.addr.inst_idx == other.addr.inst_idx
@@ -18,6 +24,10 @@ impl PartialEq for PyAddr {
 impl Eq for PyAddr {}
 
 impl Hash for PyAddr {
+    #[cfg(not(feature = "pystacks"))]
+    fn hash<H: Hasher>(&self, state: &mut H) {}
+
+    #[cfg(feature = "pystacks")]
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Hash each field
         self.addr.symbol_id.hash(state);
@@ -25,6 +35,7 @@ impl Hash for PyAddr {
     }
 }
 
+#[cfg(feature = "pystacks")]
 impl From<&crate::systing::types::stack_walker_frame> for pystacks_bindings::stack_walker_frame {
     fn from(frame: &crate::systing::types::stack_walker_frame) -> Self {
         pystacks_bindings::stack_walker_frame {
@@ -34,6 +45,7 @@ impl From<&crate::systing::types::stack_walker_frame> for pystacks_bindings::sta
     }
 }
 
+#[cfg(feature = "pystacks")]
 impl fmt::Display for crate::systing::types::stack_walker_frame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Customize the formatting as needed
@@ -45,6 +57,7 @@ impl fmt::Display for crate::systing::types::stack_walker_frame {
     }
 }
 
+#[cfg(feature = "pystacks")]
 impl fmt::Display for pystacks_bindings::stack_walker_frame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Customize the formatting as needed
