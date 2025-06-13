@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::events::{EventKeyType, EventProbe, SystingProbeEvent, SystingProbeRecorder};
+use crate::events::{EventKeyType, EventProbe, SystingProbeRecorder};
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::perfetto::TrackCounter;
@@ -191,7 +191,33 @@ mod systing {
 }
 
 pub trait SystingRecordEvent<T> {
-    fn record_event(&mut self, event: T) -> bool;
+    fn use_ringbuf(&self) -> bool {
+        self.ringbuf().max_duration() > 0
+    }
+    fn ringbuf(&self) -> &RingBuffer<T>;
+    fn ringbuf_mut(&mut self) -> &mut RingBuffer<T>;
+    fn maybe_trigger(&mut self, _event: &T) -> bool {
+        false
+    }
+    fn record_event(&mut self, event: T) -> bool
+    where
+        T: SystingEventTS,
+    {
+        if self.use_ringbuf() {
+            let ret = self.maybe_trigger(&event);
+            self.ringbuf_mut().push_front(event);
+            ret
+        } else {
+            self.handle_event(event);
+            false
+        }
+    }
+    fn drain_ringbuf(&mut self) {
+        while let Some(event) = self.ringbuf_mut().pop_back() {
+            self.handle_event(event);
+        }
+    }
+    fn handle_event(&mut self, _event: T);
 }
 
 pub trait SystingEventTS {
@@ -687,33 +713,13 @@ impl From<&task_info> for ThreadDescriptor {
     }
 }
 
-impl SystingRecordEvent<task_event> for SchedEventRecorder {
-    fn record_event(&mut self, event: task_event) -> bool {
-        if self.ringbuf.max_duration() == 0 {
-            // If the ring buffer is not enabled, we just handle the event directly.
-            self.handle_event(event);
-        } else {
-            // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push_front(event);
-        }
-        false
-    }
-}
-
 impl SystingRecordEvent<stack_event> for StackRecorder {
-    fn record_event(&mut self, event: stack_event) -> bool {
-        if self.ringbuf.max_duration() == 0 {
-            // If the ring buffer is not enabled, we just handle the event directly.
-            self.handle_event(event);
-        } else {
-            // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push_front(event);
-        }
-        false
+    fn ringbuf(&self) -> &RingBuffer<stack_event> {
+        &self.ringbuf
     }
-}
-
-impl StackRecorder {
+    fn ringbuf_mut(&mut self) -> &mut RingBuffer<stack_event> {
+        &mut self.ringbuf
+    }
     fn handle_event(&mut self, event: stack_event) {
         if event.user_stack_length > 0 || event.kernel_stack_length > 0 {
             let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
@@ -739,13 +745,9 @@ impl StackRecorder {
             self.psr.load_symbols();
         }
     }
+}
 
-    fn drain_ringbuf(&mut self) {
-        while let Some(event) = self.ringbuf.pop_back() {
-            self.handle_event(event);
-        }
-    }
-
+impl StackRecorder {
     fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         use workerpool::thunk::{Thunk, ThunkWorker};
         use workerpool::Pool;
@@ -770,78 +772,13 @@ impl StackRecorder {
     }
 }
 
-impl SystingRecordEvent<perf_counter_event> for PerfCounterRecorder {
-    fn record_event(&mut self, event: perf_counter_event) -> bool {
-        if self.ringbuf.max_duration() == 0 {
-            // If the ring buffer is not enabled, we just handle the event directly.
-            self.handle_event(event);
-        } else {
-            // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push_front(event);
-        }
-        false
-    }
-}
-
-impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
-    fn record_event(&mut self, event: probe_event) -> bool {
-        let mut extra = "".to_string();
-
-        // Capture the arg if there is one.
-        match event.arg_type {
-            systing::types::arg_type::ARG_LONG => {
-                let mut bytes: [u8; 8] = [0; 8];
-                let _ = bytes.copy_from_bytes(&event.arg[..8]);
-                let val = u64::from_ne_bytes(bytes);
-                extra = format!(":{}", val);
-            }
-            systing::types::arg_type::ARG_STRING => {
-                let arg_str = CStr::from_bytes_until_nul(&event.arg);
-                if arg_str.is_ok() {
-                    let arg_str = arg_str.unwrap();
-                    let bytes = arg_str.to_bytes();
-                    if !bytes.is_empty() && !bytes.starts_with(&[0]) {
-                        extra = format!(":{}", arg_str.to_string_lossy());
-                    }
-                }
-            }
-            _ => {}
-        }
-        let probe_event = SystingProbeEvent {
-            tgidpid: event.task.tgidpid,
-            cookie: event.cookie,
-            ts: event.ts,
-            cpu: event.cpu,
-            extra,
-        };
-
-        // If the ring buffer is not enabled, we just handle the event directly.
-        if self.ringbuf.max_duration() == 0 {
-            self.handle_event(probe_event);
-        } else {
-            let ret = self.maybe_trigger(&probe_event);
-            // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push_front(probe_event);
-            return ret;
-        }
-        false
-    }
-}
-
 impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
-    fn record_event(&mut self, event: SysInfoEvent) -> bool {
-        if self.ringbuf.max_duration() == 0 {
-            // If the ring buffer is not enabled, we just handle the event directly.
-            self.handle_event(event);
-        } else {
-            // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push_front(event);
-        }
-        false
+    fn ringbuf(&self) -> &RingBuffer<SysInfoEvent> {
+        &self.ringbuf
     }
-}
-
-impl SysinfoRecorder {
+    fn ringbuf_mut(&mut self) -> &mut RingBuffer<SysInfoEvent> {
+        &mut self.ringbuf
+    }
     fn handle_event(&mut self, event: SysInfoEvent) {
         let freq = self.frequency.entry(event.cpu).or_default();
         freq.push(TrackCounter {
@@ -849,13 +786,9 @@ impl SysinfoRecorder {
             count: event.frequency,
         });
     }
+}
 
-    fn drain_ringbuf(&mut self) {
-        while let Some(event) = self.ringbuf.pop_back() {
-            self.handle_event(event);
-        }
-    }
-
+impl SysinfoRecorder {
     fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 

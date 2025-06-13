@@ -3,6 +3,7 @@ use std::ffi::CStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::SystingRecordEvent;
 use crate::perfetto::TrackCounter;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::event_type;
@@ -42,8 +43,16 @@ pub struct SchedEventRecorder {
     process_sched_stats: bool,
 }
 
-impl SchedEventRecorder {
-    pub fn handle_event(&mut self, event: task_event) {
+impl SystingRecordEvent<task_event> for SchedEventRecorder {
+    fn ringbuf(&self) -> &RingBuffer<task_event> {
+        &self.ringbuf
+    }
+
+    fn ringbuf_mut(&mut self) -> &mut RingBuffer<task_event> {
+        &mut self.ringbuf
+    }
+
+    fn handle_event(&mut self, event: task_event) {
         // SCHED_SWITCH and SCHED_WAKING are handled in compact sched events.
         // We skip SCHED_WAKEUP because we're just using that for runqueue tracking.
         if event.r#type == event_type::SCHED_SWITCH || event.r#type == event_type::SCHED_WAKING {
@@ -108,13 +117,9 @@ impl SchedEventRecorder {
             });
         }
     }
+}
 
-    pub fn drain_ringbuf(&mut self) {
-        while let Some(event) = self.ringbuf.pop_back() {
-            self.handle_event(event);
-        }
-    }
-
+impl SchedEventRecorder {
     pub fn generate_trace(
         &self,
         pid_uuids: &HashMap<i32, u64>,

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::SystingRecordEvent;
 use crate::perfetto::TrackCounter;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::perf_counter_event;
@@ -41,19 +42,21 @@ impl From<&perf_counter_event> for PerfCounterKey {
     }
 }
 
-impl PerfCounterRecorder {
-    pub fn handle_event(&mut self, event: perf_counter_event) {
+impl SystingRecordEvent<perf_counter_event> for PerfCounterRecorder {
+    fn ringbuf(&self) -> &RingBuffer<perf_counter_event> {
+        &self.ringbuf
+    }
+    fn ringbuf_mut(&mut self) -> &mut RingBuffer<perf_counter_event> {
+        &mut self.ringbuf
+    }
+    fn handle_event(&mut self, event: perf_counter_event) {
         let key = PerfCounterKey::from(&event);
         let entry = self.perf_events.entry(key).or_default();
         entry.push(TrackCounter::from(&event));
     }
+}
 
-    pub fn drain_ringbuf(&mut self) {
-        while let Some(event) = self.ringbuf.pop_back() {
-            self.handle_event(event);
-        }
-    }
-
+impl PerfCounterRecorder {
     pub fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
         let mut desc_uuids: HashMap<String, u64> = HashMap::new();
