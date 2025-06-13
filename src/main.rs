@@ -2,6 +2,11 @@ pub mod events;
 pub mod perf;
 mod perf_recorder;
 pub mod perfetto;
+pub mod py_addr;
+#[allow(clippy::all)]
+#[allow(non_snake_case)]
+#[allow(non_camel_case_types)]
+pub mod pystacks_bindings;
 pub mod ringbuf;
 mod sched;
 pub mod symbolize;
@@ -23,6 +28,11 @@ use crate::events::{EventKeyType, EventProbe, SystingProbeEvent, SystingProbeRec
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::perfetto::TrackCounter;
+use crate::py_addr::PyAddr;
+use crate::pystacks_bindings::{
+    pystacks_free, pystacks_init, pystacks_load_symbols, pystacks_symbolize_function,
+    stack_walker_opts, stack_walker_run,
+};
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::symbolize::Stack;
@@ -35,6 +45,7 @@ use blazesym::symbolize::source::{Kernel, Process, Source};
 use blazesym::symbolize::{cache, Input, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
+use libbpf_rs::{libbpf_sys, AsRawLibbpf};
 use libbpf_rs::{
     MapCore, RawTracepointOpts, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts,
 };
@@ -55,6 +66,72 @@ use perfetto_protos::track_descriptor::TrackDescriptor;
 
 use plain::Plain;
 use protobuf::Message;
+use std::ptr::NonNull;
+
+struct StackWalkerRun {
+    ptr: *mut stack_walker_run,
+}
+impl StackWalkerRun {
+    fn new() -> Self {
+        StackWalkerRun {
+            ptr: std::ptr::null_mut(),
+        }
+    }
+
+    fn init(&mut self, bpf_object: NonNull<libbpf_sys::bpf_object>, opts: &mut stack_walker_opts) {
+        self.ptr = unsafe {
+            pystacks_init(
+                bpf_object.as_ptr() as *mut pystacks_bindings::bpf_object,
+                opts as *mut _,
+            )
+        };
+    }
+
+    fn initialized(&self) -> bool {
+        !self.ptr.is_null()
+    }
+
+    fn symbolize_function(&self, frame: &PyAddr) -> String {
+        let mut buff = vec![0; 256];
+        let len = unsafe {
+            pystacks_symbolize_function(
+                self.ptr,
+                &raw const frame.addr,
+                buff.as_mut_ptr() as *mut i8,
+                buff.len(),
+            )
+        };
+        if len > 0 {
+            core::str::from_utf8(&buff[..len as usize])
+                .unwrap_or("<unknown python>")
+                .to_string()
+        } else {
+            "<unknown python>".to_string()
+        }
+    }
+
+    fn load_symbols(&self) {
+        unsafe { pystacks_load_symbols(self.ptr) };
+    }
+}
+
+impl Default for StackWalkerRun {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for StackWalkerRun {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { pystacks_free(self.ptr) };
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
+
+unsafe impl Send for StackWalkerRun {}
+unsafe impl Sync for StackWalkerRun {}
 
 #[derive(Debug, Parser)]
 struct Command {
@@ -92,6 +169,8 @@ struct Command {
     trace_event_config: Vec<String>,
     #[arg(long, default_value = "0")]
     continuous: u64,
+    #[arg(long)]
+    collect_pystacks: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -188,6 +267,7 @@ struct LocalFrame {
 struct StackRecorder {
     ringbuf: RingBuffer<stack_event>,
     stacks: HashMap<i32, Vec<StackEvent>>,
+    psr: Arc<StackWalkerRun>,
 }
 
 #[derive(Default)]
@@ -250,6 +330,62 @@ fn add_frame(
     frame_vec.push(frame);
 }
 
+fn pystacks_to_frames_mapping(
+    psr: &mut Arc<StackWalkerRun>,
+    frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+    func_map: &mut HashMap<String, InternedString>,
+    id_counter: &mut Arc<AtomicUsize>,
+    python_stack_markers: &mut Vec<u64>,
+    stack: &Vec<PyAddr>,
+) {
+    if !psr.initialized() {
+        return;
+    }
+
+    for frame in stack {
+        if frame_map.contains_key(&(frame.addr.symbol_id as u64)) {
+            continue;
+        }
+        let name = psr.symbolize_function(frame);
+
+        add_frame(
+            frame_map,
+            func_map,
+            id_counter,
+            frame.addr.symbol_id.into(),
+            0,
+            0,
+            name.to_string(),
+        );
+
+        if name == "<interpreter trampoline>" {
+            python_stack_markers.push(frame.addr.symbol_id.into());
+        }
+    }
+}
+
+fn user_stack_to_python_calls(
+    frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+    func_map: &mut HashMap<String, InternedString>,
+    python_calls: &mut Vec<u64>,
+) {
+    let python_call_iids: Vec<_> = func_map
+        .iter()
+        .filter(|(key, value)| key.starts_with("_PyEval_EvalFrame") && value.iid.is_some())
+        .map(|(_, value)| value.iid.unwrap())
+        .collect();
+
+    for (key, values) in frame_map {
+        for value in values {
+            if value.frame.function_name_id.is_some()
+                && python_call_iids.contains(&value.frame.function_name_id.unwrap())
+            {
+                python_calls.push(*key);
+            }
+        }
+    }
+}
+
 fn stack_to_frames_mapping<'a, I>(
     symbolizer: &mut Symbolizer,
     frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
@@ -304,11 +440,94 @@ fn stack_to_frames_mapping<'a, I>(
     }
 }
 
+fn merge_pystacks(stack: &Stack, python_calls: &[u64], python_stack_markers: &[u64]) -> Vec<u64> {
+    let mut merged_addrs = Vec::new();
+    let mut user_stack_idx = 0;
+    let mut pystack_idx = stack.py_stack.len();
+
+    let py_call_count = stack
+        .user_stack
+        .iter()
+        .filter(|&x| python_calls.contains(x))
+        .count();
+    let py_marker_count = if python_stack_markers.is_empty() {
+        stack.py_stack.len()
+    } else {
+        stack
+            .py_stack
+            .iter()
+            .filter(|&x| python_stack_markers.contains(&(x.addr.symbol_id as u64)))
+            .count()
+    };
+
+    // if we have more pyton calls in the system stack than python frames
+    // skip the first N python calls, as the python frames are leafs
+    // If it is only off by 1, it is more likely that we have entered a
+    // PyEval_EvalFrameDeafult but not yet setup the leaf frame, so ignore these
+    // instances
+    let mut skip_py_calls =
+        if py_call_count > py_marker_count && py_call_count - py_marker_count > 1 {
+            py_call_count - py_marker_count
+        } else {
+            0
+        };
+
+    // if we have more python frames than python calls in the system stack
+    // drop the first N python frames. This could happen if the system stack overflows
+    // the buffer used to collect it, in which case the base of the stack would be
+    // missing.
+    let mut skip_py_frame = py_marker_count.saturating_sub(py_call_count);
+
+    if python_stack_markers.is_empty() {
+        pystack_idx -= skip_py_frame;
+    } else {
+        while skip_py_frame > 0 {
+            if python_stack_markers
+                .contains(&(stack.py_stack[pystack_idx - 1].addr.symbol_id as u64))
+            {
+                skip_py_frame -= 1;
+            }
+        }
+    }
+
+    while user_stack_idx < stack.user_stack.len() {
+        let user_addr = stack.user_stack[user_stack_idx];
+        if skip_py_calls == 0 && pystack_idx > 0 && python_calls.contains(&user_addr) {
+            // decrement either way. In the if case below, we added the address. In
+            // the else case below, we are incrementing past the stack marker that
+            // ended the previous loop
+            pystack_idx -= 1;
+            if python_stack_markers.is_empty() {
+                merged_addrs.push(stack.py_stack[pystack_idx].addr.symbol_id as u64);
+            } else {
+                while pystack_idx > 0
+                    && !python_stack_markers
+                        .contains(&(stack.py_stack[pystack_idx - 1].addr.symbol_id as u64))
+                {
+                    pystack_idx -= 1;
+                    merged_addrs.push(stack.py_stack[pystack_idx].addr.symbol_id as u64);
+                }
+            }
+        } else {
+            if python_calls.contains(&user_addr) && skip_py_calls > 0 {
+                skip_py_calls -= 1;
+            }
+
+            merged_addrs.push(user_addr);
+        }
+        // increment either way. In the if case, we are incremented past the
+        // python_call address, in the else case, we added the address
+        user_stack_idx += 1;
+    }
+    merged_addrs
+}
+
 fn generate_stack_packets(
     packets: &mut Arc<Mutex<Vec<TracePacket>>>,
     tgid: u32,
     stacks: Vec<StackEvent>,
     id_counter: &mut Arc<AtomicUsize>,
+    psr: &mut Arc<StackWalkerRun>,
 ) {
     let user_src = Source::Process(Process::new(Pid::from(tgid)));
     let kernel_src = Source::Kernel(Kernel::default());
@@ -323,6 +542,8 @@ fn generate_stack_packets(
     // out the hashmap with all of the frames.
     let mut frame_map = HashMap::new();
     let mut func_name_map = HashMap::new();
+    let mut python_calls = Vec::new();
+    let mut python_stack_markers = Vec::new();
     for stack in stacks.iter() {
         let raw_stack = &stack.stack;
         stack_to_frames_mapping(
@@ -333,6 +554,7 @@ fn generate_stack_packets(
             id_counter,
             raw_stack.user_stack.iter(),
         );
+        user_stack_to_python_calls(&mut frame_map, &mut func_name_map, &mut python_calls);
         stack_to_frames_mapping(
             &mut symbolizer,
             &mut frame_map,
@@ -340,6 +562,14 @@ fn generate_stack_packets(
             &kernel_src,
             id_counter,
             raw_stack.kernel_stack.iter(),
+        );
+        pystacks_to_frames_mapping(
+            psr,
+            &mut frame_map,
+            &mut func_name_map,
+            id_counter,
+            &mut python_stack_markers,
+            &raw_stack.py_stack,
         );
     }
 
@@ -354,18 +584,34 @@ fn generate_stack_packets(
             let mut callstack = Callstack::default();
             let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             callstack.set_iid(iid);
-            callstack.frame_ids = stack
-                .user_stack
-                .iter()
-                .chain(stack.kernel_stack.iter())
-                .flat_map(|addr| {
-                    let frame_vec = frame_map.get(addr).unwrap();
-                    frame_vec
-                        .iter()
-                        .map(|frame| frame.frame.iid())
-                        .collect::<Vec<u64>>()
-                })
-                .collect();
+            callstack.frame_ids = if stack.py_stack.is_empty() {
+                stack
+                    .user_stack
+                    .iter()
+                    .chain(stack.kernel_stack.iter())
+                    .flat_map(|addr| {
+                        let frame_vec = frame_map.get(addr).unwrap();
+                        frame_vec
+                            .iter()
+                            .map(|frame| frame.frame.iid())
+                            .collect::<Vec<u64>>()
+                    })
+                    .collect()
+            } else {
+                let merged_addrs = merge_pystacks(&stack, &python_calls, &python_stack_markers);
+
+                merged_addrs
+                    .iter()
+                    .chain(stack.kernel_stack.iter())
+                    .flat_map(|addr| {
+                        let frame_vec = frame_map.get(addr).unwrap();
+                        frame_vec
+                            .iter()
+                            .map(|frame| frame.frame.iid())
+                            .collect::<Vec<u64>>()
+                    })
+                    .collect()
+            };
             (stack, callstack)
         })
         .collect();
@@ -472,13 +718,24 @@ impl StackRecorder {
             let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
             let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
             let stack_key = (event.task.tgidpid >> 32) as i32;
+
+            let py_stack: Vec<PyAddr> =
+                Vec::from(&event.py_msg_buffer.buffer[..event.py_msg_buffer.stack_len as usize])
+                    .iter()
+                    .map(|frame| PyAddr { addr: frame.into() })
+                    .collect();
+
             let stack = StackEvent {
                 tgidpid: event.task.tgidpid,
                 ts_start: event.ts,
-                stack: Stack::new(&kstack_vec, &ustack_vec),
+                stack: Stack::new(&kstack_vec, &ustack_vec, &py_stack),
             };
             let stacks = self.stacks.entry(stack_key).or_default();
             stacks.push(stack);
+        }
+
+        if self.psr.initialized() && event.py_msg_buffer.stack_len > 0 {
+            self.psr.load_symbols();
         }
     }
 
@@ -498,11 +755,12 @@ impl StackRecorder {
         // Resolve the stacks, generate the interned data for them, and populate the trace.
         for (tgid, stacks) in self.stacks.iter() {
             let mut id_counter = id_counter.clone();
+            let mut psr = self.psr.clone();
             let stacks = stacks.clone();
             let tgid = *tgid as u32;
             let mut packets = packets.clone();
             pool.execute(Thunk::of(move || {
-                generate_stack_packets(&mut packets, tgid, stacks, &mut id_counter)
+                generate_stack_packets(&mut packets, tgid, stacks, &mut id_counter, &mut psr)
             }));
         }
         pool.join();
@@ -911,6 +1169,9 @@ fn system(opts: Command) -> Result<()> {
             if !opts.pid.is_empty() {
                 rodata.tool_config.filter_pid = 1;
             }
+            if opts.collect_pystacks {
+                rodata.tool_config.collect_pystacks = 1;
+            }
         }
         if opts.ringbuf_size_mib > 0 {
             let size = opts.ringbuf_size_mib * 1024 * 1024;
@@ -922,6 +1183,7 @@ fn system(opts: Command) -> Result<()> {
                 }
             }
         }
+
         recorder
             .event_recorder
             .lock()
@@ -1030,6 +1292,24 @@ fn system(opts: Command) -> Result<()> {
         let (probe_tx, probe_rx) = channel();
 
         let object = skel.object();
+
+        if opts.collect_pystacks && !opts.pid.is_empty() {
+            let mut pid_opts: Vec<i32> = Vec::new();
+            for pid in opts.pid.iter() {
+                pid_opts.push(*pid as i32);
+            }
+
+            let mut sw_opts = stack_walker_opts {
+                pids: pid_opts.as_mut_ptr(),
+                pidCount: pid_opts.len(),
+                manualSymbolRefresh: true,
+            };
+
+            Arc::<StackWalkerRun>::get_mut(&mut recorder.stack_recorder.lock().unwrap().psr)
+                .expect("nonshared Arc for init")
+                .init(skel.object().as_libbpf_object(), &mut sw_opts);
+        }
+
         for (i, map) in object.maps().enumerate() {
             let name = map.name().to_str().unwrap();
             if name.starts_with("ringbuf_events") {
