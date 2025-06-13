@@ -327,9 +327,7 @@ impl PerfEventFile {
                 self.need_disable = true;
                 Ok(())
             }
-            Err(e) => {
-                Err(e.into())
-            }
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -378,12 +376,10 @@ fn visit_events(dir: &Path, events: &mut Vec<PerfHwEvent>) -> Result<()> {
     // Some of the topdown metrics exposted by Intel Atom don't have a slots entry, so we have to
     // check and see if there's a slots file in this events directory to decide if any topdown
     // metrics require a slots fd.
-    let need_slots = entries
-        .iter()
-        .any(|entry| {
-            let filename = entry.file_name().unwrap().to_str().unwrap();
-            filename == "slots"
-        });
+    let need_slots = entries.iter().any(|entry| {
+        let filename = entry.file_name().unwrap().to_str().unwrap();
+        filename == "slots"
+    });
 
     let event_re = Regex::new(r"event=0x([0-9a-fA-F]+)").unwrap();
     let umask_re = Regex::new(r"umask=0x([0-9a-fA-F]+)").unwrap();
