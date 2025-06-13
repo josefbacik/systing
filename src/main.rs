@@ -19,12 +19,12 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::events::{EventKeyType, EventProbe, SystingProbeEvent, SystingProbeRecorder};
+use crate::events::{EventKeyType, EventProbe, SystingProbeRecorder};
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::perfetto::TrackCounter;
@@ -191,11 +191,43 @@ mod systing {
 }
 
 pub trait SystingRecordEvent<T> {
-    fn record_event(&mut self, event: T) -> bool;
+    fn use_ringbuf(&self) -> bool {
+        self.ringbuf().max_duration() > 0
+    }
+    fn ringbuf(&self) -> &RingBuffer<T>;
+    fn ringbuf_mut(&mut self) -> &mut RingBuffer<T>;
+    fn maybe_trigger(&mut self, _event: &T) -> bool {
+        false
+    }
+    fn record_event(&mut self, event: T) -> bool
+    where
+        T: SystingEvent,
+    {
+        if self.use_ringbuf() {
+            let ret = self.maybe_trigger(&event);
+            self.ringbuf_mut().push_front(event);
+            ret
+        } else {
+            self.handle_event(event);
+            false
+        }
+    }
+    fn drain_ringbuf(&mut self) {
+        while let Some(event) = self.ringbuf_mut().pop_back() {
+            self.handle_event(event);
+        }
+    }
+    fn handle_event(&mut self, _event: T);
 }
 
-pub trait SystingEventTS {
+pub trait SystingEvent {
     fn ts(&self) -> u64;
+    fn next_task_info(&self) -> Option<&task_info> {
+        None
+    }
+    fn prev_task_info(&self) -> Option<&task_info> {
+        None
+    }
 }
 
 use systing::types::arg_desc;
@@ -213,31 +245,52 @@ unsafe impl Plain for perf_counter_event {}
 unsafe impl Plain for probe_event {}
 unsafe impl Plain for arg_desc {}
 
-impl SystingEventTS for task_event {
+impl SystingEvent for task_event {
     fn ts(&self) -> u64 {
         self.ts
     }
-}
-
-impl SystingEventTS for stack_event {
-    fn ts(&self) -> u64 {
-        self.ts
+    fn next_task_info(&self) -> Option<&task_info> {
+        match self.r#type {
+            event_type::SCHED_SWITCH
+            | event_type::SCHED_WAKING
+            | event_type::SCHED_WAKEUP
+            | event_type::SCHED_WAKEUP_NEW => Some(&self.next),
+            _ => None,
+        }
+    }
+    fn prev_task_info(&self) -> Option<&task_info> {
+        Some(&self.prev)
     }
 }
 
-impl SystingEventTS for perf_counter_event {
+impl SystingEvent for stack_event {
     fn ts(&self) -> u64 {
         self.ts
     }
-}
-
-impl SystingEventTS for probe_event {
-    fn ts(&self) -> u64 {
-        self.ts
+    fn next_task_info(&self) -> Option<&task_info> {
+        Some(&self.task)
     }
 }
 
-impl SystingEventTS for SysInfoEvent {
+impl SystingEvent for perf_counter_event {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+    fn next_task_info(&self) -> Option<&task_info> {
+        Some(&self.task)
+    }
+}
+
+impl SystingEvent for probe_event {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+    fn next_task_info(&self) -> Option<&task_info> {
+        Some(&self.task)
+    }
+}
+
+impl SystingEvent for SysInfoEvent {
     fn ts(&self) -> u64 {
         self.ts
     }
@@ -687,33 +740,13 @@ impl From<&task_info> for ThreadDescriptor {
     }
 }
 
-impl SystingRecordEvent<task_event> for SchedEventRecorder {
-    fn record_event(&mut self, event: task_event) -> bool {
-        if self.ringbuf.max_duration() == 0 {
-            // If the ring buffer is not enabled, we just handle the event directly.
-            self.handle_event(event);
-        } else {
-            // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push_front(event);
-        }
-        false
-    }
-}
-
 impl SystingRecordEvent<stack_event> for StackRecorder {
-    fn record_event(&mut self, event: stack_event) -> bool {
-        if self.ringbuf.max_duration() == 0 {
-            // If the ring buffer is not enabled, we just handle the event directly.
-            self.handle_event(event);
-        } else {
-            // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push_front(event);
-        }
-        false
+    fn ringbuf(&self) -> &RingBuffer<stack_event> {
+        &self.ringbuf
     }
-}
-
-impl StackRecorder {
+    fn ringbuf_mut(&mut self) -> &mut RingBuffer<stack_event> {
+        &mut self.ringbuf
+    }
     fn handle_event(&mut self, event: stack_event) {
         if event.user_stack_length > 0 || event.kernel_stack_length > 0 {
             let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
@@ -739,13 +772,9 @@ impl StackRecorder {
             self.psr.load_symbols();
         }
     }
+}
 
-    fn drain_ringbuf(&mut self) {
-        while let Some(event) = self.ringbuf.pop_back() {
-            self.handle_event(event);
-        }
-    }
-
+impl StackRecorder {
     fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         use workerpool::thunk::{Thunk, ThunkWorker};
         use workerpool::Pool;
@@ -770,78 +799,13 @@ impl StackRecorder {
     }
 }
 
-impl SystingRecordEvent<perf_counter_event> for PerfCounterRecorder {
-    fn record_event(&mut self, event: perf_counter_event) -> bool {
-        if self.ringbuf.max_duration() == 0 {
-            // If the ring buffer is not enabled, we just handle the event directly.
-            self.handle_event(event);
-        } else {
-            // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push_front(event);
-        }
-        false
-    }
-}
-
-impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
-    fn record_event(&mut self, event: probe_event) -> bool {
-        let mut extra = "".to_string();
-
-        // Capture the arg if there is one.
-        match event.arg_type {
-            systing::types::arg_type::ARG_LONG => {
-                let mut bytes: [u8; 8] = [0; 8];
-                let _ = bytes.copy_from_bytes(&event.arg[..8]);
-                let val = u64::from_ne_bytes(bytes);
-                extra = format!(":{}", val);
-            }
-            systing::types::arg_type::ARG_STRING => {
-                let arg_str = CStr::from_bytes_until_nul(&event.arg);
-                if arg_str.is_ok() {
-                    let arg_str = arg_str.unwrap();
-                    let bytes = arg_str.to_bytes();
-                    if !bytes.is_empty() && !bytes.starts_with(&[0]) {
-                        extra = format!(":{}", arg_str.to_string_lossy());
-                    }
-                }
-            }
-            _ => {}
-        }
-        let probe_event = SystingProbeEvent {
-            tgidpid: event.task.tgidpid,
-            cookie: event.cookie,
-            ts: event.ts,
-            cpu: event.cpu,
-            extra,
-        };
-
-        // If the ring buffer is not enabled, we just handle the event directly.
-        if self.ringbuf.max_duration() == 0 {
-            self.handle_event(probe_event);
-        } else {
-            let ret = self.maybe_trigger(&probe_event);
-            // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push_front(probe_event);
-            return ret;
-        }
-        false
-    }
-}
-
 impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
-    fn record_event(&mut self, event: SysInfoEvent) -> bool {
-        if self.ringbuf.max_duration() == 0 {
-            // If the ring buffer is not enabled, we just handle the event directly.
-            self.handle_event(event);
-        } else {
-            // Otherwise, we push the event into the ring buffer.
-            self.ringbuf.push_front(event);
-        }
-        false
+    fn ringbuf(&self) -> &RingBuffer<SysInfoEvent> {
+        &self.ringbuf
     }
-}
-
-impl SysinfoRecorder {
+    fn ringbuf_mut(&mut self) -> &mut RingBuffer<SysInfoEvent> {
+        &mut self.ringbuf
+    }
     fn handle_event(&mut self, event: SysInfoEvent) {
         let freq = self.frequency.entry(event.cpu).or_default();
         freq.push(TrackCounter {
@@ -849,13 +813,9 @@ impl SysinfoRecorder {
             count: event.frequency,
         });
     }
+}
 
-    fn drain_ringbuf(&mut self) {
-        while let Some(event) = self.ringbuf.pop_back() {
-            self.handle_event(event);
-        }
-    }
-
+impl SysinfoRecorder {
     fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
@@ -1047,6 +1007,35 @@ where
         0
     })?;
     builder.build()
+}
+
+fn consume_loop<T, N>(
+    session_recorder: &Arc<SessionRecorder>,
+    recorder: &Mutex<T>,
+    rx: Receiver<N>,
+    stop_tx: Sender<()>,
+) where
+    T: SystingRecordEvent<N>,
+    N: Plain + SystingEvent,
+{
+    loop {
+        let res = rx.recv();
+        if res.is_err() {
+            break;
+        }
+        let event = res.unwrap();
+        if let Some(task_info) = event.next_task_info() {
+            maybe_record_task(task_info, session_recorder);
+        }
+        if let Some(task_info) = event.prev_task_info() {
+            maybe_record_task(task_info, session_recorder);
+        }
+        let ret = recorder.lock().unwrap().record_event(event);
+        if ret {
+            stop_tx.send(()).expect("Failed to send stop signal");
+            break;
+        }
+    }
 }
 
 fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
@@ -1343,31 +1332,12 @@ fn system(opts: Command) -> Result<()> {
             thread::Builder::new()
                 .name("sched_recorder".to_string())
                 .spawn(move || {
-                    loop {
-                        let res = event_rx.recv();
-                        if res.is_err() {
-                            break;
-                        }
-                        let event = res.unwrap();
-                        maybe_record_task(&event.prev, &session_recorder);
-                        match event.r#type {
-                            event_type::SCHED_SWITCH
-                            | event_type::SCHED_WAKING
-                            | event_type::SCHED_WAKEUP
-                            | event_type::SCHED_WAKEUP_NEW => {
-                                maybe_record_task(&event.next, &session_recorder);
-                            }
-                            _ => {}
-                        }
-                        let stop = session_recorder
-                            .event_recorder
-                            .lock()
-                            .unwrap()
-                            .record_event(event);
-                        if stop {
-                            my_stop_tx.send(()).expect("Failed to send stop signal");
-                        }
-                    }
+                    consume_loop::<SchedEventRecorder, task_event>(
+                        &session_recorder,
+                        &session_recorder.event_recorder,
+                        event_rx,
+                        my_stop_tx,
+                    );
                     0
                 })?,
         );
@@ -1377,22 +1347,12 @@ fn system(opts: Command) -> Result<()> {
             thread::Builder::new()
                 .name("stack_recorder".to_string())
                 .spawn(move || {
-                    loop {
-                        let res = stack_rx.recv();
-                        if res.is_err() {
-                            break;
-                        }
-                        let event = res.unwrap();
-                        maybe_record_task(&event.task, &session_recorder);
-                        let ret = session_recorder
-                            .stack_recorder
-                            .lock()
-                            .unwrap()
-                            .record_event(event);
-                        if ret {
-                            my_stop_tx.send(()).expect("Failed to send stop signal");
-                        }
-                    }
+                    consume_loop::<StackRecorder, stack_event>(
+                        &session_recorder,
+                        &session_recorder.stack_recorder,
+                        stack_rx,
+                        my_stop_tx,
+                    );
                     0
                 })?,
         );
@@ -1402,22 +1362,12 @@ fn system(opts: Command) -> Result<()> {
             thread::Builder::new()
                 .name("probe_recorder".to_string())
                 .spawn(move || {
-                    loop {
-                        let res = probe_rx.recv();
-                        if res.is_err() {
-                            break;
-                        }
-                        let event = res.unwrap();
-                        maybe_record_task(&event.task, &session_recorder);
-                        let ret = session_recorder
-                            .probe_recorder
-                            .lock()
-                            .unwrap()
-                            .record_event(event);
-                        if ret {
-                            my_stop_tx.send(()).expect("Failed to send stop signal");
-                        }
-                    }
+                    consume_loop::<SystingProbeRecorder, probe_event>(
+                        &session_recorder,
+                        &session_recorder.probe_recorder,
+                        probe_rx,
+                        my_stop_tx,
+                    );
                     0
                 })?,
         );
@@ -1428,22 +1378,12 @@ fn system(opts: Command) -> Result<()> {
                 thread::Builder::new()
                     .name("perf_counter_recorder".to_string())
                     .spawn(move || {
-                        loop {
-                            let res = cache_rx.recv();
-                            if res.is_err() {
-                                break;
-                            }
-                            let event = res.unwrap();
-                            maybe_record_task(&event.task, &session_recorder);
-                            let ret = session_recorder
-                                .perf_counter_recorder
-                                .lock()
-                                .unwrap()
-                                .record_event(event);
-                            if ret {
-                                my_stop_tx.send(()).expect("Failed to send stop signal");
-                            }
-                        }
+                        consume_loop::<PerfCounterRecorder, perf_counter_event>(
+                            &session_recorder,
+                            &session_recorder.perf_counter_recorder,
+                            cache_rx,
+                            my_stop_tx,
+                        );
                         0
                     })?,
             );

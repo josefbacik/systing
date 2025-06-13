@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::CStr;
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -6,31 +7,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::ringbuf::RingBuffer;
+use crate::systing::types::probe_event;
+use crate::SystingRecordEvent;
+
 use anyhow::Result;
+use plain::Plain;
 use serde::Deserialize;
 use serde_json;
 
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::TrackEvent;
-
-use crate::ringbuf::RingBuffer;
-use crate::SystingEventTS;
-
-#[derive(Default, Clone)]
-pub struct SystingProbeEvent {
-    pub tgidpid: u64,
-    pub cookie: u64,
-    pub ts: u64,
-    pub cpu: u32,
-    pub extra: String,
-}
-
-impl SystingEventTS for SystingProbeEvent {
-    fn ts(&self) -> u64 {
-        self.ts
-    }
-}
 
 struct TrackInstant {
     ts: u64,
@@ -52,7 +40,7 @@ struct ThresholdStopTrigger {
 // the events we've seen so far.
 #[derive(Default)]
 pub struct SystingProbeRecorder {
-    pub ringbuf: RingBuffer<SystingProbeEvent>,
+    pub ringbuf: RingBuffer<probe_event>,
 
     // The events tied to the cookie, so we know what event we're dealing with when we get a cookie
     // from bpf.
@@ -487,21 +475,62 @@ impl fmt::Display for SystingEvent {
     }
 }
 
-impl SystingProbeRecorder {
-    pub fn maybe_trigger(&mut self, event: &SystingProbeEvent) -> bool {
+impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
+    fn ringbuf(&self) -> &RingBuffer<probe_event> {
+        &self.ringbuf
+    }
+    fn ringbuf_mut(&mut self) -> &mut RingBuffer<probe_event> {
+        &mut self.ringbuf
+    }
+
+    fn handle_event(&mut self, event: probe_event) {
+        let systing_event = self.cookies.get(&event.cookie).unwrap();
+        let mut extra = "".to_string();
+
+        // Capture the arg if there is one.
+        match event.arg_type {
+            crate::systing::types::arg_type::ARG_LONG => {
+                let mut bytes: [u8; 8] = [0; 8];
+                let _ = bytes.copy_from_bytes(&event.arg[..8]);
+                let val = u64::from_ne_bytes(bytes);
+                extra = format!(":{}", val);
+            }
+            crate::systing::types::arg_type::ARG_STRING => {
+                let arg_str = CStr::from_bytes_until_nul(&event.arg);
+                if arg_str.is_ok() {
+                    let arg_str = arg_str.unwrap();
+                    let bytes = arg_str.to_bytes();
+                    if !bytes.is_empty() && !bytes.starts_with(&[0]) {
+                        extra = format!(":{}", arg_str.to_string_lossy());
+                    }
+                }
+            }
+            _ => {}
+        }
+        if systing_event.percpu {
+            self.handle_cpu_event(event, extra);
+        } else {
+            self.handle_process_event(event, extra);
+        }
+    }
+
+    fn maybe_trigger(&mut self, event: &probe_event) -> bool {
         // If this is an instant event we trigger immediately
         if self.instant_triggers.contains(&event.cookie) {
             println!(
                 "Instant event triggered on TGID {} PID {}",
-                event.tgidpid >> 32_u32,
-                event.tgidpid as u32
+                event.task.tgidpid >> 32_u32,
+                event.task.tgidpid as u32
             );
             return true;
         }
 
         // If this is a start event record the ts and continue
         if self.start_triggers.contains(&event.cookie) {
-            let entry = self.outstanding_triggers.entry(event.tgidpid).or_default();
+            let entry = self
+                .outstanding_triggers
+                .entry(event.task.tgidpid)
+                .or_default();
             entry.insert(event.cookie, event.ts);
             return false;
         }
@@ -512,7 +541,7 @@ impl SystingProbeRecorder {
         }
 
         // If this is an end event, we need to check if we have a start trigger for it
-        if let Some(start_map) = self.outstanding_triggers.get_mut(&event.tgidpid) {
+        if let Some(start_map) = self.outstanding_triggers.get_mut(&event.task.tgidpid) {
             let trigger_index = self.end_triggers.get(&event.cookie).unwrap();
             let trigger = &self.stop_triggers[*trigger_index];
             if let Some(start_ts) = start_map.remove(&trigger.start_cookie) {
@@ -523,8 +552,8 @@ impl SystingProbeRecorder {
                 if start + threshold <= end {
                     println!(
                         "Threshold exceeded on TGID {} PID {}",
-                        event.tgidpid >> 32_u32,
-                        event.tgidpid as u32
+                        event.task.tgidpid >> 32_u32,
+                        event.task.tgidpid as u32
                     );
                     return true;
                 }
@@ -533,8 +562,10 @@ impl SystingProbeRecorder {
 
         false
     }
+}
 
-    fn handle_cpu_event(&mut self, event: SystingProbeEvent) {
+impl SystingProbeRecorder {
+    fn handle_cpu_event(&mut self, event: probe_event, extra: String) {
         let systing_event = self.cookies.get(&event.cookie).unwrap();
 
         // If this is an instant event just add it to the list of events
@@ -544,7 +575,7 @@ impl SystingProbeRecorder {
             let entry = entry.entry(instant_track.clone()).or_default();
             entry.push(TrackInstant {
                 ts: event.ts,
-                name: format!("{}{}", systing_event, event.extra),
+                name: format!("{}{}", systing_event, extra),
             });
             return;
         }
@@ -589,17 +620,17 @@ impl SystingProbeRecorder {
         }
     }
 
-    fn handle_process_event(&mut self, event: SystingProbeEvent) {
+    fn handle_process_event(&mut self, event: probe_event, extra: String) {
         let systing_event = self.cookies.get(&event.cookie).unwrap();
 
         // If this is an instant event just add it to the list of events
         if self.instant_events.contains_key(&systing_event.name) {
-            let entry = self.events.entry(event.tgidpid).or_default();
+            let entry = self.events.entry(event.task.tgidpid).or_default();
             let instant_track = self.instant_events.get(&systing_event.name).unwrap();
             let entry = entry.entry(instant_track.clone()).or_default();
             entry.push(TrackInstant {
                 ts: event.ts,
-                name: format!("{}{}", systing_event, event.extra),
+                name: format!("{}{}", systing_event, extra),
             });
             return;
         }
@@ -607,11 +638,11 @@ impl SystingProbeRecorder {
         // First check to see if this is an end event, since we can have the same event for a start
         // event and an end event
         if let Some(range_name) = self.stop_events.get(&systing_event.name) {
-            if let Some(ranges) = self.outstanding_ranges.get_mut(&event.tgidpid) {
+            if let Some(ranges) = self.outstanding_ranges.get_mut(&event.task.tgidpid) {
                 if let Some(mut range) = ranges.remove(range_name) {
                     let track_name = self.ranges.get(range_name).unwrap().clone();
                     range.end = event.ts;
-                    let track_hash = self.recorded_ranges.entry(event.tgidpid).or_default();
+                    let track_hash = self.recorded_ranges.entry(event.task.tgidpid).or_default();
                     let entry = track_hash.entry(track_name).or_default();
                     entry.push(range);
                 }
@@ -620,7 +651,7 @@ impl SystingProbeRecorder {
 
         // Now handle the start event case
         if let Some(range_name) = self.start_events.get(&systing_event.name) {
-            if let Some(ranges) = self.outstanding_ranges.get_mut(&event.tgidpid) {
+            if let Some(ranges) = self.outstanding_ranges.get_mut(&event.task.tgidpid) {
                 if let Some(range) = ranges.get_mut(range_name) {
                     range.start = event.ts;
                 } else {
@@ -639,23 +670,8 @@ impl SystingProbeRecorder {
                     end: 0,
                 };
                 ranges.insert(range_name.clone(), range);
-                self.outstanding_ranges.insert(event.tgidpid, ranges);
+                self.outstanding_ranges.insert(event.task.tgidpid, ranges);
             }
-        }
-    }
-
-    pub fn handle_event(&mut self, event: SystingProbeEvent) {
-        let systing_event = self.cookies.get(&event.cookie).unwrap();
-        if systing_event.percpu {
-            self.handle_cpu_event(event);
-        } else {
-            self.handle_process_event(event);
-        }
-    }
-
-    pub fn drain_ringbuf(&mut self) {
-        while let Some(event) = self.ringbuf.pop_back() {
-            self.handle_event(event);
         }
     }
 
@@ -1077,6 +1093,7 @@ impl SystingProbeRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::systing::types::task_info;
     use rand::rngs::mock::StepRng;
 
     #[test]
@@ -1509,8 +1526,11 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        let event = SystingProbeEvent {
-            tgidpid: 1234,
+        let event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ts: 1000,
             ..Default::default()
         };
@@ -1562,8 +1582,11 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        let mut event = SystingProbeEvent {
-            tgidpid: 1234,
+        let mut event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ts: 1000,
             ..Default::default()
         };
@@ -1628,8 +1651,11 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        let event = SystingProbeEvent {
-            tgidpid: 1234,
+        let event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ts: 1000,
             ..Default::default()
         };
@@ -1676,8 +1702,11 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        let event = SystingProbeEvent {
-            tgidpid: 1234,
+        let event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ts: 2000,
             cookie: 1,
             ..Default::default()
@@ -1734,8 +1763,11 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        let mut event = SystingProbeEvent {
-            tgidpid: 1234,
+        let mut event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ts: 1000,
             ..Default::default()
         };
@@ -1830,8 +1862,11 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        let mut event = SystingProbeEvent {
-            tgidpid: 1234,
+        let mut event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ts: 1000,
             ..Default::default()
         };
@@ -1952,8 +1987,11 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        let event = SystingProbeEvent {
-            tgidpid: 1234,
+        let event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ts: 1000,
             ..Default::default()
         };
@@ -1996,8 +2034,11 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        let event = SystingProbeEvent {
-            tgidpid: 1234,
+        let event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ts: 1000,
             ..Default::default()
         };
@@ -2272,8 +2313,11 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        let mut event = SystingProbeEvent {
-            tgidpid: 1234,
+        let mut event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let ret = recorder.maybe_trigger(&event);
@@ -2313,8 +2357,11 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        let mut event = SystingProbeEvent {
-            tgidpid: 1234,
+        let mut event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let ret = recorder.maybe_trigger(&event);
@@ -2348,8 +2395,11 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        let event = SystingProbeEvent {
-            tgidpid: 1234,
+        let event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ts: 1000,
             ..Default::default()
         };
@@ -2383,8 +2433,11 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        let event = SystingProbeEvent {
-            tgidpid: 1234,
+        let event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ts: 1000,
             ..Default::default()
         };
@@ -2427,8 +2480,11 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        let event = SystingProbeEvent {
-            tgidpid: 1234,
+        let event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ts: 1000,
             ..Default::default()
         };
@@ -2471,8 +2527,11 @@ mod tests {
         "#;
 
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        let event = SystingProbeEvent {
-            tgidpid: 1234,
+        let event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ts: 1000,
             ..Default::default()
         };
@@ -2635,8 +2694,11 @@ mod tests {
         let event = recorder.config_events.get("event_percpu").unwrap();
         assert!(event.percpu);
 
-        let event = SystingProbeEvent {
-            tgidpid: 1234,
+        let event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
             ts: 1000,
             cpu: 1,
             ..Default::default()
