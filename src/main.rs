@@ -346,6 +346,7 @@ fn pystacks_to_frames_mapping(
         if frame_map.contains_key(&(frame.addr.symbol_id as u64)) {
             continue;
         }
+
         let name = psr.symbolize_function(frame);
 
         add_frame(
@@ -355,7 +356,7 @@ fn pystacks_to_frames_mapping(
             frame.addr.symbol_id.into(),
             0,
             0,
-            name.to_string(),
+            format!("{} [py]", name),
         );
 
         if name == "<interpreter trampoline>" {
