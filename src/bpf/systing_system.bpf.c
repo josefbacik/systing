@@ -3,8 +3,10 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/usdt.bpf.h>
 
+#ifdef SYSTING_PYSTACKS
 #include "strobelight/bpf_lib/common/common.h"
 #include "strobelight/bpf_lib/python/pystacks/pystacks.bpf.h"
+#endif
 
 #define TASK_RUNNING 0
 #define TASK_INTERRUPTIBLE 1
@@ -108,7 +110,9 @@ struct stack_event {
 	u64 user_stack_length;
 	u64 kernel_stack[MAX_STACK_DEPTH];
 	u64 user_stack[MAX_STACK_DEPTH];
+#ifdef SYSTING_PYSTACKS
 	struct pystacks_message py_msg_buffer;
+#endif
 };
 
 struct perf_counter_event {
@@ -434,9 +438,11 @@ static void emit_stack_event(void *ctx,struct task_struct *task,
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
 
+#ifdef SYSTING_PYSTACKS
 	if (tool_config.collect_pystacks) {
 		pystacks_read_stacks(ctx, NULL, &event->py_msg_buffer);
 	}
+#endif
 
 	event->stack_event_type = type;
 

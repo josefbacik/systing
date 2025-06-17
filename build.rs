@@ -6,6 +6,10 @@ use libbpf_cargo::SkeletonBuilder;
 
 const SRC: [&str; 1] = ["src/bpf/systing_system.bpf.c"];
 
+#[cfg(not(feature = "pystacks"))]
+fn generate_bindings(_: &PathBuf) {}
+
+#[cfg(feature = "pystacks")]
 fn generate_bindings(out_dir: &PathBuf) {
     use std::path::PathBuf;
 
@@ -26,6 +30,14 @@ fn generate_bindings(out_dir: &PathBuf) {
     println!("cargo:rustc-link-lib=dylib=re2");
     println!("cargo:rustc-link-lib=dylib=elf");
     println!("cargo:rustc-link-lib=dylib=cap");
+
+    std::process::Command::new("git")
+        .arg("submodule")
+        .arg("update")
+        .arg("--init")
+        .arg("--recursive")
+        .status()
+        .expect("Failed update submodules");
 
     let vmlinux_include_arg = format!(
         "-I{}",
@@ -59,7 +71,7 @@ fn generate_bindings(out_dir: &PathBuf) {
         .generate()
         .expect("Unable to generate bindings");
 
-    let bindings_path = PathBuf::from("src/pystacks_bindings.rs");
+    let bindings_path = PathBuf::from("src/pystacks/bindings.rs");
     bindings
         .write_to_file(bindings_path)
         .expect("Couldn't write bindings!");
@@ -111,13 +123,20 @@ fn main() {
         };
         let obj_path = out_dir.join(format!("{}_tmp.bpf.o", prefix));
 
+        // allow mut for feature pystacks
+        #[allow(unused_mut)]
+        let mut clang_args = vec![
+            OsStr::new(&bpf_include_arg),
+            OsStr::new(&include_arg),
+            OsStr::new("-D__x86_64__"),
+        ];
+
+        #[cfg(feature = "pystacks")]
+        clang_args.push(OsStr::new("-DSYSTING_PYSTACKS"));
+
         SkeletonBuilder::new()
             .source(src)
-            .clang_args([
-                OsStr::new(&bpf_include_arg),
-                OsStr::new(&include_arg),
-                OsStr::new("-D__x86_64__"),
-            ])
+            .clang_args(clang_args)
             .obj(obj_path.to_str().unwrap())
             .build()
             .expect("Failed to build BPF skeleton");
@@ -126,14 +145,24 @@ fn main() {
     }
 
     let obj_path = out_dir.join("systing_system.bpf.o");
+
+    // allow mut for feature pystacks
+    #[allow(unused_mut)]
+    let mut bpftool_args: Vec<_> = vec![
+        "gen".to_string(),
+        "object".to_string(),
+        obj_path.display().to_string(),
+        out_dir
+            .join("systing_system_tmp.bpf.o")
+            .display()
+            .to_string(),
+    ];
+
+    #[cfg(feature = "pystacks")]
+    bpftool_args.push(out_dir.join("pystacks.bpf.o").display().to_string());
+
     let bpftool_output = std::process::Command::new("bpftool")
-        .args([
-            "gen",
-            "object",
-            obj_path.to_str().unwrap(),
-            out_dir.join("pystacks.bpf.o").to_str().unwrap(),
-            out_dir.join("systing_system_tmp.bpf.o").to_str().unwrap(),
-        ])
+        .args(bpftool_args)
         .output()
         .expect("Failed to link bpf objexts via bpftool");
 
