@@ -17,7 +17,10 @@ jobs:
       - name: Install Deps.
         run: ./.github/workflows/install_deps.sh
 
-      - name: Clippy Check
+      - name: Clippy Check (no features)
+        run: cargo clippy --no-default-features -- -D warnings
+
+      - name: Clippy Check (pystacks)
         run: cargo clippy --features pystacks -- -D warnings
 
   build:
@@ -30,7 +33,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build
+      - name: Build (no features)
+        run: cargo build --no-default-features --release
+
+      - name: Build (pystacks)
         run: cargo build --features pystacks --release
 
   test:
@@ -43,6 +49,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Test
-        run: cargo test
+      - name: Test (no features)
+        run: cargo test --no-default-features
 
+      - name: Test (pystacks)
+        run: cargo test --features pystacks
