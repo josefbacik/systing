@@ -52,6 +52,7 @@ use perfetto_protos::interned_data::InternedData;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
 use perfetto_protos::profile_common::{Callstack, Frame, InternedString, Mapping};
 use perfetto_protos::profile_packet::PerfSample;
+use perfetto_protos::process_tree::{process_tree::Process as ProtoProcess, ProcessTree};
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace::Trace;
 use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
@@ -266,8 +267,10 @@ struct SessionRecorder {
     perf_counter_recorder: Mutex<PerfCounterRecorder>,
     sysinfo_recorder: Mutex<SysinfoRecorder>,
     probe_recorder: Mutex<SystingProbeRecorder>,
-    processes: RwLock<HashMap<u64, ProcessDescriptor>>,
+    process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
+    processes: RwLock<HashMap<u64, ProtoProcess>>,
     threads: RwLock<HashMap<u64, ThreadDescriptor>>,
+    system: Mutex<sysinfo::System>,
 }
 
 fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -519,6 +522,32 @@ impl From<&task_info> for ProcessDescriptor {
     }
 }
 
+fn proto_process_from_parts(task: &task_info, s: &mut sysinfo::System) -> ProtoProcess {
+    let tgid = sysinfo::Pid::from((task.tgidpid >> 32) as usize);
+    s.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[tgid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always)
+    );
+    let mut cmd = vec![];
+    if let Some(process) = s.process(tgid) {
+        cmd = process
+            .cmd()
+            .iter()
+            .cloned()
+            .map(|os| {
+                os.into_string().unwrap_or_else(|bad| {
+                    format!("<invalid UTF-8: {:?}>", bad)
+                })
+            })
+            .collect();
+    }
+    let mut process = ProtoProcess::default();
+    process.cmdline = cmd;
+    process.set_pid(task.tgidpid as i32);
+    process
+}
+
 impl From<&task_info> for ThreadDescriptor {
     fn from(task: &task_info) -> Self {
         let comm = CStr::from_bytes_until_nul(&task.comm).unwrap();
@@ -685,8 +714,8 @@ impl SessionRecorder {
         packet.set_track_descriptor(desc);
         packets.push(packet);
 
-        // Ppopulate all the process tracks
-        for process in self.processes.read().unwrap().values() {
+        // Populate all the process tracks
+        for process in self.process_descriptors.read().unwrap().values() {
             let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             pid_uuids.insert(process.pid(), uuid);
 
@@ -696,6 +725,16 @@ impl SessionRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
+            packets.push(packet);
+        }
+
+        // Populate all the process trees
+        for process in self.processes.read().unwrap().values() {
+            let mut process_tree = ProcessTree::default();
+            process_tree.processes = vec![process.clone()];
+
+            let mut packet = TracePacket::default();
+            packet.set_process_tree(process_tree);
             packets.push(packet);
         }
 
@@ -750,16 +789,23 @@ fn maybe_record_task(info: &task_info, session_recorder: &Arc<SessionRecorder>) 
     let tgid = (info.tgidpid >> 32) as i32;
     if pid == tgid {
         if !session_recorder
-            .processes
+            .process_descriptors
             .read()
             .unwrap()
             .contains_key(&info.tgidpid)
         {
             session_recorder
-                .processes
+                .process_descriptors
                 .write()
                 .unwrap()
                 .insert(info.tgidpid, ProcessDescriptor::from(info));
+
+            let mut sys = session_recorder.system.lock().unwrap();
+            session_recorder
+                .processes
+                .write()
+                .unwrap()
+                .insert(info.tgidpid, proto_process_from_parts(info, &mut sys));
         }
     } else if !session_recorder
         .threads
