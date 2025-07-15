@@ -39,6 +39,7 @@ use clap::Parser;
 use blazesym::symbolize::source::{Kernel, Process, Source};
 use blazesym::symbolize::{cache, Input, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
+use fb_procfs::ProcReader;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{
     MapCore, RawTracepointOpts, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts,
@@ -270,7 +271,7 @@ struct SessionRecorder {
     process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
     processes: RwLock<HashMap<u64, ProtoProcess>>,
     threads: RwLock<HashMap<u64, ThreadDescriptor>>,
-    system: Mutex<sysinfo::System>,
+    proc_reader: Mutex<ProcReader>,
 }
 
 fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -522,28 +523,13 @@ impl From<&task_info> for ProcessDescriptor {
     }
 }
 
-fn proto_process_from_parts(task: &task_info, s: &mut sysinfo::System) -> ProtoProcess {
-    let tgid = sysinfo::Pid::from((task.tgidpid >> 32) as usize);
-    s.refresh_processes_specifics(
-        sysinfo::ProcessesToUpdate::Some(&[tgid]),
-        true,
-        sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always)
-    );
-    let mut cmd = vec![];
-    if let Some(process) = s.process(tgid) {
-        cmd = process
-            .cmd()
-            .iter()
-            .cloned()
-            .map(|os| {
-                os.into_string().unwrap_or_else(|bad| {
-                    format!("<invalid UTF-8: {:?}>", bad)
-                })
-            })
-            .collect();
-    }
+fn proto_process_from_parts(task: &task_info, proc_reader: &ProcReader) -> ProtoProcess {
     let mut process = ProtoProcess::default();
-    process.cmdline = cmd;
+    process.cmdline = if let Ok(Some(cmdline)) = proc_reader.read_pid_cmdline((task.tgidpid >> 32) as u32) {
+        cmdline
+    } else {
+        vec![]
+    };
     process.set_pid(task.tgidpid as i32);
     process
 }
@@ -800,12 +786,15 @@ fn maybe_record_task(info: &task_info, session_recorder: &Arc<SessionRecorder>) 
                 .unwrap()
                 .insert(info.tgidpid, ProcessDescriptor::from(info));
 
-            let mut sys = session_recorder.system.lock().unwrap();
+            let proc_reader = session_recorder.proc_reader.lock().unwrap();
             session_recorder
                 .processes
                 .write()
                 .unwrap()
-                .insert(info.tgidpid, proto_process_from_parts(info, &mut sys));
+                .insert(
+                    info.tgidpid,
+                    proto_process_from_parts(info, &proc_reader)
+                );
         }
     } else if !session_recorder
         .threads
