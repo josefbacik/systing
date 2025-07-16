@@ -25,8 +25,8 @@ use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::perfetto::TrackCounter;
 use crate::pystacks::stack_walker::{
-    get_pystack_from_event, load_pystack_symbols, merge_pystacks, pystacks_to_frames_mapping,
-    user_stack_to_python_calls, StackWalkerRun, init_pystacks,
+    get_pystack_from_event, init_pystacks, load_pystack_symbols, merge_pystacks,
+    pystacks_to_frames_mapping, user_stack_to_python_calls, StackWalkerRun,
 };
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
@@ -39,6 +39,7 @@ use clap::Parser;
 use blazesym::symbolize::source::{Kernel, Process, Source};
 use blazesym::symbolize::{cache, Input, Sym, Symbolized, Symbolizer};
 use blazesym::Pid;
+use fb_procfs::ProcReader;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{
     MapCore, RawTracepointOpts, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts,
@@ -50,6 +51,7 @@ use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
 use perfetto_protos::interned_data::InternedData;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
+use perfetto_protos::process_tree::{process_tree::Process as ProtoProcess, ProcessTree};
 use perfetto_protos::profile_common::{Callstack, Frame, InternedString, Mapping};
 use perfetto_protos::profile_packet::PerfSample;
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
@@ -266,8 +268,10 @@ struct SessionRecorder {
     perf_counter_recorder: Mutex<PerfCounterRecorder>,
     sysinfo_recorder: Mutex<SysinfoRecorder>,
     probe_recorder: Mutex<SystingProbeRecorder>,
-    processes: RwLock<HashMap<u64, ProcessDescriptor>>,
+    process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
+    processes: RwLock<HashMap<u64, ProtoProcess>>,
     threads: RwLock<HashMap<u64, ThreadDescriptor>>,
+    proc_reader: Mutex<ProcReader>,
 }
 
 fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -519,6 +523,18 @@ impl From<&task_info> for ProcessDescriptor {
     }
 }
 
+fn proto_process_from_parts(task: &task_info, proc_reader: &ProcReader) -> ProtoProcess {
+    ProtoProcess {
+        cmdline: if let Ok(Some(cmd)) = proc_reader.read_pid_cmdline((task.tgidpid >> 32) as u32) {
+            cmd
+        } else {
+            vec![]
+        },
+        pid: Some(task.tgidpid as i32),
+        ..ProtoProcess::default()
+    }
+}
+
 impl From<&task_info> for ThreadDescriptor {
     fn from(task: &task_info) -> Self {
         let comm = CStr::from_bytes_until_nul(&task.comm).unwrap();
@@ -685,8 +701,8 @@ impl SessionRecorder {
         packet.set_track_descriptor(desc);
         packets.push(packet);
 
-        // Ppopulate all the process tracks
-        for process in self.processes.read().unwrap().values() {
+        // Populate all the process tracks
+        for process in self.process_descriptors.read().unwrap().values() {
             let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             pid_uuids.insert(process.pid(), uuid);
 
@@ -696,6 +712,18 @@ impl SessionRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
+            packets.push(packet);
+        }
+
+        // Populate all the process trees
+        for process in self.processes.read().unwrap().values() {
+            let process_tree = ProcessTree {
+                processes: vec![process.clone()],
+                ..ProcessTree::default()
+            };
+
+            let mut packet = TracePacket::default();
+            packet.set_process_tree(process_tree);
             packets.push(packet);
         }
 
@@ -750,16 +778,23 @@ fn maybe_record_task(info: &task_info, session_recorder: &Arc<SessionRecorder>) 
     let tgid = (info.tgidpid >> 32) as i32;
     if pid == tgid {
         if !session_recorder
-            .processes
+            .process_descriptors
             .read()
             .unwrap()
             .contains_key(&info.tgidpid)
         {
             session_recorder
-                .processes
+                .process_descriptors
                 .write()
                 .unwrap()
                 .insert(info.tgidpid, ProcessDescriptor::from(info));
+
+            let proc_reader = session_recorder.proc_reader.lock().unwrap();
+            session_recorder
+                .processes
+                .write()
+                .unwrap()
+                .insert(info.tgidpid, proto_process_from_parts(info, &proc_reader));
         }
     } else if !session_recorder
         .threads
