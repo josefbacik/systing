@@ -121,7 +121,7 @@ fn main() {
             Some((prefix, _)) => prefix,
             None => fname,
         };
-        let obj_path = out_dir.join(format!("{}_tmp.bpf.o", prefix));
+        let obj_path = out_dir.join(format!("{prefix}_tmp.bpf.o"));
 
         // allow mut for feature pystacks
         #[allow(unused_mut)]
@@ -141,7 +141,7 @@ fn main() {
             .build()
             .expect("Failed to build BPF skeleton");
 
-        println!("cargo:rerun-if-changed={}", src);
+        println!("cargo:rerun-if-changed={src}");
     }
 
     let obj_path = out_dir.join("systing_system.bpf.o");
@@ -168,8 +168,8 @@ fn main() {
 
     let bpft_stdout = String::from_utf8(bpftool_output.stdout).unwrap();
     let bpft_stderr = String::from_utf8(bpftool_output.stderr).unwrap();
-    println!("{}", bpft_stdout);
-    println!("{}", bpft_stderr);
+    println!("{bpft_stdout}");
+    println!("{bpft_stderr}");
 
     let skel_path = out_dir.join("systing_system.skel.rs");
     SkeletonBuilder::new()
