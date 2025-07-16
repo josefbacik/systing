@@ -25,8 +25,8 @@ use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::perfetto::TrackCounter;
 use crate::pystacks::stack_walker::{
-    get_pystack_from_event, load_pystack_symbols, merge_pystacks, pystacks_to_frames_mapping,
-    user_stack_to_python_calls, StackWalkerRun, init_pystacks,
+    get_pystack_from_event, init_pystacks, load_pystack_symbols, merge_pystacks,
+    pystacks_to_frames_mapping, user_stack_to_python_calls, StackWalkerRun,
 };
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
@@ -51,9 +51,9 @@ use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
 use perfetto_protos::interned_data::InternedData;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
+use perfetto_protos::process_tree::{process_tree::Process as ProtoProcess, ProcessTree};
 use perfetto_protos::profile_common::{Callstack, Frame, InternedString, Mapping};
 use perfetto_protos::profile_packet::PerfSample;
-use perfetto_protos::process_tree::{process_tree::Process as ProtoProcess, ProcessTree};
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace::Trace;
 use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
@@ -524,14 +524,15 @@ impl From<&task_info> for ProcessDescriptor {
 }
 
 fn proto_process_from_parts(task: &task_info, proc_reader: &ProcReader) -> ProtoProcess {
-    let mut process = ProtoProcess::default();
-    process.cmdline = if let Ok(Some(cmdline)) = proc_reader.read_pid_cmdline((task.tgidpid >> 32) as u32) {
-        cmdline
-    } else {
-        vec![]
-    };
-    process.set_pid(task.tgidpid as i32);
-    process
+    ProtoProcess {
+        cmdline: if let Ok(Some(cmd)) = proc_reader.read_pid_cmdline((task.tgidpid >> 32) as u32) {
+            cmd
+        } else {
+            vec![]
+        },
+        pid: Some(task.tgidpid as i32),
+        ..ProtoProcess::default()
+    }
 }
 
 impl From<&task_info> for ThreadDescriptor {
@@ -716,8 +717,10 @@ impl SessionRecorder {
 
         // Populate all the process trees
         for process in self.processes.read().unwrap().values() {
-            let mut process_tree = ProcessTree::default();
-            process_tree.processes = vec![process.clone()];
+            let process_tree = ProcessTree {
+                processes: vec![process.clone()],
+                ..ProcessTree::default()
+            };
 
             let mut packet = TracePacket::default();
             packet.set_process_tree(process_tree);
@@ -791,10 +794,7 @@ fn maybe_record_task(info: &task_info, session_recorder: &Arc<SessionRecorder>) 
                 .processes
                 .write()
                 .unwrap()
-                .insert(
-                    info.tgidpid,
-                    proto_process_from_parts(info, &proc_reader)
-                );
+                .insert(info.tgidpid, proto_process_from_parts(info, &proc_reader));
         }
     } else if !session_recorder
         .threads
