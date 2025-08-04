@@ -627,7 +627,7 @@ impl SysinfoRecorder {
             counter_desc.set_is_incremental(false);
 
             let mut desc = TrackDescriptor::default();
-            desc.set_name(format!("CPU {} frequency", cpu).to_string());
+            desc.set_name(format!("CPU {cpu} frequency").to_string());
             desc.set_uuid(desc_uuid);
             desc.counter = Some(counter_desc).into();
 
@@ -1119,7 +1119,7 @@ fn system(opts: Command) -> Result<()> {
             let name = map.name().to_str().unwrap();
             if name.starts_with("ringbuf_events") {
                 let ring = create_ring::<task_event>(&map, event_tx.clone())?;
-                rings.push((format!("events_{}", i).to_string(), ring));
+                rings.push((format!("events_{i}").to_string(), ring));
             } else if name.starts_with("ringbuf_stack") {
                 let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
                 rings.push((name.to_string(), ring));

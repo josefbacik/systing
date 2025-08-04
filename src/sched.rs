@@ -157,7 +157,7 @@ impl SchedEventRecorder {
             counter_desc.set_is_incremental(false);
 
             let mut desc = TrackDescriptor::default();
-            desc.set_name(format!("runqueue_size_cpu{}", cpu));
+            desc.set_name(format!("runqueue_size_cpu{cpu}"));
             desc.set_uuid(desc_uuid);
             desc.counter = Some(counter_desc).into();
 
@@ -180,7 +180,7 @@ impl SchedEventRecorder {
             counter_desc.set_is_incremental(false);
 
             let mut desc = TrackDescriptor::default();
-            desc.set_name(format!("latency_cpu{}", cpu));
+            desc.set_name(format!("latency_cpu{cpu}"));
             desc.set_uuid(desc_uuid);
             desc.counter = Some(counter_desc).into();
 

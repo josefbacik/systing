@@ -62,7 +62,7 @@ pub fn generate_cpu_track_descriptors(
 
     let mut desc = TrackDescriptor::default();
     let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-    desc.set_name(format!("CPU {}", cpu));
+    desc.set_name(format!("CPU {cpu}"));
     desc.set_uuid(desc_uuid);
     desc.set_parent_uuid(parent_uuid);
     descs.push(desc);
