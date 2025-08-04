@@ -357,7 +357,7 @@ impl fmt::Display for UProbeEvent {
         } else if self.offset != 0 {
             write!(f, "{}:0x{:x}", name, self.offset)
         } else {
-            write!(f, "{}", name)
+            write!(f, "{name}")
         }
     }
 }
@@ -415,7 +415,7 @@ impl fmt::Display for KProbeEvent {
         } else if self.offset != 0 {
             write!(f, "{}:0x{:x}", name, self.offset)
         } else {
-            write!(f, "{}", name)
+            write!(f, "{name}")
         }
     }
 }
@@ -466,10 +466,10 @@ impl UsdtProbeEvent {
 impl fmt::Display for SystingEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.event {
-            EventProbe::UProbe(uprobe) => write!(f, "{}", uprobe),
-            EventProbe::Usdt(usdt) => write!(f, "{}", usdt),
-            EventProbe::KProbe(kprobe) => write!(f, "{}", kprobe),
-            EventProbe::Tracepoint(tracepoint) => write!(f, "{}", tracepoint),
+            EventProbe::UProbe(uprobe) => write!(f, "{uprobe}"),
+            EventProbe::Usdt(usdt) => write!(f, "{usdt}"),
+            EventProbe::KProbe(kprobe) => write!(f, "{kprobe}"),
+            EventProbe::Tracepoint(tracepoint) => write!(f, "{tracepoint}"),
             _ => write!(f, "Invalid event"),
         }
     }
@@ -493,7 +493,7 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
                 let mut bytes: [u8; 8] = [0; 8];
                 let _ = bytes.copy_from_bytes(&event.arg[..8]);
                 let val = u64::from_ne_bytes(bytes);
-                extra = format!(":{}", val);
+                extra = format!(":{val}");
             }
             crate::systing::types::arg_type::ARG_STRING => {
                 let arg_str = CStr::from_bytes_until_nul(&event.arg);
@@ -575,7 +575,7 @@ impl SystingProbeRecorder {
             let entry = entry.entry(instant_track.clone()).or_default();
             entry.push(TrackInstant {
                 ts: event.ts,
-                name: format!("{}{}", systing_event, extra),
+                name: format!("{systing_event}{extra}"),
             });
             return;
         }
@@ -630,7 +630,7 @@ impl SystingProbeRecorder {
             let entry = entry.entry(instant_track.clone()).or_default();
             entry.push(TrackInstant {
                 ts: event.ts,
-                name: format!("{}{}", systing_event, extra),
+                name: format!("{systing_event}{extra}"),
             });
             return;
         }

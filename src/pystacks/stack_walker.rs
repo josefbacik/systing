@@ -214,7 +214,7 @@ pub(crate) fn pystacks_to_frames_mapping(
             frame.addr.symbol_id.into(),
             0,
             0,
-            format!("{} [py]", name),
+            format!("{name} [py]"),
         );
 
         if name == "<interpreter trampoline>" {
