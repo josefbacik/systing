@@ -392,13 +392,11 @@ fn visit_events(dir: &Path, events: &mut Vec<PerfHwEvent>) -> Result<()> {
             ..Default::default()
         };
 
-        if event.is_some() {
-            let event = event.unwrap();
+        if let Some(event) = event {
             let event = u64::from_str_radix(&event[1], 16).unwrap();
             hwevent.event_config = event;
         }
-        if umask.is_some() {
-            let umask = umask.unwrap();
+        if let Some(umask) = umask {
             let umask = u64::from_str_radix(&umask[1], 16).unwrap();
             hwevent.event_config |= umask << 8;
         }

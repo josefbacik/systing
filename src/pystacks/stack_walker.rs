@@ -2,10 +2,10 @@
 use crate::pystacks::bindings;
 
 #[cfg(feature = "pystacks")]
-use crate::add_frame;
+use crate::stack_recorder::add_frame;
+use crate::stack_recorder::LocalFrame;
 use crate::symbolize::Stack;
 use crate::systing::types::stack_event;
-use crate::LocalFrame;
 use libbpf_rs::libbpf_sys;
 #[cfg(feature = "pystacks")]
 use libbpf_rs::AsRawLibbpf;
