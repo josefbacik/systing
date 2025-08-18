@@ -497,8 +497,7 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
             }
             crate::systing::types::arg_type::ARG_STRING => {
                 let arg_str = CStr::from_bytes_until_nul(&event.arg);
-                if arg_str.is_ok() {
-                    let arg_str = arg_str.unwrap();
+                if let Ok(arg_str) = arg_str {
                     let bytes = arg_str.to_bytes();
                     if !bytes.is_empty() && !bytes.starts_with(&[0]) {
                         extra = format!(":{}", arg_str.to_string_lossy());
