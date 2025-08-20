@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::pystacks::stack_walker::{
-    get_pystack_from_event, load_pystack_symbols, merge_pystacks,
-    pystacks_to_frames_mapping, user_stack_to_python_calls, StackWalkerRun,
+    get_pystack_from_event, load_pystack_symbols, merge_pystacks, pystacks_to_frames_mapping,
+    user_stack_to_python_calls, StackWalkerRun,
 };
 use crate::ringbuf::RingBuffer;
 use crate::symbolize::Stack;

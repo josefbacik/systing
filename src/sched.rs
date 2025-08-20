@@ -3,11 +3,11 @@ use std::ffi::CStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::SystingRecordEvent;
 use crate::perfetto::TrackCounter;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::event_type;
 use crate::systing::types::task_event;
+use crate::SystingRecordEvent;
 
 use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;

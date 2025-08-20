@@ -224,7 +224,6 @@ struct SysInfoEvent {
     frequency: i64,
 }
 
-
 #[derive(Default)]
 struct SysinfoRecorder {
     ringbuf: RingBuffer<SysInfoEvent>,
@@ -252,7 +251,6 @@ fn get_clock_value(clock_id: libc::c_int) -> u64 {
     }
     (ts.tv_sec as u64 * 1_000_000_000) + ts.tv_nsec as u64
 }
-
 
 impl From<&task_info> for ProcessDescriptor {
     fn from(task: &task_info) -> Self {
@@ -286,7 +284,6 @@ impl From<&task_info> for ThreadDescriptor {
         thread
     }
 }
-
 
 impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
     fn ringbuf(&self) -> &RingBuffer<SysInfoEvent> {
@@ -553,10 +550,10 @@ fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
         .missed_events
         .lookup_percpu(&index, libbpf_rs::MapFlags::ANY);
     let mut missed = 0;
-    if let Ok(results) = result {
-        for val in results.unwrap() {
+    if let Ok(Some(results)) = result {
+        for cpu_data in results {
             let mut missed_events: u64 = 0;
-            plain::copy_from_bytes(&mut missed_events, &val).unwrap();
+            plain::copy_from_bytes(&mut missed_events, &cpu_data).unwrap();
             missed += missed_events;
         }
     }
@@ -591,13 +588,14 @@ fn system(opts: Command) -> Result<()> {
         // through all of our options and populate the actual counter names that we want
         for counter in opts.perf_counter.iter() {
             let events = counters.event(counter);
-            if events.is_none() {
-                Err(anyhow::anyhow!("Invalid perf counter"))?;
-            }
-            for event in events.unwrap() {
-                if !perf_counter_names.contains(&event.name) {
-                    perf_counter_names.push(event.name.clone());
+            if let Some(events) = events {
+                for event in events {
+                    if !perf_counter_names.contains(&event.name) {
+                        perf_counter_names.push(event.name.clone());
+                    }
                 }
+            } else {
+                Err(anyhow::anyhow!("Invalid perf counter"))?;
             }
         }
     }
@@ -932,10 +930,11 @@ fn system(opts: Command) -> Result<()> {
         let mut slots_files = PerfOpenEvents::default();
         if need_slots {
             let slot_hwevents = counters.event("slots");
-            if slot_hwevents.is_none() {
-                Err(anyhow::anyhow!("Failed to find slot event"))?;
-            }
-            let slot_hwevents = slot_hwevents.unwrap();
+            let slot_hwevents = if let Some(slot_hwevents) = slot_hwevents {
+                slot_hwevents
+            } else {
+                Err(anyhow::anyhow!("Failed to find slot event"))?
+            };
             for event in slot_hwevents.iter() {
                 slots_files.add_hw_event(event.clone())?;
             }

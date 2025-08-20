@@ -252,10 +252,11 @@ impl PerfOpenEvents {
                 let group_fd = if hwevent.need_slots {
                     if let Some(slots_files) = slots_files {
                         let slot_file = slots_files.get(*cpu);
-                        if slot_file.is_none() {
+                        if let Some(slot_file) = slot_file {
+                            slot_file.as_raw_fd()
+                        } else {
                             return Err(Error::new(ErrorKind::NotFound, "Slot file not found"));
                         }
-                        slot_file.unwrap().as_raw_fd()
                     } else {
                         -1
                     }

@@ -439,6 +439,7 @@ static void emit_stack_event(void *ctx,struct task_struct *task,
 	record_task_info(&event->task, task);
 
 #ifdef SYSTING_PYSTACKS
+	event->py_msg_buffer.stack_len = 0;
 	if (tool_config.collect_pystacks) {
 		pystacks_read_stacks(ctx, NULL, &event->py_msg_buffer);
 	}
