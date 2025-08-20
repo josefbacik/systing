@@ -41,6 +41,14 @@ pub struct StackRecorder {
     pub psr: Arc<StackWalkerRun>,
 }
 
+/// Holds the resolved stack information after symbolization
+pub struct ResolvedStackInfo {
+    pub frame_map: HashMap<u64, Vec<LocalFrame>>,
+    pub func_name_map: HashMap<String, InternedString>,
+    pub python_calls: Vec<u64>,
+    pub python_stack_markers: Vec<u64>,
+}
+
 pub fn add_frame(
     frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
     func_map: &mut HashMap<String, InternedString>,
@@ -129,13 +137,13 @@ pub fn stack_to_frames_mapping<'a, I>(
     }
 }
 
-pub fn generate_stack_packets(
-    packets: &mut Arc<Mutex<Vec<TracePacket>>>,
+/// Symbolizes all stacks (user, kernel, and Python) and returns the resolved information
+fn symbolize_stacks(
+    stacks: &[StackEvent],
     tgid: u32,
-    stacks: Vec<StackEvent>,
     id_counter: &mut Arc<AtomicUsize>,
     psr: &mut Arc<StackWalkerRun>,
-) {
+) -> ResolvedStackInfo {
     let user_src = Source::Process(Process::new(Pid::from(tgid)));
     let kernel_src = Source::Kernel(Kernel::default());
     let mut symbolizer = Symbolizer::builder()
@@ -145,14 +153,14 @@ pub fn generate_stack_packets(
 
     let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(tgid.into())));
 
-    // We have to symbolize all of the addresses in the stacks and fill
-    // out the hashmap with all of the frames.
     let mut frame_map = HashMap::new();
     let mut func_name_map = HashMap::new();
     let mut python_calls = Vec::new();
     let mut python_stack_markers = Vec::new();
+
     for stack in stacks.iter() {
         let raw_stack = &stack.stack;
+        // Symbolize user space stack
         stack_to_frames_mapping(
             &mut symbolizer,
             &mut frame_map,
@@ -162,6 +170,7 @@ pub fn generate_stack_packets(
             raw_stack.user_stack.iter(),
         );
         user_stack_to_python_calls(&mut frame_map, &mut func_name_map, &mut python_calls);
+        // Symbolize kernel stack
         stack_to_frames_mapping(
             &mut symbolizer,
             &mut frame_map,
@@ -170,6 +179,7 @@ pub fn generate_stack_packets(
             id_counter,
             raw_stack.kernel_stack.iter(),
         );
+        // Symbolize Python stack
         pystacks_to_frames_mapping(
             psr,
             &mut frame_map,
@@ -180,9 +190,21 @@ pub fn generate_stack_packets(
         );
     }
 
-    // Collect into a HashSet to dedup the stacks, and then iterate that to symbolize the
-    // stacks and generate the interned data.
-    let interned_stacks: HashMap<Stack, Callstack> = stacks
+    ResolvedStackInfo {
+        frame_map,
+        func_name_map,
+        python_calls,
+        python_stack_markers,
+    }
+}
+
+/// Deduplicates stacks and creates callstack mappings
+fn deduplicate_stacks(
+    stacks: &[StackEvent],
+    resolved_info: &ResolvedStackInfo,
+    id_counter: &mut Arc<AtomicUsize>,
+) -> HashMap<Stack, Callstack> {
+    stacks
         .iter()
         .map(|stack| stack.stack.clone())
         .collect::<HashSet<_>>()
@@ -192,12 +214,13 @@ pub fn generate_stack_packets(
             let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             callstack.set_iid(iid);
             callstack.frame_ids = if stack.py_stack.is_empty() {
+                // No Python stack - just chain user and kernel stacks
                 stack
                     .user_stack
                     .iter()
                     .chain(stack.kernel_stack.iter())
                     .flat_map(|addr| {
-                        let frame_vec = frame_map.get(addr).unwrap();
+                        let frame_vec = resolved_info.frame_map.get(addr).unwrap();
                         frame_vec
                             .iter()
                             .map(|frame| frame.frame.iid())
@@ -205,13 +228,18 @@ pub fn generate_stack_packets(
                     })
                     .collect()
             } else {
-                let merged_addrs = merge_pystacks(&stack, &python_calls, &python_stack_markers);
+                // Merge Python stacks with user stacks
+                let merged_addrs = merge_pystacks(
+                    &stack,
+                    &resolved_info.python_calls,
+                    &resolved_info.python_stack_markers,
+                );
 
                 merged_addrs
                     .iter()
                     .chain(stack.kernel_stack.iter())
                     .flat_map(|addr| {
-                        let frame_vec = frame_map.get(addr).unwrap();
+                        let frame_vec = resolved_info.frame_map.get(addr).unwrap();
                         frame_vec
                             .iter()
                             .map(|frame| frame.frame.iid())
@@ -221,14 +249,25 @@ pub fn generate_stack_packets(
             };
             (stack, callstack)
         })
-        .collect();
+        .collect()
+}
 
+/// Generates trace packets from the deduplicated stacks and resolved information
+fn generate_trace_packets(
+    stacks: &[StackEvent],
+    interned_stacks: &HashMap<Stack, Callstack>,
+    resolved_info: &ResolvedStackInfo,
+    id_counter: &mut Arc<AtomicUsize>,
+) -> Vec<TracePacket> {
+    let mut packets = Vec::new();
     let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
+    // Generate interned data packet
     let mut packet = TracePacket::default();
     let interned_data = InternedData {
         callstacks: interned_stacks.values().cloned().collect(),
-        function_names: func_name_map.values().cloned().collect(),
-        frames: frame_map
+        function_names: resolved_info.func_name_map.values().cloned().collect(),
+        frames: resolved_info
+            .frame_map
             .values()
             .flat_map(|frame_vec| {
                 frame_vec
@@ -237,7 +276,8 @@ pub fn generate_stack_packets(
                     .collect::<Vec<Frame>>()
             })
             .collect(),
-        mappings: frame_map
+        mappings: resolved_info
+            .frame_map
             .values()
             .flat_map(|frame_vec| {
                 frame_vec
@@ -254,8 +294,9 @@ pub fn generate_stack_packets(
         SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
             | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
     );
-    packets.lock().unwrap().push(packet);
+    packets.push(packet);
 
+    // Generate sample packets for each stack
     for stack in stacks.iter() {
         let pid = stack.tgidpid as u32;
         let tgid = (stack.tgidpid >> 32) as u32;
@@ -268,8 +309,27 @@ pub fn generate_stack_packets(
         sample.set_tid(pid);
         packet.set_perf_sample(sample);
         packet.set_trusted_packet_sequence_id(seq);
-        packets.lock().unwrap().push(packet);
+        packets.push(packet);
     }
+    packets
+}
+
+pub fn generate_stack_packets(
+    packets: &mut Arc<Mutex<Vec<TracePacket>>>,
+    tgid: u32,
+    stacks: Vec<StackEvent>,
+    id_counter: &mut Arc<AtomicUsize>,
+    psr: &mut Arc<StackWalkerRun>,
+) {
+    // Step 1: Symbolize all stacks
+    let resolved_info = symbolize_stacks(&stacks, tgid, id_counter, psr);
+    // Step 2: Deduplicate stacks
+    let interned_stacks = deduplicate_stacks(&stacks, &resolved_info, id_counter);
+    // Step 3: Generate trace packets
+    let trace_packets =
+        generate_trace_packets(&stacks, &interned_stacks, &resolved_info, id_counter);
+    // Add packets to the shared collection
+    packets.lock().unwrap().extend(trace_packets);
 }
 
 impl SystingRecordEvent<stack_event> for StackRecorder {
