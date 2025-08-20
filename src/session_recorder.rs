@@ -204,7 +204,10 @@ impl SessionRecorder {
     }
 
     /// Generates the initial trace packets including clock snapshot and root descriptor
-    fn generate_initial_packets(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
+    fn generate_initial_packets(
+        &self,
+        id_counter: &mut Arc<AtomicUsize>,
+    ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
         // Emit the clock snapshot
@@ -363,5 +366,498 @@ impl SessionRecorder {
 impl crate::SystingEvent for SysInfoEvent {
     fn ts(&self) -> u64 {
         self.ts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fb_procfs::ProcReader;
+    use std::sync::{Mutex, RwLock};
+
+    fn create_test_task_info(tgid: u32, pid: u32, comm: &str) -> task_info {
+        let mut task = task_info {
+            tgidpid: ((tgid as u64) << 32) | (pid as u64),
+            comm: [0; 16],
+        };
+
+        // Copy the comm string into the array
+        let comm_bytes = comm.as_bytes();
+        let copy_len = std::cmp::min(comm_bytes.len(), task.comm.len() - 1); // Leave space for null terminator
+        task.comm[..copy_len].copy_from_slice(&comm_bytes[..copy_len]);
+        task.comm[copy_len] = 0; // Null terminator
+
+        task
+    }
+
+    fn create_test_session_recorder() -> SessionRecorder {
+        SessionRecorder {
+            clock_snapshot: Mutex::new(ClockSnapshot::default()),
+            event_recorder: Mutex::new(SchedEventRecorder::default()),
+            stack_recorder: Mutex::new(StackRecorder::default()),
+            perf_counter_recorder: Mutex::new(PerfCounterRecorder::default()),
+            sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
+            probe_recorder: Mutex::new(SystingProbeRecorder::default()),
+            process_descriptors: RwLock::new(HashMap::new()),
+            processes: RwLock::new(HashMap::new()),
+            threads: RwLock::new(HashMap::new()),
+            proc_reader: Mutex::new(ProcReader::new()),
+        }
+    }
+
+    #[test]
+    fn test_maybe_record_task_new_process() {
+        let recorder = create_test_session_recorder();
+        let task = create_test_task_info(1234, 1234, "test_process");
+
+        // Initially, no processes should be recorded
+        assert!(recorder.process_descriptors.read().unwrap().is_empty());
+        assert!(recorder.processes.read().unwrap().is_empty());
+
+        // Record the task
+        recorder.maybe_record_task(&task);
+
+        // Now the process should be recorded
+        let process_descriptors = recorder.process_descriptors.read().unwrap();
+        assert_eq!(process_descriptors.len(), 1);
+        assert!(process_descriptors.contains_key(&task.tgidpid));
+
+        let process_desc = process_descriptors.get(&task.tgidpid).unwrap();
+        assert_eq!(process_desc.pid(), 1234);
+        assert_eq!(process_desc.process_name(), "test_process");
+
+        // Check that the process tree entry was also created
+        let processes = recorder.processes.read().unwrap();
+        assert_eq!(processes.len(), 1);
+        assert!(processes.contains_key(&task.tgidpid));
+
+        let process = processes.get(&task.tgidpid).unwrap();
+        assert_eq!(process.pid, Some(task.tgidpid as i32));
+    }
+
+    #[test]
+    fn test_maybe_record_task_new_thread() {
+        let recorder = create_test_session_recorder();
+        let task = create_test_task_info(1234, 5678, "test_thread");
+
+        // Initially, no threads should be recorded
+        assert!(recorder.threads.read().unwrap().is_empty());
+
+        // Record the task
+        recorder.maybe_record_task(&task);
+
+        // Now the thread should be recorded
+        let threads = recorder.threads.read().unwrap();
+        assert_eq!(threads.len(), 1);
+        assert!(threads.contains_key(&task.tgidpid));
+
+        let thread_desc = threads.get(&task.tgidpid).unwrap();
+        assert_eq!(thread_desc.tid(), 5678);
+        assert_eq!(thread_desc.pid(), 1234);
+        assert_eq!(thread_desc.thread_name(), "test_thread");
+
+        // Process descriptors should remain empty for threads
+        assert!(recorder.process_descriptors.read().unwrap().is_empty());
+        assert!(recorder.processes.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_maybe_record_task_duplicate_process() {
+        let recorder = create_test_session_recorder();
+        let task = create_test_task_info(1234, 1234, "test_process");
+
+        // Record the task twice
+        recorder.maybe_record_task(&task);
+        recorder.maybe_record_task(&task);
+
+        // Should still only have one entry
+        let process_descriptors = recorder.process_descriptors.read().unwrap();
+        assert_eq!(process_descriptors.len(), 1);
+
+        let processes = recorder.processes.read().unwrap();
+        assert_eq!(processes.len(), 1);
+    }
+
+    #[test]
+    fn test_maybe_record_task_duplicate_thread() {
+        let recorder = create_test_session_recorder();
+        let task = create_test_task_info(1234, 5678, "test_thread");
+
+        // Record the task twice
+        recorder.maybe_record_task(&task);
+        recorder.maybe_record_task(&task);
+
+        // Should still only have one entry
+        let threads = recorder.threads.read().unwrap();
+        assert_eq!(threads.len(), 1);
+    }
+
+    #[test]
+    fn test_maybe_record_task_multiple_processes() {
+        let recorder = create_test_session_recorder();
+        let task1 = create_test_task_info(1234, 1234, "process1");
+        let task2 = create_test_task_info(5678, 5678, "process2");
+
+        // Record both tasks
+        recorder.maybe_record_task(&task1);
+        recorder.maybe_record_task(&task2);
+
+        // Should have two processes
+        let process_descriptors = recorder.process_descriptors.read().unwrap();
+        assert_eq!(process_descriptors.len(), 2);
+        assert!(process_descriptors.contains_key(&task1.tgidpid));
+        assert!(process_descriptors.contains_key(&task2.tgidpid));
+
+        let processes = recorder.processes.read().unwrap();
+        assert_eq!(processes.len(), 2);
+    }
+
+    #[test]
+    fn test_maybe_record_task_multiple_threads() {
+        let recorder = create_test_session_recorder();
+        let task1 = create_test_task_info(1234, 5678, "thread1");
+        let task2 = create_test_task_info(1234, 9012, "thread2");
+
+        // Record both tasks
+        recorder.maybe_record_task(&task1);
+        recorder.maybe_record_task(&task2);
+
+        // Should have two threads
+        let threads = recorder.threads.read().unwrap();
+        assert_eq!(threads.len(), 2);
+        assert!(threads.contains_key(&task1.tgidpid));
+        assert!(threads.contains_key(&task2.tgidpid));
+
+        // Verify thread details
+        let thread1 = threads.get(&task1.tgidpid).unwrap();
+        assert_eq!(thread1.tid(), 5678);
+        assert_eq!(thread1.pid(), 1234);
+
+        let thread2 = threads.get(&task2.tgidpid).unwrap();
+        assert_eq!(thread2.tid(), 9012);
+        assert_eq!(thread2.pid(), 1234);
+    }
+
+    #[test]
+    fn test_maybe_record_task_process_and_threads() {
+        let recorder = create_test_session_recorder();
+        let process_task = create_test_task_info(1234, 1234, "main_process");
+        let thread_task1 = create_test_task_info(1234, 5678, "thread1");
+        let thread_task2 = create_test_task_info(1234, 9012, "thread2");
+
+        // Record process and threads
+        recorder.maybe_record_task(&process_task);
+        recorder.maybe_record_task(&thread_task1);
+        recorder.maybe_record_task(&thread_task2);
+
+        // Should have one process and two threads
+        let process_descriptors = recorder.process_descriptors.read().unwrap();
+        assert_eq!(process_descriptors.len(), 1);
+
+        let threads = recorder.threads.read().unwrap();
+        assert_eq!(threads.len(), 2);
+
+        // Verify the process
+        let process_desc = process_descriptors.get(&process_task.tgidpid).unwrap();
+        assert_eq!(process_desc.process_name(), "main_process");
+
+        // Verify the threads belong to the same process
+        for thread in threads.values() {
+            assert_eq!(thread.pid(), 1234);
+        }
+    }
+
+    #[test]
+    fn test_maybe_record_task_comm_with_null_terminator() {
+        let recorder = create_test_session_recorder();
+        let task = create_test_task_info(1234, 1234, "short");
+
+        recorder.maybe_record_task(&task);
+
+        let process_descriptors = recorder.process_descriptors.read().unwrap();
+        let process_desc = process_descriptors.get(&task.tgidpid).unwrap();
+        assert_eq!(process_desc.process_name(), "short");
+    }
+
+    #[test]
+    fn test_maybe_record_task_long_comm_truncated() {
+        let recorder = create_test_session_recorder();
+        // Create a long comm name that would exceed the buffer
+        let long_name = "this_is_a_very_long_process_name_that_exceeds_the_buffer_size";
+        let task = create_test_task_info(1234, 1234, long_name);
+
+        recorder.maybe_record_task(&task);
+
+        let process_descriptors = recorder.process_descriptors.read().unwrap();
+        let process_desc = process_descriptors.get(&task.tgidpid).unwrap();
+
+        // Should be truncated to fit in the 16-byte buffer (minus null terminator)
+        let expected = &long_name[..15]; // 15 chars + null terminator = 16 bytes
+        assert_eq!(process_desc.process_name(), expected);
+    }
+
+    #[test]
+    fn test_maybe_record_task_empty_comm() {
+        let recorder = create_test_session_recorder();
+        let task = create_test_task_info(1234, 1234, "");
+
+        recorder.maybe_record_task(&task);
+
+        let process_descriptors = recorder.process_descriptors.read().unwrap();
+        let process_desc = process_descriptors.get(&task.tgidpid).unwrap();
+        assert_eq!(process_desc.process_name(), "");
+    }
+
+    #[test]
+    fn test_generate_initial_packets() {
+        let recorder = create_test_session_recorder();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+
+        // Set up a clock snapshot
+        recorder.snapshot_clocks();
+
+        let packets = recorder.generate_initial_packets(&mut id_counter);
+
+        // Should generate exactly 2 packets: clock snapshot + root descriptor
+        assert_eq!(packets.len(), 2);
+
+        // First packet should be the clock snapshot
+        let _clock_snapshot = packets[0].clock_snapshot();
+        assert_eq!(packets[0].trusted_packet_sequence_id(), 100);
+
+        // Second packet should be the root track descriptor
+        let track_desc = packets[1].track_descriptor();
+        assert_eq!(track_desc.name(), "Systing");
+        assert_eq!(track_desc.uuid(), 101); // Should be incremented from 100
+
+        // Verify id_counter was incremented appropriately
+        assert_eq!(id_counter.load(std::sync::atomic::Ordering::Relaxed), 102);
+    }
+
+    #[test]
+    fn test_generate_initial_packets_empty_clock() {
+        let recorder = create_test_session_recorder();
+        let mut id_counter = Arc::new(AtomicUsize::new(50));
+
+        // Don't set up clock snapshot - should still work with empty snapshot
+        let packets = recorder.generate_initial_packets(&mut id_counter);
+
+        assert_eq!(packets.len(), 2);
+        let _clock_snapshot = packets[0].clock_snapshot();
+        let _track_desc = packets[1].track_descriptor();
+    }
+
+    #[test]
+    fn test_generate_process_packets_empty() {
+        let recorder = create_test_session_recorder();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let mut pid_uuids = HashMap::new();
+
+        let packets = recorder.generate_process_packets(&mut id_counter, &mut pid_uuids);
+
+        // Should generate no packets when no processes are recorded
+        assert!(packets.is_empty());
+        assert!(pid_uuids.is_empty());
+
+        // id_counter should not be incremented
+        assert_eq!(id_counter.load(std::sync::atomic::Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn test_generate_process_packets_single_process() {
+        let recorder = create_test_session_recorder();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let mut pid_uuids = HashMap::new();
+
+        // Add a process
+        let task = create_test_task_info(1234, 1234, "test_process");
+        recorder.maybe_record_task(&task);
+
+        let packets = recorder.generate_process_packets(&mut id_counter, &mut pid_uuids);
+
+        // Should generate 2 packets: process track descriptor + process tree
+        assert_eq!(packets.len(), 2);
+
+        // First packet should be the process track descriptor
+        let track_desc = packets[0].track_descriptor();
+        assert_eq!(track_desc.uuid(), 100);
+        let process_desc = &track_desc.process;
+        assert_eq!(process_desc.pid(), 1234);
+        assert_eq!(process_desc.process_name(), "test_process");
+
+        // Second packet should be the process tree
+        let process_tree = packets[1].process_tree();
+        assert_eq!(process_tree.processes.len(), 1);
+        assert_eq!(process_tree.processes[0].pid, Some(task.tgidpid as i32));
+
+        // pid_uuids should be updated
+        assert_eq!(pid_uuids.len(), 1);
+        assert_eq!(pid_uuids.get(&1234), Some(&100));
+
+        // id_counter should be incremented
+        assert_eq!(id_counter.load(std::sync::atomic::Ordering::Relaxed), 101);
+    }
+
+    #[test]
+    fn test_generate_process_packets_multiple_processes() {
+        let recorder = create_test_session_recorder();
+        let mut id_counter = Arc::new(AtomicUsize::new(200));
+        let mut pid_uuids = HashMap::new();
+
+        // Add multiple processes
+        let task1 = create_test_task_info(1234, 1234, "process1");
+        let task2 = create_test_task_info(5678, 5678, "process2");
+        recorder.maybe_record_task(&task1);
+        recorder.maybe_record_task(&task2);
+
+        let packets = recorder.generate_process_packets(&mut id_counter, &mut pid_uuids);
+
+        // Should generate 4 packets: 2 process track descriptors + 2 process trees
+        assert_eq!(packets.len(), 4);
+
+        // Check that we have track descriptors and process trees
+        let track_descriptors: Vec<_> = packets
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0) // Even indices are track descriptors
+            .collect();
+        let process_trees: Vec<_> = packets
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1) // Odd indices are process trees
+            .collect();
+
+        assert_eq!(track_descriptors.len(), 2);
+        assert_eq!(process_trees.len(), 2);
+
+        // pid_uuids should contain both processes
+        assert_eq!(pid_uuids.len(), 2);
+        assert!(pid_uuids.contains_key(&1234));
+        assert!(pid_uuids.contains_key(&5678));
+
+        // UUIDs should be unique
+        let uuid1 = pid_uuids.get(&1234).unwrap();
+        let uuid2 = pid_uuids.get(&5678).unwrap();
+        assert_ne!(uuid1, uuid2);
+
+        // id_counter should be incremented appropriately
+        assert_eq!(id_counter.load(std::sync::atomic::Ordering::Relaxed), 202);
+    }
+
+    #[test]
+    fn test_generate_thread_packets_empty() {
+        let recorder = create_test_session_recorder();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let mut thread_uuids = HashMap::new();
+
+        let packets = recorder.generate_thread_packets(&mut id_counter, &mut thread_uuids);
+
+        // Should generate no packets when no threads are recorded
+        assert!(packets.is_empty());
+        assert!(thread_uuids.is_empty());
+
+        // id_counter should not be incremented
+        assert_eq!(id_counter.load(std::sync::atomic::Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn test_generate_thread_packets_single_thread() {
+        let recorder = create_test_session_recorder();
+        let mut id_counter = Arc::new(AtomicUsize::new(150));
+        let mut thread_uuids = HashMap::new();
+
+        // Add a thread
+        let task = create_test_task_info(1234, 5678, "test_thread");
+        recorder.maybe_record_task(&task);
+
+        let packets = recorder.generate_thread_packets(&mut id_counter, &mut thread_uuids);
+
+        // Should generate 1 packet: thread track descriptor
+        assert_eq!(packets.len(), 1);
+
+        // Packet should be the thread track descriptor
+        let track_desc = packets[0].track_descriptor();
+        assert_eq!(track_desc.uuid(), 150);
+        let thread_desc = &track_desc.thread;
+        assert_eq!(thread_desc.tid(), 5678);
+        assert_eq!(thread_desc.pid(), 1234);
+        assert_eq!(thread_desc.thread_name(), "test_thread");
+
+        // thread_uuids should be updated
+        assert_eq!(thread_uuids.len(), 1);
+        assert_eq!(thread_uuids.get(&5678), Some(&150));
+
+        // id_counter should be incremented
+        assert_eq!(id_counter.load(std::sync::atomic::Ordering::Relaxed), 151);
+    }
+
+    #[test]
+    fn test_generate_thread_packets_multiple_threads() {
+        let recorder = create_test_session_recorder();
+        let mut id_counter = Arc::new(AtomicUsize::new(300));
+        let mut thread_uuids = HashMap::new();
+
+        // Add multiple threads
+        let task1 = create_test_task_info(1234, 5678, "thread1");
+        let task2 = create_test_task_info(1234, 9012, "thread2");
+        let task3 = create_test_task_info(5678, 1111, "thread3");
+        recorder.maybe_record_task(&task1);
+        recorder.maybe_record_task(&task2);
+        recorder.maybe_record_task(&task3);
+
+        let packets = recorder.generate_thread_packets(&mut id_counter, &mut thread_uuids);
+
+        // Should generate 3 packets: 3 thread track descriptors
+        assert_eq!(packets.len(), 3);
+
+        // All packets should be track descriptors with thread info
+        for packet in &packets {
+            let track_desc = packet.track_descriptor();
+            let _thread_desc = &track_desc.thread;
+        }
+
+        // thread_uuids should contain all threads
+        assert_eq!(thread_uuids.len(), 3);
+        assert!(thread_uuids.contains_key(&5678)); // TID from task1
+        assert!(thread_uuids.contains_key(&9012)); // TID from task2
+        assert!(thread_uuids.contains_key(&1111)); // TID from task3
+
+        // UUIDs should be unique
+        let uuid1 = thread_uuids.get(&5678).unwrap();
+        let uuid2 = thread_uuids.get(&9012).unwrap();
+        let uuid3 = thread_uuids.get(&1111).unwrap();
+        assert_ne!(uuid1, uuid2);
+        assert_ne!(uuid1, uuid3);
+        assert_ne!(uuid2, uuid3);
+
+        // id_counter should be incremented appropriately
+        assert_eq!(id_counter.load(std::sync::atomic::Ordering::Relaxed), 303);
+    }
+
+    #[test]
+    fn test_generate_thread_packets_thread_details() {
+        let recorder = create_test_session_recorder();
+        let mut id_counter = Arc::new(AtomicUsize::new(400));
+        let mut thread_uuids = HashMap::new();
+
+        // Add a thread with specific details to verify
+        let task = create_test_task_info(9999, 8888, "special_thread");
+        recorder.maybe_record_task(&task);
+
+        let packets = recorder.generate_thread_packets(&mut id_counter, &mut thread_uuids);
+
+        assert_eq!(packets.len(), 1);
+
+        let track_desc = packets[0].track_descriptor();
+        let thread_desc = &track_desc.thread;
+
+        // Verify all thread details are correct
+        assert_eq!(thread_desc.tid(), 8888);
+        assert_eq!(thread_desc.pid(), 9999);
+        assert_eq!(thread_desc.thread_name(), "special_thread");
+
+        // Verify UUID mapping
+        assert_eq!(thread_uuids.get(&8888), Some(&400));
+        assert_eq!(track_desc.uuid(), 400);
     }
 }
