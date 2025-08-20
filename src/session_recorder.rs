@@ -139,6 +139,35 @@ impl SysinfoRecorder {
 }
 
 impl SessionRecorder {
+    pub fn maybe_record_task(&self, info: &task_info) {
+        let pid = info.tgidpid as i32;
+        let tgid = (info.tgidpid >> 32) as i32;
+        if pid == tgid {
+            if !self
+                .process_descriptors
+                .read()
+                .unwrap()
+                .contains_key(&info.tgidpid)
+            {
+                self.process_descriptors
+                    .write()
+                    .unwrap()
+                    .insert(info.tgidpid, ProcessDescriptor::from(info));
+
+                let proc_reader = self.proc_reader.lock().unwrap();
+                self.processes
+                    .write()
+                    .unwrap()
+                    .insert(info.tgidpid, proto_process_from_parts(info, &proc_reader));
+            }
+        } else if !self.threads.read().unwrap().contains_key(&info.tgidpid) {
+            self.threads
+                .write()
+                .unwrap()
+                .insert(info.tgidpid, ThreadDescriptor::from(info));
+        }
+    }
+
     pub fn snapshot_clocks(&self) {
         let mut clock_snapshot = self.clock_snapshot.lock().unwrap();
         clock_snapshot.set_primary_trace_clock(BuiltinClock::BUILTIN_CLOCK_BOOTTIME);
@@ -264,43 +293,6 @@ impl SessionRecorder {
             &mut id_counter,
         ));
         packets
-    }
-}
-
-pub fn maybe_record_task(info: &task_info, session_recorder: &Arc<SessionRecorder>) {
-    let pid = info.tgidpid as i32;
-    let tgid = (info.tgidpid >> 32) as i32;
-    if pid == tgid {
-        if !session_recorder
-            .process_descriptors
-            .read()
-            .unwrap()
-            .contains_key(&info.tgidpid)
-        {
-            session_recorder
-                .process_descriptors
-                .write()
-                .unwrap()
-                .insert(info.tgidpid, ProcessDescriptor::from(info));
-
-            let proc_reader = session_recorder.proc_reader.lock().unwrap();
-            session_recorder
-                .processes
-                .write()
-                .unwrap()
-                .insert(info.tgidpid, proto_process_from_parts(info, &proc_reader));
-        }
-    } else if !session_recorder
-        .threads
-        .read()
-        .unwrap()
-        .contains_key(&info.tgidpid)
-    {
-        session_recorder
-            .threads
-            .write()
-            .unwrap()
-            .insert(info.tgidpid, ThreadDescriptor::from(info));
     }
 }
 

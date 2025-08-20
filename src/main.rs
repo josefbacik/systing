@@ -25,7 +25,7 @@ use crate::perf_recorder::PerfCounterRecorder;
 use crate::pystacks::stack_walker::{init_pystacks, StackWalkerRun};
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
-use crate::session_recorder::{get_clock_value, maybe_record_task, SessionRecorder, SysInfoEvent};
+use crate::session_recorder::{get_clock_value, SessionRecorder, SysInfoEvent};
 use crate::stack_recorder::StackRecorder;
 
 use anyhow::bail;
@@ -232,10 +232,10 @@ fn consume_loop<T, N>(
         }
         let event = res.unwrap();
         if let Some(task_info) = event.next_task_info() {
-            maybe_record_task(task_info, session_recorder);
+            session_recorder.maybe_record_task(task_info);
         }
         if let Some(task_info) = event.prev_task_info() {
-            maybe_record_task(task_info, session_recorder);
+            session_recorder.maybe_record_task(task_info);
         }
         let ret = recorder.lock().unwrap().record_event(event);
         if ret {
