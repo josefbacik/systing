@@ -210,7 +210,10 @@ where
     builder.add(map, move |data: &[u8]| {
         let mut event = T::default();
         plain::copy_from_bytes(&mut event, data).expect("Data buffer was too short");
-        tx.send(event).expect("Could not send event on channel.");
+        if tx.send(event).is_err() {
+            // Receiver has been dropped, we can silently ignore this
+            return -1;
+        }
         0
     })?;
     builder.build()
@@ -262,12 +265,8 @@ fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
     missed
 }
 
-fn system(opts: Command) -> Result<()> {
-    let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
-    let mut perf_counter_names = Vec::new();
-    let mut counters = PerfCounters::default();
-    let (stop_tx, stop_rx) = channel();
-    let old_kernel = if let Some(kernel_version) = sysinfo::System::kernel_version() {
+fn is_old_kernel() -> bool {
+    if let Some(kernel_version) = sysinfo::System::kernel_version() {
         let parts = kernel_version.split('.').collect::<Vec<&str>>();
 
         if parts.len() >= 2 {
@@ -281,8 +280,14 @@ fn system(opts: Command) -> Result<()> {
         }
     } else {
         false
-    };
+    }
+}
 
+fn setup_perf_counters(
+    opts: &Command,
+    counters: &mut PerfCounters,
+    perf_counter_names: &mut Vec<String>,
+) -> Result<()> {
     if !opts.perf_counter.is_empty() {
         counters.discover()?;
 
@@ -290,20 +295,20 @@ fn system(opts: Command) -> Result<()> {
         // through all of our options and populate the actual counter names that we want
         for counter in opts.perf_counter.iter() {
             let events = counters.event(counter);
-            if let Some(events) = events {
-                for event in events {
-                    if !perf_counter_names.contains(&event.name) {
-                        perf_counter_names.push(event.name.clone());
-                    }
+            if events.is_none() {
+                return Err(anyhow::anyhow!("Invalid perf counter"));
+            }
+            for event in events.unwrap() {
+                if !perf_counter_names.contains(&event.name) {
+                    perf_counter_names.push(event.name.clone());
                 }
-            } else {
-                Err(anyhow::anyhow!("Invalid perf counter"))?;
             }
         }
     }
+    Ok(())
+}
 
-    let recorder = Arc::new(SessionRecorder::default());
-
+fn configure_recorder(opts: &Command, recorder: &Arc<SessionRecorder>) {
     if opts.continuous > 0 {
         let duration = Duration::from_secs(opts.continuous);
         recorder
@@ -338,6 +343,29 @@ fn system(opts: Command) -> Result<()> {
             .set_max_duration(duration.as_nanos() as u64);
     }
 
+    recorder
+        .event_recorder
+        .lock()
+        .unwrap()
+        .set_process_sched_stats(opts.process_sched_stats);
+    recorder
+        .event_recorder
+        .lock()
+        .unwrap()
+        .set_cpu_sched_stats(opts.cpu_sched_stats);
+}
+
+fn system(opts: Command) -> Result<()> {
+    let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
+    let mut perf_counter_names = Vec::new();
+    let mut counters = PerfCounters::default();
+    let (stop_tx, stop_rx) = channel();
+    let old_kernel = is_old_kernel();
+
+    setup_perf_counters(&opts, &mut counters, &mut perf_counter_names)?;
+
+    let recorder = Arc::new(SessionRecorder::default());
+    configure_recorder(&opts, &recorder);
     recorder.snapshot_clocks();
     {
         let mut skel_builder = systing::SystingSystemSkelBuilder::default();
@@ -386,17 +414,6 @@ fn system(opts: Command) -> Result<()> {
                 }
             }
         }
-
-        recorder
-            .event_recorder
-            .lock()
-            .unwrap()
-            .set_process_sched_stats(opts.process_sched_stats);
-        recorder
-            .event_recorder
-            .lock()
-            .unwrap()
-            .set_cpu_sched_stats(opts.cpu_sched_stats);
 
         {
             let mut probe_recorder = recorder.probe_recorder.lock().unwrap();
