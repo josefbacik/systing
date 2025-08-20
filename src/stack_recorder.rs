@@ -383,3 +383,422 @@ impl StackRecorder {
         packets
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    fn create_test_stack_event(
+        tgidpid: u64,
+        ts: u64,
+        user_addrs: Vec<u64>,
+        kernel_addrs: Vec<u64>,
+    ) -> StackEvent {
+        StackEvent {
+            tgidpid,
+            ts_start: ts,
+            stack: Stack::new(&kernel_addrs, &user_addrs, &Vec::new()),
+        }
+    }
+
+    fn create_test_resolved_info() -> ResolvedStackInfo {
+        let mut frame_map = HashMap::new();
+        let mut func_name_map = HashMap::new();
+        let mut id_counter = Arc::new(AtomicUsize::new(1));
+
+        // Add test frames for addresses using add_frame()
+        add_frame(
+            &mut frame_map,
+            &mut func_name_map,
+            &mut id_counter,
+            0x1000,
+            0x1000,
+            0,
+            "test_func1".to_string(),
+        );
+        add_frame(
+            &mut frame_map,
+            &mut func_name_map,
+            &mut id_counter,
+            0x2000,
+            0x2000,
+            16,
+            "test_func1".to_string(),
+        );
+        add_frame(
+            &mut frame_map,
+            &mut func_name_map,
+            &mut id_counter,
+            0x3000,
+            0x3000,
+            0,
+            "test_func2".to_string(),
+        );
+        add_frame(
+            &mut frame_map,
+            &mut func_name_map,
+            &mut id_counter,
+            0x4000,
+            0x4000,
+            32,
+            "test_func2".to_string(),
+        );
+
+        ResolvedStackInfo {
+            frame_map,
+            func_name_map,
+            python_calls: Vec::new(),
+            python_stack_markers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_add_frame_new_address() {
+        let mut frame_map = HashMap::new();
+        let mut func_map = HashMap::new();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+
+        add_frame(
+            &mut frame_map,
+            &mut func_map,
+            &mut id_counter,
+            0x5000, // input_addr
+            0x4800, // start_addr
+            0x200,  // offset
+            "my_function".to_string(),
+        );
+
+        // Check that the frame was added to the map
+        assert!(frame_map.contains_key(&0x5000));
+        let frames = frame_map.get(&0x5000).unwrap();
+        assert_eq!(frames.len(), 1);
+
+        // Check frame properties
+        let frame = &frames[0].frame;
+        assert!(frame.iid() >= 100);
+        assert_eq!(frame.rel_pc(), 0x200);
+
+        // Check mapping properties
+        let mapping = &frames[0].mapping;
+        assert!(mapping.iid() >= 100);
+        assert_eq!(mapping.exact_offset(), 0x5000);
+        assert_eq!(mapping.start_offset(), 0x4800);
+
+        // Check that function was added to func_map
+        assert!(func_map.contains_key("my_function"));
+        let func = func_map.get("my_function").unwrap();
+        assert!(func.iid() >= 100);
+        assert_eq!(func.str(), b"my_function");
+    }
+
+    #[test]
+    fn test_add_frame_multiple_frames_same_address() {
+        let mut frame_map = HashMap::new();
+        let mut func_map = HashMap::new();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+
+        // Add first frame
+        add_frame(
+            &mut frame_map,
+            &mut func_map,
+            &mut id_counter,
+            0x5000,
+            0x4800,
+            0x200,
+            "function1".to_string(),
+        );
+
+        // Add second frame at same address (e.g., inlined function)
+        add_frame(
+            &mut frame_map,
+            &mut func_map,
+            &mut id_counter,
+            0x5000,
+            0x4800,
+            0,
+            "function2 (inlined)".to_string(),
+        );
+
+        // Check that both frames are in the vector for this address
+        let frames = frame_map.get(&0x5000).unwrap();
+        assert_eq!(frames.len(), 2);
+
+        // Check that each frame has unique IIDs
+        assert_ne!(frames[0].frame.iid(), frames[1].frame.iid());
+        assert_ne!(frames[0].mapping.iid(), frames[1].mapping.iid());
+
+        // Check that both functions are in func_map
+        assert_eq!(func_map.len(), 2);
+        assert!(func_map.contains_key("function1"));
+        assert!(func_map.contains_key("function2 (inlined)"));
+    }
+
+    #[test]
+    fn test_add_frame_reuses_existing_function() {
+        let mut frame_map = HashMap::new();
+        let mut func_map = HashMap::new();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+
+        // Add first frame with function "common_func"
+        add_frame(
+            &mut frame_map,
+            &mut func_map,
+            &mut id_counter,
+            0x5000,
+            0x4800,
+            0x200,
+            "common_func".to_string(),
+        );
+
+        let func_iid_first = func_map.get("common_func").unwrap().iid();
+
+        // Add second frame with same function name but different address
+        add_frame(
+            &mut frame_map,
+            &mut func_map,
+            &mut id_counter,
+            0x6000,
+            0x5800,
+            0x200,
+            "common_func".to_string(),
+        );
+
+        // Check that function map still has only one entry for "common_func"
+        assert_eq!(func_map.len(), 1);
+
+        // Check that the same function IID is reused
+        let func_iid_second = func_map.get("common_func").unwrap().iid();
+        assert_eq!(func_iid_first, func_iid_second);
+
+        // Check that frames at different addresses reference the same function
+        let frame1 = &frame_map.get(&0x5000).unwrap()[0].frame;
+        let frame2 = &frame_map.get(&0x6000).unwrap()[0].frame;
+        assert_eq!(frame1.function_name_id(), frame2.function_name_id());
+    }
+
+    #[test]
+    fn test_add_frame_id_counter_increments() {
+        let mut frame_map = HashMap::new();
+        let mut func_map = HashMap::new();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+
+        let initial_count = id_counter.load(Ordering::Relaxed);
+
+        add_frame(
+            &mut frame_map,
+            &mut func_map,
+            &mut id_counter,
+            0x5000,
+            0x4800,
+            0x200,
+            "test_func".to_string(),
+        );
+
+        let final_count = id_counter.load(Ordering::Relaxed);
+
+        // Should have incremented for: function IID, frame IID, mapping IID
+        // That's 3 increments minimum
+        assert!(final_count >= initial_count + 3);
+    }
+
+    #[test]
+    fn test_deduplicate_stacks_empty() {
+        let stacks = vec![];
+        let resolved_info = create_test_resolved_info();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+
+        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter);
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_deduplicate_stacks_single_stack() {
+        let stack = create_test_stack_event(
+            (1234 << 32) | 5678,
+            1000000,
+            vec![0x1000, 0x2000],
+            vec![0x3000, 0x4000],
+        );
+        let stacks = vec![stack.clone()];
+        let resolved_info = create_test_resolved_info();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+
+        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter);
+
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key(&stack.stack));
+
+        let callstack = result.get(&stack.stack).unwrap();
+        assert!(callstack.iid() >= 100); // Should have assigned an ID
+        assert!(!callstack.frame_ids.is_empty());
+    }
+
+    #[test]
+    fn test_deduplicate_stacks_duplicate_stacks() {
+        let stack1 = create_test_stack_event(
+            (1234 << 32) | 5678,
+            1000000,
+            vec![0x1000, 0x2000],
+            vec![0x3000, 0x4000],
+        );
+        let stack2 = create_test_stack_event(
+            (1234 << 32) | 5679, // Different PID, same stack
+            2000000,
+            vec![0x1000, 0x2000],
+            vec![0x3000, 0x4000],
+        );
+        let stacks = vec![stack1.clone(), stack2.clone()];
+        let resolved_info = create_test_resolved_info();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+
+        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter);
+
+        // Should only have one unique stack
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key(&stack1.stack));
+    }
+
+    #[test]
+    fn test_deduplicate_stacks_different_stacks() {
+        let stack1 =
+            create_test_stack_event((1234 << 32) | 5678, 1000000, vec![0x1000], vec![0x3000]);
+        let stack2 =
+            create_test_stack_event((1234 << 32) | 5679, 2000000, vec![0x2000], vec![0x4000]);
+        let stacks = vec![stack1.clone(), stack2.clone()];
+        let resolved_info = create_test_resolved_info();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+
+        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter);
+
+        // Should have two unique stacks
+        assert_eq!(result.len(), 2);
+        assert!(result.contains_key(&stack1.stack));
+        assert!(result.contains_key(&stack2.stack));
+    }
+
+    #[test]
+    fn test_generate_trace_packets_empty() {
+        let stacks = vec![];
+        let interned_stacks = HashMap::new();
+        let resolved_info = create_test_resolved_info();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+
+        let packets =
+            generate_trace_packets(&stacks, &interned_stacks, &resolved_info, &mut id_counter);
+
+        // Should still have at least one packet with interned data
+        assert!(packets.len() >= 1);
+
+        // First packet should be interned data
+        assert!(packets[0].interned_data.is_some());
+        let interned_data = packets[0].interned_data.as_ref().unwrap();
+        assert!(interned_data.callstacks.is_empty());
+    }
+
+    #[test]
+    fn test_generate_trace_packets_single_stack() {
+        let stack = create_test_stack_event(
+            (1234 << 32) | 5678,
+            1000000,
+            vec![0x1000, 0x2000],
+            vec![0x3000, 0x4000],
+        );
+        let stacks = vec![stack.clone()];
+
+        let mut interned_stacks = HashMap::new();
+        let mut callstack = Callstack::default();
+        callstack.set_iid(42);
+        callstack.frame_ids = vec![1, 2, 3, 4];
+        interned_stacks.insert(stack.stack.clone(), callstack);
+
+        let resolved_info = create_test_resolved_info();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+
+        let packets =
+            generate_trace_packets(&stacks, &interned_stacks, &resolved_info, &mut id_counter);
+
+        // Should have 2 packets: interned data + 1 sample
+        assert_eq!(packets.len(), 2);
+
+        // First packet should be interned data
+        assert!(packets[0].interned_data.is_some());
+        let interned_data = packets[0].interned_data.as_ref().unwrap();
+        assert_eq!(interned_data.callstacks.len(), 1);
+        assert_eq!(interned_data.function_names.len(), 2); // test_func1 and test_func2
+
+        // Second packet should be the sample
+        let sample = packets[1].perf_sample();
+        assert_eq!(sample.callstack_iid(), 42);
+        assert_eq!(sample.pid(), 1234);
+        assert_eq!(sample.tid(), 5678);
+    }
+
+    #[test]
+    fn test_generate_trace_packets_multiple_stacks() {
+        let stack1 =
+            create_test_stack_event((1234 << 32) | 5678, 1000000, vec![0x1000], vec![0x3000]);
+        let stack2 =
+            create_test_stack_event((5678 << 32) | 9012, 2000000, vec![0x2000], vec![0x4000]);
+        let stacks = vec![stack1.clone(), stack2.clone()];
+
+        let mut interned_stacks = HashMap::new();
+        let mut callstack1 = Callstack::default();
+        callstack1.set_iid(42);
+        interned_stacks.insert(stack1.stack.clone(), callstack1);
+
+        let mut callstack2 = Callstack::default();
+        callstack2.set_iid(43);
+        interned_stacks.insert(stack2.stack.clone(), callstack2);
+
+        let resolved_info = create_test_resolved_info();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+
+        let packets =
+            generate_trace_packets(&stacks, &interned_stacks, &resolved_info, &mut id_counter);
+
+        // Should have 3 packets: interned data + 2 samples
+        assert_eq!(packets.len(), 3);
+
+        // First packet should be interned data
+        assert!(packets[0].interned_data.is_some());
+        let interned_data = packets[0].interned_data.as_ref().unwrap();
+        assert_eq!(interned_data.callstacks.len(), 2);
+
+        // Second and third packets should be samples
+        // Verify the PIDs and TIDs
+        let sample1 = packets[1].perf_sample();
+        assert_eq!(sample1.pid(), 1234);
+        assert_eq!(sample1.tid(), 5678);
+
+        let sample2 = packets[2].perf_sample();
+        assert_eq!(sample2.pid(), 5678);
+        assert_eq!(sample2.tid(), 9012);
+    }
+
+    #[test]
+    fn test_generate_trace_packets_timestamps() {
+        let stack1 =
+            create_test_stack_event((1234 << 32) | 5678, 1000000, vec![0x1000], vec![0x3000]);
+        let stack2 =
+            create_test_stack_event((1234 << 32) | 5679, 2000000, vec![0x1000], vec![0x3000]);
+        let stacks = vec![stack1.clone(), stack2.clone()];
+
+        let mut interned_stacks = HashMap::new();
+        let mut callstack = Callstack::default();
+        callstack.set_iid(42);
+        interned_stacks.insert(stack1.stack.clone(), callstack);
+
+        let resolved_info = create_test_resolved_info();
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+
+        let packets =
+            generate_trace_packets(&stacks, &interned_stacks, &resolved_info, &mut id_counter);
+
+        // Check that timestamps are preserved
+        assert_eq!(packets[1].timestamp(), 1000000);
+        assert_eq!(packets[2].timestamp(), 2000000);
+    }
+}
