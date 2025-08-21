@@ -352,7 +352,8 @@ pub fn get_pystack_from_event(event: &stack_event) -> Vec<PyAddr> {
 
     #[cfg(feature = "pystacks")]
     {
-        Vec::from(&event.py_msg_buffer.buffer[..event.py_msg_buffer.stack_len as usize])
+        let stack_len = (event.py_msg_buffer.stack_len as usize).min(event.py_msg_buffer.buffer.len());
+        Vec::from(&event.py_msg_buffer.buffer[..stack_len])
             .iter()
             .map(|frame| PyAddr { addr: frame.into() })
             .collect()
