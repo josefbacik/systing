@@ -5,50 +5,38 @@ pub mod perfetto;
 pub mod pystacks;
 pub mod ringbuf;
 mod sched;
+mod session_recorder;
 mod stack_recorder;
 pub mod symbolize;
 
-use std::collections::HashMap;
-use std::ffi::CStr;
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::process;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use crate::events::{EventKeyType, EventProbe, SystingProbeRecorder};
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::perf_recorder::PerfCounterRecorder;
-use crate::perfetto::TrackCounter;
 use crate::pystacks::stack_walker::{init_pystacks, StackWalkerRun};
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
+use crate::session_recorder::{get_clock_value, SessionRecorder, SysInfoEvent};
 use crate::stack_recorder::StackRecorder;
 
 use anyhow::bail;
 use anyhow::Result;
 use clap::Parser;
 
-use fb_procfs::ProcReader;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{
     MapCore, RawTracepointOpts, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts,
 };
-use perfetto_protos::builtin_clock::BuiltinClock;
-use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
-use perfetto_protos::clock_snapshot::ClockSnapshot;
-use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
-use perfetto_protos::counter_descriptor::CounterDescriptor;
-use perfetto_protos::process_descriptor::ProcessDescriptor;
-use perfetto_protos::process_tree::{process_tree::Process as ProtoProcess, ProcessTree};
-use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace::Trace;
-use perfetto_protos::trace_packet::TracePacket;
-use perfetto_protos::track_descriptor::TrackDescriptor;
 
 use plain::Plain;
 use protobuf::Message;
@@ -211,292 +199,6 @@ impl SystingEvent for probe_event {
     }
 }
 
-impl SystingEvent for SysInfoEvent {
-    fn ts(&self) -> u64 {
-        self.ts
-    }
-}
-
-#[derive(Default)]
-struct SysInfoEvent {
-    cpu: u32,
-    ts: u64,
-    frequency: i64,
-}
-
-#[derive(Default)]
-struct SysinfoRecorder {
-    ringbuf: RingBuffer<SysInfoEvent>,
-    frequency: HashMap<u32, Vec<TrackCounter>>,
-}
-
-#[derive(Default)]
-struct SessionRecorder {
-    clock_snapshot: Mutex<ClockSnapshot>,
-    event_recorder: Mutex<SchedEventRecorder>,
-    stack_recorder: Mutex<StackRecorder>,
-    perf_counter_recorder: Mutex<PerfCounterRecorder>,
-    sysinfo_recorder: Mutex<SysinfoRecorder>,
-    probe_recorder: Mutex<SystingProbeRecorder>,
-    process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
-    processes: RwLock<HashMap<u64, ProtoProcess>>,
-    threads: RwLock<HashMap<u64, ThreadDescriptor>>,
-    proc_reader: Mutex<ProcReader>,
-}
-
-fn get_clock_value(clock_id: libc::c_int) -> u64 {
-    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
-    if unsafe { libc::clock_gettime(clock_id, &mut ts) } != 0 {
-        return 0;
-    }
-    (ts.tv_sec as u64 * 1_000_000_000) + ts.tv_nsec as u64
-}
-
-impl From<&task_info> for ProcessDescriptor {
-    fn from(task: &task_info) -> Self {
-        let comm = CStr::from_bytes_until_nul(&task.comm).unwrap();
-        let mut process = ProcessDescriptor::default();
-        process.set_pid(task.tgidpid as i32);
-        process.set_process_name(comm.to_str().unwrap().to_string());
-        process
-    }
-}
-
-fn proto_process_from_parts(task: &task_info, proc_reader: &ProcReader) -> ProtoProcess {
-    ProtoProcess {
-        cmdline: if let Ok(Some(cmd)) = proc_reader.read_pid_cmdline((task.tgidpid >> 32) as u32) {
-            cmd
-        } else {
-            vec![]
-        },
-        pid: Some(task.tgidpid as i32),
-        ..ProtoProcess::default()
-    }
-}
-
-impl From<&task_info> for ThreadDescriptor {
-    fn from(task: &task_info) -> Self {
-        let comm = CStr::from_bytes_until_nul(&task.comm).unwrap();
-        let mut thread = ThreadDescriptor::default();
-        thread.set_tid(task.tgidpid as i32);
-        thread.set_pid((task.tgidpid >> 32) as i32);
-        thread.set_thread_name(comm.to_str().unwrap().to_string());
-        thread
-    }
-}
-
-impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
-    fn ringbuf(&self) -> &RingBuffer<SysInfoEvent> {
-        &self.ringbuf
-    }
-    fn ringbuf_mut(&mut self) -> &mut RingBuffer<SysInfoEvent> {
-        &mut self.ringbuf
-    }
-    fn handle_event(&mut self, event: SysInfoEvent) {
-        let freq = self.frequency.entry(event.cpu).or_default();
-        freq.push(TrackCounter {
-            ts: event.ts,
-            count: event.frequency,
-        });
-    }
-}
-
-impl SysinfoRecorder {
-    fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
-
-        // Populate the sysinfo events
-        for (cpu, events) in self.frequency.iter() {
-            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-
-            let mut counter_desc = CounterDescriptor::default();
-            counter_desc.set_unit(Unit::UNIT_COUNT);
-            counter_desc.set_is_incremental(false);
-
-            let mut desc = TrackDescriptor::default();
-            desc.set_name(format!("CPU {cpu} frequency").to_string());
-            desc.set_uuid(desc_uuid);
-            desc.counter = Some(counter_desc).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            packets.push(packet);
-
-            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-            for event in events.iter() {
-                packets.push(event.to_track_event(desc_uuid, seq));
-            }
-        }
-        packets
-    }
-}
-
-impl SessionRecorder {
-    fn snapshot_clocks(&self) {
-        let mut clock_snapshot = self.clock_snapshot.lock().unwrap();
-        clock_snapshot.set_primary_trace_clock(BuiltinClock::BUILTIN_CLOCK_BOOTTIME);
-
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC));
-        clock_snapshot.clocks.push(clock);
-
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_BOOTTIME as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_BOOTTIME));
-        clock_snapshot.clocks.push(clock);
-
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_REALTIME as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_REALTIME));
-        clock_snapshot.clocks.push(clock);
-
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_REALTIME_COARSE as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_REALTIME_COARSE));
-        clock_snapshot.clocks.push(clock);
-
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC_COARSE as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC_COARSE));
-        clock_snapshot.clocks.push(clock);
-
-        let mut clock = Clock::default();
-        clock.set_clock_id(BuiltinClock::BUILTIN_CLOCK_MONOTONIC_RAW as u32);
-        clock.set_timestamp(get_clock_value(libc::CLOCK_MONOTONIC_RAW));
-        clock_snapshot.clocks.push(clock);
-    }
-
-    fn generate_trace(&self) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
-        let mut id_counter = Arc::new(AtomicUsize::new(1));
-        let mut pid_uuids = HashMap::new();
-        let mut thread_uuids = HashMap::new();
-        let systing_desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-
-        // First emit the clock snapshot
-        let mut packet = TracePacket::default();
-        packet.set_clock_snapshot(self.clock_snapshot.lock().unwrap().clone());
-        packet.set_trusted_packet_sequence_id(id_counter.fetch_add(1, Ordering::Relaxed) as u32);
-        packets.push(packet);
-
-        let mut desc = TrackDescriptor::default();
-        desc.set_uuid(systing_desc_uuid);
-        desc.set_name("Systing".to_string());
-
-        let mut packet = TracePacket::default();
-        packet.set_track_descriptor(desc);
-        packets.push(packet);
-
-        // Populate all the process tracks
-        for process in self.process_descriptors.read().unwrap().values() {
-            let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            pid_uuids.insert(process.pid(), uuid);
-
-            let mut desc = TrackDescriptor::default();
-            desc.set_uuid(uuid);
-            desc.process = Some(process.clone()).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            packets.push(packet);
-        }
-
-        // Populate all the process trees
-        for process in self.processes.read().unwrap().values() {
-            let process_tree = ProcessTree {
-                processes: vec![process.clone()],
-                ..ProcessTree::default()
-            };
-
-            let mut packet = TracePacket::default();
-            packet.set_process_tree(process_tree);
-            packets.push(packet);
-        }
-
-        for thread in self.threads.read().unwrap().values() {
-            let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            thread_uuids.insert(thread.tid(), uuid);
-
-            let mut desc = TrackDescriptor::default();
-            desc.set_uuid(uuid);
-            desc.thread = Some(thread.clone()).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            packets.push(packet);
-        }
-
-        // Generate the trace for all the event recorders
-        packets.extend(self.event_recorder.lock().unwrap().generate_trace(
-            &pid_uuids,
-            &thread_uuids,
-            &mut id_counter,
-        ));
-        packets.extend(
-            self.stack_recorder
-                .lock()
-                .unwrap()
-                .generate_trace(&mut id_counter),
-        );
-        packets.extend(
-            self.perf_counter_recorder
-                .lock()
-                .unwrap()
-                .generate_trace(&mut id_counter),
-        );
-        packets.extend(
-            self.sysinfo_recorder
-                .lock()
-                .unwrap()
-                .generate_trace(&mut id_counter),
-        );
-        packets.extend(self.probe_recorder.lock().unwrap().generate_trace(
-            &pid_uuids,
-            &thread_uuids,
-            &mut id_counter,
-        ));
-        packets
-    }
-}
-
-fn maybe_record_task(info: &task_info, session_recorder: &Arc<SessionRecorder>) {
-    let pid = info.tgidpid as i32;
-    let tgid = (info.tgidpid >> 32) as i32;
-    if pid == tgid {
-        if !session_recorder
-            .process_descriptors
-            .read()
-            .unwrap()
-            .contains_key(&info.tgidpid)
-        {
-            session_recorder
-                .process_descriptors
-                .write()
-                .unwrap()
-                .insert(info.tgidpid, ProcessDescriptor::from(info));
-
-            let proc_reader = session_recorder.proc_reader.lock().unwrap();
-            session_recorder
-                .processes
-                .write()
-                .unwrap()
-                .insert(info.tgidpid, proto_process_from_parts(info, &proc_reader));
-        }
-    } else if !session_recorder
-        .threads
-        .read()
-        .unwrap()
-        .contains_key(&info.tgidpid)
-    {
-        session_recorder
-            .threads
-            .write()
-            .unwrap()
-            .insert(info.tgidpid, ThreadDescriptor::from(info));
-    }
-}
-
 fn create_ring<'a, T>(
     map: &dyn libbpf_rs::MapCore,
     tx: Sender<T>,
@@ -508,7 +210,10 @@ where
     builder.add(map, move |data: &[u8]| {
         let mut event = T::default();
         plain::copy_from_bytes(&mut event, data).expect("Data buffer was too short");
-        tx.send(event).expect("Could not send event on channel.");
+        if tx.send(event).is_err() {
+            // Receiver has been dropped, we can silently ignore this
+            return -1;
+        }
         0
     })?;
     builder.build()
@@ -530,10 +235,10 @@ fn consume_loop<T, N>(
         }
         let event = res.unwrap();
         if let Some(task_info) = event.next_task_info() {
-            maybe_record_task(task_info, session_recorder);
+            session_recorder.maybe_record_task(task_info);
         }
         if let Some(task_info) = event.prev_task_info() {
-            maybe_record_task(task_info, session_recorder);
+            session_recorder.maybe_record_task(task_info);
         }
         let ret = recorder.lock().unwrap().record_event(event);
         if ret {
@@ -560,12 +265,8 @@ fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
     missed
 }
 
-fn system(opts: Command) -> Result<()> {
-    let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
-    let mut perf_counter_names = Vec::new();
-    let mut counters = PerfCounters::default();
-    let (stop_tx, stop_rx) = channel();
-    let old_kernel = if let Some(kernel_version) = sysinfo::System::kernel_version() {
+fn is_old_kernel() -> bool {
+    if let Some(kernel_version) = sysinfo::System::kernel_version() {
         let parts = kernel_version.split('.').collect::<Vec<&str>>();
 
         if parts.len() >= 2 {
@@ -579,8 +280,14 @@ fn system(opts: Command) -> Result<()> {
         }
     } else {
         false
-    };
+    }
+}
 
+fn setup_perf_counters(
+    opts: &Command,
+    counters: &mut PerfCounters,
+    perf_counter_names: &mut Vec<String>,
+) -> Result<()> {
     if !opts.perf_counter.is_empty() {
         counters.discover()?;
 
@@ -588,20 +295,20 @@ fn system(opts: Command) -> Result<()> {
         // through all of our options and populate the actual counter names that we want
         for counter in opts.perf_counter.iter() {
             let events = counters.event(counter);
-            if let Some(events) = events {
-                for event in events {
-                    if !perf_counter_names.contains(&event.name) {
-                        perf_counter_names.push(event.name.clone());
-                    }
+            if events.is_none() {
+                return Err(anyhow::anyhow!("Invalid perf counter"));
+            }
+            for event in events.unwrap() {
+                if !perf_counter_names.contains(&event.name) {
+                    perf_counter_names.push(event.name.clone());
                 }
-            } else {
-                Err(anyhow::anyhow!("Invalid perf counter"))?;
             }
         }
     }
+    Ok(())
+}
 
-    let recorder = Arc::new(SessionRecorder::default());
-
+fn configure_recorder(opts: &Command, recorder: &Arc<SessionRecorder>) {
     if opts.continuous > 0 {
         let duration = Duration::from_secs(opts.continuous);
         recorder
@@ -636,6 +343,29 @@ fn system(opts: Command) -> Result<()> {
             .set_max_duration(duration.as_nanos() as u64);
     }
 
+    recorder
+        .event_recorder
+        .lock()
+        .unwrap()
+        .set_process_sched_stats(opts.process_sched_stats);
+    recorder
+        .event_recorder
+        .lock()
+        .unwrap()
+        .set_cpu_sched_stats(opts.cpu_sched_stats);
+}
+
+fn system(opts: Command) -> Result<()> {
+    let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
+    let mut perf_counter_names = Vec::new();
+    let mut counters = PerfCounters::default();
+    let (stop_tx, stop_rx) = channel();
+    let old_kernel = is_old_kernel();
+
+    setup_perf_counters(&opts, &mut counters, &mut perf_counter_names)?;
+
+    let recorder = Arc::new(SessionRecorder::default());
+    configure_recorder(&opts, &recorder);
     recorder.snapshot_clocks();
     {
         let mut skel_builder = systing::SystingSystemSkelBuilder::default();
@@ -684,17 +414,6 @@ fn system(opts: Command) -> Result<()> {
                 }
             }
         }
-
-        recorder
-            .event_recorder
-            .lock()
-            .unwrap()
-            .set_process_sched_stats(opts.process_sched_stats);
-        recorder
-            .event_recorder
-            .lock()
-            .unwrap()
-            .set_cpu_sched_stats(opts.cpu_sched_stats);
 
         {
             let mut probe_recorder = recorder.probe_recorder.lock().unwrap();
