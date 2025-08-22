@@ -7,7 +7,6 @@ mod ringbuf;
 mod sched;
 mod session_recorder;
 mod stack_recorder;
-mod symbolize;
 
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;

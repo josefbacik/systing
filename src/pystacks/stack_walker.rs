@@ -1,5 +1,4 @@
-use crate::stack_recorder::LocalFrame;
-use crate::symbolize::Stack;
+use crate::stack_recorder::{LocalFrame, Stack};
 use crate::systing::types::stack_event;
 use libbpf_rs::Object;
 use perfetto_protos::profile_common::InternedString;
