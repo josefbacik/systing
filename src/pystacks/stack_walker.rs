@@ -174,6 +174,233 @@ impl StackWalkerRun {
     pub fn load_symbols(&self) {
         // Stub implementation when pystacks feature is disabled
     }
+
+    #[cfg(feature = "pystacks")]
+    pub fn pystacks_to_frames_mapping(
+        &mut self,
+        frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+        func_map: &mut HashMap<String, InternedString>,
+        id_counter: &mut Arc<AtomicUsize>,
+        python_stack_markers: &mut Vec<u64>,
+        stack: &[PyAddr],
+    ) {
+        if !self.initialized() {
+            return;
+        }
+
+        for frame in stack {
+            if frame_map.contains_key(&(frame.addr.symbol_id as u64)) {
+                continue;
+            }
+
+            let name = self.symbolize_function(frame);
+
+            add_frame(
+                frame_map,
+                func_map,
+                id_counter,
+                frame.addr.symbol_id.into(),
+                0,
+                0,
+                format!("{name} [py]"),
+            );
+
+            if name == "<interpreter trampoline>" {
+                python_stack_markers.push(frame.addr.symbol_id.into());
+            }
+        }
+    }
+
+    #[cfg(not(feature = "pystacks"))]
+    #[allow(clippy::ptr_arg)] // allow Vec needed for consistency with pystacks version
+    pub fn pystacks_to_frames_mapping(
+        &mut self,
+        _frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+        _func_map: &mut HashMap<String, InternedString>,
+        _id_counter: &mut Arc<AtomicUsize>,
+        _python_stack_markers: &mut Vec<u64>,
+        _stack: &[PyAddr],
+    ) {
+        // Stub implementation when pystacks feature is disabled
+    }
+
+    #[cfg(feature = "pystacks")]
+    #[allow(clippy::ptr_arg)] // allow Vec needed for push below
+    pub fn user_stack_to_python_calls(
+        &self,
+        frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+        func_map: &mut HashMap<String, InternedString>,
+        python_calls: &mut Vec<u64>,
+    ) {
+        let python_call_iids: Vec<_> = func_map
+            .iter()
+            .filter(|(key, value)| key.starts_with("_PyEval_EvalFrame") && value.iid.is_some())
+            .map(|(_, value)| value.iid.unwrap())
+            .collect();
+
+        for (key, values) in frame_map {
+            for value in values {
+                if value.frame.function_name_id.is_some()
+                    && python_call_iids.contains(&value.frame.function_name_id.unwrap())
+                {
+                    python_calls.push(*key);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "pystacks"))]
+    #[allow(clippy::ptr_arg)] // allow Vec needed for consistency with pystacks version
+    pub fn user_stack_to_python_calls(
+        &self,
+        _frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+        _func_map: &mut HashMap<String, InternedString>,
+        _python_calls: &mut Vec<u64>,
+    ) {
+        // Stub implementation when pystacks feature is disabled
+    }
+
+    #[cfg(feature = "pystacks")]
+    pub fn merge_pystacks(
+        &self,
+        stack: &Stack,
+        python_calls: &[u64],
+        python_stack_markers: &[u64],
+    ) -> Vec<u64> {
+        let mut merged_addrs = Vec::new();
+        let mut user_stack_idx = 0;
+        let mut pystack_idx = stack.py_stack.len();
+
+        let py_call_count = stack
+            .user_stack
+            .iter()
+            .filter(|&x| python_calls.contains(x))
+            .count();
+        let py_marker_count = if python_stack_markers.is_empty() {
+            stack.py_stack.len()
+        } else {
+            stack
+                .py_stack
+                .iter()
+                .filter(|&x| python_stack_markers.contains(&(x.addr.symbol_id as u64)))
+                .count()
+        };
+
+        // if we have more pyton calls in the system stack than python frames
+        // skip the first N python calls, as the python frames are leafs
+        // If it is only off by 1, it is more likely that we have entered a
+        // PyEval_EvalFrameDeafult but not yet setup the leaf frame, so ignore these
+        // instances
+        let mut skip_py_calls =
+            if py_call_count > py_marker_count && py_call_count - py_marker_count > 1 {
+                py_call_count - py_marker_count
+            } else {
+                0
+            };
+
+        // if we have more python frames than python calls in the system stack
+        // drop the first N python frames. This could happen if the system stack overflows
+        // the buffer used to collect it, in which case the base of the stack would be
+        // missing.
+        let mut skip_py_frame = py_marker_count.saturating_sub(py_call_count);
+
+        if python_stack_markers.is_empty() {
+            pystack_idx -= skip_py_frame;
+        } else {
+            while skip_py_frame > 0 {
+                if python_stack_markers
+                    .contains(&(stack.py_stack[pystack_idx - 1].addr.symbol_id as u64))
+                {
+                    skip_py_frame -= 1;
+                }
+            }
+        }
+
+        while user_stack_idx < stack.user_stack.len() {
+            let user_addr = stack.user_stack[user_stack_idx];
+            if skip_py_calls == 0 && pystack_idx > 0 && python_calls.contains(&user_addr) {
+                // decrement either way. In the if case below, we added the address. In
+                // the else case below, we are incrementing past the stack marker that
+                // ended the previous loop
+                pystack_idx -= 1;
+                if python_stack_markers.is_empty() {
+                    merged_addrs.push(stack.py_stack[pystack_idx].addr.symbol_id as u64);
+                } else {
+                    while pystack_idx > 0
+                        && !python_stack_markers
+                            .contains(&(stack.py_stack[pystack_idx - 1].addr.symbol_id as u64))
+                    {
+                        pystack_idx -= 1;
+                        merged_addrs.push(stack.py_stack[pystack_idx].addr.symbol_id as u64);
+                    }
+                }
+            } else {
+                if python_calls.contains(&user_addr) && skip_py_calls > 0 {
+                    skip_py_calls -= 1;
+                }
+
+                merged_addrs.push(user_addr);
+            }
+            // increment either way. In the if case, we are incremented past the
+            // python_call address, in the else case, we added the address
+            user_stack_idx += 1;
+        }
+
+        merged_addrs
+    }
+
+    #[cfg(not(feature = "pystacks"))]
+    pub fn merge_pystacks(
+        &self,
+        _stack: &Stack,
+        _python_calls: &[u64],
+        _python_stack_markers: &[u64],
+    ) -> Vec<u64> {
+        Vec::new()
+    }
+
+    #[cfg(feature = "pystacks")]
+    pub fn get_pystack_from_event(&self, event: &stack_event) -> Vec<PyAddr> {
+        let stack_len = (event.py_msg_buffer.stack_len as usize).min(event.py_msg_buffer.buffer.len());
+        Vec::from(&event.py_msg_buffer.buffer[..stack_len])
+            .iter()
+            .map(|frame| PyAddr { addr: frame.into() })
+            .collect()
+    }
+
+    #[cfg(not(feature = "pystacks"))]
+    pub fn get_pystack_from_event(&self, _event: &stack_event) -> Vec<PyAddr> {
+        Vec::new()
+    }
+
+    #[cfg(feature = "pystacks")]
+    pub fn load_pystack_symbols(&mut self, event: &stack_event) {
+        if self.initialized() && event.py_msg_buffer.stack_len > 0 {
+            self.load_symbols();
+        }
+    }
+
+    #[cfg(not(feature = "pystacks"))]
+    pub fn load_pystack_symbols(&mut self, _event: &stack_event) {
+        // Stub implementation when pystacks feature is disabled
+    }
+
+    #[cfg(feature = "pystacks")]
+    pub fn init_pystacks(&mut self, pids: &[u32], bpf_object: &Object) {
+        if !pids.is_empty() {
+            let mut pid_opts: Vec<i32> = Vec::new();
+            for pid in pids.iter() {
+                pid_opts.push(*pid as i32);
+            }
+
+            self.init(bpf_object.as_libbpf_object(), &mut pid_opts);
+        }
+    }
+
+    #[cfg(not(feature = "pystacks"))]
+    pub fn init_pystacks(&mut self, _pids: &[u32], _bpf_object: &Object) {
+        // Stub implementation when pystacks feature is disabled
+    }
 }
 
 impl Default for StackWalkerRun {
@@ -202,226 +429,3 @@ impl Drop for StackWalkerRun {
 unsafe impl Send for StackWalkerRun {}
 unsafe impl Sync for StackWalkerRun {}
 
-#[cfg(feature = "pystacks")]
-#[allow(clippy::ptr_arg)] // allow Vec needed for push below
-pub(crate) fn pystacks_to_frames_mapping(
-    psr: &mut Arc<StackWalkerRun>,
-    frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-    func_map: &mut HashMap<String, InternedString>,
-    id_counter: &mut Arc<AtomicUsize>,
-    python_stack_markers: &mut Vec<u64>,
-    stack: &[PyAddr],
-) {
-    if !psr.initialized() {
-        return;
-    }
-
-    for frame in stack {
-        if frame_map.contains_key(&(frame.addr.symbol_id as u64)) {
-            continue;
-        }
-
-        let name = psr.symbolize_function(frame);
-
-        add_frame(
-            frame_map,
-            func_map,
-            id_counter,
-            frame.addr.symbol_id.into(),
-            0,
-            0,
-            format!("{name} [py]"),
-        );
-
-        if name == "<interpreter trampoline>" {
-            python_stack_markers.push(frame.addr.symbol_id.into());
-        }
-    }
-}
-
-#[cfg(not(feature = "pystacks"))]
-#[allow(clippy::ptr_arg)] // allow Vec needed for consistency with pystacks version
-pub(crate) fn pystacks_to_frames_mapping(
-    _psr: &mut Arc<StackWalkerRun>,
-    _frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-    _func_map: &mut HashMap<String, InternedString>,
-    _id_counter: &mut Arc<AtomicUsize>,
-    _python_stack_markers: &mut Vec<u64>,
-    _stack: &[PyAddr],
-) {
-    // Stub implementation when pystacks feature is disabled
-}
-
-#[cfg(feature = "pystacks")]
-#[allow(clippy::ptr_arg)] // allow Vec needed for push below
-pub(crate) fn user_stack_to_python_calls(
-    frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-    func_map: &mut HashMap<String, InternedString>,
-    python_calls: &mut Vec<u64>,
-) {
-    let python_call_iids: Vec<_> = func_map
-        .iter()
-        .filter(|(key, value)| key.starts_with("_PyEval_EvalFrame") && value.iid.is_some())
-        .map(|(_, value)| value.iid.unwrap())
-        .collect();
-
-    for (key, values) in frame_map {
-        for value in values {
-            if value.frame.function_name_id.is_some()
-                && python_call_iids.contains(&value.frame.function_name_id.unwrap())
-            {
-                python_calls.push(*key);
-            }
-        }
-    }
-}
-
-#[cfg(not(feature = "pystacks"))]
-#[allow(clippy::ptr_arg)] // allow Vec needed for consistency with pystacks version
-pub(crate) fn user_stack_to_python_calls(
-    _frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-    _func_map: &mut HashMap<String, InternedString>,
-    _python_calls: &mut Vec<u64>,
-) {
-    // Stub implementation when pystacks feature is disabled
-}
-
-#[cfg(feature = "pystacks")]
-pub fn merge_pystacks(
-    stack: &Stack,
-    python_calls: &[u64],
-    python_stack_markers: &[u64],
-) -> Vec<u64> {
-    let mut merged_addrs = Vec::new();
-    let mut user_stack_idx = 0;
-    let mut pystack_idx = stack.py_stack.len();
-
-    let py_call_count = stack
-        .user_stack
-        .iter()
-        .filter(|&x| python_calls.contains(x))
-        .count();
-    let py_marker_count = if python_stack_markers.is_empty() {
-        stack.py_stack.len()
-    } else {
-        stack
-            .py_stack
-            .iter()
-            .filter(|&x| python_stack_markers.contains(&(x.addr.symbol_id as u64)))
-            .count()
-    };
-
-    // if we have more pyton calls in the system stack than python frames
-    // skip the first N python calls, as the python frames are leafs
-    // If it is only off by 1, it is more likely that we have entered a
-    // PyEval_EvalFrameDeafult but not yet setup the leaf frame, so ignore these
-    // instances
-    let mut skip_py_calls =
-        if py_call_count > py_marker_count && py_call_count - py_marker_count > 1 {
-            py_call_count - py_marker_count
-        } else {
-            0
-        };
-
-    // if we have more python frames than python calls in the system stack
-    // drop the first N python frames. This could happen if the system stack overflows
-    // the buffer used to collect it, in which case the base of the stack would be
-    // missing.
-    let mut skip_py_frame = py_marker_count.saturating_sub(py_call_count);
-
-    if python_stack_markers.is_empty() {
-        pystack_idx -= skip_py_frame;
-    } else {
-        while skip_py_frame > 0 {
-            if python_stack_markers
-                .contains(&(stack.py_stack[pystack_idx - 1].addr.symbol_id as u64))
-            {
-                skip_py_frame -= 1;
-            }
-        }
-    }
-
-    while user_stack_idx < stack.user_stack.len() {
-        let user_addr = stack.user_stack[user_stack_idx];
-        if skip_py_calls == 0 && pystack_idx > 0 && python_calls.contains(&user_addr) {
-            // decrement either way. In the if case below, we added the address. In
-            // the else case below, we are incrementing past the stack marker that
-            // ended the previous loop
-            pystack_idx -= 1;
-            if python_stack_markers.is_empty() {
-                merged_addrs.push(stack.py_stack[pystack_idx].addr.symbol_id as u64);
-            } else {
-                while pystack_idx > 0
-                    && !python_stack_markers
-                        .contains(&(stack.py_stack[pystack_idx - 1].addr.symbol_id as u64))
-                {
-                    pystack_idx -= 1;
-                    merged_addrs.push(stack.py_stack[pystack_idx].addr.symbol_id as u64);
-                }
-            }
-        } else {
-            if python_calls.contains(&user_addr) && skip_py_calls > 0 {
-                skip_py_calls -= 1;
-            }
-
-            merged_addrs.push(user_addr);
-        }
-        // increment either way. In the if case, we are incremented past the
-        // python_call address, in the else case, we added the address
-        user_stack_idx += 1;
-    }
-
-    merged_addrs
-}
-
-#[cfg(not(feature = "pystacks"))]
-pub fn merge_pystacks(
-    _stack: &Stack,
-    _python_calls: &[u64],
-    _python_stack_markers: &[u64],
-) -> Vec<u64> {
-    Vec::new()
-}
-
-#[cfg(feature = "pystacks")]
-pub fn get_pystack_from_event(event: &stack_event) -> Vec<PyAddr> {
-    let stack_len = (event.py_msg_buffer.stack_len as usize).min(event.py_msg_buffer.buffer.len());
-    Vec::from(&event.py_msg_buffer.buffer[..stack_len])
-        .iter()
-        .map(|frame| PyAddr { addr: frame.into() })
-        .collect()
-}
-
-#[cfg(not(feature = "pystacks"))]
-pub fn get_pystack_from_event(_event: &stack_event) -> Vec<PyAddr> {
-    Vec::new()
-}
-
-#[cfg(feature = "pystacks")]
-pub fn load_pystack_symbols(psr: &mut Arc<StackWalkerRun>, event: &stack_event) {
-    if psr.initialized() && event.py_msg_buffer.stack_len > 0 {
-        psr.load_symbols();
-    }
-}
-
-#[cfg(not(feature = "pystacks"))]
-pub fn load_pystack_symbols(_psr: &mut Arc<StackWalkerRun>, _event: &stack_event) {
-    // Stub implementation when pystacks feature is disabled
-}
-
-#[cfg(feature = "pystacks")]
-pub fn init_pystacks(pids: &[u32], psr: &mut StackWalkerRun, bpf_object: &Object) {
-    if !pids.is_empty() {
-        let mut pid_opts: Vec<i32> = Vec::new();
-        for pid in pids.iter() {
-            pid_opts.push(*pid as i32);
-        }
-
-        psr.init(bpf_object.as_libbpf_object(), &mut pid_opts);
-    }
-}
-
-#[cfg(not(feature = "pystacks"))]
-pub fn init_pystacks(_pids: &[u32], _psr: &mut StackWalkerRun, _bpf_object: &Object) {
-    // Stub implementation when pystacks feature is disabled
-}

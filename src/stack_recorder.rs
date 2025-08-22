@@ -3,10 +3,7 @@ use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::pystacks::stack_walker::{
-    get_pystack_from_event, load_pystack_symbols, merge_pystacks, pystacks_to_frames_mapping,
-    user_stack_to_python_calls, StackWalkerRun,
-};
+use crate::pystacks::stack_walker::StackWalkerRun;
 use crate::ringbuf::RingBuffer;
 use crate::symbolize::Stack;
 use crate::systing::types::stack_event;
@@ -169,7 +166,7 @@ fn symbolize_stacks(
             id_counter,
             raw_stack.user_stack.iter(),
         );
-        user_stack_to_python_calls(&mut frame_map, &mut func_name_map, &mut python_calls);
+        psr.user_stack_to_python_calls(&mut frame_map, &mut func_name_map, &mut python_calls);
         // Symbolize kernel stack
         stack_to_frames_mapping(
             &mut symbolizer,
@@ -180,8 +177,7 @@ fn symbolize_stacks(
             raw_stack.kernel_stack.iter(),
         );
         // Symbolize Python stack
-        pystacks_to_frames_mapping(
-            psr,
+        Arc::get_mut(psr).unwrap().pystacks_to_frames_mapping(
             &mut frame_map,
             &mut func_name_map,
             id_counter,
@@ -203,6 +199,7 @@ fn deduplicate_stacks(
     stacks: &[StackEvent],
     resolved_info: &ResolvedStackInfo,
     id_counter: &mut Arc<AtomicUsize>,
+    psr: &Arc<StackWalkerRun>,
 ) -> HashMap<Stack, Callstack> {
     stacks
         .iter()
@@ -229,7 +226,7 @@ fn deduplicate_stacks(
                     .collect()
             } else {
                 // Merge Python stacks with user stacks
-                let merged_addrs = merge_pystacks(
+                let merged_addrs = psr.merge_pystacks(
                     &stack,
                     &resolved_info.python_calls,
                     &resolved_info.python_stack_markers,
@@ -324,7 +321,7 @@ pub fn generate_stack_packets(
     // Step 1: Symbolize all stacks
     let resolved_info = symbolize_stacks(&stacks, tgid, id_counter, psr);
     // Step 2: Deduplicate stacks
-    let interned_stacks = deduplicate_stacks(&stacks, &resolved_info, id_counter);
+    let interned_stacks = deduplicate_stacks(&stacks, &resolved_info, id_counter, psr);
     // Step 3: Generate trace packets
     let trace_packets =
         generate_trace_packets(&stacks, &interned_stacks, &resolved_info, id_counter);
@@ -344,7 +341,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
             let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
             let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
             let stack_key = (event.task.tgidpid >> 32) as i32;
-            let py_stack = get_pystack_from_event(&event);
+            let py_stack = self.psr.get_pystack_from_event(&event);
 
             let stack = StackEvent {
                 tgidpid: event.task.tgidpid,
@@ -355,7 +352,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
             stacks.push(stack);
         }
 
-        load_pystack_symbols(&mut self.psr, &event);
+        Arc::get_mut(&mut self.psr).unwrap().load_pystack_symbols(&event);
     }
 }
 
@@ -609,7 +606,7 @@ mod tests {
         let resolved_info = create_test_resolved_info();
         let mut id_counter = Arc::new(AtomicUsize::new(100));
 
-        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter);
+        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter, &Arc::new(StackWalkerRun::default()));
 
         assert!(result.is_empty());
     }
@@ -626,7 +623,7 @@ mod tests {
         let resolved_info = create_test_resolved_info();
         let mut id_counter = Arc::new(AtomicUsize::new(100));
 
-        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter);
+        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter, &Arc::new(StackWalkerRun::default()));
 
         assert_eq!(result.len(), 1);
         assert!(result.contains_key(&stack.stack));
@@ -654,7 +651,7 @@ mod tests {
         let resolved_info = create_test_resolved_info();
         let mut id_counter = Arc::new(AtomicUsize::new(100));
 
-        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter);
+        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter, &Arc::new(StackWalkerRun::default()));
 
         // Should only have one unique stack
         assert_eq!(result.len(), 1);
@@ -671,7 +668,7 @@ mod tests {
         let resolved_info = create_test_resolved_info();
         let mut id_counter = Arc::new(AtomicUsize::new(100));
 
-        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter);
+        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter, &Arc::new(StackWalkerRun::default()));
 
         // Should have two unique stacks
         assert_eq!(result.len(), 2);
