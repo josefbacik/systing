@@ -1,12 +1,10 @@
 use crate::stack_recorder::LocalFrame;
 use crate::symbolize::Stack;
 use crate::systing::types::stack_event;
-use libbpf_rs::libbpf_sys;
 use libbpf_rs::Object;
 use perfetto_protos::profile_common::InternedString;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
@@ -14,6 +12,8 @@ use std::sync::Arc;
 use {
     crate::pystacks::bindings,
     crate::stack_recorder::add_frame,
+    std::ptr::NonNull,
+    libbpf_rs::libbpf_sys,
     libbpf_rs::AsRawLibbpf,
     std::fmt,
 };
@@ -102,7 +102,7 @@ impl StackWalkerRun {
         }
     }
 
-    pub fn init(&mut self, bpf_object: NonNull<libbpf_sys::bpf_object>, pid_opts: &mut [i32]) {
+    fn init(&mut self, bpf_object: NonNull<libbpf_sys::bpf_object>, pid_opts: &mut [i32]) {
         if !self.initialized() {
             let mut opts = bindings::stack_walker_opts {
                 pids: pid_opts.as_mut_ptr(),
@@ -119,11 +119,11 @@ impl StackWalkerRun {
         }
     }
 
-    pub fn initialized(&self) -> bool {
+    fn initialized(&self) -> bool {
         !self.ptr.is_null()
     }
 
-    pub fn symbolize_function(&self, frame: &PyAddr) -> String {
+    fn symbolize_function(&self, frame: &PyAddr) -> String {
         let mut buff = vec![0; 256];
         let mut len = 0;
 
@@ -147,7 +147,7 @@ impl StackWalkerRun {
         }
     }
 
-    pub fn load_symbols(&self) {
+    fn load_symbols(&self) {
         if self.initialized() {
             unsafe { bindings::pystacks_load_symbols(self.ptr) };
         }
@@ -358,22 +358,6 @@ pub struct StackWalkerRun {}
 impl StackWalkerRun {
     fn new() -> Self {
         StackWalkerRun {}
-    }
-
-    pub fn init(&mut self, _bpf_object: NonNull<libbpf_sys::bpf_object>, _pid_opts: &mut [i32]) {
-        // Stub implementation when pystacks feature is disabled
-    }
-
-    pub fn initialized(&self) -> bool {
-        false
-    }
-
-    pub fn symbolize_function(&self, _frame: &PyAddr) -> String {
-        "<unknown python>".to_string()
-    }
-
-    pub fn load_symbols(&self) {
-        // Stub implementation when pystacks feature is disabled
     }
 
     #[allow(clippy::ptr_arg)] // allow Vec needed for consistency with pystacks version

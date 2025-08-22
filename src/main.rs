@@ -1,13 +1,13 @@
-pub mod events;
-pub mod perf;
+mod events;
+mod perf;
 mod perf_recorder;
-pub mod perfetto;
-pub mod pystacks;
-pub mod ringbuf;
+mod perfetto;
+mod pystacks;
+mod ringbuf;
 mod sched;
 mod session_recorder;
 mod stack_recorder;
-pub mod symbolize;
+mod symbolize;
 
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
