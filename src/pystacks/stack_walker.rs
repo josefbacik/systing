@@ -1,23 +1,17 @@
-#[cfg(feature = "pystacks")]
-use crate::pystacks::bindings;
-
-#[cfg(feature = "pystacks")]
-use crate::stack_recorder::add_frame;
-use crate::stack_recorder::LocalFrame;
-use crate::symbolize::Stack;
+use crate::stack_recorder::{LocalFrame, Stack};
 use crate::systing::types::stack_event;
-use libbpf_rs::libbpf_sys;
-#[cfg(feature = "pystacks")]
-use libbpf_rs::AsRawLibbpf;
 use libbpf_rs::Object;
 use perfetto_protos::profile_common::InternedString;
 use std::collections::HashMap;
-#[cfg(feature = "pystacks")]
-use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+
+#[cfg(feature = "pystacks")]
+use {
+    crate::pystacks::bindings, crate::stack_recorder::add_frame, libbpf_rs::libbpf_sys,
+    libbpf_rs::AsRawLibbpf, std::fmt, std::ptr::NonNull,
+};
 
 #[derive(Debug, Clone)]
 pub struct PyAddr {
@@ -87,23 +81,23 @@ impl fmt::Display for bindings::stack_walker_frame {
     }
 }
 
+//
+// Implementation when pystacks feature is ENABLED
+//
+#[cfg(feature = "pystacks")]
 pub struct StackWalkerRun {
-    #[cfg(feature = "pystacks")]
     ptr: *mut bindings::stack_walker_run,
 }
 
+#[cfg(feature = "pystacks")]
 impl StackWalkerRun {
     fn new() -> Self {
         StackWalkerRun {
-            #[cfg(feature = "pystacks")]
             ptr: std::ptr::null_mut(),
         }
     }
 
-    // Allow unused variables due to feature usage
-    #[allow(unused_variables)]
-    pub fn init(&mut self, bpf_object: NonNull<libbpf_sys::bpf_object>, pid_opts: &mut [i32]) {
-        #[cfg(feature = "pystacks")]
+    fn init(&mut self, bpf_object: NonNull<libbpf_sys::bpf_object>, pid_opts: &mut [i32]) {
         if !self.initialized() {
             let mut opts = bindings::stack_walker_opts {
                 pids: pid_opts.as_mut_ptr(),
@@ -120,23 +114,14 @@ impl StackWalkerRun {
         }
     }
 
-    #[cfg(not(feature = "pystacks"))]
-    pub fn initialized(&self) -> bool {
-        false
-    }
-
-    #[cfg(feature = "pystacks")]
-    pub fn initialized(&self) -> bool {
+    fn initialized(&self) -> bool {
         !self.ptr.is_null()
     }
 
-    #[allow(unused_mut)] // allow mut for feature pystacks
-    #[allow(unused_variables)] // Allow unused variables due to feature usage
-    pub fn symbolize_function(&self, frame: &PyAddr) -> String {
+    fn symbolize_function(&self, frame: &PyAddr) -> String {
         let mut buff = vec![0; 256];
         let mut len = 0;
 
-        #[cfg(feature = "pystacks")]
         if self.initialized() {
             len = unsafe {
                 bindings::pystacks_symbolize_function(
@@ -157,81 +142,54 @@ impl StackWalkerRun {
         }
     }
 
-    pub fn load_symbols(&self) {
-        #[cfg(feature = "pystacks")]
+    fn load_symbols(&self) {
         if self.initialized() {
             unsafe { bindings::pystacks_load_symbols(self.ptr) };
         }
     }
-}
 
-impl Default for StackWalkerRun {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for StackWalkerRun {
-    fn drop(&mut self) {
-        #[cfg(feature = "pystacks")]
-        if !self.ptr.is_null() {
-            unsafe { bindings::pystacks_free(self.ptr) };
-            self.ptr = std::ptr::null_mut();
-        }
-    }
-}
-
-unsafe impl Send for StackWalkerRun {}
-unsafe impl Sync for StackWalkerRun {}
-
-#[allow(unused_variables)] // Allow unused variables due to feature usage
-#[allow(clippy::ptr_arg)] // allow Vec needed for push below
-pub(crate) fn pystacks_to_frames_mapping(
-    psr: &mut Arc<StackWalkerRun>,
-    frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-    func_map: &mut HashMap<String, InternedString>,
-    id_counter: &mut Arc<AtomicUsize>,
-    python_stack_markers: &mut Vec<u64>,
-    stack: &[PyAddr],
-) {
-    #[allow(clippy::needless_return)] // needed for pystacks feature
-    if !psr.initialized() {
-        return;
-    }
-
-    #[cfg(feature = "pystacks")]
-    for frame in stack {
-        if frame_map.contains_key(&(frame.addr.symbol_id as u64)) {
-            continue;
+    pub fn pystacks_to_frames_mapping(
+        &self,
+        frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+        func_map: &mut HashMap<String, InternedString>,
+        id_counter: &mut Arc<AtomicUsize>,
+        python_stack_markers: &mut Vec<u64>,
+        stack: &[PyAddr],
+    ) {
+        if !self.initialized() {
+            return;
         }
 
-        let name = psr.symbolize_function(frame);
+        for frame in stack {
+            if frame_map.contains_key(&(frame.addr.symbol_id as u64)) {
+                continue;
+            }
 
-        add_frame(
-            frame_map,
-            func_map,
-            id_counter,
-            frame.addr.symbol_id.into(),
-            0,
-            0,
-            format!("{name} [py]"),
-        );
+            let name = self.symbolize_function(frame);
 
-        if name == "<interpreter trampoline>" {
-            python_stack_markers.push(frame.addr.symbol_id.into());
+            add_frame(
+                frame_map,
+                func_map,
+                id_counter,
+                frame.addr.symbol_id.into(),
+                0,
+                0,
+                format!("{name} [py]"),
+            );
+
+            if name == "<interpreter trampoline>" {
+                python_stack_markers.push(frame.addr.symbol_id.into());
+            }
         }
     }
-}
 
-#[allow(unused_variables)] // Allow unused variables due to feature usage
-#[allow(clippy::ptr_arg)] // allow Vec needed for push below
-pub(crate) fn user_stack_to_python_calls(
-    frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-    func_map: &mut HashMap<String, InternedString>,
-    python_calls: &mut Vec<u64>,
-) {
-    #[cfg(feature = "pystacks")]
-    {
+    #[allow(clippy::ptr_arg)] // allow Vec needed for push below
+    pub fn user_stack_to_python_calls(
+        &self,
+        frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+        func_map: &mut HashMap<String, InternedString>,
+        python_calls: &mut Vec<u64>,
+    ) {
         let python_call_iids: Vec<_> = func_map
             .iter()
             .filter(|(key, value)| key.starts_with("_PyEval_EvalFrame") && value.iid.is_some())
@@ -248,19 +206,14 @@ pub(crate) fn user_stack_to_python_calls(
             }
         }
     }
-}
 
-#[allow(unused_mut)] // allow mut for feature pystacks
-#[allow(unused_variables)] // Allow unused variables due to feature usage
-pub fn merge_pystacks(
-    stack: &Stack,
-    python_calls: &[u64],
-    python_stack_markers: &[u64],
-) -> Vec<u64> {
-    let mut merged_addrs = Vec::new();
-
-    #[cfg(feature = "pystacks")]
-    {
+    pub fn merge_pystacks(
+        &self,
+        stack: &Stack,
+        python_calls: &[u64],
+        python_stack_markers: &[u64],
+    ) -> Vec<u64> {
+        let mut merged_addrs = Vec::new();
         let mut user_stack_idx = 0;
         let mut pystack_idx = stack.py_stack.len();
 
@@ -338,45 +291,130 @@ pub fn merge_pystacks(
             // python_call address, in the else case, we added the address
             user_stack_idx += 1;
         }
+
+        merged_addrs
     }
 
-    merged_addrs
-}
-
-#[allow(unused_variables)] // Allow unused variables due to feature usage
-pub fn get_pystack_from_event(event: &stack_event) -> Vec<PyAddr> {
-    #[cfg(not(feature = "pystacks"))]
-    {
-        Vec::new()
-    }
-
-    #[cfg(feature = "pystacks")]
-    {
-        let stack_len = (event.py_msg_buffer.stack_len as usize).min(event.py_msg_buffer.buffer.len());
+    pub fn get_pystack_from_event(&self, event: &stack_event) -> Vec<PyAddr> {
+        let stack_len =
+            (event.py_msg_buffer.stack_len as usize).min(event.py_msg_buffer.buffer.len());
         Vec::from(&event.py_msg_buffer.buffer[..stack_len])
             .iter()
             .map(|frame| PyAddr { addr: frame.into() })
             .collect()
     }
-}
 
-#[allow(unused_variables)] // Allow unused variables due to feature usage
-pub fn load_pystack_symbols(psr: &mut Arc<StackWalkerRun>, event: &stack_event) {
-    #[cfg(feature = "pystacks")]
-    if psr.initialized() && event.py_msg_buffer.stack_len > 0 {
-        psr.load_symbols();
-    }
-}
-
-#[allow(unused_variables)] // Allow unused variables due to feature usage
-pub fn init_pystacks(pids: &[u32], psr: &mut StackWalkerRun, bpf_object: &Object) {
-    #[cfg(feature = "pystacks")]
-    if !pids.is_empty() {
-        let mut pid_opts: Vec<i32> = Vec::new();
-        for pid in pids.iter() {
-            pid_opts.push(*pid as i32);
+    pub fn load_pystack_symbols(&self, event: &stack_event) {
+        if self.initialized() && event.py_msg_buffer.stack_len > 0 {
+            self.load_symbols();
         }
+    }
 
-        psr.init(bpf_object.as_libbpf_object(), &mut pid_opts);
+    pub fn init_pystacks(&mut self, pids: &[u32], bpf_object: &Object) {
+        if !pids.is_empty() {
+            let mut pid_opts: Vec<i32> = Vec::new();
+            for pid in pids.iter() {
+                pid_opts.push(*pid as i32);
+            }
+
+            self.init(bpf_object.as_libbpf_object(), &mut pid_opts);
+        }
     }
 }
+
+#[cfg(feature = "pystacks")]
+impl Default for StackWalkerRun {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "pystacks")]
+impl Drop for StackWalkerRun {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { bindings::pystacks_free(self.ptr) };
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
+
+#[cfg(feature = "pystacks")]
+unsafe impl Send for StackWalkerRun {}
+#[cfg(feature = "pystacks")]
+unsafe impl Sync for StackWalkerRun {}
+
+//
+// Implementation when pystacks feature is DISABLED
+//
+#[cfg(not(feature = "pystacks"))]
+pub struct StackWalkerRun {}
+
+#[cfg(not(feature = "pystacks"))]
+impl StackWalkerRun {
+    fn new() -> Self {
+        StackWalkerRun {}
+    }
+
+    #[allow(clippy::ptr_arg)] // allow Vec needed for consistency with pystacks version
+    pub fn pystacks_to_frames_mapping(
+        &self,
+        _frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+        _func_map: &mut HashMap<String, InternedString>,
+        _id_counter: &mut Arc<AtomicUsize>,
+        _python_stack_markers: &mut Vec<u64>,
+        _stack: &[PyAddr],
+    ) {
+        // Stub implementation when pystacks feature is disabled
+    }
+
+    #[allow(clippy::ptr_arg)] // allow Vec needed for consistency with pystacks version
+    pub fn user_stack_to_python_calls(
+        &self,
+        _frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+        _func_map: &mut HashMap<String, InternedString>,
+        _python_calls: &mut Vec<u64>,
+    ) {
+        // Stub implementation when pystacks feature is disabled
+    }
+
+    pub fn merge_pystacks(
+        &self,
+        _stack: &Stack,
+        _python_calls: &[u64],
+        _python_stack_markers: &[u64],
+    ) -> Vec<u64> {
+        Vec::new()
+    }
+
+    pub fn get_pystack_from_event(&self, _event: &stack_event) -> Vec<PyAddr> {
+        Vec::new()
+    }
+
+    pub fn load_pystack_symbols(&self, _event: &stack_event) {
+        // Stub implementation when pystacks feature is disabled
+    }
+
+    pub fn init_pystacks(&mut self, _pids: &[u32], _bpf_object: &Object) {
+        // Stub implementation when pystacks feature is disabled
+    }
+}
+
+#[cfg(not(feature = "pystacks"))]
+impl Default for StackWalkerRun {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(not(feature = "pystacks"))]
+impl Drop for StackWalkerRun {
+    fn drop(&mut self) {
+        // Stub implementation when pystacks feature is disabled
+    }
+}
+
+#[cfg(not(feature = "pystacks"))]
+unsafe impl Send for StackWalkerRun {}
+#[cfg(not(feature = "pystacks"))]
+unsafe impl Sync for StackWalkerRun {}

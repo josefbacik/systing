@@ -1,13 +1,12 @@
-pub mod events;
-pub mod perf;
+mod events;
+mod perf;
 mod perf_recorder;
-pub mod perfetto;
-pub mod pystacks;
-pub mod ringbuf;
+mod perfetto;
+mod pystacks;
+mod ringbuf;
 mod sched;
 mod session_recorder;
 mod stack_recorder;
-pub mod symbolize;
 
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
@@ -22,7 +21,7 @@ use std::time::Duration;
 use crate::events::{EventKeyType, EventProbe, SystingProbeRecorder};
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::perf_recorder::PerfCounterRecorder;
-use crate::pystacks::stack_walker::{init_pystacks, StackWalkerRun};
+use crate::pystacks::stack_walker::StackWalkerRun;
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::session_recorder::{get_clock_value, SessionRecorder, SysInfoEvent};
@@ -514,12 +513,9 @@ fn system(opts: Command) -> Result<()> {
         let object = skel.object();
 
         if collect_pystacks {
-            init_pystacks(
-                &opts.pid,
-                Arc::<StackWalkerRun>::get_mut(&mut recorder.stack_recorder.lock().unwrap().psr)
-                    .expect("unable to get psr from Arc"),
-                skel.object(),
-            );
+            Arc::<StackWalkerRun>::get_mut(&mut recorder.stack_recorder.lock().unwrap().psr)
+                .expect("unable to get psr from Arc")
+                .init_pystacks(&opts.pid, skel.object());
         }
 
         for (i, map) in object.maps().enumerate() {

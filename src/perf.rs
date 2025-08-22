@@ -7,7 +7,6 @@ use std::path::Path;
 
 use anyhow::Result;
 use bitfield::bitfield;
-use libbpf_rs;
 use nix::errno::Errno;
 use nix::ioctl_none;
 use regex::Regex;
@@ -129,9 +128,13 @@ pub const PERF_TYPE_HARDWARE: u32 = 0;
 pub const PERF_TYPE_SOFTWARE: u32 = 1;
 
 pub const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
+#[allow(dead_code)]
 pub const PERF_COUNT_HW_CACHE_REFERENCES: u64 = 2;
+#[allow(dead_code)]
 pub const PERF_COUNT_HW_CACHE_MISSES: u64 = 3;
+#[allow(dead_code)]
 pub const PERF_COUNT_HW_STALLED_CYCLES_FRONTEND: u64 = 7;
+#[allow(dead_code)]
 pub const PERF_COUNT_HW_STALLED_CYCLES_BACKEND: u64 = 8;
 
 pub const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;

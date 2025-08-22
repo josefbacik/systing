@@ -14,7 +14,6 @@ use crate::SystingRecordEvent;
 use anyhow::Result;
 use plain::Plain;
 use serde::Deserialize;
-use serde_json;
 
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_event::track_event::Type;
@@ -133,15 +132,14 @@ pub struct UProbeEvent {
 }
 
 // Format is
-// kprobe:<path>:<offset>
-// kprobe:<path>:<symbol>
-// kprobe:<path>:<symbol>+<offset>
-// kretprobe:<path>:<offset>
-// kretprobe:<path>:<symbol>
-// kretprobe:<path>:<symbol>+<offset>
+// kprobe:<offset>
+// kprobe:<symbol>
+// kprobe:<symbol>+<offset>
+// kretprobe:<offset>
+// kretprobe:<symbol>
+// kretprobe:<symbol>+<offset>
 #[derive(Clone, Default)]
 pub struct KProbeEvent {
-    pub path: String,
     pub offset: u64,
     pub func_name: String,
     pub retprobe: bool,
@@ -367,7 +365,7 @@ impl KProbeEvent {
         // Format is
         // kprobe:<offset>
         // kprobe:<symbol>
-        // kprobe::<symbol>+<offset>
+        // kprobe:<symbol>+<offset>
         // kretprobe:<offset>
         // kretprobe:<symbol>
         // kretprobe:<symbol>+<offset>
