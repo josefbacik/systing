@@ -177,7 +177,7 @@ fn symbolize_stacks(
             raw_stack.kernel_stack.iter(),
         );
         // Symbolize Python stack
-        Arc::get_mut(psr).unwrap().pystacks_to_frames_mapping(
+        psr.pystacks_to_frames_mapping(
             &mut frame_map,
             &mut func_name_map,
             id_counter,
@@ -352,7 +352,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
             stacks.push(stack);
         }
 
-        Arc::get_mut(&mut self.psr).unwrap().load_pystack_symbols(&event);
+        self.psr.load_pystack_symbols(&event);
     }
 }
 

@@ -177,7 +177,7 @@ impl StackWalkerRun {
 
     #[cfg(feature = "pystacks")]
     pub fn pystacks_to_frames_mapping(
-        &mut self,
+        &self,
         frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
         func_map: &mut HashMap<String, InternedString>,
         id_counter: &mut Arc<AtomicUsize>,
@@ -214,7 +214,7 @@ impl StackWalkerRun {
     #[cfg(not(feature = "pystacks"))]
     #[allow(clippy::ptr_arg)] // allow Vec needed for consistency with pystacks version
     pub fn pystacks_to_frames_mapping(
-        &mut self,
+        &self,
         _frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
         _func_map: &mut HashMap<String, InternedString>,
         _id_counter: &mut Arc<AtomicUsize>,
@@ -374,14 +374,14 @@ impl StackWalkerRun {
     }
 
     #[cfg(feature = "pystacks")]
-    pub fn load_pystack_symbols(&mut self, event: &stack_event) {
+    pub fn load_pystack_symbols(&self, event: &stack_event) {
         if self.initialized() && event.py_msg_buffer.stack_len > 0 {
             self.load_symbols();
         }
     }
 
     #[cfg(not(feature = "pystacks"))]
-    pub fn load_pystack_symbols(&mut self, _event: &stack_event) {
+    pub fn load_pystack_symbols(&self, _event: &stack_event) {
         // Stub implementation when pystacks feature is disabled
     }
 
