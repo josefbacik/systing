@@ -14,7 +14,6 @@ use crate::SystingRecordEvent;
 use anyhow::Result;
 use plain::Plain;
 use serde::Deserialize;
-use serde_json;
 
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_event::track_event::Type;

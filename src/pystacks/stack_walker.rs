@@ -9,12 +9,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "pystacks")]
 use {
-    crate::pystacks::bindings,
-    crate::stack_recorder::add_frame,
-    std::ptr::NonNull,
-    libbpf_rs::libbpf_sys,
-    libbpf_rs::AsRawLibbpf,
-    std::fmt,
+    crate::pystacks::bindings, crate::stack_recorder::add_frame, libbpf_rs::libbpf_sys,
+    libbpf_rs::AsRawLibbpf, std::fmt, std::ptr::NonNull,
 };
 
 #[derive(Debug, Clone)]
@@ -300,7 +296,8 @@ impl StackWalkerRun {
     }
 
     pub fn get_pystack_from_event(&self, event: &stack_event) -> Vec<PyAddr> {
-        let stack_len = (event.py_msg_buffer.stack_len as usize).min(event.py_msg_buffer.buffer.len());
+        let stack_len =
+            (event.py_msg_buffer.stack_len as usize).min(event.py_msg_buffer.buffer.len());
         Vec::from(&event.py_msg_buffer.buffer[..stack_len])
             .iter()
             .map(|frame| PyAddr { addr: frame.into() })

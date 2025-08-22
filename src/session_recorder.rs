@@ -204,10 +204,7 @@ impl SessionRecorder {
     }
 
     /// Generates the initial trace packets including clock snapshot and root descriptor
-    fn generate_initial_packets(
-        &self,
-        id_counter: &mut Arc<AtomicUsize>,
-    ) -> Vec<TracePacket> {
+    fn generate_initial_packets(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
         // Emit the clock snapshot

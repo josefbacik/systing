@@ -17,7 +17,6 @@ use perfetto_protos::profile_packet::PerfSample;
 use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
 use perfetto_protos::trace_packet::TracePacket;
 
-
 // Stack structure representing kernel, user, and Python stacks
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Stack {
@@ -636,7 +635,12 @@ mod tests {
         let resolved_info = create_test_resolved_info();
         let mut id_counter = Arc::new(AtomicUsize::new(100));
 
-        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter, &Arc::new(StackWalkerRun::default()));
+        let result = deduplicate_stacks(
+            &stacks,
+            &resolved_info,
+            &mut id_counter,
+            &Arc::new(StackWalkerRun::default()),
+        );
 
         assert!(result.is_empty());
     }
@@ -653,7 +657,12 @@ mod tests {
         let resolved_info = create_test_resolved_info();
         let mut id_counter = Arc::new(AtomicUsize::new(100));
 
-        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter, &Arc::new(StackWalkerRun::default()));
+        let result = deduplicate_stacks(
+            &stacks,
+            &resolved_info,
+            &mut id_counter,
+            &Arc::new(StackWalkerRun::default()),
+        );
 
         assert_eq!(result.len(), 1);
         assert!(result.contains_key(&stack.stack));
@@ -681,7 +690,12 @@ mod tests {
         let resolved_info = create_test_resolved_info();
         let mut id_counter = Arc::new(AtomicUsize::new(100));
 
-        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter, &Arc::new(StackWalkerRun::default()));
+        let result = deduplicate_stacks(
+            &stacks,
+            &resolved_info,
+            &mut id_counter,
+            &Arc::new(StackWalkerRun::default()),
+        );
 
         // Should only have one unique stack
         assert_eq!(result.len(), 1);
@@ -698,7 +712,12 @@ mod tests {
         let resolved_info = create_test_resolved_info();
         let mut id_counter = Arc::new(AtomicUsize::new(100));
 
-        let result = deduplicate_stacks(&stacks, &resolved_info, &mut id_counter, &Arc::new(StackWalkerRun::default()));
+        let result = deduplicate_stacks(
+            &stacks,
+            &resolved_info,
+            &mut id_counter,
+            &Arc::new(StackWalkerRun::default()),
+        );
 
         // Should have two unique stacks
         assert_eq!(result.len(), 2);
