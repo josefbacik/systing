@@ -24,6 +24,32 @@ This will generate a `trace.pb` file which can be uploaded to a
 
 Detailed options can be found [here](docs/USAGE.adoc).
 
+### Enhanced Symbol Resolution
+
+For improved symbol resolution, you can enable debuginfod support:
+
+```bash
+export DEBUGINFOD_URLS="https://debuginfod.fedoraproject.org/"
+sudo ./target/debug/systing --enable-debuginfod --duration 60
+```
+
+This will fetch debug information from debuginfod servers, providing more accurate stack traces.
+
+### Debugging and Verbosity
+
+Use multiple `-v` flags to control verbosity levels:
+
+```bash
+# Basic informational output
+sudo ./target/debug/systing -v --duration 60
+
+# Detailed debugging (useful for troubleshooting)
+sudo ./target/debug/systing -vv --enable-debuginfod --duration 60
+
+# Maximum verbosity (includes library debugging)
+sudo ./target/debug/systing -vvv --enable-debuginfod --duration 60
+```
+
 This tool traces all the scheduling events on the system, cgroup, or process and
 generates a [Perfetto](https://perfetto.dev/) trace.  This can be uploaded to a
 local perfetto instance for further analysis, or you can use the public one

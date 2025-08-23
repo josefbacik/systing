@@ -29,7 +29,12 @@ use crate::stack_recorder::StackRecorder;
 
 use anyhow::bail;
 use anyhow::Result;
-use clap::Parser;
+use clap::{ArgAction, Parser};
+
+use tracing::subscriber::set_global_default as set_global_subscriber;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt::time::SystemTime;
+use tracing_subscriber::FmtSubscriber;
 
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{
@@ -42,8 +47,9 @@ use protobuf::Message;
 
 #[derive(Debug, Parser)]
 struct Command {
-    #[arg(short, long)]
-    verbose: bool,
+    /// Increase verbosity (can be supplied multiple times).
+    #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
+    verbosity: u8,
     #[arg(short, long)]
     pid: Vec<u32>,
     #[arg(short, long)]
@@ -79,6 +85,9 @@ struct Command {
     #[cfg(feature = "pystacks")]
     #[arg(long)]
     collect_pystacks: bool,
+    /// Enable debuginfod for enhanced symbol resolution (requires DEBUGINFOD_URLS environment variable)
+    #[arg(long)]
+    enable_debuginfod: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -363,12 +372,12 @@ fn system(opts: Command) -> Result<()> {
 
     setup_perf_counters(&opts, &mut counters, &mut perf_counter_names)?;
 
-    let recorder = Arc::new(SessionRecorder::default());
+    let recorder = Arc::new(SessionRecorder::new(opts.enable_debuginfod));
     configure_recorder(&opts, &recorder);
     recorder.snapshot_clocks();
     {
         let mut skel_builder = systing::SystingSystemSkelBuilder::default();
-        if opts.verbose {
+        if opts.verbosity > 0 {
             skel_builder.obj_builder.debug(true);
         }
 
@@ -920,6 +929,22 @@ fn system(opts: Command) -> Result<()> {
 
 fn main() -> Result<()> {
     let opts = Command::parse();
+
+    // Set up tracing subscriber with level based on verbosity
+    let level = match opts.verbosity {
+        0 => LevelFilter::WARN,
+        1 => LevelFilter::INFO,
+        2 => LevelFilter::DEBUG,
+        _ => LevelFilter::TRACE,
+    };
+
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(level)
+        .with_timer(SystemTime)
+        .finish();
+
+    set_global_subscriber(subscriber).expect("Failed to set tracing subscriber");
+
     bump_memlock_rlimit()?;
 
     system(opts)

@@ -139,6 +139,21 @@ impl SysinfoRecorder {
 }
 
 impl SessionRecorder {
+    pub fn new(enable_debuginfod: bool) -> Self {
+        Self {
+            clock_snapshot: Mutex::new(ClockSnapshot::default()),
+            event_recorder: Mutex::new(SchedEventRecorder::default()),
+            stack_recorder: Mutex::new(StackRecorder::new(enable_debuginfod)),
+            perf_counter_recorder: Mutex::new(PerfCounterRecorder::default()),
+            sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
+            probe_recorder: Mutex::new(SystingProbeRecorder::default()),
+            process_descriptors: RwLock::new(HashMap::new()),
+            processes: RwLock::new(HashMap::new()),
+            threads: RwLock::new(HashMap::new()),
+            proc_reader: Mutex::new(ProcReader::new()),
+        }
+    }
+
     pub fn maybe_record_task(&self, info: &task_info) {
         let pid = info.tgidpid as i32;
         let tgid = (info.tgidpid >> 32) as i32;
