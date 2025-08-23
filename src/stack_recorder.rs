@@ -8,9 +8,14 @@ use crate::ringbuf::RingBuffer;
 use crate::systing::types::stack_event;
 use crate::SystingRecordEvent;
 
+use blazesym::helper::{read_elf_build_id, ElfResolver};
 use blazesym::symbolize::source::{Kernel, Process, Source};
-use blazesym::symbolize::{cache, Input, Sym, Symbolized, Symbolizer};
+use blazesym::symbolize::{
+    cache, Input, ProcessMemberInfo, ProcessMemberType, Resolve, Sym, Symbolized, Symbolizer,
+};
+use blazesym::Error as BlazeErr;
 use blazesym::{Addr, Pid};
+use debuginfod::{BuildId, CachingClient, Client};
 use perfetto_protos::interned_data::InternedData;
 use perfetto_protos::profile_common::{Callstack, Frame, InternedString, Mapping};
 use perfetto_protos::profile_packet::PerfSample;
@@ -60,11 +65,33 @@ pub struct LocalFrame {
     pub mapping: Mapping,
 }
 
-#[derive(Default)]
 pub struct StackRecorder {
     pub ringbuf: RingBuffer<stack_event>,
     pub stacks: HashMap<i32, Vec<StackEvent>>,
     pub psr: Arc<StackWalkerRun>,
+    pub enable_debuginfod: bool,
+}
+
+impl Default for StackRecorder {
+    fn default() -> Self {
+        Self {
+            ringbuf: RingBuffer::default(),
+            stacks: HashMap::new(),
+            psr: Arc::new(StackWalkerRun::default()),
+            enable_debuginfod: false,
+        }
+    }
+}
+
+impl StackRecorder {
+    pub fn new(enable_debuginfod: bool) -> Self {
+        Self {
+            ringbuf: RingBuffer::default(),
+            stacks: HashMap::new(),
+            psr: Arc::new(StackWalkerRun::default()),
+            enable_debuginfod,
+        }
+    }
 }
 
 /// Holds the resolved stack information after symbolization
@@ -132,6 +159,7 @@ pub fn stack_to_frames_mapping<'a, I>(
                 inlined,
                 ..
             })) => {
+                let name = format!("{} <{:#x}>", name, *input_addr);
                 add_frame(
                     frame_map,
                     func_map,
@@ -139,16 +167,16 @@ pub fn stack_to_frames_mapping<'a, I>(
                     *input_addr,
                     addr,
                     offset as u64,
-                    name.to_string(),
+                    name,
                 );
 
                 for inline in inlined {
-                    let name = format!("{} (inlined)", inline.name);
+                    let name = format!("{} (inlined) <{:#x}>", inline.name, *input_addr);
                     add_frame(frame_map, func_map, id_counter, *input_addr, addr, 0, name);
                 }
             }
             _ => {
-                let name = "<unknown>".to_string();
+                let name = format!("unknown <{:#x}>", *input_addr);
                 add_frame(
                     frame_map,
                     func_map,
@@ -163,19 +191,70 @@ pub fn stack_to_frames_mapping<'a, I>(
     }
 }
 
+/// Callback function for process dispatcher that fetches debug info using debuginfod
+fn dispatch_process(
+    info: ProcessMemberInfo<'_>,
+    client: &CachingClient,
+) -> Result<Option<Box<dyn Resolve>>, BlazeErr> {
+    let ProcessMemberInfo {
+        member_entry: entry,
+        ..
+    } = info;
+
+    match entry {
+        ProcessMemberType::Path(path) => {
+            let build_id = if let Some(build_id) = read_elf_build_id(&path.maps_file)? {
+                build_id
+            } else {
+                // The binary does not contain a build ID, so we cannot
+                // retrieve symbol data. Just let the default resolver do
+                // its thing.
+                return Ok(None);
+            };
+
+            let path = if let Some(path) = client
+                .fetch_debug_info(&BuildId::raw(build_id))
+                .map_err(Box::from)?
+            {
+                path
+            } else {
+                // If we were unable to find debug information for the provided
+                // build ID we let the default resolver see what it can do.
+                return Ok(None);
+            };
+
+            let resolver = ElfResolver::open(&path).map_err(Box::from)?;
+            Ok(Some(Box::new(resolver)))
+        }
+        ProcessMemberType::Component(..) => Ok(None),
+        _ => Ok(None),
+    }
+}
+
 /// Symbolizes all stacks (user, kernel, and Python) and returns the resolved information
 fn symbolize_stacks(
     stacks: &[StackEvent],
     tgid: u32,
     id_counter: &mut Arc<AtomicUsize>,
     psr: &mut Arc<StackWalkerRun>,
+    debuginfod_client: &Option<Arc<CachingClient>>,
 ) -> ResolvedStackInfo {
     let user_src = Source::Process(Process::new(Pid::from(tgid)));
     let kernel_src = Source::Kernel(Kernel::default());
-    let mut symbolizer = Symbolizer::builder()
-        .enable_code_info(true)
-        .enable_inlined_fns(true)
-        .build();
+
+    let mut symbolizer = if let Some(client) = debuginfod_client {
+        let client = client.clone();
+        Symbolizer::builder()
+            .enable_code_info(true)
+            .enable_inlined_fns(true)
+            .set_process_dispatcher(move |info| dispatch_process(info, &client))
+            .build()
+    } else {
+        Symbolizer::builder()
+            .enable_code_info(true)
+            .enable_inlined_fns(true)
+            .build()
+    };
 
     let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(tgid.into())));
 
@@ -346,9 +425,10 @@ pub fn generate_stack_packets(
     stacks: Vec<StackEvent>,
     id_counter: &mut Arc<AtomicUsize>,
     psr: &mut Arc<StackWalkerRun>,
+    debuginfod_client: &Option<Arc<CachingClient>>,
 ) {
     // Step 1: Symbolize all stacks
-    let resolved_info = symbolize_stacks(&stacks, tgid, id_counter, psr);
+    let resolved_info = symbolize_stacks(&stacks, tgid, id_counter, psr, debuginfod_client);
     // Step 2: Deduplicate stacks
     let interned_stacks = deduplicate_stacks(&stacks, &resolved_info, id_counter, psr);
     // Step 3: Generate trace packets
@@ -393,6 +473,38 @@ impl StackRecorder {
         let packets = Arc::new(Mutex::new(Vec::new()));
         let pool = Pool::<ThunkWorker<()>>::new(4);
 
+        // Create debuginfod client once for all threads if enabled
+        let debuginfod_client = if self.enable_debuginfod {
+            match Client::from_env() {
+                Ok(Some(client)) => match CachingClient::from_env(client) {
+                    Ok(caching_client) => {
+                        println!("Debuginfod enabled: using debuginfod for symbol resolution");
+                        Some(Arc::new(caching_client))
+                    }
+                    Err(e) => {
+                        println!(
+                            "Failed to create caching debuginfod client: {}, using default resolver",
+                            e
+                        );
+                        None
+                    }
+                },
+                Ok(None) => {
+                    println!("No debuginfod URLs found in environment, using default resolver. If using sudo try --preserve-env");
+                    None
+                }
+                Err(e) => {
+                    println!(
+                        "Failed to create debuginfod client: {}, using default resolver",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Resolve the stacks, generate the interned data for them, and populate the trace.
         for (tgid, stacks) in self.stacks.iter() {
             let mut id_counter = id_counter.clone();
@@ -400,8 +512,16 @@ impl StackRecorder {
             let stacks = stacks.clone();
             let tgid = *tgid as u32;
             let mut packets = packets.clone();
+            let debuginfod_client = debuginfod_client.clone();
             pool.execute(Thunk::of(move || {
-                generate_stack_packets(&mut packets, tgid, stacks, &mut id_counter, &mut psr)
+                generate_stack_packets(
+                    &mut packets,
+                    tgid,
+                    stacks,
+                    &mut id_counter,
+                    &mut psr,
+                    &debuginfod_client,
+                )
             }));
         }
         pool.join();

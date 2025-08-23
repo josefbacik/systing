@@ -71,6 +71,23 @@ The second is the current wakeup latency for this CPU at the given timestamp.
 
 Specifies the duration of the trace in seconds.
 
+=== *--enable-debuginfod*
+
+Enable debuginfod for enhanced symbol resolution.
+When enabled, systing will attempt to fetch debug information for binaries using the debuginfod protocol.
+This can significantly improve the quality of stack traces by providing more accurate symbol names and source code information.
+It will also increase the amount of time required to generate traces.
+
+To use this feature, you must set the `DEBUGINFOD_URLS` environment variable to point to one or more debuginfod servers.
+For example:
+----
+export DEBUGINFOD_URLS="https://debuginfod.fedoraporject.org/"
+# systing --enable-debuginfod --duration 60
+----
+
+If debuginfod is not available or fails to fetch debug information, systing will fall back to the default symbol resolution methods.
+This option is disabled by default to avoid unexpected network requests.
+
 === *--no-cpu-stack-traces*
 
 Do not record the `perf` style stack traces for tasks while they're running.
@@ -236,5 +253,31 @@ NOTE: For `tracepoint` events we use `raw_tracepoint`, which reads the args from
 
 `percpu` is set to true if the event is keyed to a CPU and not a specific thread.
 These events will show up under the `Systing` track in `perfetto`, each event as it's own category and then each CPU having its own track.
+
+=== *-v, --verbose*
+
+Increase verbosity level.
+This option can be specified multiple times to increase the amount of debugging information printed to stderr.
+
+* No `-v` flags: Only warnings and errors (default)
+* `-v`: Add informational messages about tool operation
+* `-vv`: Add detailed debug messages for troubleshooting
+* `-vvv` or more: Add trace-level messages including detailed library debugging from blazesym and debuginfod
+
+Higher verbosity levels are particularly useful when troubleshooting symbol resolution issues or debuginfod connectivity problems.
+Examples:
+----
+# Basic operation with minimal output
+# systing --duration 60
+
+# Show informational messages
+# systing -v --duration 60
+
+# Detailed debugging for troubleshooting
+# systing -vv --enable-debuginfod --duration 60
+
+# Maximum verbosity for library debugging
+# systing -vvv --enable-debuginfod --duration 60
+----
 
 Example files for real world examples can be found in the `examples` directory.
