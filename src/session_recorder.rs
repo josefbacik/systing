@@ -12,7 +12,6 @@ use crate::stack_recorder::StackRecorder;
 use crate::systing::types::task_info;
 use crate::SystingRecordEvent;
 
-use fb_procfs::ProcReader;
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
 use perfetto_protos::clock_snapshot::ClockSnapshot;
@@ -23,6 +22,7 @@ use perfetto_protos::process_tree::{process_tree::Process as ProtoProcess, Proce
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 #[derive(Default)]
 pub struct SysInfoEvent {
@@ -48,7 +48,7 @@ pub struct SessionRecorder {
     pub process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
     pub processes: RwLock<HashMap<u64, ProtoProcess>>,
     pub threads: RwLock<HashMap<u64, ThreadDescriptor>>,
-    pub proc_reader: Mutex<ProcReader>,
+    pub system: Mutex<System>,
 }
 
 pub fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -69,10 +69,15 @@ impl From<&task_info> for ProcessDescriptor {
     }
 }
 
-pub fn proto_process_from_parts(task: &task_info, proc_reader: &ProcReader) -> ProtoProcess {
+pub fn proto_process_from_parts(task: &task_info, system: &mut System) -> ProtoProcess {
+    let pid = Pid::from_u32((task.tgidpid >> 32) as u32);
     ProtoProcess {
-        cmdline: if let Ok(Some(cmd)) = proc_reader.read_pid_cmdline((task.tgidpid >> 32) as u32) {
-            cmd
+        cmdline: if let Some(process) = system.process(pid) {
+            process
+                .cmd()
+                .iter()
+                .map(|s| s.to_string_lossy().to_string())
+                .collect()
         } else {
             vec![]
         },
@@ -150,7 +155,7 @@ impl SessionRecorder {
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
-            proc_reader: Mutex::new(ProcReader::new()),
+            system: Mutex::new(System::new()),
         }
     }
 
@@ -169,11 +174,17 @@ impl SessionRecorder {
                     .unwrap()
                     .insert(info.tgidpid, ProcessDescriptor::from(info));
 
-                let proc_reader = self.proc_reader.lock().unwrap();
+                let mut system = self.system.lock().unwrap();
+                let pid = Pid::from_u32((info.tgidpid >> 32) as u32);
+                system.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[pid]),
+                    true,
+                    ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+                );
                 self.processes
                     .write()
                     .unwrap()
-                    .insert(info.tgidpid, proto_process_from_parts(info, &proc_reader));
+                    .insert(info.tgidpid, proto_process_from_parts(info, &mut system));
             }
         } else if !self.threads.read().unwrap().contains_key(&info.tgidpid) {
             self.threads
@@ -384,8 +395,8 @@ impl crate::SystingEvent for SysInfoEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fb_procfs::ProcReader;
     use std::sync::{Mutex, RwLock};
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
     fn create_test_task_info(tgid: u32, pid: u32, comm: &str) -> task_info {
         let mut task = task_info {
@@ -413,7 +424,7 @@ mod tests {
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
-            proc_reader: Mutex::new(ProcReader::new()),
+            system: Mutex::new(System::new()),
         }
     }
 
