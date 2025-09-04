@@ -856,7 +856,7 @@ mod tests {
             generate_trace_packets(&stacks, &interned_stacks, &resolved_info, &mut id_counter);
 
         // Should still have at least one packet with interned data
-        assert!(packets.len() >= 1);
+        assert!(!packets.is_empty());
 
         // First packet should be interned data
         assert!(packets[0].interned_data.is_some());

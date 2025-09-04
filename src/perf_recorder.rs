@@ -133,10 +133,7 @@ mod tests {
             packets[1].track_descriptor().counter.unit(),
             Unit::UNIT_COUNT
         );
-        assert_eq!(
-            packets[1].track_descriptor().counter.is_incremental(),
-            false
-        );
+        assert!(!packets[1].track_descriptor().counter.is_incremental());
         assert_eq!(
             packets[2].track_event().track_uuid(),
             packets[1].track_descriptor().uuid()

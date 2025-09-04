@@ -28,7 +28,7 @@ cargo test
 
 ### 5. Run Clippy (Linter)
 ```bash
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 ```
 
 ## Project Information
@@ -47,7 +47,7 @@ cargo clippy -- -D warnings
 3. Build with default features: `cargo build`
 4. Build with pystacks feature: `cargo build --features pystacks`
 5. Run all tests: `cargo test`
-6. Run clippy for linting: `cargo clippy -- -D warnings`
+6. Run clippy for linting: `cargo clippy --all-targets -- -D warnings`
 
 All commands must pass before considering the work complete.
 

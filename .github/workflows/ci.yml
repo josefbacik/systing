@@ -18,10 +18,10 @@ jobs:
         run: ./.github/workflows/install_deps.sh
 
       - name: Clippy Check (no features)
-        run: cargo clippy --no-default-features -- -D warnings
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
 
       - name: Clippy Check (pystacks)
-        run: cargo clippy --features pystacks -- -D warnings
+        run: cargo clippy --features pystacks --all-targets -- -D warnings
 
   build:
     runs-on: ubuntu-latest

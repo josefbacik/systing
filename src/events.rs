@@ -1587,7 +1587,7 @@ mod tests {
             ts: 1000,
             ..Default::default()
         };
-        recorder.handle_event(event.clone());
+        recorder.handle_event(event);
         event.cookie = 1;
         event.ts = 2000;
         recorder.handle_event(event);
@@ -1768,10 +1768,10 @@ mod tests {
             ts: 1000,
             ..Default::default()
         };
-        recorder.handle_event(event.clone());
+        recorder.handle_event(event);
         event.cookie = 1;
         event.ts = 2000;
-        recorder.handle_event(event.clone());
+        recorder.handle_event(event);
         event.cookie = 2;
         event.ts = 3000;
         recorder.handle_event(event);
@@ -1867,19 +1867,19 @@ mod tests {
             ts: 1000,
             ..Default::default()
         };
-        recorder.handle_event(event.clone());
+        recorder.handle_event(event);
         event.cookie = 1;
         event.ts = 2000;
-        recorder.handle_event(event.clone());
+        recorder.handle_event(event);
         event.cookie = 2;
         event.ts = 3000;
-        recorder.handle_event(event.clone());
+        recorder.handle_event(event);
         event.cookie = 0;
         event.ts = 4000;
-        recorder.handle_event(event.clone());
+        recorder.handle_event(event);
         event.cookie = 1;
         event.ts = 5000;
-        recorder.handle_event(event.clone());
+        recorder.handle_event(event);
         event.cookie = 2;
         event.ts = 6000;
         recorder.handle_event(event);
