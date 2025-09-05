@@ -151,7 +151,7 @@ impl StackWalkerRun {
         &self,
         frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
         global_func_manager: &Arc<crate::stack_recorder::GlobalFunctionManager>,
-        id_counter: &mut Arc<AtomicUsize>,
+        id_counter: &Arc<AtomicUsize>,
         python_stack_markers: &mut Vec<u64>,
         stack: &[PyAddr],
     ) {
@@ -356,7 +356,7 @@ impl StackWalkerRun {
         &self,
         _frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
         _global_func_manager: &Arc<crate::stack_recorder::GlobalFunctionManager>,
-        _id_counter: &mut Arc<AtomicUsize>,
+        _id_counter: &Arc<AtomicUsize>,
         _python_stack_markers: &mut Vec<u64>,
         _stack: &[PyAddr],
     ) {

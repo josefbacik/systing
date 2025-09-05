@@ -174,7 +174,7 @@ pub struct ResolvedStackInfo<'a> {
 pub fn add_frame(
     frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
     global_func_manager: &Arc<GlobalFunctionManager>,
-    id_counter: &mut Arc<AtomicUsize>,
+    id_counter: &Arc<AtomicUsize>,
     input_addr: u64,
     start_addr: u64,
     offset: u64,
@@ -204,7 +204,7 @@ pub fn stack_to_frames_mapping<'a, I>(
     frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
     global_func_manager: &Arc<GlobalFunctionManager>,
     source: &Source<'a>,
-    id_counter: &mut Arc<AtomicUsize>,
+    id_counter: &Arc<AtomicUsize>,
     stack: I,
 ) where
     I: IntoIterator<Item = &'a u64>,
@@ -347,8 +347,8 @@ fn dispatch_process_with_client(
 fn symbolize_stacks<'a>(
     stacks: &[StackEvent],
     tgid: u32,
-    id_counter: &mut Arc<AtomicUsize>,
-    psr: &mut Arc<StackWalkerRun>,
+    id_counter: &Arc<AtomicUsize>,
+    psr: &Arc<StackWalkerRun>,
     process_dispatcher: &Option<Arc<ProcessDispatcher>>,
     global_func_manager: &Arc<GlobalFunctionManager>,
     global_kernel_frame_map: &'a mut HashMap<u64, Vec<LocalFrame>>,
@@ -472,7 +472,7 @@ fn collect_mappings(frame_map: &HashMap<u64, Vec<LocalFrame>>) -> Vec<Mapping> {
 fn deduplicate_stacks(
     stacks: &[StackEvent],
     resolved_info: &ResolvedStackInfo,
-    id_counter: &mut Arc<AtomicUsize>,
+    id_counter: &Arc<AtomicUsize>,
     psr: &Arc<StackWalkerRun>,
 ) -> DeduplicatedStackData {
     let callstacks: HashMap<Stack, Callstack> = stacks
@@ -573,7 +573,7 @@ impl StackRecorder {
         &self,
         tgid: u32,
         stacks: &[StackEvent],
-        id_counter: &mut Arc<AtomicUsize>,
+        id_counter: &Arc<AtomicUsize>,
         global_kernel_frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
         sequence_id: u32,
     ) -> (Vec<Callstack>, Vec<Frame>, Vec<Mapping>, Vec<TracePacket>) {
@@ -582,7 +582,7 @@ impl StackRecorder {
             stacks,
             tgid,
             id_counter,
-            &mut self.psr.clone(),
+            &self.psr,
             &self.process_dispatcher,
             &self.global_func_manager,
             global_kernel_frame_map,
@@ -633,7 +633,7 @@ impl StackRecorder {
         Some(interned_packet)
     }
 
-    pub fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
+    pub fn generate_trace(&self, id_counter: &Arc<AtomicUsize>) -> Vec<TracePacket> {
         // Get a unique sequence ID for this trace
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
 
@@ -788,13 +788,13 @@ mod tests {
     #[test]
     fn test_add_frame_new_address() {
         let mut frame_map = HashMap::new();
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let id_counter = Arc::new(AtomicUsize::new(100));
         let global_func_manager = Arc::new(GlobalFunctionManager::new(id_counter.clone()));
 
         add_frame(
             &mut frame_map,
             &global_func_manager,
-            &mut id_counter,
+            &id_counter,
             0x5000, // input_addr
             0x4800, // start_addr
             0x200,  // offset
@@ -827,14 +827,14 @@ mod tests {
     #[test]
     fn test_add_frame_multiple_frames_same_address() {
         let mut frame_map = HashMap::new();
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let id_counter = Arc::new(AtomicUsize::new(100));
         let global_func_manager = Arc::new(GlobalFunctionManager::new(id_counter.clone()));
 
         // Add first frame
         add_frame(
             &mut frame_map,
             &global_func_manager,
-            &mut id_counter,
+            &id_counter,
             0x5000,
             0x4800,
             0x200,
@@ -845,7 +845,7 @@ mod tests {
         add_frame(
             &mut frame_map,
             &global_func_manager,
-            &mut id_counter,
+            &id_counter,
             0x5000,
             0x4800,
             0,
@@ -874,14 +874,14 @@ mod tests {
     #[test]
     fn test_add_frame_reuses_existing_function() {
         let mut frame_map = HashMap::new();
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let id_counter = Arc::new(AtomicUsize::new(100));
         let global_func_manager = Arc::new(GlobalFunctionManager::new(id_counter.clone()));
 
         // Add first frame with function "common_func"
         add_frame(
             &mut frame_map,
             &global_func_manager,
-            &mut id_counter,
+            &id_counter,
             0x5000,
             0x4800,
             0x200,
@@ -894,7 +894,7 @@ mod tests {
         add_frame(
             &mut frame_map,
             &global_func_manager,
-            &mut id_counter,
+            &id_counter,
             0x6000,
             0x5800,
             0x200,
@@ -918,7 +918,7 @@ mod tests {
     #[test]
     fn test_add_frame_id_counter_increments() {
         let mut frame_map = HashMap::new();
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let id_counter = Arc::new(AtomicUsize::new(100));
         let global_func_manager = Arc::new(GlobalFunctionManager::new(id_counter.clone()));
 
         let initial_count = id_counter.load(Ordering::Relaxed);
@@ -926,7 +926,7 @@ mod tests {
         add_frame(
             &mut frame_map,
             &global_func_manager,
-            &mut id_counter,
+            &id_counter,
             0x5000,
             0x4800,
             0x200,
@@ -952,12 +952,12 @@ mod tests {
             python_calls: Vec::new(),
             python_stack_markers: Vec::new(),
         };
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let id_counter = Arc::new(AtomicUsize::new(100));
 
         let result = deduplicate_stacks(
             &stacks,
             &resolved_info,
-            &mut id_counter,
+            &id_counter,
             &Arc::new(StackWalkerRun::default()),
         );
 
@@ -979,8 +979,8 @@ mod tests {
         );
         recorder.handle_event(event);
 
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&mut id_counter);
+        let id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&id_counter);
 
         // Find interned data packet with callstacks (skip global function packet)
         let interned_packet = packets
@@ -1026,8 +1026,8 @@ mod tests {
         );
         recorder.handle_event(event2);
 
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&mut id_counter);
+        let id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&id_counter);
 
         // Find interned data packet with callstacks (skip global function packet)
         let interned_packet = packets
@@ -1072,8 +1072,8 @@ mod tests {
             create_test_stack_event_raw((1234 << 32) | 5679, 2000000, &[0x2000], &[0x4000]);
         recorder.handle_event(event2);
 
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&mut id_counter);
+        let id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&id_counter);
 
         // Find interned data packet with callstacks (skip global function packet)
         let interned_packet = packets
@@ -1126,8 +1126,8 @@ mod tests {
         );
         recorder.handle_event(event);
 
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&mut id_counter);
+        let id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&id_counter);
 
         // Should have exactly 2 packets: one interned data + one sample
         assert_eq!(packets.len(), 2);
@@ -1163,8 +1163,8 @@ mod tests {
             create_test_stack_event_raw((5678 << 32) | 9012, 2000000, &[0x2000], &[0x4000]);
         recorder.handle_event(event2);
 
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&mut id_counter);
+        let id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&id_counter);
 
         // Should have exactly 3 packets: one interned data + two samples
         assert_eq!(packets.len(), 3);
@@ -1204,8 +1204,8 @@ mod tests {
         recorder.handle_event(event);
 
         // Generate trace using the mock resolver
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&mut id_counter);
+        let id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&id_counter);
 
         // Verify packets were generated
         assert!(!packets.is_empty());
@@ -1271,8 +1271,8 @@ mod tests {
         recorder.handle_event(event2);
 
         // Generate trace with mock resolver
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&mut id_counter);
+        let id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&id_counter);
 
         // Verify packets were generated
         assert!(!packets.is_empty());
@@ -1349,8 +1349,8 @@ mod tests {
         recorder.handle_event(event2);
 
         // Generate trace
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&mut id_counter);
+        let id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&id_counter);
 
         // Find interned data packet with callstacks (skip global function packet)
         let interned_packet = packets
@@ -1421,8 +1421,8 @@ mod tests {
             create_test_stack_event_raw((1234 << 32) | 5679, 2000000, &[0x1000], &[0x3000]);
         recorder.handle_event(event2);
 
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&mut id_counter);
+        let id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&id_counter);
 
         // Find sample packets and verify timestamps are preserved
         let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
