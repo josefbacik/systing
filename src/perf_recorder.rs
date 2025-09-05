@@ -57,7 +57,7 @@ impl SystingRecordEvent<perf_counter_event> for PerfCounterRecorder {
 }
 
 impl PerfCounterRecorder {
-    pub fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
+    pub fn generate_trace(&self, id_counter: &Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
         let mut desc_uuids: HashMap<String, u64> = HashMap::new();
 
@@ -120,7 +120,7 @@ mod tests {
         recorder.handle_event(event);
         assert_eq!(recorder.perf_events.len(), 1);
 
-        let packets = recorder.generate_trace(&mut Arc::new(AtomicUsize::new(0)));
+        let packets = recorder.generate_trace(&Arc::new(AtomicUsize::new(0)));
         assert!(!packets.is_empty());
         assert_eq!(packets[0].track_descriptor().name(), "test_counter");
         assert_eq!(packets[0].track_descriptor().parent_uuid(), 1);

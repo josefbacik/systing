@@ -21,7 +21,6 @@ use std::time::Duration;
 use crate::events::{EventKeyType, EventProbe, SystingProbeRecorder};
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::perf_recorder::PerfCounterRecorder;
-use crate::pystacks::stack_walker::StackWalkerRun;
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::session_recorder::{get_clock_value, SessionRecorder, SysInfoEvent};
@@ -522,8 +521,10 @@ fn system(opts: Command) -> Result<()> {
         let object = skel.object();
 
         if collect_pystacks {
-            Arc::<StackWalkerRun>::get_mut(&mut recorder.stack_recorder.lock().unwrap().psr)
-                .expect("unable to get psr from Arc")
+            recorder
+                .stack_recorder
+                .lock()
+                .unwrap()
                 .init_pystacks(&opts.pid, skel.object());
         }
 

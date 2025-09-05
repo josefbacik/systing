@@ -676,7 +676,7 @@ impl SystingProbeRecorder {
         &self,
         pid_uuids: &HashMap<i32, u64>,
         thread_uuids: &HashMap<i32, u64>,
-        id_counter: &mut Arc<AtomicUsize>,
+        id_counter: &Arc<AtomicUsize>,
     ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
@@ -1537,7 +1537,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[0].track_descriptor().name(), "track_name");
@@ -1596,7 +1596,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 3);
         assert_eq!(packets[0].track_descriptor().name(), "track_name");
@@ -1662,7 +1662,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 0);
     }
@@ -1714,7 +1714,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 0);
     }
@@ -1780,7 +1780,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 5);
         assert_eq!(packets[0].track_descriptor().name(), "track_name");
@@ -1888,7 +1888,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 9);
         assert_eq!(packets[0].track_descriptor().name(), "track_name");
@@ -1998,7 +1998,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[0].track_descriptor().name(), "uretprobe_track");
@@ -2045,7 +2045,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[0].track_descriptor().name(), "uprobe_track");
@@ -2444,7 +2444,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[0].track_descriptor().name(), "kprobe_track");
@@ -2491,7 +2491,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[0].track_descriptor().name(), "kretprobe_track");
@@ -2538,7 +2538,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[0].track_descriptor().name(), "tracepoint_track");
@@ -2705,7 +2705,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &HashMap::new(),
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 3);
         assert_eq!(packets[0].track_descriptor().name(), "percpu_track");

@@ -124,7 +124,7 @@ impl SchedEventRecorder {
         &self,
         pid_uuids: &HashMap<i32, u64>,
         thread_uuids: &HashMap<i32, u64>,
-        id_counter: &mut Arc<AtomicUsize>,
+        id_counter: &Arc<AtomicUsize>,
     ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
@@ -418,7 +418,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 1);
 
@@ -463,7 +463,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 1);
 
@@ -503,7 +503,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 1);
 
@@ -543,7 +543,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 1);
 
@@ -574,7 +574,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &HashMap::new(),
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 1);
 
@@ -605,7 +605,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &HashMap::new(),
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 1);
 
@@ -643,7 +643,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 1);
 
@@ -676,7 +676,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &HashMap::new(),
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 2);
         assert!(packets[0].has_track_descriptor());
@@ -712,7 +712,7 @@ mod tests {
         let packets = recorder.generate_trace(
             &HashMap::new(),
             &thread_uuids,
-            &mut Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(0)),
         );
         assert_eq!(packets.len(), 5);
         assert!(packets[0].has_ftrace_events());
