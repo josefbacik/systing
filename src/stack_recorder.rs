@@ -468,6 +468,43 @@ fn collect_mappings(frame_map: &HashMap<u64, Vec<LocalFrame>>) -> Vec<Mapping> {
         .collect()
 }
 
+/// Helper to build a callstack from frame IDs
+fn build_callstack_for_stack(
+    stack: &Stack,
+    resolved_info: &ResolvedStackInfo,
+    id_counter: &Arc<AtomicUsize>,
+    psr: &Arc<StackWalkerRun>,
+) -> Callstack {
+    let mut callstack = Callstack::default();
+    let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+    callstack.set_iid(iid);
+
+    callstack.frame_ids = if stack.py_stack.is_empty() {
+        // No Python stack - chain user and kernel frame IDs
+        let user_frame_ids =
+            extract_frame_ids(&resolved_info.user_frame_map, stack.user_stack.iter());
+        let kernel_frame_ids =
+            extract_frame_ids(resolved_info.kernel_frame_map, stack.kernel_stack.iter());
+
+        user_frame_ids.into_iter().chain(kernel_frame_ids).collect()
+    } else {
+        // Merge Python stacks with user stacks
+        let merged_addrs = psr.merge_pystacks(
+            stack,
+            &resolved_info.python_calls,
+            &resolved_info.python_stack_markers,
+        );
+
+        let user_frame_ids = extract_frame_ids(&resolved_info.user_frame_map, merged_addrs.iter());
+        let kernel_frame_ids =
+            extract_frame_ids(resolved_info.kernel_frame_map, stack.kernel_stack.iter());
+
+        user_frame_ids.into_iter().chain(kernel_frame_ids).collect()
+    };
+
+    callstack
+}
+
 /// Deduplicates stacks and creates callstack mappings
 fn deduplicate_stacks(
     stacks: &[StackEvent],
@@ -475,38 +512,14 @@ fn deduplicate_stacks(
     id_counter: &Arc<AtomicUsize>,
     psr: &Arc<StackWalkerRun>,
 ) -> DeduplicatedStackData {
-    let callstacks: HashMap<Stack, Callstack> = stacks
-        .iter()
-        .map(|stack| stack.stack.clone())
-        .collect::<HashSet<_>>()
+    // First, collect unique stacks
+    let unique_stacks: HashSet<Stack> = stacks.iter().map(|event| event.stack.clone()).collect();
+
+    // Then, create a callstack for each unique stack
+    let callstacks: HashMap<Stack, Callstack> = unique_stacks
         .into_iter()
         .map(|stack| {
-            let mut callstack = Callstack::default();
-            let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            callstack.set_iid(iid);
-            callstack.frame_ids = if stack.py_stack.is_empty() {
-                // No Python stack - chain user stacks from user map and kernel stacks from kernel map
-                let user_frame_ids =
-                    extract_frame_ids(&resolved_info.user_frame_map, stack.user_stack.iter());
-                let kernel_frame_ids =
-                    extract_frame_ids(&resolved_info.kernel_frame_map, stack.kernel_stack.iter());
-
-                user_frame_ids.into_iter().chain(kernel_frame_ids).collect()
-            } else {
-                // Merge Python stacks with user stacks
-                let merged_addrs = psr.merge_pystacks(
-                    &stack,
-                    &resolved_info.python_calls,
-                    &resolved_info.python_stack_markers,
-                );
-
-                let user_frame_ids =
-                    extract_frame_ids(&resolved_info.user_frame_map, merged_addrs.iter());
-                let kernel_frame_ids =
-                    extract_frame_ids(&resolved_info.kernel_frame_map, stack.kernel_stack.iter());
-
-                user_frame_ids.into_iter().chain(kernel_frame_ids).collect()
-            };
+            let callstack = build_callstack_for_stack(&stack, resolved_info, id_counter, psr);
             (stack, callstack)
         })
         .collect();
