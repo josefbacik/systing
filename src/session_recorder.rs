@@ -396,7 +396,7 @@ impl crate::SystingEvent for SysInfoEvent {
 mod tests {
     use super::*;
     use std::sync::{Mutex, RwLock};
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    use sysinfo::System;
 
     fn create_test_task_info(tgid: u32, pid: u32, comm: &str) -> task_info {
         let mut task = task_info {

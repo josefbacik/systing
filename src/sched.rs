@@ -381,8 +381,8 @@ mod tests {
     #[test]
     fn test_handle_event() {
         let mut recorder = SchedEventRecorder::default();
-        let prev_comm = CStr::from_bytes_with_nul(b"prev\0").unwrap();
-        let next_comm = CStr::from_bytes_with_nul(b"next\0").unwrap();
+        let prev_comm = c"prev";
+        let next_comm = c"next";
 
         let mut event = task_event {
             r#type: event_type::SCHED_SWITCH,
@@ -397,8 +397,8 @@ mod tests {
             },
             ..Default::default()
         };
-        copy_to_comm(&mut event.next.comm, &next_comm);
-        copy_to_comm(&mut event.prev.comm, &prev_comm);
+        copy_to_comm(&mut event.next.comm, next_comm);
+        copy_to_comm(&mut event.prev.comm, prev_comm);
         recorder.handle_event(event);
         assert_eq!(recorder.compact_sched.len(), 1);
         assert!(recorder.compact_sched.contains_key(&0));
@@ -406,8 +406,8 @@ mod tests {
         event.ts = 2000;
         event.next.tgidpid = 5678;
         event.prev.tgidpid = 1234;
-        copy_to_comm(&mut event.next.comm, &prev_comm);
-        copy_to_comm(&mut event.prev.comm, &next_comm);
+        copy_to_comm(&mut event.next.comm, prev_comm);
+        copy_to_comm(&mut event.prev.comm, next_comm);
         recorder.handle_event(event);
 
         assert_eq!(recorder.compact_sched.len(), 1);
@@ -438,7 +438,7 @@ mod tests {
     #[test]
     fn test_wakeup_new() {
         let mut recorder = SchedEventRecorder::default();
-        let next_comm = CStr::from_bytes_with_nul(b"next\0").unwrap();
+        let next_comm = c"next";
 
         let mut event = task_event {
             r#type: event_type::SCHED_WAKEUP_NEW,
@@ -451,7 +451,7 @@ mod tests {
             next_prio: 10,
             ..Default::default()
         };
-        copy_to_comm(&mut event.next.comm, &next_comm);
+        copy_to_comm(&mut event.next.comm, next_comm);
         recorder.handle_event(event);
 
         assert_eq!(recorder.compact_sched.len(), 0);
@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn test_irq_handler_events() {
         let mut recorder = SchedEventRecorder::default();
-        let next_comm = CStr::from_bytes_with_nul(b"irq_handler\0").unwrap();
+        let next_comm = c"irq_handler";
 
         let mut event = task_event {
             r#type: event_type::SCHED_IRQ_ENTER,
@@ -491,7 +491,7 @@ mod tests {
             },
             ..Default::default()
         };
-        copy_to_comm(&mut event.next.comm, &next_comm);
+        copy_to_comm(&mut event.next.comm, next_comm);
         recorder.handle_event(event);
 
         assert_eq!(recorder.compact_sched.len(), 0);
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn test_irq_exit_handler_events() {
         let mut recorder = SchedEventRecorder::default();
-        let next_comm = CStr::from_bytes_with_nul(b"irq_handler\0").unwrap();
+        let next_comm = c"irq_handler";
 
         let mut event = task_event {
             r#type: event_type::SCHED_IRQ_EXIT,
@@ -531,7 +531,7 @@ mod tests {
             },
             ..Default::default()
         };
-        copy_to_comm(&mut event.next.comm, &next_comm);
+        copy_to_comm(&mut event.next.comm, next_comm);
         recorder.handle_event(event);
 
         assert_eq!(recorder.compact_sched.len(), 0);
@@ -619,7 +619,7 @@ mod tests {
     #[test]
     fn test_process_exit_event() {
         let mut recorder = SchedEventRecorder::default();
-        let prev_comm = CStr::from_bytes_with_nul(b"prev\0").unwrap();
+        let prev_comm = c"prev";
 
         let mut event = task_event {
             r#type: event_type::SCHED_PROCESS_EXIT,
@@ -631,7 +631,7 @@ mod tests {
             prev_prio: 10,
             ..Default::default()
         };
-        copy_to_comm(&mut event.prev.comm, &prev_comm);
+        copy_to_comm(&mut event.prev.comm, prev_comm);
         recorder.handle_event(event);
 
         assert_eq!(recorder.compact_sched.len(), 0);

@@ -17,11 +17,12 @@ jobs:
       - name: Install Deps.
         run: ./.github/workflows/install_deps.sh
 
-      - name: Clippy Check (no features)
-        run: cargo clippy --no-default-features -- -D warnings
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Clippy Check (pystacks)
-        run: cargo clippy --features pystacks -- -D warnings
+      - name: Clippy Check
+        run: |
+          cargo clippy --all-targets --no-default-features -- -D warnings
+          cargo clippy --all-targets --features pystacks -- -D warnings
 
   build:
     runs-on: ubuntu-latest

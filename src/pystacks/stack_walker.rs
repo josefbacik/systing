@@ -1,7 +1,6 @@
 use crate::stack_recorder::{LocalFrame, Stack};
 use crate::systing::types::stack_event;
 use libbpf_rs::Object;
-use perfetto_protos::profile_common::InternedString;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicUsize;
@@ -151,8 +150,8 @@ impl StackWalkerRun {
     pub fn pystacks_to_frames_mapping(
         &self,
         frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-        func_map: &mut HashMap<String, InternedString>,
-        id_counter: &mut Arc<AtomicUsize>,
+        global_func_manager: &Arc<crate::stack_recorder::GlobalFunctionManager>,
+        id_counter: &Arc<AtomicUsize>,
         python_stack_markers: &mut Vec<u64>,
         stack: &[PyAddr],
     ) {
@@ -169,7 +168,7 @@ impl StackWalkerRun {
 
             add_frame(
                 frame_map,
-                func_map,
+                global_func_manager,
                 id_counter,
                 frame.addr.symbol_id.into(),
                 0,
@@ -187,14 +186,10 @@ impl StackWalkerRun {
     pub fn user_stack_to_python_calls(
         &self,
         frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-        func_map: &mut HashMap<String, InternedString>,
+        global_func_manager: &Arc<crate::stack_recorder::GlobalFunctionManager>,
         python_calls: &mut Vec<u64>,
     ) {
-        let python_call_iids: Vec<_> = func_map
-            .iter()
-            .filter(|(key, value)| key.starts_with("_PyEval_EvalFrame") && value.iid.is_some())
-            .map(|(_, value)| value.iid.unwrap())
-            .collect();
+        let python_call_iids = global_func_manager.get_function_ids_matching("_PyEval_EvalFrame");
 
         for (key, values) in frame_map {
             for value in values {
@@ -360,8 +355,8 @@ impl StackWalkerRun {
     pub fn pystacks_to_frames_mapping(
         &self,
         _frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-        _func_map: &mut HashMap<String, InternedString>,
-        _id_counter: &mut Arc<AtomicUsize>,
+        _global_func_manager: &Arc<crate::stack_recorder::GlobalFunctionManager>,
+        _id_counter: &Arc<AtomicUsize>,
         _python_stack_markers: &mut Vec<u64>,
         _stack: &[PyAddr],
     ) {
@@ -372,7 +367,7 @@ impl StackWalkerRun {
     pub fn user_stack_to_python_calls(
         &self,
         _frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-        _func_map: &mut HashMap<String, InternedString>,
+        _global_func_manager: &Arc<crate::stack_recorder::GlobalFunctionManager>,
         _python_calls: &mut Vec<u64>,
     ) {
         // Stub implementation when pystacks feature is disabled

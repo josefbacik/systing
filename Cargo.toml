@@ -31,7 +31,6 @@ serde_json = "1.0.140"
 sysinfo = "0.33.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "time"] }
-workerpool = "1.2.1"
 
 [features]
 generate-vmlinux-header = []
