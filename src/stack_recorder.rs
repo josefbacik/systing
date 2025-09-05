@@ -265,7 +265,7 @@ fn dispatch_process_with_client(
     match entry {
         ProcessMemberType::Path(path) => {
             let build_id = if let Some(build_id) = read_elf_build_id(&path.maps_file)? {
-                build_id
+                BuildId::raw(build_id)
             } else {
                 // The binary does not contain a build ID, so we cannot
                 // retrieve symbol data. Just let the default resolver do
@@ -273,16 +273,15 @@ fn dispatch_process_with_client(
                 return Ok(None);
             };
 
-            let path = if let Some(path) = client
-                .fetch_debug_info(&BuildId::raw(build_id))
-                .map_err(Box::from)?
-            {
+            println!("Fetching debug info for build ID: {}", &build_id);
+            let path = if let Some(path) = client.fetch_debug_info(&build_id).map_err(Box::from)? {
                 path
             } else {
                 // If we were unable to find debug information for the provided
                 // build ID we let the default resolver see what it can do.
                 return Ok(None);
             };
+            println!("Fetched debug info from debuginfod: {}", path.display());
 
             let resolver = ElfResolver::open(&path).map_err(Box::from)?;
             Ok(Some(Box::new(resolver)))
