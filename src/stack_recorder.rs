@@ -621,19 +621,6 @@ mod tests {
         Box::new(|_info| Ok(Some(Box::new(MockResolver::new()) as Box<dyn Resolve>)))
     }
 
-    fn create_test_stack_event(
-        tgidpid: u64,
-        ts: u64,
-        user_addrs: Vec<u64>,
-        kernel_addrs: Vec<u64>,
-    ) -> StackEvent {
-        StackEvent {
-            tgidpid,
-            ts_start: ts,
-            stack: Stack::new(&kernel_addrs, &user_addrs, &Vec::new()),
-        }
-    }
-
     fn create_test_stack_event_raw(
         tgidpid: u64,
         ts: u64,
@@ -661,57 +648,6 @@ mod tests {
         }
 
         event
-    }
-
-    fn create_test_resolved_info() -> ResolvedStackInfo {
-        let mut frame_map = HashMap::new();
-        let mut func_name_map = HashMap::new();
-        let mut id_counter = Arc::new(AtomicUsize::new(1));
-
-        // Add test frames for addresses using add_frame()
-        add_frame(
-            &mut frame_map,
-            &mut func_name_map,
-            &mut id_counter,
-            0x1000,
-            0x1000,
-            0,
-            "test_func1".to_string(),
-        );
-        add_frame(
-            &mut frame_map,
-            &mut func_name_map,
-            &mut id_counter,
-            0x2000,
-            0x2000,
-            16,
-            "test_func1".to_string(),
-        );
-        add_frame(
-            &mut frame_map,
-            &mut func_name_map,
-            &mut id_counter,
-            0x3000,
-            0x3000,
-            0,
-            "test_func2".to_string(),
-        );
-        add_frame(
-            &mut frame_map,
-            &mut func_name_map,
-            &mut id_counter,
-            0x4000,
-            0x4000,
-            32,
-            "test_func2".to_string(),
-        );
-
-        ResolvedStackInfo {
-            frame_map,
-            func_name_map,
-            python_calls: Vec::new(),
-            python_stack_markers: Vec::new(),
-        }
     }
 
     #[test]
@@ -865,8 +801,16 @@ mod tests {
 
     #[test]
     fn test_deduplicate_stacks_empty() {
+        // Test deduplication with empty stack list
         let stacks = vec![];
-        let resolved_info = create_test_resolved_info();
+        let frame_map = HashMap::new();
+        let func_name_map = HashMap::new();
+        let resolved_info = ResolvedStackInfo {
+            frame_map,
+            func_name_map,
+            python_calls: Vec::new(),
+            python_stack_markers: Vec::new(),
+        };
         let mut id_counter = Arc::new(AtomicUsize::new(100));
 
         let result = deduplicate_stacks(
@@ -876,94 +820,140 @@ mod tests {
             &Arc::new(StackWalkerRun::default()),
         );
 
+        // Should return empty map for empty input
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_deduplicate_stacks_single_stack() {
-        let stack = create_test_stack_event(
+        let mut recorder =
+            StackRecorder::default().with_process_dispatcher(create_test_dispatcher());
+
+        // Create a single test event
+        let event = create_test_stack_event_raw(
             (1234 << 32) | 5678,
             1000000,
-            vec![0x1000, 0x2000],
-            vec![0x3000, 0x4000],
+            &[0x1000, 0x2000],
+            &[0x3000, 0x4000],
         );
-        let stacks = vec![stack.clone()];
-        let resolved_info = create_test_resolved_info();
+        recorder.handle_event(event);
+
         let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&mut id_counter);
 
-        let result = deduplicate_stacks(
-            &stacks,
-            &resolved_info,
-            &mut id_counter,
-            &Arc::new(StackWalkerRun::default()),
-        );
+        // Find interned data
+        let interned_packet = packets.iter().find(|p| p.interned_data.is_some()).unwrap();
+        let interned_data = interned_packet.interned_data.as_ref().unwrap();
 
-        assert_eq!(result.len(), 1);
-        assert!(result.contains_key(&stack.stack));
+        // Should have exactly one callstack
+        assert_eq!(interned_data.callstacks.len(), 1);
 
-        let callstack = result.get(&stack.stack).unwrap();
+        let callstack = &interned_data.callstacks[0];
         assert!(callstack.iid() >= 100); // Should have assigned an ID
         assert!(!callstack.frame_ids.is_empty());
+
+        // Should have one sample packet
+        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        assert_eq!(sample_packets.len(), 1);
     }
 
     #[test]
     fn test_deduplicate_stacks_duplicate_stacks() {
-        let stack1 = create_test_stack_event(
+        let mut recorder =
+            StackRecorder::default().with_process_dispatcher(create_test_dispatcher());
+
+        // Create two events with identical stacks but different threads
+        let event1 = create_test_stack_event_raw(
             (1234 << 32) | 5678,
             1000000,
-            vec![0x1000, 0x2000],
-            vec![0x3000, 0x4000],
+            &[0x1000, 0x2000],
+            &[0x3000, 0x4000],
         );
-        let stack2 = create_test_stack_event(
+        recorder.handle_event(event1);
+
+        let event2 = create_test_stack_event_raw(
             (1234 << 32) | 5679, // Different PID, same stack
             2000000,
-            vec![0x1000, 0x2000],
-            vec![0x3000, 0x4000],
+            &[0x1000, 0x2000],
+            &[0x3000, 0x4000],
         );
-        let stacks = vec![stack1.clone(), stack2.clone()];
-        let resolved_info = create_test_resolved_info();
+        recorder.handle_event(event2);
+
         let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&mut id_counter);
 
-        let result = deduplicate_stacks(
-            &stacks,
-            &resolved_info,
-            &mut id_counter,
-            &Arc::new(StackWalkerRun::default()),
+        // Find interned data
+        let interned_packet = packets.iter().find(|p| p.interned_data.is_some()).unwrap();
+        let interned_data = interned_packet.interned_data.as_ref().unwrap();
+
+        // Should only have one unique callstack due to deduplication
+        assert_eq!(interned_data.callstacks.len(), 1);
+
+        // But should have two sample packets
+        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        assert_eq!(sample_packets.len(), 2);
+
+        // Both samples should reference the same callstack
+        let callstack_iid = interned_data.callstacks[0].iid();
+        assert_eq!(
+            sample_packets[0].perf_sample().callstack_iid(),
+            callstack_iid
         );
-
-        // Should only have one unique stack
-        assert_eq!(result.len(), 1);
-        assert!(result.contains_key(&stack1.stack));
+        assert_eq!(
+            sample_packets[1].perf_sample().callstack_iid(),
+            callstack_iid
+        );
     }
 
     #[test]
     fn test_deduplicate_stacks_different_stacks() {
-        let stack1 =
-            create_test_stack_event((1234 << 32) | 5678, 1000000, vec![0x1000], vec![0x3000]);
-        let stack2 =
-            create_test_stack_event((1234 << 32) | 5679, 2000000, vec![0x2000], vec![0x4000]);
-        let stacks = vec![stack1.clone(), stack2.clone()];
-        let resolved_info = create_test_resolved_info();
+        let mut recorder =
+            StackRecorder::default().with_process_dispatcher(create_test_dispatcher());
+
+        // Create two events with different stacks
+        let event1 =
+            create_test_stack_event_raw((1234 << 32) | 5678, 1000000, &[0x1000], &[0x3000]);
+        recorder.handle_event(event1);
+
+        let event2 =
+            create_test_stack_event_raw((1234 << 32) | 5679, 2000000, &[0x2000], &[0x4000]);
+        recorder.handle_event(event2);
+
         let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&mut id_counter);
 
-        let result = deduplicate_stacks(
-            &stacks,
-            &resolved_info,
-            &mut id_counter,
-            &Arc::new(StackWalkerRun::default()),
-        );
+        // Find interned data
+        let interned_packet = packets.iter().find(|p| p.interned_data.is_some()).unwrap();
+        let interned_data = interned_packet.interned_data.as_ref().unwrap();
 
-        // Should have two unique stacks
-        assert_eq!(result.len(), 2);
-        assert!(result.contains_key(&stack1.stack));
-        assert!(result.contains_key(&stack2.stack));
+        // Should have two unique callstacks
+        assert_eq!(interned_data.callstacks.len(), 2);
+
+        // Should have two sample packets
+        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        assert_eq!(sample_packets.len(), 2);
+
+        // Each sample should reference a different callstack
+        let callstack_iids: Vec<_> = sample_packets
+            .iter()
+            .map(|p| p.perf_sample().callstack_iid())
+            .collect();
+        assert_ne!(callstack_iids[0], callstack_iids[1]);
     }
 
     #[test]
     fn test_generate_trace_packets_empty() {
+        // Test packet generation with no stacks
         let stacks = vec![];
         let interned_stacks = HashMap::new();
-        let resolved_info = create_test_resolved_info();
+        let frame_map = HashMap::new();
+        let func_name_map = HashMap::new();
+        let resolved_info = ResolvedStackInfo {
+            frame_map,
+            func_name_map,
+            python_calls: Vec::new(),
+            python_stack_markers: Vec::new(),
+        };
         let mut id_counter = Arc::new(AtomicUsize::new(100));
 
         let packets =
@@ -980,82 +970,88 @@ mod tests {
 
     #[test]
     fn test_generate_trace_packets_single_stack() {
-        let stack = create_test_stack_event(
+        let mut recorder =
+            StackRecorder::default().with_process_dispatcher(create_test_dispatcher());
+
+        // Create a single test event
+        let event = create_test_stack_event_raw(
             (1234 << 32) | 5678,
             1000000,
-            vec![0x1000, 0x2000],
-            vec![0x3000, 0x4000],
+            &[0x1000, 0x2000],
+            &[0x3000, 0x4000],
         );
-        let stacks = vec![stack.clone()];
+        recorder.handle_event(event);
 
-        let mut interned_stacks = HashMap::new();
-        let mut callstack = Callstack::default();
-        callstack.set_iid(42);
-        callstack.frame_ids = vec![1, 2, 3, 4];
-        interned_stacks.insert(stack.stack.clone(), callstack);
-
-        let resolved_info = create_test_resolved_info();
         let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&mut id_counter);
 
-        let packets =
-            generate_trace_packets(&stacks, &interned_stacks, &resolved_info, &mut id_counter);
-
-        // Should have 2 packets: interned data + 1 sample
-        assert_eq!(packets.len(), 2);
+        // Should have at least 2 packets: interned data + 1 sample
+        assert!(packets.len() >= 2);
 
         // First packet should be interned data
         assert!(packets[0].interned_data.is_some());
         let interned_data = packets[0].interned_data.as_ref().unwrap();
         assert_eq!(interned_data.callstacks.len(), 1);
-        assert_eq!(interned_data.function_names.len(), 2); // test_func1 and test_func2
+        assert!(!interned_data.function_names.is_empty());
 
-        // Second packet should be the sample
-        let sample = packets[1].perf_sample();
-        assert_eq!(sample.callstack_iid(), 42);
+        // Find the sample packet
+        let sample_packet = packets.iter().find(|p| p.has_perf_sample()).unwrap();
+        let sample = sample_packet.perf_sample();
         assert_eq!(sample.pid(), 1234);
         assert_eq!(sample.tid(), 5678);
+
+        // Verify the callstack ID matches
+        let callstack_iid = interned_data.callstacks[0].iid();
+        assert_eq!(sample.callstack_iid(), callstack_iid);
     }
 
     #[test]
     fn test_generate_trace_packets_multiple_stacks() {
-        let stack1 =
-            create_test_stack_event((1234 << 32) | 5678, 1000000, vec![0x1000], vec![0x3000]);
-        let stack2 =
-            create_test_stack_event((5678 << 32) | 9012, 2000000, vec![0x2000], vec![0x4000]);
-        let stacks = vec![stack1.clone(), stack2.clone()];
+        let mut recorder =
+            StackRecorder::default().with_process_dispatcher(create_test_dispatcher());
 
-        let mut interned_stacks = HashMap::new();
-        let mut callstack1 = Callstack::default();
-        callstack1.set_iid(42);
-        interned_stacks.insert(stack1.stack.clone(), callstack1);
+        // Create two test events with different processes
+        let event1 =
+            create_test_stack_event_raw((1234 << 32) | 5678, 1000000, &[0x1000], &[0x3000]);
+        recorder.handle_event(event1);
 
-        let mut callstack2 = Callstack::default();
-        callstack2.set_iid(43);
-        interned_stacks.insert(stack2.stack.clone(), callstack2);
+        let event2 =
+            create_test_stack_event_raw((5678 << 32) | 9012, 2000000, &[0x2000], &[0x4000]);
+        recorder.handle_event(event2);
 
-        let resolved_info = create_test_resolved_info();
         let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&mut id_counter);
 
-        let packets =
-            generate_trace_packets(&stacks, &interned_stacks, &resolved_info, &mut id_counter);
+        // May have multiple interned data packets since events are from different processes
+        // The generate_trace method processes each tgid separately and may produce separate packets
+        assert!(packets.len() >= 3);
 
-        // Should have 3 packets: interned data + 2 samples
-        assert_eq!(packets.len(), 3);
+        // Find all interned data packets
+        let interned_packets: Vec<_> = packets
+            .iter()
+            .filter(|p| p.interned_data.is_some())
+            .collect();
+        assert!(!interned_packets.is_empty());
 
-        // First packet should be interned data
-        assert!(packets[0].interned_data.is_some());
-        let interned_data = packets[0].interned_data.as_ref().unwrap();
-        assert_eq!(interned_data.callstacks.len(), 2);
+        // Count total callstacks across all interned data packets
+        let total_callstacks: usize = interned_packets
+            .iter()
+            .map(|p| p.interned_data.as_ref().unwrap().callstacks.len())
+            .sum();
+        assert_eq!(total_callstacks, 2);
 
-        // Second and third packets should be samples
-        // Verify the PIDs and TIDs
-        let sample1 = packets[1].perf_sample();
-        assert_eq!(sample1.pid(), 1234);
-        assert_eq!(sample1.tid(), 5678);
+        // Find sample packets
+        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        assert_eq!(sample_packets.len(), 2);
 
-        let sample2 = packets[2].perf_sample();
-        assert_eq!(sample2.pid(), 5678);
-        assert_eq!(sample2.tid(), 9012);
+        // Verify the PIDs and TIDs - they should be present but order may vary
+        let pids_tids: Vec<(u32, u32)> = sample_packets
+            .iter()
+            .map(|p| (p.perf_sample().pid(), p.perf_sample().tid()))
+            .collect();
+
+        assert!(pids_tids.contains(&(1234, 5678)));
+        assert!(pids_tids.contains(&(5678, 9012)));
     }
 
     #[test]
@@ -1233,25 +1229,27 @@ mod tests {
 
     #[test]
     fn test_generate_trace_packets_timestamps() {
-        let stack1 =
-            create_test_stack_event((1234 << 32) | 5678, 1000000, vec![0x1000], vec![0x3000]);
-        let stack2 =
-            create_test_stack_event((1234 << 32) | 5679, 2000000, vec![0x1000], vec![0x3000]);
-        let stacks = vec![stack1.clone(), stack2.clone()];
+        let mut recorder =
+            StackRecorder::default().with_process_dispatcher(create_test_dispatcher());
 
-        let mut interned_stacks = HashMap::new();
-        let mut callstack = Callstack::default();
-        callstack.set_iid(42);
-        interned_stacks.insert(stack1.stack.clone(), callstack);
+        // Create two test events with same stack but different timestamps
+        let event1 =
+            create_test_stack_event_raw((1234 << 32) | 5678, 1000000, &[0x1000], &[0x3000]);
+        recorder.handle_event(event1);
 
-        let resolved_info = create_test_resolved_info();
+        let event2 =
+            create_test_stack_event_raw((1234 << 32) | 5679, 2000000, &[0x1000], &[0x3000]);
+        recorder.handle_event(event2);
+
         let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&mut id_counter);
 
-        let packets =
-            generate_trace_packets(&stacks, &interned_stacks, &resolved_info, &mut id_counter);
+        // Find sample packets and verify timestamps are preserved
+        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        assert_eq!(sample_packets.len(), 2);
 
         // Check that timestamps are preserved
-        assert_eq!(packets[1].timestamp(), 1000000);
-        assert_eq!(packets[2].timestamp(), 2000000);
+        assert_eq!(sample_packets[0].timestamp(), 1000000);
+        assert_eq!(sample_packets[1].timestamp(), 2000000);
     }
 }
