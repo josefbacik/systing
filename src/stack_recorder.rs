@@ -36,23 +36,17 @@ pub struct Stack {
     pub py_stack: Vec<PyAddr>,
 }
 
+/// Helper function to filter and reverse a stack trace
+/// Removes zero addresses and reverses the order
+fn filter_and_reverse_stack(stack: &[u64]) -> Vec<u64> {
+    stack.iter().rev().filter(|x| **x > 0).copied().collect()
+}
+
 impl Stack {
     pub fn new(kernel_stack: &[u64], user_stack: &[u64], py_stack: &[PyAddr]) -> Self {
-        let my_kernel_stack = kernel_stack
-            .iter()
-            .rev()
-            .filter(|x| **x > 0)
-            .copied()
-            .collect();
-        let my_user_stack = user_stack
-            .iter()
-            .rev()
-            .filter(|x| **x > 0)
-            .copied()
-            .collect();
         Stack {
-            kernel_stack: my_kernel_stack,
-            user_stack: my_user_stack,
+            kernel_stack: filter_and_reverse_stack(kernel_stack),
+            user_stack: filter_and_reverse_stack(user_stack),
             py_stack: py_stack.to_vec(),
         }
     }
