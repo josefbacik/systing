@@ -81,7 +81,10 @@ impl GlobalFunctionManager {
 
     /// Get or create a function IID for the given name
     pub fn get_or_create_function(&self, name: &str) -> u64 {
-        let mut functions = self.global_functions.write().unwrap();
+        let mut functions = self
+            .global_functions
+            .write()
+            .expect("Failed to acquire write lock on global_functions");
         if let Some(interned) = functions.get(name) {
             return interned.iid();
         }
@@ -543,7 +546,12 @@ fn generate_sample_packets(
         packet.set_timestamp(stack.ts_start);
 
         let mut sample = PerfSample::default();
-        sample.set_callstack_iid(callstack_map.get(&stack.stack).unwrap().iid());
+        sample.set_callstack_iid(
+            callstack_map
+                .get(&stack.stack)
+                .expect("Stack should exist in callstack_map after deduplication")
+                .iid(),
+        );
         sample.set_pid(tgid);
         sample.set_tid(pid);
         packet.set_perf_sample(sample);
