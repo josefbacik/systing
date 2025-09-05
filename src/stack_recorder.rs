@@ -170,8 +170,9 @@ impl StackRecorder {
 }
 
 /// Holds the resolved stack information after symbolization
-pub struct ResolvedStackInfo {
-    pub frame_map: HashMap<u64, Vec<LocalFrame>>,
+pub struct ResolvedStackInfo<'a> {
+    pub user_frame_map: HashMap<u64, Vec<LocalFrame>>,
+    pub kernel_frame_map: &'a HashMap<u64, Vec<LocalFrame>>,
     pub python_calls: Vec<u64>,
     pub python_stack_markers: Vec<u64>,
 }
@@ -349,14 +350,15 @@ fn dispatch_process_with_client(
 }
 
 /// Symbolizes all stacks (user, kernel, and Python) and returns the resolved information
-fn symbolize_stacks(
+fn symbolize_stacks<'a>(
     stacks: &[StackEvent],
     tgid: u32,
     id_counter: &mut Arc<AtomicUsize>,
     psr: &mut Arc<StackWalkerRun>,
     process_dispatcher: &Option<Arc<ProcessDispatcher>>,
     global_func_manager: &Arc<GlobalFunctionManager>,
-) -> ResolvedStackInfo {
+    global_kernel_frame_map: &'a mut HashMap<u64, Vec<LocalFrame>>,
+) -> ResolvedStackInfo<'a> {
     let user_src = Source::Process(Process::new(Pid::from(tgid)));
     let kernel_src = Source::Kernel(Kernel::default());
 
@@ -378,34 +380,34 @@ fn symbolize_stacks(
 
     let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(tgid.into())));
 
-    let mut frame_map = HashMap::new();
+    let mut user_frame_map = HashMap::new();
     let mut python_calls = Vec::new();
     let mut python_stack_markers = Vec::new();
 
     for stack in stacks.iter() {
         let raw_stack = &stack.stack;
-        // Symbolize user space stack
+        // Symbolize user space stack (per-process)
         stack_to_frames_mapping(
             &mut symbolizer,
-            &mut frame_map,
+            &mut user_frame_map,
             global_func_manager,
             &user_src,
             id_counter,
             raw_stack.user_stack.iter(),
         );
-        psr.user_stack_to_python_calls(&mut frame_map, global_func_manager, &mut python_calls);
-        // Symbolize kernel stack
+        psr.user_stack_to_python_calls(&mut user_frame_map, global_func_manager, &mut python_calls);
+        // Symbolize kernel stack (global)
         stack_to_frames_mapping(
             &mut symbolizer,
-            &mut frame_map,
+            global_kernel_frame_map,
             global_func_manager,
             &kernel_src,
             id_counter,
             raw_stack.kernel_stack.iter(),
         );
-        // Symbolize Python stack
+        // Symbolize Python stack (per-process)
         psr.pystacks_to_frames_mapping(
-            &mut frame_map,
+            &mut user_frame_map,
             global_func_manager,
             id_counter,
             &mut python_stack_markers,
@@ -414,7 +416,8 @@ fn symbolize_stacks(
     }
 
     ResolvedStackInfo {
-        frame_map,
+        user_frame_map,
+        kernel_frame_map: global_kernel_frame_map,
         python_calls,
         python_stack_markers,
     }
@@ -423,8 +426,6 @@ fn symbolize_stacks(
 /// Holds deduplicated stack data
 struct DeduplicatedStackData {
     callstacks: HashMap<Stack, Callstack>,
-    frames: Vec<Frame>,
-    mappings: Vec<Mapping>,
 }
 
 /// Deduplicates stacks and creates callstack mappings
@@ -444,18 +445,24 @@ fn deduplicate_stacks(
             let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             callstack.set_iid(iid);
             callstack.frame_ids = if stack.py_stack.is_empty() {
-                // No Python stack - just chain user and kernel stacks
+                // No Python stack - chain user stacks from user map and kernel stacks from kernel map
                 stack
                     .user_stack
                     .iter()
-                    .chain(stack.kernel_stack.iter())
                     .flat_map(|addr| {
-                        let frame_vec = resolved_info.frame_map.get(addr).unwrap();
+                        let frame_vec = resolved_info.user_frame_map.get(addr).unwrap();
                         frame_vec
                             .iter()
                             .map(|frame| frame.frame.iid())
                             .collect::<Vec<u64>>()
                     })
+                    .chain(stack.kernel_stack.iter().flat_map(|addr| {
+                        let frame_vec = resolved_info.kernel_frame_map.get(addr).unwrap();
+                        frame_vec
+                            .iter()
+                            .map(|frame| frame.frame.iid())
+                            .collect::<Vec<u64>>()
+                    }))
                     .collect()
             } else {
                 // Merge Python stacks with user stacks
@@ -467,48 +474,27 @@ fn deduplicate_stacks(
 
                 merged_addrs
                     .iter()
-                    .chain(stack.kernel_stack.iter())
                     .flat_map(|addr| {
-                        let frame_vec = resolved_info.frame_map.get(addr).unwrap();
+                        let frame_vec = resolved_info.user_frame_map.get(addr).unwrap();
                         frame_vec
                             .iter()
                             .map(|frame| frame.frame.iid())
                             .collect::<Vec<u64>>()
                     })
+                    .chain(stack.kernel_stack.iter().flat_map(|addr| {
+                        let frame_vec = resolved_info.kernel_frame_map.get(addr).unwrap();
+                        frame_vec
+                            .iter()
+                            .map(|frame| frame.frame.iid())
+                            .collect::<Vec<u64>>()
+                    }))
                     .collect()
             };
             (stack, callstack)
         })
         .collect();
 
-    // Extract frames and mappings from resolved_info
-    let frames = resolved_info
-        .frame_map
-        .values()
-        .flat_map(|frame_vec| {
-            frame_vec
-                .iter()
-                .map(|frame| frame.frame.clone())
-                .collect::<Vec<Frame>>()
-        })
-        .collect();
-
-    let mappings = resolved_info
-        .frame_map
-        .values()
-        .flat_map(|frame_vec| {
-            frame_vec
-                .iter()
-                .map(|frame| frame.mapping.clone())
-                .collect::<Vec<Mapping>>()
-        })
-        .collect();
-
-    DeduplicatedStackData {
-        callstacks,
-        frames,
-        mappings,
-    }
+    DeduplicatedStackData { callstacks }
 }
 
 /// Generates PerfSample packets from the deduplicated stacks
@@ -575,8 +561,11 @@ impl StackRecorder {
 
         // Collect all interned data from all processes
         let mut all_callstacks = Vec::new();
-        let mut all_frames = Vec::new();
-        let mut all_mappings = Vec::new();
+        let mut all_user_frames = Vec::new();
+        let mut all_user_mappings = Vec::new();
+
+        // Global kernel frame map shared across all processes
+        let mut global_kernel_frame_map = HashMap::new();
 
         // Process each tgid's stacks
         for (tgid, stacks) in self.stacks.iter() {
@@ -590,22 +579,73 @@ impl StackRecorder {
                 &mut self.psr.clone(),
                 &self.process_dispatcher,
                 &self.global_func_manager,
+                &mut global_kernel_frame_map,
             );
 
             // Step 2: Deduplicate stacks and collect interned data
             let deduplicated_data =
                 deduplicate_stacks(stacks, &resolved_info, id_counter, &self.psr);
 
-            // Collect all interned data
+            // Collect all interned data (only user frames/mappings from per-process data)
             all_callstacks.extend(deduplicated_data.callstacks.values().cloned());
-            all_frames.extend(deduplicated_data.frames);
-            all_mappings.extend(deduplicated_data.mappings);
+            // Only collect user frames and mappings here (kernel ones will be added later)
+            let user_frames: Vec<Frame> = resolved_info
+                .user_frame_map
+                .values()
+                .flat_map(|frame_vec| {
+                    frame_vec
+                        .iter()
+                        .map(|frame| frame.frame.clone())
+                        .collect::<Vec<Frame>>()
+                })
+                .collect();
+            let user_mappings: Vec<Mapping> = resolved_info
+                .user_frame_map
+                .values()
+                .flat_map(|frame_vec| {
+                    frame_vec
+                        .iter()
+                        .map(|frame| frame.mapping.clone())
+                        .collect::<Vec<Mapping>>()
+                })
+                .collect();
+            all_user_frames.extend(user_frames);
+            all_user_mappings.extend(user_mappings);
 
             // Step 3: Generate sample packets for this process
             let sample_packets =
                 generate_sample_packets(stacks, &deduplicated_data.callstacks, sequence_id);
             all_sample_packets.extend(sample_packets);
         }
+
+        // Extract kernel frames and mappings from the global kernel frame map
+        let kernel_frames: Vec<Frame> = global_kernel_frame_map
+            .values()
+            .flat_map(|frame_vec| {
+                frame_vec
+                    .iter()
+                    .map(|frame| frame.frame.clone())
+                    .collect::<Vec<Frame>>()
+            })
+            .collect();
+        let kernel_mappings: Vec<Mapping> = global_kernel_frame_map
+            .values()
+            .flat_map(|frame_vec| {
+                frame_vec
+                    .iter()
+                    .map(|frame| frame.mapping.clone())
+                    .collect::<Vec<Mapping>>()
+            })
+            .collect();
+
+        // Combine user and kernel frames/mappings
+        let mut all_frames = Vec::new();
+        all_frames.extend(kernel_frames);
+        all_frames.extend(all_user_frames);
+
+        let mut all_mappings = Vec::new();
+        all_mappings.extend(kernel_mappings);
+        all_mappings.extend(all_user_mappings);
 
         // Create a single interned data packet with everything
         if !all_callstacks.is_empty() || !all_frames.is_empty() || !all_mappings.is_empty() {
@@ -883,9 +923,11 @@ mod tests {
     fn test_deduplicate_stacks_empty() {
         // Test deduplication with empty stack list
         let stacks = vec![];
-        let frame_map = HashMap::new();
+        let user_frame_map = HashMap::new();
+        let kernel_frame_map = HashMap::new();
         let resolved_info = ResolvedStackInfo {
-            frame_map,
+            user_frame_map,
+            kernel_frame_map: &kernel_frame_map,
             python_calls: Vec::new(),
             python_stack_markers: Vec::new(),
         };
@@ -900,8 +942,6 @@ mod tests {
 
         // Should return empty data for empty input
         assert!(result.callstacks.is_empty());
-        assert!(result.frames.is_empty());
-        assert!(result.mappings.is_empty());
     }
 
     #[test]
