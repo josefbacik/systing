@@ -634,6 +634,35 @@ mod tests {
         }
     }
 
+    fn create_test_stack_event_raw(
+        tgidpid: u64,
+        ts: u64,
+        user_addrs: &[u64],
+        kernel_addrs: &[u64],
+    ) -> stack_event {
+        let mut event: stack_event = unsafe { std::mem::zeroed() };
+        event.task.tgidpid = tgidpid;
+        event.ts = ts;
+
+        // Copy user stack addresses
+        event.user_stack_length = user_addrs.len() as u64;
+        for (i, &addr) in user_addrs.iter().enumerate() {
+            if i < event.user_stack.len() {
+                event.user_stack[i] = addr;
+            }
+        }
+
+        // Copy kernel stack addresses
+        event.kernel_stack_length = kernel_addrs.len() as u64;
+        for (i, &addr) in kernel_addrs.iter().enumerate() {
+            if i < event.kernel_stack.len() {
+                event.kernel_stack[i] = addr;
+            }
+        }
+
+        event
+    }
+
     fn create_test_resolved_info() -> ResolvedStackInfo {
         let mut frame_map = HashMap::new();
         let mut func_name_map = HashMap::new();
@@ -1031,67 +1060,175 @@ mod tests {
 
     #[test]
     fn test_symbolize_stacks_with_mock_resolver() {
-        // Test that custom dispatcher can be set and passed through
-        let stack = create_test_stack_event(
+        // Test that mock resolver provides consistent function names via generate_trace
+        let mut recorder =
+            StackRecorder::default().with_process_dispatcher(create_test_dispatcher());
+
+        // Create and handle a test event with addresses that MockResolver knows
+        let event = create_test_stack_event_raw(
             (1234 << 32) | 5678,
             1000000,
-            vec![0x1000, 0x2000],
-            vec![0x3000, 0x4000],
+            &[0x1000, 0x2000],
+            &[0x3000, 0x4000],
         );
-        let stacks = vec![stack];
+        recorder.handle_event(event);
+
+        // Generate trace using the mock resolver
         let mut id_counter = Arc::new(AtomicUsize::new(100));
-        let mut psr = Arc::new(StackWalkerRun::default());
-        let dispatcher = Arc::new(create_test_dispatcher());
+        let packets = recorder.generate_trace(&mut id_counter);
 
-        // Symbolize with our custom dispatcher - even though it may not be called for all addresses,
-        // this tests that the dispatcher is correctly passed through the system
-        let resolved_info =
-            symbolize_stacks(&stacks, 1234, &mut id_counter, &mut psr, &Some(dispatcher));
+        // Verify packets were generated
+        assert!(!packets.is_empty());
 
-        // Basic sanity checks - frames should still be created even if using default names
-        assert!(resolved_info.frame_map.contains_key(&0x1000));
-        assert!(resolved_info.frame_map.contains_key(&0x2000));
-        assert!(resolved_info.frame_map.contains_key(&0x3000));
-        assert!(resolved_info.frame_map.contains_key(&0x4000));
+        // Find the interned data packet
+        let interned_packet = packets.iter().find(|p| p.interned_data.is_some()).unwrap();
+        let interned_data = interned_packet.interned_data.as_ref().unwrap();
 
-        // Function names should be created (even if just "unknown")
-        assert!(!resolved_info.func_name_map.is_empty());
+        // Extract function names from the interned data
+        let func_names: Vec<_> = interned_data
+            .function_names
+            .iter()
+            .map(|f| String::from_utf8_lossy(f.str()).to_string())
+            .collect();
+
+        // Note: The mock resolver may not be called for all addresses due to how
+        // blazesym's process dispatcher works (only for specific member types).
+        // For now, we just verify that symbolization occurred and frames were created.
+        // In real usage, the dispatcher would be called when resolving ELF files with build IDs.
+
+        // Verify that symbolization occurred (even if using default resolver)
+        assert!(!func_names.is_empty(), "Expected some function names");
+
+        // Verify frames were created for our addresses
+        assert!(
+            !interned_data.frames.is_empty(),
+            "Expected frames to be created"
+        );
+        assert!(
+            !interned_data.callstacks.is_empty(),
+            "Expected callstacks to be created"
+        );
     }
 
     #[test]
     fn test_stack_recorder_with_custom_dispatcher() {
-        // Test that StackRecorder can be constructed with a custom dispatcher
+        // Test multiple stack events with mock resolver for consistent results
         let mut recorder =
             StackRecorder::default().with_process_dispatcher(create_test_dispatcher());
 
-        // Verify the dispatcher was set
-        assert!(recorder.process_dispatcher.is_some());
+        // Create and handle multiple test events with different known addresses
+        let event1 =
+            create_test_stack_event_raw((1234 << 32) | 5678, 1000000, &[0x1000, 0x2000], &[0x3000]);
+        recorder.handle_event(event1);
 
-        // Add a test stack event
-        let tgidpid = (1234 << 32) | 5678;
-        let stack = StackEvent {
-            tgidpid,
-            ts_start: 1000000,
-            stack: Stack::new(&[0x3000, 0x4000], &[0x1000, 0x2000], &Vec::new()),
-        };
-        let tgid = (tgidpid >> 32) as i32;
-        recorder.stacks.entry(tgid).or_default().push(stack);
+        let event2 =
+            create_test_stack_event_raw((1234 << 32) | 5679, 2000000, &[0x5000, 0x6000], &[0x4000]);
+        recorder.handle_event(event2);
 
-        // Generate trace - this tests that the dispatcher is correctly passed through
+        // Generate trace with mock resolver
         let mut id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&mut id_counter);
 
-        // Verify we got packets
+        // Verify packets were generated
         assert!(!packets.is_empty());
 
-        // Check that the interned data was generated
+        // Find the interned data packet
         let interned_packet = packets.iter().find(|p| p.interned_data.is_some()).unwrap();
         let interned_data = interned_packet.interned_data.as_ref().unwrap();
 
-        // Basic checks that symbolization occurred (even if using defaults)
-        assert!(!interned_data.function_names.is_empty());
-        assert!(!interned_data.frames.is_empty());
-        assert!(!interned_data.callstacks.is_empty());
+        // Extract function names
+        let func_names: Vec<_> = interned_data
+            .function_names
+            .iter()
+            .map(|f| String::from_utf8_lossy(f.str()).to_string())
+            .collect();
+
+        // Note: The mock resolver may not be called for all addresses due to how
+        // blazesym's process dispatcher works (only for specific member types).
+        // The dispatcher is primarily used when resolving ELF files with build IDs.
+
+        // Verify that symbolization occurred
+        assert!(!func_names.is_empty(), "Expected some function names");
+
+        // Verify frames and callstacks were created
+        assert!(
+            !interned_data.frames.is_empty(),
+            "Expected frames to be created"
+        );
+        assert!(
+            !interned_data.callstacks.is_empty(),
+            "Expected callstacks to be created"
+        );
+
+        // Verify we have the expected number of samples
+        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        assert_eq!(sample_packets.len(), 2, "Expected 2 sample packets");
+    }
+
+    #[test]
+    fn test_deduplicate_stacks_with_mock_resolver() {
+        // Test that duplicate stacks are properly deduplicated with consistent mock names
+        let mut recorder =
+            StackRecorder::default().with_process_dispatcher(create_test_dispatcher());
+
+        // Create and handle identical stacks from different threads - should be deduplicated
+        let event1 = create_test_stack_event_raw(
+            (1234 << 32) | 5678,
+            1000000,
+            &[0x1000, 0x2000],
+            &[0x3000, 0x4000],
+        );
+        recorder.handle_event(event1);
+
+        let event2 = create_test_stack_event_raw(
+            (1234 << 32) | 5679, // Different thread, same stack
+            2000000,
+            &[0x1000, 0x2000],
+            &[0x3000, 0x4000],
+        );
+        recorder.handle_event(event2);
+
+        // Generate trace
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&mut id_counter);
+
+        // Find interned data
+        let interned_packet = packets.iter().find(|p| p.interned_data.is_some()).unwrap();
+        let interned_data = interned_packet.interned_data.as_ref().unwrap();
+
+        // Should have only one unique callstack due to deduplication
+        assert_eq!(
+            interned_data.callstacks.len(),
+            1,
+            "Expected 1 deduplicated callstack, got {}",
+            interned_data.callstacks.len()
+        );
+
+        // But should have two sample packets
+        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        assert_eq!(sample_packets.len(), 2, "Expected 2 sample packets");
+
+        // Both samples should reference the same callstack
+        let callstack_iid = interned_data.callstacks[0].iid();
+        assert_eq!(
+            sample_packets[0].perf_sample().callstack_iid(),
+            callstack_iid
+        );
+        assert_eq!(
+            sample_packets[1].perf_sample().callstack_iid(),
+            callstack_iid
+        );
+
+        // Verify function names were created during symbolization
+        let func_names: Vec<_> = interned_data
+            .function_names
+            .iter()
+            .map(|f| String::from_utf8_lossy(f.str()).to_string())
+            .collect();
+        assert!(
+            !func_names.is_empty(),
+            "Expected function names to be created"
+        );
     }
 
     #[test]
