@@ -448,6 +448,32 @@ fn extract_frame_ids<'a>(
         .collect()
 }
 
+/// Helper function to collect all frames from a frame map
+fn collect_frames(frame_map: &HashMap<u64, Vec<LocalFrame>>) -> Vec<Frame> {
+    frame_map
+        .values()
+        .flat_map(|frame_vec| {
+            frame_vec
+                .iter()
+                .map(|frame| frame.frame.clone())
+                .collect::<Vec<Frame>>()
+        })
+        .collect()
+}
+
+/// Helper function to collect all mappings from a frame map
+fn collect_mappings(frame_map: &HashMap<u64, Vec<LocalFrame>>) -> Vec<Mapping> {
+    frame_map
+        .values()
+        .flat_map(|frame_vec| {
+            frame_vec
+                .iter()
+                .map(|frame| frame.mapping.clone())
+                .collect::<Vec<Mapping>>()
+        })
+        .collect()
+}
+
 /// Deduplicates stacks and creates callstack mappings
 fn deduplicate_stacks(
     stacks: &[StackEvent],
@@ -586,26 +612,8 @@ impl StackRecorder {
             // Collect all interned data (only user frames/mappings from per-process data)
             all_callstacks.extend(deduplicated_data.callstacks.values().cloned());
             // Only collect user frames and mappings here (kernel ones will be added later)
-            let user_frames: Vec<Frame> = resolved_info
-                .user_frame_map
-                .values()
-                .flat_map(|frame_vec| {
-                    frame_vec
-                        .iter()
-                        .map(|frame| frame.frame.clone())
-                        .collect::<Vec<Frame>>()
-                })
-                .collect();
-            let user_mappings: Vec<Mapping> = resolved_info
-                .user_frame_map
-                .values()
-                .flat_map(|frame_vec| {
-                    frame_vec
-                        .iter()
-                        .map(|frame| frame.mapping.clone())
-                        .collect::<Vec<Mapping>>()
-                })
-                .collect();
+            let user_frames = collect_frames(&resolved_info.user_frame_map);
+            let user_mappings = collect_mappings(&resolved_info.user_frame_map);
             all_user_frames.extend(user_frames);
             all_user_mappings.extend(user_mappings);
 
@@ -616,24 +624,8 @@ impl StackRecorder {
         }
 
         // Extract kernel frames and mappings from the global kernel frame map
-        let kernel_frames: Vec<Frame> = global_kernel_frame_map
-            .values()
-            .flat_map(|frame_vec| {
-                frame_vec
-                    .iter()
-                    .map(|frame| frame.frame.clone())
-                    .collect::<Vec<Frame>>()
-            })
-            .collect();
-        let kernel_mappings: Vec<Mapping> = global_kernel_frame_map
-            .values()
-            .flat_map(|frame_vec| {
-                frame_vec
-                    .iter()
-                    .map(|frame| frame.mapping.clone())
-                    .collect::<Vec<Mapping>>()
-            })
-            .collect();
+        let kernel_frames = collect_frames(&global_kernel_frame_map);
+        let kernel_mappings = collect_mappings(&global_kernel_frame_map);
 
         // Combine user and kernel frames/mappings
         let mut all_frames = Vec::new();
