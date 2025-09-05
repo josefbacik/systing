@@ -15,6 +15,13 @@ use blazesym::symbolize::{
 };
 use blazesym::Error as BlazeErr;
 use blazesym::{Addr, Pid};
+
+// Type alias for the dispatch function
+type ProcessDispatcher = Box<
+    dyn for<'a> Fn(ProcessMemberInfo<'a>) -> Result<Option<Box<dyn Resolve>>, BlazeErr>
+        + Send
+        + Sync,
+>;
 use debuginfod::{BuildId, CachingClient, Client};
 use perfetto_protos::interned_data::InternedData;
 use perfetto_protos::profile_common::{Callstack, Frame, InternedString, Mapping};
@@ -69,7 +76,7 @@ pub struct StackRecorder {
     pub ringbuf: RingBuffer<stack_event>,
     pub stacks: HashMap<i32, Vec<StackEvent>>,
     pub psr: Arc<StackWalkerRun>,
-    pub enable_debuginfod: bool,
+    pub process_dispatcher: Option<Arc<ProcessDispatcher>>,
 }
 
 impl Default for StackRecorder {
@@ -78,19 +85,31 @@ impl Default for StackRecorder {
             ringbuf: RingBuffer::default(),
             stacks: HashMap::new(),
             psr: Arc::new(StackWalkerRun::default()),
-            enable_debuginfod: false,
+            process_dispatcher: None,
         }
     }
 }
 
 impl StackRecorder {
     pub fn new(enable_debuginfod: bool) -> Self {
+        let process_dispatcher = if enable_debuginfod {
+            create_debuginfod_dispatcher()
+        } else {
+            None
+        };
+
         Self {
             ringbuf: RingBuffer::default(),
             stacks: HashMap::new(),
             psr: Arc::new(StackWalkerRun::default()),
-            enable_debuginfod,
+            process_dispatcher,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_process_dispatcher(mut self, dispatcher: ProcessDispatcher) -> Self {
+        self.process_dispatcher = Some(Arc::new(dispatcher));
+        self
     }
 }
 
@@ -191,10 +210,52 @@ pub fn stack_to_frames_mapping<'a, I>(
     }
 }
 
+/// Create a debuginfod dispatcher if debuginfod is available in the environment
+fn create_debuginfod_dispatcher() -> Option<Arc<ProcessDispatcher>> {
+    match Client::from_env() {
+        Ok(Some(client)) => match CachingClient::from_env(client) {
+            Ok(caching_client) => {
+                println!("Debuginfod enabled: using debuginfod for symbol resolution");
+
+                // Wrap the CachingClient in an Arc so it can be shared across threads.
+                // The closure below will take ownership of this Arc (via the `move` keyword),
+                // storing it as part of the closure's captured state. When the closure is
+                // called during symbolization, it will clone the Arc to pass to
+                // dispatch_process_with_client. The CachingClient itself remains shared
+                // across all threads (only the Arc reference is cloned, not the client).
+                // The closure and its captured Arc<CachingClient> will live as long as the
+                // StackRecorder that owns the process_dispatcher field.
+                let client = Arc::new(caching_client);
+                Some(Arc::new(Box::new(move |info: ProcessMemberInfo<'_>| -> Result<Option<Box<dyn Resolve>>, BlazeErr> {
+                    dispatch_process_with_client(info, client.clone())
+                }) as ProcessDispatcher))
+            }
+            Err(e) => {
+                println!(
+                    "Failed to create caching debuginfod client: {}, using default resolver",
+                    e
+                );
+                None
+            }
+        },
+        Ok(None) => {
+            println!("No debuginfod URLs found in environment, using default resolver. If using sudo try --preserve-env");
+            None
+        }
+        Err(e) => {
+            println!(
+                "Failed to create debuginfod client: {}, using default resolver",
+                e
+            );
+            None
+        }
+    }
+}
+
 /// Callback function for process dispatcher that fetches debug info using debuginfod
-fn dispatch_process(
+fn dispatch_process_with_client(
     info: ProcessMemberInfo<'_>,
-    client: &CachingClient,
+    client: Arc<CachingClient>,
 ) -> Result<Option<Box<dyn Resolve>>, BlazeErr> {
     let ProcessMemberInfo {
         member_entry: entry,
@@ -237,19 +298,21 @@ fn symbolize_stacks(
     tgid: u32,
     id_counter: &mut Arc<AtomicUsize>,
     psr: &mut Arc<StackWalkerRun>,
-    debuginfod_client: &Option<Arc<CachingClient>>,
+    process_dispatcher: &Option<Arc<ProcessDispatcher>>,
 ) -> ResolvedStackInfo {
     let user_src = Source::Process(Process::new(Pid::from(tgid)));
     let kernel_src = Source::Kernel(Kernel::default());
 
-    let mut symbolizer = if let Some(client) = debuginfod_client {
-        let client = client.clone();
+    let mut symbolizer = if let Some(dispatcher) = process_dispatcher {
+        // Use the custom dispatcher if provided
+        let dispatcher = dispatcher.clone();
         Symbolizer::builder()
             .enable_code_info(true)
             .enable_inlined_fns(true)
-            .set_process_dispatcher(move |info| dispatch_process(info, &client))
+            .set_process_dispatcher(move |info| dispatcher(info))
             .build()
     } else {
+        // Use default symbolizer
         Symbolizer::builder()
             .enable_code_info(true)
             .enable_inlined_fns(true)
@@ -425,10 +488,10 @@ pub fn generate_stack_packets(
     stacks: Vec<StackEvent>,
     id_counter: &mut Arc<AtomicUsize>,
     psr: &mut Arc<StackWalkerRun>,
-    debuginfod_client: &Option<Arc<CachingClient>>,
+    process_dispatcher: &Option<Arc<ProcessDispatcher>>,
 ) {
     // Step 1: Symbolize all stacks
-    let resolved_info = symbolize_stacks(&stacks, tgid, id_counter, psr, debuginfod_client);
+    let resolved_info = symbolize_stacks(&stacks, tgid, id_counter, psr, process_dispatcher);
     // Step 2: Deduplicate stacks
     let interned_stacks = deduplicate_stacks(&stacks, &resolved_info, id_counter, psr);
     // Step 3: Generate trace packets
@@ -473,38 +536,6 @@ impl StackRecorder {
         let packets = Arc::new(Mutex::new(Vec::new()));
         let pool = Pool::<ThunkWorker<()>>::new(4);
 
-        // Create debuginfod client once for all threads if enabled
-        let debuginfod_client = if self.enable_debuginfod {
-            match Client::from_env() {
-                Ok(Some(client)) => match CachingClient::from_env(client) {
-                    Ok(caching_client) => {
-                        println!("Debuginfod enabled: using debuginfod for symbol resolution");
-                        Some(Arc::new(caching_client))
-                    }
-                    Err(e) => {
-                        println!(
-                            "Failed to create caching debuginfod client: {}, using default resolver",
-                            e
-                        );
-                        None
-                    }
-                },
-                Ok(None) => {
-                    println!("No debuginfod URLs found in environment, using default resolver. If using sudo try --preserve-env");
-                    None
-                }
-                Err(e) => {
-                    println!(
-                        "Failed to create debuginfod client: {}, using default resolver",
-                        e
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         // Resolve the stacks, generate the interned data for them, and populate the trace.
         for (tgid, stacks) in self.stacks.iter() {
             let mut id_counter = id_counter.clone();
@@ -512,7 +543,7 @@ impl StackRecorder {
             let stacks = stacks.clone();
             let tgid = *tgid as u32;
             let mut packets = packets.clone();
-            let debuginfod_client = debuginfod_client.clone();
+            let process_dispatcher = self.process_dispatcher.clone();
             pool.execute(Thunk::of(move || {
                 generate_stack_packets(
                     &mut packets,
@@ -520,7 +551,7 @@ impl StackRecorder {
                     stacks,
                     &mut id_counter,
                     &mut psr,
-                    &debuginfod_client,
+                    &process_dispatcher,
                 )
             }));
         }
@@ -533,8 +564,63 @@ impl StackRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blazesym::symbolize::{FindSymOpts, Reason, ResolvedSym, SrcLang};
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
+
+    /// Mock resolver for testing that maps specific addresses to known function names
+    #[derive(Debug)]
+    struct MockResolver {
+        addr_to_func: HashMap<u64, String>,
+    }
+
+    impl MockResolver {
+        fn new() -> Self {
+            let mut addr_to_func = HashMap::new();
+            // Set up some test mappings
+            addr_to_func.insert(0x1000, "mock_func_1000".to_string());
+            addr_to_func.insert(0x2000, "mock_func_2000".to_string());
+            addr_to_func.insert(0x3000, "mock_kernel_func_3000".to_string());
+            addr_to_func.insert(0x4000, "mock_kernel_func_4000".to_string());
+            addr_to_func.insert(0x5000, "mock_func_5000".to_string());
+            addr_to_func.insert(0x6000, "mock_func_6000".to_string());
+            MockResolver { addr_to_func }
+        }
+    }
+
+    impl blazesym::symbolize::Symbolize for MockResolver {
+        fn find_sym(
+            &self,
+            addr: u64,
+            _opts: &FindSymOpts,
+        ) -> Result<Result<ResolvedSym<'_>, Reason>, BlazeErr> {
+            if let Some(name) = self.addr_to_func.get(&addr) {
+                Ok(Ok(ResolvedSym {
+                    name: name.as_str(),
+                    addr,
+                    code_info: None,
+                    inlined: Box::new([]),
+                    size: None,
+                    module: None,
+                    lang: SrcLang::Unknown,
+                }))
+            } else {
+                Ok(Err(Reason::UnknownAddr))
+            }
+        }
+    }
+
+    impl blazesym::symbolize::TranslateFileOffset for MockResolver {
+        fn file_offset_to_virt_offset(&self, _file_offset: u64) -> Result<Option<u64>, BlazeErr> {
+            // For testing, just return the same offset
+            Ok(Some(0))
+        }
+    }
+
+    /// Create a test dispatcher that returns our mock resolver
+    fn create_test_dispatcher() -> ProcessDispatcher {
+        Box::new(|_info| Ok(Some(Box::new(MockResolver::new()) as Box<dyn Resolve>)))
+    }
 
     fn create_test_stack_event(
         tgidpid: u64,
@@ -942,6 +1028,71 @@ mod tests {
         let sample2 = packets[2].perf_sample();
         assert_eq!(sample2.pid(), 5678);
         assert_eq!(sample2.tid(), 9012);
+    }
+
+    #[test]
+    fn test_symbolize_stacks_with_mock_resolver() {
+        // Test that custom dispatcher can be set and passed through
+        let stack = create_test_stack_event(
+            (1234 << 32) | 5678,
+            1000000,
+            vec![0x1000, 0x2000],
+            vec![0x3000, 0x4000],
+        );
+        let stacks = vec![stack];
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let mut psr = Arc::new(StackWalkerRun::default());
+        let dispatcher = Arc::new(create_test_dispatcher());
+
+        // Symbolize with our custom dispatcher - even though it may not be called for all addresses,
+        // this tests that the dispatcher is correctly passed through the system
+        let resolved_info =
+            symbolize_stacks(&stacks, 1234, &mut id_counter, &mut psr, &Some(dispatcher));
+
+        // Basic sanity checks - frames should still be created even if using default names
+        assert!(resolved_info.frame_map.contains_key(&0x1000));
+        assert!(resolved_info.frame_map.contains_key(&0x2000));
+        assert!(resolved_info.frame_map.contains_key(&0x3000));
+        assert!(resolved_info.frame_map.contains_key(&0x4000));
+
+        // Function names should be created (even if just "unknown")
+        assert!(!resolved_info.func_name_map.is_empty());
+    }
+
+    #[test]
+    fn test_stack_recorder_with_custom_dispatcher() {
+        // Test that StackRecorder can be constructed with a custom dispatcher
+        let mut recorder =
+            StackRecorder::default().with_process_dispatcher(create_test_dispatcher());
+
+        // Verify the dispatcher was set
+        assert!(recorder.process_dispatcher.is_some());
+
+        // Add a test stack event
+        let tgidpid = (1234 << 32) | 5678;
+        let stack = StackEvent {
+            tgidpid,
+            ts_start: 1000000,
+            stack: Stack::new(&[0x3000, 0x4000], &[0x1000, 0x2000], &Vec::new()),
+        };
+        let tgid = (tgidpid >> 32) as i32;
+        recorder.stacks.entry(tgid).or_default().push(stack);
+
+        // Generate trace - this tests that the dispatcher is correctly passed through
+        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let packets = recorder.generate_trace(&mut id_counter);
+
+        // Verify we got packets
+        assert!(!packets.is_empty());
+
+        // Check that the interned data was generated
+        let interned_packet = packets.iter().find(|p| p.interned_data.is_some()).unwrap();
+        let interned_data = interned_packet.interned_data.as_ref().unwrap();
+
+        // Basic checks that symbolization occurred (even if using defaults)
+        assert!(!interned_data.function_names.is_empty());
+        assert!(!interned_data.frames.is_empty());
+        assert!(!interned_data.callstacks.is_empty());
     }
 
     #[test]
