@@ -568,6 +568,71 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
 }
 
 impl StackRecorder {
+    /// Process stacks for a single process and collect the interned data
+    fn process_tgid_stacks(
+        &self,
+        tgid: u32,
+        stacks: &[StackEvent],
+        id_counter: &mut Arc<AtomicUsize>,
+        global_kernel_frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+        sequence_id: u32,
+    ) -> (Vec<Callstack>, Vec<Frame>, Vec<Mapping>, Vec<TracePacket>) {
+        // Step 1: Symbolize all stacks
+        let resolved_info = symbolize_stacks(
+            stacks,
+            tgid,
+            id_counter,
+            &mut self.psr.clone(),
+            &self.process_dispatcher,
+            &self.global_func_manager,
+            global_kernel_frame_map,
+        );
+
+        // Step 2: Deduplicate stacks and collect interned data
+        let deduplicated_data = deduplicate_stacks(stacks, &resolved_info, id_counter, &self.psr);
+
+        // Collect all interned data (only user frames/mappings from per-process data)
+        let callstacks: Vec<Callstack> = deduplicated_data.callstacks.values().cloned().collect();
+        let user_frames = collect_frames(&resolved_info.user_frame_map);
+        let user_mappings = collect_mappings(&resolved_info.user_frame_map);
+
+        // Step 3: Generate sample packets for this process
+        let sample_packets =
+            generate_sample_packets(stacks, &deduplicated_data.callstacks, sequence_id);
+
+        (callstacks, user_frames, user_mappings, sample_packets)
+    }
+
+    /// Create the interned data packet with all collected data
+    fn create_interned_packet(
+        &self,
+        callstacks: Vec<Callstack>,
+        frames: Vec<Frame>,
+        mappings: Vec<Mapping>,
+        sequence_id: u32,
+    ) -> Option<TracePacket> {
+        if callstacks.is_empty() && frames.is_empty() && mappings.is_empty() {
+            return None;
+        }
+
+        let mut interned_packet = TracePacket::default();
+        let interned_data = InternedData {
+            function_names: self.global_func_manager.get_all_functions(),
+            callstacks,
+            frames,
+            mappings,
+            ..Default::default()
+        };
+        interned_packet.interned_data = Some(interned_data).into();
+        interned_packet.set_trusted_packet_sequence_id(sequence_id);
+        interned_packet.set_sequence_flags(
+            SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
+                | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
+        );
+
+        Some(interned_packet)
+    }
+
     pub fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
         // Get a unique sequence ID for this trace
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
@@ -588,32 +653,18 @@ impl StackRecorder {
         for (tgid, stacks) in self.stacks.iter() {
             let tgid = *tgid as u32;
 
-            // Step 1: Symbolize all stacks
-            let resolved_info = symbolize_stacks(
-                stacks,
-                tgid,
-                id_counter,
-                &mut self.psr.clone(),
-                &self.process_dispatcher,
-                &self.global_func_manager,
-                &mut global_kernel_frame_map,
-            );
+            let (callstacks, user_frames, user_mappings, sample_packets) = self
+                .process_tgid_stacks(
+                    tgid,
+                    stacks,
+                    id_counter,
+                    &mut global_kernel_frame_map,
+                    sequence_id,
+                );
 
-            // Step 2: Deduplicate stacks and collect interned data
-            let deduplicated_data =
-                deduplicate_stacks(stacks, &resolved_info, id_counter, &self.psr);
-
-            // Collect all interned data (only user frames/mappings from per-process data)
-            all_callstacks.extend(deduplicated_data.callstacks.values().cloned());
-            // Only collect user frames and mappings here (kernel ones will be added later)
-            let user_frames = collect_frames(&resolved_info.user_frame_map);
-            let user_mappings = collect_mappings(&resolved_info.user_frame_map);
+            all_callstacks.extend(callstacks);
             all_user_frames.extend(user_frames);
             all_user_mappings.extend(user_mappings);
-
-            // Step 3: Generate sample packets for this process
-            let sample_packets =
-                generate_sample_packets(stacks, &deduplicated_data.callstacks, sequence_id);
             all_sample_packets.extend(sample_packets);
         }
 
@@ -631,22 +682,9 @@ impl StackRecorder {
         all_mappings.extend(all_user_mappings);
 
         // Create a single interned data packet with everything
-        if !all_callstacks.is_empty() || !all_frames.is_empty() || !all_mappings.is_empty() {
-            let mut interned_packet = TracePacket::default();
-            let interned_data = InternedData {
-                function_names: self.global_func_manager.get_all_functions(),
-                callstacks: all_callstacks,
-                frames: all_frames,
-                mappings: all_mappings,
-                ..Default::default()
-            };
-            interned_packet.interned_data = Some(interned_data).into();
-            interned_packet.set_trusted_packet_sequence_id(sequence_id);
-            interned_packet.set_sequence_flags(
-                SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
-                    | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
-            );
-
+        if let Some(interned_packet) =
+            self.create_interned_packet(all_callstacks, all_frames, all_mappings, sequence_id)
+        {
             all_packets.push(interned_packet);
         }
 
