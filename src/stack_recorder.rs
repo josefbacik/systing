@@ -428,6 +428,26 @@ struct DeduplicatedStackData {
     callstacks: HashMap<Stack, Callstack>,
 }
 
+/// Helper function to extract frame IDs from a frame map for given addresses
+fn extract_frame_ids<'a>(
+    frame_map: &HashMap<u64, Vec<LocalFrame>>,
+    addrs: impl Iterator<Item = &'a u64>,
+) -> Vec<u64> {
+    addrs
+        .flat_map(|addr| {
+            frame_map
+                .get(addr)
+                .map(|frame_vec| {
+                    frame_vec
+                        .iter()
+                        .map(|frame| frame.frame.iid())
+                        .collect::<Vec<u64>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 /// Deduplicates stacks and creates callstack mappings
 fn deduplicate_stacks(
     stacks: &[StackEvent],
@@ -446,24 +466,12 @@ fn deduplicate_stacks(
             callstack.set_iid(iid);
             callstack.frame_ids = if stack.py_stack.is_empty() {
                 // No Python stack - chain user stacks from user map and kernel stacks from kernel map
-                stack
-                    .user_stack
-                    .iter()
-                    .flat_map(|addr| {
-                        let frame_vec = resolved_info.user_frame_map.get(addr).unwrap();
-                        frame_vec
-                            .iter()
-                            .map(|frame| frame.frame.iid())
-                            .collect::<Vec<u64>>()
-                    })
-                    .chain(stack.kernel_stack.iter().flat_map(|addr| {
-                        let frame_vec = resolved_info.kernel_frame_map.get(addr).unwrap();
-                        frame_vec
-                            .iter()
-                            .map(|frame| frame.frame.iid())
-                            .collect::<Vec<u64>>()
-                    }))
-                    .collect()
+                let user_frame_ids =
+                    extract_frame_ids(&resolved_info.user_frame_map, stack.user_stack.iter());
+                let kernel_frame_ids =
+                    extract_frame_ids(&resolved_info.kernel_frame_map, stack.kernel_stack.iter());
+
+                user_frame_ids.into_iter().chain(kernel_frame_ids).collect()
             } else {
                 // Merge Python stacks with user stacks
                 let merged_addrs = psr.merge_pystacks(
@@ -472,23 +480,12 @@ fn deduplicate_stacks(
                     &resolved_info.python_stack_markers,
                 );
 
-                merged_addrs
-                    .iter()
-                    .flat_map(|addr| {
-                        let frame_vec = resolved_info.user_frame_map.get(addr).unwrap();
-                        frame_vec
-                            .iter()
-                            .map(|frame| frame.frame.iid())
-                            .collect::<Vec<u64>>()
-                    })
-                    .chain(stack.kernel_stack.iter().flat_map(|addr| {
-                        let frame_vec = resolved_info.kernel_frame_map.get(addr).unwrap();
-                        frame_vec
-                            .iter()
-                            .map(|frame| frame.frame.iid())
-                            .collect::<Vec<u64>>()
-                    }))
-                    .collect()
+                let user_frame_ids =
+                    extract_frame_ids(&resolved_info.user_frame_map, merged_addrs.iter());
+                let kernel_frame_ids =
+                    extract_frame_ids(&resolved_info.kernel_frame_map, stack.kernel_stack.iter());
+
+                user_frame_ids.into_iter().chain(kernel_frame_ids).collect()
             };
             (stack, callstack)
         })
