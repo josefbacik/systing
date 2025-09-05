@@ -159,6 +159,16 @@ impl StackRecorder {
         }
     }
 
+    pub fn init_pystacks(&mut self, pids: &[u32], bpf_object: &libbpf_rs::Object) {
+        if let Some(psr) = Arc::get_mut(&mut self.psr) {
+            psr.init_pystacks(pids, bpf_object);
+        } else {
+            // If we can't get exclusive access, it means the Arc is already shared
+            // This shouldn't happen during initialization, but we handle it gracefully
+            eprintln!("Warning: Unable to initialize pystacks - Arc is already shared");
+        }
+    }
+
     #[cfg(test)]
     pub fn with_process_dispatcher(mut self, dispatcher: ProcessDispatcher) -> Self {
         self.process_dispatcher = Some(Arc::new(dispatcher));

@@ -40,7 +40,7 @@ pub fn generate_cpu_track_descriptors(
     desc_uuids: &mut HashMap<String, u64>,
     cpu: u32,
     name: String,
-    id_counter: &mut Arc<AtomicUsize>,
+    id_counter: &Arc<AtomicUsize>,
 ) -> Vec<TrackDescriptor> {
     let mut descs = Vec::new();
     let parent_uuid = if let Some(uuid) = desc_uuids.get(&name) {

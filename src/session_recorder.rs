@@ -114,7 +114,7 @@ impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
 }
 
 impl SysinfoRecorder {
-    pub fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
+    pub fn generate_trace(&self, id_counter: &Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
         // Populate the sysinfo events
@@ -230,7 +230,7 @@ impl SessionRecorder {
     }
 
     /// Generates the initial trace packets including clock snapshot and root descriptor
-    fn generate_initial_packets(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
+    fn generate_initial_packets(&self, id_counter: &Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
         // Emit the clock snapshot
@@ -255,7 +255,7 @@ impl SessionRecorder {
     /// Generates trace packets for all processes
     fn generate_process_packets(
         &self,
-        id_counter: &mut Arc<AtomicUsize>,
+        id_counter: &Arc<AtomicUsize>,
         pid_uuids: &mut HashMap<i32, u64>,
     ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
@@ -292,7 +292,7 @@ impl SessionRecorder {
     /// Generates trace packets for all threads
     fn generate_thread_packets(
         &self,
-        id_counter: &mut Arc<AtomicUsize>,
+        id_counter: &Arc<AtomicUsize>,
         thread_uuids: &mut HashMap<i32, u64>,
     ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
@@ -318,7 +318,7 @@ impl SessionRecorder {
         &self,
         pid_uuids: &HashMap<i32, u64>,
         thread_uuids: &HashMap<i32, u64>,
-        id_counter: &mut Arc<AtomicUsize>,
+        id_counter: &Arc<AtomicUsize>,
     ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
@@ -364,23 +364,23 @@ impl SessionRecorder {
     }
 
     pub fn generate_trace(&self) -> Vec<TracePacket> {
-        let mut id_counter = Arc::new(AtomicUsize::new(1));
+        let id_counter = Arc::new(AtomicUsize::new(1));
         let mut pid_uuids = HashMap::new();
         let mut thread_uuids = HashMap::new();
 
         let mut packets = Vec::new();
 
         // Step 1: Generate initial packets (clock snapshot and root descriptor)
-        packets.extend(self.generate_initial_packets(&mut id_counter));
+        packets.extend(self.generate_initial_packets(&id_counter));
 
         // Step 2: Generate process-related packets
-        packets.extend(self.generate_process_packets(&mut id_counter, &mut pid_uuids));
+        packets.extend(self.generate_process_packets(&id_counter, &mut pid_uuids));
 
         // Step 3: Generate thread-related packets
-        packets.extend(self.generate_thread_packets(&mut id_counter, &mut thread_uuids));
+        packets.extend(self.generate_thread_packets(&id_counter, &mut thread_uuids));
 
         // Step 4: Collect traces from all recorders
-        packets.extend(self.collect_recorder_traces(&pid_uuids, &thread_uuids, &mut id_counter));
+        packets.extend(self.collect_recorder_traces(&pid_uuids, &thread_uuids, &id_counter));
 
         packets
     }
@@ -634,12 +634,12 @@ mod tests {
     #[test]
     fn test_generate_initial_packets() {
         let recorder = create_test_session_recorder();
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let id_counter = Arc::new(AtomicUsize::new(100));
 
         // Set up a clock snapshot
         recorder.snapshot_clocks();
 
-        let packets = recorder.generate_initial_packets(&mut id_counter);
+        let packets = recorder.generate_initial_packets(&id_counter);
 
         // Should generate exactly 2 packets: clock snapshot + root descriptor
         assert_eq!(packets.len(), 2);
@@ -660,10 +660,10 @@ mod tests {
     #[test]
     fn test_generate_initial_packets_empty_clock() {
         let recorder = create_test_session_recorder();
-        let mut id_counter = Arc::new(AtomicUsize::new(50));
+        let id_counter = Arc::new(AtomicUsize::new(50));
 
         // Don't set up clock snapshot - should still work with empty snapshot
-        let packets = recorder.generate_initial_packets(&mut id_counter);
+        let packets = recorder.generate_initial_packets(&id_counter);
 
         assert_eq!(packets.len(), 2);
         let _clock_snapshot = packets[0].clock_snapshot();
@@ -673,10 +673,10 @@ mod tests {
     #[test]
     fn test_generate_process_packets_empty() {
         let recorder = create_test_session_recorder();
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let id_counter = Arc::new(AtomicUsize::new(100));
         let mut pid_uuids = HashMap::new();
 
-        let packets = recorder.generate_process_packets(&mut id_counter, &mut pid_uuids);
+        let packets = recorder.generate_process_packets(&id_counter, &mut pid_uuids);
 
         // Should generate no packets when no processes are recorded
         assert!(packets.is_empty());
@@ -689,14 +689,14 @@ mod tests {
     #[test]
     fn test_generate_process_packets_single_process() {
         let recorder = create_test_session_recorder();
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let id_counter = Arc::new(AtomicUsize::new(100));
         let mut pid_uuids = HashMap::new();
 
         // Add a process
         let task = create_test_task_info(1234, 1234, "test_process");
         recorder.maybe_record_task(&task);
 
-        let packets = recorder.generate_process_packets(&mut id_counter, &mut pid_uuids);
+        let packets = recorder.generate_process_packets(&id_counter, &mut pid_uuids);
 
         // Should generate 2 packets: process track descriptor + process tree
         assert_eq!(packets.len(), 2);
@@ -724,7 +724,7 @@ mod tests {
     #[test]
     fn test_generate_process_packets_multiple_processes() {
         let recorder = create_test_session_recorder();
-        let mut id_counter = Arc::new(AtomicUsize::new(200));
+        let id_counter = Arc::new(AtomicUsize::new(200));
         let mut pid_uuids = HashMap::new();
 
         // Add multiple processes
@@ -733,7 +733,7 @@ mod tests {
         recorder.maybe_record_task(&task1);
         recorder.maybe_record_task(&task2);
 
-        let packets = recorder.generate_process_packets(&mut id_counter, &mut pid_uuids);
+        let packets = recorder.generate_process_packets(&id_counter, &mut pid_uuids);
 
         // Should generate 4 packets: 2 process track descriptors + 2 process trees
         assert_eq!(packets.len(), 4);
@@ -770,10 +770,10 @@ mod tests {
     #[test]
     fn test_generate_thread_packets_empty() {
         let recorder = create_test_session_recorder();
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let id_counter = Arc::new(AtomicUsize::new(100));
         let mut thread_uuids = HashMap::new();
 
-        let packets = recorder.generate_thread_packets(&mut id_counter, &mut thread_uuids);
+        let packets = recorder.generate_thread_packets(&id_counter, &mut thread_uuids);
 
         // Should generate no packets when no threads are recorded
         assert!(packets.is_empty());
@@ -786,14 +786,14 @@ mod tests {
     #[test]
     fn test_generate_thread_packets_single_thread() {
         let recorder = create_test_session_recorder();
-        let mut id_counter = Arc::new(AtomicUsize::new(150));
+        let id_counter = Arc::new(AtomicUsize::new(150));
         let mut thread_uuids = HashMap::new();
 
         // Add a thread
         let task = create_test_task_info(1234, 5678, "test_thread");
         recorder.maybe_record_task(&task);
 
-        let packets = recorder.generate_thread_packets(&mut id_counter, &mut thread_uuids);
+        let packets = recorder.generate_thread_packets(&id_counter, &mut thread_uuids);
 
         // Should generate 1 packet: thread track descriptor
         assert_eq!(packets.len(), 1);
@@ -817,7 +817,7 @@ mod tests {
     #[test]
     fn test_generate_thread_packets_multiple_threads() {
         let recorder = create_test_session_recorder();
-        let mut id_counter = Arc::new(AtomicUsize::new(300));
+        let id_counter = Arc::new(AtomicUsize::new(300));
         let mut thread_uuids = HashMap::new();
 
         // Add multiple threads
@@ -828,7 +828,7 @@ mod tests {
         recorder.maybe_record_task(&task2);
         recorder.maybe_record_task(&task3);
 
-        let packets = recorder.generate_thread_packets(&mut id_counter, &mut thread_uuids);
+        let packets = recorder.generate_thread_packets(&id_counter, &mut thread_uuids);
 
         // Should generate 3 packets: 3 thread track descriptors
         assert_eq!(packets.len(), 3);
@@ -860,14 +860,14 @@ mod tests {
     #[test]
     fn test_generate_thread_packets_thread_details() {
         let recorder = create_test_session_recorder();
-        let mut id_counter = Arc::new(AtomicUsize::new(400));
+        let id_counter = Arc::new(AtomicUsize::new(400));
         let mut thread_uuids = HashMap::new();
 
         // Add a thread with specific details to verify
         let task = create_test_task_info(9999, 8888, "special_thread");
         recorder.maybe_record_task(&task);
 
-        let packets = recorder.generate_thread_packets(&mut id_counter, &mut thread_uuids);
+        let packets = recorder.generate_thread_packets(&id_counter, &mut thread_uuids);
 
         assert_eq!(packets.len(), 1);
 
