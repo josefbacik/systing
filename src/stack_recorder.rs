@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::ringbuf::RingBuffer;
@@ -72,20 +71,75 @@ pub struct LocalFrame {
     pub mapping: Mapping,
 }
 
+/// GlobalFunctionManager manages function name deduplication globally across all processes
+pub struct GlobalFunctionManager {
+    pub global_functions: Arc<RwLock<HashMap<String, InternedString>>>,
+    pub id_counter: Arc<AtomicUsize>,
+}
+
+impl GlobalFunctionManager {
+    pub fn new(id_counter: Arc<AtomicUsize>) -> Self {
+        Self {
+            global_functions: Arc::new(RwLock::new(HashMap::new())),
+            id_counter,
+        }
+    }
+
+    /// Get or create a function IID for the given name
+    pub fn get_or_create_function(&self, name: &str) -> u64 {
+        let mut functions = self.global_functions.write().unwrap();
+        if let Some(interned) = functions.get(name) {
+            return interned.iid();
+        }
+
+        let iid = self.id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        let mut interned = InternedString::default();
+        interned.set_iid(iid);
+        interned.set_str(name.as_bytes().to_vec());
+        functions.insert(name.to_string(), interned);
+        iid
+    }
+
+    /// Get all interned functions
+    pub fn get_all_functions(&self) -> Vec<InternedString> {
+        self.global_functions
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Get function IDs matching a pattern
+    #[allow(dead_code)]
+    pub fn get_function_ids_matching(&self, pattern: &str) -> Vec<u64> {
+        self.global_functions
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name.contains(pattern))
+            .map(|(_, interned)| interned.iid())
+            .collect()
+    }
+}
+
 pub struct StackRecorder {
     pub ringbuf: RingBuffer<stack_event>,
     pub stacks: HashMap<i32, Vec<StackEvent>>,
     pub psr: Arc<StackWalkerRun>,
     pub process_dispatcher: Option<Arc<ProcessDispatcher>>,
+    pub global_func_manager: Arc<GlobalFunctionManager>,
 }
 
 impl Default for StackRecorder {
     fn default() -> Self {
+        let id_counter = Arc::new(AtomicUsize::new(1));
         Self {
             ringbuf: RingBuffer::default(),
             stacks: HashMap::new(),
             psr: Arc::new(StackWalkerRun::default()),
             process_dispatcher: None,
+            global_func_manager: Arc::new(GlobalFunctionManager::new(id_counter)),
         }
     }
 }
@@ -97,12 +151,14 @@ impl StackRecorder {
         } else {
             None
         };
+        let id_counter = Arc::new(AtomicUsize::new(1));
 
         Self {
             ringbuf: RingBuffer::default(),
             stacks: HashMap::new(),
             psr: Arc::new(StackWalkerRun::default()),
             process_dispatcher,
+            global_func_manager: Arc::new(GlobalFunctionManager::new(id_counter)),
         }
     }
 
@@ -116,14 +172,13 @@ impl StackRecorder {
 /// Holds the resolved stack information after symbolization
 pub struct ResolvedStackInfo {
     pub frame_map: HashMap<u64, Vec<LocalFrame>>,
-    pub func_name_map: HashMap<String, InternedString>,
     pub python_calls: Vec<u64>,
     pub python_stack_markers: Vec<u64>,
 }
 
 pub fn add_frame(
     frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-    func_map: &mut HashMap<String, InternedString>,
+    global_func_manager: &Arc<GlobalFunctionManager>,
     id_counter: &mut Arc<AtomicUsize>,
     input_addr: u64,
     start_addr: u64,
@@ -131,16 +186,10 @@ pub fn add_frame(
     name: String,
 ) {
     let mut frame = Frame::default();
-    let my_func = func_map.entry(name.to_string()).or_insert_with(|| {
-        let mut interned_str = InternedString::default();
-        let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-        interned_str.set_iid(iid);
-        interned_str.set_str(name.into_bytes());
-        interned_str
-    });
+    let func_iid = global_func_manager.get_or_create_function(&name);
     let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
     frame.set_iid(iid);
-    frame.set_function_name_id(my_func.iid());
+    frame.set_function_name_id(func_iid);
     frame.set_rel_pc(offset);
 
     let mut mapping = Mapping::default();
@@ -158,7 +207,7 @@ pub fn add_frame(
 pub fn stack_to_frames_mapping<'a, I>(
     symbolizer: &mut Symbolizer,
     frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-    func_map: &mut HashMap<String, InternedString>,
+    global_func_manager: &Arc<GlobalFunctionManager>,
     source: &Source<'a>,
     id_counter: &mut Arc<AtomicUsize>,
     stack: I,
@@ -181,7 +230,7 @@ pub fn stack_to_frames_mapping<'a, I>(
                 let name = format!("{} <{:#x}>", name, *input_addr);
                 add_frame(
                     frame_map,
-                    func_map,
+                    global_func_manager,
                     id_counter,
                     *input_addr,
                     addr,
@@ -191,14 +240,22 @@ pub fn stack_to_frames_mapping<'a, I>(
 
                 for inline in inlined {
                     let name = format!("{} (inlined) <{:#x}>", inline.name, *input_addr);
-                    add_frame(frame_map, func_map, id_counter, *input_addr, addr, 0, name);
+                    add_frame(
+                        frame_map,
+                        global_func_manager,
+                        id_counter,
+                        *input_addr,
+                        addr,
+                        0,
+                        name,
+                    );
                 }
             }
             _ => {
                 let name = format!("unknown <{:#x}>", *input_addr);
                 add_frame(
                     frame_map,
-                    func_map,
+                    global_func_manager,
                     id_counter,
                     *input_addr,
                     *input_addr,
@@ -298,6 +355,7 @@ fn symbolize_stacks(
     id_counter: &mut Arc<AtomicUsize>,
     psr: &mut Arc<StackWalkerRun>,
     process_dispatcher: &Option<Arc<ProcessDispatcher>>,
+    global_func_manager: &Arc<GlobalFunctionManager>,
 ) -> ResolvedStackInfo {
     let user_src = Source::Process(Process::new(Pid::from(tgid)));
     let kernel_src = Source::Kernel(Kernel::default());
@@ -321,7 +379,6 @@ fn symbolize_stacks(
     let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(tgid.into())));
 
     let mut frame_map = HashMap::new();
-    let mut func_name_map = HashMap::new();
     let mut python_calls = Vec::new();
     let mut python_stack_markers = Vec::new();
 
@@ -331,17 +388,17 @@ fn symbolize_stacks(
         stack_to_frames_mapping(
             &mut symbolizer,
             &mut frame_map,
-            &mut func_name_map,
+            global_func_manager,
             &user_src,
             id_counter,
             raw_stack.user_stack.iter(),
         );
-        psr.user_stack_to_python_calls(&mut frame_map, &mut func_name_map, &mut python_calls);
+        psr.user_stack_to_python_calls(&mut frame_map, global_func_manager, &mut python_calls);
         // Symbolize kernel stack
         stack_to_frames_mapping(
             &mut symbolizer,
             &mut frame_map,
-            &mut func_name_map,
+            global_func_manager,
             &kernel_src,
             id_counter,
             raw_stack.kernel_stack.iter(),
@@ -349,7 +406,7 @@ fn symbolize_stacks(
         // Symbolize Python stack
         psr.pystacks_to_frames_mapping(
             &mut frame_map,
-            &mut func_name_map,
+            global_func_manager,
             id_counter,
             &mut python_stack_markers,
             &raw_stack.py_stack,
@@ -358,10 +415,16 @@ fn symbolize_stacks(
 
     ResolvedStackInfo {
         frame_map,
-        func_name_map,
         python_calls,
         python_stack_markers,
     }
+}
+
+/// Holds deduplicated stack data
+struct DeduplicatedStackData {
+    callstacks: HashMap<Stack, Callstack>,
+    frames: Vec<Frame>,
+    mappings: Vec<Mapping>,
 }
 
 /// Deduplicates stacks and creates callstack mappings
@@ -370,8 +433,8 @@ fn deduplicate_stacks(
     resolved_info: &ResolvedStackInfo,
     id_counter: &mut Arc<AtomicUsize>,
     psr: &Arc<StackWalkerRun>,
-) -> HashMap<Stack, Callstack> {
-    stacks
+) -> DeduplicatedStackData {
+    let callstacks: HashMap<Stack, Callstack> = stacks
         .iter()
         .map(|stack| stack.stack.clone())
         .collect::<HashSet<_>>()
@@ -416,52 +479,45 @@ fn deduplicate_stacks(
             };
             (stack, callstack)
         })
-        .collect()
+        .collect();
+
+    // Extract frames and mappings from resolved_info
+    let frames = resolved_info
+        .frame_map
+        .values()
+        .flat_map(|frame_vec| {
+            frame_vec
+                .iter()
+                .map(|frame| frame.frame.clone())
+                .collect::<Vec<Frame>>()
+        })
+        .collect();
+
+    let mappings = resolved_info
+        .frame_map
+        .values()
+        .flat_map(|frame_vec| {
+            frame_vec
+                .iter()
+                .map(|frame| frame.mapping.clone())
+                .collect::<Vec<Mapping>>()
+        })
+        .collect();
+
+    DeduplicatedStackData {
+        callstacks,
+        frames,
+        mappings,
+    }
 }
 
-/// Generates trace packets from the deduplicated stacks and resolved information
-fn generate_trace_packets(
+/// Generates PerfSample packets from the deduplicated stacks
+fn generate_sample_packets(
     stacks: &[StackEvent],
-    interned_stacks: &HashMap<Stack, Callstack>,
-    resolved_info: &ResolvedStackInfo,
-    id_counter: &mut Arc<AtomicUsize>,
+    callstack_map: &HashMap<Stack, Callstack>,
+    sequence_id: u32,
 ) -> Vec<TracePacket> {
     let mut packets = Vec::new();
-    let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-    // Generate interned data packet
-    let mut packet = TracePacket::default();
-    let interned_data = InternedData {
-        callstacks: interned_stacks.values().cloned().collect(),
-        function_names: resolved_info.func_name_map.values().cloned().collect(),
-        frames: resolved_info
-            .frame_map
-            .values()
-            .flat_map(|frame_vec| {
-                frame_vec
-                    .iter()
-                    .map(|frame| frame.frame.clone())
-                    .collect::<Vec<Frame>>()
-            })
-            .collect(),
-        mappings: resolved_info
-            .frame_map
-            .values()
-            .flat_map(|frame_vec| {
-                frame_vec
-                    .iter()
-                    .map(|frame| frame.mapping.clone())
-                    .collect::<Vec<Mapping>>()
-            })
-            .collect(),
-        ..Default::default()
-    };
-    packet.interned_data = Some(interned_data).into();
-    packet.set_trusted_packet_sequence_id(seq);
-    packet.set_sequence_flags(
-        SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
-            | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
-    );
-    packets.push(packet);
 
     // Generate sample packets for each stack
     for stack in stacks.iter() {
@@ -471,33 +527,14 @@ fn generate_trace_packets(
         packet.set_timestamp(stack.ts_start);
 
         let mut sample = PerfSample::default();
-        sample.set_callstack_iid(interned_stacks.get(&stack.stack).unwrap().iid());
+        sample.set_callstack_iid(callstack_map.get(&stack.stack).unwrap().iid());
         sample.set_pid(tgid);
         sample.set_tid(pid);
         packet.set_perf_sample(sample);
-        packet.set_trusted_packet_sequence_id(seq);
+        packet.set_trusted_packet_sequence_id(sequence_id);
         packets.push(packet);
     }
     packets
-}
-
-pub fn generate_stack_packets(
-    packets: &mut Arc<Mutex<Vec<TracePacket>>>,
-    tgid: u32,
-    stacks: Vec<StackEvent>,
-    id_counter: &mut Arc<AtomicUsize>,
-    psr: &mut Arc<StackWalkerRun>,
-    process_dispatcher: &Option<Arc<ProcessDispatcher>>,
-) {
-    // Step 1: Symbolize all stacks
-    let resolved_info = symbolize_stacks(&stacks, tgid, id_counter, psr, process_dispatcher);
-    // Step 2: Deduplicate stacks
-    let interned_stacks = deduplicate_stacks(&stacks, &resolved_info, id_counter, psr);
-    // Step 3: Generate trace packets
-    let trace_packets =
-        generate_trace_packets(&stacks, &interned_stacks, &resolved_info, id_counter);
-    // Add packets to the shared collection
-    packets.lock().unwrap().extend(trace_packets);
 }
 
 impl SystingRecordEvent<stack_event> for StackRecorder {
@@ -529,34 +566,71 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
 
 impl StackRecorder {
     pub fn generate_trace(&self, id_counter: &mut Arc<AtomicUsize>) -> Vec<TracePacket> {
-        use workerpool::thunk::{Thunk, ThunkWorker};
-        use workerpool::Pool;
+        // Get a unique sequence ID for this trace
+        let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
 
-        let packets = Arc::new(Mutex::new(Vec::new()));
-        let pool = Pool::<ThunkWorker<()>>::new(4);
+        // Process all stacks synchronously to avoid the interleaving issue
+        let mut all_packets = Vec::new();
+        let mut all_sample_packets = Vec::new();
 
-        // Resolve the stacks, generate the interned data for them, and populate the trace.
+        // Collect all interned data from all processes
+        let mut all_callstacks = Vec::new();
+        let mut all_frames = Vec::new();
+        let mut all_mappings = Vec::new();
+
+        // Process each tgid's stacks
         for (tgid, stacks) in self.stacks.iter() {
-            let mut id_counter = id_counter.clone();
-            let mut psr = self.psr.clone();
-            let stacks = stacks.clone();
             let tgid = *tgid as u32;
-            let mut packets = packets.clone();
-            let process_dispatcher = self.process_dispatcher.clone();
-            pool.execute(Thunk::of(move || {
-                generate_stack_packets(
-                    &mut packets,
-                    tgid,
-                    stacks,
-                    &mut id_counter,
-                    &mut psr,
-                    &process_dispatcher,
-                )
-            }));
+
+            // Step 1: Symbolize all stacks
+            let resolved_info = symbolize_stacks(
+                stacks,
+                tgid,
+                id_counter,
+                &mut self.psr.clone(),
+                &self.process_dispatcher,
+                &self.global_func_manager,
+            );
+
+            // Step 2: Deduplicate stacks and collect interned data
+            let deduplicated_data =
+                deduplicate_stacks(stacks, &resolved_info, id_counter, &self.psr);
+
+            // Collect all interned data
+            all_callstacks.extend(deduplicated_data.callstacks.values().cloned());
+            all_frames.extend(deduplicated_data.frames);
+            all_mappings.extend(deduplicated_data.mappings);
+
+            // Step 3: Generate sample packets for this process
+            let sample_packets =
+                generate_sample_packets(stacks, &deduplicated_data.callstacks, sequence_id);
+            all_sample_packets.extend(sample_packets);
         }
-        pool.join();
-        let packets = mem::take(&mut *packets.lock().unwrap());
-        packets
+
+        // Create a single interned data packet with everything
+        if !all_callstacks.is_empty() || !all_frames.is_empty() || !all_mappings.is_empty() {
+            let mut interned_packet = TracePacket::default();
+            let interned_data = InternedData {
+                function_names: self.global_func_manager.get_all_functions(),
+                callstacks: all_callstacks,
+                frames: all_frames,
+                mappings: all_mappings,
+                ..Default::default()
+            };
+            interned_packet.interned_data = Some(interned_data).into();
+            interned_packet.set_trusted_packet_sequence_id(sequence_id);
+            interned_packet.set_sequence_flags(
+                SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
+                    | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
+            );
+
+            all_packets.push(interned_packet);
+        }
+
+        // Then add all the sample packets
+        all_packets.extend(all_sample_packets);
+
+        all_packets
     }
 }
 
@@ -653,12 +727,12 @@ mod tests {
     #[test]
     fn test_add_frame_new_address() {
         let mut frame_map = HashMap::new();
-        let mut func_map = HashMap::new();
         let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let global_func_manager = Arc::new(GlobalFunctionManager::new(id_counter.clone()));
 
         add_frame(
             &mut frame_map,
-            &mut func_map,
+            &global_func_manager,
             &mut id_counter,
             0x5000, // input_addr
             0x4800, // start_addr
@@ -682,23 +756,23 @@ mod tests {
         assert_eq!(mapping.exact_offset(), 0x5000);
         assert_eq!(mapping.start_offset(), 0x4800);
 
-        // Check that function was added to func_map
-        assert!(func_map.contains_key("my_function"));
-        let func = func_map.get("my_function").unwrap();
-        assert!(func.iid() >= 100);
-        assert_eq!(func.str(), b"my_function");
+        // Check that function was added to global_func_manager
+        let funcs = global_func_manager.get_all_functions();
+        assert_eq!(funcs.len(), 1);
+        assert!(funcs[0].iid() >= 100);
+        assert_eq!(funcs[0].str(), b"my_function");
     }
 
     #[test]
     fn test_add_frame_multiple_frames_same_address() {
         let mut frame_map = HashMap::new();
-        let mut func_map = HashMap::new();
         let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let global_func_manager = Arc::new(GlobalFunctionManager::new(id_counter.clone()));
 
         // Add first frame
         add_frame(
             &mut frame_map,
-            &mut func_map,
+            &global_func_manager,
             &mut id_counter,
             0x5000,
             0x4800,
@@ -709,7 +783,7 @@ mod tests {
         // Add second frame at same address (e.g., inlined function)
         add_frame(
             &mut frame_map,
-            &mut func_map,
+            &global_func_manager,
             &mut id_counter,
             0x5000,
             0x4800,
@@ -725,22 +799,27 @@ mod tests {
         assert_ne!(frames[0].frame.iid(), frames[1].frame.iid());
         assert_ne!(frames[0].mapping.iid(), frames[1].mapping.iid());
 
-        // Check that both functions are in func_map
-        assert_eq!(func_map.len(), 2);
-        assert!(func_map.contains_key("function1"));
-        assert!(func_map.contains_key("function2 (inlined)"));
+        // Check that both functions are in global_func_manager
+        let funcs = global_func_manager.get_all_functions();
+        assert_eq!(funcs.len(), 2);
+        let func_names: Vec<String> = funcs
+            .iter()
+            .map(|f| String::from_utf8(f.str.clone().unwrap()).unwrap())
+            .collect();
+        assert!(func_names.contains(&"function1".to_string()));
+        assert!(func_names.contains(&"function2 (inlined)".to_string()));
     }
 
     #[test]
     fn test_add_frame_reuses_existing_function() {
         let mut frame_map = HashMap::new();
-        let mut func_map = HashMap::new();
         let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let global_func_manager = Arc::new(GlobalFunctionManager::new(id_counter.clone()));
 
         // Add first frame with function "common_func"
         add_frame(
             &mut frame_map,
-            &mut func_map,
+            &global_func_manager,
             &mut id_counter,
             0x5000,
             0x4800,
@@ -748,12 +827,12 @@ mod tests {
             "common_func".to_string(),
         );
 
-        let func_iid_first = func_map.get("common_func").unwrap().iid();
+        let func_iid_first = global_func_manager.get_or_create_function("common_func");
 
         // Add second frame with same function name but different address
         add_frame(
             &mut frame_map,
-            &mut func_map,
+            &global_func_manager,
             &mut id_counter,
             0x6000,
             0x5800,
@@ -761,11 +840,12 @@ mod tests {
             "common_func".to_string(),
         );
 
-        // Check that function map still has only one entry for "common_func"
-        assert_eq!(func_map.len(), 1);
+        // Check that function manager still has only one entry for "common_func"
+        let funcs = global_func_manager.get_all_functions();
+        assert_eq!(funcs.len(), 1);
 
         // Check that the same function IID is reused
-        let func_iid_second = func_map.get("common_func").unwrap().iid();
+        let func_iid_second = global_func_manager.get_or_create_function("common_func");
         assert_eq!(func_iid_first, func_iid_second);
 
         // Check that frames at different addresses reference the same function
@@ -777,14 +857,14 @@ mod tests {
     #[test]
     fn test_add_frame_id_counter_increments() {
         let mut frame_map = HashMap::new();
-        let mut func_map = HashMap::new();
         let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let global_func_manager = Arc::new(GlobalFunctionManager::new(id_counter.clone()));
 
         let initial_count = id_counter.load(Ordering::Relaxed);
 
         add_frame(
             &mut frame_map,
-            &mut func_map,
+            &global_func_manager,
             &mut id_counter,
             0x5000,
             0x4800,
@@ -804,10 +884,8 @@ mod tests {
         // Test deduplication with empty stack list
         let stacks = vec![];
         let frame_map = HashMap::new();
-        let func_name_map = HashMap::new();
         let resolved_info = ResolvedStackInfo {
             frame_map,
-            func_name_map,
             python_calls: Vec::new(),
             python_stack_markers: Vec::new(),
         };
@@ -820,8 +898,10 @@ mod tests {
             &Arc::new(StackWalkerRun::default()),
         );
 
-        // Should return empty map for empty input
-        assert!(result.is_empty());
+        // Should return empty data for empty input
+        assert!(result.callstacks.is_empty());
+        assert!(result.frames.is_empty());
+        assert!(result.mappings.is_empty());
     }
 
     #[test]
@@ -841,8 +921,14 @@ mod tests {
         let mut id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&mut id_counter);
 
-        // Find interned data
-        let interned_packet = packets.iter().find(|p| p.interned_data.is_some()).unwrap();
+        // Find interned data packet with callstacks (skip global function packet)
+        let interned_packet = packets
+            .iter()
+            .find(|p| {
+                p.interned_data.is_some()
+                    && !p.interned_data.as_ref().unwrap().callstacks.is_empty()
+            })
+            .unwrap();
         let interned_data = interned_packet.interned_data.as_ref().unwrap();
 
         // Should have exactly one callstack
@@ -882,8 +968,14 @@ mod tests {
         let mut id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&mut id_counter);
 
-        // Find interned data
-        let interned_packet = packets.iter().find(|p| p.interned_data.is_some()).unwrap();
+        // Find interned data packet with callstacks (skip global function packet)
+        let interned_packet = packets
+            .iter()
+            .find(|p| {
+                p.interned_data.is_some()
+                    && !p.interned_data.as_ref().unwrap().callstacks.is_empty()
+            })
+            .unwrap();
         let interned_data = interned_packet.interned_data.as_ref().unwrap();
 
         // Should only have one unique callstack due to deduplication
@@ -922,8 +1014,14 @@ mod tests {
         let mut id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&mut id_counter);
 
-        // Find interned data
-        let interned_packet = packets.iter().find(|p| p.interned_data.is_some()).unwrap();
+        // Find interned data packet with callstacks (skip global function packet)
+        let interned_packet = packets
+            .iter()
+            .find(|p| {
+                p.interned_data.is_some()
+                    && !p.interned_data.as_ref().unwrap().callstacks.is_empty()
+            })
+            .unwrap();
         let interned_data = interned_packet.interned_data.as_ref().unwrap();
 
         // Should have two unique callstacks
@@ -942,30 +1040,15 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_trace_packets_empty() {
+    fn test_generate_sample_packets_empty() {
         // Test packet generation with no stacks
         let stacks = vec![];
-        let interned_stacks = HashMap::new();
-        let frame_map = HashMap::new();
-        let func_name_map = HashMap::new();
-        let resolved_info = ResolvedStackInfo {
-            frame_map,
-            func_name_map,
-            python_calls: Vec::new(),
-            python_stack_markers: Vec::new(),
-        };
-        let mut id_counter = Arc::new(AtomicUsize::new(100));
+        let callstack_map = HashMap::new();
 
-        let packets =
-            generate_trace_packets(&stacks, &interned_stacks, &resolved_info, &mut id_counter);
+        let packets = generate_sample_packets(&stacks, &callstack_map, 1);
 
-        // Should still have at least one packet with interned data
-        assert!(!packets.is_empty());
-
-        // First packet should be interned data
-        assert!(packets[0].interned_data.is_some());
-        let interned_data = packets[0].interned_data.as_ref().unwrap();
-        assert!(interned_data.callstacks.is_empty());
+        // Should have no packets since there are no stacks
+        assert!(packets.is_empty());
     }
 
     #[test]
@@ -985,14 +1068,14 @@ mod tests {
         let mut id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&mut id_counter);
 
-        // Should have at least 2 packets: interned data + 1 sample
-        assert!(packets.len() >= 2);
+        // Should have exactly 2 packets: one interned data + one sample
+        assert_eq!(packets.len(), 2);
 
-        // First packet should be interned data
+        // First packet should be interned data with everything
         assert!(packets[0].interned_data.is_some());
         let interned_data = packets[0].interned_data.as_ref().unwrap();
-        assert_eq!(interned_data.callstacks.len(), 1);
         assert!(!interned_data.function_names.is_empty());
+        assert_eq!(interned_data.callstacks.len(), 1);
 
         // Find the sample packet
         let sample_packet = packets.iter().find(|p| p.has_perf_sample()).unwrap();
@@ -1022,23 +1105,13 @@ mod tests {
         let mut id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&mut id_counter);
 
-        // May have multiple interned data packets since events are from different processes
-        // The generate_trace method processes each tgid separately and may produce separate packets
-        assert!(packets.len() >= 3);
+        // Should have exactly 3 packets: one interned data + two samples
+        assert_eq!(packets.len(), 3);
 
-        // Find all interned data packets
-        let interned_packets: Vec<_> = packets
-            .iter()
-            .filter(|p| p.interned_data.is_some())
-            .collect();
-        assert!(!interned_packets.is_empty());
-
-        // Count total callstacks across all interned data packets
-        let total_callstacks: usize = interned_packets
-            .iter()
-            .map(|p| p.interned_data.as_ref().unwrap().callstacks.len())
-            .sum();
-        assert_eq!(total_callstacks, 2);
+        // First packet should be the single interned data packet with all data
+        assert!(packets[0].interned_data.is_some());
+        let interned_data = packets[0].interned_data.as_ref().unwrap();
+        assert_eq!(interned_data.callstacks.len(), 2);
 
         // Find sample packets
         let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
@@ -1076,16 +1149,31 @@ mod tests {
         // Verify packets were generated
         assert!(!packets.is_empty());
 
-        // Find the interned data packet
-        let interned_packet = packets.iter().find(|p| p.interned_data.is_some()).unwrap();
-        let interned_data = interned_packet.interned_data.as_ref().unwrap();
+        // Find the global function packet (first packet with function_names)
+        let global_packet = packets
+            .iter()
+            .find(|p| {
+                p.interned_data.is_some()
+                    && !p.interned_data.as_ref().unwrap().function_names.is_empty()
+            })
+            .unwrap();
+        let global_data = global_packet.interned_data.as_ref().unwrap();
 
-        // Extract function names from the interned data
-        let func_names: Vec<_> = interned_data
+        // Extract function names from the global data
+        let func_names: Vec<_> = global_data
             .function_names
             .iter()
             .map(|f| String::from_utf8_lossy(f.str()).to_string())
             .collect();
+
+        // Find process packet with frames and callstacks
+        let process_packet = packets
+            .iter()
+            .find(|p| {
+                p.interned_data.is_some() && !p.interned_data.as_ref().unwrap().frames.is_empty()
+            })
+            .unwrap();
+        let process_data = process_packet.interned_data.as_ref().unwrap();
 
         // Note: The mock resolver may not be called for all addresses due to how
         // blazesym's process dispatcher works (only for specific member types).
@@ -1097,11 +1185,11 @@ mod tests {
 
         // Verify frames were created for our addresses
         assert!(
-            !interned_data.frames.is_empty(),
+            !process_data.frames.is_empty(),
             "Expected frames to be created"
         );
         assert!(
-            !interned_data.callstacks.is_empty(),
+            !process_data.callstacks.is_empty(),
             "Expected callstacks to be created"
         );
     }
@@ -1128,16 +1216,31 @@ mod tests {
         // Verify packets were generated
         assert!(!packets.is_empty());
 
-        // Find the interned data packet
-        let interned_packet = packets.iter().find(|p| p.interned_data.is_some()).unwrap();
-        let interned_data = interned_packet.interned_data.as_ref().unwrap();
+        // Find the global function packet (first packet with function_names)
+        let global_packet = packets
+            .iter()
+            .find(|p| {
+                p.interned_data.is_some()
+                    && !p.interned_data.as_ref().unwrap().function_names.is_empty()
+            })
+            .unwrap();
+        let global_data = global_packet.interned_data.as_ref().unwrap();
 
         // Extract function names
-        let func_names: Vec<_> = interned_data
+        let func_names: Vec<_> = global_data
             .function_names
             .iter()
             .map(|f| String::from_utf8_lossy(f.str()).to_string())
             .collect();
+
+        // Find process packet with frames and callstacks
+        let process_packet = packets
+            .iter()
+            .find(|p| {
+                p.interned_data.is_some() && !p.interned_data.as_ref().unwrap().frames.is_empty()
+            })
+            .unwrap();
+        let process_data = process_packet.interned_data.as_ref().unwrap();
 
         // Note: The mock resolver may not be called for all addresses due to how
         // blazesym's process dispatcher works (only for specific member types).
@@ -1148,11 +1251,11 @@ mod tests {
 
         // Verify frames and callstacks were created
         assert!(
-            !interned_data.frames.is_empty(),
+            !process_data.frames.is_empty(),
             "Expected frames to be created"
         );
         assert!(
-            !interned_data.callstacks.is_empty(),
+            !process_data.callstacks.is_empty(),
             "Expected callstacks to be created"
         );
 
@@ -1188,8 +1291,14 @@ mod tests {
         let mut id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&mut id_counter);
 
-        // Find interned data
-        let interned_packet = packets.iter().find(|p| p.interned_data.is_some()).unwrap();
+        // Find interned data packet with callstacks (skip global function packet)
+        let interned_packet = packets
+            .iter()
+            .find(|p| {
+                p.interned_data.is_some()
+                    && !p.interned_data.as_ref().unwrap().callstacks.is_empty()
+            })
+            .unwrap();
         let interned_data = interned_packet.interned_data.as_ref().unwrap();
 
         // Should have only one unique callstack due to deduplication
@@ -1215,8 +1324,18 @@ mod tests {
             callstack_iid
         );
 
+        // Find the global function packet (first packet with function_names)
+        let global_packet = packets
+            .iter()
+            .find(|p| {
+                p.interned_data.is_some()
+                    && !p.interned_data.as_ref().unwrap().function_names.is_empty()
+            })
+            .unwrap();
+        let global_data = global_packet.interned_data.as_ref().unwrap();
+
         // Verify function names were created during symbolization
-        let func_names: Vec<_> = interned_data
+        let func_names: Vec<_> = global_data
             .function_names
             .iter()
             .map(|f| String::from_utf8_lossy(f.str()).to_string())
