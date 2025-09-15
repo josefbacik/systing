@@ -92,6 +92,20 @@ This option is disabled by default to avoid unexpected network requests.
 
 Do not record the `perf` style stack traces for tasks while they're running.
 
+=== *--no-sched*
+
+Disable scheduler event tracing (sched_* tracepoints and scheduler event recorder).
+When this option is enabled, systing will not collect any scheduler-related events including:
+
+* `sched_switch` - Task switching events
+* `sched_waking` - Task waking events
+* `sched_wakeup` - Task wakeup events
+* `sched_wakeup_new` - New task wakeup events
+* `sched_process_exit` - Process exit events
+
+This option can be useful when you only want to collect stack traces, perf counters, or custom tracepoint events without the overhead of scheduler event processing.
+Note that disabling scheduler events will result in an incomplete view of system activity in the generated Perfetto trace.
+
 === *--no-sleep-stack-traces*
 
 Do not record stack traces when the task is in an uninterruptible sleep state.

@@ -539,8 +539,7 @@ static int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 	return 0;
 }
 
-SEC("tp_btf/sched_wakeup")
-int BPF_PROG(systing_sched_wakeup, struct task_struct *task, int success)
+static int handle_sched_wakeup(struct task_struct *task, int success)
 {
 	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
 
@@ -549,8 +548,13 @@ int BPF_PROG(systing_sched_wakeup, struct task_struct *task, int success)
 	return handle_wakeup(cur, task, SCHED_WAKEUP);
 }
 
-SEC("tp_btf/sched_wakeup_new")
-int BPF_PROG(systing_sched_wakeup_new, struct task_struct *task)
+SEC("tp_btf/sched_wakeup")
+int BPF_PROG(systing_sched_wakeup, struct task_struct *task, int success)
+{
+	return handle_sched_wakeup(task, success);
+}
+
+static int handle_sched_wakeup_new(struct task_struct *task)
 {
 	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
 
@@ -559,9 +563,14 @@ int BPF_PROG(systing_sched_wakeup_new, struct task_struct *task)
 	return handle_wakeup(cur, task, SCHED_WAKEUP_NEW);
 }
 
-SEC("tp_btf/sched_switch")
-int BPF_PROG(systing_sched_switch, bool preempt, struct task_struct *prev,
-	     struct task_struct *next)
+SEC("tp_btf/sched_wakeup_new")
+int BPF_PROG(systing_sched_wakeup_new, struct task_struct *task)
+{
+	return handle_sched_wakeup_new(task);
+}
+
+static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev,
+			       struct task_struct *next)
 {
 	struct task_event *event;
 	u64 next_key = task_key(next);
@@ -600,8 +609,14 @@ int BPF_PROG(systing_sched_switch, bool preempt, struct task_struct *prev,
 	return 0;
 }
 
-SEC("tp_btf/sched_waking")
-int BPF_PROG(systing_sched_waking, struct task_struct *task)
+SEC("tp_btf/sched_switch")
+int BPF_PROG(systing_sched_switch, bool preempt, struct task_struct *prev,
+	     struct task_struct *next)
+{
+	return handle_sched_switch(ctx, preempt, prev, next);
+}
+
+static int handle_sched_waking(struct task_struct *task)
 {
 	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
 
@@ -610,8 +625,13 @@ int BPF_PROG(systing_sched_waking, struct task_struct *task)
 	return handle_wakeup(cur, task, SCHED_WAKING);
 }
 
-SEC("tp_btf/sched_process_exit")
-int BPF_PROG(systing_sched_process_exit, struct task_struct *task)
+SEC("tp_btf/sched_waking")
+int BPF_PROG(systing_sched_waking, struct task_struct *task)
+{
+	return handle_sched_waking(task);
+}
+
+static int handle_sched_process_exit(struct task_struct *task)
 {
 	struct task_event *event;
 	u64 ts = bpf_ktime_get_boot_ns();
@@ -629,6 +649,12 @@ int BPF_PROG(systing_sched_process_exit, struct task_struct *task)
 	event->prev_prio = task->prio;
 	bpf_ringbuf_submit(event, 0);
 	return 0;
+}
+
+SEC("tp_btf/sched_process_exit")
+int BPF_PROG(systing_sched_process_exit, struct task_struct *task)
+{
+	return handle_sched_process_exit(task);
 }
 
 SEC("tp_btf/irq_handler_entry")

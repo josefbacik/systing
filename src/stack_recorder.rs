@@ -296,10 +296,7 @@ fn create_debuginfod_dispatcher() -> Option<Arc<ProcessDispatcher>> {
                 }) as ProcessDispatcher))
             }
             Err(e) => {
-                println!(
-                    "Failed to create caching debuginfod client: {}, using default resolver",
-                    e
-                );
+                println!("Failed to create caching debuginfod client: {e}, using default resolver");
                 None
             }
         },
@@ -308,10 +305,7 @@ fn create_debuginfod_dispatcher() -> Option<Arc<ProcessDispatcher>> {
             None
         }
         Err(e) => {
-            println!(
-                "Failed to create debuginfod client: {}, using default resolver",
-                e
-            );
+            println!("Failed to create debuginfod client: {e}, using default resolver");
             None
         }
     }
