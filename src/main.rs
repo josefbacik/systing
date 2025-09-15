@@ -87,6 +87,9 @@ struct Command {
     /// Enable debuginfod for enhanced symbol resolution (requires DEBUGINFOD_URLS environment variable)
     #[arg(long)]
     enable_debuginfod: bool,
+    /// Disable scheduler event tracing (sched_* tracepoints and scheduler event recorder)
+    #[arg(long)]
+    no_sched: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -459,6 +462,19 @@ fn system(opts: Command) -> Result<()> {
             open_skel.progs.systing_raw_tracepoint.set_autoload(false);
         } else {
             open_skel.progs.systing_tracepoint.set_autoload(false);
+        }
+
+        // Don't load scheduler tracepoints if --no-sched is set
+        // This prevents them from being loaded into the kernel at all
+        if opts.no_sched {
+            open_skel.progs.systing_sched_wakeup.set_autoload(false);
+            open_skel.progs.systing_sched_wakeup_new.set_autoload(false);
+            open_skel.progs.systing_sched_switch.set_autoload(false);
+            open_skel.progs.systing_sched_waking.set_autoload(false);
+            open_skel
+                .progs
+                .systing_sched_process_exit
+                .set_autoload(false);
         }
 
         let mut need_slots = false;
@@ -901,7 +917,7 @@ fn system(opts: Command) -> Result<()> {
             thread.join().expect("Failed to join receiver thread");
         }
 
-        println!("Missed sched events: {}", dump_missed_events(&skel, 0));
+        println!("Missed sched/IRQ events: {}", dump_missed_events(&skel, 0));
         println!("Missed stack events: {}", dump_missed_events(&skel, 1));
         println!("Missed probe events: {}", dump_missed_events(&skel, 2));
         println!("Missed perf events: {}", dump_missed_events(&skel, 3));
