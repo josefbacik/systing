@@ -38,6 +38,8 @@ const volatile struct {
 	u32 num_perf_counters;
 	u32 num_cpus;
 	u32 my_tgid;
+	u64 my_dev;
+	u64 my_ino;
 	u32 collect_pystacks;
 } tool_config = {};
 
@@ -371,13 +373,53 @@ static u64 task_key(struct task_struct *task)
 	return ((u64)task->tgid << 32) | task->pid;
 }
 
+struct systing_pid_filter {
+	u32 kernel_tgid;
+	u32 initialized;
+};
+
+struct systing_pid_filter filter = {0, 0};
+
+static bool should_filter_systing(struct task_struct *task)
+{
+	// If filter is initialized, check against kernel namespace TGID
+	if (filter.initialized) {
+		return task->tgid == filter.kernel_tgid;
+	}
+
+	// Filter not initialized - check if we have namespace info
+	if (tool_config.my_dev == 0 && tool_config.my_ino == 0) {
+		// No namespace info, use the userspace TGID directly
+		filter.kernel_tgid = tool_config.my_tgid;
+		filter.initialized = 1;
+		return task->tgid == filter.kernel_tgid;
+	}
+
+	// We have namespace info, check if current process matches our namespace TGID
+	struct bpf_pidns_info ns_info = {};
+	if (bpf_get_ns_current_pid_tgid(tool_config.my_dev, tool_config.my_ino,
+					 &ns_info, sizeof(ns_info)) == 0) {
+		// Check if the namespace TGID matches our userspace TGID
+		if (ns_info.tgid == tool_config.my_tgid) {
+			// This is our process - get the kernel namespace TGID
+			u64 pid_tgid = bpf_get_current_pid_tgid();
+			filter.kernel_tgid = pid_tgid >> 32;
+			filter.initialized = 1;
+			return true; // This is systing process
+		}
+	}
+
+	// Unable to determine if this is our process, don't filter
+	return false;
+}
+
 static bool trace_task(struct task_struct *task)
 {
 	if (!tracing_enabled)
 		return false;
 	if (task->tgid == 0)
 		return false;
-	if (task->tgid == tool_config.my_tgid)
+	if (should_filter_systing(task))
 		return false;
 	if (tool_config.filter_pid) {
 		u32 pid = task->tgid;

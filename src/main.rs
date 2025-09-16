@@ -105,6 +105,25 @@ fn bump_memlock_rlimit() -> Result<()> {
     Ok(())
 }
 
+/// Get the device and inode number of our PID namespace
+/// Returns (dev, ino) or (0, 0) if the file doesn't exist or fails
+fn get_pid_namespace_info() -> (u64, u64) {
+    use std::fs;
+
+    match fs::metadata("/proc/self/ns/pid") {
+        Ok(metadata) => {
+            // Get the device and inode numbers
+            let dev = metadata.dev();
+            let ino = metadata.ino();
+            (dev, ino)
+        }
+        Err(_) => {
+            // If we can't access the namespace file, return zeros
+            (0, 0)
+        }
+    }
+}
+
 mod systing {
     include!(concat!(env!("OUT_DIR"), "/systing_system.skel.rs"));
 }
@@ -397,8 +416,11 @@ fn system(opts: Command) -> Result<()> {
                 .as_deref_mut()
                 .expect("'rodata' is not mmap'ed, your kernel is too old");
 
+            let (my_dev, my_ino) = get_pid_namespace_info();
             rodata.tool_config.num_cpus = num_cpus;
             rodata.tool_config.my_tgid = process::id();
+            rodata.tool_config.my_dev = my_dev;
+            rodata.tool_config.my_ino = my_ino;
             rodata.tool_config.no_cpu_stack_traces = opts.no_cpu_stack_traces as u32;
             rodata.tool_config.no_sleep_stack_traces = opts.no_sleep_stack_traces as u32;
             if !opts.cgroup.is_empty() {
