@@ -41,6 +41,7 @@ const volatile struct {
 	u64 my_dev;
 	u64 my_ino;
 	u32 collect_pystacks;
+	u32 collect_syscalls;
 } tool_config = {};
 
 enum event_type {
@@ -125,6 +126,15 @@ struct perf_counter_event {
 	u32 counter_num;
 };
 
+struct syscall_event {
+	u64 ts;
+	struct task_info task;
+	u64 syscall_nr;
+	u64 ret;
+	u32 cpu;
+	u8 is_enter;  // 1 for sys_enter, 0 for sys_exit
+};
+
 /*
  * Dummy instance to get skeleton to generate definition for
  * `struct task_event`
@@ -132,6 +142,7 @@ struct perf_counter_event {
 struct task_event _event = {0};
 struct stack_event _stack_event = {0};
 struct perf_counter_event _perf_counter_event = {0};
+struct syscall_event _syscall_event = {0};
 struct task_info _task_info = {0};
 struct probe_event _uprobe_event = {0};
 struct arg_desc _arg_desc = {0};
@@ -186,7 +197,8 @@ struct {
 #define MISSED_STACK_EVENT 1
 #define MISSED_PROBE_EVENT 2
 #define MISSED_CACHE_EVENT 3
-#define MISSED_EVENT_MAX 4
+#define MISSED_SYSCALL_EVENT 4
+#define MISSED_EVENT_MAX 5
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
@@ -236,6 +248,18 @@ struct perf_counter_ringbuf_map {
 	ringbuf_perf_counter_events_node5 SEC(".maps"),
 	ringbuf_perf_counter_events_node6 SEC(".maps"),
 	ringbuf_perf_counter_events_node7 SEC(".maps");
+
+struct syscall_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
+} ringbuf_syscall_events_node0 SEC(".maps"),
+	ringbuf_syscall_events_node1 SEC(".maps"),
+	ringbuf_syscall_events_node2 SEC(".maps"),
+	ringbuf_syscall_events_node3 SEC(".maps"),
+	ringbuf_syscall_events_node4 SEC(".maps"),
+	ringbuf_syscall_events_node5 SEC(".maps"),
+	ringbuf_syscall_events_node6 SEC(".maps"),
+	ringbuf_syscall_events_node7 SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
@@ -309,6 +333,24 @@ struct {
 	},
 };
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS);
+	__type(key, u32);
+	__array(values, struct syscall_ringbuf_map);
+} syscall_ringbufs SEC(".maps") = {
+	.values = {
+		&ringbuf_syscall_events_node0,
+		&ringbuf_syscall_events_node1,
+		&ringbuf_syscall_events_node2,
+		&ringbuf_syscall_events_node3,
+		&ringbuf_syscall_events_node4,
+		&ringbuf_syscall_events_node5,
+		&ringbuf_syscall_events_node6,
+		&ringbuf_syscall_events_node7,
+	},
+};
+
 static struct task_event *reserve_task_event(void)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
@@ -351,6 +393,17 @@ static struct probe_event *reserve_probe_event(void)
 	if (!rb)
 		return NULL;
 	return bpf_ringbuf_reserve(rb, sizeof(struct probe_event), 0);
+}
+
+static struct syscall_event *reserve_syscall_event(void)
+{
+	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&syscall_ringbufs, &node);
+	if (!rb)
+		return NULL;
+	return bpf_ringbuf_reserve(rb, sizeof(struct syscall_event), 0);
 }
 
 static u32 task_cpu(struct task_struct *task)
@@ -965,6 +1018,60 @@ int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
 	// in systing, if you want arguments you need a newer kernel and then
 	// systing will use the raw_tracepoint variation where we can record the
 	// argument.
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
+SEC("tracepoint/raw_syscalls/sys_enter")
+int tracepoint__raw_syscalls__sys_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	if (!tool_config.collect_syscalls)
+		return 0;
+
+	struct task_struct *task = bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	struct syscall_event *event = reserve_syscall_event();
+	if (!event) {
+		handle_missed_event(MISSED_SYSCALL_EVENT);
+		return 0;
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->syscall_nr = ctx->id;
+	event->ret = 0;  // Not available for sys_enter
+	event->is_enter = 1;
+
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
+SEC("tracepoint/raw_syscalls/sys_exit")
+int tracepoint__raw_syscalls__sys_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	if (!tool_config.collect_syscalls)
+		return 0;
+
+	struct task_struct *task = bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	struct syscall_event *event = reserve_syscall_event();
+	if (!event) {
+		handle_missed_event(MISSED_SYSCALL_EVENT);
+		return 0;
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->syscall_nr = ctx->id;
+	event->ret = ctx->ret;
+	event->is_enter = 0;
+
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
