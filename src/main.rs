@@ -7,6 +7,7 @@ mod ringbuf;
 mod sched;
 mod session_recorder;
 mod stack_recorder;
+mod syscall_recorder;
 
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
@@ -25,6 +26,7 @@ use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::session_recorder::{get_clock_value, SessionRecorder, SysInfoEvent};
 use crate::stack_recorder::StackRecorder;
+use crate::syscall_recorder::SyscallRecorder;
 
 use anyhow::bail;
 use anyhow::Result;
@@ -90,6 +92,9 @@ struct Command {
     /// Disable scheduler event tracing (sched_* tracepoints and scheduler event recorder)
     #[arg(long)]
     no_sched: bool,
+    /// Enable syscall tracing (raw_syscalls:sys_enter and sys_exit tracepoints)
+    #[arg(long)]
+    syscalls: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -174,6 +179,7 @@ use systing::types::event_type;
 use systing::types::perf_counter_event;
 use systing::types::probe_event;
 use systing::types::stack_event;
+use systing::types::syscall_event;
 use systing::types::task_event;
 use systing::types::task_info;
 
@@ -181,6 +187,7 @@ unsafe impl Plain for task_event {}
 unsafe impl Plain for stack_event {}
 unsafe impl Plain for perf_counter_event {}
 unsafe impl Plain for probe_event {}
+unsafe impl Plain for syscall_event {}
 unsafe impl Plain for arg_desc {}
 
 impl SystingEvent for task_event {
@@ -220,6 +227,15 @@ impl SystingEvent for perf_counter_event {
 }
 
 impl SystingEvent for probe_event {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+    fn next_task_info(&self) -> Option<&task_info> {
+        Some(&self.task)
+    }
+}
+
+impl SystingEvent for syscall_event {
     fn ts(&self) -> u64 {
         self.ts
     }
@@ -435,6 +451,9 @@ fn system(opts: Command) -> Result<()> {
             if collect_pystacks {
                 rodata.tool_config.collect_pystacks = 1;
             }
+            if opts.syscalls {
+                rodata.tool_config.collect_syscalls = 1;
+            }
         }
         if opts.ringbuf_size_mib > 0 {
             let size = opts.ringbuf_size_mib * 1024 * 1024;
@@ -555,6 +574,7 @@ fn system(opts: Command) -> Result<()> {
         let (stack_tx, stack_rx) = channel();
         let (cache_tx, cache_rx) = channel();
         let (probe_tx, probe_rx) = channel();
+        let (syscall_tx, syscall_rx) = channel();
 
         let object = skel.object();
 
@@ -582,6 +602,9 @@ fn system(opts: Command) -> Result<()> {
             } else if name.starts_with("ringbuf_probe") {
                 let ring = create_ring::<probe_event>(&map, probe_tx.clone())?;
                 rings.push((name.to_string(), ring));
+            } else if name.starts_with("ringbuf_syscall") && opts.syscalls {
+                let ring = create_ring::<syscall_event>(&map, syscall_tx.clone())?;
+                rings.push((name.to_string(), ring));
             }
         }
 
@@ -590,6 +613,7 @@ fn system(opts: Command) -> Result<()> {
         drop(stack_tx);
         drop(cache_tx);
         drop(probe_tx);
+        drop(syscall_tx);
 
         let mut recv_threads = Vec::new();
         let session_recorder = recorder.clone();
@@ -637,6 +661,23 @@ fn system(opts: Command) -> Result<()> {
                     0
                 })?,
         );
+        if opts.syscalls {
+            let session_recorder = recorder.clone();
+            let my_stop_tx = stop_tx.clone();
+            recv_threads.push(
+                thread::Builder::new()
+                    .name("syscall_recorder".to_string())
+                    .spawn(move || {
+                        consume_loop::<SyscallRecorder, syscall_event>(
+                            &session_recorder,
+                            &session_recorder.syscall_recorder,
+                            syscall_rx,
+                            my_stop_tx,
+                        );
+                        0
+                    })?,
+            );
+        }
         if !perf_counter_names.is_empty() {
             let session_recorder = recorder.clone();
             let my_stop_tx = stop_tx.clone();
@@ -943,6 +984,9 @@ fn system(opts: Command) -> Result<()> {
         println!("Missed stack events: {}", dump_missed_events(&skel, 1));
         println!("Missed probe events: {}", dump_missed_events(&skel, 2));
         println!("Missed perf events: {}", dump_missed_events(&skel, 3));
+        if opts.syscalls {
+            println!("Missed syscall events: {}", dump_missed_events(&skel, 4));
+        }
     }
 
     if opts.continuous > 0 {
@@ -956,6 +1000,7 @@ fn system(opts: Command) -> Result<()> {
             .drain_ringbuf();
         recorder.sysinfo_recorder.lock().unwrap().drain_ringbuf();
         recorder.probe_recorder.lock().unwrap().drain_ringbuf();
+        recorder.syscall_recorder.lock().unwrap().drain_ringbuf();
     }
 
     println!("Generating trace...");
