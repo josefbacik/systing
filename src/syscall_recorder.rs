@@ -7,7 +7,6 @@ use crate::SystingRecordEvent;
 use perfetto_protos::interned_data::InternedData;
 use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
 use perfetto_protos::trace_packet::TracePacket;
-use perfetto_protos::track_descriptor::TrackDescriptor;
 use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::{EventName, TrackEvent};
 use syscalls::Sysno;
@@ -24,10 +23,10 @@ struct PendingSyscall {
 #[derive(Default)]
 pub struct SyscallRecorder {
     pub ringbuf: RingBuffer<syscall_event>,
-    // Map from PID to pending syscalls (syscall_nr -> PendingSyscall)
-    pending_syscalls: HashMap<u32, HashMap<u64, PendingSyscall>>,
-    // Map from PID to completed syscall ranges
-    completed_syscalls: HashMap<u32, Vec<(u64, u64, u64)>>, // (start_ts, end_ts, syscall_nr)
+    // Map from tgidpid to pending syscalls (syscall_nr -> PendingSyscall)
+    pending_syscalls: HashMap<u64, HashMap<u64, PendingSyscall>>,
+    // Map from tgidpid to completed syscall ranges
+    completed_syscalls: HashMap<u64, Vec<(u64, u64, u64)>>, // (start_ts, end_ts, syscall_nr)
     // Map from syscall number to interned id
     syscall_iids: HashMap<u64, u64>,
     // Map from syscall name to interned id (for deduplication)
@@ -73,11 +72,11 @@ impl SyscallRecorder {
 
     pub fn generate_trace_packets(
         &mut self,
+        pid_uuids: &HashMap<i32, u64>,
         thread_uuids: &HashMap<i32, u64>,
         id_counter: &Arc<AtomicUsize>,
     ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
-        let mut syscall_track_uuids: HashMap<u32, u64> = HashMap::new();
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
 
         // Collect all syscall numbers we need to intern
@@ -121,25 +120,22 @@ impl SyscallRecorder {
         packets.push(interned_packet);
 
         // Generate per-thread syscall tracks and events
-        for (pid, syscalls) in self.completed_syscalls.iter() {
+        for (tgidpid, syscalls) in self.completed_syscalls.iter() {
             if syscalls.is_empty() {
                 continue;
             }
 
-            // Get the thread UUID if it exists
-            let thread_uuid = match thread_uuids.get(&(*pid as i32)) {
-                Some(uuid) => *uuid,
-                None => continue, // Skip if we don't have a thread UUID
-            };
-
-            // Create a syscall track for this thread
+            // Create a syscall track for this thread/process
+            // We are guaranteed to have the UUIDs since every thread is recorded via maybe_record_task
             let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            syscall_track_uuids.insert(*pid, track_uuid);
 
-            let mut desc = TrackDescriptor::default();
-            desc.set_uuid(track_uuid);
-            desc.set_parent_uuid(thread_uuid);
-            desc.set_name("Syscalls".to_string());
+            let desc = crate::perfetto::generate_pidtgid_track_descriptor(
+                pid_uuids,
+                thread_uuids,
+                tgidpid,
+                "Syscalls".to_string(),
+                track_uuid,
+            );
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
@@ -192,21 +188,23 @@ impl SystingRecordEvent<syscall_event> for SyscallRecorder {
     }
 
     fn handle_event(&mut self, event: syscall_event) {
-        let pid = event.task.tgidpid as u32;
+        // Store the full tgidpid value
+        // This contains both TGID (upper 32 bits) and PID (lower 32 bits)
+        let tgidpid = event.task.tgidpid;
 
         if event.is_enter == 1 {
             // sys_enter: record pending syscall
             let pending = PendingSyscall { enter_ts: event.ts };
             self.pending_syscalls
-                .entry(pid)
+                .entry(tgidpid)
                 .or_default()
                 .insert(event.syscall_nr, pending);
         } else {
             // sys_exit: match with pending syscall
-            if let Some(pid_pending) = self.pending_syscalls.get_mut(&pid) {
+            if let Some(pid_pending) = self.pending_syscalls.get_mut(&tgidpid) {
                 if let Some(pending) = pid_pending.remove(&event.syscall_nr) {
                     // Found matching sys_enter, create a complete range
-                    self.completed_syscalls.entry(pid).or_default().push((
+                    self.completed_syscalls.entry(tgidpid).or_default().push((
                         pending.enter_ts,
                         event.ts,
                         event.syscall_nr,
@@ -245,9 +243,10 @@ mod tests {
         recorder.handle_event(event);
 
         // Check that the syscall is pending (syscall 1 is write)
+        let tgidpid = (100u64 << 32) | 101u64;
         assert_eq!(recorder.pending_syscalls.len(), 1);
-        assert!(recorder.pending_syscalls.contains_key(&101));
-        let pid_pending = &recorder.pending_syscalls[&101];
+        assert!(recorder.pending_syscalls.contains_key(&tgidpid));
+        let pid_pending = &recorder.pending_syscalls[&tgidpid];
         assert_eq!(pid_pending.len(), 1);
         assert!(pid_pending.contains_key(&1)); // syscall 1 = write
 
@@ -302,13 +301,14 @@ mod tests {
         recorder.handle_event(enter_event);
         recorder.handle_event(exit_event);
 
-        // Check that the syscall is completed (the PID entry exists but is empty)
+        // Check that the syscall is completed (the tgidpid entry exists but is empty)
+        let tgidpid = (100u64 << 32) | 101u64;
         assert_eq!(recorder.pending_syscalls.len(), 1);
-        assert!(recorder.pending_syscalls[&101].is_empty());
+        assert!(recorder.pending_syscalls[&tgidpid].is_empty());
         assert_eq!(recorder.completed_syscalls.len(), 1);
-        assert!(recorder.completed_syscalls.contains_key(&101));
+        assert!(recorder.completed_syscalls.contains_key(&tgidpid));
 
-        let completed = &recorder.completed_syscalls[&101];
+        let completed = &recorder.completed_syscalls[&tgidpid];
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0], (1000, 2000, 1)); // syscall 1 = write
     }
@@ -363,12 +363,14 @@ mod tests {
         recorder.handle_event(event4);
 
         // Check that we have completed syscalls for both threads
+        let tgidpid1 = (100u64 << 32) | 101u64;
+        let tgidpid2 = (200u64 << 32) | 201u64;
         assert_eq!(recorder.completed_syscalls.len(), 2);
-        assert_eq!(recorder.completed_syscalls[&101].len(), 1);
-        assert_eq!(recorder.completed_syscalls[&201].len(), 1);
+        assert_eq!(recorder.completed_syscalls[&tgidpid1].len(), 1);
+        assert_eq!(recorder.completed_syscalls[&tgidpid2].len(), 1);
 
-        assert_eq!(recorder.completed_syscalls[&101][0], (1000, 2000, 1)); // write
-        assert_eq!(recorder.completed_syscalls[&201][0], (1500, 2500, 2)); // fork
+        assert_eq!(recorder.completed_syscalls[&tgidpid1][0], (1000, 2000, 1)); // write
+        assert_eq!(recorder.completed_syscalls[&tgidpid2][0], (1500, 2500, 2)); // fork
     }
 
     #[test]
@@ -376,9 +378,11 @@ mod tests {
         let mut recorder = SyscallRecorder::default();
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(101, 500); // Thread 101 has UUID 500
+        let _pid_uuids: HashMap<i32, u64> = HashMap::new();
         let id_counter = Arc::new(AtomicUsize::new(1000));
 
         // Add some complete syscalls (write syscall)
+        let _tgidpid = (100u64 << 32) | 101u64;
         let enter_event = syscall_event {
             ts: 1000,
             task: create_test_task_info(100, 101),
@@ -401,7 +405,8 @@ mod tests {
         recorder.handle_event(exit_event);
 
         // Generate trace packets
-        let packets = recorder.generate_trace_packets(&thread_uuids, &id_counter);
+        let pid_uuids: HashMap<i32, u64> = HashMap::new();
+        let packets = recorder.generate_trace_packets(&pid_uuids, &thread_uuids, &id_counter);
 
         // Should have:
         // 1. Interned data packet with event names
@@ -445,36 +450,6 @@ mod tests {
         assert_eq!(end_event.track_uuid(), 1001);
 
         // Events should be cleared after generating packets
-        assert!(recorder.completed_syscalls.is_empty());
-    }
-
-    #[test]
-    fn test_generate_trace_packets_no_thread_uuid() {
-        let mut recorder = SyscallRecorder::default();
-        let thread_uuids = HashMap::new(); // No thread UUIDs
-        let id_counter = Arc::new(AtomicUsize::new(1000));
-
-        // Add a complete syscall
-        recorder
-            .completed_syscalls
-            .insert(101, vec![(1000, 2000, 1)]);
-
-        // Generate trace packets
-        let packets = recorder.generate_trace_packets(&thread_uuids, &id_counter);
-
-        // Should generate only the interned data packet since thread UUID is missing
-        // The syscall tracks and events won't be generated without thread UUIDs
-        assert_eq!(packets.len(), 1);
-
-        // Check that we do have the interned data packet with the syscall name
-        let interned_packet = &packets[0];
-        assert!(interned_packet.interned_data.is_some());
-        let interned_data = interned_packet.interned_data.as_ref().unwrap();
-        assert_eq!(interned_data.event_names.len(), 1);
-        let event_name = &interned_data.event_names[0];
-        assert_eq!(event_name.name(), "write");
-
-        // Events should still be cleared
         assert!(recorder.completed_syscalls.is_empty());
     }
 }

@@ -368,7 +368,7 @@ impl SessionRecorder {
             self.syscall_recorder
                 .lock()
                 .unwrap()
-                .generate_trace_packets(thread_uuids, id_counter),
+                .generate_trace_packets(pid_uuids, thread_uuids, id_counter),
         );
 
         packets
