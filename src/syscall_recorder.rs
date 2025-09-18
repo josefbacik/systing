@@ -77,7 +77,6 @@ impl SyscallRecorder {
         id_counter: &Arc<AtomicUsize>,
     ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
-        let mut syscall_track_uuids: HashMap<u64, u64> = HashMap::new();
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
 
         // Collect all syscall numbers we need to intern
@@ -129,7 +128,6 @@ impl SyscallRecorder {
             // Create a syscall track for this thread/process
             // We are guaranteed to have the UUIDs since every thread is recorded via maybe_record_task
             let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            syscall_track_uuids.insert(*tgidpid, track_uuid);
 
             let desc = crate::perfetto::generate_pidtgid_track_descriptor(
                 pid_uuids,
