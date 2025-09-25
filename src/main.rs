@@ -105,7 +105,34 @@ fn validate_recorder_names(names: &[String]) -> Result<()> {
 
 fn process_recorder_options(opts: &mut Command) -> Result<()> {
     validate_recorder_names(&opts.add_recorder)?;
+    validate_recorder_names(&opts.only_recorder)?;
 
+    // If --only-recorder is specified, disable all recorders first
+    if !opts.only_recorder.is_empty() {
+        opts.no_sched = true;
+        opts.syscalls = false;
+        opts.no_sleep_stack_traces = true;
+        opts.no_cpu_stack_traces = true;
+        #[cfg(feature = "pystacks")]
+        {
+            opts.collect_pystacks = false;
+        }
+
+        // Then enable only the specified recorders
+        for recorder_name in &opts.only_recorder {
+            match recorder_name.as_str() {
+                "syscalls" => opts.syscalls = true,
+                "sched" => opts.no_sched = false,
+                "sleep-stacks" => opts.no_sleep_stack_traces = false,
+                "cpu-stacks" => opts.no_cpu_stack_traces = false,
+                #[cfg(feature = "pystacks")]
+                "pystacks" => opts.collect_pystacks = true,
+                _ => {}
+            }
+        }
+    }
+
+    // Process --add-recorder to enable additional recorders
     for recorder_name in &opts.add_recorder {
         match recorder_name.as_str() {
             "syscalls" => opts.syscalls = true,
@@ -175,6 +202,9 @@ struct Command {
     /// Enable a specific recorder by name (can be specified multiple times)
     #[arg(long)]
     add_recorder: Vec<String>,
+    /// Disable all recorders and only enable the specified ones (can be specified multiple times)
+    #[arg(long)]
+    only_recorder: Vec<String>,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
