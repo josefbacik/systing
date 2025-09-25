@@ -79,6 +79,11 @@ fn get_available_recorders() -> Vec<RecorderInfo> {
             description: "CPU perf stack traces",
             default_enabled: true,
         },
+        RecorderInfo {
+            name: "tcplatency",
+            description: "TCP send latency tracking",
+            default_enabled: false,
+        },
     ];
 
     #[cfg(feature = "pystacks")]
@@ -115,6 +120,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
     if !opts.only_recorder.is_empty() {
         opts.no_sched = true;
         opts.syscalls = false;
+        opts.tcplatency = false;
         opts.no_sleep_stack_traces = true;
         opts.no_cpu_stack_traces = true;
         #[cfg(feature = "pystacks")]
@@ -127,6 +133,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
             match recorder_name.as_str() {
                 "syscalls" => opts.syscalls = true,
                 "sched" => opts.no_sched = false,
+                "tcplatency" => opts.tcplatency = true,
                 "sleep-stacks" => opts.no_sleep_stack_traces = false,
                 "cpu-stacks" => opts.no_cpu_stack_traces = false,
                 #[cfg(feature = "pystacks")]
@@ -141,6 +148,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         match recorder_name.as_str() {
             "syscalls" => opts.syscalls = true,
             "sched" => opts.no_sched = false,
+            "tcplatency" => opts.tcplatency = true,
             "sleep-stacks" => opts.no_sleep_stack_traces = false,
             "cpu-stacks" => opts.no_cpu_stack_traces = false,
             #[cfg(feature = "pystacks")]
@@ -200,6 +208,7 @@ struct Command {
     /// Enable syscall tracing (raw_syscalls:sys_enter and sys_exit tracepoints)
     #[arg(long)]
     syscalls: bool,
+    tcplatency: bool,
     /// List all available recorders and their default states
     #[arg(long)]
     list_recorders: bool,
@@ -634,8 +643,10 @@ fn system(opts: Command) -> Result<()> {
                 .set_autoload(false);
         }
 
-        open_skel.progs.tcp_sendmsg_entry.set_autoload(false);
-        open_skel.progs.tcp_transmit_skb_entry.set_autoload(false);
+        if !opts.tcplatency {
+            open_skel.progs.tcp_sendmsg_entry.set_autoload(false);
+            open_skel.progs.tcp_transmit_skb_entry.set_autoload(false);
+        }
 
         let mut need_slots = false;
         for counter in perf_counter_names.iter() {
@@ -1065,7 +1076,7 @@ fn system(opts: Command) -> Result<()> {
         }
 
         // Start the tcp_send_latency recorder thread
-        {
+        if opts.tcplatency {
             let tcp_map_handle = MapHandle::try_from(&skel.maps.tcp_send_latency)?;
             let thread_done_clone = thread_done.clone();
             let tcp_send_latency_recorder = recorder.clone();

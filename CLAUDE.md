@@ -40,6 +40,25 @@ cargo fmt
 - **Build Tool**: Cargo
 - **Main Binary**: systing
 
+## Available Recorders
+
+Systing supports multiple recorders that can be enabled/disabled:
+
+- `sched` - Scheduler event tracing (default: **on**)
+- `syscalls` - Syscall tracing (default: off)
+- `tcplatency` - TCP send latency tracking (default: off)
+- `sleep-stacks` - Sleep stack traces (default: **on**)
+- `cpu-stacks` - CPU perf stack traces (default: **on**)
+- `pystacks` - Python stack tracing (default: off, requires `pystacks` feature)
+
+### Controlling Recorders
+
+- `--list-recorders` - List all available recorders and their states
+- `--add-recorder <name>` - Enable a specific recorder (can be used multiple times)
+- `--only-recorder <name>` - Disable all recorders except the specified one(s)
+- `--syscalls` - Enable syscall tracing
+- `--no-sched` - Disable scheduler event tracing
+
 ## Development Workflow
 
 1. Make your code changes
