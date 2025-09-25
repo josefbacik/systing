@@ -628,6 +628,9 @@ fn system(opts: Command) -> Result<()> {
                 .set_autoload(false);
         }
 
+        open_skel.progs.tcp_sendmsg_entry.set_autoload(false);
+        open_skel.progs.tcp_transmit_skb_entry.set_autoload(false);
+
         let mut need_slots = false;
         for counter in perf_counter_names.iter() {
             recorder

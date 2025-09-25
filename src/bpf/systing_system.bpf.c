@@ -25,6 +25,9 @@
 #define PF_WQ_WORKER 0x00000020
 #define PF_KTHREAD 0x00200000
 
+#define AF_INET 2
+#define AF_INET6 10
+
 #define MAX_STACK_DEPTH 36
 #define SKIP_STACK_DEPTH 3
 #define NR_RINGBUFS 8
@@ -193,12 +196,44 @@ struct {
 	__uint(max_entries, 10240);
 } event_key_types SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u32);
+	__type(value, struct tcp_send_info);
+	__uint(max_entries, 65536);
+} tcp_send_tracking SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct latency_key);
+	__type(value, struct latency_stats);
+	__uint(max_entries, 10240);
+} tcp_send_latency SEC(".maps");
+
 #define MISSED_SCHED_EVENT 0
 #define MISSED_STACK_EVENT 1
 #define MISSED_PROBE_EVENT 2
 #define MISSED_CACHE_EVENT 3
 #define MISSED_SYSCALL_EVENT 4
 #define MISSED_EVENT_MAX 5
+
+struct tcp_send_info {
+	u64 tgidpid;
+	u64 start_ts;
+	u32 dst_addr_v6[4];
+	u16 family;
+};
+
+struct latency_key {
+	u64 tgidpid;
+	u32 dst_addr_v6[4];
+	u16 family;
+};
+
+struct latency_stats {
+	u64 count;
+	u64 sum_latency;
+};
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
@@ -1073,6 +1108,96 @@ int tracepoint__raw_syscalls__sys_exit(struct trace_event_raw_sys_exit *ctx)
 	event->is_enter = 0;
 
 	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+
+SEC("kprobe/tcp_sendmsg")
+int BPF_KPROBE(tcp_sendmsg_entry, struct sock *sk, struct msghdr *msg, size_t size)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	struct tcp_sock *tp = bpf_core_cast(sk, struct tcp_sock);
+	u32 seq;
+	u16 family;
+
+	bpf_probe_read_kernel(&seq, sizeof(seq), &tp->write_seq);
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	struct tcp_send_info info = {
+		.tgidpid = task_key(task),
+		.start_ts = bpf_ktime_get_boot_ns(),
+		.family = family,
+	};
+
+	if (family == AF_INET) {
+		u32 daddr;
+		bpf_probe_read_kernel(&daddr, sizeof(daddr), &sk->__sk_common.skc_daddr);
+		info.dst_addr_v6[0] = daddr;
+		info.dst_addr_v6[1] = 0;
+		info.dst_addr_v6[2] = 0;
+		info.dst_addr_v6[3] = 0;
+	} else if (family == AF_INET6) {
+		bpf_probe_read_kernel(&info.dst_addr_v6, sizeof(info.dst_addr_v6),
+				      &sk->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
+	} else {
+		return 0;
+	}
+
+	bpf_map_update_elem(&tcp_send_tracking, &seq, &info, BPF_ANY);
+	return 0;
+}
+
+SEC("kprobe/__tcp_transmit_skb")
+int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb)
+{
+	struct tcp_skb_cb {
+		union {
+			struct {
+				__u32 flags;
+			} header;
+			struct {
+				__u32 seq;
+				__u32 end_seq;
+			} tcp;
+		};
+	};
+
+	u32 seq;
+	struct tcp_skb_cb *tcb;
+
+	tcb = (struct tcp_skb_cb *)&skb->cb[0];
+	bpf_probe_read_kernel(&seq, sizeof(seq), &tcb->tcp.seq);
+
+	struct tcp_send_info *send_info = bpf_map_lookup_elem(&tcp_send_tracking, &seq);
+	if (!send_info)
+		return 0;
+
+	u64 now = bpf_ktime_get_boot_ns();
+	u64 latency = 0;
+	if (now > send_info->start_ts)
+		latency = now - send_info->start_ts;
+
+	struct latency_key key = {
+		.tgidpid = send_info->tgidpid,
+		.family = send_info->family,
+	};
+	__builtin_memcpy(&key.dst_addr_v6, &send_info->dst_addr_v6, sizeof(key.dst_addr_v6));
+
+	struct latency_stats *stats = bpf_map_lookup_elem(&tcp_send_latency, &key);
+	if (stats) {
+		__sync_fetch_and_add(&stats->count, 1);
+		__sync_fetch_and_add(&stats->sum_latency, latency);
+	} else {
+		struct latency_stats new_stats = {
+			.count = 1,
+			.sum_latency = latency,
+		};
+		bpf_map_update_elem(&tcp_send_latency, &key, &new_stats, BPF_NOEXIST);
+	}
+
+	bpf_map_delete_elem(&tcp_send_tracking, &seq);
 	return 0;
 }
 
