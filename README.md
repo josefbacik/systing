@@ -35,6 +35,47 @@ sudo ./target/debug/systing --enable-debuginfod --duration 60
 
 This will fetch debug information from debuginfod servers, providing more accurate stack traces.
 
+### Recorder Management
+
+Systing includes several recorders for different types of events. You can control which recorders are active using the following options:
+
+#### List Available Recorders
+
+```bash
+sudo ./target/debug/systing --list-recorders
+```
+
+This will display all available recorders and their default states:
+- `sched` - Scheduler event tracing (on by default)
+- `syscalls` - Syscall tracing
+- `sleep-stacks` - Sleep stack traces (on by default)
+- `cpu-stacks` - CPU perf stack traces (on by default)
+- `pystacks` - Python stack tracing (requires pystacks feature)
+
+#### Add Specific Recorders
+
+Use `--add-recorder` to enable additional recorders on top of the defaults:
+
+```bash
+# Enable syscalls in addition to default recorders
+sudo ./target/debug/systing --add-recorder syscalls --duration 60
+
+# Enable multiple additional recorders
+sudo ./target/debug/systing --add-recorder syscalls --add-recorder pystacks --duration 60
+```
+
+#### Use Only Specific Recorders
+
+Use `--only-recorder` to disable all recorders and enable only the ones you specify:
+
+```bash
+# Only record syscalls (disable everything else)
+sudo ./target/debug/systing --only-recorder syscalls --duration 60
+
+# Only record syscalls and cpu-stacks
+sudo ./target/debug/systing --only-recorder syscalls --only-recorder cpu-stacks --duration 60
+```
+
 ### Debugging and Verbosity
 
 Use multiple `-v` flags to control verbosity levels:
