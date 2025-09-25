@@ -46,6 +46,47 @@ use perfetto_protos::trace::Trace;
 use plain::Plain;
 use protobuf::Message;
 
+struct RecorderInfo {
+    name: &'static str,
+    description: &'static str,
+    default_enabled: bool,
+}
+
+fn get_available_recorders() -> Vec<RecorderInfo> {
+    #[allow(unused_mut)]
+    let mut recorders = vec![
+        RecorderInfo {
+            name: "sched",
+            description: "Scheduler event tracing",
+            default_enabled: true,
+        },
+        RecorderInfo {
+            name: "syscalls",
+            description: "Syscall tracing",
+            default_enabled: false,
+        },
+        RecorderInfo {
+            name: "sleep-stacks",
+            description: "Sleep stack traces",
+            default_enabled: true,
+        },
+        RecorderInfo {
+            name: "cpu-stacks",
+            description: "CPU perf stack traces",
+            default_enabled: true,
+        },
+    ];
+
+    #[cfg(feature = "pystacks")]
+    recorders.push(RecorderInfo {
+        name: "pystacks",
+        description: "Python stack tracing",
+        default_enabled: false,
+    });
+
+    recorders
+}
+
 #[derive(Debug, Parser)]
 struct Command {
     /// Increase verbosity (can be supplied multiple times).
@@ -95,6 +136,9 @@ struct Command {
     /// Enable syscall tracing (raw_syscalls:sys_enter and sys_exit tracepoints)
     #[arg(long)]
     syscalls: bool,
+    /// List all available recorders and their default states
+    #[arg(long)]
+    list_recorders: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -1013,6 +1057,22 @@ fn system(opts: Command) -> Result<()> {
 
 fn main() -> Result<()> {
     let opts = Command::parse();
+
+    if opts.list_recorders {
+        println!("Available recorders:");
+        for recorder in get_available_recorders() {
+            let default_text = if recorder.default_enabled {
+                " (on by default)"
+            } else {
+                ""
+            };
+            println!(
+                "  {:<14} - {}{}",
+                recorder.name, recorder.description, default_text
+            );
+        }
+        return Ok(());
+    }
 
     // Set up tracing subscriber with level based on verbosity
     let level = match opts.verbosity {
