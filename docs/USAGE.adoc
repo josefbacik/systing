@@ -36,6 +36,29 @@ Trace only a qemu process and record every time it calls `v9fs_create`::
 
 == Options
 
+=== *--add-recorder* _RECORDER_
+
+Enable a specific recorder by name in addition to the default enabled recorders.
+This option can be specified multiple times to enable multiple recorders.
+Use *--list-recorders* to see available recorders and their default states.
+
+Available recorders:
+
+* `sched` - Scheduler event tracing (enabled by default)
+* `syscalls` - Syscall tracing (disabled by default)
+* `sleep-stacks` - Sleep stack traces (enabled by default)
+* `cpu-stacks` - CPU perf stack traces (enabled by default)
+* `pystacks` - Python stack tracing (disabled by default, requires pystacks feature)
+
+Examples:
+----
+# Enable syscalls in addition to default recorders
+# systing --add-recorder syscalls --duration 60
+
+# Enable both syscalls and pystacks
+# systing --add-recorder syscalls --add-recorder pystacks --duration 60
+----
+
 === *--cgroup* _PATH_
 
 Record only processes that belong to this cgroup.
@@ -88,6 +111,23 @@ export DEBUGINFOD_URLS="https://debuginfod.fedoraporject.org/"
 If debuginfod is not available or fails to fetch debug information, systing will fall back to the default symbol resolution methods.
 This option is disabled by default to avoid unexpected network requests.
 
+=== *--list-recorders*
+
+List all available recorders and their default states.
+This is useful for discovering which recorders are available and which ones are enabled by default.
+Use this in conjunction with *--add-recorder* or *--only-recorder* to control which recorders are active.
+
+Example:
+----
+# systing --list-recorders
+Available recorders:
+  sched          - Scheduler event tracing (on by default)
+  syscalls       - Syscall tracing
+  sleep-stacks   - Sleep stack traces (on by default)
+  cpu-stacks     - CPU perf stack traces (on by default)
+  pystacks       - Python stack tracing
+----
+
 === *--no-cpu-stack-traces*
 
 Do not record the `perf` style stack traces for tasks while they're running.
@@ -114,6 +154,26 @@ Do not record stack traces when the task is in an uninterruptible sleep state.
 
 Do not record stack traces for the threads in the system.
 This disables the perf style stack traces as well as the uninterruptible sleep stack traces.
+
+=== *--only-recorder* _RECORDER_
+
+Disable all recorders and only enable the specified ones.
+This option can be specified multiple times to enable multiple recorders exclusively.
+Use *--list-recorders* to see available recorders.
+
+This is different from *--add-recorder* which adds recorders to the default enabled set.
+*--only-recorder* provides explicit control over exactly which recorders are active.
+
+Available recorders are the same as documented in *--add-recorder*.
+
+Examples:
+----
+# Only record syscalls, disable everything else
+# systing --only-recorder syscalls --duration 60
+
+# Only record syscalls and cpu-stacks
+# systing --only-recorder syscalls --only-recorder cpu-stacks --duration 60
+----
 
 === *--perf-counter* _COUNTERNAME_
 
@@ -146,6 +206,19 @@ Only increase this if you are having misseed sched events, as that affects the t
 === *--sw-event*
 
 If recording inside of a VM, this can be specified to enable the software events necessary to record stack traces.
+
+=== *--syscalls*
+
+Enable syscall tracing (raw_syscalls:sys_enter and sys_exit tracepoints).
+When enabled, systing will record all system call entry and exit events for traced processes.
+This generates detailed information about system call usage but can create large trace files.
+
+Note: This option is equivalent to using `--add-recorder syscalls`.
+
+Example:
+----
+# systing --syscalls --duration 60
+----
 
 === *--trace-event* _EVENT_
 

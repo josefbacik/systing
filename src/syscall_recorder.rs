@@ -47,7 +47,7 @@ impl SyscallRecorder {
             Some(sysno) => sysno.name().to_string(),
             None => {
                 // For unknown syscalls, just use the number
-                format!("syscall_{}", syscall_nr)
+                format!("syscall_{syscall_nr}")
             }
         };
 

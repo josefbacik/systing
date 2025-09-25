@@ -46,6 +46,107 @@ use perfetto_protos::trace::Trace;
 use plain::Plain;
 use protobuf::Message;
 
+struct RecorderInfo {
+    name: &'static str,
+    description: &'static str,
+    default_enabled: bool,
+}
+
+fn get_available_recorders() -> Vec<RecorderInfo> {
+    #[allow(unused_mut)]
+    let mut recorders = vec![
+        RecorderInfo {
+            name: "sched",
+            description: "Scheduler event tracing",
+            default_enabled: true,
+        },
+        RecorderInfo {
+            name: "syscalls",
+            description: "Syscall tracing",
+            default_enabled: false,
+        },
+        RecorderInfo {
+            name: "sleep-stacks",
+            description: "Sleep stack traces",
+            default_enabled: true,
+        },
+        RecorderInfo {
+            name: "cpu-stacks",
+            description: "CPU perf stack traces",
+            default_enabled: true,
+        },
+    ];
+
+    #[cfg(feature = "pystacks")]
+    recorders.push(RecorderInfo {
+        name: "pystacks",
+        description: "Python stack tracing",
+        default_enabled: false,
+    });
+
+    recorders
+}
+
+fn validate_recorder_names(names: &[String]) -> Result<()> {
+    let available_recorders = get_available_recorders();
+    let valid_names: Vec<&str> = available_recorders.iter().map(|r| r.name).collect();
+
+    for name in names {
+        if !valid_names.contains(&name.as_str()) {
+            bail!(
+                "Invalid recorder name '{}'. Valid recorders: {}",
+                name,
+                valid_names.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn process_recorder_options(opts: &mut Command) -> Result<()> {
+    validate_recorder_names(&opts.add_recorder)?;
+    validate_recorder_names(&opts.only_recorder)?;
+
+    // If --only-recorder is specified, disable all recorders first
+    if !opts.only_recorder.is_empty() {
+        opts.no_sched = true;
+        opts.syscalls = false;
+        opts.no_sleep_stack_traces = true;
+        opts.no_cpu_stack_traces = true;
+        #[cfg(feature = "pystacks")]
+        {
+            opts.collect_pystacks = false;
+        }
+
+        // Then enable only the specified recorders
+        for recorder_name in &opts.only_recorder {
+            match recorder_name.as_str() {
+                "syscalls" => opts.syscalls = true,
+                "sched" => opts.no_sched = false,
+                "sleep-stacks" => opts.no_sleep_stack_traces = false,
+                "cpu-stacks" => opts.no_cpu_stack_traces = false,
+                #[cfg(feature = "pystacks")]
+                "pystacks" => opts.collect_pystacks = true,
+                _ => {}
+            }
+        }
+    }
+
+    // Process --add-recorder to enable additional recorders
+    for recorder_name in &opts.add_recorder {
+        match recorder_name.as_str() {
+            "syscalls" => opts.syscalls = true,
+            "sched" => opts.no_sched = false,
+            "sleep-stacks" => opts.no_sleep_stack_traces = false,
+            "cpu-stacks" => opts.no_cpu_stack_traces = false,
+            #[cfg(feature = "pystacks")]
+            "pystacks" => opts.collect_pystacks = true,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Parser)]
 struct Command {
     /// Increase verbosity (can be supplied multiple times).
@@ -95,6 +196,15 @@ struct Command {
     /// Enable syscall tracing (raw_syscalls:sys_enter and sys_exit tracepoints)
     #[arg(long)]
     syscalls: bool,
+    /// List all available recorders and their default states
+    #[arg(long)]
+    list_recorders: bool,
+    /// Enable a specific recorder by name (can be specified multiple times)
+    #[arg(long)]
+    add_recorder: Vec<String>,
+    /// Disable all recorders and only enable the specified ones (can be specified multiple times)
+    #[arg(long)]
+    only_recorder: Vec<String>,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -1012,7 +1122,25 @@ fn system(opts: Command) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let opts = Command::parse();
+    let mut opts = Command::parse();
+
+    if opts.list_recorders {
+        println!("Available recorders:");
+        for recorder in get_available_recorders() {
+            let default_text = if recorder.default_enabled {
+                " (on by default)"
+            } else {
+                ""
+            };
+            println!(
+                "  {:<14} - {}{}",
+                recorder.name, recorder.description, default_text
+            );
+        }
+        return Ok(());
+    }
+
+    process_recorder_options(&mut opts)?;
 
     // Set up tracing subscriber with level based on verbosity
     let level = match opts.verbosity {
