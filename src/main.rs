@@ -8,6 +8,7 @@ mod sched;
 mod session_recorder;
 mod stack_recorder;
 mod syscall_recorder;
+mod tcp_recorder;
 
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
@@ -27,6 +28,9 @@ use crate::sched::SchedEventRecorder;
 use crate::session_recorder::{get_clock_value, SessionRecorder, SysInfoEvent};
 use crate::stack_recorder::StackRecorder;
 use crate::syscall_recorder::SyscallRecorder;
+use crate::tcp_recorder::{TcpSendLatencyEvent, TcpSendLatencyKey};
+
+use systing::types::{latency_key, latency_stats};
 
 use anyhow::bail;
 use anyhow::Result;
@@ -39,7 +43,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{
-    MapCore, RawTracepointOpts, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts,
+    MapCore, MapHandle, RawTracepointOpts, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts,
 };
 use perfetto_protos::trace::Trace;
 
@@ -299,6 +303,8 @@ unsafe impl Plain for perf_counter_event {}
 unsafe impl Plain for probe_event {}
 unsafe impl Plain for syscall_event {}
 unsafe impl Plain for arg_desc {}
+unsafe impl Plain for latency_key {}
+unsafe impl Plain for latency_stats {}
 
 impl SystingEvent for task_event {
     fn ts(&self) -> u64 {
@@ -1051,6 +1057,63 @@ fn system(opts: Command) -> Result<()> {
                                     recorder.record_event(event);
                                 }
                             }
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                        0
+                    })?,
+            );
+        }
+
+        // Start the tcp_send_latency recorder thread
+        {
+            let tcp_map_handle = MapHandle::try_from(&skel.maps.tcp_send_latency)?;
+            let thread_done_clone = thread_done.clone();
+            let tcp_send_latency_recorder = recorder.clone();
+            threads.push(
+                thread::Builder::new()
+                    .name("tcp_send_latency_recorder".to_string())
+                    .spawn(move || {
+                        loop {
+                            if thread_done_clone.load(Ordering::Relaxed) {
+                                break;
+                            }
+
+                            let ts = get_clock_value(libc::CLOCK_BOOTTIME);
+
+                            if let Ok(iter) = tcp_map_handle.lookup_and_delete_batch(
+                                1024,
+                                libbpf_rs::MapFlags::ANY,
+                                libbpf_rs::MapFlags::ANY,
+                            ) {
+                                for (key_bytes, value_bytes) in iter {
+                                    let key = plain::from_bytes::<latency_key>(&key_bytes).unwrap();
+                                    let stats =
+                                        plain::from_bytes::<latency_stats>(&value_bytes).unwrap();
+
+                                    let avg_latency = if stats.count > 0 {
+                                        stats.sum_latency / stats.count
+                                    } else {
+                                        0
+                                    };
+
+                                    let event = TcpSendLatencyEvent::new(
+                                        ts,
+                                        TcpSendLatencyKey::from(key),
+                                        avg_latency,
+                                    );
+
+                                    if let Some(task_info) = event.next_task_info() {
+                                        tcp_send_latency_recorder.maybe_record_task(task_info);
+                                    }
+
+                                    tcp_send_latency_recorder
+                                        .tcp_send_latency_recorder
+                                        .lock()
+                                        .unwrap()
+                                        .record_event(event);
+                                }
+                            }
+
                             thread::sleep(Duration::from_millis(100));
                         }
                         0

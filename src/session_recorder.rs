@@ -11,6 +11,7 @@ use crate::sched::SchedEventRecorder;
 use crate::stack_recorder::StackRecorder;
 use crate::syscall_recorder::SyscallRecorder;
 use crate::systing::types::task_info;
+use crate::tcp_recorder::TcpSendLatencyRecorder;
 use crate::SystingRecordEvent;
 
 use perfetto_protos::builtin_clock::BuiltinClock;
@@ -47,6 +48,7 @@ pub struct SessionRecorder {
     pub sysinfo_recorder: Mutex<SysinfoRecorder>,
     pub probe_recorder: Mutex<SystingProbeRecorder>,
     pub syscall_recorder: Mutex<SyscallRecorder>,
+    pub tcp_send_latency_recorder: Mutex<TcpSendLatencyRecorder>,
     pub process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
     pub processes: RwLock<HashMap<u64, ProtoProcess>>,
     pub threads: RwLock<HashMap<u64, ThreadDescriptor>>,
@@ -155,6 +157,7 @@ impl SessionRecorder {
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::default()),
             syscall_recorder: Mutex::new(SyscallRecorder::default()),
+            tcp_send_latency_recorder: Mutex::new(TcpSendLatencyRecorder::default()),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
@@ -371,6 +374,14 @@ impl SessionRecorder {
                 .generate_trace_packets(pid_uuids, thread_uuids, id_counter),
         );
 
+        // TCP send latency recorder
+        packets.extend(
+            self.tcp_send_latency_recorder
+                .lock()
+                .unwrap()
+                .generate_trace(pid_uuids, thread_uuids, id_counter),
+        );
+
         packets
     }
 
@@ -433,6 +444,7 @@ mod tests {
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::default()),
             syscall_recorder: Mutex::new(SyscallRecorder::default()),
+            tcp_send_latency_recorder: Mutex::new(TcpSendLatencyRecorder::default()),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
