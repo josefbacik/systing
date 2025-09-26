@@ -1226,8 +1226,8 @@ int BPF_KPROBE(tcp_ack_entry, struct sock *sk)
 	return 0;
 }
 
-SEC("kprobe/__tcp_transmit_skb")
-int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb)
+SEC("tp_btf/net_dev_xmit")
+int BPF_PROG(net_dev_xmit, struct sk_buff *skb, int rc, struct net_device *dev, unsigned int skb_len)
 {
 	struct tcp_skb_cb {
 		union {

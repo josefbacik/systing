@@ -645,7 +645,7 @@ fn system(opts: Command) -> Result<()> {
 
         if !opts.tcplatency {
             open_skel.progs.tcp_sendmsg_entry.set_autoload(false);
-            open_skel.progs.tcp_transmit_skb_entry.set_autoload(false);
+            open_skel.progs.net_dev_xmit.set_autoload(false);
         }
 
         let mut need_slots = false;
