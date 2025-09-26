@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -114,6 +114,8 @@ pub struct TcpSendLatencyRecorder {
     pub ringbuf: RingBuffer<TcpSendLatencyEvent>,
     pub latency_events: HashMap<TcpSendLatencyKey, Vec<TrackCounter>>,
     pub bytes_events: HashMap<TcpSendLatencyKey, Vec<TrackCounter>>,
+    // Track UUIDs for destination address parent tracks, keyed by (tgidpid, dst_addr)
+    dst_track_uuids: HashMap<TcpSendLatencyKey, u64>,
 }
 
 impl SystingRecordEvent<TcpSendLatencyEvent> for TcpSendLatencyRecorder {
@@ -142,28 +144,56 @@ impl SystingRecordEvent<TcpSendLatencyEvent> for TcpSendLatencyRecorder {
 
 impl TcpSendLatencyRecorder {
     pub fn generate_trace(
-        &self,
+        &mut self,
         pid_uuids: &HashMap<i32, u64>,
         thread_uuids: &HashMap<i32, u64>,
         id_counter: &Arc<AtomicUsize>,
     ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
-        // Generate latency track
+        // Collect all unique destination address keys
+        let mut all_keys: HashSet<TcpSendLatencyKey> = HashSet::new();
+        for key in self.latency_events.keys() {
+            all_keys.insert(key.clone());
+        }
+        for key in self.bytes_events.keys() {
+            all_keys.insert(key.clone());
+        }
+
+        // Create parent tracks for each unique destination address
+        for key in all_keys.iter() {
+            if !self.dst_track_uuids.contains_key(key) {
+                let dst_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+                self.dst_track_uuids.insert(key.clone(), dst_track_uuid);
+
+                // Create parent track descriptor for this destination address
+                let desc = crate::perfetto::generate_pidtgid_track_descriptor(
+                    pid_uuids,
+                    thread_uuids,
+                    &key.tgidpid,
+                    format!("TCP to {}", key.format_address()),
+                    dst_track_uuid,
+                );
+
+                let mut packet = TracePacket::default();
+                packet.set_track_descriptor(desc);
+                packets.push(packet);
+            }
+        }
+
+        // Generate latency track as child of destination track
         for (key, counters) in self.latency_events.iter() {
+            let parent_uuid = *self.dst_track_uuids.get(key).unwrap();
             let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
             let mut counter_desc = CounterDescriptor::default();
             counter_desc.set_unit(Unit::UNIT_TIME_NS);
             counter_desc.set_is_incremental(false);
 
-            let mut desc = crate::perfetto::generate_pidtgid_track_descriptor(
-                pid_uuids,
-                thread_uuids,
-                &key.tgidpid,
-                format!("TCP send to {}", key.format_address()),
-                track_uuid,
-            );
+            let mut desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+            desc.set_name("Latency".to_string());
+            desc.set_uuid(track_uuid);
+            desc.set_parent_uuid(parent_uuid);
             desc.counter = Some(counter_desc).into();
 
             let mut packet = TracePacket::default();
@@ -176,21 +206,19 @@ impl TcpSendLatencyRecorder {
             }
         }
 
-        // Generate bytes sent track
+        // Generate bytes sent track as child of destination track
         for (key, counters) in self.bytes_events.iter() {
+            let parent_uuid = *self.dst_track_uuids.get(key).unwrap();
             let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
             let mut counter_desc = CounterDescriptor::default();
             counter_desc.set_unit(Unit::UNIT_SIZE_BYTES);
             counter_desc.set_is_incremental(false);
 
-            let mut desc = crate::perfetto::generate_pidtgid_track_descriptor(
-                pid_uuids,
-                thread_uuids,
-                &key.tgidpid,
-                format!("TCP bytes sent to {}", key.format_address()),
-                track_uuid,
-            );
+            let mut desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+            desc.set_name("Bytes sent".to_string());
+            desc.set_uuid(track_uuid);
+            desc.set_parent_uuid(parent_uuid);
             desc.counter = Some(counter_desc).into();
 
             let mut packet = TracePacket::default();
@@ -271,10 +299,18 @@ mod tests {
         let packets = recorder.generate_trace(&pid_uuids, &thread_uuids, &id_counter);
 
         assert!(!packets.is_empty());
+        // First packet should be the parent destination track
         assert_eq!(packets[0].track_descriptor().uuid(), 100);
-        assert_eq!(
-            packets[0].track_descriptor().name(),
-            "TCP send to 127.0.0.1"
-        );
+        assert_eq!(packets[0].track_descriptor().name(), "TCP to 127.0.0.1");
+        // Second packet should be the latency child track
+        assert_eq!(packets[1].track_descriptor().uuid(), 101);
+        assert_eq!(packets[1].track_descriptor().name(), "Latency");
+        assert_eq!(packets[1].track_descriptor().parent_uuid(), 100);
+        // Check that we have bytes track as well
+        let bytes_track = packets
+            .iter()
+            .find(|p| p.track_descriptor().name() == "Bytes sent");
+        assert!(bytes_track.is_some());
+        assert_eq!(bytes_track.unwrap().track_descriptor().parent_uuid(), 100);
     }
 }
