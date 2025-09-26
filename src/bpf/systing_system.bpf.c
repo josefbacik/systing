@@ -233,6 +233,7 @@ struct latency_key {
 struct latency_stats {
 	u64 count;
 	u64 sum_latency;
+	u64 bytes_sent;
 };
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -1146,6 +1147,26 @@ int BPF_KPROBE(tcp_sendmsg_entry, struct sock *sk, struct msghdr *msg, size_t si
 	}
 
 	bpf_map_update_elem(&tcp_send_tracking, &seq, &info, BPF_ANY);
+
+	// Update bytes sent in latency stats
+	struct latency_key key = {
+		.tgidpid = info.tgidpid,
+		.family = info.family,
+	};
+	__builtin_memcpy(&key.dst_addr_v6, &info.dst_addr_v6, sizeof(key.dst_addr_v6));
+
+	struct latency_stats *stats = bpf_map_lookup_elem(&tcp_send_latency, &key);
+	if (stats) {
+		__sync_fetch_and_add(&stats->bytes_sent, size);
+	} else {
+		struct latency_stats new_stats = {
+			.count = 0,
+			.sum_latency = 0,
+			.bytes_sent = size,
+		};
+		bpf_map_update_elem(&tcp_send_latency, &key, &new_stats, BPF_NOEXIST);
+	}
+
 	return 0;
 }
 
@@ -1193,6 +1214,7 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb)
 		struct latency_stats new_stats = {
 			.count = 1,
 			.sum_latency = latency,
+			.bytes_sent = 0,
 		};
 		bpf_map_update_elem(&tcp_send_latency, &key, &new_stats, BPF_NOEXIST);
 	}

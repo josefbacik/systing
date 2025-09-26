@@ -1111,6 +1111,7 @@ fn system(opts: Command) -> Result<()> {
                                         ts,
                                         TcpSendLatencyKey::from(key),
                                         avg_latency,
+                                        stats.bytes_sent,
                                     );
 
                                     if let Some(task_info) = event.next_task_info() {

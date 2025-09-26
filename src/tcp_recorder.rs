@@ -65,6 +65,7 @@ pub struct TcpSendLatencyEvent {
     pub ts: u64,
     pub key: TcpSendLatencyKey,
     pub avg_latency: u64,
+    pub bytes_sent: u64,
     task: task_info,
 }
 
@@ -74,6 +75,7 @@ impl Default for TcpSendLatencyEvent {
             ts: 0,
             key: TcpSendLatencyKey::default(),
             avg_latency: 0,
+            bytes_sent: 0,
             task: task_info {
                 tgidpid: 0,
                 comm: [0; 16],
@@ -83,7 +85,7 @@ impl Default for TcpSendLatencyEvent {
 }
 
 impl TcpSendLatencyEvent {
-    pub fn new(ts: u64, key: TcpSendLatencyKey, avg_latency: u64) -> Self {
+    pub fn new(ts: u64, key: TcpSendLatencyKey, avg_latency: u64, bytes_sent: u64) -> Self {
         Self {
             ts,
             task: task_info {
@@ -92,6 +94,7 @@ impl TcpSendLatencyEvent {
             },
             key,
             avg_latency,
+            bytes_sent,
         }
     }
 }
@@ -110,6 +113,7 @@ impl crate::SystingEvent for TcpSendLatencyEvent {
 pub struct TcpSendLatencyRecorder {
     pub ringbuf: RingBuffer<TcpSendLatencyEvent>,
     pub latency_events: HashMap<TcpSendLatencyKey, Vec<TrackCounter>>,
+    pub bytes_events: HashMap<TcpSendLatencyKey, Vec<TrackCounter>>,
 }
 
 impl SystingRecordEvent<TcpSendLatencyEvent> for TcpSendLatencyRecorder {
@@ -122,10 +126,16 @@ impl SystingRecordEvent<TcpSendLatencyEvent> for TcpSendLatencyRecorder {
     }
 
     fn handle_event(&mut self, event: TcpSendLatencyEvent) {
-        let entry = self.latency_events.entry(event.key).or_default();
-        entry.push(TrackCounter {
+        let latency_entry = self.latency_events.entry(event.key.clone()).or_default();
+        latency_entry.push(TrackCounter {
             ts: event.ts,
             count: event.avg_latency as i64,
+        });
+
+        let bytes_entry = self.bytes_events.entry(event.key).or_default();
+        bytes_entry.push(TrackCounter {
+            ts: event.ts,
+            count: event.bytes_sent as i64,
         });
     }
 }
@@ -139,6 +149,7 @@ impl TcpSendLatencyRecorder {
     ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
 
+        // Generate latency track
         for (key, counters) in self.latency_events.iter() {
             let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
@@ -151,6 +162,33 @@ impl TcpSendLatencyRecorder {
                 thread_uuids,
                 &key.tgidpid,
                 format!("TCP send to {}", key.format_address()),
+                track_uuid,
+            );
+            desc.counter = Some(counter_desc).into();
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packets.push(packet);
+
+            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
+            for counter in counters.iter() {
+                packets.push(counter.to_track_event(track_uuid, seq));
+            }
+        }
+
+        // Generate bytes sent track
+        for (key, counters) in self.bytes_events.iter() {
+            let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+
+            let mut counter_desc = CounterDescriptor::default();
+            counter_desc.set_unit(Unit::UNIT_SIZE_BYTES);
+            counter_desc.set_is_incremental(false);
+
+            let mut desc = crate::perfetto::generate_pidtgid_track_descriptor(
+                pid_uuids,
+                thread_uuids,
+                &key.tgidpid,
+                format!("TCP bytes sent to {}", key.format_address()),
                 track_uuid,
             );
             desc.counter = Some(counter_desc).into();
@@ -201,13 +239,17 @@ mod tests {
             dst_addr_v6: [0x0100007f, 0, 0, 0],
             family: 2,
         };
-        let event = TcpSendLatencyEvent::new(123456789, key.clone(), 50000);
+        let event = TcpSendLatencyEvent::new(123456789, key.clone(), 50000, 1024);
 
         recorder.handle_event(event);
         assert_eq!(recorder.latency_events.len(), 1);
         assert_eq!(recorder.latency_events.get(&key).unwrap().len(), 1);
         assert_eq!(recorder.latency_events.get(&key).unwrap()[0].ts, 123456789);
         assert_eq!(recorder.latency_events.get(&key).unwrap()[0].count, 50000);
+        assert_eq!(recorder.bytes_events.len(), 1);
+        assert_eq!(recorder.bytes_events.get(&key).unwrap().len(), 1);
+        assert_eq!(recorder.bytes_events.get(&key).unwrap()[0].ts, 123456789);
+        assert_eq!(recorder.bytes_events.get(&key).unwrap()[0].count, 1024);
     }
 
     #[test]
@@ -218,7 +260,7 @@ mod tests {
             dst_addr_v6: [0x0100007f, 0, 0, 0],
             family: 2,
         };
-        let event = TcpSendLatencyEvent::new(123456789, key.clone(), 50000);
+        let event = TcpSendLatencyEvent::new(123456789, key.clone(), 50000, 1024);
 
         recorder.handle_event(event);
 
