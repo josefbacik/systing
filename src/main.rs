@@ -1107,11 +1107,18 @@ fn system(opts: Command) -> Result<()> {
                                         0
                                     };
 
+                                    let avg_ack_latency = if stats.ack_count > 0 {
+                                        stats.sum_ack_latency / stats.ack_count
+                                    } else {
+                                        0
+                                    };
+
                                     let event = TcpSendLatencyEvent::new(
                                         ts,
                                         TcpSendLatencyKey::from(key),
                                         avg_latency,
                                         stats.bytes_sent,
+                                        avg_ack_latency,
                                     );
 
                                     if let Some(task_info) = event.next_task_info() {

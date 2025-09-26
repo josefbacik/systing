@@ -66,6 +66,7 @@ pub struct TcpSendLatencyEvent {
     pub key: TcpSendLatencyKey,
     pub avg_latency: u64,
     pub bytes_sent: u64,
+    pub avg_ack_latency: u64,
     task: task_info,
 }
 
@@ -76,6 +77,7 @@ impl Default for TcpSendLatencyEvent {
             key: TcpSendLatencyKey::default(),
             avg_latency: 0,
             bytes_sent: 0,
+            avg_ack_latency: 0,
             task: task_info {
                 tgidpid: 0,
                 comm: [0; 16],
@@ -85,7 +87,13 @@ impl Default for TcpSendLatencyEvent {
 }
 
 impl TcpSendLatencyEvent {
-    pub fn new(ts: u64, key: TcpSendLatencyKey, avg_latency: u64, bytes_sent: u64) -> Self {
+    pub fn new(
+        ts: u64,
+        key: TcpSendLatencyKey,
+        avg_latency: u64,
+        bytes_sent: u64,
+        avg_ack_latency: u64,
+    ) -> Self {
         Self {
             ts,
             task: task_info {
@@ -95,6 +103,7 @@ impl TcpSendLatencyEvent {
             key,
             avg_latency,
             bytes_sent,
+            avg_ack_latency,
         }
     }
 }
@@ -114,6 +123,7 @@ pub struct TcpSendLatencyRecorder {
     pub ringbuf: RingBuffer<TcpSendLatencyEvent>,
     pub latency_events: HashMap<TcpSendLatencyKey, Vec<TrackCounter>>,
     pub bytes_events: HashMap<TcpSendLatencyKey, Vec<TrackCounter>>,
+    pub ack_latency_events: HashMap<TcpSendLatencyKey, Vec<TrackCounter>>,
     // Track UUIDs for destination address parent tracks, keyed by (tgidpid, dst_addr)
     dst_track_uuids: HashMap<TcpSendLatencyKey, u64>,
 }
@@ -134,10 +144,16 @@ impl SystingRecordEvent<TcpSendLatencyEvent> for TcpSendLatencyRecorder {
             count: event.avg_latency as i64,
         });
 
-        let bytes_entry = self.bytes_events.entry(event.key).or_default();
+        let bytes_entry = self.bytes_events.entry(event.key.clone()).or_default();
         bytes_entry.push(TrackCounter {
             ts: event.ts,
             count: event.bytes_sent as i64,
+        });
+
+        let ack_latency_entry = self.ack_latency_events.entry(event.key).or_default();
+        ack_latency_entry.push(TrackCounter {
+            ts: event.ts,
+            count: event.avg_ack_latency as i64,
         });
     }
 }
@@ -157,6 +173,9 @@ impl TcpSendLatencyRecorder {
             all_keys.insert(key.clone());
         }
         for key in self.bytes_events.keys() {
+            all_keys.insert(key.clone());
+        }
+        for key in self.ack_latency_events.keys() {
             all_keys.insert(key.clone());
         }
 
@@ -231,6 +250,31 @@ impl TcpSendLatencyRecorder {
             }
         }
 
+        // Generate ACK latency track as child of destination track
+        for (key, counters) in self.ack_latency_events.iter() {
+            let parent_uuid = *self.dst_track_uuids.get(key).unwrap();
+            let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+
+            let mut counter_desc = CounterDescriptor::default();
+            counter_desc.set_unit(Unit::UNIT_TIME_NS);
+            counter_desc.set_is_incremental(false);
+
+            let mut desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+            desc.set_name("ACK Latency".to_string());
+            desc.set_uuid(track_uuid);
+            desc.set_parent_uuid(parent_uuid);
+            desc.counter = Some(counter_desc).into();
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packets.push(packet);
+
+            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
+            for counter in counters.iter() {
+                packets.push(counter.to_track_event(track_uuid, seq));
+            }
+        }
+
         packets
     }
 }
@@ -267,7 +311,7 @@ mod tests {
             dst_addr_v6: [0x0100007f, 0, 0, 0],
             family: 2,
         };
-        let event = TcpSendLatencyEvent::new(123456789, key.clone(), 50000, 1024);
+        let event = TcpSendLatencyEvent::new(123456789, key.clone(), 50000, 1024, 75000);
 
         recorder.handle_event(event);
         assert_eq!(recorder.latency_events.len(), 1);
@@ -278,6 +322,16 @@ mod tests {
         assert_eq!(recorder.bytes_events.get(&key).unwrap().len(), 1);
         assert_eq!(recorder.bytes_events.get(&key).unwrap()[0].ts, 123456789);
         assert_eq!(recorder.bytes_events.get(&key).unwrap()[0].count, 1024);
+        assert_eq!(recorder.ack_latency_events.len(), 1);
+        assert_eq!(recorder.ack_latency_events.get(&key).unwrap().len(), 1);
+        assert_eq!(
+            recorder.ack_latency_events.get(&key).unwrap()[0].ts,
+            123456789
+        );
+        assert_eq!(
+            recorder.ack_latency_events.get(&key).unwrap()[0].count,
+            75000
+        );
     }
 
     #[test]
@@ -288,7 +342,7 @@ mod tests {
             dst_addr_v6: [0x0100007f, 0, 0, 0],
             family: 2,
         };
-        let event = TcpSendLatencyEvent::new(123456789, key.clone(), 50000, 1024);
+        let event = TcpSendLatencyEvent::new(123456789, key.clone(), 50000, 1024, 75000);
 
         recorder.handle_event(event);
 
@@ -312,5 +366,11 @@ mod tests {
             .find(|p| p.track_descriptor().name() == "Bytes sent");
         assert!(bytes_track.is_some());
         assert_eq!(bytes_track.unwrap().track_descriptor().parent_uuid(), 100);
+        // Check that we have ACK latency track as well
+        let ack_track = packets
+            .iter()
+            .find(|p| p.track_descriptor().name() == "ACK Latency");
+        assert!(ack_track.is_some());
+        assert_eq!(ack_track.unwrap().track_descriptor().parent_uuid(), 100);
     }
 }

@@ -220,6 +220,7 @@ struct {
 struct tcp_send_info {
 	u64 tgidpid;
 	u64 start_ts;
+	u64 xmit_ts;
 	u32 dst_addr_v6[4];
 	u16 family;
 };
@@ -234,6 +235,8 @@ struct latency_stats {
 	u64 count;
 	u64 sum_latency;
 	u64 bytes_sent;
+	u64 ack_count;
+	u64 sum_ack_latency;
 };
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -1163,9 +1166,62 @@ int BPF_KPROBE(tcp_sendmsg_entry, struct sock *sk, struct msghdr *msg, size_t si
 			.count = 0,
 			.sum_latency = 0,
 			.bytes_sent = size,
+			.ack_count = 0,
+			.sum_ack_latency = 0,
 		};
 		bpf_map_update_elem(&tcp_send_latency, &key, &new_stats, BPF_NOEXIST);
 	}
+
+	return 0;
+}
+
+SEC("kprobe/tcp_ack")
+int BPF_KPROBE(tcp_ack_entry, struct sock *sk)
+{
+	struct tcp_sock *tp = bpf_core_cast(sk, struct tcp_sock);
+	u32 snd_una;
+	u16 family;
+
+	bpf_probe_read_kernel(&snd_una, sizeof(snd_una), &tp->snd_una);
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	if (family != AF_INET && family != AF_INET6)
+		return 0;
+
+	struct tcp_send_info *send_info = bpf_map_lookup_elem(&tcp_send_tracking, &snd_una);
+	if (!send_info)
+		return 0;
+
+	if (send_info->xmit_ts == 0)
+		return 0;
+
+	u64 now = bpf_ktime_get_boot_ns();
+	u64 ack_latency = 0;
+	if (now > send_info->xmit_ts)
+		ack_latency = now - send_info->xmit_ts;
+
+	struct latency_key ack_key = {
+		.tgidpid = send_info->tgidpid,
+		.family = send_info->family,
+	};
+	__builtin_memcpy(&ack_key.dst_addr_v6, &send_info->dst_addr_v6, sizeof(ack_key.dst_addr_v6));
+
+	struct latency_stats *ack_stats = bpf_map_lookup_elem(&tcp_send_latency, &ack_key);
+	if (ack_stats) {
+		__sync_fetch_and_add(&ack_stats->ack_count, 1);
+		__sync_fetch_and_add(&ack_stats->sum_ack_latency, ack_latency);
+	} else {
+		struct latency_stats new_stats = {
+			.count = 0,
+			.sum_latency = 0,
+			.bytes_sent = 0,
+			.ack_count = 1,
+			.sum_ack_latency = ack_latency,
+		};
+		bpf_map_update_elem(&tcp_send_latency, &ack_key, &new_stats, BPF_NOEXIST);
+	}
+
+	bpf_map_delete_elem(&tcp_send_tracking, &snd_una);
 
 	return 0;
 }
@@ -1215,11 +1271,15 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb)
 			.count = 1,
 			.sum_latency = latency,
 			.bytes_sent = 0,
+			.ack_count = 0,
+			.sum_ack_latency = 0,
 		};
 		bpf_map_update_elem(&tcp_send_latency, &key, &new_stats, BPF_NOEXIST);
 	}
 
-	bpf_map_delete_elem(&tcp_send_tracking, &seq);
+	// Update transmit timestamp for ACK tracking
+	send_info->xmit_ts = now;
+
 	return 0;
 }
 
