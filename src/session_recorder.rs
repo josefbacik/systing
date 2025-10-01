@@ -61,17 +61,6 @@ pub fn get_clock_value(clock_id: libc::c_int) -> u64 {
     (ts.tv_sec as u64 * 1_000_000_000) + ts.tv_nsec as u64
 }
 
-impl From<&task_info> for ThreadDescriptor {
-    fn from(task: &task_info) -> Self {
-        let comm = CStr::from_bytes_until_nul(&task.comm).unwrap();
-        let mut thread = ThreadDescriptor::default();
-        thread.set_tid(task.tgidpid as i32);
-        thread.set_pid((task.tgidpid >> 32) as i32);
-        thread.set_thread_name(comm.to_str().unwrap().to_string());
-        thread
-    }
-}
-
 impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
     fn ringbuf(&self) -> &RingBuffer<SysInfoEvent> {
         &self.ringbuf
@@ -223,10 +212,44 @@ impl SessionRecorder {
                     .insert(info.tgidpid, proto_process);
             }
         } else if !self.threads.read().unwrap().contains_key(&info.tgidpid) {
+            // Convert comm once and use it throughout
+            let original_comm = CStr::from_bytes_until_nul(&info.comm)
+                .ok()
+                .and_then(|s| s.to_str().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+
+            let thread_name = if original_comm.is_empty() {
+                // Comm is empty, try to get exe from sysinfo
+                let mut system = self.system.lock().unwrap();
+                let tid = Pid::from_u32(info.tgidpid as u32);
+
+                // Refresh process with exe to get the thread name
+                system.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[tid]),
+                    true,
+                    ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+                );
+
+                if let Some(process) = system.process(tid) {
+                    process.name().to_string_lossy().to_string()
+                } else {
+                    String::new()
+                }
+            } else {
+                original_comm
+            };
+
+            // Create ThreadDescriptor with the appropriate thread name
+            let mut thread_descriptor = ThreadDescriptor::default();
+            thread_descriptor.set_tid(info.tgidpid as i32);
+            thread_descriptor.set_pid((info.tgidpid >> 32) as i32);
+            thread_descriptor.set_thread_name(thread_name);
+
             self.threads
                 .write()
                 .unwrap()
-                .insert(info.tgidpid, ThreadDescriptor::from(info));
+                .insert(info.tgidpid, thread_descriptor);
         }
     }
 
