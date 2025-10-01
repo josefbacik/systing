@@ -545,15 +545,22 @@ static __always_inline long safe_probe_read_user_str(void *dst, u32 size, const 
 static void record_task_info(struct task_info *info, struct task_struct *task)
 {
 	info->tgidpid = task_key(task);
+
+	// In confidentiality mode, use NULL comm (all zeros)
+	if (tool_config.confidentiality_mode) {
+		__builtin_memset(info->comm, 0, TASK_COMM_LEN);
+		return;
+	}
+
 	if (task->flags & PF_WQ_WORKER) {
 		struct kthread *k = bpf_core_cast(task->worker_private,
 						  struct kthread);
 		struct worker *worker = bpf_core_cast(k->data, struct worker);
 
-		safe_probe_read_kernel_str(info->comm, TASK_COMM_LEN,
+		bpf_probe_read_kernel_str(info->comm, TASK_COMM_LEN,
 					  worker->desc);
 	} else {
-		safe_probe_read_kernel_str(info->comm, TASK_COMM_LEN,
+		bpf_probe_read_kernel_str(info->comm, TASK_COMM_LEN,
 					  task->comm);
 	}
 }
@@ -627,8 +634,12 @@ static int trace_irq_event(struct irqaction *action, int irq, int ret, bool ente
 	event->target_cpu = irq;
 	if (enter) {
 		event->type = SCHED_IRQ_ENTER;
-		safe_probe_read_kernel_str(event->next.comm, TASK_COMM_LEN,
-					  action->name);
+		if (tool_config.confidentiality_mode) {
+			__builtin_memset(event->next.comm, 0, TASK_COMM_LEN);
+		} else {
+			bpf_probe_read_kernel_str(event->next.comm, TASK_COMM_LEN,
+						  action->name);
+		}
 	} else {
 		event->type = SCHED_IRQ_EXIT;
 		event->next_prio = ret;
