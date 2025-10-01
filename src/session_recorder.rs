@@ -61,33 +61,6 @@ pub fn get_clock_value(clock_id: libc::c_int) -> u64 {
     (ts.tv_sec as u64 * 1_000_000_000) + ts.tv_nsec as u64
 }
 
-impl From<&task_info> for ProcessDescriptor {
-    fn from(task: &task_info) -> Self {
-        let comm = CStr::from_bytes_until_nul(&task.comm).unwrap();
-        let mut process = ProcessDescriptor::default();
-        process.set_pid(task.tgidpid as i32);
-        process.set_process_name(comm.to_str().unwrap().to_string());
-        process
-    }
-}
-
-pub fn proto_process_from_parts(task: &task_info, system: &mut System) -> ProtoProcess {
-    let pid = Pid::from_u32((task.tgidpid >> 32) as u32);
-    ProtoProcess {
-        cmdline: if let Some(process) = system.process(pid) {
-            process
-                .cmd()
-                .iter()
-                .map(|s| s.to_string_lossy().to_string())
-                .collect()
-        } else {
-            vec![]
-        },
-        pid: Some(task.tgidpid as i32),
-        ..ProtoProcess::default()
-    }
-}
-
 impl From<&task_info> for ThreadDescriptor {
     fn from(task: &task_info) -> Self {
         let comm = CStr::from_bytes_until_nul(&task.comm).unwrap();
@@ -172,22 +145,82 @@ impl SessionRecorder {
                 .unwrap()
                 .contains_key(&info.tgidpid)
             {
+                // Convert comm once and use it throughout
+                let original_comm = CStr::from_bytes_until_nul(&info.comm)
+                    .ok()
+                    .and_then(|s| s.to_str().ok())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+
+                // First, refresh the process information and collect cmdline/comm
+                let (cmdline, process_name) = {
+                    let mut system = self.system.lock().unwrap();
+                    let pid = Pid::from_u32((info.tgidpid >> 32) as u32);
+
+                    // Refresh process with cmdline and optionally process name
+                    let refresh_kind = if original_comm.is_empty() {
+                        // If comm is empty, also refresh the process name
+                        ProcessRefreshKind::nothing()
+                            .with_cmd(UpdateKind::Always)
+                            .with_exe(UpdateKind::Always)
+                    } else {
+                        // Otherwise just refresh cmdline
+                        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always)
+                    };
+
+                    system.refresh_processes_specifics(
+                        ProcessesToUpdate::Some(&[pid]),
+                        true,
+                        refresh_kind,
+                    );
+
+                    // Collect cmdline and optionally comm into local variables
+                    let cmdline = if let Some(process) = system.process(pid) {
+                        process
+                            .cmd()
+                            .iter()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+
+                    let process_name = if original_comm.is_empty() {
+                        // Comm is empty, try to get it from sysinfo
+                        if let Some(process) = system.process(pid) {
+                            process.name().to_string_lossy().to_string()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        original_comm.clone()
+                    };
+
+                    (cmdline, process_name)
+                };
+
+                // Create ProcessDescriptor with the appropriate comm/process name
+                let mut process_descriptor = ProcessDescriptor::default();
+                process_descriptor.set_pid(info.tgidpid as i32);
+                process_descriptor.set_process_name(process_name);
+
+                // Now update process_descriptors
                 self.process_descriptors
                     .write()
                     .unwrap()
-                    .insert(info.tgidpid, ProcessDescriptor::from(info));
+                    .insert(info.tgidpid, process_descriptor);
 
-                let mut system = self.system.lock().unwrap();
-                let pid = Pid::from_u32((info.tgidpid >> 32) as u32);
-                system.refresh_processes_specifics(
-                    ProcessesToUpdate::Some(&[pid]),
-                    true,
-                    ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-                );
+                // Create ProtoProcess with the cmdline we collected
+                let proto_process = ProtoProcess {
+                    cmdline,
+                    pid: Some(info.tgidpid as i32),
+                    ..ProtoProcess::default()
+                };
+
                 self.processes
                     .write()
                     .unwrap()
-                    .insert(info.tgidpid, proto_process_from_parts(info, &mut system));
+                    .insert(info.tgidpid, proto_process);
             }
         } else if !self.threads.read().unwrap().contains_key(&info.tgidpid) {
             self.threads
