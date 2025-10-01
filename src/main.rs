@@ -222,6 +222,29 @@ fn bump_memlock_rlimit() -> Result<()> {
 
 /// Get the device and inode number of our PID namespace
 /// Returns (dev, ino) or (0, 0) if the file doesn't exist or fails
+fn detect_confidentiality_mode() -> u32 {
+    use std::fs;
+
+    // Read /sys/kernel/security/lockdown to check if confidentiality mode is enabled
+    match fs::read_to_string("/sys/kernel/security/lockdown") {
+        Ok(content) => {
+            // The file contains "[none] integrity confidentiality" with the active mode in brackets
+            if content.contains("[confidentiality]") {
+                eprintln!(
+                    "Kernel confidentiality mode detected - some BPF helpers will be restricted"
+                );
+                1
+            } else {
+                0
+            }
+        }
+        Err(_) => {
+            // If we can't read the file, assume no confidentiality mode
+            0
+        }
+    }
+}
+
 fn get_pid_namespace_info() -> (u64, u64) {
     use std::fs;
 
@@ -549,6 +572,7 @@ fn system(opts: Command) -> Result<()> {
             rodata.tool_config.my_ino = my_ino;
             rodata.tool_config.no_cpu_stack_traces = opts.no_cpu_stack_traces as u32;
             rodata.tool_config.no_sleep_stack_traces = opts.no_sleep_stack_traces as u32;
+            rodata.tool_config.confidentiality_mode = detect_confidentiality_mode();
             if !opts.cgroup.is_empty() {
                 rodata.tool_config.filter_cgroup = 1;
             }
@@ -908,21 +932,27 @@ fn system(opts: Command) -> Result<()> {
 
                 match &event.event {
                     EventProbe::Usdt(usdt) => {
-                        for pid in opts.trace_event_pid.iter() {
-                            let link = skel.progs.systing_usdt.attach_usdt_with_opts(
-                                *pid as i32,
-                                &usdt.path,
-                                &usdt.provider,
-                                &usdt.name,
-                                UsdtOpts {
-                                    cookie: event.cookie,
-                                    ..Default::default()
-                                },
-                            );
-                            if link.is_err() {
-                                Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+                        // Skip USDT probes in confidentiality mode as they use restricted helpers
+                        if detect_confidentiality_mode() == 1 {
+                            eprintln!("Skipping USDT probe {}:{}:{} - not supported in confidentiality mode",
+                                     usdt.path, usdt.provider, usdt.name);
+                        } else {
+                            for pid in opts.trace_event_pid.iter() {
+                                let link = skel.progs.systing_usdt.attach_usdt_with_opts(
+                                    *pid as i32,
+                                    &usdt.path,
+                                    &usdt.provider,
+                                    &usdt.name,
+                                    UsdtOpts {
+                                        cookie: event.cookie,
+                                        ..Default::default()
+                                    },
+                                );
+                                if link.is_err() {
+                                    Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+                                }
+                                probe_links.push(link);
                             }
-                            probe_links.push(link);
                         }
                     }
                     EventProbe::UProbe(uprobe) => {

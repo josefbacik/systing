@@ -42,6 +42,7 @@ const volatile struct {
 	u64 my_ino;
 	u32 collect_pystacks;
 	u32 collect_syscalls;
+	u32 confidentiality_mode;
 } tool_config = {};
 
 enum event_type {
@@ -495,6 +496,52 @@ static int handle_missed_event(u32 index)
 	return 0;
 }
 
+/*
+ * Safe wrapper for reading kernel strings that handles confidentiality mode.
+ * When confidentiality mode is enabled, bpf_probe_read_kernel_str is disabled,
+ * so we use a placeholder string instead.
+ */
+static __always_inline long safe_probe_read_kernel_str(void *dst, u32 size, const void *unsafe_ptr)
+{
+	if (tool_config.confidentiality_mode) {
+		// In confidentiality mode, use a placeholder
+		// We can't use bpf_probe_read_str as it's also restricted
+		const char placeholder[] = "<restricted>";
+		int len = sizeof(placeholder) - 1;
+		if (len > size - 1)
+			len = size - 1;
+		__builtin_memcpy(dst, placeholder, len);
+		((char *)dst)[len] = '\0';
+		return len;
+	}
+
+	// Normal mode - use the standard kernel string reader
+	return bpf_probe_read_kernel_str(dst, size, unsafe_ptr);
+}
+
+/*
+ * Safe wrapper for reading user strings that handles confidentiality mode.
+ * When confidentiality mode is enabled, bpf_probe_read_user_str is disabled,
+ * so we use a placeholder string instead.
+ */
+static __always_inline long safe_probe_read_user_str(void *dst, u32 size, const void *unsafe_ptr)
+{
+	if (tool_config.confidentiality_mode) {
+		// In confidentiality mode, use a placeholder
+		// We can't use bpf_probe_read_str as it's also restricted
+		const char placeholder[] = "<restricted>";
+		int len = sizeof(placeholder) - 1;
+		if (len > size - 1)
+			len = size - 1;
+		__builtin_memcpy(dst, placeholder, len);
+		((char *)dst)[len] = '\0';
+		return len;
+	}
+
+	// Normal mode - use the standard user string reader
+	return bpf_probe_read_user_str(dst, size, unsafe_ptr);
+}
+
 static void record_task_info(struct task_info *info, struct task_struct *task)
 {
 	info->tgidpid = task_key(task);
@@ -503,10 +550,10 @@ static void record_task_info(struct task_info *info, struct task_struct *task)
 						  struct kthread);
 		struct worker *worker = bpf_core_cast(k->data, struct worker);
 
-		bpf_probe_read_kernel_str(info->comm, TASK_COMM_LEN,
+		safe_probe_read_kernel_str(info->comm, TASK_COMM_LEN,
 					  worker->desc);
 	} else {
-		bpf_probe_read_kernel_str(info->comm, TASK_COMM_LEN,
+		safe_probe_read_kernel_str(info->comm, TASK_COMM_LEN,
 					  task->comm);
 	}
 }
@@ -580,7 +627,7 @@ static int trace_irq_event(struct irqaction *action, int irq, int ret, bool ente
 	event->target_cpu = irq;
 	if (enter) {
 		event->type = SCHED_IRQ_ENTER;
-		bpf_probe_read_kernel_str(event->next.comm, TASK_COMM_LEN,
+		safe_probe_read_kernel_str(event->next.comm, TASK_COMM_LEN,
 					  action->name);
 	} else {
 		event->type = SCHED_IRQ_EXIT;
@@ -779,6 +826,10 @@ int BPF_PROG(systing_softirq_exit, unsigned int vec_nr)
 SEC("usdt")
 int systing_usdt(struct pt_regs *ctx)
 {
+	// Exit early in confidentiality mode since USDT helpers are restricted
+	if (tool_config.confidentiality_mode)
+		return 0;
+
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 
 	if (!trace_task(task))
@@ -802,7 +853,7 @@ int systing_usdt(struct pt_regs *ctx)
 		bpf_usdt_arg(ctx, desc->arg_index, &val);
 		if (val) {
 			if (desc->arg_type == ARG_STRING) {
-				bpf_probe_read_user_str(&event->arg,
+				safe_probe_read_user_str(&event->arg,
 							sizeof(event->arg), (long *)val);
 				event->arg_type = ARG_STRING;
 			} else {
@@ -908,11 +959,11 @@ static void handle_probe_event(struct pt_regs *ctx, bool kernel)
 		}
 		if (desc->arg_type == ARG_STRING) {
 			if (kernel)
-				bpf_probe_read_kernel_str(&event->arg,
+				safe_probe_read_kernel_str(&event->arg,
 							  sizeof(event->arg),
 							  (void *)arg);
 			else
-				bpf_probe_read_user_str(&event->arg,
+				safe_probe_read_user_str(&event->arg,
 							sizeof(event->arg),
 							(void *)arg);
 			event->arg_type = ARG_STRING;
@@ -927,6 +978,10 @@ static void handle_probe_event(struct pt_regs *ctx, bool kernel)
 SEC("uprobe")
 int systing_uprobe(struct pt_regs *ctx)
 {
+	// Exit early in confidentiality mode since probe helpers are restricted
+	if (tool_config.confidentiality_mode)
+		return 0;
+
 	handle_probe_event(ctx, false);
 	return 0;
 }
@@ -934,6 +989,10 @@ int systing_uprobe(struct pt_regs *ctx)
 SEC("kprobe")
 int systing_kprobe(struct pt_regs *ctx)
 {
+	// Exit early in confidentiality mode since probe helpers are restricted
+	if (tool_config.confidentiality_mode)
+		return 0;
+
 	handle_probe_event(ctx, true);
 	return 0;
 }
@@ -941,6 +1000,10 @@ int systing_kprobe(struct pt_regs *ctx)
 SEC("raw_tracepoint")
 int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
 {
+	// Exit early in confidentiality mode since probe helpers are restricted
+	if (tool_config.confidentiality_mode)
+		return 0;
+
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 
 	if (!trace_task(task))
@@ -977,7 +1040,7 @@ int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
 			bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[5]);
 		}
 		if (desc->arg_type == ARG_STRING) {
-			bpf_probe_read_kernel_str(&event->arg,
+			safe_probe_read_kernel_str(&event->arg,
 						  sizeof(event->arg),
 						  (void *)arg);
 			event->arg_type = ARG_STRING;
@@ -993,6 +1056,10 @@ int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
 SEC("tracepoint")
 int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
 {
+	// Exit early in confidentiality mode since we can't read arguments
+	if (tool_config.confidentiality_mode)
+		return 0;
+
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 
 	if (!trace_task(task))
