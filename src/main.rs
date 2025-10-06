@@ -832,24 +832,51 @@ fn system(opts: Command) -> Result<()> {
             drop(cache_rx);
         }
 
-        let mut clock_files = PerfOpenEvents::default();
-        clock_files.add_hw_event(PerfHwEvent {
-            name: "clock".to_string(),
-            event_type: if opts.sw_event {
-                perf::PERF_TYPE_SOFTWARE
-            } else {
-                perf::PERF_TYPE_HARDWARE
-            },
-            event_config: if opts.sw_event {
-                perf::PERF_COUNT_SW_CPU_CLOCK
-            } else {
-                perf::PERF_COUNT_HW_CPU_CYCLES
-            },
-            disabled: false,
-            need_slots: false,
-            cpus: (0..num_cpus).collect(),
-        })?;
-        clock_files.open_events(None, 1000)?;
+        // Set up clock perf events with automatic VM detection and fallback
+        let clock_files = {
+            let mut clock_files = PerfOpenEvents::default();
+            let mut clock_event = PerfHwEvent {
+                name: "clock".to_string(),
+                event_type: if opts.sw_event {
+                    perf::PERF_TYPE_SOFTWARE
+                } else {
+                    perf::PERF_TYPE_HARDWARE
+                },
+                event_config: if opts.sw_event {
+                    perf::PERF_COUNT_SW_CPU_CLOCK
+                } else {
+                    perf::PERF_COUNT_HW_CPU_CYCLES
+                },
+                disabled: false,
+                need_slots: false,
+                cpus: (0..num_cpus).collect(),
+            };
+
+            clock_files.add_hw_event(clock_event.clone())?;
+
+            // Try to open the events, handle VM detection
+            if let Err(e) = clock_files.open_events(None, 1000) {
+                // Check if this is a VM-related error (ErrorKind::NotFound)
+                if e.kind() == std::io::ErrorKind::NotFound && !opts.sw_event {
+                    // Detected VM environment, automatically retry with software events
+                    eprintln!("Detected virtualized environment, automatically switching to software events (--sw-event)");
+
+                    // Modify the event to use software events
+                    clock_event.event_type = perf::PERF_TYPE_SOFTWARE;
+                    clock_event.event_config = perf::PERF_COUNT_SW_CPU_CLOCK;
+
+                    // Recreate clock_files with the modified event
+                    clock_files = PerfOpenEvents::default();
+                    clock_files.add_hw_event(clock_event)?;
+                    clock_files.open_events(None, 1000)?;
+                } else {
+                    // Not a VM error or already using software events, propagate the error
+                    return Err(e.into());
+                }
+            }
+
+            clock_files
+        };
         let mut perf_links = Vec::new();
         for (_, file) in clock_files {
             let link = skel
