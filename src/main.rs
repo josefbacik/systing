@@ -1395,8 +1395,23 @@ fn system(opts: Command) -> Result<()> {
     }
 
     let trace = generate_trace_from_recorder(&recorder)?;
-    let mut file = std::fs::File::create("trace.pb")?;
-    trace.write_to_writer(&mut file)?;
+
+    if opts.privileged_mode {
+        // Privileged collector: write trace to stdout for parent process
+        use std::io::{self, Write};
+        eprintln!("Collection complete, writing trace data to stdout...");
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        trace.write_to_writer(&mut handle)?;
+        handle.flush()?;
+        eprintln!("Trace data sent to unprivileged process");
+    } else {
+        // Normal mode: write trace.pb file
+        let mut file = std::fs::File::create("trace.pb")?;
+        trace.write_to_writer(&mut file)?;
+        println!("Trace written to trace.pb");
+    }
+
     Ok(())
 }
 
