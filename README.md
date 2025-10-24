@@ -67,6 +67,12 @@ sudo setcap cap_bpf,cap_perfmon,cap_sys_resource=ep $(which systing)
 
 **In containers**: Grant `CAP_BPF` and `CAP_PERFMON` capabilities to the container
 
+**"Permission denied" when writing trace.pb**: If trace.pb exists from a previous root-owned run:
+```bash
+rm trace.pb  # Remove old root-owned file
+./target/debug/systing --duration 60
+```
+
 **SELinux denials on Fedora/RHEL**: If running from home directory (e.g., `./target/debug/systing`), SELinux prevents systemd from executing user home files. Solutions:
 
 1. **Install to system location** (recommended):

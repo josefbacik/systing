@@ -858,7 +858,20 @@ fn run_unprivileged(opts: &Command) -> Result<()> {
 
     // Write trace.pb file (with user ownership, not root!)
     eprintln!("Writing trace.pb...");
-    let mut file = std::fs::File::create("trace.pb")?;
+    let mut file = std::fs::File::create("trace.pb").map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            anyhow::anyhow!(
+                "Failed to create trace.pb: Permission denied\n\
+                 \n\
+                 This usually means trace.pb exists and is owned by root from a previous run.\n\
+                 Solution: rm trace.pb\n\
+                 \n\
+                 If the directory itself is not writable, cd to a writable directory first."
+            )
+        } else {
+            anyhow::anyhow!("Failed to create trace.pb: {}", e)
+        }
+    })?;
     trace.write_to_writer(&mut file)?;
     println!("Trace written to trace.pb");
 
