@@ -9,9 +9,11 @@ mod session_recorder;
 mod stack_recorder;
 mod syscall_recorder;
 
+use std::env;
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::UnixDatagram;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -531,6 +533,17 @@ fn configure_recorder(opts: &Command, recorder: &Arc<SessionRecorder>) {
         .lock()
         .unwrap()
         .set_cpu_sched_stats(opts.cpu_sched_stats);
+}
+
+fn sd_notify() -> Result<()> {
+    let Some(socket_path) = env::var_os("NOTIFY_SOCKET") else {
+        return Ok(());
+    };
+
+    let sock = UnixDatagram::unbound()?;
+    sock.connect(socket_path)?;
+    sock.send("READY=1".as_bytes())?;
+    Ok(())
 }
 
 fn system(opts: Command) -> Result<()> {
@@ -1111,6 +1124,8 @@ fn system(opts: Command) -> Result<()> {
                     })?,
             );
         }
+
+        sd_notify()?;
 
         if opts.duration > 0 {
             println!("Tracing for {} seconds", opts.duration);
