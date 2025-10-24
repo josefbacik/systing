@@ -90,6 +90,18 @@ fn has_systemd_run() -> bool {
         .unwrap_or(false)
 }
 
+/// Environment variables to forward to the privileged collector process.
+///
+/// Note: DEBUGINFOD_URLS is intentionally NOT forwarded because symbol
+/// resolution happens in the unprivileged process, not during BPF collection.
+/// The privileged process only collects raw stack addresses.
+fn get_env_vars_to_forward() -> Vec<&'static str> {
+    vec![
+        "RUST_LOG",        // Debugging/tracing output
+        "RUST_BACKTRACE",  // Stack traces on panic
+    ]
+}
+
 struct RecorderInfo {
     name: &'static str,
     description: &'static str,
