@@ -102,6 +102,14 @@ fn get_env_vars_to_forward() -> Vec<&'static str> {
     ]
 }
 
+/// Generate a Perfetto trace from the session recorder.
+fn generate_trace_from_recorder(recorder: &SessionRecorder) -> Result<Trace> {
+    println!("Generating trace...");
+    let mut trace = Trace::default();
+    trace.packet.extend(recorder.generate_trace());
+    Ok(trace)
+}
+
 /// Build systemd-run command to re-execute systing with privileges.
 ///
 /// This uses subprocess invocation of systemd-run for simplicity and reliability.
@@ -1386,9 +1394,7 @@ fn system(opts: Command) -> Result<()> {
         recorder.syscall_recorder.lock().unwrap().drain_ringbuf();
     }
 
-    println!("Generating trace...");
-    let mut trace = Trace::default();
-    trace.packet.extend(recorder.generate_trace());
+    let trace = generate_trace_from_recorder(&recorder)?;
     let mut file = std::fs::File::create("trace.pb")?;
     trace.write_to_writer(&mut file)?;
     Ok(())
