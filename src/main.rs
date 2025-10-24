@@ -80,6 +80,16 @@ fn needs_privilege_elevation() -> bool {
     !has_bpf_privileges()
 }
 
+/// Check if systemd-run is available on this system.
+/// Returns true if systemd-run can be executed and reports its version.
+fn has_systemd_run() -> bool {
+    process::Command::new("systemd-run")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 struct RecorderInfo {
     name: &'static str,
     description: &'static str,
