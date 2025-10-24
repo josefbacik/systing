@@ -1510,13 +1510,8 @@ fn main() -> Result<()> {
         check_privilege_requirements()?;
     }
 
-    // Check if we should use privilege separation via systemd-run
-    // This is opt-in via environment variable for safe rollout
-    if env::var("SYSTING_USE_SYSTEMD_RUN").is_ok()
-        && !opts.privileged_mode
-        && needs_privilege_elevation()
-        && has_systemd_run()
-    {
+    // Use privilege separation via systemd-run if needed
+    if !opts.privileged_mode && needs_privilege_elevation() && has_systemd_run() {
         return run_unprivileged(&opts);
     }
 
