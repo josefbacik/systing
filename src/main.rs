@@ -249,6 +249,9 @@ struct Command {
     /// Disable all recorders and only enable the specified ones (can be specified multiple times)
     #[arg(long)]
     only_recorder: Vec<String>,
+    /// Internal flag: running in privileged collector mode (hidden from users)
+    #[arg(long, hide = true)]
+    privileged_mode: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
