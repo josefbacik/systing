@@ -280,7 +280,7 @@ fn create_debuginfod_dispatcher() -> Option<Arc<ProcessDispatcher>> {
     match Client::from_env() {
         Ok(Some(client)) => match CachingClient::from_env(client) {
             Ok(caching_client) => {
-                println!("Debuginfod enabled: using debuginfod for symbol resolution");
+                eprintln!("Debuginfod enabled: using debuginfod for symbol resolution");
 
                 // Wrap the CachingClient in an Arc so it can be shared across threads.
                 // The closure below will take ownership of this Arc (via the `move` keyword),
@@ -296,16 +296,18 @@ fn create_debuginfod_dispatcher() -> Option<Arc<ProcessDispatcher>> {
                 }) as ProcessDispatcher))
             }
             Err(e) => {
-                println!("Failed to create caching debuginfod client: {e}, using default resolver");
+                eprintln!(
+                    "Failed to create caching debuginfod client: {e}, using default resolver"
+                );
                 None
             }
         },
         Ok(None) => {
-            println!("No debuginfod URLs found in environment, using default resolver. If using sudo try --preserve-env");
+            eprintln!("No debuginfod URLs found in environment, using default resolver. If using sudo try --preserve-env");
             None
         }
         Err(e) => {
-            println!("Failed to create debuginfod client: {e}, using default resolver");
+            eprintln!("Failed to create debuginfod client: {e}, using default resolver");
             None
         }
     }
@@ -332,7 +334,7 @@ fn dispatch_process_with_client(
                 return Ok(None);
             };
 
-            println!("Fetching debug info for build ID: {}", &build_id);
+            eprintln!("Fetching debug info for build ID: {}", &build_id);
             let path = if let Some(path) = client.fetch_debug_info(&build_id).map_err(Box::from)? {
                 path
             } else {
@@ -340,7 +342,7 @@ fn dispatch_process_with_client(
                 // build ID we let the default resolver see what it can do.
                 return Ok(None);
             };
-            println!("Fetched debug info from debuginfod: {}", path.display());
+            eprintln!("Fetched debug info from debuginfod: {}", path.display());
 
             let resolver = ElfResolver::open(&path).map_err(Box::from)?;
             Ok(Some(Box::new(resolver)))
