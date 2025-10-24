@@ -746,6 +746,53 @@ fn sd_notify() -> Result<()> {
     Ok(())
 }
 
+/// Run in unprivileged mode: spawn privileged collector and process its output.
+fn run_unprivileged(opts: &Command) -> Result<()> {
+    eprintln!("Starting privileged collector via systemd-run...");
+    eprintln!("(You may be prompted for authentication via polkit)");
+
+    let mut cmd = build_systemd_run_command(opts)?;
+
+    // Capture stdout (contains binary trace data)
+    // Inherit stderr (for progress messages from privileged process)
+    cmd.stdout(process::Stdio::piped());
+    cmd.stderr(process::Stdio::inherit());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn systemd-run: {}", e))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
+
+    eprintln!("Reading trace data from privileged process...");
+
+    // Read and parse the protobuf trace from stdout
+    use std::io::Read;
+    let mut buffer = Vec::new();
+    std::io::BufReader::new(stdout).read_to_end(&mut buffer)?;
+
+    eprintln!("Parsing trace data...");
+    let trace = Trace::parse_from_bytes(&buffer)
+        .map_err(|e| anyhow::anyhow!("Failed to parse trace from privileged process: {}", e))?;
+
+    // Wait for privileged process to complete
+    let status = child.wait()?;
+    if !status.success() {
+        bail!("Privileged collector failed with status: {}", status);
+    }
+
+    // Write trace.pb file (with user ownership, not root!)
+    eprintln!("Writing trace.pb...");
+    let mut file = std::fs::File::create("trace.pb")?;
+    trace.write_to_writer(&mut file)?;
+    println!("Trace written to trace.pb");
+
+    Ok(())
+}
+
 fn system(opts: Command) -> Result<()> {
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
@@ -1441,20 +1488,7 @@ fn main() -> Result<()> {
         && needs_privilege_elevation()
         && has_systemd_run()
     {
-        eprintln!("Re-executing with systemd-run for privilege elevation...");
-        eprintln!("(You may be prompted for authentication via polkit)");
-
-        let mut cmd = build_systemd_run_command(&opts)?;
-
-        // Inherit stdin/stdout/stderr for --pipe to work
-        cmd.stdin(process::Stdio::inherit());
-        cmd.stdout(process::Stdio::inherit());
-        cmd.stderr(process::Stdio::inherit());
-
-        let status = cmd
-            .status()
-            .map_err(|e| anyhow::anyhow!("Failed to execute systemd-run: {}", e))?;
-        process::exit(status.code().unwrap_or(1));
+        return run_unprivileged(&opts);
     }
 
     process_recorder_options(&mut opts)?;
