@@ -48,6 +48,38 @@ use perfetto_protos::trace::Trace;
 use plain::Plain;
 use protobuf::Message;
 
+/// Check if we have the necessary capabilities to load BPF programs.
+/// Works correctly in containers and user namespaces, unlike just checking UID.
+fn has_bpf_privileges() -> bool {
+    use caps::{has_cap, CapSet, Capability};
+
+    // On Linux 5.8+, CAP_BPF is sufficient for BPF operations
+    if has_cap(None, CapSet::Effective, Capability::CAP_BPF).unwrap_or(false) {
+        return true;
+    }
+
+    // Fallback for older kernels: CAP_SYS_ADMIN includes BPF privileges
+    if has_cap(None, CapSet::Effective, Capability::CAP_SYS_ADMIN).unwrap_or(false) {
+        return true;
+    }
+
+    false
+}
+
+/// Determine if we need to elevate privileges via systemd-run.
+/// Returns true if we don't have the necessary capabilities.
+///
+/// This handles multiple scenarios:
+/// - Normal users: returns true (need elevation)
+/// - Root users: returns false (already elevated)
+/// - Containers with CAP_BPF granted: returns false (have necessary caps)
+/// - User namespaces with UID 0: returns true (fake root, no real privileges)
+fn needs_privilege_elevation() -> bool {
+    // Check if we have the necessary capabilities
+    // (e.g., container with CAP_BPF granted, or binary with file capabilities)
+    !has_bpf_privileges()
+}
+
 struct RecorderInfo {
     name: &'static str,
     description: &'static str,

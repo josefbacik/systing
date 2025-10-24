@@ -15,6 +15,7 @@ pkg-config = "0.3.32"
 anyhow = "1.0"
 bitfield = "0.19.0"
 blazesym = "0.2.0-rc.4"
+caps = "0.5"
 clap = { version = "4.5.20", features = ["derive"] }
 ctrlc = "3.4"
 debuginfod = { version = "0.2.1", features = ["fs-cache", "tracing"] }
