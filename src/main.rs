@@ -90,6 +90,30 @@ fn has_systemd_run() -> bool {
         .unwrap_or(false)
 }
 
+/// Check privilege requirements and provide helpful error messages.
+fn check_privilege_requirements() -> Result<()> {
+    if !needs_privilege_elevation() {
+        // Already have necessary privileges (CAP_BPF capability)
+        return Ok(());
+    }
+
+    // Need elevation - check if systemd-run is available
+    if !has_systemd_run() {
+        bail!(
+            "systing requires BPF privileges to run.\n\
+             \n\
+             You have several options:\n\
+             1. Run as root: sudo systing <args>\n\
+             2. Install systemd for automatic privilege elevation via systemd-run\n\
+             3. Grant CAP_BPF capability (Linux 5.8+): sudo setcap cap_bpf,cap_perfmon,cap_sys_resource=ep $(which systing)\n\
+             \n\
+             Current system: systemd-run not found"
+        );
+    }
+
+    Ok(())
+}
+
 /// Environment variables to forward to the privileged collector process.
 ///
 /// Note: DEBUGINFOD_URLS is intentionally NOT forwarded because symbol
@@ -1479,6 +1503,11 @@ fn main() -> Result<()> {
             );
         }
         return Ok(());
+    }
+
+    // Check privileges early with helpful messages (unless already in privileged mode)
+    if !opts.privileged_mode {
+        check_privilege_requirements()?;
     }
 
     // Check if we should use privilege separation via systemd-run
