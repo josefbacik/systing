@@ -1413,6 +1413,29 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Check if we should use privilege separation via systemd-run
+    // This is opt-in via environment variable for safe rollout
+    if env::var("SYSTING_USE_SYSTEMD_RUN").is_ok()
+        && !opts.privileged_mode
+        && needs_privilege_elevation()
+        && has_systemd_run()
+    {
+        eprintln!("Re-executing with systemd-run for privilege elevation...");
+        eprintln!("(You may be prompted for authentication via polkit)");
+
+        let mut cmd = build_systemd_run_command(&opts)?;
+
+        // Inherit stdin/stdout/stderr for --pipe to work
+        cmd.stdin(process::Stdio::inherit());
+        cmd.stdout(process::Stdio::inherit());
+        cmd.stderr(process::Stdio::inherit());
+
+        let status = cmd
+            .status()
+            .map_err(|e| anyhow::anyhow!("Failed to execute systemd-run: {}", e))?;
+        process::exit(status.code().unwrap_or(1));
+    }
+
     process_recorder_options(&mut opts)?;
 
     // Set up tracing subscriber with level based on verbosity
