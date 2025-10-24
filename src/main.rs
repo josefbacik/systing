@@ -431,6 +431,11 @@ struct Command {
     /// Internal flag: running in privileged collector mode (hidden from users)
     #[arg(long, hide = true)]
     privileged_mode: bool,
+    /// Disable automatic privilege separation via systemd-run.
+    /// Use this if you prefer to run systing with sudo/doas instead,
+    /// or if systemd-run is causing issues on your system.
+    #[arg(long)]
+    no_privilege_separation: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -1511,7 +1516,11 @@ fn main() -> Result<()> {
     }
 
     // Use privilege separation via systemd-run if needed
-    if !opts.privileged_mode && needs_privilege_elevation() && has_systemd_run() {
+    if !opts.privileged_mode
+        && !opts.no_privilege_separation
+        && needs_privilege_elevation()
+        && has_systemd_run()
+    {
         return run_unprivileged(&opts);
     }
 
