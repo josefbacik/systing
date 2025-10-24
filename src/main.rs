@@ -121,8 +121,8 @@ fn check_privilege_requirements() -> Result<()> {
 /// The privileged process only collects raw stack addresses.
 fn get_env_vars_to_forward() -> Vec<&'static str> {
     vec![
-        "RUST_LOG",        // Debugging/tracing output
-        "RUST_BACKTRACE",  // Stack traces on panic
+        "RUST_LOG",       // Debugging/tracing output
+        "RUST_BACKTRACE", // Stack traces on panic
     ]
 }
 
@@ -148,7 +148,7 @@ fn build_systemd_run_command(opts: &Command) -> Result<process::Command> {
     let mut cmd = process::Command::new("systemd-run");
 
     // Core flags for privilege elevation with data piping
-    cmd.args(&[
+    cmd.args([
         "--pipe",               // Pass stdin/stdout/stderr to privileged process
         "--wait",               // Wait synchronously for completion
         "--collect",            // Clean up transient unit after completion
@@ -202,7 +202,8 @@ fn build_systemd_run_command(opts: &Command) -> Result<process::Command> {
     }
 
     for trace_event_pid in &opts.trace_event_pid {
-        cmd.arg("--trace-event-pid").arg(trace_event_pid.to_string());
+        cmd.arg("--trace-event-pid")
+            .arg(trace_event_pid.to_string());
     }
 
     if opts.sw_event {
