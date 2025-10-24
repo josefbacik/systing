@@ -665,6 +665,15 @@ fn system(opts: Command) -> Result<()> {
                 .set_autoload(false);
         }
 
+        // Only load fork tracepoint when --pid is specified
+        // This hook tracks child processes created by traced processes
+        if opts.pid.is_empty() {
+            open_skel
+                .progs
+                .systing_sched_process_fork
+                .set_autoload(false);
+        }
+
         let mut need_slots = false;
         for counter in perf_counter_names.iter() {
             recorder
