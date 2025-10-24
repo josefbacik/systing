@@ -90,6 +90,26 @@ fn has_systemd_run() -> bool {
         .unwrap_or(false)
 }
 
+/// Check if SELinux is enabled and enforcing.
+fn is_selinux_enforcing() -> bool {
+    std::fs::read_to_string("/sys/fs/selinux/enforce")
+        .ok()
+        .and_then(|s| s.trim().parse::<u8>().ok())
+        .map(|v| v == 1)
+        .unwrap_or(false)
+}
+
+/// Check if running from a user home directory (potential SELinux issue).
+fn is_running_from_home_directory() -> bool {
+    if let Ok(exe) = env::current_exe() {
+        if let Some(exe_str) = exe.to_str() {
+            // Check if path contains /home/ or /root/
+            return exe_str.contains("/home/") || exe_str.contains("/root/");
+        }
+    }
+    false
+}
+
 /// Check privilege requirements and provide helpful error messages.
 fn check_privilege_requirements() -> Result<()> {
     if !needs_privilege_elevation() {
@@ -108,6 +128,28 @@ fn check_privilege_requirements() -> Result<()> {
              3. Grant CAP_BPF capability (Linux 5.8+): sudo setcap cap_bpf,cap_perfmon,cap_sys_resource=ep $(which systing)\n\
              \n\
              Current system: systemd-run not found"
+        );
+    }
+
+    // Warn about potential SELinux issues when running from home directory
+    if is_selinux_enforcing() && is_running_from_home_directory() {
+        eprintln!(
+            "⚠️  WARNING: Running from home directory on SELinux system.\n\
+             If privilege separation fails with 'Permission denied', SELinux may be blocking execution.\n\
+             \n\
+             Solutions:\n\
+             1. Install to system location: sudo cp {} /usr/local/bin/\n\
+             2. Change SELinux context: chcon -t bin_t {}\n\
+             3. Use sudo instead: sudo systing --no-privilege-separation <args>\n\
+             4. Check denials: sudo ausearch -c '(systing)' --raw | audit2why\n",
+            env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_else(|| "systing".to_string()),
+            env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_else(|| "./systing".to_string())
         );
     }
 

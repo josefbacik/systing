@@ -67,6 +67,27 @@ sudo setcap cap_bpf,cap_perfmon,cap_sys_resource=ep $(which systing)
 
 **In containers**: Grant `CAP_BPF` and `CAP_PERFMON` capabilities to the container
 
+**SELinux denials on Fedora/RHEL**: If running from home directory (e.g., `./target/debug/systing`), SELinux prevents systemd from executing user home files. Solutions:
+
+1. **Install to system location** (recommended):
+   ```bash
+   sudo cp ./target/debug/systing /usr/local/bin/
+   /usr/local/bin/systing --duration 60
+   ```
+
+2. **Change SELinux context**:
+   ```bash
+   chcon -t bin_t ./target/debug/systing
+   ./target/debug/systing --duration 60
+   ```
+
+3. **Use fallback with sudo**:
+   ```bash
+   sudo ./target/debug/systing --no-privilege-separation --duration 60
+   ```
+
+4. **Check for denials**: `sudo ausearch -c '(systing)' --raw | audit2why`
+
 ### Enhanced Symbol Resolution
 
 For improved symbol resolution, you can enable debuginfod support:
