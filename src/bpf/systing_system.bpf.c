@@ -810,6 +810,28 @@ int BPF_PROG(systing_sched_process_exit, struct task_struct *task)
 	return handle_sched_process_exit(task);
 }
 
+static int handle_sched_process_fork(struct task_struct *parent,
+				     struct task_struct *child)
+{
+	// Check if parent is being traced
+	if (!trace_task(parent))
+		return 0;
+
+	// Add child to the pids map so we trace it too
+	u32 child_pid = child->tgid;
+	u8 val = 1;
+	bpf_map_update_elem(&pids, &child_pid, &val, BPF_ANY);
+
+	return 0;
+}
+
+SEC("tp_btf/sched_process_fork")
+int BPF_PROG(systing_sched_process_fork, struct task_struct *parent,
+	     struct task_struct *child)
+{
+	return handle_sched_process_fork(parent, child);
+}
+
 SEC("tp_btf/irq_handler_entry")
 int BPF_PROG(systing_irq_handler_entry, int irq, struct irqaction *action)
 {
