@@ -170,7 +170,7 @@ fn get_env_vars_to_forward() -> Vec<&'static str> {
 
 /// Generate a Perfetto trace from the session recorder.
 fn generate_trace_from_recorder(recorder: &SessionRecorder) -> Result<Trace> {
-    println!("Generating trace...");
+    eprintln!("Generating trace...");
     let mut trace = Trace::default();
     trace.packet.extend(recorder.generate_trace());
     Ok(trace)
@@ -1456,7 +1456,7 @@ fn system(opts: Command) -> Result<()> {
         sd_notify()?;
 
         if opts.duration > 0 {
-            println!("Tracing for {} seconds", opts.duration);
+            eprintln!("Tracing for {} seconds", opts.duration);
             thread::sleep(Duration::from_secs(opts.duration));
         } else {
             ctrlc::set_handler(move || {
@@ -1464,11 +1464,11 @@ fn system(opts: Command) -> Result<()> {
             })
             .expect("Error setting Ctrl-C handler");
             if opts.continuous > 0 {
-                println!("Tracing in a continues loop of {} seconds", opts.continuous);
-                println!("Will stop if a trigger is specified, otherwise Ctrl-C to stop");
+                eprintln!("Tracing in a continues loop of {} seconds", opts.continuous);
+                eprintln!("Will stop if a trigger is specified, otherwise Ctrl-C to stop");
             } else {
-                println!("Tracing indefinitely...");
-                println!("Press Ctrl-C to stop");
+                eprintln!("Tracing indefinitely...");
+                eprintln!("Press Ctrl-C to stop");
             }
             stop_rx
                 .recv()
@@ -1476,31 +1476,31 @@ fn system(opts: Command) -> Result<()> {
         }
 
         if opts.continuous > 0 {
-            println!("Asked to stop, waiting 1 second before stopping");
+            eprintln!("Asked to stop, waiting 1 second before stopping");
             thread::sleep(Duration::from_secs(1));
         }
-        println!("Stopping...");
+        eprintln!("Stopping...");
         skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
         thread_done.store(true, Ordering::Relaxed);
         for thread in threads {
             thread.join().expect("Failed to join thread");
         }
-        println!("Stopping receiver threads...");
+        eprintln!("Stopping receiver threads...");
         for thread in recv_threads {
             thread.join().expect("Failed to join receiver thread");
         }
 
-        println!("Missed sched/IRQ events: {}", dump_missed_events(&skel, 0));
-        println!("Missed stack events: {}", dump_missed_events(&skel, 1));
-        println!("Missed probe events: {}", dump_missed_events(&skel, 2));
-        println!("Missed perf events: {}", dump_missed_events(&skel, 3));
+        eprintln!("Missed sched/IRQ events: {}", dump_missed_events(&skel, 0));
+        eprintln!("Missed stack events: {}", dump_missed_events(&skel, 1));
+        eprintln!("Missed probe events: {}", dump_missed_events(&skel, 2));
+        eprintln!("Missed perf events: {}", dump_missed_events(&skel, 3));
         if opts.syscalls {
-            println!("Missed syscall events: {}", dump_missed_events(&skel, 4));
+            eprintln!("Missed syscall events: {}", dump_missed_events(&skel, 4));
         }
     }
 
     if opts.continuous > 0 {
-        println!("Draining recorder ringbuffers...");
+        eprintln!("Draining recorder ringbuffers...");
         recorder.event_recorder.lock().unwrap().drain_ringbuf();
         recorder.stack_recorder.lock().unwrap().drain_ringbuf();
         recorder
