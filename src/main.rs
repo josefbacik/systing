@@ -102,6 +102,141 @@ fn get_env_vars_to_forward() -> Vec<&'static str> {
     ]
 }
 
+/// Build systemd-run command to re-execute systing with privileges.
+///
+/// This uses subprocess invocation of systemd-run for simplicity and reliability.
+/// The systemd-run binary itself uses D-Bus to communicate with systemd's PID 1.
+///
+/// Future improvement: Consider migrating to systemd-zbus crate for direct D-Bus
+/// communication, which would:
+/// - Eliminate dependency on systemd-run binary
+/// - Provide better error handling from polkit
+/// - Allow more control over transient unit lifecycle
+fn build_systemd_run_command(opts: &Command) -> Result<process::Command> {
+    let mut cmd = process::Command::new("systemd-run");
+
+    // Core flags for privilege elevation with data piping
+    cmd.args(&[
+        "--pipe",               // Pass stdin/stdout/stderr to privileged process
+        "--wait",               // Wait synchronously for completion
+        "--collect",            // Clean up transient unit after completion
+        "--quiet",              // Suppress systemd status messages
+        "--uid=root",           // Run as root
+        "--gid=root",           // Run as root group
+        "--property=Type=exec", // Only succeed if exec actually works
+    ]);
+
+    // Forward environment variables (minimal set - no DEBUGINFOD_URLS)
+    for var in get_env_vars_to_forward() {
+        if let Ok(val) = env::var(var) {
+            cmd.arg(format!("--setenv={}={}", var, val));
+        }
+    }
+
+    // Re-exec current binary with --privileged-mode
+    cmd.arg(env::current_exe()?);
+    cmd.arg("--privileged-mode");
+
+    // Forward all original arguments
+    if opts.verbosity > 0 {
+        for _ in 0..opts.verbosity {
+            cmd.arg("-v");
+        }
+    }
+
+    for pid in &opts.pid {
+        cmd.arg("--pid").arg(pid.to_string());
+    }
+
+    for cgroup in &opts.cgroup {
+        cmd.arg("--cgroup").arg(cgroup);
+    }
+
+    if opts.duration > 0 {
+        cmd.arg("--duration").arg(opts.duration.to_string());
+    }
+
+    if opts.no_stack_traces {
+        cmd.arg("--no-stack-traces");
+    }
+
+    if opts.ringbuf_size_mib > 0 {
+        cmd.arg("--ringbuf-size-mib")
+            .arg(opts.ringbuf_size_mib.to_string());
+    }
+
+    for trace_event in &opts.trace_event {
+        cmd.arg("--trace-event").arg(trace_event);
+    }
+
+    for trace_event_pid in &opts.trace_event_pid {
+        cmd.arg("--trace-event-pid").arg(trace_event_pid.to_string());
+    }
+
+    if opts.sw_event {
+        cmd.arg("--sw-event");
+    }
+
+    if opts.process_sched_stats {
+        cmd.arg("--process-sched-stats");
+    }
+
+    if opts.cpu_sched_stats {
+        cmd.arg("--cpu-sched-stats");
+    }
+
+    if opts.cpu_frequency {
+        cmd.arg("--cpu-frequency");
+    }
+
+    for perf_counter in &opts.perf_counter {
+        cmd.arg("--perf-counter").arg(perf_counter);
+    }
+
+    if opts.no_cpu_stack_traces {
+        cmd.arg("--no-cpu-stack-traces");
+    }
+
+    if opts.no_sleep_stack_traces {
+        cmd.arg("--no-sleep-stack-traces");
+    }
+
+    for trace_event_config in &opts.trace_event_config {
+        cmd.arg("--trace-event-config").arg(trace_event_config);
+    }
+
+    if opts.continuous > 0 {
+        cmd.arg("--continuous").arg(opts.continuous.to_string());
+    }
+
+    #[cfg(feature = "pystacks")]
+    if opts.collect_pystacks {
+        cmd.arg("--collect-pystacks");
+    }
+
+    if opts.enable_debuginfod {
+        cmd.arg("--enable-debuginfod");
+    }
+
+    if opts.no_sched {
+        cmd.arg("--no-sched");
+    }
+
+    if opts.syscalls {
+        cmd.arg("--syscalls");
+    }
+
+    for add_recorder in &opts.add_recorder {
+        cmd.arg("--add-recorder").arg(add_recorder);
+    }
+
+    for only_recorder in &opts.only_recorder {
+        cmd.arg("--only-recorder").arg(only_recorder);
+    }
+
+    Ok(cmd)
+}
+
 struct RecorderInfo {
     name: &'static str,
     description: &'static str,
