@@ -14,7 +14,7 @@ To build, ensure you have installed bpftool. This only builds on linux.
 
 ```bash
 cargo build
-./target/debug/systing --duration 60
+sudo ./target/debug/systing --duration 60
 ```
 
 This will generate a `trace.pb` file which can be uploaded to a
@@ -24,83 +24,13 @@ This will generate a `trace.pb` file which can be uploaded to a
 
 Detailed options can be found [here](docs/USAGE.adoc).
 
-### Privilege Requirements
-
-Systing requires elevated privileges to load eBPF programs. It supports two modes:
-
-#### Automatic Privilege Separation (Recommended)
-
-When run as a normal user on systems with systemd, systing automatically:
-1. Spawns a privileged collector process via `systemd-run` (polkit authentication)
-2. Runs the data processing and file writing in your unprivileged session
-3. Creates output files owned by your user (not root)
-4. Uses your `~/.cache/debuginfod_client` for symbol caching
-
-No special setup required - just run `systing` and authenticate when prompted:
-
-```bash
-./target/debug/systing --duration 60
-```
-
-#### Manual Privilege Elevation
-
-On systems without systemd, or with `--no-privilege-separation`:
-```bash
-sudo ./target/debug/systing --duration 60
-```
-
-Note: Output files will be owned by root, and you may need `sudo -E` to preserve DEBUGINFOD_URLS.
-
-#### Capability-Based (Advanced)
-
-On Linux 5.8+, you can grant specific capabilities instead of full root:
-```bash
-sudo setcap cap_bpf,cap_perfmon,cap_sys_resource=ep $(which systing)
-./target/debug/systing --duration 60  # No sudo or systemd-run needed
-```
-
-#### Troubleshooting
-
-**"systemd-run not found"**: Install systemd or use `sudo systing`
-
-**Polkit authentication fails**: Check polkit rules or use `sudo systing --no-privilege-separation`
-
-**In containers**: Grant `CAP_BPF` and `CAP_PERFMON` capabilities to the container
-
-**"Permission denied" when writing trace.pb**: If trace.pb exists from a previous root-owned run:
-```bash
-rm trace.pb  # Remove old root-owned file
-./target/debug/systing --duration 60
-```
-
-**SELinux denials on Fedora/RHEL**: If running from home directory (e.g., `./target/debug/systing`), SELinux prevents systemd from executing user home files. Solutions:
-
-1. **Install to system location** (recommended):
-   ```bash
-   sudo cp ./target/debug/systing /usr/local/bin/
-   /usr/local/bin/systing --duration 60
-   ```
-
-2. **Change SELinux context**:
-   ```bash
-   chcon -t bin_t ./target/debug/systing
-   ./target/debug/systing --duration 60
-   ```
-
-3. **Use fallback with sudo**:
-   ```bash
-   sudo ./target/debug/systing --no-privilege-separation --duration 60
-   ```
-
-4. **Check for denials**: `sudo ausearch -c '(systing)' --raw | audit2why`
-
 ### Enhanced Symbol Resolution
 
 For improved symbol resolution, you can enable debuginfod support:
 
 ```bash
 export DEBUGINFOD_URLS="https://debuginfod.fedoraproject.org/"
-./target/debug/systing --enable-debuginfod --duration 60
+sudo ./target/debug/systing --enable-debuginfod --duration 60
 ```
 
 This will fetch debug information from debuginfod servers, providing more accurate stack traces.
@@ -112,7 +42,7 @@ Systing includes several recorders for different types of events. You can contro
 #### List Available Recorders
 
 ```bash
-./target/debug/systing --list-recorders
+sudo ./target/debug/systing --list-recorders
 ```
 
 This will display all available recorders and their default states:
@@ -128,10 +58,10 @@ Use `--add-recorder` to enable additional recorders on top of the defaults:
 
 ```bash
 # Enable syscalls in addition to default recorders
-./target/debug/systing --add-recorder syscalls --duration 60
+sudo ./target/debug/systing --add-recorder syscalls --duration 60
 
 # Enable multiple additional recorders
-./target/debug/systing --add-recorder syscalls --add-recorder pystacks --duration 60
+sudo ./target/debug/systing --add-recorder syscalls --add-recorder pystacks --duration 60
 ```
 
 #### Use Only Specific Recorders
@@ -140,10 +70,10 @@ Use `--only-recorder` to disable all recorders and enable only the ones you spec
 
 ```bash
 # Only record syscalls (disable everything else)
-./target/debug/systing --only-recorder syscalls --duration 60
+sudo ./target/debug/systing --only-recorder syscalls --duration 60
 
 # Only record syscalls and cpu-stacks
-./target/debug/systing --only-recorder syscalls --only-recorder cpu-stacks --duration 60
+sudo ./target/debug/systing --only-recorder syscalls --only-recorder cpu-stacks --duration 60
 ```
 
 ### Debugging and Verbosity
@@ -152,13 +82,13 @@ Use multiple `-v` flags to control verbosity levels:
 
 ```bash
 # Basic informational output
-./target/debug/systing -v --duration 60
+sudo ./target/debug/systing -v --duration 60
 
 # Detailed debugging (useful for troubleshooting)
-./target/debug/systing -vv --enable-debuginfod --duration 60
+sudo ./target/debug/systing -vv --enable-debuginfod --duration 60
 
 # Maximum verbosity (includes library debugging)
-./target/debug/systing -vvv --enable-debuginfod --duration 60
+sudo ./target/debug/systing -vvv --enable-debuginfod --duration 60
 ```
 
 This tool traces all the scheduling events on the system, cgroup, or process and
