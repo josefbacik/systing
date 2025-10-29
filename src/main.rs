@@ -15,6 +15,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
 use std::process;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -1202,7 +1203,90 @@ fn system(opts: Command) -> Result<()> {
     Ok(())
 }
 
+/// Check if we have the necessary capabilities to run BPF programs
+/// We need CAP_BPF, CAP_PERFMON, or at a minimum CAP_SYS_ADMIN
+fn has_bpf_capabilities() -> bool {
+    // If we're root, we have all capabilities
+    if unsafe { libc::getuid() } == 0 {
+        return true;
+    }
+
+    // Try to load a simple BPF program to check if we have the necessary capabilities
+    // This is the most reliable way to check since capability APIs may not accurately
+    // reflect the effective capabilities needed for BPF
+
+    // For now, we'll do a simple check: if we can bump memlock rlimit,
+    // we likely have capabilities. Otherwise, we need systemd-run.
+    // A better approach would be to actually try loading a minimal BPF program,
+    // but that's more complex.
+
+    // Check if we can set rlimit - this is a good proxy for having needed capabilities
+    let rlimit = libc::rlimit {
+        rlim_cur: 128 << 20,
+        rlim_max: 128 << 20,
+    };
+
+    unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlimit) == 0 }
+}
+
+/// Re-execute the current program using systemd-run to get elevated privileges
+/// Returns an exit code to use for process exit
+fn reexec_with_systemd_run() -> Result<i32> {
+    let current_exe = env::current_exe()?;
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    // Get the current user for --uid parameter
+    let uid = unsafe { libc::getuid() };
+
+    println!("Insufficient capabilities detected, re-executing with systemd-run...");
+    println!("You may be prompted for authentication.");
+
+    // Build the systemd-run command
+    let mut cmd = ProcessCommand::new("systemd-run");
+    cmd.arg(format!("--uid={}", uid))
+        .arg("--wait")
+        .arg("--pty")
+        .arg("--same-dir")
+        .arg("--quiet");
+
+    // Preserve important environment variables
+    let env_vars = ["DEBUGINFOD_URLS", "PATH", "HOME", "USER"];
+    for var in &env_vars {
+        if env::var(var).is_ok() {
+            cmd.arg(format!("--setenv={}", var));
+        }
+    }
+
+    // Clear ambient capabilities - systemd will handle granting the right capabilities
+    cmd.arg("--property=AmbientCapabilities=~");
+
+    // Add the current executable and all arguments
+    cmd.arg(&current_exe);
+    cmd.args(&args);
+
+    // Add an environment variable to prevent infinite recursion
+    cmd.env("SYSTING_REEXECED", "1");
+
+    // Execute and wait for completion
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let status = cmd.status()?;
+
+    Ok(status.code().unwrap_or(1))
+}
+
 fn main() -> Result<()> {
+    // Check if we've already been re-executed to prevent infinite loops
+    let already_reexeced = env::var("SYSTING_REEXECED").is_ok();
+
+    // Check if we have the necessary capabilities
+    if !already_reexeced && !has_bpf_capabilities() {
+        let exit_code = reexec_with_systemd_run()?;
+        process::exit(exit_code);
+    }
+
     let mut opts = Command::parse();
 
     if opts.list_recorders {
