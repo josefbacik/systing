@@ -675,6 +675,19 @@ fn system(opts: Command) -> Result<()> {
                 .set_autoload(false);
         }
 
+        // Only load syscall tracepoints when syscall tracing is enabled
+        // This prevents unnecessary overhead from loading unused tracepoints
+        if !opts.syscalls {
+            open_skel
+                .progs
+                .tracepoint__raw_syscalls__sys_enter
+                .set_autoload(false);
+            open_skel
+                .progs
+                .tracepoint__raw_syscalls__sys_exit
+                .set_autoload(false);
+        }
+
         let mut need_slots = false;
         for counter in perf_counter_names.iter() {
             recorder
