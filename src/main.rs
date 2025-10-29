@@ -15,6 +15,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
 use std::process;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -47,270 +48,6 @@ use perfetto_protos::trace::Trace;
 
 use plain::Plain;
 use protobuf::Message;
-
-/// Check if we have the necessary capabilities to load BPF programs.
-/// Works correctly in containers and user namespaces, unlike just checking UID.
-fn has_bpf_privileges() -> bool {
-    use caps::{has_cap, CapSet, Capability};
-
-    // On Linux 5.8+, CAP_BPF is sufficient for BPF operations
-    if has_cap(None, CapSet::Effective, Capability::CAP_BPF).unwrap_or(false) {
-        return true;
-    }
-
-    // Fallback for older kernels: CAP_SYS_ADMIN includes BPF privileges
-    if has_cap(None, CapSet::Effective, Capability::CAP_SYS_ADMIN).unwrap_or(false) {
-        return true;
-    }
-
-    false
-}
-
-/// Determine if we need to elevate privileges via systemd-run.
-/// Returns true if we don't have the necessary capabilities.
-///
-/// This handles multiple scenarios:
-/// - Normal users: returns true (need elevation)
-/// - Root users: returns false (already elevated)
-/// - Containers with CAP_BPF granted: returns false (have necessary caps)
-/// - User namespaces with UID 0: returns true (fake root, no real privileges)
-fn needs_privilege_elevation() -> bool {
-    // Check if we have the necessary capabilities
-    // (e.g., container with CAP_BPF granted, or binary with file capabilities)
-    !has_bpf_privileges()
-}
-
-/// Check if systemd-run is available on this system.
-/// Returns true if systemd-run can be executed and reports its version.
-fn has_systemd_run() -> bool {
-    process::Command::new("systemd-run")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Check if SELinux is enabled and enforcing.
-fn is_selinux_enforcing() -> bool {
-    std::fs::read_to_string("/sys/fs/selinux/enforce")
-        .ok()
-        .and_then(|s| s.trim().parse::<u8>().ok())
-        .map(|v| v == 1)
-        .unwrap_or(false)
-}
-
-/// Check if running from a user home directory (potential SELinux issue).
-fn is_running_from_home_directory() -> bool {
-    if let Ok(exe) = env::current_exe() {
-        if let Some(exe_str) = exe.to_str() {
-            // Check if path contains /home/ or /root/
-            return exe_str.contains("/home/") || exe_str.contains("/root/");
-        }
-    }
-    false
-}
-
-/// Check privilege requirements and provide helpful error messages.
-fn check_privilege_requirements() -> Result<()> {
-    if !needs_privilege_elevation() {
-        // Already have necessary privileges (CAP_BPF capability)
-        return Ok(());
-    }
-
-    // Need elevation - check if systemd-run is available
-    if !has_systemd_run() {
-        bail!(
-            "systing requires BPF privileges to run.\n\
-             \n\
-             You have several options:\n\
-             1. Run as root: sudo systing <args>\n\
-             2. Install systemd for automatic privilege elevation via systemd-run\n\
-             3. Grant CAP_BPF capability (Linux 5.8+): sudo setcap cap_bpf,cap_perfmon,cap_sys_resource=ep $(which systing)\n\
-             \n\
-             Current system: systemd-run not found"
-        );
-    }
-
-    // Warn about potential SELinux issues when running from home directory
-    if is_selinux_enforcing() && is_running_from_home_directory() {
-        eprintln!(
-            "⚠️  WARNING: Running from home directory on SELinux system.\n\
-             If privilege separation fails with 'Permission denied', SELinux may be blocking execution.\n\
-             \n\
-             Solutions:\n\
-             1. Install to system location: sudo cp {} /usr/local/bin/\n\
-             2. Change SELinux context: chcon -t bin_t {}\n\
-             3. Use sudo instead: sudo systing --no-privilege-separation <args>\n\
-             4. Check denials: sudo ausearch -c '(systing)' --raw | audit2why\n",
-            env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or_else(|| "systing".to_string()),
-            env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or_else(|| "./systing".to_string())
-        );
-    }
-
-    Ok(())
-}
-
-/// Environment variables to forward to the privileged collector process.
-///
-/// Note: DEBUGINFOD_URLS is intentionally NOT forwarded because symbol
-/// resolution happens in the unprivileged process, not during BPF collection.
-/// The privileged process only collects raw stack addresses.
-fn get_env_vars_to_forward() -> Vec<&'static str> {
-    vec![
-        "RUST_LOG",       // Debugging/tracing output
-        "RUST_BACKTRACE", // Stack traces on panic
-    ]
-}
-
-/// Generate a Perfetto trace from the session recorder.
-fn generate_trace_from_recorder(recorder: &SessionRecorder) -> Result<Trace> {
-    eprintln!("Generating trace...");
-    let mut trace = Trace::default();
-    trace.packet.extend(recorder.generate_trace());
-    Ok(trace)
-}
-
-/// Build systemd-run command to re-execute systing with privileges.
-///
-/// This uses subprocess invocation of systemd-run for simplicity and reliability.
-/// The systemd-run binary itself uses D-Bus to communicate with systemd's PID 1.
-///
-/// Future improvement: Consider migrating to systemd-zbus crate for direct D-Bus
-/// communication, which would:
-/// - Eliminate dependency on systemd-run binary
-/// - Provide better error handling from polkit
-/// - Allow more control over transient unit lifecycle
-fn build_systemd_run_command(opts: &Command) -> Result<process::Command> {
-    let mut cmd = process::Command::new("systemd-run");
-
-    // Core flags for privilege elevation with data piping
-    cmd.args([
-        "--pipe",               // Pass stdin/stdout/stderr to privileged process
-        "--wait",               // Wait synchronously for completion
-        "--collect",            // Clean up transient unit after completion
-        "--quiet",              // Suppress systemd status messages
-        "--uid=root",           // Run as root
-        "--gid=root",           // Run as root group
-        "--property=Type=exec", // Only succeed if exec actually works
-    ]);
-
-    // Forward environment variables (minimal set - no DEBUGINFOD_URLS)
-    for var in get_env_vars_to_forward() {
-        if let Ok(val) = env::var(var) {
-            cmd.arg(format!("--setenv={}={}", var, val));
-        }
-    }
-
-    // Re-exec current binary with --privileged-mode
-    cmd.arg(env::current_exe()?);
-    cmd.arg("--privileged-mode");
-
-    // Forward all original arguments
-    if opts.verbosity > 0 {
-        for _ in 0..opts.verbosity {
-            cmd.arg("-v");
-        }
-    }
-
-    for pid in &opts.pid {
-        cmd.arg("--pid").arg(pid.to_string());
-    }
-
-    for cgroup in &opts.cgroup {
-        cmd.arg("--cgroup").arg(cgroup);
-    }
-
-    if opts.duration > 0 {
-        cmd.arg("--duration").arg(opts.duration.to_string());
-    }
-
-    if opts.no_stack_traces {
-        cmd.arg("--no-stack-traces");
-    }
-
-    if opts.ringbuf_size_mib > 0 {
-        cmd.arg("--ringbuf-size-mib")
-            .arg(opts.ringbuf_size_mib.to_string());
-    }
-
-    for trace_event in &opts.trace_event {
-        cmd.arg("--trace-event").arg(trace_event);
-    }
-
-    for trace_event_pid in &opts.trace_event_pid {
-        cmd.arg("--trace-event-pid")
-            .arg(trace_event_pid.to_string());
-    }
-
-    if opts.sw_event {
-        cmd.arg("--sw-event");
-    }
-
-    if opts.process_sched_stats {
-        cmd.arg("--process-sched-stats");
-    }
-
-    if opts.cpu_sched_stats {
-        cmd.arg("--cpu-sched-stats");
-    }
-
-    if opts.cpu_frequency {
-        cmd.arg("--cpu-frequency");
-    }
-
-    for perf_counter in &opts.perf_counter {
-        cmd.arg("--perf-counter").arg(perf_counter);
-    }
-
-    if opts.no_cpu_stack_traces {
-        cmd.arg("--no-cpu-stack-traces");
-    }
-
-    if opts.no_sleep_stack_traces {
-        cmd.arg("--no-sleep-stack-traces");
-    }
-
-    for trace_event_config in &opts.trace_event_config {
-        cmd.arg("--trace-event-config").arg(trace_event_config);
-    }
-
-    if opts.continuous > 0 {
-        cmd.arg("--continuous").arg(opts.continuous.to_string());
-    }
-
-    #[cfg(feature = "pystacks")]
-    if opts.collect_pystacks {
-        cmd.arg("--collect-pystacks");
-    }
-
-    if opts.enable_debuginfod {
-        cmd.arg("--enable-debuginfod");
-    }
-
-    if opts.no_sched {
-        cmd.arg("--no-sched");
-    }
-
-    if opts.syscalls {
-        cmd.arg("--syscalls");
-    }
-
-    for add_recorder in &opts.add_recorder {
-        cmd.arg("--add-recorder").arg(add_recorder);
-    }
-
-    for only_recorder in &opts.only_recorder {
-        cmd.arg("--only-recorder").arg(only_recorder);
-    }
-
-    Ok(cmd)
-}
 
 struct RecorderInfo {
     name: &'static str,
@@ -471,14 +208,6 @@ struct Command {
     /// Disable all recorders and only enable the specified ones (can be specified multiple times)
     #[arg(long)]
     only_recorder: Vec<String>,
-    /// Internal flag: running in privileged collector mode (hidden from users)
-    #[arg(long, hide = true)]
-    privileged_mode: bool,
-    /// Disable automatic privilege separation via systemd-run.
-    /// Use this if you prefer to run systing with sudo/doas instead,
-    /// or if systemd-run is causing issues on your system.
-    #[arg(long)]
-    no_privilege_separation: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -818,66 +547,6 @@ fn sd_notify() -> Result<()> {
     Ok(())
 }
 
-/// Run in unprivileged mode: spawn privileged collector and process its output.
-fn run_unprivileged(opts: &Command) -> Result<()> {
-    eprintln!("Starting privileged collector via systemd-run...");
-    eprintln!("(You may be prompted for authentication via polkit)");
-
-    let mut cmd = build_systemd_run_command(opts)?;
-
-    // Capture stdout (contains binary trace data)
-    // Inherit stderr (for progress messages from privileged process)
-    cmd.stdout(process::Stdio::piped());
-    cmd.stderr(process::Stdio::inherit());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn systemd-run: {}", e))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
-
-    eprintln!("Reading trace data from privileged process...");
-
-    // Read and parse the protobuf trace from stdout
-    use std::io::Read;
-    let mut buffer = Vec::new();
-    std::io::BufReader::new(stdout).read_to_end(&mut buffer)?;
-
-    eprintln!("Parsing trace data...");
-    let trace = Trace::parse_from_bytes(&buffer)
-        .map_err(|e| anyhow::anyhow!("Failed to parse trace from privileged process: {}", e))?;
-
-    // Wait for privileged process to complete
-    let status = child.wait()?;
-    if !status.success() {
-        bail!("Privileged collector failed with status: {}", status);
-    }
-
-    // Write trace.pb file (with user ownership, not root!)
-    eprintln!("Writing trace.pb...");
-    let mut file = std::fs::File::create("trace.pb").map_err(|e| {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            anyhow::anyhow!(
-                "Failed to create trace.pb: Permission denied\n\
-                 \n\
-                 This usually means trace.pb exists and is owned by root from a previous run.\n\
-                 Solution: rm trace.pb\n\
-                 \n\
-                 If the directory itself is not writable, cd to a writable directory first."
-            )
-        } else {
-            anyhow::anyhow!("Failed to create trace.pb: {}", e)
-        }
-    })?;
-    trace.write_to_writer(&mut file)?;
-    println!("Trace written to trace.pb");
-
-    Ok(())
-}
-
 fn system(opts: Command) -> Result<()> {
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
@@ -1003,6 +672,19 @@ fn system(opts: Command) -> Result<()> {
             open_skel
                 .progs
                 .systing_sched_process_fork
+                .set_autoload(false);
+        }
+
+        // Only load syscall tracepoints when syscall tracing is enabled
+        // This prevents unnecessary overhead from loading unused tracepoints
+        if !opts.syscalls {
+            open_skel
+                .progs
+                .tracepoint__raw_syscalls__sys_enter
+                .set_autoload(false);
+            open_skel
+                .progs
+                .tracepoint__raw_syscalls__sys_exit
                 .set_autoload(false);
         }
 
@@ -1469,7 +1151,7 @@ fn system(opts: Command) -> Result<()> {
         sd_notify()?;
 
         if opts.duration > 0 {
-            eprintln!("Tracing for {} seconds", opts.duration);
+            println!("Tracing for {} seconds", opts.duration);
             thread::sleep(Duration::from_secs(opts.duration));
         } else {
             ctrlc::set_handler(move || {
@@ -1477,11 +1159,11 @@ fn system(opts: Command) -> Result<()> {
             })
             .expect("Error setting Ctrl-C handler");
             if opts.continuous > 0 {
-                eprintln!("Tracing in a continues loop of {} seconds", opts.continuous);
-                eprintln!("Will stop if a trigger is specified, otherwise Ctrl-C to stop");
+                println!("Tracing in a continues loop of {} seconds", opts.continuous);
+                println!("Will stop if a trigger is specified, otherwise Ctrl-C to stop");
             } else {
-                eprintln!("Tracing indefinitely...");
-                eprintln!("Press Ctrl-C to stop");
+                println!("Tracing indefinitely...");
+                println!("Press Ctrl-C to stop");
             }
             stop_rx
                 .recv()
@@ -1489,31 +1171,31 @@ fn system(opts: Command) -> Result<()> {
         }
 
         if opts.continuous > 0 {
-            eprintln!("Asked to stop, waiting 1 second before stopping");
+            println!("Asked to stop, waiting 1 second before stopping");
             thread::sleep(Duration::from_secs(1));
         }
-        eprintln!("Stopping...");
+        println!("Stopping...");
         skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
         thread_done.store(true, Ordering::Relaxed);
         for thread in threads {
             thread.join().expect("Failed to join thread");
         }
-        eprintln!("Stopping receiver threads...");
+        println!("Stopping receiver threads...");
         for thread in recv_threads {
             thread.join().expect("Failed to join receiver thread");
         }
 
-        eprintln!("Missed sched/IRQ events: {}", dump_missed_events(&skel, 0));
-        eprintln!("Missed stack events: {}", dump_missed_events(&skel, 1));
-        eprintln!("Missed probe events: {}", dump_missed_events(&skel, 2));
-        eprintln!("Missed perf events: {}", dump_missed_events(&skel, 3));
+        println!("Missed sched/IRQ events: {}", dump_missed_events(&skel, 0));
+        println!("Missed stack events: {}", dump_missed_events(&skel, 1));
+        println!("Missed probe events: {}", dump_missed_events(&skel, 2));
+        println!("Missed perf events: {}", dump_missed_events(&skel, 3));
         if opts.syscalls {
-            eprintln!("Missed syscall events: {}", dump_missed_events(&skel, 4));
+            println!("Missed syscall events: {}", dump_missed_events(&skel, 4));
         }
     }
 
     if opts.continuous > 0 {
-        eprintln!("Draining recorder ringbuffers...");
+        println!("Draining recorder ringbuffers...");
         recorder.event_recorder.lock().unwrap().drain_ringbuf();
         recorder.stack_recorder.lock().unwrap().drain_ringbuf();
         recorder
@@ -1526,28 +1208,98 @@ fn system(opts: Command) -> Result<()> {
         recorder.syscall_recorder.lock().unwrap().drain_ringbuf();
     }
 
-    let trace = generate_trace_from_recorder(&recorder)?;
-
-    if opts.privileged_mode {
-        // Privileged collector: write trace to stdout for parent process
-        use std::io::{self, Write};
-        eprintln!("Collection complete, writing trace data to stdout...");
-        let stdout = io::stdout();
-        let mut handle = stdout.lock();
-        trace.write_to_writer(&mut handle)?;
-        handle.flush()?;
-        eprintln!("Trace data sent to unprivileged process");
-    } else {
-        // Normal mode: write trace.pb file
-        let mut file = std::fs::File::create("trace.pb")?;
-        trace.write_to_writer(&mut file)?;
-        println!("Trace written to trace.pb");
-    }
-
+    println!("Generating trace...");
+    let mut trace = Trace::default();
+    trace.packet.extend(recorder.generate_trace());
+    let mut file = std::fs::File::create("trace.pb")?;
+    trace.write_to_writer(&mut file)?;
     Ok(())
 }
 
+/// Check if we have the necessary capabilities to run BPF programs
+/// We need CAP_BPF, CAP_PERFMON, or at a minimum CAP_SYS_ADMIN
+fn has_bpf_capabilities() -> bool {
+    // If we're root, we have all capabilities
+    if unsafe { libc::getuid() } == 0 {
+        return true;
+    }
+
+    // Try to load a simple BPF program to check if we have the necessary capabilities
+    // This is the most reliable way to check since capability APIs may not accurately
+    // reflect the effective capabilities needed for BPF
+
+    // For now, we'll do a simple check: if we can bump memlock rlimit,
+    // we likely have capabilities. Otherwise, we need systemd-run.
+    // A better approach would be to actually try loading a minimal BPF program,
+    // but that's more complex.
+
+    // Check if we can set rlimit - this is a good proxy for having needed capabilities
+    let rlimit = libc::rlimit {
+        rlim_cur: 128 << 20,
+        rlim_max: 128 << 20,
+    };
+
+    unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlimit) == 0 }
+}
+
+/// Re-execute the current program using systemd-run to get elevated privileges
+/// Returns an exit code to use for process exit
+fn reexec_with_systemd_run() -> Result<i32> {
+    let current_exe = env::current_exe()?;
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    // Get the current user for --uid parameter
+    let uid = unsafe { libc::getuid() };
+
+    println!("Insufficient capabilities detected, re-executing with systemd-run...");
+    println!("You may be prompted for authentication.");
+
+    // Build the systemd-run command
+    let mut cmd = ProcessCommand::new("systemd-run");
+    cmd.arg(format!("--uid={}", uid))
+        .arg("--wait")
+        .arg("--pty")
+        .arg("--same-dir")
+        .arg("--quiet");
+
+    // Preserve important environment variables
+    let env_vars = ["DEBUGINFOD_URLS", "PATH", "HOME", "USER"];
+    for var in &env_vars {
+        if env::var(var).is_ok() {
+            cmd.arg(format!("--setenv={}", var));
+        }
+    }
+
+    // Clear ambient capabilities - systemd will handle granting the right capabilities
+    cmd.arg("--property=AmbientCapabilities=~");
+
+    // Add the current executable and all arguments
+    cmd.arg(&current_exe);
+    cmd.args(&args);
+
+    // Add an environment variable to prevent infinite recursion
+    cmd.env("SYSTING_REEXECED", "1");
+
+    // Execute and wait for completion
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let status = cmd.status()?;
+
+    Ok(status.code().unwrap_or(1))
+}
+
 fn main() -> Result<()> {
+    // Check if we've already been re-executed to prevent infinite loops
+    let already_reexeced = env::var("SYSTING_REEXECED").is_ok();
+
+    // Check if we have the necessary capabilities
+    if !already_reexeced && !has_bpf_capabilities() {
+        let exit_code = reexec_with_systemd_run()?;
+        process::exit(exit_code);
+    }
+
     let mut opts = Command::parse();
 
     if opts.list_recorders {
@@ -1564,20 +1316,6 @@ fn main() -> Result<()> {
             );
         }
         return Ok(());
-    }
-
-    // Check privileges early with helpful messages (unless already in privileged mode)
-    if !opts.privileged_mode {
-        check_privilege_requirements()?;
-    }
-
-    // Use privilege separation via systemd-run if needed
-    if !opts.privileged_mode
-        && !opts.no_privilege_separation
-        && needs_privilege_elevation()
-        && has_systemd_run()
-    {
-        return run_unprivileged(&opts);
     }
 
     process_recorder_options(&mut opts)?;

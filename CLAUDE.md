@@ -73,13 +73,3 @@ cargo fmt
 5. **Run `cargo fmt`** - apply formatting to prevent whitespace errors
 
 ⚠️ **IMPORTANT**: Always run `cargo fmt` as the LAST step before committing to ensure consistent formatting.
-
-## Privilege Separation
-
-Systing automatically uses systemd-run for privilege elevation when:
-- Not running with sufficient capabilities (CAP_BPF)
-- systemd-run is available on the system
-
-This ensures output files are owned by your user, and debuginfod cache goes to your home directory instead of /root/.cache.
-
-To disable automatic privilege separation: `--no-privilege-separation`
