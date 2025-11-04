@@ -131,6 +131,31 @@ fn main() {
             OsStr::new("-D__x86_64__"),
         ];
 
+        // Handle multiarch include paths for Ubuntu/Debian
+        // On these distros, asm/errno.h is in /usr/include/<triplet>/asm/
+        // On Fedora/RHEL, it's directly in /usr/include/asm/
+        let multiarch_include = if !Path::new("/usr/include/asm").exists() {
+            // Try to detect multiarch triplet using dpkg-architecture
+            std::process::Command::new("dpkg-architecture")
+                .arg("-qDEB_HOST_MULTIARCH")
+                .output()
+                .ok()
+                .and_then(|output| {
+                    if output.status.success() {
+                        String::from_utf8(output.stdout).ok()
+                    } else {
+                        None
+                    }
+                })
+                .map(|triplet| format!("-I/usr/include/{}", triplet.trim()))
+        } else {
+            None
+        };
+
+        if let Some(ref include_path) = multiarch_include {
+            clang_args.push(OsStr::new(include_path));
+        }
+
         #[cfg(feature = "pystacks")]
         clang_args.push(OsStr::new("-DSYSTING_PYSTACKS"));
 
