@@ -16,9 +16,36 @@ fn generate_bindings(out_dir: &PathBuf) {
     use bindgen::builder;
     use pkg_config;
 
-    pkg_config::probe_library("fmt").unwrap_or_else(|_| panic!("Failed to find fmt library"));
-    pkg_config::probe_library("re2").unwrap_or_else(|_| panic!("Failed to find re2 library"));
-    pkg_config::probe_library("libcap").unwrap_or_else(|_| panic!("Failed to find libcap library"));
+    // Check for required libraries and collect missing ones
+    let mut missing_libs = Vec::new();
+
+    if pkg_config::probe_library("fmt").is_err() {
+        missing_libs.push("libfmt-dev");
+    }
+    if pkg_config::probe_library("re2").is_err() {
+        missing_libs.push("libre2-dev");
+    }
+    if pkg_config::probe_library("libcap").is_err() {
+        missing_libs.push("libcap-dev");
+    }
+
+    if !missing_libs.is_empty() {
+        eprintln!("\n===============================================");
+        eprintln!("ERROR: Missing required libraries for 'pystacks' feature");
+        eprintln!("===============================================\n");
+        eprintln!("The following development libraries are required but not found:");
+        for lib in &missing_libs {
+            eprintln!("  - {}", lib);
+        }
+        eprintln!("\nTo install these libraries on Ubuntu/Debian, run:");
+        eprintln!("  sudo apt-get install {}\n", missing_libs.join(" "));
+        eprintln!("On Fedora/RHEL, run:");
+        eprintln!("  sudo dnf install fmt-devel re2-devel libcap-devel\n");
+        eprintln!("On Arch Linux, run:");
+        eprintln!("  sudo pacman -S fmt re2 libcap\n");
+        eprintln!("===============================================\n");
+        panic!("Missing required libraries for pystacks feature. See error message above for installation instructions.");
+    }
 
     println!("cargo:rerun-if-changed=strobelight-libs/strobelight/bpf_lib");
     println!("cargo:rustc-link-search={}", out_dir.display());
