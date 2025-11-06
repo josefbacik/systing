@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::network_event;
@@ -63,6 +63,8 @@ pub struct NetworkRecorder {
     network_events: HashMap<u64, HashMap<ConnectionId, ConnectionEvents>>,
     // Map from event name to interned id (for deduplication)
     event_name_ids: HashMap<String, u64>,
+    // Cache of resolved hostnames (IP address -> hostname)
+    hostname_cache: HashMap<u32, String>,
 }
 
 impl NetworkRecorder {
@@ -75,6 +77,41 @@ impl NetworkRecorder {
         } else {
             "network"
         }
+    }
+
+    /// Resolve an IP address to a hostname, with caching and fallback to IP string.
+    /// Returns the hostname if resolution succeeds, otherwise returns the IP address as a string.
+    fn resolve_hostname(&mut self, dest_addr: u32) -> &str {
+        self.hostname_cache.entry(dest_addr).or_insert_with(|| {
+            // Convert from network byte order to Ipv4Addr
+            let addr = Ipv4Addr::from(u32::from_be(dest_addr));
+
+            // Attempt reverse DNS lookup
+            match dns_lookup::lookup_addr(&IpAddr::V4(addr)) {
+                Ok(name) => name,
+                Err(err) => {
+                    // Log failure and fallback to IP address string
+                    tracing::debug!("DNS lookup failed for {}: {}", addr, err);
+                    addr.to_string()
+                }
+            }
+        })
+    }
+
+    /// Format a connection identifier with hostname resolution.
+    /// Returns a string like "TCP:example.com:8080" or "TCP:127.0.0.1:8080" (if lookup fails)
+    fn format_connection_name(&mut self, conn_id: &ConnectionId) -> String {
+        let protocol_str =
+            if conn_id.protocol == crate::systing::types::network_protocol::NETWORK_TCP.0 {
+                "TCP"
+            } else if conn_id.protocol == crate::systing::types::network_protocol::NETWORK_UDP.0 {
+                "UDP"
+            } else {
+                "UNKNOWN"
+            };
+
+        let host = self.resolve_hostname(conn_id.dest_addr);
+        format!("{}:{}:{}", protocol_str, host, conn_id.dest_port)
     }
 
     fn get_or_create_event_name_iid(&mut self, name: String, id_counter: &Arc<AtomicUsize>) -> u64 {
@@ -134,11 +171,15 @@ impl NetworkRecorder {
         let mut packets = Vec::new();
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
 
-        // Collect all unique protocol/operation combinations used in recorded events
+        // Collect all unique connection IDs and protocol/operation combinations
         use crate::systing::types::network_operation;
         let mut protocol_ops_used = std::collections::HashSet::new();
+        let mut connection_ids = Vec::new();
+
         for connections in self.network_events.values() {
             for (conn_id, events) in connections.iter() {
+                connection_ids.push(*conn_id);
+
                 if !events.sends.is_empty() {
                     protocol_ops_used.insert((conn_id.protocol, network_operation::NETWORK_SEND.0));
                 }
@@ -146,6 +187,14 @@ impl NetworkRecorder {
                     protocol_ops_used.insert((conn_id.protocol, network_operation::NETWORK_RECV.0));
                 }
             }
+        }
+
+        // Pre-resolve all hostnames before iterating (avoids borrow checker issues)
+        let mut connection_names = HashMap::new();
+        for conn_id in connection_ids {
+            connection_names
+                .entry(conn_id)
+                .or_insert_with(|| self.format_connection_name(&conn_id));
         }
 
         // Create IIDs for all protocol/operation combinations that were used
@@ -223,7 +272,12 @@ impl NetworkRecorder {
 
                 let mut conn_group_desc = TrackDescriptor::default();
                 conn_group_desc.set_uuid(conn_group_uuid);
-                conn_group_desc.set_name(conn_id.to_string());
+                conn_group_desc.set_name(
+                    connection_names
+                        .get(conn_id)
+                        .expect("connection name should have been pre-resolved")
+                        .clone(),
+                );
                 conn_group_desc.set_parent_uuid(thread_group_uuid);
 
                 let mut conn_group_packet = TracePacket::default();
@@ -303,6 +357,7 @@ impl NetworkRecorder {
         // the SEQ_INCREMENTAL_STATE_CLEARED flag
         self.network_events.clear();
         self.event_name_ids.clear();
+        self.hostname_cache.clear();
 
         packets
     }
