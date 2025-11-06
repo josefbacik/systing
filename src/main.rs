@@ -31,8 +31,8 @@ use crate::session_recorder::{get_clock_value, SessionRecorder, SysInfoEvent};
 use crate::stack_recorder::StackRecorder;
 use crate::syscall_recorder::SyscallRecorder;
 
-use anyhow::bail;
 use anyhow::Result;
+use anyhow::{bail, Context};
 use clap::{ArgAction, Parser};
 
 use tracing::subscriber::set_global_default as set_global_subscriber;
@@ -48,6 +48,21 @@ use perfetto_protos::trace::Trace;
 
 use plain::Plain;
 use protobuf::Message;
+
+/// Duration to poll ringbuffers before checking for shutdown
+const RINGBUF_POLL_DURATION_MS: u64 = 100;
+
+/// Sample period for perf clock events (1ms = 1000 samples/sec)
+const PERF_CLOCK_SAMPLE_PERIOD: u64 = 1000;
+
+/// Memory lock limit for BPF programs (128 MiB)
+const MEMLOCK_RLIMIT_BYTES: u64 = 128 << 20;
+
+/// Sleep duration before stopping in continuous mode (1 second)
+const CONTINUOUS_MODE_STOP_DELAY_SECS: u64 = 1;
+
+/// Interval for refreshing system info like CPU frequency (100ms)
+const SYSINFO_REFRESH_INTERVAL_MS: u64 = 100;
 
 struct RecorderInfo {
     name: &'static str,
@@ -106,6 +121,18 @@ fn validate_recorder_names(names: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
+    match recorder_name {
+        "syscalls" => opts.syscalls = enable,
+        "sched" => opts.no_sched = !enable,
+        "sleep-stacks" => opts.no_sleep_stack_traces = !enable,
+        "cpu-stacks" => opts.no_cpu_stack_traces = !enable,
+        #[cfg(feature = "pystacks")]
+        "pystacks" => opts.collect_pystacks = enable,
+        _ => {}
+    }
+}
+
 fn process_recorder_options(opts: &mut Command) -> Result<()> {
     validate_recorder_names(&opts.add_recorder)?;
     validate_recorder_names(&opts.only_recorder)?;
@@ -122,30 +149,16 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         }
 
         // Then enable only the specified recorders
-        for recorder_name in &opts.only_recorder {
-            match recorder_name.as_str() {
-                "syscalls" => opts.syscalls = true,
-                "sched" => opts.no_sched = false,
-                "sleep-stacks" => opts.no_sleep_stack_traces = false,
-                "cpu-stacks" => opts.no_cpu_stack_traces = false,
-                #[cfg(feature = "pystacks")]
-                "pystacks" => opts.collect_pystacks = true,
-                _ => {}
-            }
+        let recorders = opts.only_recorder.clone();
+        for recorder_name in &recorders {
+            enable_recorder(opts, recorder_name, true);
         }
     }
 
     // Process --add-recorder to enable additional recorders
-    for recorder_name in &opts.add_recorder {
-        match recorder_name.as_str() {
-            "syscalls" => opts.syscalls = true,
-            "sched" => opts.no_sched = false,
-            "sleep-stacks" => opts.no_sleep_stack_traces = false,
-            "cpu-stacks" => opts.no_cpu_stack_traces = false,
-            #[cfg(feature = "pystacks")]
-            "pystacks" => opts.collect_pystacks = true,
-            _ => {}
-        }
+    let recorders = opts.add_recorder.clone();
+    for recorder_name in &recorders {
+        enable_recorder(opts, recorder_name, true);
     }
     Ok(())
 }
@@ -212,12 +225,16 @@ struct Command {
 
 fn bump_memlock_rlimit() -> Result<()> {
     let rlimit = libc::rlimit {
-        rlim_cur: 128 << 20,
-        rlim_max: 128 << 20,
+        rlim_cur: MEMLOCK_RLIMIT_BYTES,
+        rlim_max: MEMLOCK_RLIMIT_BYTES,
     };
 
     if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlimit) } != 0 {
-        bail!("Failed to increase rlimit");
+        bail!(
+            "Failed to increase RLIMIT_MEMLOCK to {} bytes ({} MiB). This is required for BPF programs.",
+            MEMLOCK_RLIMIT_BYTES,
+            MEMLOCK_RLIMIT_BYTES >> 20
+        );
     }
 
     Ok(())
@@ -429,6 +446,124 @@ fn consume_loop<T, N>(
     }
 }
 
+fn spawn_recorder_threads(
+    recorder: &Arc<SessionRecorder>,
+    channels: RecorderChannels,
+    opts: &Command,
+    stop_tx: &Sender<()>,
+    perf_counter_names: &[String],
+) -> Result<Vec<thread::JoinHandle<i32>>> {
+    let RecorderChannels {
+        event_rx,
+        stack_rx,
+        cache_rx,
+        probe_rx,
+        syscall_rx,
+    } = channels;
+
+    let mut threads = Vec::new();
+
+    // Always spawn sched recorder
+    {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("sched_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<SchedEventRecorder, task_event>(
+                        &session_recorder,
+                        &session_recorder.event_recorder,
+                        event_rx,
+                        my_stop_tx,
+                    );
+                    0
+                })?,
+        );
+    }
+
+    // Always spawn stack recorder
+    {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("stack_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<StackRecorder, stack_event>(
+                        &session_recorder,
+                        &session_recorder.stack_recorder,
+                        stack_rx,
+                        my_stop_tx,
+                    );
+                    0
+                })?,
+        );
+    }
+
+    // Always spawn probe recorder
+    {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("probe_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<SystingProbeRecorder, probe_event>(
+                        &session_recorder,
+                        &session_recorder.probe_recorder,
+                        probe_rx,
+                        my_stop_tx,
+                    );
+                    0
+                })?,
+        );
+    }
+
+    // Conditionally spawn syscall recorder
+    if opts.syscalls {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("syscall_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<SyscallRecorder, syscall_event>(
+                        &session_recorder,
+                        &session_recorder.syscall_recorder,
+                        syscall_rx,
+                        my_stop_tx,
+                    );
+                    0
+                })?,
+        );
+    }
+
+    // Conditionally spawn perf counter recorder
+    if perf_counter_names.is_empty() {
+        // Drop the channel receiver if not using perf counters
+        drop(cache_rx);
+    } else {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("perf_counter_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<PerfCounterRecorder, perf_counter_event>(
+                        &session_recorder,
+                        &session_recorder.perf_counter_recorder,
+                        cache_rx,
+                        my_stop_tx,
+                    );
+                    0
+                })?,
+        );
+    }
+
+    Ok(threads)
+}
+
 fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
     let index = index.to_ne_bytes();
     let result = skel
@@ -470,14 +605,19 @@ fn setup_perf_counters(
     perf_counter_names: &mut Vec<String>,
 ) -> Result<()> {
     if !opts.perf_counter.is_empty() {
-        counters.discover()?;
+        counters
+            .discover()
+            .with_context(|| "Failed to discover available perf counters on this system")?;
 
         // We can do things like topdown* to get all of the topdown counters, so we have to loop
         // through all of our options and populate the actual counter names that we want
         for counter in opts.perf_counter.iter() {
             let events = counters.event(counter);
             if events.is_none() {
-                return Err(anyhow::anyhow!("Invalid perf counter"));
+                return Err(anyhow::anyhow!(
+                    "Invalid perf counter: '{}'. Use a valid counter name or pattern (e.g., 'instructions', 'cycles', 'topdown*')",
+                    counter
+                ));
             }
             for event in events.unwrap() {
                 if !perf_counter_names.contains(&event.name) {
@@ -489,51 +629,48 @@ fn setup_perf_counters(
     Ok(())
 }
 
+fn set_ringbuf_duration(recorder: &Arc<SessionRecorder>, duration_nanos: u64) {
+    recorder
+        .event_recorder
+        .lock()
+        .unwrap()
+        .ringbuf
+        .set_max_duration(duration_nanos);
+    recorder
+        .stack_recorder
+        .lock()
+        .unwrap()
+        .ringbuf
+        .set_max_duration(duration_nanos);
+    recorder
+        .perf_counter_recorder
+        .lock()
+        .unwrap()
+        .ringbuf
+        .set_max_duration(duration_nanos);
+    recorder
+        .sysinfo_recorder
+        .lock()
+        .unwrap()
+        .ringbuf
+        .set_max_duration(duration_nanos);
+    recorder
+        .probe_recorder
+        .lock()
+        .unwrap()
+        .ringbuf
+        .set_max_duration(duration_nanos);
+}
+
 fn configure_recorder(opts: &Command, recorder: &Arc<SessionRecorder>) {
     if opts.continuous > 0 {
-        let duration = Duration::from_secs(opts.continuous);
-        recorder
-            .event_recorder
-            .lock()
-            .unwrap()
-            .ringbuf
-            .set_max_duration(duration.as_nanos() as u64);
-        recorder
-            .stack_recorder
-            .lock()
-            .unwrap()
-            .ringbuf
-            .set_max_duration(duration.as_nanos() as u64);
-        recorder
-            .perf_counter_recorder
-            .lock()
-            .unwrap()
-            .ringbuf
-            .set_max_duration(duration.as_nanos() as u64);
-        recorder
-            .sysinfo_recorder
-            .lock()
-            .unwrap()
-            .ringbuf
-            .set_max_duration(duration.as_nanos() as u64);
-        recorder
-            .probe_recorder
-            .lock()
-            .unwrap()
-            .ringbuf
-            .set_max_duration(duration.as_nanos() as u64);
+        let duration_nanos = Duration::from_secs(opts.continuous).as_nanos() as u64;
+        set_ringbuf_duration(recorder, duration_nanos);
     }
 
-    recorder
-        .event_recorder
-        .lock()
-        .unwrap()
-        .set_process_sched_stats(opts.process_sched_stats);
-    recorder
-        .event_recorder
-        .lock()
-        .unwrap()
-        .set_cpu_sched_stats(opts.cpu_sched_stats);
+    let mut event_recorder = recorder.event_recorder.lock().unwrap();
+    event_recorder.set_process_sched_stats(opts.process_sched_stats);
+    event_recorder.set_cpu_sched_stats(opts.cpu_sched_stats);
 }
 
 fn sd_notify() -> Result<()> {
@@ -541,9 +678,17 @@ fn sd_notify() -> Result<()> {
         return Ok(());
     };
 
-    let sock = UnixDatagram::unbound()?;
-    sock.connect(socket_path)?;
-    sock.send("READY=1".as_bytes())?;
+    let sock = UnixDatagram::unbound().with_context(|| {
+        "Failed to create unbound Unix datagram socket for systemd notification"
+    })?;
+    sock.connect(&socket_path).with_context(|| {
+        format!(
+            "Failed to connect to systemd notify socket: {:?}",
+            socket_path
+        )
+    })?;
+    sock.send("READY=1".as_bytes())
+        .with_context(|| "Failed to send READY=1 message to systemd")?;
     Ok(())
 }
 
@@ -590,6 +735,536 @@ fn discover_python_processes() -> Vec<u32> {
     python_pids
 }
 
+struct RecorderChannels {
+    event_rx: Receiver<task_event>,
+    stack_rx: Receiver<stack_event>,
+    cache_rx: Receiver<perf_counter_event>,
+    probe_rx: Receiver<probe_event>,
+    syscall_rx: Receiver<syscall_event>,
+}
+
+fn setup_ringbuffers<'a>(
+    skel: &systing::SystingSystemSkel,
+    opts: &Command,
+    perf_counter_names: &[String],
+) -> Result<(Vec<(String, libbpf_rs::RingBuffer<'a>)>, RecorderChannels)> {
+    let mut rings = Vec::new();
+    let (event_tx, event_rx) = channel();
+    let (stack_tx, stack_rx) = channel();
+    let (cache_tx, cache_rx) = channel();
+    let (probe_tx, probe_rx) = channel();
+    let (syscall_tx, syscall_rx) = channel();
+
+    let object = skel.object();
+
+    for (i, map) in object.maps().enumerate() {
+        let name = map.name().to_str().unwrap();
+        if name.starts_with("ringbuf_events") {
+            let ring = create_ring::<task_event>(&map, event_tx.clone())?;
+            rings.push((format!("events_{i}").to_string(), ring));
+        } else if name.starts_with("ringbuf_stack") {
+            let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
+            rings.push((name.to_string(), ring));
+        } else if name.starts_with("ringbuf_perf_counter") {
+            if !perf_counter_names.is_empty() {
+                let ring = create_ring::<perf_counter_event>(&map, cache_tx.clone())?;
+                rings.push((name.to_string(), ring));
+            }
+        } else if name.starts_with("ringbuf_probe") {
+            let ring = create_ring::<probe_event>(&map, probe_tx.clone())?;
+            rings.push((name.to_string(), ring));
+        } else if name.starts_with("ringbuf_syscall") && opts.syscalls {
+            let ring = create_ring::<syscall_event>(&map, syscall_tx.clone())?;
+            rings.push((name.to_string(), ring));
+        }
+    }
+
+    let channels = RecorderChannels {
+        event_rx,
+        stack_rx,
+        cache_rx,
+        probe_rx,
+        syscall_rx,
+    };
+
+    Ok((rings, channels))
+}
+
+fn configure_bpf_skeleton(
+    open_skel: &mut systing::OpenSystingSystemSkel,
+    opts: &Command,
+    num_cpus: u32,
+    old_kernel: bool,
+    collect_pystacks: bool,
+    recorder: &Arc<SessionRecorder>,
+) -> Result<()> {
+    // Configure rodata with tool settings
+    {
+        let rodata = open_skel
+            .maps
+            .rodata_data
+            .as_deref_mut()
+            .expect("'rodata' is not mmap'ed, your kernel is too old");
+
+        let (my_dev, my_ino) = get_pid_namespace_info();
+        rodata.tool_config.num_cpus = num_cpus;
+        rodata.tool_config.my_tgid = process::id();
+        rodata.tool_config.my_dev = my_dev;
+        rodata.tool_config.my_ino = my_ino;
+        rodata.tool_config.no_cpu_stack_traces = opts.no_cpu_stack_traces as u32;
+        rodata.tool_config.no_sleep_stack_traces = opts.no_sleep_stack_traces as u32;
+        rodata.tool_config.confidentiality_mode = detect_confidentiality_mode();
+        if !opts.cgroup.is_empty() {
+            rodata.tool_config.filter_cgroup = 1;
+        }
+        if opts.no_stack_traces {
+            rodata.tool_config.no_stack_traces = 1;
+        }
+        if !opts.pid.is_empty() {
+            rodata.tool_config.filter_pid = 1;
+        }
+        if collect_pystacks {
+            rodata.tool_config.collect_pystacks = 1;
+        }
+        if opts.syscalls {
+            rodata.tool_config.collect_syscalls = 1;
+        }
+    }
+
+    // Configure ringbuf size if specified
+    if opts.ringbuf_size_mib > 0 {
+        let size = opts.ringbuf_size_mib * 1024 * 1024;
+        let object = open_skel.open_object_mut();
+        for mut map in object.maps_mut() {
+            let name = map.name().to_str().unwrap().to_string();
+            if name.starts_with("node") {
+                map.set_max_entries(size).with_context(|| {
+                    format!(
+                        "Failed to set ringbuf size to {} MiB for map '{}'",
+                        opts.ringbuf_size_mib, name
+                    )
+                })?;
+            }
+        }
+    }
+
+    // Setup probe recorder with trace events
+    {
+        let mut probe_recorder = recorder.probe_recorder.lock().unwrap();
+        let mut rng = rand::rng();
+        for tracepoint in opts.trace_event.iter() {
+            probe_recorder
+                .add_event_from_str(tracepoint, &mut rng)
+                .with_context(|| format!("Failed to parse trace event: '{}'", tracepoint))?;
+        }
+
+        for config in opts.trace_event_config.iter() {
+            probe_recorder
+                .load_config(config, &mut rng)
+                .with_context(|| format!("Failed to load trace event config file: '{}'", config))?;
+        }
+
+        if opts.trace_event_pid.is_empty() {
+            for event in probe_recorder.config_events.values() {
+                match event.event {
+                    EventProbe::Usdt(_) => {
+                        Err(anyhow::anyhow!(
+                            "USDT events must be specified with --trace-event-pid"
+                        ))?;
+                    }
+                    EventProbe::UProbe(_) => {
+                        Err(anyhow::anyhow!(
+                            "UPROBE events must be specified with --trace-event-pid"
+                        ))?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Configure program autoload based on kernel version and options
+    // If we're on an older kernel we can't use the raw_tracepoint version since it doesn't
+    // have the cookie support. Newer kernels will use the raw_tracepoint version so don't need
+    // to load the old tracepoint program.
+    if old_kernel {
+        open_skel.progs.systing_raw_tracepoint.set_autoload(false);
+    } else {
+        open_skel.progs.systing_tracepoint.set_autoload(false);
+    }
+
+    // Don't load scheduler tracepoints if --no-sched is set
+    // This prevents them from being loaded into the kernel at all
+    if opts.no_sched {
+        open_skel.progs.systing_sched_wakeup.set_autoload(false);
+        open_skel.progs.systing_sched_wakeup_new.set_autoload(false);
+        open_skel.progs.systing_sched_switch.set_autoload(false);
+        open_skel.progs.systing_sched_waking.set_autoload(false);
+        open_skel
+            .progs
+            .systing_sched_process_exit
+            .set_autoload(false);
+    }
+
+    // Only load fork tracepoint when --pid is specified
+    // This hook tracks child processes created by traced processes
+    if opts.pid.is_empty() {
+        open_skel
+            .progs
+            .systing_sched_process_fork
+            .set_autoload(false);
+    }
+
+    // Only load syscall tracepoints when syscall tracing is enabled
+    // This prevents unnecessary overhead from loading unused tracepoints
+    if !opts.syscalls {
+        open_skel
+            .progs
+            .tracepoint__raw_syscalls__sys_enter
+            .set_autoload(false);
+        open_skel
+            .progs
+            .tracepoint__raw_syscalls__sys_exit
+            .set_autoload(false);
+    }
+
+    Ok(())
+}
+
+fn setup_perf_events(
+    skel: &mut systing::SystingSystemSkel,
+    opts: &Command,
+    counters: &PerfCounters,
+    perf_counter_names: &[String],
+    num_cpus: u32,
+) -> Result<(Vec<libbpf_rs::Link>, Vec<PerfOpenEvents>)> {
+    let mut perf_links = Vec::new();
+    let mut event_files_vec = Vec::new();
+
+    // Set up clock perf events with automatic VM detection and fallback
+    let clock_files = {
+        let mut clock_files = PerfOpenEvents::default();
+        let mut clock_event = PerfHwEvent {
+            name: "clock".to_string(),
+            event_type: if opts.sw_event {
+                perf::PERF_TYPE_SOFTWARE
+            } else {
+                perf::PERF_TYPE_HARDWARE
+            },
+            event_config: if opts.sw_event {
+                perf::PERF_COUNT_SW_CPU_CLOCK
+            } else {
+                perf::PERF_COUNT_HW_CPU_CYCLES
+            },
+            disabled: false,
+            need_slots: false,
+            cpus: (0..num_cpus).collect(),
+        };
+
+        clock_files.add_hw_event(clock_event.clone())?;
+
+        // Try to open the events, handle VM detection
+        if let Err(e) = clock_files.open_events(None, PERF_CLOCK_SAMPLE_PERIOD) {
+            // Check if this is a VM-related error (ErrorKind::NotFound)
+            if e.kind() == std::io::ErrorKind::NotFound && !opts.sw_event {
+                // Detected VM environment, automatically retry with software events
+                eprintln!("Detected virtualized environment, automatically switching to software events (--sw-event)");
+
+                // Modify the event to use software events
+                clock_event.event_type = perf::PERF_TYPE_SOFTWARE;
+                clock_event.event_config = perf::PERF_COUNT_SW_CPU_CLOCK;
+
+                // Recreate clock_files with the modified event
+                clock_files = PerfOpenEvents::default();
+                clock_files.add_hw_event(clock_event)?;
+                clock_files.open_events(None, PERF_CLOCK_SAMPLE_PERIOD)?;
+            } else {
+                // Not a VM error or already using software events, propagate the error
+                return Err(e.into());
+            }
+        }
+
+        clock_files
+    };
+
+    // Attach clock events to BPF program
+    for (_, file) in clock_files {
+        let link = skel
+            .progs
+            .systing_perf_event_clock
+            .attach_perf_event_with_opts(
+                file.as_raw_fd(),
+                libbpf_rs::PerfEventOpts {
+                    cookie: 0,
+                    ..Default::default()
+                },
+            )?;
+        perf_links.push(link);
+    }
+
+    // Determine if we need slots for topdown counters
+    let need_slots = perf_counter_names
+        .iter()
+        .any(|counter| counter.starts_with("topdown"));
+
+    // Setup slots files if needed
+    let mut slots_files = PerfOpenEvents::default();
+    if need_slots {
+        let slot_hwevents = counters.event("slots");
+        let slot_hwevents = if let Some(slot_hwevents) = slot_hwevents {
+            slot_hwevents
+        } else {
+            Err(anyhow::anyhow!(
+                "Failed to find 'slots' perf event required for topdown counters. This may not be supported on your CPU."
+            ))?
+        };
+        for event in slot_hwevents.iter() {
+            slots_files.add_hw_event(event.clone())?;
+        }
+        slots_files
+            .open_events(None, 0)
+            .with_context(|| "Failed to open 'slots' perf events for topdown counters")?;
+        slots_files
+            .enable()
+            .with_context(|| "Failed to enable 'slots' perf events")?;
+    }
+
+    // Setup counter events and populate perf_counters map
+    for (index, event_name) in perf_counter_names.iter().enumerate() {
+        let mut event_files = PerfOpenEvents::default();
+        let hwevents = counters.event(event_name).unwrap();
+
+        for hwevent in hwevents {
+            event_files.add_hw_event(hwevent)?;
+        }
+        event_files.open_events(Some(&slots_files), 0)?;
+
+        let floor = index * num_cpus as usize;
+        for (cpu, file) in &event_files {
+            let key: u32 = (floor + *cpu as usize).try_into().unwrap();
+            let key_val = key.to_ne_bytes();
+            let fd_val = file.as_raw_fd().to_ne_bytes();
+            skel.maps
+                .perf_counters
+                .update(&key_val, &fd_val, libbpf_rs::MapFlags::ANY)?;
+        }
+        event_files.enable()?;
+        event_files_vec.push(event_files);
+    }
+
+    // Keep slots_files alive if used
+    if need_slots {
+        event_files_vec.push(slots_files);
+    }
+
+    Ok((perf_links, event_files_vec))
+}
+
+fn attach_probes(
+    skel: &mut systing::SystingSystemSkel,
+    recorder: &Arc<SessionRecorder>,
+    opts: &Command,
+    old_kernel: bool,
+) -> Result<Vec<libbpf_rs::Link>> {
+    let mut probe_links = Vec::new();
+    let probe_recorder = recorder.probe_recorder.lock().unwrap();
+
+    for event in probe_recorder.config_events.values() {
+        for key in event.keys.iter() {
+            let key_type = match key.key_type {
+                EventKeyType::String => arg_type::ARG_STRING,
+                EventKeyType::Long => arg_type::ARG_LONG,
+            };
+
+            let desc = arg_desc {
+                arg_type: key_type,
+                arg_index: key.key_index as i32,
+            };
+
+            // Safe because we're not padded
+            let desc_data = unsafe { plain::as_bytes(&desc) };
+            skel.maps.event_key_types.update(
+                &event.cookie.to_ne_bytes(),
+                desc_data,
+                libbpf_rs::MapFlags::ANY,
+            )?;
+        }
+
+        match &event.event {
+            EventProbe::Usdt(usdt) => {
+                // Skip USDT probes in confidentiality mode as they use restricted helpers
+                if detect_confidentiality_mode() == 1 {
+                    eprintln!(
+                        "Skipping USDT probe {}:{}:{} - not supported in confidentiality mode",
+                        usdt.path, usdt.provider, usdt.name
+                    );
+                } else {
+                    for pid in opts.trace_event_pid.iter() {
+                        let link = skel
+                            .progs
+                            .systing_usdt
+                            .attach_usdt_with_opts(
+                                *pid as i32,
+                                &usdt.path,
+                                &usdt.provider,
+                                &usdt.name,
+                                UsdtOpts {
+                                    cookie: event.cookie,
+                                    ..Default::default()
+                                },
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "Failed to attach USDT probe {}:{}:{} to PID {}",
+                                    usdt.path, usdt.provider, usdt.name, *pid
+                                )
+                            })?;
+                        probe_links.push(link);
+                    }
+                }
+            }
+            EventProbe::UProbe(uprobe) => {
+                for pid in opts.trace_event_pid.iter() {
+                    let link = skel
+                        .progs
+                        .systing_uprobe
+                        .attach_uprobe_with_opts(
+                            *pid as i32,
+                            &uprobe.path,
+                            uprobe.offset as usize,
+                            UprobeOpts {
+                                cookie: event.cookie,
+                                retprobe: uprobe.retprobe,
+                                func_name: Some(uprobe.func_name.clone()),
+                                ..Default::default()
+                            },
+                        )
+                        .with_context(|| {
+                            format!(
+                                "Failed to attach uprobe '{}' ({}retprobe) at {}+{:#x} to PID {}",
+                                uprobe.func_name,
+                                if uprobe.retprobe { "" } else { "not " },
+                                uprobe.path,
+                                uprobe.offset,
+                                *pid
+                            )
+                        })?;
+                    probe_links.push(link);
+                }
+            }
+            EventProbe::KProbe(kprobe) => {
+                let link = skel
+                    .progs
+                    .systing_kprobe
+                    .attach_kprobe_with_opts(
+                        kprobe.retprobe,
+                        &kprobe.func_name,
+                        libbpf_rs::KprobeOpts {
+                            cookie: event.cookie,
+                            ..Default::default()
+                        },
+                    )
+                    .with_context(|| format!(
+                        "Failed to attach kprobe '{}' ({}retprobe). Ensure the function exists in the kernel.",
+                        kprobe.func_name,
+                        if kprobe.retprobe { "" } else { "not " }
+                    ))?;
+                probe_links.push(link);
+            }
+            EventProbe::Tracepoint(tracepoint) => {
+                let link = if old_kernel {
+                    let category =
+                        libbpf_rs::TracepointCategory::Custom(tracepoint.category.clone());
+                    skel.progs.systing_tracepoint.attach_tracepoint_with_opts(
+                        category,
+                        &tracepoint.name,
+                        TracepointOpts {
+                            cookie: event.cookie,
+                            ..Default::default()
+                        },
+                    )
+                } else {
+                    skel.progs
+                        .systing_raw_tracepoint
+                        .attach_raw_tracepoint_with_opts(
+                            &tracepoint.name,
+                            RawTracepointOpts {
+                                cookie: event.cookie,
+                                ..Default::default()
+                            },
+                        )
+                }
+                .with_context(|| format!(
+                    "Failed to attach tracepoint '{}:{}'. Verify the tracepoint exists with: ls /sys/kernel/debug/tracing/events/{}/{}",
+                    tracepoint.category, tracepoint.name, tracepoint.category, tracepoint.name
+                ))?;
+                probe_links.push(link);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(probe_links)
+}
+
+fn run_tracing_loop(
+    threads: Vec<thread::JoinHandle<i32>>,
+    recv_threads: Vec<thread::JoinHandle<i32>>,
+    opts: &Command,
+    stop_tx: Sender<()>,
+    stop_rx: Receiver<()>,
+    thread_done: Arc<AtomicBool>,
+    skel: &mut systing::SystingSystemSkel,
+) -> Result<()> {
+    sd_notify()?;
+
+    if opts.duration > 0 {
+        println!("Tracing for {} seconds", opts.duration);
+        thread::sleep(Duration::from_secs(opts.duration));
+    } else {
+        ctrlc::set_handler(move || stop_tx.send(()).expect("Could not send signal on channel."))
+            .expect("Error setting Ctrl-C handler");
+        if opts.continuous > 0 {
+            println!("Tracing in a continues loop of {} seconds", opts.continuous);
+            println!("Will stop if a trigger is specified, otherwise Ctrl-C to stop");
+        } else {
+            println!("Tracing indefinitely...");
+            println!("Press Ctrl-C to stop");
+        }
+        stop_rx
+            .recv()
+            .expect("Could not receive signal on channel.");
+    }
+
+    if opts.continuous > 0 {
+        println!(
+            "Asked to stop, waiting {} second before stopping",
+            CONTINUOUS_MODE_STOP_DELAY_SECS
+        );
+        thread::sleep(Duration::from_secs(CONTINUOUS_MODE_STOP_DELAY_SECS));
+    }
+    println!("Stopping...");
+    skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
+    thread_done.store(true, Ordering::Relaxed);
+    for thread in threads {
+        thread.join().expect("Failed to join thread");
+    }
+    println!("Stopping receiver threads...");
+    for thread in recv_threads {
+        thread.join().expect("Failed to join receiver thread");
+    }
+
+    println!("Missed sched/IRQ events: {}", dump_missed_events(skel, 0));
+    println!("Missed stack events: {}", dump_missed_events(skel, 1));
+    println!("Missed probe events: {}", dump_missed_events(skel, 2));
+    println!("Missed perf events: {}", dump_missed_events(skel, 3));
+    if opts.syscalls {
+        println!("Missed syscall events: {}", dump_missed_events(skel, 4));
+    }
+
+    Ok(())
+}
+
 fn system(opts: Command) -> Result<()> {
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
@@ -614,124 +1289,20 @@ fn system(opts: Command) -> Result<()> {
         let collect_pystacks = opts.collect_pystacks;
 
         let mut open_object = MaybeUninit::uninit();
-        let mut open_skel = skel_builder.open(&mut open_object)?;
-        {
-            let rodata = open_skel
-                .maps
-                .rodata_data
-                .as_deref_mut()
-                .expect("'rodata' is not mmap'ed, your kernel is too old");
+        let mut open_skel = skel_builder.open(&mut open_object).with_context(|| {
+            "Failed to open BPF skeleton. Ensure BPF is supported on your kernel."
+        })?;
 
-            let (my_dev, my_ino) = get_pid_namespace_info();
-            rodata.tool_config.num_cpus = num_cpus;
-            rodata.tool_config.my_tgid = process::id();
-            rodata.tool_config.my_dev = my_dev;
-            rodata.tool_config.my_ino = my_ino;
-            rodata.tool_config.no_cpu_stack_traces = opts.no_cpu_stack_traces as u32;
-            rodata.tool_config.no_sleep_stack_traces = opts.no_sleep_stack_traces as u32;
-            rodata.tool_config.confidentiality_mode = detect_confidentiality_mode();
-            if !opts.cgroup.is_empty() {
-                rodata.tool_config.filter_cgroup = 1;
-            }
-            if opts.no_stack_traces {
-                rodata.tool_config.no_stack_traces = 1;
-            }
-            if !opts.pid.is_empty() {
-                rodata.tool_config.filter_pid = 1;
-            }
-            if collect_pystacks {
-                rodata.tool_config.collect_pystacks = 1;
-            }
-            if opts.syscalls {
-                rodata.tool_config.collect_syscalls = 1;
-            }
-        }
-        if opts.ringbuf_size_mib > 0 {
-            let size = opts.ringbuf_size_mib * 1024 * 1024;
-            let object = open_skel.open_object_mut();
-            for mut map in object.maps_mut() {
-                let name = map.name().to_str().unwrap();
-                if name.starts_with("node") {
-                    map.set_max_entries(size)?;
-                }
-            }
-        }
+        // Configure the BPF skeleton with all settings
+        configure_bpf_skeleton(
+            &mut open_skel,
+            &opts,
+            num_cpus,
+            old_kernel,
+            collect_pystacks,
+            &recorder,
+        )?;
 
-        {
-            let mut probe_recorder = recorder.probe_recorder.lock().unwrap();
-            let mut rng = rand::rng();
-            for tracepoint in opts.trace_event.iter() {
-                probe_recorder.add_event_from_str(tracepoint, &mut rng)?;
-            }
-
-            for config in opts.trace_event_config.iter() {
-                probe_recorder.load_config(config, &mut rng)?;
-            }
-
-            if opts.trace_event_pid.is_empty() {
-                for event in probe_recorder.config_events.values() {
-                    match event.event {
-                        EventProbe::Usdt(_) => {
-                            Err(anyhow::anyhow!(
-                                "USDT events must be specified with --trace-event-pid"
-                            ))?;
-                        }
-                        EventProbe::UProbe(_) => {
-                            Err(anyhow::anyhow!(
-                                "UPROBE events must be specified with --trace-event-pid"
-                            ))?;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        // If we're on an older kernel we can't use the raw_tracepoint version since it doesn't
-        // have the cookie support. Newer kernels will use the raw_tracepoint version so don't need
-        // to load the old tracepoint program.
-        if old_kernel {
-            open_skel.progs.systing_raw_tracepoint.set_autoload(false);
-        } else {
-            open_skel.progs.systing_tracepoint.set_autoload(false);
-        }
-
-        // Don't load scheduler tracepoints if --no-sched is set
-        // This prevents them from being loaded into the kernel at all
-        if opts.no_sched {
-            open_skel.progs.systing_sched_wakeup.set_autoload(false);
-            open_skel.progs.systing_sched_wakeup_new.set_autoload(false);
-            open_skel.progs.systing_sched_switch.set_autoload(false);
-            open_skel.progs.systing_sched_waking.set_autoload(false);
-            open_skel
-                .progs
-                .systing_sched_process_exit
-                .set_autoload(false);
-        }
-
-        // Only load fork tracepoint when --pid is specified
-        // This hook tracks child processes created by traced processes
-        if opts.pid.is_empty() {
-            open_skel
-                .progs
-                .systing_sched_process_fork
-                .set_autoload(false);
-        }
-
-        // Only load syscall tracepoints when syscall tracing is enabled
-        // This prevents unnecessary overhead from loading unused tracepoints
-        if !opts.syscalls {
-            open_skel
-                .progs
-                .tracepoint__raw_syscalls__sys_enter
-                .set_autoload(false);
-            open_skel
-                .progs
-                .tracepoint__raw_syscalls__sys_exit
-                .set_autoload(false);
-        }
-
-        let mut need_slots = false;
         for counter in perf_counter_names.iter() {
             recorder
                 .perf_counter_recorder
@@ -739,9 +1310,6 @@ fn system(opts: Command) -> Result<()> {
                 .unwrap()
                 .perf_counters
                 .push(counter.clone());
-            if !need_slots && counter.starts_with("topdown") {
-                need_slots = true;
-            }
         }
 
         let num_events = perf_counter_names.len() as u32;
@@ -755,41 +1323,58 @@ fn system(opts: Command) -> Result<()> {
         open_skel
             .maps
             .perf_counters
-            .set_max_entries(num_cpus * num_events)?;
+            .set_max_entries(num_cpus * num_events)
+            .with_context(|| {
+                format!(
+                    "Failed to set perf_counters map size to {} entries",
+                    num_cpus * num_events
+                )
+            })?;
         if num_events > 0 {
             open_skel
                 .maps
                 .last_perf_counter_value
-                .set_max_entries(num_events)?;
+                .set_max_entries(num_events)
+                .with_context(|| {
+                    format!(
+                        "Failed to set last_perf_counter_value map size to {} entries",
+                        num_events
+                    )
+                })?;
         }
 
-        open_skel.maps.missed_events.set_max_entries(num_cpus)?;
+        open_skel
+            .maps
+            .missed_events
+            .set_max_entries(num_cpus)
+            .with_context(|| {
+                format!(
+                    "Failed to set missed_events map size to {} entries",
+                    num_cpus
+                )
+            })?;
 
-        let mut skel = open_skel.load()?;
+        let mut skel = open_skel.load().with_context(|| {
+            "Failed to load BPF skeleton into kernel. Check dmesg for BPF verifier errors."
+        })?;
         for cgroup in opts.cgroup.iter() {
-            let metadata = std::fs::metadata(cgroup)?;
+            let metadata = std::fs::metadata(cgroup)
+                .with_context(|| format!("Failed to access cgroup path: {}", cgroup))?;
             let cgroupid = metadata.ino().to_ne_bytes();
             let val = (1_u8).to_ne_bytes();
             skel.maps
                 .cgroups
-                .update(&cgroupid, &val, libbpf_rs::MapFlags::ANY)?;
+                .update(&cgroupid, &val, libbpf_rs::MapFlags::ANY)
+                .with_context(|| format!("Failed to add cgroup {} to BPF map", cgroup))?;
         }
 
         for pid in opts.pid.iter() {
             let val = (1_u8).to_ne_bytes();
             skel.maps
                 .pids
-                .update(&pid.to_ne_bytes(), &val, libbpf_rs::MapFlags::ANY)?;
+                .update(&pid.to_ne_bytes(), &val, libbpf_rs::MapFlags::ANY)
+                .with_context(|| format!("Failed to add PID {} to BPF map", pid))?;
         }
-
-        let mut rings = Vec::new();
-        let (event_tx, event_rx) = channel();
-        let (stack_tx, stack_rx) = channel();
-        let (cache_tx, cache_rx) = channel();
-        let (probe_tx, probe_rx) = channel();
-        let (syscall_tx, syscall_rx) = channel();
-
-        let object = skel.object();
 
         if collect_pystacks {
             // Determine which PIDs to use for pystacks
@@ -819,339 +1404,22 @@ fn system(opts: Command) -> Result<()> {
                 .init_pystacks(&pystacks_pids, skel.object());
         }
 
-        for (i, map) in object.maps().enumerate() {
-            let name = map.name().to_str().unwrap();
-            if name.starts_with("ringbuf_events") {
-                let ring = create_ring::<task_event>(&map, event_tx.clone())?;
-                rings.push((format!("events_{i}").to_string(), ring));
-            } else if name.starts_with("ringbuf_stack") {
-                let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
-                rings.push((name.to_string(), ring));
-            } else if name.starts_with("ringbuf_perf_counter") {
-                if !perf_counter_names.is_empty() {
-                    let ring = create_ring::<perf_counter_event>(&map, cache_tx.clone())?;
-                    rings.push((name.to_string(), ring));
-                }
-            } else if name.starts_with("ringbuf_probe") {
-                let ring = create_ring::<probe_event>(&map, probe_tx.clone())?;
-                rings.push((name.to_string(), ring));
-            } else if name.starts_with("ringbuf_syscall") && opts.syscalls {
-                let ring = create_ring::<syscall_event>(&map, syscall_tx.clone())?;
-                rings.push((name.to_string(), ring));
-            }
-        }
+        let (rings, channels) = setup_ringbuffers(&skel, &opts, &perf_counter_names)?;
 
-        // Drop the extra tx references
-        drop(event_tx);
-        drop(stack_tx);
-        drop(cache_tx);
-        drop(probe_tx);
-        drop(syscall_tx);
+        // Spawn all recorder threads
+        let recv_threads =
+            spawn_recorder_threads(&recorder, channels, &opts, &stop_tx, &perf_counter_names)?;
 
-        let mut recv_threads = Vec::new();
-        let session_recorder = recorder.clone();
-        let my_stop_tx = stop_tx.clone();
-        recv_threads.push(
-            thread::Builder::new()
-                .name("sched_recorder".to_string())
-                .spawn(move || {
-                    consume_loop::<SchedEventRecorder, task_event>(
-                        &session_recorder,
-                        &session_recorder.event_recorder,
-                        event_rx,
-                        my_stop_tx,
-                    );
-                    0
-                })?,
-        );
-        let session_recorder = recorder.clone();
-        let my_stop_tx = stop_tx.clone();
-        recv_threads.push(
-            thread::Builder::new()
-                .name("stack_recorder".to_string())
-                .spawn(move || {
-                    consume_loop::<StackRecorder, stack_event>(
-                        &session_recorder,
-                        &session_recorder.stack_recorder,
-                        stack_rx,
-                        my_stop_tx,
-                    );
-                    0
-                })?,
-        );
-        let session_recorder = recorder.clone();
-        let my_stop_tx = stop_tx.clone();
-        recv_threads.push(
-            thread::Builder::new()
-                .name("probe_recorder".to_string())
-                .spawn(move || {
-                    consume_loop::<SystingProbeRecorder, probe_event>(
-                        &session_recorder,
-                        &session_recorder.probe_recorder,
-                        probe_rx,
-                        my_stop_tx,
-                    );
-                    0
-                })?,
-        );
-        if opts.syscalls {
-            let session_recorder = recorder.clone();
-            let my_stop_tx = stop_tx.clone();
-            recv_threads.push(
-                thread::Builder::new()
-                    .name("syscall_recorder".to_string())
-                    .spawn(move || {
-                        consume_loop::<SyscallRecorder, syscall_event>(
-                            &session_recorder,
-                            &session_recorder.syscall_recorder,
-                            syscall_rx,
-                            my_stop_tx,
-                        );
-                        0
-                    })?,
-            );
-        }
-        if !perf_counter_names.is_empty() {
-            let session_recorder = recorder.clone();
-            let my_stop_tx = stop_tx.clone();
-            recv_threads.push(
-                thread::Builder::new()
-                    .name("perf_counter_recorder".to_string())
-                    .spawn(move || {
-                        consume_loop::<PerfCounterRecorder, perf_counter_event>(
-                            &session_recorder,
-                            &session_recorder.perf_counter_recorder,
-                            cache_rx,
-                            my_stop_tx,
-                        );
-                        0
-                    })?,
-            );
-        } else {
-            drop(cache_rx);
-        }
+        // Set up perf events (clock events and counter events)
+        let (_perf_links, _events_files) =
+            setup_perf_events(&mut skel, &opts, &counters, &perf_counter_names, num_cpus)?;
 
-        // Set up clock perf events with automatic VM detection and fallback
-        let clock_files = {
-            let mut clock_files = PerfOpenEvents::default();
-            let mut clock_event = PerfHwEvent {
-                name: "clock".to_string(),
-                event_type: if opts.sw_event {
-                    perf::PERF_TYPE_SOFTWARE
-                } else {
-                    perf::PERF_TYPE_HARDWARE
-                },
-                event_config: if opts.sw_event {
-                    perf::PERF_COUNT_SW_CPU_CLOCK
-                } else {
-                    perf::PERF_COUNT_HW_CPU_CYCLES
-                },
-                disabled: false,
-                need_slots: false,
-                cpus: (0..num_cpus).collect(),
-            };
-
-            clock_files.add_hw_event(clock_event.clone())?;
-
-            // Try to open the events, handle VM detection
-            if let Err(e) = clock_files.open_events(None, 1000) {
-                // Check if this is a VM-related error (ErrorKind::NotFound)
-                if e.kind() == std::io::ErrorKind::NotFound && !opts.sw_event {
-                    // Detected VM environment, automatically retry with software events
-                    eprintln!("Detected virtualized environment, automatically switching to software events (--sw-event)");
-
-                    // Modify the event to use software events
-                    clock_event.event_type = perf::PERF_TYPE_SOFTWARE;
-                    clock_event.event_config = perf::PERF_COUNT_SW_CPU_CLOCK;
-
-                    // Recreate clock_files with the modified event
-                    clock_files = PerfOpenEvents::default();
-                    clock_files.add_hw_event(clock_event)?;
-                    clock_files.open_events(None, 1000)?;
-                } else {
-                    // Not a VM error or already using software events, propagate the error
-                    return Err(e.into());
-                }
-            }
-
-            clock_files
-        };
-        let mut perf_links = Vec::new();
-        for (_, file) in clock_files {
-            let link = skel
-                .progs
-                .systing_perf_event_clock
-                .attach_perf_event_with_opts(
-                    file.as_raw_fd(),
-                    libbpf_rs::PerfEventOpts {
-                        cookie: 0,
-                        ..Default::default()
-                    },
-                )?;
-            perf_links.push(link);
-        }
-
-        let mut slots_files = PerfOpenEvents::default();
-        if need_slots {
-            let slot_hwevents = counters.event("slots");
-            let slot_hwevents = if let Some(slot_hwevents) = slot_hwevents {
-                slot_hwevents
-            } else {
-                Err(anyhow::anyhow!("Failed to find slot event"))?
-            };
-            for event in slot_hwevents.iter() {
-                slots_files.add_hw_event(event.clone())?;
-            }
-            slots_files.open_events(None, 0)?;
-            slots_files.enable()?;
-        }
-
-        let mut events_files = Vec::new();
-        for (index, event_name) in perf_counter_names.iter().enumerate() {
-            let mut event_files = PerfOpenEvents::default();
-            let hwevents = counters.event(event_name).unwrap();
-
-            for hwevent in hwevents {
-                event_files.add_hw_event(hwevent)?;
-            }
-            event_files.open_events(Some(&slots_files), 0)?;
-
-            let floor = index * num_cpus as usize;
-            for (cpu, file) in &event_files {
-                let key: u32 = (floor + *cpu as usize).try_into().unwrap();
-                let key_val = key.to_ne_bytes();
-                let fd_val = file.as_raw_fd().to_ne_bytes();
-                skel.maps
-                    .perf_counters
-                    .update(&key_val, &fd_val, libbpf_rs::MapFlags::ANY)?;
-            }
-            event_files.enable()?;
-            events_files.push(event_files);
-        }
-
-        skel.attach()?;
+        skel.attach().with_context(|| {
+            "Failed to attach BPF programs to tracepoints. Check if tracepoints are enabled."
+        })?;
 
         // Attach any usdt's that we may have
-        let mut probe_links = Vec::new();
-        {
-            let probe_recorder = recorder.probe_recorder.lock().unwrap();
-            for event in probe_recorder.config_events.values() {
-                for key in event.keys.iter() {
-                    let key_type = match key.key_type {
-                        EventKeyType::String => arg_type::ARG_STRING,
-                        EventKeyType::Long => arg_type::ARG_LONG,
-                    };
-
-                    let desc = arg_desc {
-                        arg_type: key_type,
-                        arg_index: key.key_index as i32,
-                    };
-
-                    // Safe because we're not padded
-                    let desc_data = unsafe { plain::as_bytes(&desc) };
-                    skel.maps.event_key_types.update(
-                        &event.cookie.to_ne_bytes(),
-                        desc_data,
-                        libbpf_rs::MapFlags::ANY,
-                    )?;
-                }
-
-                match &event.event {
-                    EventProbe::Usdt(usdt) => {
-                        // Skip USDT probes in confidentiality mode as they use restricted helpers
-                        if detect_confidentiality_mode() == 1 {
-                            eprintln!("Skipping USDT probe {}:{}:{} - not supported in confidentiality mode",
-                                     usdt.path, usdt.provider, usdt.name);
-                        } else {
-                            for pid in opts.trace_event_pid.iter() {
-                                let link = skel.progs.systing_usdt.attach_usdt_with_opts(
-                                    *pid as i32,
-                                    &usdt.path,
-                                    &usdt.provider,
-                                    &usdt.name,
-                                    UsdtOpts {
-                                        cookie: event.cookie,
-                                        ..Default::default()
-                                    },
-                                );
-                                if link.is_err() {
-                                    Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
-                                }
-                                probe_links.push(link);
-                            }
-                        }
-                    }
-                    EventProbe::UProbe(uprobe) => {
-                        for pid in opts.trace_event_pid.iter() {
-                            let link = skel.progs.systing_uprobe.attach_uprobe_with_opts(
-                                *pid as i32,
-                                &uprobe.path,
-                                uprobe.offset as usize,
-                                UprobeOpts {
-                                    cookie: event.cookie,
-                                    retprobe: uprobe.retprobe,
-                                    func_name: Some(uprobe.func_name.clone()),
-                                    ..Default::default()
-                                },
-                            );
-                            if link.is_err() {
-                                Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
-                            }
-                            probe_links.push(link);
-                        }
-                    }
-                    EventProbe::KProbe(kprobe) => {
-                        let link = skel.progs.systing_kprobe.attach_kprobe_with_opts(
-                            kprobe.retprobe,
-                            &kprobe.func_name,
-                            libbpf_rs::KprobeOpts {
-                                cookie: event.cookie,
-                                ..Default::default()
-                            },
-                        );
-                        if link.is_err() {
-                            Err(anyhow::anyhow!(
-                                "Failed to attach kprobe {}",
-                                kprobe.func_name
-                            ))?;
-                        }
-                        probe_links.push(link);
-                    }
-                    EventProbe::Tracepoint(tracepoint) => {
-                        let link = if old_kernel {
-                            let category =
-                                libbpf_rs::TracepointCategory::Custom(tracepoint.category.clone());
-                            skel.progs.systing_tracepoint.attach_tracepoint_with_opts(
-                                category,
-                                &tracepoint.name,
-                                TracepointOpts {
-                                    cookie: event.cookie,
-                                    ..Default::default()
-                                },
-                            )
-                        } else {
-                            skel.progs
-                                .systing_raw_tracepoint
-                                .attach_raw_tracepoint_with_opts(
-                                    &tracepoint.name,
-                                    RawTracepointOpts {
-                                        cookie: event.cookie,
-                                        ..Default::default()
-                                    },
-                                )
-                        };
-                        if link.is_err() {
-                            Err(anyhow::anyhow!(
-                                "Failed to attach tracepoint {}",
-                                tracepoint.name
-                            ))?;
-                        }
-                        probe_links.push(link);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let _probe_links = attach_probes(&mut skel, &recorder, &opts, old_kernel)?;
 
         let mut threads = Vec::new();
         let thread_done = Arc::new(AtomicBool::new(false));
@@ -1164,7 +1432,7 @@ fn system(opts: Command) -> Result<()> {
                         let _ = ring.consume();
                         break;
                     }
-                    let res = ring.poll(Duration::from_millis(100));
+                    let res = ring.poll(Duration::from_millis(RINGBUF_POLL_DURATION_MS));
                     if res.is_err() {
                         break;
                     }
@@ -1204,78 +1472,37 @@ fn system(opts: Command) -> Result<()> {
                                     recorder.record_event(event);
                                 }
                             }
-                            thread::sleep(Duration::from_millis(100));
+                            thread::sleep(Duration::from_millis(SYSINFO_REFRESH_INTERVAL_MS));
                         }
                         0
                     })?,
             );
         }
 
-        sd_notify()?;
-
-        if opts.duration > 0 {
-            println!("Tracing for {} seconds", opts.duration);
-            thread::sleep(Duration::from_secs(opts.duration));
-        } else {
-            ctrlc::set_handler(move || {
-                stop_tx.send(()).expect("Could not send signal on channel.")
-            })
-            .expect("Error setting Ctrl-C handler");
-            if opts.continuous > 0 {
-                println!("Tracing in a continues loop of {} seconds", opts.continuous);
-                println!("Will stop if a trigger is specified, otherwise Ctrl-C to stop");
-            } else {
-                println!("Tracing indefinitely...");
-                println!("Press Ctrl-C to stop");
-            }
-            stop_rx
-                .recv()
-                .expect("Could not receive signal on channel.");
-        }
-
-        if opts.continuous > 0 {
-            println!("Asked to stop, waiting 1 second before stopping");
-            thread::sleep(Duration::from_secs(1));
-        }
-        println!("Stopping...");
-        skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
-        thread_done.store(true, Ordering::Relaxed);
-        for thread in threads {
-            thread.join().expect("Failed to join thread");
-        }
-        println!("Stopping receiver threads...");
-        for thread in recv_threads {
-            thread.join().expect("Failed to join receiver thread");
-        }
-
-        println!("Missed sched/IRQ events: {}", dump_missed_events(&skel, 0));
-        println!("Missed stack events: {}", dump_missed_events(&skel, 1));
-        println!("Missed probe events: {}", dump_missed_events(&skel, 2));
-        println!("Missed perf events: {}", dump_missed_events(&skel, 3));
-        if opts.syscalls {
-            println!("Missed syscall events: {}", dump_missed_events(&skel, 4));
-        }
+        run_tracing_loop(
+            threads,
+            recv_threads,
+            &opts,
+            stop_tx,
+            stop_rx,
+            thread_done,
+            &mut skel,
+        )?;
     }
 
     if opts.continuous > 0 {
         println!("Draining recorder ringbuffers...");
-        recorder.event_recorder.lock().unwrap().drain_ringbuf();
-        recorder.stack_recorder.lock().unwrap().drain_ringbuf();
-        recorder
-            .perf_counter_recorder
-            .lock()
-            .unwrap()
-            .drain_ringbuf();
-        recorder.sysinfo_recorder.lock().unwrap().drain_ringbuf();
-        recorder.probe_recorder.lock().unwrap().drain_ringbuf();
-        recorder.syscall_recorder.lock().unwrap().drain_ringbuf();
+        recorder.drain_all_ringbufs();
     }
 
     println!("Generating trace...");
     let mut trace = Trace::default();
     trace.packet.extend(recorder.generate_trace());
-    let mut file = std::fs::File::create("trace.pb")?;
-    trace.write_to_writer(&mut file)?;
+    let mut file = std::fs::File::create("trace.pb")
+        .with_context(|| "Failed to create output file 'trace.pb' in current directory")?;
+    trace
+        .write_to_writer(&mut file)
+        .with_context(|| "Failed to write trace data to 'trace.pb'")?;
     Ok(())
 }
 
@@ -1298,8 +1525,8 @@ fn has_bpf_capabilities() -> bool {
 
     // Check if we can set rlimit - this is a good proxy for having needed capabilities
     let rlimit = libc::rlimit {
-        rlim_cur: 128 << 20,
-        rlim_max: 128 << 20,
+        rlim_cur: MEMLOCK_RLIMIT_BYTES,
+        rlim_max: MEMLOCK_RLIMIT_BYTES,
     };
 
     unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlimit) == 0 }
@@ -1308,7 +1535,8 @@ fn has_bpf_capabilities() -> bool {
 /// Re-execute the current program using systemd-run to get elevated privileges
 /// Returns an exit code to use for process exit
 fn reexec_with_systemd_run() -> Result<i32> {
-    let current_exe = env::current_exe()?;
+    let current_exe =
+        env::current_exe().with_context(|| "Failed to determine current executable path")?;
     let args: Vec<String> = env::args().skip(1).collect();
 
     // Get the current user for --uid parameter
@@ -1348,7 +1576,9 @@ fn reexec_with_systemd_run() -> Result<i32> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let status = cmd.status()?;
+    let status = cmd.status().with_context(|| {
+        "Failed to execute systemd-run. Ensure systemd is available on your system."
+    })?;
 
     Ok(status.code().unwrap_or(1))
 }
