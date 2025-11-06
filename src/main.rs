@@ -605,51 +605,48 @@ fn setup_perf_counters(
     Ok(())
 }
 
+fn set_ringbuf_duration(recorder: &Arc<SessionRecorder>, duration_nanos: u64) {
+    recorder
+        .event_recorder
+        .lock()
+        .unwrap()
+        .ringbuf
+        .set_max_duration(duration_nanos);
+    recorder
+        .stack_recorder
+        .lock()
+        .unwrap()
+        .ringbuf
+        .set_max_duration(duration_nanos);
+    recorder
+        .perf_counter_recorder
+        .lock()
+        .unwrap()
+        .ringbuf
+        .set_max_duration(duration_nanos);
+    recorder
+        .sysinfo_recorder
+        .lock()
+        .unwrap()
+        .ringbuf
+        .set_max_duration(duration_nanos);
+    recorder
+        .probe_recorder
+        .lock()
+        .unwrap()
+        .ringbuf
+        .set_max_duration(duration_nanos);
+}
+
 fn configure_recorder(opts: &Command, recorder: &Arc<SessionRecorder>) {
     if opts.continuous > 0 {
-        let duration = Duration::from_secs(opts.continuous);
-        recorder
-            .event_recorder
-            .lock()
-            .unwrap()
-            .ringbuf
-            .set_max_duration(duration.as_nanos() as u64);
-        recorder
-            .stack_recorder
-            .lock()
-            .unwrap()
-            .ringbuf
-            .set_max_duration(duration.as_nanos() as u64);
-        recorder
-            .perf_counter_recorder
-            .lock()
-            .unwrap()
-            .ringbuf
-            .set_max_duration(duration.as_nanos() as u64);
-        recorder
-            .sysinfo_recorder
-            .lock()
-            .unwrap()
-            .ringbuf
-            .set_max_duration(duration.as_nanos() as u64);
-        recorder
-            .probe_recorder
-            .lock()
-            .unwrap()
-            .ringbuf
-            .set_max_duration(duration.as_nanos() as u64);
+        let duration_nanos = Duration::from_secs(opts.continuous).as_nanos() as u64;
+        set_ringbuf_duration(recorder, duration_nanos);
     }
 
-    recorder
-        .event_recorder
-        .lock()
-        .unwrap()
-        .set_process_sched_stats(opts.process_sched_stats);
-    recorder
-        .event_recorder
-        .lock()
-        .unwrap()
-        .set_cpu_sched_stats(opts.cpu_sched_stats);
+    let mut event_recorder = recorder.event_recorder.lock().unwrap();
+    event_recorder.set_process_sched_stats(opts.process_sched_stats);
+    event_recorder.set_cpu_sched_stats(opts.cpu_sched_stats);
 }
 
 fn sd_notify() -> Result<()> {
