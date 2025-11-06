@@ -1,0 +1,20 @@
+#!/bin/bash
+#
+# Pre-commit hook to enforce cargo fmt
+#
+# This hook checks if the code is properly formatted before allowing a commit.
+# If formatting is needed, it will fail with a helpful message.
+
+# Colors
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+# Check if code is formatted
+if cargo fmt --check &> /dev/null; then
+    echo -e "${GREEN}✓ cargo fmt check passed${NC}"
+    exit 0
+else
+    echo -e "${RED}✗ cargo fmt check failed - run 'cargo fmt' to fix${NC}"
+    exit 1
+fi
