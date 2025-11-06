@@ -1018,6 +1018,132 @@ fn setup_perf_events(
     Ok((perf_links, event_files_vec))
 }
 
+fn attach_probes(
+    skel: &mut systing::SystingSystemSkel,
+    recorder: &Arc<SessionRecorder>,
+    opts: &Command,
+    old_kernel: bool,
+) -> Result<Vec<libbpf_rs::Link>> {
+    let mut probe_links = Vec::new();
+    let probe_recorder = recorder.probe_recorder.lock().unwrap();
+
+    for event in probe_recorder.config_events.values() {
+        for key in event.keys.iter() {
+            let key_type = match key.key_type {
+                EventKeyType::String => arg_type::ARG_STRING,
+                EventKeyType::Long => arg_type::ARG_LONG,
+            };
+
+            let desc = arg_desc {
+                arg_type: key_type,
+                arg_index: key.key_index as i32,
+            };
+
+            // Safe because we're not padded
+            let desc_data = unsafe { plain::as_bytes(&desc) };
+            skel.maps.event_key_types.update(
+                &event.cookie.to_ne_bytes(),
+                desc_data,
+                libbpf_rs::MapFlags::ANY,
+            )?;
+        }
+
+        match &event.event {
+            EventProbe::Usdt(usdt) => {
+                // Skip USDT probes in confidentiality mode as they use restricted helpers
+                if detect_confidentiality_mode() == 1 {
+                    eprintln!(
+                        "Skipping USDT probe {}:{}:{} - not supported in confidentiality mode",
+                        usdt.path, usdt.provider, usdt.name
+                    );
+                } else {
+                    for pid in opts.trace_event_pid.iter() {
+                        let link = skel
+                            .progs
+                            .systing_usdt
+                            .attach_usdt_with_opts(
+                                *pid as i32,
+                                &usdt.path,
+                                &usdt.provider,
+                                &usdt.name,
+                                UsdtOpts {
+                                    cookie: event.cookie,
+                                    ..Default::default()
+                                },
+                            )
+                            .map_err(|_| anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+                        probe_links.push(link);
+                    }
+                }
+            }
+            EventProbe::UProbe(uprobe) => {
+                for pid in opts.trace_event_pid.iter() {
+                    let link = skel
+                        .progs
+                        .systing_uprobe
+                        .attach_uprobe_with_opts(
+                            *pid as i32,
+                            &uprobe.path,
+                            uprobe.offset as usize,
+                            UprobeOpts {
+                                cookie: event.cookie,
+                                retprobe: uprobe.retprobe,
+                                func_name: Some(uprobe.func_name.clone()),
+                                ..Default::default()
+                            },
+                        )
+                        .map_err(|_| anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+                    probe_links.push(link);
+                }
+            }
+            EventProbe::KProbe(kprobe) => {
+                let link = skel
+                    .progs
+                    .systing_kprobe
+                    .attach_kprobe_with_opts(
+                        kprobe.retprobe,
+                        &kprobe.func_name,
+                        libbpf_rs::KprobeOpts {
+                            cookie: event.cookie,
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|_| anyhow::anyhow!("Failed to attach kprobe {}", kprobe.func_name))?;
+                probe_links.push(link);
+            }
+            EventProbe::Tracepoint(tracepoint) => {
+                let link = if old_kernel {
+                    let category =
+                        libbpf_rs::TracepointCategory::Custom(tracepoint.category.clone());
+                    skel.progs.systing_tracepoint.attach_tracepoint_with_opts(
+                        category,
+                        &tracepoint.name,
+                        TracepointOpts {
+                            cookie: event.cookie,
+                            ..Default::default()
+                        },
+                    )
+                } else {
+                    skel.progs
+                        .systing_raw_tracepoint
+                        .attach_raw_tracepoint_with_opts(
+                            &tracepoint.name,
+                            RawTracepointOpts {
+                                cookie: event.cookie,
+                                ..Default::default()
+                            },
+                        )
+                }
+                .map_err(|_| anyhow::anyhow!("Failed to attach tracepoint {}", tracepoint.name))?;
+                probe_links.push(link);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(probe_links)
+}
+
 fn system(opts: Command) -> Result<()> {
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
@@ -1142,126 +1268,7 @@ fn system(opts: Command) -> Result<()> {
         skel.attach()?;
 
         // Attach any usdt's that we may have
-        let mut probe_links = Vec::new();
-        {
-            let probe_recorder = recorder.probe_recorder.lock().unwrap();
-            for event in probe_recorder.config_events.values() {
-                for key in event.keys.iter() {
-                    let key_type = match key.key_type {
-                        EventKeyType::String => arg_type::ARG_STRING,
-                        EventKeyType::Long => arg_type::ARG_LONG,
-                    };
-
-                    let desc = arg_desc {
-                        arg_type: key_type,
-                        arg_index: key.key_index as i32,
-                    };
-
-                    // Safe because we're not padded
-                    let desc_data = unsafe { plain::as_bytes(&desc) };
-                    skel.maps.event_key_types.update(
-                        &event.cookie.to_ne_bytes(),
-                        desc_data,
-                        libbpf_rs::MapFlags::ANY,
-                    )?;
-                }
-
-                match &event.event {
-                    EventProbe::Usdt(usdt) => {
-                        // Skip USDT probes in confidentiality mode as they use restricted helpers
-                        if detect_confidentiality_mode() == 1 {
-                            eprintln!("Skipping USDT probe {}:{}:{} - not supported in confidentiality mode",
-                                     usdt.path, usdt.provider, usdt.name);
-                        } else {
-                            for pid in opts.trace_event_pid.iter() {
-                                let link = skel.progs.systing_usdt.attach_usdt_with_opts(
-                                    *pid as i32,
-                                    &usdt.path,
-                                    &usdt.provider,
-                                    &usdt.name,
-                                    UsdtOpts {
-                                        cookie: event.cookie,
-                                        ..Default::default()
-                                    },
-                                );
-                                if link.is_err() {
-                                    Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
-                                }
-                                probe_links.push(link);
-                            }
-                        }
-                    }
-                    EventProbe::UProbe(uprobe) => {
-                        for pid in opts.trace_event_pid.iter() {
-                            let link = skel.progs.systing_uprobe.attach_uprobe_with_opts(
-                                *pid as i32,
-                                &uprobe.path,
-                                uprobe.offset as usize,
-                                UprobeOpts {
-                                    cookie: event.cookie,
-                                    retprobe: uprobe.retprobe,
-                                    func_name: Some(uprobe.func_name.clone()),
-                                    ..Default::default()
-                                },
-                            );
-                            if link.is_err() {
-                                Err(anyhow::anyhow!("Failed to connect pid {}", *pid))?;
-                            }
-                            probe_links.push(link);
-                        }
-                    }
-                    EventProbe::KProbe(kprobe) => {
-                        let link = skel.progs.systing_kprobe.attach_kprobe_with_opts(
-                            kprobe.retprobe,
-                            &kprobe.func_name,
-                            libbpf_rs::KprobeOpts {
-                                cookie: event.cookie,
-                                ..Default::default()
-                            },
-                        );
-                        if link.is_err() {
-                            Err(anyhow::anyhow!(
-                                "Failed to attach kprobe {}",
-                                kprobe.func_name
-                            ))?;
-                        }
-                        probe_links.push(link);
-                    }
-                    EventProbe::Tracepoint(tracepoint) => {
-                        let link = if old_kernel {
-                            let category =
-                                libbpf_rs::TracepointCategory::Custom(tracepoint.category.clone());
-                            skel.progs.systing_tracepoint.attach_tracepoint_with_opts(
-                                category,
-                                &tracepoint.name,
-                                TracepointOpts {
-                                    cookie: event.cookie,
-                                    ..Default::default()
-                                },
-                            )
-                        } else {
-                            skel.progs
-                                .systing_raw_tracepoint
-                                .attach_raw_tracepoint_with_opts(
-                                    &tracepoint.name,
-                                    RawTracepointOpts {
-                                        cookie: event.cookie,
-                                        ..Default::default()
-                                    },
-                                )
-                        };
-                        if link.is_err() {
-                            Err(anyhow::anyhow!(
-                                "Failed to attach tracepoint {}",
-                                tracepoint.name
-                            ))?;
-                        }
-                        probe_links.push(link);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let _probe_links = attach_probes(&mut skel, &recorder, &opts, old_kernel)?;
 
         let mut threads = Vec::new();
         let thread_done = Arc::new(AtomicBool::new(false));
