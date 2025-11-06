@@ -49,6 +49,21 @@ use perfetto_protos::trace::Trace;
 use plain::Plain;
 use protobuf::Message;
 
+/// Duration to poll ringbuffers before checking for shutdown
+const RINGBUF_POLL_DURATION_MS: u64 = 100;
+
+/// Sample period for perf clock events (1ms = 1000 samples/sec)
+const PERF_CLOCK_SAMPLE_PERIOD: u64 = 1000;
+
+/// Memory lock limit for BPF programs (128 MiB)
+const MEMLOCK_RLIMIT_BYTES: u64 = 128 << 20;
+
+/// Sleep duration before stopping in continuous mode (1 second)
+const CONTINUOUS_MODE_STOP_DELAY_SECS: u64 = 1;
+
+/// Interval for refreshing system info like CPU frequency (100ms)
+const SYSINFO_REFRESH_INTERVAL_MS: u64 = 100;
+
 struct RecorderInfo {
     name: &'static str,
     description: &'static str,
@@ -210,8 +225,8 @@ struct Command {
 
 fn bump_memlock_rlimit() -> Result<()> {
     let rlimit = libc::rlimit {
-        rlim_cur: 128 << 20,
-        rlim_max: 128 << 20,
+        rlim_cur: MEMLOCK_RLIMIT_BYTES,
+        rlim_max: MEMLOCK_RLIMIT_BYTES,
     };
 
     if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlimit) } != 0 {
@@ -923,7 +938,7 @@ fn setup_perf_events(
         clock_files.add_hw_event(clock_event.clone())?;
 
         // Try to open the events, handle VM detection
-        if let Err(e) = clock_files.open_events(None, 1000) {
+        if let Err(e) = clock_files.open_events(None, PERF_CLOCK_SAMPLE_PERIOD) {
             // Check if this is a VM-related error (ErrorKind::NotFound)
             if e.kind() == std::io::ErrorKind::NotFound && !opts.sw_event {
                 // Detected VM environment, automatically retry with software events
@@ -936,7 +951,7 @@ fn setup_perf_events(
                 // Recreate clock_files with the modified event
                 clock_files = PerfOpenEvents::default();
                 clock_files.add_hw_event(clock_event)?;
-                clock_files.open_events(None, 1000)?;
+                clock_files.open_events(None, PERF_CLOCK_SAMPLE_PERIOD)?;
             } else {
                 // Not a VM error or already using software events, propagate the error
                 return Err(e.into());
@@ -1169,8 +1184,11 @@ fn run_tracing_loop(
     }
 
     if opts.continuous > 0 {
-        println!("Asked to stop, waiting 1 second before stopping");
-        thread::sleep(Duration::from_secs(1));
+        println!(
+            "Asked to stop, waiting {} second before stopping",
+            CONTINUOUS_MODE_STOP_DELAY_SECS
+        );
+        thread::sleep(Duration::from_secs(CONTINUOUS_MODE_STOP_DELAY_SECS));
     }
     println!("Stopping...");
     skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
@@ -1331,7 +1349,7 @@ fn system(opts: Command) -> Result<()> {
                         let _ = ring.consume();
                         break;
                     }
-                    let res = ring.poll(Duration::from_millis(100));
+                    let res = ring.poll(Duration::from_millis(RINGBUF_POLL_DURATION_MS));
                     if res.is_err() {
                         break;
                     }
@@ -1371,7 +1389,7 @@ fn system(opts: Command) -> Result<()> {
                                     recorder.record_event(event);
                                 }
                             }
-                            thread::sleep(Duration::from_millis(100));
+                            thread::sleep(Duration::from_millis(SYSINFO_REFRESH_INTERVAL_MS));
                         }
                         0
                     })?,
@@ -1421,8 +1439,8 @@ fn has_bpf_capabilities() -> bool {
 
     // Check if we can set rlimit - this is a good proxy for having needed capabilities
     let rlimit = libc::rlimit {
-        rlim_cur: 128 << 20,
-        rlim_max: 128 << 20,
+        rlim_cur: MEMLOCK_RLIMIT_BYTES,
+        rlim_max: MEMLOCK_RLIMIT_BYTES,
     };
 
     unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlimit) == 0 }
