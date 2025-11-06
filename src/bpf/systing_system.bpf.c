@@ -12,6 +12,10 @@
 #define TASK_INTERRUPTIBLE 1
 #define TASK_UNINTERRUPTIBLE 2
 
+/* Address family constants (from linux/socket.h) */
+#define AF_INET 2
+#define AF_INET6 10
+
 /*
  * Used specifically to make sure we don't accidentally record stats for a value
  * we didn't catch at sched_waking time.
@@ -146,14 +150,20 @@ enum network_operation {
 	NETWORK_RECV,
 };
 
+enum network_address_family {
+	NETWORK_AF_INET,   // IPv4
+	NETWORK_AF_INET6,  // IPv6
+};
+
 struct network_event {
 	u64 start_ts;
 	u64 end_ts;
 	struct task_info task;
 	enum network_protocol protocol;
 	enum network_operation operation;
-	u32 dest_addr;  // IPv4 address in network byte order
-	u16 dest_port;  // Port in host byte order
+	enum network_address_family af;  // Address family (IPv4 or IPv6)
+	u8 dest_addr[16];  // IPv4 (first 4 bytes) or IPv6 (all 16 bytes) in network byte order
+	u16 dest_port;     // Port in host byte order
 	u32 bytes;
 	u32 cpu;
 };
@@ -175,6 +185,7 @@ enum arg_type _arg_type = ARG_NONE;
 enum stack_event_type _stack_type = STACK_SLEEP;
 enum network_protocol _network_proto = NETWORK_TCP;
 enum network_operation _network_op = NETWORK_SEND;
+enum network_address_family _network_af = NETWORK_AF_INET;
 bool tracing_enabled = true;
 
 struct {
@@ -220,10 +231,15 @@ struct {
 } event_key_types SEC(".maps");
 
 // Tracks pending network operations (both sends and receives)
-// Fields needed are identical for both operation types
+//
+// Note: network_send_info and network_recv_info have identical structure currently,
+// but are kept separate for future extensibility. Potential future additions:
+//   - send_info: TTL, TOS/DSCP, fragmentation flags
+//   - recv_info: flags, truncation indicators, multicast info
 struct network_send_info {
 	enum network_protocol protocol;
-	u32 dest_addr;
+	enum network_address_family af;
+	u8 dest_addr[16];
 	u16 dest_port;
 	u64 start_ts;
 };
@@ -231,7 +247,8 @@ struct network_send_info {
 // Tracks pending receive operations with peer address
 struct network_recv_info {
 	enum network_protocol protocol;
-	u32 peer_addr;
+	enum network_address_family af;
+	u8 peer_addr[16];
 	u16 peer_port;
 	u64 start_ts;
 };
@@ -1287,6 +1304,7 @@ static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum networ
 
 	info.protocol = protocol;
 	info.start_ts = bpf_ktime_get_boot_ns();
+	info.af = NETWORK_AF_INET;  // Default to IPv4, will update if IPv6
 
 	// For UDP (and optionally TCP with msg_name), try to read from msghdr first
 	// This handles unconnected UDP sockets where destination is passed per-send
@@ -1298,28 +1316,55 @@ static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum networ
 		bpf_probe_read_kernel(&msg_name, sizeof(msg_name), &msg->msg_name);
 		bpf_probe_read_kernel(&msg_namelen, sizeof(msg_namelen), &msg->msg_namelen);
 
-		if (msg_name && msg_namelen >= sizeof(struct sockaddr_in)) {
-			struct sockaddr_in addr;
-			bpf_probe_read_kernel(&addr, sizeof(addr), msg_name);
+		if (msg_name) {
+			u16 family;
+			bpf_probe_read_kernel(&family, sizeof(family), msg_name);
 
-			// Check if this is IPv4 (AF_INET = 2)
-			if (addr.sin_family == 2) {
-				info.dest_addr = addr.sin_addr.s_addr;  // Already in network byte order
-				info.dest_port = __builtin_bswap16(addr.sin_port);  // Convert to host byte order
+			// Check if this is IPv4
+			if (family == AF_INET && msg_namelen >= sizeof(struct sockaddr_in)) {
+				struct sockaddr_in addr;
+				bpf_probe_read_kernel(&addr, sizeof(addr), msg_name);
+
+				info.af = NETWORK_AF_INET;
+				__builtin_memcpy(info.dest_addr, &addr.sin_addr.s_addr, 4);
+				info.dest_port = __builtin_bswap16(addr.sin_port);
+			}
+			// Check if this is IPv6
+			else if (family == AF_INET6 && msg_namelen >= sizeof(struct sockaddr_in6)) {
+				struct sockaddr_in6 addr6;
+				bpf_probe_read_kernel(&addr6, sizeof(addr6), msg_name);
+
+				info.af = NETWORK_AF_INET6;
+				__builtin_memcpy(info.dest_addr, &addr6.sin6_addr, 16);
+				info.dest_port = __builtin_bswap16(addr6.sin6_port);
 			}
 		}
 	}
 
 	// Fallback: for TCP or connected UDP sockets, read from socket structure
-	if (sk && info.dest_addr == 0) {
-		// For TCP or connected UDP sockets, read from socket structure
-		bpf_probe_read_kernel(&info.dest_addr, sizeof(info.dest_addr),
-				      &sk->__sk_common.skc_daddr);
-		bpf_probe_read_kernel(&info.dest_port, sizeof(info.dest_port),
-				      &sk->__sk_common.skc_dport);
+	// Check if we haven't extracted an address yet (port will be non-zero if extracted from msg_name)
+	if (sk && info.dest_port == 0) {
+		u16 family;
+		bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
 
-		// Convert port from network byte order to host byte order
-		info.dest_port = __builtin_bswap16(info.dest_port);
+		if (family == AF_INET) {
+			info.af = NETWORK_AF_INET;
+			u32 addr;
+			bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
+			__builtin_memcpy(info.dest_addr, &addr, 4);
+			bpf_probe_read_kernel(&info.dest_port, sizeof(info.dest_port),
+					      &sk->__sk_common.skc_dport);
+			info.dest_port = __builtin_bswap16(info.dest_port);
+		} else if (family == AF_INET6) {
+			// Note: IPv4-mapped IPv6 addresses (::ffff:192.0.2.1) are stored as IPv6.
+			// This is intentional - we preserve the address family from the socket,
+			// allowing userspace to see the actual socket type being used.
+			info.af = NETWORK_AF_INET6;
+			bpf_probe_read_kernel(info.dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
+			bpf_probe_read_kernel(&info.dest_port, sizeof(info.dest_port),
+					      &sk->__sk_common.skc_dport);
+			info.dest_port = __builtin_bswap16(info.dest_port);
+		}
 	}
 
 	bpf_map_update_elem(&pending_network_sends, &tgidpid, &info, BPF_ANY);
@@ -1358,7 +1403,8 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 	record_task_info(&event->task, task);
 	event->protocol = info->protocol;
 	event->operation = NETWORK_SEND;
-	event->dest_addr = info->dest_addr;
+	event->af = info->af;
+	__builtin_memcpy(event->dest_addr, info->dest_addr, 16);
 	event->dest_port = info->dest_port;
 	event->bytes = (u32)ret;  // Return value is number of bytes sent
 
@@ -1405,15 +1451,31 @@ static int handle_tcp_recvmsg_entry(struct sock *sk, struct msghdr *msg)
 
 	info.protocol = NETWORK_TCP;
 	info.start_ts = bpf_ktime_get_boot_ns();
+	info.af = NETWORK_AF_INET;  // Default to IPv4
 
 	// For TCP (connected socket): socket stores peer address/port
 	// skc_daddr/skc_dport are the remote endpoint (peer)
 	if (sk) {
-		bpf_probe_read_kernel(&info.peer_addr, sizeof(info.peer_addr),
-				      &sk->__sk_common.skc_daddr);
-		bpf_probe_read_kernel(&info.peer_port, sizeof(info.peer_port),
-				      &sk->__sk_common.skc_dport);
-		info.peer_port = __builtin_bswap16(info.peer_port);
+		u16 family;
+		bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+		if (family == AF_INET) {
+			info.af = NETWORK_AF_INET;
+			u32 addr;
+			bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
+			__builtin_memcpy(info.peer_addr, &addr, 4);
+			bpf_probe_read_kernel(&info.peer_port, sizeof(info.peer_port),
+					      &sk->__sk_common.skc_dport);
+			info.peer_port = __builtin_bswap16(info.peer_port);
+		} else if (family == AF_INET6) {
+			// Note: IPv4-mapped IPv6 addresses (::ffff:192.0.2.1) are stored as IPv6.
+			// This preserves the actual socket family for accurate connection tracking.
+			info.af = NETWORK_AF_INET6;
+			bpf_probe_read_kernel(info.peer_addr, 16, &sk->__sk_common.skc_v6_daddr);
+			bpf_probe_read_kernel(&info.peer_port, sizeof(info.peer_port),
+					      &sk->__sk_common.skc_dport);
+			info.peer_port = __builtin_bswap16(info.peer_port);
+		}
 	}
 
 	bpf_map_update_elem(&pending_network_recvs, &tgidpid, &info, BPF_ANY);
@@ -1440,6 +1502,13 @@ static int handle_recvmsg_exit(void *ctx, int ret)
 		return 0;
 	}
 
+	// For UDP: skip if peer address wasn't successfully extracted (peer_port will be 0)
+	// This can happen if __skb_recv_udp returned NULL
+	if (info->protocol == NETWORK_UDP && info->peer_port == 0) {
+		bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
+		return 0;
+	}
+
 	struct network_event *event = reserve_network_event();
 	if (!event) {
 		bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
@@ -1452,10 +1521,11 @@ static int handle_recvmsg_exit(void *ctx, int ret)
 	record_task_info(&event->task, task);
 	event->protocol = info->protocol;
 	event->operation = NETWORK_RECV;
+	event->af = info->af;
 	event->bytes = (u32)ret;  // Return value is number of bytes received
 
 	// Use the peer address that was extracted in the entry handler
-	event->dest_addr = info->peer_addr;
+	__builtin_memcpy(event->dest_addr, info->peer_addr, 16);
 	event->dest_port = info->peer_port;
 
 	bpf_ringbuf_submit(event, 0);
@@ -1490,6 +1560,7 @@ int BPF_KPROBE(udp_recvmsg_entry, struct sock *sk, struct msghdr *msg, size_t le
 
 	info.protocol = NETWORK_UDP;
 	info.start_ts = bpf_ktime_get_boot_ns();
+	info.af = NETWORK_AF_INET;  // Default to IPv4
 	// Peer address/port will be extracted from sk_buff headers by __skb_recv_udp kretprobe
 
 	bpf_map_update_elem(&pending_network_recvs, &tgidpid, &info, BPF_ANY);
@@ -1525,18 +1596,43 @@ int BPF_KRETPROBE(skb_recv_udp_exit, struct sk_buff *skb)
 	bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
 
 	if (head) {
-		struct iphdr ip = {0};
-		struct udphdr udp = {0};
+		// First, determine IP version by reading the first byte
+		u8 ip_version = 0;
+		bpf_probe_read_kernel(&ip_version, sizeof(ip_version), head + network_header);
+		ip_version = (ip_version >> 4) & 0x0F;
 
-		// For UDP receive: IP source = sender = peer
-		// Read IP header to get source address (peer who sent to us)
-		if (bpf_probe_read_kernel(&ip, sizeof(ip), head + network_header) == 0) {
-			info->peer_addr = ip.saddr;  // Source addr = peer addr for receive
-		}
+		if (ip_version == 4) {
+			// IPv4
+			struct iphdr ip = {0};
+			struct udphdr udp = {0};
 
-		// Read UDP header to get source port (peer port)
-		if (bpf_probe_read_kernel(&udp, sizeof(udp), head + transport_header) == 0) {
-			info->peer_port = __builtin_bswap16(udp.source);  // Source port = peer port
+			info->af = NETWORK_AF_INET;
+
+			// Read IP header to get source address (peer who sent to us)
+			if (bpf_probe_read_kernel(&ip, sizeof(ip), head + network_header) == 0) {
+				__builtin_memcpy(info->peer_addr, &ip.saddr, 4);
+			}
+
+			// Read UDP header to get source port (peer port)
+			if (bpf_probe_read_kernel(&udp, sizeof(udp), head + transport_header) == 0) {
+				info->peer_port = __builtin_bswap16(udp.source);
+			}
+		} else if (ip_version == 6) {
+			// IPv6
+			struct ipv6hdr ip6 = {0};
+			struct udphdr udp = {0};
+
+			info->af = NETWORK_AF_INET6;
+
+			// Read IPv6 header to get source address
+			if (bpf_probe_read_kernel(&ip6, sizeof(ip6), head + network_header) == 0) {
+				__builtin_memcpy(info->peer_addr, &ip6.saddr, 16);
+			}
+
+			// Read UDP header to get source port
+			if (bpf_probe_read_kernel(&udp, sizeof(udp), head + transport_header) == 0) {
+				info->peer_port = __builtin_bswap16(udp.source);
+			}
 		}
 	}
 

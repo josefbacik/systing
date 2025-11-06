@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::network_event;
@@ -20,9 +20,25 @@ use std::sync::Arc;
 // Unique identifier for a network connection
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 struct ConnectionId {
-    protocol: u32, // Cast from network_protocol enum
-    dest_addr: u32,
+    protocol: u32,       // Cast from network_protocol enum
+    af: u32,             // Cast from network_address_family enum
+    dest_addr: [u8; 16], // IPv4 (first 4 bytes) or IPv6 (all 16 bytes) in network byte order
     dest_port: u16,
+}
+
+impl ConnectionId {
+    fn ip_addr(&self) -> IpAddr {
+        use crate::systing::types::network_address_family;
+        if self.af == network_address_family::NETWORK_AF_INET.0 {
+            // IPv4 - use first 4 bytes
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&self.dest_addr[0..4]);
+            IpAddr::V4(Ipv4Addr::from(bytes))
+        } else {
+            // IPv6 - use all 16 bytes
+            IpAddr::V6(Ipv6Addr::from(self.dest_addr))
+        }
+    }
 }
 
 impl fmt::Display for ConnectionId {
@@ -35,8 +51,7 @@ impl fmt::Display for ConnectionId {
         } else {
             "UNKNOWN"
         };
-        // dest_addr is stored in network byte order (big-endian), convert to native for display
-        let addr = Ipv4Addr::from(u32::from_be(self.dest_addr));
+        let addr = self.ip_addr();
         write!(f, "{}:{}:{}", protocol_str, addr, self.dest_port)
     }
 }
@@ -64,7 +79,7 @@ pub struct NetworkRecorder {
     // Map from event name to interned id (for deduplication)
     event_name_ids: HashMap<String, u64>,
     // Cache of resolved hostnames (IP address -> hostname)
-    hostname_cache: HashMap<u32, String>,
+    hostname_cache: HashMap<IpAddr, String>,
 }
 
 impl NetworkRecorder {
@@ -81,13 +96,10 @@ impl NetworkRecorder {
 
     /// Resolve an IP address to a hostname, with caching and fallback to IP string.
     /// Returns the hostname if resolution succeeds, otherwise returns the IP address as a string.
-    fn resolve_hostname(&mut self, dest_addr: u32) -> &str {
-        self.hostname_cache.entry(dest_addr).or_insert_with(|| {
-            // Convert from network byte order to Ipv4Addr
-            let addr = Ipv4Addr::from(u32::from_be(dest_addr));
-
+    fn resolve_hostname(&mut self, addr: IpAddr) -> &str {
+        self.hostname_cache.entry(addr).or_insert_with(|| {
             // Attempt reverse DNS lookup
-            match dns_lookup::lookup_addr(&IpAddr::V4(addr)) {
+            match dns_lookup::lookup_addr(&addr) {
                 Ok(name) => name,
                 Err(err) => {
                     // Log failure and fallback to IP address string
@@ -110,7 +122,8 @@ impl NetworkRecorder {
                 "UNKNOWN"
             };
 
-        let host = self.resolve_hostname(conn_id.dest_addr);
+        let addr = conn_id.ip_addr();
+        let host = self.resolve_hostname(addr);
         format!("{}:{}:{}", protocol_str, host, conn_id.dest_port)
     }
 
@@ -379,6 +392,7 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
 
         let conn_id = ConnectionId {
             protocol: event.protocol.0,
+            af: event.af.0,
             dest_addr: event.dest_addr,
             dest_port: event.dest_port,
         };
@@ -426,9 +440,12 @@ mod tests {
 
     #[test]
     fn test_network_recorder_tcp_send() {
-        use crate::systing::types::network_operation;
+        use crate::systing::types::{network_address_family, network_operation};
 
         let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 in network byte order
 
         let event = network_event {
             start_ts: 1000,
@@ -436,7 +453,8 @@ mod tests {
             task: create_test_task_info(100, 101),
             protocol: test_protocol_tcp(),
             operation: network_operation::NETWORK_SEND,
-            dest_addr: 0x0100007f, // 127.0.0.1 in network byte order
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
             dest_port: 8080,
             bytes: 1024,
             cpu: 0,
@@ -453,7 +471,8 @@ mod tests {
 
         let conn_id = ConnectionId {
             protocol: network_protocol::NETWORK_TCP.0,
-            dest_addr: 0x0100007f,
+            af: network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
             dest_port: 8080,
         };
         assert!(connections.contains_key(&conn_id));
@@ -464,9 +483,12 @@ mod tests {
 
     #[test]
     fn test_network_recorder_multiple_sends() {
-        use crate::systing::types::network_operation;
+        use crate::systing::types::{network_address_family, network_operation};
 
         let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 in network byte order
 
         // Send 1
         let event1 = network_event {
@@ -475,7 +497,8 @@ mod tests {
             task: create_test_task_info(100, 101),
             protocol: test_protocol_tcp(),
             operation: network_operation::NETWORK_SEND,
-            dest_addr: 0x0100007f,
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
             dest_port: 8080,
             bytes: 1024,
             cpu: 0,
@@ -488,7 +511,8 @@ mod tests {
             task: create_test_task_info(100, 101),
             protocol: test_protocol_tcp(),
             operation: network_operation::NETWORK_SEND,
-            dest_addr: 0x0100007f,
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
             dest_port: 8080,
             bytes: 2048,
             cpu: 0,
@@ -501,7 +525,8 @@ mod tests {
         let connections = &recorder.network_events[&tgidpid];
         let conn_id = ConnectionId {
             protocol: network_protocol::NETWORK_TCP.0,
-            dest_addr: 0x0100007f,
+            af: network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
             dest_port: 8080,
         };
 
@@ -512,9 +537,12 @@ mod tests {
 
     #[test]
     fn test_network_recorder_multiple_connections() {
-        use crate::systing::types::network_operation;
+        use crate::systing::types::{network_address_family, network_operation};
 
         let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 in network byte order
 
         // TCP send
         let event1 = network_event {
@@ -523,7 +551,8 @@ mod tests {
             task: create_test_task_info(100, 101),
             protocol: test_protocol_tcp(),
             operation: network_operation::NETWORK_SEND,
-            dest_addr: 0x0100007f,
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
             dest_port: 8080,
             bytes: 1024,
             cpu: 0,
@@ -536,7 +565,8 @@ mod tests {
             task: create_test_task_info(100, 101),
             protocol: test_protocol_udp(),
             operation: network_operation::NETWORK_SEND,
-            dest_addr: 0x0100007f,
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
             dest_port: 9090,
             bytes: 512,
             cpu: 0,
@@ -552,7 +582,7 @@ mod tests {
 
     #[test]
     fn test_generate_trace_packets() {
-        use crate::systing::types::network_operation;
+        use crate::systing::types::{network_address_family, network_operation};
 
         let mut recorder = NetworkRecorder::default();
         let mut thread_uuids = HashMap::new();
@@ -560,13 +590,17 @@ mod tests {
         let pid_uuids: HashMap<i32, u64> = HashMap::new();
         let id_counter = Arc::new(AtomicUsize::new(1000));
 
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 in network byte order
+
         let event = network_event {
             start_ts: 1000,
             end_ts: 2000,
             task: create_test_task_info(100, 101),
             protocol: test_protocol_tcp(),
             operation: network_operation::NETWORK_SEND,
-            dest_addr: 0x0100007f,
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
             dest_port: 8080,
             bytes: 1024,
             cpu: 0,
@@ -634,9 +668,12 @@ mod tests {
 
     #[test]
     fn test_network_recorder_sends_and_receives() {
-        use crate::systing::types::network_operation;
+        use crate::systing::types::{network_address_family, network_operation};
 
         let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 in network byte order
 
         // TCP send
         let send_event = network_event {
@@ -645,7 +682,8 @@ mod tests {
             task: create_test_task_info(100, 101),
             protocol: test_protocol_tcp(),
             operation: network_operation::NETWORK_SEND,
-            dest_addr: 0x0100007f,
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
             dest_port: 8080,
             bytes: 1024,
             cpu: 0,
@@ -658,7 +696,8 @@ mod tests {
             task: create_test_task_info(100, 101),
             protocol: test_protocol_tcp(),
             operation: network_operation::NETWORK_RECV,
-            dest_addr: 0x0100007f,
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
             dest_port: 8080,
             bytes: 512,
             cpu: 0,
@@ -673,7 +712,285 @@ mod tests {
 
         let conn_id = ConnectionId {
             protocol: network_protocol::NETWORK_TCP.0,
-            dest_addr: 0x0100007f,
+            af: network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            dest_port: 8080,
+        };
+        assert!(connections.contains_key(&conn_id));
+        assert_eq!(connections[&conn_id].sends.len(), 1);
+        assert_eq!(connections[&conn_id].sends[0].bytes, 1024);
+        assert_eq!(connections[&conn_id].recvs.len(), 1);
+        assert_eq!(connections[&conn_id].recvs[0].bytes, 512);
+    }
+
+    #[test]
+    fn test_network_recorder_ipv6_tcp_send() {
+        use crate::systing::types::{network_address_family, network_operation};
+
+        let mut recorder = NetworkRecorder::default();
+
+        // IPv6 address 2001:db8::1
+        let mut dest_addr = [0u8; 16];
+        dest_addr.copy_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ]);
+
+        let event = network_event {
+            start_ts: 1000,
+            end_ts: 2000,
+            task: create_test_task_info(100, 101),
+            protocol: test_protocol_tcp(),
+            operation: network_operation::NETWORK_SEND,
+            af: network_address_family::NETWORK_AF_INET6,
+            dest_addr,
+            dest_port: 8080,
+            bytes: 2048,
+            cpu: 0,
+        };
+
+        recorder.handle_event(event);
+
+        let tgidpid = (100u64 << 32) | 101u64;
+        assert_eq!(recorder.network_events.len(), 1);
+        assert!(recorder.network_events.contains_key(&tgidpid));
+
+        let connections = &recorder.network_events[&tgidpid];
+        assert_eq!(connections.len(), 1);
+
+        let conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_TCP.0,
+            af: network_address_family::NETWORK_AF_INET6.0,
+            dest_addr,
+            dest_port: 8080,
+        };
+        assert!(connections.contains_key(&conn_id));
+        assert_eq!(connections[&conn_id].sends.len(), 1);
+        assert_eq!(connections[&conn_id].sends[0].bytes, 2048);
+        assert_eq!(connections[&conn_id].recvs.len(), 0);
+
+        // Verify IPv6 address parsing
+        let ip = conn_id.ip_addr();
+        assert!(matches!(ip, IpAddr::V6(_)));
+        assert_eq!(ip.to_string(), "2001:db8::1");
+    }
+
+    #[test]
+    fn test_network_recorder_ipv6_udp_send() {
+        use crate::systing::types::{network_address_family, network_operation};
+
+        let mut recorder = NetworkRecorder::default();
+
+        // IPv6 localhost ::1
+        let mut dest_addr = [0u8; 16];
+        dest_addr[15] = 1; // ::1
+
+        let event = network_event {
+            start_ts: 1000,
+            end_ts: 2000,
+            task: create_test_task_info(100, 101),
+            protocol: test_protocol_udp(),
+            operation: network_operation::NETWORK_SEND,
+            af: network_address_family::NETWORK_AF_INET6,
+            dest_addr,
+            dest_port: 9090,
+            bytes: 512,
+            cpu: 0,
+        };
+
+        recorder.handle_event(event);
+
+        let tgidpid = (100u64 << 32) | 101u64;
+        let connections = &recorder.network_events[&tgidpid];
+        assert_eq!(connections.len(), 1);
+
+        let conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_UDP.0,
+            af: network_address_family::NETWORK_AF_INET6.0,
+            dest_addr,
+            dest_port: 9090,
+        };
+        assert!(connections.contains_key(&conn_id));
+        assert_eq!(connections[&conn_id].sends.len(), 1);
+        assert_eq!(connections[&conn_id].sends[0].bytes, 512);
+
+        // Verify IPv6 localhost address
+        let ip = conn_id.ip_addr();
+        assert_eq!(ip.to_string(), "::1");
+    }
+
+    #[test]
+    fn test_network_recorder_ipv6_and_ipv4_mixed() {
+        use crate::systing::types::{network_address_family, network_operation};
+
+        let mut recorder = NetworkRecorder::default();
+
+        // IPv4 address 127.0.0.1
+        let mut ipv4_addr = [0u8; 16];
+        ipv4_addr[0..4].copy_from_slice(&[127, 0, 0, 1]);
+
+        // IPv6 address 2001:db8::2
+        let mut ipv6_addr = [0u8; 16];
+        ipv6_addr.copy_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02,
+        ]);
+
+        // IPv4 TCP send
+        let ipv4_event = network_event {
+            start_ts: 1000,
+            end_ts: 1500,
+            task: create_test_task_info(100, 101),
+            protocol: test_protocol_tcp(),
+            operation: network_operation::NETWORK_SEND,
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr: ipv4_addr,
+            dest_port: 8080,
+            bytes: 1024,
+            cpu: 0,
+        };
+
+        // IPv6 TCP send
+        let ipv6_event = network_event {
+            start_ts: 2000,
+            end_ts: 2500,
+            task: create_test_task_info(100, 101),
+            protocol: test_protocol_tcp(),
+            operation: network_operation::NETWORK_SEND,
+            af: network_address_family::NETWORK_AF_INET6,
+            dest_addr: ipv6_addr,
+            dest_port: 8080,
+            bytes: 2048,
+            cpu: 0,
+        };
+
+        recorder.handle_event(ipv4_event);
+        recorder.handle_event(ipv6_event);
+
+        let tgidpid = (100u64 << 32) | 101u64;
+        let connections = &recorder.network_events[&tgidpid];
+
+        // Should have 2 distinct connections (IPv4 and IPv6 are different)
+        assert_eq!(connections.len(), 2);
+
+        // Verify IPv4 connection
+        let ipv4_conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_TCP.0,
+            af: network_address_family::NETWORK_AF_INET.0,
+            dest_addr: ipv4_addr,
+            dest_port: 8080,
+        };
+        assert!(connections.contains_key(&ipv4_conn_id));
+        assert_eq!(connections[&ipv4_conn_id].sends[0].bytes, 1024);
+
+        // Verify IPv6 connection
+        let ipv6_conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_TCP.0,
+            af: network_address_family::NETWORK_AF_INET6.0,
+            dest_addr: ipv6_addr,
+            dest_port: 8080,
+        };
+        assert!(connections.contains_key(&ipv6_conn_id));
+        assert_eq!(connections[&ipv6_conn_id].sends[0].bytes, 2048);
+    }
+
+    #[test]
+    fn test_network_recorder_ipv6_address_formatting() {
+        use crate::systing::types::network_address_family;
+
+        // Test various IPv6 addresses
+        let test_cases = vec![
+            (
+                [
+                    0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x01,
+                ],
+                "2001:db8::1",
+            ),
+            (
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                "::1", // localhost
+            ),
+            (
+                [
+                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x5e, 0xff, 0xfe,
+                    0x00, 0x00, 0x53,
+                ],
+                "fe80::200:5eff:fe00:53",
+            ),
+        ];
+
+        for (addr_bytes, expected_str) in test_cases {
+            let conn_id = ConnectionId {
+                protocol: network_protocol::NETWORK_TCP.0,
+                af: network_address_family::NETWORK_AF_INET6.0,
+                dest_addr: addr_bytes,
+                dest_port: 443,
+            };
+
+            let ip = conn_id.ip_addr();
+            assert_eq!(ip.to_string(), expected_str);
+
+            // Test Display formatting for ConnectionId
+            let display_str = conn_id.to_string();
+            assert!(display_str.starts_with("TCP:"));
+            assert!(display_str.contains(expected_str));
+            assert!(display_str.contains(":443"));
+        }
+    }
+
+    #[test]
+    fn test_network_recorder_ipv6_sends_and_receives() {
+        use crate::systing::types::{network_address_family, network_operation};
+
+        let mut recorder = NetworkRecorder::default();
+
+        // IPv6 address 2001:db8::1
+        let mut dest_addr = [0u8; 16];
+        dest_addr.copy_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ]);
+
+        // TCP send
+        let send_event = network_event {
+            start_ts: 1000,
+            end_ts: 1500,
+            task: create_test_task_info(100, 101),
+            protocol: test_protocol_tcp(),
+            operation: network_operation::NETWORK_SEND,
+            af: network_address_family::NETWORK_AF_INET6,
+            dest_addr,
+            dest_port: 8080,
+            bytes: 1024,
+            cpu: 0,
+        };
+
+        // TCP receive from same connection
+        let recv_event = network_event {
+            start_ts: 2000,
+            end_ts: 2500,
+            task: create_test_task_info(100, 101),
+            protocol: test_protocol_tcp(),
+            operation: network_operation::NETWORK_RECV,
+            af: network_address_family::NETWORK_AF_INET6,
+            dest_addr,
+            dest_port: 8080,
+            bytes: 512,
+            cpu: 0,
+        };
+
+        recorder.handle_event(send_event);
+        recorder.handle_event(recv_event);
+
+        let tgidpid = (100u64 << 32) | 101u64;
+        let connections = &recorder.network_events[&tgidpid];
+        assert_eq!(connections.len(), 1);
+
+        let conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_TCP.0,
+            af: network_address_family::NETWORK_AF_INET6.0,
+            dest_addr,
             dest_port: 8080,
         };
         assert!(connections.contains_key(&conn_id));
