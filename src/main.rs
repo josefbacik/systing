@@ -590,6 +590,61 @@ fn discover_python_processes() -> Vec<u32> {
     python_pids
 }
 
+struct RecorderChannels {
+    event_rx: Receiver<task_event>,
+    stack_rx: Receiver<stack_event>,
+    cache_rx: Receiver<perf_counter_event>,
+    probe_rx: Receiver<probe_event>,
+    syscall_rx: Receiver<syscall_event>,
+}
+
+fn setup_ringbuffers<'a>(
+    skel: &systing::SystingSystemSkel,
+    opts: &Command,
+    perf_counter_names: &[String],
+) -> Result<(Vec<(String, libbpf_rs::RingBuffer<'a>)>, RecorderChannels)> {
+    let mut rings = Vec::new();
+    let (event_tx, event_rx) = channel();
+    let (stack_tx, stack_rx) = channel();
+    let (cache_tx, cache_rx) = channel();
+    let (probe_tx, probe_rx) = channel();
+    let (syscall_tx, syscall_rx) = channel();
+
+    let object = skel.object();
+
+    for (i, map) in object.maps().enumerate() {
+        let name = map.name().to_str().unwrap();
+        if name.starts_with("ringbuf_events") {
+            let ring = create_ring::<task_event>(&map, event_tx.clone())?;
+            rings.push((format!("events_{i}").to_string(), ring));
+        } else if name.starts_with("ringbuf_stack") {
+            let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
+            rings.push((name.to_string(), ring));
+        } else if name.starts_with("ringbuf_perf_counter") {
+            if !perf_counter_names.is_empty() {
+                let ring = create_ring::<perf_counter_event>(&map, cache_tx.clone())?;
+                rings.push((name.to_string(), ring));
+            }
+        } else if name.starts_with("ringbuf_probe") {
+            let ring = create_ring::<probe_event>(&map, probe_tx.clone())?;
+            rings.push((name.to_string(), ring));
+        } else if name.starts_with("ringbuf_syscall") && opts.syscalls {
+            let ring = create_ring::<syscall_event>(&map, syscall_tx.clone())?;
+            rings.push((name.to_string(), ring));
+        }
+    }
+
+    let channels = RecorderChannels {
+        event_rx,
+        stack_rx,
+        cache_rx,
+        probe_rx,
+        syscall_rx,
+    };
+
+    Ok((rings, channels))
+}
+
 fn configure_bpf_skeleton(
     open_skel: &mut systing::OpenSystingSystemSkel,
     opts: &Command,
@@ -809,15 +864,6 @@ fn system(opts: Command) -> Result<()> {
                 .update(&pid.to_ne_bytes(), &val, libbpf_rs::MapFlags::ANY)?;
         }
 
-        let mut rings = Vec::new();
-        let (event_tx, event_rx) = channel();
-        let (stack_tx, stack_rx) = channel();
-        let (cache_tx, cache_rx) = channel();
-        let (probe_tx, probe_rx) = channel();
-        let (syscall_tx, syscall_rx) = channel();
-
-        let object = skel.object();
-
         if collect_pystacks {
             // Determine which PIDs to use for pystacks
             let pystacks_pids = if opts.pid.is_empty() {
@@ -846,34 +892,14 @@ fn system(opts: Command) -> Result<()> {
                 .init_pystacks(&pystacks_pids, skel.object());
         }
 
-        for (i, map) in object.maps().enumerate() {
-            let name = map.name().to_str().unwrap();
-            if name.starts_with("ringbuf_events") {
-                let ring = create_ring::<task_event>(&map, event_tx.clone())?;
-                rings.push((format!("events_{i}").to_string(), ring));
-            } else if name.starts_with("ringbuf_stack") {
-                let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
-                rings.push((name.to_string(), ring));
-            } else if name.starts_with("ringbuf_perf_counter") {
-                if !perf_counter_names.is_empty() {
-                    let ring = create_ring::<perf_counter_event>(&map, cache_tx.clone())?;
-                    rings.push((name.to_string(), ring));
-                }
-            } else if name.starts_with("ringbuf_probe") {
-                let ring = create_ring::<probe_event>(&map, probe_tx.clone())?;
-                rings.push((name.to_string(), ring));
-            } else if name.starts_with("ringbuf_syscall") && opts.syscalls {
-                let ring = create_ring::<syscall_event>(&map, syscall_tx.clone())?;
-                rings.push((name.to_string(), ring));
-            }
-        }
-
-        // Drop the extra tx references
-        drop(event_tx);
-        drop(stack_tx);
-        drop(cache_tx);
-        drop(probe_tx);
-        drop(syscall_tx);
+        let (rings, channels) = setup_ringbuffers(&skel, &opts, &perf_counter_names)?;
+        let RecorderChannels {
+            event_rx,
+            stack_rx,
+            cache_rx,
+            probe_rx,
+            syscall_rx,
+        } = channels;
 
         let mut recv_threads = Vec::new();
         let session_recorder = recorder.clone();
