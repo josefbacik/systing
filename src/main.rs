@@ -1394,16 +1394,7 @@ fn system(opts: Command) -> Result<()> {
 
     if opts.continuous > 0 {
         println!("Draining recorder ringbuffers...");
-        recorder.event_recorder.lock().unwrap().drain_ringbuf();
-        recorder.stack_recorder.lock().unwrap().drain_ringbuf();
-        recorder
-            .perf_counter_recorder
-            .lock()
-            .unwrap()
-            .drain_ringbuf();
-        recorder.sysinfo_recorder.lock().unwrap().drain_ringbuf();
-        recorder.probe_recorder.lock().unwrap().drain_ringbuf();
-        recorder.syscall_recorder.lock().unwrap().drain_ringbuf();
+        recorder.drain_all_ringbufs();
     }
 
     println!("Generating trace...");

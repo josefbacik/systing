@@ -261,6 +261,15 @@ impl SessionRecorder {
         }
     }
 
+    pub fn drain_all_ringbufs(&self) {
+        self.event_recorder.lock().unwrap().drain_ringbuf();
+        self.stack_recorder.lock().unwrap().drain_ringbuf();
+        self.perf_counter_recorder.lock().unwrap().drain_ringbuf();
+        self.sysinfo_recorder.lock().unwrap().drain_ringbuf();
+        self.probe_recorder.lock().unwrap().drain_ringbuf();
+        self.syscall_recorder.lock().unwrap().drain_ringbuf();
+    }
+
     pub fn snapshot_clocks(&self) {
         let mut clock_snapshot = self.clock_snapshot.lock().unwrap();
         clock_snapshot.set_primary_trace_clock(BuiltinClock::BUILTIN_CLOCK_BOOTTIME);
