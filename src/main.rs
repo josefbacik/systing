@@ -547,6 +547,49 @@ fn sd_notify() -> Result<()> {
     Ok(())
 }
 
+/// Discover all Python processes on the system by examining /proc
+fn discover_python_processes() -> Vec<u32> {
+    use std::fs;
+    use std::path::PathBuf;
+
+    let mut python_pids = Vec::new();
+
+    // Read /proc directory
+    let proc_dir = match fs::read_dir("/proc") {
+        Ok(dir) => dir,
+        Err(_) => return python_pids,
+    };
+
+    for entry in proc_dir.flatten() {
+        // Only look at numeric directories (PIDs)
+        let dir_name = entry.file_name();
+        let dir_name_str = dir_name.to_string_lossy();
+        if !dir_name_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        let pid: u32 = match dir_name_str.parse() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+
+        // Check if /proc/[pid]/exe points to a python executable
+        let exe_path = PathBuf::from("/proc")
+            .join(dir_name_str.as_ref())
+            .join("exe");
+        if let Ok(exe_link) = fs::read_link(exe_path) {
+            let exe_str = exe_link.to_string_lossy();
+            // Check if the executable name contains "python"
+            // This catches python, python2, python3, python3.11, etc.
+            if exe_str.contains("python") {
+                python_pids.push(pid);
+            }
+        }
+    }
+
+    python_pids
+}
+
 fn system(opts: Command) -> Result<()> {
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
@@ -749,11 +792,31 @@ fn system(opts: Command) -> Result<()> {
         let object = skel.object();
 
         if collect_pystacks {
+            // Determine which PIDs to use for pystacks
+            let pystacks_pids = if opts.pid.is_empty() {
+                // No PIDs specified, discover all Python processes
+                let discovered = discover_python_processes();
+                if discovered.is_empty() {
+                    println!("Warning: No Python processes found on the system");
+                } else {
+                    println!(
+                        "Discovered {} Python process(es) for pystacks: {:?}",
+                        discovered.len(),
+                        discovered
+                    );
+                }
+                discovered
+            } else {
+                // Use the PIDs specified by the user
+                println!("Using specified PIDs for pystacks: {:?}", opts.pid);
+                opts.pid.clone()
+            };
+
             recorder
                 .stack_recorder
                 .lock()
                 .unwrap()
-                .init_pystacks(&opts.pid, skel.object());
+                .init_pystacks(&pystacks_pids, skel.object());
         }
 
         for (i, map) in object.maps().enumerate() {

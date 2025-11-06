@@ -590,7 +590,8 @@ static void emit_stack_event(void *ctx,struct task_struct *task,
 #ifdef SYSTING_PYSTACKS
 	event->py_msg_buffer.stack_len = 0;
 	if (tool_config.collect_pystacks) {
-		pystacks_read_stacks(ctx, NULL, &event->py_msg_buffer);
+		struct pt_regs *pt_regs = (struct pt_regs *)bpf_task_pt_regs(task);
+		pystacks_read_stacks(pt_regs, NULL, &event->py_msg_buffer);
 	}
 #endif
 
