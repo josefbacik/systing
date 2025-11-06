@@ -590,6 +590,138 @@ fn discover_python_processes() -> Vec<u32> {
     python_pids
 }
 
+fn configure_bpf_skeleton(
+    open_skel: &mut systing::OpenSystingSystemSkel,
+    opts: &Command,
+    num_cpus: u32,
+    old_kernel: bool,
+    collect_pystacks: bool,
+    recorder: &Arc<SessionRecorder>,
+) -> Result<()> {
+    // Configure rodata with tool settings
+    {
+        let rodata = open_skel
+            .maps
+            .rodata_data
+            .as_deref_mut()
+            .expect("'rodata' is not mmap'ed, your kernel is too old");
+
+        let (my_dev, my_ino) = get_pid_namespace_info();
+        rodata.tool_config.num_cpus = num_cpus;
+        rodata.tool_config.my_tgid = process::id();
+        rodata.tool_config.my_dev = my_dev;
+        rodata.tool_config.my_ino = my_ino;
+        rodata.tool_config.no_cpu_stack_traces = opts.no_cpu_stack_traces as u32;
+        rodata.tool_config.no_sleep_stack_traces = opts.no_sleep_stack_traces as u32;
+        rodata.tool_config.confidentiality_mode = detect_confidentiality_mode();
+        if !opts.cgroup.is_empty() {
+            rodata.tool_config.filter_cgroup = 1;
+        }
+        if opts.no_stack_traces {
+            rodata.tool_config.no_stack_traces = 1;
+        }
+        if !opts.pid.is_empty() {
+            rodata.tool_config.filter_pid = 1;
+        }
+        if collect_pystacks {
+            rodata.tool_config.collect_pystacks = 1;
+        }
+        if opts.syscalls {
+            rodata.tool_config.collect_syscalls = 1;
+        }
+    }
+
+    // Configure ringbuf size if specified
+    if opts.ringbuf_size_mib > 0 {
+        let size = opts.ringbuf_size_mib * 1024 * 1024;
+        let object = open_skel.open_object_mut();
+        for mut map in object.maps_mut() {
+            let name = map.name().to_str().unwrap();
+            if name.starts_with("node") {
+                map.set_max_entries(size)?;
+            }
+        }
+    }
+
+    // Setup probe recorder with trace events
+    {
+        let mut probe_recorder = recorder.probe_recorder.lock().unwrap();
+        let mut rng = rand::rng();
+        for tracepoint in opts.trace_event.iter() {
+            probe_recorder.add_event_from_str(tracepoint, &mut rng)?;
+        }
+
+        for config in opts.trace_event_config.iter() {
+            probe_recorder.load_config(config, &mut rng)?;
+        }
+
+        if opts.trace_event_pid.is_empty() {
+            for event in probe_recorder.config_events.values() {
+                match event.event {
+                    EventProbe::Usdt(_) => {
+                        Err(anyhow::anyhow!(
+                            "USDT events must be specified with --trace-event-pid"
+                        ))?;
+                    }
+                    EventProbe::UProbe(_) => {
+                        Err(anyhow::anyhow!(
+                            "UPROBE events must be specified with --trace-event-pid"
+                        ))?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Configure program autoload based on kernel version and options
+    // If we're on an older kernel we can't use the raw_tracepoint version since it doesn't
+    // have the cookie support. Newer kernels will use the raw_tracepoint version so don't need
+    // to load the old tracepoint program.
+    if old_kernel {
+        open_skel.progs.systing_raw_tracepoint.set_autoload(false);
+    } else {
+        open_skel.progs.systing_tracepoint.set_autoload(false);
+    }
+
+    // Don't load scheduler tracepoints if --no-sched is set
+    // This prevents them from being loaded into the kernel at all
+    if opts.no_sched {
+        open_skel.progs.systing_sched_wakeup.set_autoload(false);
+        open_skel.progs.systing_sched_wakeup_new.set_autoload(false);
+        open_skel.progs.systing_sched_switch.set_autoload(false);
+        open_skel.progs.systing_sched_waking.set_autoload(false);
+        open_skel
+            .progs
+            .systing_sched_process_exit
+            .set_autoload(false);
+    }
+
+    // Only load fork tracepoint when --pid is specified
+    // This hook tracks child processes created by traced processes
+    if opts.pid.is_empty() {
+        open_skel
+            .progs
+            .systing_sched_process_fork
+            .set_autoload(false);
+    }
+
+    // Only load syscall tracepoints when syscall tracing is enabled
+    // This prevents unnecessary overhead from loading unused tracepoints
+    if !opts.syscalls {
+        open_skel
+            .progs
+            .tracepoint__raw_syscalls__sys_enter
+            .set_autoload(false);
+        open_skel
+            .progs
+            .tracepoint__raw_syscalls__sys_exit
+            .set_autoload(false);
+    }
+
+    Ok(())
+}
+
 fn system(opts: Command) -> Result<()> {
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
@@ -615,121 +747,16 @@ fn system(opts: Command) -> Result<()> {
 
         let mut open_object = MaybeUninit::uninit();
         let mut open_skel = skel_builder.open(&mut open_object)?;
-        {
-            let rodata = open_skel
-                .maps
-                .rodata_data
-                .as_deref_mut()
-                .expect("'rodata' is not mmap'ed, your kernel is too old");
 
-            let (my_dev, my_ino) = get_pid_namespace_info();
-            rodata.tool_config.num_cpus = num_cpus;
-            rodata.tool_config.my_tgid = process::id();
-            rodata.tool_config.my_dev = my_dev;
-            rodata.tool_config.my_ino = my_ino;
-            rodata.tool_config.no_cpu_stack_traces = opts.no_cpu_stack_traces as u32;
-            rodata.tool_config.no_sleep_stack_traces = opts.no_sleep_stack_traces as u32;
-            rodata.tool_config.confidentiality_mode = detect_confidentiality_mode();
-            if !opts.cgroup.is_empty() {
-                rodata.tool_config.filter_cgroup = 1;
-            }
-            if opts.no_stack_traces {
-                rodata.tool_config.no_stack_traces = 1;
-            }
-            if !opts.pid.is_empty() {
-                rodata.tool_config.filter_pid = 1;
-            }
-            if collect_pystacks {
-                rodata.tool_config.collect_pystacks = 1;
-            }
-            if opts.syscalls {
-                rodata.tool_config.collect_syscalls = 1;
-            }
-        }
-        if opts.ringbuf_size_mib > 0 {
-            let size = opts.ringbuf_size_mib * 1024 * 1024;
-            let object = open_skel.open_object_mut();
-            for mut map in object.maps_mut() {
-                let name = map.name().to_str().unwrap();
-                if name.starts_with("node") {
-                    map.set_max_entries(size)?;
-                }
-            }
-        }
-
-        {
-            let mut probe_recorder = recorder.probe_recorder.lock().unwrap();
-            let mut rng = rand::rng();
-            for tracepoint in opts.trace_event.iter() {
-                probe_recorder.add_event_from_str(tracepoint, &mut rng)?;
-            }
-
-            for config in opts.trace_event_config.iter() {
-                probe_recorder.load_config(config, &mut rng)?;
-            }
-
-            if opts.trace_event_pid.is_empty() {
-                for event in probe_recorder.config_events.values() {
-                    match event.event {
-                        EventProbe::Usdt(_) => {
-                            Err(anyhow::anyhow!(
-                                "USDT events must be specified with --trace-event-pid"
-                            ))?;
-                        }
-                        EventProbe::UProbe(_) => {
-                            Err(anyhow::anyhow!(
-                                "UPROBE events must be specified with --trace-event-pid"
-                            ))?;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        // If we're on an older kernel we can't use the raw_tracepoint version since it doesn't
-        // have the cookie support. Newer kernels will use the raw_tracepoint version so don't need
-        // to load the old tracepoint program.
-        if old_kernel {
-            open_skel.progs.systing_raw_tracepoint.set_autoload(false);
-        } else {
-            open_skel.progs.systing_tracepoint.set_autoload(false);
-        }
-
-        // Don't load scheduler tracepoints if --no-sched is set
-        // This prevents them from being loaded into the kernel at all
-        if opts.no_sched {
-            open_skel.progs.systing_sched_wakeup.set_autoload(false);
-            open_skel.progs.systing_sched_wakeup_new.set_autoload(false);
-            open_skel.progs.systing_sched_switch.set_autoload(false);
-            open_skel.progs.systing_sched_waking.set_autoload(false);
-            open_skel
-                .progs
-                .systing_sched_process_exit
-                .set_autoload(false);
-        }
-
-        // Only load fork tracepoint when --pid is specified
-        // This hook tracks child processes created by traced processes
-        if opts.pid.is_empty() {
-            open_skel
-                .progs
-                .systing_sched_process_fork
-                .set_autoload(false);
-        }
-
-        // Only load syscall tracepoints when syscall tracing is enabled
-        // This prevents unnecessary overhead from loading unused tracepoints
-        if !opts.syscalls {
-            open_skel
-                .progs
-                .tracepoint__raw_syscalls__sys_enter
-                .set_autoload(false);
-            open_skel
-                .progs
-                .tracepoint__raw_syscalls__sys_exit
-                .set_autoload(false);
-        }
+        // Configure the BPF skeleton with all settings
+        configure_bpf_skeleton(
+            &mut open_skel,
+            &opts,
+            num_cpus,
+            old_kernel,
+            collect_pystacks,
+            &recorder,
+        )?;
 
         let mut need_slots = false;
         for counter in perf_counter_names.iter() {
