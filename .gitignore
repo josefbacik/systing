@@ -1,3 +1,5 @@
 /target
 
 /src/bpf/*.skel.rs
+
+*.pb
