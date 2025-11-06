@@ -1,4 +1,5 @@
 mod events;
+mod network_recorder;
 mod perf;
 mod perf_recorder;
 mod perfetto;
@@ -329,6 +330,7 @@ pub trait SystingEvent {
 use systing::types::arg_desc;
 use systing::types::arg_type;
 use systing::types::event_type;
+use systing::types::network_event;
 use systing::types::perf_counter_event;
 use systing::types::probe_event;
 use systing::types::stack_event;
@@ -341,6 +343,7 @@ unsafe impl Plain for stack_event {}
 unsafe impl Plain for perf_counter_event {}
 unsafe impl Plain for probe_event {}
 unsafe impl Plain for syscall_event {}
+unsafe impl Plain for network_event {}
 unsafe impl Plain for arg_desc {}
 
 impl SystingEvent for task_event {
@@ -389,6 +392,15 @@ impl SystingEvent for probe_event {
 }
 
 impl SystingEvent for syscall_event {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+    fn next_task_info(&self) -> Option<&task_info> {
+        Some(&self.task)
+    }
+}
+
+impl SystingEvent for network_event {
     fn ts(&self) -> u64 {
         self.ts
     }
@@ -459,6 +471,7 @@ fn spawn_recorder_threads(
         cache_rx,
         probe_rx,
         syscall_rx,
+        network_rx,
     } = channels;
 
     let mut threads = Vec::new();
@@ -532,6 +545,25 @@ fn spawn_recorder_threads(
                         &session_recorder,
                         &session_recorder.syscall_recorder,
                         syscall_rx,
+                        my_stop_tx,
+                    );
+                    0
+                })?,
+        );
+    }
+
+    // Always spawn network recorder
+    {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("network_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<network_recorder::NetworkRecorder, network_event>(
+                        &session_recorder,
+                        &session_recorder.network_recorder,
+                        network_rx,
                         my_stop_tx,
                     );
                     0
@@ -741,6 +773,7 @@ struct RecorderChannels {
     cache_rx: Receiver<perf_counter_event>,
     probe_rx: Receiver<probe_event>,
     syscall_rx: Receiver<syscall_event>,
+    network_rx: Receiver<network_event>,
 }
 
 fn setup_ringbuffers<'a>(
@@ -754,6 +787,7 @@ fn setup_ringbuffers<'a>(
     let (cache_tx, cache_rx) = channel();
     let (probe_tx, probe_rx) = channel();
     let (syscall_tx, syscall_rx) = channel();
+    let (network_tx, network_rx) = channel();
 
     let object = skel.object();
 
@@ -776,6 +810,9 @@ fn setup_ringbuffers<'a>(
         } else if name.starts_with("ringbuf_syscall") && opts.syscalls {
             let ring = create_ring::<syscall_event>(&map, syscall_tx.clone())?;
             rings.push((name.to_string(), ring));
+        } else if name.starts_with("ringbuf_network") {
+            let ring = create_ring::<network_event>(&map, network_tx.clone())?;
+            rings.push((name.to_string(), ring));
         }
     }
 
@@ -785,6 +822,7 @@ fn setup_ringbuffers<'a>(
         cache_rx,
         probe_rx,
         syscall_rx,
+        network_rx,
     };
 
     Ok((rings, channels))

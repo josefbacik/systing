@@ -136,6 +136,21 @@ struct syscall_event {
 	u8 is_enter;  // 1 for sys_enter, 0 for sys_exit
 };
 
+enum network_protocol {
+	NETWORK_TCP,
+	NETWORK_UDP,
+};
+
+struct network_event {
+	u64 ts;
+	struct task_info task;
+	enum network_protocol protocol;
+	u32 dest_addr;  // IPv4 address in network byte order
+	u16 dest_port;  // Port in host byte order
+	u32 bytes;
+	u32 cpu;
+};
+
 /*
  * Dummy instance to get skeleton to generate definition for
  * `struct task_event`
@@ -144,12 +159,14 @@ struct task_event _event = {0};
 struct stack_event _stack_event = {0};
 struct perf_counter_event _perf_counter_event = {0};
 struct syscall_event _syscall_event = {0};
+struct network_event _network_event = {0};
 struct task_info _task_info = {0};
 struct probe_event _uprobe_event = {0};
 struct arg_desc _arg_desc = {0};
 enum event_type _type = SCHED_SWITCH;
 enum arg_type _arg_type = ARG_NONE;
 enum stack_event_type _stack_type = STACK_SLEEP;
+enum network_protocol _network_proto = NETWORK_TCP;
 bool tracing_enabled = true;
 
 struct {
@@ -194,12 +211,26 @@ struct {
 	__uint(max_entries, 10240);
 } event_key_types SEC(".maps");
 
+struct network_send_info {
+	enum network_protocol protocol;
+	u32 dest_addr;
+	u16 dest_port;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);  // tgidpid
+	__type(value, struct network_send_info);
+	__uint(max_entries, 10240);
+} pending_network_sends SEC(".maps");
+
 #define MISSED_SCHED_EVENT 0
 #define MISSED_STACK_EVENT 1
 #define MISSED_PROBE_EVENT 2
 #define MISSED_CACHE_EVENT 3
 #define MISSED_SYSCALL_EVENT 4
-#define MISSED_EVENT_MAX 5
+#define MISSED_NETWORK_EVENT 5
+#define MISSED_EVENT_MAX 6
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
@@ -261,6 +292,18 @@ struct syscall_ringbuf_map {
 	ringbuf_syscall_events_node5 SEC(".maps"),
 	ringbuf_syscall_events_node6 SEC(".maps"),
 	ringbuf_syscall_events_node7 SEC(".maps");
+
+struct network_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
+} ringbuf_network_events_node0 SEC(".maps"),
+	ringbuf_network_events_node1 SEC(".maps"),
+	ringbuf_network_events_node2 SEC(".maps"),
+	ringbuf_network_events_node3 SEC(".maps"),
+	ringbuf_network_events_node4 SEC(".maps"),
+	ringbuf_network_events_node5 SEC(".maps"),
+	ringbuf_network_events_node6 SEC(".maps"),
+	ringbuf_network_events_node7 SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
@@ -352,6 +395,24 @@ struct {
 	},
 };
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS);
+	__type(key, u32);
+	__array(values, struct network_ringbuf_map);
+} network_ringbufs SEC(".maps") = {
+	.values = {
+		&ringbuf_network_events_node0,
+		&ringbuf_network_events_node1,
+		&ringbuf_network_events_node2,
+		&ringbuf_network_events_node3,
+		&ringbuf_network_events_node4,
+		&ringbuf_network_events_node5,
+		&ringbuf_network_events_node6,
+		&ringbuf_network_events_node7,
+	},
+};
+
 static struct task_event *reserve_task_event(void)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
@@ -405,6 +466,17 @@ static struct syscall_event *reserve_syscall_event(void)
 	if (!rb)
 		return NULL;
 	return bpf_ringbuf_reserve(rb, sizeof(struct syscall_event), 0);
+}
+
+static struct network_event *reserve_network_event(void)
+{
+	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&network_ringbufs, &node);
+	if (!rb)
+		return NULL;
+	return bpf_ringbuf_reserve(rb, sizeof(struct network_event), 0);
 }
 
 static u32 task_cpu(struct task_struct *task)
@@ -1175,6 +1247,96 @@ int tracepoint__raw_syscalls__sys_exit(struct trace_event_raw_sys_exit *ctx)
 
 	bpf_ringbuf_submit(event, 0);
 	return 0;
+}
+
+static int handle_sendmsg_entry(struct sock *sk, enum network_protocol protocol)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct network_send_info info = {0};
+
+	info.protocol = protocol;
+
+	// Read destination address and port from socket
+	// These are in network byte order in the socket structure
+	bpf_probe_read_kernel(&info.dest_addr, sizeof(info.dest_addr),
+			      &sk->__sk_common.skc_daddr);
+	bpf_probe_read_kernel(&info.dest_port, sizeof(info.dest_port),
+			      &sk->__sk_common.skc_dport);
+
+	// Convert port from network byte order to host byte order
+	info.dest_port = __builtin_bswap16(info.dest_port);
+
+	bpf_map_update_elem(&pending_network_sends, &tgidpid, &info, BPF_ANY);
+
+	return 0;
+}
+
+static int handle_sendmsg_exit(void *ctx, int ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	// Only record successful sends
+	if (ret <= 0)
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct network_send_info *info = bpf_map_lookup_elem(&pending_network_sends, &tgidpid);
+
+	if (!info) {
+		// No matching entry, skip
+		return 0;
+	}
+
+	struct network_event *event = reserve_network_event();
+	if (!event) {
+		bpf_map_delete_elem(&pending_network_sends, &tgidpid);
+		return handle_missed_event(MISSED_NETWORK_EVENT);
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->protocol = info->protocol;
+	event->dest_addr = info->dest_addr;
+	event->dest_port = info->dest_port;
+	event->bytes = (u32)ret;  // Return value is number of bytes sent
+
+	bpf_ringbuf_submit(event, 0);
+	bpf_map_delete_elem(&pending_network_sends, &tgidpid);
+
+	return 0;
+}
+
+SEC("kprobe/tcp_sendmsg")
+int BPF_KPROBE(tcp_sendmsg_entry, struct sock *sk, struct msghdr *msg, size_t size)
+{
+	return handle_sendmsg_entry(sk, NETWORK_TCP);
+}
+
+SEC("kretprobe/tcp_sendmsg")
+int BPF_KRETPROBE(tcp_sendmsg_exit, int ret)
+{
+	return handle_sendmsg_exit(ctx, ret);
+}
+
+SEC("kprobe/udp_sendmsg")
+int BPF_KPROBE(udp_sendmsg_entry, struct sock *sk, struct msghdr *msg, size_t size)
+{
+	return handle_sendmsg_entry(sk, NETWORK_UDP);
+}
+
+SEC("kretprobe/udp_sendmsg")
+int BPF_KRETPROBE(udp_sendmsg_exit, int ret)
+{
+	return handle_sendmsg_exit(ctx, ret);
 }
 
 char LICENSE[] SEC("license") = "GPL";

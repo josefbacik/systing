@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::events::SystingProbeRecorder;
+use crate::network_recorder::NetworkRecorder;
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::perfetto::TrackCounter;
 use crate::ringbuf::RingBuffer;
@@ -47,6 +48,7 @@ pub struct SessionRecorder {
     pub sysinfo_recorder: Mutex<SysinfoRecorder>,
     pub probe_recorder: Mutex<SystingProbeRecorder>,
     pub syscall_recorder: Mutex<SyscallRecorder>,
+    pub network_recorder: Mutex<NetworkRecorder>,
     pub process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
     pub processes: RwLock<HashMap<u64, ProtoProcess>>,
     pub threads: RwLock<HashMap<u64, ThreadDescriptor>>,
@@ -117,6 +119,7 @@ impl SessionRecorder {
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::default()),
             syscall_recorder: Mutex::new(SyscallRecorder::default()),
+            network_recorder: Mutex::new(NetworkRecorder::default()),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
@@ -268,6 +271,7 @@ impl SessionRecorder {
         self.sysinfo_recorder.lock().unwrap().drain_ringbuf();
         self.probe_recorder.lock().unwrap().drain_ringbuf();
         self.syscall_recorder.lock().unwrap().drain_ringbuf();
+        self.network_recorder.lock().unwrap().drain_ringbuf();
     }
 
     pub fn snapshot_clocks(&self) {
@@ -444,6 +448,14 @@ impl SessionRecorder {
                 .generate_trace_packets(pid_uuids, thread_uuids, id_counter),
         );
 
+        // Network recorder
+        packets.extend(
+            self.network_recorder
+                .lock()
+                .unwrap()
+                .generate_trace_packets(pid_uuids, thread_uuids, id_counter),
+        );
+
         packets
     }
 
@@ -506,6 +518,7 @@ mod tests {
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::default()),
             syscall_recorder: Mutex::new(SyscallRecorder::default()),
+            network_recorder: Mutex::new(NetworkRecorder::default()),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
