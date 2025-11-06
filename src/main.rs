@@ -895,6 +895,129 @@ fn configure_bpf_skeleton(
     Ok(())
 }
 
+fn setup_perf_events(
+    skel: &mut systing::SystingSystemSkel,
+    opts: &Command,
+    counters: &PerfCounters,
+    perf_counter_names: &[String],
+    num_cpus: u32,
+) -> Result<(Vec<libbpf_rs::Link>, Vec<PerfOpenEvents>)> {
+    let mut perf_links = Vec::new();
+    let mut event_files_vec = Vec::new();
+
+    // Set up clock perf events with automatic VM detection and fallback
+    let clock_files = {
+        let mut clock_files = PerfOpenEvents::default();
+        let mut clock_event = PerfHwEvent {
+            name: "clock".to_string(),
+            event_type: if opts.sw_event {
+                perf::PERF_TYPE_SOFTWARE
+            } else {
+                perf::PERF_TYPE_HARDWARE
+            },
+            event_config: if opts.sw_event {
+                perf::PERF_COUNT_SW_CPU_CLOCK
+            } else {
+                perf::PERF_COUNT_HW_CPU_CYCLES
+            },
+            disabled: false,
+            need_slots: false,
+            cpus: (0..num_cpus).collect(),
+        };
+
+        clock_files.add_hw_event(clock_event.clone())?;
+
+        // Try to open the events, handle VM detection
+        if let Err(e) = clock_files.open_events(None, 1000) {
+            // Check if this is a VM-related error (ErrorKind::NotFound)
+            if e.kind() == std::io::ErrorKind::NotFound && !opts.sw_event {
+                // Detected VM environment, automatically retry with software events
+                eprintln!("Detected virtualized environment, automatically switching to software events (--sw-event)");
+
+                // Modify the event to use software events
+                clock_event.event_type = perf::PERF_TYPE_SOFTWARE;
+                clock_event.event_config = perf::PERF_COUNT_SW_CPU_CLOCK;
+
+                // Recreate clock_files with the modified event
+                clock_files = PerfOpenEvents::default();
+                clock_files.add_hw_event(clock_event)?;
+                clock_files.open_events(None, 1000)?;
+            } else {
+                // Not a VM error or already using software events, propagate the error
+                return Err(e.into());
+            }
+        }
+
+        clock_files
+    };
+
+    // Attach clock events to BPF program
+    for (_, file) in clock_files {
+        let link = skel
+            .progs
+            .systing_perf_event_clock
+            .attach_perf_event_with_opts(
+                file.as_raw_fd(),
+                libbpf_rs::PerfEventOpts {
+                    cookie: 0,
+                    ..Default::default()
+                },
+            )?;
+        perf_links.push(link);
+    }
+
+    // Determine if we need slots for topdown counters
+    let need_slots = perf_counter_names
+        .iter()
+        .any(|counter| counter.starts_with("topdown"));
+
+    // Setup slots files if needed
+    let mut slots_files = PerfOpenEvents::default();
+    if need_slots {
+        let slot_hwevents = counters.event("slots");
+        let slot_hwevents = if let Some(slot_hwevents) = slot_hwevents {
+            slot_hwevents
+        } else {
+            Err(anyhow::anyhow!("Failed to find slot event"))?
+        };
+        for event in slot_hwevents.iter() {
+            slots_files.add_hw_event(event.clone())?;
+        }
+        slots_files.open_events(None, 0)?;
+        slots_files.enable()?;
+    }
+
+    // Setup counter events and populate perf_counters map
+    for (index, event_name) in perf_counter_names.iter().enumerate() {
+        let mut event_files = PerfOpenEvents::default();
+        let hwevents = counters.event(event_name).unwrap();
+
+        for hwevent in hwevents {
+            event_files.add_hw_event(hwevent)?;
+        }
+        event_files.open_events(Some(&slots_files), 0)?;
+
+        let floor = index * num_cpus as usize;
+        for (cpu, file) in &event_files {
+            let key: u32 = (floor + *cpu as usize).try_into().unwrap();
+            let key_val = key.to_ne_bytes();
+            let fd_val = file.as_raw_fd().to_ne_bytes();
+            skel.maps
+                .perf_counters
+                .update(&key_val, &fd_val, libbpf_rs::MapFlags::ANY)?;
+        }
+        event_files.enable()?;
+        event_files_vec.push(event_files);
+    }
+
+    // Keep slots_files alive if used
+    if need_slots {
+        event_files_vec.push(slots_files);
+    }
+
+    Ok((perf_links, event_files_vec))
+}
+
 fn system(opts: Command) -> Result<()> {
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
@@ -931,7 +1054,6 @@ fn system(opts: Command) -> Result<()> {
             &recorder,
         )?;
 
-        let mut need_slots = false;
         for counter in perf_counter_names.iter() {
             recorder
                 .perf_counter_recorder
@@ -939,9 +1061,6 @@ fn system(opts: Command) -> Result<()> {
                 .unwrap()
                 .perf_counters
                 .push(counter.clone());
-            if !need_slots && counter.starts_with("topdown") {
-                need_slots = true;
-            }
         }
 
         let num_events = perf_counter_names.len() as u32;
@@ -1016,103 +1135,9 @@ fn system(opts: Command) -> Result<()> {
         let recv_threads =
             spawn_recorder_threads(&recorder, channels, &opts, &stop_tx, &perf_counter_names)?;
 
-        // Set up clock perf events with automatic VM detection and fallback
-        let clock_files = {
-            let mut clock_files = PerfOpenEvents::default();
-            let mut clock_event = PerfHwEvent {
-                name: "clock".to_string(),
-                event_type: if opts.sw_event {
-                    perf::PERF_TYPE_SOFTWARE
-                } else {
-                    perf::PERF_TYPE_HARDWARE
-                },
-                event_config: if opts.sw_event {
-                    perf::PERF_COUNT_SW_CPU_CLOCK
-                } else {
-                    perf::PERF_COUNT_HW_CPU_CYCLES
-                },
-                disabled: false,
-                need_slots: false,
-                cpus: (0..num_cpus).collect(),
-            };
-
-            clock_files.add_hw_event(clock_event.clone())?;
-
-            // Try to open the events, handle VM detection
-            if let Err(e) = clock_files.open_events(None, 1000) {
-                // Check if this is a VM-related error (ErrorKind::NotFound)
-                if e.kind() == std::io::ErrorKind::NotFound && !opts.sw_event {
-                    // Detected VM environment, automatically retry with software events
-                    eprintln!("Detected virtualized environment, automatically switching to software events (--sw-event)");
-
-                    // Modify the event to use software events
-                    clock_event.event_type = perf::PERF_TYPE_SOFTWARE;
-                    clock_event.event_config = perf::PERF_COUNT_SW_CPU_CLOCK;
-
-                    // Recreate clock_files with the modified event
-                    clock_files = PerfOpenEvents::default();
-                    clock_files.add_hw_event(clock_event)?;
-                    clock_files.open_events(None, 1000)?;
-                } else {
-                    // Not a VM error or already using software events, propagate the error
-                    return Err(e.into());
-                }
-            }
-
-            clock_files
-        };
-        let mut perf_links = Vec::new();
-        for (_, file) in clock_files {
-            let link = skel
-                .progs
-                .systing_perf_event_clock
-                .attach_perf_event_with_opts(
-                    file.as_raw_fd(),
-                    libbpf_rs::PerfEventOpts {
-                        cookie: 0,
-                        ..Default::default()
-                    },
-                )?;
-            perf_links.push(link);
-        }
-
-        let mut slots_files = PerfOpenEvents::default();
-        if need_slots {
-            let slot_hwevents = counters.event("slots");
-            let slot_hwevents = if let Some(slot_hwevents) = slot_hwevents {
-                slot_hwevents
-            } else {
-                Err(anyhow::anyhow!("Failed to find slot event"))?
-            };
-            for event in slot_hwevents.iter() {
-                slots_files.add_hw_event(event.clone())?;
-            }
-            slots_files.open_events(None, 0)?;
-            slots_files.enable()?;
-        }
-
-        let mut events_files = Vec::new();
-        for (index, event_name) in perf_counter_names.iter().enumerate() {
-            let mut event_files = PerfOpenEvents::default();
-            let hwevents = counters.event(event_name).unwrap();
-
-            for hwevent in hwevents {
-                event_files.add_hw_event(hwevent)?;
-            }
-            event_files.open_events(Some(&slots_files), 0)?;
-
-            let floor = index * num_cpus as usize;
-            for (cpu, file) in &event_files {
-                let key: u32 = (floor + *cpu as usize).try_into().unwrap();
-                let key_val = key.to_ne_bytes();
-                let fd_val = file.as_raw_fd().to_ne_bytes();
-                skel.maps
-                    .perf_counters
-                    .update(&key_val, &fd_val, libbpf_rs::MapFlags::ANY)?;
-            }
-            event_files.enable()?;
-            events_files.push(event_files);
-        }
+        // Set up perf events (clock events and counter events)
+        let (_perf_links, _events_files) =
+            setup_perf_events(&mut skel, &opts, &counters, &perf_counter_names, num_cpus)?;
 
         skel.attach()?;
 
