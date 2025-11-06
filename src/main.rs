@@ -106,6 +106,18 @@ fn validate_recorder_names(names: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
+    match recorder_name {
+        "syscalls" => opts.syscalls = enable,
+        "sched" => opts.no_sched = !enable,
+        "sleep-stacks" => opts.no_sleep_stack_traces = !enable,
+        "cpu-stacks" => opts.no_cpu_stack_traces = !enable,
+        #[cfg(feature = "pystacks")]
+        "pystacks" => opts.collect_pystacks = enable,
+        _ => {}
+    }
+}
+
 fn process_recorder_options(opts: &mut Command) -> Result<()> {
     validate_recorder_names(&opts.add_recorder)?;
     validate_recorder_names(&opts.only_recorder)?;
@@ -122,30 +134,16 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         }
 
         // Then enable only the specified recorders
-        for recorder_name in &opts.only_recorder {
-            match recorder_name.as_str() {
-                "syscalls" => opts.syscalls = true,
-                "sched" => opts.no_sched = false,
-                "sleep-stacks" => opts.no_sleep_stack_traces = false,
-                "cpu-stacks" => opts.no_cpu_stack_traces = false,
-                #[cfg(feature = "pystacks")]
-                "pystacks" => opts.collect_pystacks = true,
-                _ => {}
-            }
+        let recorders = opts.only_recorder.clone();
+        for recorder_name in &recorders {
+            enable_recorder(opts, recorder_name, true);
         }
     }
 
     // Process --add-recorder to enable additional recorders
-    for recorder_name in &opts.add_recorder {
-        match recorder_name.as_str() {
-            "syscalls" => opts.syscalls = true,
-            "sched" => opts.no_sched = false,
-            "sleep-stacks" => opts.no_sleep_stack_traces = false,
-            "cpu-stacks" => opts.no_cpu_stack_traces = false,
-            #[cfg(feature = "pystacks")]
-            "pystacks" => opts.collect_pystacks = true,
-            _ => {}
-        }
+    let recorders = opts.add_recorder.clone();
+    for recorder_name in &recorders {
+        enable_recorder(opts, recorder_name, true);
     }
     Ok(())
 }
