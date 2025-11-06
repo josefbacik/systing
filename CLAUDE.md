@@ -73,3 +73,45 @@ cargo fmt
 5. **Run `cargo fmt`** - apply formatting to prevent whitespace errors
 
 ⚠️ **IMPORTANT**: Always run `cargo fmt` as the LAST step before committing to ensure consistent formatting.
+
+## Git Hooks
+
+This repository uses shared git hooks to automatically enforce code formatting and linting. The hooks are tracked in the `hooks/` directory and shared with all developers.
+
+### Setup for New Developers
+
+After cloning the repository, run the setup script to enable the hooks:
+
+```bash
+./setup-hooks.sh
+```
+
+Alternatively, you can manually configure the hooks:
+
+```bash
+git config core.hooksPath hooks
+```
+
+### Active Hooks
+
+- **pre-commit**: Runs `cargo fmt --check` before each commit. Fast feedback on formatting issues.
+- **pre-push**: Runs comprehensive checks before each push:
+  - `cargo fmt --check` - Verifies code formatting
+  - `cargo clippy --all-targets --no-default-features -- -D warnings`
+  - `cargo clippy --all-targets --features pystacks -- -D warnings`
+  - `cargo test --no-default-features`
+  - `cargo test --features pystacks`
+
+These hooks ensure that improperly formatted, non-compliant, or failing code cannot be committed or pushed to the repository.
+
+**If a hook fails:**
+
+1. For formatting issues: Run `cargo fmt` to format your code
+2. For clippy issues: Fix the warnings/errors reported by clippy
+3. For test failures: Fix the failing tests
+4. Stage your changes with `git add` (if needed)
+5. Try your commit or push again
+
+### Hook Location
+
+The git hooks are stored in the `hooks/` directory (tracked by git) and are shared across all developers. This ensures consistent code quality enforcement for everyone working on the project.

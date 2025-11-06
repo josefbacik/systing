@@ -20,6 +20,16 @@ sudo ./target/debug/systing --duration 60
 This will generate a `trace.pb` file which can be uploaded to a
 [Perfetto](https://perfetto.dev/) instance for further analysis.
 
+## Development Setup
+
+**IMPORTANT**: If you're contributing code, enable the git hooks to enforce code formatting:
+
+```bash
+./setup-hooks.sh
+```
+
+This sets up automatic `cargo fmt` checks before commits and pushes. See [CLAUDE.md](CLAUDE.md) for full development workflow details.
+
 ## Usage
 
 Detailed options can be found [here](docs/USAGE.adoc).

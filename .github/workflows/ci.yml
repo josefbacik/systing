@@ -9,6 +9,14 @@ on:
         - main
 
 jobs:
+  format_check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check formatting
+        run: cargo fmt --check
+
   clippy_check:
     runs-on: ubuntu-latest
     steps:
