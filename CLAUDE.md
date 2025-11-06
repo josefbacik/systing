@@ -40,6 +40,21 @@ cargo fmt
 - **Build Tool**: Cargo
 - **Main Binary**: systing
 
+## Generated Files
+
+The `src/pystacks/bindings.rs` file is **generated from C++ headers** using bindgen and is **committed to the repository**. This avoids requiring all developers to have the C++ build dependencies (libfmt-dev, libre2-dev, libcap-dev) installed.
+
+**When to regenerate:**
+- After updating the `strobelight-libs` submodule
+- After modifying C++ headers that affect the bindings
+
+**How to regenerate:**
+```bash
+cargo clean
+cargo check --features pystacks
+git add src/pystacks/bindings.rs
+```
+
 ## Development Workflow
 
 1. Make your code changes
