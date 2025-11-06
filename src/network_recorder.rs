@@ -17,9 +17,6 @@ use perfetto_protos::track_event::{EventName, TrackEvent};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-// Start IIDs at 2000 to avoid conflicts with other interned data types
-const NETWORK_EVENT_NAME_IID_START: u64 = 2000;
-
 // Unique identifier for a network connection
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 struct ConnectionId {
@@ -59,25 +56,13 @@ struct ConnectionEvents {
     recvs: Vec<NetworkEvent>,
 }
 
+#[derive(Default)]
 pub struct NetworkRecorder {
     pub ringbuf: RingBuffer<network_event>,
     // Map from tgidpid to connections to events (sends and receives)
     network_events: HashMap<u64, HashMap<ConnectionId, ConnectionEvents>>,
     // Map from event name to interned id (for deduplication)
     event_name_ids: HashMap<String, u64>,
-    // Counter for generating unique interned IDs
-    next_name_iid: u64,
-}
-
-impl Default for NetworkRecorder {
-    fn default() -> Self {
-        Self {
-            ringbuf: RingBuffer::default(),
-            network_events: HashMap::new(),
-            event_name_ids: HashMap::new(),
-            next_name_iid: NETWORK_EVENT_NAME_IID_START,
-        }
-    }
 }
 
 impl NetworkRecorder {
@@ -92,13 +77,12 @@ impl NetworkRecorder {
         }
     }
 
-    fn get_or_create_event_name_iid(&mut self, name: String) -> u64 {
+    fn get_or_create_event_name_iid(&mut self, name: String, id_counter: &Arc<AtomicUsize>) -> u64 {
         if let Some(&iid) = self.event_name_ids.get(&name) {
             return iid;
         }
 
-        let iid = self.next_name_iid;
-        self.next_name_iid += 1;
+        let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
         self.event_name_ids.insert(name, iid);
         iid
     }
@@ -177,7 +161,7 @@ impl NetworkRecorder {
             };
 
             let event_name = format!("{}_{}", proto_str, op_str);
-            self.get_or_create_event_name_iid(event_name);
+            self.get_or_create_event_name_iid(event_name, id_counter);
         }
 
         // Generate interned data packet with event names
@@ -314,8 +298,11 @@ impl NetworkRecorder {
             }
         }
 
-        // Clear events after generating packets
+        // Clear events and IID state after generating packets
+        // This ensures we start fresh for the next trace generation with
+        // the SEQ_INCREMENTAL_STATE_CLEARED flag
         self.network_events.clear();
+        self.event_name_ids.clear();
 
         packets
     }
