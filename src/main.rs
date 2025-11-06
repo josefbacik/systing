@@ -31,8 +31,8 @@ use crate::session_recorder::{get_clock_value, SessionRecorder, SysInfoEvent};
 use crate::stack_recorder::StackRecorder;
 use crate::syscall_recorder::SyscallRecorder;
 
-use anyhow::bail;
 use anyhow::Result;
+use anyhow::{bail, Context};
 use clap::{ArgAction, Parser};
 
 use tracing::subscriber::set_global_default as set_global_subscriber;
@@ -230,7 +230,11 @@ fn bump_memlock_rlimit() -> Result<()> {
     };
 
     if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlimit) } != 0 {
-        bail!("Failed to increase rlimit");
+        bail!(
+            "Failed to increase RLIMIT_MEMLOCK to {} bytes ({} MiB). This is required for BPF programs.",
+            MEMLOCK_RLIMIT_BYTES,
+            MEMLOCK_RLIMIT_BYTES >> 20
+        );
     }
 
     Ok(())
@@ -601,14 +605,19 @@ fn setup_perf_counters(
     perf_counter_names: &mut Vec<String>,
 ) -> Result<()> {
     if !opts.perf_counter.is_empty() {
-        counters.discover()?;
+        counters
+            .discover()
+            .with_context(|| "Failed to discover available perf counters on this system")?;
 
         // We can do things like topdown* to get all of the topdown counters, so we have to loop
         // through all of our options and populate the actual counter names that we want
         for counter in opts.perf_counter.iter() {
             let events = counters.event(counter);
             if events.is_none() {
-                return Err(anyhow::anyhow!("Invalid perf counter"));
+                return Err(anyhow::anyhow!(
+                    "Invalid perf counter: '{}'. Use a valid counter name or pattern (e.g., 'instructions', 'cycles', 'topdown*')",
+                    counter
+                ));
             }
             for event in events.unwrap() {
                 if !perf_counter_names.contains(&event.name) {
@@ -669,9 +678,17 @@ fn sd_notify() -> Result<()> {
         return Ok(());
     };
 
-    let sock = UnixDatagram::unbound()?;
-    sock.connect(socket_path)?;
-    sock.send("READY=1".as_bytes())?;
+    let sock = UnixDatagram::unbound().with_context(|| {
+        "Failed to create unbound Unix datagram socket for systemd notification"
+    })?;
+    sock.connect(&socket_path).with_context(|| {
+        format!(
+            "Failed to connect to systemd notify socket: {:?}",
+            socket_path
+        )
+    })?;
+    sock.send("READY=1".as_bytes())
+        .with_context(|| "Failed to send READY=1 message to systemd")?;
     Ok(())
 }
 
@@ -819,9 +836,14 @@ fn configure_bpf_skeleton(
         let size = opts.ringbuf_size_mib * 1024 * 1024;
         let object = open_skel.open_object_mut();
         for mut map in object.maps_mut() {
-            let name = map.name().to_str().unwrap();
+            let name = map.name().to_str().unwrap().to_string();
             if name.starts_with("node") {
-                map.set_max_entries(size)?;
+                map.set_max_entries(size).with_context(|| {
+                    format!(
+                        "Failed to set ringbuf size to {} MiB for map '{}'",
+                        opts.ringbuf_size_mib, name
+                    )
+                })?;
             }
         }
     }
@@ -831,11 +853,15 @@ fn configure_bpf_skeleton(
         let mut probe_recorder = recorder.probe_recorder.lock().unwrap();
         let mut rng = rand::rng();
         for tracepoint in opts.trace_event.iter() {
-            probe_recorder.add_event_from_str(tracepoint, &mut rng)?;
+            probe_recorder
+                .add_event_from_str(tracepoint, &mut rng)
+                .with_context(|| format!("Failed to parse trace event: '{}'", tracepoint))?;
         }
 
         for config in opts.trace_event_config.iter() {
-            probe_recorder.load_config(config, &mut rng)?;
+            probe_recorder
+                .load_config(config, &mut rng)
+                .with_context(|| format!("Failed to load trace event config file: '{}'", config))?;
         }
 
         if opts.trace_event_pid.is_empty() {
@@ -988,13 +1014,19 @@ fn setup_perf_events(
         let slot_hwevents = if let Some(slot_hwevents) = slot_hwevents {
             slot_hwevents
         } else {
-            Err(anyhow::anyhow!("Failed to find slot event"))?
+            Err(anyhow::anyhow!(
+                "Failed to find 'slots' perf event required for topdown counters. This may not be supported on your CPU."
+            ))?
         };
         for event in slot_hwevents.iter() {
             slots_files.add_hw_event(event.clone())?;
         }
-        slots_files.open_events(None, 0)?;
-        slots_files.enable()?;
+        slots_files
+            .open_events(None, 0)
+            .with_context(|| "Failed to open 'slots' perf events for topdown counters")?;
+        slots_files
+            .enable()
+            .with_context(|| "Failed to enable 'slots' perf events")?;
     }
 
     // Setup counter events and populate perf_counters map
@@ -1081,7 +1113,12 @@ fn attach_probes(
                                     ..Default::default()
                                 },
                             )
-                            .map_err(|_| anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+                            .with_context(|| {
+                                format!(
+                                    "Failed to attach USDT probe {}:{}:{} to PID {}",
+                                    usdt.path, usdt.provider, usdt.name, *pid
+                                )
+                            })?;
                         probe_links.push(link);
                     }
                 }
@@ -1102,7 +1139,16 @@ fn attach_probes(
                                 ..Default::default()
                             },
                         )
-                        .map_err(|_| anyhow::anyhow!("Failed to connect pid {}", *pid))?;
+                        .with_context(|| {
+                            format!(
+                                "Failed to attach uprobe '{}' ({}retprobe) at {}+{:#x} to PID {}",
+                                uprobe.func_name,
+                                if uprobe.retprobe { "" } else { "not " },
+                                uprobe.path,
+                                uprobe.offset,
+                                *pid
+                            )
+                        })?;
                     probe_links.push(link);
                 }
             }
@@ -1118,7 +1164,11 @@ fn attach_probes(
                             ..Default::default()
                         },
                     )
-                    .map_err(|_| anyhow::anyhow!("Failed to attach kprobe {}", kprobe.func_name))?;
+                    .with_context(|| format!(
+                        "Failed to attach kprobe '{}' ({}retprobe). Ensure the function exists in the kernel.",
+                        kprobe.func_name,
+                        if kprobe.retprobe { "" } else { "not " }
+                    ))?;
                 probe_links.push(link);
             }
             EventProbe::Tracepoint(tracepoint) => {
@@ -1144,7 +1194,10 @@ fn attach_probes(
                             },
                         )
                 }
-                .map_err(|_| anyhow::anyhow!("Failed to attach tracepoint {}", tracepoint.name))?;
+                .with_context(|| format!(
+                    "Failed to attach tracepoint '{}:{}'. Verify the tracepoint exists with: ls /sys/kernel/debug/tracing/events/{}/{}",
+                    tracepoint.category, tracepoint.name, tracepoint.category, tracepoint.name
+                ))?;
                 probe_links.push(link);
             }
             _ => {}
@@ -1236,7 +1289,9 @@ fn system(opts: Command) -> Result<()> {
         let collect_pystacks = opts.collect_pystacks;
 
         let mut open_object = MaybeUninit::uninit();
-        let mut open_skel = skel_builder.open(&mut open_object)?;
+        let mut open_skel = skel_builder.open(&mut open_object).with_context(|| {
+            "Failed to open BPF skeleton. Ensure BPF is supported on your kernel."
+        })?;
 
         // Configure the BPF skeleton with all settings
         configure_bpf_skeleton(
@@ -1268,31 +1323,57 @@ fn system(opts: Command) -> Result<()> {
         open_skel
             .maps
             .perf_counters
-            .set_max_entries(num_cpus * num_events)?;
+            .set_max_entries(num_cpus * num_events)
+            .with_context(|| {
+                format!(
+                    "Failed to set perf_counters map size to {} entries",
+                    num_cpus * num_events
+                )
+            })?;
         if num_events > 0 {
             open_skel
                 .maps
                 .last_perf_counter_value
-                .set_max_entries(num_events)?;
+                .set_max_entries(num_events)
+                .with_context(|| {
+                    format!(
+                        "Failed to set last_perf_counter_value map size to {} entries",
+                        num_events
+                    )
+                })?;
         }
 
-        open_skel.maps.missed_events.set_max_entries(num_cpus)?;
+        open_skel
+            .maps
+            .missed_events
+            .set_max_entries(num_cpus)
+            .with_context(|| {
+                format!(
+                    "Failed to set missed_events map size to {} entries",
+                    num_cpus
+                )
+            })?;
 
-        let mut skel = open_skel.load()?;
+        let mut skel = open_skel.load().with_context(|| {
+            "Failed to load BPF skeleton into kernel. Check dmesg for BPF verifier errors."
+        })?;
         for cgroup in opts.cgroup.iter() {
-            let metadata = std::fs::metadata(cgroup)?;
+            let metadata = std::fs::metadata(cgroup)
+                .with_context(|| format!("Failed to access cgroup path: {}", cgroup))?;
             let cgroupid = metadata.ino().to_ne_bytes();
             let val = (1_u8).to_ne_bytes();
             skel.maps
                 .cgroups
-                .update(&cgroupid, &val, libbpf_rs::MapFlags::ANY)?;
+                .update(&cgroupid, &val, libbpf_rs::MapFlags::ANY)
+                .with_context(|| format!("Failed to add cgroup {} to BPF map", cgroup))?;
         }
 
         for pid in opts.pid.iter() {
             let val = (1_u8).to_ne_bytes();
             skel.maps
                 .pids
-                .update(&pid.to_ne_bytes(), &val, libbpf_rs::MapFlags::ANY)?;
+                .update(&pid.to_ne_bytes(), &val, libbpf_rs::MapFlags::ANY)
+                .with_context(|| format!("Failed to add PID {} to BPF map", pid))?;
         }
 
         if collect_pystacks {
@@ -1333,7 +1414,9 @@ fn system(opts: Command) -> Result<()> {
         let (_perf_links, _events_files) =
             setup_perf_events(&mut skel, &opts, &counters, &perf_counter_names, num_cpus)?;
 
-        skel.attach()?;
+        skel.attach().with_context(|| {
+            "Failed to attach BPF programs to tracepoints. Check if tracepoints are enabled."
+        })?;
 
         // Attach any usdt's that we may have
         let _probe_links = attach_probes(&mut skel, &recorder, &opts, old_kernel)?;
@@ -1415,8 +1498,11 @@ fn system(opts: Command) -> Result<()> {
     println!("Generating trace...");
     let mut trace = Trace::default();
     trace.packet.extend(recorder.generate_trace());
-    let mut file = std::fs::File::create("trace.pb")?;
-    trace.write_to_writer(&mut file)?;
+    let mut file = std::fs::File::create("trace.pb")
+        .with_context(|| "Failed to create output file 'trace.pb' in current directory")?;
+    trace
+        .write_to_writer(&mut file)
+        .with_context(|| "Failed to write trace data to 'trace.pb'")?;
     Ok(())
 }
 
@@ -1449,7 +1535,8 @@ fn has_bpf_capabilities() -> bool {
 /// Re-execute the current program using systemd-run to get elevated privileges
 /// Returns an exit code to use for process exit
 fn reexec_with_systemd_run() -> Result<i32> {
-    let current_exe = env::current_exe()?;
+    let current_exe =
+        env::current_exe().with_context(|| "Failed to determine current executable path")?;
     let args: Vec<String> = env::args().skip(1).collect();
 
     // Get the current user for --uid parameter
@@ -1489,7 +1576,9 @@ fn reexec_with_systemd_run() -> Result<i32> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let status = cmd.status()?;
+    let status = cmd.status().with_context(|| {
+        "Failed to execute systemd-run. Ensure systemd is available on your system."
+    })?;
 
     Ok(status.code().unwrap_or(1))
 }
