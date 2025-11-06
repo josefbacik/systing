@@ -1144,6 +1144,61 @@ fn attach_probes(
     Ok(probe_links)
 }
 
+fn run_tracing_loop(
+    threads: Vec<thread::JoinHandle<i32>>,
+    recv_threads: Vec<thread::JoinHandle<i32>>,
+    opts: &Command,
+    stop_tx: Sender<()>,
+    stop_rx: Receiver<()>,
+    thread_done: Arc<AtomicBool>,
+    skel: &mut systing::SystingSystemSkel,
+) -> Result<()> {
+    sd_notify()?;
+
+    if opts.duration > 0 {
+        println!("Tracing for {} seconds", opts.duration);
+        thread::sleep(Duration::from_secs(opts.duration));
+    } else {
+        ctrlc::set_handler(move || stop_tx.send(()).expect("Could not send signal on channel."))
+            .expect("Error setting Ctrl-C handler");
+        if opts.continuous > 0 {
+            println!("Tracing in a continues loop of {} seconds", opts.continuous);
+            println!("Will stop if a trigger is specified, otherwise Ctrl-C to stop");
+        } else {
+            println!("Tracing indefinitely...");
+            println!("Press Ctrl-C to stop");
+        }
+        stop_rx
+            .recv()
+            .expect("Could not receive signal on channel.");
+    }
+
+    if opts.continuous > 0 {
+        println!("Asked to stop, waiting 1 second before stopping");
+        thread::sleep(Duration::from_secs(1));
+    }
+    println!("Stopping...");
+    skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
+    thread_done.store(true, Ordering::Relaxed);
+    for thread in threads {
+        thread.join().expect("Failed to join thread");
+    }
+    println!("Stopping receiver threads...");
+    for thread in recv_threads {
+        thread.join().expect("Failed to join receiver thread");
+    }
+
+    println!("Missed sched/IRQ events: {}", dump_missed_events(skel, 0));
+    println!("Missed stack events: {}", dump_missed_events(skel, 1));
+    println!("Missed probe events: {}", dump_missed_events(skel, 2));
+    println!("Missed perf events: {}", dump_missed_events(skel, 3));
+    if opts.syscalls {
+        println!("Missed syscall events: {}", dump_missed_events(skel, 4));
+    }
+
+    Ok(())
+}
+
 fn system(opts: Command) -> Result<()> {
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
@@ -1328,50 +1383,15 @@ fn system(opts: Command) -> Result<()> {
             );
         }
 
-        sd_notify()?;
-
-        if opts.duration > 0 {
-            println!("Tracing for {} seconds", opts.duration);
-            thread::sleep(Duration::from_secs(opts.duration));
-        } else {
-            ctrlc::set_handler(move || {
-                stop_tx.send(()).expect("Could not send signal on channel.")
-            })
-            .expect("Error setting Ctrl-C handler");
-            if opts.continuous > 0 {
-                println!("Tracing in a continues loop of {} seconds", opts.continuous);
-                println!("Will stop if a trigger is specified, otherwise Ctrl-C to stop");
-            } else {
-                println!("Tracing indefinitely...");
-                println!("Press Ctrl-C to stop");
-            }
-            stop_rx
-                .recv()
-                .expect("Could not receive signal on channel.");
-        }
-
-        if opts.continuous > 0 {
-            println!("Asked to stop, waiting 1 second before stopping");
-            thread::sleep(Duration::from_secs(1));
-        }
-        println!("Stopping...");
-        skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
-        thread_done.store(true, Ordering::Relaxed);
-        for thread in threads {
-            thread.join().expect("Failed to join thread");
-        }
-        println!("Stopping receiver threads...");
-        for thread in recv_threads {
-            thread.join().expect("Failed to join receiver thread");
-        }
-
-        println!("Missed sched/IRQ events: {}", dump_missed_events(&skel, 0));
-        println!("Missed stack events: {}", dump_missed_events(&skel, 1));
-        println!("Missed probe events: {}", dump_missed_events(&skel, 2));
-        println!("Missed perf events: {}", dump_missed_events(&skel, 3));
-        if opts.syscalls {
-            println!("Missed syscall events: {}", dump_missed_events(&skel, 4));
-        }
+        run_tracing_loop(
+            threads,
+            recv_threads,
+            &opts,
+            stop_tx,
+            stop_rx,
+            thread_done,
+            &mut skel,
+        )?;
     }
 
     if opts.continuous > 0 {
