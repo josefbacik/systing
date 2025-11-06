@@ -1249,7 +1249,7 @@ int tracepoint__raw_syscalls__sys_exit(struct trace_event_raw_sys_exit *ctx)
 	return 0;
 }
 
-static int handle_sendmsg_entry(struct sock *sk, enum network_protocol protocol)
+static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum network_protocol protocol)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 
@@ -1261,15 +1261,39 @@ static int handle_sendmsg_entry(struct sock *sk, enum network_protocol protocol)
 
 	info.protocol = protocol;
 
-	// Read destination address and port from socket
-	// These are in network byte order in the socket structure
-	bpf_probe_read_kernel(&info.dest_addr, sizeof(info.dest_addr),
-			      &sk->__sk_common.skc_daddr);
-	bpf_probe_read_kernel(&info.dest_port, sizeof(info.dest_port),
-			      &sk->__sk_common.skc_dport);
+	// For UDP (and optionally TCP with msg_name), try to read from msghdr first
+	// This handles unconnected UDP sockets where destination is passed per-send
+	if (msg) {
+		void *msg_name;
+		size_t msg_namelen;
 
-	// Convert port from network byte order to host byte order
-	info.dest_port = __builtin_bswap16(info.dest_port);
+		// Read msg_name and msg_namelen from the msghdr structure using probe_read
+		bpf_probe_read_kernel(&msg_name, sizeof(msg_name), &msg->msg_name);
+		bpf_probe_read_kernel(&msg_namelen, sizeof(msg_namelen), &msg->msg_namelen);
+
+		if (msg_name && msg_namelen >= sizeof(struct sockaddr_in)) {
+			struct sockaddr_in addr;
+			bpf_probe_read_kernel(&addr, sizeof(addr), msg_name);
+
+			// Check if this is IPv4 (AF_INET = 2)
+			if (addr.sin_family == 2) {
+				info.dest_addr = addr.sin_addr.s_addr;  // Already in network byte order
+				info.dest_port = __builtin_bswap16(addr.sin_port);  // Convert to host byte order
+			}
+		}
+	}
+
+	// Fallback: for TCP or connected UDP sockets, read from socket structure
+	if (sk && info.dest_addr == 0) {
+		// For TCP or connected UDP sockets, read from socket structure
+		bpf_probe_read_kernel(&info.dest_addr, sizeof(info.dest_addr),
+				      &sk->__sk_common.skc_daddr);
+		bpf_probe_read_kernel(&info.dest_port, sizeof(info.dest_port),
+				      &sk->__sk_common.skc_dport);
+
+		// Convert port from network byte order to host byte order
+		info.dest_port = __builtin_bswap16(info.dest_port);
+	}
 
 	bpf_map_update_elem(&pending_network_sends, &tgidpid, &info, BPF_ANY);
 
@@ -1318,7 +1342,7 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 SEC("kprobe/tcp_sendmsg")
 int BPF_KPROBE(tcp_sendmsg_entry, struct sock *sk, struct msghdr *msg, size_t size)
 {
-	return handle_sendmsg_entry(sk, NETWORK_TCP);
+	return handle_sendmsg_entry(sk, msg, NETWORK_TCP);
 }
 
 SEC("kretprobe/tcp_sendmsg")
@@ -1330,7 +1354,7 @@ int BPF_KRETPROBE(tcp_sendmsg_exit, int ret)
 SEC("kprobe/udp_sendmsg")
 int BPF_KPROBE(udp_sendmsg_entry, struct sock *sk, struct msghdr *msg, size_t size)
 {
-	return handle_sendmsg_entry(sk, NETWORK_UDP);
+	return handle_sendmsg_entry(sk, msg, NETWORK_UDP);
 }
 
 SEC("kretprobe/udp_sendmsg")
