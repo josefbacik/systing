@@ -43,7 +43,8 @@ impl fmt::Display for ConnectionId {
 // A single network send event
 #[derive(Clone)]
 struct NetworkSendEvent {
-    ts: u64,
+    start_ts: u64,
+    end_ts: u64,
     bytes: u32,
 }
 
@@ -186,24 +187,36 @@ impl NetworkRecorder {
                 };
                 let name_iid = *self.event_name_ids.get(event_name).unwrap();
 
-                // Generate instant events for each send
+                // Generate slice events (begin and end) for each send
                 for send_event in events {
-                    let mut track_event = TrackEvent::default();
-                    track_event.set_type(Type::TYPE_INSTANT);
-                    track_event.set_name_iid(name_iid);
-                    track_event.set_track_uuid(track_uuid);
+                    // Slice begin event
+                    let mut begin_event = TrackEvent::default();
+                    begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+                    begin_event.set_name_iid(name_iid);
+                    begin_event.set_track_uuid(track_uuid);
 
-                    // Add debug annotation for the size
+                    // Add debug annotation for the size on begin event
                     let mut debug_annotation = DebugAnnotation::default();
                     debug_annotation.set_name("bytes".to_string());
                     debug_annotation.set_uint_value(send_event.bytes as u64);
-                    track_event.debug_annotations.push(debug_annotation);
+                    begin_event.debug_annotations.push(debug_annotation);
 
-                    let mut packet = TracePacket::default();
-                    packet.set_timestamp(send_event.ts);
-                    packet.set_track_event(track_event);
-                    packet.set_trusted_packet_sequence_id(sequence_id);
-                    packets.push(packet);
+                    let mut begin_packet = TracePacket::default();
+                    begin_packet.set_timestamp(send_event.start_ts);
+                    begin_packet.set_track_event(begin_event);
+                    begin_packet.set_trusted_packet_sequence_id(sequence_id);
+                    packets.push(begin_packet);
+
+                    // Slice end event
+                    let mut end_event = TrackEvent::default();
+                    end_event.set_type(Type::TYPE_SLICE_END);
+                    end_event.set_track_uuid(track_uuid);
+
+                    let mut end_packet = TracePacket::default();
+                    end_packet.set_timestamp(send_event.end_ts);
+                    end_packet.set_track_event(end_event);
+                    end_packet.set_trusted_packet_sequence_id(sequence_id);
+                    packets.push(end_packet);
                 }
             }
         }
@@ -234,7 +247,8 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
         };
 
         let send_event = NetworkSendEvent {
-            ts: event.ts,
+            start_ts: event.start_ts,
+            end_ts: event.end_ts,
             bytes: event.bytes,
         };
 
@@ -272,7 +286,8 @@ mod tests {
         let mut recorder = NetworkRecorder::default();
 
         let event = network_event {
-            ts: 1000,
+            start_ts: 1000,
+            end_ts: 2000,
             task: create_test_task_info(100, 101),
             protocol: test_protocol_tcp(),
             dest_addr: 0x0100007f, // 127.0.0.1 in network byte order
@@ -307,7 +322,8 @@ mod tests {
 
         // Send 1
         let event1 = network_event {
-            ts: 1000,
+            start_ts: 1000,
+            end_ts: 1500,
             task: create_test_task_info(100, 101),
             protocol: test_protocol_tcp(),
             dest_addr: 0x0100007f,
@@ -319,7 +335,8 @@ mod tests {
 
         // Send 2 to same connection
         let event2 = network_event {
-            ts: 2000,
+            start_ts: 2000,
+            end_ts: 2500,
             task: create_test_task_info(100, 101),
             protocol: test_protocol_tcp(),
             dest_addr: 0x0100007f,
@@ -351,7 +368,8 @@ mod tests {
 
         // TCP send
         let event1 = network_event {
-            ts: 1000,
+            start_ts: 1000,
+            end_ts: 1500,
             task: create_test_task_info(100, 101),
             protocol: test_protocol_tcp(),
             dest_addr: 0x0100007f,
@@ -363,7 +381,8 @@ mod tests {
 
         // UDP send
         let event2 = network_event {
-            ts: 2000,
+            start_ts: 2000,
+            end_ts: 2500,
             task: create_test_task_info(100, 101),
             protocol: test_protocol_udp(),
             dest_addr: 0x0100007f,
@@ -390,7 +409,8 @@ mod tests {
         let id_counter = Arc::new(AtomicUsize::new(1000));
 
         let event = network_event {
-            ts: 1000,
+            start_ts: 1000,
+            end_ts: 2000,
             task: create_test_task_info(100, 101),
             protocol: test_protocol_tcp(),
             dest_addr: 0x0100007f,
@@ -408,8 +428,9 @@ mod tests {
         // 1. Interned data packet with event names
         // 2. Track group descriptor for "Network Connections"
         // 3. Track descriptor for the connection
-        // 4. Instant event for the send
-        assert_eq!(packets.len(), 4);
+        // 4. Slice begin event for the send
+        // 5. Slice end event for the send
+        assert_eq!(packets.len(), 5);
 
         // Check interned data
         let interned_packet = &packets[0];
@@ -428,16 +449,24 @@ mod tests {
         assert!(track_desc.name().starts_with("TCP:"));
         assert_eq!(track_desc.parent_uuid(), group_desc.uuid());
 
-        // Check instant event
-        let event_packet = &packets[3];
-        assert!(event_packet.has_track_event());
-        assert_eq!(event_packet.timestamp(), 1000);
-        let track_event = event_packet.track_event();
-        assert_eq!(track_event.type_(), Type::TYPE_INSTANT);
-        assert_eq!(track_event.track_uuid(), track_desc.uuid());
-        assert_eq!(track_event.debug_annotations.len(), 1);
-        assert_eq!(track_event.debug_annotations[0].name(), "bytes");
-        assert_eq!(track_event.debug_annotations[0].uint_value(), 1024);
+        // Check slice begin event
+        let begin_packet = &packets[3];
+        assert!(begin_packet.has_track_event());
+        assert_eq!(begin_packet.timestamp(), 1000);
+        let begin_event = begin_packet.track_event();
+        assert_eq!(begin_event.type_(), Type::TYPE_SLICE_BEGIN);
+        assert_eq!(begin_event.track_uuid(), track_desc.uuid());
+        assert_eq!(begin_event.debug_annotations.len(), 1);
+        assert_eq!(begin_event.debug_annotations[0].name(), "bytes");
+        assert_eq!(begin_event.debug_annotations[0].uint_value(), 1024);
+
+        // Check slice end event
+        let end_packet = &packets[4];
+        assert!(end_packet.has_track_event());
+        assert_eq!(end_packet.timestamp(), 2000);
+        let end_event = end_packet.track_event();
+        assert_eq!(end_event.type_(), Type::TYPE_SLICE_END);
+        assert_eq!(end_event.track_uuid(), track_desc.uuid());
 
         // Events should be cleared after generating packets
         assert!(recorder.network_events.is_empty());

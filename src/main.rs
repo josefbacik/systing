@@ -402,7 +402,7 @@ impl SystingEvent for syscall_event {
 
 impl SystingEvent for network_event {
     fn ts(&self) -> u64 {
-        self.ts
+        self.start_ts
     }
     fn next_task_info(&self) -> Option<&task_info> {
         Some(&self.task)

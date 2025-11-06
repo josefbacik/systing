@@ -142,7 +142,8 @@ enum network_protocol {
 };
 
 struct network_event {
-	u64 ts;
+	u64 start_ts;
+	u64 end_ts;
 	struct task_info task;
 	enum network_protocol protocol;
 	u32 dest_addr;  // IPv4 address in network byte order
@@ -215,6 +216,7 @@ struct network_send_info {
 	enum network_protocol protocol;
 	u32 dest_addr;
 	u16 dest_port;
+	u64 start_ts;
 };
 
 struct {
@@ -1260,6 +1262,7 @@ static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum networ
 	struct network_send_info info = {0};
 
 	info.protocol = protocol;
+	info.start_ts = bpf_ktime_get_boot_ns();
 
 	// For UDP (and optionally TCP with msg_name), try to read from msghdr first
 	// This handles unconnected UDP sockets where destination is passed per-send
@@ -1325,7 +1328,8 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 		return handle_missed_event(MISSED_NETWORK_EVENT);
 	}
 
-	event->ts = bpf_ktime_get_boot_ns();
+	event->start_ts = info->start_ts;
+	event->end_ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
 	event->protocol = info->protocol;
