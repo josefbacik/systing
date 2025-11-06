@@ -141,11 +141,17 @@ enum network_protocol {
 	NETWORK_UDP,
 };
 
+enum network_operation {
+	NETWORK_SEND,
+	NETWORK_RECV,
+};
+
 struct network_event {
 	u64 start_ts;
 	u64 end_ts;
 	struct task_info task;
 	enum network_protocol protocol;
+	enum network_operation operation;
 	u32 dest_addr;  // IPv4 address in network byte order
 	u16 dest_port;  // Port in host byte order
 	u32 bytes;
@@ -168,6 +174,7 @@ enum event_type _type = SCHED_SWITCH;
 enum arg_type _arg_type = ARG_NONE;
 enum stack_event_type _stack_type = STACK_SLEEP;
 enum network_protocol _network_proto = NETWORK_TCP;
+enum network_operation _network_op = NETWORK_SEND;
 bool tracing_enabled = true;
 
 struct {
@@ -212,10 +219,20 @@ struct {
 	__uint(max_entries, 10240);
 } event_key_types SEC(".maps");
 
+// Tracks pending network operations (both sends and receives)
+// Fields needed are identical for both operation types
 struct network_send_info {
 	enum network_protocol protocol;
 	u32 dest_addr;
 	u16 dest_port;
+	u64 start_ts;
+};
+
+// Tracks pending receive operations with peer address
+struct network_recv_info {
+	enum network_protocol protocol;
+	u32 peer_addr;
+	u16 peer_port;
 	u64 start_ts;
 };
 
@@ -225,6 +242,13 @@ struct {
 	__type(value, struct network_send_info);
 	__uint(max_entries, 10240);
 } pending_network_sends SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);  // tgidpid
+	__type(value, struct network_recv_info);
+	__uint(max_entries, 10240);
+} pending_network_recvs SEC(".maps");
 
 #define MISSED_SCHED_EVENT 0
 #define MISSED_STACK_EVENT 1
@@ -1333,6 +1357,7 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
 	event->protocol = info->protocol;
+	event->operation = NETWORK_SEND;
 	event->dest_addr = info->dest_addr;
 	event->dest_port = info->dest_port;
 	event->bytes = (u32)ret;  // Return value is number of bytes sent
@@ -1365,6 +1390,163 @@ SEC("kretprobe/udp_sendmsg")
 int BPF_KRETPROBE(udp_sendmsg_exit, int ret)
 {
 	return handle_sendmsg_exit(ctx, ret);
+}
+
+// For TCP: read peer address from socket structure
+static int handle_tcp_recvmsg_entry(struct sock *sk, struct msghdr *msg)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct network_recv_info info = {0};
+
+	info.protocol = NETWORK_TCP;
+	info.start_ts = bpf_ktime_get_boot_ns();
+
+	// For TCP (connected socket): socket stores peer address/port
+	// skc_daddr/skc_dport are the remote endpoint (peer)
+	if (sk) {
+		bpf_probe_read_kernel(&info.peer_addr, sizeof(info.peer_addr),
+				      &sk->__sk_common.skc_daddr);
+		bpf_probe_read_kernel(&info.peer_port, sizeof(info.peer_port),
+				      &sk->__sk_common.skc_dport);
+		info.peer_port = __builtin_bswap16(info.peer_port);
+	}
+
+	bpf_map_update_elem(&pending_network_recvs, &tgidpid, &info, BPF_ANY);
+
+	return 0;
+}
+
+static int handle_recvmsg_exit(void *ctx, int ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	// Only record successful receives
+	if (ret <= 0)
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct network_recv_info *info = bpf_map_lookup_elem(&pending_network_recvs, &tgidpid);
+
+	if (!info) {
+		// No matching entry, skip
+		return 0;
+	}
+
+	struct network_event *event = reserve_network_event();
+	if (!event) {
+		bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
+		return handle_missed_event(MISSED_NETWORK_EVENT);
+	}
+
+	event->start_ts = info->start_ts;
+	event->end_ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->protocol = info->protocol;
+	event->operation = NETWORK_RECV;
+	event->bytes = (u32)ret;  // Return value is number of bytes received
+
+	// Use the peer address that was extracted in the entry handler
+	event->dest_addr = info->peer_addr;
+	event->dest_port = info->peer_port;
+
+	bpf_ringbuf_submit(event, 0);
+	bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
+
+	return 0;
+}
+
+SEC("kprobe/tcp_recvmsg")
+int BPF_KPROBE(tcp_recvmsg_entry, struct sock *sk, struct msghdr *msg, size_t len, int flags)
+{
+	return handle_tcp_recvmsg_entry(sk, msg);
+}
+
+SEC("kretprobe/tcp_recvmsg")
+int BPF_KRETPROBE(tcp_recvmsg_exit, int ret)
+{
+	return handle_recvmsg_exit(ctx, ret);
+}
+
+// Store timing info for UDP receives on entry
+SEC("kprobe/udp_recvmsg")
+int BPF_KPROBE(udp_recvmsg_entry, struct sock *sk, struct msghdr *msg, size_t len, int flags)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct network_recv_info info = {0};
+
+	info.protocol = NETWORK_UDP;
+	info.start_ts = bpf_ktime_get_boot_ns();
+	// Peer address/port will be extracted from sk_buff headers by __skb_recv_udp kretprobe
+
+	bpf_map_update_elem(&pending_network_recvs, &tgidpid, &info, BPF_ANY);
+
+	return 0;
+}
+
+// Capture the sk_buff when __skb_recv_udp returns it
+SEC("kretprobe/__skb_recv_udp")
+int BPF_KRETPROBE(skb_recv_udp_exit, struct sk_buff *skb)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	if (!skb)
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct network_recv_info *info = bpf_map_lookup_elem(&pending_network_recvs, &tgidpid);
+
+	if (!info || info->protocol != NETWORK_UDP)
+		return 0;
+
+	// Extract headers from the sk_buff
+	unsigned char *head = NULL;
+	u16 network_header = 0;
+	u16 transport_header = 0;
+
+	bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+	bpf_probe_read_kernel(&network_header, sizeof(network_header), &skb->network_header);
+	bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
+
+	if (head) {
+		struct iphdr ip = {0};
+		struct udphdr udp = {0};
+
+		// For UDP receive: IP source = sender = peer
+		// Read IP header to get source address (peer who sent to us)
+		if (bpf_probe_read_kernel(&ip, sizeof(ip), head + network_header) == 0) {
+			info->peer_addr = ip.saddr;  // Source addr = peer addr for receive
+		}
+
+		// Read UDP header to get source port (peer port)
+		if (bpf_probe_read_kernel(&udp, sizeof(udp), head + transport_header) == 0) {
+			info->peer_port = __builtin_bswap16(udp.source);  // Source port = peer port
+		}
+	}
+
+	return 0;
+}
+
+SEC("kretprobe/udp_recvmsg")
+int BPF_KRETPROBE(udp_recvmsg_exit, int ret)
+{
+	return handle_recvmsg_exit(ctx, ret);
 }
 
 char LICENSE[] SEC("license") = "GPL";
