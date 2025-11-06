@@ -429,6 +429,124 @@ fn consume_loop<T, N>(
     }
 }
 
+fn spawn_recorder_threads(
+    recorder: &Arc<SessionRecorder>,
+    channels: RecorderChannels,
+    opts: &Command,
+    stop_tx: &Sender<()>,
+    perf_counter_names: &[String],
+) -> Result<Vec<thread::JoinHandle<i32>>> {
+    let RecorderChannels {
+        event_rx,
+        stack_rx,
+        cache_rx,
+        probe_rx,
+        syscall_rx,
+    } = channels;
+
+    let mut threads = Vec::new();
+
+    // Always spawn sched recorder
+    {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("sched_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<SchedEventRecorder, task_event>(
+                        &session_recorder,
+                        &session_recorder.event_recorder,
+                        event_rx,
+                        my_stop_tx,
+                    );
+                    0
+                })?,
+        );
+    }
+
+    // Always spawn stack recorder
+    {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("stack_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<StackRecorder, stack_event>(
+                        &session_recorder,
+                        &session_recorder.stack_recorder,
+                        stack_rx,
+                        my_stop_tx,
+                    );
+                    0
+                })?,
+        );
+    }
+
+    // Always spawn probe recorder
+    {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("probe_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<SystingProbeRecorder, probe_event>(
+                        &session_recorder,
+                        &session_recorder.probe_recorder,
+                        probe_rx,
+                        my_stop_tx,
+                    );
+                    0
+                })?,
+        );
+    }
+
+    // Conditionally spawn syscall recorder
+    if opts.syscalls {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("syscall_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<SyscallRecorder, syscall_event>(
+                        &session_recorder,
+                        &session_recorder.syscall_recorder,
+                        syscall_rx,
+                        my_stop_tx,
+                    );
+                    0
+                })?,
+        );
+    }
+
+    // Conditionally spawn perf counter recorder
+    if perf_counter_names.is_empty() {
+        // Drop the channel receiver if not using perf counters
+        drop(cache_rx);
+    } else {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("perf_counter_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<PerfCounterRecorder, perf_counter_event>(
+                        &session_recorder,
+                        &session_recorder.perf_counter_recorder,
+                        cache_rx,
+                        my_stop_tx,
+                    );
+                    0
+                })?,
+        );
+    }
+
+    Ok(threads)
+}
+
 fn dump_missed_events(skel: &systing::SystingSystemSkel, index: u32) -> u64 {
     let index = index.to_ne_bytes();
     let result = skel
@@ -893,96 +1011,10 @@ fn system(opts: Command) -> Result<()> {
         }
 
         let (rings, channels) = setup_ringbuffers(&skel, &opts, &perf_counter_names)?;
-        let RecorderChannels {
-            event_rx,
-            stack_rx,
-            cache_rx,
-            probe_rx,
-            syscall_rx,
-        } = channels;
 
-        let mut recv_threads = Vec::new();
-        let session_recorder = recorder.clone();
-        let my_stop_tx = stop_tx.clone();
-        recv_threads.push(
-            thread::Builder::new()
-                .name("sched_recorder".to_string())
-                .spawn(move || {
-                    consume_loop::<SchedEventRecorder, task_event>(
-                        &session_recorder,
-                        &session_recorder.event_recorder,
-                        event_rx,
-                        my_stop_tx,
-                    );
-                    0
-                })?,
-        );
-        let session_recorder = recorder.clone();
-        let my_stop_tx = stop_tx.clone();
-        recv_threads.push(
-            thread::Builder::new()
-                .name("stack_recorder".to_string())
-                .spawn(move || {
-                    consume_loop::<StackRecorder, stack_event>(
-                        &session_recorder,
-                        &session_recorder.stack_recorder,
-                        stack_rx,
-                        my_stop_tx,
-                    );
-                    0
-                })?,
-        );
-        let session_recorder = recorder.clone();
-        let my_stop_tx = stop_tx.clone();
-        recv_threads.push(
-            thread::Builder::new()
-                .name("probe_recorder".to_string())
-                .spawn(move || {
-                    consume_loop::<SystingProbeRecorder, probe_event>(
-                        &session_recorder,
-                        &session_recorder.probe_recorder,
-                        probe_rx,
-                        my_stop_tx,
-                    );
-                    0
-                })?,
-        );
-        if opts.syscalls {
-            let session_recorder = recorder.clone();
-            let my_stop_tx = stop_tx.clone();
-            recv_threads.push(
-                thread::Builder::new()
-                    .name("syscall_recorder".to_string())
-                    .spawn(move || {
-                        consume_loop::<SyscallRecorder, syscall_event>(
-                            &session_recorder,
-                            &session_recorder.syscall_recorder,
-                            syscall_rx,
-                            my_stop_tx,
-                        );
-                        0
-                    })?,
-            );
-        }
-        if !perf_counter_names.is_empty() {
-            let session_recorder = recorder.clone();
-            let my_stop_tx = stop_tx.clone();
-            recv_threads.push(
-                thread::Builder::new()
-                    .name("perf_counter_recorder".to_string())
-                    .spawn(move || {
-                        consume_loop::<PerfCounterRecorder, perf_counter_event>(
-                            &session_recorder,
-                            &session_recorder.perf_counter_recorder,
-                            cache_rx,
-                            my_stop_tx,
-                        );
-                        0
-                    })?,
-            );
-        } else {
-            drop(cache_rx);
-        }
+        // Spawn all recorder threads
+        let recv_threads =
+            spawn_recorder_threads(&recorder, channels, &opts, &stop_tx, &perf_counter_names)?;
 
         // Set up clock perf events with automatic VM detection and fallback
         let clock_files = {
