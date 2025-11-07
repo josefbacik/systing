@@ -57,17 +57,13 @@ impl fmt::Display for ConnectionId {
     }
 }
 
-// A single network event (send or receive)
-#[derive(Clone)]
 struct NetworkEvent {
     start_ts: u64,
     end_ts: u64,
     bytes: u32,
-    sendmsg_seq: u32, // TCP sequence at sendmsg time (TCP sends only)
+    sendmsg_seq: u32,
 }
 
-// A single packet event (TCP packet transmission)
-#[derive(Clone)]
 struct PacketEvent {
     start_ts: u64,
     end_ts: u64,
@@ -76,8 +72,7 @@ struct PacketEvent {
     tcp_flags: u8,
 }
 
-// Events grouped by operation type
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct ConnectionEvents {
     sends: Vec<NetworkEvent>,
     recvs: Vec<NetworkEvent>,
@@ -86,14 +81,35 @@ struct ConnectionEvents {
 }
 
 #[derive(Default)]
+struct DnsStats {
+    attempted: usize,
+    ipv4_succeeded: usize,
+    ipv4_failed: usize,
+    ipv6_succeeded: usize,
+    ipv6_failed: usize,
+}
+
+impl DnsStats {
+    fn succeeded(&self) -> usize {
+        self.ipv4_succeeded + self.ipv6_succeeded
+    }
+
+    fn success_rate(&self) -> f64 {
+        if self.attempted == 0 {
+            0.0
+        } else {
+            (self.succeeded() as f64 / self.attempted as f64) * 100.0
+        }
+    }
+}
+
+#[derive(Default)]
 pub struct NetworkRecorder {
     pub ringbuf: RingBuffer<network_event>,
-    // Map from tgidpid to connections to events (sends and receives, and packets)
     network_events: HashMap<u64, HashMap<ConnectionId, ConnectionEvents>>,
-    // Map from event name to interned id (for deduplication)
     event_name_ids: HashMap<String, u64>,
-    // Cache of resolved hostnames (IP address -> hostname)
     hostname_cache: HashMap<IpAddr, String>,
+    dns_stats: DnsStats,
 }
 
 impl NetworkRecorder {
@@ -172,37 +188,32 @@ impl NetworkRecorder {
         }
     }
 
-    /// Resolve an IP address to a hostname, with caching and fallback to IP string.
-    /// Returns the hostname if resolution succeeds, otherwise returns the IP address as a string.
     fn resolve_hostname(&mut self, addr: IpAddr) -> &str {
         self.hostname_cache.entry(addr).or_insert_with(|| {
-            // Attempt reverse DNS lookup
-            match dns_lookup::lookup_addr(&addr) {
-                Ok(name) => name,
-                Err(err) => {
-                    // Log failure and fallback to IP address string
-                    tracing::debug!("DNS lookup failed for {}: {}", addr, err);
-                    addr.to_string()
-                }
-            }
-        })
-    }
+            self.dns_stats.attempted += 1;
 
-    /// Format a connection identifier with hostname resolution.
-    /// Returns a string like "TCP:example.com:8080" or "TCP:127.0.0.1:8080" (if lookup fails)
-    fn format_connection_name(&mut self, conn_id: &ConnectionId) -> String {
-        let protocol_str =
-            if conn_id.protocol == crate::systing::types::network_protocol::NETWORK_TCP.0 {
-                "TCP"
-            } else if conn_id.protocol == crate::systing::types::network_protocol::NETWORK_UDP.0 {
-                "UDP"
-            } else {
-                "UNKNOWN"
+            let lookup_addr = addr.to_canonical();
+
+            let (succeeded, hostname) = match dns_lookup::lookup_addr(&lookup_addr) {
+                Ok(name) => {
+                    tracing::debug!("DNS lookup succeeded for {}: {}", lookup_addr, name);
+                    (true, name)
+                }
+                Err(err) => {
+                    tracing::debug!("DNS lookup failed for {}: {}", lookup_addr, err);
+                    (false, lookup_addr.to_string())
+                }
             };
 
-        let addr = conn_id.ip_addr();
-        let host = self.resolve_hostname(addr);
-        format!("{}:{}:{}", protocol_str, host, conn_id.dest_port)
+            match (lookup_addr, succeeded) {
+                (IpAddr::V4(_), true) => self.dns_stats.ipv4_succeeded += 1,
+                (IpAddr::V4(_), false) => self.dns_stats.ipv4_failed += 1,
+                (IpAddr::V6(_), true) => self.dns_stats.ipv6_succeeded += 1,
+                (IpAddr::V6(_), false) => self.dns_stats.ipv6_failed += 1,
+            }
+
+            hostname
+        })
     }
 
     fn get_or_create_event_name_iid(&mut self, name: String, id_counter: &Arc<AtomicUsize>) -> u64 {
@@ -309,7 +320,6 @@ impl NetworkRecorder {
         let mut packets = Vec::new();
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
 
-        // Collect all unique connection IDs and protocol/operation combinations
         use crate::systing::types::network_operation;
         let mut protocol_ops_used = std::collections::HashSet::new();
         let mut connection_ids = Vec::new();
@@ -319,7 +329,6 @@ impl NetworkRecorder {
         for connections in self.network_events.values() {
             for (conn_id, events) in connections.iter() {
                 connection_ids.push(*conn_id);
-
                 if !events.sends.is_empty() {
                     protocol_ops_used.insert((conn_id.protocol, network_operation::NETWORK_SEND.0));
                 }
@@ -335,12 +344,8 @@ impl NetworkRecorder {
             }
         }
 
-        // Resolve hostnames before packet generation to cache them
-        let mut connection_names = HashMap::new();
-        for conn_id in connection_ids {
-            connection_names
-                .entry(conn_id)
-                .or_insert_with(|| self.format_connection_name(&conn_id));
+        for conn_id in &connection_ids {
+            self.resolve_hostname(conn_id.ip_addr());
         }
 
         // Create IIDs for all protocol/operation combinations that were used
@@ -430,7 +435,25 @@ impl NetworkRecorder {
 
                 let mut conn_group_desc = TrackDescriptor::default();
                 conn_group_desc.set_uuid(conn_group_uuid);
-                conn_group_desc.set_name(connection_names[conn_id].clone());
+                let protocol_str = if conn_id.protocol
+                    == crate::systing::types::network_protocol::NETWORK_TCP.0
+                {
+                    "TCP"
+                } else if conn_id.protocol == crate::systing::types::network_protocol::NETWORK_UDP.0
+                {
+                    "UDP"
+                } else {
+                    "UNKNOWN"
+                };
+                let hostname = self
+                    .hostname_cache
+                    .get(&conn_id.ip_addr())
+                    .map(|s| s.as_str())
+                    .unwrap_or_else(|| "unknown");
+                conn_group_desc.set_name(format!(
+                    "{}:{}:{}",
+                    protocol_str, hostname, conn_id.dest_port
+                ));
                 conn_group_desc.set_parent_uuid(thread_group_uuid);
 
                 let mut conn_group_packet = TracePacket::default();
@@ -450,29 +473,21 @@ impl NetworkRecorder {
                     send_track_packet.set_track_descriptor(send_track_desc);
                     packets.push(send_track_packet);
 
-                    // Get the event name IID for sends
                     let proto_str = Self::protocol_to_str(conn_id.protocol);
                     let send_event_name = format!("{}_send", proto_str);
-                    let send_name_iid = *self
-                        .event_name_ids
-                        .get(&send_event_name)
-                        .expect("send event name should exist after IID generation");
+                    let send_name_iid = *self.event_name_ids.get(&send_event_name).unwrap();
 
-                    // Generate slice events for sends
                     for event in &events.sends {
-                        // Slice begin event
                         let mut begin_event = TrackEvent::default();
                         begin_event.set_type(Type::TYPE_SLICE_BEGIN);
                         begin_event.set_name_iid(send_name_iid);
                         begin_event.set_track_uuid(send_track_uuid);
 
-                        // Add debug annotation for the size
                         let mut debug_annotation = DebugAnnotation::default();
                         debug_annotation.set_name("bytes".to_string());
                         debug_annotation.set_uint_value(event.bytes as u64);
                         begin_event.debug_annotations.push(debug_annotation);
 
-                        // Add seq annotation for TCP sends
                         if event.sendmsg_seq > 0 {
                             let mut seq_annotation = DebugAnnotation::default();
                             seq_annotation.set_name("seq".to_string());
@@ -486,7 +501,6 @@ impl NetworkRecorder {
                         begin_packet.set_trusted_packet_sequence_id(sequence_id);
                         packets.push(begin_packet);
 
-                        // Slice end event
                         let mut end_event = TrackEvent::default();
                         end_event.set_type(Type::TYPE_SLICE_END);
                         end_event.set_track_uuid(send_track_uuid);
@@ -512,15 +526,9 @@ impl NetworkRecorder {
                     recv_track_packet.set_track_descriptor(recv_track_desc);
                     packets.push(recv_track_packet);
 
-                    // Get the event name IID for receives
                     let proto_str = Self::protocol_to_str(conn_id.protocol);
                     let recv_event_name = format!("{}_recv", proto_str);
-                    let recv_name_iid = *self
-                        .event_name_ids
-                        .get(&recv_event_name)
-                        .expect("recv event name should exist after IID generation");
-
-                    // Generate slice events for receives
+                    let recv_name_iid = *self.event_name_ids.get(&recv_event_name).unwrap();
                     for event in &events.recvs {
                         self.add_slice_events(
                             &mut packets,
@@ -532,7 +540,6 @@ impl NetworkRecorder {
                     }
                 }
 
-                // Create packets track if we have any packet events (TCP only)
                 if !events.enqueue_packets.is_empty() || !events.send_packets.is_empty() {
                     let packets_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
@@ -546,10 +553,7 @@ impl NetworkRecorder {
                     packets.push(packets_track_packet);
 
                     if !events.enqueue_packets.is_empty() {
-                        let enqueue_iid = *self
-                            .event_name_ids
-                            .get("TCP packet_enqueue")
-                            .expect("enqueue packet event name should exist after IID generation");
+                        let enqueue_iid = *self.event_name_ids.get("TCP packet_enqueue").unwrap();
 
                         self.add_packet_slice_events(
                             &mut packets,
@@ -561,10 +565,7 @@ impl NetworkRecorder {
                     }
 
                     if !events.send_packets.is_empty() {
-                        let send_iid = *self
-                            .event_name_ids
-                            .get("TCP packet_send")
-                            .expect("send packet event name should exist after IID generation");
+                        let send_iid = *self.event_name_ids.get("TCP packet_send").unwrap();
 
                         self.add_packet_slice_events(
                             &mut packets,
@@ -578,12 +579,23 @@ impl NetworkRecorder {
             }
         }
 
-        // Clear events and IID state after generating packets
-        // This ensures we start fresh for the next trace generation with
-        // the SEQ_INCREMENTAL_STATE_CLEARED flag
+        if self.dns_stats.attempted > 0 {
+            tracing::info!(
+                "DNS resolution stats: {} attempted, {} succeeded ({:.1}%), IPv4: {} succeeded / {} failed, IPv6: {} succeeded / {} failed",
+                self.dns_stats.attempted,
+                self.dns_stats.succeeded(),
+                self.dns_stats.success_rate(),
+                self.dns_stats.ipv4_succeeded,
+                self.dns_stats.ipv4_failed,
+                self.dns_stats.ipv6_succeeded,
+                self.dns_stats.ipv6_failed
+            );
+        }
+
         self.network_events.clear();
         self.event_name_ids.clear();
         self.hostname_cache.clear();
+        self.dns_stats = Default::default();
 
         packets
     }
