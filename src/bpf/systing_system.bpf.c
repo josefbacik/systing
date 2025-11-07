@@ -1387,6 +1387,34 @@ int tracepoint__raw_syscalls__sys_exit(struct trace_event_raw_sys_exit *ctx)
 	return 0;
 }
 
+static __always_inline int read_socket_dest_info(struct sock *sk,
+						  enum network_address_family *af,
+						  u8 *dest_addr,
+						  u16 *dest_port)
+{
+	u16 family;
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	if (family == AF_INET) {
+		*af = NETWORK_AF_INET;
+		u32 addr;
+		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
+		__builtin_memcpy(dest_addr, &addr, 4);
+		u16 port;
+		bpf_probe_read_kernel(&port, sizeof(port), &sk->__sk_common.skc_dport);
+		*dest_port = __builtin_bswap16(port);
+		return 0;
+	} else if (family == AF_INET6) {
+		*af = NETWORK_AF_INET6;
+		bpf_probe_read_kernel(dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
+		u16 port;
+		bpf_probe_read_kernel(&port, sizeof(port), &sk->__sk_common.skc_dport);
+		*dest_port = __builtin_bswap16(port);
+		return 0;
+	}
+	return -1;
+}
+
 static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum network_protocol protocol)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
@@ -1443,30 +1471,8 @@ static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum networ
 		}
 	}
 
-	// Fallback: for TCP or connected UDP sockets, read from socket structure
-	// Check if we haven't extracted an address yet (port will be non-zero if extracted from msg_name)
 	if (sk && info.dest_port == 0) {
-		u16 family;
-		bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
-
-		if (family == AF_INET) {
-			info.af = NETWORK_AF_INET;
-			u32 addr;
-			bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
-			__builtin_memcpy(info.dest_addr, &addr, 4);
-			bpf_probe_read_kernel(&info.dest_port, sizeof(info.dest_port),
-					      &sk->__sk_common.skc_dport);
-			info.dest_port = __builtin_bswap16(info.dest_port);
-		} else if (family == AF_INET6) {
-			// Note: IPv4-mapped IPv6 addresses (::ffff:192.0.2.1) are stored as IPv6.
-			// This is intentional - we preserve the address family from the socket,
-			// allowing userspace to see the actual socket type being used.
-			info.af = NETWORK_AF_INET6;
-			bpf_probe_read_kernel(info.dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
-			bpf_probe_read_kernel(&info.dest_port, sizeof(info.dest_port),
-					      &sk->__sk_common.skc_dport);
-			info.dest_port = __builtin_bswap16(info.dest_port);
-		}
+		read_socket_dest_info(sk, &info.af, info.dest_addr, &info.dest_port);
 	}
 
 	bpf_map_update_elem(&pending_network_sends, &tgidpid, &info, BPF_ANY);
@@ -1562,29 +1568,8 @@ static int handle_tcp_recvmsg_entry(struct sock *sk, struct msghdr *msg)
 	info.start_ts = bpf_ktime_get_boot_ns();
 	info.af = NETWORK_AF_INET;  // Default to IPv4
 
-	// For TCP (connected socket): socket stores peer address/port
-	// skc_daddr/skc_dport are the remote endpoint (peer)
 	if (sk) {
-		u16 family;
-		bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
-
-		if (family == AF_INET) {
-			info.af = NETWORK_AF_INET;
-			u32 addr;
-			bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
-			__builtin_memcpy(info.peer_addr, &addr, 4);
-			bpf_probe_read_kernel(&info.peer_port, sizeof(info.peer_port),
-					      &sk->__sk_common.skc_dport);
-			info.peer_port = __builtin_bswap16(info.peer_port);
-		} else if (family == AF_INET6) {
-			// Note: IPv4-mapped IPv6 addresses (::ffff:192.0.2.1) are stored as IPv6.
-			// This preserves the actual socket family for accurate connection tracking.
-			info.af = NETWORK_AF_INET6;
-			bpf_probe_read_kernel(info.peer_addr, 16, &sk->__sk_common.skc_v6_daddr);
-			bpf_probe_read_kernel(&info.peer_port, sizeof(info.peer_port),
-					      &sk->__sk_common.skc_dport);
-			info.peer_port = __builtin_bswap16(info.peer_port);
-		}
+		read_socket_dest_info(sk, &info.af, info.peer_addr, &info.peer_port);
 	}
 
 	bpf_map_update_elem(&pending_network_recvs, &tgidpid, &info, BPF_ANY);
