@@ -165,6 +165,20 @@ struct network_event {
 	u8 dest_addr[16];  // IPv4 (first 4 bytes) or IPv6 (all 16 bytes) in network byte order
 	u16 dest_port;     // Port in host byte order
 	u32 bytes;
+	u32 sendmsg_seq;   // TCP sequence number at sendmsg time (TCP only)
+	u32 cpu;
+};
+
+struct packet_event {
+	u64 start_ts;
+	u64 end_ts;
+	struct task_info task;
+	enum network_address_family af;  // Address family (IPv4 or IPv6)
+	u8 dest_addr[16];  // IPv4 (first 4 bytes) or IPv6 (all 16 bytes) in network byte order
+	u16 dest_port;     // Port in host byte order
+	u32 seq;           // TCP sequence number at transmit time
+	u32 length;        // Packet length (calculated from end_seq - seq)
+	u8 tcp_flags;      // TCP flags (SYN, ACK, FIN, etc.)
 	u32 cpu;
 };
 
@@ -177,6 +191,7 @@ struct stack_event _stack_event = {0};
 struct perf_counter_event _perf_counter_event = {0};
 struct syscall_event _syscall_event = {0};
 struct network_event _network_event = {0};
+struct packet_event _packet_event = {0};
 struct task_info _task_info = {0};
 struct probe_event _uprobe_event = {0};
 struct arg_desc _arg_desc = {0};
@@ -230,18 +245,13 @@ struct {
 	__uint(max_entries, 10240);
 } event_key_types SEC(".maps");
 
-// Tracks pending network operations (both sends and receives)
-//
-// Note: network_send_info and network_recv_info have identical structure currently,
-// but are kept separate for future extensibility. Potential future additions:
-//   - send_info: TTL, TOS/DSCP, fragmentation flags
-//   - recv_info: flags, truncation indicators, multicast info
 struct network_send_info {
 	enum network_protocol protocol;
 	enum network_address_family af;
 	u8 dest_addr[16];
 	u16 dest_port;
 	u64 start_ts;
+	u32 sendmsg_seq;  // Sequence number at sendmsg time
 };
 
 // Tracks pending receive operations with peer address
@@ -267,13 +277,50 @@ struct {
 	__uint(max_entries, 10240);
 } pending_network_recvs SEC(".maps");
 
+// Map sk pointer to tgidpid for associating packets with threads
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);  // struct sock * (cast to u64)
+	__type(value, u64);  // tgidpid
+	__uint(max_entries, 10240);
+} sk_to_tgidpid SEC(".maps");
+
+// Tracks pending packet transmissions from __tcp_transmit_skb to dev_queue_xmit
+struct packet_info {
+	u64 start_ts;
+	u64 tgidpid;
+	enum network_address_family af;
+	u8 dest_addr[16];
+	u16 dest_port;
+	u32 seq;
+	u32 length;
+	u8 tcp_flags;
+};
+
+// Key for pending_packets map - survives SKB cloning
+// Uses connection 5-tuple + seq number instead of skb pointer
+struct packet_key {
+	u64 tgidpid;
+	u8 dest_addr[16];
+	u16 dest_port;
+	u32 seq;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct packet_key);
+	__type(value, struct packet_info);
+	__uint(max_entries, 10240);
+} pending_packets SEC(".maps");
+
 #define MISSED_SCHED_EVENT 0
 #define MISSED_STACK_EVENT 1
 #define MISSED_PROBE_EVENT 2
 #define MISSED_CACHE_EVENT 3
 #define MISSED_SYSCALL_EVENT 4
 #define MISSED_NETWORK_EVENT 5
-#define MISSED_EVENT_MAX 6
+#define MISSED_PACKET_EVENT 6
+#define MISSED_EVENT_MAX 7
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
@@ -347,6 +394,18 @@ struct network_ringbuf_map {
 	ringbuf_network_events_node5 SEC(".maps"),
 	ringbuf_network_events_node6 SEC(".maps"),
 	ringbuf_network_events_node7 SEC(".maps");
+
+struct packet_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
+} ringbuf_packet_events_node0 SEC(".maps"),
+	ringbuf_packet_events_node1 SEC(".maps"),
+	ringbuf_packet_events_node2 SEC(".maps"),
+	ringbuf_packet_events_node3 SEC(".maps"),
+	ringbuf_packet_events_node4 SEC(".maps"),
+	ringbuf_packet_events_node5 SEC(".maps"),
+	ringbuf_packet_events_node6 SEC(".maps"),
+	ringbuf_packet_events_node7 SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
@@ -456,6 +515,24 @@ struct {
 	},
 };
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS);
+	__type(key, u32);
+	__array(values, struct packet_ringbuf_map);
+} packet_ringbufs SEC(".maps") = {
+	.values = {
+		&ringbuf_packet_events_node0,
+		&ringbuf_packet_events_node1,
+		&ringbuf_packet_events_node2,
+		&ringbuf_packet_events_node3,
+		&ringbuf_packet_events_node4,
+		&ringbuf_packet_events_node5,
+		&ringbuf_packet_events_node6,
+		&ringbuf_packet_events_node7,
+	},
+};
+
 static struct task_event *reserve_task_event(void)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
@@ -520,6 +597,17 @@ static struct network_event *reserve_network_event(void)
 	if (!rb)
 		return NULL;
 	return bpf_ringbuf_reserve(rb, sizeof(struct network_event), 0);
+}
+
+static struct packet_event *reserve_packet_event(void)
+{
+	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&packet_ringbufs, &node);
+	if (!rb)
+		return NULL;
+	return bpf_ringbuf_reserve(rb, sizeof(struct packet_event), 0);
 }
 
 static u32 task_cpu(struct task_struct *task)
@@ -1304,7 +1392,14 @@ static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum networ
 
 	info.protocol = protocol;
 	info.start_ts = bpf_ktime_get_boot_ns();
-	info.af = NETWORK_AF_INET;  // Default to IPv4, will update if IPv6
+	info.af = NETWORK_AF_INET;
+
+	if (protocol == NETWORK_TCP && sk) {
+		struct tcp_sock *tp = (struct tcp_sock *)sk;
+		u32 write_seq = 0;
+		bpf_probe_read_kernel(&write_seq, sizeof(write_seq), &tp->write_seq);
+		info.sendmsg_seq = write_seq;
+	}
 
 	// For UDP (and optionally TCP with msg_name), try to read from msghdr first
 	// This handles unconnected UDP sockets where destination is passed per-send
@@ -1407,6 +1502,7 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 	__builtin_memcpy(event->dest_addr, info->dest_addr, 16);
 	event->dest_port = info->dest_port;
 	event->bytes = (u32)ret;  // Return value is number of bytes sent
+	event->sendmsg_seq = info->sendmsg_seq;  // TCP sequence at sendmsg time
 
 	bpf_ringbuf_submit(event, 0);
 	bpf_map_delete_elem(&pending_network_sends, &tgidpid);
@@ -1417,6 +1513,12 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 SEC("kprobe/tcp_sendmsg")
 int BPF_KPROBE(tcp_sendmsg_entry, struct sock *sk, struct msghdr *msg, size_t size)
 {
+	if (sk) {
+		u64 sk_ptr = (u64)sk;
+		u64 tgidpid = bpf_get_current_pid_tgid();
+		bpf_map_update_elem(&sk_to_tgidpid, &sk_ptr, &tgidpid, BPF_ANY);
+	}
+
 	return handle_sendmsg_entry(sk, msg, NETWORK_TCP);
 }
 
@@ -1643,6 +1745,168 @@ SEC("kretprobe/udp_recvmsg")
 int BPF_KRETPROBE(udp_recvmsg_exit, int ret)
 {
 	return handle_recvmsg_exit(ctx, ret);
+}
+
+// Trace __tcp_transmit_skb to capture packet details at transmission
+SEC("kprobe/__tcp_transmit_skb")
+int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int clone_it, gfp_t gfp_mask, u32 rcv_nxt)
+{
+	if (!sk || !skb)
+		return 0;
+
+	u64 sk_ptr = (u64)sk;
+	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
+
+	u64 tgidpid;
+	if (tgidpid_ptr) {
+		tgidpid = *tgidpid_ptr;
+	} else {
+		// Socket not yet tracked - use current task (may be kernel thread)
+		tgidpid = bpf_get_current_pid_tgid();
+		bpf_map_update_elem(&sk_to_tgidpid, &sk_ptr, &tgidpid, BPF_ANY);
+	}
+
+	// Filter based on tgidpid from socket (may differ from current task due to TSQ/softirq)
+	u32 tgid = tgidpid >> 32;
+	if (tgid == 0 || tgid == tool_config.my_tgid)
+		return 0;
+
+	struct packet_info pkt_info = {0};
+	pkt_info.start_ts = bpf_ktime_get_boot_ns();
+	pkt_info.tgidpid = tgidpid;
+
+	// Extract destination address and port from the socket
+	u16 family;
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	if (family == AF_INET) {
+		pkt_info.af = NETWORK_AF_INET;
+		u32 addr;
+		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
+		__builtin_memcpy(pkt_info.dest_addr, &addr, 4);
+		bpf_probe_read_kernel(&pkt_info.dest_port, sizeof(pkt_info.dest_port),
+				      &sk->__sk_common.skc_dport);
+		pkt_info.dest_port = __builtin_bswap16(pkt_info.dest_port);
+	} else if (family == AF_INET6) {
+		pkt_info.af = NETWORK_AF_INET6;
+		bpf_probe_read_kernel(pkt_info.dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
+		bpf_probe_read_kernel(&pkt_info.dest_port, sizeof(pkt_info.dest_port),
+				      &sk->__sk_common.skc_dport);
+		pkt_info.dest_port = __builtin_bswap16(pkt_info.dest_port);
+	}
+
+	struct tcp_skb_cb *tcb = (struct tcp_skb_cb *)&skb->cb[0];
+	u32 start_seq = 0;
+	u32 end_seq = 0;
+	u8 tcp_flags = 0;
+
+	bpf_probe_read_kernel(&start_seq, sizeof(start_seq), &tcb->seq);
+	bpf_probe_read_kernel(&end_seq, sizeof(end_seq), &tcb->end_seq);
+	bpf_probe_read_kernel(&tcp_flags, sizeof(tcp_flags), &tcb->tcp_flags);
+
+	pkt_info.seq = start_seq;
+	pkt_info.length = end_seq - start_seq;
+	pkt_info.tcp_flags = tcp_flags;
+
+	// Use connection 5-tuple + seq as key instead of skb pointer
+	// because skb may be cloned during transmission
+	struct packet_key key = {0};
+	key.tgidpid = tgidpid;
+	__builtin_memcpy(key.dest_addr, pkt_info.dest_addr, 16);
+	key.dest_port = pkt_info.dest_port;
+	key.seq = start_seq;
+
+	bpf_map_update_elem(&pending_packets, &key, &pkt_info, BPF_ANY);
+
+	return 0;
+}
+
+// Trace __dev_queue_xmit to capture packet transmission completion
+SEC("kprobe/__dev_queue_xmit")
+int BPF_KPROBE(dev_queue_xmit_entry, struct sk_buff *skb)
+{
+	if (!skb)
+		return 0;
+
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+
+	if (!sk)
+		return 0;
+
+	u64 sk_ptr = (u64)sk;
+	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
+	if (!tgidpid_ptr)
+		return 0;
+
+	unsigned char *head = NULL;
+	u16 transport_header = 0;
+
+	bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+	bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
+
+	if (!head || transport_header == (u16)~0U)
+		return 0;
+
+	struct tcphdr tcp = {0};
+	if (bpf_probe_read_kernel(&tcp, sizeof(tcp), head + transport_header) != 0)
+		return 0;
+
+	u32 seq = __builtin_bswap32(tcp.seq);
+
+	u16 family;
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	struct packet_key key = {0};
+	key.tgidpid = *tgidpid_ptr;
+	key.seq = seq;
+
+	if (family == AF_INET) {
+		u32 addr;
+		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
+		__builtin_memcpy(key.dest_addr, &addr, 4);
+		bpf_probe_read_kernel(&key.dest_port, sizeof(key.dest_port),
+				      &sk->__sk_common.skc_dport);
+		key.dest_port = __builtin_bswap16(key.dest_port);
+	} else if (family == AF_INET6) {
+		bpf_probe_read_kernel(key.dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
+		bpf_probe_read_kernel(&key.dest_port, sizeof(key.dest_port),
+				      &sk->__sk_common.skc_dport);
+		key.dest_port = __builtin_bswap16(key.dest_port);
+	} else {
+		return 0;
+	}
+
+	// Look up the packet info using the reconstructed key
+	struct packet_info *pkt_info = bpf_map_lookup_elem(&pending_packets, &key);
+	if (!pkt_info)
+		return 0;
+
+	// Emit the packet event
+	struct packet_event *event = reserve_packet_event();
+	if (!event) {
+		bpf_map_delete_elem(&pending_packets, &key);
+		return handle_missed_event(MISSED_PACKET_EVENT);
+	}
+
+	event->start_ts = pkt_info->start_ts;
+	event->end_ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+
+	event->task.tgidpid = pkt_info->tgidpid;
+	// comm is matched in userspace via tgidpid
+
+	event->af = pkt_info->af;
+	__builtin_memcpy(event->dest_addr, pkt_info->dest_addr, 16);
+	event->dest_port = pkt_info->dest_port;
+	event->seq = pkt_info->seq;
+	event->length = pkt_info->length;
+	event->tcp_flags = pkt_info->tcp_flags;
+
+	bpf_ringbuf_submit(event, 0);
+	bpf_map_delete_elem(&pending_packets, &key);
+
+	return 0;
 }
 
 char LICENSE[] SEC("license") = "GPL";

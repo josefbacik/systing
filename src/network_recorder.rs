@@ -30,13 +30,14 @@ impl ConnectionId {
     fn ip_addr(&self) -> IpAddr {
         use crate::systing::types::network_address_family;
         if self.af == network_address_family::NETWORK_AF_INET.0 {
-            // IPv4 - use first 4 bytes
             let mut bytes = [0u8; 4];
             bytes.copy_from_slice(&self.dest_addr[0..4]);
             IpAddr::V4(Ipv4Addr::from(bytes))
-        } else {
-            // IPv6 - use all 16 bytes
+        } else if self.af == network_address_family::NETWORK_AF_INET6.0 {
             IpAddr::V6(Ipv6Addr::from(self.dest_addr))
+        } else {
+            // Invalid af value - default to IPv4
+            IpAddr::V4(Ipv4Addr::from([0, 0, 0, 0]))
         }
     }
 }
@@ -62,6 +63,17 @@ struct NetworkEvent {
     start_ts: u64,
     end_ts: u64,
     bytes: u32,
+    sendmsg_seq: u32, // TCP sequence at sendmsg time (TCP sends only)
+}
+
+// A single packet event (TCP packet transmission)
+#[derive(Clone)]
+struct PacketEvent {
+    start_ts: u64,
+    end_ts: u64,
+    seq: u32,
+    length: u32,
+    tcp_flags: u8,
 }
 
 // Events grouped by operation type
@@ -69,12 +81,13 @@ struct NetworkEvent {
 struct ConnectionEvents {
     sends: Vec<NetworkEvent>,
     recvs: Vec<NetworkEvent>,
+    packets: Vec<PacketEvent>,
 }
 
 #[derive(Default)]
 pub struct NetworkRecorder {
     pub ringbuf: RingBuffer<network_event>,
-    // Map from tgidpid to connections to events (sends and receives)
+    // Map from tgidpid to connections to events (sends and receives, and packets)
     network_events: HashMap<u64, HashMap<ConnectionId, ConnectionEvents>>,
     // Map from event name to interned id (for deduplication)
     event_name_ids: HashMap<String, u64>,
@@ -83,6 +96,66 @@ pub struct NetworkRecorder {
 }
 
 impl NetworkRecorder {
+    fn format_tcp_flags(flags: u8) -> String {
+        if flags == 0 {
+            return "NONE".to_string();
+        }
+
+        let mut result = String::with_capacity(32);
+        let mut first = true;
+
+        for (mask, name) in [
+            (0x01, "FIN"),
+            (0x02, "SYN"),
+            (0x04, "RST"),
+            (0x08, "PSH"),
+            (0x10, "ACK"),
+            (0x20, "URG"),
+            (0x40, "ECE"),
+            (0x80, "CWR"),
+        ] {
+            if flags & mask != 0 {
+                if !first {
+                    result.push('|');
+                }
+                result.push_str(name);
+                first = false;
+            }
+        }
+
+        result
+    }
+
+    pub fn handle_packet_event(&mut self, event: crate::systing::types::packet_event) {
+        use crate::systing::types::network_protocol;
+
+        let tgidpid = event.task.tgidpid;
+
+        let conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_TCP.0, // Packets are always TCP
+            af: event.af.0,
+            dest_addr: event.dest_addr,
+            dest_port: event.dest_port,
+        };
+
+        let pkt_event = PacketEvent {
+            start_ts: event.start_ts,
+            end_ts: event.end_ts,
+            seq: event.seq,
+            length: event.length,
+            tcp_flags: event.tcp_flags,
+        };
+
+        let conn_events = self
+            .network_events
+            .entry(tgidpid)
+            .or_default()
+            .entry(conn_id)
+            .or_default();
+
+        conn_events.packets.push(pkt_event);
+    }
+
     fn protocol_to_str(protocol: u32) -> &'static str {
         use crate::systing::types::network_protocol;
         if protocol == network_protocol::NETWORK_TCP.0 {
@@ -188,6 +261,7 @@ impl NetworkRecorder {
         use crate::systing::types::network_operation;
         let mut protocol_ops_used = std::collections::HashSet::new();
         let mut connection_ids = Vec::new();
+        let mut has_packets = false;
 
         for connections in self.network_events.values() {
             for (conn_id, events) in connections.iter() {
@@ -199,10 +273,13 @@ impl NetworkRecorder {
                 if !events.recvs.is_empty() {
                     protocol_ops_used.insert((conn_id.protocol, network_operation::NETWORK_RECV.0));
                 }
+                if !events.packets.is_empty() {
+                    has_packets = true;
+                }
             }
         }
 
-        // Pre-resolve all hostnames before iterating (avoids borrow checker issues)
+        // Resolve hostnames before packet generation to cache them
         let mut connection_names = HashMap::new();
         for conn_id in connection_ids {
             connection_names
@@ -224,6 +301,11 @@ impl NetworkRecorder {
 
             let event_name = format!("{}_{}", proto_str, op_str);
             self.get_or_create_event_name_iid(event_name, id_counter);
+        }
+
+        // Create IID for packet events if we have any
+        if has_packets {
+            self.get_or_create_event_name_iid("tcp_packet".to_string(), id_counter);
         }
 
         // Generate interned data packet with event names
@@ -276,7 +358,7 @@ impl NetworkRecorder {
 
             // Create a track group for each unique connection
             for (conn_id, events) in connections.iter() {
-                if events.sends.is_empty() && events.recvs.is_empty() {
+                if events.sends.is_empty() && events.recvs.is_empty() && events.packets.is_empty() {
                     continue;
                 }
 
@@ -285,12 +367,7 @@ impl NetworkRecorder {
 
                 let mut conn_group_desc = TrackDescriptor::default();
                 conn_group_desc.set_uuid(conn_group_uuid);
-                conn_group_desc.set_name(
-                    connection_names
-                        .get(conn_id)
-                        .expect("connection name should have been pre-resolved")
-                        .clone(),
-                );
+                conn_group_desc.set_name(connection_names[conn_id].clone());
                 conn_group_desc.set_parent_uuid(thread_group_uuid);
 
                 let mut conn_group_packet = TracePacket::default();
@@ -320,13 +397,42 @@ impl NetworkRecorder {
 
                     // Generate slice events for sends
                     for event in &events.sends {
-                        self.add_slice_events(
-                            &mut packets,
-                            sequence_id,
-                            send_track_uuid,
-                            send_name_iid,
-                            event,
-                        );
+                        // Slice begin event
+                        let mut begin_event = TrackEvent::default();
+                        begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+                        begin_event.set_name_iid(send_name_iid);
+                        begin_event.set_track_uuid(send_track_uuid);
+
+                        // Add debug annotation for the size
+                        let mut debug_annotation = DebugAnnotation::default();
+                        debug_annotation.set_name("bytes".to_string());
+                        debug_annotation.set_uint_value(event.bytes as u64);
+                        begin_event.debug_annotations.push(debug_annotation);
+
+                        // Add seq annotation for TCP sends
+                        if event.sendmsg_seq > 0 {
+                            let mut seq_annotation = DebugAnnotation::default();
+                            seq_annotation.set_name("seq".to_string());
+                            seq_annotation.set_uint_value(event.sendmsg_seq as u64);
+                            begin_event.debug_annotations.push(seq_annotation);
+                        }
+
+                        let mut begin_packet = TracePacket::default();
+                        begin_packet.set_timestamp(event.start_ts);
+                        begin_packet.set_track_event(begin_event);
+                        begin_packet.set_trusted_packet_sequence_id(sequence_id);
+                        packets.push(begin_packet);
+
+                        // Slice end event
+                        let mut end_event = TrackEvent::default();
+                        end_event.set_type(Type::TYPE_SLICE_END);
+                        end_event.set_track_uuid(send_track_uuid);
+
+                        let mut end_packet = TracePacket::default();
+                        end_packet.set_timestamp(event.end_ts);
+                        end_packet.set_track_event(end_event);
+                        end_packet.set_trusted_packet_sequence_id(sequence_id);
+                        packets.push(end_packet);
                     }
                 }
 
@@ -360,6 +466,69 @@ impl NetworkRecorder {
                             recv_name_iid,
                             event,
                         );
+                    }
+                }
+
+                // Create packets track if we have packet events (TCP only)
+                if !events.packets.is_empty() {
+                    let packets_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+
+                    let mut packets_track_desc = TrackDescriptor::default();
+                    packets_track_desc.set_uuid(packets_track_uuid);
+                    packets_track_desc.set_name("Packets".to_string());
+                    packets_track_desc.set_parent_uuid(conn_group_uuid);
+
+                    let mut packets_track_packet = TracePacket::default();
+                    packets_track_packet.set_track_descriptor(packets_track_desc);
+                    packets.push(packets_track_packet);
+
+                    // Get the event name IID for packets
+                    let packet_name_iid = *self
+                        .event_name_ids
+                        .get("tcp_packet")
+                        .expect("packet event name should exist after IID generation");
+
+                    // Generate slice events for packets
+                    for pkt in &events.packets {
+                        // Slice begin event
+                        let mut begin_event = TrackEvent::default();
+                        begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+                        begin_event.set_name_iid(packet_name_iid);
+                        begin_event.set_track_uuid(packets_track_uuid);
+
+                        // Add debug annotations for sequence number, length, and flags
+                        let mut seq_annotation = DebugAnnotation::default();
+                        seq_annotation.set_name("seq".to_string());
+                        seq_annotation.set_uint_value(pkt.seq as u64);
+                        begin_event.debug_annotations.push(seq_annotation);
+
+                        let mut len_annotation = DebugAnnotation::default();
+                        len_annotation.set_name("length".to_string());
+                        len_annotation.set_uint_value(pkt.length as u64);
+                        begin_event.debug_annotations.push(len_annotation);
+
+                        // Add TCP flags annotation as a formatted string
+                        let mut flags_annotation = DebugAnnotation::default();
+                        flags_annotation.set_name("flags".to_string());
+                        flags_annotation.set_string_value(Self::format_tcp_flags(pkt.tcp_flags));
+                        begin_event.debug_annotations.push(flags_annotation);
+
+                        let mut begin_packet = TracePacket::default();
+                        begin_packet.set_timestamp(pkt.start_ts);
+                        begin_packet.set_track_event(begin_event);
+                        begin_packet.set_trusted_packet_sequence_id(sequence_id);
+                        packets.push(begin_packet);
+
+                        // Slice end event
+                        let mut end_event = TrackEvent::default();
+                        end_event.set_type(Type::TYPE_SLICE_END);
+                        end_event.set_track_uuid(packets_track_uuid);
+
+                        let mut end_packet = TracePacket::default();
+                        end_packet.set_timestamp(pkt.end_ts);
+                        end_packet.set_track_event(end_event);
+                        end_packet.set_trusted_packet_sequence_id(sequence_id);
+                        packets.push(end_packet);
                     }
                 }
             }
@@ -401,6 +570,7 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
             start_ts: event.start_ts,
             end_ts: event.end_ts,
             bytes: event.bytes,
+            sendmsg_seq: event.sendmsg_seq,
         };
 
         let conn_events = self
@@ -457,7 +627,9 @@ mod tests {
             dest_addr,
             dest_port: 8080,
             bytes: 1024,
+            sendmsg_seq: 0,
             cpu: 0,
+            ..Default::default()
         };
 
         recorder.handle_event(event);
@@ -501,7 +673,9 @@ mod tests {
             dest_addr,
             dest_port: 8080,
             bytes: 1024,
+            sendmsg_seq: 0,
             cpu: 0,
+            ..Default::default()
         };
 
         // Send 2 to same connection
@@ -515,7 +689,9 @@ mod tests {
             dest_addr,
             dest_port: 8080,
             bytes: 2048,
+            sendmsg_seq: 0,
             cpu: 0,
+            ..Default::default()
         };
 
         recorder.handle_event(event1);
@@ -555,7 +731,9 @@ mod tests {
             dest_addr,
             dest_port: 8080,
             bytes: 1024,
+            sendmsg_seq: 0,
             cpu: 0,
+            ..Default::default()
         };
 
         // UDP send
@@ -569,7 +747,9 @@ mod tests {
             dest_addr,
             dest_port: 9090,
             bytes: 512,
+            sendmsg_seq: 0,
             cpu: 0,
+            ..Default::default()
         };
 
         recorder.handle_event(event1);
@@ -603,7 +783,9 @@ mod tests {
             dest_addr,
             dest_port: 8080,
             bytes: 1024,
+            sendmsg_seq: 0,
             cpu: 0,
+            ..Default::default()
         };
 
         recorder.handle_event(event);
@@ -686,7 +868,9 @@ mod tests {
             dest_addr,
             dest_port: 8080,
             bytes: 1024,
+            sendmsg_seq: 0,
             cpu: 0,
+            ..Default::default()
         };
 
         // TCP receive from same connection
@@ -700,7 +884,9 @@ mod tests {
             dest_addr,
             dest_port: 8080,
             bytes: 512,
+            sendmsg_seq: 0,
             cpu: 0,
+            ..Default::default()
         };
 
         recorder.handle_event(send_event);
@@ -746,7 +932,9 @@ mod tests {
             dest_addr,
             dest_port: 8080,
             bytes: 2048,
+            sendmsg_seq: 0,
             cpu: 0,
+            ..Default::default()
         };
 
         recorder.handle_event(event);
@@ -795,7 +983,9 @@ mod tests {
             dest_addr,
             dest_port: 9090,
             bytes: 512,
+            sendmsg_seq: 0,
             cpu: 0,
+            ..Default::default()
         };
 
         recorder.handle_event(event);
@@ -847,7 +1037,9 @@ mod tests {
             dest_addr: ipv4_addr,
             dest_port: 8080,
             bytes: 1024,
+            sendmsg_seq: 0,
             cpu: 0,
+            ..Default::default()
         };
 
         // IPv6 TCP send
@@ -861,7 +1053,9 @@ mod tests {
             dest_addr: ipv6_addr,
             dest_port: 8080,
             bytes: 2048,
+            sendmsg_seq: 0,
             cpu: 0,
+            ..Default::default()
         };
 
         recorder.handle_event(ipv4_event);
@@ -963,7 +1157,9 @@ mod tests {
             dest_addr,
             dest_port: 8080,
             bytes: 1024,
+            sendmsg_seq: 0,
             cpu: 0,
+            ..Default::default()
         };
 
         // TCP receive from same connection
@@ -977,7 +1173,9 @@ mod tests {
             dest_addr,
             dest_port: 8080,
             bytes: 512,
+            sendmsg_seq: 0,
             cpu: 0,
+            ..Default::default()
         };
 
         recorder.handle_event(send_event);
