@@ -169,6 +169,11 @@ struct network_event {
 	u32 cpu;
 };
 
+enum packet_event_type {
+	PACKET_ENQUEUE,  // TCP -> device queue
+	PACKET_SEND,     // device queue -> NIC
+};
+
 struct packet_event {
 	u64 start_ts;
 	u64 end_ts;
@@ -179,6 +184,7 @@ struct packet_event {
 	u32 seq;           // TCP sequence number at transmit time
 	u32 length;        // Packet length (calculated from end_seq - seq)
 	u8 tcp_flags;      // TCP flags (SYN, ACK, FIN, etc.)
+	enum packet_event_type event_type;  // Type of packet event (enqueue or send)
 	u32 cpu;
 };
 
@@ -201,6 +207,7 @@ enum stack_event_type _stack_type = STACK_SLEEP;
 enum network_protocol _network_proto = NETWORK_TCP;
 enum network_operation _network_op = NETWORK_SEND;
 enum network_address_family _network_af = NETWORK_AF_INET;
+enum packet_event_type _packet_event_type = PACKET_ENQUEUE;
 bool tracing_enabled = true;
 
 struct {
@@ -1821,7 +1828,75 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	return 0;
 }
 
-// Trace __dev_queue_xmit to capture packet transmission completion
+// Helper to extract TCP sequence from skb
+static __always_inline int read_tcp_seq_from_skb(struct sk_buff *skb, u32 *seq)
+{
+	unsigned char *head = NULL;
+	u16 transport_header = 0;
+
+	bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+	bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
+
+	if (!head || transport_header == (u16)~0U)
+		return -1;
+
+	struct tcphdr tcp = {0};
+	if (bpf_probe_read_kernel(&tcp, sizeof(tcp), head + transport_header) != 0)
+		return -1;
+
+	*seq = __builtin_bswap32(tcp.seq);
+	return 0;
+}
+
+// Helper to build packet key from socket and sequence
+static __always_inline int build_packet_key(struct sock *sk, u32 seq, u64 tgidpid,
+					     struct packet_key *key)
+{
+	u16 family;
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	key->tgidpid = tgidpid;
+	key->seq = seq;
+
+	if (family == AF_INET) {
+		u32 addr;
+		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
+		__builtin_memcpy(key->dest_addr, &addr, 4);
+		bpf_probe_read_kernel(&key->dest_port, sizeof(key->dest_port),
+				      &sk->__sk_common.skc_dport);
+		key->dest_port = __builtin_bswap16(key->dest_port);
+		return 0;
+	} else if (family == AF_INET6) {
+		bpf_probe_read_kernel(key->dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
+		bpf_probe_read_kernel(&key->dest_port, sizeof(key->dest_port),
+				      &sk->__sk_common.skc_dport);
+		key->dest_port = __builtin_bswap16(key->dest_port);
+		return 0;
+	}
+
+	return -1;
+}
+
+// Helper to populate packet event from packet info
+static __always_inline void populate_packet_event(struct packet_event *event,
+						   struct packet_info *pkt_info,
+						   u64 end_ts,
+						   enum packet_event_type event_type)
+{
+	event->start_ts = pkt_info->start_ts;
+	event->end_ts = end_ts;
+	event->cpu = bpf_get_smp_processor_id();
+	event->task.tgidpid = pkt_info->tgidpid;
+	event->af = pkt_info->af;
+	__builtin_memcpy(event->dest_addr, pkt_info->dest_addr, 16);
+	event->dest_port = pkt_info->dest_port;
+	event->seq = pkt_info->seq;
+	event->length = pkt_info->length;
+	event->tcp_flags = pkt_info->tcp_flags;
+	event->event_type = event_type;
+}
+
+// Trace __dev_queue_xmit to capture packet enqueue (TCP -> device queue)
 SEC("kprobe/__dev_queue_xmit")
 int BPF_KPROBE(dev_queue_xmit_entry, struct sk_buff *skb)
 {
@@ -1830,7 +1905,6 @@ int BPF_KPROBE(dev_queue_xmit_entry, struct sk_buff *skb)
 
 	struct sock *sk = NULL;
 	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
-
 	if (!sk)
 		return 0;
 
@@ -1839,69 +1913,70 @@ int BPF_KPROBE(dev_queue_xmit_entry, struct sk_buff *skb)
 	if (!tgidpid_ptr)
 		return 0;
 
-	unsigned char *head = NULL;
-	u16 transport_header = 0;
-
-	bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
-	bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
-
-	if (!head || transport_header == (u16)~0U)
+	u32 seq;
+	if (read_tcp_seq_from_skb(skb, &seq) != 0)
 		return 0;
-
-	struct tcphdr tcp = {0};
-	if (bpf_probe_read_kernel(&tcp, sizeof(tcp), head + transport_header) != 0)
-		return 0;
-
-	u32 seq = __builtin_bswap32(tcp.seq);
-
-	u16 family;
-	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
 
 	struct packet_key key = {0};
-	key.tgidpid = *tgidpid_ptr;
-	key.seq = seq;
-
-	if (family == AF_INET) {
-		u32 addr;
-		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
-		__builtin_memcpy(key.dest_addr, &addr, 4);
-		bpf_probe_read_kernel(&key.dest_port, sizeof(key.dest_port),
-				      &sk->__sk_common.skc_dport);
-		key.dest_port = __builtin_bswap16(key.dest_port);
-	} else if (family == AF_INET6) {
-		bpf_probe_read_kernel(key.dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
-		bpf_probe_read_kernel(&key.dest_port, sizeof(key.dest_port),
-				      &sk->__sk_common.skc_dport);
-		key.dest_port = __builtin_bswap16(key.dest_port);
-	} else {
+	if (build_packet_key(sk, seq, *tgidpid_ptr, &key) != 0)
 		return 0;
-	}
 
-	// Look up the packet info using the reconstructed key
 	struct packet_info *pkt_info = bpf_map_lookup_elem(&pending_packets, &key);
 	if (!pkt_info)
 		return 0;
 
-	// Emit the packet event
 	struct packet_event *event = reserve_packet_event();
 	if (!event) {
 		bpf_map_delete_elem(&pending_packets, &key);
 		return handle_missed_event(MISSED_PACKET_EVENT);
 	}
 
-	event->start_ts = pkt_info->start_ts;
-	event->end_ts = bpf_ktime_get_boot_ns();
-	event->cpu = bpf_get_smp_processor_id();
+	u64 now = bpf_ktime_get_boot_ns();
+	populate_packet_event(event, pkt_info, now, PACKET_ENQUEUE);
 
-	event->task.tgidpid = pkt_info->tgidpid;
-	// comm is matched in userspace via tgidpid
+	bpf_ringbuf_submit(event, 0);
 
-	event->af = pkt_info->af;
-	__builtin_memcpy(event->dest_addr, pkt_info->dest_addr, 16);
-	event->dest_port = pkt_info->dest_port;
-	event->seq = pkt_info->seq;
-	event->length = pkt_info->length;
-	event->tcp_flags = pkt_info->tcp_flags;
+	pkt_info->start_ts = now;
+
+	return 0;
+}
+
+// Trace net_dev_start_xmit to capture actual packet transmission (device queue -> NIC)
+SEC("tp_btf/net_dev_start_xmit")
+int BPF_PROG(net_dev_start_xmit, struct sk_buff *skb, struct net_device *dev)
+{
+	if (!skb)
+		return 0;
+
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (!sk)
+		return 0;
+
+	u64 sk_ptr = (u64)sk;
+	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
+	if (!tgidpid_ptr)
+		return 0;
+
+	u32 seq;
+	if (read_tcp_seq_from_skb(skb, &seq) != 0)
+		return 0;
+
+	struct packet_key key = {0};
+	if (build_packet_key(sk, seq, *tgidpid_ptr, &key) != 0)
+		return 0;
+
+	struct packet_info *pkt_info = bpf_map_lookup_elem(&pending_packets, &key);
+	if (!pkt_info)
+		return 0;
+
+	struct packet_event *event = reserve_packet_event();
+	if (!event) {
+		bpf_map_delete_elem(&pending_packets, &key);
+		return handle_missed_event(MISSED_PACKET_EVENT);
+	}
+
+	populate_packet_event(event, pkt_info, bpf_ktime_get_boot_ns(), PACKET_SEND);
 
 	bpf_ringbuf_submit(event, 0);
 	bpf_map_delete_elem(&pending_packets, &key);

@@ -81,7 +81,8 @@ struct PacketEvent {
 struct ConnectionEvents {
     sends: Vec<NetworkEvent>,
     recvs: Vec<NetworkEvent>,
-    packets: Vec<PacketEvent>,
+    enqueue_packets: Vec<PacketEvent>,
+    send_packets: Vec<PacketEvent>,
 }
 
 #[derive(Default)]
@@ -127,7 +128,7 @@ impl NetworkRecorder {
     }
 
     pub fn handle_packet_event(&mut self, event: crate::systing::types::packet_event) {
-        use crate::systing::types::network_protocol;
+        use crate::systing::types::{network_protocol, packet_event_type};
 
         let tgidpid = event.task.tgidpid;
 
@@ -153,7 +154,11 @@ impl NetworkRecorder {
             .entry(conn_id)
             .or_default();
 
-        conn_events.packets.push(pkt_event);
+        if event.event_type.0 == packet_event_type::PACKET_ENQUEUE.0 {
+            conn_events.enqueue_packets.push(pkt_event);
+        } else if event.event_type.0 == packet_event_type::PACKET_SEND.0 {
+            conn_events.send_packets.push(pkt_event);
+        }
     }
 
     fn protocol_to_str(protocol: u32) -> &'static str {
@@ -210,6 +215,53 @@ impl NetworkRecorder {
         iid
     }
 
+    fn add_packet_slice_events(
+        &self,
+        packets: &mut Vec<TracePacket>,
+        sequence_id: u32,
+        track_uuid: u64,
+        name_iid: u64,
+        packet_events: &[PacketEvent],
+    ) {
+        for pkt in packet_events {
+            let mut begin_event = TrackEvent::default();
+            begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+            begin_event.set_name_iid(name_iid);
+            begin_event.set_track_uuid(track_uuid);
+
+            let mut seq_annotation = DebugAnnotation::default();
+            seq_annotation.set_name("seq".to_string());
+            seq_annotation.set_uint_value(pkt.seq as u64);
+            begin_event.debug_annotations.push(seq_annotation);
+
+            let mut len_annotation = DebugAnnotation::default();
+            len_annotation.set_name("length".to_string());
+            len_annotation.set_uint_value(pkt.length as u64);
+            begin_event.debug_annotations.push(len_annotation);
+
+            let mut flags_annotation = DebugAnnotation::default();
+            flags_annotation.set_name("flags".to_string());
+            flags_annotation.set_string_value(Self::format_tcp_flags(pkt.tcp_flags));
+            begin_event.debug_annotations.push(flags_annotation);
+
+            let mut begin_packet = TracePacket::default();
+            begin_packet.set_timestamp(pkt.start_ts);
+            begin_packet.set_track_event(begin_event);
+            begin_packet.set_trusted_packet_sequence_id(sequence_id);
+            packets.push(begin_packet);
+
+            let mut end_event = TrackEvent::default();
+            end_event.set_type(Type::TYPE_SLICE_END);
+            end_event.set_track_uuid(track_uuid);
+
+            let mut end_packet = TracePacket::default();
+            end_packet.set_timestamp(pkt.end_ts);
+            end_packet.set_track_event(end_event);
+            end_packet.set_trusted_packet_sequence_id(sequence_id);
+            packets.push(end_packet);
+        }
+    }
+
     fn add_slice_events(
         &self,
         packets: &mut Vec<TracePacket>,
@@ -261,7 +313,8 @@ impl NetworkRecorder {
         use crate::systing::types::network_operation;
         let mut protocol_ops_used = std::collections::HashSet::new();
         let mut connection_ids = Vec::new();
-        let mut has_packets = false;
+        let mut has_enqueue_packets = false;
+        let mut has_send_packets = false;
 
         for connections in self.network_events.values() {
             for (conn_id, events) in connections.iter() {
@@ -273,8 +326,11 @@ impl NetworkRecorder {
                 if !events.recvs.is_empty() {
                     protocol_ops_used.insert((conn_id.protocol, network_operation::NETWORK_RECV.0));
                 }
-                if !events.packets.is_empty() {
-                    has_packets = true;
+                if !events.enqueue_packets.is_empty() {
+                    has_enqueue_packets = true;
+                }
+                if !events.send_packets.is_empty() {
+                    has_send_packets = true;
                 }
             }
         }
@@ -303,9 +359,12 @@ impl NetworkRecorder {
             self.get_or_create_event_name_iid(event_name, id_counter);
         }
 
-        // Create IID for packet events if we have any
-        if has_packets {
-            self.get_or_create_event_name_iid("tcp_packet".to_string(), id_counter);
+        // Create IIDs for packet events if we have any
+        if has_enqueue_packets {
+            self.get_or_create_event_name_iid("TCP packet_enqueue".to_string(), id_counter);
+        }
+        if has_send_packets {
+            self.get_or_create_event_name_iid("TCP packet_send".to_string(), id_counter);
         }
 
         // Generate interned data packet with event names
@@ -358,7 +417,11 @@ impl NetworkRecorder {
 
             // Create a track group for each unique connection
             for (conn_id, events) in connections.iter() {
-                if events.sends.is_empty() && events.recvs.is_empty() && events.packets.is_empty() {
+                if events.sends.is_empty()
+                    && events.recvs.is_empty()
+                    && events.enqueue_packets.is_empty()
+                    && events.send_packets.is_empty()
+                {
                     continue;
                 }
 
@@ -469,8 +532,8 @@ impl NetworkRecorder {
                     }
                 }
 
-                // Create packets track if we have packet events (TCP only)
-                if !events.packets.is_empty() {
+                // Create packets track if we have any packet events (TCP only)
+                if !events.enqueue_packets.is_empty() || !events.send_packets.is_empty() {
                     let packets_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
                     let mut packets_track_desc = TrackDescriptor::default();
@@ -482,53 +545,34 @@ impl NetworkRecorder {
                     packets_track_packet.set_track_descriptor(packets_track_desc);
                     packets.push(packets_track_packet);
 
-                    // Get the event name IID for packets
-                    let packet_name_iid = *self
-                        .event_name_ids
-                        .get("tcp_packet")
-                        .expect("packet event name should exist after IID generation");
+                    if !events.enqueue_packets.is_empty() {
+                        let enqueue_iid = *self
+                            .event_name_ids
+                            .get("TCP packet_enqueue")
+                            .expect("enqueue packet event name should exist after IID generation");
 
-                    // Generate slice events for packets
-                    for pkt in &events.packets {
-                        // Slice begin event
-                        let mut begin_event = TrackEvent::default();
-                        begin_event.set_type(Type::TYPE_SLICE_BEGIN);
-                        begin_event.set_name_iid(packet_name_iid);
-                        begin_event.set_track_uuid(packets_track_uuid);
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            packets_track_uuid,
+                            enqueue_iid,
+                            &events.enqueue_packets,
+                        );
+                    }
 
-                        // Add debug annotations for sequence number, length, and flags
-                        let mut seq_annotation = DebugAnnotation::default();
-                        seq_annotation.set_name("seq".to_string());
-                        seq_annotation.set_uint_value(pkt.seq as u64);
-                        begin_event.debug_annotations.push(seq_annotation);
+                    if !events.send_packets.is_empty() {
+                        let send_iid = *self
+                            .event_name_ids
+                            .get("TCP packet_send")
+                            .expect("send packet event name should exist after IID generation");
 
-                        let mut len_annotation = DebugAnnotation::default();
-                        len_annotation.set_name("length".to_string());
-                        len_annotation.set_uint_value(pkt.length as u64);
-                        begin_event.debug_annotations.push(len_annotation);
-
-                        // Add TCP flags annotation as a formatted string
-                        let mut flags_annotation = DebugAnnotation::default();
-                        flags_annotation.set_name("flags".to_string());
-                        flags_annotation.set_string_value(Self::format_tcp_flags(pkt.tcp_flags));
-                        begin_event.debug_annotations.push(flags_annotation);
-
-                        let mut begin_packet = TracePacket::default();
-                        begin_packet.set_timestamp(pkt.start_ts);
-                        begin_packet.set_track_event(begin_event);
-                        begin_packet.set_trusted_packet_sequence_id(sequence_id);
-                        packets.push(begin_packet);
-
-                        // Slice end event
-                        let mut end_event = TrackEvent::default();
-                        end_event.set_type(Type::TYPE_SLICE_END);
-                        end_event.set_track_uuid(packets_track_uuid);
-
-                        let mut end_packet = TracePacket::default();
-                        end_packet.set_timestamp(pkt.end_ts);
-                        end_packet.set_track_event(end_event);
-                        end_packet.set_trusted_packet_sequence_id(sequence_id);
-                        packets.push(end_packet);
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            packets_track_uuid,
+                            send_iid,
+                            &events.send_packets,
+                        );
                     }
                 }
             }
