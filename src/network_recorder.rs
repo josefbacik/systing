@@ -78,6 +78,9 @@ struct ConnectionEvents {
     recvs: Vec<NetworkEvent>,
     enqueue_packets: Vec<PacketEvent>,
     send_packets: Vec<PacketEvent>,
+    rcv_established_packets: Vec<PacketEvent>,
+    queue_rcv_packets: Vec<PacketEvent>,
+    buffer_queue_packets: Vec<PacketEvent>,
 }
 
 #[derive(Default)]
@@ -174,6 +177,12 @@ impl NetworkRecorder {
             conn_events.enqueue_packets.push(pkt_event);
         } else if event.event_type.0 == packet_event_type::PACKET_SEND.0 {
             conn_events.send_packets.push(pkt_event);
+        } else if event.event_type.0 == packet_event_type::PACKET_RCV_ESTABLISHED.0 {
+            conn_events.rcv_established_packets.push(pkt_event);
+        } else if event.event_type.0 == packet_event_type::PACKET_QUEUE_RCV.0 {
+            conn_events.queue_rcv_packets.push(pkt_event);
+        } else if event.event_type.0 == packet_event_type::PACKET_BUFFER_QUEUE.0 {
+            conn_events.buffer_queue_packets.push(pkt_event);
         }
     }
 
@@ -325,6 +334,9 @@ impl NetworkRecorder {
         let mut connection_ids = Vec::new();
         let mut has_enqueue_packets = false;
         let mut has_send_packets = false;
+        let mut has_rcv_established_packets = false;
+        let mut has_queue_rcv_packets = false;
+        let mut has_buffer_queue_packets = false;
 
         for connections in self.network_events.values() {
             for (conn_id, events) in connections.iter() {
@@ -340,6 +352,15 @@ impl NetworkRecorder {
                 }
                 if !events.send_packets.is_empty() {
                     has_send_packets = true;
+                }
+                if !events.rcv_established_packets.is_empty() {
+                    has_rcv_established_packets = true;
+                }
+                if !events.queue_rcv_packets.is_empty() {
+                    has_queue_rcv_packets = true;
+                }
+                if !events.buffer_queue_packets.is_empty() {
+                    has_buffer_queue_packets = true;
                 }
             }
         }
@@ -370,6 +391,15 @@ impl NetworkRecorder {
         }
         if has_send_packets {
             self.get_or_create_event_name_iid("TCP packet_send".to_string(), id_counter);
+        }
+        if has_rcv_established_packets {
+            self.get_or_create_event_name_iid("TCP packet_rcv_established".to_string(), id_counter);
+        }
+        if has_queue_rcv_packets {
+            self.get_or_create_event_name_iid("TCP packet_queue_rcv".to_string(), id_counter);
+        }
+        if has_buffer_queue_packets {
+            self.get_or_create_event_name_iid("TCP buffer_queue".to_string(), id_counter);
         }
 
         // Generate interned data packet with event names
@@ -426,6 +456,9 @@ impl NetworkRecorder {
                     && events.recvs.is_empty()
                     && events.enqueue_packets.is_empty()
                     && events.send_packets.is_empty()
+                    && events.rcv_established_packets.is_empty()
+                    && events.queue_rcv_packets.is_empty()
+                    && events.buffer_queue_packets.is_empty()
                 {
                     continue;
                 }
@@ -540,7 +573,12 @@ impl NetworkRecorder {
                     }
                 }
 
-                if !events.enqueue_packets.is_empty() || !events.send_packets.is_empty() {
+                if !events.enqueue_packets.is_empty()
+                    || !events.send_packets.is_empty()
+                    || !events.rcv_established_packets.is_empty()
+                    || !events.queue_rcv_packets.is_empty()
+                    || !events.buffer_queue_packets.is_empty()
+                {
                     let packets_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
                     let mut packets_track_desc = TrackDescriptor::default();
@@ -573,6 +611,47 @@ impl NetworkRecorder {
                             packets_track_uuid,
                             send_iid,
                             &events.send_packets,
+                        );
+                    }
+
+                    if !events.rcv_established_packets.is_empty() {
+                        let rcv_established_iid = *self
+                            .event_name_ids
+                            .get("TCP packet_rcv_established")
+                            .unwrap();
+
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            packets_track_uuid,
+                            rcv_established_iid,
+                            &events.rcv_established_packets,
+                        );
+                    }
+
+                    if !events.queue_rcv_packets.is_empty() {
+                        let queue_rcv_iid =
+                            *self.event_name_ids.get("TCP packet_queue_rcv").unwrap();
+
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            packets_track_uuid,
+                            queue_rcv_iid,
+                            &events.queue_rcv_packets,
+                        );
+                    }
+
+                    if !events.buffer_queue_packets.is_empty() {
+                        let buffer_queue_iid =
+                            *self.event_name_ids.get("TCP buffer_queue").unwrap();
+
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            packets_track_uuid,
+                            buffer_queue_iid,
+                            &events.buffer_queue_packets,
                         );
                     }
                 }
@@ -1252,5 +1331,391 @@ mod tests {
         assert_eq!(connections[&conn_id].sends[0].bytes, 1024);
         assert_eq!(connections[&conn_id].recvs.len(), 1);
         assert_eq!(connections[&conn_id].recvs[0].bytes, 512);
+    }
+
+    #[test]
+    fn test_packet_event_rcv_established() {
+        use crate::systing::types::{network_address_family, packet_event_type};
+
+        let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+
+        let event = crate::systing::types::packet_event {
+            start_ts: 1000,
+            end_ts: 1100,
+            task: create_test_task_info(200, 201),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 8080,
+            seq: 1000,
+            length: 500,
+            tcp_flags: 0x10,
+            event_type: packet_event_type::PACKET_RCV_ESTABLISHED,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        recorder.handle_packet_event(event);
+
+        let tgidpid = (200u64 << 32) | 201u64;
+        assert_eq!(recorder.network_events.len(), 1);
+        let connections = &recorder.network_events[&tgidpid];
+        assert_eq!(connections.len(), 1);
+
+        let conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_TCP.0,
+            af: network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            dest_port: 8080,
+        };
+        assert!(connections.contains_key(&conn_id));
+        assert_eq!(connections[&conn_id].rcv_established_packets.len(), 1);
+        assert_eq!(connections[&conn_id].rcv_established_packets[0].seq, 1000);
+        assert_eq!(connections[&conn_id].rcv_established_packets[0].length, 500);
+    }
+
+    #[test]
+    fn test_packet_event_queue_rcv() {
+        use crate::systing::types::{network_address_family, packet_event_type};
+
+        let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+
+        let event = crate::systing::types::packet_event {
+            start_ts: 1100,
+            end_ts: 1110,
+            task: create_test_task_info(200, 201),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 8080,
+            seq: 1000,
+            length: 500,
+            tcp_flags: 0x10,
+            event_type: packet_event_type::PACKET_QUEUE_RCV,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        recorder.handle_packet_event(event);
+
+        let tgidpid = (200u64 << 32) | 201u64;
+        let connections = &recorder.network_events[&tgidpid];
+        let conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_TCP.0,
+            af: network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            dest_port: 8080,
+        };
+        assert_eq!(connections[&conn_id].queue_rcv_packets.len(), 1);
+        assert_eq!(connections[&conn_id].queue_rcv_packets[0].seq, 1000);
+    }
+
+    #[test]
+    fn test_packet_event_buffer_queue() {
+        use crate::systing::types::{network_address_family, packet_event_type};
+
+        let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+
+        let event = crate::systing::types::packet_event {
+            start_ts: 1110,
+            end_ts: 50000000,
+            task: create_test_task_info(200, 201),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 8080,
+            seq: 1000,
+            length: 500,
+            tcp_flags: 0,
+            event_type: packet_event_type::PACKET_BUFFER_QUEUE,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        recorder.handle_packet_event(event);
+
+        let tgidpid = (200u64 << 32) | 201u64;
+        let connections = &recorder.network_events[&tgidpid];
+        let conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_TCP.0,
+            af: network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            dest_port: 8080,
+        };
+        assert_eq!(connections[&conn_id].buffer_queue_packets.len(), 1);
+        assert_eq!(connections[&conn_id].buffer_queue_packets[0].start_ts, 1110);
+        assert_eq!(
+            connections[&conn_id].buffer_queue_packets[0].end_ts,
+            50000000
+        );
+    }
+
+    #[test]
+    fn test_multiple_receive_packet_events() {
+        use crate::systing::types::{network_address_family, packet_event_type};
+
+        let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+
+        let rcv_est_event = crate::systing::types::packet_event {
+            start_ts: 1000,
+            end_ts: 1100,
+            task: create_test_task_info(200, 201),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 8080,
+            seq: 1000,
+            length: 500,
+            tcp_flags: 0x10,
+            event_type: packet_event_type::PACKET_RCV_ESTABLISHED,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        let queue_rcv_event = crate::systing::types::packet_event {
+            start_ts: 1100,
+            end_ts: 1110,
+            task: create_test_task_info(200, 201),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 8080,
+            seq: 1000,
+            length: 500,
+            tcp_flags: 0x10,
+            event_type: packet_event_type::PACKET_QUEUE_RCV,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        let buffer_queue_event = crate::systing::types::packet_event {
+            start_ts: 1110,
+            end_ts: 100000000,
+            task: create_test_task_info(200, 201),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 8080,
+            seq: 1000,
+            length: 500,
+            tcp_flags: 0,
+            event_type: packet_event_type::PACKET_BUFFER_QUEUE,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        recorder.handle_packet_event(rcv_est_event);
+        recorder.handle_packet_event(queue_rcv_event);
+        recorder.handle_packet_event(buffer_queue_event);
+
+        let tgidpid = (200u64 << 32) | 201u64;
+        let connections = &recorder.network_events[&tgidpid];
+        assert_eq!(connections.len(), 1);
+
+        let conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_TCP.0,
+            af: network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            dest_port: 8080,
+        };
+        assert!(connections.contains_key(&conn_id));
+        assert_eq!(connections[&conn_id].rcv_established_packets.len(), 1);
+        assert_eq!(connections[&conn_id].queue_rcv_packets.len(), 1);
+        assert_eq!(connections[&conn_id].buffer_queue_packets.len(), 1);
+    }
+
+    #[test]
+    fn test_multiple_packets_different_sequences() {
+        use crate::systing::types::{network_address_family, packet_event_type};
+
+        let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+
+        let packet1 = crate::systing::types::packet_event {
+            start_ts: 1000,
+            end_ts: 2000,
+            task: create_test_task_info(200, 201),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 8080,
+            seq: 1000,
+            length: 100,
+            tcp_flags: 0x10,
+            event_type: packet_event_type::PACKET_BUFFER_QUEUE,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        let packet2 = crate::systing::types::packet_event {
+            start_ts: 1100,
+            end_ts: 2100,
+            task: create_test_task_info(200, 201),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 8080,
+            seq: 1100,
+            length: 100,
+            tcp_flags: 0x10,
+            event_type: packet_event_type::PACKET_BUFFER_QUEUE,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        recorder.handle_packet_event(packet1);
+        recorder.handle_packet_event(packet2);
+
+        let tgidpid = (200u64 << 32) | 201u64;
+        let connections = &recorder.network_events[&tgidpid];
+        let conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_TCP.0,
+            af: network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            dest_port: 8080,
+        };
+        assert_eq!(connections[&conn_id].buffer_queue_packets.len(), 2);
+        assert_eq!(connections[&conn_id].buffer_queue_packets[0].seq, 1000);
+        assert_eq!(connections[&conn_id].buffer_queue_packets[1].seq, 1100);
+    }
+
+    #[test]
+    fn test_generate_trace_packets_with_receive_packets() {
+        use crate::systing::types::{network_address_family, packet_event_type};
+
+        let mut recorder = NetworkRecorder::default();
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(201, 500);
+        let pid_uuids: HashMap<i32, u64> = HashMap::new();
+        let id_counter = Arc::new(AtomicUsize::new(1000));
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+
+        let rcv_est = crate::systing::types::packet_event {
+            start_ts: 1000,
+            end_ts: 1100,
+            task: create_test_task_info(200, 201),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 8080,
+            seq: 1000,
+            length: 500,
+            tcp_flags: 0x10,
+            event_type: packet_event_type::PACKET_RCV_ESTABLISHED,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        let queue_rcv = crate::systing::types::packet_event {
+            start_ts: 1100,
+            end_ts: 1110,
+            task: create_test_task_info(200, 201),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 8080,
+            seq: 1000,
+            length: 500,
+            tcp_flags: 0x10,
+            event_type: packet_event_type::PACKET_QUEUE_RCV,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        let buffer_queue = crate::systing::types::packet_event {
+            start_ts: 1110,
+            end_ts: 100000000,
+            task: create_test_task_info(200, 201),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 8080,
+            seq: 1000,
+            length: 500,
+            tcp_flags: 0,
+            event_type: packet_event_type::PACKET_BUFFER_QUEUE,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        recorder.handle_packet_event(rcv_est);
+        recorder.handle_packet_event(queue_rcv);
+        recorder.handle_packet_event(buffer_queue);
+
+        let packets = recorder.generate_trace_packets(&pid_uuids, &thread_uuids, &id_counter);
+
+        assert!(!packets.is_empty());
+        let interned_packet = &packets[0];
+        assert!(interned_packet.interned_data.is_some());
+
+        let thread_group_packet = &packets[1];
+        assert!(thread_group_packet.has_track_descriptor());
+        assert_eq!(
+            thread_group_packet.track_descriptor().name(),
+            "Network Connections"
+        );
+
+        assert!(recorder.network_events.is_empty());
+    }
+
+    #[test]
+    fn test_packet_events_send_and_receive() {
+        use crate::systing::types::{network_address_family, packet_event_type};
+
+        let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+
+        let send_enqueue = crate::systing::types::packet_event {
+            start_ts: 1000,
+            end_ts: 1010,
+            task: create_test_task_info(200, 201),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 8080,
+            seq: 500,
+            length: 200,
+            tcp_flags: 0x18,
+            event_type: packet_event_type::PACKET_ENQUEUE,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        let recv_buffer = crate::systing::types::packet_event {
+            start_ts: 2000,
+            end_ts: 50000000,
+            task: create_test_task_info(200, 201),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 8080,
+            seq: 1000,
+            length: 300,
+            tcp_flags: 0,
+            event_type: packet_event_type::PACKET_BUFFER_QUEUE,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        recorder.handle_packet_event(send_enqueue);
+        recorder.handle_packet_event(recv_buffer);
+
+        let tgidpid = (200u64 << 32) | 201u64;
+        let connections = &recorder.network_events[&tgidpid];
+        assert_eq!(connections.len(), 1);
+
+        let conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_TCP.0,
+            af: network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            dest_port: 8080,
+        };
+        assert_eq!(connections[&conn_id].enqueue_packets.len(), 1);
+        assert_eq!(connections[&conn_id].buffer_queue_packets.len(), 1);
     }
 }

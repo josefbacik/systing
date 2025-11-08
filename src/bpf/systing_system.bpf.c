@@ -170,8 +170,11 @@ struct network_event {
 };
 
 enum packet_event_type {
-	PACKET_ENQUEUE,  // TCP -> device queue
-	PACKET_SEND,     // device queue -> NIC
+	PACKET_ENQUEUE,         // TCP -> device queue
+	PACKET_SEND,            // device queue -> NIC
+	PACKET_RCV_ESTABLISHED, // NIC -> TCP layer (tcp_rcv_established)
+	PACKET_QUEUE_RCV,       // TCP layer -> socket buffer (tcp_queue_rcv)
+	PACKET_BUFFER_QUEUE,    // socket buffer -> application read (buffer queue latency)
 };
 
 struct packet_event {
@@ -268,6 +271,7 @@ struct network_recv_info {
 	u8 peer_addr[16];
 	u16 peer_port;
 	u64 start_ts;
+	u64 sk_ptr;  // Socket pointer for buffer queue latency tracking
 };
 
 struct {
@@ -319,6 +323,31 @@ struct {
 	__type(value, struct packet_info);
 	__uint(max_entries, 10240);
 } pending_packets SEC(".maps");
+
+// Tracks pending received packets from tcp_rcv_established to tcp_queue_rcv
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct packet_key);
+	__type(value, struct packet_info);
+	__uint(max_entries, 10240);
+} pending_recv_packets SEC(".maps");
+
+// Tracks buffer queue time: timestamp when data entered socket buffer (per-packet)
+struct buffer_queue_info {
+	u64 queue_ts;       // Timestamp when data was queued
+	u64 tgidpid;        // Thread that owns the socket
+	enum network_address_family af;
+	u8 peer_addr[16];
+	u16 peer_port;
+	u32 length;         // Packet length for this entry
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct packet_key);  // Per-packet tracking (tgidpid, peer_addr, peer_port, seq)
+	__type(value, struct buffer_queue_info);
+	__uint(max_entries, 10240);
+} socket_buffer_queue SEC(".maps");
 
 #define MISSED_SCHED_EVENT 0
 #define MISSED_STACK_EVENT 1
@@ -1567,6 +1596,7 @@ static int handle_tcp_recvmsg_entry(struct sock *sk, struct msghdr *msg)
 	info.protocol = NETWORK_TCP;
 	info.start_ts = bpf_ktime_get_boot_ns();
 	info.af = NETWORK_AF_INET;  // Default to IPv4
+	info.sk_ptr = (u64)sk;  // Store socket pointer for buffer queue latency
 
 	if (sk) {
 		read_socket_dest_info(sk, &info.af, info.peer_addr, &info.peer_port);
@@ -1624,6 +1654,9 @@ static int handle_recvmsg_exit(void *ctx, int ret)
 
 	bpf_ringbuf_submit(event, 0);
 	bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
+
+	// Note: Buffer queue end events are now emitted at packet dequeue time
+	// in tcp_recv_skb probe, not here at recvmsg exit
 
 	return 0;
 }
@@ -1965,6 +1998,320 @@ int BPF_PROG(net_dev_start_xmit, struct sk_buff *skb, struct net_device *dev)
 
 	bpf_ringbuf_submit(event, 0);
 	bpf_map_delete_elem(&pending_packets, &key);
+
+	return 0;
+}
+
+// Helper to read source address from IP headers in received packet
+static __always_inline int read_src_addr_from_skb(struct sk_buff *skb,
+						   enum network_address_family *af,
+						   u8 *src_addr, u16 *src_port)
+{
+	unsigned char *head = NULL;
+	u16 network_header = 0;
+	u16 transport_header = 0;
+
+	bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+	bpf_probe_read_kernel(&network_header, sizeof(network_header), &skb->network_header);
+	bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
+
+	if (!head || network_header == (u16)~0U || transport_header == (u16)~0U)
+		return -1;
+
+	u8 ip_version = 0;
+	bpf_probe_read_kernel(&ip_version, sizeof(ip_version), head + network_header);
+	ip_version = (ip_version >> 4) & 0x0F;
+
+	if (ip_version == 4) {
+		*af = NETWORK_AF_INET;
+		struct iphdr ip = {0};
+		struct tcphdr tcp = {0};
+
+		if (bpf_probe_read_kernel(&ip, sizeof(ip), head + network_header) != 0)
+			return -1;
+		if (bpf_probe_read_kernel(&tcp, sizeof(tcp), head + transport_header) != 0)
+			return -1;
+
+		__builtin_memcpy(src_addr, &ip.saddr, 4);
+		*src_port = __builtin_bswap16(tcp.source);
+		return 0;
+	} else if (ip_version == 6) {
+		*af = NETWORK_AF_INET6;
+		struct ipv6hdr ip6 = {0};
+		struct tcphdr tcp = {0};
+
+		if (bpf_probe_read_kernel(&ip6, sizeof(ip6), head + network_header) != 0)
+			return -1;
+		if (bpf_probe_read_kernel(&tcp, sizeof(tcp), head + transport_header) != 0)
+			return -1;
+
+		__builtin_memcpy(src_addr, &ip6.saddr, 16);
+		*src_port = __builtin_bswap16(tcp.source);
+		return 0;
+	}
+
+	return -1;
+}
+
+// Trace tcp_rcv_established to capture when packet enters TCP layer
+SEC("kprobe/tcp_rcv_established")
+int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
+{
+	if (!sk || !skb)
+		return 0;
+
+	u64 sk_ptr = (u64)sk;
+	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
+	if (!tgidpid_ptr)
+		return 0;
+
+	u64 tgidpid = *tgidpid_ptr;
+	u32 tgid = tgidpid >> 32;
+	if (tgid == 0 || tgid == tool_config.my_tgid)
+		return 0;
+
+	u32 seq;
+	if (read_tcp_seq_from_skb(skb, &seq) != 0)
+		return 0;
+
+	struct packet_info pkt_info = {0};
+	pkt_info.start_ts = bpf_ktime_get_boot_ns();
+	pkt_info.tgidpid = tgidpid;
+
+	// For receive: dest_addr/port are actually the peer who sent to us
+	if (read_src_addr_from_skb(skb, &pkt_info.af, pkt_info.dest_addr, &pkt_info.dest_port) != 0)
+		return 0;
+
+	struct tcp_skb_cb *tcb = (struct tcp_skb_cb *)&skb->cb[0];
+	u32 start_seq = 0;
+	u32 end_seq = 0;
+	u8 tcp_flags = 0;
+
+	bpf_probe_read_kernel(&start_seq, sizeof(start_seq), &tcb->seq);
+	bpf_probe_read_kernel(&end_seq, sizeof(end_seq), &tcb->end_seq);
+	bpf_probe_read_kernel(&tcp_flags, sizeof(tcp_flags), &tcb->tcp_flags);
+
+	pkt_info.seq = start_seq;
+	pkt_info.length = end_seq - start_seq;
+	pkt_info.tcp_flags = tcp_flags;
+
+	struct packet_key key = {0};
+	key.tgidpid = tgidpid;
+	__builtin_memcpy(key.dest_addr, pkt_info.dest_addr, 16);
+	key.dest_port = pkt_info.dest_port;
+	key.seq = start_seq;
+
+	bpf_map_update_elem(&pending_recv_packets, &key, &pkt_info, BPF_ANY);
+
+	struct packet_event *event = reserve_packet_event();
+	if (!event) {
+		bpf_map_delete_elem(&pending_recv_packets, &key);
+		return handle_missed_event(MISSED_PACKET_EVENT);
+	}
+
+	u64 now = bpf_ktime_get_boot_ns();
+	populate_packet_event(event, &pkt_info, now, PACKET_RCV_ESTABLISHED);
+
+	bpf_ringbuf_submit(event, 0);
+
+	pkt_info.start_ts = now;
+	bpf_map_update_elem(&pending_recv_packets, &key, &pkt_info, BPF_ANY);
+
+	return 0;
+}
+
+// Trace tcp_queue_rcv to capture when data enters socket buffer (fast path)
+// Note: No tgid filtering here - only called if tcp_rcv_established already validated
+SEC("kprobe/tcp_queue_rcv")
+int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *fragstolen)
+{
+	if (!sk || !skb)
+		return 0;
+
+	u64 sk_ptr = (u64)sk;
+	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
+	if (!tgidpid_ptr)
+		return 0;
+
+	u64 tgidpid = *tgidpid_ptr;
+
+	u32 seq;
+	if (read_tcp_seq_from_skb(skb, &seq) != 0)
+		return 0;
+
+	struct packet_key key = {0};
+	enum network_address_family af;
+	u8 src_addr[16] = {0};
+	u16 src_port;
+
+	if (read_src_addr_from_skb(skb, &af, src_addr, &src_port) != 0)
+		return 0;
+
+	key.tgidpid = tgidpid;
+	__builtin_memcpy(key.dest_addr, src_addr, 16);
+	key.dest_port = src_port;
+	key.seq = seq;
+
+	struct packet_info *pkt_info = bpf_map_lookup_elem(&pending_recv_packets, &key);
+	if (!pkt_info)
+		return 0;
+
+	struct packet_event *event = reserve_packet_event();
+	if (!event) {
+		bpf_map_delete_elem(&pending_recv_packets, &key);
+		return handle_missed_event(MISSED_PACKET_EVENT);
+	}
+
+	u64 now = bpf_ktime_get_boot_ns();
+	populate_packet_event(event, pkt_info, now, PACKET_QUEUE_RCV);
+
+	bpf_ringbuf_submit(event, 0);
+	bpf_map_delete_elem(&pending_recv_packets, &key);
+
+	struct buffer_queue_info buf_info = {0};
+	buf_info.queue_ts = now;
+	buf_info.tgidpid = tgidpid;
+	buf_info.af = af;
+	__builtin_memcpy(buf_info.peer_addr, src_addr, 16);
+	buf_info.peer_port = src_port;
+	buf_info.length = pkt_info->length;
+
+	bpf_map_update_elem(&socket_buffer_queue, &key, &buf_info, BPF_ANY);
+
+	return 0;
+}
+
+// Trace tcp_data_queue to capture slow path packets (packets arriving when buffer has data)
+// This complements tcp_queue_rcv which only handles fast path
+SEC("kprobe/tcp_data_queue")
+int BPF_KPROBE(tcp_data_queue_entry, struct sock *sk, struct sk_buff *skb)
+{
+	if (!sk || !skb)
+		return 0;
+
+	u64 sk_ptr = (u64)sk;
+	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
+	if (!tgidpid_ptr)
+		return 0;
+
+	u64 tgidpid = *tgidpid_ptr;
+	u32 tgid = tgidpid >> 32;
+	if (tgid == 0 || tgid == tool_config.my_tgid)
+		return 0;
+
+	u32 seq;
+	if (read_tcp_seq_from_skb(skb, &seq) != 0)
+		return 0;
+
+	struct packet_key key = {0};
+	enum network_address_family af;
+	u8 src_addr[16] = {0};
+	u16 src_port;
+
+	if (read_src_addr_from_skb(skb, &af, src_addr, &src_port) != 0)
+		return 0;
+
+	key.tgidpid = tgidpid;
+	__builtin_memcpy(key.dest_addr, src_addr, 16);
+	key.dest_port = src_port;
+	key.seq = seq;
+
+	struct packet_info *pkt_info = bpf_map_lookup_elem(&pending_recv_packets, &key);
+	if (!pkt_info)
+		return 0;
+
+	struct packet_event *event = reserve_packet_event();
+	if (!event) {
+		bpf_map_delete_elem(&pending_recv_packets, &key);
+		return handle_missed_event(MISSED_PACKET_EVENT);
+	}
+
+	u64 now = bpf_ktime_get_boot_ns();
+	populate_packet_event(event, pkt_info, now, PACKET_QUEUE_RCV);
+	bpf_ringbuf_submit(event, 0);
+
+	struct buffer_queue_info buf_info = {0};
+	buf_info.queue_ts = now;
+	buf_info.tgidpid = tgidpid;
+	buf_info.af = af;
+	__builtin_memcpy(buf_info.peer_addr, src_addr, 16);
+	buf_info.peer_port = src_port;
+	buf_info.length = pkt_info->length;
+
+	bpf_map_update_elem(&socket_buffer_queue, &key, &buf_info, BPF_ANY);
+	bpf_map_delete_elem(&pending_recv_packets, &key);
+
+	return 0;
+}
+
+// Track when data is copied from skb to userspace (actual packet consumption)
+// Note: No tgid filtering early - only tracked sockets have entries in sk_to_tgidpid map
+SEC("tp_btf/skb_copy_datagram_iovec")
+int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	if (!skb)
+		return 0;
+
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (!sk)
+		return 0;
+
+	u64 sk_ptr = (u64)sk;
+	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
+	if (!tgidpid_ptr)
+		return 0;
+
+	u64 tgidpid = *tgidpid_ptr;
+	u32 tgid = tgidpid >> 32;
+	if (tgid == 0 || tgid == tool_config.my_tgid)
+		return 0;
+
+	enum network_address_family af;
+	u8 dest_addr[16] = {0};
+	u16 dest_port;
+
+	if (read_socket_dest_info(sk, &af, dest_addr, &dest_port) != 0)
+		return 0;
+
+	u32 seq;
+	if (read_tcp_seq_from_skb(skb, &seq) != 0)
+		return 0;
+
+	struct packet_key pkt_key = {0};
+	pkt_key.tgidpid = tgidpid;
+	__builtin_memcpy(pkt_key.dest_addr, dest_addr, 16);
+	pkt_key.dest_port = dest_port;
+	pkt_key.seq = seq;
+
+	struct buffer_queue_info *buf_info = bpf_map_lookup_elem(&socket_buffer_queue, &pkt_key);
+	if (buf_info) {
+		struct packet_event *pkt_event = reserve_packet_event();
+		if (pkt_event) {
+			u64 now = bpf_ktime_get_boot_ns();
+			pkt_event->start_ts = buf_info->queue_ts;
+			pkt_event->end_ts = now;
+			pkt_event->task.tgidpid = buf_info->tgidpid;
+			__builtin_memset(pkt_event->task.comm, 0, TASK_COMM_LEN);
+			record_task_info(&pkt_event->task, task);
+			pkt_event->af = buf_info->af;
+			__builtin_memcpy(pkt_event->dest_addr, buf_info->peer_addr, 16);
+			pkt_event->dest_port = buf_info->peer_port;
+			pkt_event->seq = seq;
+			pkt_event->length = buf_info->length;
+			pkt_event->tcp_flags = 0;
+			pkt_event->event_type = PACKET_BUFFER_QUEUE;
+			pkt_event->cpu = bpf_get_smp_processor_id();
+
+			bpf_ringbuf_submit(pkt_event, 0);
+		}
+		bpf_map_delete_elem(&socket_buffer_queue, &pkt_key);
+	}
 
 	return 0;
 }
