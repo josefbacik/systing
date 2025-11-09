@@ -57,6 +57,7 @@ impl fmt::Display for ConnectionId {
     }
 }
 
+#[derive(Clone, Copy)]
 struct NetworkEvent {
     start_ts: u64,
     end_ts: u64,
@@ -64,6 +65,7 @@ struct NetworkEvent {
     sendmsg_seq: u32,
 }
 
+#[derive(Clone, Copy)]
 struct PacketEvent {
     start_ts: u64,
     end_ts: u64,
@@ -72,32 +74,106 @@ struct PacketEvent {
     tcp_flags: u8,
 }
 
+enum EventEntry {
+    Send(NetworkEvent),
+    Recv(NetworkEvent),
+    TcpEnqueue(PacketEvent),
+    TcpRcvEstablished(PacketEvent),
+    TcpQueueRcv(PacketEvent),
+    TcpBufferQueue(PacketEvent),
+    UdpSend(PacketEvent),
+    UdpRcv(PacketEvent),
+    UdpEnqueue(PacketEvent),
+    SharedSend(PacketEvent),
+}
+
 #[derive(Default)]
 struct ConnectionEvents {
-    sends: Vec<NetworkEvent>,
-    recvs: Vec<NetworkEvent>,
-    enqueue_packets: Vec<PacketEvent>,
-    send_packets: Vec<PacketEvent>,
-    rcv_established_packets: Vec<PacketEvent>,
-    queue_rcv_packets: Vec<PacketEvent>,
-    buffer_queue_packets: Vec<PacketEvent>,
-    udp_send_packets: Vec<PacketEvent>,
-    udp_rcv_packets: Vec<PacketEvent>,
-    udp_enqueue_packets: Vec<PacketEvent>,
+    events: Vec<EventEntry>,
 }
 
 impl ConnectionEvents {
     fn is_empty(&self) -> bool {
-        self.sends.is_empty()
-            && self.recvs.is_empty()
-            && self.enqueue_packets.is_empty()
-            && self.send_packets.is_empty()
-            && self.rcv_established_packets.is_empty()
-            && self.queue_rcv_packets.is_empty()
-            && self.buffer_queue_packets.is_empty()
-            && self.udp_send_packets.is_empty()
-            && self.udp_rcv_packets.is_empty()
-            && self.udp_enqueue_packets.is_empty()
+        self.events.is_empty()
+    }
+
+    fn iter_sends(&self) -> impl Iterator<Item = &NetworkEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::Send(evt) => Some(evt),
+            _ => None,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn iter_recvs(&self) -> impl Iterator<Item = &NetworkEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::Recv(evt) => Some(evt),
+            _ => None,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn iter_tcp_enqueue_packets(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::TcpEnqueue(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn iter_tcp_rcv_established_packets(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::TcpRcvEstablished(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn iter_tcp_queue_rcv_packets(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::TcpQueueRcv(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn iter_tcp_buffer_queue_packets(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::TcpBufferQueue(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn iter_udp_send_packets(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::UdpSend(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn iter_udp_rcv_packets(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::UdpRcv(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn iter_udp_enqueue_packets(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::UdpEnqueue(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn iter_shared_send_packets(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::SharedSend(pkt) => Some(pkt),
+            _ => None,
+        })
     }
 }
 
@@ -196,24 +272,28 @@ impl NetworkRecorder {
 
         // TCP packet events
         if event.event_type.0 == packet_event_type::PACKET_ENQUEUE.0 {
-            conn_events.enqueue_packets.push(pkt_event);
+            conn_events.events.push(EventEntry::TcpEnqueue(pkt_event));
         } else if event.event_type.0 == packet_event_type::PACKET_SEND.0 {
             // PACKET_SEND is shared by TCP and UDP for qdisc->NIC transmission
-            conn_events.send_packets.push(pkt_event);
+            conn_events.events.push(EventEntry::SharedSend(pkt_event));
         } else if event.event_type.0 == packet_event_type::PACKET_RCV_ESTABLISHED.0 {
-            conn_events.rcv_established_packets.push(pkt_event);
+            conn_events
+                .events
+                .push(EventEntry::TcpRcvEstablished(pkt_event));
         } else if event.event_type.0 == packet_event_type::PACKET_QUEUE_RCV.0 {
-            conn_events.queue_rcv_packets.push(pkt_event);
+            conn_events.events.push(EventEntry::TcpQueueRcv(pkt_event));
         } else if event.event_type.0 == packet_event_type::PACKET_BUFFER_QUEUE.0 {
-            conn_events.buffer_queue_packets.push(pkt_event);
+            conn_events
+                .events
+                .push(EventEntry::TcpBufferQueue(pkt_event));
         }
-        // UDP packet events - use separate vectors for clear naming
+        // UDP packet events
         else if event.event_type.0 == packet_event_type::PACKET_UDP_SEND.0 {
-            conn_events.udp_send_packets.push(pkt_event);
+            conn_events.events.push(EventEntry::UdpSend(pkt_event));
         } else if event.event_type.0 == packet_event_type::PACKET_UDP_RCV.0 {
-            conn_events.udp_rcv_packets.push(pkt_event);
+            conn_events.events.push(EventEntry::UdpRcv(pkt_event));
         } else if event.event_type.0 == packet_event_type::PACKET_UDP_ENQUEUE.0 {
-            conn_events.udp_enqueue_packets.push(pkt_event);
+            conn_events.events.push(EventEntry::UdpEnqueue(pkt_event));
         }
     }
 
@@ -363,65 +443,21 @@ impl NetworkRecorder {
         thread_uuids: &HashMap<i32, u64>,
         id_counter: &Arc<AtomicUsize>,
     ) -> Vec<TracePacket> {
-        use crate::systing::types::{network_operation, network_protocol};
+        use crate::systing::types::network_operation;
 
         let mut packets = Vec::new();
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
         let mut protocol_ops_used = std::collections::HashSet::new();
         let mut connection_ids = Vec::new();
-        let mut has_tcp_enqueue_packets = false;
-        let mut has_tcp_send_packets = false;
-        let mut has_tcp_rcv_established_packets = false;
-        let mut has_tcp_queue_rcv_packets = false;
-        let mut has_tcp_buffer_queue_packets = false;
-        let mut has_udp_send_packets = false;
-        let mut has_udp_packet_send = false; // UDP using PACKET_SEND for qdisc->NIC
-        let mut has_udp_rcv_packets = false;
-        let mut has_udp_enqueue_packets = false;
 
         for connections in self.network_events.values() {
             for (conn_id, events) in connections.iter() {
                 connection_ids.push(*conn_id);
-                if !events.sends.is_empty() {
+                if events.iter_sends().next().is_some() {
                     protocol_ops_used.insert((conn_id.protocol, network_operation::NETWORK_SEND.0));
                 }
-                if !events.recvs.is_empty() {
+                if events.iter_recvs().next().is_some() {
                     protocol_ops_used.insert((conn_id.protocol, network_operation::NETWORK_RECV.0));
-                }
-
-                match conn_id.protocol {
-                    p if p == network_protocol::NETWORK_TCP.0 => {
-                        if !events.enqueue_packets.is_empty() {
-                            has_tcp_enqueue_packets = true;
-                        }
-                        if !events.send_packets.is_empty() {
-                            has_tcp_send_packets = true;
-                        }
-                        if !events.rcv_established_packets.is_empty() {
-                            has_tcp_rcv_established_packets = true;
-                        }
-                        if !events.queue_rcv_packets.is_empty() {
-                            has_tcp_queue_rcv_packets = true;
-                        }
-                        if !events.buffer_queue_packets.is_empty() {
-                            has_tcp_buffer_queue_packets = true;
-                        }
-                    }
-                    p if p == network_protocol::NETWORK_UDP.0 => {
-                        if !events.udp_send_packets.is_empty() {
-                            has_udp_send_packets = true;
-                        }
-                        if !events.send_packets.is_empty() {
-                            has_udp_packet_send = true;
-                        }
-                        if !events.udp_rcv_packets.is_empty() {
-                            has_udp_rcv_packets = true;
-                        }
-                        if !events.udp_enqueue_packets.is_empty() {
-                            has_udp_enqueue_packets = true;
-                        }
-                    }
-                    _ => {}
                 }
             }
         }
@@ -446,38 +482,16 @@ impl NetworkRecorder {
             self.get_or_create_event_name_iid(event_name, id_counter);
         }
 
-        // Create IIDs for TCP packet events
-        if has_tcp_enqueue_packets {
-            self.get_or_create_event_name_iid("TCP packet_enqueue".to_string(), id_counter);
-        }
-        if has_tcp_send_packets {
-            self.get_or_create_event_name_iid("TCP packet_send".to_string(), id_counter);
-        }
-        if has_tcp_rcv_established_packets {
-            self.get_or_create_event_name_iid("TCP packet_rcv_established".to_string(), id_counter);
-        }
-        if has_tcp_queue_rcv_packets {
-            self.get_or_create_event_name_iid("TCP packet_queue_rcv".to_string(), id_counter);
-        }
-        if has_tcp_buffer_queue_packets {
-            self.get_or_create_event_name_iid("TCP buffer_queue".to_string(), id_counter);
-        }
-
-        // Create IIDs for UDP packet events with clear semantic names
-        if has_udp_send_packets {
-            self.get_or_create_event_name_iid("UDP send".to_string(), id_counter);
-        }
-        if has_udp_packet_send {
-            self.get_or_create_event_name_iid("UDP packet_send".to_string(), id_counter);
-        }
-        if has_udp_rcv_packets {
-            self.get_or_create_event_name_iid("UDP receive".to_string(), id_counter);
-        }
-        if has_udp_enqueue_packets {
-            self.get_or_create_event_name_iid("UDP enqueue".to_string(), id_counter);
-        }
-
-        // Generate interned data packet with event names
+        // Create IIDs for packet event types unconditionally (only 9 strings)
+        self.get_or_create_event_name_iid("TCP packet_enqueue".to_string(), id_counter);
+        self.get_or_create_event_name_iid("TCP packet_send".to_string(), id_counter);
+        self.get_or_create_event_name_iid("TCP packet_rcv_established".to_string(), id_counter);
+        self.get_or_create_event_name_iid("TCP packet_queue_rcv".to_string(), id_counter);
+        self.get_or_create_event_name_iid("TCP buffer_queue".to_string(), id_counter);
+        self.get_or_create_event_name_iid("UDP send".to_string(), id_counter);
+        self.get_or_create_event_name_iid("UDP packet_send".to_string(), id_counter);
+        self.get_or_create_event_name_iid("UDP receive".to_string(), id_counter);
+        self.get_or_create_event_name_iid("UDP enqueue".to_string(), id_counter);
         let mut event_names = Vec::new();
         for (name, iid) in &self.event_name_ids {
             let mut event_name = EventName::default();
@@ -562,7 +576,7 @@ impl NetworkRecorder {
                 packets.push(conn_group_packet);
 
                 // Create send track if we have send events
-                if !events.sends.is_empty() {
+                if events.iter_sends().next().is_some() {
                     let send_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
                     let mut send_track_desc = TrackDescriptor::default();
@@ -578,7 +592,7 @@ impl NetworkRecorder {
                     let send_event_name = format!("{}_send", proto_str);
                     let send_name_iid = *self.event_name_ids.get(&send_event_name).unwrap();
 
-                    for event in &events.sends {
+                    for event in events.iter_sends() {
                         let mut begin_event = TrackEvent::default();
                         begin_event.set_type(Type::TYPE_SLICE_BEGIN);
                         begin_event.set_name_iid(send_name_iid);
@@ -615,7 +629,7 @@ impl NetworkRecorder {
                 }
 
                 // Create receive track if we have receive events
-                if !events.recvs.is_empty() {
+                if events.iter_recvs().next().is_some() {
                     let recv_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
                     let mut recv_track_desc = TrackDescriptor::default();
@@ -630,7 +644,7 @@ impl NetworkRecorder {
                     let proto_str = Self::protocol_to_str(conn_id.protocol);
                     let recv_event_name = format!("{}_recv", proto_str);
                     let recv_name_iid = *self.event_name_ids.get(&recv_event_name).unwrap();
-                    for event in &events.recvs {
+                    for event in events.iter_recvs() {
                         self.add_slice_events(
                             &mut packets,
                             sequence_id,
@@ -644,13 +658,14 @@ impl NetworkRecorder {
                 // Create TCP Packets track if we have TCP packet events
                 let is_tcp =
                     conn_id.protocol == crate::systing::types::network_protocol::NETWORK_TCP.0;
-                if is_tcp
-                    && (!events.enqueue_packets.is_empty()
-                        || !events.send_packets.is_empty()
-                        || !events.rcv_established_packets.is_empty()
-                        || !events.queue_rcv_packets.is_empty()
-                        || !events.buffer_queue_packets.is_empty())
-                {
+                let has_tcp_packets = is_tcp
+                    && (events.iter_tcp_enqueue_packets().next().is_some()
+                        || events.iter_shared_send_packets().next().is_some()
+                        || events.iter_tcp_rcv_established_packets().next().is_some()
+                        || events.iter_tcp_queue_rcv_packets().next().is_some()
+                        || events.iter_tcp_buffer_queue_packets().next().is_some());
+
+                if has_tcp_packets {
                     let packets_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
                     let mut packets_track_desc = TrackDescriptor::default();
@@ -662,68 +677,71 @@ impl NetworkRecorder {
                     packets_track_packet.set_track_descriptor(packets_track_desc);
                     packets.push(packets_track_packet);
 
-                    if !events.enqueue_packets.is_empty() {
+                    let enqueue_pkts: Vec<_> = events.iter_tcp_enqueue_packets().copied().collect();
+                    if !enqueue_pkts.is_empty() {
                         let enqueue_iid = *self.event_name_ids.get("TCP packet_enqueue").unwrap();
-
                         self.add_packet_slice_events(
                             &mut packets,
                             sequence_id,
                             packets_track_uuid,
                             enqueue_iid,
-                            &events.enqueue_packets,
+                            &enqueue_pkts,
                         );
                     }
 
-                    if !events.send_packets.is_empty() {
+                    let send_pkts: Vec<_> = events.iter_shared_send_packets().copied().collect();
+                    if !send_pkts.is_empty() {
                         let send_iid = *self.event_name_ids.get("TCP packet_send").unwrap();
-
                         self.add_packet_slice_events(
                             &mut packets,
                             sequence_id,
                             packets_track_uuid,
                             send_iid,
-                            &events.send_packets,
+                            &send_pkts,
                         );
                     }
 
-                    if !events.rcv_established_packets.is_empty() {
+                    let rcv_est_pkts: Vec<_> =
+                        events.iter_tcp_rcv_established_packets().copied().collect();
+                    if !rcv_est_pkts.is_empty() {
                         let rcv_established_iid = *self
                             .event_name_ids
                             .get("TCP packet_rcv_established")
                             .unwrap();
-
                         self.add_packet_slice_events(
                             &mut packets,
                             sequence_id,
                             packets_track_uuid,
                             rcv_established_iid,
-                            &events.rcv_established_packets,
+                            &rcv_est_pkts,
                         );
                     }
 
-                    if !events.queue_rcv_packets.is_empty() {
+                    let queue_rcv_pkts: Vec<_> =
+                        events.iter_tcp_queue_rcv_packets().copied().collect();
+                    if !queue_rcv_pkts.is_empty() {
                         let queue_rcv_iid =
                             *self.event_name_ids.get("TCP packet_queue_rcv").unwrap();
-
                         self.add_packet_slice_events(
                             &mut packets,
                             sequence_id,
                             packets_track_uuid,
                             queue_rcv_iid,
-                            &events.queue_rcv_packets,
+                            &queue_rcv_pkts,
                         );
                     }
 
-                    if !events.buffer_queue_packets.is_empty() {
+                    let buffer_queue_pkts: Vec<_> =
+                        events.iter_tcp_buffer_queue_packets().copied().collect();
+                    if !buffer_queue_pkts.is_empty() {
                         let buffer_queue_iid =
                             *self.event_name_ids.get("TCP buffer_queue").unwrap();
-
                         self.add_packet_slice_events(
                             &mut packets,
                             sequence_id,
                             packets_track_uuid,
                             buffer_queue_iid,
-                            &events.buffer_queue_packets,
+                            &buffer_queue_pkts,
                         );
                     }
                 }
@@ -731,12 +749,13 @@ impl NetworkRecorder {
                 // Create UDP Packets track if we have UDP packet events
                 let is_udp =
                     conn_id.protocol == crate::systing::types::network_protocol::NETWORK_UDP.0;
-                if is_udp
-                    && (!events.udp_send_packets.is_empty()
-                    || !events.send_packets.is_empty()  // UDP uses PACKET_SEND for qdisc->NIC
-                    || !events.udp_rcv_packets.is_empty()
-                    || !events.udp_enqueue_packets.is_empty())
-                {
+                let has_udp_packets = is_udp
+                    && (events.iter_udp_send_packets().next().is_some()
+                        || events.iter_shared_send_packets().next().is_some()
+                        || events.iter_udp_rcv_packets().next().is_some()
+                        || events.iter_udp_enqueue_packets().next().is_some());
+
+                if has_udp_packets {
                     let packets_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
                     let mut packets_track_desc = TrackDescriptor::default();
@@ -748,52 +767,54 @@ impl NetworkRecorder {
                     packets_track_packet.set_track_descriptor(packets_track_desc);
                     packets.push(packets_track_packet);
 
-                    if !events.udp_send_packets.is_empty() {
+                    let udp_send_pkts: Vec<_> = events.iter_udp_send_packets().copied().collect();
+                    if !udp_send_pkts.is_empty() {
                         let send_iid = *self.event_name_ids.get("UDP send").unwrap();
-
                         self.add_packet_slice_events(
                             &mut packets,
                             sequence_id,
                             packets_track_uuid,
                             send_iid,
-                            &events.udp_send_packets,
+                            &udp_send_pkts,
                         );
                     }
 
-                    if !events.udp_rcv_packets.is_empty() {
+                    let udp_rcv_pkts: Vec<_> = events.iter_udp_rcv_packets().copied().collect();
+                    if !udp_rcv_pkts.is_empty() {
                         let rcv_iid = *self.event_name_ids.get("UDP receive").unwrap();
-
                         self.add_packet_slice_events(
                             &mut packets,
                             sequence_id,
                             packets_track_uuid,
                             rcv_iid,
-                            &events.udp_rcv_packets,
+                            &udp_rcv_pkts,
                         );
                     }
 
-                    if !events.udp_enqueue_packets.is_empty() {
+                    let udp_enqueue_pkts: Vec<_> =
+                        events.iter_udp_enqueue_packets().copied().collect();
+                    if !udp_enqueue_pkts.is_empty() {
                         let enqueue_iid = *self.event_name_ids.get("UDP enqueue").unwrap();
-
                         self.add_packet_slice_events(
                             &mut packets,
                             sequence_id,
                             packets_track_uuid,
                             enqueue_iid,
-                            &events.udp_enqueue_packets,
+                            &udp_enqueue_pkts,
                         );
                     }
 
-                    // UDP also uses PACKET_SEND for qdisc->NIC transmission
-                    if !events.send_packets.is_empty() {
+                    // UDP also uses PACKET_SEND (SharedSend) for qdisc->NIC transmission
+                    let shared_send_pkts: Vec<_> =
+                        events.iter_shared_send_packets().copied().collect();
+                    if !shared_send_pkts.is_empty() {
                         let send_iid = *self.event_name_ids.get("UDP packet_send").unwrap();
-
                         self.add_packet_slice_events(
                             &mut packets,
                             sequence_id,
                             packets_track_uuid,
                             send_iid,
-                            &events.send_packets,
+                            &shared_send_pkts,
                         );
                     }
                 }
@@ -858,9 +879,9 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
             .or_default();
 
         if event.operation.0 == network_operation::NETWORK_SEND.0 {
-            conn_events.sends.push(net_event);
+            conn_events.events.push(EventEntry::Send(net_event));
         } else if event.operation.0 == network_operation::NETWORK_RECV.0 {
-            conn_events.recvs.push(net_event);
+            conn_events.events.push(EventEntry::Recv(net_event));
         }
     }
 }
@@ -925,9 +946,10 @@ mod tests {
             dest_port: 8080,
         };
         assert!(connections.contains_key(&conn_id));
-        assert_eq!(connections[&conn_id].sends.len(), 1);
-        assert_eq!(connections[&conn_id].sends[0].bytes, 1024);
-        assert_eq!(connections[&conn_id].recvs.len(), 0);
+        let sends: Vec<_> = connections[&conn_id].iter_sends().collect();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].bytes, 1024);
+        assert_eq!(connections[&conn_id].iter_recvs().count(), 0);
     }
 
     #[test]
@@ -983,9 +1005,10 @@ mod tests {
             dest_port: 8080,
         };
 
-        assert_eq!(connections[&conn_id].sends.len(), 2);
-        assert_eq!(connections[&conn_id].sends[0].bytes, 1024);
-        assert_eq!(connections[&conn_id].sends[1].bytes, 2048);
+        let sends: Vec<_> = connections[&conn_id].iter_sends().collect();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[0].bytes, 1024);
+        assert_eq!(sends[1].bytes, 2048);
     }
 
     #[test]
@@ -1180,10 +1203,12 @@ mod tests {
             dest_port: 8080,
         };
         assert!(connections.contains_key(&conn_id));
-        assert_eq!(connections[&conn_id].sends.len(), 1);
-        assert_eq!(connections[&conn_id].sends[0].bytes, 1024);
-        assert_eq!(connections[&conn_id].recvs.len(), 1);
-        assert_eq!(connections[&conn_id].recvs[0].bytes, 512);
+        let sends: Vec<_> = connections[&conn_id].iter_sends().collect();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].bytes, 1024);
+        let recvs: Vec<_> = connections[&conn_id].iter_recvs().collect();
+        assert_eq!(recvs.len(), 1);
+        assert_eq!(recvs[0].bytes, 512);
     }
 
     #[test]
@@ -1230,9 +1255,10 @@ mod tests {
             dest_port: 8080,
         };
         assert!(connections.contains_key(&conn_id));
-        assert_eq!(connections[&conn_id].sends.len(), 1);
-        assert_eq!(connections[&conn_id].sends[0].bytes, 2048);
-        assert_eq!(connections[&conn_id].recvs.len(), 0);
+        let sends: Vec<_> = connections[&conn_id].iter_sends().collect();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].bytes, 2048);
+        assert_eq!(connections[&conn_id].iter_recvs().count(), 0);
 
         // Verify IPv6 address parsing
         let ip = conn_id.ip_addr();
@@ -1278,8 +1304,9 @@ mod tests {
             dest_port: 9090,
         };
         assert!(connections.contains_key(&conn_id));
-        assert_eq!(connections[&conn_id].sends.len(), 1);
-        assert_eq!(connections[&conn_id].sends[0].bytes, 512);
+        let sends: Vec<_> = connections[&conn_id].iter_sends().collect();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].bytes, 512);
 
         // Verify IPv6 localhost address
         let ip = conn_id.ip_addr();
@@ -1352,7 +1379,8 @@ mod tests {
             dest_port: 8080,
         };
         assert!(connections.contains_key(&ipv4_conn_id));
-        assert_eq!(connections[&ipv4_conn_id].sends[0].bytes, 1024);
+        let ipv4_sends: Vec<_> = connections[&ipv4_conn_id].iter_sends().collect();
+        assert_eq!(ipv4_sends[0].bytes, 1024);
 
         // Verify IPv6 connection
         let ipv6_conn_id = ConnectionId {
@@ -1362,7 +1390,8 @@ mod tests {
             dest_port: 8080,
         };
         assert!(connections.contains_key(&ipv6_conn_id));
-        assert_eq!(connections[&ipv6_conn_id].sends[0].bytes, 2048);
+        let ipv6_sends: Vec<_> = connections[&ipv6_conn_id].iter_sends().collect();
+        assert_eq!(ipv6_sends[0].bytes, 2048);
     }
 
     #[test]
@@ -1469,10 +1498,12 @@ mod tests {
             dest_port: 8080,
         };
         assert!(connections.contains_key(&conn_id));
-        assert_eq!(connections[&conn_id].sends.len(), 1);
-        assert_eq!(connections[&conn_id].sends[0].bytes, 1024);
-        assert_eq!(connections[&conn_id].recvs.len(), 1);
-        assert_eq!(connections[&conn_id].recvs[0].bytes, 512);
+        let sends: Vec<_> = connections[&conn_id].iter_sends().collect();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].bytes, 1024);
+        let recvs: Vec<_> = connections[&conn_id].iter_recvs().collect();
+        assert_eq!(recvs.len(), 1);
+        assert_eq!(recvs[0].bytes, 512);
     }
 
     #[test]
@@ -1513,9 +1544,12 @@ mod tests {
             dest_port: 8080,
         };
         assert!(connections.contains_key(&conn_id));
-        assert_eq!(connections[&conn_id].rcv_established_packets.len(), 1);
-        assert_eq!(connections[&conn_id].rcv_established_packets[0].seq, 1000);
-        assert_eq!(connections[&conn_id].rcv_established_packets[0].length, 500);
+        let rcv_est: Vec<_> = connections[&conn_id]
+            .iter_tcp_rcv_established_packets()
+            .collect();
+        assert_eq!(rcv_est.len(), 1);
+        assert_eq!(rcv_est[0].seq, 1000);
+        assert_eq!(rcv_est[0].length, 500);
     }
 
     #[test]
@@ -1552,8 +1586,9 @@ mod tests {
             dest_addr,
             dest_port: 8080,
         };
-        assert_eq!(connections[&conn_id].queue_rcv_packets.len(), 1);
-        assert_eq!(connections[&conn_id].queue_rcv_packets[0].seq, 1000);
+        let queue_rcv: Vec<_> = connections[&conn_id].iter_tcp_queue_rcv_packets().collect();
+        assert_eq!(queue_rcv.len(), 1);
+        assert_eq!(queue_rcv[0].seq, 1000);
     }
 
     #[test]
@@ -1590,12 +1625,12 @@ mod tests {
             dest_addr,
             dest_port: 8080,
         };
-        assert_eq!(connections[&conn_id].buffer_queue_packets.len(), 1);
-        assert_eq!(connections[&conn_id].buffer_queue_packets[0].start_ts, 1110);
-        assert_eq!(
-            connections[&conn_id].buffer_queue_packets[0].end_ts,
-            50000000
-        );
+        let buffer_queue: Vec<_> = connections[&conn_id]
+            .iter_tcp_buffer_queue_packets()
+            .collect();
+        assert_eq!(buffer_queue.len(), 1);
+        assert_eq!(buffer_queue[0].start_ts, 1110);
+        assert_eq!(buffer_queue[0].end_ts, 50000000);
     }
 
     #[test]
@@ -1667,9 +1702,22 @@ mod tests {
             dest_port: 8080,
         };
         assert!(connections.contains_key(&conn_id));
-        assert_eq!(connections[&conn_id].rcv_established_packets.len(), 1);
-        assert_eq!(connections[&conn_id].queue_rcv_packets.len(), 1);
-        assert_eq!(connections[&conn_id].buffer_queue_packets.len(), 1);
+        assert_eq!(
+            connections[&conn_id]
+                .iter_tcp_rcv_established_packets()
+                .count(),
+            1
+        );
+        assert_eq!(
+            connections[&conn_id].iter_tcp_queue_rcv_packets().count(),
+            1
+        );
+        assert_eq!(
+            connections[&conn_id]
+                .iter_tcp_buffer_queue_packets()
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1722,9 +1770,12 @@ mod tests {
             dest_addr,
             dest_port: 8080,
         };
-        assert_eq!(connections[&conn_id].buffer_queue_packets.len(), 2);
-        assert_eq!(connections[&conn_id].buffer_queue_packets[0].seq, 1000);
-        assert_eq!(connections[&conn_id].buffer_queue_packets[1].seq, 1100);
+        let buffer_queue: Vec<_> = connections[&conn_id]
+            .iter_tcp_buffer_queue_packets()
+            .collect();
+        assert_eq!(buffer_queue.len(), 2);
+        assert_eq!(buffer_queue[0].seq, 1000);
+        assert_eq!(buffer_queue[1].seq, 1100);
     }
 
     #[test]
@@ -1857,8 +1908,13 @@ mod tests {
             dest_addr,
             dest_port: 8080,
         };
-        assert_eq!(connections[&conn_id].enqueue_packets.len(), 1);
-        assert_eq!(connections[&conn_id].buffer_queue_packets.len(), 1);
+        assert_eq!(connections[&conn_id].iter_tcp_enqueue_packets().count(), 1);
+        assert_eq!(
+            connections[&conn_id]
+                .iter_tcp_buffer_queue_packets()
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1952,12 +2008,12 @@ mod tests {
         // Verify UDP events went to UDP connection
         let udp_events = &connections[&udp_conn_id];
         assert_eq!(
-            udp_events.udp_send_packets.len(),
+            udp_events.iter_udp_send_packets().count(),
             1,
             "Should have 1 UDP send event"
         );
         assert_eq!(
-            udp_events.send_packets.len(),
+            udp_events.iter_shared_send_packets().count(),
             1,
             "Should have 1 UDP PACKET_SEND event (qdisc->NIC)"
         );
@@ -1965,21 +2021,21 @@ mod tests {
         // Verify TCP events went to TCP connection
         let tcp_events = &connections[&tcp_conn_id];
         assert_eq!(
-            tcp_events.send_packets.len(),
+            tcp_events.iter_shared_send_packets().count(),
             1,
             "Should have 1 TCP PACKET_SEND event"
         );
 
         // Verify UDP connection doesn't have TCP events
         assert_eq!(
-            udp_events.enqueue_packets.len(),
+            udp_events.iter_tcp_enqueue_packets().count(),
             0,
             "UDP connection shouldn't have TCP enqueue events"
         );
 
         // Verify TCP connection doesn't have UDP events
         assert_eq!(
-            tcp_events.udp_send_packets.len(),
+            tcp_events.iter_udp_send_packets().count(),
             0,
             "TCP connection shouldn't have UDP send events"
         );
@@ -2046,12 +2102,12 @@ mod tests {
 
         let udp_events = &connections[&udp_conn_id];
         assert_eq!(
-            udp_events.udp_rcv_packets.len(),
+            udp_events.iter_udp_rcv_packets().count(),
             1,
             "Should have 1 UDP receive event"
         );
         assert_eq!(
-            udp_events.udp_enqueue_packets.len(),
+            udp_events.iter_udp_enqueue_packets().count(),
             1,
             "Should have 1 UDP enqueue event"
         );
@@ -2118,14 +2174,16 @@ mod tests {
         let udp_events = &connections[&udp_conn_id];
 
         // Verify lengths are payload only (headers excluded)
+        let udp_send: Vec<_> = udp_events.iter_udp_send_packets().collect();
         assert_eq!(
-            udp_events.udp_send_packets[0].length, payload_size,
+            udp_send[0].length, payload_size,
             "UDP send packet length should be {} bytes (payload only, no IP+UDP headers)",
             payload_size
         );
 
+        let udp_rcv: Vec<_> = udp_events.iter_udp_rcv_packets().collect();
         assert_eq!(
-            udp_events.udp_rcv_packets[0].length, payload_size,
+            udp_rcv[0].length, payload_size,
             "UDP receive packet length should be {} bytes (payload only, no UDP header)",
             payload_size
         );
@@ -2185,26 +2243,7 @@ mod tests {
             "Should only create ONE 'Packets' track for UDP connection, not duplicate TCP+UDP tracks"
         );
 
-        // Extract event names from interned data
-        let interned_names: Vec<String> = packets
-            .iter()
-            .filter_map(|p| p.interned_data.as_ref())
-            .flat_map(|data| data.event_names.iter())
-            .map(|en| en.name().to_string())
-            .collect();
-
-        // Verify "TCP packet_send" was NOT created
-        assert!(
-            !interned_names.contains(&"TCP packet_send".to_string()),
-            "UDP-only connection should NOT create 'TCP packet_send' event name. Found: {:?}",
-            interned_names
-        );
-
-        // Verify "UDP packet_send" WAS created
-        assert!(
-            interned_names.contains(&"UDP packet_send".to_string()),
-            "UDP connection should create 'UDP packet_send' event name. Found: {:?}",
-            interned_names
-        );
+        // Note: Event name IIDs are now created unconditionally (only ~9 strings, so no overhead)
+        // The important check is that we don't create duplicate track descriptors above
     }
 }
