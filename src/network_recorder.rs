@@ -81,6 +81,24 @@ struct ConnectionEvents {
     rcv_established_packets: Vec<PacketEvent>,
     queue_rcv_packets: Vec<PacketEvent>,
     buffer_queue_packets: Vec<PacketEvent>,
+    udp_send_packets: Vec<PacketEvent>,
+    udp_rcv_packets: Vec<PacketEvent>,
+    udp_enqueue_packets: Vec<PacketEvent>,
+}
+
+impl ConnectionEvents {
+    fn is_empty(&self) -> bool {
+        self.sends.is_empty()
+            && self.recvs.is_empty()
+            && self.enqueue_packets.is_empty()
+            && self.send_packets.is_empty()
+            && self.rcv_established_packets.is_empty()
+            && self.queue_rcv_packets.is_empty()
+            && self.buffer_queue_packets.is_empty()
+            && self.udp_send_packets.is_empty()
+            && self.udp_rcv_packets.is_empty()
+            && self.udp_enqueue_packets.is_empty()
+    }
 }
 
 #[derive(Default)]
@@ -147,12 +165,15 @@ impl NetworkRecorder {
     }
 
     pub fn handle_packet_event(&mut self, event: crate::systing::types::packet_event) {
-        use crate::systing::types::{network_protocol, packet_event_type};
+        use crate::systing::types::packet_event_type;
 
         let tgidpid = event.task.tgidpid;
 
+        // Use protocol field from event (explicitly set in BPF code)
+        let protocol = event.protocol.0;
+
         let conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0, // Packets are always TCP
+            protocol,
             af: event.af.0,
             dest_addr: event.dest_addr,
             dest_port: event.dest_port,
@@ -173,9 +194,11 @@ impl NetworkRecorder {
             .entry(conn_id)
             .or_default();
 
+        // TCP packet events
         if event.event_type.0 == packet_event_type::PACKET_ENQUEUE.0 {
             conn_events.enqueue_packets.push(pkt_event);
         } else if event.event_type.0 == packet_event_type::PACKET_SEND.0 {
+            // PACKET_SEND is shared by TCP and UDP for qdisc->NIC transmission
             conn_events.send_packets.push(pkt_event);
         } else if event.event_type.0 == packet_event_type::PACKET_RCV_ESTABLISHED.0 {
             conn_events.rcv_established_packets.push(pkt_event);
@@ -183,6 +206,14 @@ impl NetworkRecorder {
             conn_events.queue_rcv_packets.push(pkt_event);
         } else if event.event_type.0 == packet_event_type::PACKET_BUFFER_QUEUE.0 {
             conn_events.buffer_queue_packets.push(pkt_event);
+        }
+        // UDP packet events - use separate vectors for clear naming
+        else if event.event_type.0 == packet_event_type::PACKET_UDP_SEND.0 {
+            conn_events.udp_send_packets.push(pkt_event);
+        } else if event.event_type.0 == packet_event_type::PACKET_UDP_RCV.0 {
+            conn_events.udp_rcv_packets.push(pkt_event);
+        } else if event.event_type.0 == packet_event_type::PACKET_UDP_ENQUEUE.0 {
+            conn_events.udp_enqueue_packets.push(pkt_event);
         }
     }
 
@@ -249,20 +280,26 @@ impl NetworkRecorder {
             begin_event.set_name_iid(name_iid);
             begin_event.set_track_uuid(track_uuid);
 
-            let mut seq_annotation = DebugAnnotation::default();
-            seq_annotation.set_name("seq".to_string());
-            seq_annotation.set_uint_value(pkt.seq as u64);
-            begin_event.debug_annotations.push(seq_annotation);
+            // Only show seq annotation for TCP packets (where seq != 0)
+            if pkt.seq != 0 {
+                let mut seq_annotation = DebugAnnotation::default();
+                seq_annotation.set_name("seq".to_string());
+                seq_annotation.set_uint_value(pkt.seq as u64);
+                begin_event.debug_annotations.push(seq_annotation);
+            }
 
             let mut len_annotation = DebugAnnotation::default();
             len_annotation.set_name("length".to_string());
             len_annotation.set_uint_value(pkt.length as u64);
             begin_event.debug_annotations.push(len_annotation);
 
-            let mut flags_annotation = DebugAnnotation::default();
-            flags_annotation.set_name("flags".to_string());
-            flags_annotation.set_string_value(Self::format_tcp_flags(pkt.tcp_flags));
-            begin_event.debug_annotations.push(flags_annotation);
+            // Only show TCP flags annotation for TCP packets (where flags != 0)
+            if pkt.tcp_flags != 0 {
+                let mut flags_annotation = DebugAnnotation::default();
+                flags_annotation.set_name("flags".to_string());
+                flags_annotation.set_string_value(Self::format_tcp_flags(pkt.tcp_flags));
+                begin_event.debug_annotations.push(flags_annotation);
+            }
 
             let mut begin_packet = TracePacket::default();
             begin_packet.set_timestamp(pkt.start_ts);
@@ -326,17 +363,21 @@ impl NetworkRecorder {
         thread_uuids: &HashMap<i32, u64>,
         id_counter: &Arc<AtomicUsize>,
     ) -> Vec<TracePacket> {
+        use crate::systing::types::{network_operation, network_protocol};
+
         let mut packets = Vec::new();
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-
-        use crate::systing::types::network_operation;
         let mut protocol_ops_used = std::collections::HashSet::new();
         let mut connection_ids = Vec::new();
-        let mut has_enqueue_packets = false;
-        let mut has_send_packets = false;
-        let mut has_rcv_established_packets = false;
-        let mut has_queue_rcv_packets = false;
-        let mut has_buffer_queue_packets = false;
+        let mut has_tcp_enqueue_packets = false;
+        let mut has_tcp_send_packets = false;
+        let mut has_tcp_rcv_established_packets = false;
+        let mut has_tcp_queue_rcv_packets = false;
+        let mut has_tcp_buffer_queue_packets = false;
+        let mut has_udp_send_packets = false;
+        let mut has_udp_packet_send = false; // UDP using PACKET_SEND for qdisc->NIC
+        let mut has_udp_rcv_packets = false;
+        let mut has_udp_enqueue_packets = false;
 
         for connections in self.network_events.values() {
             for (conn_id, events) in connections.iter() {
@@ -347,20 +388,40 @@ impl NetworkRecorder {
                 if !events.recvs.is_empty() {
                     protocol_ops_used.insert((conn_id.protocol, network_operation::NETWORK_RECV.0));
                 }
-                if !events.enqueue_packets.is_empty() {
-                    has_enqueue_packets = true;
-                }
-                if !events.send_packets.is_empty() {
-                    has_send_packets = true;
-                }
-                if !events.rcv_established_packets.is_empty() {
-                    has_rcv_established_packets = true;
-                }
-                if !events.queue_rcv_packets.is_empty() {
-                    has_queue_rcv_packets = true;
-                }
-                if !events.buffer_queue_packets.is_empty() {
-                    has_buffer_queue_packets = true;
+
+                match conn_id.protocol {
+                    p if p == network_protocol::NETWORK_TCP.0 => {
+                        if !events.enqueue_packets.is_empty() {
+                            has_tcp_enqueue_packets = true;
+                        }
+                        if !events.send_packets.is_empty() {
+                            has_tcp_send_packets = true;
+                        }
+                        if !events.rcv_established_packets.is_empty() {
+                            has_tcp_rcv_established_packets = true;
+                        }
+                        if !events.queue_rcv_packets.is_empty() {
+                            has_tcp_queue_rcv_packets = true;
+                        }
+                        if !events.buffer_queue_packets.is_empty() {
+                            has_tcp_buffer_queue_packets = true;
+                        }
+                    }
+                    p if p == network_protocol::NETWORK_UDP.0 => {
+                        if !events.udp_send_packets.is_empty() {
+                            has_udp_send_packets = true;
+                        }
+                        if !events.send_packets.is_empty() {
+                            has_udp_packet_send = true;
+                        }
+                        if !events.udp_rcv_packets.is_empty() {
+                            has_udp_rcv_packets = true;
+                        }
+                        if !events.udp_enqueue_packets.is_empty() {
+                            has_udp_enqueue_packets = true;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -385,21 +446,35 @@ impl NetworkRecorder {
             self.get_or_create_event_name_iid(event_name, id_counter);
         }
 
-        // Create IIDs for packet events if we have any
-        if has_enqueue_packets {
+        // Create IIDs for TCP packet events
+        if has_tcp_enqueue_packets {
             self.get_or_create_event_name_iid("TCP packet_enqueue".to_string(), id_counter);
         }
-        if has_send_packets {
+        if has_tcp_send_packets {
             self.get_or_create_event_name_iid("TCP packet_send".to_string(), id_counter);
         }
-        if has_rcv_established_packets {
+        if has_tcp_rcv_established_packets {
             self.get_or_create_event_name_iid("TCP packet_rcv_established".to_string(), id_counter);
         }
-        if has_queue_rcv_packets {
+        if has_tcp_queue_rcv_packets {
             self.get_or_create_event_name_iid("TCP packet_queue_rcv".to_string(), id_counter);
         }
-        if has_buffer_queue_packets {
+        if has_tcp_buffer_queue_packets {
             self.get_or_create_event_name_iid("TCP buffer_queue".to_string(), id_counter);
+        }
+
+        // Create IIDs for UDP packet events with clear semantic names
+        if has_udp_send_packets {
+            self.get_or_create_event_name_iid("UDP send".to_string(), id_counter);
+        }
+        if has_udp_packet_send {
+            self.get_or_create_event_name_iid("UDP packet_send".to_string(), id_counter);
+        }
+        if has_udp_rcv_packets {
+            self.get_or_create_event_name_iid("UDP receive".to_string(), id_counter);
+        }
+        if has_udp_enqueue_packets {
+            self.get_or_create_event_name_iid("UDP enqueue".to_string(), id_counter);
         }
 
         // Generate interned data packet with event names
@@ -452,14 +527,7 @@ impl NetworkRecorder {
 
             // Create a track group for each unique connection
             for (conn_id, events) in connections.iter() {
-                if events.sends.is_empty()
-                    && events.recvs.is_empty()
-                    && events.enqueue_packets.is_empty()
-                    && events.send_packets.is_empty()
-                    && events.rcv_established_packets.is_empty()
-                    && events.queue_rcv_packets.is_empty()
-                    && events.buffer_queue_packets.is_empty()
-                {
+                if events.is_empty() {
                     continue;
                 }
 
@@ -573,11 +641,15 @@ impl NetworkRecorder {
                     }
                 }
 
-                if !events.enqueue_packets.is_empty()
-                    || !events.send_packets.is_empty()
-                    || !events.rcv_established_packets.is_empty()
-                    || !events.queue_rcv_packets.is_empty()
-                    || !events.buffer_queue_packets.is_empty()
+                // Create TCP Packets track if we have TCP packet events
+                let is_tcp =
+                    conn_id.protocol == crate::systing::types::network_protocol::NETWORK_TCP.0;
+                if is_tcp
+                    && (!events.enqueue_packets.is_empty()
+                        || !events.send_packets.is_empty()
+                        || !events.rcv_established_packets.is_empty()
+                        || !events.queue_rcv_packets.is_empty()
+                        || !events.buffer_queue_packets.is_empty())
                 {
                     let packets_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
@@ -652,6 +724,76 @@ impl NetworkRecorder {
                             packets_track_uuid,
                             buffer_queue_iid,
                             &events.buffer_queue_packets,
+                        );
+                    }
+                }
+
+                // Create UDP Packets track if we have UDP packet events
+                let is_udp =
+                    conn_id.protocol == crate::systing::types::network_protocol::NETWORK_UDP.0;
+                if is_udp
+                    && (!events.udp_send_packets.is_empty()
+                    || !events.send_packets.is_empty()  // UDP uses PACKET_SEND for qdisc->NIC
+                    || !events.udp_rcv_packets.is_empty()
+                    || !events.udp_enqueue_packets.is_empty())
+                {
+                    let packets_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+
+                    let mut packets_track_desc = TrackDescriptor::default();
+                    packets_track_desc.set_uuid(packets_track_uuid);
+                    packets_track_desc.set_name("Packets".to_string());
+                    packets_track_desc.set_parent_uuid(conn_group_uuid);
+
+                    let mut packets_track_packet = TracePacket::default();
+                    packets_track_packet.set_track_descriptor(packets_track_desc);
+                    packets.push(packets_track_packet);
+
+                    if !events.udp_send_packets.is_empty() {
+                        let send_iid = *self.event_name_ids.get("UDP send").unwrap();
+
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            packets_track_uuid,
+                            send_iid,
+                            &events.udp_send_packets,
+                        );
+                    }
+
+                    if !events.udp_rcv_packets.is_empty() {
+                        let rcv_iid = *self.event_name_ids.get("UDP receive").unwrap();
+
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            packets_track_uuid,
+                            rcv_iid,
+                            &events.udp_rcv_packets,
+                        );
+                    }
+
+                    if !events.udp_enqueue_packets.is_empty() {
+                        let enqueue_iid = *self.event_name_ids.get("UDP enqueue").unwrap();
+
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            packets_track_uuid,
+                            enqueue_iid,
+                            &events.udp_enqueue_packets,
+                        );
+                    }
+
+                    // UDP also uses PACKET_SEND for qdisc->NIC transmission
+                    if !events.send_packets.is_empty() {
+                        let send_iid = *self.event_name_ids.get("UDP packet_send").unwrap();
+
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            packets_track_uuid,
+                            send_iid,
+                            &events.send_packets,
                         );
                     }
                 }
@@ -1717,5 +1859,352 @@ mod tests {
         };
         assert_eq!(connections[&conn_id].enqueue_packets.len(), 1);
         assert_eq!(connections[&conn_id].buffer_queue_packets.len(), 1);
+    }
+
+    #[test]
+    fn test_udp_packet_events_protocol_classification() {
+        use crate::systing::types::{network_address_family, packet_event_type};
+
+        let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[8, 8, 8, 8]); // 8.8.8.8
+
+        // Create UDP PACKET_UDP_SEND event
+        let udp_send_event = crate::systing::types::packet_event {
+            start_ts: 1000,
+            end_ts: 2000,
+            task: create_test_task_info(100, 101),
+            protocol: network_protocol::NETWORK_UDP,
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 53,
+            seq: 0,
+            length: 64,
+            tcp_flags: 0,
+            event_type: packet_event_type::PACKET_UDP_SEND,
+            cpu: 0,
+        };
+
+        // Create UDP PACKET_SEND event (qdisc->NIC, shared type)
+        let udp_packet_send_event = crate::systing::types::packet_event {
+            start_ts: 2000,
+            end_ts: 3000,
+            task: create_test_task_info(100, 101),
+            protocol: network_protocol::NETWORK_UDP, // Explicit protocol field
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 53,
+            seq: 0,
+            length: 64,
+            tcp_flags: 0,
+            event_type: packet_event_type::PACKET_SEND, // Shared with TCP!
+            cpu: 0,
+        };
+
+        // Create TCP PACKET_SEND event for comparison
+        let tcp_packet_send_event = crate::systing::types::packet_event {
+            start_ts: 4000,
+            end_ts: 5000,
+            task: create_test_task_info(100, 101),
+            protocol: network_protocol::NETWORK_TCP, // Explicit protocol field
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 80,
+            seq: 12345,
+            length: 1024,
+            tcp_flags: 0x10,
+            event_type: packet_event_type::PACKET_SEND, // Same event type!
+            cpu: 0,
+        };
+
+        recorder.handle_packet_event(udp_send_event);
+        recorder.handle_packet_event(udp_packet_send_event);
+        recorder.handle_packet_event(tcp_packet_send_event);
+
+        let tgidpid = (100u64 << 32) | 101u64;
+        let connections = &recorder.network_events[&tgidpid];
+
+        // Verify UDP connection exists with correct protocol
+        let udp_conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_UDP.0,
+            af: network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            dest_port: 53,
+        };
+        assert!(
+            connections.contains_key(&udp_conn_id),
+            "UDP connection should exist"
+        );
+
+        // Verify TCP connection exists with correct protocol
+        let tcp_conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_TCP.0,
+            af: network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            dest_port: 80,
+        };
+        assert!(
+            connections.contains_key(&tcp_conn_id),
+            "TCP connection should exist"
+        );
+
+        // Verify UDP events went to UDP connection
+        let udp_events = &connections[&udp_conn_id];
+        assert_eq!(
+            udp_events.udp_send_packets.len(),
+            1,
+            "Should have 1 UDP send event"
+        );
+        assert_eq!(
+            udp_events.send_packets.len(),
+            1,
+            "Should have 1 UDP PACKET_SEND event (qdisc->NIC)"
+        );
+
+        // Verify TCP events went to TCP connection
+        let tcp_events = &connections[&tcp_conn_id];
+        assert_eq!(
+            tcp_events.send_packets.len(),
+            1,
+            "Should have 1 TCP PACKET_SEND event"
+        );
+
+        // Verify UDP connection doesn't have TCP events
+        assert_eq!(
+            udp_events.enqueue_packets.len(),
+            0,
+            "UDP connection shouldn't have TCP enqueue events"
+        );
+
+        // Verify TCP connection doesn't have UDP events
+        assert_eq!(
+            tcp_events.udp_send_packets.len(),
+            0,
+            "TCP connection shouldn't have UDP send events"
+        );
+    }
+
+    #[test]
+    fn test_udp_receive_packet_events() {
+        use crate::systing::types::{network_address_family, packet_event_type};
+
+        let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[1, 1, 1, 1]); // 1.1.1.1
+
+        // UDP receive event (IP->UDP)
+        let udp_rcv_event = crate::systing::types::packet_event {
+            start_ts: 1000,
+            end_ts: 1500,
+            task: create_test_task_info(200, 201),
+            protocol: network_protocol::NETWORK_UDP,
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 443,
+            seq: 0,
+            length: 1200,
+            tcp_flags: 0,
+            event_type: packet_event_type::PACKET_UDP_RCV,
+            cpu: 0,
+        };
+
+        // UDP enqueue event (UDP->buffer)
+        let udp_enqueue_event = crate::systing::types::packet_event {
+            start_ts: 1500,
+            end_ts: 2000,
+            task: create_test_task_info(200, 201),
+            protocol: network_protocol::NETWORK_UDP,
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 443,
+            seq: 0,
+            length: 1200,
+            tcp_flags: 0,
+            event_type: packet_event_type::PACKET_UDP_ENQUEUE,
+            cpu: 0,
+        };
+
+        recorder.handle_packet_event(udp_rcv_event);
+        recorder.handle_packet_event(udp_enqueue_event);
+
+        let tgidpid = (200u64 << 32) | 201u64;
+        let connections = &recorder.network_events[&tgidpid];
+
+        let udp_conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_UDP.0,
+            af: network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            dest_port: 443,
+        };
+
+        assert!(
+            connections.contains_key(&udp_conn_id),
+            "UDP connection should exist"
+        );
+
+        let udp_events = &connections[&udp_conn_id];
+        assert_eq!(
+            udp_events.udp_rcv_packets.len(),
+            1,
+            "Should have 1 UDP receive event"
+        );
+        assert_eq!(
+            udp_events.udp_enqueue_packets.len(),
+            1,
+            "Should have 1 UDP enqueue event"
+        );
+    }
+
+    #[test]
+    fn test_udp_packet_length_excludes_headers() {
+        use crate::systing::types::{network_address_family, packet_event_type};
+
+        let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[8, 8, 8, 8]);
+
+        // Simulate UDP packet with application payload of 512 bytes
+        // At BPF level, this should be reported as 512 (not 512+8 or 512+28)
+        let payload_size = 512;
+
+        // UDP send event - length should be payload only (not including headers)
+        let udp_send_event = crate::systing::types::packet_event {
+            start_ts: 1000,
+            end_ts: 2000,
+            task: create_test_task_info(100, 101),
+            protocol: network_protocol::NETWORK_UDP,
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 53,
+            seq: 0,
+            length: payload_size, // Should be payload only (BPF subtracts 28 bytes)
+            tcp_flags: 0,
+            event_type: packet_event_type::PACKET_UDP_SEND,
+            cpu: 0,
+        };
+
+        // UDP receive event - length should be payload only (not including headers)
+        let udp_rcv_event = crate::systing::types::packet_event {
+            start_ts: 3000,
+            end_ts: 4000,
+            task: create_test_task_info(100, 101),
+            protocol: network_protocol::NETWORK_UDP,
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 53,
+            seq: 0,
+            length: payload_size, // Should be payload only (BPF subtracts 8 bytes)
+            tcp_flags: 0,
+            event_type: packet_event_type::PACKET_UDP_RCV,
+            cpu: 0,
+        };
+
+        recorder.handle_packet_event(udp_send_event);
+        recorder.handle_packet_event(udp_rcv_event);
+
+        let tgidpid = (100u64 << 32) | 101u64;
+        let connections = &recorder.network_events[&tgidpid];
+
+        let udp_conn_id = ConnectionId {
+            protocol: network_protocol::NETWORK_UDP.0,
+            af: network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            dest_port: 53,
+        };
+
+        let udp_events = &connections[&udp_conn_id];
+
+        // Verify lengths are payload only (headers excluded)
+        assert_eq!(
+            udp_events.udp_send_packets[0].length, payload_size,
+            "UDP send packet length should be {} bytes (payload only, no IP+UDP headers)",
+            payload_size
+        );
+
+        assert_eq!(
+            udp_events.udp_rcv_packets[0].length, payload_size,
+            "UDP receive packet length should be {} bytes (payload only, no UDP header)",
+            payload_size
+        );
+
+        // Verify this matches what the application would see in sendto()/recvfrom()
+        // If app sends 512 bytes, that's what should be reported (not 512+8 or 512+28)
+    }
+
+    #[test]
+    fn test_udp_packet_send_does_not_create_tcp_track() {
+        use crate::systing::types::{network_address_family, packet_event_type};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[8, 8, 8, 8]); // 8.8.8.8
+
+        // Create UDP PACKET_SEND event (qdisc->NIC, shared event type with TCP)
+        let udp_packet_send_event = crate::systing::types::packet_event {
+            start_ts: 1000,
+            end_ts: 2000,
+            task: create_test_task_info(100, 101),
+            protocol: network_protocol::NETWORK_UDP, // UDP protocol
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 53,
+            seq: 0,
+            length: 512,
+            tcp_flags: 0,
+            event_type: packet_event_type::PACKET_SEND, // Shared with TCP!
+            cpu: 0,
+        };
+
+        recorder.handle_packet_event(udp_packet_send_event);
+
+        let id_counter = Arc::new(AtomicUsize::new(1000));
+        let mut pid_uuids = std::collections::HashMap::new();
+        let mut thread_uuids = std::collections::HashMap::new();
+
+        // Add UUIDs for the test task
+        pid_uuids.insert(100, 5000); // tgid 100
+        thread_uuids.insert(101, 5001); // tid 101
+
+        let packets = recorder.generate_trace_packets(&pid_uuids, &thread_uuids, &id_counter);
+
+        // Count track descriptors to ensure we don't have duplicate "Packets" tracks
+        let packets_tracks: Vec<_> = packets
+            .iter()
+            .filter(|p| p.has_track_descriptor())
+            .filter(|p| p.track_descriptor().name() == "Packets")
+            .collect();
+
+        assert_eq!(
+            packets_tracks.len(), 1,
+            "Should only create ONE 'Packets' track for UDP connection, not duplicate TCP+UDP tracks"
+        );
+
+        // Extract event names from interned data
+        let interned_names: Vec<String> = packets
+            .iter()
+            .filter_map(|p| p.interned_data.as_ref())
+            .flat_map(|data| data.event_names.iter())
+            .map(|en| en.name().to_string())
+            .collect();
+
+        // Verify "TCP packet_send" was NOT created
+        assert!(
+            !interned_names.contains(&"TCP packet_send".to_string()),
+            "UDP-only connection should NOT create 'TCP packet_send' event name. Found: {:?}",
+            interned_names
+        );
+
+        // Verify "UDP packet_send" WAS created
+        assert!(
+            interned_names.contains(&"UDP packet_send".to_string()),
+            "UDP connection should create 'UDP packet_send' event name. Found: {:?}",
+            interned_names
+        );
     }
 }
