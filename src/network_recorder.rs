@@ -437,16 +437,15 @@ impl NetworkRecorder {
         packets.push(end_packet);
     }
 
-    pub fn generate_trace_packets(
-        &mut self,
-        pid_uuids: &HashMap<i32, u64>,
-        thread_uuids: &HashMap<i32, u64>,
-        id_counter: &Arc<AtomicUsize>,
-    ) -> Vec<TracePacket> {
+    /// Prepares all metadata needed for packet generation, including:
+    /// - Collecting protocol operations used
+    /// - Resolving hostnames for all connections
+    /// - Creating IIDs for protocol operations and packet events
+    /// - Building the event names array
+    fn prepare_event_metadata(&mut self, id_counter: &Arc<AtomicUsize>) -> Vec<EventName> {
         use crate::systing::types::network_operation;
 
-        let mut packets = Vec::new();
-        let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
+        // Collect protocol operations used across all connections
         let mut protocol_ops_used = std::collections::HashSet::new();
         let mut connection_ids = Vec::new();
 
@@ -462,6 +461,7 @@ impl NetworkRecorder {
             }
         }
 
+        // Resolve hostnames for all connections
         for conn_id in &connection_ids {
             self.resolve_hostname(conn_id.ip_addr());
         }
@@ -492,6 +492,8 @@ impl NetworkRecorder {
         self.get_or_create_event_name_iid("UDP packet_send".to_string(), id_counter);
         self.get_or_create_event_name_iid("UDP receive".to_string(), id_counter);
         self.get_or_create_event_name_iid("UDP enqueue".to_string(), id_counter);
+
+        // Build and sort event names array
         let mut event_names = Vec::new();
         for (name, iid) in &self.event_name_ids {
             let mut event_name = EventName::default();
@@ -499,10 +501,24 @@ impl NetworkRecorder {
             event_name.set_name(name.clone());
             event_names.push(event_name);
         }
-
-        // Sort by iid for consistency
         event_names.sort_by_key(|e| e.iid());
 
+        event_names
+    }
+
+    pub fn generate_trace_packets(
+        &mut self,
+        pid_uuids: &HashMap<i32, u64>,
+        thread_uuids: &HashMap<i32, u64>,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Vec<TracePacket> {
+        let mut packets = Vec::new();
+        let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
+
+        // Phase 1: Prepare all metadata (event names, IIDs, DNS resolution)
+        let event_names = self.prepare_event_metadata(id_counter);
+
+        // Phase 2: Create interned data packet if we have event names
         if !event_names.is_empty() {
             let mut interned_packet = TracePacket::default();
             let interned_data = InternedData {
