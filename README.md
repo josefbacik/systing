@@ -60,6 +60,7 @@ This will display all available recorders and their default states:
 - `syscalls` - Syscall tracing
 - `sleep-stacks` - Sleep stack traces (on by default)
 - `cpu-stacks` - CPU perf stack traces (on by default)
+- `network` - Network traffic recording (TCP/UDP send/receive and packet-level latency)
 - `pystacks` - Python stack tracing (requires pystacks feature)
 
 #### Add Specific Recorders
@@ -70,8 +71,11 @@ Use `--add-recorder` to enable additional recorders on top of the defaults:
 # Enable syscalls in addition to default recorders
 sudo ./target/debug/systing --add-recorder syscalls --duration 60
 
+# Enable network traffic recording in addition to default recorders
+sudo ./target/debug/systing --add-recorder network --duration 60
+
 # Enable multiple additional recorders
-sudo ./target/debug/systing --add-recorder syscalls --add-recorder pystacks --duration 60
+sudo ./target/debug/systing --add-recorder syscalls --add-recorder network --duration 60
 ```
 
 #### Use Only Specific Recorders
@@ -82,9 +86,38 @@ Use `--only-recorder` to disable all recorders and enable only the ones you spec
 # Only record syscalls (disable everything else)
 sudo ./target/debug/systing --only-recorder syscalls --duration 60
 
+# Only record network traffic (disable everything else)
+sudo ./target/debug/systing --only-recorder network --duration 60
+
 # Only record syscalls and cpu-stacks
 sudo ./target/debug/systing --only-recorder syscalls --only-recorder cpu-stacks --duration 60
 ```
+
+### Network Traffic Recording
+
+The network recorder captures detailed network traffic information including:
+- TCP and UDP send/receive operations at the connection level
+- Packet-level latency tracking through the network stack
+- Timing information for packet transmission and reception
+- Queue latencies and buffer management
+
+**Note:** Network recording is disabled by default to minimize overhead. Enable it explicitly when you need to analyze network performance.
+
+```bash
+# Enable network recording
+sudo ./target/debug/systing --add-recorder network --duration 60
+
+# Only record network traffic (disable everything else)
+sudo ./target/debug/systing --only-recorder network --duration 60
+```
+
+The network recorder instruments multiple points in the Linux network stack:
+- `tcp_sendmsg`/`udp_sendmsg` - Connection-level send operations
+- `tcp_recvmsg`/`udp_recvmsg` - Connection-level receive operations
+- `__tcp_transmit_skb`/`udp_send_skb` - Packet transmission
+- `tcp_rcv_established`/`__udp4_lib_rcv` - Packet reception
+- `__dev_queue_xmit`/`net_dev_start_xmit` - Device queue and transmission
+- And additional points for tracking packet flow through queues and buffers
 
 ### Debugging and Verbosity
 
