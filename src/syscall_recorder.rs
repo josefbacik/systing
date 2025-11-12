@@ -31,12 +31,14 @@ pub struct SyscallRecorder {
     syscall_iids: HashMap<u64, u64>,
     // Map from syscall name to interned id (for deduplication)
     syscall_name_ids: HashMap<String, u64>,
-    // Counter for generating unique interned IDs
-    next_name_iid: u64,
 }
 
 impl SyscallRecorder {
-    fn get_or_create_syscall_name_iid(&mut self, syscall_nr: u64) -> u64 {
+    fn get_or_create_syscall_name_iid(
+        &mut self,
+        syscall_nr: u64,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> u64 {
         // Check if we already have an IID for this syscall number
         if let Some(&iid) = self.syscall_iids.get(&syscall_nr) {
             return iid;
@@ -55,12 +57,7 @@ impl SyscallRecorder {
         let iid = if let Some(&existing_iid) = self.syscall_name_ids.get(&syscall_name) {
             existing_iid
         } else {
-            // Start IIDs at 1000 to avoid conflicts with other interned data
-            if self.next_name_iid == 0 {
-                self.next_name_iid = 1000;
-            }
-            let new_iid = self.next_name_iid;
-            self.next_name_iid += 1;
+            let new_iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             self.syscall_name_ids.insert(syscall_name, new_iid);
             new_iid
         };
@@ -89,7 +86,7 @@ impl SyscallRecorder {
 
         // Create interned IDs for all unique syscall numbers
         for syscall_nr in syscall_numbers {
-            self.get_or_create_syscall_name_iid(syscall_nr);
+            self.get_or_create_syscall_name_iid(syscall_nr, id_counter);
         }
 
         // Generate interned data packet with syscall names
@@ -171,8 +168,12 @@ impl SyscallRecorder {
             }
         }
 
-        // Clear completed syscalls after generating packets
+        // Clear completed syscalls and IID state after generating packets
+        // This ensures we start fresh for the next trace generation with
+        // the SEQ_INCREMENTAL_STATE_CLEARED flag
         self.completed_syscalls.clear();
+        self.syscall_iids.clear();
+        self.syscall_name_ids.clear();
 
         packets
     }
@@ -421,14 +422,16 @@ mod tests {
         let interned_data = interned_packet.interned_data.as_ref().unwrap();
         assert_eq!(interned_data.event_names.len(), 1);
         let event_name = &interned_data.event_names[0];
-        assert_eq!(event_name.iid(), 1000); // First syscall gets iid 1000
+        // Syscall name IID allocated from shared counter (after sequence_id)
+        assert_eq!(event_name.iid(), 1001);
         assert_eq!(event_name.name(), "write");
 
         // Check track descriptor
         let track_desc_packet = &packets[1];
         assert!(track_desc_packet.has_track_descriptor());
         let track_desc = track_desc_packet.track_descriptor();
-        assert_eq!(track_desc.uuid(), 1001); // ID counter was at 1000, incremented for track
+        // Track UUID allocated from shared counter (after syscall name IID)
+        assert_eq!(track_desc.uuid(), 1002);
         assert_eq!(track_desc.parent_uuid(), 500);
         assert_eq!(track_desc.name(), "Syscalls");
 
@@ -437,9 +440,9 @@ mod tests {
         assert!(begin_packet.has_track_event());
         assert_eq!(begin_packet.timestamp(), 1000);
         let begin_event = begin_packet.track_event();
-        assert_eq!(begin_event.name_iid(), 1000); // References interned "write" name
+        assert_eq!(begin_event.name_iid(), 1001); // References interned "write" name
         assert_eq!(begin_event.type_(), Type::TYPE_SLICE_BEGIN);
-        assert_eq!(begin_event.track_uuid(), 1001);
+        assert_eq!(begin_event.track_uuid(), 1002);
 
         // Check end event
         let end_packet = &packets[3];
@@ -447,7 +450,7 @@ mod tests {
         assert_eq!(end_packet.timestamp(), 2000);
         let end_event = end_packet.track_event();
         assert_eq!(end_event.type_(), Type::TYPE_SLICE_END);
-        assert_eq!(end_event.track_uuid(), 1001);
+        assert_eq!(end_event.track_uuid(), 1002);
 
         // Events should be cleared after generating packets
         assert!(recorder.completed_syscalls.is_empty());

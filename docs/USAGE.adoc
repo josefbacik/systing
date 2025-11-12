@@ -48,6 +48,7 @@ Available recorders:
 * `syscalls` - Syscall tracing (disabled by default)
 * `sleep-stacks` - Sleep stack traces (enabled by default)
 * `cpu-stacks` - CPU perf stack traces (enabled by default)
+* `network` - Network traffic recording (disabled by default) - Captures TCP/UDP send/receive operations, packet-level latency tracking, and queue management through multiple kernel instrumentation points
 * `pystacks` - Python stack tracing (disabled by default, requires pystacks feature)
 
 Examples:
@@ -55,8 +56,11 @@ Examples:
 # Enable syscalls in addition to default recorders
 # systing --add-recorder syscalls --duration 60
 
-# Enable both syscalls and pystacks
-# systing --add-recorder syscalls --add-recorder pystacks --duration 60
+# Enable network traffic recording in addition to default recorders
+# systing --add-recorder network --duration 60
+
+# Enable both syscalls and network
+# systing --add-recorder syscalls --add-recorder network --duration 60
 ----
 
 === *--cgroup* _PATH_
@@ -125,6 +129,7 @@ Available recorders:
   syscalls       - Syscall tracing
   sleep-stacks   - Sleep stack traces (on by default)
   cpu-stacks     - CPU perf stack traces (on by default)
+  network        - Network traffic recording
   pystacks       - Python stack tracing
 ----
 
@@ -170,6 +175,9 @@ Examples:
 ----
 # Only record syscalls, disable everything else
 # systing --only-recorder syscalls --duration 60
+
+# Only record network traffic, disable everything else
+# systing --only-recorder network --duration 60
 
 # Only record syscalls and cpu-stacks
 # systing --only-recorder syscalls --only-recorder cpu-stacks --duration 60

@@ -1,4 +1,5 @@
 mod events;
+mod network_recorder;
 mod perf;
 mod perf_recorder;
 mod perfetto;
@@ -93,6 +94,11 @@ fn get_available_recorders() -> Vec<RecorderInfo> {
             description: "CPU perf stack traces",
             default_enabled: true,
         },
+        RecorderInfo {
+            name: "network",
+            description: "Network traffic recording",
+            default_enabled: false,
+        },
     ];
 
     #[cfg(feature = "pystacks")]
@@ -127,6 +133,7 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
         "sched" => opts.no_sched = !enable,
         "sleep-stacks" => opts.no_sleep_stack_traces = !enable,
         "cpu-stacks" => opts.no_cpu_stack_traces = !enable,
+        "network" => opts.network = enable,
         #[cfg(feature = "pystacks")]
         "pystacks" => opts.collect_pystacks = enable,
         _ => {}
@@ -143,6 +150,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         opts.syscalls = false;
         opts.no_sleep_stack_traces = true;
         opts.no_cpu_stack_traces = true;
+        opts.network = false;
         #[cfg(feature = "pystacks")]
         {
             opts.collect_pystacks = false;
@@ -212,6 +220,9 @@ struct Command {
     /// Enable syscall tracing (raw_syscalls:sys_enter and sys_exit tracepoints)
     #[arg(long)]
     syscalls: bool,
+    // Network recording enabled state (set by recorder management, not a CLI flag)
+    #[arg(skip)]
+    network: bool,
     /// List all available recorders and their default states
     #[arg(long)]
     list_recorders: bool,
@@ -329,6 +340,8 @@ pub trait SystingEvent {
 use systing::types::arg_desc;
 use systing::types::arg_type;
 use systing::types::event_type;
+use systing::types::network_event;
+use systing::types::packet_event;
 use systing::types::perf_counter_event;
 use systing::types::probe_event;
 use systing::types::stack_event;
@@ -341,6 +354,8 @@ unsafe impl Plain for stack_event {}
 unsafe impl Plain for perf_counter_event {}
 unsafe impl Plain for probe_event {}
 unsafe impl Plain for syscall_event {}
+unsafe impl Plain for network_event {}
+unsafe impl Plain for packet_event {}
 unsafe impl Plain for arg_desc {}
 
 impl SystingEvent for task_event {
@@ -391,6 +406,24 @@ impl SystingEvent for probe_event {
 impl SystingEvent for syscall_event {
     fn ts(&self) -> u64 {
         self.ts
+    }
+    fn next_task_info(&self) -> Option<&task_info> {
+        Some(&self.task)
+    }
+}
+
+impl SystingEvent for network_event {
+    fn ts(&self) -> u64 {
+        self.start_ts
+    }
+    fn next_task_info(&self) -> Option<&task_info> {
+        Some(&self.task)
+    }
+}
+
+impl SystingEvent for packet_event {
+    fn ts(&self) -> u64 {
+        self.start_ts
     }
     fn next_task_info(&self) -> Option<&task_info> {
         Some(&self.task)
@@ -459,6 +492,8 @@ fn spawn_recorder_threads(
         cache_rx,
         probe_rx,
         syscall_rx,
+        network_rx,
+        packet_rx,
     } = channels;
 
     let mut threads = Vec::new();
@@ -534,6 +569,45 @@ fn spawn_recorder_threads(
                         syscall_rx,
                         my_stop_tx,
                     );
+                    0
+                })?,
+        );
+    }
+
+    // Spawn network recorder if network recording is enabled
+    if opts.network {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("network_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<network_recorder::NetworkRecorder, network_event>(
+                        &session_recorder,
+                        &session_recorder.network_recorder,
+                        network_rx,
+                        my_stop_tx,
+                    );
+                    0
+                })?,
+        );
+
+        // Packet recorder: processes packet events into network_recorder
+        let session_recorder = recorder.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("packet_recorder".to_string())
+                .spawn(move || {
+                    while let Ok(event) = packet_rx.recv() {
+                        if let Some(task_info) = event.next_task_info() {
+                            session_recorder.maybe_record_task(task_info);
+                        }
+                        session_recorder
+                            .network_recorder
+                            .lock()
+                            .unwrap()
+                            .handle_packet_event(event);
+                    }
                     0
                 })?,
         );
@@ -741,6 +815,8 @@ struct RecorderChannels {
     cache_rx: Receiver<perf_counter_event>,
     probe_rx: Receiver<probe_event>,
     syscall_rx: Receiver<syscall_event>,
+    network_rx: Receiver<network_event>,
+    packet_rx: Receiver<packet_event>,
 }
 
 fn setup_ringbuffers<'a>(
@@ -754,6 +830,8 @@ fn setup_ringbuffers<'a>(
     let (cache_tx, cache_rx) = channel();
     let (probe_tx, probe_rx) = channel();
     let (syscall_tx, syscall_rx) = channel();
+    let (network_tx, network_rx) = channel();
+    let (packet_tx, packet_rx) = channel();
 
     let object = skel.object();
 
@@ -776,6 +854,12 @@ fn setup_ringbuffers<'a>(
         } else if name.starts_with("ringbuf_syscall") && opts.syscalls {
             let ring = create_ring::<syscall_event>(&map, syscall_tx.clone())?;
             rings.push((name.to_string(), ring));
+        } else if name.starts_with("ringbuf_network") && opts.network {
+            let ring = create_ring::<network_event>(&map, network_tx.clone())?;
+            rings.push((name.to_string(), ring));
+        } else if name.starts_with("ringbuf_packet") && opts.network {
+            let ring = create_ring::<packet_event>(&map, packet_tx.clone())?;
+            rings.push((name.to_string(), ring));
         }
     }
 
@@ -785,6 +869,8 @@ fn setup_ringbuffers<'a>(
         cache_rx,
         probe_rx,
         syscall_rx,
+        network_rx,
+        packet_rx,
     };
 
     Ok((rings, channels))
@@ -842,6 +928,24 @@ fn configure_bpf_skeleton(
                     format!(
                         "Failed to set ringbuf size to {} MiB for map '{}'",
                         opts.ringbuf_size_mib, name
+                    )
+                })?;
+            }
+        }
+    }
+
+    // Set network ringbuffer maps to zero capacity if network recording is disabled
+    if !opts.network {
+        let object = open_skel.open_object_mut();
+        for mut map in object.maps_mut() {
+            let name = map.name().to_str().unwrap().to_string();
+            if name.starts_with("ringbuf_network_events_")
+                || name.starts_with("ringbuf_packet_events_")
+            {
+                map.set_max_entries(0).with_context(|| {
+                    format!(
+                        "Failed to set network ringbuf map '{}' to zero capacity",
+                        name
                     )
                 })?;
             }
@@ -926,6 +1030,39 @@ fn configure_bpf_skeleton(
             .progs
             .tracepoint__raw_syscalls__sys_exit
             .set_autoload(false);
+    }
+
+    // Only load network programs when network recording is enabled
+    // This prevents unnecessary overhead from loading unused kprobes and tracepoints
+    if !opts.network {
+        open_skel.progs.tcp_sendmsg_entry.set_autoload(false);
+        open_skel.progs.tcp_sendmsg_exit.set_autoload(false);
+        open_skel.progs.udp_sendmsg_entry.set_autoload(false);
+        open_skel.progs.udp_sendmsg_exit.set_autoload(false);
+        open_skel.progs.tcp_recvmsg_entry.set_autoload(false);
+        open_skel.progs.tcp_recvmsg_exit.set_autoload(false);
+        open_skel.progs.udp_recvmsg_entry.set_autoload(false);
+        open_skel.progs.udp_recvmsg_exit.set_autoload(false);
+        open_skel.progs.udp_send_skb_entry.set_autoload(false);
+        open_skel.progs.udp4_lib_rcv_entry.set_autoload(false);
+        open_skel
+            .progs
+            .udp_queue_rcv_one_skb_entry
+            .set_autoload(false);
+        open_skel
+            .progs
+            .udp_enqueue_schedule_skb_entry
+            .set_autoload(false);
+        open_skel.progs.tcp_transmit_skb_entry.set_autoload(false);
+        open_skel.progs.dev_queue_xmit_entry.set_autoload(false);
+        open_skel
+            .progs
+            .tcp_rcv_established_entry
+            .set_autoload(false);
+        open_skel.progs.tcp_queue_rcv_entry.set_autoload(false);
+        open_skel.progs.tcp_data_queue_entry.set_autoload(false);
+        open_skel.progs.net_dev_start_xmit.set_autoload(false);
+        open_skel.progs.skb_copy_datagram_iovec.set_autoload(false);
     }
 
     Ok(())
