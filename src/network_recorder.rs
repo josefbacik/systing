@@ -478,7 +478,7 @@ impl NetworkRecorder {
                 "op"
             };
 
-            let event_name = format!("{}_{}", proto_str, op_str);
+            let event_name = format!("{proto_str}_{op_str}");
             self.get_or_create_event_name_iid(event_name, id_counter);
         }
 
@@ -605,7 +605,7 @@ impl NetworkRecorder {
                     packets.push(send_track_packet);
 
                     let proto_str = Self::protocol_to_str(conn_id.protocol);
-                    let send_event_name = format!("{}_send", proto_str);
+                    let send_event_name = format!("{proto_str}_send");
                     let send_name_iid = *self.event_name_ids.get(&send_event_name).unwrap();
 
                     for event in events.iter_sends() {
@@ -658,7 +658,7 @@ impl NetworkRecorder {
                     packets.push(recv_track_packet);
 
                     let proto_str = Self::protocol_to_str(conn_id.protocol);
-                    let recv_event_name = format!("{}_recv", proto_str);
+                    let recv_event_name = format!("{proto_str}_recv");
                     let recv_name_iid = *self.event_name_ids.get(&recv_event_name).unwrap();
                     for event in events.iter_recvs() {
                         self.add_slice_events(
@@ -2193,15 +2193,13 @@ mod tests {
         let udp_send: Vec<_> = udp_events.iter_udp_send_packets().collect();
         assert_eq!(
             udp_send[0].length, payload_size,
-            "UDP send packet length should be {} bytes (payload only, no IP+UDP headers)",
-            payload_size
+            "UDP send packet length should be {payload_size} bytes (payload only, no IP+UDP headers)"
         );
 
         let udp_rcv: Vec<_> = udp_events.iter_udp_rcv_packets().collect();
         assert_eq!(
             udp_rcv[0].length, payload_size,
-            "UDP receive packet length should be {} bytes (payload only, no UDP header)",
-            payload_size
+            "UDP receive packet length should be {payload_size} bytes (payload only, no UDP header)"
         );
 
         // Verify this matches what the application would see in sendto()/recvfrom()

@@ -196,7 +196,8 @@ the mutex and the time that the mutex is locked by the thread.
       "args": [
         {
           "arg_index": 0,
-          "arg_type": "long"
+          "arg_type": "long",
+          "arg_name": "mutex_addr"
         }
       ]
     },
@@ -206,7 +207,8 @@ the mutex and the time that the mutex is locked by the thread.
       "args": [
         {
           "arg_index": 0,
-          "arg_type": "long"
+          "arg_type": "long",
+          "arg_name": "mutex_addr"
         }
       ]
     },
@@ -216,7 +218,8 @@ the mutex and the time that the mutex is locked by the thread.
       "args": [
         {
           "arg_index": 0,
-          "arg_type": "long"
+          "arg_type": "long",
+          "arg_name": "mutex_addr"
         }
       ]
     },
@@ -242,12 +245,14 @@ the mutex and the time that the mutex is locked by the thread.
 ```
 
 The `args` field is optional and allows you to capture probe arguments that will
-show up as annotations on the events in the trace. Each arg specifies:
+show up as debug annotations on the events in the trace. Each arg specifies:
 - `arg_index`: Which argument to capture (0-based index)
 - `arg_type`: The type of the argument ("string" or "long")
+- `arg_name`: The name of the debug annotation (e.g., "mutex_addr")
 
-These annotations provide additional context when viewing the trace, such as the
-mutex address in the example above.
+These debug annotations provide additional context when viewing the trace in
+Perfetto, showing the captured value with the specified name. In the example
+above, the mutex address will appear as a "mutex_addr" annotation on each event.
 
 This results in a track that looks like this
 

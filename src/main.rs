@@ -755,12 +755,8 @@ fn sd_notify() -> Result<()> {
     let sock = UnixDatagram::unbound().with_context(|| {
         "Failed to create unbound Unix datagram socket for systemd notification"
     })?;
-    sock.connect(&socket_path).with_context(|| {
-        format!(
-            "Failed to connect to systemd notify socket: {:?}",
-            socket_path
-        )
-    })?;
+    sock.connect(&socket_path)
+        .with_context(|| format!("Failed to connect to systemd notify socket: {socket_path:?}"))?;
     sock.send("READY=1".as_bytes())
         .with_context(|| "Failed to send READY=1 message to systemd")?;
     Ok(())
@@ -943,10 +939,7 @@ fn configure_bpf_skeleton(
                 || name.starts_with("ringbuf_packet_events_")
             {
                 map.set_max_entries(1).with_context(|| {
-                    format!(
-                        "Failed to set network ringbuf map '{}' to zero capacity",
-                        name
-                    )
+                    format!("Failed to set network ringbuf map '{name}' to zero capacity")
                 })?;
             }
         }
@@ -959,13 +952,13 @@ fn configure_bpf_skeleton(
         for tracepoint in opts.trace_event.iter() {
             probe_recorder
                 .add_event_from_str(tracepoint, &mut rng)
-                .with_context(|| format!("Failed to parse trace event: '{}'", tracepoint))?;
+                .with_context(|| format!("Failed to parse trace event: '{tracepoint}'"))?;
         }
 
         for config in opts.trace_event_config.iter() {
             probe_recorder
                 .load_config(config, &mut rng)
-                .with_context(|| format!("Failed to load trace event config file: '{}'", config))?;
+                .with_context(|| format!("Failed to load trace event config file: '{config}'"))?;
         }
 
         if opts.trace_event_pid.is_empty() {
@@ -1374,10 +1367,7 @@ fn run_tracing_loop(
     }
 
     if opts.continuous > 0 {
-        println!(
-            "Asked to stop, waiting {} second before stopping",
-            CONTINUOUS_MODE_STOP_DELAY_SECS
-        );
+        println!("Asked to stop, waiting {CONTINUOUS_MODE_STOP_DELAY_SECS} second before stopping");
         thread::sleep(Duration::from_secs(CONTINUOUS_MODE_STOP_DELAY_SECS));
     }
     println!("Stopping...");
@@ -1474,8 +1464,7 @@ fn system(opts: Command) -> Result<()> {
                 .set_max_entries(num_events)
                 .with_context(|| {
                     format!(
-                        "Failed to set last_perf_counter_value map size to {} entries",
-                        num_events
+                        "Failed to set last_perf_counter_value map size to {num_events} entries"
                     )
                 })?;
         }
@@ -1485,10 +1474,7 @@ fn system(opts: Command) -> Result<()> {
             .missed_events
             .set_max_entries(num_cpus)
             .with_context(|| {
-                format!(
-                    "Failed to set missed_events map size to {} entries",
-                    num_cpus
-                )
+                format!("Failed to set missed_events map size to {num_cpus} entries")
             })?;
 
         let mut skel = open_skel.load().with_context(|| {
@@ -1496,13 +1482,13 @@ fn system(opts: Command) -> Result<()> {
         })?;
         for cgroup in opts.cgroup.iter() {
             let metadata = std::fs::metadata(cgroup)
-                .with_context(|| format!("Failed to access cgroup path: {}", cgroup))?;
+                .with_context(|| format!("Failed to access cgroup path: {cgroup}"))?;
             let cgroupid = metadata.ino().to_ne_bytes();
             let val = (1_u8).to_ne_bytes();
             skel.maps
                 .cgroups
                 .update(&cgroupid, &val, libbpf_rs::MapFlags::ANY)
-                .with_context(|| format!("Failed to add cgroup {} to BPF map", cgroup))?;
+                .with_context(|| format!("Failed to add cgroup {cgroup} to BPF map"))?;
         }
 
         for pid in opts.pid.iter() {
@@ -1510,7 +1496,7 @@ fn system(opts: Command) -> Result<()> {
             skel.maps
                 .pids
                 .update(&pid.to_ne_bytes(), &val, libbpf_rs::MapFlags::ANY)
-                .with_context(|| format!("Failed to add PID {} to BPF map", pid))?;
+                .with_context(|| format!("Failed to add PID {pid} to BPF map"))?;
         }
 
         if collect_pystacks {
@@ -1684,7 +1670,7 @@ fn reexec_with_systemd_run() -> Result<i32> {
 
     // Build the systemd-run command
     let mut cmd = ProcessCommand::new("systemd-run");
-    cmd.arg(format!("--uid={}", uid))
+    cmd.arg(format!("--uid={uid}"))
         .arg("--wait")
         .arg("--pty")
         .arg("--same-dir")
@@ -1694,7 +1680,7 @@ fn reexec_with_systemd_run() -> Result<i32> {
     let env_vars = ["DEBUGINFOD_URLS", "PATH", "HOME", "USER"];
     for var in &env_vars {
         if env::var(var).is_ok() {
-            cmd.arg(format!("--setenv={}", var));
+            cmd.arg(format!("--setenv={var}"));
         }
     }
 

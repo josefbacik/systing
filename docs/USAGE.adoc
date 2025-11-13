@@ -270,7 +270,8 @@ The configuration is a JSON file with the following format.
       "args": [
         {
           "arg_index": 0,
-          "arg_type": "long"
+          "arg_type": "long",
+          "arg_name": "value"
         }
       ]
     },
@@ -280,7 +281,8 @@ The configuration is a JSON file with the following format.
       "args": [
         {
           "arg_index": 0,
-          "arg_type": "long"
+          "arg_type": "long",
+          "arg_name": "value"
         }
       ]
     },
@@ -291,7 +293,8 @@ The configuration is a JSON file with the following format.
       "args": [
         {
           "arg_index": 0,
-          "arg_type": "long"
+          "arg_type": "long",
+          "arg_name": "value"
         }
       ]
     }
@@ -343,8 +346,8 @@ This is used in conjunction with the *--continuous* option.
 
 `args` is an optional set of arguments to be extracted from the probe event.
 Currently only 1 is supported.
-The captured argument will show up as an annotation on the event in the trace, providing additional context when viewing in `perfetto`.
-Each arg specifies an `arg_index` (0-based) and `arg_type` ("string" or "long").
+The captured argument will show up as a debug annotation on the event in the trace, providing additional context when viewing in `perfetto`.
+Each arg specifies an `arg_index` (0-based), `arg_type` ("string" or "long"), and `arg_name` (the name of the debug annotation).
 NOTE: For `tracepoint` events we use `raw_tracepoint`, which reads the args from the TP_EVENT definition, not what is found in /sys/kernel/debug/tracing/events/category/name/format.
 
 `percpu` is set to true if the event is keyed to a CPU and not a specific thread.
