@@ -267,20 +267,20 @@ The configuration is a JSON file with the following format.
     {
       "name": "tracepoint_start",
       "event": "_EVENT_",
-      "keys": [
+      "args": [
         {
-          "key_index": 0,
-          "key_type": "long"
+          "arg_index": 0,
+          "arg_type": "long"
         }
       ]
     },
     {
       "name": "tracepoint_end",
       "event": "_EVENT_",
-      "keys": [
+      "args": [
         {
-          "key_index": 0,
-          "key_type": "long"
+          "arg_index": 0,
+          "arg_type": "long"
         }
       ]
     },
@@ -288,10 +288,10 @@ The configuration is a JSON file with the following format.
       "name": "tracepoint_instant",
       "event": "_EVENT_",
       "percpu": true,
-      "keys": [
+      "args": [
         {
-          "key_index": 0,
-          "key_type": "long"
+          "arg_index": 0,
+          "arg_type": "long"
         }
       ]
     }
@@ -341,9 +341,10 @@ You can specify multiple `ranges` or `instants` per track.
 `stop_triggers` can be optionally specified to stop the trace when a certain condition is met.
 This is used in conjunction with the *--continuous* option.
 
-`keys` is an optional set of extra data to be extracted from the trace event.
-Currently only 1 is suspported.
-The value will be attached to the trace event and be visible with the event in `perfetto`.
+`args` is an optional set of arguments to be extracted from the probe event.
+Currently only 1 is supported.
+The captured argument will show up as an annotation on the event in the trace, providing additional context when viewing in `perfetto`.
+Each arg specifies an `arg_index` (0-based) and `arg_type` ("string" or "long").
 NOTE: For `tracepoint` events we use `raw_tracepoint`, which reads the args from the TP_EVENT definition, not what is found in /sys/kernel/debug/tracing/events/category/name/format.
 
 `percpu` is set to true if the event is keyed to a CPU and not a specific thread.

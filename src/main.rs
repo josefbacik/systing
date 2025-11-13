@@ -1207,15 +1207,15 @@ fn attach_probes(
     let probe_recorder = recorder.probe_recorder.lock().unwrap();
 
     for event in probe_recorder.config_events.values() {
-        for key in event.keys.iter() {
-            let key_type = match key.key_type {
+        for arg in event.args.iter() {
+            let bpf_arg_type = match arg.arg_type {
                 EventKeyType::String => arg_type::ARG_STRING,
                 EventKeyType::Long => arg_type::ARG_LONG,
             };
 
             let desc = arg_desc {
-                arg_type: key_type,
-                arg_index: key.key_index as i32,
+                arg_type: bpf_arg_type,
+                arg_index: arg.arg_index as i32,
             };
 
             // Safe because we're not padded

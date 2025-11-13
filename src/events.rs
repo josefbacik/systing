@@ -172,17 +172,16 @@ pub enum EventKeyType {
 
 #[derive(Clone, Default)]
 pub struct EventKey {
-    pub key_index: u8,
-    pub key_type: EventKeyType,
+    pub arg_index: u8,
+    pub arg_type: EventKeyType,
 }
 
-// Any configured event is turned into this object
 #[derive(Clone, Default)]
 pub struct SystingEvent {
     pub name: String,
     pub cookie: u64,
     pub event: EventProbe,
-    pub keys: Vec<EventKey>,
+    pub args: Vec<EventKey>,
     percpu: bool,
 }
 
@@ -193,17 +192,23 @@ pub struct SystingEvent {
 //       "name": "event_name",
 //       "event": "<PROBE TYPE SPECIFIC FORMAT>",
 //       "percpu": false,
-//       "keys": [
+//       "args": [
 //         {
-//           "key_index": 0,
-//           "key_type": "string"
+//           "arg_index": 0,
+//           "arg_type": "string"
 //         },
 //         {
-//           "key_index": 1,
-//           "key_type": "long"
+//           "arg_index": 1,
+//           "arg_type": "long"
 //         }
 //      ]
+//     }
 //   ],
+//
+//   Args are optional and will show up as annotations on the events in the trace.
+//   The arg_index specifies which argument to capture (0-based), and arg_type
+//   specifies the type ("string" or "long").
+//
 //   "tracks": [
 //     {
 //       "track_name": "track_name",
@@ -254,7 +259,7 @@ struct SystingJSONEvent {
     name: String,
     event: String,
     percpu: Option<bool>,
-    keys: Option<Vec<SystingJSONEventKey>>,
+    args: Option<Vec<SystingJSONEventKey>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -297,8 +302,8 @@ struct SystingInstant {
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct SystingJSONEventKey {
-    key_index: u8,
-    key_type: String,
+    arg_index: u8,
+    arg_type: String,
 }
 
 impl UProbeEvent {
@@ -897,22 +902,22 @@ impl SystingProbeRecorder {
         event: &SystingJSONEvent,
         rng: &mut dyn rand::RngCore,
     ) -> Result<()> {
-        let mut keys = Vec::new();
-        if event.keys.iter().flatten().count() > 1 {
+        let mut args = Vec::new();
+        if event.args.iter().flatten().count() > 1 {
             return Err(anyhow::anyhow!(
-                "Only one key is allowed per event: {}",
+                "Only one arg is allowed per event: {}",
                 event.name
             ));
         }
-        for key in event.keys.iter().flatten() {
-            let key_type = match key.key_type.as_str() {
+        for json_arg in event.args.iter().flatten() {
+            let arg_type = match json_arg.arg_type.as_str() {
                 "string" => EventKeyType::String,
                 "long" => EventKeyType::Long,
-                _ => return Err(anyhow::anyhow!("Invalid key type: {}", key.key_type)),
+                _ => return Err(anyhow::anyhow!("Invalid arg type: {}", json_arg.arg_type)),
             };
-            keys.push(EventKey {
-                key_index: key.key_index,
-                key_type,
+            args.push(EventKey {
+                arg_index: json_arg.arg_index,
+                arg_type,
             });
         }
         let parts = event.event.split(':').collect::<Vec<&str>>();
@@ -926,7 +931,7 @@ impl SystingProbeRecorder {
                 "tracepoint" => EventProbe::Tracepoint(TracepointEvent::from_parts(parts)?),
                 _ => return Err(anyhow::anyhow!("Invalid event type")),
             },
-            keys,
+            args,
             percpu: event.percpu.unwrap_or(false),
         };
         if self.config_events.contains_key(&event.name) {

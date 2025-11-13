@@ -193,30 +193,30 @@ the mutex and the time that the mutex is locked by the thread.
     {
       "name": "mutex_entry",
       "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_entry",
-      "keys": [
+      "args": [
         {
-          "key_index": 0,
-          "key_type": "long"
+          "arg_index": 0,
+          "arg_type": "long"
         }
       ]
     },
     {
       "name": "mutex_acquired",
       "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_acquired",
-      "keys": [
+      "args": [
         {
-          "key_index": 0,
-          "key_type": "long"
+          "arg_index": 0,
+          "arg_type": "long"
         }
       ]
     },
     {
       "name": "mutex_release",
       "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_release",
-      "keys": [
+      "args": [
         {
-          "key_index": 0,
-          "key_type": "long"
+          "arg_index": 0,
+          "arg_type": "long"
         }
       ]
     },
@@ -240,6 +240,14 @@ the mutex and the time that the mutex is locked by the thread.
   ]
 }
 ```
+
+The `args` field is optional and allows you to capture probe arguments that will
+show up as annotations on the events in the trace. Each arg specifies:
+- `arg_index`: Which argument to capture (0-based index)
+- `arg_type`: The type of the argument ("string" or "long")
+
+These annotations provide additional context when viewing the trace, such as the
+mutex address in the example above.
 
 This results in a track that looks like this
 
