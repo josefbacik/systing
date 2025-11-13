@@ -991,18 +991,42 @@ impl SystingProbeRecorder {
         };
 
         // Validate retval args are only used with retprobes
-        let is_retprobe = match &probe {
-            EventProbe::UProbe(uprobe) => uprobe.retprobe,
-            EventProbe::KProbe(kprobe) => kprobe.retprobe,
-            _ => false,
-        };
-
         for arg in args.iter() {
-            if matches!(arg.arg_type, EventKeyType::Retval) && !is_retprobe {
-                return Err(anyhow::anyhow!(
-                    "retval arg type can only be used with kretprobe or uretprobe events: {}",
-                    event.name
-                ));
+            if matches!(arg.arg_type, EventKeyType::Retval) {
+                match &probe {
+                    EventProbe::UProbe(uprobe) if uprobe.retprobe => {}
+                    EventProbe::KProbe(kprobe) if kprobe.retprobe => {}
+                    EventProbe::UProbe(_) => {
+                        return Err(anyhow::anyhow!(
+                            "retval arg type requires uretprobe, not uprobe: {}",
+                            event.name
+                        ));
+                    }
+                    EventProbe::KProbe(_) => {
+                        return Err(anyhow::anyhow!(
+                            "retval arg type requires kretprobe, not kprobe: {}",
+                            event.name
+                        ));
+                    }
+                    EventProbe::Usdt(_) => {
+                        return Err(anyhow::anyhow!(
+                            "retval arg type is not supported for usdt probes: {}",
+                            event.name
+                        ));
+                    }
+                    EventProbe::Tracepoint(_) => {
+                        return Err(anyhow::anyhow!(
+                            "retval arg type is not supported for tracepoint events: {}",
+                            event.name
+                        ));
+                    }
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "retval arg type is only valid for kretprobe and uretprobe events: {}",
+                            event.name
+                        ));
+                    }
+                }
             }
         }
 
@@ -2809,7 +2833,7 @@ mod tests {
     }
 
     #[test]
-    fn test_retval_invalid_on_non_retprobe() {
+    fn test_retval_invalid_on_uprobe() {
         let mut rng = StepRng::new(0, 1);
         let mut recorder = SystingProbeRecorder::default();
         let json = r#"
@@ -2835,7 +2859,100 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "retval arg type can only be used with kretprobe or uretprobe events: uprobe_event"
+            "retval arg type requires uretprobe, not uprobe: uprobe_event"
+        );
+    }
+
+    #[test]
+    fn test_retval_invalid_on_kprobe() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "kprobe_event",
+                    "event": "kprobe:symbol",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "retval arg type requires kretprobe, not kprobe: kprobe_event"
+        );
+    }
+
+    #[test]
+    fn test_retval_invalid_on_usdt() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "usdt_event",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "retval arg type is not supported for usdt probes: usdt_event"
+        );
+    }
+
+    #[test]
+    fn test_retval_invalid_on_tracepoint() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "tracepoint_event",
+                    "event": "tracepoint:category:name",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "retval arg type is not supported for tracepoint events: tracepoint_event"
         );
     }
 

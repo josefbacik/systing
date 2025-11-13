@@ -1190,25 +1190,23 @@ int systing_usdt(struct pt_regs *ctx)
 			event->args[i].type = ARG_NONE;
 			event->args[i].size = 0;
 
+			// ARG_RETVAL not supported for USDT - skip it
 			if (desc->arg_type == ARG_RETVAL) {
-				val = PT_REGS_RC_CORE(ctx);
-				__builtin_memcpy(&event->args[i].value, &val, sizeof(long));
-				event->args[i].type = ARG_RETVAL;
-				event->args[i].size = sizeof(long);
-			} else {
-				bpf_usdt_arg(ctx, desc->arg_index, &val);
+				continue;
+			}
 
-				if (val) {
-					if (desc->arg_type == ARG_STRING) {
-						int len = safe_probe_read_user_str(&event->args[i].value,
-										   sizeof(event->args[i].value), (long *)val);
-						event->args[i].type = ARG_STRING;
-						event->args[i].size = len > 0 ? len : 0;
-					} else if (desc->arg_type == ARG_LONG) {
-						__builtin_memcpy(&event->args[i].value, &val, sizeof(long));
-						event->args[i].type = ARG_LONG;
-						event->args[i].size = sizeof(long);
-					}
+			bpf_usdt_arg(ctx, desc->arg_index, &val);
+
+			if (val) {
+				if (desc->arg_type == ARG_STRING) {
+					int len = safe_probe_read_user_str(&event->args[i].value,
+									   sizeof(event->args[i].value), (long *)val);
+					event->args[i].type = ARG_STRING;
+					event->args[i].size = len > 0 ? len : 0;
+				} else if (desc->arg_type == ARG_LONG) {
+					__builtin_memcpy(&event->args[i].value, &val, sizeof(long));
+					event->args[i].type = ARG_LONG;
+					event->args[i].size = sizeof(long);
 				}
 			}
 		}
