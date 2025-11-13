@@ -176,6 +176,7 @@ pub enum EventKeyType {
     String,
     #[default]
     Long,
+    Retval,
 }
 
 #[derive(Clone, Default)]
@@ -218,8 +219,9 @@ pub struct SystingEvent {
 //
 //   Args are optional and will show up as debug annotations on the events in the trace.
 //   Up to 4 args can be specified per event. The arg_index specifies which argument
-//   to capture (0-based), arg_type specifies the type ("string" or "long"), and
-//   arg_name specifies the name of the annotation.
+//   to capture (0-based), arg_type specifies the type ("string", "long", or "retval"),
+//   and arg_name specifies the name of the annotation. The "retval" type captures the
+//   function return value and is only valid for kretprobe and uretprobe events.
 //
 //   "tracks": [
 //     {
@@ -514,6 +516,12 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
 
             match bpf_arg.r#type {
                 crate::systing::types::arg_type::ARG_LONG => {
+                    let mut bytes: [u8; 8] = [0; 8];
+                    let _ = bytes.copy_from_bytes(&bpf_arg.value[..8]);
+                    let val = u64::from_ne_bytes(bytes);
+                    arg_data.push((event_key.arg_name.clone(), ArgValue::Long(val)));
+                }
+                crate::systing::types::arg_type::ARG_RETVAL => {
                     let mut bytes: [u8; 8] = [0; 8];
                     let _ = bytes.copy_from_bytes(&bpf_arg.value[..8]);
                     let val = u64::from_ne_bytes(bytes);
@@ -964,6 +972,7 @@ impl SystingProbeRecorder {
             let arg_type = match json_arg.arg_type.as_str() {
                 "string" => EventKeyType::String,
                 "long" => EventKeyType::Long,
+                "retval" => EventKeyType::Retval,
                 _ => return Err(anyhow::anyhow!("Invalid arg type: {}", json_arg.arg_type)),
             };
             args.push(EventKey {
@@ -973,16 +982,34 @@ impl SystingProbeRecorder {
             });
         }
         let parts = event.event.split(':').collect::<Vec<&str>>();
+        let probe = match parts[0] {
+            "usdt" => EventProbe::Usdt(UsdtProbeEvent::from_parts(parts)?),
+            "uprobe" | "uretprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
+            "kprobe" | "kretprobe" => EventProbe::KProbe(KProbeEvent::from_parts(parts)?),
+            "tracepoint" => EventProbe::Tracepoint(TracepointEvent::from_parts(parts)?),
+            _ => return Err(anyhow::anyhow!("Invalid event type")),
+        };
+
+        // Validate retval args are only used with retprobes
+        let is_retprobe = match &probe {
+            EventProbe::UProbe(uprobe) => uprobe.retprobe,
+            EventProbe::KProbe(kprobe) => kprobe.retprobe,
+            _ => false,
+        };
+
+        for arg in args.iter() {
+            if matches!(arg.arg_type, EventKeyType::Retval) && !is_retprobe {
+                return Err(anyhow::anyhow!(
+                    "retval arg type can only be used with kretprobe or uretprobe events: {}",
+                    event.name
+                ));
+            }
+        }
+
         let event = SystingEvent {
             name: event.name.clone(),
             cookie: rng.next_u64(),
-            event: match parts[0] {
-                "usdt" => EventProbe::Usdt(UsdtProbeEvent::from_parts(parts)?),
-                "uprobe" | "uretprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
-                "kprobe" | "kretprobe" => EventProbe::KProbe(KProbeEvent::from_parts(parts)?),
-                "tracepoint" => EventProbe::Tracepoint(TracepointEvent::from_parts(parts)?),
-                _ => return Err(anyhow::anyhow!("Invalid event type")),
-            },
+            event: probe,
             args,
             percpu: event.percpu.unwrap_or(false),
         };
@@ -2733,6 +2760,83 @@ mod tests {
         assert_eq!(event.args[2].arg_index, 2);
         assert!(matches!(event.args[2].arg_type, EventKeyType::Long));
         assert_eq!(event.args[2].arg_name, "offset");
+    }
+
+    #[test]
+    fn test_event_with_retval() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "uretprobe_event",
+                    "event": "uretprobe:/path/to/file:symbol",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                },
+                {
+                    "name": "kretprobe_event",
+                    "event": "kretprobe:symbol",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "retval",
+                        "arg_name": "result"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        let event = recorder.config_events.get("uretprobe_event").unwrap();
+        assert_eq!(event.args.len(), 1);
+        assert!(matches!(event.args[0].arg_type, EventKeyType::Retval));
+        assert_eq!(event.args[0].arg_name, "return_value");
+        let event = recorder.config_events.get("kretprobe_event").unwrap();
+        assert_eq!(event.args.len(), 1);
+        assert!(matches!(event.args[0].arg_type, EventKeyType::Retval));
+        assert_eq!(event.args[0].arg_name, "result");
+    }
+
+    #[test]
+    fn test_retval_invalid_on_non_retprobe() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "uprobe_event",
+                    "event": "uprobe:/path/to/file:symbol",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "retval arg type can only be used with kretprobe or uretprobe events: uprobe_event"
+        );
     }
 
     #[test]

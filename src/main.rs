@@ -1215,6 +1215,7 @@ fn attach_probes(
             let bpf_arg_type = match arg.arg_type {
                 EventKeyType::String => arg_type::ARG_STRING,
                 EventKeyType::Long => arg_type::ARG_LONG,
+                EventKeyType::Retval => arg_type::ARG_RETVAL,
             };
 
             desc_array.args[i] = arg_desc {

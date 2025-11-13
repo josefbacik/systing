@@ -248,8 +248,13 @@ The `args` field is optional and allows you to capture probe arguments that will
 show up as debug annotations on the events in the trace. Up to 4 args can be
 captured per event. Each arg specifies:
 - `arg_index`: Which argument to capture (0-based index)
-- `arg_type`: The type of the argument ("string" or "long")
+- `arg_type`: The type of the argument ("string", "long", or "retval")
 - `arg_name`: The name of the debug annotation (e.g., "mutex_addr")
+
+Available arg types:
+- `"string"`: Captures a string pointer argument
+- `"long"`: Captures a 64-bit integer argument
+- `"retval"`: Captures the function return value (only valid for kretprobe and uretprobe)
 
 These debug annotations provide additional context when viewing the trace in
 Perfetto, showing the captured value with the specified name. In the example

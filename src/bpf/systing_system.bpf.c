@@ -92,6 +92,7 @@ enum arg_type {
 	ARG_NONE,
 	ARG_LONG,
 	ARG_STRING,
+	ARG_RETVAL,
 };
 
 struct arg_desc {
@@ -1185,21 +1186,29 @@ int systing_usdt(struct pt_regs *ctx)
 		for (int i = 0; i < MAX_ARGS && i < desc_array->num_args; i++) {
 			struct arg_desc *desc = &desc_array->args[i];
 			long val = 0;
-			bpf_usdt_arg(ctx, desc->arg_index, &val);
 
 			event->args[i].type = ARG_NONE;
 			event->args[i].size = 0;
 
-			if (val) {
-				if (desc->arg_type == ARG_STRING) {
-					int len = safe_probe_read_user_str(&event->args[i].value,
-									   sizeof(event->args[i].value), (long *)val);
-					event->args[i].type = ARG_STRING;
-					event->args[i].size = len > 0 ? len : 0;
-				} else if (desc->arg_type == ARG_LONG) {
-					__builtin_memcpy(&event->args[i].value, &val, sizeof(long));
-					event->args[i].type = ARG_LONG;
-					event->args[i].size = sizeof(long);
+			if (desc->arg_type == ARG_RETVAL) {
+				val = PT_REGS_RC_CORE(ctx);
+				__builtin_memcpy(&event->args[i].value, &val, sizeof(long));
+				event->args[i].type = ARG_RETVAL;
+				event->args[i].size = sizeof(long);
+			} else {
+				bpf_usdt_arg(ctx, desc->arg_index, &val);
+
+				if (val) {
+					if (desc->arg_type == ARG_STRING) {
+						int len = safe_probe_read_user_str(&event->args[i].value,
+										   sizeof(event->args[i].value), (long *)val);
+						event->args[i].type = ARG_STRING;
+						event->args[i].size = len > 0 ? len : 0;
+					} else if (desc->arg_type == ARG_LONG) {
+						__builtin_memcpy(&event->args[i].value, &val, sizeof(long));
+						event->args[i].type = ARG_LONG;
+						event->args[i].size = sizeof(long);
+					}
 				}
 			}
 		}
@@ -1290,39 +1299,46 @@ static void handle_probe_event(struct pt_regs *ctx, bool kernel)
 			struct arg_desc *desc = &desc_array->args[i];
 			u64 arg = 0;
 
-			if (desc->arg_index == 0) {
-				arg = PT_REGS_PARM1_CORE(ctx);
-			} else if (desc->arg_index == 1) {
-				arg = PT_REGS_PARM2_CORE(ctx);
-			} else if (desc->arg_index == 2) {
-				arg = PT_REGS_PARM3_CORE(ctx);
-			} else if (desc->arg_index == 3) {
-				arg = PT_REGS_PARM4_CORE(ctx);
-			} else if (desc->arg_index == 4) {
-				arg = PT_REGS_PARM5_CORE(ctx);
-			} else if (desc->arg_index == 5) {
-				arg = PT_REGS_PARM6_CORE(ctx);
-			}
-
 			event->args[i].type = ARG_NONE;
 			event->args[i].size = 0;
 
-			if (desc->arg_type == ARG_STRING) {
-				int len;
-				if (kernel)
-					len = safe_probe_read_kernel_str(&event->args[i].value,
-									 sizeof(event->args[i].value),
-									 (void *)arg);
-				else
-					len = safe_probe_read_user_str(&event->args[i].value,
-								       sizeof(event->args[i].value),
-								       (void *)arg);
-				event->args[i].type = ARG_STRING;
-				event->args[i].size = len > 0 ? len : 0;
-			} else if (desc->arg_type == ARG_LONG) {
+			if (desc->arg_type == ARG_RETVAL) {
+				arg = PT_REGS_RC_CORE(ctx);
 				__builtin_memcpy(&event->args[i].value, &arg, sizeof(u64));
-				event->args[i].type = ARG_LONG;
+				event->args[i].type = ARG_RETVAL;
 				event->args[i].size = sizeof(u64);
+			} else {
+				if (desc->arg_index == 0) {
+					arg = PT_REGS_PARM1_CORE(ctx);
+				} else if (desc->arg_index == 1) {
+					arg = PT_REGS_PARM2_CORE(ctx);
+				} else if (desc->arg_index == 2) {
+					arg = PT_REGS_PARM3_CORE(ctx);
+				} else if (desc->arg_index == 3) {
+					arg = PT_REGS_PARM4_CORE(ctx);
+				} else if (desc->arg_index == 4) {
+					arg = PT_REGS_PARM5_CORE(ctx);
+				} else if (desc->arg_index == 5) {
+					arg = PT_REGS_PARM6_CORE(ctx);
+				}
+
+				if (desc->arg_type == ARG_STRING) {
+					int len;
+					if (kernel)
+						len = safe_probe_read_kernel_str(&event->args[i].value,
+										 sizeof(event->args[i].value),
+										 (void *)arg);
+					else
+						len = safe_probe_read_user_str(&event->args[i].value,
+									       sizeof(event->args[i].value),
+									       (void *)arg);
+					event->args[i].type = ARG_STRING;
+					event->args[i].size = len > 0 ? len : 0;
+				} else if (desc->arg_type == ARG_LONG) {
+					__builtin_memcpy(&event->args[i].value, &arg, sizeof(u64));
+					event->args[i].type = ARG_LONG;
+					event->args[i].size = sizeof(u64);
+				}
 			}
 		}
 	}
@@ -1384,6 +1400,14 @@ int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
 			struct arg_desc *desc = &desc_array->args[i];
 			u64 arg = 0;
 
+			event->args[i].type = ARG_NONE;
+			event->args[i].size = 0;
+
+			// ARG_RETVAL not supported for raw_tracepoint - skip it
+			if (desc->arg_type == ARG_RETVAL) {
+				continue;
+			}
+
 			if (desc->arg_index == 0) {
 				bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[0]);
 			} else if (desc->arg_index == 1) {
@@ -1397,9 +1421,6 @@ int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
 			} else if (desc->arg_index == 5) {
 				bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[5]);
 			}
-
-			event->args[i].type = ARG_NONE;
-			event->args[i].size = 0;
 
 			if (desc->arg_type == ARG_STRING) {
 				int len = safe_probe_read_kernel_str(&event->args[i].value,

@@ -347,7 +347,14 @@ This is used in conjunction with the *--continuous* option.
 `args` is an optional set of arguments to be extracted from the probe event.
 Up to 4 arguments can be captured per event.
 The captured arguments will show up as debug annotations on the event in the trace, providing additional context when viewing in `perfetto`.
-Each arg specifies an `arg_index` (0-based), `arg_type` ("string" or "long"), and `arg_name` (the name of the debug annotation).
+Each arg specifies an `arg_index` (0-based), `arg_type`, and `arg_name` (the name of the debug annotation).
+
+Available arg types:
+
+* `"string"` - Captures a string pointer argument
+* `"long"` - Captures a 64-bit integer argument
+* `"retval"` - Captures the function return value (only valid for `kretprobe` and `uretprobe` events)
+
 NOTE: For `tracepoint` events we use `raw_tracepoint`, which reads the args from the TP_EVENT definition, not what is found in /sys/kernel/debug/tracing/events/category/name/format.
 
 `percpu` is set to true if the event is keyed to a CPU and not a specific thread.
