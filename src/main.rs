@@ -942,7 +942,7 @@ fn configure_bpf_skeleton(
             if name.starts_with("ringbuf_network_events_")
                 || name.starts_with("ringbuf_packet_events_")
             {
-                map.set_max_entries(0).with_context(|| {
+                map.set_max_entries(1).with_context(|| {
                     format!(
                         "Failed to set network ringbuf map '{}' to zero capacity",
                         name
