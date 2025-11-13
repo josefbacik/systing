@@ -338,6 +338,7 @@ pub trait SystingEvent {
 }
 
 use systing::types::arg_desc;
+use systing::types::arg_desc_array;
 use systing::types::arg_type;
 use systing::types::event_type;
 use systing::types::network_event;
@@ -357,6 +358,7 @@ unsafe impl Plain for syscall_event {}
 unsafe impl Plain for network_event {}
 unsafe impl Plain for packet_event {}
 unsafe impl Plain for arg_desc {}
+unsafe impl Plain for arg_desc_array {}
 
 impl SystingEvent for task_event {
     fn ts(&self) -> u64 {
@@ -1200,25 +1202,34 @@ fn attach_probes(
     let probe_recorder = recorder.probe_recorder.lock().unwrap();
 
     for event in probe_recorder.config_events.values() {
-        for arg in event.args.iter() {
+        let mut desc_array = arg_desc_array {
+            num_args: event.args.len() as u8,
+            pad: [0; 3],
+            args: [arg_desc {
+                arg_type: arg_type::ARG_NONE,
+                arg_index: 0,
+            }; 4],
+        };
+
+        for (i, arg) in event.args.iter().enumerate() {
             let bpf_arg_type = match arg.arg_type {
                 EventKeyType::String => arg_type::ARG_STRING,
                 EventKeyType::Long => arg_type::ARG_LONG,
             };
 
-            let desc = arg_desc {
+            desc_array.args[i] = arg_desc {
                 arg_type: bpf_arg_type,
                 arg_index: arg.arg_index as i32,
             };
-
-            // Safe because we're not padded
-            let desc_data = unsafe { plain::as_bytes(&desc) };
-            skel.maps.event_key_types.update(
-                &event.cookie.to_ne_bytes(),
-                desc_data,
-                libbpf_rs::MapFlags::ANY,
-            )?;
         }
+
+        // Safe because we're not padded
+        let desc_data = unsafe { plain::as_bytes(&desc_array) };
+        skel.maps.event_key_types.update(
+            &event.cookie.to_ne_bytes(),
+            desc_data,
+            libbpf_rs::MapFlags::ANY,
+        )?;
 
         match &event.event {
             EventProbe::Usdt(usdt) => {

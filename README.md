@@ -245,7 +245,8 @@ the mutex and the time that the mutex is locked by the thread.
 ```
 
 The `args` field is optional and allows you to capture probe arguments that will
-show up as debug annotations on the events in the trace. Each arg specifies:
+show up as debug annotations on the events in the trace. Up to 4 args can be
+captured per event. Each arg specifies:
 - `arg_index`: Which argument to capture (0-based index)
 - `arg_type`: The type of the argument ("string" or "long")
 - `arg_name`: The name of the debug annotation (e.g., "mutex_addr")

@@ -28,14 +28,14 @@ enum ArgValue {
 struct TrackInstant {
     ts: u64,
     name: String,
-    arg: Option<(String, ArgValue)>,
+    args: Vec<(String, ArgValue)>,
 }
 
 struct TrackRange {
     range_name: String,
     start: u64,
     end: u64,
-    arg: Option<(String, ArgValue)>,
+    args: Vec<(String, ArgValue)>,
 }
 
 struct ThresholdStopTrigger {
@@ -217,8 +217,9 @@ pub struct SystingEvent {
 //   ],
 //
 //   Args are optional and will show up as debug annotations on the events in the trace.
-//   The arg_index specifies which argument to capture (0-based), arg_type specifies
-//   the type ("string" or "long"), and arg_name specifies the name of the annotation.
+//   Up to 4 args can be specified per event. The arg_index specifies which argument
+//   to capture (0-based), arg_type specifies the type ("string" or "long"), and
+//   arg_name specifies the name of the annotation.
 //
 //   "tracks": [
 //     {
@@ -500,23 +501,30 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
 
     fn handle_event(&mut self, event: probe_event) {
         let systing_event = self.cookies.get(&event.cookie).unwrap();
-        let mut arg_data: Option<(String, ArgValue)> = None;
+        let mut arg_data: Vec<(String, ArgValue)> = Vec::new();
 
-        // Capture the arg if there is one.
-        if let Some(event_key) = systing_event.args.first() {
-            match event.arg_type {
+        let num_args = event.num_args.min(event.args.len() as u8);
+        for i in 0..num_args as usize {
+            if i >= systing_event.args.len() {
+                break;
+            }
+
+            let bpf_arg = &event.args[i];
+            let event_key = &systing_event.args[i];
+
+            match bpf_arg.r#type {
                 crate::systing::types::arg_type::ARG_LONG => {
                     let mut bytes: [u8; 8] = [0; 8];
-                    let _ = bytes.copy_from_bytes(&event.arg[..8]);
+                    let _ = bytes.copy_from_bytes(&bpf_arg.value[..8]);
                     let val = u64::from_ne_bytes(bytes);
-                    arg_data = Some((event_key.arg_name.clone(), ArgValue::Long(val)));
+                    arg_data.push((event_key.arg_name.clone(), ArgValue::Long(val)));
                 }
                 crate::systing::types::arg_type::ARG_STRING => {
-                    let arg_str = CStr::from_bytes_until_nul(&event.arg);
+                    let arg_str = CStr::from_bytes_until_nul(&bpf_arg.value);
                     if let Ok(arg_str) = arg_str {
                         let bytes = arg_str.to_bytes();
                         if !bytes.is_empty() && !bytes.starts_with(&[0]) {
-                            arg_data = Some((
+                            arg_data.push((
                                 event_key.arg_name.clone(),
                                 ArgValue::String(arg_str.to_string_lossy().to_string()),
                             ));
@@ -584,8 +592,8 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
 }
 
 impl SystingProbeRecorder {
-    fn add_arg_annotation(tevent: &mut TrackEvent, arg: &Option<(String, ArgValue)>) {
-        if let Some((name, value)) = arg {
+    fn add_arg_annotations(tevent: &mut TrackEvent, args: &[(String, ArgValue)]) {
+        for (name, value) in args {
             let mut annotation = DebugAnnotation::default();
             annotation.set_name(name.clone());
             match value {
@@ -596,7 +604,7 @@ impl SystingProbeRecorder {
         }
     }
 
-    fn handle_cpu_event(&mut self, event: probe_event, arg_data: Option<(String, ArgValue)>) {
+    fn handle_cpu_event(&mut self, event: probe_event, arg_data: Vec<(String, ArgValue)>) {
         let systing_event = self.cookies.get(&event.cookie).unwrap();
 
         // If this is an instant event just add it to the list of events
@@ -607,7 +615,7 @@ impl SystingProbeRecorder {
             entry.push(TrackInstant {
                 ts: event.ts,
                 name: format!("{systing_event}"),
-                arg: arg_data,
+                args: arg_data,
             });
             return;
         }
@@ -631,13 +639,13 @@ impl SystingProbeRecorder {
             if let Some(ranges) = self.outstanding_cpu_ranges.get_mut(&event.cpu) {
                 if let Some(range) = ranges.get_mut(range_name) {
                     range.start = event.ts;
-                    range.arg = arg_data;
+                    range.args = arg_data;
                 } else {
                     let range = TrackRange {
                         range_name: range_name.clone(),
                         start: event.ts,
                         end: 0,
-                        arg: arg_data,
+                        args: arg_data,
                     };
                     ranges.insert(range_name.clone(), range);
                 }
@@ -647,7 +655,7 @@ impl SystingProbeRecorder {
                     range_name: range_name.clone(),
                     start: event.ts,
                     end: 0,
-                    arg: arg_data,
+                    args: arg_data,
                 };
                 ranges.insert(range_name.clone(), range);
                 self.outstanding_cpu_ranges.insert(event.cpu, ranges);
@@ -655,7 +663,7 @@ impl SystingProbeRecorder {
         }
     }
 
-    fn handle_process_event(&mut self, event: probe_event, arg_data: Option<(String, ArgValue)>) {
+    fn handle_process_event(&mut self, event: probe_event, arg_data: Vec<(String, ArgValue)>) {
         let systing_event = self.cookies.get(&event.cookie).unwrap();
 
         // If this is an instant event just add it to the list of events
@@ -666,7 +674,7 @@ impl SystingProbeRecorder {
             entry.push(TrackInstant {
                 ts: event.ts,
                 name: format!("{systing_event}"),
-                arg: arg_data,
+                args: arg_data,
             });
             return;
         }
@@ -690,13 +698,13 @@ impl SystingProbeRecorder {
             if let Some(ranges) = self.outstanding_ranges.get_mut(&event.task.tgidpid) {
                 if let Some(range) = ranges.get_mut(range_name) {
                     range.start = event.ts;
-                    range.arg = arg_data;
+                    range.args = arg_data;
                 } else {
                     let range = TrackRange {
                         range_name: range_name.clone(),
                         start: event.ts,
                         end: 0,
-                        arg: arg_data,
+                        args: arg_data,
                     };
                     ranges.insert(range_name.clone(), range);
                 }
@@ -706,7 +714,7 @@ impl SystingProbeRecorder {
                     range_name: range_name.clone(),
                     start: event.ts,
                     end: 0,
-                    arg: arg_data,
+                    args: arg_data,
                 };
                 ranges.insert(range_name.clone(), range);
                 self.outstanding_ranges.insert(event.task.tgidpid, ranges);
@@ -743,7 +751,7 @@ impl SystingProbeRecorder {
                     tevent.set_type(Type::TYPE_INSTANT);
                     tevent.set_name(event.name.clone());
                     tevent.set_track_uuid(desc_uuid);
-                    Self::add_arg_annotation(&mut tevent, &event.arg);
+                    Self::add_arg_annotations(&mut tevent, &event.args);
 
                     let mut packet = TracePacket::default();
                     packet.set_timestamp(event.ts);
@@ -775,7 +783,7 @@ impl SystingProbeRecorder {
                     tevent.set_type(Type::TYPE_SLICE_BEGIN);
                     tevent.set_name(range.range_name.clone());
                     tevent.set_track_uuid(desc_uuid);
-                    Self::add_arg_annotation(&mut tevent, &range.arg);
+                    Self::add_arg_annotations(&mut tevent, &range.args);
 
                     let mut packet = TracePacket::default();
                     packet.set_timestamp(range.start);
@@ -827,7 +835,7 @@ impl SystingProbeRecorder {
                     tevent.set_type(Type::TYPE_SLICE_BEGIN);
                     tevent.set_name(range.range_name.clone());
                     tevent.set_track_uuid(desc_uuid);
-                    Self::add_arg_annotation(&mut tevent, &range.arg);
+                    Self::add_arg_annotations(&mut tevent, &range.args);
 
                     let mut packet = TracePacket::default();
                     packet.set_timestamp(range.start);
@@ -878,7 +886,7 @@ impl SystingProbeRecorder {
                     tevent.set_type(Type::TYPE_INSTANT);
                     tevent.set_name(event.name.clone());
                     tevent.set_track_uuid(desc_uuid);
-                    Self::add_arg_annotation(&mut tevent, &event.arg);
+                    Self::add_arg_annotations(&mut tevent, &event.args);
 
                     let mut packet = TracePacket::default();
                     packet.set_timestamp(event.ts);
@@ -944,9 +952,11 @@ impl SystingProbeRecorder {
         rng: &mut dyn rand::RngCore,
     ) -> Result<()> {
         let mut args = Vec::new();
-        if event.args.iter().flatten().count() > 1 {
+        let arg_count = event.args.iter().flatten().count();
+        if arg_count > 4 {
             return Err(anyhow::anyhow!(
-                "Only one arg is allowed per event: {}",
+                "Maximum 4 args allowed per event, got {} for event: {}",
+                arg_count,
                 event.name
             ));
         }
@@ -2674,6 +2684,58 @@ mod tests {
     }
 
     #[test]
+    fn test_event_with_multiple_args() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_with_multiple_args",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "string",
+                        "arg_name": "filename"
+                      },
+                      {
+                        "arg_index": 1,
+                        "arg_type": "long",
+                        "arg_name": "size"
+                      },
+                      {
+                        "arg_index": 2,
+                        "arg_type": "long",
+                        "arg_name": "offset"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        assert_eq!(recorder.config_events.len(), 1);
+        let event = recorder
+            .config_events
+            .get("event_with_multiple_args")
+            .unwrap();
+        assert_eq!(event.args.len(), 3);
+        assert_eq!(event.args[0].arg_index, 0);
+        assert!(matches!(event.args[0].arg_type, EventKeyType::String));
+        assert_eq!(event.args[0].arg_name, "filename");
+        assert_eq!(event.args[1].arg_index, 1);
+        assert!(matches!(event.args[1].arg_type, EventKeyType::Long));
+        assert_eq!(event.args[1].arg_name, "size");
+        assert_eq!(event.args[2].arg_index, 2);
+        assert!(matches!(event.args[2].arg_type, EventKeyType::Long));
+        assert_eq!(event.args[2].arg_name, "offset");
+    }
+
+    #[test]
     fn test_event_too_many_args() {
         let mut rng = StepRng::new(0, 1);
         let mut recorder = SystingProbeRecorder::default();
@@ -2698,6 +2760,16 @@ mod tests {
                         "arg_index": 2,
                         "arg_type": "string",
                         "arg_name": "extra"
+                      },
+                      {
+                        "arg_index": 3,
+                        "arg_type": "long",
+                        "arg_name": "fourth"
+                      },
+                      {
+                        "arg_index": 4,
+                        "arg_type": "long",
+                        "arg_name": "fifth"
                       }
                     ]
                 }
@@ -2710,7 +2782,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "Only one arg is allowed per event: event_with_too_many_args"
+            "Maximum 4 args allowed per event, got 5 for event: event_with_too_many_args"
         );
     }
 
