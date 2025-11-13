@@ -351,9 +351,9 @@ Each arg specifies an `arg_index` (0-based), `arg_type`, and `arg_name` (the nam
 
 Available arg types:
 
-* `"string"` - Captures a string pointer argument
-* `"long"` - Captures a 64-bit integer argument
-* `"retval"` - Captures the function return value (only valid for `kretprobe` and `uretprobe` events)
+* `"string"` - Captures a string pointer argument (requires `arg_index`)
+* `"long"` - Captures a 64-bit integer argument (requires `arg_index`)
+* `"retval"` - Captures the function return value (only valid for `kretprobe` and `uretprobe` events; `arg_index` is optional and ignored)
 
 NOTE: For `tracepoint` events we use `raw_tracepoint`, which reads the args from the TP_EVENT definition, not what is found in /sys/kernel/debug/tracing/events/category/name/format.
 

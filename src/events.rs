@@ -171,7 +171,7 @@ pub enum EventProbe {
     Undefined,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub enum EventKeyType {
     String,
     #[default]
@@ -221,7 +221,8 @@ pub struct SystingEvent {
 //   Up to 4 args can be specified per event. The arg_index specifies which argument
 //   to capture (0-based), arg_type specifies the type ("string", "long", or "retval"),
 //   and arg_name specifies the name of the annotation. The "retval" type captures the
-//   function return value and is only valid for kretprobe and uretprobe events.
+//   function return value and is only valid for kretprobe and uretprobe events. The
+//   arg_index field is not used for "retval" type and should be omitted.
 //
 //   "tracks": [
 //     {
@@ -316,6 +317,7 @@ struct SystingInstant {
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct SystingJSONEventKey {
+    #[serde(default)]
     arg_index: u8,
     arg_type: String,
     arg_name: String,
@@ -975,6 +977,15 @@ impl SystingProbeRecorder {
                 "retval" => EventKeyType::Retval,
                 _ => return Err(anyhow::anyhow!("Invalid arg type: {}", json_arg.arg_type)),
             };
+
+            // Validate arg_index is not used with retval
+            if arg_type == EventKeyType::Retval && json_arg.arg_index != 0 {
+                return Err(anyhow::anyhow!(
+                    "arg_index must be 0 or omitted for retval type in event: {}",
+                    event.name
+                ));
+            }
+
             args.push(EventKey {
                 arg_index: json_arg.arg_index,
                 arg_type,
@@ -2798,7 +2809,6 @@ mod tests {
                     "event": "uretprobe:/path/to/file:symbol",
                     "args": [
                       {
-                        "arg_index": 0,
                         "arg_type": "retval",
                         "arg_name": "return_value"
                       }
@@ -2809,7 +2819,6 @@ mod tests {
                     "event": "kretprobe:symbol",
                     "args": [
                       {
-                        "arg_index": 0,
                         "arg_type": "retval",
                         "arg_name": "result"
                       }
@@ -2830,6 +2839,68 @@ mod tests {
         assert_eq!(event.args.len(), 1);
         assert!(matches!(event.args[0].arg_type, EventKeyType::Retval));
         assert_eq!(event.args[0].arg_name, "result");
+    }
+
+    #[test]
+    fn test_event_with_retval_no_arg_index() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "uretprobe_event",
+                    "event": "uretprobe:/path/to/file:symbol",
+                    "args": [
+                      {
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        let event = recorder.config_events.get("uretprobe_event").unwrap();
+        assert_eq!(event.args.len(), 1);
+        assert!(matches!(event.args[0].arg_type, EventKeyType::Retval));
+        assert_eq!(event.args[0].arg_name, "return_value");
+        assert_eq!(event.args[0].arg_index, 0);
+    }
+
+    #[test]
+    fn test_retval_with_nonzero_arg_index_rejected() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "uretprobe_event",
+                    "event": "uretprobe:/path/to/file:symbol",
+                    "args": [
+                      {
+                        "arg_index": 1,
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "arg_index must be 0 or omitted for retval type in event: uretprobe_event"
+        );
     }
 
     #[test]

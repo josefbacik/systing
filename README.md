@@ -252,9 +252,9 @@ captured per event. Each arg specifies:
 - `arg_name`: The name of the debug annotation (e.g., "mutex_addr")
 
 Available arg types:
-- `"string"`: Captures a string pointer argument
-- `"long"`: Captures a 64-bit integer argument
-- `"retval"`: Captures the function return value (only valid for kretprobe and uretprobe)
+- `"string"`: Captures a string pointer argument (requires `arg_index`)
+- `"long"`: Captures a 64-bit integer argument (requires `arg_index`)
+- `"retval"`: Captures the function return value (only valid for kretprobe and uretprobe; `arg_index` not used)
 
 These debug annotations provide additional context when viewing the trace in
 Perfetto, showing the captured value with the specified name. In the example
