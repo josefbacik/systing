@@ -92,6 +92,7 @@ enum arg_type {
 	ARG_NONE,
 	ARG_LONG,
 	ARG_STRING,
+	ARG_RETVAL,
 };
 
 struct arg_desc {
@@ -99,14 +100,22 @@ struct arg_desc {
 	int arg_index;
 };
 
-#define ARG_SIZE 64
+#define MAX_ARGS 4
+#define ARG_VALUE_SIZE 24
+
+struct arg_value {
+	enum arg_type type;
+	u16 size;
+	u8 value[ARG_VALUE_SIZE];
+};
+
 struct probe_event {
 	u32 cpu;
-	enum arg_type arg_type;
 	u64 ts;
 	u64 cookie;
 	struct task_info task;
-	u8 arg[ARG_SIZE];
+	u8 num_args;
+	struct arg_value args[MAX_ARGS];
 };
 
 struct stack_event {
@@ -252,12 +261,27 @@ struct {
 	__uint(max_entries, 10240);
 } irq_events SEC(".maps");
 
+struct arg_desc_array {
+	u8 num_args;
+	u8 pad[3];
+	struct arg_desc args[MAX_ARGS];
+};
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, u64);
-	__type(value, struct arg_desc);
+	__type(value, struct arg_desc_array);
 	__uint(max_entries, 10240);
 } event_key_types SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, u8);
+	__uint(max_entries, 10240);
+} event_stack_capture SEC(".maps");
+
+struct arg_desc_array _arg_desc_array = {0};
 
 struct network_send_info {
 	enum network_protocol protocol;
@@ -1160,25 +1184,46 @@ int systing_usdt(struct pt_regs *ctx)
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
 	event->cookie = cookie;
-	event->arg[0] = 0;
-	event->arg_type = ARG_NONE;
+	event->num_args = 0;
 
-	struct arg_desc *desc = bpf_map_lookup_elem(&event_key_types, &cookie);
-	if (desc) {
-		long val = 0;
-		bpf_usdt_arg(ctx, desc->arg_index, &val);
-		if (val) {
-			if (desc->arg_type == ARG_STRING) {
-				safe_probe_read_user_str(&event->arg,
-							sizeof(event->arg), (long *)val);
-				event->arg_type = ARG_STRING;
-			} else {
-				__builtin_memcpy(&event->arg, &val, sizeof(long));
-				event->arg_type = ARG_LONG;
+	struct arg_desc_array *desc_array = bpf_map_lookup_elem(&event_key_types, &cookie);
+	if (desc_array && desc_array->num_args > 0) {
+		event->num_args = desc_array->num_args < MAX_ARGS ? desc_array->num_args : MAX_ARGS;
+
+		for (int i = 0; i < MAX_ARGS && i < desc_array->num_args; i++) {
+			struct arg_desc *desc = &desc_array->args[i];
+			long val = 0;
+
+			event->args[i].type = ARG_NONE;
+			event->args[i].size = 0;
+
+			// ARG_RETVAL not supported for USDT - skip it
+			if (desc->arg_type == ARG_RETVAL) {
+				continue;
+			}
+
+			bpf_usdt_arg(ctx, desc->arg_index, &val);
+
+			if (val) {
+				if (desc->arg_type == ARG_STRING) {
+					int len = safe_probe_read_user_str(&event->args[i].value,
+									   sizeof(event->args[i].value), (long *)val);
+					event->args[i].type = ARG_STRING;
+					event->args[i].size = len > 0 ? len : 0;
+				} else if (desc->arg_type == ARG_LONG) {
+					__builtin_memcpy(&event->args[i].value, &val, sizeof(long));
+					event->args[i].type = ARG_LONG;
+					event->args[i].size = sizeof(long);
+				}
 			}
 		}
 	}
 	bpf_ringbuf_submit(event, 0);
+
+	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
+	if (should_capture_stack && *should_capture_stack)
+		emit_stack_event(ctx, task, STACK_RUNNING);
+
 	return 0;
 }
 
@@ -1254,41 +1299,64 @@ static void handle_probe_event(struct pt_regs *ctx, bool kernel)
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
 	event->cookie = cookie;
-	event->arg[0] = 0;
-	event->arg_type = ARG_NONE;
+	event->num_args = 0;
 
-	struct arg_desc *desc = bpf_map_lookup_elem(&event_key_types, &cookie);
-	if (desc) {
-		u64 arg = 0;
-		if (desc->arg_index == 0) {
-			arg = PT_REGS_PARM1_CORE(ctx);
-		} else if (desc->arg_index == 1) {
-			arg = PT_REGS_PARM2_CORE(ctx);
-		} else if (desc->arg_index == 2) {
-			arg = PT_REGS_PARM3_CORE(ctx);
-		} else if (desc->arg_index == 3) {
-			arg = PT_REGS_PARM4_CORE(ctx);
-		} else if (desc->arg_index == 4) {
-			arg = PT_REGS_PARM5_CORE(ctx);
-		} else if (desc->arg_index == 5) {
-			arg = PT_REGS_PARM6_CORE(ctx);
-		}
-		if (desc->arg_type == ARG_STRING) {
-			if (kernel)
-				safe_probe_read_kernel_str(&event->arg,
-							  sizeof(event->arg),
-							  (void *)arg);
-			else
-				safe_probe_read_user_str(&event->arg,
-							sizeof(event->arg),
-							(void *)arg);
-			event->arg_type = ARG_STRING;
-		} else if (desc->arg_type == ARG_LONG) {
-			__builtin_memcpy(&event->arg, &arg, sizeof(u64));
-			event->arg_type = ARG_LONG;
+	struct arg_desc_array *desc_array = bpf_map_lookup_elem(&event_key_types, &cookie);
+	if (desc_array && desc_array->num_args > 0) {
+		event->num_args = desc_array->num_args < MAX_ARGS ? desc_array->num_args : MAX_ARGS;
+
+		for (int i = 0; i < MAX_ARGS && i < desc_array->num_args; i++) {
+			struct arg_desc *desc = &desc_array->args[i];
+			u64 arg = 0;
+
+			event->args[i].type = ARG_NONE;
+			event->args[i].size = 0;
+
+			if (desc->arg_type == ARG_RETVAL) {
+				arg = PT_REGS_RC_CORE(ctx);
+				__builtin_memcpy(&event->args[i].value, &arg, sizeof(u64));
+				event->args[i].type = ARG_RETVAL;
+				event->args[i].size = sizeof(u64);
+			} else {
+				if (desc->arg_index == 0) {
+					arg = PT_REGS_PARM1_CORE(ctx);
+				} else if (desc->arg_index == 1) {
+					arg = PT_REGS_PARM2_CORE(ctx);
+				} else if (desc->arg_index == 2) {
+					arg = PT_REGS_PARM3_CORE(ctx);
+				} else if (desc->arg_index == 3) {
+					arg = PT_REGS_PARM4_CORE(ctx);
+				} else if (desc->arg_index == 4) {
+					arg = PT_REGS_PARM5_CORE(ctx);
+				} else if (desc->arg_index == 5) {
+					arg = PT_REGS_PARM6_CORE(ctx);
+				}
+
+				if (desc->arg_type == ARG_STRING) {
+					int len;
+					if (kernel)
+						len = safe_probe_read_kernel_str(&event->args[i].value,
+										 sizeof(event->args[i].value),
+										 (void *)arg);
+					else
+						len = safe_probe_read_user_str(&event->args[i].value,
+									       sizeof(event->args[i].value),
+									       (void *)arg);
+					event->args[i].type = ARG_STRING;
+					event->args[i].size = len > 0 ? len : 0;
+				} else if (desc->arg_type == ARG_LONG) {
+					__builtin_memcpy(&event->args[i].value, &arg, sizeof(u64));
+					event->args[i].type = ARG_LONG;
+					event->args[i].size = sizeof(u64);
+				}
+			}
 		}
 	}
 	bpf_ringbuf_submit(event, 0);
+
+	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
+	if (should_capture_stack && *should_capture_stack)
+		emit_stack_event(ctx, task, STACK_RUNNING);
 }
 
 SEC("uprobe")
@@ -1336,36 +1404,57 @@ int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
 	event->cookie = cookie;
-	event->arg[0] = 0;
-	event->arg_type = ARG_NONE;
+	event->num_args = 0;
 
-	struct arg_desc *desc = bpf_map_lookup_elem(&event_key_types, &cookie);
-	if (desc) {
-		u64 arg = 0;
-		if (desc->arg_index == 0) {
-			bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[0]);
-		} else if (desc->arg_index == 1) {
-			bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[1]);
-		} else if (desc->arg_index == 2) {
-			bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[2]);
-		} else if (desc->arg_index == 3) {
-			bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[3]);
-		} else if (desc->arg_index == 4) {
-			bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[4]);
-		} else if (desc->arg_index == 5) {
-			bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[5]);
-		}
-		if (desc->arg_type == ARG_STRING) {
-			safe_probe_read_kernel_str(&event->arg,
-						  sizeof(event->arg),
-						  (void *)arg);
-			event->arg_type = ARG_STRING;
-		} else if (desc->arg_type == ARG_LONG) {
-			__builtin_memcpy(&event->arg, &arg, sizeof(u64));
-			event->arg_type = ARG_LONG;
+	struct arg_desc_array *desc_array = bpf_map_lookup_elem(&event_key_types, &cookie);
+	if (desc_array && desc_array->num_args > 0) {
+		event->num_args = desc_array->num_args < MAX_ARGS ? desc_array->num_args : MAX_ARGS;
+
+		for (int i = 0; i < MAX_ARGS && i < desc_array->num_args; i++) {
+			struct arg_desc *desc = &desc_array->args[i];
+			u64 arg = 0;
+
+			event->args[i].type = ARG_NONE;
+			event->args[i].size = 0;
+
+			// ARG_RETVAL not supported for raw_tracepoint - skip it
+			if (desc->arg_type == ARG_RETVAL) {
+				continue;
+			}
+
+			if (desc->arg_index == 0) {
+				bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[0]);
+			} else if (desc->arg_index == 1) {
+				bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[1]);
+			} else if (desc->arg_index == 2) {
+				bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[2]);
+			} else if (desc->arg_index == 3) {
+				bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[3]);
+			} else if (desc->arg_index == 4) {
+				bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[4]);
+			} else if (desc->arg_index == 5) {
+				bpf_probe_read_kernel(&arg, sizeof(arg), &args->args[5]);
+			}
+
+			if (desc->arg_type == ARG_STRING) {
+				int len = safe_probe_read_kernel_str(&event->args[i].value,
+								     sizeof(event->args[i].value),
+								     (void *)arg);
+				event->args[i].type = ARG_STRING;
+				event->args[i].size = len > 0 ? len : 0;
+			} else if (desc->arg_type == ARG_LONG) {
+				__builtin_memcpy(&event->args[i].value, &arg, sizeof(u64));
+				event->args[i].type = ARG_LONG;
+				event->args[i].size = sizeof(u64);
+			}
 		}
 	}
 	bpf_ringbuf_submit(event, 0);
+
+	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
+	if (should_capture_stack && *should_capture_stack)
+		emit_stack_event(args, task, STACK_RUNNING);
+
 	return 0;
 }
 
@@ -1392,8 +1481,7 @@ int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
 	event->cookie = cookie;
-	event->arg[0] = 0;
-	event->arg_type = ARG_NONE;
+	event->num_args = 0;
 
 	// To get the tracepoint arguments we'd have to figure out the memory
 	// layout of the buffer and get to the right argument, which we're not
@@ -1402,6 +1490,11 @@ int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
 	// systing will use the raw_tracepoint variation where we can record the
 	// argument.
 	bpf_ringbuf_submit(event, 0);
+
+	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
+	if (should_capture_stack && *should_capture_stack)
+		emit_stack_event(args, task, STACK_RUNNING);
+
 	return 0;
 }
 

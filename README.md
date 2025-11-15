@@ -193,30 +193,33 @@ the mutex and the time that the mutex is locked by the thread.
     {
       "name": "mutex_entry",
       "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_entry",
-      "keys": [
+      "args": [
         {
-          "key_index": 0,
-          "key_type": "long"
+          "arg_index": 0,
+          "arg_type": "long",
+          "arg_name": "mutex_addr"
         }
       ]
     },
     {
       "name": "mutex_acquired",
       "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_acquired",
-      "keys": [
+      "args": [
         {
-          "key_index": 0,
-          "key_type": "long"
+          "arg_index": 0,
+          "arg_type": "long",
+          "arg_name": "mutex_addr"
         }
       ]
     },
     {
       "name": "mutex_release",
       "event": "usdt:/usr/lib64/libc.so.6:libc:mutex_release",
-      "keys": [
+      "args": [
         {
-          "key_index": 0,
-          "key_type": "long"
+          "arg_index": 0,
+          "arg_type": "long",
+          "arg_name": "mutex_addr"
         }
       ]
     },
@@ -240,6 +243,27 @@ the mutex and the time that the mutex is locked by the thread.
   ]
 }
 ```
+
+The `args` field is optional and allows you to capture probe arguments that will
+show up as debug annotations on the events in the trace. Up to 4 args can be
+captured per event. Each arg specifies:
+- `arg_index`: Which argument to capture (0-based index)
+- `arg_type`: The type of the argument ("string", "long", or "retval")
+- `arg_name`: The name of the debug annotation (e.g., "mutex_addr")
+
+Available arg types:
+- `"string"`: Captures a string pointer argument (requires `arg_index`)
+- `"long"`: Captures a 64-bit integer argument (requires `arg_index`)
+- `"retval"`: Captures the function return value (only valid for kretprobe and uretprobe; `arg_index` not used)
+
+These debug annotations provide additional context when viewing the trace in
+Perfetto, showing the captured value with the specified name. In the example
+above, the mutex address will appear as a "mutex_addr" annotation on each event.
+
+The `stack` field is optional (defaults to `false`). When set to `true`, systing
+will capture and emit a stack trace whenever this event fires. This allows you to
+see the call stack at the point where the event occurred, which is useful for
+debugging and performance analysis.
 
 This results in a track that looks like this
 

@@ -15,19 +15,27 @@ use anyhow::Result;
 use plain::Plain;
 use serde::Deserialize;
 
+use perfetto_protos::debug_annotation::DebugAnnotation;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::TrackEvent;
 
+enum ArgValue {
+    String(String),
+    Long(u64),
+}
+
 struct TrackInstant {
     ts: u64,
     name: String,
+    args: Vec<(String, ArgValue)>,
 }
 
 struct TrackRange {
     range_name: String,
     start: u64,
     end: u64,
+    args: Vec<(String, ArgValue)>,
 }
 
 struct ThresholdStopTrigger {
@@ -163,27 +171,29 @@ pub enum EventProbe {
     Undefined,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub enum EventKeyType {
     String,
     #[default]
     Long,
+    Retval,
 }
 
 #[derive(Clone, Default)]
 pub struct EventKey {
-    pub key_index: u8,
-    pub key_type: EventKeyType,
+    pub arg_index: u8,
+    pub arg_type: EventKeyType,
+    pub arg_name: String,
 }
 
-// Any configured event is turned into this object
 #[derive(Clone, Default)]
 pub struct SystingEvent {
     pub name: String,
     pub cookie: u64,
     pub event: EventProbe,
-    pub keys: Vec<EventKey>,
+    pub args: Vec<EventKey>,
     percpu: bool,
+    pub stack: bool,
 }
 
 // The JSON config file format is
@@ -193,17 +203,32 @@ pub struct SystingEvent {
 //       "name": "event_name",
 //       "event": "<PROBE TYPE SPECIFIC FORMAT>",
 //       "percpu": false,
-//       "keys": [
+//       "stack": false,
+//       "args": [
 //         {
-//           "key_index": 0,
-//           "key_type": "string"
+//           "arg_index": 0,
+//           "arg_type": "string",
+//           "arg_name": "filename"
 //         },
 //         {
-//           "key_index": 1,
-//           "key_type": "long"
+//           "arg_index": 1,
+//           "arg_type": "long",
+//           "arg_name": "size"
 //         }
 //      ]
+//     }
 //   ],
+//
+//   Args are optional and will show up as debug annotations on the events in the trace.
+//   Up to 4 args can be specified per event. The arg_index specifies which argument
+//   to capture (0-based), arg_type specifies the type ("string", "long", or "retval"),
+//   and arg_name specifies the name of the annotation. The "retval" type captures the
+//   function return value and is only valid for kretprobe and uretprobe events. The
+//   arg_index field is not used for "retval" type and should be omitted.
+//
+//   The "stack" field is optional (defaults to false). When set to true, systing will
+//   capture and emit a stack trace whenever this event fires.
+//
 //   "tracks": [
 //     {
 //       "track_name": "track_name",
@@ -254,7 +279,8 @@ struct SystingJSONEvent {
     name: String,
     event: String,
     percpu: Option<bool>,
-    keys: Option<Vec<SystingJSONEventKey>>,
+    args: Option<Vec<SystingJSONEventKey>>,
+    stack: Option<bool>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -297,8 +323,10 @@ struct SystingInstant {
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct SystingJSONEventKey {
-    key_index: u8,
-    key_type: String,
+    #[serde(default)]
+    arg_index: u8,
+    arg_type: String,
+    arg_name: String,
 }
 
 impl UProbeEvent {
@@ -483,31 +511,49 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
 
     fn handle_event(&mut self, event: probe_event) {
         let systing_event = self.cookies.get(&event.cookie).unwrap();
-        let mut extra = "".to_string();
+        let mut arg_data: Vec<(String, ArgValue)> = Vec::new();
 
-        // Capture the arg if there is one.
-        match event.arg_type {
-            crate::systing::types::arg_type::ARG_LONG => {
-                let mut bytes: [u8; 8] = [0; 8];
-                let _ = bytes.copy_from_bytes(&event.arg[..8]);
-                let val = u64::from_ne_bytes(bytes);
-                extra = format!(":{val}");
+        let num_args = event.num_args.min(event.args.len() as u8);
+        for i in 0..num_args as usize {
+            if i >= systing_event.args.len() {
+                break;
             }
-            crate::systing::types::arg_type::ARG_STRING => {
-                let arg_str = CStr::from_bytes_until_nul(&event.arg);
-                if let Ok(arg_str) = arg_str {
-                    let bytes = arg_str.to_bytes();
-                    if !bytes.is_empty() && !bytes.starts_with(&[0]) {
-                        extra = format!(":{}", arg_str.to_string_lossy());
+
+            let bpf_arg = &event.args[i];
+            let event_key = &systing_event.args[i];
+
+            match bpf_arg.r#type {
+                crate::systing::types::arg_type::ARG_LONG => {
+                    let mut bytes: [u8; 8] = [0; 8];
+                    let _ = bytes.copy_from_bytes(&bpf_arg.value[..8]);
+                    let val = u64::from_ne_bytes(bytes);
+                    arg_data.push((event_key.arg_name.clone(), ArgValue::Long(val)));
+                }
+                crate::systing::types::arg_type::ARG_RETVAL => {
+                    let mut bytes: [u8; 8] = [0; 8];
+                    let _ = bytes.copy_from_bytes(&bpf_arg.value[..8]);
+                    let val = u64::from_ne_bytes(bytes);
+                    arg_data.push((event_key.arg_name.clone(), ArgValue::Long(val)));
+                }
+                crate::systing::types::arg_type::ARG_STRING => {
+                    let arg_str = CStr::from_bytes_until_nul(&bpf_arg.value);
+                    if let Ok(arg_str) = arg_str {
+                        let bytes = arg_str.to_bytes();
+                        if !bytes.is_empty() && !bytes.starts_with(&[0]) {
+                            arg_data.push((
+                                event_key.arg_name.clone(),
+                                ArgValue::String(arg_str.to_string_lossy().to_string()),
+                            ));
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
         if systing_event.percpu {
-            self.handle_cpu_event(event, extra);
+            self.handle_cpu_event(event, arg_data);
         } else {
-            self.handle_process_event(event, extra);
+            self.handle_process_event(event, arg_data);
         }
     }
 
@@ -562,7 +608,19 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
 }
 
 impl SystingProbeRecorder {
-    fn handle_cpu_event(&mut self, event: probe_event, extra: String) {
+    fn add_arg_annotations(tevent: &mut TrackEvent, args: &[(String, ArgValue)]) {
+        for (name, value) in args {
+            let mut annotation = DebugAnnotation::default();
+            annotation.set_name(name.clone());
+            match value {
+                ArgValue::String(s) => annotation.set_string_value(s.clone()),
+                ArgValue::Long(v) => annotation.set_uint_value(*v),
+            }
+            tevent.debug_annotations.push(annotation);
+        }
+    }
+
+    fn handle_cpu_event(&mut self, event: probe_event, arg_data: Vec<(String, ArgValue)>) {
         let systing_event = self.cookies.get(&event.cookie).unwrap();
 
         // If this is an instant event just add it to the list of events
@@ -572,7 +630,8 @@ impl SystingProbeRecorder {
             let entry = entry.entry(instant_track.clone()).or_default();
             entry.push(TrackInstant {
                 ts: event.ts,
-                name: format!("{systing_event}{extra}"),
+                name: format!("{systing_event}"),
+                args: arg_data,
             });
             return;
         }
@@ -596,11 +655,13 @@ impl SystingProbeRecorder {
             if let Some(ranges) = self.outstanding_cpu_ranges.get_mut(&event.cpu) {
                 if let Some(range) = ranges.get_mut(range_name) {
                     range.start = event.ts;
+                    range.args = arg_data;
                 } else {
                     let range = TrackRange {
                         range_name: range_name.clone(),
                         start: event.ts,
                         end: 0,
+                        args: arg_data,
                     };
                     ranges.insert(range_name.clone(), range);
                 }
@@ -610,6 +671,7 @@ impl SystingProbeRecorder {
                     range_name: range_name.clone(),
                     start: event.ts,
                     end: 0,
+                    args: arg_data,
                 };
                 ranges.insert(range_name.clone(), range);
                 self.outstanding_cpu_ranges.insert(event.cpu, ranges);
@@ -617,7 +679,7 @@ impl SystingProbeRecorder {
         }
     }
 
-    fn handle_process_event(&mut self, event: probe_event, extra: String) {
+    fn handle_process_event(&mut self, event: probe_event, arg_data: Vec<(String, ArgValue)>) {
         let systing_event = self.cookies.get(&event.cookie).unwrap();
 
         // If this is an instant event just add it to the list of events
@@ -627,7 +689,8 @@ impl SystingProbeRecorder {
             let entry = entry.entry(instant_track.clone()).or_default();
             entry.push(TrackInstant {
                 ts: event.ts,
-                name: format!("{systing_event}{extra}"),
+                name: format!("{systing_event}"),
+                args: arg_data,
             });
             return;
         }
@@ -651,11 +714,13 @@ impl SystingProbeRecorder {
             if let Some(ranges) = self.outstanding_ranges.get_mut(&event.task.tgidpid) {
                 if let Some(range) = ranges.get_mut(range_name) {
                     range.start = event.ts;
+                    range.args = arg_data;
                 } else {
                     let range = TrackRange {
                         range_name: range_name.clone(),
                         start: event.ts,
                         end: 0,
+                        args: arg_data,
                     };
                     ranges.insert(range_name.clone(), range);
                 }
@@ -665,6 +730,7 @@ impl SystingProbeRecorder {
                     range_name: range_name.clone(),
                     start: event.ts,
                     end: 0,
+                    args: arg_data,
                 };
                 ranges.insert(range_name.clone(), range);
                 self.outstanding_ranges.insert(event.task.tgidpid, ranges);
@@ -701,6 +767,7 @@ impl SystingProbeRecorder {
                     tevent.set_type(Type::TYPE_INSTANT);
                     tevent.set_name(event.name.clone());
                     tevent.set_track_uuid(desc_uuid);
+                    Self::add_arg_annotations(&mut tevent, &event.args);
 
                     let mut packet = TracePacket::default();
                     packet.set_timestamp(event.ts);
@@ -732,6 +799,7 @@ impl SystingProbeRecorder {
                     tevent.set_type(Type::TYPE_SLICE_BEGIN);
                     tevent.set_name(range.range_name.clone());
                     tevent.set_track_uuid(desc_uuid);
+                    Self::add_arg_annotations(&mut tevent, &range.args);
 
                     let mut packet = TracePacket::default();
                     packet.set_timestamp(range.start);
@@ -783,6 +851,7 @@ impl SystingProbeRecorder {
                     tevent.set_type(Type::TYPE_SLICE_BEGIN);
                     tevent.set_name(range.range_name.clone());
                     tevent.set_track_uuid(desc_uuid);
+                    Self::add_arg_annotations(&mut tevent, &range.args);
 
                     let mut packet = TracePacket::default();
                     packet.set_timestamp(range.start);
@@ -833,6 +902,7 @@ impl SystingProbeRecorder {
                     tevent.set_type(Type::TYPE_INSTANT);
                     tevent.set_name(event.name.clone());
                     tevent.set_track_uuid(desc_uuid);
+                    Self::add_arg_annotations(&mut tevent, &event.args);
 
                     let mut packet = TracePacket::default();
                     packet.set_timestamp(event.ts);
@@ -897,37 +967,93 @@ impl SystingProbeRecorder {
         event: &SystingJSONEvent,
         rng: &mut dyn rand::RngCore,
     ) -> Result<()> {
-        let mut keys = Vec::new();
-        if event.keys.iter().flatten().count() > 1 {
+        let mut args = Vec::new();
+        let arg_count = event.args.iter().flatten().count();
+        if arg_count > 4 {
             return Err(anyhow::anyhow!(
-                "Only one key is allowed per event: {}",
+                "Maximum 4 args allowed per event, got {} for event: {}",
+                arg_count,
                 event.name
             ));
         }
-        for key in event.keys.iter().flatten() {
-            let key_type = match key.key_type.as_str() {
+        for json_arg in event.args.iter().flatten() {
+            let arg_type = match json_arg.arg_type.as_str() {
                 "string" => EventKeyType::String,
                 "long" => EventKeyType::Long,
-                _ => return Err(anyhow::anyhow!("Invalid key type: {}", key.key_type)),
+                "retval" => EventKeyType::Retval,
+                _ => return Err(anyhow::anyhow!("Invalid arg type: {}", json_arg.arg_type)),
             };
-            keys.push(EventKey {
-                key_index: key.key_index,
-                key_type,
+
+            // Validate arg_index is not used with retval
+            if arg_type == EventKeyType::Retval && json_arg.arg_index != 0 {
+                return Err(anyhow::anyhow!(
+                    "arg_index must be 0 or omitted for retval type in event: {}",
+                    event.name
+                ));
+            }
+
+            args.push(EventKey {
+                arg_index: json_arg.arg_index,
+                arg_type,
+                arg_name: json_arg.arg_name.clone(),
             });
         }
         let parts = event.event.split(':').collect::<Vec<&str>>();
+        let probe = match parts[0] {
+            "usdt" => EventProbe::Usdt(UsdtProbeEvent::from_parts(parts)?),
+            "uprobe" | "uretprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
+            "kprobe" | "kretprobe" => EventProbe::KProbe(KProbeEvent::from_parts(parts)?),
+            "tracepoint" => EventProbe::Tracepoint(TracepointEvent::from_parts(parts)?),
+            _ => return Err(anyhow::anyhow!("Invalid event type")),
+        };
+
+        // Validate retval args are only used with retprobes
+        for arg in args.iter() {
+            if matches!(arg.arg_type, EventKeyType::Retval) {
+                match &probe {
+                    EventProbe::UProbe(uprobe) if uprobe.retprobe => {}
+                    EventProbe::KProbe(kprobe) if kprobe.retprobe => {}
+                    EventProbe::UProbe(_) => {
+                        return Err(anyhow::anyhow!(
+                            "retval arg type requires uretprobe, not uprobe: {}",
+                            event.name
+                        ));
+                    }
+                    EventProbe::KProbe(_) => {
+                        return Err(anyhow::anyhow!(
+                            "retval arg type requires kretprobe, not kprobe: {}",
+                            event.name
+                        ));
+                    }
+                    EventProbe::Usdt(_) => {
+                        return Err(anyhow::anyhow!(
+                            "retval arg type is not supported for usdt probes: {}",
+                            event.name
+                        ));
+                    }
+                    EventProbe::Tracepoint(_) => {
+                        return Err(anyhow::anyhow!(
+                            "retval arg type is not supported for tracepoint events: {}",
+                            event.name
+                        ));
+                    }
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "retval arg type is only valid for kretprobe and uretprobe events: {}",
+                            event.name
+                        ));
+                    }
+                }
+            }
+        }
+
         let event = SystingEvent {
             name: event.name.clone(),
             cookie: rng.next_u64(),
-            event: match parts[0] {
-                "usdt" => EventProbe::Usdt(UsdtProbeEvent::from_parts(parts)?),
-                "uprobe" | "uretprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
-                "kprobe" | "kretprobe" => EventProbe::KProbe(KProbeEvent::from_parts(parts)?),
-                "tracepoint" => EventProbe::Tracepoint(TracepointEvent::from_parts(parts)?),
-                _ => return Err(anyhow::anyhow!("Invalid event type")),
-            },
-            keys,
+            event: probe,
+            args,
             percpu: event.percpu.unwrap_or(false),
+            stack: event.stack.unwrap_or(false),
         };
         if self.config_events.contains_key(&event.name) {
             return Err(anyhow::anyhow!("Event {} already exists", event.name));
@@ -2142,19 +2268,19 @@ mod tests {
         let event = recorder.config_events.get("symbol").unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
         assert_eq!(event.name, "symbol");
-        assert_eq!(event.keys.len(), 0);
+        assert_eq!(event.args.len(), 0);
         let event = recorder.config_events.get("symbol1").unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
         assert_eq!(event.name, "symbol1");
-        assert_eq!(event.keys.len(), 0);
+        assert_eq!(event.args.len(), 0);
         let event = recorder.config_events.get("symbol2").unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
         assert_eq!(event.name, "symbol2");
-        assert_eq!(event.keys.len(), 0);
+        assert_eq!(event.args.len(), 0);
         let event = recorder.config_events.get("symbol3").unwrap();
         assert!(matches!(event.event, EventProbe::UProbe(_)));
         assert_eq!(event.name, "symbol3");
-        assert_eq!(event.keys.len(), 0);
+        assert_eq!(event.args.len(), 0);
     }
 
     #[test]
@@ -2546,29 +2672,31 @@ mod tests {
     }
 
     #[test]
-    fn test_event_with_keys() {
+    fn test_event_with_args() {
         let mut rng = StepRng::new(0, 1);
         let mut recorder = SystingProbeRecorder::default();
         let json = r#"
         {
             "events": [
                 {
-                    "name": "event_with_string_key",
+                    "name": "event_with_string_arg",
                     "event": "usdt:/path/to/file:provider:name",
-                    "keys": [
+                    "args": [
                       {
-                        "key_index": 0,
-                        "key_type": "string"
+                        "arg_index": 0,
+                        "arg_type": "string",
+                        "arg_name": "filename"
                       }
                     ]
                 },
                 {
-                    "name": "event_with_long_key",
+                    "name": "event_with_long_arg",
                     "event": "usdt:/path/to/file:provider:name",
-                    "keys": [
+                    "args": [
                       {
-                        "key_index": 1,
-                        "key_type": "long"
+                        "arg_index": 1,
+                        "arg_type": "long",
+                        "arg_name": "size"
                       }
                     ]
                 }
@@ -2580,31 +2708,34 @@ mod tests {
         let result = recorder.load_config_from_json(json, &mut rng);
         assert!(result.is_ok());
         assert_eq!(recorder.config_events.len(), 2);
-        let event = recorder.config_events.get("event_with_string_key").unwrap();
-        assert_eq!(event.name, "event_with_string_key");
-        assert_eq!(event.keys.len(), 1);
-        assert_eq!(event.keys[0].key_index, 0);
-        assert!(matches!(event.keys[0].key_type, EventKeyType::String));
-        let event = recorder.config_events.get("event_with_long_key").unwrap();
-        assert_eq!(event.keys.len(), 1);
-        assert_eq!(event.keys[0].key_index, 1);
-        assert!(matches!(event.keys[0].key_type, EventKeyType::Long));
+        let event = recorder.config_events.get("event_with_string_arg").unwrap();
+        assert_eq!(event.name, "event_with_string_arg");
+        assert_eq!(event.args.len(), 1);
+        assert_eq!(event.args[0].arg_index, 0);
+        assert!(matches!(event.args[0].arg_type, EventKeyType::String));
+        assert_eq!(event.args[0].arg_name, "filename");
+        let event = recorder.config_events.get("event_with_long_arg").unwrap();
+        assert_eq!(event.args.len(), 1);
+        assert_eq!(event.args[0].arg_index, 1);
+        assert!(matches!(event.args[0].arg_type, EventKeyType::Long));
+        assert_eq!(event.args[0].arg_name, "size");
     }
 
     #[test]
-    fn test_event_bad_key_type() {
+    fn test_event_bad_arg_type() {
         let mut rng = StepRng::new(0, 1);
         let mut recorder = SystingProbeRecorder::default();
         let json = r#"
         {
             "events": [
                 {
-                    "name": "event_with_bad_key",
+                    "name": "event_with_bad_arg",
                     "event": "usdt:/path/to/file:provider:name",
-                    "keys": [
+                    "args": [
                       {
-                        "key_index": 0,
-                        "key_type": "invalid_type"
+                        "arg_index": 0,
+                        "arg_type": "invalid_type",
+                        "arg_name": "test"
                       }
                     ]
                 }
@@ -2617,32 +2748,152 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "Invalid key type: invalid_type"
+            "Invalid arg type: invalid_type"
         );
     }
 
     #[test]
-    fn test_event_too_many_keys() {
+    fn test_event_with_multiple_args() {
         let mut rng = StepRng::new(0, 1);
         let mut recorder = SystingProbeRecorder::default();
         let json = r#"
         {
             "events": [
                 {
-                    "name": "event_with_too_many_keys",
+                    "name": "event_with_multiple_args",
                     "event": "usdt:/path/to/file:provider:name",
-                    "keys": [
+                    "args": [
                       {
-                        "key_index": 0,
-                        "key_type": "string"
+                        "arg_index": 0,
+                        "arg_type": "string",
+                        "arg_name": "filename"
                       },
                       {
-                        "key_index": 1,
-                        "key_type": "long"
+                        "arg_index": 1,
+                        "arg_type": "long",
+                        "arg_name": "size"
                       },
                       {
-                        "key_index": 2,
-                        "key_type": "string"
+                        "arg_index": 2,
+                        "arg_type": "long",
+                        "arg_name": "offset"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        assert_eq!(recorder.config_events.len(), 1);
+        let event = recorder
+            .config_events
+            .get("event_with_multiple_args")
+            .unwrap();
+        assert_eq!(event.args.len(), 3);
+        assert_eq!(event.args[0].arg_index, 0);
+        assert!(matches!(event.args[0].arg_type, EventKeyType::String));
+        assert_eq!(event.args[0].arg_name, "filename");
+        assert_eq!(event.args[1].arg_index, 1);
+        assert!(matches!(event.args[1].arg_type, EventKeyType::Long));
+        assert_eq!(event.args[1].arg_name, "size");
+        assert_eq!(event.args[2].arg_index, 2);
+        assert!(matches!(event.args[2].arg_type, EventKeyType::Long));
+        assert_eq!(event.args[2].arg_name, "offset");
+    }
+
+    #[test]
+    fn test_event_with_retval() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "uretprobe_event",
+                    "event": "uretprobe:/path/to/file:symbol",
+                    "args": [
+                      {
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                },
+                {
+                    "name": "kretprobe_event",
+                    "event": "kretprobe:symbol",
+                    "args": [
+                      {
+                        "arg_type": "retval",
+                        "arg_name": "result"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        let event = recorder.config_events.get("uretprobe_event").unwrap();
+        assert_eq!(event.args.len(), 1);
+        assert!(matches!(event.args[0].arg_type, EventKeyType::Retval));
+        assert_eq!(event.args[0].arg_name, "return_value");
+        let event = recorder.config_events.get("kretprobe_event").unwrap();
+        assert_eq!(event.args.len(), 1);
+        assert!(matches!(event.args[0].arg_type, EventKeyType::Retval));
+        assert_eq!(event.args[0].arg_name, "result");
+    }
+
+    #[test]
+    fn test_event_with_retval_no_arg_index() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "uretprobe_event",
+                    "event": "uretprobe:/path/to/file:symbol",
+                    "args": [
+                      {
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        let event = recorder.config_events.get("uretprobe_event").unwrap();
+        assert_eq!(event.args.len(), 1);
+        assert!(matches!(event.args[0].arg_type, EventKeyType::Retval));
+        assert_eq!(event.args[0].arg_name, "return_value");
+        assert_eq!(event.args[0].arg_index, 0);
+    }
+
+    #[test]
+    fn test_retval_with_nonzero_arg_index_rejected() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "uretprobe_event",
+                    "event": "uretprobe:/path/to/file:symbol",
+                    "args": [
+                      {
+                        "arg_index": 1,
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
                       }
                     ]
                 }
@@ -2655,7 +2906,182 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "Only one key is allowed per event: event_with_too_many_keys"
+            "arg_index must be 0 or omitted for retval type in event: uretprobe_event"
+        );
+    }
+
+    #[test]
+    fn test_retval_invalid_on_uprobe() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "uprobe_event",
+                    "event": "uprobe:/path/to/file:symbol",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "retval arg type requires uretprobe, not uprobe: uprobe_event"
+        );
+    }
+
+    #[test]
+    fn test_retval_invalid_on_kprobe() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "kprobe_event",
+                    "event": "kprobe:symbol",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "retval arg type requires kretprobe, not kprobe: kprobe_event"
+        );
+    }
+
+    #[test]
+    fn test_retval_invalid_on_usdt() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "usdt_event",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "retval arg type is not supported for usdt probes: usdt_event"
+        );
+    }
+
+    #[test]
+    fn test_retval_invalid_on_tracepoint() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "tracepoint_event",
+                    "event": "tracepoint:category:name",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "retval arg type is not supported for tracepoint events: tracepoint_event"
+        );
+    }
+
+    #[test]
+    fn test_event_too_many_args() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_with_too_many_args",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "string",
+                        "arg_name": "file"
+                      },
+                      {
+                        "arg_index": 1,
+                        "arg_type": "long",
+                        "arg_name": "size"
+                      },
+                      {
+                        "arg_index": 2,
+                        "arg_type": "string",
+                        "arg_name": "extra"
+                      },
+                      {
+                        "arg_index": 3,
+                        "arg_type": "long",
+                        "arg_name": "fourth"
+                      },
+                      {
+                        "arg_index": 4,
+                        "arg_type": "long",
+                        "arg_name": "fifth"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Maximum 4 args allowed per event, got 5 for event: event_with_too_many_args"
         );
     }
 
@@ -2724,5 +3150,111 @@ mod tests {
             packets[2].track_event().track_uuid(),
             packets[1].track_descriptor().uuid()
         );
+    }
+
+    #[test]
+    fn test_stack_field_true() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_with_stack",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "stack": true
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        assert_eq!(recorder.config_events.len(), 1);
+        let event = recorder.config_events.get("event_with_stack").unwrap();
+        assert!(event.stack);
+    }
+
+    #[test]
+    fn test_stack_field_false() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_without_stack",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "stack": false
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        assert_eq!(recorder.config_events.len(), 1);
+        let event = recorder.config_events.get("event_without_stack").unwrap();
+        assert!(!event.stack);
+    }
+
+    #[test]
+    fn test_stack_field_default() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_default_stack",
+                    "event": "usdt:/path/to/file:provider:name"
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        assert_eq!(recorder.config_events.len(), 1);
+        let event = recorder.config_events.get("event_default_stack").unwrap();
+        assert!(!event.stack);
+    }
+
+    #[test]
+    fn test_stack_field_with_args() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_with_stack_and_args",
+                    "event": "uprobe:/path/to/file:symbol",
+                    "stack": true,
+                    "args": [
+                        {
+                            "arg_index": 0,
+                            "arg_type": "long",
+                            "arg_name": "arg1"
+                        }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        assert_eq!(recorder.config_events.len(), 1);
+        let event = recorder
+            .config_events
+            .get("event_with_stack_and_args")
+            .unwrap();
+        assert!(event.stack);
+        assert_eq!(event.args.len(), 1);
     }
 }
