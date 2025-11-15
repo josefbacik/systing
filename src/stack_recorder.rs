@@ -387,6 +387,14 @@ fn symbolize_stacks<'a>(
 
     for stack in stacks.iter() {
         let raw_stack = &stack.stack;
+        // Symbolize Python stack FIRST (per-process)
+        psr.pystacks_to_frames_mapping(
+            &mut user_frame_map,
+            global_func_manager,
+            id_counter,
+            &mut python_stack_markers,
+            &raw_stack.py_stack,
+        );
         // Symbolize user space stack (per-process)
         stack_to_frames_mapping(
             &mut symbolizer,
@@ -396,6 +404,7 @@ fn symbolize_stacks<'a>(
             id_counter,
             raw_stack.user_stack.iter(),
         );
+        // Detect PyEval frames in user stack (must run after user stack symbolization)
         psr.user_stack_to_python_calls(&mut user_frame_map, global_func_manager, &mut python_calls);
         // Symbolize kernel stack (global)
         stack_to_frames_mapping(
@@ -405,14 +414,6 @@ fn symbolize_stacks<'a>(
             &kernel_src,
             id_counter,
             raw_stack.kernel_stack.iter(),
-        );
-        // Symbolize Python stack (per-process)
-        psr.pystacks_to_frames_mapping(
-            &mut user_frame_map,
-            global_func_manager,
-            id_counter,
-            &mut python_stack_markers,
-            &raw_stack.py_stack,
         );
     }
 
@@ -573,7 +574,15 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
         &mut self.ringbuf
     }
     fn handle_event(&mut self, event: stack_event) {
-        if event.user_stack_length > 0 || event.kernel_stack_length > 0 {
+        #[cfg(feature = "pystacks")]
+        let py_stack_len = event.py_msg_buffer.stack_len;
+        #[cfg(not(feature = "pystacks"))]
+        let py_stack_len = 0;
+
+        let has_stack =
+            event.user_stack_length > 0 || event.kernel_stack_length > 0 || py_stack_len > 0;
+
+        if has_stack {
             let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
             let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
             let stack_key = (event.task.tgidpid >> 32) as i32;
