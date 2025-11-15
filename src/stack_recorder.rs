@@ -207,6 +207,19 @@ pub fn add_frame(
     frame_vec.push(frame);
 }
 
+/// Formats code location information as a string suffix
+/// Returns empty string if no code info is available
+fn format_location_info(code_info: &Option<blazesym::symbolize::CodeInfo>) -> String {
+    code_info.as_ref().map_or(String::new(), |info| {
+        let file_name = info.file.to_str().unwrap_or("unknown");
+        if let Some(line) = info.line {
+            format!(" [{}:{}]", file_name, line)
+        } else {
+            format!(" [{}]", file_name)
+        }
+    })
+}
+
 pub fn stack_to_frames_mapping<'a, I>(
     symbolizer: &mut Symbolizer,
     frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
@@ -226,11 +239,26 @@ pub fn stack_to_frames_mapping<'a, I>(
             Ok(Symbolized::Sym(Sym {
                 addr,
                 name,
+                module,
                 offset,
+                code_info,
                 inlined,
                 ..
             })) => {
-                let name = format!("{} <{:#x}>", name, *input_addr);
+                // Build symbol name with module and optional source location
+                let module_name = module
+                    .as_ref()
+                    .and_then(|m| m.to_str())
+                    .and_then(|m| std::path::Path::new(m).file_name())
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("unknown");
+
+                let location_info = format_location_info(&code_info);
+
+                let name = format!(
+                    "{} ({}{}) <{:#x}>",
+                    name, module_name, location_info, *input_addr
+                );
                 add_frame(
                     frame_map,
                     global_func_manager,
@@ -242,7 +270,12 @@ pub fn stack_to_frames_mapping<'a, I>(
                 );
 
                 for inline in inlined {
-                    let name = format!("{} (inlined) <{:#x}>", inline.name, *input_addr);
+                    let inline_location_info = format_location_info(&inline.code_info);
+
+                    let name = format!(
+                        "{} ({}{}) (inlined) <{:#x}>",
+                        inline.name, module_name, inline_location_info, *input_addr
+                    );
                     add_frame(
                         frame_map,
                         global_func_manager,
