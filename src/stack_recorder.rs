@@ -16,6 +16,8 @@ use blazesym::symbolize::{
 use blazesym::Error as BlazeErr;
 use blazesym::{Addr, Pid};
 
+use indicatif::{ProgressBar, ProgressStyle};
+
 // Type alias for the dispatch function
 type ProcessDispatcher = Box<
     dyn for<'a> Fn(ProcessMemberInfo<'a>) -> Result<Option<Box<dyn Resolve>>, BlazeErr>
@@ -227,11 +229,15 @@ pub fn stack_to_frames_mapping<'a, I>(
     source: &Source<'a>,
     id_counter: &Arc<AtomicUsize>,
     stack: I,
+    progress_bar: &Option<ProgressBar>,
 ) where
     I: IntoIterator<Item = &'a u64>,
 {
     for input_addr in stack {
         if frame_map.contains_key(input_addr) {
+            if let Some(pb) = progress_bar {
+                pb.inc(1);
+            }
             continue;
         }
 
@@ -303,6 +309,11 @@ pub fn stack_to_frames_mapping<'a, I>(
             _ => {
                 // Skip all other addresses (UnknownAddr, errors, etc.)
             }
+        }
+
+        // Update progress bar for each address processed
+        if let Some(pb) = progress_bar {
+            pb.inc(1);
         }
     }
 }
@@ -383,6 +394,7 @@ fn dispatch_process_with_client(
 }
 
 /// Symbolizes all stacks (user, kernel, and Python) and returns the resolved information
+#[allow(clippy::too_many_arguments)]
 fn symbolize_stacks<'a>(
     stacks: &[StackEvent],
     tgid: u32,
@@ -391,6 +403,7 @@ fn symbolize_stacks<'a>(
     process_dispatcher: &Option<Arc<ProcessDispatcher>>,
     global_func_manager: &Arc<GlobalFunctionManager>,
     global_kernel_frame_map: &'a mut HashMap<u64, Vec<LocalFrame>>,
+    progress_bar: &Option<ProgressBar>,
 ) -> ResolvedStackInfo<'a> {
     let user_src = Source::Process(Process::new(Pid::from(tgid)));
     let kernel_src = Source::Kernel(Kernel::default());
@@ -435,6 +448,7 @@ fn symbolize_stacks<'a>(
             &user_src,
             id_counter,
             raw_stack.user_stack.iter(),
+            progress_bar,
         );
         // Detect PyEval frames in user stack (must run after user stack symbolization)
         psr.user_stack_to_python_calls(&mut user_frame_map, global_func_manager, &mut python_calls);
@@ -446,6 +460,7 @@ fn symbolize_stacks<'a>(
             &kernel_src,
             id_counter,
             raw_stack.kernel_stack.iter(),
+            progress_bar,
         );
     }
 
@@ -633,6 +648,19 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
     }
 }
 
+/// Collects the total count of all addresses from all stacks that will need symbolization
+fn collect_total_addresses(stacks: &HashMap<i32, Vec<StackEvent>>) -> usize {
+    stacks
+        .values()
+        .flat_map(|events| events.iter())
+        .map(|event| {
+            event.stack.user_stack.len()
+                + event.stack.kernel_stack.len()
+                + event.stack.py_stack.len()
+        })
+        .sum()
+}
+
 impl StackRecorder {
     /// Process stacks for a single process and collect the interned data
     fn process_tgid_stacks(
@@ -642,6 +670,7 @@ impl StackRecorder {
         id_counter: &Arc<AtomicUsize>,
         global_kernel_frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
         sequence_id: u32,
+        progress_bar: &Option<ProgressBar>,
     ) -> (Vec<Callstack>, Vec<Frame>, Vec<Mapping>, Vec<TracePacket>) {
         // Step 1: Symbolize all stacks
         let resolved_info = symbolize_stacks(
@@ -652,6 +681,7 @@ impl StackRecorder {
             &self.process_dispatcher,
             &self.global_func_manager,
             global_kernel_frame_map,
+            progress_bar,
         );
 
         // Step 2: Deduplicate stacks and collect interned data
@@ -703,6 +733,26 @@ impl StackRecorder {
         // Get a unique sequence ID for this trace
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
 
+        // Count all addresses that will need symbolization
+        let total_addresses = collect_total_addresses(&self.stacks);
+
+        // Create a progress bar if we have addresses to process
+        let progress_bar = if total_addresses > 0 {
+            let pb = ProgressBar::new(total_addresses as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(
+                        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} symbols ({per_sec}, {eta})"
+                    )
+                    .expect("Failed to set progress bar template")
+                    .progress_chars("#>-"),
+            );
+            pb.set_message("Resolving stack symbols");
+            Some(pb)
+        } else {
+            None
+        };
+
         // Process all stacks synchronously to avoid the interleaving issue
         let mut all_packets = Vec::new();
         let mut all_sample_packets = Vec::new();
@@ -726,6 +776,7 @@ impl StackRecorder {
                     id_counter,
                     &mut global_kernel_frame_map,
                     sequence_id,
+                    &progress_bar,
                 );
 
             all_callstacks.extend(callstacks);
@@ -756,6 +807,11 @@ impl StackRecorder {
 
         // Then add all the sample packets
         all_packets.extend(all_sample_packets);
+
+        // Finish the progress bar
+        if let Some(pb) = progress_bar {
+            pb.finish_with_message("Stack symbol resolution complete");
+        }
 
         all_packets
     }
