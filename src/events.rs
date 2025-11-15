@@ -193,6 +193,7 @@ pub struct SystingEvent {
     pub event: EventProbe,
     pub args: Vec<EventKey>,
     percpu: bool,
+    pub stack: bool,
 }
 
 // The JSON config file format is
@@ -202,6 +203,7 @@ pub struct SystingEvent {
 //       "name": "event_name",
 //       "event": "<PROBE TYPE SPECIFIC FORMAT>",
 //       "percpu": false,
+//       "stack": false,
 //       "args": [
 //         {
 //           "arg_index": 0,
@@ -223,6 +225,9 @@ pub struct SystingEvent {
 //   and arg_name specifies the name of the annotation. The "retval" type captures the
 //   function return value and is only valid for kretprobe and uretprobe events. The
 //   arg_index field is not used for "retval" type and should be omitted.
+//
+//   The "stack" field is optional (defaults to false). When set to true, systing will
+//   capture and emit a stack trace whenever this event fires.
 //
 //   "tracks": [
 //     {
@@ -275,6 +280,7 @@ struct SystingJSONEvent {
     event: String,
     percpu: Option<bool>,
     args: Option<Vec<SystingJSONEventKey>>,
+    stack: Option<bool>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1047,6 +1053,7 @@ impl SystingProbeRecorder {
             event: probe,
             args,
             percpu: event.percpu.unwrap_or(false),
+            stack: event.stack.unwrap_or(false),
         };
         if self.config_events.contains_key(&event.name) {
             return Err(anyhow::anyhow!("Event {} already exists", event.name));
@@ -3143,5 +3150,111 @@ mod tests {
             packets[2].track_event().track_uuid(),
             packets[1].track_descriptor().uuid()
         );
+    }
+
+    #[test]
+    fn test_stack_field_true() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_with_stack",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "stack": true
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        assert_eq!(recorder.config_events.len(), 1);
+        let event = recorder.config_events.get("event_with_stack").unwrap();
+        assert!(event.stack);
+    }
+
+    #[test]
+    fn test_stack_field_false() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_without_stack",
+                    "event": "usdt:/path/to/file:provider:name",
+                    "stack": false
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        assert_eq!(recorder.config_events.len(), 1);
+        let event = recorder.config_events.get("event_without_stack").unwrap();
+        assert!(!event.stack);
+    }
+
+    #[test]
+    fn test_stack_field_default() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_default_stack",
+                    "event": "usdt:/path/to/file:provider:name"
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        assert_eq!(recorder.config_events.len(), 1);
+        let event = recorder.config_events.get("event_default_stack").unwrap();
+        assert!(!event.stack);
+    }
+
+    #[test]
+    fn test_stack_field_with_args() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "event_with_stack_and_args",
+                    "event": "uprobe:/path/to/file:symbol",
+                    "stack": true,
+                    "args": [
+                        {
+                            "arg_index": 0,
+                            "arg_type": "long",
+                            "arg_name": "arg1"
+                        }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_ok());
+        assert_eq!(recorder.config_events.len(), 1);
+        let event = recorder
+            .config_events
+            .get("event_with_stack_and_args")
+            .unwrap();
+        assert!(event.stack);
+        assert_eq!(event.args.len(), 1);
     }
 }

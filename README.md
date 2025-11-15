@@ -260,6 +260,11 @@ These debug annotations provide additional context when viewing the trace in
 Perfetto, showing the captured value with the specified name. In the example
 above, the mutex address will appear as a "mutex_addr" annotation on each event.
 
+The `stack` field is optional (defaults to `false`). When set to `true`, systing
+will capture and emit a stack trace whenever this event fires. This allows you to
+see the call stack at the point where the event occurred, which is useful for
+debugging and performance analysis.
+
 This results in a track that looks like this
 
 ![pthread mutex example](docs/pthread.png)

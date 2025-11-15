@@ -1232,6 +1232,15 @@ fn attach_probes(
             libbpf_rs::MapFlags::ANY,
         )?;
 
+        if event.stack {
+            let stack_flag: u8 = 1;
+            skel.maps.event_stack_capture.update(
+                &event.cookie.to_ne_bytes(),
+                &stack_flag.to_ne_bytes(),
+                libbpf_rs::MapFlags::ANY,
+            )?;
+        }
+
         match &event.event {
             EventProbe::Usdt(usdt) => {
                 // Skip USDT probes in confidentiality mode as they use restricted helpers

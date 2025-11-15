@@ -274,6 +274,13 @@ struct {
 	__uint(max_entries, 10240);
 } event_key_types SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, u8);
+	__uint(max_entries, 10240);
+} event_stack_capture SEC(".maps");
+
 struct arg_desc_array _arg_desc_array = {0};
 
 struct network_send_info {
@@ -1212,6 +1219,11 @@ int systing_usdt(struct pt_regs *ctx)
 		}
 	}
 	bpf_ringbuf_submit(event, 0);
+
+	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
+	if (should_capture_stack && *should_capture_stack)
+		emit_stack_event(ctx, task, STACK_RUNNING);
+
 	return 0;
 }
 
@@ -1341,6 +1353,10 @@ static void handle_probe_event(struct pt_regs *ctx, bool kernel)
 		}
 	}
 	bpf_ringbuf_submit(event, 0);
+
+	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
+	if (should_capture_stack && *should_capture_stack)
+		emit_stack_event(ctx, task, STACK_RUNNING);
 }
 
 SEC("uprobe")
@@ -1434,6 +1450,11 @@ int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
 		}
 	}
 	bpf_ringbuf_submit(event, 0);
+
+	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
+	if (should_capture_stack && *should_capture_stack)
+		emit_stack_event(args, task, STACK_RUNNING);
+
 	return 0;
 }
 
@@ -1469,6 +1490,11 @@ int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
 	// systing will use the raw_tracepoint variation where we can record the
 	// argument.
 	bpf_ringbuf_submit(event, 0);
+
+	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
+	if (should_capture_stack && *should_capture_stack)
+		emit_stack_event(args, task, STACK_RUNNING);
+
 	return 0;
 }
 

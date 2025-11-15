@@ -35,7 +35,7 @@ fn generate_bindings(out_dir: &PathBuf) {
         eprintln!("===============================================\n");
         eprintln!("The following development libraries are required but not found:");
         for lib in &missing_libs {
-            eprintln!("  - {}", lib);
+            eprintln!("  - {lib}");
         }
         eprintln!("\nTo install these libraries on Ubuntu/Debian, run:");
         eprintln!("  sudo apt-get install {}\n", missing_libs.join(" "));

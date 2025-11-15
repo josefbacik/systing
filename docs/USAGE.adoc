@@ -290,6 +290,7 @@ The configuration is a JSON file with the following format.
       "name": "tracepoint_instant",
       "event": "_EVENT_",
       "percpu": true,
+      "stack": true,
       "args": [
         {
           "arg_index": 0,
@@ -359,6 +360,11 @@ NOTE: For `tracepoint` events we use `raw_tracepoint`, which reads the args from
 
 `percpu` is set to true if the event is keyed to a CPU and not a specific thread.
 These events will show up under the `Systing` track in `perfetto`, each event as it's own category and then each CPU having its own track.
+
+`stack` is an optional field (defaults to `false`).
+When set to `true`, systing will capture and emit a stack trace whenever this event fires.
+The stack trace will appear in the perfetto trace alongside the event, showing the call stack at the point where the event occurred.
+This is useful for debugging and performance analysis.
 
 === *-v, --verbose*
 
