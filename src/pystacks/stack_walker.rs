@@ -143,6 +143,53 @@ impl StackWalkerRun {
         }
     }
 
+    /// Symbolizes a Python frame to extract the source filename and line number.
+    ///
+    /// Returns a tuple of (filename, line_number) where:
+    /// - `filename` is the source file path, or "unknown" if unavailable
+    /// - `line_number` is `Some(line)` if available, or `None` if unavailable
+    ///
+    /// The C++ pystacks library uses `u32::MAX` as a sentinel value to indicate
+    /// no line information is available.
+    fn symbolize_filename_line(&self, frame: &PyAddr) -> (String, Option<usize>) {
+        const FILENAME_BUFFER_SIZE: usize = 512;
+        const NO_LINE_INFO: usize = u32::MAX as usize;
+        const UNKNOWN_FILENAME: &str = "unknown";
+
+        let mut buff = vec![0; FILENAME_BUFFER_SIZE];
+        let mut line_number: usize = 0;
+
+        let len = if self.initialized() {
+            unsafe {
+                bindings::pystacks_symbolize_filename_line(
+                    self.ptr,
+                    &raw const frame.addr,
+                    buff.as_mut_ptr() as *mut i8,
+                    buff.len(),
+                    &mut line_number as *mut usize,
+                )
+            }
+        } else {
+            0
+        };
+
+        let filename = if len > 0 {
+            core::str::from_utf8(&buff[..len as usize])
+                .unwrap_or(UNKNOWN_FILENAME)
+                .to_string()
+        } else {
+            UNKNOWN_FILENAME.to_string()
+        };
+
+        let line = if line_number == NO_LINE_INFO {
+            None
+        } else {
+            Some(line_number)
+        };
+
+        (filename, line)
+    }
+
     fn load_symbols(&self) {
         if self.initialized() {
             unsafe { bindings::pystacks_load_symbols(self.ptr) };
@@ -166,7 +213,20 @@ impl StackWalkerRun {
                 continue;
             }
 
-            let name = self.symbolize_function(frame);
+            let func_name = self.symbolize_function(frame);
+            let (filename, line_number) = self.symbolize_filename_line(frame);
+
+            // Extract just the base filename (similar to how blazesym extracts module name)
+            let base_filename = std::path::Path::new(&filename)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(&filename);
+
+            // Format matches blazesym: "function_name (python) [filename:line]"
+            let formatted_name = match line_number {
+                Some(line) => format!("{} (python) [{}:{}]", func_name, base_filename, line),
+                None => format!("{} (python) [{}]", func_name, base_filename),
+            };
 
             add_frame(
                 frame_map,
@@ -175,10 +235,10 @@ impl StackWalkerRun {
                 frame.addr.symbol_id.into(),
                 0,
                 0,
-                format!("{name} [py]"),
+                formatted_name,
             );
 
-            if name == "<interpreter trampoline>" {
+            if func_name == "<interpreter trampoline>" {
                 python_stack_markers.push(frame.addr.symbol_id.into());
             }
         }
