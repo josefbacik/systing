@@ -39,8 +39,7 @@ pub struct Stack {
     pub py_stack: Vec<PyAddr>,
 }
 
-/// Helper function to filter and reverse a stack trace
-/// Removes zero addresses and reverses the order
+/// Filters out zero addresses and reverses the stack trace order
 fn filter_and_reverse_stack(stack: &[u64]) -> Vec<u64> {
     stack.iter().rev().filter(|x| **x > 0).copied().collect()
 }
@@ -110,8 +109,8 @@ impl GlobalFunctionManager {
             .collect()
     }
 
-    /// Get function IDs matching a pattern
-    #[allow(dead_code)]
+    /// Get function IDs matching a pattern (used by pystacks feature)
+    #[cfg(feature = "pystacks")]
     pub fn get_function_ids_matching(&self, pattern: &str) -> Vec<u64> {
         self.global_functions
             .read()
@@ -209,8 +208,7 @@ pub fn add_frame(
     frame_vec.push(frame);
 }
 
-/// Formats code location information as a string suffix
-/// Returns empty string if no code info is available
+/// Formats code location information as a string suffix (e.g., "[file.rs:123]")
 fn format_location_info(code_info: &Option<blazesym::symbolize::CodeInfo>) -> String {
     code_info.as_ref().map_or(String::new(), |info| {
         let file_name = info.file.to_str().unwrap_or("unknown");
@@ -477,7 +475,7 @@ struct DeduplicatedStackData {
     callstacks: HashMap<Stack, Callstack>,
 }
 
-/// Helper function to extract frame IDs from a frame map for given addresses
+/// Extracts frame IDs from the frame map for the given addresses
 fn extract_frame_ids<'a>(
     frame_map: &HashMap<u64, Vec<LocalFrame>>,
     addrs: impl Iterator<Item = &'a u64>,
@@ -497,7 +495,7 @@ fn extract_frame_ids<'a>(
         .collect()
 }
 
-/// Helper function to collect all frames from a frame map
+/// Collects all frames from the frame map
 fn collect_frames(frame_map: &HashMap<u64, Vec<LocalFrame>>) -> Vec<Frame> {
     frame_map
         .values()
@@ -510,7 +508,7 @@ fn collect_frames(frame_map: &HashMap<u64, Vec<LocalFrame>>) -> Vec<Frame> {
         .collect()
 }
 
-/// Helper function to collect all mappings from a frame map
+/// Collects all mappings from the frame map
 fn collect_mappings(frame_map: &HashMap<u64, Vec<LocalFrame>>) -> Vec<Mapping> {
     frame_map
         .values()
@@ -523,7 +521,7 @@ fn collect_mappings(frame_map: &HashMap<u64, Vec<LocalFrame>>) -> Vec<Mapping> {
         .collect()
 }
 
-/// Helper to build a callstack from frame IDs
+/// Builds a callstack from frame IDs
 /// Returns None if the resulting callstack would have no frames
 fn build_callstack_for_stack(
     stack: &Stack,
@@ -655,7 +653,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
             stacks.push(stack);
         }
 
-        self.psr.load_pystack_symbols(&event);
+        // Symbol loading will be handled by dedicated thread via channel
     }
 }
 
@@ -830,6 +828,14 @@ impl StackRecorder {
 
 #[cfg(test)]
 mod tests {
+    //! Test suite for stack recording and symbolization.
+    //!
+    //! Note: Tests in this module use fake PIDs and addresses that don't exist in /proc.
+    //! The blazesym resolver returns UnknownAddr for unmapped addresses, which our logic
+    //! skips during symbolization (only MissingSyms gets "unknown" frames). As a result,
+    //! stacks with no resolved frames are filtered out. These tests verify the trace
+    //! generation pipeline works end-to-end despite fake data.
+
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
@@ -1059,14 +1065,6 @@ mod tests {
         let id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&id_counter);
 
-        // Note: With fake PIDs and addresses, frames are not generated because:
-        // 1. blazesym can't access /proc/1234/maps (doesn't exist)
-        // 2. Default resolver returns UnknownAddr for unmapped addresses
-        // 3. Our logic skips UnknownAddr (only MissingSyms gets "unknown" frames)
-        // 4. Stacks with no frames are filtered out entirely
-        // This test verifies the trace generation pipeline works end-to-end.
-
-        // With fake addresses, no frames are resolved, so stacks are filtered out
         let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
         assert_eq!(sample_packets.len(), 0);
     }
@@ -1095,14 +1093,6 @@ mod tests {
         let id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&id_counter);
 
-        // Note: With fake PIDs and addresses, frames are not generated because:
-        // 1. blazesym can't access /proc/1234/maps (doesn't exist)
-        // 2. Default resolver returns UnknownAddr for unmapped addresses
-        // 3. Our logic skips UnknownAddr (only MissingSyms gets "unknown" frames)
-        // 4. Stacks with no frames are filtered out entirely
-        // This test verifies the trace generation pipeline works end-to-end.
-
-        // With fake addresses, no frames are resolved, so stacks are filtered out
         let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
         assert_eq!(sample_packets.len(), 0);
     }
@@ -1123,14 +1113,6 @@ mod tests {
         let id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&id_counter);
 
-        // Note: With fake PIDs and addresses, frames are not generated because:
-        // 1. blazesym can't access /proc/1234/maps (doesn't exist)
-        // 2. Default resolver returns UnknownAddr for unmapped addresses
-        // 3. Our logic skips UnknownAddr (only MissingSyms gets "unknown" frames)
-        // 4. Stacks with no frames are filtered out entirely
-        // This test verifies the trace generation pipeline works end-to-end.
-
-        // With fake addresses, no frames are resolved, so stacks are filtered out
         let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
         assert_eq!(sample_packets.len(), 0);
     }
@@ -1163,14 +1145,6 @@ mod tests {
         let id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&id_counter);
 
-        // Note: With fake PIDs and addresses, frames are not generated because:
-        // 1. blazesym can't access /proc/1234/maps (doesn't exist)
-        // 2. Default resolver returns UnknownAddr for unmapped addresses
-        // 3. Our logic skips UnknownAddr (only MissingSyms gets "unknown" frames)
-        // 4. Stacks with no frames are filtered out entirely
-        // This test verifies the trace generation pipeline works end-to-end.
-
-        // With fake addresses, no frames are resolved, so stacks are filtered out
         let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
         assert_eq!(sample_packets.len(), 0);
     }
@@ -1191,14 +1165,6 @@ mod tests {
         let id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&id_counter);
 
-        // Note: With fake PIDs and addresses, frames are not generated because:
-        // 1. blazesym can't access /proc/1234/maps (doesn't exist)
-        // 2. Default resolver returns UnknownAddr for unmapped addresses
-        // 3. Our logic skips UnknownAddr (only MissingSyms gets "unknown" frames)
-        // 4. Stacks with no frames are filtered out entirely
-        // This test verifies the trace generation pipeline works end-to-end.
-
-        // With fake addresses, no frames are resolved, so stacks are filtered out
         let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
         assert_eq!(sample_packets.len(), 0);
     }
@@ -1221,14 +1187,6 @@ mod tests {
         let id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&id_counter);
 
-        // Note: With fake PIDs and addresses, frames are not generated because:
-        // 1. blazesym can't access /proc/1234/maps (doesn't exist)
-        // 2. Default resolver returns UnknownAddr for unmapped addresses
-        // 3. Our logic skips UnknownAddr (only MissingSyms gets "unknown" frames)
-        // 4. Stacks with no frames are filtered out entirely
-        // This test verifies the trace generation pipeline works end-to-end.
-
-        // With fake addresses, no frames are resolved, so stacks are filtered out
         let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
         assert_eq!(sample_packets.len(), 0);
     }
@@ -1251,14 +1209,6 @@ mod tests {
         let id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&id_counter);
 
-        // Note: With fake PIDs and addresses, frames are not generated because:
-        // 1. blazesym can't access /proc/1234/maps (doesn't exist)
-        // 2. Default resolver returns UnknownAddr for unmapped addresses
-        // 3. Our logic skips UnknownAddr (only MissingSyms gets "unknown" frames)
-        // 4. Stacks with no frames are filtered out entirely
-        // This test verifies the trace generation pipeline works end-to-end.
-
-        // With fake addresses, no frames are resolved, so stacks are filtered out
         let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
         assert_eq!(sample_packets.len(), 0);
     }
@@ -1289,14 +1239,6 @@ mod tests {
         let id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&id_counter);
 
-        // Note: With fake PIDs and addresses, frames are not generated because:
-        // 1. blazesym can't access /proc/1234/maps (doesn't exist)
-        // 2. Default resolver returns UnknownAddr for unmapped addresses
-        // 3. Our logic skips UnknownAddr (only MissingSyms gets "unknown" frames)
-        // 4. Stacks with no frames are filtered out entirely
-        // This test verifies the trace generation pipeline works end-to-end.
-
-        // With fake addresses, no frames are resolved, so stacks are filtered out
         let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
         assert_eq!(sample_packets.len(), 0);
     }
@@ -1317,14 +1259,6 @@ mod tests {
         let id_counter = Arc::new(AtomicUsize::new(100));
         let packets = recorder.generate_trace(&id_counter);
 
-        // Note: With fake PIDs and addresses, frames are not generated because:
-        // 1. blazesym can't access /proc/1234/maps (doesn't exist)
-        // 2. Default resolver returns UnknownAddr for unmapped addresses
-        // 3. Our logic skips UnknownAddr (only MissingSyms gets "unknown" frames)
-        // 4. Stacks with no frames are filtered out entirely
-        // This test verifies the trace generation pipeline works end-to-end.
-
-        // With fake addresses, no frames are resolved, so stacks are filtered out
         let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
         assert_eq!(sample_packets.len(), 0);
     }
