@@ -93,6 +93,7 @@ fn generate_bindings(out_dir: &PathBuf) {
             vmlinux_include_arg.to_string(),
             "-x".to_string(),
             "c++".to_string(),
+            "-std=c++20".to_string(),
         ])
         .allowlist_function("pystacks_.*")
         .generate()

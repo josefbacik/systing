@@ -453,27 +453,40 @@ where
 }
 
 fn consume_loop<T, N>(
-    session_recorder: &Arc<SessionRecorder>,
     recorder: &Mutex<T>,
     rx: Receiver<N>,
     stop_tx: Sender<()>,
+    task_info_tx: Sender<task_info>,
+    pystack_symbol_tx: Option<Sender<N>>,
 ) where
     T: SystingRecordEvent<N>,
-    N: Plain + SystingEvent,
+    N: Plain + SystingEvent + Copy,
 {
     loop {
-        let res = rx.recv();
-        if res.is_err() {
+        let Ok(event) = rx.recv() else {
             break;
-        }
-        let event = res.unwrap();
+        };
+
+        // Send task_info to process discovery thread
         if let Some(task_info) = event.next_task_info() {
-            session_recorder.maybe_record_task(task_info);
+            task_info_tx
+                .send(*task_info)
+                .expect("Failed to send task_info to discovery thread");
         }
         if let Some(task_info) = event.prev_task_info() {
-            session_recorder.maybe_record_task(task_info);
+            task_info_tx
+                .send(*task_info)
+                .expect("Failed to send task_info to discovery thread");
         }
+
+        // Send event to pystack symbol loading thread
+        if let Some(ref tx) = pystack_symbol_tx {
+            tx.send(event)
+                .expect("Failed to send event to pystack symbol loader thread");
+        }
+
         let ret = recorder.lock().unwrap().record_event(event);
+
         if ret {
             stop_tx.send(()).expect("Failed to send stop signal");
             break;
@@ -487,6 +500,8 @@ fn spawn_recorder_threads(
     opts: &Command,
     stop_tx: &Sender<()>,
     perf_counter_names: &[String],
+    task_info_tx: &Sender<task_info>,
+    pystack_symbol_tx: &Option<Sender<stack_event>>,
 ) -> Result<Vec<thread::JoinHandle<i32>>> {
     let RecorderChannels {
         event_rx,
@@ -504,15 +519,17 @@ fn spawn_recorder_threads(
     {
         let session_recorder = recorder.clone();
         let my_stop_tx = stop_tx.clone();
+        let my_task_tx = task_info_tx.clone();
         threads.push(
             thread::Builder::new()
                 .name("sched_recorder".to_string())
                 .spawn(move || {
                     consume_loop::<SchedEventRecorder, task_event>(
-                        &session_recorder,
                         &session_recorder.event_recorder,
                         event_rx,
                         my_stop_tx,
+                        my_task_tx,
+                        None,
                     );
                     0
                 })?,
@@ -523,15 +540,18 @@ fn spawn_recorder_threads(
     {
         let session_recorder = recorder.clone();
         let my_stop_tx = stop_tx.clone();
+        let my_task_tx = task_info_tx.clone();
+        let my_pystack_tx = pystack_symbol_tx.clone();
         threads.push(
             thread::Builder::new()
                 .name("stack_recorder".to_string())
                 .spawn(move || {
                     consume_loop::<StackRecorder, stack_event>(
-                        &session_recorder,
                         &session_recorder.stack_recorder,
                         stack_rx,
                         my_stop_tx,
+                        my_task_tx,
+                        my_pystack_tx,
                     );
                     0
                 })?,
@@ -542,15 +562,17 @@ fn spawn_recorder_threads(
     {
         let session_recorder = recorder.clone();
         let my_stop_tx = stop_tx.clone();
+        let my_task_tx = task_info_tx.clone();
         threads.push(
             thread::Builder::new()
                 .name("probe_recorder".to_string())
                 .spawn(move || {
                     consume_loop::<SystingProbeRecorder, probe_event>(
-                        &session_recorder,
                         &session_recorder.probe_recorder,
                         probe_rx,
                         my_stop_tx,
+                        my_task_tx,
+                        None,
                     );
                     0
                 })?,
@@ -561,15 +583,17 @@ fn spawn_recorder_threads(
     if opts.syscalls {
         let session_recorder = recorder.clone();
         let my_stop_tx = stop_tx.clone();
+        let my_task_tx = task_info_tx.clone();
         threads.push(
             thread::Builder::new()
                 .name("syscall_recorder".to_string())
                 .spawn(move || {
                     consume_loop::<SyscallRecorder, syscall_event>(
-                        &session_recorder,
                         &session_recorder.syscall_recorder,
                         syscall_rx,
                         my_stop_tx,
+                        my_task_tx,
+                        None,
                     );
                     0
                 })?,
@@ -580,15 +604,17 @@ fn spawn_recorder_threads(
     if opts.network {
         let session_recorder = recorder.clone();
         let my_stop_tx = stop_tx.clone();
+        let my_task_tx = task_info_tx.clone();
         threads.push(
             thread::Builder::new()
                 .name("network_recorder".to_string())
                 .spawn(move || {
                     consume_loop::<network_recorder::NetworkRecorder, network_event>(
-                        &session_recorder,
                         &session_recorder.network_recorder,
                         network_rx,
                         my_stop_tx,
+                        my_task_tx,
+                        None,
                     );
                     0
                 })?,
@@ -622,15 +648,17 @@ fn spawn_recorder_threads(
     } else {
         let session_recorder = recorder.clone();
         let my_stop_tx = stop_tx.clone();
+        let my_task_tx = task_info_tx.clone();
         threads.push(
             thread::Builder::new()
                 .name("perf_counter_recorder".to_string())
                 .spawn(move || {
                     consume_loop::<PerfCounterRecorder, perf_counter_event>(
-                        &session_recorder,
                         &session_recorder.perf_counter_recorder,
                         cache_rx,
                         my_stop_tx,
+                        my_task_tx,
+                        None,
                     );
                     0
                 })?,
@@ -1358,13 +1386,22 @@ fn attach_probes(
     Ok(probe_links)
 }
 
+struct ThreadHandles {
+    ringbuf_threads: Vec<thread::JoinHandle<i32>>,
+    recorder_threads: Vec<thread::JoinHandle<i32>>,
+    discovery_thread: thread::JoinHandle<i32>,
+    symbol_loader_thread: thread::JoinHandle<i32>,
+    task_info_tx: Sender<task_info>,
+    pystack_symbol_tx: Sender<stack_event>,
+}
+
 fn run_tracing_loop(
-    threads: Vec<thread::JoinHandle<i32>>,
-    recv_threads: Vec<thread::JoinHandle<i32>>,
+    handles: ThreadHandles,
     opts: &Command,
     stop_tx: Sender<()>,
     stop_rx: Receiver<()>,
     thread_done: Arc<AtomicBool>,
+    shutdown_signal: Arc<AtomicBool>,
     skel: &mut systing::SystingSystemSkel,
 ) -> Result<()> {
     sd_notify()?;
@@ -1394,13 +1431,24 @@ fn run_tracing_loop(
     println!("Stopping...");
     skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
     thread_done.store(true, Ordering::Relaxed);
-    for thread in threads {
+    for thread in handles.ringbuf_threads {
         thread.join().expect("Failed to join thread");
     }
-    println!("Stopping receiver threads...");
-    for thread in recv_threads {
+    shutdown_signal.store(true, Ordering::Relaxed);
+    for thread in handles.recorder_threads {
         thread.join().expect("Failed to join receiver thread");
     }
+    // Drop senders to allow background threads to exit
+    drop(handles.task_info_tx);
+    drop(handles.pystack_symbol_tx);
+    handles
+        .discovery_thread
+        .join()
+        .expect("Failed to join discovery thread");
+    handles
+        .symbol_loader_thread
+        .join()
+        .expect("Failed to join symbol thread");
 
     println!("Missed sched/IRQ events: {}", dump_missed_events(skel, 0));
     println!("Missed stack events: {}", dump_missed_events(skel, 1));
@@ -1550,9 +1598,52 @@ fn system(opts: Command) -> Result<()> {
 
         let (rings, channels) = setup_ringbuffers(&skel, &opts, &perf_counter_names)?;
 
+        // Create shutdown signal for receiver threads
+        let shutdown_signal = Arc::new(AtomicBool::new(false));
+
+        // Create channel for process discovery
+        let (task_info_tx, task_info_rx) = channel();
+
+        // Spawn dedicated process discovery thread
+        let discovery_recorder = recorder.clone();
+        let discovery_thread = thread::Builder::new()
+            .name("process_discovery".to_string())
+            .spawn(move || {
+                while let Ok(task_info) = task_info_rx.recv() {
+                    discovery_recorder.maybe_record_task(&task_info);
+                }
+                0
+            })?;
+
+        // Create channel for Python symbol loading
+        let (pystack_symbol_tx, pystack_symbol_rx) = channel();
+
+        // Spawn dedicated Python symbol loading thread
+        let symbol_recorder = recorder.clone();
+        let symbol_thread = thread::Builder::new()
+            .name("pystack_symbol_loader".to_string())
+            .spawn(move || {
+                while let Ok(event) = pystack_symbol_rx.recv() {
+                    symbol_recorder
+                        .stack_recorder
+                        .lock()
+                        .unwrap()
+                        .psr
+                        .load_pystack_symbols(&event);
+                }
+                0
+            })?;
+
         // Spawn all recorder threads
-        let recv_threads =
-            spawn_recorder_threads(&recorder, channels, &opts, &stop_tx, &perf_counter_names)?;
+        let recv_threads = spawn_recorder_threads(
+            &recorder,
+            channels,
+            &opts,
+            &stop_tx,
+            &perf_counter_names,
+            &task_info_tx,
+            &Some(pystack_symbol_tx.clone()),
+        )?;
 
         // Set up perf events (clock events and counter events)
         let (_perf_links, _events_files) =
@@ -1623,13 +1714,22 @@ fn system(opts: Command) -> Result<()> {
             );
         }
 
+        let handles = ThreadHandles {
+            ringbuf_threads: threads,
+            recorder_threads: recv_threads,
+            discovery_thread,
+            symbol_loader_thread: symbol_thread,
+            task_info_tx,
+            pystack_symbol_tx,
+        };
+
         run_tracing_loop(
-            threads,
-            recv_threads,
+            handles,
             &opts,
             stop_tx,
             stop_rx,
             thread_done,
+            shutdown_signal,
             &mut skel,
         )?;
     }

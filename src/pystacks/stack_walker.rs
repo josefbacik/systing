@@ -2,6 +2,8 @@ use crate::stack_recorder::{LocalFrame, Stack};
 use crate::systing::types::stack_event;
 use libbpf_rs::Object;
 use std::collections::HashMap;
+#[cfg(feature = "pystacks")]
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -141,6 +143,53 @@ impl StackWalkerRun {
         }
     }
 
+    /// Symbolizes a Python frame to extract the source filename and line number.
+    ///
+    /// Returns a tuple of (filename, line_number) where:
+    /// - `filename` is the source file path, or "unknown" if unavailable
+    /// - `line_number` is `Some(line)` if available, or `None` if unavailable
+    ///
+    /// The C++ pystacks library uses `u32::MAX` as a sentinel value to indicate
+    /// no line information is available.
+    fn symbolize_filename_line(&self, frame: &PyAddr) -> (String, Option<usize>) {
+        const FILENAME_BUFFER_SIZE: usize = 512;
+        const NO_LINE_INFO: usize = u32::MAX as usize;
+        const UNKNOWN_FILENAME: &str = "unknown";
+
+        let mut buff = vec![0; FILENAME_BUFFER_SIZE];
+        let mut line_number: usize = 0;
+
+        let len = if self.initialized() {
+            unsafe {
+                bindings::pystacks_symbolize_filename_line(
+                    self.ptr,
+                    &raw const frame.addr,
+                    buff.as_mut_ptr() as *mut i8,
+                    buff.len(),
+                    &mut line_number as *mut usize,
+                )
+            }
+        } else {
+            0
+        };
+
+        let filename = if len > 0 {
+            core::str::from_utf8(&buff[..len as usize])
+                .unwrap_or(UNKNOWN_FILENAME)
+                .to_string()
+        } else {
+            UNKNOWN_FILENAME.to_string()
+        };
+
+        let line = if line_number == NO_LINE_INFO {
+            None
+        } else {
+            Some(line_number)
+        };
+
+        (filename, line)
+    }
+
     fn load_symbols(&self) {
         if self.initialized() {
             unsafe { bindings::pystacks_load_symbols(self.ptr) };
@@ -164,7 +213,20 @@ impl StackWalkerRun {
                 continue;
             }
 
-            let name = self.symbolize_function(frame);
+            let func_name = self.symbolize_function(frame);
+            let (filename, line_number) = self.symbolize_filename_line(frame);
+
+            // Extract just the base filename (similar to how blazesym extracts module name)
+            let base_filename = std::path::Path::new(&filename)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(&filename);
+
+            // Format matches blazesym: "function_name (python) [filename:line]"
+            let formatted_name = match line_number {
+                Some(line) => format!("{} (python) [{}:{}]", func_name, base_filename, line),
+                None => format!("{} (python) [{}]", func_name, base_filename),
+            };
 
             add_frame(
                 frame_map,
@@ -173,10 +235,10 @@ impl StackWalkerRun {
                 frame.addr.symbol_id.into(),
                 0,
                 0,
-                format!("{name} [py]"),
+                formatted_name,
             );
 
-            if name == "<interpreter trampoline>" {
+            if func_name == "<interpreter trampoline>" {
                 python_stack_markers.push(frame.addr.symbol_id.into());
             }
         }
@@ -189,18 +251,25 @@ impl StackWalkerRun {
         global_func_manager: &Arc<crate::stack_recorder::GlobalFunctionManager>,
         python_calls: &mut Vec<u64>,
     ) {
-        let python_call_iids = global_func_manager.get_function_ids_matching("_PyEval_EvalFrame");
+        let all_python_iids: HashSet<u64> = global_func_manager
+            .get_function_ids_matching("PyEval")
+            .into_iter()
+            .chain(global_func_manager.get_function_ids_matching("_PyEval_EvalFrame"))
+            .collect();
 
         for (key, values) in frame_map {
             for value in values {
                 if value.frame.function_name_id.is_some()
-                    && python_call_iids.contains(&value.frame.function_name_id.unwrap())
+                    && all_python_iids.contains(&value.frame.function_name_id.unwrap())
                 {
                     python_calls.push(*key);
                 }
             }
         }
     }
+
+    // Heuristic threshold for detecting stack truncation vs normal frame count mismatch
+    const FRAME_MISMATCH_THRESHOLD: usize = 5;
 
     pub fn merge_pystacks(
         &self,
@@ -227,10 +296,24 @@ impl StackWalkerRun {
                 .count()
         };
 
-        // if we have more pyton calls in the system stack than python frames
+        // Fallback for Python binaries without frame pointers: C stack unwinding fails,
+        // so use Python frames directly when no _PyEval_EvalFrame marker is found.
+        if !stack.py_stack.is_empty() && py_call_count == 0 {
+            merged_addrs.extend(
+                stack
+                    .py_stack
+                    .iter()
+                    .rev()
+                    .map(|frame| frame.addr.symbol_id as u64),
+            );
+            merged_addrs.extend(stack.user_stack.iter().copied());
+            return merged_addrs;
+        }
+
+        // if we have more python calls in the system stack than python frames
         // skip the first N python calls, as the python frames are leafs
         // If it is only off by 1, it is more likely that we have entered a
-        // PyEval_EvalFrameDeafult but not yet setup the leaf frame, so ignore these
+        // PyEval_EvalFrameDefault but not yet setup the leaf frame, so ignore these
         // instances
         let mut skip_py_calls =
             if py_call_count > py_marker_count && py_call_count - py_marker_count > 1 {
@@ -243,7 +326,16 @@ impl StackWalkerRun {
         // drop the first N python frames. This could happen if the system stack overflows
         // the buffer used to collect it, in which case the base of the stack would be
         // missing.
-        let mut skip_py_frame = py_marker_count.saturating_sub(py_call_count);
+        let frame_mismatch = py_marker_count.saturating_sub(py_call_count);
+        let mut skip_py_frame = if python_stack_markers.is_empty() {
+            // No markers - we'll add all frames when we hit PyEval, so don't skip any
+            0
+        } else if frame_mismatch > Self::FRAME_MISMATCH_THRESHOLD {
+            // With markers but significant mismatch - likely truncation
+            frame_mismatch
+        } else {
+            0
+        };
 
         if python_stack_markers.is_empty() {
             pystack_idx -= skip_py_frame;
@@ -263,10 +355,13 @@ impl StackWalkerRun {
                 // decrement either way. In the if case below, we added the address. In
                 // the else case below, we are incrementing past the stack marker that
                 // ended the previous loop
-                pystack_idx -= 1;
                 if python_stack_markers.is_empty() {
-                    merged_addrs.push(stack.py_stack[pystack_idx].addr.symbol_id as u64);
+                    while pystack_idx > 0 {
+                        pystack_idx -= 1;
+                        merged_addrs.push(stack.py_stack[pystack_idx].addr.symbol_id as u64);
+                    }
                 } else {
+                    pystack_idx -= 1;
                     while pystack_idx > 0
                         && !python_stack_markers
                             .contains(&(stack.py_stack[pystack_idx - 1].addr.symbol_id as u64))

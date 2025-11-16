@@ -403,13 +403,15 @@ impl SessionRecorder {
         let mut packets = Vec::new();
 
         // Event recorder
+        eprintln!("Generating scheduler trace packets...");
         packets.extend(self.event_recorder.lock().unwrap().generate_trace(
             pid_uuids,
             thread_uuids,
             id_counter,
         ));
 
-        // Stack recorder
+        // Stack recorder - it has its own detailed progress bar for symbol resolution
+        eprintln!("Generating stack trace packets...");
         packets.extend(
             self.stack_recorder
                 .lock()
@@ -418,6 +420,7 @@ impl SessionRecorder {
         );
 
         // Performance counter recorder
+        eprintln!("Generating perf counter trace packets...");
         packets.extend(
             self.perf_counter_recorder
                 .lock()
@@ -426,6 +429,7 @@ impl SessionRecorder {
         );
 
         // System info recorder
+        eprintln!("Generating sysinfo trace packets...");
         packets.extend(
             self.sysinfo_recorder
                 .lock()
@@ -434,6 +438,7 @@ impl SessionRecorder {
         );
 
         // Probe recorder
+        eprintln!("Generating probe trace packets...");
         packets.extend(self.probe_recorder.lock().unwrap().generate_trace(
             pid_uuids,
             thread_uuids,
@@ -441,6 +446,7 @@ impl SessionRecorder {
         ));
 
         // Syscall recorder
+        eprintln!("Generating syscall trace packets...");
         packets.extend(
             self.syscall_recorder
                 .lock()
@@ -449,6 +455,7 @@ impl SessionRecorder {
         );
 
         // Network recorder
+        eprintln!("Generating network trace packets...");
         packets.extend(
             self.network_recorder
                 .lock()
