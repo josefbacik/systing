@@ -1351,6 +1351,20 @@ fn attach_probes(
                 probe_links.push(link);
             }
             EventProbe::Tracepoint(tracepoint) => {
+                // Validate that we're not trying to capture arguments on old kernels
+                // where raw_tracepoint doesn't support bpf_get_attach_cookie()
+                if old_kernel && !event.args.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "Cannot capture tracepoint arguments on kernel < 6.10. \
+                         Tracepoint '{}:{}' has {} argument(s) configured, but this kernel \
+                         version doesn't support bpf_get_attach_cookie() for raw_tracepoint programs. \
+                         Either upgrade to kernel 6.10+ or remove the argument specifications from the event configuration.",
+                        tracepoint.category,
+                        tracepoint.name,
+                        event.args.len()
+                    ));
+                }
+
                 let link = if old_kernel {
                     let category =
                         libbpf_rs::TracepointCategory::Custom(tracepoint.category.clone());

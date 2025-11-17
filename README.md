@@ -260,6 +260,41 @@ These debug annotations provide additional context when viewing the trace in
 Perfetto, showing the captured value with the specified name. In the example
 above, the mutex address will appear as a "mutex_addr" annotation on each event.
 
+### Kernel Version Requirements
+
+**Important**: Capturing arguments from tracepoint events requires **Linux kernel 6.10 or newer**.
+
+Prior to kernel 6.10, the BPF `raw_tracepoint` infrastructure did not support `bpf_get_attach_cookie()`,
+which is required for systing to capture arguments from tracepoint events. This limitation affects:
+
+- `tracepoint:syscalls:sys_enter_*` events (e.g., `sys_enter_mmap`, `sys_enter_open`)
+- `tracepoint:syscalls:sys_exit_*` events
+- Any other custom tracepoint events with arguments
+
+**What this means:**
+- ✅ **Kernel 6.10+**: Full support for tracepoint argument capture
+- ⚠️ **Kernel < 6.10**: Tracepoint events work, but argument capture is **not supported**
+
+If you attempt to use tracepoint argument capture on kernel < 6.10, systing will fail with a clear error message:
+```
+Cannot capture tracepoint arguments on kernel < 6.10.
+Tracepoint 'syscalls:sys_enter_mmap' has 2 argument(s) configured, but this kernel
+version doesn't support bpf_get_attach_cookie() for raw_tracepoint programs.
+Either upgrade to kernel 6.10+ or remove the argument specifications from the event configuration.
+```
+
+**Other probe types are not affected:**
+- `kprobe`/`kretprobe` - Work on all kernel versions
+- `uprobe`/`uretprobe` - Work on all kernel versions
+- `usdt` - Work on all kernel versions
+
+To check your kernel version:
+```bash
+uname -r
+```
+
+For kernel < 6.10, you can still use tracepoint events without arguments, or use kprobes/uprobes instead.
+
 The `stack` field is optional (defaults to `false`). When set to `true`, systing
 will capture and emit a stack trace whenever this event fires. This allows you to
 see the call stack at the point where the event occurred, which is useful for
