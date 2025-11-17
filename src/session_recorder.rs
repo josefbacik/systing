@@ -10,7 +10,6 @@ use crate::perfetto::TrackCounter;
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::stack_recorder::StackRecorder;
-use crate::syscall_recorder::SyscallRecorder;
 use crate::systing::types::task_info;
 use crate::SystingRecordEvent;
 
@@ -47,7 +46,6 @@ pub struct SessionRecorder {
     pub perf_counter_recorder: Mutex<PerfCounterRecorder>,
     pub sysinfo_recorder: Mutex<SysinfoRecorder>,
     pub probe_recorder: Mutex<SystingProbeRecorder>,
-    pub syscall_recorder: Mutex<SyscallRecorder>,
     pub network_recorder: Mutex<NetworkRecorder>,
     pub process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
     pub processes: RwLock<HashMap<u64, ProtoProcess>>,
@@ -118,7 +116,6 @@ impl SessionRecorder {
             perf_counter_recorder: Mutex::new(PerfCounterRecorder::default()),
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::default()),
-            syscall_recorder: Mutex::new(SyscallRecorder::default()),
             network_recorder: Mutex::new(NetworkRecorder::default()),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
@@ -270,7 +267,6 @@ impl SessionRecorder {
         self.perf_counter_recorder.lock().unwrap().drain_ringbuf();
         self.sysinfo_recorder.lock().unwrap().drain_ringbuf();
         self.probe_recorder.lock().unwrap().drain_ringbuf();
-        self.syscall_recorder.lock().unwrap().drain_ringbuf();
         self.network_recorder.lock().unwrap().drain_ringbuf();
     }
 
@@ -437,7 +433,6 @@ impl SessionRecorder {
                 .generate_trace(id_counter),
         );
 
-        // Probe recorder
         eprintln!("Generating probe trace packets...");
         packets.extend(self.probe_recorder.lock().unwrap().generate_trace(
             pid_uuids,
@@ -445,14 +440,7 @@ impl SessionRecorder {
             id_counter,
         ));
 
-        // Syscall recorder
         eprintln!("Generating syscall trace packets...");
-        packets.extend(
-            self.syscall_recorder
-                .lock()
-                .unwrap()
-                .generate_trace_packets(pid_uuids, thread_uuids, id_counter),
-        );
 
         // Network recorder
         eprintln!("Generating network trace packets...");
@@ -524,7 +512,6 @@ mod tests {
             perf_counter_recorder: Mutex::new(PerfCounterRecorder::default()),
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::default()),
-            syscall_recorder: Mutex::new(SyscallRecorder::default()),
             network_recorder: Mutex::new(NetworkRecorder::default()),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),

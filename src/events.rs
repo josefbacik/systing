@@ -16,9 +16,13 @@ use plain::Plain;
 use serde::Deserialize;
 
 use perfetto_protos::debug_annotation::DebugAnnotation;
+use perfetto_protos::interned_data::InternedData;
+use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_event::track_event::Type;
-use perfetto_protos::track_event::TrackEvent;
+use perfetto_protos::track_event::{EventName, TrackEvent};
+
+const SYS_ENTER_COOKIE: u64 = 0xFFFFFFFFFFFFFFFE;
 
 enum ArgValue {
     String(String),
@@ -114,6 +118,12 @@ pub struct SystingProbeRecorder {
 
     // The mapping of the range name -> track name.
     ranges: HashMap<String, String>,
+
+    // Syscall tracking state (cookies >= SYS_ENTER_COOKIE)
+    pending_syscalls: HashMap<u64, HashMap<u64, u64>>,
+    completed_syscalls: HashMap<u64, Vec<(u64, u64, u64)>>,
+    syscall_iids: HashMap<u64, u64>,
+    syscall_name_ids: HashMap<String, u64>,
 }
 
 // usdt:<path>:<provider>:<name>
@@ -510,6 +520,11 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
     }
 
     fn handle_event(&mut self, event: probe_event) {
+        if event.cookie >= SYS_ENTER_COOKIE {
+            self.handle_syscall_event(event);
+            return;
+        }
+
         let systing_event = self.cookies.get(&event.cookie).unwrap();
         let mut arg_data: Vec<(String, ArgValue)> = Vec::new();
 
@@ -608,6 +623,59 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
 }
 
 impl SystingProbeRecorder {
+    fn handle_syscall_event(&mut self, event: probe_event) {
+        if event.num_args == 0 {
+            return;
+        }
+
+        let mut bytes: [u8; 8] = [0; 8];
+        let _ = bytes.copy_from_bytes(&event.args[0].value[..8]);
+        let syscall_nr = u64::from_ne_bytes(bytes);
+        let tgidpid = event.task.tgidpid;
+
+        if event.cookie == SYS_ENTER_COOKIE {
+            self.pending_syscalls
+                .entry(tgidpid)
+                .or_default()
+                .insert(syscall_nr, event.ts);
+        } else if let Some(pid_pending) = self.pending_syscalls.get_mut(&tgidpid) {
+            if let Some(enter_ts) = pid_pending.remove(&syscall_nr) {
+                self.completed_syscalls
+                    .entry(tgidpid)
+                    .or_default()
+                    .push((enter_ts, event.ts, syscall_nr));
+            }
+        }
+    }
+
+    fn get_or_create_syscall_name_iid(
+        &mut self,
+        syscall_nr: u64,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> u64 {
+        use syscalls::Sysno;
+
+        if let Some(&iid) = self.syscall_iids.get(&syscall_nr) {
+            return iid;
+        }
+
+        let syscall_name = match Sysno::new(syscall_nr as usize) {
+            Some(sysno) => sysno.name().to_string(),
+            None => format!("syscall_{syscall_nr}"),
+        };
+
+        let iid = if let Some(&existing_iid) = self.syscall_name_ids.get(&syscall_name) {
+            existing_iid
+        } else {
+            let new_iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+            self.syscall_name_ids.insert(syscall_name, new_iid);
+            new_iid
+        };
+
+        self.syscall_iids.insert(syscall_nr, iid);
+        iid
+    }
+
     fn add_arg_annotations(tevent: &mut TrackEvent, args: &[(String, ArgValue)]) {
         for (name, value) in args {
             let mut annotation = DebugAnnotation::default();
@@ -739,7 +807,7 @@ impl SystingProbeRecorder {
     }
 
     pub fn generate_trace(
-        &self,
+        &mut self,
         pid_uuids: &HashMap<i32, u64>,
         thread_uuids: &HashMap<i32, u64>,
         id_counter: &Arc<AtomicUsize>,
@@ -912,6 +980,98 @@ impl SystingProbeRecorder {
                 }
             }
         }
+
+        // Generate syscall trace packets
+        let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
+
+        // Collect unique syscall numbers first
+        let mut syscall_numbers: Vec<u64> = Vec::new();
+        for (_pid, syscalls) in self.completed_syscalls.iter() {
+            for (_start_ts, _end_ts, syscall_nr) in syscalls {
+                syscall_numbers.push(*syscall_nr);
+            }
+        }
+
+        // Intern all unique syscall numbers
+        for syscall_nr in syscall_numbers {
+            self.get_or_create_syscall_name_iid(syscall_nr, id_counter);
+        }
+
+        // Generate interned data packet with syscall names
+        if !self.syscall_name_ids.is_empty() {
+            let mut event_names = Vec::new();
+            for (name, iid) in &self.syscall_name_ids {
+                let mut event_name = EventName::default();
+                event_name.set_iid(*iid);
+                event_name.set_name(name.clone());
+                event_names.push(event_name);
+            }
+            event_names.sort_by_key(|e| e.iid());
+
+            let mut interned_packet = TracePacket::default();
+            let interned_data = InternedData {
+                event_names,
+                ..Default::default()
+            };
+            interned_packet.interned_data = Some(interned_data).into();
+            interned_packet.set_trusted_packet_sequence_id(sequence_id);
+            interned_packet.set_sequence_flags(
+                SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
+                    | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
+            );
+            packets.push(interned_packet);
+        }
+
+        // Generate per-thread syscall tracks and events
+        for (tgidpid, syscalls) in self.completed_syscalls.iter() {
+            if syscalls.is_empty() {
+                continue;
+            }
+
+            let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+            let desc = crate::perfetto::generate_pidtgid_track_descriptor(
+                pid_uuids,
+                thread_uuids,
+                tgidpid,
+                "Syscalls".to_string(),
+                track_uuid,
+            );
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            packets.push(packet);
+
+            for (start_ts, end_ts, syscall_nr) in syscalls {
+                let name_iid = *self.syscall_iids.get(syscall_nr).unwrap();
+
+                let mut begin_event = TrackEvent::default();
+                begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+                begin_event.set_name_iid(name_iid);
+                begin_event.set_track_uuid(track_uuid);
+
+                let mut begin_packet = TracePacket::default();
+                begin_packet.set_timestamp(*start_ts);
+                begin_packet.set_track_event(begin_event);
+                begin_packet.set_trusted_packet_sequence_id(sequence_id);
+                packets.push(begin_packet);
+
+                let mut end_event = TrackEvent::default();
+                end_event.set_type(Type::TYPE_SLICE_END);
+                end_event.set_track_uuid(track_uuid);
+
+                let mut end_packet = TracePacket::default();
+                end_packet.set_timestamp(*end_ts);
+                end_packet.set_track_event(end_event);
+                end_packet.set_trusted_packet_sequence_id(sequence_id);
+                packets.push(end_packet);
+            }
+        }
+
+        // Clear syscall state after generating packets
+        self.completed_syscalls.clear();
+        self.pending_syscalls.clear();
+        self.syscall_iids.clear();
+        self.syscall_name_ids.clear();
 
         packets
     }
@@ -3256,5 +3416,167 @@ mod tests {
             .unwrap();
         assert!(event.stack);
         assert_eq!(event.args.len(), 1);
+    }
+
+    fn create_test_task_info(tgid: u32, pid: u32) -> task_info {
+        task_info {
+            tgidpid: ((tgid as u64) << 32) | (pid as u64),
+            comm: [0; 16],
+        }
+    }
+
+    fn create_syscall_enter_event(tgid: u32, pid: u32, ts: u64, syscall_nr: u64) -> probe_event {
+        let mut event = probe_event {
+            task: create_test_task_info(tgid, pid),
+            ts,
+            cookie: SYS_ENTER_COOKIE,
+            num_args: 1,
+            ..Default::default()
+        };
+        event.args[0].r#type = crate::systing::types::arg_type::ARG_LONG;
+        event.args[0].size = 8;
+        let bytes = syscall_nr.to_ne_bytes();
+        event.args[0].value[..8].copy_from_slice(&bytes);
+        event
+    }
+
+    fn create_syscall_exit_event(
+        tgid: u32,
+        pid: u32,
+        ts: u64,
+        syscall_nr: u64,
+        ret: u64,
+    ) -> probe_event {
+        let mut event = probe_event {
+            task: create_test_task_info(tgid, pid),
+            ts,
+            cookie: SYS_ENTER_COOKIE + 1,
+            num_args: 2,
+            ..Default::default()
+        };
+        event.args[0].r#type = crate::systing::types::arg_type::ARG_LONG;
+        event.args[0].size = 8;
+        let bytes = syscall_nr.to_ne_bytes();
+        event.args[0].value[..8].copy_from_slice(&bytes);
+        event.args[1].r#type = crate::systing::types::arg_type::ARG_LONG;
+        event.args[1].size = 8;
+        let ret_bytes = ret.to_ne_bytes();
+        event.args[1].value[..8].copy_from_slice(&ret_bytes);
+        event
+    }
+
+    #[test]
+    fn test_syscall_sys_enter() {
+        let mut recorder = SystingProbeRecorder::default();
+        let event = create_syscall_enter_event(100, 101, 1000, 1);
+
+        recorder.handle_event(event);
+
+        let tgidpid = (100u64 << 32) | 101u64;
+        assert_eq!(recorder.pending_syscalls.len(), 1);
+        assert!(recorder.pending_syscalls.contains_key(&tgidpid));
+        assert_eq!(recorder.pending_syscalls[&tgidpid].len(), 1);
+        assert!(recorder.pending_syscalls[&tgidpid].contains_key(&1));
+        assert!(recorder.completed_syscalls.is_empty());
+    }
+
+    #[test]
+    fn test_syscall_sys_exit_without_enter() {
+        let mut recorder = SystingProbeRecorder::default();
+        let event = create_syscall_exit_event(100, 101, 2000, 1, 42);
+
+        recorder.handle_event(event);
+
+        assert!(recorder.pending_syscalls.is_empty());
+        assert!(recorder.completed_syscalls.is_empty());
+    }
+
+    #[test]
+    fn test_syscall_complete_pair() {
+        let mut recorder = SystingProbeRecorder::default();
+        let enter = create_syscall_enter_event(100, 101, 1000, 1);
+        let exit = create_syscall_exit_event(100, 101, 2000, 1, 42);
+
+        recorder.handle_event(enter);
+        recorder.handle_event(exit);
+
+        let tgidpid = (100u64 << 32) | 101u64;
+        assert_eq!(recorder.pending_syscalls.len(), 1);
+        assert!(recorder.pending_syscalls[&tgidpid].is_empty());
+        assert_eq!(recorder.completed_syscalls.len(), 1);
+        assert_eq!(recorder.completed_syscalls[&tgidpid].len(), 1);
+        assert_eq!(recorder.completed_syscalls[&tgidpid][0], (1000, 2000, 1));
+    }
+
+    #[test]
+    fn test_syscall_multiple_threads() {
+        let mut recorder = SystingProbeRecorder::default();
+
+        let enter1 = create_syscall_enter_event(100, 101, 1000, 1);
+        let enter2 = create_syscall_enter_event(200, 201, 1500, 2);
+        let exit1 = create_syscall_exit_event(100, 101, 2000, 1, 10);
+        let exit2 = create_syscall_exit_event(200, 201, 2500, 2, 20);
+
+        recorder.handle_event(enter1);
+        recorder.handle_event(enter2);
+        recorder.handle_event(exit1);
+        recorder.handle_event(exit2);
+
+        let tgidpid1 = (100u64 << 32) | 101u64;
+        let tgidpid2 = (200u64 << 32) | 201u64;
+        assert_eq!(recorder.completed_syscalls.len(), 2);
+        assert_eq!(recorder.completed_syscalls[&tgidpid1].len(), 1);
+        assert_eq!(recorder.completed_syscalls[&tgidpid2].len(), 1);
+        assert_eq!(recorder.completed_syscalls[&tgidpid1][0], (1000, 2000, 1));
+        assert_eq!(recorder.completed_syscalls[&tgidpid2][0], (1500, 2500, 2));
+    }
+
+    #[test]
+    fn test_syscall_generate_trace_packets() {
+        let mut recorder = SystingProbeRecorder::default();
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(101, 500);
+        let pid_uuids: HashMap<i32, u64> = HashMap::new();
+        let id_counter = Arc::new(AtomicUsize::new(1000));
+
+        let enter = create_syscall_enter_event(100, 101, 1000, 1);
+        let exit = create_syscall_exit_event(100, 101, 2000, 1, 42);
+
+        recorder.handle_event(enter);
+        recorder.handle_event(exit);
+
+        let packets = recorder.generate_trace(&pid_uuids, &thread_uuids, &id_counter);
+
+        let syscall_packets: Vec<_> = packets
+            .iter()
+            .filter(|p| p.has_track_descriptor() && p.track_descriptor().name() == "Syscalls")
+            .collect();
+        assert_eq!(syscall_packets.len(), 1);
+
+        let slice_packets: Vec<_> = packets.iter().filter(|p| p.has_track_event()).collect();
+        assert!(slice_packets.len() >= 2);
+
+        let interned_packets: Vec<_> = packets
+            .iter()
+            .filter(|p| p.interned_data.is_some())
+            .collect();
+        assert_eq!(interned_packets.len(), 1);
+
+        assert!(recorder.completed_syscalls.is_empty());
+        assert!(recorder.pending_syscalls.is_empty());
+    }
+
+    #[test]
+    fn test_syscall_name_interning() {
+        let mut recorder = SystingProbeRecorder::default();
+        let id_counter = Arc::new(AtomicUsize::new(1000));
+
+        let iid1 = recorder.get_or_create_syscall_name_iid(1, &id_counter);
+        let iid2 = recorder.get_or_create_syscall_name_iid(1, &id_counter);
+        let iid3 = recorder.get_or_create_syscall_name_iid(2, &id_counter);
+
+        assert_eq!(iid1, iid2);
+        assert_ne!(iid1, iid3);
+        assert_eq!(recorder.syscall_iids.len(), 2);
     }
 }
