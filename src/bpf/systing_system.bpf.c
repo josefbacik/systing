@@ -33,6 +33,9 @@
 #define SKIP_STACK_DEPTH 3
 #define NR_RINGBUFS 8
 
+#define SYS_ENTER_COOKIE 0xFFFFFFFFFFFFFFFEULL
+#define SYS_EXIT_COOKIE 0xFFFFFFFFFFFFFFFFULL
+
 const volatile struct {
 	u32 filter_pid;
 	u32 filter_cgroup;
@@ -140,15 +143,6 @@ struct perf_counter_event {
 	u32 counter_num;
 };
 
-struct syscall_event {
-	u64 ts;
-	struct task_info task;
-	u64 syscall_nr;
-	u64 ret;
-	u32 cpu;
-	u8 is_enter;  // 1 for sys_enter, 0 for sys_exit
-};
-
 enum network_protocol {
 	NETWORK_TCP,
 	NETWORK_UDP,
@@ -211,7 +205,6 @@ struct packet_event {
 struct task_event _event = {0};
 struct stack_event _stack_event = {0};
 struct perf_counter_event _perf_counter_event = {0};
-struct syscall_event _syscall_event = {0};
 struct network_event _network_event = {0};
 struct packet_event _packet_event = {0};
 struct task_info _task_info = {0};
@@ -420,10 +413,9 @@ struct {
 #define MISSED_STACK_EVENT 1
 #define MISSED_PROBE_EVENT 2
 #define MISSED_CACHE_EVENT 3
-#define MISSED_SYSCALL_EVENT 4
-#define MISSED_NETWORK_EVENT 5
-#define MISSED_PACKET_EVENT 6
-#define MISSED_EVENT_MAX 7
+#define MISSED_NETWORK_EVENT 4
+#define MISSED_PACKET_EVENT 5
+#define MISSED_EVENT_MAX 6
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
@@ -473,18 +465,6 @@ struct perf_counter_ringbuf_map {
 	ringbuf_perf_counter_events_node5 SEC(".maps"),
 	ringbuf_perf_counter_events_node6 SEC(".maps"),
 	ringbuf_perf_counter_events_node7 SEC(".maps");
-
-struct syscall_ringbuf_map {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
-} ringbuf_syscall_events_node0 SEC(".maps"),
-	ringbuf_syscall_events_node1 SEC(".maps"),
-	ringbuf_syscall_events_node2 SEC(".maps"),
-	ringbuf_syscall_events_node3 SEC(".maps"),
-	ringbuf_syscall_events_node4 SEC(".maps"),
-	ringbuf_syscall_events_node5 SEC(".maps"),
-	ringbuf_syscall_events_node6 SEC(".maps"),
-	ringbuf_syscall_events_node7 SEC(".maps");
 
 struct network_ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -586,24 +566,6 @@ struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
 	__uint(max_entries, NR_RINGBUFS);
 	__type(key, u32);
-	__array(values, struct syscall_ringbuf_map);
-} syscall_ringbufs SEC(".maps") = {
-	.values = {
-		&ringbuf_syscall_events_node0,
-		&ringbuf_syscall_events_node1,
-		&ringbuf_syscall_events_node2,
-		&ringbuf_syscall_events_node3,
-		&ringbuf_syscall_events_node4,
-		&ringbuf_syscall_events_node5,
-		&ringbuf_syscall_events_node6,
-		&ringbuf_syscall_events_node7,
-	},
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, NR_RINGBUFS);
-	__type(key, u32);
 	__array(values, struct network_ringbuf_map);
 } network_ringbufs SEC(".maps") = {
 	.values = {
@@ -678,17 +640,6 @@ static struct probe_event *reserve_probe_event(void)
 	if (!rb)
 		return NULL;
 	return bpf_ringbuf_reserve(rb, sizeof(struct probe_event), 0);
-}
-
-static struct syscall_event *reserve_syscall_event(void)
-{
-	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
-	void *rb;
-
-	rb = bpf_map_lookup_elem(&syscall_ringbufs, &node);
-	if (!rb)
-		return NULL;
-	return bpf_ringbuf_reserve(rb, sizeof(struct syscall_event), 0);
 }
 
 static struct network_event *reserve_network_event(void)
@@ -1166,7 +1117,6 @@ int BPF_PROG(systing_softirq_exit, unsigned int vec_nr)
 SEC("usdt")
 int systing_usdt(struct pt_regs *ctx)
 {
-	// Exit early in confidentiality mode since USDT helpers are restricted
 	if (tool_config.confidentiality_mode)
 		return 0;
 
@@ -1176,10 +1126,10 @@ int systing_usdt(struct pt_regs *ctx)
 		return 0;
 
 	u64 cookie = bpf_usdt_cookie(ctx);
-
 	struct probe_event *event = reserve_probe_event();
 	if (!event)
 		return handle_missed_event(MISSED_PROBE_EVENT);
+
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
@@ -1384,7 +1334,6 @@ int systing_kprobe(struct pt_regs *ctx)
 SEC("raw_tracepoint")
 int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
 {
-	// Exit early in confidentiality mode since probe helpers are restricted
 	if (tool_config.confidentiality_mode)
 		return 0;
 
@@ -1461,7 +1410,6 @@ int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
 SEC("tracepoint")
 int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
 {
-	// Exit early in confidentiality mode since we can't read arguments
 	if (tool_config.confidentiality_mode)
 		return 0;
 
@@ -1483,12 +1431,6 @@ int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
 	event->cookie = cookie;
 	event->num_args = 0;
 
-	// To get the tracepoint arguments we'd have to figure out the memory
-	// layout of the buffer and get to the right argument, which we're not
-	// going to do here. This is only provided so we can capture tracepoints
-	// in systing, if you want arguments you need a newer kernel and then
-	// systing will use the raw_tracepoint variation where we can record the
-	// argument.
 	bpf_ringbuf_submit(event, 0);
 
 	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
@@ -1508,18 +1450,20 @@ int tracepoint__raw_syscalls__sys_enter(struct trace_event_raw_sys_enter *ctx)
 	if (!trace_task(task))
 		return 0;
 
-	struct syscall_event *event = reserve_syscall_event();
+	struct probe_event *event = reserve_probe_event();
 	if (!event) {
-		handle_missed_event(MISSED_SYSCALL_EVENT);
+		handle_missed_event(MISSED_PROBE_EVENT);
 		return 0;
 	}
 
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
-	event->syscall_nr = ctx->id;
-	event->ret = 0;  // Not available for sys_enter
-	event->is_enter = 1;
+	event->cookie = SYS_ENTER_COOKIE;
+	event->num_args = 1;
+	event->args[0].type = ARG_LONG;
+	event->args[0].size = sizeof(u64);
+	__builtin_memcpy(&event->args[0].value, &ctx->id, sizeof(u64));
 
 	bpf_ringbuf_submit(event, 0);
 	return 0;
@@ -1535,18 +1479,23 @@ int tracepoint__raw_syscalls__sys_exit(struct trace_event_raw_sys_exit *ctx)
 	if (!trace_task(task))
 		return 0;
 
-	struct syscall_event *event = reserve_syscall_event();
+	struct probe_event *event = reserve_probe_event();
 	if (!event) {
-		handle_missed_event(MISSED_SYSCALL_EVENT);
+		handle_missed_event(MISSED_PROBE_EVENT);
 		return 0;
 	}
 
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
-	event->syscall_nr = ctx->id;
-	event->ret = ctx->ret;
-	event->is_enter = 0;
+	event->cookie = SYS_EXIT_COOKIE;
+	event->num_args = 2;
+	event->args[0].type = ARG_LONG;
+	event->args[0].size = sizeof(u64);
+	__builtin_memcpy(&event->args[0].value, &ctx->id, sizeof(u64));
+	event->args[1].type = ARG_LONG;
+	event->args[1].size = sizeof(u64);
+	__builtin_memcpy(&event->args[1].value, &ctx->ret, sizeof(u64));
 
 	bpf_ringbuf_submit(event, 0);
 	return 0;

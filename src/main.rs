@@ -8,7 +8,6 @@ mod ringbuf;
 mod sched;
 mod session_recorder;
 mod stack_recorder;
-mod syscall_recorder;
 
 use std::env;
 use std::mem::MaybeUninit;
@@ -30,7 +29,6 @@ use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::session_recorder::{get_clock_value, SessionRecorder, SysInfoEvent};
 use crate::stack_recorder::StackRecorder;
-use crate::syscall_recorder::SyscallRecorder;
 
 use anyhow::Result;
 use anyhow::{bail, Context};
@@ -346,7 +344,6 @@ use systing::types::packet_event;
 use systing::types::perf_counter_event;
 use systing::types::probe_event;
 use systing::types::stack_event;
-use systing::types::syscall_event;
 use systing::types::task_event;
 use systing::types::task_info;
 
@@ -354,7 +351,6 @@ unsafe impl Plain for task_event {}
 unsafe impl Plain for stack_event {}
 unsafe impl Plain for perf_counter_event {}
 unsafe impl Plain for probe_event {}
-unsafe impl Plain for syscall_event {}
 unsafe impl Plain for network_event {}
 unsafe impl Plain for packet_event {}
 unsafe impl Plain for arg_desc {}
@@ -397,15 +393,6 @@ impl SystingEvent for perf_counter_event {
 }
 
 impl SystingEvent for probe_event {
-    fn ts(&self) -> u64 {
-        self.ts
-    }
-    fn next_task_info(&self) -> Option<&task_info> {
-        Some(&self.task)
-    }
-}
-
-impl SystingEvent for syscall_event {
     fn ts(&self) -> u64 {
         self.ts
     }
@@ -508,7 +495,6 @@ fn spawn_recorder_threads(
         stack_rx,
         cache_rx,
         probe_rx,
-        syscall_rx,
         network_rx,
         packet_rx,
     } = channels;
@@ -558,7 +544,7 @@ fn spawn_recorder_threads(
         );
     }
 
-    // Always spawn probe recorder
+    // Spawn probe recorder
     {
         let session_recorder = recorder.clone();
         let my_stop_tx = stop_tx.clone();
@@ -570,27 +556,6 @@ fn spawn_recorder_threads(
                     consume_loop::<SystingProbeRecorder, probe_event>(
                         &session_recorder.probe_recorder,
                         probe_rx,
-                        my_stop_tx,
-                        my_task_tx,
-                        None,
-                    );
-                    0
-                })?,
-        );
-    }
-
-    // Conditionally spawn syscall recorder
-    if opts.syscalls {
-        let session_recorder = recorder.clone();
-        let my_stop_tx = stop_tx.clone();
-        let my_task_tx = task_info_tx.clone();
-        threads.push(
-            thread::Builder::new()
-                .name("syscall_recorder".to_string())
-                .spawn(move || {
-                    consume_loop::<SyscallRecorder, syscall_event>(
-                        &session_recorder.syscall_recorder,
-                        syscall_rx,
                         my_stop_tx,
                         my_task_tx,
                         None,
@@ -840,7 +805,6 @@ struct RecorderChannels {
     stack_rx: Receiver<stack_event>,
     cache_rx: Receiver<perf_counter_event>,
     probe_rx: Receiver<probe_event>,
-    syscall_rx: Receiver<syscall_event>,
     network_rx: Receiver<network_event>,
     packet_rx: Receiver<packet_event>,
 }
@@ -855,7 +819,6 @@ fn setup_ringbuffers<'a>(
     let (stack_tx, stack_rx) = channel();
     let (cache_tx, cache_rx) = channel();
     let (probe_tx, probe_rx) = channel();
-    let (syscall_tx, syscall_rx) = channel();
     let (network_tx, network_rx) = channel();
     let (packet_tx, packet_rx) = channel();
 
@@ -877,9 +840,6 @@ fn setup_ringbuffers<'a>(
         } else if name.starts_with("ringbuf_probe") {
             let ring = create_ring::<probe_event>(&map, probe_tx.clone())?;
             rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_syscall") && opts.syscalls {
-            let ring = create_ring::<syscall_event>(&map, syscall_tx.clone())?;
-            rings.push((name.to_string(), ring));
         } else if name.starts_with("ringbuf_network") && opts.network {
             let ring = create_ring::<network_event>(&map, network_tx.clone())?;
             rings.push((name.to_string(), ring));
@@ -894,7 +854,6 @@ fn setup_ringbuffers<'a>(
         stack_rx,
         cache_rx,
         probe_rx,
-        syscall_rx,
         network_rx,
         packet_rx,
     };
