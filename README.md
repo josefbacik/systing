@@ -180,9 +180,11 @@ systing --trace-event-pid <PID of qemu> --trace-event "usdt:/usr/bin/qemu-system
 ## Custom track events
 
 You can also add complex track event configurations to the trace.  Examples of
-these configuration files can be found in the examples directory.  The format is
-described in the [docs](docs/USAGE.adoc) and is a JSON file.  You can specify
-these configuration files with `--track-event-config`.
+these configuration files can be found in the examples directory.
+
+**📖 For complete documentation on the JSON configuration format, see [docs/TRACE_CONFIG_FORMAT.md](docs/TRACE_CONFIG_FORMAT.md)**
+
+The format is a JSON file specified with `--trace-event-config`.
 
 The `pthread_mutex` example will add a track that shows the time spent locking
 the mutex and the time that the mutex is locked by the thread.
