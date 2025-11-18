@@ -213,9 +213,9 @@ fn format_location_info(code_info: &Option<blazesym::symbolize::CodeInfo>) -> St
     code_info.as_ref().map_or(String::new(), |info| {
         let file_name = info.file.to_str().unwrap_or("unknown");
         if let Some(line) = info.line {
-            format!(" [{}:{}]", file_name, line)
+            format!(" [{file_name}:{line}]")
         } else {
-            format!(" [{}]", file_name)
+            format!(" [{file_name}]")
         }
     })
 }

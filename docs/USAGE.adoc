@@ -29,9 +29,14 @@ Trace all the scheduling events and stack traces for all threads in the system f
 # systing --duration 60
 ----
 
-Trace only a qemu process and record every time it calls `v9fs_create`::
+Trace a specific qemu process and record every time it calls `v9fs_create`::
 ----
 # systing --duration 60 --trace-event "usdt:/usr/bin/qemu-system-x86_64:qemu:v9fs_create" --trace-event-pid <pid>
+----
+
+Trace all processes that have libc loaded and record malloc calls (auto-discovery)::
+----
+# systing --duration 60 --trace-event "uprobe:libc.so.6:malloc"
 ----
 
 == Options
@@ -232,7 +237,8 @@ Example:
 
 This is a special option that takes a format similar to https://bpftrace.org[`bpftrace`].
 Currently the supported events are only `usdt`, `uprobe`, `uretprobe`, `kprobe`, `kretprobe`, and `tracepoint`.
-If using the userspace related events you must also specify *--trace-event-pid* to specify the PID of the process you want to trace.
+For userspace related events (uprobe, uretprobe, usdt), you can optionally specify *--trace-event-pid* to target specific processes.
+If no PIDs are specified, systing will automatically discover and attach to all processes that have the specified binary or library loaded.
 The following is an exhaustive list of the supported formats
 
 * `usdt:/path/to/executable:tracepoint_name:tracepoint_class`
@@ -251,12 +257,14 @@ The following is an exhaustive list of the supported formats
 
 === *--trace-event-pid* _PID_
 
-This is to be paired with *--trace-event-pid*.
-Any _PID_ specified here will have any of the userspace trace events specified applied to it.
+Optional parameter for userspace trace events (uprobe, uretprobe, usdt).
+When specified, trace events will be attached only to the given PID(s).
+When omitted, systing will automatically discover all processes that have the specified binary or library loaded and attach to all of them.
+This option can be specified multiple times to trace multiple specific processes.
 
 === *--trace-event-config* _CONFIG_
 
-This must be parid with *--trace-event-pid* if you are using a userspace trace event.
+This is used with trace events to provide complex configurations.
 This provides an optional configuration for complex trace event descriptions.
 The configuration is a JSON file with the following format.
 

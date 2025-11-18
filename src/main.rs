@@ -9,6 +9,7 @@ mod sched;
 mod session_recorder;
 mod stack_recorder;
 
+use std::collections::HashMap;
 use std::env;
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
@@ -757,47 +758,176 @@ fn sd_notify() -> Result<()> {
     Ok(())
 }
 
-/// Discover all Python processes on the system by examining /proc
-fn discover_python_processes() -> Vec<u32> {
-    use std::fs;
-    use std::path::PathBuf;
+/// Resolves the actual library path for a PID, handling chrooted processes.
+/// Returns the resolved path with /proc/$PID/root prefix, or None if not found.
+fn resolve_library_path_for_pid(pid: u32, lib_name: &str) -> Option<String> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+    use std::path::{Path, PathBuf};
 
-    let mut python_pids = Vec::new();
+    // Early return for empty library names
+    if lib_name.is_empty() {
+        return None;
+    }
 
-    // Read /proc directory
-    let proc_dir = match fs::read_dir("/proc") {
-        Ok(dir) => dir,
-        Err(_) => return python_pids,
+    let maps_path = PathBuf::from("/proc").join(pid.to_string()).join("maps");
+
+    let maps_file = match File::open(&maps_path) {
+        Ok(file) => file,
+        Err(_) => return None, // Process may have exited, silent failure is acceptable
     };
+    let reader = BufReader::new(maps_file);
 
-    for entry in proc_dir.flatten() {
-        // Only look at numeric directories (PIDs)
-        let dir_name = entry.file_name();
-        let dir_name_str = dir_name.to_string_lossy();
-        if !dir_name_str.chars().all(|c| c.is_ascii_digit()) {
+    let lib_path = Path::new(lib_name);
+    let is_absolute = lib_path.is_absolute();
+    let lib_filename = lib_path.file_name()?.to_string_lossy();
+
+    for line in reader.lines().map_while(Result::ok) {
+        if !line.contains('/') {
             continue;
         }
 
-        let pid: u32 = match dir_name_str.parse() {
-            Ok(pid) => pid,
-            Err(_) => continue,
+        let mapped_path = match line.split_whitespace().nth(5) {
+            Some(path) => path,
+            None => continue,
         };
 
-        // Check if /proc/[pid]/exe points to a python executable
-        let exe_path = PathBuf::from("/proc")
-            .join(dir_name_str.as_ref())
-            .join("exe");
-        if let Ok(exe_link) = fs::read_link(exe_path) {
-            let exe_str = exe_link.to_string_lossy();
-            // Check if the executable name contains "python"
-            // This catches python, python2, python3, python3.11, etc.
-            if exe_str.contains("python") {
-                python_pids.push(pid);
+        // Validate that the mapped path is absolute
+        if !mapped_path.starts_with('/') {
+            continue;
+        }
+
+        let matches = if is_absolute {
+            mapped_path == lib_name
+        } else if let Some(mapped_filename) = Path::new(mapped_path).file_name() {
+            mapped_filename
+                .to_string_lossy()
+                .contains(lib_filename.as_ref())
+        } else {
+            false
+        };
+
+        if matches {
+            return Some(format!("/proc/{pid}/root{mapped_path}"));
+        }
+    }
+
+    None
+}
+
+/// Convenience function to discover all Python processes by checking their main executable.
+fn discover_python_processes() -> Vec<u32> {
+    discover_processes_with_mapping("python", false)
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_else(|_| Vec::new())
+}
+
+/// Discovers processes with a specific binary or library mapped.
+/// Returns a map of PID -> resolved library path (with /proc/PID/root prefix).
+/// Note: TOCTOU race - processes may exit between discovery and attachment.
+fn discover_processes_with_mapping(
+    target_path: &str,
+    check_maps: bool,
+) -> Result<HashMap<u32, String>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+    use std::path::{Path, PathBuf};
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let mut discovered_pids = HashMap::new();
+
+    let target_normalized = if target_path.contains('/') && !Path::new(target_path).is_absolute() {
+        // Try to canonicalize relative paths
+        std::fs::canonicalize(target_path).unwrap_or_else(|e| {
+            eprintln!("Warning: Could not resolve path '{target_path}': {e} - using as-is");
+            PathBuf::from(target_path)
+        })
+    } else {
+        // Absolute paths or library names are used as-is
+        PathBuf::from(target_path)
+    };
+
+    let target_str = target_normalized.to_string_lossy();
+    let is_absolute = target_normalized.is_absolute();
+
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        false,
+        ProcessRefreshKind::nothing(),
+    );
+
+    for (pid, process) in system.processes() {
+        let pid_u32 = pid.as_u32();
+
+        if pid_u32 <= 2 {
+            // Skip kernel processes (0=scheduler, 1=init, 2=kthreadd)
+            continue;
+        }
+
+        if let Some(exe) = process.exe() {
+            if is_absolute {
+                if exe == target_normalized {
+                    let exe_str = exe.to_string_lossy();
+                    let resolved_path = format!("/proc/{pid_u32}/root{exe_str}");
+                    discovered_pids.insert(pid_u32, resolved_path);
+                    continue; // Skip checking maps after finding exe match
+                }
+            } else if let Some(exe_filename) = exe.file_name() {
+                if exe_filename.to_string_lossy().contains(&*target_str) {
+                    let exe_str = exe.to_string_lossy();
+                    let resolved_path = format!("/proc/{pid_u32}/root{exe_str}");
+                    discovered_pids.insert(pid_u32, resolved_path);
+                    continue; // Skip checking maps after finding exe match
+                }
+            }
+        }
+
+        if check_maps {
+            let maps_path = PathBuf::from("/proc")
+                .join(pid_u32.to_string())
+                .join("maps");
+
+            let maps_file = match File::open(&maps_path) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+
+            let reader = BufReader::new(maps_file);
+
+            for line in reader.lines().map_while(Result::ok) {
+                if !line.contains('/') {
+                    continue;
+                }
+
+                let mapped_path = match line.split_whitespace().nth(5) {
+                    Some(path) => path,
+                    None => continue,
+                };
+
+                // Validate absolute path
+                if !mapped_path.starts_with('/') {
+                    continue;
+                }
+
+                let found = if is_absolute {
+                    mapped_path == &*target_str
+                } else if let Some(mapping_filename) = Path::new(mapped_path).file_name() {
+                    mapping_filename.to_string_lossy().contains(&*target_str)
+                } else {
+                    false
+                };
+
+                if found {
+                    let resolved_path = format!("/proc/{pid_u32}/root{mapped_path}");
+                    discovered_pids.insert(pid_u32, resolved_path);
+                    break;
+                }
             }
         }
     }
 
-    python_pids
+    Ok(discovered_pids)
 }
 
 struct RecorderChannels {
@@ -950,23 +1080,7 @@ fn configure_bpf_skeleton(
                 .with_context(|| format!("Failed to load trace event config file: '{config}'"))?;
         }
 
-        if opts.trace_event_pid.is_empty() {
-            for event in probe_recorder.config_events.values() {
-                match event.event {
-                    EventProbe::Usdt(_) => {
-                        Err(anyhow::anyhow!(
-                            "USDT events must be specified with --trace-event-pid"
-                        ))?;
-                    }
-                    EventProbe::UProbe(_) => {
-                        Err(anyhow::anyhow!(
-                            "UPROBE events must be specified with --trace-event-pid"
-                        ))?;
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // UPROBE/USDT validation removed: PIDs are now auto-discovered if not specified
     }
 
     // Configure program autoload based on kernel version and options
@@ -1179,6 +1293,45 @@ fn setup_perf_events(
     Ok((perf_links, event_files_vec))
 }
 
+/// Returns PIDs to attach probes to with their resolved library paths.
+/// Returns (pid_to_path_map, is_auto_discovered).
+fn resolve_pids_for_probe(
+    opts: &Command,
+    target_path: &str,
+    probe_type: &str,
+    probe_name: &str,
+) -> Result<(HashMap<u32, String>, bool)> {
+    if opts.trace_event_pid.is_empty() {
+        let discovered = discover_processes_with_mapping(target_path, true).with_context(|| {
+            format!("Failed to discover processes for {probe_type} probe {probe_name}")
+        })?;
+        if discovered.is_empty() {
+            eprintln!(
+                "Warning: No processes found with {target_path} loaded for {probe_type} probe {probe_name}"
+            );
+        } else {
+            let pids: Vec<u32> = discovered.keys().cloned().collect();
+            println!(
+                "Auto-discovered {} process(es) with {target_path} loaded: {:?}",
+                discovered.len(),
+                pids
+            );
+        }
+        Ok((discovered, true))
+    } else {
+        // For user-specified PIDs, resolve paths individually
+        let mut pid_map = HashMap::new();
+        for pid in &opts.trace_event_pid {
+            if let Some(resolved_path) = resolve_library_path_for_pid(*pid, target_path) {
+                pid_map.insert(*pid, resolved_path);
+            } else {
+                pid_map.insert(*pid, target_path.to_string());
+            }
+        }
+        Ok((pid_map, false))
+    }
+}
+
 fn attach_probes(
     skel: &mut systing::SystingSystemSkel,
     recorder: &Arc<SessionRecorder>,
@@ -1237,57 +1390,127 @@ fn attach_probes(
                         usdt.path, usdt.provider, usdt.name
                     );
                 } else {
-                    for pid in opts.trace_event_pid.iter() {
-                        let link = skel
-                            .progs
-                            .systing_usdt
-                            .attach_usdt_with_opts(
-                                *pid as i32,
-                                &usdt.path,
-                                &usdt.provider,
-                                &usdt.name,
-                                UsdtOpts {
-                                    cookie: event.cookie,
-                                    ..Default::default()
-                                },
-                            )
-                            .with_context(|| {
-                                format!(
-                                    "Failed to attach USDT probe {}:{}:{} to PID {}",
-                                    usdt.path, usdt.provider, usdt.name, *pid
-                                )
-                            })?;
-                        probe_links.push(link);
+                    let (pid_path_map, is_auto_discovered) = resolve_pids_for_probe(
+                        opts,
+                        &usdt.path,
+                        "USDT",
+                        &format!("{}:{}", usdt.provider, usdt.name),
+                    )?;
+
+                    for (pid, resolved_path) in pid_path_map.iter() {
+                        let attach_result = skel.progs.systing_usdt.attach_usdt_with_opts(
+                            *pid as i32,
+                            resolved_path,
+                            &usdt.provider,
+                            &usdt.name,
+                            UsdtOpts {
+                                cookie: event.cookie,
+                                ..Default::default()
+                            },
+                        );
+
+                        match attach_result {
+                            Ok(link) => {
+                                if resolved_path != &usdt.path {
+                                    println!(
+                                        "Attached USDT probe {}:{} to PID {} using resolved path: {}",
+                                        usdt.provider, usdt.name, *pid, resolved_path
+                                    );
+                                }
+                                probe_links.push(link);
+                            }
+                            Err(e) => {
+                                if is_auto_discovered {
+                                    // Non-fatal for auto-discovered PIDs (process may have exited)
+                                    eprintln!(
+                                        "Warning: Failed to attach USDT probe {}:{}:{} to PID {} (resolved: {}): {}",
+                                        usdt.path, usdt.provider, usdt.name, *pid, resolved_path, e
+                                    );
+                                } else {
+                                    // Fatal for user-specified PIDs
+                                    return Err(e).with_context(|| {
+                                        format!(
+                                            "Failed to attach USDT probe {}:{}:{} to PID {} (resolved: {})",
+                                            usdt.path, usdt.provider, usdt.name, *pid, resolved_path
+                                        )
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
             EventProbe::UProbe(uprobe) => {
-                for pid in opts.trace_event_pid.iter() {
-                    let link = skel
-                        .progs
-                        .systing_uprobe
-                        .attach_uprobe_with_opts(
-                            *pid as i32,
-                            &uprobe.path,
-                            uprobe.offset as usize,
-                            UprobeOpts {
-                                cookie: event.cookie,
-                                retprobe: uprobe.retprobe,
-                                func_name: Some(uprobe.func_name.clone()),
-                                ..Default::default()
-                            },
-                        )
-                        .with_context(|| {
-                            format!(
-                                "Failed to attach uprobe '{}' ({}retprobe) at {}+{:#x} to PID {}",
-                                uprobe.func_name,
-                                if uprobe.retprobe { "" } else { "not " },
-                                uprobe.path,
-                                uprobe.offset,
-                                *pid
-                            )
-                        })?;
-                    probe_links.push(link);
+                let (pid_path_map, is_auto_discovered) = resolve_pids_for_probe(
+                    opts,
+                    &uprobe.path,
+                    if uprobe.retprobe {
+                        "uretprobe"
+                    } else {
+                        "uprobe"
+                    },
+                    &uprobe.func_name,
+                )?;
+
+                for (pid, resolved_path) in pid_path_map.iter() {
+                    let attach_result = skel.progs.systing_uprobe.attach_uprobe_with_opts(
+                        *pid as i32,
+                        resolved_path,
+                        uprobe.offset as usize,
+                        UprobeOpts {
+                            cookie: event.cookie,
+                            retprobe: uprobe.retprobe,
+                            func_name: Some(uprobe.func_name.clone()),
+                            ..Default::default()
+                        },
+                    );
+
+                    match attach_result {
+                        Ok(link) => {
+                            if resolved_path != &uprobe.path {
+                                println!(
+                                    "Attached {} '{}' to PID {} using resolved path: {}",
+                                    if uprobe.retprobe {
+                                        "uretprobe"
+                                    } else {
+                                        "uprobe"
+                                    },
+                                    uprobe.func_name,
+                                    *pid,
+                                    resolved_path
+                                );
+                            }
+                            probe_links.push(link);
+                        }
+                        Err(e) => {
+                            if is_auto_discovered {
+                                // Non-fatal for auto-discovered PIDs (process may have exited)
+                                eprintln!(
+                                    "Warning: Failed to attach {} '{}' at {}+{:#x} to PID {} (resolved: {}): {}",
+                                    if uprobe.retprobe { "uretprobe" } else { "uprobe" },
+                                    uprobe.func_name,
+                                    uprobe.path,
+                                    uprobe.offset,
+                                    *pid,
+                                    resolved_path,
+                                    e
+                                );
+                            } else {
+                                // Fatal for user-specified PIDs
+                                return Err(e).with_context(|| {
+                                    format!(
+                                        "Failed to attach {} '{}' at {}+{:#x} to PID {} (resolved: {})",
+                                        if uprobe.retprobe { "uretprobe" } else { "uprobe" },
+                                        uprobe.func_name,
+                                        uprobe.path,
+                                        uprobe.offset,
+                                        *pid,
+                                        resolved_path
+                                    )
+                                });
+                            }
+                        }
+                    }
                 }
             }
             EventProbe::KProbe(kprobe) => {
