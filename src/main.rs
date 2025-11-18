@@ -1398,9 +1398,18 @@ fn attach_probes(
                     )?;
 
                     for (pid, resolved_path) in pid_path_map.iter() {
+                        // For USDT, libbpf needs the actual path to the ELF file to read USDT metadata.
+                        // If the original path exists and is accessible, use it instead of /proc/PID/root version
+                        let usdt_path = if std::path::Path::new(&usdt.path).exists() {
+                            &usdt.path
+                        } else {
+                            // Fall back to resolved path for chrooted processes or non-standard locations
+                            resolved_path.as_str()
+                        };
+
                         let attach_result = skel.progs.systing_usdt.attach_usdt_with_opts(
                             *pid as i32,
-                            resolved_path,
+                            usdt_path,
                             &usdt.provider,
                             &usdt.name,
                             UsdtOpts {
@@ -1411,10 +1420,10 @@ fn attach_probes(
 
                         match attach_result {
                             Ok(link) => {
-                                if resolved_path != &usdt.path {
+                                if usdt_path != usdt.path.as_str() {
                                     println!(
-                                        "Attached USDT probe {}:{} to PID {} using resolved path: {}",
-                                        usdt.provider, usdt.name, *pid, resolved_path
+                                        "Attached USDT probe {}:{} to PID {} using path: {}",
+                                        usdt.provider, usdt.name, *pid, usdt_path
                                     );
                                 }
                                 probe_links.push(link);
@@ -1423,15 +1432,15 @@ fn attach_probes(
                                 if is_auto_discovered {
                                     // Non-fatal for auto-discovered PIDs (process may have exited)
                                     eprintln!(
-                                        "Warning: Failed to attach USDT probe {}:{}:{} to PID {} (resolved: {}): {}",
-                                        usdt.path, usdt.provider, usdt.name, *pid, resolved_path, e
+                                        "Warning: Failed to attach USDT probe {}:{}:{} to PID {} (using: {}): {}",
+                                        usdt.path, usdt.provider, usdt.name, *pid, usdt_path, e
                                     );
                                 } else {
                                     // Fatal for user-specified PIDs
                                     return Err(e).with_context(|| {
                                         format!(
-                                            "Failed to attach USDT probe {}:{}:{} to PID {} (resolved: {})",
-                                            usdt.path, usdt.provider, usdt.name, *pid, resolved_path
+                                            "Failed to attach USDT probe {}:{}:{} to PID {} (using: {})",
+                                            usdt.path, usdt.provider, usdt.name, *pid, usdt_path
                                         )
                                     });
                                 }
@@ -1453,9 +1462,16 @@ fn attach_probes(
                 )?;
 
                 for (pid, resolved_path) in pid_path_map.iter() {
+                    // For uprobes, use the actual file path if it exists
+                    let uprobe_path = if std::path::Path::new(&uprobe.path).exists() {
+                        &uprobe.path
+                    } else {
+                        resolved_path.as_str()
+                    };
+
                     let attach_result = skel.progs.systing_uprobe.attach_uprobe_with_opts(
                         *pid as i32,
-                        resolved_path,
+                        uprobe_path,
                         uprobe.offset as usize,
                         UprobeOpts {
                             cookie: event.cookie,
@@ -1467,9 +1483,9 @@ fn attach_probes(
 
                     match attach_result {
                         Ok(link) => {
-                            if resolved_path != &uprobe.path {
+                            if uprobe_path != uprobe.path.as_str() {
                                 println!(
-                                    "Attached {} '{}' to PID {} using resolved path: {}",
+                                    "Attached {} '{}' to PID {} using path: {}",
                                     if uprobe.retprobe {
                                         "uretprobe"
                                     } else {
@@ -1477,7 +1493,7 @@ fn attach_probes(
                                     },
                                     uprobe.func_name,
                                     *pid,
-                                    resolved_path
+                                    uprobe_path
                                 );
                             }
                             probe_links.push(link);
@@ -1486,26 +1502,26 @@ fn attach_probes(
                             if is_auto_discovered {
                                 // Non-fatal for auto-discovered PIDs (process may have exited)
                                 eprintln!(
-                                    "Warning: Failed to attach {} '{}' at {}+{:#x} to PID {} (resolved: {}): {}",
+                                    "Warning: Failed to attach {} '{}' at {}+{:#x} to PID {} (using: {}): {}",
                                     if uprobe.retprobe { "uretprobe" } else { "uprobe" },
                                     uprobe.func_name,
                                     uprobe.path,
                                     uprobe.offset,
                                     *pid,
-                                    resolved_path,
+                                    uprobe_path,
                                     e
                                 );
                             } else {
                                 // Fatal for user-specified PIDs
                                 return Err(e).with_context(|| {
                                     format!(
-                                        "Failed to attach {} '{}' at {}+{:#x} to PID {} (resolved: {})",
+                                        "Failed to attach {} '{}' at {}+{:#x} to PID {} (using: {})",
                                         if uprobe.retprobe { "uretprobe" } else { "uprobe" },
                                         uprobe.func_name,
                                         uprobe.path,
                                         uprobe.offset,
                                         *pid,
-                                        resolved_path
+                                        uprobe_path
                                     )
                                 });
                             }
