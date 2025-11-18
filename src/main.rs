@@ -865,6 +865,30 @@ fn discover_processes_with_mapping(
             continue;
         }
 
+        // Skip threads - only attach to thread group leaders (main processes)
+        // Check if this is a thread by reading /proc/PID/status
+        let status_path = PathBuf::from("/proc")
+            .join(pid_u32.to_string())
+            .join("status");
+
+        if let Ok(status) = std::fs::read_to_string(&status_path) {
+            let mut is_thread = false;
+            for line in status.lines() {
+                if let Some(tgid_str) = line.strip_prefix("Tgid:\t") {
+                    if let Ok(tgid) = tgid_str.trim().parse::<u32>() {
+                        if tgid != pid_u32 {
+                            is_thread = true;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            if is_thread {
+                continue;
+            }
+        }
+
         if let Some(exe) = process.exe() {
             if is_absolute {
                 if exe == target_normalized {
