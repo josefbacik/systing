@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
 use perfetto_protos::clock_snapshot::ClockSnapshot;
+use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
+use perfetto_protos::counter_descriptor::CounterDescriptor;
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
 use perfetto_protos::ftrace_event_bundle::FtraceEventBundle;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
@@ -16,6 +18,8 @@ use perfetto_protos::trace::Trace;
 use perfetto_protos::trace_packet::trace_packet::Data;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
+use perfetto_protos::track_event::track_event::Type;
+use perfetto_protos::track_event::TrackEvent;
 use protobuf::Message;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
@@ -74,6 +78,9 @@ pub fn convert_sqlite_to_perfetto(input_path: &str, output_path: &str) -> Result
 
     // 4. Scheduler events (the actual trace events!)
     add_scheduler_event_packets(&conn, &mut trace, &sequence_counter)?;
+
+    // 5. Counter tracks and values (runqueue size, latency, etc.)
+    add_counter_packets(&conn, &mut trace, &sequence_counter)?;
 
     println!(
         "Generated {} trace packets from SQLite database",
@@ -485,6 +492,156 @@ fn add_scheduler_event_packets(
     }
 
     println!("Extracted {} scheduler events", event_count);
+    Ok(())
+}
+
+/// Read counter tracks and values from SQLite and generate TrackDescriptor and TrackEvent packets
+///
+/// This includes counter tracks for runqueue size, CPU latency, process wake latency,
+/// and any other performance counters stored in the database.
+fn add_counter_packets(
+    conn: &Connection,
+    trace: &mut Trace,
+    sequence_counter: &AtomicU32,
+) -> Result<()> {
+    // First, query for counter tracks
+    let mut track_stmt = conn
+        .prepare(
+            "SELECT DISTINCT t.uuid, t.name, t.cpu, t.pid, t.tid, p.unit
+             FROM tracks t
+             LEFT JOIN perf_counters p ON t.uuid = p.track_uuid
+             WHERE t.track_type = 'counter'
+             ORDER BY t.uuid",
+        )
+        .context("Failed to prepare counter track query")?;
+
+    struct CounterTrack {
+        uuid: u64,
+        name: String,
+        cpu: Option<u32>,
+        pid: Option<i32>,
+        tid: Option<i32>,
+        unit: String,
+    }
+
+    let tracks: Vec<CounterTrack> = track_stmt
+        .query_map([], |row| {
+            Ok(CounterTrack {
+                uuid: row.get::<_, i64>(0)? as u64,
+                name: row.get(1)?,
+                cpu: row.get::<_, Option<i32>>(2)?.map(|c| c as u32),
+                pid: row.get(3)?,
+                tid: row.get(4)?,
+                unit: row.get(5).unwrap_or_else(|_| "count".to_string()),
+            })
+        })
+        .context("Failed to query counter tracks")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to collect counter tracks")?;
+
+    let mut counter_count = 0;
+
+    // Generate TrackDescriptor packets for each counter track
+    for track in &tracks {
+        let mut counter_desc = CounterDescriptor::new();
+        counter_desc.set_is_incremental(false);
+
+        // Map unit string to enum
+        let unit = match track.unit.as_str() {
+            "ns" | "time_ns" => Unit::UNIT_TIME_NS,
+            "count" | _ => Unit::UNIT_COUNT,
+            // Note: UNIT_TIME_MS and UNIT_BYTES don't exist in this version
+            // We'll map everything else to UNIT_COUNT
+        };
+        counter_desc.set_unit(unit);
+
+        let mut track_desc = TrackDescriptor::new();
+        track_desc.set_uuid(track.uuid);
+        track_desc.set_name(track.name.clone());
+        track_desc.counter = Some(counter_desc).into();
+
+        // Set parent UUID based on what's available
+        if let Some(tid) = track.tid {
+            // Thread-scoped counter
+            track_desc.set_parent_uuid((tid as u64) + 10000); // Match thread UUID scheme
+        } else if let Some(pid) = track.pid {
+            // Process-scoped counter
+            track_desc.set_parent_uuid((pid as u64) + 1000); // Match process UUID scheme
+        } else if let Some(cpu) = track.cpu {
+            // CPU-scoped counter (no parent, but we could set cpu field if needed)
+            // For now, include CPU in the name
+            if !track.name.contains("cpu") {
+                track_desc.set_name(format!("{}_cpu{}", track.name, cpu));
+            }
+        }
+
+        let mut packet = TracePacket::new();
+        packet.set_trusted_packet_sequence_id(sequence_counter.fetch_add(1, Ordering::Relaxed));
+        packet.data = Some(Data::TrackDescriptor(track_desc));
+        trace.packet.push(packet);
+        counter_count += 1;
+    }
+
+    // Now query for counter values
+    let mut value_stmt = conn
+        .prepare(
+            "SELECT pc.track_uuid, pcv.ts, pcv.value
+             FROM perf_counter_values pcv
+             JOIN perf_counters pc ON pcv.counter_id = pc.id
+             WHERE pc.track_uuid IN (
+                 SELECT uuid FROM tracks WHERE track_type = 'counter'
+             )
+             ORDER BY pc.track_uuid, pcv.ts",
+        )
+        .context("Failed to prepare counter value query")?;
+
+    // Group values by track UUID
+    let mut values_by_track: HashMap<u64, Vec<(u64, i64)>> = HashMap::new();
+
+    let value_rows = value_stmt
+        .query_map([], |row| {
+            let track_uuid: i64 = row.get(0)?;
+            let ts: i64 = row.get(1)?;
+            let value: i64 = row.get(2)?;
+            Ok((track_uuid as u64, ts as u64, value))
+        })
+        .context("Failed to query counter values")?;
+
+    let mut value_count = 0;
+    for row_result in value_rows {
+        let (track_uuid, ts, value) = row_result.context("Failed to read counter value row")?;
+        values_by_track
+            .entry(track_uuid)
+            .or_default()
+            .push((ts, value));
+        value_count += 1;
+    }
+
+    // Generate TrackEvent packets for counter values
+    for (track_uuid, values) in values_by_track {
+        for (ts, value) in values {
+            let mut track_event = TrackEvent::new();
+            track_event.set_timestamp_absolute_us((ts / 1000) as i64); // Convert ns to us
+            track_event.set_type(Type::TYPE_COUNTER);
+            track_event.set_track_uuid(track_uuid);
+            // Set the counter value directly
+            track_event.set_counter_value(value);
+
+            let mut packet = TracePacket::new();
+            packet.set_trusted_packet_sequence_id(sequence_counter.fetch_add(1, Ordering::Relaxed));
+            packet.set_timestamp(ts);
+            packet.data = Some(Data::TrackEvent(track_event));
+            trace.packet.push(packet);
+        }
+    }
+
+    if counter_count > 0 {
+        println!(
+            "Extracted {} counter tracks with {} values",
+            counter_count, value_count
+        );
+    }
+
     Ok(())
 }
 
