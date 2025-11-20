@@ -412,6 +412,63 @@ impl SchedEventRecorder {
             }
         }
 
+        // Write runqueue size counters
+        for (cpu, counters) in self.runqueue.iter() {
+            let track_info = crate::output::CounterTrackInfo {
+                name: format!("runqueue_size_cpu{}", cpu),
+                description: Some(format!("Runqueue size for CPU {}", cpu)),
+                unit: crate::output::CounterUnit::Count,
+                is_incremental: false,
+                cpu: Some(*cpu as u32),
+                pid: None,
+                tid: None,
+            };
+            let track_uuid = output.write_counter_track(&track_info)?;
+
+            for counter in counters {
+                output.write_counter_value(track_uuid, counter.ts, counter.count)?;
+            }
+        }
+
+        // Write CPU latency counters
+        for (cpu, counters) in self.cpu_latencies.iter() {
+            let track_info = crate::output::CounterTrackInfo {
+                name: format!("latency_cpu{}", cpu),
+                description: Some(format!("Scheduling latency for CPU {}", cpu)),
+                unit: crate::output::CounterUnit::TimeNs,
+                is_incremental: false,
+                cpu: Some(*cpu),
+                pid: None,
+                tid: None,
+            };
+            let track_uuid = output.write_counter_track(&track_info)?;
+
+            for counter in counters {
+                output.write_counter_value(track_uuid, counter.ts, counter.count)?;
+            }
+        }
+
+        // Write process wake latency counters
+        for (pidtgid, counters) in self.process_latencies.iter() {
+            let pid = (*pidtgid >> 32) as i32;
+            let tid = (*pidtgid & 0xFFFFFFFF) as i32;
+
+            let track_info = crate::output::CounterTrackInfo {
+                name: format!("Wake latency pid_{}", pid),
+                description: Some(format!("Wake latency for process {}", pid)),
+                unit: crate::output::CounterUnit::TimeNs,
+                is_incremental: false,
+                cpu: None,
+                pid: Some(pid),
+                tid: Some(tid),
+            };
+            let track_uuid = output.write_counter_track(&track_info)?;
+
+            for counter in counters {
+                output.write_counter_value(track_uuid, counter.ts, counter.count)?;
+            }
+        }
+
         Ok(())
     }
 }

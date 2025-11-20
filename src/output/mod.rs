@@ -78,6 +78,14 @@ pub trait TraceOutput {
     /// Write performance counter value at a specific timestamp
     fn write_perf_counter_value(&mut self, counter_id: u64, ts: u64, value: i64) -> Result<()>;
 
+    // Generic counter tracks (for runqueue size, latency, etc.)
+
+    /// Write counter track definition and return its UUID
+    fn write_counter_track(&mut self, track: &CounterTrackInfo) -> Result<u64>;
+
+    /// Write counter value for a specific track
+    fn write_counter_value(&mut self, track_uuid: u64, ts: u64, value: i64) -> Result<()>;
+
     // Probe events
 
     /// Write event definition and return its ID

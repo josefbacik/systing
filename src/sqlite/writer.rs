@@ -30,6 +30,7 @@ pub struct SqliteOutput {
     connection_cache: HashMap<NetworkConnection, u64>,
     event_def_cache: HashMap<String, u64>, // event_name -> ID
     perf_counter_cache: HashMap<(u64, String, Option<u32>), u64>, // (track_uuid, name, cpu) -> ID
+    counter_track_cache: HashMap<String, u64>, // track_name -> UUID
 
     // ID counters for new entities
     next_symbol_id: u64,
@@ -37,6 +38,7 @@ pub struct SqliteOutput {
     next_connection_id: u64,
     next_event_def_id: u64,
     next_perf_counter_id: u64,
+    next_track_uuid: u64,
 }
 
 impl SqliteOutput {
@@ -75,11 +77,13 @@ impl SqliteOutput {
             connection_cache: HashMap::new(),
             event_def_cache: HashMap::new(),
             perf_counter_cache: HashMap::new(),
+            counter_track_cache: HashMap::new(),
             next_symbol_id: 1,
             next_stack_id: 1,
             next_connection_id: 1,
             next_event_def_id: 1,
             next_perf_counter_id: 1,
+            next_track_uuid: 1000, // Start at 1000 to avoid conflicts
         })
     }
 
@@ -514,6 +518,144 @@ impl TraceOutput for SqliteOutput {
                 params![counter_id as i64, ts as i64, value],
             )
             .context("Failed to write perf counter value")?;
+
+        Ok(())
+    }
+
+    fn write_counter_track(&mut self, track: &CounterTrackInfo) -> Result<u64> {
+        // Check cache first
+        if let Some(&uuid) = self.counter_track_cache.get(&track.name) {
+            return Ok(uuid);
+        }
+
+        let uuid = self.next_track_uuid;
+
+        // Map CounterUnit to string representation
+        let unit_str = match track.unit {
+            CounterUnit::Count => "count",
+            CounterUnit::TimeNs => "ns",
+            CounterUnit::Bytes => "bytes",
+            CounterUnit::Custom(_) => "custom",
+        };
+
+        // Insert track record
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO tracks (uuid, name, track_type, pid, tid, cpu)
+             VALUES (?1, ?2, 'counter', ?3, ?4, ?5)",
+                params![
+                    uuid as i64,
+                    track.name,
+                    track.pid,
+                    track.tid,
+                    track.cpu.map(|c| c as i64),
+                ],
+            )
+            .context("Failed to write counter track")?;
+
+        // Also insert into perf_counters table for compatibility
+        // This allows the counter to be queried through the perf_counter tables
+        if track.cpu.is_some() || track.pid.is_some() || track.tid.is_some() {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO perf_counters (track_uuid, counter_name, cpu, unit)
+                 VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        uuid as i64,
+                        track.name,
+                        track.cpu.map(|c| c as i64),
+                        unit_str,
+                    ],
+                )
+                .context("Failed to write counter to perf_counters")?;
+        }
+
+        // Get actual UUID in case it already existed
+        let actual_uuid: i64 = self
+            .conn
+            .query_row(
+                "SELECT uuid FROM tracks WHERE name = ?1 AND track_type = 'counter'",
+                params![track.name],
+                |row| row.get(0),
+            )
+            .context("Failed to query track UUID")?;
+
+        let actual_uuid = actual_uuid as u64;
+
+        // Update cache
+        self.counter_track_cache
+            .insert(track.name.clone(), actual_uuid);
+
+        // Only increment if we actually inserted
+        if actual_uuid == uuid {
+            self.next_track_uuid += 1;
+        }
+
+        Ok(actual_uuid)
+    }
+
+    fn write_counter_value(&mut self, track_uuid: u64, ts: u64, value: i64) -> Result<()> {
+        // Check if this track is in the perf_counters table
+        let counter_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM perf_counters WHERE track_uuid = ?1",
+                params![track_uuid as i64],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(counter_id) = counter_id {
+            // Use perf_counter_values table if it's a perf counter
+            self.conn
+                .execute(
+                    "INSERT INTO perf_counter_values (counter_id, ts, value)
+                 VALUES (?1, ?2, ?3)",
+                    params![counter_id, ts as i64, value],
+                )
+                .context("Failed to write counter value")?;
+        } else {
+            // Otherwise, we'd need a generic counter_values table
+            // For now, we'll try to use perf_counter_values by looking up or creating a perf_counter entry
+
+            // First try to get the counter name from tracks table
+            let counter_name: String = self
+                .conn
+                .query_row(
+                    "SELECT name FROM tracks WHERE uuid = ?1",
+                    params![track_uuid as i64],
+                    |row| row.get(0),
+                )
+                .context("Failed to find track for counter value")?;
+
+            // Create a perf_counter entry if it doesn't exist
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO perf_counters (track_uuid, counter_name, unit)
+                 VALUES (?1, ?2, 'count')",
+                    params![track_uuid as i64, counter_name],
+                )
+                .context("Failed to create perf_counter entry")?;
+
+            // Now get the counter_id
+            let counter_id: i64 = self
+                .conn
+                .query_row(
+                    "SELECT id FROM perf_counters WHERE track_uuid = ?1",
+                    params![track_uuid as i64],
+                    |row| row.get(0),
+                )
+                .context("Failed to get counter ID")?;
+
+            // Write the value
+            self.conn
+                .execute(
+                    "INSERT INTO perf_counter_values (counter_id, ts, value)
+                 VALUES (?1, ?2, ?3)",
+                    params![counter_id, ts as i64, value],
+                )
+                .context("Failed to write counter value")?;
+        }
 
         Ok(())
     }

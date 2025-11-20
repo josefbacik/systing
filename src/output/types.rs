@@ -102,6 +102,27 @@ pub struct PerfCounterDef {
     pub is_incremental: bool,
 }
 
+/// Generic counter track information (for runqueue size, latency, etc.)
+#[derive(Debug, Clone)]
+pub struct CounterTrackInfo {
+    pub name: String,
+    pub description: Option<String>,
+    pub unit: CounterUnit,
+    pub is_incremental: bool,
+    pub cpu: Option<u32>,
+    pub pid: Option<i32>,
+    pub tid: Option<i32>,
+}
+
+/// Units for counter tracks
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CounterUnit {
+    Count,
+    TimeNs,
+    Bytes,
+    Custom(u32),
+}
+
 /// Event definition for probe events
 #[derive(Debug, Clone)]
 pub struct EventDefinition {
