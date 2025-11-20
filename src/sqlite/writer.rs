@@ -43,6 +43,7 @@ impl SqliteOutput {
     /// Create a new SQLite output file at the specified path
     ///
     /// This will create the database file, set up the schema, and begin a transaction.
+    /// If the file already exists, it will be overwritten (matching Perfetto behavior).
     ///
     /// # Arguments
     ///
@@ -52,6 +53,12 @@ impl SqliteOutput {
     ///
     /// A new `SqliteOutput` instance ready to receive trace data
     pub fn create(path: &str) -> Result<Self> {
+        // Remove existing file if it exists (matching Perfetto overwrite behavior)
+        if std::path::Path::new(path).exists() {
+            std::fs::remove_file(path)
+                .with_context(|| format!("Failed to remove existing database file: {}", path))?;
+        }
+
         let conn = Connection::open(path).context("Failed to open SQLite database")?;
 
         // Create the schema
