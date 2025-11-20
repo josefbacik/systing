@@ -86,7 +86,8 @@ Attach to USDT probe points in user-space applications.
 **Discovery:** Use `bpftrace -l 'usdt:<path>:*'` or examine with `readelf -n <binary>`
 
 **Restrictions:**
-- Requires `--trace-event-pid` to specify target process ID(s)
+- Optionally use `--trace-event-pid` to target specific process ID(s)
+- If no PIDs specified, automatically discovers all processes with the binary/library loaded
 - Not supported in confidentiality mode
 - Path must be accessible to the profiled process
 
@@ -128,7 +129,8 @@ Attach to function entry/exit points in user-space binaries.
 ```
 
 **Restrictions:**
-- Requires `--trace-event-pid` to specify target process ID(s)
+- Optionally use `--trace-event-pid` to target specific process ID(s)
+- If no PIDs specified, automatically discovers all processes with the binary/library loaded
 - Symbol must exist in the binary's symbol table
 - `retval` argument type only valid for `uretprobe` (not `uprobe`)
 

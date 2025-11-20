@@ -224,8 +224,8 @@ impl StackWalkerRun {
 
             // Format matches blazesym: "function_name (python) [filename:line]"
             let formatted_name = match line_number {
-                Some(line) => format!("{} (python) [{}:{}]", func_name, base_filename, line),
-                None => format!("{} (python) [{}]", func_name, base_filename),
+                Some(line) => format!("{func_name} (python) [{base_filename}:{line}]"),
+                None => format!("{func_name} (python) [{base_filename}]"),
             };
 
             add_frame(
