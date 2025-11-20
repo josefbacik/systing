@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::output::{ArgValue as OutputArgValue, EventDefinition, ProbeEventData, TraceOutput};
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::probe_event;
-use crate::utils::tid_from_tgidpid;
+use crate::utils::{pid_from_tgidpid, tid_from_tgidpid};
 use crate::SystingRecordEvent;
 
 use anyhow::Result;
@@ -582,8 +582,8 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
         if self.instant_triggers.contains(&event.cookie) {
             println!(
                 "Instant event triggered on TGID {} PID {}",
-                event.task.tgidpid >> 32_u32,
-                event.task.tgidpid as u32
+                pid_from_tgidpid(event.task.tgidpid),
+                tid_from_tgidpid(event.task.tgidpid)
             );
             return true;
         }
@@ -615,8 +615,8 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
                 if start + threshold <= end {
                     println!(
                         "Threshold exceeded on TGID {} PID {}",
-                        event.task.tgidpid >> 32_u32,
-                        event.task.tgidpid as u32
+                        pid_from_tgidpid(event.task.tgidpid),
+                        tid_from_tgidpid(event.task.tgidpid)
                     );
                     return true;
                 }

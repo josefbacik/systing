@@ -8,7 +8,7 @@ use crate::output::{PerfSampleData, StackTraceData, SymbolInfo, TraceOutput};
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::stack_event;
-use crate::utils::tid_from_tgidpid;
+use crate::utils::{pid_from_tgidpid, tid_from_tgidpid};
 use crate::SystingRecordEvent;
 
 use blazesym::helper::{read_elf_build_id, ElfResolver};
@@ -611,7 +611,7 @@ fn generate_sample_packets(
         };
 
         let pid = stack.tgidpid as u32;
-        let tgid = (stack.tgidpid >> 32) as u32;
+        let tgid = pid_from_tgidpid(stack.tgidpid) as u32;
         let mut packet = TracePacket::default();
         packet.set_timestamp(stack.ts_start);
 
@@ -645,7 +645,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
         if has_stack {
             let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
             let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
-            let stack_key = (event.task.tgidpid >> 32) as i32;
+            let stack_key = pid_from_tgidpid(event.task.tgidpid);
             let py_stack = self.psr.get_pystack_from_event(&event);
 
             let stack = StackEvent {

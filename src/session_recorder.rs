@@ -12,6 +12,7 @@ use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::stack_recorder::StackRecorder;
 use crate::systing::types::task_info;
+use crate::utils::pid_from_tgidpid;
 use crate::SystingRecordEvent;
 
 use anyhow::Result;
@@ -148,7 +149,7 @@ impl SessionRecorder {
     /// Check if a task is a process (pid == tgid)
     fn is_process(info: &task_info) -> bool {
         let pid = info.tgidpid as i32;
-        let tgid = (info.tgidpid >> 32) as i32;
+        let tgid = pid_from_tgidpid(info.tgidpid);
         pid == tgid
     }
 
@@ -204,7 +205,7 @@ impl SessionRecorder {
     fn record_new_process(&self, info: &task_info) {
         // Extract comm
         let comm = Self::extract_comm(info);
-        let pid = Pid::from_u32((info.tgidpid >> 32) as u32);
+        let pid = Pid::from_u32(pid_from_tgidpid(info.tgidpid) as u32);
 
         // Get process name and cmdline
         let process_name = if comm.is_empty() {
@@ -254,7 +255,7 @@ impl SessionRecorder {
         // Create and store ThreadDescriptor
         let mut thread_descriptor = ThreadDescriptor::default();
         thread_descriptor.set_tid(info.tgidpid as i32);
-        thread_descriptor.set_pid((info.tgidpid >> 32) as i32);
+        thread_descriptor.set_pid(pid_from_tgidpid(info.tgidpid));
         thread_descriptor.set_thread_name(thread_name);
 
         self.threads

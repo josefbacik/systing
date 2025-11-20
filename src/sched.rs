@@ -8,6 +8,7 @@ use crate::perfetto::TrackCounter;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::event_type;
 use crate::systing::types::task_event;
+use crate::utils::pid_from_tgidpid;
 use crate::SystingRecordEvent;
 use anyhow::Result;
 
@@ -495,7 +496,7 @@ impl From<&task_event> for SoftirqEntryFtraceEvent {
 impl From<&task_event> for SchedProcessExitFtraceEvent {
     fn from(event: &task_event) -> Self {
         let pid = event.prev.tgidpid as i32;
-        let tgid = (event.prev.tgidpid >> 32) as i32;
+        let tgid = pid_from_tgidpid(event.prev.tgidpid);
         let name_cstr = CStr::from_bytes_until_nul(&event.prev.comm).unwrap();
         let mut sched_process_exit = SchedProcessExitFtraceEvent::default();
         sched_process_exit.set_pid(pid);
