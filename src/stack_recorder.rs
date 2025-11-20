@@ -1044,7 +1044,7 @@ fn extract_module_name(formatted_name: &str) -> Option<String> {
     // Look for pattern (module ...)
     if let Some(start) = formatted_name.find('(') {
         if let Some(space_or_bracket) = formatted_name[start + 1..]
-            .find(|c| c == ' ' || c == '[')
+            .find([' ', '['])
             .map(|pos| pos + start + 1)
         {
             return Some(formatted_name[start + 1..space_or_bracket].to_string());

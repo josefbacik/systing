@@ -1103,7 +1103,9 @@ impl SystingProbeRecorder {
             for (track_name, track_events) in events.iter() {
                 for event in track_events.iter() {
                     let event_key = format!("instant:{}:{}", track_name, event.name);
-                    if !event_defs.contains_key(&event_key) {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        event_defs.entry(event_key)
+                    {
                         // Find the cookie for this event
                         let cookie = self
                             .cookies
@@ -1120,7 +1122,7 @@ impl SystingProbeRecorder {
                             cookie,
                         };
                         let def_id = output.write_event_definition(&def)?;
-                        event_defs.insert(event_key, def_id);
+                        e.insert(def_id);
                     }
                 }
             }
@@ -1132,7 +1134,9 @@ impl SystingProbeRecorder {
                 for range in ranges.iter() {
                     // Range start event
                     let start_key = format!("range_start:{}:{}", track_name, range.range_name);
-                    if !event_defs.contains_key(&start_key) {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        event_defs.entry(start_key)
+                    {
                         let cookie = self
                             .cookies
                             .iter()
@@ -1148,12 +1152,13 @@ impl SystingProbeRecorder {
                             cookie,
                         };
                         let def_id = output.write_event_definition(&def)?;
-                        event_defs.insert(start_key, def_id);
+                        e.insert(def_id);
                     }
 
                     // Range end event
                     let end_key = format!("range_end:{}:{}", track_name, range.range_name);
-                    if !event_defs.contains_key(&end_key) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = event_defs.entry(end_key)
+                    {
                         let cookie = self
                             .cookies
                             .iter()
@@ -1169,7 +1174,7 @@ impl SystingProbeRecorder {
                             cookie,
                         };
                         let def_id = output.write_event_definition(&def)?;
-                        event_defs.insert(end_key, def_id);
+                        e.insert(def_id);
                     }
                 }
             }
@@ -1180,7 +1185,9 @@ impl SystingProbeRecorder {
             for (track_name, track_events) in events.iter() {
                 for event in track_events.iter() {
                     let event_key = format!("instant:{}:{}", track_name, event.name);
-                    if !event_defs.contains_key(&event_key) {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        event_defs.entry(event_key)
+                    {
                         let cookie = self
                             .cookies
                             .iter()
@@ -1196,7 +1203,7 @@ impl SystingProbeRecorder {
                             cookie,
                         };
                         let def_id = output.write_event_definition(&def)?;
-                        event_defs.insert(event_key, def_id);
+                        e.insert(def_id);
                     }
                 }
             }
@@ -1208,7 +1215,9 @@ impl SystingProbeRecorder {
                 for range in ranges.iter() {
                     // Range start event
                     let start_key = format!("range_start:{}:{}", track_name, range.range_name);
-                    if !event_defs.contains_key(&start_key) {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        event_defs.entry(start_key)
+                    {
                         let cookie = self
                             .cookies
                             .iter()
@@ -1224,12 +1233,13 @@ impl SystingProbeRecorder {
                             cookie,
                         };
                         let def_id = output.write_event_definition(&def)?;
-                        event_defs.insert(start_key, def_id);
+                        e.insert(def_id);
                     }
 
                     // Range end event
                     let end_key = format!("range_end:{}:{}", track_name, range.range_name);
-                    if !event_defs.contains_key(&end_key) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = event_defs.entry(end_key)
+                    {
                         let cookie = self
                             .cookies
                             .iter()
@@ -1245,7 +1255,7 @@ impl SystingProbeRecorder {
                             cookie,
                         };
                         let def_id = output.write_event_definition(&def)?;
-                        event_defs.insert(end_key, def_id);
+                        e.insert(def_id);
                     }
                 }
             }

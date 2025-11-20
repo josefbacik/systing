@@ -88,7 +88,7 @@ impl SqliteOutput {
     /// the transaction.
     fn maybe_checkpoint(&mut self) -> Result<()> {
         self.event_count += 1;
-        if self.event_count % self.checkpoint_interval == 0 {
+        if self.event_count.is_multiple_of(self.checkpoint_interval) {
             // Use PASSIVE checkpoint which never blocks - if it can't checkpoint, that's OK
             // We'll get another chance later and the final flush will ensure data is written
             if let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
@@ -115,7 +115,7 @@ impl SqliteOutput {
             }
             if let Some(line) = symbol.line_number {
                 hasher.update(b"|line:");
-                hasher.update(&line.to_le_bytes());
+                hasher.update(line.to_le_bytes());
             }
             if let Some(ref build_id) = symbol.build_id {
                 hasher.update(b"|build:");
@@ -127,7 +127,7 @@ impl SqliteOutput {
             }
             if let Some(offset) = symbol.mapping_offset {
                 hasher.update(b"|off:");
-                hasher.update(&offset.to_le_bytes());
+                hasher.update(offset.to_le_bytes());
             }
             hasher.update(b";");
         }
@@ -142,7 +142,7 @@ impl SqliteOutput {
             }
             if let Some(line) = symbol.line_number {
                 hasher.update(b"|line:");
-                hasher.update(&line.to_le_bytes());
+                hasher.update(line.to_le_bytes());
             }
             if let Some(ref build_id) = symbol.build_id {
                 hasher.update(b"|build:");
@@ -154,7 +154,7 @@ impl SqliteOutput {
             }
             if let Some(offset) = symbol.mapping_offset {
                 hasher.update(b"|off:");
-                hasher.update(&offset.to_le_bytes());
+                hasher.update(offset.to_le_bytes());
             }
             hasher.update(b";");
         }
@@ -169,7 +169,7 @@ impl SqliteOutput {
             }
             if let Some(line) = symbol.line_number {
                 hasher.update(b"|line:");
-                hasher.update(&line.to_le_bytes());
+                hasher.update(line.to_le_bytes());
             }
             if let Some(ref build_id) = symbol.build_id {
                 hasher.update(b"|build:");
@@ -181,7 +181,7 @@ impl SqliteOutput {
             }
             if let Some(offset) = symbol.mapping_offset {
                 hasher.update(b"|off:");
-                hasher.update(&offset.to_le_bytes());
+                hasher.update(offset.to_le_bytes());
             }
             hasher.update(b";");
         }

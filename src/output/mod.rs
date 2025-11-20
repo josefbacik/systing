@@ -43,6 +43,7 @@ pub trait TraceOutput {
     fn write_thread(&mut self, tid: i32, pid: i32, name: &str) -> Result<()>;
 
     /// Write process/thread exit event
+    #[allow(dead_code)]
     fn write_process_exit(&mut self, tid: i32, ts: u64) -> Result<()>;
 
     // Track management

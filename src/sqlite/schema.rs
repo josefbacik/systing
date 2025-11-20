@@ -3,7 +3,6 @@
 /// This schema is designed to be simple and relational, optimized for SQL queries.
 /// Unlike Perfetto's complex interning system, we use straightforward deduplication
 /// with foreign keys and unique constraints.
-
 pub const SCHEMA_VERSION: i32 = 1;
 
 /// SQL schema for systing SQLite output

@@ -177,7 +177,7 @@ fn extract_process_tree(trace: &Trace, output: &mut dyn TraceOutput) -> Result<(
                 let pid = process_desc.pid();
 
                 // Only write each process once
-                if !seen_processes.contains_key(&pid) {
+                if let std::collections::hash_map::Entry::Vacant(e) = seen_processes.entry(pid) {
                     let process_name = if process_desc.has_process_name() {
                         process_desc.process_name()
                     } else {
@@ -194,7 +194,7 @@ fn extract_process_tree(trace: &Trace, output: &mut dyn TraceOutput) -> Result<(
                             format!("Failed to write process descriptor for PID {}", pid)
                         })?;
 
-                    seen_processes.insert(pid, process_name.to_string());
+                    e.insert(process_name.to_string());
                 }
             }
         }
@@ -208,7 +208,7 @@ fn extract_process_tree(trace: &Trace, output: &mut dyn TraceOutput) -> Result<(
                 let tid = thread_desc.tid();
 
                 // Only write each thread once
-                if !seen_threads.contains_key(&tid) {
+                if let std::collections::hash_map::Entry::Vacant(e) = seen_threads.entry(tid) {
                     let thread_name = if thread_desc.has_thread_name() {
                         thread_desc.thread_name()
                     } else {
@@ -216,12 +216,13 @@ fn extract_process_tree(trace: &Trace, output: &mut dyn TraceOutput) -> Result<(
                     };
 
                     // Ensure the parent process exists
-                    if !seen_processes.contains_key(&pid) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = seen_processes.entry(pid)
+                    {
                         // Create a placeholder process
                         output.write_process(pid, "unknown", &[]).with_context(|| {
                             format!("Failed to write placeholder process for PID {}", pid)
                         })?;
-                        seen_processes.insert(pid, "unknown".to_string());
+                        e.insert("unknown".to_string());
                     }
 
                     output
@@ -230,7 +231,7 @@ fn extract_process_tree(trace: &Trace, output: &mut dyn TraceOutput) -> Result<(
                             format!("Failed to write thread descriptor for TID {}", tid)
                         })?;
 
-                    seen_threads.insert(tid, thread_name.to_string());
+                    e.insert(thread_name.to_string());
                 }
             }
         }

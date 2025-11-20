@@ -9,6 +9,7 @@ use std::collections::HashMap;
 /// Clock information for synchronizing timestamps across different clock sources
 #[derive(Debug, Clone)]
 pub struct ClockInfo {
+    #[allow(dead_code)]
     pub clock_id: u32,
     pub clock_name: String,
     pub timestamp: u64,
@@ -31,7 +32,9 @@ pub enum TrackType {
     Process,
     Thread,
     Cpu,
+    #[allow(dead_code)]
     Counter,
+    #[allow(dead_code)]
     Global,
 }
 
@@ -44,7 +47,9 @@ pub struct SchedEventData {
     pub prev_pid: Option<i32>,
     pub prev_state: Option<String>,
     pub next_pid: Option<i32>,
+    #[allow(dead_code)]
     pub target_cpu: Option<u32>,
+    #[allow(dead_code)]
     pub latency: Option<u64>,
 }
 
@@ -53,6 +58,7 @@ pub struct SchedEventData {
 pub enum SchedEventType {
     Switch,
     Waking,
+    #[allow(dead_code)]
     Wakeup,
     WakeupNew,
     Exit,
@@ -92,6 +98,7 @@ pub struct PerfCounterDef {
     pub counter_name: String,
     pub cpu: Option<u32>,
     pub unit: String,
+    #[allow(dead_code)]
     pub is_incremental: bool,
 }
 
@@ -153,6 +160,7 @@ pub enum IrqType {
 
 /// IRQ/SoftIRQ event data
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct IrqEventData {
     /// Timestamp of the event
     pub ts: u64,

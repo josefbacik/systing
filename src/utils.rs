@@ -3,8 +3,8 @@
 /// In the Linux kernel, `bpf_get_current_pid_tgid()` returns a u64 where:
 /// - Lower 32 bits: TID (Thread ID)
 /// - Upper 32 bits: TGID (Thread Group ID, which is the Process ID)
-
-/// Extract TID (Thread ID) from combined tgidpid value.
+///
+///   Extract TID (Thread ID) from combined tgidpid value.
 ///
 /// The lower 32 bits contain the TID.
 ///
