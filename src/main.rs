@@ -1758,6 +1758,31 @@ fn run_tracing_loop(
     Ok(())
 }
 
+/// Map clock ID to human-readable clock name
+fn get_clock_name(clock_id: u32) -> String {
+    use perfetto_protos::builtin_clock::BuiltinClock;
+
+    match clock_id {
+        id if id == BuiltinClock::BUILTIN_CLOCK_UNKNOWN as u32 => "UNKNOWN".to_string(),
+        id if id == BuiltinClock::BUILTIN_CLOCK_REALTIME as u32 => "REALTIME".to_string(),
+        id if id == BuiltinClock::BUILTIN_CLOCK_REALTIME_COARSE as u32 => {
+            "REALTIME_COARSE".to_string()
+        }
+        id if id == BuiltinClock::BUILTIN_CLOCK_MONOTONIC as u32 => "MONOTONIC".to_string(),
+        id if id == BuiltinClock::BUILTIN_CLOCK_MONOTONIC_COARSE as u32 => {
+            "MONOTONIC_COARSE".to_string()
+        }
+        id if id == BuiltinClock::BUILTIN_CLOCK_MONOTONIC_RAW as u32 => "MONOTONIC_RAW".to_string(),
+        id if id == BuiltinClock::BUILTIN_CLOCK_BOOTTIME as u32 => "BOOTTIME".to_string(),
+        id if id == BuiltinClock::BUILTIN_CLOCK_TSC as u32 => "TSC".to_string(),
+        id if id == BuiltinClock::BUILTIN_CLOCK_PERF as u32 => "PERF".to_string(),
+        _ => {
+            eprintln!("Warning: Unknown clock ID {}, storing as UNKNOWN", clock_id);
+            "UNKNOWN".to_string() // Store unknown clock IDs as UNKNOWN
+        }
+    }
+}
+
 /// Write trace data from SessionRecorder to a TraceOutput implementation
 ///
 /// This function writes all trace data including metadata, clock snapshots, processes,
@@ -1798,7 +1823,7 @@ fn write_trace_to_output(
         .iter()
         .map(|c| ClockInfo {
             clock_id: c.clock_id(),
-            clock_name: format!("clock_{}", c.clock_id()),
+            clock_name: get_clock_name(c.clock_id()),
             timestamp: c.timestamp(),
         })
         .collect();
