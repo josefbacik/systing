@@ -1380,7 +1380,7 @@ fn setup_perf_events(
 /// Returns PIDs to attach probes to with their resolved library paths.
 /// Returns (pid_to_path_map, is_auto_discovered).
 fn resolve_pids_for_probe(
-    opts: &Command,
+    opts: &RecordArgs,
     target_path: &str,
     probe_type: &str,
     probe_name: &str,
