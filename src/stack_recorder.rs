@@ -1002,7 +1002,7 @@ fn get_function_name_from_manager(
     }
 
     // Fallback if not found (shouldn't happen)
-    format!("unknown_function_{}", func_iid)
+    format!("unknown_function_{func_iid}")
 }
 
 /// Extract file name from formatted function name string

@@ -1777,7 +1777,7 @@ fn get_clock_name(clock_id: u32) -> String {
         id if id == BuiltinClock::BUILTIN_CLOCK_TSC as u32 => "TSC".to_string(),
         id if id == BuiltinClock::BUILTIN_CLOCK_PERF as u32 => "PERF".to_string(),
         _ => {
-            eprintln!("Warning: Unknown clock ID {}, storing as UNKNOWN", clock_id);
+            eprintln!("Warning: Unknown clock ID {clock_id}, storing as UNKNOWN");
             "UNKNOWN".to_string() // Store unknown clock IDs as UNKNOWN
         }
     }
@@ -1938,7 +1938,7 @@ fn write_trace_to_output(
         let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
         let track = TrackInfo {
             uuid: track_uuid,
-            name: format!("CPU {}", cpu),
+            name: format!("CPU {cpu}"),
             parent_uuid: None,
             track_type: TrackType::Cpu,
             pid: None,
@@ -2278,15 +2278,12 @@ fn handle_record(opts: RecordArgs) -> Result<()> {
             let mut trace = Trace::default();
             trace.packet.extend(recorder.generate_trace());
             let mut file = std::fs::File::create(&output_path).with_context(|| {
-                format!(
-                    "Failed to create output file '{}' in current directory",
-                    output_path
-                )
+                format!("Failed to create output file '{output_path}' in current directory")
             })?;
             trace
                 .write_to_writer(&mut file)
-                .with_context(|| format!("Failed to write trace data to '{}'", output_path))?;
-            println!("Trace written to: {}", output_path);
+                .with_context(|| format!("Failed to write trace data to '{output_path}'"))?;
+            println!("Trace written to: {output_path}");
         }
         OutputFormat::Sqlite => {
             let mut sqlite_output =
@@ -2298,7 +2295,7 @@ fn handle_record(opts: RecordArgs) -> Result<()> {
             sqlite_output
                 .flush()
                 .context("Failed to flush SQLite output")?;
-            println!("Trace written to: {}", output_path);
+            println!("Trace written to: {output_path}");
         }
     }
     Ok(())

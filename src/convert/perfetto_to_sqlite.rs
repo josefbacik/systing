@@ -44,7 +44,7 @@ use crate::sqlite::SqliteOutput;
 pub fn convert_perfetto_to_sqlite(input_path: &str, output_path: &str) -> Result<()> {
     // Read Perfetto trace file
     let mut file = File::open(input_path)
-        .with_context(|| format!("Failed to open Perfetto trace file: {}", input_path))?;
+        .with_context(|| format!("Failed to open Perfetto trace file: {input_path}"))?;
 
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)
@@ -59,7 +59,7 @@ pub fn convert_perfetto_to_sqlite(input_path: &str, output_path: &str) -> Result
 
     // Create SQLite output
     let mut sqlite = SqliteOutput::create(output_path)
-        .with_context(|| format!("Failed to create SQLite output: {}", output_path))?;
+        .with_context(|| format!("Failed to create SQLite output: {output_path}"))?;
 
     // Extract timestamp range from trace
     let (start_ts, end_ts) = extract_timestamp_range(&trace);
@@ -87,7 +87,7 @@ pub fn convert_perfetto_to_sqlite(input_path: &str, output_path: &str) -> Result
     // Flush and finalize the SQLite database
     sqlite.flush().context("Failed to flush SQLite database")?;
 
-    println!("Conversion complete: {} -> {}", input_path, output_path);
+    println!("Conversion complete: {input_path} -> {output_path}");
     Ok(())
 }
 
@@ -200,7 +200,7 @@ fn extract_process_tree(trace: &Trace, output: &mut dyn TraceOutput) -> Result<(
                     output
                         .write_process(pid, process_name, &cmdline)
                         .with_context(|| {
-                            format!("Failed to write process descriptor for PID {}", pid)
+                            format!("Failed to write process descriptor for PID {pid}")
                         })?;
 
                     e.insert(process_name.to_string());
@@ -229,7 +229,7 @@ fn extract_process_tree(trace: &Trace, output: &mut dyn TraceOutput) -> Result<(
                     {
                         // Create a placeholder process
                         output.write_process(pid, "unknown", &[]).with_context(|| {
-                            format!("Failed to write placeholder process for PID {}", pid)
+                            format!("Failed to write placeholder process for PID {pid}")
                         })?;
                         e.insert("unknown".to_string());
                     }
@@ -237,7 +237,7 @@ fn extract_process_tree(trace: &Trace, output: &mut dyn TraceOutput) -> Result<(
                     output
                         .write_thread(tid, pid, thread_name)
                         .with_context(|| {
-                            format!("Failed to write thread descriptor for TID {}", tid)
+                            format!("Failed to write thread descriptor for TID {tid}")
                         })?;
 
                     e.insert(thread_name.to_string());
@@ -282,7 +282,8 @@ fn extract_counters(trace: &Trace, output: &mut dyn TraceOutput) -> Result<()> {
                     let unit = if counter_desc.has_unit() {
                         match counter_desc.unit() {
                             Unit::UNIT_TIME_NS => CounterUnit::TimeNs,
-                            Unit::UNIT_COUNT | _ => CounterUnit::Count,
+                            Unit::UNIT_COUNT => CounterUnit::Count,
+                            _ => CounterUnit::Count,
                         }
                     } else {
                         CounterUnit::Count
@@ -292,7 +293,7 @@ fn extract_counters(trace: &Trace, output: &mut dyn TraceOutput) -> Result<()> {
                     let name = if track_desc.has_name() {
                         track_desc.name().to_string()
                     } else {
-                        format!("counter_{}", uuid)
+                        format!("counter_{uuid}")
                     };
 
                     // Extract CPU/PID/TID if available from parent relationships
@@ -359,7 +360,7 @@ fn extract_counters(trace: &Trace, output: &mut dyn TraceOutput) -> Result<()> {
                         output
                             .write_counter_value(assigned_uuid, ts, value)
                             .with_context(|| {
-                                format!("Failed to write counter value for track {}", track_uuid)
+                                format!("Failed to write counter value for track {track_uuid}")
                             })?;
 
                         counter_value_count += 1;
@@ -486,7 +487,7 @@ fn extract_stack_traces(trace: &Trace, output: &mut dyn TraceOutput) -> Result<(
     // Second pass: Extract PerfSample packets and convert them
     let mut sample_count = 0;
     let mut skipped_no_callstack = 0;
-    let mut skipped_no_frames = 0;
+    let skipped_no_frames = 0; // Reserved for future use
 
     for packet in &trace.packet {
         if let Some(data) = &packet.data {
@@ -544,21 +545,17 @@ fn extract_stack_traces(trace: &Trace, output: &mut dyn TraceOutput) -> Result<(
     }
 
     if sample_count > 0 {
-        println!("Converted {} perf samples with stack traces", sample_count);
+        println!("Converted {sample_count} perf samples with stack traces");
     }
 
     if skipped_no_callstack > 0 {
         println!(
-            "Warning: Skipped {} perf samples due to missing callstack data",
-            skipped_no_callstack
+            "Warning: Skipped {skipped_no_callstack} perf samples due to missing callstack data"
         );
     }
 
     if skipped_no_frames > 0 {
-        println!(
-            "Warning: Skipped {} frames due to missing frame data",
-            skipped_no_frames
-        );
+        println!("Warning: Skipped {skipped_no_frames} frames due to missing frame data");
     }
 
     Ok(())
@@ -572,6 +569,9 @@ fn extract_network_events(trace: &Trace, output: &mut dyn TraceOutput) -> Result
     use crate::output::{NetworkConnection, NetworkEventData};
     use perfetto_protos::track_event::track_event::Type;
     use std::collections::HashMap;
+
+    // Type alias to simplify complex type
+    type PendingSlice = (u64, String, Vec<(String, String)>, i32);
 
     // Map track UUIDs to their track names and connection info
     let mut track_names: HashMap<u64, String> = HashMap::new();
@@ -620,8 +620,7 @@ fn extract_network_events(trace: &Trace, output: &mut dyn TraceOutput) -> Result
     }
 
     // Map to store begin events waiting for their end event
-    let mut pending_slices: HashMap<u64, (u64, String, Vec<(String, String)>, i32)> =
-        HashMap::new();
+    let mut pending_slices: HashMap<u64, PendingSlice> = HashMap::new();
 
     let mut event_count = 0;
     let mut skipped_no_connection = 0;
@@ -768,21 +767,17 @@ fn extract_network_events(trace: &Trace, output: &mut dyn TraceOutput) -> Result
     }
 
     if event_count > 0 {
-        println!("Converted {} network events", event_count);
+        println!("Converted {event_count} network events");
     }
 
     if skipped_no_connection > 0 {
         println!(
-            "Warning: Skipped {} network events due to unparseable connection info",
-            skipped_no_connection
+            "Warning: Skipped {skipped_no_connection} network events due to unparseable connection info"
         );
     }
 
     if skipped_no_end > 0 {
-        println!(
-            "Warning: {} unmatched slice end events (missing begin events)",
-            skipped_no_end
-        );
+        println!("Warning: {skipped_no_end} unmatched slice end events (missing begin events)");
     }
 
     Ok(())

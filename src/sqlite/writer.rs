@@ -58,7 +58,7 @@ impl SqliteOutput {
         // Remove existing file if it exists (matching Perfetto overwrite behavior)
         if std::path::Path::new(path).exists() {
             std::fs::remove_file(path)
-                .with_context(|| format!("Failed to remove existing database file: {}", path))?;
+                .with_context(|| format!("Failed to remove existing database file: {path}"))?;
         }
 
         let conn = Connection::open(path).context("Failed to open SQLite database")?;
@@ -808,8 +808,7 @@ impl TraceOutput for SqliteOutput {
         // If this fails, the data is still committed, so we'll just log a warning
         if let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(RESTART)") {
             eprintln!(
-                "Warning: Failed to checkpoint WAL during flush: {}. Data is still committed.",
-                e
+                "Warning: Failed to checkpoint WAL during flush: {e}. Data is still committed."
             );
         }
 

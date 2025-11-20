@@ -58,7 +58,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub fn convert_sqlite_to_perfetto(input_path: &str, output_path: &str) -> Result<()> {
     // Open SQLite database
     let conn = Connection::open(input_path)
-        .with_context(|| format!("Failed to open SQLite database: {}", input_path))?;
+        .with_context(|| format!("Failed to open SQLite database: {input_path}"))?;
 
     // Create trace with packets
     let mut trace = Trace::default();
@@ -97,12 +97,12 @@ pub fn convert_sqlite_to_perfetto(input_path: &str, output_path: &str) -> Result
 
     // Write to file
     let mut file = File::create(output_path)
-        .with_context(|| format!("Failed to create output file: {}", output_path))?;
+        .with_context(|| format!("Failed to create output file: {output_path}"))?;
     trace
         .write_to_writer(&mut file)
         .context("Failed to write Perfetto trace")?;
 
-    println!("Conversion complete: {} -> {}", input_path, output_path);
+    println!("Conversion complete: {input_path} -> {output_path}");
     Ok(())
 }
 
@@ -160,7 +160,7 @@ fn add_clock_packets(
                 "TSC" => BuiltinClock::BUILTIN_CLOCK_TSC as u32,         // 9
                 "PERF" => BuiltinClock::BUILTIN_CLOCK_PERF as u32,       // 10
                 _ => {
-                    eprintln!("Warning: Unknown clock type '{}', skipping", clock_type);
+                    eprintln!("Warning: Unknown clock type '{clock_type}', skipping");
                     continue; // Skip unknown clock types
                 }
             };
@@ -247,7 +247,7 @@ fn add_process_packets(
         process_count += 1;
     }
 
-    println!("Extracted {} process descriptors", process_count);
+    println!("Extracted {process_count} process descriptors");
     Ok(())
 }
 
@@ -298,7 +298,7 @@ fn add_thread_packets(
         thread_count += 1;
     }
 
-    println!("Extracted {} thread descriptors", thread_count);
+    println!("Extracted {thread_count} thread descriptors");
     Ok(())
 }
 
@@ -391,7 +391,7 @@ fn add_scheduler_event_packets(
                     // Get thread name for next_pid
                     let thread_name: String = thread_name_stmt
                         .query_row([pid], |row| row.get(0))
-                        .unwrap_or_else(|_| format!("pid-{}", pid));
+                        .unwrap_or_else(|_| format!("pid-{pid}"));
                     cpu_events.switch_next_comms.push(thread_name);
                 }
             }
@@ -406,12 +406,12 @@ fn add_scheduler_event_packets(
                     // Get thread name for waking pid
                     let thread_name: String = thread_name_stmt
                         .query_row([pid], |row| row.get(0))
-                        .unwrap_or_else(|_| format!("pid-{}", pid));
+                        .unwrap_or_else(|_| format!("pid-{pid}"));
                     cpu_events.waking_comms.push(thread_name);
                 }
             }
             _ => {
-                eprintln!("Warning: Unknown scheduler event type '{}'", event_type);
+                eprintln!("Warning: Unknown scheduler event type '{event_type}'");
             }
         }
         event_count += 1;
@@ -499,7 +499,7 @@ fn add_scheduler_event_packets(
         trace.packet.push(packet);
     }
 
-    println!("Extracted {} scheduler events", event_count);
+    println!("Extracted {event_count} scheduler events");
     Ok(())
 }
 
@@ -557,7 +557,8 @@ fn add_counter_packets(
         // Map unit string to enum
         let unit = match track.unit.as_str() {
             "ns" | "time_ns" => Unit::UNIT_TIME_NS,
-            "count" | _ => Unit::UNIT_COUNT,
+            "count" => Unit::UNIT_COUNT,
+            _ => Unit::UNIT_COUNT,
             // Note: UNIT_TIME_MS and UNIT_BYTES don't exist in this version
             // We'll map everything else to UNIT_COUNT
         };
@@ -644,10 +645,7 @@ fn add_counter_packets(
     }
 
     if counter_count > 0 {
-        println!(
-            "Extracted {} counter tracks with {} values",
-            counter_count, value_count
-        );
+        println!("Extracted {counter_count} counter tracks with {value_count} values");
     }
 
     Ok(())
@@ -797,8 +795,7 @@ fn add_stack_trace_packets(
         trace.packet.push(interned_packet);
 
         println!(
-            "Created interned data: {} functions, {} frames, {} callstacks",
-            function_count, frame_count, callstack_count
+            "Created interned data: {function_count} functions, {frame_count} frames, {callstack_count} callstacks"
         );
     }
 
@@ -837,7 +834,7 @@ fn add_stack_trace_packets(
     }
 
     if sample_count > 0 {
-        println!("Converted {} perf samples with stack traces", sample_count);
+        println!("Converted {sample_count} perf samples with stack traces");
     }
 
     Ok(())
@@ -1051,7 +1048,7 @@ fn add_network_event_packets(
     }
 
     if event_count > 0 {
-        println!("Converted {} network events", event_count);
+        println!("Converted {event_count} network events");
     }
 
     Ok(())
