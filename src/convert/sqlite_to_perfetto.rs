@@ -12,10 +12,12 @@ use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
 use perfetto_protos::ftrace_event_bundle::FtraceEventBundle;
+use perfetto_protos::interned_data::InternedData;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace::Trace;
 use perfetto_protos::trace_packet::trace_packet::Data;
+use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
 use perfetto_protos::track_event::track_event::Type;
@@ -81,6 +83,12 @@ pub fn convert_sqlite_to_perfetto(input_path: &str, output_path: &str) -> Result
 
     // 5. Counter tracks and values (runqueue size, latency, etc.)
     add_counter_packets(&conn, &mut trace, &sequence_counter)?;
+
+    // 6. Stack traces and perf samples
+    add_stack_trace_packets(&conn, &mut trace, &sequence_counter)?;
+
+    // 7. Network events
+    add_network_event_packets(&conn, &mut trace, &sequence_counter)?;
 
     println!(
         "Generated {} trace packets from SQLite database",
@@ -643,6 +651,440 @@ fn add_counter_packets(
     }
 
     Ok(())
+}
+
+/// Read stack traces and perf samples from SQLite and generate InternedData + PerfSample packets
+///
+/// This creates the interning structure (function_names, frames, callstacks) and
+/// PerfSample packets that reference the interned callstacks by IID.
+fn add_stack_trace_packets(
+    conn: &Connection,
+    trace: &mut Trace,
+    sequence_counter: &AtomicU32,
+) -> Result<()> {
+    use perfetto_protos::profile_common::{Callstack, Frame, InternedString};
+    use perfetto_protos::profile_packet::PerfSample;
+    use std::collections::HashMap;
+
+    // Query symbols from SQLite
+    let mut symbol_stmt = conn
+        .prepare(
+            "SELECT id, function_name, file_name, line_number, build_id, mapping_name, mapping_offset
+             FROM symbols ORDER BY id"
+        )
+        .context("Failed to prepare symbols query")?;
+
+    // Map SQLite symbol IDs to Perfetto function name IIDs
+    let mut function_name_map: HashMap<i64, u64> = HashMap::new();
+    let mut function_names: Vec<InternedString> = Vec::new();
+    let mut next_function_iid = 1u64;
+
+    let symbol_rows = symbol_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,    // id
+                row.get::<_, String>(1)?, // function_name
+            ))
+        })
+        .context("Failed to query symbols")?;
+
+    for result in symbol_rows {
+        let (symbol_id, function_name) = result?;
+
+        // Create interned function name
+        let mut interned_str = InternedString::default();
+        interned_str.set_iid(next_function_iid);
+        interned_str.set_str(function_name.as_bytes().to_vec());
+
+        function_names.push(interned_str);
+        function_name_map.insert(symbol_id, next_function_iid);
+        next_function_iid += 1;
+    }
+
+    // Query stack traces
+    let mut stack_stmt = conn
+        .prepare("SELECT DISTINCT stack_id FROM stack_trace_frames ORDER BY stack_id")
+        .context("Failed to prepare stack trace query")?;
+
+    let stack_ids: Vec<i64> = stack_stmt
+        .query_map([], |row| row.get(0))
+        .context("Failed to query stack IDs")?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut frames: Vec<Frame> = Vec::new();
+    let mut callstacks: Vec<Callstack> = Vec::new();
+    let mut next_frame_iid = 1u64;
+    let mut next_callstack_iid = 1u64;
+    let mut callstack_map: HashMap<i64, u64> = HashMap::new();
+
+    // For each stack, read its frames and build the interned data
+    for stack_id in &stack_ids {
+        let mut frame_stmt = conn
+            .prepare(
+                "SELECT stf.frame_index, stf.stack_type, s.id, s.function_name, s.mapping_offset
+                 FROM stack_trace_frames stf
+                 JOIN symbols s ON stf.symbol_id = s.id
+                 WHERE stf.stack_id = ?1
+                 ORDER BY stf.stack_type, stf.frame_index",
+            )
+            .context("Failed to prepare frame query")?;
+
+        let frame_rows = frame_stmt
+            .query_map([stack_id], |row| {
+                Ok((
+                    row.get::<_, i64>(2)?,         // symbol id
+                    row.get::<_, Option<u64>>(4)?, // mapping_offset
+                ))
+            })
+            .context("Failed to query frames")?;
+
+        let mut frame_iids = Vec::new();
+
+        for result in frame_rows {
+            let (symbol_id, mapping_offset) = result?;
+
+            // Get the function name IID for this symbol
+            if let Some(&function_iid) = function_name_map.get(&symbol_id) {
+                // Create a Frame
+                let mut frame = Frame::default();
+                frame.set_iid(next_frame_iid);
+                frame.set_function_name_id(function_iid);
+
+                if let Some(offset) = mapping_offset {
+                    frame.set_rel_pc(offset);
+                }
+
+                frames.push(frame);
+                frame_iids.push(next_frame_iid);
+                next_frame_iid += 1;
+            }
+        }
+
+        // Create callstack from the frames
+        if !frame_iids.is_empty() {
+            let mut callstack = Callstack::default();
+            callstack.set_iid(next_callstack_iid);
+            callstack.frame_ids = frame_iids;
+
+            callstacks.push(callstack);
+            callstack_map.insert(*stack_id, next_callstack_iid);
+            next_callstack_iid += 1;
+        }
+    }
+
+    // Create InternedData packet with all the interned data
+    if !function_names.is_empty() || !frames.is_empty() || !callstacks.is_empty() {
+        // Capture lengths before moving data
+        let function_count = function_name_map.len();
+        let frame_count = frames.len();
+        let callstack_count = callstack_map.len();
+
+        let mut interned_packet = TracePacket::new();
+        let interned_data = InternedData {
+            function_names,
+            frames,
+            callstacks,
+            mappings: Vec::new(),
+            ..Default::default()
+        };
+        interned_packet.interned_data = Some(interned_data).into();
+        interned_packet
+            .set_trusted_packet_sequence_id(sequence_counter.fetch_add(1, Ordering::Relaxed));
+        interned_packet.set_sequence_flags(
+            SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
+                | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
+        );
+        trace.packet.push(interned_packet);
+
+        println!(
+            "Created interned data: {} functions, {} frames, {} callstacks",
+            function_count, frame_count, callstack_count
+        );
+    }
+
+    // Now create PerfSample packets
+    let mut sample_stmt = conn
+        .prepare("SELECT ts, tid, stack_id FROM perf_samples ORDER BY ts")
+        .context("Failed to prepare perf samples query")?;
+
+    let sample_rows = sample_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, u64>(0)?, // ts
+                row.get::<_, i32>(1)?, // tid
+                row.get::<_, i64>(2)?, // stack_id
+            ))
+        })
+        .context("Failed to query perf samples")?;
+
+    let mut sample_count = 0;
+    for result in sample_rows {
+        let (ts, tid, stack_id) = result?;
+
+        if let Some(&callstack_iid) = callstack_map.get(&stack_id) {
+            let mut perf_sample = PerfSample::default();
+            perf_sample.set_tid(tid as u32);
+            perf_sample.set_callstack_iid(callstack_iid);
+
+            let mut packet = TracePacket::new();
+            packet.set_trusted_packet_sequence_id(sequence_counter.fetch_add(1, Ordering::Relaxed));
+            packet.set_timestamp(ts);
+            packet.data = Some(Data::PerfSample(perf_sample));
+
+            trace.packet.push(packet);
+            sample_count += 1;
+        }
+    }
+
+    if sample_count > 0 {
+        println!("Converted {} perf samples with stack traces", sample_count);
+    }
+
+    Ok(())
+}
+
+/// Read network events from SQLite and generate TrackDescriptor + TrackEvent packets
+///
+/// This creates track descriptors for each network connection and generates slice events
+/// (begin/end pairs) with debug annotations for the network operations.
+fn add_network_event_packets(
+    conn: &Connection,
+    trace: &mut Trace,
+    sequence_counter: &AtomicU32,
+) -> Result<()> {
+    use perfetto_protos::debug_annotation::DebugAnnotation;
+    use perfetto_protos::interned_data::InternedData;
+    use perfetto_protos::track_event::EventName;
+    use std::collections::HashMap;
+
+    // Query network connections
+    let mut conn_stmt = conn
+        .prepare(
+            "SELECT id, protocol, address_family, dest_addr, dest_port
+             FROM network_connections
+             ORDER BY id",
+        )
+        .context("Failed to prepare network connections query")?;
+
+    struct NetworkConn {
+        id: u64,
+        protocol: String,
+        dest_addr: String,
+        dest_port: u16,
+    }
+
+    let connections: Vec<NetworkConn> = conn_stmt
+        .query_map([], |row| {
+            Ok(NetworkConn {
+                id: row.get::<_, i64>(0)? as u64,
+                protocol: row.get(1)?,
+                dest_addr: row.get(3)?,
+                dest_port: row.get::<_, i64>(4)? as u16,
+            })
+        })
+        .context("Failed to query network connections")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to collect network connections")?;
+
+    // Create track descriptors for each connection
+    let mut track_uuid_map: HashMap<u64, u64> = HashMap::new();
+
+    for connection in &connections {
+        // Generate a unique track UUID for this connection
+        let track_uuid = 1000000 + connection.id; // Offset to avoid conflicts
+
+        let mut track_desc = TrackDescriptor::new();
+        track_desc.set_uuid(track_uuid);
+        track_desc.set_name(format!(
+            "{} {}:{}",
+            connection.protocol, connection.dest_addr, connection.dest_port
+        ));
+
+        let mut packet = TracePacket::new();
+        packet.set_trusted_packet_sequence_id(sequence_counter.fetch_add(1, Ordering::Relaxed));
+        packet.data = Some(Data::TrackDescriptor(track_desc));
+        trace.packet.push(packet);
+
+        track_uuid_map.insert(connection.id, track_uuid);
+    }
+
+    // Query network events
+    let mut event_stmt = conn
+        .prepare(
+            "SELECT connection_id, tid, track_uuid, event_type, start_ts, end_ts,
+                    bytes, sequence_num, tcp_flags
+             FROM network_events
+             ORDER BY start_ts",
+        )
+        .context("Failed to prepare network events query")?;
+
+    // Collect event names for interning
+    let mut event_name_set: HashMap<String, u64> = HashMap::new();
+    let mut next_event_name_iid = 1u64;
+
+    let event_rows = event_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,                    // connection_id
+                row.get::<_, i32>(1)?,                           // tid
+                row.get::<_, i64>(2)? as u64,                    // track_uuid
+                row.get::<_, String>(3)?,                        // event_type
+                row.get::<_, i64>(4)? as u64,                    // start_ts
+                row.get::<_, Option<i64>>(5)?.map(|t| t as u64), // end_ts
+                row.get::<_, Option<i32>>(6)?,                   // bytes
+                row.get::<_, Option<i32>>(7)?,                   // sequence_num
+                row.get::<_, Option<u8>>(8)?,                    // tcp_flags
+            ))
+        })
+        .context("Failed to query network events")?;
+
+    let mut events = Vec::new();
+    for row_result in event_rows {
+        let event = row_result.context("Failed to read network event row")?;
+
+        // Add event name to interning set
+        let event_type = &event.3;
+        if !event_name_set.contains_key(event_type) {
+            event_name_set.insert(event_type.clone(), next_event_name_iid);
+            next_event_name_iid += 1;
+        }
+
+        events.push(event);
+    }
+
+    // Create interned data packet for event names
+    if !event_name_set.is_empty() {
+        let mut event_names = Vec::new();
+        for (name, iid) in &event_name_set {
+            let mut event_name = EventName::default();
+            event_name.set_iid(*iid);
+            event_name.set_name(name.clone());
+            event_names.push(event_name);
+        }
+
+        let mut interned_packet = TracePacket::new();
+        let interned_data = InternedData {
+            event_names,
+            ..Default::default()
+        };
+        interned_packet.interned_data = Some(interned_data).into();
+        interned_packet
+            .set_trusted_packet_sequence_id(sequence_counter.fetch_add(1, Ordering::Relaxed));
+        interned_packet.set_sequence_flags(
+            SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
+                | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
+        );
+        trace.packet.push(interned_packet);
+    }
+
+    // Generate slice events (begin/end pairs)
+    let mut event_count = 0;
+    for (
+        connection_id,
+        _tid,
+        _orig_track_uuid,
+        event_type,
+        start_ts,
+        end_ts,
+        bytes,
+        sequence_num,
+        tcp_flags,
+    ) in events
+    {
+        // Get the track UUID for this connection
+        let track_uuid = track_uuid_map
+            .get(&connection_id)
+            .copied()
+            .unwrap_or(connection_id);
+        let event_name_iid = *event_name_set.get(&event_type).unwrap();
+
+        // Create begin event
+        let mut begin_event = TrackEvent::new();
+        begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+        begin_event.set_name_iid(event_name_iid);
+        begin_event.set_track_uuid(track_uuid);
+
+        // Add debug annotations
+        if let Some(bytes_val) = bytes {
+            let mut annotation = DebugAnnotation::default();
+            annotation.set_name("length".to_string());
+            annotation.set_uint_value(bytes_val as u64);
+            begin_event.debug_annotations.push(annotation);
+        }
+
+        if let Some(seq) = sequence_num {
+            let mut annotation = DebugAnnotation::default();
+            annotation.set_name("seq".to_string());
+            annotation.set_uint_value(seq as u64);
+            begin_event.debug_annotations.push(annotation);
+        }
+
+        if let Some(flags) = tcp_flags {
+            let mut annotation = DebugAnnotation::default();
+            annotation.set_name("flags".to_string());
+            annotation.set_string_value(format_tcp_flags(flags));
+            begin_event.debug_annotations.push(annotation);
+        }
+
+        let mut begin_packet = TracePacket::new();
+        begin_packet
+            .set_trusted_packet_sequence_id(sequence_counter.fetch_add(1, Ordering::Relaxed));
+        begin_packet.set_timestamp(start_ts);
+        begin_packet.data = Some(Data::TrackEvent(begin_event));
+        trace.packet.push(begin_packet);
+
+        // Create end event if end timestamp exists
+        if let Some(end_ts_val) = end_ts {
+            let mut end_event = TrackEvent::new();
+            end_event.set_type(Type::TYPE_SLICE_END);
+            end_event.set_track_uuid(track_uuid);
+
+            let mut end_packet = TracePacket::new();
+            end_packet
+                .set_trusted_packet_sequence_id(sequence_counter.fetch_add(1, Ordering::Relaxed));
+            end_packet.set_timestamp(end_ts_val);
+            end_packet.data = Some(Data::TrackEvent(end_event));
+            trace.packet.push(end_packet);
+        }
+
+        event_count += 1;
+    }
+
+    if event_count > 0 {
+        println!("Converted {} network events", event_count);
+    }
+
+    Ok(())
+}
+
+/// Format TCP flags as a string like "PSH|ACK"
+fn format_tcp_flags(flags: u8) -> String {
+    let mut parts = Vec::new();
+
+    if flags & 0x01 != 0 {
+        parts.push("FIN");
+    }
+    if flags & 0x02 != 0 {
+        parts.push("SYN");
+    }
+    if flags & 0x04 != 0 {
+        parts.push("RST");
+    }
+    if flags & 0x08 != 0 {
+        parts.push("PSH");
+    }
+    if flags & 0x10 != 0 {
+        parts.push("ACK");
+    }
+    if flags & 0x20 != 0 {
+        parts.push("URG");
+    }
+
+    if parts.is_empty() {
+        "NONE".to_string()
+    } else {
+        parts.join("|")
+    }
 }
 
 #[cfg(test)]

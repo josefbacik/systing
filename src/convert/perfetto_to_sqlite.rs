@@ -78,6 +78,12 @@ pub fn convert_perfetto_to_sqlite(input_path: &str, output_path: &str) -> Result
     // Extract and write counter tracks and values
     extract_counters(&trace, &mut sqlite)?;
 
+    // Extract and write stack traces and perf samples
+    extract_stack_traces(&trace, &mut sqlite)?;
+
+    // Extract and write network events
+    extract_network_events(&trace, &mut sqlite)?;
+
     // Flush and finalize the SQLite database
     sqlite.flush().context("Failed to flush SQLite database")?;
 
@@ -372,6 +378,456 @@ fn extract_counters(trace: &Trace, output: &mut dyn TraceOutput) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Extract and write stack traces and perf samples from the trace
+///
+/// Processes InternedData packets to build a mapping of IIDs to actual data,
+/// then extracts PerfSample packets and converts them to the SQLite format.
+fn extract_stack_traces(trace: &Trace, output: &mut dyn TraceOutput) -> Result<()> {
+    use crate::output::{PerfSampleData, StackTraceData, SymbolInfo};
+    use perfetto_protos::profile_common::{Callstack, Frame, Mapping};
+    use std::collections::HashMap;
+
+    // Storage for interned data (IID -> actual data)
+    let mut function_names: HashMap<u64, String> = HashMap::new();
+    let mut mappings: HashMap<u64, Mapping> = HashMap::new();
+    let mut frames: HashMap<u64, Frame> = HashMap::new();
+    let mut callstacks: HashMap<u64, Callstack> = HashMap::new();
+
+    // First pass: Extract all interned data
+    for packet in &trace.packet {
+        if let Some(interned_data) = &packet.interned_data.0 {
+            // Extract function names
+            for func in &interned_data.function_names {
+                if func.has_iid() && func.has_str() {
+                    // Convert bytes to string
+                    let name = String::from_utf8_lossy(func.str()).to_string();
+                    function_names.insert(func.iid(), name);
+                }
+            }
+
+            // Extract mappings
+            for mapping in &interned_data.mappings {
+                if mapping.has_iid() {
+                    mappings.insert(mapping.iid(), mapping.clone());
+                }
+            }
+
+            // Extract frames
+            for frame in &interned_data.frames {
+                if frame.has_iid() {
+                    frames.insert(frame.iid(), frame.clone());
+                }
+            }
+
+            // Extract callstacks
+            for callstack in &interned_data.callstacks {
+                if callstack.has_iid() {
+                    callstacks.insert(callstack.iid(), callstack.clone());
+                }
+            }
+        }
+    }
+
+    println!(
+        "Extracted interned data: {} functions, {} mappings, {} frames, {} callstacks",
+        function_names.len(),
+        mappings.len(),
+        frames.len(),
+        callstacks.len()
+    );
+
+    // Helper function to convert a Frame to SymbolInfo
+    let frame_to_symbol = |frame: &Frame| -> Result<SymbolInfo> {
+        let function_name = if frame.has_function_name_id() {
+            function_names
+                .get(&frame.function_name_id())
+                .cloned()
+                .unwrap_or_else(|| format!("unknown_{}", frame.function_name_id()))
+        } else {
+            "unknown".to_string()
+        };
+
+        let mapping_info = if frame.has_mapping_id() {
+            mappings.get(&frame.mapping_id())
+        } else {
+            None
+        };
+
+        let mapping_name = mapping_info.and_then(|m| {
+            if m.has_build_id() {
+                Some(format!("build_id:{}", m.build_id()))
+            } else {
+                None
+            }
+        });
+
+        Ok(SymbolInfo {
+            function_name,
+            file_name: None, // Perfetto doesn't typically have file info in frames
+            line_number: None,
+            build_id: mapping_info.and_then(|m| {
+                if m.has_build_id() {
+                    Some(m.build_id().to_string())
+                } else {
+                    None
+                }
+            }),
+            mapping_name,
+            mapping_offset: if frame.has_rel_pc() {
+                Some(frame.rel_pc())
+            } else {
+                None
+            },
+        })
+    };
+
+    // Second pass: Extract PerfSample packets and convert them
+    let mut sample_count = 0;
+    let mut skipped_no_callstack = 0;
+    let mut skipped_no_frames = 0;
+
+    for packet in &trace.packet {
+        if let Some(data) = &packet.data {
+            use perfetto_protos::trace_packet::trace_packet::Data;
+
+            if let Data::PerfSample(perf_sample) = data {
+                if !perf_sample.has_callstack_iid() {
+                    continue; // Skip samples without callstacks
+                }
+
+                let callstack_iid = perf_sample.callstack_iid();
+                let callstack = match callstacks.get(&callstack_iid) {
+                    Some(cs) => cs,
+                    None => {
+                        // Missing callstack - skip this sample
+                        skipped_no_callstack += 1;
+                        continue;
+                    }
+                };
+
+                // Convert frame IIDs to symbols
+                let mut kernel_symbols = Vec::new();
+                let mut user_symbols = Vec::new();
+
+                for &frame_iid in &callstack.frame_ids {
+                    if let Some(frame) = frames.get(&frame_iid) {
+                        let symbol = frame_to_symbol(frame)?;
+
+                        // Heuristic: kernel addresses are typically very high
+                        // This is a simplification - ideally we'd check the mapping
+                        if frame.has_rel_pc() && frame.rel_pc() > 0xffff_0000_0000_0000 {
+                            kernel_symbols.push(symbol);
+                        } else {
+                            user_symbols.push(symbol);
+                        }
+                    }
+                }
+
+                let stack_data = StackTraceData {
+                    kernel_symbols,
+                    user_symbols,
+                    py_symbols: Vec::new(), // Python stacks not in standard Perfetto samples
+                };
+
+                let sample_data = PerfSampleData {
+                    ts: packet.timestamp(),
+                    tid: perf_sample.tid() as i32,
+                    stack: stack_data,
+                };
+
+                output.write_perf_sample(&sample_data)?;
+                sample_count += 1;
+            }
+        }
+    }
+
+    if sample_count > 0 {
+        println!("Converted {} perf samples with stack traces", sample_count);
+    }
+
+    if skipped_no_callstack > 0 {
+        println!(
+            "Warning: Skipped {} perf samples due to missing callstack data",
+            skipped_no_callstack
+        );
+    }
+
+    if skipped_no_frames > 0 {
+        println!(
+            "Warning: Skipped {} frames due to missing frame data",
+            skipped_no_frames
+        );
+    }
+
+    Ok(())
+}
+
+/// Extract and write network events from the trace
+///
+/// Processes TrackEvent slice pairs (begin/end) that represent network operations,
+/// extracts connection information and event details, and writes to SQLite.
+fn extract_network_events(trace: &Trace, output: &mut dyn TraceOutput) -> Result<()> {
+    use crate::output::{NetworkConnection, NetworkEventData};
+    use perfetto_protos::track_event::track_event::Type;
+    use std::collections::HashMap;
+
+    // Map track UUIDs to their track names and connection info
+    let mut track_names: HashMap<u64, String> = HashMap::new();
+
+    // Extract track names from TrackDescriptor packets
+    for packet in &trace.packet {
+        if let Some(data) = &packet.data {
+            use perfetto_protos::trace_packet::trace_packet::Data;
+
+            if let Data::TrackDescriptor(track_desc) = data {
+                if track_desc.has_uuid() && track_desc.has_name() {
+                    track_names.insert(track_desc.uuid(), track_desc.name().to_string());
+                }
+            }
+        }
+    }
+
+    // Extract event names from interned data
+    let mut event_names: HashMap<u64, String> = HashMap::new();
+    for packet in &trace.packet {
+        if let Some(interned_data) = &packet.interned_data.0 {
+            for event_name in &interned_data.event_names {
+                if event_name.has_iid() && event_name.has_name() {
+                    event_names.insert(event_name.iid(), event_name.name().to_string());
+                }
+            }
+        }
+    }
+
+    // Extract thread information from packets for TID lookup
+    let mut thread_track_map: HashMap<u64, i32> = HashMap::new();
+    for packet in &trace.packet {
+        if let Some(data) = &packet.data {
+            use perfetto_protos::trace_packet::trace_packet::Data;
+
+            if let Data::TrackDescriptor(track_desc) = data {
+                if track_desc.has_uuid() && track_desc.thread.0.is_some() {
+                    if let Some(ref thread_desc) = track_desc.thread.0 {
+                        if thread_desc.has_tid() {
+                            thread_track_map.insert(track_desc.uuid(), thread_desc.tid());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Map to store begin events waiting for their end event
+    let mut pending_slices: HashMap<u64, (u64, String, Vec<(String, String)>, i32)> =
+        HashMap::new();
+
+    let mut event_count = 0;
+    let mut skipped_no_connection = 0;
+    let mut skipped_no_end = 0;
+
+    // Process TrackEvent packets
+    for packet in &trace.packet {
+        if let Some(data) = &packet.data {
+            use perfetto_protos::trace_packet::trace_packet::Data;
+
+            if let Data::TrackEvent(track_event) = data {
+                if !track_event.has_track_uuid() {
+                    continue;
+                }
+
+                let track_uuid = track_event.track_uuid();
+                let track_name = track_names.get(&track_uuid).cloned().unwrap_or_default();
+
+                // Only process network-related tracks (heuristic: check track name)
+                if !track_name.contains("TCP")
+                    && !track_name.contains("UDP")
+                    && !track_name.contains("network")
+                    && !track_name.contains("send")
+                    && !track_name.contains("recv")
+                {
+                    continue;
+                }
+
+                let event_type = if track_event.has_type() {
+                    track_event.type_()
+                } else {
+                    continue;
+                };
+
+                match event_type {
+                    Type::TYPE_SLICE_BEGIN => {
+                        // Extract event name
+                        let event_name = if track_event.has_name_iid() {
+                            event_names
+                                .get(&track_event.name_iid())
+                                .cloned()
+                                .unwrap_or_default()
+                        } else if track_event.has_name() {
+                            track_event.name().to_string()
+                        } else {
+                            continue;
+                        };
+
+                        // Extract debug annotations
+                        let mut annotations: Vec<(String, String)> = Vec::new();
+                        for annotation in &track_event.debug_annotations {
+                            if annotation.has_name() {
+                                let name = annotation.name().to_string();
+                                let value = if annotation.has_uint_value() {
+                                    annotation.uint_value().to_string()
+                                } else if annotation.has_string_value() {
+                                    annotation.string_value().to_string()
+                                } else {
+                                    continue;
+                                };
+                                annotations.push((name, value));
+                            }
+                        }
+
+                        // Extract TID from thread track map or use 0 as fallback
+                        let tid = thread_track_map.get(&track_uuid).copied().unwrap_or(0);
+
+                        // Store the begin event with TID
+                        pending_slices.insert(
+                            track_uuid,
+                            (packet.timestamp(), event_name, annotations, tid),
+                        );
+                    }
+                    Type::TYPE_SLICE_END => {
+                        // Find matching begin event
+                        if let Some((start_ts, event_name, annotations, tid)) =
+                            pending_slices.remove(&track_uuid)
+                        {
+                            let end_ts = packet.timestamp();
+
+                            // Parse connection info from track name and annotations
+                            // Format: "TCP/UDP <addr>:<port>" or similar
+                            let (protocol, dest_addr, dest_port) =
+                                parse_network_track_name(&track_name);
+
+                            if !protocol.is_empty() && !dest_addr.is_empty() {
+                                // Create connection
+                                let connection = NetworkConnection {
+                                    protocol: protocol.clone(),
+                                    address_family: if dest_addr.contains(':') {
+                                        "IPv6".to_string()
+                                    } else {
+                                        "IPv4".to_string()
+                                    },
+                                    dest_addr: dest_addr.clone(),
+                                    dest_port,
+                                };
+
+                                let connection_id = output.write_network_connection(&connection)?;
+
+                                // Extract additional data from annotations
+                                let mut bytes = None;
+                                let mut sequence_num = None;
+                                let mut tcp_flags = None;
+
+                                for (name, value) in &annotations {
+                                    match name.as_str() {
+                                        "length" => bytes = value.parse().ok(),
+                                        "seq" => sequence_num = value.parse().ok(),
+                                        "flags" => {
+                                            // Parse TCP flags string like "PSH|ACK"
+                                            tcp_flags = parse_tcp_flags(value);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                // Create network event (TID extracted from track descriptor)
+                                let network_event = NetworkEventData {
+                                    connection_id,
+                                    tid,
+                                    track_uuid,
+                                    event_type: event_name.clone(),
+                                    start_ts,
+                                    end_ts: Some(end_ts),
+                                    bytes,
+                                    sequence_num,
+                                    tcp_flags,
+                                };
+
+                                output.write_network_event(&network_event)?;
+                                event_count += 1;
+                            } else {
+                                skipped_no_connection += 1;
+                            }
+                        } else {
+                            skipped_no_end += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if event_count > 0 {
+        println!("Converted {} network events", event_count);
+    }
+
+    if skipped_no_connection > 0 {
+        println!(
+            "Warning: Skipped {} network events due to unparseable connection info",
+            skipped_no_connection
+        );
+    }
+
+    if skipped_no_end > 0 {
+        println!(
+            "Warning: {} unmatched slice end events (missing begin events)",
+            skipped_no_end
+        );
+    }
+
+    Ok(())
+}
+
+/// Parse network track name to extract protocol, address, and port
+/// Expected format: "TCP <addr>:<port>" or "UDP <addr>:<port>"
+fn parse_network_track_name(track_name: &str) -> (String, String, u16) {
+    let parts: Vec<&str> = track_name.split_whitespace().collect();
+
+    if parts.len() >= 2 {
+        let protocol = parts[0].to_string();
+        let addr_port = parts[1];
+
+        if let Some(colon_pos) = addr_port.rfind(':') {
+            let addr = addr_port[..colon_pos].to_string();
+            let port = addr_port[colon_pos + 1..].parse().unwrap_or(0);
+            return (protocol, addr, port);
+        }
+    }
+
+    (String::new(), String::new(), 0)
+}
+
+/// Parse TCP flags string like "PSH|ACK" into a bitfield
+fn parse_tcp_flags(flags_str: &str) -> Option<u8> {
+    let mut flags = 0u8;
+
+    for flag in flags_str.split('|') {
+        flags |= match flag.trim() {
+            "FIN" => 0x01,
+            "SYN" => 0x02,
+            "RST" => 0x04,
+            "PSH" => 0x08,
+            "ACK" => 0x10,
+            "URG" => 0x20,
+            _ => 0,
+        };
+    }
+
+    if flags > 0 {
+        Some(flags)
+    } else {
+        None
+    }
 }
 
 /// Parse track scope (CPU/PID/TID) from track name
