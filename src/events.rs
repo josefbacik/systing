@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::output::{ArgValue as OutputArgValue, EventDefinition, ProbeEventData, TraceOutput};
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::probe_event;
+use crate::utils::tid_from_tgidpid;
 use crate::SystingRecordEvent;
 
 use anyhow::Result;
@@ -1265,7 +1266,7 @@ impl SystingProbeRecorder {
 
                         let probe_event = ProbeEventData {
                             ts: event.ts,
-                            tid: (*tgidpid & 0xFFFFFFFF) as i32,
+                            tid: tid_from_tgidpid(*tgidpid),
                             event_def_id: def_id,
                             args,
                         };
@@ -1289,7 +1290,7 @@ impl SystingProbeRecorder {
 
                         let probe_event = ProbeEventData {
                             ts: range.start,
-                            tid: (*tgidpid & 0xFFFFFFFF) as i32,
+                            tid: tid_from_tgidpid(*tgidpid),
                             event_def_id: def_id,
                             args,
                         };
@@ -1301,7 +1302,7 @@ impl SystingProbeRecorder {
                     if let Some(&def_id) = event_defs.get(&end_key) {
                         let probe_event = ProbeEventData {
                             ts: range.end,
-                            tid: (*tgidpid & 0xFFFFFFFF) as i32,
+                            tid: tid_from_tgidpid(*tgidpid),
                             event_def_id: def_id,
                             args: HashMap::new(), // End events don't have args
                         };

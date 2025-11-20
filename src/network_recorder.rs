@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::output::{NetworkConnection, NetworkEventData, TraceOutput};
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::network_event;
+use crate::utils::tid_from_tgidpid;
 use crate::SystingRecordEvent;
 
 use anyhow::Result;
@@ -924,7 +925,7 @@ impl NetworkRecorder {
         // Second pass: Write all network events
         for (tgidpid, connections) in self.network_events.iter() {
             // Extract tid from tgidpid (lower 32 bits)
-            let tid = (*tgidpid & 0xFFFFFFFF) as i32;
+            let tid = tid_from_tgidpid(*tgidpid);
 
             for (conn_id, events) in connections.iter() {
                 if events.is_empty() {

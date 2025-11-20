@@ -8,6 +8,7 @@ use crate::output::{PerfSampleData, StackTraceData, SymbolInfo, TraceOutput};
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::stack_event;
+use crate::utils::tid_from_tgidpid;
 use crate::SystingRecordEvent;
 
 use blazesym::helper::{read_elf_build_id, ElfResolver};
@@ -923,7 +924,7 @@ impl StackRecorder {
                 };
 
                 // Extract TID from tgidpid
-                let tid = (stack_event.tgidpid & 0xFFFFFFFF) as i32;
+                let tid = tid_from_tgidpid(stack_event.tgidpid);
 
                 // Create perf sample data
                 let sample = PerfSampleData {

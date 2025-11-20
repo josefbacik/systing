@@ -7,6 +7,8 @@ use perfetto_protos::track_descriptor::TrackDescriptor;
 use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::TrackEvent;
 
+use crate::utils::{pid_from_tgidpid, tid_from_tgidpid};
+
 pub struct TrackCounter {
     pub ts: u64,
     pub count: i64,
@@ -19,8 +21,8 @@ pub fn generate_pidtgid_track_descriptor(
     name: String,
     desc_uuid: u64,
 ) -> TrackDescriptor {
-    let pid = *tgidpid as i32;
-    let tgid = (*tgidpid >> 32) as i32;
+    let pid = tid_from_tgidpid(*tgidpid);
+    let tgid = pid_from_tgidpid(*tgidpid);
 
     let uuid = if pid == tgid {
         *pid_uuids.get(&tgid).unwrap()

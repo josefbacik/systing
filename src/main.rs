@@ -11,6 +11,7 @@ mod sched;
 mod session_recorder;
 mod sqlite;
 mod stack_recorder;
+mod utils;
 
 use std::collections::HashMap;
 use std::env;

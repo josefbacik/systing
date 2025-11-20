@@ -7,3 +7,7 @@
 *.rej
 *.pyc
 /__pycache__
+*.db
+*.db-shm
+*.db-wal
+.semcode.db/
