@@ -1,3 +1,4 @@
+mod convert;
 mod events;
 mod network_recorder;
 mod output;
@@ -2278,15 +2279,56 @@ fn handle_record(opts: RecordArgs) -> Result<()> {
 }
 
 fn handle_convert(args: ConvertArgs) -> Result<()> {
-    println!("Convert command called:");
-    println!("  Input:  {}", args.input);
-    println!("  Output: {}", args.output);
-    println!("  From format: {:?}", args.from);
-    println!("  To format: {:?}", args.to);
-    println!("\nConversion functionality not yet implemented.");
-    Err(anyhow::anyhow!(
-        "Trace format conversion is not yet implemented. This will be added in a future phase."
-    ))
+    // Auto-detect formats from file extensions if not specified
+    let from_format = args.from.unwrap_or_else(|| {
+        if args.input.ends_with(".pb") {
+            TraceFormat::Perfetto
+        } else if args.input.ends_with(".db") {
+            TraceFormat::Sqlite
+        } else {
+            eprintln!("Warning: Cannot auto-detect input format from extension, assuming Perfetto");
+            TraceFormat::Perfetto
+        }
+    });
+
+    let to_format = args.to.unwrap_or_else(|| {
+        if args.output.ends_with(".pb") {
+            TraceFormat::Perfetto
+        } else if args.output.ends_with(".db") {
+            TraceFormat::Sqlite
+        } else {
+            eprintln!("Warning: Cannot auto-detect output format from extension, assuming SQLite");
+            TraceFormat::Sqlite
+        }
+    });
+
+    println!("Converting trace:");
+    println!("  Input:  {} ({:?})", args.input, from_format);
+    println!("  Output: {} ({:?})", args.output, to_format);
+
+    // Perform conversion based on format combination
+    match (from_format, to_format) {
+        (TraceFormat::Perfetto, TraceFormat::Sqlite) => {
+            convert::convert_perfetto_to_sqlite(&args.input, &args.output)
+                .context("Perfetto to SQLite conversion failed")?;
+        }
+        (TraceFormat::Sqlite, TraceFormat::Perfetto) => {
+            convert::convert_sqlite_to_perfetto(&args.input, &args.output)
+                .context("SQLite to Perfetto conversion failed")?;
+        }
+        (TraceFormat::Perfetto, TraceFormat::Perfetto) => {
+            Err(anyhow::anyhow!(
+                "Perfetto to Perfetto conversion is not supported (use cp to copy the file)"
+            ))?;
+        }
+        (TraceFormat::Sqlite, TraceFormat::Sqlite) => {
+            Err(anyhow::anyhow!(
+                "SQLite to SQLite conversion is not supported (use cp to copy the file)"
+            ))?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Check if we have the necessary capabilities to run BPF programs
