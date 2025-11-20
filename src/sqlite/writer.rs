@@ -37,10 +37,6 @@ pub struct SqliteOutput {
     next_connection_id: u64,
     next_event_def_id: u64,
     next_perf_counter_id: u64,
-
-    // Event counter for periodic checkpointing
-    event_count: u64,
-    checkpoint_interval: u64,
 }
 
 impl SqliteOutput {
@@ -77,25 +73,7 @@ impl SqliteOutput {
             next_connection_id: 1,
             next_event_def_id: 1,
             next_perf_counter_id: 1,
-            event_count: 0,
-            checkpoint_interval: 10_000,
         })
-    }
-
-    /// Perform a WAL checkpoint if we've processed enough events
-    ///
-    /// This helps manage memory usage during long traces without committing
-    /// the transaction.
-    fn maybe_checkpoint(&mut self) -> Result<()> {
-        self.event_count += 1;
-        if self.event_count.is_multiple_of(self.checkpoint_interval) {
-            // Use PASSIVE checkpoint which never blocks - if it can't checkpoint, that's OK
-            // We'll get another chance later and the final flush will ensure data is written
-            if let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
-                eprintln!("Warning: Periodic WAL checkpoint failed (non-fatal): {}", e);
-            }
-        }
-        Ok(())
     }
 
     /// Compute a SHA-256 hash of a stack trace for deduplication
@@ -314,7 +292,6 @@ impl TraceOutput for SqliteOutput {
             )
             .context("Failed to write scheduler event")?;
 
-        self.maybe_checkpoint()?;
         Ok(())
     }
 
@@ -470,7 +447,6 @@ impl TraceOutput for SqliteOutput {
             )
             .context("Failed to write perf sample")?;
 
-        self.maybe_checkpoint()?;
         Ok(())
     }
 
@@ -532,7 +508,6 @@ impl TraceOutput for SqliteOutput {
             )
             .context("Failed to write perf counter value")?;
 
-        self.maybe_checkpoint()?;
         Ok(())
     }
 
@@ -599,7 +574,6 @@ impl TraceOutput for SqliteOutput {
             )
             .context("Failed to write probe event")?;
 
-        self.maybe_checkpoint()?;
         Ok(())
     }
 
@@ -660,7 +634,6 @@ impl TraceOutput for SqliteOutput {
             ],
         ).context("Failed to write network event")?;
 
-        self.maybe_checkpoint()?;
         Ok(())
     }
 
@@ -673,7 +646,6 @@ impl TraceOutput for SqliteOutput {
             )
             .context("Failed to write CPU frequency")?;
 
-        self.maybe_checkpoint()?;
         Ok(())
     }
 
