@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
 use perfetto_protos::clock_snapshot::ClockSnapshot;
+use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
+use perfetto_protos::ftrace_event_bundle::FtraceEventBundle;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace::Trace;
@@ -16,7 +18,7 @@ use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
 use protobuf::Message;
 use rusqlite::Connection;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -69,6 +71,9 @@ pub fn convert_sqlite_to_perfetto(input_path: &str, output_path: &str) -> Result
 
     // 3. Thread descriptors (wrapped in TrackDescriptors)
     add_thread_packets(&conn, &mut trace, &sequence_counter)?;
+
+    // 4. Scheduler events (the actual trace events!)
+    add_scheduler_event_packets(&conn, &mut trace, &sequence_counter)?;
 
     println!(
         "Generated {} trace packets from SQLite database",
@@ -279,6 +284,207 @@ fn add_thread_packets(
     }
 
     println!("Extracted {} thread descriptors", thread_count);
+    Ok(())
+}
+
+/// Read scheduler events from SQLite and generate FtraceEventBundle packets
+///
+/// Scheduler events (SCHED_SWITCH and SCHED_WAKING) provide information about
+/// context switches and thread wakeups. These are converted to CompactSched
+/// format for efficient representation in Perfetto.
+fn add_scheduler_event_packets(
+    conn: &Connection,
+    trace: &mut Trace,
+    sequence_counter: &AtomicU32,
+) -> Result<()> {
+    // Query all scheduler events grouped by CPU
+    let mut stmt = conn
+        .prepare(
+            "SELECT ts, cpu, event_type, prev_pid, prev_state, prev_prio, next_pid, next_prio
+             FROM sched_events
+             ORDER BY cpu, ts",
+        )
+        .context("Failed to prepare scheduler events query")?;
+
+    // Structure to hold events per CPU
+    struct CpuEvents {
+        switch_timestamps: Vec<u64>,
+        switch_prev_states: Vec<i64>,
+        switch_next_pids: Vec<i32>,
+        switch_next_prios: Vec<i32>,
+        switch_next_comms: Vec<String>,
+        waking_timestamps: Vec<u64>,
+        waking_pids: Vec<i32>,
+        waking_target_cpus: Vec<i32>,
+        waking_prios: Vec<i32>,
+        waking_comms: Vec<String>,
+    }
+
+    let mut cpu_events_map: HashMap<u32, CpuEvents> = HashMap::new();
+
+    // Also prepare a query to get thread names for PIDs
+    let mut thread_name_stmt = conn
+        .prepare("SELECT name FROM threads WHERE tid = ?1")
+        .context("Failed to prepare thread name query")?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let ts: u64 = row.get(0)?;
+            let cpu: u32 = row.get(1)?;
+            let event_type: String = row.get(2)?;
+            let prev_pid: Option<i32> = row.get(3)?;
+            let prev_state: Option<i32> = row.get(4)?;
+            let prev_prio: Option<i32> = row.get(5)?;
+            let next_pid: Option<i32> = row.get(6)?;
+            let next_prio: Option<i32> = row.get(7)?;
+
+            Ok((
+                ts, cpu, event_type, prev_pid, prev_state, prev_prio, next_pid, next_prio,
+            ))
+        })
+        .context("Failed to query scheduler events")?;
+
+    let mut event_count = 0;
+
+    for row_result in rows {
+        let (ts, cpu, event_type, _prev_pid, prev_state, _prev_prio, next_pid, next_prio) =
+            row_result.context("Failed to read scheduler event row")?;
+
+        let cpu_events = cpu_events_map.entry(cpu).or_insert_with(|| CpuEvents {
+            switch_timestamps: Vec::new(),
+            switch_prev_states: Vec::new(),
+            switch_next_pids: Vec::new(),
+            switch_next_prios: Vec::new(),
+            switch_next_comms: Vec::new(),
+            waking_timestamps: Vec::new(),
+            waking_pids: Vec::new(),
+            waking_target_cpus: Vec::new(),
+            waking_prios: Vec::new(),
+            waking_comms: Vec::new(),
+        });
+
+        match event_type.as_str() {
+            "switch" => {
+                if let Some(pid) = next_pid {
+                    cpu_events.switch_timestamps.push(ts);
+                    cpu_events
+                        .switch_prev_states
+                        .push(prev_state.unwrap_or(0) as i64);
+                    cpu_events.switch_next_pids.push(pid);
+                    cpu_events.switch_next_prios.push(next_prio.unwrap_or(0));
+
+                    // Get thread name for next_pid
+                    let thread_name: String = thread_name_stmt
+                        .query_row([pid], |row| row.get(0))
+                        .unwrap_or_else(|_| format!("pid-{}", pid));
+                    cpu_events.switch_next_comms.push(thread_name);
+                }
+            }
+            "waking" => {
+                if let Some(pid) = next_pid {
+                    cpu_events.waking_timestamps.push(ts);
+                    cpu_events.waking_pids.push(pid);
+                    // Target CPU is the CPU where the waking event happened
+                    cpu_events.waking_target_cpus.push(cpu as i32);
+                    cpu_events.waking_prios.push(next_prio.unwrap_or(0));
+
+                    // Get thread name for waking pid
+                    let thread_name: String = thread_name_stmt
+                        .query_row([pid], |row| row.get(0))
+                        .unwrap_or_else(|_| format!("pid-{}", pid));
+                    cpu_events.waking_comms.push(thread_name);
+                }
+            }
+            _ => {
+                eprintln!("Warning: Unknown scheduler event type '{}'", event_type);
+            }
+        }
+        event_count += 1;
+    }
+
+    // Generate FtraceEventBundle packets for each CPU
+    for (cpu, events) in cpu_events_map {
+        if events.switch_timestamps.is_empty() && events.waking_timestamps.is_empty() {
+            continue;
+        }
+
+        // Build intern table for unique strings (thread names)
+        let mut intern_table = Vec::new();
+        let mut intern_map = HashMap::new();
+
+        // Helper to intern a string
+        let mut intern_string = |s: &str| -> u32 {
+            if let Some(&idx) = intern_map.get(s) {
+                idx
+            } else {
+                let idx = intern_table.len() as u32;
+                intern_table.push(s.to_string());
+                intern_map.insert(s.to_string(), idx);
+                idx
+            }
+        };
+
+        // Create CompactSched message
+        let mut compact_sched = CompactSched::new();
+
+        // Convert switch events to delta-encoded format
+        if !events.switch_timestamps.is_empty() {
+            let mut delta_timestamps = Vec::new();
+            let mut prev_ts = 0u64;
+            for &ts in &events.switch_timestamps {
+                delta_timestamps.push(ts - prev_ts);
+                prev_ts = ts;
+            }
+            compact_sched.switch_timestamp = delta_timestamps;
+            compact_sched.switch_prev_state = events.switch_prev_states;
+            compact_sched.switch_next_pid = events.switch_next_pids;
+            compact_sched.switch_next_prio = events.switch_next_prios;
+
+            // Intern thread names and build comm index array
+            let mut comm_indices = Vec::new();
+            for comm in &events.switch_next_comms {
+                comm_indices.push(intern_string(comm));
+            }
+            compact_sched.switch_next_comm_index = comm_indices;
+        }
+
+        // Convert waking events to delta-encoded format
+        if !events.waking_timestamps.is_empty() {
+            let mut delta_timestamps = Vec::new();
+            let mut prev_ts = 0u64;
+            for &ts in &events.waking_timestamps {
+                delta_timestamps.push(ts - prev_ts);
+                prev_ts = ts;
+            }
+            compact_sched.waking_timestamp = delta_timestamps;
+            compact_sched.waking_pid = events.waking_pids;
+            compact_sched.waking_target_cpu = events.waking_target_cpus;
+            compact_sched.waking_prio = events.waking_prios;
+
+            // Intern thread names and build comm index array
+            let mut comm_indices = Vec::new();
+            for comm in &events.waking_comms {
+                comm_indices.push(intern_string(comm));
+            }
+            compact_sched.waking_comm_index = comm_indices;
+        }
+
+        // Set the intern table
+        compact_sched.intern_table = intern_table;
+
+        // Create FtraceEventBundle
+        let mut event_bundle = FtraceEventBundle::default();
+        event_bundle.set_cpu(cpu);
+        event_bundle.compact_sched = Some(compact_sched).into();
+
+        // Create TracePacket
+        let mut packet = TracePacket::new();
+        packet.set_trusted_packet_sequence_id(sequence_counter.fetch_add(1, Ordering::Relaxed));
+        packet.data = Some(Data::FtraceEvents(event_bundle));
+        trace.packet.push(packet);
+    }
+
+    println!("Extracted {} scheduler events", event_count);
     Ok(())
 }
 
@@ -835,5 +1041,648 @@ mod tests {
             all_have_sequence_ids,
             "All packets should have sequence IDs"
         );
+    }
+
+    #[test]
+    fn test_scheduler_event_conversion_switch() {
+        // Test that sched_switch events are properly converted
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        // Insert test process and threads
+        conn.execute(
+            "INSERT INTO processes (pid, name, cmdline) VALUES (100, 'test_proc', '[]')",
+            [],
+        )
+        .unwrap();
+        // Insert both threads referenced in the events
+        conn.execute(
+            "INSERT INTO threads (tid, pid, name) VALUES (100, 100, 'thread_100')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (tid, pid, name) VALUES (200, 100, 'thread_200')",
+            [],
+        )
+        .unwrap();
+
+        // Insert sched_switch events
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, prev_pid, prev_state, next_pid, next_prio)
+             VALUES (1000000, 0, 'switch', 100, 0, 200, 120)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, prev_pid, prev_state, next_pid, next_prio)
+             VALUES (2000000, 0, 'switch', 200, 1, 100, 120)",
+            [],
+        )
+        .unwrap();
+
+        let mut trace = Trace::default();
+        let sequence_counter = AtomicU32::new(1);
+        add_scheduler_event_packets(&conn, &mut trace, &sequence_counter).unwrap();
+
+        // Should have one FtraceEventBundle packet for CPU 0
+        assert_eq!(trace.packet.len(), 1, "Should have one packet for CPU 0");
+
+        // Verify it's an FtraceEventBundle with CompactSched
+        if let Some(Data::FtraceEvents(ref bundle)) = trace.packet[0].data {
+            assert_eq!(bundle.cpu(), 0, "Should be for CPU 0");
+            assert!(
+                bundle.compact_sched.0.is_some(),
+                "Should have compact_sched"
+            );
+
+            let compact_sched = bundle.compact_sched.0.as_ref().unwrap();
+
+            // Check switch events
+            assert_eq!(
+                compact_sched.switch_timestamp.len(),
+                2,
+                "Should have 2 switch events"
+            );
+            assert_eq!(
+                compact_sched.switch_next_pid,
+                vec![200, 100],
+                "Should have correct next PIDs"
+            );
+
+            // Check delta encoding - first timestamp is absolute, second is delta
+            assert_eq!(
+                compact_sched.switch_timestamp[0], 1000000,
+                "First timestamp should be absolute"
+            );
+            assert_eq!(
+                compact_sched.switch_timestamp[1], 1000000,
+                "Second timestamp should be delta (2000000 - 1000000)"
+            );
+        } else {
+            panic!("Expected FtraceEvents packet");
+        }
+    }
+
+    #[test]
+    fn test_scheduler_event_conversion_waking() {
+        // Test that sched_waking events are properly converted
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        // Insert test process and threads
+        conn.execute(
+            "INSERT INTO processes (pid, name, cmdline) VALUES (100, 'test_proc', '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (tid, pid, name) VALUES (200, 100, 'waker')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (tid, pid, name) VALUES (300, 100, 'wakee')",
+            [],
+        )
+        .unwrap();
+
+        // Insert sched_waking events
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid, next_prio)
+             VALUES (500000, 1, 'waking', 300, 120)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid, next_prio)
+             VALUES (600000, 1, 'waking', 200, 110)",
+            [],
+        )
+        .unwrap();
+
+        let mut trace = Trace::default();
+        let sequence_counter = AtomicU32::new(1);
+        add_scheduler_event_packets(&conn, &mut trace, &sequence_counter).unwrap();
+
+        assert_eq!(trace.packet.len(), 1, "Should have one packet for CPU 1");
+
+        if let Some(Data::FtraceEvents(ref bundle)) = trace.packet[0].data {
+            assert_eq!(bundle.cpu(), 1, "Should be for CPU 1");
+            let compact_sched = bundle.compact_sched.0.as_ref().unwrap();
+
+            // Check waking events
+            assert_eq!(
+                compact_sched.waking_timestamp.len(),
+                2,
+                "Should have 2 waking events"
+            );
+            assert_eq!(
+                compact_sched.waking_pid,
+                vec![300, 200],
+                "Should have correct waking PIDs"
+            );
+
+            // Check delta encoding
+            assert_eq!(
+                compact_sched.waking_timestamp[0], 500000,
+                "First timestamp should be absolute"
+            );
+            assert_eq!(
+                compact_sched.waking_timestamp[1], 100000,
+                "Second timestamp should be delta (600000 - 500000)"
+            );
+
+            // Check target CPU (should be same as source CPU for waking events)
+            assert_eq!(
+                compact_sched.waking_target_cpu,
+                vec![1, 1],
+                "Target CPU should be CPU 1 for both"
+            );
+        } else {
+            panic!("Expected FtraceEvents packet");
+        }
+    }
+
+    #[test]
+    fn test_scheduler_event_thread_name_interning() {
+        // Test that thread names are properly interned
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        // Insert test process and threads with specific names
+        conn.execute(
+            "INSERT INTO processes (pid, name, cmdline) VALUES (100, 'test_proc', '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (tid, pid, name) VALUES (200, 100, 'thread_a')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (tid, pid, name) VALUES (300, 100, 'thread_b')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (tid, pid, name) VALUES (400, 100, 'thread_a')",
+            [],
+        )
+        .unwrap(); // Same name as 200
+
+        // Insert events that reference these threads
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
+             VALUES (1000, 0, 'switch', 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
+             VALUES (2000, 0, 'switch', 300)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
+             VALUES (3000, 0, 'switch', 400)",
+            [],
+        )
+        .unwrap();
+
+        let mut trace = Trace::default();
+        let sequence_counter = AtomicU32::new(1);
+        add_scheduler_event_packets(&conn, &mut trace, &sequence_counter).unwrap();
+
+        if let Some(Data::FtraceEvents(ref bundle)) = trace.packet[0].data {
+            let compact_sched = bundle.compact_sched.0.as_ref().unwrap();
+
+            // Check intern table - should have exactly 2 unique strings
+            assert_eq!(
+                compact_sched.intern_table.len(),
+                2,
+                "Should have 2 unique thread names"
+            );
+            assert!(
+                compact_sched.intern_table.contains(&"thread_a".to_string()),
+                "Should contain thread_a"
+            );
+            assert!(
+                compact_sched.intern_table.contains(&"thread_b".to_string()),
+                "Should contain thread_b"
+            );
+
+            // Check comm indices refer to correct interned strings
+            assert_eq!(
+                compact_sched.switch_next_comm_index.len(),
+                3,
+                "Should have 3 comm indices"
+            );
+
+            // First and third should refer to same interned string (thread_a)
+            assert_eq!(
+                compact_sched.switch_next_comm_index[0], compact_sched.switch_next_comm_index[2],
+                "PIDs 200 and 400 should have same comm index (both thread_a)"
+            );
+        } else {
+            panic!("Expected FtraceEvents packet");
+        }
+    }
+
+    #[test]
+    fn test_scheduler_events_grouped_by_cpu() {
+        // Test that events are properly grouped by CPU
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        // Insert test process and thread
+        conn.execute(
+            "INSERT INTO processes (pid, name, cmdline) VALUES (100, 'test_proc', '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (tid, pid, name) VALUES (200, 100, 'worker')",
+            [],
+        )
+        .unwrap();
+
+        // Insert events on different CPUs
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
+             VALUES (1000, 0, 'switch', 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
+             VALUES (2000, 1, 'switch', 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
+             VALUES (3000, 0, 'waking', 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
+             VALUES (4000, 2, 'waking', 200)",
+            [],
+        )
+        .unwrap();
+
+        let mut trace = Trace::default();
+        let sequence_counter = AtomicU32::new(1);
+        add_scheduler_event_packets(&conn, &mut trace, &sequence_counter).unwrap();
+
+        // Should have 3 packets (one for each CPU: 0, 1, 2)
+        assert_eq!(trace.packet.len(), 3, "Should have 3 packets for 3 CPUs");
+
+        // Collect CPU numbers from packets
+        let mut cpus = Vec::new();
+        for packet in &trace.packet {
+            if let Some(Data::FtraceEvents(ref bundle)) = packet.data {
+                cpus.push(bundle.cpu());
+            }
+        }
+        cpus.sort_unstable();
+        assert_eq!(cpus, vec![0, 1, 2], "Should have packets for CPUs 0, 1, 2");
+
+        // Check CPU 0 packet has both switch and waking
+        for packet in &trace.packet {
+            if let Some(Data::FtraceEvents(ref bundle)) = packet.data {
+                if bundle.cpu() == 0 {
+                    let compact_sched = bundle.compact_sched.0.as_ref().unwrap();
+                    assert_eq!(
+                        compact_sched.switch_timestamp.len(),
+                        1,
+                        "CPU 0 should have 1 switch event"
+                    );
+                    assert_eq!(
+                        compact_sched.waking_timestamp.len(),
+                        1,
+                        "CPU 0 should have 1 waking event"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_scheduler_event_with_missing_thread() {
+        // Test handling of events referencing non-existent threads
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        // Disable foreign key constraints for this test
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+
+        // Insert events without corresponding thread entries
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
+             VALUES (1000, 0, 'switch', 999)",
+            [],
+        )
+        .unwrap(); // PID 999 doesn't exist
+
+        let mut trace = Trace::default();
+        let sequence_counter = AtomicU32::new(1);
+        add_scheduler_event_packets(&conn, &mut trace, &sequence_counter).unwrap();
+
+        if let Some(Data::FtraceEvents(ref bundle)) = trace.packet[0].data {
+            let compact_sched = bundle.compact_sched.0.as_ref().unwrap();
+
+            // Should generate a default name for missing thread
+            assert_eq!(compact_sched.intern_table.len(), 1);
+            assert_eq!(
+                compact_sched.intern_table[0], "pid-999",
+                "Should generate default name for missing thread"
+            );
+        } else {
+            panic!("Expected FtraceEvents packet");
+        }
+    }
+
+    #[test]
+    fn test_scheduler_event_unknown_event_types() {
+        // Test that unknown event types are properly skipped
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        // Insert process and thread
+        conn.execute(
+            "INSERT INTO processes (pid, name, cmdline) VALUES (100, 'test_proc', '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (tid, pid, name) VALUES (200, 100, 'worker')",
+            [],
+        )
+        .unwrap();
+
+        // Insert valid and invalid event types
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
+             VALUES (1000, 0, 'switch', 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
+             VALUES (2000, 0, 'unknown_type', 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
+             VALUES (3000, 0, 'waking', 200)",
+            [],
+        )
+        .unwrap();
+
+        let mut trace = Trace::default();
+        let sequence_counter = AtomicU32::new(1);
+
+        // Should not panic and should process valid events
+        add_scheduler_event_packets(&conn, &mut trace, &sequence_counter).unwrap();
+
+        if let Some(Data::FtraceEvents(ref bundle)) = trace.packet[0].data {
+            let compact_sched = bundle.compact_sched.0.as_ref().unwrap();
+
+            // Should only have the valid events
+            assert_eq!(
+                compact_sched.switch_timestamp.len(),
+                1,
+                "Should have 1 switch event (unknown_type skipped)"
+            );
+            assert_eq!(
+                compact_sched.waking_timestamp.len(),
+                1,
+                "Should have 1 waking event"
+            );
+        } else {
+            panic!("Expected FtraceEvents packet");
+        }
+    }
+
+    #[test]
+    fn test_scheduler_event_empty_database() {
+        // Test that empty scheduler events table produces no packets
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let mut trace = Trace::default();
+        let sequence_counter = AtomicU32::new(1);
+        add_scheduler_event_packets(&conn, &mut trace, &sequence_counter).unwrap();
+
+        assert_eq!(
+            trace.packet.len(),
+            0,
+            "Empty scheduler events should produce no packets"
+        );
+    }
+
+    #[test]
+    fn test_scheduler_event_priority_values() {
+        // Test that priority values are correctly preserved
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        // Insert test data
+        conn.execute(
+            "INSERT INTO processes (pid, name, cmdline) VALUES (100, 'test_proc', '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (tid, pid, name) VALUES (200, 100, 'high_prio')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (tid, pid, name) VALUES (300, 100, 'low_prio')",
+            [],
+        )
+        .unwrap();
+
+        // Insert events with different priorities
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid, next_prio)
+             VALUES (1000, 0, 'switch', 200, 50)",
+            [],
+        )
+        .unwrap(); // High priority (lower number)
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid, next_prio)
+             VALUES (2000, 0, 'switch', 300, 139)",
+            [],
+        )
+        .unwrap(); // Low priority (higher number)
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, next_pid, next_prio)
+             VALUES (3000, 0, 'waking', 200, 50)",
+            [],
+        )
+        .unwrap();
+
+        let mut trace = Trace::default();
+        let sequence_counter = AtomicU32::new(1);
+        add_scheduler_event_packets(&conn, &mut trace, &sequence_counter).unwrap();
+
+        if let Some(Data::FtraceEvents(ref bundle)) = trace.packet[0].data {
+            let compact_sched = bundle.compact_sched.0.as_ref().unwrap();
+
+            // Check switch priorities
+            assert_eq!(
+                compact_sched.switch_next_prio,
+                vec![50, 139],
+                "Should preserve priority values for switch events"
+            );
+
+            // Check waking priorities
+            assert_eq!(
+                compact_sched.waking_prio,
+                vec![50],
+                "Should preserve priority values for waking events"
+            );
+        } else {
+            panic!("Expected FtraceEvents packet");
+        }
+    }
+
+    #[test]
+    fn test_scheduler_event_state_values() {
+        // Test that prev_state values are correctly preserved
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        // Insert test data
+        conn.execute(
+            "INSERT INTO processes (pid, name, cmdline) VALUES (100, 'test_proc', '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (tid, pid, name) VALUES (200, 100, 'worker')",
+            [],
+        )
+        .unwrap();
+
+        // Insert switch events with different state values
+        // Common Linux task states: 0=RUNNING, 1=INTERRUPTIBLE, 2=UNINTERRUPTIBLE, etc.
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, prev_state, next_pid)
+             VALUES (1000, 0, 'switch', 0, 200)",
+            [],
+        )
+        .unwrap(); // RUNNING
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, prev_state, next_pid)
+             VALUES (2000, 0, 'switch', 1, 200)",
+            [],
+        )
+        .unwrap(); // INTERRUPTIBLE
+        conn.execute(
+            "INSERT INTO sched_events (ts, cpu, event_type, prev_state, next_pid)
+             VALUES (3000, 0, 'switch', 2, 200)",
+            [],
+        )
+        .unwrap(); // UNINTERRUPTIBLE
+
+        let mut trace = Trace::default();
+        let sequence_counter = AtomicU32::new(1);
+        add_scheduler_event_packets(&conn, &mut trace, &sequence_counter).unwrap();
+
+        if let Some(Data::FtraceEvents(ref bundle)) = trace.packet[0].data {
+            let compact_sched = bundle.compact_sched.0.as_ref().unwrap();
+
+            assert_eq!(
+                compact_sched.switch_prev_state,
+                vec![0, 1, 2],
+                "Should preserve all state values"
+            );
+        } else {
+            panic!("Expected FtraceEvents packet");
+        }
+    }
+
+    #[test]
+    fn test_scheduler_event_large_timestamp_delta() {
+        // Test that large timestamp deltas are handled correctly
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        // Insert test data
+        conn.execute(
+            "INSERT INTO processes (pid, name, cmdline) VALUES (100, 'test_proc', '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (tid, pid, name) VALUES (200, 100, 'worker')",
+            [],
+        )
+        .unwrap();
+
+        // Insert events with large timestamp gaps
+        let ts1 = 1_000_000_000u64; // 1 second in nanoseconds
+        let ts2 = 60_000_000_000u64; // 60 seconds
+        let ts3 = 3_600_000_000_000u64; // 1 hour
+
+        conn.execute(
+            &format!(
+                "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
+                 VALUES ({}, 0, 'switch', 200)",
+                ts1
+            ),
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
+                 VALUES ({}, 0, 'switch', 200)",
+                ts2
+            ),
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
+                 VALUES ({}, 0, 'switch', 200)",
+                ts3
+            ),
+            [],
+        )
+        .unwrap();
+
+        let mut trace = Trace::default();
+        let sequence_counter = AtomicU32::new(1);
+        add_scheduler_event_packets(&conn, &mut trace, &sequence_counter).unwrap();
+
+        if let Some(Data::FtraceEvents(ref bundle)) = trace.packet[0].data {
+            let compact_sched = bundle.compact_sched.0.as_ref().unwrap();
+
+            // Verify delta encoding
+            assert_eq!(compact_sched.switch_timestamp[0], ts1, "First is absolute");
+            assert_eq!(
+                compact_sched.switch_timestamp[1],
+                ts2 - ts1,
+                "Second is delta from first"
+            );
+            assert_eq!(
+                compact_sched.switch_timestamp[2],
+                ts3 - ts2,
+                "Third is delta from second"
+            );
+        } else {
+            panic!("Expected FtraceEvents packet");
+        }
     }
 }
