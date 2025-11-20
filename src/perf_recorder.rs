@@ -364,19 +364,29 @@ mod tests {
 
         // Verify counter definitions were written
         assert_eq!(output.counters.len(), 2);
-        assert_eq!(output.counters[0].counter_name, "test_counter_1");
-        assert_eq!(output.counters[0].cpu, Some(0));
-        assert_eq!(output.counters[0].unit, "count");
-        assert!(!output.counters[0].is_incremental);
 
-        assert_eq!(output.counters[1].counter_name, "test_counter_2");
-        assert_eq!(output.counters[1].cpu, Some(1));
+        // Find each counter by name instead of assuming order
+        let counter_1 = output
+            .counters
+            .iter()
+            .find(|c| c.counter_name == "test_counter_1")
+            .expect("test_counter_1 not found");
+        assert_eq!(counter_1.cpu, Some(0));
+        assert_eq!(counter_1.unit, "count");
+        assert!(!counter_1.is_incremental);
+
+        let counter_2 = output
+            .counters
+            .iter()
+            .find(|c| c.counter_name == "test_counter_2")
+            .expect("test_counter_2 not found");
+        assert_eq!(counter_2.cpu, Some(1));
 
         // Verify counter values were written
         assert_eq!(output.values.len(), 3);
 
-        // Find values for the first counter (CPU 0, counter 0)
-        let counter_id_0 = output.counters[0].track_uuid;
+        // Find values for the first counter (CPU 0, counter 0) using the actual track UUID
+        let counter_id_0 = counter_1.track_uuid;
         let values_0: Vec<_> = output
             .values
             .iter()
@@ -388,8 +398,8 @@ mod tests {
         assert_eq!(values_0[1].1, 200);
         assert_eq!(values_0[1].2, 20);
 
-        // Find values for the second counter (CPU 1, counter 1)
-        let counter_id_1 = output.counters[1].track_uuid;
+        // Find values for the second counter (CPU 1, counter 1) using the actual track UUID
+        let counter_id_1 = counter_2.track_uuid;
         let values_1: Vec<_> = output
             .values
             .iter()
