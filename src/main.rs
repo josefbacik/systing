@@ -1,5 +1,6 @@
 mod events;
 mod network_recorder;
+mod output;
 mod perf;
 mod perf_recorder;
 mod perfetto;
@@ -7,6 +8,7 @@ mod pystacks;
 mod ringbuf;
 mod sched;
 mod session_recorder;
+mod sqlite;
 mod stack_recorder;
 
 use std::collections::HashMap;
@@ -24,16 +26,18 @@ use std::thread;
 use std::time::Duration;
 
 use crate::events::{EventKeyType, EventProbe, SystingProbeRecorder};
+use crate::output::TraceOutput;
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::session_recorder::{get_clock_value, SessionRecorder, SysInfoEvent};
+use crate::sqlite::SqliteOutput;
 use crate::stack_recorder::StackRecorder;
 
 use anyhow::Result;
 use anyhow::{bail, Context};
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 use tracing::subscriber::set_global_default as set_global_subscriber;
 use tracing_subscriber::filter::LevelFilter;
@@ -126,7 +130,7 @@ fn validate_recorder_names(names: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
+fn enable_recorder(opts: &mut RecordArgs, recorder_name: &str, enable: bool) {
     match recorder_name {
         "syscalls" => opts.syscalls = enable,
         "sched" => opts.no_sched = !enable,
@@ -139,7 +143,7 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
     }
 }
 
-fn process_recorder_options(opts: &mut Command) -> Result<()> {
+fn process_recorder_options(opts: &mut RecordArgs) -> Result<()> {
     validate_recorder_names(&opts.add_recorder)?;
     validate_recorder_names(&opts.only_recorder)?;
 
@@ -170,8 +174,27 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Parser)]
-struct Command {
+#[derive(Parser, Debug)]
+#[command(name = "systing")]
+#[command(
+    about = "Linux BPF tracer with SQLite and Perfetto output support",
+    version
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Record a new trace
+    Record(RecordArgs),
+    /// Convert between trace formats
+    Convert(ConvertArgs),
+}
+
+#[derive(Args, Debug)]
+struct RecordArgs {
     /// Increase verbosity (can be supplied multiple times).
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
     verbosity: u8,
@@ -231,6 +254,38 @@ struct Command {
     /// Disable all recorders and only enable the specified ones (can be specified multiple times)
     #[arg(long)]
     only_recorder: Vec<String>,
+    /// Output format: perfetto or sqlite
+    #[arg(long, value_enum, default_value = "perfetto")]
+    format: OutputFormat,
+    /// Output file path (default: trace.pb or trace.db based on format)
+    #[arg(short = 'o', long)]
+    output: Option<String>,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum OutputFormat {
+    Perfetto,
+    Sqlite,
+}
+
+#[derive(Args, Debug)]
+struct ConvertArgs {
+    /// Input file path
+    input: String,
+    /// Output file path
+    output: String,
+    /// Input format (auto-detected if not specified)
+    #[arg(long, value_enum)]
+    from: Option<TraceFormat>,
+    /// Output format (auto-detected from extension if not specified)
+    #[arg(long, value_enum)]
+    to: Option<TraceFormat>,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum TraceFormat {
+    Perfetto,
+    Sqlite,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -485,7 +540,7 @@ fn consume_loop<T, N>(
 fn spawn_recorder_threads(
     recorder: &Arc<SessionRecorder>,
     channels: RecorderChannels,
-    opts: &Command,
+    opts: &RecordArgs,
     stop_tx: &Sender<()>,
     perf_counter_names: &[String],
     task_info_tx: &Sender<task_info>,
@@ -670,7 +725,7 @@ fn is_old_kernel() -> bool {
 }
 
 fn setup_perf_counters(
-    opts: &Command,
+    opts: &RecordArgs,
     counters: &mut PerfCounters,
     perf_counter_names: &mut Vec<String>,
 ) -> Result<()> {
@@ -732,7 +787,7 @@ fn set_ringbuf_duration(recorder: &Arc<SessionRecorder>, duration_nanos: u64) {
         .set_max_duration(duration_nanos);
 }
 
-fn configure_recorder(opts: &Command, recorder: &Arc<SessionRecorder>) {
+fn configure_recorder(opts: &RecordArgs, recorder: &Arc<SessionRecorder>) {
     if opts.continuous > 0 {
         let duration_nanos = Duration::from_secs(opts.continuous).as_nanos() as u64;
         set_ringbuf_duration(recorder, duration_nanos);
@@ -968,7 +1023,7 @@ struct RecorderChannels {
 
 fn setup_ringbuffers<'a>(
     skel: &systing::SystingSystemSkel,
-    opts: &Command,
+    opts: &RecordArgs,
     perf_counter_names: &[String],
 ) -> Result<(Vec<(String, libbpf_rs::RingBuffer<'a>)>, RecorderChannels)> {
     let mut rings = Vec::new();
@@ -1020,7 +1075,7 @@ fn setup_ringbuffers<'a>(
 
 fn configure_bpf_skeleton(
     open_skel: &mut systing::OpenSystingSystemSkel,
-    opts: &Command,
+    opts: &RecordArgs,
     num_cpus: u32,
     old_kernel: bool,
     collect_pystacks: bool,
@@ -1193,7 +1248,7 @@ fn configure_bpf_skeleton(
 
 fn setup_perf_events(
     skel: &mut systing::SystingSystemSkel,
-    opts: &Command,
+    opts: &RecordArgs,
     counters: &PerfCounters,
     perf_counter_names: &[String],
     num_cpus: u32,
@@ -1362,7 +1417,7 @@ fn resolve_pids_for_probe(
 fn attach_probes(
     skel: &mut systing::SystingSystemSkel,
     recorder: &Arc<SessionRecorder>,
-    opts: &Command,
+    opts: &RecordArgs,
     old_kernel: bool,
 ) -> Result<Vec<libbpf_rs::Link>> {
     let mut probe_links = Vec::new();
@@ -1637,7 +1692,7 @@ struct ThreadHandles {
 
 fn run_tracing_loop(
     handles: ThreadHandles,
-    opts: &Command,
+    opts: &RecordArgs,
     stop_tx: Sender<()>,
     stop_rx: Receiver<()>,
     thread_done: Arc<AtomicBool>,
@@ -1701,7 +1756,55 @@ fn run_tracing_loop(
     Ok(())
 }
 
-fn system(opts: Command) -> Result<()> {
+/// Write trace data from SessionRecorder to a TraceOutput implementation
+///
+/// This function provides a basic implementation that writes metadata and clock snapshots.
+/// Future versions will fully populate all trace data through the recorders.
+fn write_trace_to_output(
+    recorder: &Arc<SessionRecorder>,
+    output: &mut dyn TraceOutput,
+) -> Result<()> {
+    use crate::output::ClockInfo;
+
+    // Get clock snapshot data
+    let clock_snapshot = recorder.clock_snapshot.lock().unwrap();
+
+    // Extract start time from the BOOTTIME clock (primary trace clock)
+    let start_ts = clock_snapshot
+        .clocks
+        .iter()
+        .find(|c| {
+            c.clock_id()
+                == perfetto_protos::builtin_clock::BuiltinClock::BUILTIN_CLOCK_BOOTTIME as u32
+        })
+        .map(|c| c.timestamp())
+        .unwrap_or(0);
+
+    // Use current time as end time
+    let end_ts = get_clock_value(libc::CLOCK_BOOTTIME);
+
+    // Write metadata
+    output.write_metadata(start_ts, end_ts, env!("CARGO_PKG_VERSION"))?;
+
+    // Write clock snapshot
+    let clocks: Vec<ClockInfo> = clock_snapshot
+        .clocks
+        .iter()
+        .map(|c| ClockInfo {
+            clock_id: c.clock_id(),
+            clock_name: format!("clock_{}", c.clock_id()),
+            timestamp: c.timestamp(),
+        })
+        .collect();
+    output.write_clock_snapshot(&clocks)?;
+
+    // TODO: Write processes and threads
+    // TODO: Write events from each recorder
+
+    Ok(())
+}
+
+fn handle_record(opts: RecordArgs) -> Result<()> {
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
     let mut counters = PerfCounters::default();
@@ -1979,15 +2082,54 @@ fn system(opts: Command) -> Result<()> {
         recorder.drain_all_ringbufs();
     }
 
+    // Determine output file path based on format
+    let output_path = opts.output.unwrap_or_else(|| match opts.format {
+        OutputFormat::Perfetto => "trace.pb".to_string(),
+        OutputFormat::Sqlite => "trace.db".to_string(),
+    });
+
     println!("Generating trace...");
-    let mut trace = Trace::default();
-    trace.packet.extend(recorder.generate_trace());
-    let mut file = std::fs::File::create("trace.pb")
-        .with_context(|| "Failed to create output file 'trace.pb' in current directory")?;
-    trace
-        .write_to_writer(&mut file)
-        .with_context(|| "Failed to write trace data to 'trace.pb'")?;
+    match opts.format {
+        OutputFormat::Perfetto => {
+            let mut trace = Trace::default();
+            trace.packet.extend(recorder.generate_trace());
+            let mut file = std::fs::File::create(&output_path).with_context(|| {
+                format!(
+                    "Failed to create output file '{}' in current directory",
+                    output_path
+                )
+            })?;
+            trace
+                .write_to_writer(&mut file)
+                .with_context(|| format!("Failed to write trace data to '{}'", output_path))?;
+            println!("Trace written to: {}", output_path);
+        }
+        OutputFormat::Sqlite => {
+            let mut sqlite_output =
+                SqliteOutput::create(&output_path).context("Failed to create SQLite output")?;
+
+            write_trace_to_output(&recorder, &mut sqlite_output)
+                .context("Failed to write trace to SQLite")?;
+
+            sqlite_output
+                .flush()
+                .context("Failed to flush SQLite output")?;
+            println!("Trace written to: {}", output_path);
+        }
+    }
     Ok(())
+}
+
+fn handle_convert(args: ConvertArgs) -> Result<()> {
+    println!("Convert command called:");
+    println!("  Input:  {}", args.input);
+    println!("  Output: {}", args.output);
+    println!("  From format: {:?}", args.from);
+    println!("  To format: {:?}", args.to);
+    println!("\nConversion functionality not yet implemented.");
+    Err(anyhow::anyhow!(
+        "Trace format conversion is not yet implemented. This will be added in a future phase."
+    ))
 }
 
 /// Check if we have the necessary capabilities to run BPF programs
@@ -2068,51 +2210,60 @@ fn reexec_with_systemd_run() -> Result<i32> {
 }
 
 fn main() -> Result<()> {
-    // Check if we've already been re-executed to prevent infinite loops
-    let already_reexeced = env::var("SYSTING_REEXECED").is_ok();
+    let cli = Cli::parse();
 
-    // Check if we have the necessary capabilities
-    if !already_reexeced && !has_bpf_capabilities() {
-        let exit_code = reexec_with_systemd_run()?;
-        process::exit(exit_code);
-    }
+    match cli.command {
+        Commands::Record(mut opts) => {
+            // Handle list-recorders early, before checking capabilities
+            if opts.list_recorders {
+                println!("Available recorders:");
+                for recorder in get_available_recorders() {
+                    let default_text = if recorder.default_enabled {
+                        " (on by default)"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "  {:<14} - {}{}",
+                        recorder.name, recorder.description, default_text
+                    );
+                }
+                return Ok(());
+            }
 
-    let mut opts = Command::parse();
+            // Check if we've already been re-executed to prevent infinite loops
+            let already_reexeced = env::var("SYSTING_REEXECED").is_ok();
 
-    if opts.list_recorders {
-        println!("Available recorders:");
-        for recorder in get_available_recorders() {
-            let default_text = if recorder.default_enabled {
-                " (on by default)"
-            } else {
-                ""
+            // Check if we have the necessary capabilities
+            if !already_reexeced && !has_bpf_capabilities() {
+                let exit_code = reexec_with_systemd_run()?;
+                process::exit(exit_code);
+            }
+
+            process_recorder_options(&mut opts)?;
+
+            // Set up tracing subscriber with level based on verbosity
+            let level = match opts.verbosity {
+                0 => LevelFilter::WARN,
+                1 => LevelFilter::INFO,
+                2 => LevelFilter::DEBUG,
+                _ => LevelFilter::TRACE,
             };
-            println!(
-                "  {:<14} - {}{}",
-                recorder.name, recorder.description, default_text
-            );
+
+            let subscriber = FmtSubscriber::builder()
+                .with_max_level(level)
+                .with_timer(SystemTime)
+                .finish();
+
+            set_global_subscriber(subscriber).expect("Failed to set tracing subscriber");
+
+            bump_memlock_rlimit()?;
+
+            handle_record(opts)
         }
-        return Ok(());
+        Commands::Convert(args) => {
+            // Convert command doesn't need BPF capabilities or special setup
+            handle_convert(args)
+        }
     }
-
-    process_recorder_options(&mut opts)?;
-
-    // Set up tracing subscriber with level based on verbosity
-    let level = match opts.verbosity {
-        0 => LevelFilter::WARN,
-        1 => LevelFilter::INFO,
-        2 => LevelFilter::DEBUG,
-        _ => LevelFilter::TRACE,
-    };
-
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(level)
-        .with_timer(SystemTime)
-        .finish();
-
-    set_global_subscriber(subscriber).expect("Failed to set tracing subscriber");
-
-    bump_memlock_rlimit()?;
-
-    system(opts)
 }
