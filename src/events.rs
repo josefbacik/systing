@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::output::{ArgValue as OutputArgValue, EventDefinition, ProbeEventData, TraceOutput};
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::probe_event;
 use crate::SystingRecordEvent;
@@ -1077,6 +1078,300 @@ impl SystingProbeRecorder {
         self.syscall_name_ids.clear();
 
         packets
+    }
+
+    pub fn write_output(
+        &self,
+        output: &mut dyn TraceOutput,
+        _id_counter: &Arc<AtomicUsize>,
+    ) -> Result<()> {
+        // First pass: Define all event types and store their definition IDs
+        // We need to collect all unique event definitions from all event sources
+        let mut event_defs: HashMap<String, u64> = HashMap::new();
+
+        // Helper function to convert local ArgValue to output ArgValue
+        let convert_arg = |arg: &ArgValue| -> OutputArgValue {
+            match arg {
+                ArgValue::String(s) => OutputArgValue::String(s.clone()),
+                ArgValue::Long(l) => OutputArgValue::Long(*l as i64),
+            }
+        };
+
+        // Collect event definitions from instant events (thread-based)
+        for (_tgidpid, events) in self.events.iter() {
+            for (track_name, track_events) in events.iter() {
+                for event in track_events.iter() {
+                    let event_key = format!("instant:{}:{}", track_name, event.name);
+                    if !event_defs.contains_key(&event_key) {
+                        // Find the cookie for this event
+                        let cookie = self
+                            .cookies
+                            .iter()
+                            .find(|(_, e)| e.name == event.name)
+                            .map(|(c, _)| *c)
+                            .unwrap_or(0);
+
+                        let def = EventDefinition {
+                            event_name: event.name.clone(),
+                            event_type: "instant".to_string(),
+                            track_name: Some(track_name.clone()),
+                            category: None,
+                            cookie,
+                        };
+                        let def_id = output.write_event_definition(&def)?;
+                        event_defs.insert(event_key, def_id);
+                    }
+                }
+            }
+        }
+
+        // Collect event definitions from range events (thread-based)
+        for (_tgidpid, tracks) in self.recorded_ranges.iter() {
+            for (track_name, ranges) in tracks.iter() {
+                for range in ranges.iter() {
+                    // Range start event
+                    let start_key = format!("range_start:{}:{}", track_name, range.range_name);
+                    if !event_defs.contains_key(&start_key) {
+                        let cookie = self
+                            .cookies
+                            .iter()
+                            .find(|(_, e)| e.name == range.range_name)
+                            .map(|(c, _)| *c)
+                            .unwrap_or(0);
+
+                        let def = EventDefinition {
+                            event_name: range.range_name.clone(),
+                            event_type: "range_start".to_string(),
+                            track_name: Some(track_name.clone()),
+                            category: None,
+                            cookie,
+                        };
+                        let def_id = output.write_event_definition(&def)?;
+                        event_defs.insert(start_key, def_id);
+                    }
+
+                    // Range end event
+                    let end_key = format!("range_end:{}:{}", track_name, range.range_name);
+                    if !event_defs.contains_key(&end_key) {
+                        let cookie = self
+                            .cookies
+                            .iter()
+                            .find(|(_, e)| e.name == range.range_name)
+                            .map(|(c, _)| *c)
+                            .unwrap_or(0);
+
+                        let def = EventDefinition {
+                            event_name: range.range_name.clone(),
+                            event_type: "range_end".to_string(),
+                            track_name: Some(track_name.clone()),
+                            category: None,
+                            cookie,
+                        };
+                        let def_id = output.write_event_definition(&def)?;
+                        event_defs.insert(end_key, def_id);
+                    }
+                }
+            }
+        }
+
+        // Collect event definitions from CPU instant events
+        for (_cpu, events) in self.cpu_events.iter() {
+            for (track_name, track_events) in events.iter() {
+                for event in track_events.iter() {
+                    let event_key = format!("instant:{}:{}", track_name, event.name);
+                    if !event_defs.contains_key(&event_key) {
+                        let cookie = self
+                            .cookies
+                            .iter()
+                            .find(|(_, e)| e.name == event.name)
+                            .map(|(c, _)| *c)
+                            .unwrap_or(0);
+
+                        let def = EventDefinition {
+                            event_name: event.name.clone(),
+                            event_type: "instant".to_string(),
+                            track_name: Some(track_name.clone()),
+                            category: None,
+                            cookie,
+                        };
+                        let def_id = output.write_event_definition(&def)?;
+                        event_defs.insert(event_key, def_id);
+                    }
+                }
+            }
+        }
+
+        // Collect event definitions from CPU range events
+        for (_cpu, tracks) in self.cpu_ranges.iter() {
+            for (track_name, ranges) in tracks.iter() {
+                for range in ranges.iter() {
+                    // Range start event
+                    let start_key = format!("range_start:{}:{}", track_name, range.range_name);
+                    if !event_defs.contains_key(&start_key) {
+                        let cookie = self
+                            .cookies
+                            .iter()
+                            .find(|(_, e)| e.name == range.range_name)
+                            .map(|(c, _)| *c)
+                            .unwrap_or(0);
+
+                        let def = EventDefinition {
+                            event_name: range.range_name.clone(),
+                            event_type: "range_start".to_string(),
+                            track_name: Some(track_name.clone()),
+                            category: None,
+                            cookie,
+                        };
+                        let def_id = output.write_event_definition(&def)?;
+                        event_defs.insert(start_key, def_id);
+                    }
+
+                    // Range end event
+                    let end_key = format!("range_end:{}:{}", track_name, range.range_name);
+                    if !event_defs.contains_key(&end_key) {
+                        let cookie = self
+                            .cookies
+                            .iter()
+                            .find(|(_, e)| e.name == range.range_name)
+                            .map(|(c, _)| *c)
+                            .unwrap_or(0);
+
+                        let def = EventDefinition {
+                            event_name: range.range_name.clone(),
+                            event_type: "range_end".to_string(),
+                            track_name: Some(track_name.clone()),
+                            category: None,
+                            cookie,
+                        };
+                        let def_id = output.write_event_definition(&def)?;
+                        event_defs.insert(end_key, def_id);
+                    }
+                }
+            }
+        }
+
+        // Second pass: Write all probe event occurrences
+
+        // Write instant events (thread-based)
+        for (tgidpid, events) in self.events.iter() {
+            for (track_name, track_events) in events.iter() {
+                for event in track_events.iter() {
+                    let event_key = format!("instant:{}:{}", track_name, event.name);
+                    if let Some(&def_id) = event_defs.get(&event_key) {
+                        let mut args = HashMap::new();
+                        for (arg_name, arg_value) in &event.args {
+                            args.insert(arg_name.clone(), convert_arg(arg_value));
+                        }
+
+                        let probe_event = ProbeEventData {
+                            ts: event.ts,
+                            tid: (*tgidpid & 0xFFFFFFFF) as i32,
+                            event_def_id: def_id,
+                            args,
+                        };
+                        output.write_probe_event(&probe_event)?;
+                    }
+                }
+            }
+        }
+
+        // Write range events (thread-based)
+        for (tgidpid, tracks) in self.recorded_ranges.iter() {
+            for (track_name, ranges) in tracks.iter() {
+                for range in ranges.iter() {
+                    // Write range start event
+                    let start_key = format!("range_start:{}:{}", track_name, range.range_name);
+                    if let Some(&def_id) = event_defs.get(&start_key) {
+                        let mut args = HashMap::new();
+                        for (arg_name, arg_value) in &range.args {
+                            args.insert(arg_name.clone(), convert_arg(arg_value));
+                        }
+
+                        let probe_event = ProbeEventData {
+                            ts: range.start,
+                            tid: (*tgidpid & 0xFFFFFFFF) as i32,
+                            event_def_id: def_id,
+                            args,
+                        };
+                        output.write_probe_event(&probe_event)?;
+                    }
+
+                    // Write range end event
+                    let end_key = format!("range_end:{}:{}", track_name, range.range_name);
+                    if let Some(&def_id) = event_defs.get(&end_key) {
+                        let probe_event = ProbeEventData {
+                            ts: range.end,
+                            tid: (*tgidpid & 0xFFFFFFFF) as i32,
+                            event_def_id: def_id,
+                            args: HashMap::new(), // End events don't have args
+                        };
+                        output.write_probe_event(&probe_event)?;
+                    }
+                }
+            }
+        }
+
+        // Write CPU instant events
+        for (_cpu, events) in self.cpu_events.iter() {
+            for (track_name, track_events) in events.iter() {
+                for event in track_events.iter() {
+                    let event_key = format!("instant:{}:{}", track_name, event.name);
+                    if let Some(&def_id) = event_defs.get(&event_key) {
+                        let mut args = HashMap::new();
+                        for (arg_name, arg_value) in &event.args {
+                            args.insert(arg_name.clone(), convert_arg(arg_value));
+                        }
+
+                        // CPU events don't have a TID, use 0
+                        let probe_event = ProbeEventData {
+                            ts: event.ts,
+                            tid: 0,
+                            event_def_id: def_id,
+                            args,
+                        };
+                        output.write_probe_event(&probe_event)?;
+                    }
+                }
+            }
+        }
+
+        // Write CPU range events
+        for (_cpu, tracks) in self.cpu_ranges.iter() {
+            for (track_name, ranges) in tracks.iter() {
+                for range in ranges.iter() {
+                    // Write range start event
+                    let start_key = format!("range_start:{}:{}", track_name, range.range_name);
+                    if let Some(&def_id) = event_defs.get(&start_key) {
+                        let mut args = HashMap::new();
+                        for (arg_name, arg_value) in &range.args {
+                            args.insert(arg_name.clone(), convert_arg(arg_value));
+                        }
+
+                        let probe_event = ProbeEventData {
+                            ts: range.start,
+                            tid: 0, // CPU events don't have a TID
+                            event_def_id: def_id,
+                            args,
+                        };
+                        output.write_probe_event(&probe_event)?;
+                    }
+
+                    // Write range end event
+                    let end_key = format!("range_end:{}:{}", track_name, range.range_name);
+                    if let Some(&def_id) = event_defs.get(&end_key) {
+                        let probe_event = ProbeEventData {
+                            ts: range.end,
+                            tid: 0, // CPU events don't have a TID
+                            event_def_id: def_id,
+                            args: HashMap::new(), // End events don't have args
+                        };
+                        output.write_probe_event(&probe_event)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn add_event_from_str(&mut self, event: &str, rng: &mut dyn rand::RngCore) -> Result<()> {

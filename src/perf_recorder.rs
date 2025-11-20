@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use anyhow::Result;
+
+use crate::output::{PerfCounterDef, TraceOutput};
 use crate::perfetto::TrackCounter;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::perf_counter_event;
@@ -11,7 +14,7 @@ use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
 use perfetto_protos::trace_packet::TracePacket;
 
-#[derive(Default, PartialEq, Eq, Hash)]
+#[derive(Default, PartialEq, Eq, Hash, Clone)]
 struct PerfCounterKey {
     cpu: u32,
     index: usize,
@@ -57,6 +60,51 @@ impl SystingRecordEvent<perf_counter_event> for PerfCounterRecorder {
 }
 
 impl PerfCounterRecorder {
+    pub fn write_output(
+        &self,
+        output: &mut dyn TraceOutput,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Result<()> {
+        // Map to store counter ID for each (cpu, counter_index) pair
+        let mut counter_ids: HashMap<PerfCounterKey, u64> = HashMap::new();
+
+        // First pass: Define all counters and store their IDs
+        for (key, _) in self.perf_events.iter() {
+            // Generate a unique track UUID for this counter
+            let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+
+            // Create counter definition
+            let counter_def = PerfCounterDef {
+                track_uuid,
+                counter_name: self.perf_counters[key.index].clone(),
+                cpu: Some(key.cpu),
+                unit: "count".to_string(),
+                is_incremental: false,
+            };
+
+            // Write the counter definition
+            output.write_perf_counter(&counter_def)?;
+
+            // Store the mapping for later use
+            counter_ids.insert(key.clone(), track_uuid);
+        }
+
+        // Second pass: Write all counter values
+        for (key, counters) in self.perf_events.iter() {
+            // Get the counter ID we stored earlier
+            let counter_id = counter_ids
+                .get(key)
+                .expect("Counter ID should exist from first pass");
+
+            // Write each counter value
+            for event in counters.iter() {
+                output.write_perf_counter_value(*counter_id, event.ts, event.count)?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn generate_trace(&self, id_counter: &Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
         let mut desc_uuids: HashMap<String, u64> = HashMap::new();
@@ -140,5 +188,215 @@ mod tests {
         );
         assert_eq!(packets[2].timestamp(), 123456789);
         assert_eq!(packets[2].track_event().counter_value(), 42);
+    }
+
+    #[test]
+    fn test_perf_counter_write_output() {
+        use crate::output::{PerfCounterDef, TraceOutput};
+
+        // Mock TraceOutput implementation for testing
+        struct MockOutput {
+            counters: Vec<PerfCounterDef>,
+            values: Vec<(u64, u64, i64)>, // (counter_id, ts, value)
+        }
+
+        impl MockOutput {
+            fn new() -> Self {
+                MockOutput {
+                    counters: Vec::new(),
+                    values: Vec::new(),
+                }
+            }
+        }
+
+        impl TraceOutput for MockOutput {
+            fn write_metadata(
+                &mut self,
+                _start_ts: u64,
+                _end_ts: u64,
+                _version: &str,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_clock_snapshot(&mut self, _clocks: &[crate::output::ClockInfo]) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_process(&mut self, _pid: i32, _name: &str, _cmdline: &[String]) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_thread(&mut self, _tid: i32, _pid: i32, _name: &str) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_process_exit(&mut self, _tid: i32, _ts: u64) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_track(&mut self, _track: &crate::output::TrackInfo) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_sched_event(&mut self, _event: &crate::output::SchedEventData) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_irq_event(&mut self, _event: &crate::output::IrqEventData) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_symbol(&mut self, _symbol: &crate::output::SymbolInfo) -> Result<u64> {
+                Ok(0)
+            }
+
+            fn write_stack_trace(&mut self, _stack: &crate::output::StackTraceData) -> Result<u64> {
+                Ok(0)
+            }
+
+            fn write_perf_sample(&mut self, _sample: &crate::output::PerfSampleData) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_perf_counter(&mut self, counter: &PerfCounterDef) -> Result<()> {
+                self.counters.push(counter.clone());
+                Ok(())
+            }
+
+            fn write_perf_counter_value(
+                &mut self,
+                counter_id: u64,
+                ts: u64,
+                value: i64,
+            ) -> Result<()> {
+                self.values.push((counter_id, ts, value));
+                Ok(())
+            }
+
+            fn write_event_definition(
+                &mut self,
+                _def: &crate::output::EventDefinition,
+            ) -> Result<u64> {
+                Ok(0)
+            }
+
+            fn write_probe_event(&mut self, _event: &crate::output::ProbeEventData) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_network_connection(
+                &mut self,
+                _conn: &crate::output::NetworkConnection,
+            ) -> Result<u64> {
+                Ok(0)
+            }
+
+            fn write_network_event(
+                &mut self,
+                _event: &crate::output::NetworkEventData,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_cpu_frequency(
+                &mut self,
+                _cpu: u32,
+                _ts: u64,
+                _freq: i64,
+                _track_uuid: u64,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn flush(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        // Create a recorder with test data
+        let mut recorder = PerfCounterRecorder::default();
+        recorder.perf_counters.push("test_counter_1".to_string());
+        recorder.perf_counters.push("test_counter_2".to_string());
+
+        // Add events for counter 0 on CPU 0
+        let event1 = perf_counter_event {
+            cpu: 0,
+            counter_num: 0,
+            ts: 100,
+            value: crate::systing::types::bpf_perf_event_value {
+                counter: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        recorder.handle_event(event1);
+
+        let event2 = perf_counter_event {
+            cpu: 0,
+            counter_num: 0,
+            ts: 200,
+            value: crate::systing::types::bpf_perf_event_value {
+                counter: 20,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        recorder.handle_event(event2);
+
+        // Add events for counter 1 on CPU 1
+        let event3 = perf_counter_event {
+            cpu: 1,
+            counter_num: 1,
+            ts: 150,
+            value: crate::systing::types::bpf_perf_event_value {
+                counter: 15,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        recorder.handle_event(event3);
+
+        // Write output
+        let mut output = MockOutput::new();
+        let id_counter = Arc::new(AtomicUsize::new(100));
+        recorder.write_output(&mut output, &id_counter).unwrap();
+
+        // Verify counter definitions were written
+        assert_eq!(output.counters.len(), 2);
+        assert_eq!(output.counters[0].counter_name, "test_counter_1");
+        assert_eq!(output.counters[0].cpu, Some(0));
+        assert_eq!(output.counters[0].unit, "count");
+        assert!(!output.counters[0].is_incremental);
+
+        assert_eq!(output.counters[1].counter_name, "test_counter_2");
+        assert_eq!(output.counters[1].cpu, Some(1));
+
+        // Verify counter values were written
+        assert_eq!(output.values.len(), 3);
+
+        // Find values for the first counter (CPU 0, counter 0)
+        let counter_id_0 = output.counters[0].track_uuid;
+        let values_0: Vec<_> = output
+            .values
+            .iter()
+            .filter(|(id, _, _)| *id == counter_id_0)
+            .collect();
+        assert_eq!(values_0.len(), 2);
+        assert_eq!(values_0[0].1, 100);
+        assert_eq!(values_0[0].2, 10);
+        assert_eq!(values_0[1].1, 200);
+        assert_eq!(values_0[1].2, 20);
+
+        // Find values for the second counter (CPU 1, counter 1)
+        let counter_id_1 = output.counters[1].track_uuid;
+        let values_1: Vec<_> = output
+            .values
+            .iter()
+            .filter(|(id, _, _)| *id == counter_id_1)
+            .collect();
+        assert_eq!(values_1.len(), 1);
+        assert_eq!(values_1[0].1, 150);
+        assert_eq!(values_1[0].2, 15);
     }
 }

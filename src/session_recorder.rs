@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::events::SystingProbeRecorder;
 use crate::network_recorder::NetworkRecorder;
+use crate::output::TraceOutput;
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::perfetto::TrackCounter;
 use crate::ringbuf::RingBuffer;
@@ -12,6 +13,8 @@ use crate::sched::SchedEventRecorder;
 use crate::stack_recorder::StackRecorder;
 use crate::systing::types::task_info;
 use crate::SystingRecordEvent;
+
+use anyhow::Result;
 
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
@@ -104,6 +107,24 @@ impl SysinfoRecorder {
             }
         }
         packets
+    }
+
+    pub fn write_output(
+        &self,
+        output: &mut dyn TraceOutput,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Result<()> {
+        // Iterate through CPU frequency data
+        for (cpu, events) in self.frequency.iter() {
+            // Generate a unique track UUID for this CPU frequency counter
+            let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+
+            // Write each CPU frequency event
+            for event in events.iter() {
+                output.write_cpu_frequency(*cpu, event.ts, event.count, track_uuid)?;
+            }
+        }
+        Ok(())
     }
 }
 

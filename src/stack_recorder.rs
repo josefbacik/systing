@@ -2,6 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
+use anyhow::{Context, Result};
+
+use crate::output::{PerfSampleData, StackTraceData, SymbolInfo, TraceOutput};
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::stack_event;
@@ -824,6 +827,229 @@ impl StackRecorder {
 
         all_packets
     }
+
+    /// Write stack trace data via the TraceOutput trait
+    ///
+    /// This method converts the internal stack data structures to the format-agnostic
+    /// TraceOutput types and writes them through the provided output interface.
+    pub fn write_output(&self, output: &mut dyn TraceOutput) -> Result<()> {
+        // Count all addresses that will need symbolization
+        let total_addresses = collect_total_addresses(&self.stacks);
+
+        // Create a progress bar if we have addresses to process
+        let progress_bar = if total_addresses > 0 {
+            let pb = ProgressBar::new(total_addresses as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(
+                        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} symbols ({per_sec}, {eta})"
+                    )
+                    .expect("Failed to set progress bar template")
+                    .progress_chars("#>-"),
+            );
+            pb.set_message("Resolving stack symbols");
+            Some(pb)
+        } else {
+            None
+        };
+
+        // Global kernel frame map shared across all processes
+        let mut global_kernel_frame_map = HashMap::new();
+
+        // Process each tgid's stacks
+        for (tgid, stacks) in self.stacks.iter() {
+            let tgid = *tgid as u32;
+
+            // Symbolize all stacks for this process
+            let resolved_info = symbolize_stacks(
+                stacks,
+                tgid,
+                &self.global_func_manager.id_counter,
+                &self.psr,
+                &self.process_dispatcher,
+                &self.global_func_manager,
+                &mut global_kernel_frame_map,
+                &progress_bar,
+            );
+
+            // Process each stack event
+            for stack_event in stacks.iter() {
+                // Extract frame information and build symbols
+                let stack = &stack_event.stack;
+
+                // Build kernel symbols
+                let kernel_symbols = extract_symbols_from_frames(
+                    resolved_info.kernel_frame_map,
+                    stack.kernel_stack.iter(),
+                    &self.global_func_manager,
+                );
+
+                // Build user symbols (may include Python)
+                let user_symbols = if stack.py_stack.is_empty() {
+                    // No Python stack - just extract user symbols
+                    extract_symbols_from_frames(
+                        &resolved_info.user_frame_map,
+                        stack.user_stack.iter(),
+                        &self.global_func_manager,
+                    )
+                } else {
+                    // Merge Python stacks with user stacks
+                    let merged_addrs = self.psr.merge_pystacks(
+                        stack,
+                        &resolved_info.python_calls,
+                        &resolved_info.python_stack_markers,
+                    );
+                    extract_symbols_from_frames(
+                        &resolved_info.user_frame_map,
+                        merged_addrs.iter(),
+                        &self.global_func_manager,
+                    )
+                };
+
+                // Python symbols are already included in user_symbols after merging,
+                // so we keep py_symbols empty to avoid duplication
+                let py_symbols = Vec::new();
+
+                // Skip stacks with no symbols at all
+                if kernel_symbols.is_empty() && user_symbols.is_empty() && py_symbols.is_empty() {
+                    continue;
+                }
+
+                // Create stack trace data
+                let stack_trace = StackTraceData {
+                    kernel_symbols,
+                    user_symbols,
+                    py_symbols,
+                };
+
+                // Extract TID from tgidpid
+                let tid = (stack_event.tgidpid & 0xFFFFFFFF) as i32;
+
+                // Create perf sample data
+                let sample = PerfSampleData {
+                    ts: stack_event.ts_start,
+                    tid,
+                    stack: stack_trace,
+                };
+
+                // Write the sample
+                output
+                    .write_perf_sample(&sample)
+                    .context("Failed to write perf sample")?;
+            }
+        }
+
+        // Finish the progress bar
+        if let Some(pb) = progress_bar {
+            pb.finish_with_message("Stack symbol resolution complete");
+        }
+
+        Ok(())
+    }
+}
+
+/// Extract symbols from frame map for the given addresses
+///
+/// Converts the internal LocalFrame representation to SymbolInfo for TraceOutput
+fn extract_symbols_from_frames<'a>(
+    frame_map: &HashMap<u64, Vec<LocalFrame>>,
+    addrs: impl Iterator<Item = &'a u64>,
+    global_func_manager: &Arc<GlobalFunctionManager>,
+) -> Vec<SymbolInfo> {
+    addrs
+        .flat_map(|addr| {
+            frame_map.get(addr).map(|frame_vec| {
+                frame_vec
+                    .iter()
+                    .map(|local_frame| {
+                        // Get the formatted function name from the global function manager
+                        let func_name =
+                            get_function_name_from_manager(local_frame, global_func_manager);
+
+                        SymbolInfo {
+                            function_name: func_name.clone(),
+                            file_name: extract_file_name(&func_name),
+                            line_number: extract_line_number(&func_name),
+                            build_id: None,
+                            mapping_name: extract_module_name(&func_name),
+                            mapping_offset: Some(local_frame.frame.rel_pc()),
+                        }
+                    })
+                    .collect::<Vec<SymbolInfo>>()
+            })
+        })
+        .flatten()
+        .collect()
+}
+
+/// Get the function name from the global function manager
+///
+/// The function name is stored in the format:
+/// "function_name (module [file:line]) <addr>"
+fn get_function_name_from_manager(
+    local_frame: &LocalFrame,
+    global_func_manager: &Arc<GlobalFunctionManager>,
+) -> String {
+    let func_iid = local_frame.frame.function_name_id();
+    let functions = global_func_manager.global_functions.read().unwrap();
+
+    // Find the function with the matching IID
+    for (name, interned) in functions.iter() {
+        if interned.iid() == func_iid {
+            return name.clone();
+        }
+    }
+
+    // Fallback if not found (shouldn't happen)
+    format!("unknown_function_{}", func_iid)
+}
+
+/// Extract file name from formatted function name string
+///
+/// Parses file name from format: "name (module [file:line]) <addr>"
+fn extract_file_name(formatted_name: &str) -> Option<String> {
+    // Look for pattern [filename:line]
+    if let Some(start) = formatted_name.find('[') {
+        if let Some(end) = formatted_name.find(']') {
+            let content = &formatted_name[start + 1..end];
+            if let Some(colon) = content.rfind(':') {
+                return Some(content[..colon].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract line number from formatted function name string
+///
+/// Parses line number from format: "name (module [file:line]) <addr>"
+fn extract_line_number(formatted_name: &str) -> Option<u32> {
+    // Look for pattern [filename:line]
+    if let Some(start) = formatted_name.find('[') {
+        if let Some(end) = formatted_name.find(']') {
+            let content = &formatted_name[start + 1..end];
+            if let Some(colon) = content.rfind(':') {
+                return content[colon + 1..].parse::<u32>().ok();
+            }
+        }
+    }
+    None
+}
+
+/// Extract module name from formatted function name string
+///
+/// Parses module name from format: "name (module [file:line]) <addr>"
+fn extract_module_name(formatted_name: &str) -> Option<String> {
+    // Look for pattern (module ...)
+    if let Some(start) = formatted_name.find('(') {
+        if let Some(space_or_bracket) = formatted_name[start + 1..]
+            .find(|c| c == ' ' || c == '[')
+            .map(|pos| pos + start + 1)
+        {
+            return Some(formatted_name[start + 1..space_or_bracket].to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]

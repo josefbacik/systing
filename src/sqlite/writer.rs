@@ -89,9 +89,11 @@ impl SqliteOutput {
     fn maybe_checkpoint(&mut self) -> Result<()> {
         self.event_count += 1;
         if self.event_count % self.checkpoint_interval == 0 {
-            self.conn
-                .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")
-                .context("Failed to checkpoint WAL")?;
+            // Use PASSIVE checkpoint which never blocks - if it can't checkpoint, that's OK
+            // We'll get another chance later and the final flush will ensure data is written
+            if let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
+                eprintln!("Warning: Periodic WAL checkpoint failed (non-fatal): {}", e);
+            }
         }
         Ok(())
     }
@@ -681,10 +683,14 @@ impl TraceOutput for SqliteOutput {
             .execute_batch("COMMIT")
             .context("Failed to commit transaction")?;
 
-        // Final checkpoint
-        self.conn
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-            .context("Failed to perform final WAL checkpoint")?;
+        // Final checkpoint - use RESTART instead of TRUNCATE for better compatibility
+        // If this fails, the data is still committed, so we'll just log a warning
+        if let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(RESTART)") {
+            eprintln!(
+                "Warning: Failed to checkpoint WAL during flush: {}. Data is still committed.",
+                e
+            );
+        }
 
         Ok(())
     }

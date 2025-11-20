@@ -3,11 +3,13 @@ use std::ffi::CStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::output::{IrqEventData, IrqType, SchedEventData, SchedEventType, TraceOutput};
 use crate::perfetto::TrackCounter;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::event_type;
 use crate::systing::types::task_event;
 use crate::SystingRecordEvent;
+use anyhow::Result;
 
 use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
@@ -229,6 +231,187 @@ impl SchedEventRecorder {
 
     pub fn set_process_sched_stats(&mut self, enabled: bool) {
         self.process_sched_stats = enabled;
+    }
+
+    /// Collect all thread IDs referenced in scheduler events
+    pub fn collect_referenced_tids(&self) -> std::collections::HashSet<i32> {
+        let mut tids = std::collections::HashSet::new();
+
+        // Collect from compact sched events
+        for (_cpu, compact_sched) in self.compact_sched.iter() {
+            // SCHED_WAKING events
+            for &pid in &compact_sched.compact_sched.waking_pid {
+                tids.insert(pid);
+            }
+
+            // SCHED_SWITCH events
+            for &next_pid in &compact_sched.compact_sched.switch_next_pid {
+                tids.insert(next_pid);
+            }
+        }
+
+        // Collect from non-compact events
+        for (_cpu, events) in self.events.iter() {
+            for (_ts, ftrace_event) in events.iter() {
+                // SCHED_WAKEUP_NEW
+                if ftrace_event.has_sched_wakeup_new() {
+                    let wakeup_new = ftrace_event.sched_wakeup_new();
+                    tids.insert(wakeup_new.pid());
+                }
+
+                // SCHED_PROCESS_EXIT
+                if ftrace_event.has_sched_process_exit() {
+                    let exit = ftrace_event.sched_process_exit();
+                    tids.insert(exit.pid());
+                }
+            }
+        }
+
+        tids
+    }
+
+    pub fn write_output(&self, output: &mut dyn TraceOutput) -> Result<()> {
+        // Process compact sched events (SCHED_SWITCH and SCHED_WAKING)
+        for (cpu, compact_sched) in self.compact_sched.iter() {
+            // Process SCHED_WAKING events
+            let waking_count = compact_sched.compact_sched.waking_timestamp.len();
+            let mut cumulative_waking_ts = 0u64;
+            for i in 0..waking_count {
+                cumulative_waking_ts += compact_sched.compact_sched.waking_timestamp[i];
+                let pid = compact_sched.compact_sched.waking_pid[i];
+                let target_cpu = compact_sched.compact_sched.waking_target_cpu[i] as u32;
+
+                let event_data = SchedEventData {
+                    ts: cumulative_waking_ts,
+                    cpu: *cpu,
+                    event_type: SchedEventType::Waking,
+                    prev_pid: None,
+                    prev_state: None,
+                    next_pid: Some(pid),
+                    target_cpu: Some(target_cpu),
+                    latency: None,
+                };
+                output.write_sched_event(&event_data)?;
+            }
+
+            // Process SCHED_SWITCH events
+            let switch_count = compact_sched.compact_sched.switch_timestamp.len();
+            let mut cumulative_switch_ts = 0u64;
+            for i in 0..switch_count {
+                cumulative_switch_ts += compact_sched.compact_sched.switch_timestamp[i];
+                let next_pid = compact_sched.compact_sched.switch_next_pid[i];
+                let prev_state = compact_sched.compact_sched.switch_prev_state[i];
+
+                let event_data = SchedEventData {
+                    ts: cumulative_switch_ts,
+                    cpu: *cpu,
+                    event_type: SchedEventType::Switch,
+                    prev_pid: None, // Not stored in compact format
+                    prev_state: Some(format!("{}", prev_state)),
+                    next_pid: Some(next_pid),
+                    target_cpu: None,
+                    latency: None,
+                };
+                output.write_sched_event(&event_data)?;
+            }
+        }
+
+        // Process non-compact events (wakeup_new, IRQ, process_exit)
+        for (cpu, events) in self.events.iter() {
+            for (_ts, ftrace_event) in events.iter() {
+                let ts = ftrace_event.timestamp();
+
+                // Handle SCHED_WAKEUP_NEW
+                if ftrace_event.has_sched_wakeup_new() {
+                    let wakeup_new = ftrace_event.sched_wakeup_new();
+                    let event_data = SchedEventData {
+                        ts,
+                        cpu: *cpu,
+                        event_type: SchedEventType::WakeupNew,
+                        prev_pid: None,
+                        prev_state: None,
+                        next_pid: Some(wakeup_new.pid()),
+                        target_cpu: Some(wakeup_new.target_cpu() as u32),
+                        latency: None,
+                    };
+                    output.write_sched_event(&event_data)?;
+                }
+
+                // Handle SCHED_PROCESS_EXIT
+                if ftrace_event.has_sched_process_exit() {
+                    let exit = ftrace_event.sched_process_exit();
+                    let event_data = SchedEventData {
+                        ts,
+                        cpu: *cpu,
+                        event_type: SchedEventType::Exit,
+                        prev_pid: Some(exit.pid()),
+                        prev_state: None,
+                        next_pid: None,
+                        target_cpu: None,
+                        latency: None,
+                    };
+                    output.write_sched_event(&event_data)?;
+                }
+
+                // Handle IRQ_HANDLER_ENTRY
+                if ftrace_event.has_irq_handler_entry() {
+                    let irq_entry = ftrace_event.irq_handler_entry();
+                    let irq_data = IrqEventData {
+                        ts,
+                        cpu: *cpu,
+                        irq_type: IrqType::Hardware,
+                        is_entry: true,
+                        irq_number: Some(irq_entry.irq() as u32),
+                        name: Some(irq_entry.name().to_string()),
+                    };
+                    output.write_irq_event(&irq_data)?;
+                }
+
+                // Handle IRQ_HANDLER_EXIT
+                if ftrace_event.has_irq_handler_exit() {
+                    let irq_exit = ftrace_event.irq_handler_exit();
+                    let irq_data = IrqEventData {
+                        ts,
+                        cpu: *cpu,
+                        irq_type: IrqType::Hardware,
+                        is_entry: false,
+                        irq_number: Some(irq_exit.irq() as u32),
+                        name: None,
+                    };
+                    output.write_irq_event(&irq_data)?;
+                }
+
+                // Handle SOFTIRQ_ENTRY
+                if ftrace_event.has_softirq_entry() {
+                    let softirq_entry = ftrace_event.softirq_entry();
+                    let irq_data = IrqEventData {
+                        ts,
+                        cpu: *cpu,
+                        irq_type: IrqType::Software,
+                        is_entry: true,
+                        irq_number: Some(softirq_entry.vec()),
+                        name: None,
+                    };
+                    output.write_irq_event(&irq_data)?;
+                }
+
+                // Handle SOFTIRQ_EXIT
+                if ftrace_event.has_softirq_exit() {
+                    let softirq_exit = ftrace_event.softirq_exit();
+                    let irq_data = IrqEventData {
+                        ts,
+                        cpu: *cpu,
+                        irq_type: IrqType::Software,
+                        is_entry: false,
+                        irq_number: Some(softirq_exit.vec()),
+                        name: None,
+                    };
+                    output.write_irq_event(&irq_data)?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

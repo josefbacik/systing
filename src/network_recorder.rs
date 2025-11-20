@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use crate::output::{NetworkConnection, NetworkEventData, TraceOutput};
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::network_event;
 use crate::SystingRecordEvent;
 
+use anyhow::Result;
 use perfetto_protos::debug_annotation::DebugAnnotation;
 use perfetto_protos::interned_data::InternedData;
 use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
@@ -856,6 +858,274 @@ impl NetworkRecorder {
         self.dns_stats = Default::default();
 
         packets
+    }
+
+    /// Write network event data via the TraceOutput trait
+    ///
+    /// This method converts internal network event data structures to the
+    /// format-agnostic TraceOutput interface, enabling output to various
+    /// formats (Perfetto, SQLite, etc.) without changing the recorder code.
+    pub fn write_output(
+        &self,
+        output: &mut dyn TraceOutput,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Result<()> {
+        use crate::systing::types::{network_address_family, network_protocol};
+
+        // Map from ConnectionId to assigned connection ID
+        let mut connection_ids: HashMap<ConnectionId, u64> = HashMap::new();
+
+        // First pass: Define all unique connections and get their IDs
+        for (_tgidpid, connections) in self.network_events.iter() {
+            for (conn_id, events) in connections.iter() {
+                if events.is_empty() {
+                    continue;
+                }
+
+                // Check if we've already defined this connection
+                if connection_ids.contains_key(conn_id) {
+                    continue;
+                }
+
+                // Convert protocol
+                let protocol = if conn_id.protocol == network_protocol::NETWORK_TCP.0 {
+                    "TCP"
+                } else if conn_id.protocol == network_protocol::NETWORK_UDP.0 {
+                    "UDP"
+                } else {
+                    "UNKNOWN"
+                };
+
+                // Convert address family
+                let address_family = if conn_id.af == network_address_family::NETWORK_AF_INET.0 {
+                    "IPv4"
+                } else if conn_id.af == network_address_family::NETWORK_AF_INET6.0 {
+                    "IPv6"
+                } else {
+                    "UNKNOWN"
+                };
+
+                // Get destination address as string
+                let dest_addr = conn_id.ip_addr().to_string();
+
+                // Create NetworkConnection and write it
+                let net_conn = NetworkConnection {
+                    protocol: protocol.to_string(),
+                    address_family: address_family.to_string(),
+                    dest_addr,
+                    dest_port: conn_id.dest_port,
+                };
+
+                let conn_id_assigned = output.write_network_connection(&net_conn)?;
+                connection_ids.insert(*conn_id, conn_id_assigned);
+            }
+        }
+
+        // Second pass: Write all network events
+        for (tgidpid, connections) in self.network_events.iter() {
+            // Extract tid from tgidpid (lower 32 bits)
+            let tid = (*tgidpid & 0xFFFFFFFF) as i32;
+
+            for (conn_id, events) in connections.iter() {
+                if events.is_empty() {
+                    continue;
+                }
+
+                // Get the connection ID we assigned in the first pass
+                let connection_id = *connection_ids.get(conn_id).unwrap();
+
+                // Generate a track UUID for this connection on this thread
+                let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+
+                // Write send events
+                for event in events.iter_sends() {
+                    let net_event = NetworkEventData {
+                        connection_id,
+                        tid,
+                        track_uuid,
+                        event_type: "send".to_string(),
+                        start_ts: event.start_ts,
+                        end_ts: Some(event.end_ts),
+                        bytes: Some(event.bytes),
+                        sequence_num: if event.sendmsg_seq > 0 {
+                            Some(event.sendmsg_seq)
+                        } else {
+                            None
+                        },
+                        tcp_flags: None,
+                    };
+                    output.write_network_event(&net_event)?;
+                }
+
+                // Write receive events
+                for event in events.iter_recvs() {
+                    let net_event = NetworkEventData {
+                        connection_id,
+                        tid,
+                        track_uuid,
+                        event_type: "recv".to_string(),
+                        start_ts: event.start_ts,
+                        end_ts: Some(event.end_ts),
+                        bytes: Some(event.bytes),
+                        sequence_num: if event.sendmsg_seq > 0 {
+                            Some(event.sendmsg_seq)
+                        } else {
+                            None
+                        },
+                        tcp_flags: None,
+                    };
+                    output.write_network_event(&net_event)?;
+                }
+
+                // Write TCP packet events
+                if conn_id.protocol == network_protocol::NETWORK_TCP.0 {
+                    // TCP enqueue events
+                    for pkt in events.iter_tcp_enqueue_packets() {
+                        let net_event = NetworkEventData {
+                            connection_id,
+                            tid,
+                            track_uuid,
+                            event_type: "tcp_enqueue".to_string(),
+                            start_ts: pkt.start_ts,
+                            end_ts: Some(pkt.end_ts),
+                            bytes: Some(pkt.length),
+                            sequence_num: Some(pkt.seq),
+                            tcp_flags: Some(pkt.tcp_flags),
+                        };
+                        output.write_network_event(&net_event)?;
+                    }
+
+                    // TCP rcv_established events
+                    for pkt in events.iter_tcp_rcv_established_packets() {
+                        let net_event = NetworkEventData {
+                            connection_id,
+                            tid,
+                            track_uuid,
+                            event_type: "tcp_rcv_established".to_string(),
+                            start_ts: pkt.start_ts,
+                            end_ts: Some(pkt.end_ts),
+                            bytes: Some(pkt.length),
+                            sequence_num: Some(pkt.seq),
+                            tcp_flags: Some(pkt.tcp_flags),
+                        };
+                        output.write_network_event(&net_event)?;
+                    }
+
+                    // TCP queue_rcv events
+                    for pkt in events.iter_tcp_queue_rcv_packets() {
+                        let net_event = NetworkEventData {
+                            connection_id,
+                            tid,
+                            track_uuid,
+                            event_type: "tcp_queue_rcv".to_string(),
+                            start_ts: pkt.start_ts,
+                            end_ts: Some(pkt.end_ts),
+                            bytes: Some(pkt.length),
+                            sequence_num: Some(pkt.seq),
+                            tcp_flags: Some(pkt.tcp_flags),
+                        };
+                        output.write_network_event(&net_event)?;
+                    }
+
+                    // TCP buffer_queue events
+                    for pkt in events.iter_tcp_buffer_queue_packets() {
+                        let net_event = NetworkEventData {
+                            connection_id,
+                            tid,
+                            track_uuid,
+                            event_type: "tcp_buffer_queue".to_string(),
+                            start_ts: pkt.start_ts,
+                            end_ts: Some(pkt.end_ts),
+                            bytes: Some(pkt.length),
+                            sequence_num: Some(pkt.seq),
+                            tcp_flags: Some(pkt.tcp_flags),
+                        };
+                        output.write_network_event(&net_event)?;
+                    }
+                }
+
+                // Write UDP packet events
+                if conn_id.protocol == network_protocol::NETWORK_UDP.0 {
+                    // UDP send events
+                    for pkt in events.iter_udp_send_packets() {
+                        let net_event = NetworkEventData {
+                            connection_id,
+                            tid,
+                            track_uuid,
+                            event_type: "udp_send".to_string(),
+                            start_ts: pkt.start_ts,
+                            end_ts: Some(pkt.end_ts),
+                            bytes: Some(pkt.length),
+                            sequence_num: Some(pkt.seq),
+                            tcp_flags: None,
+                        };
+                        output.write_network_event(&net_event)?;
+                    }
+
+                    // UDP rcv events
+                    for pkt in events.iter_udp_rcv_packets() {
+                        let net_event = NetworkEventData {
+                            connection_id,
+                            tid,
+                            track_uuid,
+                            event_type: "udp_rcv".to_string(),
+                            start_ts: pkt.start_ts,
+                            end_ts: Some(pkt.end_ts),
+                            bytes: Some(pkt.length),
+                            sequence_num: Some(pkt.seq),
+                            tcp_flags: None,
+                        };
+                        output.write_network_event(&net_event)?;
+                    }
+
+                    // UDP enqueue events
+                    for pkt in events.iter_udp_enqueue_packets() {
+                        let net_event = NetworkEventData {
+                            connection_id,
+                            tid,
+                            track_uuid,
+                            event_type: "udp_enqueue".to_string(),
+                            start_ts: pkt.start_ts,
+                            end_ts: Some(pkt.end_ts),
+                            bytes: Some(pkt.length),
+                            sequence_num: Some(pkt.seq),
+                            tcp_flags: None,
+                        };
+                        output.write_network_event(&net_event)?;
+                    }
+                }
+
+                // Write shared send events (used by both TCP and UDP for packet transmission)
+                for pkt in events.iter_shared_send_packets() {
+                    let event_type = if conn_id.protocol == network_protocol::NETWORK_TCP.0 {
+                        "tcp_packet_send"
+                    } else if conn_id.protocol == network_protocol::NETWORK_UDP.0 {
+                        "udp_packet_send"
+                    } else {
+                        "packet_send"
+                    };
+
+                    let net_event = NetworkEventData {
+                        connection_id,
+                        tid,
+                        track_uuid,
+                        event_type: event_type.to_string(),
+                        start_ts: pkt.start_ts,
+                        end_ts: Some(pkt.end_ts),
+                        bytes: Some(pkt.length),
+                        sequence_num: Some(pkt.seq),
+                        tcp_flags: if conn_id.protocol == network_protocol::NETWORK_TCP.0 {
+                            Some(pkt.tcp_flags)
+                        } else {
+                            None
+                        },
+                    };
+                    output.write_network_event(&net_event)?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -2259,5 +2529,238 @@ mod tests {
 
         // Note: Event name IIDs are now created unconditionally (only ~9 strings, so no overhead)
         // The important check is that we don't create duplicate track descriptors above
+    }
+
+    #[test]
+    fn test_write_output_basic() {
+        use crate::systing::types::{network_address_family, network_operation};
+
+        // Mock implementation of TraceOutput for testing
+        struct MockTraceOutput {
+            connections: Vec<NetworkConnection>,
+            events: Vec<NetworkEventData>,
+        }
+
+        impl crate::output::TraceOutput for MockTraceOutput {
+            fn write_metadata(
+                &mut self,
+                _start_ts: u64,
+                _end_ts: u64,
+                _version: &str,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_clock_snapshot(&mut self, _clocks: &[crate::output::ClockInfo]) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_process(&mut self, _pid: i32, _name: &str, _cmdline: &[String]) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_thread(&mut self, _tid: i32, _pid: i32, _name: &str) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_process_exit(&mut self, _tid: i32, _ts: u64) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_track(&mut self, _track: &crate::output::TrackInfo) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_sched_event(&mut self, _event: &crate::output::SchedEventData) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_irq_event(&mut self, _event: &crate::output::IrqEventData) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_symbol(&mut self, _symbol: &crate::output::SymbolInfo) -> Result<u64> {
+                Ok(0)
+            }
+
+            fn write_stack_trace(&mut self, _stack: &crate::output::StackTraceData) -> Result<u64> {
+                Ok(0)
+            }
+
+            fn write_perf_sample(&mut self, _sample: &crate::output::PerfSampleData) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_perf_counter(
+                &mut self,
+                _counter: &crate::output::PerfCounterDef,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_perf_counter_value(
+                &mut self,
+                _counter_id: u64,
+                _ts: u64,
+                _value: i64,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_event_definition(
+                &mut self,
+                _def: &crate::output::EventDefinition,
+            ) -> Result<u64> {
+                Ok(0)
+            }
+
+            fn write_probe_event(&mut self, _event: &crate::output::ProbeEventData) -> Result<()> {
+                Ok(())
+            }
+
+            fn write_network_connection(&mut self, conn: &NetworkConnection) -> Result<u64> {
+                let id = self.connections.len() as u64;
+                self.connections.push(conn.clone());
+                Ok(id)
+            }
+
+            fn write_network_event(&mut self, event: &NetworkEventData) -> Result<()> {
+                self.events.push(event.clone());
+                Ok(())
+            }
+
+            fn write_cpu_frequency(
+                &mut self,
+                _cpu: u32,
+                _ts: u64,
+                _freq: i64,
+                _track_uuid: u64,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn flush(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut recorder = NetworkRecorder::default();
+
+        let mut dest_addr = [0u8; 16];
+        dest_addr[0..4].copy_from_slice(&[192, 168, 1, 1]);
+
+        // Create a TCP send event
+        let tcp_send_event = network_event {
+            start_ts: 1000,
+            end_ts: 2000,
+            task: create_test_task_info(100, 101),
+            protocol: test_protocol_tcp(),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr,
+            dest_port: 80,
+            bytes: 1024,
+            sendmsg_seq: 42,
+            operation: network_operation::NETWORK_SEND,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        recorder.handle_event(tcp_send_event);
+
+        // Create a UDP receive event on different connection
+        let mut udp_dest_addr = [0u8; 16];
+        udp_dest_addr[0..4].copy_from_slice(&[8, 8, 8, 8]);
+
+        let udp_recv_event = network_event {
+            start_ts: 3000,
+            end_ts: 4000,
+            task: create_test_task_info(100, 101),
+            protocol: test_protocol_udp(),
+            af: network_address_family::NETWORK_AF_INET,
+            dest_addr: udp_dest_addr,
+            dest_port: 53,
+            bytes: 512,
+            sendmsg_seq: 0,
+            operation: network_operation::NETWORK_RECV,
+            cpu: 0,
+            ..Default::default()
+        };
+
+        recorder.handle_event(udp_recv_event);
+
+        let id_counter = Arc::new(AtomicUsize::new(1000));
+        let mut mock_output = MockTraceOutput {
+            connections: Vec::new(),
+            events: Vec::new(),
+        };
+
+        // Call write_output
+        recorder
+            .write_output(&mut mock_output, &id_counter)
+            .unwrap();
+
+        // Verify connections were written
+        assert_eq!(
+            mock_output.connections.len(),
+            2,
+            "Should have 2 connections"
+        );
+
+        // Find TCP and UDP connections (order is not guaranteed in HashMap iteration)
+        let tcp_conn = mock_output
+            .connections
+            .iter()
+            .find(|c| c.protocol == "TCP")
+            .expect("TCP connection should exist");
+        let udp_conn = mock_output
+            .connections
+            .iter()
+            .find(|c| c.protocol == "UDP")
+            .expect("UDP connection should exist");
+
+        // Check TCP connection
+        assert_eq!(tcp_conn.protocol, "TCP");
+        assert_eq!(tcp_conn.address_family, "IPv4");
+        assert_eq!(tcp_conn.dest_addr, "192.168.1.1");
+        assert_eq!(tcp_conn.dest_port, 80);
+
+        // Check UDP connection
+        assert_eq!(udp_conn.protocol, "UDP");
+        assert_eq!(udp_conn.address_family, "IPv4");
+        assert_eq!(udp_conn.dest_addr, "8.8.8.8");
+        assert_eq!(udp_conn.dest_port, 53);
+
+        // Verify events were written
+        assert_eq!(mock_output.events.len(), 2, "Should have 2 events");
+
+        // Find TCP send and UDP recv events (order is not guaranteed)
+        let tcp_event = mock_output
+            .events
+            .iter()
+            .find(|e| e.event_type == "send")
+            .expect("TCP send event should exist");
+        let udp_event = mock_output
+            .events
+            .iter()
+            .find(|e| e.event_type == "recv")
+            .expect("UDP recv event should exist");
+
+        // Check TCP send event
+        assert_eq!(tcp_event.event_type, "send");
+        assert_eq!(tcp_event.tid, 101);
+        assert_eq!(tcp_event.start_ts, 1000);
+        assert_eq!(tcp_event.end_ts, Some(2000));
+        assert_eq!(tcp_event.bytes, Some(1024));
+        assert_eq!(tcp_event.sequence_num, Some(42));
+        assert_eq!(tcp_event.tcp_flags, None);
+
+        // Check UDP recv event
+        assert_eq!(udp_event.event_type, "recv");
+        assert_eq!(udp_event.tid, 101);
+        assert_eq!(udp_event.start_ts, 3000);
+        assert_eq!(udp_event.end_ts, Some(4000));
+        assert_eq!(udp_event.bytes, Some(512));
+        assert_eq!(udp_event.sequence_num, None);
+        assert_eq!(udp_event.tcp_flags, None);
     }
 }

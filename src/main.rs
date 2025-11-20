@@ -1758,13 +1758,17 @@ fn run_tracing_loop(
 
 /// Write trace data from SessionRecorder to a TraceOutput implementation
 ///
-/// This function provides a basic implementation that writes metadata and clock snapshots.
-/// Future versions will fully populate all trace data through the recorders.
+/// This function writes all trace data including metadata, clock snapshots, processes,
+/// threads, tracks, and events from all recorders.
 fn write_trace_to_output(
     recorder: &Arc<SessionRecorder>,
     output: &mut dyn TraceOutput,
 ) -> Result<()> {
-    use crate::output::ClockInfo;
+    use crate::output::{ClockInfo, TrackInfo, TrackType};
+    use std::sync::atomic::AtomicUsize;
+
+    // Create id_counter for generating unique IDs
+    let id_counter = Arc::new(AtomicUsize::new(1));
 
     // Get clock snapshot data
     let clock_snapshot = recorder.clock_snapshot.lock().unwrap();
@@ -1798,8 +1802,161 @@ fn write_trace_to_output(
         .collect();
     output.write_clock_snapshot(&clocks)?;
 
-    // TODO: Write processes and threads
-    // TODO: Write events from each recorder
+    drop(clock_snapshot); // Release the lock
+
+    // Collect all TIDs referenced by scheduler events to ensure they exist
+    let referenced_tids = {
+        let sched_recorder = recorder.event_recorder.lock().unwrap();
+        sched_recorder.collect_referenced_tids()
+    };
+
+    // Write processes and track which PIDs have been written
+    let mut written_processes = std::collections::HashSet::new();
+    {
+        let processes = recorder.processes.read().unwrap();
+        let process_descriptors = recorder.process_descriptors.read().unwrap();
+
+        for (tgidpid, proto_process) in processes.iter() {
+            if let Some(process_desc) = process_descriptors.get(tgidpid) {
+                output.write_process(
+                    process_desc.pid(),
+                    process_desc.process_name(),
+                    &proto_process.cmdline,
+                )?;
+                written_processes.insert(process_desc.pid());
+            }
+        }
+    }
+
+    // Write threads, creating placeholder processes for missing parent PIDs
+    // Also track which threads have been written
+    let mut written_threads = std::collections::HashSet::new();
+    {
+        let threads = recorder.threads.read().unwrap();
+
+        for thread_desc in threads.values() {
+            let pid = thread_desc.pid();
+            let tid = thread_desc.tid();
+
+            // Ensure parent process exists before writing thread
+            if !written_processes.contains(&pid) {
+                // Create a minimal process entry for the missing parent
+                output.write_process(pid, "unknown", &[])?;
+                written_processes.insert(pid);
+            }
+
+            output.write_thread(tid, pid, thread_desc.thread_name())?;
+            written_threads.insert(tid);
+        }
+    }
+
+    // Create placeholder threads for any TIDs referenced in scheduler events that weren't captured
+    for tid in referenced_tids {
+        if !written_threads.contains(&tid) {
+            // Thread is referenced in events but wasn't captured
+            // We need to create both the process and thread as placeholders
+            let pid = tid; // For threads we don't know about, assume TID == PID (single-threaded process)
+
+            // Ensure process exists
+            if !written_processes.contains(&pid) {
+                output.write_process(pid, "unknown", &[])?;
+                written_processes.insert(pid);
+            }
+
+            // Create placeholder thread
+            output.write_thread(tid, pid, "unknown")?;
+            written_threads.insert(tid);
+        }
+    }
+
+    // Write tracks for processes
+    {
+        let process_descriptors = recorder.process_descriptors.read().unwrap();
+
+        for process_desc in process_descriptors.values() {
+            let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+            let track = TrackInfo {
+                uuid: track_uuid,
+                name: process_desc.process_name().to_string(),
+                parent_uuid: None,
+                track_type: TrackType::Process,
+                pid: Some(process_desc.pid()),
+                tid: None,
+            };
+            output.write_track(&track)?;
+        }
+    }
+
+    // Write tracks for threads
+    {
+        let threads = recorder.threads.read().unwrap();
+
+        for thread_desc in threads.values() {
+            let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+            let track = TrackInfo {
+                uuid: track_uuid,
+                name: thread_desc.thread_name().to_string(),
+                parent_uuid: None,
+                track_type: TrackType::Thread,
+                pid: Some(thread_desc.pid()),
+                tid: Some(thread_desc.tid()),
+            };
+            output.write_track(&track)?;
+        }
+    }
+
+    // Write tracks for CPUs
+    let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
+    for cpu in 0..num_cpus {
+        let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        let track = TrackInfo {
+            uuid: track_uuid,
+            name: format!("CPU {}", cpu),
+            parent_uuid: None,
+            track_type: TrackType::Cpu,
+            pid: None,
+            tid: None,
+        };
+        output.write_track(&track)?;
+    }
+
+    // Call write_output() for each recorder
+
+    // Sysinfo recorder
+    {
+        let sysinfo_recorder = recorder.sysinfo_recorder.lock().unwrap();
+        sysinfo_recorder.write_output(output, &id_counter)?;
+    }
+
+    // Perf counter recorder
+    {
+        let perf_counter_recorder = recorder.perf_counter_recorder.lock().unwrap();
+        perf_counter_recorder.write_output(output, &id_counter)?;
+    }
+
+    // Sched event recorder
+    {
+        let sched_recorder = recorder.event_recorder.lock().unwrap();
+        sched_recorder.write_output(output)?;
+    }
+
+    // Stack recorder
+    {
+        let stack_recorder = recorder.stack_recorder.lock().unwrap();
+        stack_recorder.write_output(output)?;
+    }
+
+    // Systing probe recorder
+    {
+        let probe_recorder = recorder.probe_recorder.lock().unwrap();
+        probe_recorder.write_output(output, &id_counter)?;
+    }
+
+    // Network recorder
+    {
+        let network_recorder = recorder.network_recorder.lock().unwrap();
+        network_recorder.write_output(output, &id_counter)?;
+    }
 
     Ok(())
 }
