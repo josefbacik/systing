@@ -106,8 +106,10 @@ pub struct PerfCounterDef {
 #[derive(Debug, Clone)]
 pub struct CounterTrackInfo {
     pub name: String,
+    #[allow(dead_code)]
     pub description: Option<String>,
     pub unit: CounterUnit,
+    #[allow(dead_code)]
     pub is_incremental: bool,
     pub cpu: Option<u32>,
     pub pid: Option<i32>,
@@ -119,7 +121,9 @@ pub struct CounterTrackInfo {
 pub enum CounterUnit {
     Count,
     TimeNs,
+    #[allow(dead_code)]
     Bytes,
+    #[allow(dead_code)]
     Custom(u32),
 }
 
