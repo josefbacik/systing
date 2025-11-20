@@ -274,6 +274,22 @@ mod tests {
                 Ok(())
             }
 
+            fn write_counter_track(
+                &mut self,
+                _track: &crate::output::CounterTrackInfo,
+            ) -> Result<u64> {
+                Ok(0)
+            }
+
+            fn write_counter_value(
+                &mut self,
+                _track_uuid: u64,
+                _ts: u64,
+                _value: i64,
+            ) -> Result<()> {
+                Ok(())
+            }
+
             fn write_event_definition(
                 &mut self,
                 _def: &crate::output::EventDefinition,
