@@ -6,7 +6,7 @@ Previous versions of this tool had 3 distinct sub-commands, `system`, `profile`,
 and `describe`, as I was experimenting with different approaches to identifying
 problems.  That code can be found in the `old-systing` branch.
 
-The current iteration is just a single command, `systing`.
+The current iteration uses subcommands: `record` for capturing traces and `convert` for format conversion.
 
 ## Quick start
 
@@ -14,11 +14,82 @@ To build, ensure you have installed bpftool. This only builds on linux.
 
 ```bash
 cargo build
-sudo ./target/debug/systing --duration 60
+sudo ./target/debug/systing record --duration 60
 ```
 
 This will generate a `trace.pb` file which can be uploaded to a
 [Perfetto](https://perfetto.dev/) instance for further analysis.
+
+## Output Formats
+
+Systing supports two output formats:
+
+### Perfetto Format (Default)
+Binary protobuf format compatible with [Perfetto UI](https://ui.perfetto.dev/).
+
+```bash
+# Record with Perfetto output (default)
+sudo ./target/debug/systing record --duration 5
+
+# Specify output file
+sudo ./target/debug/systing record --duration 5 -o trace.pb
+```
+
+### SQLite Format
+Relational database format for SQL analysis and custom tooling.
+
+```bash
+# Record with SQLite output
+sudo ./target/debug/systing record --format sqlite --duration 5
+
+# Specify output file
+sudo ./target/debug/systing record --format sqlite -o trace.db
+```
+
+### Format Conversion
+
+Convert between formats bidirectionally:
+
+```bash
+# Perfetto → SQLite
+./target/debug/systing convert trace.pb trace.db
+
+# SQLite → Perfetto
+./target/debug/systing convert trace.db trace.pb
+```
+
+### SQLite Schema
+
+The SQLite output uses a normalized relational schema with 18 tables:
+- **Processes & Threads**: Process and thread information
+- **Scheduler Events**: Context switches, waking, wakeup events
+- **Stack Traces**: Symbolized stack traces with function names, files, and line numbers
+- **Performance Counters**: Hardware performance counter data
+- **Network Events**: TCP/UDP connection tracking and packet-level events
+- **Probe Events**: Custom USDT/kprobe/tracepoint events
+
+Example SQL queries:
+
+```sql
+-- Find top processes by scheduling activity
+SELECT p.name, COUNT(*) as event_count
+FROM processes p
+JOIN threads t ON p.pid = t.pid
+JOIN sched_events se ON (t.tid = se.next_pid OR t.tid = se.prev_pid)
+GROUP BY p.pid, p.name
+ORDER BY event_count DESC
+LIMIT 10;
+
+-- Find stacks containing a specific function
+SELECT DISTINCT st.id, COUNT(ps.id) as sample_count
+FROM stack_traces st
+JOIN stack_trace_frames stf ON st.id = stf.stack_id
+JOIN symbols s ON stf.symbol_id = s.id
+JOIN perf_samples ps ON st.id = ps.stack_id
+WHERE s.function_name LIKE '%malloc%'
+GROUP BY st.id
+ORDER BY sample_count DESC;
+```
 
 ## Development Setup
 
@@ -40,7 +111,7 @@ For improved symbol resolution, you can enable debuginfod support:
 
 ```bash
 export DEBUGINFOD_URLS="https://debuginfod.fedoraproject.org/"
-sudo ./target/debug/systing --enable-debuginfod --duration 60
+sudo ./target/debug/systing record --enable-debuginfod --duration 60
 ```
 
 This will fetch debug information from debuginfod servers, providing more accurate stack traces.
@@ -52,7 +123,7 @@ Systing includes several recorders for different types of events. You can contro
 #### List Available Recorders
 
 ```bash
-sudo ./target/debug/systing --list-recorders
+sudo ./target/debug/systing record --list-recorders
 ```
 
 This will display all available recorders and their default states:
@@ -69,13 +140,13 @@ Use `--add-recorder` to enable additional recorders on top of the defaults:
 
 ```bash
 # Enable syscalls in addition to default recorders
-sudo ./target/debug/systing --add-recorder syscalls --duration 60
+sudo ./target/debug/systing record --add-recorder syscalls --duration 60
 
 # Enable network traffic recording in addition to default recorders
-sudo ./target/debug/systing --add-recorder network --duration 60
+sudo ./target/debug/systing record --add-recorder network --duration 60
 
 # Enable multiple additional recorders
-sudo ./target/debug/systing --add-recorder syscalls --add-recorder network --duration 60
+sudo ./target/debug/systing record --add-recorder syscalls --add-recorder network --duration 60
 ```
 
 #### Use Only Specific Recorders
@@ -84,13 +155,13 @@ Use `--only-recorder` to disable all recorders and enable only the ones you spec
 
 ```bash
 # Only record syscalls (disable everything else)
-sudo ./target/debug/systing --only-recorder syscalls --duration 60
+sudo ./target/debug/systing record --only-recorder syscalls --duration 60
 
 # Only record network traffic (disable everything else)
-sudo ./target/debug/systing --only-recorder network --duration 60
+sudo ./target/debug/systing record --only-recorder network --duration 60
 
 # Only record syscalls and cpu-stacks
-sudo ./target/debug/systing --only-recorder syscalls --only-recorder cpu-stacks --duration 60
+sudo ./target/debug/systing record --only-recorder syscalls --only-recorder cpu-stacks --duration 60
 ```
 
 ### Network Traffic Recording
@@ -105,10 +176,10 @@ The network recorder captures detailed network traffic information including:
 
 ```bash
 # Enable network recording
-sudo ./target/debug/systing --add-recorder network --duration 60
+sudo ./target/debug/systing record --add-recorder network --duration 60
 
 # Only record network traffic (disable everything else)
-sudo ./target/debug/systing --only-recorder network --duration 60
+sudo ./target/debug/systing record --only-recorder network --duration 60
 ```
 
 The network recorder instruments multiple points in the Linux network stack:
@@ -174,7 +245,7 @@ indicate which PID's you wish to record the events for. For example, if you want
 to trace when `qemu` does a v9fs create, you would run the following
 
 ```
-systing --trace-event-pid <PID of qemu> --trace-event "usdt:/usr/bin/qemu-system-x86_64:qemu:v9fs_create"
+systing record --trace-event-pid <PID of qemu> --trace-event "usdt:/usr/bin/qemu-system-x86_64:qemu:v9fs_create"
 ````
 
 ## Custom track events
