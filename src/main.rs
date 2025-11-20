@@ -817,6 +817,7 @@ fn resolve_library_path_for_pid(pid: u32, lib_name: &str) -> Option<String> {
 
 /// Convenience function to discover all Python processes by checking their main executable.
 fn discover_python_processes() -> Vec<u32> {
+    // Only discover main Python processes (TGIDs), not threads
     discover_processes_with_mapping("python", false)
         .map(|map| map.keys().cloned().collect())
         .unwrap_or_else(|_| Vec::new())
@@ -854,7 +855,7 @@ fn discover_processes_with_mapping(
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         false,
-        ProcessRefreshKind::nothing(),
+        ProcessRefreshKind::everything().without_memory(),
     );
 
     for (pid, process) in system.processes() {
@@ -898,7 +899,9 @@ fn discover_processes_with_mapping(
                     continue; // Skip checking maps after finding exe match
                 }
             } else if let Some(exe_filename) = exe.file_name() {
-                if exe_filename.to_string_lossy().contains(&*target_str) {
+                let exe_name = exe_filename.to_string_lossy();
+                // Check if the executable name contains the target (e.g., "python3.11" contains "python")
+                if exe_name.contains(&*target_str) {
                     let exe_str = exe.to_string_lossy();
                     let resolved_path = format!("/proc/{pid_u32}/root{exe_str}");
                     discovered_pids.insert(pid_u32, resolved_path);
@@ -1423,11 +1426,12 @@ fn attach_probes(
 
                     for (pid, resolved_path) in pid_path_map.iter() {
                         // For USDT, libbpf needs the actual path to the ELF file to read USDT metadata.
-                        // If the original path exists and is accessible, use it instead of /proc/PID/root version
-                        let usdt_path = if std::path::Path::new(&usdt.path).exists() {
+                        // Check if we can use the direct path or need the resolved path
+                        let direct_path_exists = std::path::Path::new(&usdt.path).exists();
+
+                        let usdt_path = if direct_path_exists {
                             &usdt.path
                         } else {
-                            // Fall back to resolved path for chrooted processes or non-standard locations
                             resolved_path.as_str()
                         };
 

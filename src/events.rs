@@ -525,7 +525,10 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
             return;
         }
 
-        let systing_event = self.cookies.get(&event.cookie).unwrap();
+        let systing_event = match self.cookies.get(&event.cookie) {
+            Some(evt) => evt,
+            None => return,
+        };
         let mut arg_data: Vec<(String, ArgValue)> = Vec::new();
 
         let num_args = event.num_args.min(event.args.len() as u8);
@@ -693,8 +696,8 @@ impl SystingProbeRecorder {
 
         // If this is an instant event just add it to the list of events
         if self.instant_events.contains_key(&systing_event.name) {
-            let entry = self.cpu_events.entry(event.cpu).or_default();
             let instant_track = self.instant_events.get(&systing_event.name).unwrap();
+            let entry = self.cpu_events.entry(event.cpu).or_default();
             let entry = entry.entry(instant_track.clone()).or_default();
             entry.push(TrackInstant {
                 ts: event.ts,
@@ -752,8 +755,8 @@ impl SystingProbeRecorder {
 
         // If this is an instant event just add it to the list of events
         if self.instant_events.contains_key(&systing_event.name) {
-            let entry = self.events.entry(event.task.tgidpid).or_default();
             let instant_track = self.instant_events.get(&systing_event.name).unwrap();
+            let entry = self.events.entry(event.task.tgidpid).or_default();
             let entry = entry.entry(instant_track.clone()).or_default();
             entry.push(TrackInstant {
                 ts: event.ts,
