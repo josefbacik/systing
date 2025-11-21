@@ -819,6 +819,14 @@ impl TraceOutput for SqliteOutput {
 }
 
 #[cfg(test)]
+impl SqliteOutput {
+    /// Get a reference to the database connection (test-only)
+    pub fn get_connection(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

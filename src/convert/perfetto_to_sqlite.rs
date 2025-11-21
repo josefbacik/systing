@@ -170,77 +170,78 @@ fn extract_clock_snapshots(trace: &Trace, output: &mut dyn TraceOutput) -> Resul
 
 /// Extract and write process tree (processes and threads) from the trace
 ///
-/// Scans for ProcessDescriptor and ThreadDescriptor packets to build
-/// the process hierarchy and thread information.
+/// Scans TrackDescriptor packets for embedded ProcessDescriptor and ThreadDescriptor fields.
 fn extract_process_tree(trace: &Trace, output: &mut dyn TraceOutput) -> Result<()> {
+    use perfetto_protos::trace_packet::trace_packet::Data;
+
     // Track which processes and threads we've seen to avoid duplicates
     let mut seen_processes = HashMap::new();
     let mut seen_threads = HashMap::new();
 
     for packet in &trace.packet {
-        // Extract process descriptors
-        if packet.has_process_descriptor() {
-            let process_desc = packet.process_descriptor();
+        if let Some(Data::TrackDescriptor(track_desc)) = &packet.data {
+            // Extract process from TrackDescriptor
+            if let Some(ref process_desc) = track_desc.process.0 {
+                if process_desc.has_pid() {
+                    let pid = process_desc.pid();
 
-            if process_desc.has_pid() {
-                let pid = process_desc.pid();
-
-                // Only write each process once
-                if let std::collections::hash_map::Entry::Vacant(e) = seen_processes.entry(pid) {
-                    let process_name = if process_desc.has_process_name() {
-                        process_desc.process_name()
-                    } else {
-                        "unknown"
-                    };
-
-                    // Extract cmdline if available
-                    let cmdline: Vec<String> =
-                        process_desc.cmdline.iter().map(|s| s.to_string()).collect();
-
-                    output
-                        .write_process(pid, process_name, &cmdline)
-                        .with_context(|| {
-                            format!("Failed to write process descriptor for PID {pid}")
-                        })?;
-
-                    e.insert(process_name.to_string());
-                }
-            }
-        }
-
-        // Extract thread descriptors
-        if packet.has_thread_descriptor() {
-            let thread_desc = packet.thread_descriptor();
-
-            if thread_desc.has_pid() && thread_desc.has_tid() {
-                let pid = thread_desc.pid();
-                let tid = thread_desc.tid();
-
-                // Only write each thread once
-                if let std::collections::hash_map::Entry::Vacant(e) = seen_threads.entry(tid) {
-                    let thread_name = if thread_desc.has_thread_name() {
-                        thread_desc.thread_name()
-                    } else {
-                        "unknown"
-                    };
-
-                    // Ensure the parent process exists
+                    // Only write each process once
                     if let std::collections::hash_map::Entry::Vacant(e) = seen_processes.entry(pid)
                     {
-                        // Create a placeholder process
-                        output.write_process(pid, "unknown", &[]).with_context(|| {
-                            format!("Failed to write placeholder process for PID {pid}")
-                        })?;
-                        e.insert("unknown".to_string());
+                        let process_name = if process_desc.has_process_name() {
+                            process_desc.process_name()
+                        } else {
+                            "unknown"
+                        };
+
+                        // Extract cmdline if available
+                        let cmdline: Vec<String> =
+                            process_desc.cmdline.iter().map(|s| s.to_string()).collect();
+
+                        output
+                            .write_process(pid, process_name, &cmdline)
+                            .with_context(|| {
+                                format!("Failed to write process descriptor for PID {pid}")
+                            })?;
+
+                        e.insert(process_name.to_string());
                     }
+                }
+            }
 
-                    output
-                        .write_thread(tid, pid, thread_name)
-                        .with_context(|| {
-                            format!("Failed to write thread descriptor for TID {tid}")
-                        })?;
+            // Extract thread from TrackDescriptor
+            if let Some(ref thread_desc) = track_desc.thread.0 {
+                if thread_desc.has_pid() && thread_desc.has_tid() {
+                    let pid = thread_desc.pid();
+                    let tid = thread_desc.tid();
 
-                    e.insert(thread_name.to_string());
+                    // Only write each thread once
+                    if let std::collections::hash_map::Entry::Vacant(e) = seen_threads.entry(tid) {
+                        let thread_name = if thread_desc.has_thread_name() {
+                            thread_desc.thread_name()
+                        } else {
+                            "unknown"
+                        };
+
+                        // Ensure the parent process exists
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            seen_processes.entry(pid)
+                        {
+                            // Create a placeholder process
+                            output.write_process(pid, "unknown", &[]).with_context(|| {
+                                format!("Failed to write placeholder process for PID {pid}")
+                            })?;
+                            e.insert("unknown".to_string());
+                        }
+
+                        output
+                            .write_thread(tid, pid, thread_name)
+                            .with_context(|| {
+                                format!("Failed to write thread descriptor for TID {tid}")
+                            })?;
+
+                        e.insert(thread_name.to_string());
+                    }
                 }
             }
         }
@@ -864,6 +865,12 @@ fn parse_track_scope(name: &str) -> (Option<u32>, Option<i32>, Option<i32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use perfetto_protos::process_descriptor::ProcessDescriptor;
+    use perfetto_protos::thread_descriptor::ThreadDescriptor;
+    use perfetto_protos::trace_packet::trace_packet::Data;
+    use perfetto_protos::trace_packet::TracePacket;
+    use perfetto_protos::track_descriptor::TrackDescriptor;
+    use protobuf::MessageField;
 
     #[test]
     fn test_timestamp_range_empty_trace() {
@@ -871,5 +878,123 @@ mod tests {
         let (start, end) = extract_timestamp_range(&trace);
         assert_eq!(start, 0);
         assert_eq!(end, 0);
+    }
+
+    /// Test that process and thread information is correctly extracted from TrackDescriptor packets
+    ///
+    /// This test verifies the bug fix where processes/threads were not being extracted
+    /// from modern Perfetto traces that use TrackDescriptor packets instead of the
+    /// deprecated top-level ProcessDescriptor and ThreadDescriptor packets.
+    #[test]
+    fn test_extract_process_tree_from_track_descriptors() {
+        use crate::sqlite::SqliteOutput;
+
+        // Create a trace with TrackDescriptor packets containing process and thread info
+        let mut trace = Trace::default();
+
+        // Create a TrackDescriptor with a ProcessDescriptor
+        let mut process_desc = ProcessDescriptor::default();
+        process_desc.set_pid(1234);
+        process_desc.set_process_name("test_process".to_string());
+        process_desc.cmdline = vec!["test_process".to_string(), "--arg1".to_string()];
+
+        let mut track_desc1 = TrackDescriptor::default();
+        track_desc1.set_uuid(100);
+        track_desc1.set_name("Process Track".to_string());
+        track_desc1.process = MessageField::some(process_desc);
+
+        let packet1 = TracePacket {
+            data: Some(Data::TrackDescriptor(track_desc1)),
+            ..Default::default()
+        };
+        trace.packet.push(packet1);
+
+        // Create a TrackDescriptor with a ThreadDescriptor
+        let mut thread_desc = ThreadDescriptor::default();
+        thread_desc.set_tid(5678);
+        thread_desc.set_pid(1234); // Same PID as above
+        thread_desc.set_thread_name("test_thread".to_string());
+
+        let mut track_desc2 = TrackDescriptor::default();
+        track_desc2.set_uuid(200);
+        track_desc2.set_name("Thread Track".to_string());
+        track_desc2.thread = MessageField::some(thread_desc);
+
+        let packet2 = TracePacket {
+            data: Some(Data::TrackDescriptor(track_desc2)),
+            ..Default::default()
+        };
+        trace.packet.push(packet2);
+
+        // Create an in-memory SQLite database for testing
+        let mut sqlite = SqliteOutput::create(":memory:")
+            .expect("Failed to create in-memory SQLite database for testing");
+        sqlite
+            .write_metadata(0, 1000, "test")
+            .expect("Failed to write test metadata");
+
+        // Extract process tree - this should not error and should extract both process and thread
+        let result = extract_process_tree(&trace, &mut sqlite);
+        assert!(
+            result.is_ok(),
+            "extract_process_tree should succeed: {:?}",
+            result.err()
+        );
+
+        // Flush to complete the transaction
+        sqlite.flush().expect("Failed to flush database");
+
+        // Verify the data was actually written to the database
+        let conn = sqlite.get_connection();
+
+        // Verify process was written correctly
+        let process_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM processes WHERE pid = 1234",
+                [],
+                |row| row.get(0),
+            )
+            .expect("Failed to query processes table");
+        assert_eq!(
+            process_count, 1,
+            "Process 1234 should be written to database"
+        );
+
+        let (pid, name, cmdline): (i32, String, String) = conn
+            .query_row(
+                "SELECT pid, name, cmdline FROM processes WHERE pid = 1234",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("Failed to retrieve process data");
+        assert_eq!(pid, 1234);
+        assert_eq!(name, "test_process");
+        assert!(
+            cmdline.contains("test_process"),
+            "cmdline should contain process name"
+        );
+        assert!(
+            cmdline.contains("--arg1"),
+            "cmdline should contain arguments"
+        );
+
+        // Verify thread was written correctly
+        let thread_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM threads WHERE tid = 5678", [], |row| {
+                row.get(0)
+            })
+            .expect("Failed to query threads table");
+        assert_eq!(thread_count, 1, "Thread 5678 should be written to database");
+
+        let (tid, thread_pid, thread_name): (i32, i32, String) = conn
+            .query_row(
+                "SELECT tid, pid, name FROM threads WHERE tid = 5678",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("Failed to retrieve thread data");
+        assert_eq!(tid, 5678);
+        assert_eq!(thread_pid, 1234, "Thread should belong to process 1234");
+        assert_eq!(thread_name, "test_thread");
     }
 }
