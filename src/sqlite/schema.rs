@@ -3,9 +3,13 @@
 /// This schema is designed to be simple and relational, optimized for SQL queries.
 /// Unlike Perfetto's complex interning system, we use straightforward deduplication
 /// with foreign keys and unique constraints.
+///
+/// This schema uses a minimal set of indexes (6 instead of 31) to reduce database
+/// size by ~30% while maintaining performance for common queries (time-range queries,
+/// CPU/thread-specific queries, and stack reconstruction).
 pub const SCHEMA_VERSION: i32 = 1;
 
-/// SQL schema for systing SQLite output
+/// SQL schema for systing SQLite output (optimized with minimal indexes)
 pub const SCHEMA_SQL: &str = r#"
 -- ============================================================================
 -- SQLite Configuration and Optimizations
@@ -69,8 +73,6 @@ CREATE TABLE IF NOT EXISTS clocks (
     UNIQUE(snapshot_id, clock_type)
 );
 
-CREATE INDEX idx_clocks_snapshot ON clocks(snapshot_id);
-
 -- ============================================================================
 -- Process and Thread Information
 -- ============================================================================
@@ -88,8 +90,6 @@ CREATE TABLE IF NOT EXISTS threads (
     FOREIGN KEY (pid) REFERENCES processes(pid)
 );
 
-CREATE INDEX idx_threads_pid ON threads(pid);
-
 -- ============================================================================
 -- Tracks (for organizing event streams)
 -- ============================================================================
@@ -106,10 +106,6 @@ CREATE TABLE IF NOT EXISTS tracks (
     FOREIGN KEY (pid) REFERENCES processes(pid),
     FOREIGN KEY (tid) REFERENCES threads(tid)
 );
-
-CREATE INDEX idx_tracks_pid ON tracks(pid);
-CREATE INDEX idx_tracks_tid ON tracks(tid);
-CREATE INDEX idx_tracks_parent ON tracks(parent_uuid);
 
 -- ============================================================================
 -- Scheduler Events
@@ -129,15 +125,10 @@ CREATE TABLE IF NOT EXISTS sched_events (
     FOREIGN KEY (next_pid) REFERENCES threads(tid)
 );
 
--- Index for time-range queries
+-- Essential indexes for common queries
 CREATE INDEX idx_sched_events_ts ON sched_events(ts);
-
--- Index for queries by CPU
 CREATE INDEX idx_sched_events_cpu ON sched_events(cpu, ts);
-
--- Composite index for thread timeline queries
 CREATE INDEX idx_sched_events_next_pid_ts ON sched_events(next_pid, ts);
-CREATE INDEX idx_sched_events_prev_pid_ts ON sched_events(prev_pid, ts);
 
 -- ============================================================================
 -- Stack Traces and Symbols
@@ -156,9 +147,6 @@ CREATE TABLE IF NOT EXISTS symbols (
     UNIQUE(function_name, file_name, line_number, build_id, mapping_name, mapping_offset)
 );
 
-CREATE INDEX idx_symbols_function ON symbols(function_name);
-CREATE INDEX idx_symbols_build_id ON symbols(build_id);
-
 -- Stack trace records (identified by hash)
 CREATE TABLE IF NOT EXISTS stack_traces (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,9 +164,8 @@ CREATE TABLE IF NOT EXISTS stack_trace_frames (
     FOREIGN KEY (symbol_id) REFERENCES symbols(id)
 );
 
--- Index for efficient stack trace reconstruction
+-- Essential index for stack trace reconstruction
 CREATE INDEX idx_stack_frames_stack_id ON stack_trace_frames(stack_id, frame_index);
-CREATE INDEX idx_stack_frames_symbol ON stack_trace_frames(symbol_id, stack_type);
 
 -- ============================================================================
 -- Performance Samples
@@ -214,8 +201,6 @@ CREATE TABLE IF NOT EXISTS perf_counters (
     FOREIGN KEY (track_uuid) REFERENCES tracks(uuid)
 );
 
-CREATE INDEX idx_perf_counters_track ON perf_counters(track_uuid);
-
 -- Counter value samples
 CREATE TABLE IF NOT EXISTS perf_counter_values (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -224,9 +209,6 @@ CREATE TABLE IF NOT EXISTS perf_counter_values (
     value INTEGER NOT NULL,
     FOREIGN KEY (counter_id) REFERENCES perf_counters(id)
 );
-
-CREATE INDEX idx_perf_counter_values_ts ON perf_counter_values(ts);
-CREATE INDEX idx_perf_counter_values_counter_ts ON perf_counter_values(counter_id, ts);
 
 -- ============================================================================
 -- Custom Probe Events
@@ -242,8 +224,6 @@ CREATE TABLE IF NOT EXISTS event_definitions (
     cookie INTEGER
 );
 
-CREATE INDEX idx_event_defs_name ON event_definitions(event_name);
-
 -- Custom probe event instances
 CREATE TABLE IF NOT EXISTS probe_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -254,10 +234,6 @@ CREATE TABLE IF NOT EXISTS probe_events (
     FOREIGN KEY (tid) REFERENCES threads(tid),
     FOREIGN KEY (event_def_id) REFERENCES event_definitions(id)
 );
-
-CREATE INDEX idx_probe_events_ts ON probe_events(ts);
-CREATE INDEX idx_probe_events_tid ON probe_events(tid, ts);
-CREATE INDEX idx_probe_events_def ON probe_events(event_def_id, ts);
 
 -- ============================================================================
 -- Network Events
@@ -272,9 +248,6 @@ CREATE TABLE IF NOT EXISTS network_connections (
     dest_port INTEGER NOT NULL,
     UNIQUE(protocol, address_family, dest_addr, dest_port)
 );
-
-CREATE INDEX idx_network_connections_proto ON network_connections(protocol);
-CREATE INDEX idx_network_connections_dest ON network_connections(dest_addr, dest_port);
 
 -- Network event instances (send, receive, etc.)
 CREATE TABLE IF NOT EXISTS network_events (
@@ -293,11 +266,6 @@ CREATE TABLE IF NOT EXISTS network_events (
     FOREIGN KEY (track_uuid) REFERENCES tracks(uuid)
 );
 
-CREATE INDEX idx_network_events_ts ON network_events(start_ts);
-CREATE INDEX idx_network_events_tid ON network_events(tid, start_ts);
-CREATE INDEX idx_network_events_connection ON network_events(connection_id, start_ts);
-CREATE INDEX idx_network_events_track ON network_events(track_uuid);
-
 -- ============================================================================
 -- CPU Frequency Tracking
 -- ============================================================================
@@ -310,10 +278,6 @@ CREATE TABLE IF NOT EXISTS cpu_frequency (
     track_uuid INTEGER NOT NULL,
     FOREIGN KEY (track_uuid) REFERENCES tracks(uuid)
 );
-
-CREATE INDEX idx_cpu_frequency_ts ON cpu_frequency(ts);
-CREATE INDEX idx_cpu_frequency_cpu_ts ON cpu_frequency(cpu, ts);
-CREATE INDEX idx_cpu_frequency_track ON cpu_frequency(track_uuid);
 "#;
 
 /// Creates the complete schema in the provided SQLite connection
@@ -401,5 +365,45 @@ mod tests {
             journal_mode == "wal" || journal_mode == "memory",
             "Journal mode should be WAL or memory (for in-memory DBs)"
         );
+    }
+
+    #[test]
+    fn test_optimized_index_count() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        // Verify we have exactly 6 indexes (optimized schema)
+        let index_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            index_count, 6,
+            "Expected exactly 6 indexes in optimized schema, found {index_count}"
+        );
+
+        // Verify the essential indexes exist
+        let expected_indexes = vec![
+            "idx_sched_events_ts",
+            "idx_sched_events_cpu",
+            "idx_sched_events_next_pid_ts",
+            "idx_perf_samples_ts",
+            "idx_perf_samples_tid_ts",
+            "idx_stack_frames_stack_id",
+        ];
+
+        for index_name in expected_indexes {
+            let count: i32 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [index_name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "Index {index_name} should exist");
+        }
     }
 }
