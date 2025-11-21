@@ -430,7 +430,6 @@ impl SchedEventRecorder {
         for (cpu, counters) in self.runqueue.iter() {
             let track_info = crate::output::CounterTrackInfo {
                 name: format!("runqueue_size_cpu{cpu}"),
-                description: Some(format!("Runqueue size for CPU {cpu}")),
                 unit: crate::output::CounterUnit::Count,
                 is_incremental: false,
                 cpu: Some(*cpu as u32),
@@ -448,7 +447,6 @@ impl SchedEventRecorder {
         for (cpu, counters) in self.cpu_latencies.iter() {
             let track_info = crate::output::CounterTrackInfo {
                 name: format!("latency_cpu{cpu}"),
-                description: Some(format!("Scheduling latency for CPU {cpu}")),
                 unit: crate::output::CounterUnit::TimeNs,
                 is_incremental: false,
                 cpu: Some(*cpu),
@@ -469,7 +467,6 @@ impl SchedEventRecorder {
 
             let track_info = crate::output::CounterTrackInfo {
                 name: format!("Wake latency pid_{pid}"),
-                description: Some(format!("Wake latency for process {pid}")),
                 unit: crate::output::CounterUnit::TimeNs,
                 is_incremental: false,
                 cpu: None,

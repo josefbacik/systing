@@ -492,14 +492,15 @@ impl TraceOutput for SqliteOutput {
 
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO perf_counters (id, track_uuid, counter_name, cpu, unit)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT OR IGNORE INTO perf_counters (id, track_uuid, counter_name, cpu, unit, is_incremental)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     id as i64,
                     counter.track_uuid as i64,
                     counter.counter_name,
                     counter.cpu,
                     counter.unit,
+                    counter.is_incremental,
                 ],
             )
             .context("Failed to write perf counter")?;
@@ -572,13 +573,14 @@ impl TraceOutput for SqliteOutput {
         if track.cpu.is_some() || track.pid.is_some() || track.tid.is_some() {
             self.conn
                 .execute(
-                    "INSERT OR IGNORE INTO perf_counters (track_uuid, counter_name, cpu, unit)
-                 VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT OR IGNORE INTO perf_counters (track_uuid, counter_name, cpu, unit, is_incremental)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         uuid as i64,
                         track.name,
                         track.cpu.map(|c| c as i64),
                         unit_str,
+                        track.is_incremental,
                     ],
                 )
                 .context("Failed to write counter to perf_counters")?;

@@ -131,7 +131,6 @@ pub struct PerfCounterDef {
     pub counter_name: String,
     pub cpu: Option<u32>,
     pub unit: String,
-    #[allow(dead_code)]
     pub is_incremental: bool,
 }
 
@@ -139,10 +138,7 @@ pub struct PerfCounterDef {
 #[derive(Debug, Clone)]
 pub struct CounterTrackInfo {
     pub name: String,
-    #[allow(dead_code)]
-    pub description: Option<String>,
     pub unit: CounterUnit,
-    #[allow(dead_code)]
     pub is_incremental: bool,
     pub cpu: Option<u32>,
     pub pid: Option<i32>,

@@ -723,7 +723,7 @@ fn add_counter_packets(
     // First, query for counter tracks
     let mut track_stmt = conn
         .prepare(
-            "SELECT DISTINCT t.uuid, t.name, t.cpu, t.pid, t.tid, p.unit
+            "SELECT DISTINCT t.uuid, t.name, t.cpu, t.pid, t.tid, p.unit, p.is_incremental
              FROM tracks t
              LEFT JOIN perf_counters p ON t.uuid = p.track_uuid
              WHERE t.track_type = 'counter'
@@ -738,6 +738,7 @@ fn add_counter_packets(
         pid: Option<i32>,
         tid: Option<i32>,
         unit: String,
+        is_incremental: bool,
     }
 
     let tracks: Vec<CounterTrack> = track_stmt
@@ -749,6 +750,7 @@ fn add_counter_packets(
                 pid: row.get(3)?,
                 tid: row.get(4)?,
                 unit: row.get(5).unwrap_or_else(|_| "count".to_string()),
+                is_incremental: row.get(6).unwrap_or(false),
             })
         })
         .context("Failed to query counter tracks")?
@@ -760,7 +762,7 @@ fn add_counter_packets(
     // Generate TrackDescriptor packets for each counter track
     for track in &tracks {
         let mut counter_desc = CounterDescriptor::new();
-        counter_desc.set_is_incremental(false);
+        counter_desc.set_is_incremental(track.is_incremental);
 
         // Map unit string to enum
         let unit = match track.unit.as_str() {

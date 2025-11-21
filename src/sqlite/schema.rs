@@ -184,6 +184,7 @@ CREATE TABLE IF NOT EXISTS perf_counters (
     counter_name TEXT NOT NULL,
     cpu INTEGER,
     unit TEXT,
+    is_incremental BOOLEAN DEFAULT 0,
     UNIQUE(track_uuid, counter_name, cpu),
     FOREIGN KEY (track_uuid) REFERENCES tracks(uuid)
 );

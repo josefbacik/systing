@@ -303,7 +303,6 @@ fn extract_counters(trace: &Trace, output: &mut dyn TraceOutput) -> Result<()> {
 
                     let track_info = CounterTrackInfo {
                         name: name.clone(),
-                        description: None,
                         unit,
                         is_incremental: counter_desc.is_incremental.unwrap_or(false),
                         cpu,
