@@ -56,14 +56,46 @@ pub struct SchedEventData {
 }
 
 /// Types of scheduler events
+///
+/// Uses `#[repr(i32)]` for efficient SQLite storage (INTEGER vs TEXT).
+/// The discriminant values (0-4) are explicitly assigned for database stability.
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SchedEventType {
-    Switch,
-    Waking,
+    Switch = 0,
+    Waking = 1,
     #[allow(dead_code)]
-    Wakeup,
-    WakeupNew,
-    Exit,
+    Wakeup = 2,
+    WakeupNew = 3,
+    Exit = 4,
+}
+
+impl SchedEventType {
+    /// Convert to string (for debugging and compatibility)
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SchedEventType::Switch => "switch",
+            SchedEventType::Waking => "waking",
+            SchedEventType::Wakeup => "wakeup",
+            SchedEventType::WakeupNew => "wakeup_new",
+            SchedEventType::Exit => "exit",
+        }
+    }
+}
+
+impl TryFrom<i32> for SchedEventType {
+    type Error = String;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(SchedEventType::Switch),
+            1 => Ok(SchedEventType::Waking),
+            2 => Ok(SchedEventType::Wakeup),
+            3 => Ok(SchedEventType::WakeupNew),
+            4 => Ok(SchedEventType::Exit),
+            _ => Err(format!("Invalid SchedEventType value: {value}")),
+        }
+    }
 }
 
 /// Symbol information for stack traces

@@ -274,13 +274,8 @@ impl TraceOutput for SqliteOutput {
     }
 
     fn write_sched_event(&mut self, event: &SchedEventData) -> Result<()> {
-        let event_type = match event.event_type {
-            SchedEventType::Switch => "switch",
-            SchedEventType::Waking => "waking",
-            SchedEventType::Wakeup => "wakeup",
-            SchedEventType::WakeupNew => "wakeup_new",
-            SchedEventType::Exit => "exit",
-        };
+        // Convert event_type enum to its discriminant value for storage
+        let event_type_int = event.event_type as i32;
 
         // Convert prev_state Option<String> to Option<i32> for database
         let prev_state_val: Option<i32> = event.prev_state.as_ref().and_then(|s| {
@@ -295,7 +290,7 @@ impl TraceOutput for SqliteOutput {
                 params![
                     event.ts as i64,
                     event.cpu,
-                    event_type,
+                    event_type_int,
                     event.prev_pid,
                     prev_state_val,
                     event.prev_prio,
@@ -1155,10 +1150,10 @@ mod tests {
         // Verify priorities are stored
         let conn = &output.conn;
 
-        // Check switch event
+        // Check switch event (event_type 0 = switch)
         let (next_prio, prev_prio): (Option<i32>, Option<i32>) = conn
             .query_row(
-                "SELECT next_prio, prev_prio FROM sched_events WHERE event_type = 'switch'",
+                "SELECT next_prio, prev_prio FROM sched_events WHERE event_type = 0",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -1167,10 +1162,10 @@ mod tests {
         assert_eq!(next_prio, Some(100), "Switch next_prio should be 100");
         assert_eq!(prev_prio, Some(120), "Switch prev_prio should be 120");
 
-        // Check waking event
+        // Check waking event (event_type 1 = waking)
         let next_prio: Option<i32> = conn
             .query_row(
-                "SELECT next_prio FROM sched_events WHERE event_type = 'waking'",
+                "SELECT next_prio FROM sched_events WHERE event_type = 1",
                 [],
                 |row| row.get(0),
             )

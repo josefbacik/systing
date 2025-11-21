@@ -354,7 +354,7 @@ fn add_scheduler_event_packets(
         .query_map([], |row| {
             let ts: u64 = row.get(0)?;
             let cpu: u32 = row.get(1)?;
-            let event_type: String = row.get(2)?;
+            let event_type_int: i32 = row.get(2)?;
             let prev_pid: Option<i32> = row.get(3)?;
             let prev_state: Option<i32> = row.get(4)?;
             let prev_prio: Option<i32> = row.get(5)?;
@@ -362,7 +362,14 @@ fn add_scheduler_event_packets(
             let next_prio: Option<i32> = row.get(7)?;
 
             Ok((
-                ts, cpu, event_type, prev_pid, prev_state, prev_prio, next_pid, next_prio,
+                ts,
+                cpu,
+                event_type_int,
+                prev_pid,
+                prev_state,
+                prev_prio,
+                next_pid,
+                next_prio,
             ))
         })
         .context("Failed to query scheduler events")?;
@@ -370,8 +377,17 @@ fn add_scheduler_event_packets(
     let mut event_count = 0;
 
     for row_result in rows {
-        let (ts, cpu, event_type, _prev_pid, prev_state, _prev_prio, next_pid, next_prio) =
+        let (ts, cpu, event_type_int, _prev_pid, prev_state, _prev_prio, next_pid, next_prio) =
             row_result.context("Failed to read scheduler event row")?;
+
+        // Convert integer to event type enum, skip if unknown
+        let event_type = match crate::output::SchedEventType::try_from(event_type_int) {
+            Ok(et) => et,
+            Err(err) => {
+                eprintln!("Warning: {err}, skipping");
+                continue; // Skip this event
+            }
+        };
 
         let cpu_events = cpu_events_map.entry(cpu).or_insert_with(|| CpuEvents {
             switch_timestamps: Vec::new(),
@@ -387,8 +403,8 @@ fn add_scheduler_event_packets(
             other_events: Vec::new(),
         });
 
-        match event_type.as_str() {
-            "switch" => {
+        match event_type {
+            crate::output::SchedEventType::Switch => {
                 if let Some(pid) = next_pid {
                     cpu_events.switch_timestamps.push(ts);
                     cpu_events
@@ -404,7 +420,7 @@ fn add_scheduler_event_packets(
                     cpu_events.switch_next_comms.push(thread_name);
                 }
             }
-            "waking" => {
+            crate::output::SchedEventType::Waking => {
                 if let Some(pid) = next_pid {
                     cpu_events.waking_timestamps.push(ts);
                     cpu_events.waking_pids.push(pid);
@@ -419,7 +435,9 @@ fn add_scheduler_event_packets(
                     cpu_events.waking_comms.push(thread_name);
                 }
             }
-            "wakeup" | "wakeup_new" | "exit" => {
+            crate::output::SchedEventType::Wakeup
+            | crate::output::SchedEventType::WakeupNew
+            | crate::output::SchedEventType::Exit => {
                 // These event types are not supported in CompactSched format,
                 // but can be represented as individual FtraceEvent messages
                 if let Some(pid) = next_pid {
@@ -428,15 +446,12 @@ fn add_scheduler_event_packets(
                         .unwrap_or_else(|_| format!("pid-{pid}"));
                     cpu_events.other_events.push((
                         ts,
-                        event_type.clone(),
+                        event_type.as_str().to_string(),
                         pid,
                         next_prio.unwrap_or(0),
                         thread_name,
                     ));
                 }
-            }
-            _ => {
-                eprintln!("Warning: Unknown scheduler event type '{event_type}'");
             }
         }
         event_count += 1;
@@ -1733,16 +1748,16 @@ mod tests {
         )
         .unwrap();
 
-        // Insert sched_switch events
+        // Insert sched_switch events (event_type: 0=switch, 1=waking)
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, prev_pid, prev_state, next_pid, next_prio)
-             VALUES (1000000, 0, 'switch', 100, 0, 200, 120)",
+             VALUES (1000000, 0, 0, 100, 0, 200, 120)",
             [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, prev_pid, prev_state, next_pid, next_prio)
-             VALUES (2000000, 0, 'switch', 200, 1, 100, 120)",
+             VALUES (2000000, 0, 0, 200, 1, 100, 120)",
             [],
         )
         .unwrap();
@@ -1816,13 +1831,13 @@ mod tests {
         // Insert sched_waking events
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid, next_prio)
-             VALUES (500000, 1, 'waking', 300, 120)",
+             VALUES (500000, 1, 1, 300, 120)",
             [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid, next_prio)
-             VALUES (600000, 1, 'waking', 200, 110)",
+             VALUES (600000, 1, 1, 200, 110)",
             [],
         )
         .unwrap();
@@ -1901,19 +1916,19 @@ mod tests {
         // Insert events that reference these threads
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-             VALUES (1000, 0, 'switch', 200)",
+             VALUES (1000, 0, 0, 200)",
             [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-             VALUES (2000, 0, 'switch', 300)",
+             VALUES (2000, 0, 0, 300)",
             [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-             VALUES (3000, 0, 'switch', 400)",
+             VALUES (3000, 0, 0, 400)",
             [],
         )
         .unwrap();
@@ -1978,25 +1993,25 @@ mod tests {
         // Insert events on different CPUs
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-             VALUES (1000, 0, 'switch', 200)",
+             VALUES (1000, 0, 0, 200)",
             [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-             VALUES (2000, 1, 'switch', 200)",
+             VALUES (2000, 1, 0, 200)",
             [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-             VALUES (3000, 0, 'waking', 200)",
+             VALUES (3000, 0, 1, 200)",
             [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-             VALUES (4000, 2, 'waking', 200)",
+             VALUES (4000, 2, 1, 200)",
             [],
         )
         .unwrap();
@@ -2050,7 +2065,7 @@ mod tests {
         // Insert events without corresponding thread entries
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-             VALUES (1000, 0, 'switch', 999)",
+             VALUES (1000, 0, 0, 999)",
             [],
         )
         .unwrap(); // PID 999 doesn't exist
@@ -2091,22 +2106,22 @@ mod tests {
         )
         .unwrap();
 
-        // Insert valid and invalid event types
+        // Insert valid and invalid event types (0=switch, 1=waking, 999=invalid)
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-             VALUES (1000, 0, 'switch', 200)",
+             VALUES (1000, 0, 0, 200)",
             [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-             VALUES (2000, 0, 'unknown_type', 200)",
+             VALUES (2000, 0, 999, 200)",
             [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-             VALUES (3000, 0, 'waking', 200)",
+             VALUES (3000, 0, 1, 200)",
             [],
         )
         .unwrap();
@@ -2179,19 +2194,19 @@ mod tests {
         // Insert events with different priorities
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid, next_prio)
-             VALUES (1000, 0, 'switch', 200, 50)",
+             VALUES (1000, 0, 0, 200, 50)",
             [],
         )
         .unwrap(); // High priority (lower number)
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid, next_prio)
-             VALUES (2000, 0, 'switch', 300, 139)",
+             VALUES (2000, 0, 0, 300, 139)",
             [],
         )
         .unwrap(); // Low priority (higher number)
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, next_pid, next_prio)
-             VALUES (3000, 0, 'waking', 200, 50)",
+             VALUES (3000, 0, 1, 200, 50)",
             [],
         )
         .unwrap();
@@ -2243,19 +2258,19 @@ mod tests {
         // Common Linux task states: 0=RUNNING, 1=INTERRUPTIBLE, 2=UNINTERRUPTIBLE, etc.
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, prev_state, next_pid)
-             VALUES (1000, 0, 'switch', 0, 200)",
+             VALUES (1000, 0, 0, 0, 200)",
             [],
         )
         .unwrap(); // RUNNING
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, prev_state, next_pid)
-             VALUES (2000, 0, 'switch', 1, 200)",
+             VALUES (2000, 0, 0, 1, 200)",
             [],
         )
         .unwrap(); // INTERRUPTIBLE
         conn.execute(
             "INSERT INTO sched_events (ts, cpu, event_type, prev_state, next_pid)
-             VALUES (3000, 0, 'switch', 2, 200)",
+             VALUES (3000, 0, 0, 2, 200)",
             [],
         )
         .unwrap(); // UNINTERRUPTIBLE
@@ -2303,7 +2318,7 @@ mod tests {
         conn.execute(
             &format!(
                 "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-                 VALUES ({ts1}, 0, 'switch', 200)"
+                 VALUES ({ts1}, 0, 0, 200)"
             ),
             [],
         )
@@ -2311,7 +2326,7 @@ mod tests {
         conn.execute(
             &format!(
                 "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-                 VALUES ({ts2}, 0, 'switch', 200)"
+                 VALUES ({ts2}, 0, 0, 200)"
             ),
             [],
         )
@@ -2319,7 +2334,7 @@ mod tests {
         conn.execute(
             &format!(
                 "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-                 VALUES ({ts3}, 0, 'switch', 200)"
+                 VALUES ({ts3}, 0, 0, 200)"
             ),
             [],
         )

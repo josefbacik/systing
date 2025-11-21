@@ -116,7 +116,7 @@ CREATE TABLE IF NOT EXISTS sched_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts INTEGER NOT NULL,
     cpu INTEGER NOT NULL,
-    event_type TEXT NOT NULL,  -- 'waking', 'switch'
+    event_type INTEGER NOT NULL,  -- Enum: 0=switch, 1=waking, 2=wakeup, 3=wakeup_new, 4=exit
     prev_pid INTEGER,
     prev_state INTEGER,
     prev_prio INTEGER,
