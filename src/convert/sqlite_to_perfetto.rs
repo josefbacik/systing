@@ -333,6 +333,8 @@ fn add_scheduler_event_packets(
         waking_target_cpus: Vec<i32>,
         waking_prios: Vec<i32>,
         waking_comms: Vec<String>,
+        // Individual ftrace events (not in CompactSched)
+        other_events: Vec<(u64, String, i32, i32, String)>, // (ts, event_type, pid, prio, comm)
     }
 
     let mut cpu_events_map: HashMap<u32, CpuEvents> = HashMap::new();
@@ -376,6 +378,7 @@ fn add_scheduler_event_packets(
             waking_target_cpus: Vec::new(),
             waking_prios: Vec::new(),
             waking_comms: Vec::new(),
+            other_events: Vec::new(),
         });
 
         match event_type.as_str() {
@@ -410,6 +413,22 @@ fn add_scheduler_event_packets(
                     cpu_events.waking_comms.push(thread_name);
                 }
             }
+            "wakeup" | "wakeup_new" | "exit" => {
+                // These event types are not supported in CompactSched format,
+                // but can be represented as individual FtraceEvent messages
+                if let Some(pid) = next_pid {
+                    let thread_name: String = thread_name_stmt
+                        .query_row([pid], |row| row.get(0))
+                        .unwrap_or_else(|_| format!("pid-{pid}"));
+                    cpu_events.other_events.push((
+                        ts,
+                        event_type.clone(),
+                        pid,
+                        next_prio.unwrap_or(0),
+                        thread_name,
+                    ));
+                }
+            }
             _ => {
                 eprintln!("Warning: Unknown scheduler event type '{event_type}'");
             }
@@ -419,7 +438,10 @@ fn add_scheduler_event_packets(
 
     // Generate FtraceEventBundle packets for each CPU
     for (cpu, events) in cpu_events_map {
-        if events.switch_timestamps.is_empty() && events.waking_timestamps.is_empty() {
+        if events.switch_timestamps.is_empty()
+            && events.waking_timestamps.is_empty()
+            && events.other_events.is_empty()
+        {
             continue;
         }
 
@@ -491,6 +513,47 @@ fn add_scheduler_event_packets(
         let mut event_bundle = FtraceEventBundle::default();
         event_bundle.set_cpu(cpu);
         event_bundle.compact_sched = Some(compact_sched).into();
+
+        // Add individual ftrace events for wakeup, wakeup_new, and exit
+        for (ts, event_type, pid, prio, comm) in &events.other_events {
+            use perfetto_protos::ftrace_event::ftrace_event::Event;
+            use perfetto_protos::ftrace_event::FtraceEvent;
+            use perfetto_protos::sched::SchedProcessExitFtraceEvent;
+            use perfetto_protos::sched::SchedWakeupFtraceEvent;
+            use perfetto_protos::sched::SchedWakeupNewFtraceEvent;
+
+            let mut ftrace_event = FtraceEvent::new();
+            ftrace_event.set_timestamp(*ts);
+            ftrace_event.set_pid(*pid as u32);
+
+            match event_type.as_str() {
+                "wakeup" => {
+                    let mut wakeup = SchedWakeupFtraceEvent::new();
+                    wakeup.set_comm(comm.clone());
+                    wakeup.set_pid(*pid);
+                    wakeup.set_prio(*prio);
+                    wakeup.set_target_cpu(cpu as i32);
+                    ftrace_event.event = Some(Event::SchedWakeup(wakeup));
+                }
+                "wakeup_new" => {
+                    let mut wakeup_new = SchedWakeupNewFtraceEvent::new();
+                    wakeup_new.set_comm(comm.clone());
+                    wakeup_new.set_pid(*pid);
+                    wakeup_new.set_prio(*prio);
+                    wakeup_new.set_target_cpu(cpu as i32);
+                    ftrace_event.event = Some(Event::SchedWakeupNew(wakeup_new));
+                }
+                "exit" => {
+                    let mut exit = SchedProcessExitFtraceEvent::new();
+                    exit.set_comm(comm.clone());
+                    exit.set_pid(*pid);
+                    ftrace_event.event = Some(Event::SchedProcessExit(exit));
+                }
+                _ => {} // Should not happen due to earlier match
+            }
+
+            event_bundle.event.push(ftrace_event);
+        }
 
         // Create TracePacket
         let mut packet = TracePacket::new();
