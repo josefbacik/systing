@@ -218,7 +218,6 @@ pub enum IrqType {
 
 /// IRQ/SoftIRQ event data
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct IrqEventData {
     /// Timestamp of the event
     pub ts: u64,

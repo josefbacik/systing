@@ -265,6 +265,20 @@ CREATE TABLE IF NOT EXISTS cpu_frequency (
     track_uuid INTEGER NOT NULL,
     FOREIGN KEY (track_uuid) REFERENCES tracks(uuid)
 );
+
+-- ============================================================================
+-- IRQ/SoftIRQ Events
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS irq_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    cpu INTEGER NOT NULL,
+    irq_type TEXT NOT NULL,  -- 'hardware' or 'software'
+    is_entry INTEGER NOT NULL,  -- 1 for entry, 0 for exit (boolean)
+    irq_number INTEGER,  -- NULL for software IRQs that don't have a number
+    name TEXT  -- IRQ name/description, NULL if not available
+);
 "#;
 
 /// Creates the complete schema in the provided SQLite connection
@@ -314,6 +328,7 @@ mod tests {
             "network_connections",
             "network_events",
             "cpu_frequency",
+            "irq_events",
         ];
 
         for table in tables {

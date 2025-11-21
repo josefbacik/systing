@@ -87,13 +87,16 @@ pub fn convert_sqlite_to_perfetto(input_path: &str, output_path: &str) -> Result
     // 4. Scheduler events (the actual trace events!)
     add_scheduler_event_packets(&conn, &mut trace, &sequence_counter)?;
 
-    // 5. Counter tracks and values (runqueue size, latency, etc.)
+    // 5. IRQ/SoftIRQ events
+    add_irq_event_packets(&conn, &mut trace, &sequence_counter)?;
+
+    // 6. Counter tracks and values (runqueue size, latency, etc.)
     add_counter_packets(&conn, &mut trace, &sequence_counter)?;
 
-    // 6. Stack traces and perf samples
+    // 7. Stack traces and perf samples
     add_stack_trace_packets(&conn, &mut trace, &sequence_counter)?;
 
-    // 7. Network events
+    // 8. Network events
     add_network_event_packets(&conn, &mut trace, &sequence_counter)?;
 
     println!(
@@ -584,6 +587,127 @@ fn add_scheduler_event_packets(
     }
 
     println!("Extracted {event_count} scheduler events");
+    Ok(())
+}
+
+/// Read IRQ/SoftIRQ events from SQLite and generate FtraceEvent packets
+///
+/// This converts IRQ events stored in the irq_events table back to Perfetto's
+/// FtraceEvent format with irq_handler_entry/exit and softirq_entry/exit events.
+fn add_irq_event_packets(
+    conn: &Connection,
+    trace: &mut Trace,
+    sequence_counter: &AtomicU32,
+) -> Result<()> {
+    use perfetto_protos::ftrace_event::ftrace_event::Event;
+    use perfetto_protos::ftrace_event::FtraceEvent;
+    use perfetto_protos::irq::IrqHandlerEntryFtraceEvent;
+    use perfetto_protos::irq::IrqHandlerExitFtraceEvent;
+    use perfetto_protos::irq::SoftirqEntryFtraceEvent;
+    use perfetto_protos::irq::SoftirqExitFtraceEvent;
+
+    // Query IRQ events from SQLite, ordered by timestamp and CPU
+    let mut stmt = conn
+        .prepare(
+            "SELECT ts, cpu, irq_type, is_entry, irq_number, name
+             FROM irq_events
+             ORDER BY cpu, ts",
+        )
+        .context("Failed to prepare IRQ events query")?;
+
+    // Type alias for cleaner code
+    type IrqEvent = (i64, String, bool, Option<u32>, Option<String>);
+
+    // Group events by CPU for FtraceEventBundle
+    let mut cpu_events_map: HashMap<u32, Vec<IrqEvent>> = HashMap::new();
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,            // ts
+                row.get::<_, u32>(1)?,            // cpu
+                row.get::<_, String>(2)?,         // irq_type
+                row.get::<_, i32>(3)? != 0,       // is_entry (convert int to bool)
+                row.get::<_, Option<u32>>(4)?,    // irq_number
+                row.get::<_, Option<String>>(5)?, // name
+            ))
+        })
+        .context("Failed to query IRQ events")?;
+
+    let mut event_count = 0;
+
+    for row_result in rows {
+        let (ts, cpu, irq_type, is_entry, irq_number, name) =
+            row_result.context("Failed to read IRQ event row")?;
+
+        cpu_events_map
+            .entry(cpu)
+            .or_default()
+            .push((ts, irq_type, is_entry, irq_number, name));
+        event_count += 1;
+    }
+
+    // Generate FtraceEventBundle packets for each CPU
+    for (cpu, events) in cpu_events_map {
+        for (ts, irq_type, is_entry, irq_number, name) in events {
+            let mut ftrace_event = FtraceEvent::new();
+            ftrace_event.set_timestamp(ts as u64);
+
+            // Create the appropriate event type based on irq_type and is_entry
+            match (irq_type.as_str(), is_entry) {
+                ("hardware", true) => {
+                    let mut irq_entry = IrqHandlerEntryFtraceEvent::new();
+                    if let Some(num) = irq_number {
+                        irq_entry.set_irq(num as i32);
+                    }
+                    if let Some(n) = name {
+                        irq_entry.set_name(n);
+                    }
+                    ftrace_event.event = Some(Event::IrqHandlerEntry(irq_entry));
+                }
+                ("hardware", false) => {
+                    let mut irq_exit = IrqHandlerExitFtraceEvent::new();
+                    if let Some(num) = irq_number {
+                        irq_exit.set_irq(num as i32);
+                    }
+                    ftrace_event.event = Some(Event::IrqHandlerExit(irq_exit));
+                }
+                ("software", true) => {
+                    let mut softirq_entry = SoftirqEntryFtraceEvent::new();
+                    if let Some(num) = irq_number {
+                        softirq_entry.set_vec(num);
+                    }
+                    ftrace_event.event = Some(Event::SoftirqEntry(softirq_entry));
+                }
+                ("software", false) => {
+                    let mut softirq_exit = SoftirqExitFtraceEvent::new();
+                    if let Some(num) = irq_number {
+                        softirq_exit.set_vec(num);
+                    }
+                    ftrace_event.event = Some(Event::SoftirqExit(softirq_exit));
+                }
+                _ => {
+                    eprintln!("Warning: Unknown IRQ type '{irq_type}', skipping event");
+                    continue;
+                }
+            }
+
+            // Wrap in FtraceEventBundle
+            let mut ftrace_bundle = FtraceEventBundle::new();
+            ftrace_bundle.set_cpu(cpu);
+            ftrace_bundle.event.push(ftrace_event);
+
+            let mut packet = TracePacket::new();
+            packet.set_trusted_packet_sequence_id(sequence_counter.fetch_add(1, Ordering::Relaxed));
+            packet.data = Some(Data::FtraceEvents(ftrace_bundle));
+            trace.packet.push(packet);
+        }
+    }
+
+    if event_count > 0 {
+        println!("Extracted {event_count} IRQ/SoftIRQ events");
+    }
+
     Ok(())
 }
 

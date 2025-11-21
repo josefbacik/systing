@@ -303,10 +303,27 @@ impl TraceOutput for SqliteOutput {
         Ok(())
     }
 
-    fn write_irq_event(&mut self, _event: &IrqEventData) -> Result<()> {
-        // The schema doesn't currently have an IRQ events table
-        // This could be added if IRQ tracking is needed
-        // For now, we'll just acknowledge the event
+    fn write_irq_event(&mut self, event: &IrqEventData) -> Result<()> {
+        let irq_type_str = match event.irq_type {
+            IrqType::Hardware => "hardware",
+            IrqType::Software => "software",
+        };
+
+        self.conn
+            .execute(
+                "INSERT INTO irq_events (ts, cpu, irq_type, is_entry, irq_number, name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    event.ts as i64,
+                    event.cpu,
+                    irq_type_str,
+                    if event.is_entry { 1 } else { 0 },
+                    event.irq_number,
+                    event.name,
+                ],
+            )
+            .context("Failed to write IRQ event")?;
+
         Ok(())
     }
 
