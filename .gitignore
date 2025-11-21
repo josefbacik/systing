@@ -3,3 +3,7 @@
 /src/bpf/*.skel.rs
 
 *.pb
+*.orig
+*.rej
+*.pyc
+/__pycache__
