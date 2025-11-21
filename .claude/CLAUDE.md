@@ -185,6 +185,10 @@ src/
     └── systing_system.bpf.c    # BPF programs
 ```
 
+- Place all temporary files, scratch scripts, and working files in `./scratch/`
+- Never create `.md`, `.py`, or `.sh` files in the project root unless explicitly requested
+- The `scratch/` directory is gitignored
+
 ## Dependencies
 
 Key dependencies:
