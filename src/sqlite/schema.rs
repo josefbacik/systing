@@ -373,7 +373,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(count, 1, "Table {} should exist", table);
+            assert_eq!(count, 1, "Table {table} should exist");
         }
     }
 

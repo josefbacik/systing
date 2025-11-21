@@ -1444,8 +1444,7 @@ mod tests {
         for (i, packet) in trace.packet.iter().enumerate() {
             assert!(
                 packet.trusted_packet_sequence_id() > 0,
-                "Packet {} should have a trusted_packet_sequence_id",
-                i
+                "Packet {i} should have a trusted_packet_sequence_id"
             );
         }
 
@@ -1455,8 +1454,7 @@ mod tests {
             let seq_id = packet.trusted_packet_sequence_id();
             assert!(
                 seen_ids.insert(seq_id),
-                "Duplicate sequence ID found: {}",
-                seq_id
+                "Duplicate sequence ID found: {seq_id}"
             );
         }
     }
@@ -1486,7 +1484,7 @@ mod tests {
             conn.execute("DELETE FROM clocks", []).unwrap();
 
             conn.execute(
-                &format!("INSERT INTO clocks (snapshot_id, clock_type, timestamp) VALUES (1, '{}', 1000000)", name),
+                &format!("INSERT INTO clocks (snapshot_id, clock_type, timestamp) VALUES (1, '{name}', 1000000)"),
                 [],
             )
             .unwrap();
@@ -1505,7 +1503,7 @@ mod tests {
                     expected_enum as u32
                 );
             } else {
-                panic!("Expected ClockSnapshot packet for clock '{}'", name);
+                panic!("Expected ClockSnapshot packet for clock '{name}'");
             }
         }
     }
@@ -2233,8 +2231,7 @@ mod tests {
         conn.execute(
             &format!(
                 "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-                 VALUES ({}, 0, 'switch', 200)",
-                ts1
+                 VALUES ({ts1}, 0, 'switch', 200)"
             ),
             [],
         )
@@ -2242,8 +2239,7 @@ mod tests {
         conn.execute(
             &format!(
                 "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-                 VALUES ({}, 0, 'switch', 200)",
-                ts2
+                 VALUES ({ts2}, 0, 'switch', 200)"
             ),
             [],
         )
@@ -2251,8 +2247,7 @@ mod tests {
         conn.execute(
             &format!(
                 "INSERT INTO sched_events (ts, cpu, event_type, next_pid)
-                 VALUES ({}, 0, 'switch', 200)",
-                ts3
+                 VALUES ({ts3}, 0, 'switch', 200)"
             ),
             [],
         )
