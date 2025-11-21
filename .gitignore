@@ -2,7 +2,9 @@
 
 /src/bpf/*.skel.rs
 
+*.db
 *.pb
+*.gz
 *.orig
 *.rej
 *.pyc
