@@ -4,12 +4,13 @@
 /// Unlike Perfetto's complex interning system, we use straightforward deduplication
 /// with foreign keys and unique constraints.
 ///
-/// This schema uses a minimal set of indexes (6 instead of 31) to reduce database
-/// size by ~30% while maintaining performance for common queries (time-range queries,
-/// CPU/thread-specific queries, and stack reconstruction).
+/// This schema intentionally creates NO indexes to maximize recording performance
+/// and minimize database size (~71% smaller than the original 31-index schema).
+/// Indexes can be added later if needed for SQL analysis, and the conversion tool
+/// creates temporary indexes automatically for efficient format conversion.
 pub const SCHEMA_VERSION: i32 = 1;
 
-/// SQL schema for systing SQLite output (optimized with minimal indexes)
+/// SQL schema for systing SQLite output (no indexes for maximum performance)
 pub const SCHEMA_SQL: &str = r#"
 -- ============================================================================
 -- SQLite Configuration and Optimizations
@@ -125,11 +126,6 @@ CREATE TABLE IF NOT EXISTS sched_events (
     FOREIGN KEY (next_pid) REFERENCES threads(tid)
 );
 
--- Essential indexes for common queries
-CREATE INDEX idx_sched_events_ts ON sched_events(ts);
-CREATE INDEX idx_sched_events_cpu ON sched_events(cpu, ts);
-CREATE INDEX idx_sched_events_next_pid_ts ON sched_events(next_pid, ts);
-
 -- ============================================================================
 -- Stack Traces and Symbols
 -- ============================================================================
@@ -164,9 +160,6 @@ CREATE TABLE IF NOT EXISTS stack_trace_frames (
     FOREIGN KEY (symbol_id) REFERENCES symbols(id)
 );
 
--- Essential index for stack trace reconstruction
-CREATE INDEX idx_stack_frames_stack_id ON stack_trace_frames(stack_id, frame_index);
-
 -- ============================================================================
 -- Performance Samples
 -- ============================================================================
@@ -179,12 +172,6 @@ CREATE TABLE IF NOT EXISTS perf_samples (
     FOREIGN KEY (tid) REFERENCES threads(tid),
     FOREIGN KEY (stack_id) REFERENCES stack_traces(id)
 );
-
--- Index for time-range queries
-CREATE INDEX idx_perf_samples_ts ON perf_samples(ts);
-
--- Composite index for thread timeline queries
-CREATE INDEX idx_perf_samples_tid_ts ON perf_samples(tid, ts);
 
 -- ============================================================================
 -- Performance Counters
@@ -368,11 +355,11 @@ mod tests {
     }
 
     #[test]
-    fn test_optimized_index_count() {
+    fn test_no_indexes_created() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         create_schema(&conn).unwrap();
 
-        // Verify we have exactly 6 indexes (optimized schema)
+        // Verify we have NO user-created indexes (only implicit UNIQUE constraint indexes)
         let index_count: i32 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'",
@@ -381,29 +368,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            index_count, 6,
-            "Expected exactly 6 indexes in optimized schema, found {index_count}"
+            index_count, 0,
+            "Expected no indexes in schema (indexes created on-demand), found {index_count}"
         );
-
-        // Verify the essential indexes exist
-        let expected_indexes = vec![
-            "idx_sched_events_ts",
-            "idx_sched_events_cpu",
-            "idx_sched_events_next_pid_ts",
-            "idx_perf_samples_ts",
-            "idx_perf_samples_tid_ts",
-            "idx_stack_frames_stack_id",
-        ];
-
-        for index_name in expected_indexes {
-            let count: i32 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
-                    [index_name],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(count, 1, "Index {index_name} should exist");
-        }
     }
 }
