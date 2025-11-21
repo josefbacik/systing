@@ -290,15 +290,17 @@ impl TraceOutput for SqliteOutput {
 
         self.conn
             .execute(
-                "INSERT INTO sched_events (ts, cpu, event_type, prev_pid, prev_state, next_pid)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO sched_events (ts, cpu, event_type, prev_pid, prev_state, prev_prio, next_pid, next_prio)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     event.ts as i64,
                     event.cpu,
                     event_type,
                     event.prev_pid,
                     prev_state_val,
+                    event.prev_prio,
                     event.next_pid,
+                    event.next_prio,
                 ],
             )
             .context("Failed to write scheduler event")?;
@@ -1088,5 +1090,84 @@ mod tests {
 
         let hash3 = SqliteOutput::compute_stack_hash(&stack3);
         assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_sched_event_priority_preservation() {
+        let mut output = create_test_db();
+
+        // Create a process and thread first
+        output
+            .write_process(1234, "test_process", &[])
+            .expect("Failed to write process");
+        output
+            .write_thread(5678, 1234, "test_thread")
+            .expect("Failed to write thread");
+        output
+            .write_thread(9999, 1234, "another_thread")
+            .expect("Failed to write thread");
+
+        // Write a switch event with priority values
+        let switch_event = SchedEventData {
+            ts: 1000000,
+            cpu: 0,
+            event_type: SchedEventType::Switch,
+            prev_pid: Some(5678),
+            prev_state: Some("1".to_string()),
+            prev_prio: Some(120),
+            next_pid: Some(9999),
+            next_prio: Some(100),
+            target_cpu: None,
+            latency: None,
+        };
+        output
+            .write_sched_event(&switch_event)
+            .expect("Failed to write sched event");
+
+        // Write a waking event with priority
+        let waking_event = SchedEventData {
+            ts: 1000100,
+            cpu: 0,
+            event_type: SchedEventType::Waking,
+            prev_pid: None,
+            prev_state: None,
+            prev_prio: None,
+            next_pid: Some(5678),
+            next_prio: Some(110),
+            target_cpu: Some(1),
+            latency: None,
+        };
+        output
+            .write_sched_event(&waking_event)
+            .expect("Failed to write sched event");
+
+        // Flush to database
+        output.flush().expect("Failed to flush");
+
+        // Verify priorities are stored
+        let conn = &output.conn;
+
+        // Check switch event
+        let (next_prio, prev_prio): (Option<i32>, Option<i32>) = conn
+            .query_row(
+                "SELECT next_prio, prev_prio FROM sched_events WHERE event_type = 'switch'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("Failed to query switch event");
+
+        assert_eq!(next_prio, Some(100), "Switch next_prio should be 100");
+        assert_eq!(prev_prio, Some(120), "Switch prev_prio should be 120");
+
+        // Check waking event
+        let next_prio: Option<i32> = conn
+            .query_row(
+                "SELECT next_prio FROM sched_events WHERE event_type = 'waking'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("Failed to query waking event");
+
+        assert_eq!(next_prio, Some(110), "Waking next_prio should be 110");
     }
 }

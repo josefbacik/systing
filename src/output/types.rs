@@ -46,7 +46,9 @@ pub struct SchedEventData {
     pub event_type: SchedEventType,
     pub prev_pid: Option<i32>,
     pub prev_state: Option<String>,
+    pub prev_prio: Option<i32>,
     pub next_pid: Option<i32>,
+    pub next_prio: Option<i32>,
     #[allow(dead_code)]
     pub target_cpu: Option<u32>,
     #[allow(dead_code)]

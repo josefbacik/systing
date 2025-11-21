@@ -282,13 +282,18 @@ impl SchedEventRecorder {
                 let pid = compact_sched.compact_sched.waking_pid[i];
                 let target_cpu = compact_sched.compact_sched.waking_target_cpu[i] as u32;
 
+                // Extract priority if available (may be empty in older traces)
+                let waking_prio = compact_sched.compact_sched.waking_prio.get(i).copied();
+
                 let event_data = SchedEventData {
                     ts: cumulative_waking_ts,
                     cpu: *cpu,
                     event_type: SchedEventType::Waking,
                     prev_pid: None,
                     prev_state: None,
+                    prev_prio: None,
                     next_pid: Some(pid),
+                    next_prio: waking_prio,
                     target_cpu: Some(target_cpu),
                     latency: None,
                 };
@@ -303,13 +308,18 @@ impl SchedEventRecorder {
                 let next_pid = compact_sched.compact_sched.switch_next_pid[i];
                 let prev_state = compact_sched.compact_sched.switch_prev_state[i];
 
+                // Extract priority if available (may be empty in older traces)
+                let next_prio = compact_sched.compact_sched.switch_next_prio.get(i).copied();
+
                 let event_data = SchedEventData {
                     ts: cumulative_switch_ts,
                     cpu: *cpu,
                     event_type: SchedEventType::Switch,
-                    prev_pid: None, // Not stored in compact format
+                    prev_pid: None, // prev_pid not in CompactSched format
                     prev_state: Some(format!("{prev_state}")),
+                    prev_prio: None, // prev_prio not in CompactSched format
                     next_pid: Some(next_pid),
+                    next_prio,
                     target_cpu: None,
                     latency: None,
                 };
@@ -331,7 +341,9 @@ impl SchedEventRecorder {
                         event_type: SchedEventType::WakeupNew,
                         prev_pid: None,
                         prev_state: None,
+                        prev_prio: None,
                         next_pid: Some(wakeup_new.pid()),
+                        next_prio: Some(wakeup_new.prio()),
                         target_cpu: Some(wakeup_new.target_cpu() as u32),
                         latency: None,
                     };
@@ -347,7 +359,9 @@ impl SchedEventRecorder {
                         event_type: SchedEventType::Exit,
                         prev_pid: Some(exit.pid()),
                         prev_state: None,
+                        prev_prio: Some(exit.prio()),
                         next_pid: None,
+                        next_prio: None,
                         target_cpu: None,
                         latency: None,
                     };
