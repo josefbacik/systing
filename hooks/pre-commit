@@ -1,20 +1,50 @@
 #!/bin/bash
 #
-# Pre-commit hook to enforce cargo fmt
+# Pre-commit hook to enforce cargo fmt and clippy
 #
-# This hook checks if the code is properly formatted before allowing a commit.
-# If formatting is needed, it will fail with a helpful message.
+# This hook checks if the code is properly formatted and passes clippy
+# before allowing a commit.
 
 # Colors
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
+# Track if any check fails
+FAILED=0
+
 # Check if code is formatted
+echo -ne "Checking formatting... "
 if cargo fmt --check &> /dev/null; then
-    echo -e "${GREEN}✓ cargo fmt check passed${NC}"
-    exit 0
+    echo -e "${GREEN}✓${NC}"
 else
-    echo -e "${RED}✗ cargo fmt check failed - run 'cargo fmt' to fix${NC}"
+    echo -e "${RED}✗ (run 'cargo fmt')${NC}"
+    FAILED=1
+fi
+
+# Check clippy with no-default-features
+echo -ne "Checking clippy (no-default-features)... "
+if cargo clippy --all-targets --no-default-features -- -D warnings &> /dev/null; then
+    echo -e "${GREEN}✓${NC}"
+else
+    echo -e "${RED}✗${NC}"
+    FAILED=1
+fi
+
+# Check clippy with pystacks feature
+echo -ne "Checking clippy (pystacks)... "
+if cargo clippy --all-targets --features pystacks -- -D warnings &> /dev/null; then
+    echo -e "${GREEN}✓${NC}"
+else
+    echo -e "${RED}✗${NC}"
+    FAILED=1
+fi
+
+# Exit with failure if any check failed
+if [ $FAILED -eq 1 ]; then
+    echo -e "\n${RED}Pre-commit checks failed. Please fix the issues above.${NC}"
     exit 1
+else
+    echo -e "\n${GREEN}All pre-commit checks passed!${NC}"
+    exit 0
 fi
