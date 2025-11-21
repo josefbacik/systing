@@ -64,7 +64,6 @@ pub struct SchedEventData {
 pub enum SchedEventType {
     Switch = 0,
     Waking = 1,
-    #[allow(dead_code)]
     Wakeup = 2,
     WakeupNew = 3,
     Exit = 4,

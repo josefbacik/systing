@@ -107,7 +107,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_recvs(&self) -> impl Iterator<Item = &NetworkEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::Recv(evt) => Some(evt),
@@ -115,7 +114,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_tcp_enqueue_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::TcpEnqueue(pkt) => Some(pkt),
@@ -123,7 +121,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_tcp_rcv_established_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::TcpRcvEstablished(pkt) => Some(pkt),
@@ -131,7 +128,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_tcp_queue_rcv_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::TcpQueueRcv(pkt) => Some(pkt),
@@ -139,7 +135,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_tcp_buffer_queue_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::TcpBufferQueue(pkt) => Some(pkt),
@@ -147,7 +142,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_udp_send_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::UdpSend(pkt) => Some(pkt),
@@ -155,7 +149,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_udp_rcv_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::UdpRcv(pkt) => Some(pkt),
@@ -163,7 +156,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_udp_enqueue_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::UdpEnqueue(pkt) => Some(pkt),
@@ -171,7 +163,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_shared_send_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::SharedSend(pkt) => Some(pkt),
