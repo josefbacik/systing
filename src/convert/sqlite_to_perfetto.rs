@@ -833,6 +833,10 @@ fn add_stack_trace_packets(
         }
     }
 
+    // Allocate a single sequence ID for both InternedData and PerfSample packets
+    // This is critical - they must share the same sequence ID for incremental state tracking
+    let stack_sequence_id = sequence_counter.fetch_add(1, Ordering::Relaxed);
+
     // Create InternedData packet with all the interned data
     if !function_names.is_empty() || !frames.is_empty() || !callstacks.is_empty() {
         // Capture lengths before moving data
@@ -849,8 +853,7 @@ fn add_stack_trace_packets(
             ..Default::default()
         };
         interned_packet.interned_data = Some(interned_data).into();
-        interned_packet
-            .set_trusted_packet_sequence_id(sequence_counter.fetch_add(1, Ordering::Relaxed));
+        interned_packet.set_trusted_packet_sequence_id(stack_sequence_id);
         interned_packet.set_sequence_flags(
             SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
                 | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
@@ -862,7 +865,7 @@ fn add_stack_trace_packets(
         );
     }
 
-    // Now create PerfSample packets
+    // Now create PerfSample packets - they must use the SAME sequence ID as InternedData
     let mut sample_stmt = conn
         .prepare("SELECT ts, tid, stack_id FROM perf_samples ORDER BY ts")
         .context("Failed to prepare perf samples query")?;
@@ -887,9 +890,9 @@ fn add_stack_trace_packets(
             perf_sample.set_callstack_iid(callstack_iid);
 
             let mut packet = TracePacket::new();
-            packet.set_trusted_packet_sequence_id(sequence_counter.fetch_add(1, Ordering::Relaxed));
+            packet.set_trusted_packet_sequence_id(stack_sequence_id);
             packet.set_timestamp(ts);
-            packet.data = Some(Data::PerfSample(perf_sample));
+            packet.set_perf_sample(perf_sample);
 
             trace.packet.push(packet);
             sample_count += 1;
