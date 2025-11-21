@@ -49,6 +49,7 @@ pub trait TraceOutput {
     // Track management
 
     /// Write track information for organizing events
+    #[allow(dead_code)]
     fn write_track(&mut self, track: &TrackInfo) -> Result<()>;
 
     // Scheduler events

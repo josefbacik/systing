@@ -726,7 +726,7 @@ fn add_counter_packets(
             "SELECT DISTINCT t.uuid, t.name, t.cpu, t.pid, t.tid, p.unit, p.is_incremental
              FROM tracks t
              LEFT JOIN perf_counters p ON t.uuid = p.track_uuid
-             WHERE t.track_type = 'counter'
+             WHERE t.is_counter = 1
              ORDER BY t.uuid",
         )
         .context("Failed to prepare counter track query")?;
@@ -808,7 +808,7 @@ fn add_counter_packets(
              FROM perf_counter_values pcv
              JOIN perf_counters pc ON pcv.counter_id = pc.id
              WHERE pc.track_uuid IN (
-                 SELECT uuid FROM tracks WHERE track_type = 'counter'
+                 SELECT uuid FROM tracks WHERE is_counter = 1
              )
              ORDER BY pc.track_uuid, pcv.ts",
         )

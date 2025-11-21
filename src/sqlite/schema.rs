@@ -8,7 +8,11 @@
 /// and minimize database size (~71% smaller than the original 31-index schema).
 /// Indexes can be added later if needed for SQL analysis, and the conversion tool
 /// creates temporary indexes automatically for efficient format conversion.
-pub const SCHEMA_VERSION: i32 = 1;
+///
+/// Schema version history:
+/// - v1: Initial schema with track_type TEXT
+/// - v2: Changed tracks.track_type TEXT to tracks.is_counter BOOLEAN
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// SQL schema for systing SQLite output (no indexes for maximum performance)
 pub const SCHEMA_SQL: &str = r#"
@@ -45,7 +49,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 
 INSERT INTO schema_version (version, description)
-VALUES (1, 'Initial schema');
+VALUES (2, 'Changed tracks.track_type TEXT to tracks.is_counter BOOLEAN');
 
 -- ============================================================================
 -- Trace Metadata
@@ -98,7 +102,7 @@ CREATE TABLE IF NOT EXISTS threads (
 CREATE TABLE IF NOT EXISTS tracks (
     uuid INTEGER PRIMARY KEY,
     name TEXT,
-    track_type TEXT,  -- 'process', 'thread', 'cpu', 'counter', etc.
+    is_counter BOOLEAN NOT NULL DEFAULT 0,  -- TRUE for counter tracks, FALSE otherwise
     parent_uuid INTEGER,
     pid INTEGER,
     tid INTEGER,

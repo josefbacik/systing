@@ -1786,12 +1786,12 @@ fn get_clock_name(clock_id: u32) -> String {
 /// Write trace data from SessionRecorder to a TraceOutput implementation
 ///
 /// This function writes all trace data including metadata, clock snapshots, processes,
-/// threads, tracks, and events from all recorders.
+/// threads, and events from all recorders.
 fn write_trace_to_output(
     recorder: &Arc<SessionRecorder>,
     output: &mut dyn TraceOutput,
 ) -> Result<()> {
-    use crate::output::{ClockInfo, TrackInfo, TrackType};
+    use crate::output::ClockInfo;
     use std::sync::atomic::AtomicUsize;
 
     // Create id_counter for generating unique IDs
@@ -1894,57 +1894,6 @@ fn write_trace_to_output(
             output.write_thread(tid, pid, "unknown")?;
             written_threads.insert(tid);
         }
-    }
-
-    // Write tracks for processes
-    {
-        let process_descriptors = recorder.process_descriptors.read().unwrap();
-
-        for process_desc in process_descriptors.values() {
-            let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            let track = TrackInfo {
-                uuid: track_uuid,
-                name: process_desc.process_name().to_string(),
-                parent_uuid: None,
-                track_type: TrackType::Process,
-                pid: Some(process_desc.pid()),
-                tid: None,
-            };
-            output.write_track(&track)?;
-        }
-    }
-
-    // Write tracks for threads
-    {
-        let threads = recorder.threads.read().unwrap();
-
-        for thread_desc in threads.values() {
-            let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            let track = TrackInfo {
-                uuid: track_uuid,
-                name: thread_desc.thread_name().to_string(),
-                parent_uuid: None,
-                track_type: TrackType::Thread,
-                pid: Some(thread_desc.pid()),
-                tid: Some(thread_desc.tid()),
-            };
-            output.write_track(&track)?;
-        }
-    }
-
-    // Write tracks for CPUs
-    let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
-    for cpu in 0..num_cpus {
-        let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-        let track = TrackInfo {
-            uuid: track_uuid,
-            name: format!("CPU {cpu}"),
-            parent_uuid: None,
-            track_type: TrackType::Cpu,
-            pid: None,
-            tid: None,
-        };
-        output.write_track(&track)?;
     }
 
     // Call write_output() for each recorder

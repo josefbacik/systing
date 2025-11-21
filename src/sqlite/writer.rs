@@ -248,22 +248,14 @@ impl TraceOutput for SqliteOutput {
     }
 
     fn write_track(&mut self, track: &TrackInfo) -> Result<()> {
-        let track_type = match track.track_type {
-            TrackType::Process => "process",
-            TrackType::Thread => "thread",
-            TrackType::Cpu => "cpu",
-            TrackType::Counter => "counter",
-            TrackType::Global => "global",
-        };
-
+        // General tracks (process/thread/cpu) are not counters
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO tracks (uuid, name, track_type, parent_uuid, pid, tid, cpu)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                "INSERT OR IGNORE INTO tracks (uuid, name, is_counter, parent_uuid, pid, tid, cpu)
+             VALUES (?1, ?2, 0, ?3, ?4, ?5, NULL)",
                 params![
                     track.uuid as i64,
                     track.name,
-                    track_type,
                     track.parent_uuid.map(|u| u as i64),
                     track.pid,
                     track.tid,
@@ -556,8 +548,8 @@ impl TraceOutput for SqliteOutput {
         // Insert track record
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO tracks (uuid, name, track_type, pid, tid, cpu)
-             VALUES (?1, ?2, 'counter', ?3, ?4, ?5)",
+                "INSERT OR IGNORE INTO tracks (uuid, name, is_counter, pid, tid, cpu)
+             VALUES (?1, ?2, 1, ?3, ?4, ?5)",
                 params![
                     uuid as i64,
                     track.name,
@@ -590,7 +582,7 @@ impl TraceOutput for SqliteOutput {
         let actual_uuid: i64 = self
             .conn
             .query_row(
-                "SELECT uuid FROM tracks WHERE name = ?1 AND track_type = 'counter'",
+                "SELECT uuid FROM tracks WHERE name = ?1 AND is_counter = 1",
                 params![track.name],
                 |row| row.get(0),
             )

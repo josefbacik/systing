@@ -17,6 +17,7 @@ pub struct ClockInfo {
 
 /// Track information for organizing events in the trace viewer
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TrackInfo {
     pub uuid: u64,
     pub name: String,
@@ -28,14 +29,11 @@ pub struct TrackInfo {
 
 /// Types of tracks for different event categories
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub enum TrackType {
     Process,
     Thread,
     Cpu,
-    #[allow(dead_code)]
-    Counter,
-    #[allow(dead_code)]
-    Global,
 }
 
 /// Scheduler event data with various event types
