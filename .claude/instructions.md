@@ -78,6 +78,20 @@ git add src/pystacks/bindings.rs
 - Follow Rust idioms and best practices
 - Address all clippy warnings
 
+## Temporary Files and Scratch Work
+
+**IMPORTANT**: All temporary files, scratch scripts, and working files MUST be placed in the `./scratch` directory.
+
+This includes:
+- Temporary .md files
+- Test/scratch .py scripts
+- Test/scratch .sh scripts
+- Any experimental or temporary work files
+
+**DO NOT** create these types of files in the project root unless explicitly asked by the user.
+
+The `./scratch` directory is the designated location for all temporary and experimental work.
+
 ## Before Committing
 
 **MANDATORY pre-commit checklist:**
