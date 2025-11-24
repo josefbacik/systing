@@ -23,7 +23,8 @@ use perfetto_protos::process_tree::{process_tree::Process as ProtoProcess, Proce
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use std::fs;
+use std::path::Path;
 
 #[derive(Default)]
 pub struct SysInfoEvent {
@@ -50,7 +51,6 @@ pub struct SessionRecorder {
     pub process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
     pub processes: RwLock<HashMap<u64, ProtoProcess>>,
     pub threads: RwLock<HashMap<u64, ThreadDescriptor>>,
-    pub system: Mutex<System>,
 }
 
 pub fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -120,7 +120,6 @@ impl SessionRecorder {
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
-            system: Mutex::new(System::new()),
         }
     }
 
@@ -140,59 +139,40 @@ impl SessionRecorder {
             .unwrap_or_default()
     }
 
-    /// Fetch name from sysinfo when comm is empty
-    fn fetch_name_from_system(&self, pid: Pid) -> String {
-        let mut system = self.system.lock().unwrap();
-
-        // Refresh with exe to get the process/thread name
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[pid]),
-            true,
-            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
-        );
-
-        if let Some(process) = system.process(pid) {
-            process.name().to_string_lossy().to_string()
-        } else {
-            String::new()
+    fn fetch_name_from_proc(pid: u32) -> String {
+        let exe_path = Path::new("/proc").join(pid.to_string()).join("exe");
+        if let Ok(exe) = fs::read_link(&exe_path) {
+            if let Some(name) = exe.file_name() {
+                return name.to_string_lossy().to_string();
+            }
         }
+        String::new()
     }
 
-    /// Fetch cmdline from sysinfo for a process
-    fn fetch_cmdline_from_system(&self, pid: Pid) -> Vec<String> {
-        let mut system = self.system.lock().unwrap();
-
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[pid]),
-            true,
-            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-        );
-
-        if let Some(process) = system.process(pid) {
-            process
-                .cmd()
-                .iter()
-                .map(|s| s.to_string_lossy().to_string())
+    fn fetch_cmdline_from_proc(pid: u32) -> Vec<String> {
+        let cmdline_path = Path::new("/proc").join(pid.to_string()).join("cmdline");
+        if let Ok(data) = fs::read(&cmdline_path) {
+            // cmdline is null-separated
+            data.split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).to_string())
                 .collect()
         } else {
             vec![]
         }
     }
 
-    /// Record a new process
     fn record_new_process(&self, info: &task_info) {
-        // Extract comm
         let comm = Self::extract_comm(info);
-        let pid = Pid::from_u32((info.tgidpid >> 32) as u32);
+        let pid = (info.tgidpid >> 32) as u32;
 
-        // Get process name and cmdline
         let process_name = if comm.is_empty() {
-            self.fetch_name_from_system(pid)
+            Self::fetch_name_from_proc(pid)
         } else {
             comm
         };
 
-        let cmdline = self.fetch_cmdline_from_system(pid);
+        let cmdline = Self::fetch_cmdline_from_proc(pid);
 
         // Create and store ProcessDescriptor
         let mut process_descriptor = ProcessDescriptor::default();
@@ -217,15 +197,12 @@ impl SessionRecorder {
             .insert(info.tgidpid, proto_process);
     }
 
-    /// Record a new thread
     fn record_new_thread(&self, info: &task_info) {
-        // Extract comm
         let comm = Self::extract_comm(info);
-        let tid = Pid::from_u32(info.tgidpid as u32);
+        let tid = info.tgidpid as u32;
 
-        // Get thread name
         let thread_name = if comm.is_empty() {
-            self.fetch_name_from_system(tid)
+            Self::fetch_name_from_proc(tid)
         } else {
             comm
         };
@@ -487,7 +464,6 @@ impl crate::SystingEvent for SysInfoEvent {
 mod tests {
     use super::*;
     use std::sync::{Mutex, RwLock};
-    use sysinfo::System;
 
     fn create_test_task_info(tgid: u32, pid: u32, comm: &str) -> task_info {
         let mut task = task_info {
@@ -516,7 +492,6 @@ mod tests {
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
-            system: Mutex::new(System::new()),
         }
     }
 

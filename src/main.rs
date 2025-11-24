@@ -964,46 +964,36 @@ fn discover_processes_with_mapping(
     use std::fs::File;
     use std::io::{BufRead, BufReader};
     use std::path::{Path, PathBuf};
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
     let mut discovered_pids = HashMap::new();
 
     let target_normalized = if target_path.contains('/') && !Path::new(target_path).is_absolute() {
-        // Try to canonicalize relative paths
         std::fs::canonicalize(target_path).unwrap_or_else(|e| {
             eprintln!("Warning: Could not resolve path '{target_path}': {e} - using as-is");
             PathBuf::from(target_path)
         })
     } else {
-        // Absolute paths or library names are used as-is
         PathBuf::from(target_path)
     };
 
     let target_str = target_normalized.to_string_lossy();
     let is_absolute = target_normalized.is_absolute();
 
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        false,
-        ProcessRefreshKind::everything().without_memory(),
-    );
+    let proc_dir = match std::fs::read_dir("/proc") {
+        Ok(dir) => dir,
+        Err(e) => return Err(anyhow::anyhow!("Failed to read /proc: {e}")),
+    };
 
-    for (pid, process) in system.processes() {
-        let pid_u32 = pid.as_u32();
+    for entry in proc_dir.filter_map(Result::ok) {
+        let pid_u32: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
+            Some(pid) if pid > 2 => pid,
+            _ => continue,
+        };
 
-        if pid_u32 <= 2 {
-            // Skip kernel processes (0=scheduler, 1=init, 2=kthreadd)
-            continue;
-        }
+        let proc_path = entry.path();
 
-        // Skip threads - only attach to thread group leaders (main processes)
-        // Check if this is a thread by reading /proc/PID/status
-        let status_path = PathBuf::from("/proc")
-            .join(pid_u32.to_string())
-            .join("status");
-
-        if let Ok(status) = std::fs::read_to_string(&status_path) {
+        // Skip threads - only process thread group leaders
+        if let Ok(status) = std::fs::read_to_string(proc_path.join("status")) {
             let mut is_thread = false;
             for line in status.lines() {
                 if let Some(tgid_str) = line.strip_prefix("Tgid:\t") {
@@ -1021,7 +1011,7 @@ fn discover_processes_with_mapping(
             }
         }
 
-        if let Some(exe) = process.exe() {
+        if let Ok(exe) = std::fs::read_link(proc_path.join("exe")) {
             if is_absolute {
                 if exe == target_normalized {
                     let exe_str = exe.to_string_lossy();
@@ -1031,7 +1021,6 @@ fn discover_processes_with_mapping(
                 }
             } else if let Some(exe_filename) = exe.file_name() {
                 let exe_name = exe_filename.to_string_lossy();
-                // Check if the executable name contains the target (e.g., "python3.11" contains "python")
                 if exe_name.contains(&*target_str) {
                     let exe_str = exe.to_string_lossy();
                     let resolved_path = format!("/proc/{pid_u32}/root{exe_str}");
@@ -1042,11 +1031,7 @@ fn discover_processes_with_mapping(
         }
 
         if check_maps {
-            let maps_path = PathBuf::from("/proc")
-                .join(pid_u32.to_string())
-                .join("maps");
-
-            let maps_file = match File::open(&maps_path) {
+            let maps_file = match File::open(proc_path.join("maps")) {
                 Ok(file) => file,
                 Err(_) => continue,
             };
@@ -1063,7 +1048,6 @@ fn discover_processes_with_mapping(
                     None => continue,
                 };
 
-                // Validate absolute path
                 if !mapped_path.starts_with('/') {
                     continue;
                 }
