@@ -202,6 +202,7 @@ impl StackRecorder {
                 &mut python_stack_markers,
                 &raw_stack.py_stack,
             );
+
             // Symbolize user space stack (per-process)
             stack_to_frames_mapping(
                 symbolizer,
@@ -211,12 +212,6 @@ impl StackRecorder {
                 id_counter,
                 raw_stack.user_stack.iter(),
                 progress_bar,
-            );
-            // Detect PyEval frames in user stack (must run after user stack symbolization)
-            self.psr.user_stack_to_python_calls(
-                &mut user_frame_map,
-                &self.global_func_manager,
-                &mut python_calls,
             );
 
             // Symbolize kernel stack
@@ -230,6 +225,13 @@ impl StackRecorder {
                 progress_bar,
             );
         }
+
+        // Detect PyEval frames in user stack (called once after all stacks are symbolized)
+        self.psr.user_stack_to_python_calls(
+            &mut user_frame_map,
+            &self.global_func_manager,
+            &mut python_calls,
+        );
 
         ResolvedStackInfo {
             user_frame_map,
