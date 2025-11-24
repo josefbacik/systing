@@ -515,6 +515,7 @@ where
 
 fn consume_loop<T, N>(
     recorder: &Mutex<T>,
+    session_recorder: &SessionRecorder,
     rx: Receiver<N>,
     stop_tx: Sender<()>,
     task_info_tx: Sender<task_info>,
@@ -528,16 +529,16 @@ fn consume_loop<T, N>(
             break;
         };
 
-        // Send task_info to process discovery thread
+        // Send task_info to process discovery thread only if not already known
         if let Some(task_info) = event.next_task_info() {
-            task_info_tx
-                .send(*task_info)
-                .expect("Failed to send task_info to discovery thread");
+            if !session_recorder.is_task_known(task_info) {
+                let _ = task_info_tx.send(*task_info);
+            }
         }
         if let Some(task_info) = event.prev_task_info() {
-            task_info_tx
-                .send(*task_info)
-                .expect("Failed to send task_info to discovery thread");
+            if !session_recorder.is_task_known(task_info) {
+                let _ = task_info_tx.send(*task_info);
+            }
         }
 
         // Send event to pystack symbol loading thread (with rate limiting)
@@ -586,6 +587,7 @@ fn spawn_recorder_threads(
                 .spawn(move || {
                     consume_loop::<SchedEventRecorder, task_event>(
                         &session_recorder.event_recorder,
+                        &session_recorder,
                         event_rx,
                         my_stop_tx,
                         my_task_tx,
@@ -608,6 +610,7 @@ fn spawn_recorder_threads(
                 .spawn(move || {
                     consume_loop::<StackRecorder, stack_event>(
                         &session_recorder.stack_recorder,
+                        &session_recorder,
                         stack_rx,
                         my_stop_tx,
                         my_task_tx,
@@ -629,6 +632,7 @@ fn spawn_recorder_threads(
                 .spawn(move || {
                     consume_loop::<SystingProbeRecorder, probe_event>(
                         &session_recorder.probe_recorder,
+                        &session_recorder,
                         probe_rx,
                         my_stop_tx,
                         my_task_tx,
@@ -650,6 +654,7 @@ fn spawn_recorder_threads(
                 .spawn(move || {
                     consume_loop::<network_recorder::NetworkRecorder, network_event>(
                         &session_recorder.network_recorder,
+                        &session_recorder,
                         network_rx,
                         my_stop_tx,
                         my_task_tx,
@@ -667,7 +672,9 @@ fn spawn_recorder_threads(
                 .spawn(move || {
                     while let Ok(event) = packet_rx.recv() {
                         if let Some(task_info) = event.next_task_info() {
-                            session_recorder.maybe_record_task(task_info);
+                            if !session_recorder.is_task_known(task_info) {
+                                session_recorder.maybe_record_task(task_info);
+                            }
                         }
                         session_recorder
                             .network_recorder
@@ -694,6 +701,7 @@ fn spawn_recorder_threads(
                 .spawn(move || {
                     consume_loop::<PerfCounterRecorder, perf_counter_event>(
                         &session_recorder.perf_counter_recorder,
+                        &session_recorder,
                         cache_rx,
                         my_stop_tx,
                         my_task_tx,
