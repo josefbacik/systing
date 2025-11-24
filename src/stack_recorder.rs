@@ -170,6 +170,250 @@ impl StackRecorder {
             eprintln!("Warning: Unable to initialize pystacks - Arc is already shared");
         }
     }
+
+    /// Symbolizes all stacks (user, kernel, and Python) and returns the resolved information
+    fn symbolize_stacks<'a>(
+        &self,
+        symbolizer: &mut Symbolizer,
+        stacks: &[StackEvent],
+        tgid: u32,
+        id_counter: &Arc<AtomicUsize>,
+        global_kernel_frame_map: &'a mut HashMap<u64, Vec<LocalFrame>>,
+        progress_bar: &Option<ProgressBar>,
+    ) -> ResolvedStackInfo<'a> {
+        let user_src = Source::Process(Process::new(Pid::from(tgid)));
+        let kernel_src = Source::Kernel(Kernel::default());
+
+        // Cache process metadata for this specific process
+        let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(tgid.into())));
+
+        let mut user_frame_map = HashMap::new();
+        let mut python_calls = Vec::new();
+        let mut python_stack_markers = Vec::new();
+
+        for stack in stacks.iter() {
+            let raw_stack = &stack.stack;
+
+            // Symbolize Python stack FIRST (per-process)
+            self.psr.pystacks_to_frames_mapping(
+                &mut user_frame_map,
+                &self.global_func_manager,
+                id_counter,
+                &mut python_stack_markers,
+                &raw_stack.py_stack,
+            );
+
+            // Symbolize user space stack (per-process)
+            stack_to_frames_mapping(
+                symbolizer,
+                &mut user_frame_map,
+                &self.global_func_manager,
+                &user_src,
+                id_counter,
+                raw_stack.user_stack.iter(),
+                progress_bar,
+            );
+
+            // Symbolize kernel stack
+            stack_to_frames_mapping(
+                symbolizer,
+                global_kernel_frame_map,
+                &self.global_func_manager,
+                &kernel_src,
+                id_counter,
+                raw_stack.kernel_stack.iter(),
+                progress_bar,
+            );
+        }
+
+        // Detect PyEval frames in user stack (called once after all stacks are symbolized)
+        self.psr.user_stack_to_python_calls(
+            &mut user_frame_map,
+            &self.global_func_manager,
+            &mut python_calls,
+        );
+
+        ResolvedStackInfo {
+            user_frame_map,
+            kernel_frame_map: global_kernel_frame_map,
+            python_calls,
+            python_stack_markers,
+        }
+    }
+
+    /// Process stacks for a single process and collect the interned data
+    fn process_tgid_stacks(
+        &self,
+        symbolizer: &mut Symbolizer,
+        tgid: u32,
+        stacks: &[StackEvent],
+        global_kernel_frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
+        ctx: &TraceContext,
+    ) -> (Vec<Callstack>, Vec<Frame>, Vec<Mapping>, Vec<TracePacket>) {
+        // Step 1: Symbolize all stacks
+        let resolved_info = self.symbolize_stacks(
+            symbolizer,
+            stacks,
+            tgid,
+            ctx.id_counter,
+            global_kernel_frame_map,
+            ctx.progress_bar,
+        );
+
+        // Step 2: Deduplicate stacks and collect interned data
+        let deduplicated_data =
+            deduplicate_stacks(stacks, &resolved_info, ctx.id_counter, &self.psr);
+
+        // Collect all interned data (only user frames/mappings from per-process data)
+        let callstacks: Vec<Callstack> = deduplicated_data.callstacks.values().cloned().collect();
+        let user_frames = collect_frames(&resolved_info.user_frame_map);
+        let user_mappings = collect_mappings(&resolved_info.user_frame_map);
+
+        // Step 3: Generate sample packets for this process
+        let sample_packets =
+            generate_sample_packets(stacks, &deduplicated_data.callstacks, ctx.sequence_id);
+
+        (callstacks, user_frames, user_mappings, sample_packets)
+    }
+
+    /// Create the interned data packet with all collected data
+    fn create_interned_packet(
+        &self,
+        callstacks: Vec<Callstack>,
+        frames: Vec<Frame>,
+        mappings: Vec<Mapping>,
+        sequence_id: u32,
+    ) -> Option<TracePacket> {
+        if callstacks.is_empty() && frames.is_empty() && mappings.is_empty() {
+            return None;
+        }
+
+        let mut interned_packet = TracePacket::default();
+        let interned_data = InternedData {
+            function_names: self.global_func_manager.get_all_functions(),
+            callstacks,
+            frames,
+            mappings,
+            ..Default::default()
+        };
+        interned_packet.interned_data = Some(interned_data).into();
+        interned_packet.set_trusted_packet_sequence_id(sequence_id);
+        interned_packet.set_sequence_flags(
+            SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
+                | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
+        );
+
+        Some(interned_packet)
+    }
+
+    pub fn generate_trace(&self, id_counter: &Arc<AtomicUsize>) -> Vec<TracePacket> {
+        // Get a unique sequence ID for this trace
+        let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
+
+        // Count all addresses that will need symbolization
+        let total_addresses = collect_total_addresses(&self.stacks);
+
+        // Create a single symbolizer to reuse across all processes
+        // This avoids the ~60ms initialization overhead per process
+        let mut symbolizer = if let Some(dispatcher) = &self.process_dispatcher {
+            let dispatcher = dispatcher.clone();
+            Symbolizer::builder()
+                .enable_code_info(true)
+                .enable_inlined_fns(true)
+                .set_process_dispatcher(move |info| dispatcher(info))
+                .build()
+        } else {
+            Symbolizer::builder()
+                .enable_code_info(true)
+                .enable_inlined_fns(true)
+                .build()
+        };
+
+        // Create a progress bar if we have addresses to process
+        let progress_bar = if total_addresses > 0 {
+            let pb = ProgressBar::new(total_addresses as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(
+                        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} symbols ({per_sec}, {eta})"
+                    )
+                    .expect("Failed to set progress bar template")
+                    .progress_chars("#>-"),
+            );
+            pb.set_message("Resolving stack symbols");
+            Some(pb)
+        } else {
+            None
+        };
+
+        // Process all stacks synchronously to avoid the interleaving issue
+        let mut all_packets = Vec::new();
+        let mut all_sample_packets = Vec::new();
+
+        // Collect all interned data from all processes
+        let mut all_callstacks = Vec::new();
+        let mut all_user_frames = Vec::new();
+        let mut all_user_mappings = Vec::new();
+
+        // Global kernel frame map shared across all processes
+        let mut global_kernel_frame_map = HashMap::new();
+
+        // Create trace context to pass common parameters
+        let ctx = TraceContext {
+            id_counter,
+            sequence_id,
+            progress_bar: &progress_bar,
+        };
+
+        // Process each tgid's stacks
+        for (tgid, stacks) in self.stacks.iter() {
+            let tgid = *tgid as u32;
+
+            let (callstacks, user_frames, user_mappings, sample_packets) = self
+                .process_tgid_stacks(
+                    &mut symbolizer,
+                    tgid,
+                    stacks,
+                    &mut global_kernel_frame_map,
+                    &ctx,
+                );
+
+            all_callstacks.extend(callstacks);
+            all_user_frames.extend(user_frames);
+            all_user_mappings.extend(user_mappings);
+            all_sample_packets.extend(sample_packets);
+        }
+
+        // Extract kernel frames and mappings from the global kernel frame map
+        let kernel_frames = collect_frames(&global_kernel_frame_map);
+        let kernel_mappings = collect_mappings(&global_kernel_frame_map);
+
+        // Combine user and kernel frames/mappings
+        let mut all_frames = Vec::new();
+        all_frames.extend(kernel_frames);
+        all_frames.extend(all_user_frames);
+
+        let mut all_mappings = Vec::new();
+        all_mappings.extend(kernel_mappings);
+        all_mappings.extend(all_user_mappings);
+
+        // Create a single interned data packet with everything
+        if let Some(interned_packet) =
+            self.create_interned_packet(all_callstacks, all_frames, all_mappings, sequence_id)
+        {
+            all_packets.push(interned_packet);
+        }
+
+        // Then add all the sample packets
+        all_packets.extend(all_sample_packets);
+
+        // Finish the progress bar
+        if let Some(pb) = progress_bar {
+            pb.finish_with_message("Stack symbol resolution complete");
+        }
+
+        all_packets
+    }
 }
 
 /// Holds the resolved stack information after symbolization
@@ -391,83 +635,11 @@ fn dispatch_process_with_client(
     }
 }
 
-/// Symbolizes all stacks (user, kernel, and Python) and returns the resolved information
-#[allow(clippy::too_many_arguments)]
-fn symbolize_stacks<'a>(
-    stacks: &[StackEvent],
-    tgid: u32,
-    id_counter: &Arc<AtomicUsize>,
-    psr: &Arc<StackWalkerRun>,
-    process_dispatcher: &Option<Arc<ProcessDispatcher>>,
-    global_func_manager: &Arc<GlobalFunctionManager>,
-    global_kernel_frame_map: &'a mut HashMap<u64, Vec<LocalFrame>>,
-    progress_bar: &Option<ProgressBar>,
-) -> ResolvedStackInfo<'a> {
-    let user_src = Source::Process(Process::new(Pid::from(tgid)));
-    let kernel_src = Source::Kernel(Kernel::default());
-
-    let mut symbolizer = if let Some(dispatcher) = process_dispatcher {
-        // Use the custom dispatcher if provided
-        let dispatcher = dispatcher.clone();
-        Symbolizer::builder()
-            .enable_code_info(true)
-            .enable_inlined_fns(true)
-            .set_process_dispatcher(move |info| dispatcher(info))
-            .build()
-    } else {
-        // Use default symbolizer
-        Symbolizer::builder()
-            .enable_code_info(true)
-            .enable_inlined_fns(true)
-            .build()
-    };
-
-    let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(tgid.into())));
-
-    let mut user_frame_map = HashMap::new();
-    let mut python_calls = Vec::new();
-    let mut python_stack_markers = Vec::new();
-
-    for stack in stacks.iter() {
-        let raw_stack = &stack.stack;
-        // Symbolize Python stack FIRST (per-process)
-        psr.pystacks_to_frames_mapping(
-            &mut user_frame_map,
-            global_func_manager,
-            id_counter,
-            &mut python_stack_markers,
-            &raw_stack.py_stack,
-        );
-        // Symbolize user space stack (per-process)
-        stack_to_frames_mapping(
-            &mut symbolizer,
-            &mut user_frame_map,
-            global_func_manager,
-            &user_src,
-            id_counter,
-            raw_stack.user_stack.iter(),
-            progress_bar,
-        );
-        // Detect PyEval frames in user stack (must run after user stack symbolization)
-        psr.user_stack_to_python_calls(&mut user_frame_map, global_func_manager, &mut python_calls);
-        // Symbolize kernel stack (global)
-        stack_to_frames_mapping(
-            &mut symbolizer,
-            global_kernel_frame_map,
-            global_func_manager,
-            &kernel_src,
-            id_counter,
-            raw_stack.kernel_stack.iter(),
-            progress_bar,
-        );
-    }
-
-    ResolvedStackInfo {
-        user_frame_map,
-        kernel_frame_map: global_kernel_frame_map,
-        python_calls,
-        python_stack_markers,
-    }
+/// Context for trace generation shared across symbolization calls
+struct TraceContext<'a> {
+    id_counter: &'a Arc<AtomicUsize>,
+    sequence_id: u32,
+    progress_bar: &'a Option<ProgressBar>,
 }
 
 /// Holds deduplicated stack data
@@ -668,162 +840,6 @@ fn collect_total_addresses(stacks: &HashMap<i32, Vec<StackEvent>>) -> usize {
                 + event.stack.py_stack.len()
         })
         .sum()
-}
-
-impl StackRecorder {
-    /// Process stacks for a single process and collect the interned data
-    fn process_tgid_stacks(
-        &self,
-        tgid: u32,
-        stacks: &[StackEvent],
-        id_counter: &Arc<AtomicUsize>,
-        global_kernel_frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-        sequence_id: u32,
-        progress_bar: &Option<ProgressBar>,
-    ) -> (Vec<Callstack>, Vec<Frame>, Vec<Mapping>, Vec<TracePacket>) {
-        // Step 1: Symbolize all stacks
-        let resolved_info = symbolize_stacks(
-            stacks,
-            tgid,
-            id_counter,
-            &self.psr,
-            &self.process_dispatcher,
-            &self.global_func_manager,
-            global_kernel_frame_map,
-            progress_bar,
-        );
-
-        // Step 2: Deduplicate stacks and collect interned data
-        let deduplicated_data = deduplicate_stacks(stacks, &resolved_info, id_counter, &self.psr);
-
-        // Collect all interned data (only user frames/mappings from per-process data)
-        let callstacks: Vec<Callstack> = deduplicated_data.callstacks.values().cloned().collect();
-        let user_frames = collect_frames(&resolved_info.user_frame_map);
-        let user_mappings = collect_mappings(&resolved_info.user_frame_map);
-
-        // Step 3: Generate sample packets for this process
-        let sample_packets =
-            generate_sample_packets(stacks, &deduplicated_data.callstacks, sequence_id);
-
-        (callstacks, user_frames, user_mappings, sample_packets)
-    }
-
-    /// Create the interned data packet with all collected data
-    fn create_interned_packet(
-        &self,
-        callstacks: Vec<Callstack>,
-        frames: Vec<Frame>,
-        mappings: Vec<Mapping>,
-        sequence_id: u32,
-    ) -> Option<TracePacket> {
-        if callstacks.is_empty() && frames.is_empty() && mappings.is_empty() {
-            return None;
-        }
-
-        let mut interned_packet = TracePacket::default();
-        let interned_data = InternedData {
-            function_names: self.global_func_manager.get_all_functions(),
-            callstacks,
-            frames,
-            mappings,
-            ..Default::default()
-        };
-        interned_packet.interned_data = Some(interned_data).into();
-        interned_packet.set_trusted_packet_sequence_id(sequence_id);
-        interned_packet.set_sequence_flags(
-            SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
-                | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
-        );
-
-        Some(interned_packet)
-    }
-
-    pub fn generate_trace(&self, id_counter: &Arc<AtomicUsize>) -> Vec<TracePacket> {
-        // Get a unique sequence ID for this trace
-        let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-
-        // Count all addresses that will need symbolization
-        let total_addresses = collect_total_addresses(&self.stacks);
-
-        // Create a progress bar if we have addresses to process
-        let progress_bar = if total_addresses > 0 {
-            let pb = ProgressBar::new(total_addresses as u64);
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template(
-                        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} symbols ({per_sec}, {eta})"
-                    )
-                    .expect("Failed to set progress bar template")
-                    .progress_chars("#>-"),
-            );
-            pb.set_message("Resolving stack symbols");
-            Some(pb)
-        } else {
-            None
-        };
-
-        // Process all stacks synchronously to avoid the interleaving issue
-        let mut all_packets = Vec::new();
-        let mut all_sample_packets = Vec::new();
-
-        // Collect all interned data from all processes
-        let mut all_callstacks = Vec::new();
-        let mut all_user_frames = Vec::new();
-        let mut all_user_mappings = Vec::new();
-
-        // Global kernel frame map shared across all processes
-        let mut global_kernel_frame_map = HashMap::new();
-
-        // Process each tgid's stacks
-        for (tgid, stacks) in self.stacks.iter() {
-            let tgid = *tgid as u32;
-
-            let (callstacks, user_frames, user_mappings, sample_packets) = self
-                .process_tgid_stacks(
-                    tgid,
-                    stacks,
-                    id_counter,
-                    &mut global_kernel_frame_map,
-                    sequence_id,
-                    &progress_bar,
-                );
-
-            all_callstacks.extend(callstacks);
-            all_user_frames.extend(user_frames);
-            all_user_mappings.extend(user_mappings);
-            all_sample_packets.extend(sample_packets);
-        }
-
-        // Extract kernel frames and mappings from the global kernel frame map
-        let kernel_frames = collect_frames(&global_kernel_frame_map);
-        let kernel_mappings = collect_mappings(&global_kernel_frame_map);
-
-        // Combine user and kernel frames/mappings
-        let mut all_frames = Vec::new();
-        all_frames.extend(kernel_frames);
-        all_frames.extend(all_user_frames);
-
-        let mut all_mappings = Vec::new();
-        all_mappings.extend(kernel_mappings);
-        all_mappings.extend(all_user_mappings);
-
-        // Create a single interned data packet with everything
-        if let Some(interned_packet) =
-            self.create_interned_packet(all_callstacks, all_frames, all_mappings, sequence_id)
-        {
-            all_packets.push(interned_packet);
-        }
-
-        // Then add all the sample packets
-        all_packets.extend(all_sample_packets);
-
-        // Finish the progress bar
-        if let Some(pb) = progress_bar {
-            pb.finish_with_message("Stack symbol resolution complete");
-        }
-
-        all_packets
-    }
 }
 
 #[cfg(test)]

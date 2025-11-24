@@ -467,7 +467,7 @@ fn consume_loop<T, N>(
                 .expect("Failed to send task_info to discovery thread");
         }
 
-        // Send event to pystack symbol loading thread
+        // Send event to pystack symbol loading thread (with rate limiting)
         if let Some(ref tx) = pystack_symbol_tx {
             tx.send(event)
                 .expect("Failed to send event to pystack symbol loader thread");
@@ -1858,7 +1858,7 @@ fn system(opts: Command) -> Result<()> {
         // Create channel for Python symbol loading
         let (pystack_symbol_tx, pystack_symbol_rx) = channel();
 
-        // Spawn dedicated Python symbol loading thread
+        // Spawn dedicated Python symbol loading thread with rate limiting
         let symbol_recorder = recorder.clone();
         let symbol_thread = thread::Builder::new()
             .name("pystack_symbol_loader".to_string())

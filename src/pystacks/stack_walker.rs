@@ -7,6 +7,8 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+#[cfg(feature = "pystacks")]
+use std::time::Instant;
 
 #[cfg(feature = "pystacks")]
 use {
@@ -88,6 +90,9 @@ impl fmt::Display for bindings::stack_walker_frame {
 #[cfg(feature = "pystacks")]
 pub struct StackWalkerRun {
     ptr: *mut bindings::stack_walker_run,
+    // Symbol loading rate limiting
+    last_symbol_load: std::cell::Cell<Option<Instant>>,
+    symbol_load_interval: std::time::Duration,
 }
 
 #[cfg(feature = "pystacks")]
@@ -95,6 +100,10 @@ impl StackWalkerRun {
     fn new() -> Self {
         StackWalkerRun {
             ptr: std::ptr::null_mut(),
+            last_symbol_load: std::cell::Cell::new(None),
+            // Load symbols at most once per 500ms (2 Hz) to catch dying processes
+            // while minimizing overhead on long traces
+            symbol_load_interval: std::time::Duration::from_millis(500),
         }
     }
 
@@ -395,8 +404,21 @@ impl StackWalkerRun {
     }
 
     pub fn load_pystack_symbols(&self, event: &stack_event) {
-        if self.initialized() && event.py_msg_buffer.stack_len > 0 {
+        if !self.initialized() || event.py_msg_buffer.stack_len == 0 {
+            return;
+        }
+
+        // Rate limit symbol loading - only reload if enough time has passed
+        // This catches dying processes while avoiding excessive BPF map scanning
+        let now = Instant::now();
+        let should_load = match self.last_symbol_load.get() {
+            None => true, // First time, always load
+            Some(last_load) => now.duration_since(last_load) >= self.symbol_load_interval,
+        };
+
+        if should_load {
             self.load_symbols();
+            self.last_symbol_load.set(Some(now));
         }
     }
 
