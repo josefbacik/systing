@@ -18,7 +18,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
 use std::process;
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -93,17 +93,21 @@ impl ShutdownSignal {
     }
 }
 
-struct AtomicBloomFilter {
-    bits: Box<[AtomicU64]>,
+/// Thread-local bloom filter for task deduplication.
+/// Each thread gets its own instance - no atomic operations needed.
+/// This trades a small increase in duplicate task_info messages
+/// (which the discovery thread handles anyway) for much lower CPU usage.
+struct ThreadLocalBloomFilter {
+    bits: Box<[u64]>,
     num_bits: usize,
 }
 
-impl AtomicBloomFilter {
+impl ThreadLocalBloomFilter {
     const NUM_HASHES: usize = 3;
 
     fn new(size_bytes: usize) -> Self {
         let num_u64s = size_bytes / 8;
-        let bits: Vec<AtomicU64> = (0..num_u64s).map(|_| AtomicU64::new(0)).collect();
+        let bits: Vec<u64> = vec![0; num_u64s];
         Self {
             bits: bits.into_boxed_slice(),
             num_bits: num_u64s * 64,
@@ -120,16 +124,17 @@ impl AtomicBloomFilter {
         (h as usize) % self.num_bits
     }
 
-    fn insert_and_check(&self, key: u64) -> bool {
+    fn insert_and_check(&mut self, key: u64) -> bool {
         let mut was_present = true;
         for i in 0..Self::NUM_HASHES {
             let bit_idx = self.hash(key, i);
             let word_idx = bit_idx / 64;
             let bit_offset = bit_idx % 64;
             let mask = 1u64 << bit_offset;
-            let old = self.bits[word_idx].fetch_or(mask, Ordering::Relaxed);
+            let old = self.bits[word_idx];
             if old & mask == 0 {
                 was_present = false;
+                self.bits[word_idx] = old | mask;
             }
         }
         was_present
@@ -558,7 +563,6 @@ where
 
 fn consume_loop<T, N>(
     recorder: &Mutex<T>,
-    task_bloom: &AtomicBloomFilter,
     rx: Receiver<N>,
     stop_tx: Sender<()>,
     task_info_tx: Sender<task_info>,
@@ -567,6 +571,9 @@ fn consume_loop<T, N>(
     T: SystingRecordEvent<N>,
     N: Plain + SystingEvent + Copy,
 {
+    // Each thread gets its own bloom filter - no atomic operations needed
+    let mut task_bloom = ThreadLocalBloomFilter::new(4096);
+
     loop {
         let Ok(event) = rx.recv() else {
             break;
@@ -601,7 +608,6 @@ fn consume_loop<T, N>(
 
 fn spawn_recorder_threads(
     recorder: &Arc<SessionRecorder>,
-    task_bloom: &Arc<AtomicBloomFilter>,
     channels: RecorderChannels,
     opts: &Command,
     stop_tx: &Sender<()>,
@@ -623,7 +629,6 @@ fn spawn_recorder_threads(
     // Always spawn sched recorder
     {
         let session_recorder = recorder.clone();
-        let bloom = task_bloom.clone();
         let my_stop_tx = stop_tx.clone();
         let my_task_tx = task_info_tx.clone();
         threads.push(
@@ -632,7 +637,6 @@ fn spawn_recorder_threads(
                 .spawn(move || {
                     consume_loop::<SchedEventRecorder, task_event>(
                         &session_recorder.event_recorder,
-                        &bloom,
                         event_rx,
                         my_stop_tx,
                         my_task_tx,
@@ -646,7 +650,6 @@ fn spawn_recorder_threads(
     // Always spawn stack recorder
     {
         let session_recorder = recorder.clone();
-        let bloom = task_bloom.clone();
         let my_stop_tx = stop_tx.clone();
         let my_task_tx = task_info_tx.clone();
         let my_pystack_tx = pystack_symbol_tx.clone();
@@ -656,7 +659,6 @@ fn spawn_recorder_threads(
                 .spawn(move || {
                     consume_loop::<StackRecorder, stack_event>(
                         &session_recorder.stack_recorder,
-                        &bloom,
                         stack_rx,
                         my_stop_tx,
                         my_task_tx,
@@ -670,7 +672,6 @@ fn spawn_recorder_threads(
     // Spawn probe recorder
     {
         let session_recorder = recorder.clone();
-        let bloom = task_bloom.clone();
         let my_stop_tx = stop_tx.clone();
         let my_task_tx = task_info_tx.clone();
         threads.push(
@@ -679,7 +680,6 @@ fn spawn_recorder_threads(
                 .spawn(move || {
                     consume_loop::<SystingProbeRecorder, probe_event>(
                         &session_recorder.probe_recorder,
-                        &bloom,
                         probe_rx,
                         my_stop_tx,
                         my_task_tx,
@@ -693,7 +693,6 @@ fn spawn_recorder_threads(
     // Spawn network recorder if network recording is enabled
     if opts.network {
         let session_recorder = recorder.clone();
-        let bloom = task_bloom.clone();
         let my_stop_tx = stop_tx.clone();
         let my_task_tx = task_info_tx.clone();
         threads.push(
@@ -702,7 +701,6 @@ fn spawn_recorder_threads(
                 .spawn(move || {
                     consume_loop::<network_recorder::NetworkRecorder, network_event>(
                         &session_recorder.network_recorder,
-                        &bloom,
                         network_rx,
                         my_stop_tx,
                         my_task_tx,
@@ -713,15 +711,16 @@ fn spawn_recorder_threads(
         );
 
         // Packet recorder: processes packet events into network_recorder
-        let bloom = task_bloom.clone();
         let session_recorder = recorder.clone();
         threads.push(
             thread::Builder::new()
                 .name("packet_recorder".to_string())
                 .spawn(move || {
+                    // Thread-local bloom filter for task deduplication
+                    let mut task_bloom = ThreadLocalBloomFilter::new(4096);
                     while let Ok(event) = packet_rx.recv() {
                         if let Some(task_info) = event.next_task_info() {
-                            if !bloom.insert_and_check(task_info.tgidpid) {
+                            if !task_bloom.insert_and_check(task_info.tgidpid) {
                                 session_recorder.maybe_record_task(task_info);
                             }
                         }
@@ -742,7 +741,6 @@ fn spawn_recorder_threads(
         drop(cache_rx);
     } else {
         let session_recorder = recorder.clone();
-        let bloom = task_bloom.clone();
         let my_stop_tx = stop_tx.clone();
         let my_task_tx = task_info_tx.clone();
         threads.push(
@@ -751,7 +749,6 @@ fn spawn_recorder_threads(
                 .spawn(move || {
                     consume_loop::<PerfCounterRecorder, perf_counter_event>(
                         &session_recorder.perf_counter_recorder,
-                        &bloom,
                         cache_rx,
                         my_stop_tx,
                         my_task_tx,
@@ -1963,9 +1960,6 @@ fn system(opts: Command) -> Result<()> {
         // Create channel for process discovery
         let (task_info_tx, task_info_rx) = channel();
 
-        // Create bloom filter for fast task deduplication (4KB, ~0.1% false positive rate for 1000 tasks)
-        let task_bloom = Arc::new(AtomicBloomFilter::new(4096));
-
         // Spawn dedicated process discovery thread
         let discovery_recorder = recorder.clone();
         let discovery_thread = thread::Builder::new()
@@ -1995,7 +1989,6 @@ fn system(opts: Command) -> Result<()> {
         // Spawn all recorder threads
         let recv_threads = spawn_recorder_threads(
             &recorder,
-            &task_bloom,
             channels,
             &opts,
             &stop_tx,
