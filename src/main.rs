@@ -1996,18 +1996,14 @@ fn system(opts: Command) -> Result<()> {
         // Create channel for Python symbol loading
         let (pystack_symbol_tx, pystack_symbol_rx) = channel();
 
-        // Spawn dedicated Python symbol loading thread with rate limiting
-        let symbol_recorder = recorder.clone();
+        // Spawn dedicated Python symbol loading thread
+        // Clone the Arc<StackWalkerRun> directly to avoid locking the entire StackRecorder
+        let psr = recorder.stack_recorder.lock().unwrap().psr.clone();
         let symbol_thread = thread::Builder::new()
             .name("pystack_symbol_loader".to_string())
             .spawn(move || {
                 while let Ok(event) = pystack_symbol_rx.recv() {
-                    symbol_recorder
-                        .stack_recorder
-                        .lock()
-                        .unwrap()
-                        .psr
-                        .load_pystack_symbols(&event);
+                    psr.load_pystack_symbols(&event);
                 }
                 0
             })?;
