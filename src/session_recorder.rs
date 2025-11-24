@@ -131,18 +131,6 @@ impl SessionRecorder {
         pid == tgid
     }
 
-    /// Check if a task (process or thread) is already known
-    pub fn is_task_known(&self, info: &task_info) -> bool {
-        if Self::is_process(info) {
-            self.process_descriptors
-                .read()
-                .unwrap()
-                .contains_key(&info.tgidpid)
-        } else {
-            self.threads.read().unwrap().contains_key(&info.tgidpid)
-        }
-    }
-
     /// Extract comm from task_info
     fn extract_comm(info: &task_info) -> String {
         CStr::from_bytes_until_nul(&info.comm)
