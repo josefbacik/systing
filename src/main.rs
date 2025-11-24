@@ -11,8 +11,9 @@ mod stack_recorder;
 
 use std::collections::HashMap;
 use std::env;
+use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
 use std::process;
@@ -49,9 +50,6 @@ use perfetto_protos::trace::Trace;
 use plain::Plain;
 use protobuf::Message;
 
-/// Duration to poll ringbuffers before checking for shutdown
-const RINGBUF_POLL_DURATION_MS: u64 = 100;
-
 /// Sample period for perf clock events (1ms = 1000 samples/sec)
 const PERF_CLOCK_SAMPLE_PERIOD: u64 = 1000;
 
@@ -63,6 +61,81 @@ const CONTINUOUS_MODE_STOP_DELAY_SECS: u64 = 1;
 
 /// Interval for refreshing system info like CPU frequency (100ms)
 const SYSINFO_REFRESH_INTERVAL_MS: u64 = 100;
+
+struct ShutdownSignal {
+    eventfd: OwnedFd,
+}
+
+impl ShutdownSignal {
+    fn new() -> io::Result<Self> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            eventfd: unsafe { OwnedFd::from_raw_fd(fd) },
+        })
+    }
+
+    fn signal(&self) {
+        let val: u64 = 1;
+        let _ = unsafe {
+            libc::write(
+                self.eventfd.as_raw_fd(),
+                &val as *const u64 as *const libc::c_void,
+                8,
+            )
+        };
+    }
+
+    fn fd(&self) -> RawFd {
+        self.eventfd.as_raw_fd()
+    }
+}
+
+fn create_ringbuf_epoll(ringbuf_fd: RawFd, shutdown_fd: RawFd) -> io::Result<OwnedFd> {
+    let epoll_fd = {
+        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    };
+
+    let mut ev = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: 0,
+    };
+    if unsafe {
+        libc::epoll_ctl(
+            epoll_fd.as_raw_fd(),
+            libc::EPOLL_CTL_ADD,
+            ringbuf_fd,
+            &mut ev,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut ev = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: 1,
+    };
+    if unsafe {
+        libc::epoll_ctl(
+            epoll_fd.as_raw_fd(),
+            libc::EPOLL_CTL_ADD,
+            shutdown_fd,
+            &mut ev,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(epoll_fd)
+}
 
 struct RecorderInfo {
     name: &'static str,
@@ -1628,6 +1701,7 @@ fn attach_probes(
 
 struct ThreadHandles {
     ringbuf_threads: Vec<thread::JoinHandle<i32>>,
+    sysinfo_thread: Option<thread::JoinHandle<i32>>,
     recorder_threads: Vec<thread::JoinHandle<i32>>,
     discovery_thread: thread::JoinHandle<i32>,
     symbol_loader_thread: thread::JoinHandle<i32>,
@@ -1640,7 +1714,7 @@ fn run_tracing_loop(
     opts: &Command,
     stop_tx: Sender<()>,
     stop_rx: Receiver<()>,
-    thread_done: Arc<AtomicBool>,
+    ringbuf_shutdown: Arc<ShutdownSignal>,
     shutdown_signal: Arc<AtomicBool>,
     skel: &mut systing::SystingSystemSkel,
 ) -> Result<()> {
@@ -1670,11 +1744,14 @@ fn run_tracing_loop(
     }
     println!("Stopping...");
     skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
-    thread_done.store(true, Ordering::Relaxed);
+    ringbuf_shutdown.signal();
     for thread in handles.ringbuf_threads {
         thread.join().expect("Failed to join thread");
     }
     shutdown_signal.store(true, Ordering::Relaxed);
+    if let Some(thread) = handles.sysinfo_thread {
+        thread.join().expect("Failed to join sysinfo thread");
+    }
     for thread in handles.recorder_threads {
         thread.join().expect("Failed to join receiver thread");
     }
@@ -1896,19 +1973,36 @@ fn system(opts: Command) -> Result<()> {
         // Attach any usdt's that we may have
         let _probe_links = attach_probes(&mut skel, &recorder, &opts, old_kernel)?;
 
-        let mut threads = Vec::new();
-        let thread_done = Arc::new(AtomicBool::new(false));
+        let mut ringbuf_threads = Vec::new();
+        let ringbuf_shutdown = Arc::new(ShutdownSignal::new()?);
         for (name, ring) in rings {
-            let thread_done_clone = thread_done.clone();
-            threads.push(thread::Builder::new().name(name).spawn(move || {
+            let shutdown_fd = ringbuf_shutdown.fd();
+            let epoll_fd = create_ringbuf_epoll(ring.epoll_fd(), shutdown_fd)?;
+            ringbuf_threads.push(thread::Builder::new().name(name).spawn(move || {
+                let mut events = [libc::epoll_event { events: 0, u64: 0 }; 2];
                 loop {
-                    if thread_done_clone.load(Ordering::Relaxed) {
-                        // Flush whatever is left in the ringbuf
-                        let _ = ring.consume();
+                    let n = unsafe {
+                        libc::epoll_wait(epoll_fd.as_raw_fd(), events.as_mut_ptr(), 2, -1)
+                    };
+
+                    if n < 0 {
+                        let err = io::Error::last_os_error();
+                        if err.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
                         break;
                     }
-                    let res = ring.poll(Duration::from_millis(RINGBUF_POLL_DURATION_MS));
-                    if res.is_err() {
+
+                    let mut should_exit = false;
+                    for event in events.iter().take(n as usize) {
+                        if event.u64 == 1 {
+                            should_exit = true;
+                        }
+                    }
+
+                    let _ = ring.consume();
+
+                    if should_exit {
                         break;
                     }
                 }
@@ -1917,10 +2011,11 @@ fn system(opts: Command) -> Result<()> {
         }
 
         // Start the sysinfo recorder if it's enabled
+        let mut sysinfo_thread = None;
         if opts.cpu_frequency {
-            let thread_done_clone = thread_done.clone();
+            let shutdown_clone = shutdown_signal.clone();
             let sysinfo_recorder = recorder.clone();
-            threads.push(
+            sysinfo_thread = Some(
                 thread::Builder::new()
                     .name("sysinfo_recorder".to_string())
                     .spawn(move || {
@@ -1930,7 +2025,7 @@ fn system(opts: Command) -> Result<()> {
                         );
 
                         loop {
-                            if thread_done_clone.load(Ordering::Relaxed) {
+                            if shutdown_clone.load(Ordering::Relaxed) {
                                 break;
                             }
                             sys.refresh_cpu_frequency();
@@ -1955,7 +2050,8 @@ fn system(opts: Command) -> Result<()> {
         }
 
         let handles = ThreadHandles {
-            ringbuf_threads: threads,
+            ringbuf_threads,
+            sysinfo_thread,
             recorder_threads: recv_threads,
             discovery_thread,
             symbol_loader_thread: symbol_thread,
@@ -1968,7 +2064,7 @@ fn system(opts: Command) -> Result<()> {
             &opts,
             stop_tx,
             stop_rx,
-            thread_done,
+            ringbuf_shutdown,
             shutdown_signal,
             &mut skel,
         )?;
