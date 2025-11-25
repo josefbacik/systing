@@ -9,7 +9,7 @@ Usage:
     ./analyze_trace.py trace.pb [--format json|markdown] [--output summary.md]
 
 Requirements:
-    - trace_processor_shell (from Perfetto)
+    - trace_processor (from Perfetto)
     - Python 3.8+
 """
 
@@ -93,33 +93,33 @@ class TraceSummary:
 
 
 class TraceProcessor:
-    """Wrapper around trace_processor_shell"""
+    """Wrapper around trace_processor"""
 
     def __init__(self, trace_path: str):
         self.trace_path = trace_path
         self.tp_path = self._find_trace_processor()
 
     def _find_trace_processor(self) -> str:
-        """Find trace_processor_shell in PATH or common locations"""
+        """Find trace_processor in PATH or common locations"""
         # Check PATH first
-        for name in ['trace_processor_shell', 'trace_processor']:
+        for name in ['trace_processor', 'trace_processor_shell']:
             result = subprocess.run(['which', name], capture_output=True, text=True)
             if result.returncode == 0:
                 return result.stdout.strip()
 
         # Check common locations
         common_paths = [
-            '/usr/local/bin/trace_processor_shell',
-            '/usr/bin/trace_processor_shell',
-            os.path.expanduser('~/perfetto/out/linux/trace_processor_shell'),
-            os.path.expanduser('~/.local/bin/trace_processor_shell'),
+            '/usr/local/bin/trace_processor',
+            '/usr/bin/trace_processor',
+            os.path.expanduser('~/perfetto/out/linux/trace_processor'),
+            os.path.expanduser('~/.local/bin/trace_processor'),
         ]
         for path in common_paths:
             if os.path.exists(path):
                 return path
 
         raise FileNotFoundError(
-            "trace_processor_shell not found. Install from: "
+            "trace_processor not found. Install from: "
             "https://perfetto.dev/docs/quickstart/trace-analysis"
         )
 
