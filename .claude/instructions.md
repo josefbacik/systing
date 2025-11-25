@@ -42,7 +42,9 @@ cargo fmt
 
 ## Generated Files
 
-The `src/pystacks/bindings.rs` file is **generated from C++ headers** using bindgen and is **committed to the repository**. This avoids requiring all developers to have the C++ build dependencies (libfmt-dev, libre2-dev, libcap-dev) installed.
+The `src/pystacks/bindings.rs` file is **generated from C++ headers** using bindgen and is **committed to the repository**. This avoids requiring bindgen to regenerate the Rust bindings from C++ headers.
+
+**Note:** Building with `--features pystacks` still requires the C++ libraries (libfmt, libre2, libcap) and LLVM to be installed. See the README.md for installation instructions.
 
 **When to regenerate:**
 - After updating the `strobelight-libs` submodule
