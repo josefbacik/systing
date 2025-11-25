@@ -1169,6 +1169,15 @@ fn configure_bpf_skeleton(
         if opts.syscalls {
             rodata.tool_config.collect_syscalls = 1;
         }
+
+        // Set wakeup threshold to 50% of ringbuf size for batched wakeups
+        // Default ringbuf size is 50 MiB if not specified
+        let ringbuf_size = if opts.ringbuf_size_mib > 0 {
+            opts.ringbuf_size_mib as u64 * 1024 * 1024
+        } else {
+            50 * 1024 * 1024 // Default 50 MiB
+        };
+        rodata.tool_config.wakeup_data_size = ringbuf_size / 2;
     }
 
     // Configure ringbuf size if specified
