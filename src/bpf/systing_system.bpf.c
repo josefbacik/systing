@@ -50,6 +50,7 @@ const volatile struct {
 	u32 collect_pystacks;
 	u32 collect_syscalls;
 	u32 confidentiality_mode;
+	u64 wakeup_data_size;  /* Ringbuf fill threshold for wakeup (0 = default) */
 } tool_config = {};
 
 enum event_type {
@@ -598,7 +599,22 @@ struct {
 	},
 };
 
-static struct task_event *reserve_task_event(void)
+/*
+ * Helper to determine wakeup flags based on ringbuf fill level.
+ * Uses the kernel's recommended pattern from ringbuf_bench.c
+ */
+static __always_inline long get_ringbuf_flags(void *rb)
+{
+	long sz;
+
+	if (!tool_config.wakeup_data_size)
+		return 0;
+
+	sz = bpf_ringbuf_query(rb, BPF_RB_AVAIL_DATA);
+	return sz >= tool_config.wakeup_data_size ? BPF_RB_FORCE_WAKEUP : BPF_RB_NO_WAKEUP;
+}
+
+static struct task_event *reserve_task_event(long *flags)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
 	void *rb;
@@ -606,10 +622,11 @@ static struct task_event *reserve_task_event(void)
 	rb = bpf_map_lookup_elem(&ringbufs, &node);
 	if (!rb)
 		return NULL;
+	*flags = get_ringbuf_flags(rb);
 	return bpf_ringbuf_reserve(rb, sizeof(struct task_event), 0);
 }
 
-static struct stack_event *reserve_stack_event(void)
+static struct stack_event *reserve_stack_event(long *flags)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
 	void *rb;
@@ -617,10 +634,11 @@ static struct stack_event *reserve_stack_event(void)
 	rb = bpf_map_lookup_elem(&stack_ringbufs, &node);
 	if (!rb)
 		return NULL;
+	*flags = get_ringbuf_flags(rb);
 	return bpf_ringbuf_reserve(rb, sizeof(struct stack_event), 0);
 }
 
-static struct perf_counter_event *reserve_perf_counter_event(void)
+static struct perf_counter_event *reserve_perf_counter_event(long *flags)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
 	void *rb;
@@ -628,10 +646,11 @@ static struct perf_counter_event *reserve_perf_counter_event(void)
 	rb = bpf_map_lookup_elem(&perf_counter_ringbufs, &node);
 	if (!rb)
 		return NULL;
+	*flags = get_ringbuf_flags(rb);
 	return bpf_ringbuf_reserve(rb, sizeof(struct perf_counter_event), 0);
 }
 
-static struct probe_event *reserve_probe_event(void)
+static struct probe_event *reserve_probe_event(long *flags)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
 	void *rb;
@@ -639,10 +658,11 @@ static struct probe_event *reserve_probe_event(void)
 	rb = bpf_map_lookup_elem(&probe_ringbufs, &node);
 	if (!rb)
 		return NULL;
+	*flags = get_ringbuf_flags(rb);
 	return bpf_ringbuf_reserve(rb, sizeof(struct probe_event), 0);
 }
 
-static struct network_event *reserve_network_event(void)
+static struct network_event *reserve_network_event(long *flags)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
 	void *rb;
@@ -650,10 +670,11 @@ static struct network_event *reserve_network_event(void)
 	rb = bpf_map_lookup_elem(&network_ringbufs, &node);
 	if (!rb)
 		return NULL;
+	*flags = get_ringbuf_flags(rb);
 	return bpf_ringbuf_reserve(rb, sizeof(struct network_event), 0);
 }
 
-static struct packet_event *reserve_packet_event(void)
+static struct packet_event *reserve_packet_event(long *flags)
 {
 	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
 	void *rb;
@@ -661,6 +682,7 @@ static struct packet_event *reserve_packet_event(void)
 	rb = bpf_map_lookup_elem(&packet_ringbufs, &node);
 	if (!rb)
 		return NULL;
+	*flags = get_ringbuf_flags(rb);
 	return bpf_ringbuf_reserve(rb, sizeof(struct packet_event), 0);
 }
 
@@ -693,6 +715,8 @@ struct systing_pid_filter filter = {0, 0};
 
 static bool should_filter_systing(struct task_struct *task)
 {
+	return false;
+
 	// If filter is initialized, check against kernel namespace TGID
 	if (filter.initialized) {
 		return task->tgid == filter.kernel_tgid;
@@ -834,7 +858,8 @@ static void emit_stack_event(void *ctx,struct task_struct *task,
 	if (!trace_task(task))
 		return;
 
-	event = reserve_stack_event();
+	long flags;
+	event = reserve_stack_event(&flags);
 	if (!event) {
 		handle_missed_event(MISSED_STACK_EVENT);
 		return;
@@ -872,7 +897,7 @@ static void emit_stack_event(void *ctx,struct task_struct *task,
 		event->kernel_stack_length = len / sizeof(u64);
 	else
 		event->kernel_stack_length = 0;
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 }
 
 static int trace_irq_event(struct irqaction *action, int irq, int ret, bool enter)
@@ -883,7 +908,8 @@ static int trace_irq_event(struct irqaction *action, int irq, int ret, bool ente
 		return 0;
 
 	struct task_event *event;
-	event = reserve_task_event();
+	long flags;
+	event = reserve_task_event(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_SCHED_EVENT);
 	event->ts = bpf_ktime_get_boot_ns();
@@ -902,7 +928,7 @@ static int trace_irq_event(struct irqaction *action, int irq, int ret, bool ente
 		event->type = SCHED_IRQ_EXIT;
 		event->next_prio = ret;
 	}
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 	return 0;
 }
 
@@ -914,7 +940,8 @@ static int trace_softirq_event(unsigned int vec_nr, bool enter)
 		return 0;
 
 	struct task_event *event;
-	event = reserve_task_event();
+	long flags;
+	event = reserve_task_event(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_SCHED_EVENT);
 	event->ts = bpf_ktime_get_boot_ns();
@@ -922,7 +949,7 @@ static int trace_softirq_event(unsigned int vec_nr, bool enter)
 	record_task_info(&event->prev, tsk);
 	event->target_cpu = vec_nr;
 	event->type = enter ? SCHED_SOFTIRQ_ENTER : SCHED_SOFTIRQ_EXIT;
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 	return 0;
 }
 
@@ -930,13 +957,14 @@ static int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 			 enum event_type type)
 {
 	struct task_event *event;
+	long flags;
 	u64 ts = bpf_ktime_get_boot_ns();
 	u64 key = task_key(wakee);
 
 	if (type == SCHED_WAKING || type == SCHED_WAKEUP_NEW)
 		bpf_map_update_elem(&wake_ts, &key, &ts, BPF_ANY);
 
-	event = reserve_task_event();
+	event = reserve_task_event(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_SCHED_EVENT);
 	event->ts = ts;
@@ -946,7 +974,7 @@ static int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 	event->target_cpu = task_cpu(wakee);
 	record_task_info(&event->prev, waker);
 	record_task_info(&event->next, wakee);
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 	return 0;
 }
 
@@ -984,6 +1012,7 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 			       struct task_struct *next)
 {
 	struct task_event *event;
+	long flags;
 	u64 next_key = task_key(next);
 	u64 ts = bpf_ktime_get_boot_ns();
 	u64 latency = 0;
@@ -999,7 +1028,7 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 		bpf_map_delete_elem(&wake_ts, &next_key);
 	}
 
-	event = reserve_task_event();
+	event = reserve_task_event(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_SCHED_EVENT);
 
@@ -1012,7 +1041,7 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 	event->prev_state = prev->__state;
 	event->next_prio = next->prio;
 	event->prev_prio = prev->prio;
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 
 	/* Record the blocked stack trace. */
 	if (!tool_config.no_sleep_stack_traces && prev->__state & TASK_UNINTERRUPTIBLE)
@@ -1045,12 +1074,13 @@ int BPF_PROG(systing_sched_waking, struct task_struct *task)
 static int handle_sched_process_exit(struct task_struct *task)
 {
 	struct task_event *event;
+	long flags;
 	u64 ts = bpf_ktime_get_boot_ns();
 
 	if (!trace_task(task))
 		return 0;
 
-	event = reserve_task_event();
+	event = reserve_task_event(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_SCHED_EVENT);
 	event->ts = ts;
@@ -1058,7 +1088,7 @@ static int handle_sched_process_exit(struct task_struct *task)
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->prev, task);
 	event->prev_prio = task->prio;
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 	return 0;
 }
 
@@ -1126,7 +1156,8 @@ int systing_usdt(struct pt_regs *ctx)
 		return 0;
 
 	u64 cookie = bpf_usdt_cookie(ctx);
-	struct probe_event *event = reserve_probe_event();
+	long flags;
+	struct probe_event *event = reserve_probe_event(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_PROBE_EVENT);
 
@@ -1168,7 +1199,7 @@ int systing_usdt(struct pt_regs *ctx)
 			}
 		}
 	}
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 
 	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
 	if (should_capture_stack && *should_capture_stack)
@@ -1189,8 +1220,9 @@ static void read_counters(void *ctx, struct task_struct *task)
 
 	for (int i = 0; i < tool_config.num_perf_counters; i++, key += tool_config.num_cpus) {
 		int err;
+		long flags;
 
-		struct perf_counter_event *event = reserve_perf_counter_event();
+		struct perf_counter_event *event = reserve_perf_counter_event(&flags);
 		if (!event) {
 			handle_missed_event(MISSED_CACHE_EVENT);
 			continue;
@@ -1217,7 +1249,7 @@ static void read_counters(void *ctx, struct task_struct *task)
 		event->cpu = cpu;
 		event->counter_num = i;
 		record_task_info(&event->task, task);
-		bpf_ringbuf_submit(event, 0);
+		bpf_ringbuf_submit(event, flags);
 	}
 }
 
@@ -1239,7 +1271,8 @@ static void handle_probe_event(struct pt_regs *ctx, bool kernel)
 		return;
 
 	u64 cookie = bpf_get_attach_cookie(ctx);
-	struct probe_event *event = reserve_probe_event();
+	long flags;
+	struct probe_event *event = reserve_probe_event(&flags);
 	if (!event) {
 		handle_missed_event(MISSED_PROBE_EVENT);
 		return;
@@ -1302,7 +1335,7 @@ static void handle_probe_event(struct pt_regs *ctx, bool kernel)
 			}
 		}
 	}
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 
 	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
 	if (should_capture_stack && *should_capture_stack)
@@ -1343,7 +1376,8 @@ int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
 		return 0;
 
 	u64 cookie = bpf_get_attach_cookie(args);
-	struct probe_event *event = reserve_probe_event();
+	long flags;
+	struct probe_event *event = reserve_probe_event(&flags);
 	if (!event) {
 		handle_missed_event(MISSED_PROBE_EVENT);
 		return 0;
@@ -1398,7 +1432,7 @@ int systing_raw_tracepoint(struct bpf_raw_tracepoint_args *args)
 			}
 		}
 	}
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 
 	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
 	if (should_capture_stack && *should_capture_stack)
@@ -1419,7 +1453,8 @@ int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
 		return 0;
 
 	u64 cookie = bpf_get_attach_cookie(args);
-	struct probe_event *event = reserve_probe_event();
+	long flags;
+	struct probe_event *event = reserve_probe_event(&flags);
 	if (!event) {
 		handle_missed_event(MISSED_PROBE_EVENT);
 		return 0;
@@ -1431,7 +1466,7 @@ int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
 	event->cookie = cookie;
 	event->num_args = 0;
 
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 
 	u8 *should_capture_stack = bpf_map_lookup_elem(&event_stack_capture, &cookie);
 	if (should_capture_stack && *should_capture_stack)
@@ -1450,7 +1485,8 @@ int tracepoint__raw_syscalls__sys_enter(struct trace_event_raw_sys_enter *ctx)
 	if (!trace_task(task))
 		return 0;
 
-	struct probe_event *event = reserve_probe_event();
+	long flags;
+	struct probe_event *event = reserve_probe_event(&flags);
 	if (!event) {
 		handle_missed_event(MISSED_PROBE_EVENT);
 		return 0;
@@ -1465,7 +1501,7 @@ int tracepoint__raw_syscalls__sys_enter(struct trace_event_raw_sys_enter *ctx)
 	event->args[0].size = sizeof(u64);
 	__builtin_memcpy(&event->args[0].value, &ctx->id, sizeof(u64));
 
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 	return 0;
 }
 
@@ -1479,7 +1515,8 @@ int tracepoint__raw_syscalls__sys_exit(struct trace_event_raw_sys_exit *ctx)
 	if (!trace_task(task))
 		return 0;
 
-	struct probe_event *event = reserve_probe_event();
+	long flags;
+	struct probe_event *event = reserve_probe_event(&flags);
 	if (!event) {
 		handle_missed_event(MISSED_PROBE_EVENT);
 		return 0;
@@ -1497,7 +1534,7 @@ int tracepoint__raw_syscalls__sys_exit(struct trace_event_raw_sys_exit *ctx)
 	event->args[1].size = sizeof(u64);
 	__builtin_memcpy(&event->args[1].value, &ctx->ret, sizeof(u64));
 
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 	return 0;
 }
 
@@ -1613,7 +1650,8 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 		return 0;
 	}
 
-	struct network_event *event = reserve_network_event();
+	long flags;
+	struct network_event *event = reserve_network_event(&flags);
 	if (!event) {
 		bpf_map_delete_elem(&pending_network_sends, &tgidpid);
 		return handle_missed_event(MISSED_NETWORK_EVENT);
@@ -1631,7 +1669,7 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 	event->bytes = (u32)ret;  // Return value is number of bytes sent
 	event->sendmsg_seq = info->sendmsg_seq;  // TCP sequence at sendmsg time
 
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 	bpf_map_delete_elem(&pending_network_sends, &tgidpid);
 
 	return 0;
@@ -1724,7 +1762,8 @@ static int handle_recvmsg_exit(void *ctx, int ret)
 		return 0;
 	}
 
-	struct network_event *event = reserve_network_event();
+	long flags;
+	struct network_event *event = reserve_network_event(&flags);
 	if (!event) {
 		bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
 		return handle_missed_event(MISSED_NETWORK_EVENT);
@@ -1743,7 +1782,7 @@ static int handle_recvmsg_exit(void *ctx, int ret)
 	__builtin_memcpy(event->dest_addr, info->peer_addr, 16);
 	event->dest_port = info->peer_port;
 
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 	bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
 
 	// Note: Buffer queue end events are now emitted at packet dequeue time
@@ -2026,7 +2065,8 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 	}
 
 	// Emit PACKET_UDP_RCV as duration event (IP->UDP handoff latency)
-	struct packet_event *rcv_event = reserve_packet_event();
+	long flags;
+	struct packet_event *rcv_event = reserve_packet_event(&flags);
 	if (!rcv_event)
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
@@ -2046,7 +2086,7 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 		rcv_event->task.tgidpid = tgidpid;
 		__builtin_memset(rcv_event->task.comm, 0, TASK_COMM_LEN);
 
-		bpf_ringbuf_submit(rcv_event, 0);
+		bpf_ringbuf_submit(rcv_event, flags);
 	}
 
 	// Update stored info for UDP->enqueue phase
@@ -2093,7 +2133,8 @@ int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *
 	u64 tgidpid = *tgidpid_ptr;
 
 	// Found matching packet - emit enqueue event
-	struct packet_event *event = reserve_packet_event();
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event) {
 		bpf_map_delete_elem(&pending_udp_rx_packets, &key);
 		return handle_missed_event(MISSED_PACKET_EVENT);
@@ -2117,7 +2158,7 @@ int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *
 		// comm will be empty - we don't have process context to read it
 		__builtin_memset(event->task.comm, 0, TASK_COMM_LEN);
 
-		bpf_ringbuf_submit(event, 0);
+		bpf_ringbuf_submit(event, flags);
 	}
 
 	// Store for buffer queue latency tracking (reuse sk_ptr and tgidpid from above)
@@ -2289,7 +2330,8 @@ static __always_inline int handle_udp_tx_event(struct sk_buff *skb,
 	if (!udp_info)
 		return 0;
 
-	struct packet_event *event = reserve_packet_event();
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event) {
 		if (is_final_phase)
 			bpf_map_delete_elem(&pending_udp_tx_packets, &udp_key);
@@ -2309,7 +2351,7 @@ static __always_inline int handle_udp_tx_event(struct sk_buff *skb,
 	event->cpu = bpf_get_smp_processor_id();
 	event->task.tgidpid = udp_info->tgidpid;
 
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 
 	if (is_final_phase) {
 		bpf_map_delete_elem(&pending_udp_tx_packets, &udp_key);
@@ -2357,14 +2399,15 @@ int BPF_KPROBE(dev_queue_xmit_entry, struct sk_buff *skb)
 		if (!pkt_info)
 			return 0;
 
-		struct packet_event *event = reserve_packet_event();
+		long flags;
+		struct packet_event *event = reserve_packet_event(&flags);
 		if (!event) {
 			bpf_map_delete_elem(&pending_packets, &key);
 			return handle_missed_event(MISSED_PACKET_EVENT);
 		}
 
 		populate_packet_event(event, pkt_info, now, PACKET_ENQUEUE, NETWORK_TCP);
-		bpf_ringbuf_submit(event, 0);
+		bpf_ringbuf_submit(event, flags);
 
 		pkt_info->start_ts = now;
 		return 0;
@@ -2412,14 +2455,15 @@ int BPF_PROG(net_dev_start_xmit, struct sk_buff *skb, struct net_device *dev)
 		if (!pkt_info)
 			return 0;
 
-		struct packet_event *event = reserve_packet_event();
+		long flags;
+		struct packet_event *event = reserve_packet_event(&flags);
 		if (!event) {
 			bpf_map_delete_elem(&pending_packets, &key);
 			return handle_missed_event(MISSED_PACKET_EVENT);
 		}
 
 		populate_packet_event(event, pkt_info, now, PACKET_SEND, NETWORK_TCP);
-		bpf_ringbuf_submit(event, 0);
+		bpf_ringbuf_submit(event, flags);
 		bpf_map_delete_elem(&pending_packets, &key);
 		return 0;
 	} else if (protocol == IPPROTO_UDP) {
@@ -2530,7 +2574,8 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 
 	bpf_map_update_elem(&pending_recv_packets, &key, &pkt_info, BPF_ANY);
 
-	struct packet_event *event = reserve_packet_event();
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event) {
 		bpf_map_delete_elem(&pending_recv_packets, &key);
 		return handle_missed_event(MISSED_PACKET_EVENT);
@@ -2539,7 +2584,7 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 	u64 now = bpf_ktime_get_boot_ns();
 	populate_packet_event(event, &pkt_info, now, PACKET_RCV_ESTABLISHED, NETWORK_TCP);
 
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 
 	pkt_info.start_ts = now;
 	bpf_map_update_elem(&pending_recv_packets, &key, &pkt_info, BPF_ANY);
@@ -2583,7 +2628,8 @@ int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *
 	if (!pkt_info)
 		return 0;
 
-	struct packet_event *event = reserve_packet_event();
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event) {
 		bpf_map_delete_elem(&pending_recv_packets, &key);
 		return handle_missed_event(MISSED_PACKET_EVENT);
@@ -2592,7 +2638,7 @@ int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *
 	u64 now = bpf_ktime_get_boot_ns();
 	populate_packet_event(event, pkt_info, now, PACKET_QUEUE_RCV, NETWORK_TCP);
 
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 	bpf_map_delete_elem(&pending_recv_packets, &key);
 
 	struct buffer_queue_info buf_info = {0};
@@ -2647,7 +2693,8 @@ int BPF_KPROBE(tcp_data_queue_entry, struct sock *sk, struct sk_buff *skb)
 	if (!pkt_info)
 		return 0;
 
-	struct packet_event *event = reserve_packet_event();
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event) {
 		bpf_map_delete_elem(&pending_recv_packets, &key);
 		return handle_missed_event(MISSED_PACKET_EVENT);
@@ -2655,7 +2702,7 @@ int BPF_KPROBE(tcp_data_queue_entry, struct sock *sk, struct sk_buff *skb)
 
 	u64 now = bpf_ktime_get_boot_ns();
 	populate_packet_event(event, pkt_info, now, PACKET_QUEUE_RCV, NETWORK_TCP);
-	bpf_ringbuf_submit(event, 0);
+	bpf_ringbuf_submit(event, flags);
 
 	struct buffer_queue_info buf_info = {0};
 	buf_info.queue_ts = now;
@@ -2718,7 +2765,8 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 
 	struct buffer_queue_info *buf_info = bpf_map_lookup_elem(&socket_buffer_queue, &pkt_key);
 	if (buf_info) {
-		struct packet_event *pkt_event = reserve_packet_event();
+		long flags;
+		struct packet_event *pkt_event = reserve_packet_event(&flags);
 		if (pkt_event) {
 			u64 now = bpf_ktime_get_boot_ns();
 			pkt_event->start_ts = buf_info->queue_ts;
@@ -2735,7 +2783,7 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 			pkt_event->event_type = PACKET_BUFFER_QUEUE;
 			pkt_event->cpu = bpf_get_smp_processor_id();
 
-			bpf_ringbuf_submit(pkt_event, 0);
+			bpf_ringbuf_submit(pkt_event, flags);
 		}
 		bpf_map_delete_elem(&socket_buffer_queue, &pkt_key);
 	}

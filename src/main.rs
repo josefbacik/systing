@@ -11,8 +11,9 @@ mod stack_recorder;
 
 use std::collections::HashMap;
 use std::env;
+use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
 use std::process;
@@ -49,9 +50,6 @@ use perfetto_protos::trace::Trace;
 use plain::Plain;
 use protobuf::Message;
 
-/// Duration to poll ringbuffers before checking for shutdown
-const RINGBUF_POLL_DURATION_MS: u64 = 100;
-
 /// Sample period for perf clock events (1ms = 1000 samples/sec)
 const PERF_CLOCK_SAMPLE_PERIOD: u64 = 1000;
 
@@ -63,6 +61,129 @@ const CONTINUOUS_MODE_STOP_DELAY_SECS: u64 = 1;
 
 /// Interval for refreshing system info like CPU frequency (100ms)
 const SYSINFO_REFRESH_INTERVAL_MS: u64 = 100;
+
+struct ShutdownSignal {
+    eventfd: OwnedFd,
+}
+
+impl ShutdownSignal {
+    fn new() -> io::Result<Self> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            eventfd: unsafe { OwnedFd::from_raw_fd(fd) },
+        })
+    }
+
+    fn signal(&self) {
+        let val: u64 = 1;
+        let _ = unsafe {
+            libc::write(
+                self.eventfd.as_raw_fd(),
+                &val as *const u64 as *const libc::c_void,
+                8,
+            )
+        };
+    }
+
+    fn fd(&self) -> RawFd {
+        self.eventfd.as_raw_fd()
+    }
+}
+
+/// Thread-local bloom filter for task deduplication.
+/// Each thread gets its own instance - no atomic operations needed.
+/// This trades a small increase in duplicate task_info messages
+/// (which the discovery thread handles anyway) for much lower CPU usage.
+struct ThreadLocalBloomFilter {
+    bits: Box<[u64]>,
+    num_bits: usize,
+}
+
+impl ThreadLocalBloomFilter {
+    const NUM_HASHES: usize = 3;
+
+    fn new(size_bytes: usize) -> Self {
+        let num_u64s = size_bytes / 8;
+        let bits: Vec<u64> = vec![0; num_u64s];
+        Self {
+            bits: bits.into_boxed_slice(),
+            num_bits: num_u64s * 64,
+        }
+    }
+
+    fn hash(&self, key: u64, seed: usize) -> usize {
+        let mut h = key.wrapping_add(seed as u64);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51afd7ed558ccd);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
+        h ^= h >> 33;
+        (h as usize) % self.num_bits
+    }
+
+    fn insert_and_check(&mut self, key: u64) -> bool {
+        let mut was_present = true;
+        for i in 0..Self::NUM_HASHES {
+            let bit_idx = self.hash(key, i);
+            let word_idx = bit_idx / 64;
+            let bit_offset = bit_idx % 64;
+            let mask = 1u64 << bit_offset;
+            let old = self.bits[word_idx];
+            if old & mask == 0 {
+                was_present = false;
+                self.bits[word_idx] = old | mask;
+            }
+        }
+        was_present
+    }
+}
+
+fn create_ringbuf_epoll(ringbuf_fd: RawFd, shutdown_fd: RawFd) -> io::Result<OwnedFd> {
+    let epoll_fd = {
+        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    };
+
+    let mut ev = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: 0,
+    };
+    if unsafe {
+        libc::epoll_ctl(
+            epoll_fd.as_raw_fd(),
+            libc::EPOLL_CTL_ADD,
+            ringbuf_fd,
+            &mut ev,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut ev = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: 1,
+    };
+    if unsafe {
+        libc::epoll_ctl(
+            epoll_fd.as_raw_fd(),
+            libc::EPOLL_CTL_ADD,
+            shutdown_fd,
+            &mut ev,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(epoll_fd)
+}
 
 struct RecorderInfo {
     name: &'static str,
@@ -450,21 +571,24 @@ fn consume_loop<T, N>(
     T: SystingRecordEvent<N>,
     N: Plain + SystingEvent + Copy,
 {
+    // Each thread gets its own bloom filter - no atomic operations needed
+    let mut task_bloom = ThreadLocalBloomFilter::new(4096);
+
     loop {
         let Ok(event) = rx.recv() else {
             break;
         };
 
-        // Send task_info to process discovery thread
+        // Send task_info to process discovery thread only if not already seen
         if let Some(task_info) = event.next_task_info() {
-            task_info_tx
-                .send(*task_info)
-                .expect("Failed to send task_info to discovery thread");
+            if !task_bloom.insert_and_check(task_info.tgidpid) {
+                let _ = task_info_tx.send(*task_info);
+            }
         }
         if let Some(task_info) = event.prev_task_info() {
-            task_info_tx
-                .send(*task_info)
-                .expect("Failed to send task_info to discovery thread");
+            if !task_bloom.insert_and_check(task_info.tgidpid) {
+                let _ = task_info_tx.send(*task_info);
+            }
         }
 
         // Send event to pystack symbol loading thread (with rate limiting)
@@ -592,9 +716,13 @@ fn spawn_recorder_threads(
             thread::Builder::new()
                 .name("packet_recorder".to_string())
                 .spawn(move || {
+                    // Thread-local bloom filter for task deduplication
+                    let mut task_bloom = ThreadLocalBloomFilter::new(4096);
                     while let Ok(event) = packet_rx.recv() {
                         if let Some(task_info) = event.next_task_info() {
-                            session_recorder.maybe_record_task(task_info);
+                            if !task_bloom.insert_and_check(task_info.tgidpid) {
+                                session_recorder.maybe_record_task(task_info);
+                            }
                         }
                         session_recorder
                             .network_recorder
@@ -833,46 +961,36 @@ fn discover_processes_with_mapping(
     use std::fs::File;
     use std::io::{BufRead, BufReader};
     use std::path::{Path, PathBuf};
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
     let mut discovered_pids = HashMap::new();
 
     let target_normalized = if target_path.contains('/') && !Path::new(target_path).is_absolute() {
-        // Try to canonicalize relative paths
         std::fs::canonicalize(target_path).unwrap_or_else(|e| {
             eprintln!("Warning: Could not resolve path '{target_path}': {e} - using as-is");
             PathBuf::from(target_path)
         })
     } else {
-        // Absolute paths or library names are used as-is
         PathBuf::from(target_path)
     };
 
     let target_str = target_normalized.to_string_lossy();
     let is_absolute = target_normalized.is_absolute();
 
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        false,
-        ProcessRefreshKind::everything().without_memory(),
-    );
+    let proc_dir = match std::fs::read_dir("/proc") {
+        Ok(dir) => dir,
+        Err(e) => return Err(anyhow::anyhow!("Failed to read /proc: {e}")),
+    };
 
-    for (pid, process) in system.processes() {
-        let pid_u32 = pid.as_u32();
+    for entry in proc_dir.filter_map(Result::ok) {
+        let pid_u32: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
+            Some(pid) if pid > 2 => pid,
+            _ => continue,
+        };
 
-        if pid_u32 <= 2 {
-            // Skip kernel processes (0=scheduler, 1=init, 2=kthreadd)
-            continue;
-        }
+        let proc_path = entry.path();
 
-        // Skip threads - only attach to thread group leaders (main processes)
-        // Check if this is a thread by reading /proc/PID/status
-        let status_path = PathBuf::from("/proc")
-            .join(pid_u32.to_string())
-            .join("status");
-
-        if let Ok(status) = std::fs::read_to_string(&status_path) {
+        // Skip threads - only process thread group leaders
+        if let Ok(status) = std::fs::read_to_string(proc_path.join("status")) {
             let mut is_thread = false;
             for line in status.lines() {
                 if let Some(tgid_str) = line.strip_prefix("Tgid:\t") {
@@ -890,7 +1008,7 @@ fn discover_processes_with_mapping(
             }
         }
 
-        if let Some(exe) = process.exe() {
+        if let Ok(exe) = std::fs::read_link(proc_path.join("exe")) {
             if is_absolute {
                 if exe == target_normalized {
                     let exe_str = exe.to_string_lossy();
@@ -900,7 +1018,6 @@ fn discover_processes_with_mapping(
                 }
             } else if let Some(exe_filename) = exe.file_name() {
                 let exe_name = exe_filename.to_string_lossy();
-                // Check if the executable name contains the target (e.g., "python3.11" contains "python")
                 if exe_name.contains(&*target_str) {
                     let exe_str = exe.to_string_lossy();
                     let resolved_path = format!("/proc/{pid_u32}/root{exe_str}");
@@ -911,11 +1028,7 @@ fn discover_processes_with_mapping(
         }
 
         if check_maps {
-            let maps_path = PathBuf::from("/proc")
-                .join(pid_u32.to_string())
-                .join("maps");
-
-            let maps_file = match File::open(&maps_path) {
+            let maps_file = match File::open(proc_path.join("maps")) {
                 Ok(file) => file,
                 Err(_) => continue,
             };
@@ -932,7 +1045,6 @@ fn discover_processes_with_mapping(
                     None => continue,
                 };
 
-                // Validate absolute path
                 if !mapped_path.starts_with('/') {
                     continue;
                 }
@@ -1057,6 +1169,15 @@ fn configure_bpf_skeleton(
         if opts.syscalls {
             rodata.tool_config.collect_syscalls = 1;
         }
+
+        // Set wakeup threshold to 50% of ringbuf size for batched wakeups
+        // Default ringbuf size is 50 MiB if not specified
+        let ringbuf_size = if opts.ringbuf_size_mib > 0 {
+            opts.ringbuf_size_mib as u64 * 1024 * 1024
+        } else {
+            50 * 1024 * 1024 // Default 50 MiB
+        };
+        rodata.tool_config.wakeup_data_size = ringbuf_size / 2;
     }
 
     // Configure ringbuf size if specified
@@ -1628,6 +1749,7 @@ fn attach_probes(
 
 struct ThreadHandles {
     ringbuf_threads: Vec<thread::JoinHandle<i32>>,
+    sysinfo_thread: Option<thread::JoinHandle<i32>>,
     recorder_threads: Vec<thread::JoinHandle<i32>>,
     discovery_thread: thread::JoinHandle<i32>,
     symbol_loader_thread: thread::JoinHandle<i32>,
@@ -1640,7 +1762,7 @@ fn run_tracing_loop(
     opts: &Command,
     stop_tx: Sender<()>,
     stop_rx: Receiver<()>,
-    thread_done: Arc<AtomicBool>,
+    ringbuf_shutdown: Arc<ShutdownSignal>,
     shutdown_signal: Arc<AtomicBool>,
     skel: &mut systing::SystingSystemSkel,
 ) -> Result<()> {
@@ -1670,11 +1792,14 @@ fn run_tracing_loop(
     }
     println!("Stopping...");
     skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
-    thread_done.store(true, Ordering::Relaxed);
+    ringbuf_shutdown.signal();
     for thread in handles.ringbuf_threads {
         thread.join().expect("Failed to join thread");
     }
     shutdown_signal.store(true, Ordering::Relaxed);
+    if let Some(thread) = handles.sysinfo_thread {
+        thread.join().expect("Failed to join sysinfo thread");
+    }
     for thread in handles.recorder_threads {
         thread.join().expect("Failed to join receiver thread");
     }
@@ -1858,18 +1983,14 @@ fn system(opts: Command) -> Result<()> {
         // Create channel for Python symbol loading
         let (pystack_symbol_tx, pystack_symbol_rx) = channel();
 
-        // Spawn dedicated Python symbol loading thread with rate limiting
-        let symbol_recorder = recorder.clone();
+        // Spawn dedicated Python symbol loading thread
+        // Clone the Arc<StackWalkerRun> directly to avoid locking the entire StackRecorder
+        let psr = recorder.stack_recorder.lock().unwrap().psr.clone();
         let symbol_thread = thread::Builder::new()
             .name("pystack_symbol_loader".to_string())
             .spawn(move || {
                 while let Ok(event) = pystack_symbol_rx.recv() {
-                    symbol_recorder
-                        .stack_recorder
-                        .lock()
-                        .unwrap()
-                        .psr
-                        .load_pystack_symbols(&event);
+                    psr.load_pystack_symbols(&event);
                 }
                 0
             })?;
@@ -1896,19 +2017,36 @@ fn system(opts: Command) -> Result<()> {
         // Attach any usdt's that we may have
         let _probe_links = attach_probes(&mut skel, &recorder, &opts, old_kernel)?;
 
-        let mut threads = Vec::new();
-        let thread_done = Arc::new(AtomicBool::new(false));
+        let mut ringbuf_threads = Vec::new();
+        let ringbuf_shutdown = Arc::new(ShutdownSignal::new()?);
         for (name, ring) in rings {
-            let thread_done_clone = thread_done.clone();
-            threads.push(thread::Builder::new().name(name).spawn(move || {
+            let shutdown_fd = ringbuf_shutdown.fd();
+            let epoll_fd = create_ringbuf_epoll(ring.epoll_fd(), shutdown_fd)?;
+            ringbuf_threads.push(thread::Builder::new().name(name).spawn(move || {
+                let mut events = [libc::epoll_event { events: 0, u64: 0 }; 2];
                 loop {
-                    if thread_done_clone.load(Ordering::Relaxed) {
-                        // Flush whatever is left in the ringbuf
-                        let _ = ring.consume();
+                    let n = unsafe {
+                        libc::epoll_wait(epoll_fd.as_raw_fd(), events.as_mut_ptr(), 2, -1)
+                    };
+
+                    if n < 0 {
+                        let err = io::Error::last_os_error();
+                        if err.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
                         break;
                     }
-                    let res = ring.poll(Duration::from_millis(RINGBUF_POLL_DURATION_MS));
-                    if res.is_err() {
+
+                    let mut should_exit = false;
+                    for event in events.iter().take(n as usize) {
+                        if event.u64 == 1 {
+                            should_exit = true;
+                        }
+                    }
+
+                    let _ = ring.consume();
+
+                    if should_exit {
                         break;
                     }
                 }
@@ -1917,10 +2055,11 @@ fn system(opts: Command) -> Result<()> {
         }
 
         // Start the sysinfo recorder if it's enabled
+        let mut sysinfo_thread = None;
         if opts.cpu_frequency {
-            let thread_done_clone = thread_done.clone();
+            let shutdown_clone = shutdown_signal.clone();
             let sysinfo_recorder = recorder.clone();
-            threads.push(
+            sysinfo_thread = Some(
                 thread::Builder::new()
                     .name("sysinfo_recorder".to_string())
                     .spawn(move || {
@@ -1930,7 +2069,7 @@ fn system(opts: Command) -> Result<()> {
                         );
 
                         loop {
-                            if thread_done_clone.load(Ordering::Relaxed) {
+                            if shutdown_clone.load(Ordering::Relaxed) {
                                 break;
                             }
                             sys.refresh_cpu_frequency();
@@ -1955,7 +2094,8 @@ fn system(opts: Command) -> Result<()> {
         }
 
         let handles = ThreadHandles {
-            ringbuf_threads: threads,
+            ringbuf_threads,
+            sysinfo_thread,
             recorder_threads: recv_threads,
             discovery_thread,
             symbol_loader_thread: symbol_thread,
@@ -1968,7 +2108,7 @@ fn system(opts: Command) -> Result<()> {
             &opts,
             stop_tx,
             stop_rx,
-            thread_done,
+            ringbuf_shutdown,
             shutdown_signal,
             &mut skel,
         )?;
