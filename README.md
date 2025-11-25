@@ -30,6 +30,30 @@ This will generate a `trace.pb` file which can be uploaded to a
 
 This sets up automatic `cargo fmt` checks before commits and pushes. See [CLAUDE.md](CLAUDE.md) for full development workflow details.
 
+### Building with pystacks Feature
+
+The `pystacks` feature enables Python stack tracing support. It requires additional system libraries:
+
+**Fedora/RHEL:**
+```bash
+sudo dnf install fmt-devel re2-devel libcap-devel llvm
+```
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get install libfmt-dev libre2-dev libcap-dev llvm
+```
+
+**Arch Linux:**
+```bash
+sudo pacman -S fmt re2 libcap llvm
+```
+
+Then build with:
+```bash
+cargo build --features pystacks
+```
+
 ## Usage
 
 Detailed options can be found [here](docs/USAGE.adoc).
