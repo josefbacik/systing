@@ -11,16 +11,22 @@ Usage:
 Requirements:
     - trace_processor (from Perfetto)
     - Python 3.8+
+
+Performance optimization:
+    - Converts trace to SQLite database on first run
+    - Reuses database if trace file hasn't changed (based on mtime + size)
+    - Subsequent queries are fast since they run against SQLite directly
 """
 
 import argparse
+import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
-import tempfile
 import os
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List
+from typing import Optional
 from pathlib import Path
 
 
@@ -92,22 +98,41 @@ class TraceSummary:
     anomalies: list = field(default_factory=list)
 
 
-class TraceProcessor:
-    """Wrapper around trace_processor"""
+class TraceDatabase:
+    """Manages SQLite database creation and validation for Perfetto traces"""
 
-    def __init__(self, trace_path: str):
-        self.trace_path = trace_path
+    # Metadata table to track trace file identity
+    METADATA_TABLE = """
+        CREATE TABLE IF NOT EXISTS _trace_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """
+
+    def __init__(self, trace_path: str, db_path: Optional[str] = None):
+        self.trace_path = os.path.abspath(trace_path)
+        self.db_path = db_path or self._default_db_path()
         self.tp_path = self._find_trace_processor()
+        self._conn: Optional[sqlite3.Connection] = None
+
+    def _default_db_path(self) -> str:
+        """Generate default database path next to trace file"""
+        trace_dir = os.path.dirname(self.trace_path)
+        trace_name = os.path.basename(self.trace_path)
+        # Remove .pb, .pb.gz, .perfetto-trace extensions
+        for ext in ['.pb.gz', '.pb', '.perfetto-trace', '.pftrace']:
+            if trace_name.endswith(ext):
+                trace_name = trace_name[:-len(ext)]
+                break
+        return os.path.join(trace_dir, f"{trace_name}.sqlite")
 
     def _find_trace_processor(self) -> str:
         """Find trace_processor in PATH or common locations"""
-        # Check PATH first
         for name in ['trace_processor', 'trace_processor_shell']:
             result = subprocess.run(['which', name], capture_output=True, text=True)
             if result.returncode == 0:
                 return result.stdout.strip()
 
-        # Check common locations
         common_paths = [
             '/usr/local/bin/trace_processor',
             '/usr/bin/trace_processor',
@@ -123,76 +148,123 @@ class TraceProcessor:
             "https://perfetto.dev/docs/quickstart/trace-analysis"
         )
 
+    def _get_trace_identity(self) -> str:
+        """Generate a unique identity string for the trace file based on mtime and size"""
+        stat = os.stat(self.trace_path)
+        return f"{stat.st_mtime}:{stat.st_size}:{self.trace_path}"
+
+    def _get_stored_identity(self) -> Optional[str]:
+        """Get the stored trace identity from the database"""
+        if not os.path.exists(self.db_path):
+            return None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.execute(
+                "SELECT value FROM _trace_metadata WHERE key = 'trace_identity'"
+            )
+            row = cursor.fetchone()
+            conn.close()
+            return row[0] if row else None
+        except sqlite3.Error:
+            return None
+
+    def _needs_regeneration(self) -> bool:
+        """Check if the database needs to be regenerated"""
+        if not os.path.exists(self.db_path):
+            return True
+
+        current_identity = self._get_trace_identity()
+        stored_identity = self._get_stored_identity()
+
+        if stored_identity != current_identity:
+            print(f"  Trace file changed, regenerating database...", file=sys.stderr)
+            return True
+
+        return False
+
+    def _create_database(self) -> None:
+        """Create SQLite database from trace file using trace_processor"""
+        print(f"  Converting trace to SQLite (one-time operation)...", file=sys.stderr)
+
+        # Remove existing database if present
+        if os.path.exists(self.db_path):
+            os.unlink(self.db_path)
+
+        # Use trace_processor to export to SQLite
+        # The -e/--export flag creates a full SQLite database
+        result = subprocess.run(
+            [self.tp_path, self.trace_path, '-e', self.db_path],
+            capture_output=True,
+            text=True,
+            timeout=600  # 10 minute timeout for large traces
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to create SQLite database: {result.stderr}")
+
+        if not os.path.exists(self.db_path):
+            raise RuntimeError("trace_processor did not create database file")
+
+        # Store trace identity in the database
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(self.METADATA_TABLE)
+        conn.execute(
+            "INSERT OR REPLACE INTO _trace_metadata (key, value) VALUES (?, ?)",
+            ('trace_identity', self._get_trace_identity())
+        )
+        conn.commit()
+        conn.close()
+
+        db_size = os.path.getsize(self.db_path) / (1024 * 1024)
+        print(f"  Database created: {self.db_path} ({db_size:.1f} MB)", file=sys.stderr)
+
+    def ensure_database(self) -> None:
+        """Ensure the database exists and is up to date"""
+        if self._needs_regeneration():
+            self._create_database()
+
+    def connect(self) -> sqlite3.Connection:
+        """Get a connection to the database"""
+        if self._conn is None:
+            self.ensure_database()
+            self._conn = sqlite3.connect(self.db_path)
+            self._conn.row_factory = sqlite3.Row
+        return self._conn
+
     def query(self, sql: str) -> list[dict]:
         """Execute SQL query and return results as list of dicts"""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sql', delete=False) as f:
-            f.write(sql)
-            query_file = f.name
-
+        conn = self.connect()
         try:
-            result = subprocess.run(
-                [self.tp_path, self.trace_path, '-q', query_file],
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
+            cursor = conn.execute(sql)
+            columns = [desc[0] for desc in cursor.description] if cursor.description else []
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            # Some queries may fail if tables don't exist
+            print(f"  Query warning: {e}", file=sys.stderr)
+            return []
 
-            if result.returncode != 0:
-                # Some queries may fail if data doesn't exist, return empty
-                return []
-
-            # Parse CSV output
-            lines = result.stdout.strip().split('\n')
-            if len(lines) < 2:
-                return []
-
-            headers = lines[0].split(',')
-            headers = [h.strip('"') for h in headers]
-
-            rows = []
-            for line in lines[1:]:
-                if not line.strip():
-                    continue
-                # Handle CSV with potential quoted fields
-                values = self._parse_csv_line(line)
-                if len(values) == len(headers):
-                    rows.append(dict(zip(headers, values)))
-
-            return rows
-
-        finally:
-            os.unlink(query_file)
-
-    def _parse_csv_line(self, line: str) -> list:
-        """Parse a CSV line handling quoted fields"""
-        values = []
-        current = ""
-        in_quotes = False
-
-        for char in line:
-            if char == '"':
-                in_quotes = not in_quotes
-            elif char == ',' and not in_quotes:
-                values.append(current.strip().strip('"'))
-                current = ""
-            else:
-                current += char
-
-        values.append(current.strip().strip('"'))
-        return values
+    def close(self) -> None:
+        """Close the database connection"""
+        if self._conn:
+            self._conn.close()
+            self._conn = None
 
 
 class TraceAnalyzer:
     """Analyzes Perfetto traces and generates summaries"""
 
-    def __init__(self, trace_path: str):
-        self.tp = TraceProcessor(trace_path)
+    def __init__(self, trace_path: str, db_path: Optional[str] = None):
+        self.db = TraceDatabase(trace_path, db_path)
         self.summary = TraceSummary()
 
     def analyze(self) -> TraceSummary:
         """Run all analyses and return summary"""
         print("Analyzing trace...", file=sys.stderr)
 
+        # Ensure database exists (created once, reused on subsequent runs)
+        self.db.ensure_database()
+
+        print("  Running queries...", file=sys.stderr)
         self._analyze_overview()
         self._analyze_scheduling_latency()
         self._analyze_per_cpu_stats()
@@ -207,40 +279,38 @@ class TraceAnalyzer:
         self._analyze_custom_events()
         self._detect_anomalies()
 
+        self.db.close()
         return self.summary
 
     def _analyze_overview(self):
-        """Get basic trace overview stats"""
-        print("  - Overview...", file=sys.stderr)
-
-        # Duration
-        rows = self.tp.query("""
-            SELECT
-                (MAX(ts) - MIN(ts)) / 1e9 as duration_sec
-            FROM sched_slice
+        """Analyze trace overview"""
+        rows = self.db.query("""
+            SELECT (MAX(ts) - MIN(ts)) / 1e9 as duration_sec FROM sched_slice
         """)
         if rows:
-            self.summary.duration_sec = float(rows[0].get('duration_sec', 0) or 0)
+            self.summary.duration_sec = float(rows[0].get('duration_sec') or 0)
 
-        # CPU count
-        rows = self.tp.query("SELECT COUNT(DISTINCT cpu) as num_cpus FROM sched_slice")
+        rows = self.db.query("""
+            SELECT COUNT(DISTINCT cpu) as num_cpus FROM sched_slice
+        """)
         if rows:
-            self.summary.num_cpus = int(rows[0].get('num_cpus', 0) or 0)
+            self.summary.num_cpus = int(rows[0].get('num_cpus') or 0)
 
-        # Process/thread count
-        rows = self.tp.query("SELECT COUNT(DISTINCT upid) as cnt FROM process WHERE upid > 0")
+        rows = self.db.query("""
+            SELECT COUNT(DISTINCT upid) as cnt FROM process WHERE upid > 0
+        """)
         if rows:
-            self.summary.num_processes = int(rows[0].get('cnt', 0) or 0)
+            self.summary.num_processes = int(rows[0].get('cnt') or 0)
 
-        rows = self.tp.query("SELECT COUNT(DISTINCT utid) as cnt FROM thread WHERE utid > 0")
+        rows = self.db.query("""
+            SELECT COUNT(DISTINCT utid) as cnt FROM thread WHERE utid > 0
+        """)
         if rows:
-            self.summary.num_threads = int(rows[0].get('cnt', 0) or 0)
+            self.summary.num_threads = int(rows[0].get('cnt') or 0)
 
     def _analyze_scheduling_latency(self):
-        """Analyze system-wide scheduling latency"""
-        print("  - Scheduling latency...", file=sys.stderr)
-
-        rows = self.tp.query("""
+        """Analyze scheduling latency statistics"""
+        rows = self.db.query("""
             SELECT
                 COUNT(*) as count,
                 MIN(dur) / 1000.0 as min_us,
@@ -250,25 +320,22 @@ class TraceAnalyzer:
             FROM sched_slice
             WHERE dur > 0
         """)
-
         if rows and rows[0].get('count'):
             r = rows[0]
-            self.summary.total_context_switches = int(r.get('count', 0) or 0)
-            self.summary.system_latency.count = int(r.get('count', 0) or 0)
-            self.summary.system_latency.min_us = float(r.get('min_us', 0) or 0)
-            self.summary.system_latency.max_us = float(r.get('max_us', 0) or 0)
-            self.summary.system_latency.avg_us = float(r.get('avg_us', 0) or 0)
-            self.summary.system_latency.total_us = float(r.get('total_us', 0) or 0)
+            self.summary.total_context_switches = int(r.get('count') or 0)
+            self.summary.system_latency.count = int(r.get('count') or 0)
+            self.summary.system_latency.min_us = float(r.get('min_us') or 0)
+            self.summary.system_latency.max_us = float(r.get('max_us') or 0)
+            self.summary.system_latency.avg_us = float(r.get('avg_us') or 0)
+            self.summary.system_latency.total_us = float(r.get('total_us') or 0)
 
-        # Percentiles (separate query for compatibility)
-        rows = self.tp.query("""
-            SELECT
-                dur / 1000.0 as latency_us
+        # Calculate percentiles
+        rows = self.db.query("""
+            SELECT dur / 1000.0 as latency_us
             FROM sched_slice
             WHERE dur > 0
             ORDER BY dur
         """)
-
         if rows:
             latencies = [float(r['latency_us']) for r in rows if r.get('latency_us')]
             if latencies:
@@ -278,10 +345,8 @@ class TraceAnalyzer:
                 self.summary.system_latency.p99_us = latencies[min(int(n * 0.99), n - 1)]
 
     def _analyze_per_cpu_stats(self):
-        """Analyze per-CPU scheduling stats"""
-        print("  - Per-CPU stats...", file=sys.stderr)
-
-        rows = self.tp.query("""
+        """Analyze per-CPU statistics"""
+        rows = self.db.query("""
             SELECT
                 cpu,
                 COUNT(*) as context_switches,
@@ -293,23 +358,20 @@ class TraceAnalyzer:
             GROUP BY cpu
             ORDER BY cpu
         """)
-
         self.summary.per_cpu_stats = [
             {
-                'cpu': int(r.get('cpu', 0) or 0),
-                'context_switches': int(r.get('context_switches', 0) or 0),
-                'avg_latency_us': float(r.get('avg_latency_us', 0) or 0),
-                'max_latency_us': float(r.get('max_latency_us', 0) or 0),
-                'total_time_sec': float(r.get('total_time_sec', 0) or 0),
+                'cpu': int(r.get('cpu') or 0),
+                'context_switches': int(r.get('context_switches') or 0),
+                'avg_latency_us': float(r.get('avg_latency_us') or 0),
+                'max_latency_us': float(r.get('max_latency_us') or 0),
+                'total_time_sec': float(r.get('total_time_sec') or 0),
             }
             for r in rows
         ]
 
     def _analyze_process_latency(self):
-        """Analyze scheduling latency by process"""
-        print("  - Process latency...", file=sys.stderr)
-
-        rows = self.tp.query("""
+        """Analyze process scheduling latency"""
+        rows = self.db.query("""
             SELECT
                 p.name as process_name,
                 p.pid,
@@ -325,24 +387,21 @@ class TraceAnalyzer:
             ORDER BY max_us DESC
             LIMIT 20
         """)
-
         self.summary.top_processes_by_latency = [
             {
-                'name': r.get('process_name', 'unknown'),
-                'pid': int(r.get('pid', 0) or 0),
-                'samples': int(r.get('samples', 0) or 0),
-                'avg_us': float(r.get('avg_us', 0) or 0),
-                'max_us': float(r.get('max_us', 0) or 0),
-                'total_us': float(r.get('total_us', 0) or 0),
+                'name': r.get('process_name') or 'unknown',
+                'pid': int(r.get('pid') or 0),
+                'samples': int(r.get('samples') or 0),
+                'avg_us': float(r.get('avg_us') or 0),
+                'max_us': float(r.get('max_us') or 0),
+                'total_us': float(r.get('total_us') or 0),
             }
             for r in rows
         ]
 
     def _analyze_thread_latency(self):
-        """Analyze scheduling latency by thread"""
-        print("  - Thread latency...", file=sys.stderr)
-
-        rows = self.tp.query("""
+        """Analyze thread scheduling latency"""
+        rows = self.db.query("""
             SELECT
                 p.name as process_name,
                 p.pid,
@@ -360,28 +419,32 @@ class TraceAnalyzer:
             ORDER BY max_us DESC
             LIMIT 20
         """)
-
         self.summary.top_threads_by_latency = [
             {
-                'process': r.get('process_name', 'unknown'),
-                'pid': int(r.get('pid', 0) or 0),
-                'thread': r.get('thread_name', 'unknown'),
-                'tid': int(r.get('tid', 0) or 0),
-                'samples': int(r.get('samples', 0) or 0),
-                'avg_us': float(r.get('avg_us', 0) or 0),
-                'max_us': float(r.get('max_us', 0) or 0),
-                'total_us': float(r.get('total_us', 0) or 0),
+                'process': r.get('process_name') or 'unknown',
+                'pid': int(r.get('pid') or 0),
+                'thread': r.get('thread_name') or 'unknown',
+                'tid': int(r.get('tid') or 0),
+                'samples': int(r.get('samples') or 0),
+                'avg_us': float(r.get('avg_us') or 0),
+                'max_us': float(r.get('max_us') or 0),
+                'total_us': float(r.get('total_us') or 0),
             }
             for r in rows
         ]
 
     def _analyze_sleep_stacks(self):
-        """Analyze sleep/blocking stack traces weighted by actual sleep duration"""
-        print("  - Sleep stacks...", file=sys.stderr)
+        """Analyze sleep stacks weighted by sleep time"""
+        # First check if the required tables exist
+        tables_check = self.db.query("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name IN ('perf_sample', 'thread_state')
+        """)
+        if len(tables_check) < 2:
+            self.summary.top_sleep_stacks = []
+            return
 
-        # Join perf_sample with thread_state to get actual sleep durations
-        # This weights stacks by how long they were actually blocked
-        rows = self.tp.query("""
+        rows = self.db.query("""
             WITH sleep_weighted AS (
                 SELECT
                     ps.callsite_id,
@@ -403,28 +466,41 @@ class TraceAnalyzer:
                 samples,
                 max_sleep_ms
             FROM sleep_weighted
-            WHERE total_sleep_ms > 1  -- Filter out noise
+            WHERE total_sleep_ms > 1
             ORDER BY total_sleep_ms DESC
             LIMIT 50
         """)
 
         if not rows:
-            # Fallback to sample-based if no sleep correlation available
             self.summary.top_sleep_stacks = []
             return
 
-        # Get full stacks for top sleep-weighted callsites
-        total_sleep = sum(float(r.get('total_sleep_ms', 0) or 0) for r in rows)
+        # Build callsite lookup for stack reconstruction
+        callsite_rows = self.db.query("""
+            SELECT c.id, c.parent_id, c.frame_id, f.name as function_name
+            FROM stack_profile_callsite c
+            JOIN stack_profile_frame f ON c.frame_id = f.id
+        """)
+        callsite_map = {}
+        for r in callsite_rows:
+            cid = r.get('id')
+            if cid:
+                callsite_map[int(cid)] = (
+                    int(r['parent_id']) if r.get('parent_id') else None,
+                    r.get('function_name') or 'unknown'
+                )
+
+        total_sleep = sum(float(r.get('total_sleep_ms') or 0) for r in rows)
 
         stack_data = []
-        for r in rows[:20]:  # Process top 20
-            callsite_id = int(r.get('callsite_id', 0))
-            sleep_ms = float(r.get('total_sleep_ms', 0) or 0)
-            state = r.get('state', 'S')
-            samples = int(r.get('samples', 0) or 0)
-            max_ms = float(r.get('max_sleep_ms', 0) or 0)
+        for r in rows[:20]:
+            callsite_id = int(r.get('callsite_id') or 0)
+            sleep_ms = float(r.get('total_sleep_ms') or 0)
+            state = r.get('state') or 'S'
+            samples = int(r.get('samples') or 0)
+            max_ms = float(r.get('max_sleep_ms') or 0)
 
-            full_stack = self._get_full_stack(callsite_id)
+            full_stack = self._reconstruct_stack(callsite_id, callsite_map)
 
             stack_data.append({
                 'stack': full_stack[:600],
@@ -437,13 +513,30 @@ class TraceAnalyzer:
 
         self.summary.top_sleep_stacks = stack_data
 
-    def _analyze_uninterruptible_sleep(self):
-        """Find stack traces associated with uninterruptible sleep (D state)"""
-        print("  - Uninterruptible sleep analysis...", file=sys.stderr)
+    def _reconstruct_stack(self, callsite_id: int, callsite_map: dict) -> str:
+        """Reconstruct stack trace from callsite_id"""
+        funcs = []
+        current_id = callsite_id
+        max_depth = 50
 
-        # Look for long scheduling events that might indicate D state
-        # Perfetto doesn't directly expose task state, but we can infer from duration
-        rows = self.tp.query("""
+        while current_id and max_depth > 0:
+            if current_id not in callsite_map:
+                break
+            parent_id, func_name = callsite_map[current_id]
+            clean_name = self._clean_function_name(func_name)
+            funcs.append(clean_name)
+            current_id = parent_id
+            max_depth -= 1
+
+        if not funcs:
+            return "unknown"
+
+        funcs.reverse()
+        return ' -> '.join(funcs[-10:])
+
+    def _analyze_uninterruptible_sleep(self):
+        """Analyze long blocking events"""
+        rows = self.db.query("""
             SELECT
                 p.name as process_name,
                 p.pid,
@@ -455,27 +548,25 @@ class TraceAnalyzer:
             FROM sched_slice s
             JOIN thread t ON s.utid = t.utid
             JOIN process p ON t.upid = p.upid
-            WHERE s.dur > 10000000  -- > 10ms (potential D state or contention)
+            WHERE s.dur > 10000000
             AND p.pid > 0
             ORDER BY s.dur DESC
             LIMIT 50
         """)
-
         self.summary.long_sleep_events = [
             {
-                'process': r.get('process_name', 'unknown'),
-                'pid': int(r.get('pid', 0) or 0),
-                'thread': r.get('thread_name', 'unknown'),
-                'tid': int(r.get('tid', 0) or 0),
-                'time_sec': float(r.get('time_sec', 0) or 0),
-                'duration_us': float(r.get('duration_us', 0) or 0),
-                'state': r.get('end_state', 'unknown'),
+                'process': r.get('process_name') or 'unknown',
+                'pid': int(r.get('pid') or 0),
+                'thread': r.get('thread_name') or 'unknown',
+                'tid': int(r.get('tid') or 0),
+                'time_sec': float(r.get('time_sec') or 0),
+                'duration_us': float(r.get('duration_us') or 0),
+                'state': r.get('end_state') or 'unknown',
             }
             for r in rows
         ]
 
-        # Group by process to find patterns
-        rows = self.tp.query("""
+        rows = self.db.query("""
             SELECT
                 p.name as process_name,
                 p.pid,
@@ -486,32 +577,27 @@ class TraceAnalyzer:
             FROM sched_slice s
             JOIN thread t ON s.utid = t.utid
             JOIN process p ON t.upid = p.upid
-            WHERE s.dur > 10000000  -- > 10ms
+            WHERE s.dur > 10000000
             AND p.pid > 0
             GROUP BY p.pid
             ORDER BY total_blocked_us DESC
             LIMIT 20
         """)
-
         self.summary.uninterruptible_sleep_stacks = [
             {
-                'process': r.get('process_name', 'unknown'),
-                'pid': int(r.get('pid', 0) or 0),
-                'long_sleep_count': int(r.get('long_sleep_count', 0) or 0),
-                'avg_duration_us': float(r.get('avg_duration_us', 0) or 0),
-                'max_duration_us': float(r.get('max_duration_us', 0) or 0),
-                'total_blocked_us': float(r.get('total_blocked_us', 0) or 0),
+                'process': r.get('process_name') or 'unknown',
+                'pid': int(r.get('pid') or 0),
+                'long_sleep_count': int(r.get('long_sleep_count') or 0),
+                'avg_duration_us': float(r.get('avg_duration_us') or 0),
+                'max_duration_us': float(r.get('max_duration_us') or 0),
+                'total_blocked_us': float(r.get('total_blocked_us') or 0),
             }
             for r in rows
         ]
 
     def _analyze_cpu_stacks(self):
-        """Analyze CPU-bound stack traces (hotspots)"""
-        print("  - CPU stacks (hotspots)...", file=sys.stderr)
-
-        # Get all functions from stack profile (systing stores stacks here)
-        # Count how often each function appears in any stack
-        rows = self.tp.query("""
+        """Analyze CPU hotspots by function"""
+        rows = self.db.query("""
             SELECT
                 f.name as function_name,
                 m.name as module,
@@ -524,15 +610,14 @@ class TraceAnalyzer:
             ORDER BY sample_count DESC
             LIMIT 40
         """)
-
-        total_samples = sum(int(r.get('sample_count', 0) or 0) for r in rows)
+        total_samples = sum(int(r.get('sample_count') or 0) for r in rows)
 
         self.summary.top_cpu_stacks = [
             {
-                'function': self._clean_function_name(r.get('function_name', 'unknown')),
+                'function': self._clean_function_name(r.get('function_name') or 'unknown'),
                 'module': self._clean_module_name(r.get('module')),
-                'samples': int(r.get('sample_count', 0) or 0),
-                'pct': round(100.0 * int(r.get('sample_count', 0) or 0) / max(total_samples, 1), 2),
+                'samples': int(r.get('sample_count') or 0),
+                'pct': round(100.0 * int(r.get('sample_count') or 0) / max(total_samples, 1), 2),
             }
             for r in rows
         ]
@@ -541,8 +626,6 @@ class TraceAnalyzer:
         """Extract clean function name from systing's format"""
         if not name:
             return 'unknown'
-        # Systing format: "func_name (module) <address>"
-        # Extract just the function name
         if ' (' in name:
             return name.split(' (')[0]
         if ' <' in name:
@@ -553,44 +636,11 @@ class TraceAnalyzer:
         """Extract clean module name"""
         if not name:
             return 'kernel'
-        # Get just the filename
         return name.split('/')[-1] if '/' in name else name
 
-    def _get_full_stack(self, callsite_id: int) -> str:
-        """Reconstruct full stack trace from callsite_id"""
-        rows = self.tp.query(f"""
-            WITH RECURSIVE stack_walk AS (
-                SELECT id, parent_id, frame_id, 0 as depth
-                FROM stack_profile_callsite
-                WHERE id = {callsite_id}
-                UNION ALL
-                SELECT c.id, c.parent_id, c.frame_id, sw.depth + 1
-                FROM stack_profile_callsite c
-                JOIN stack_walk sw ON c.id = sw.parent_id
-            )
-            SELECT f.name as function_name
-            FROM stack_walk sw
-            JOIN stack_profile_frame f ON sw.frame_id = f.id
-            ORDER BY sw.depth DESC
-        """)
-
-        if not rows:
-            return "unknown"
-
-        # Build stack string, cleaning up function names
-        funcs = []
-        for r in rows:
-            name = r.get('function_name', 'unknown')
-            clean_name = self._clean_function_name(name)
-            funcs.append(clean_name)
-
-        return ' -> '.join(funcs[-10:])  # Last 10 frames
-
     def _analyze_cpu_by_process(self):
-        """Analyze CPU usage by process"""
-        print("  - CPU by process...", file=sys.stderr)
-
-        rows = self.tp.query("""
+        """Analyze CPU time by process"""
+        rows = self.db.query("""
             SELECT
                 p.name as process_name,
                 p.pid,
@@ -604,25 +654,22 @@ class TraceAnalyzer:
             ORDER BY cpu_time_sec DESC
             LIMIT 20
         """)
-
-        total_cpu = sum(float(r.get('cpu_time_sec', 0) or 0) for r in rows)
+        total_cpu = sum(float(r.get('cpu_time_sec') or 0) for r in rows)
 
         self.summary.cpu_hotspots_by_process = [
             {
-                'process': r.get('process_name', 'unknown'),
-                'pid': int(r.get('pid', 0) or 0),
-                'samples': int(r.get('sample_count', 0) or 0),
-                'cpu_time_sec': float(r.get('cpu_time_sec', 0) or 0),
-                'pct': round(100.0 * float(r.get('cpu_time_sec', 0) or 0) / max(total_cpu, 0.001), 2),
+                'process': r.get('process_name') or 'unknown',
+                'pid': int(r.get('pid') or 0),
+                'samples': int(r.get('sample_count') or 0),
+                'cpu_time_sec': float(r.get('cpu_time_sec') or 0),
+                'pct': round(100.0 * float(r.get('cpu_time_sec') or 0) / max(total_cpu, 0.001), 2),
             }
             for r in rows
         ]
 
     def _analyze_cpu_by_thread(self):
-        """Analyze CPU usage by thread"""
-        print("  - CPU by thread...", file=sys.stderr)
-
-        rows = self.tp.query("""
+        """Analyze CPU time by thread"""
+        rows = self.db.query("""
             SELECT
                 p.name as process_name,
                 p.pid,
@@ -638,28 +685,24 @@ class TraceAnalyzer:
             ORDER BY cpu_time_sec DESC
             LIMIT 30
         """)
-
-        total_cpu = sum(float(r.get('cpu_time_sec', 0) or 0) for r in rows)
+        total_cpu = sum(float(r.get('cpu_time_sec') or 0) for r in rows)
 
         self.summary.cpu_hotspots_by_thread = [
             {
-                'process': r.get('process_name', 'unknown'),
-                'pid': int(r.get('pid', 0) or 0),
-                'thread': r.get('thread_name', 'unknown'),
-                'tid': int(r.get('tid', 0) or 0),
-                'samples': int(r.get('sample_count', 0) or 0),
-                'cpu_time_sec': float(r.get('cpu_time_sec', 0) or 0),
-                'pct': round(100.0 * float(r.get('cpu_time_sec', 0) or 0) / max(total_cpu, 0.001), 2),
+                'process': r.get('process_name') or 'unknown',
+                'pid': int(r.get('pid') or 0),
+                'thread': r.get('thread_name') or 'unknown',
+                'tid': int(r.get('tid') or 0),
+                'samples': int(r.get('sample_count') or 0),
+                'cpu_time_sec': float(r.get('cpu_time_sec') or 0),
+                'pct': round(100.0 * float(r.get('cpu_time_sec') or 0) / max(total_cpu, 0.001), 2),
             }
             for r in rows
         ]
 
     def _analyze_counters(self):
-        """Analyze counter tracks (perf counters, runqueue, etc.)"""
-        print("  - Counters...", file=sys.stderr)
-
-        # Runqueue stats
-        rows = self.tp.query("""
+        """Analyze performance counters"""
+        rows = self.db.query("""
             SELECT
                 track.name as counter_name,
                 AVG(counter.value) as avg_value,
@@ -671,20 +714,18 @@ class TraceAnalyzer:
             WHERE track.name LIKE '%runqueue%' OR track.name LIKE '%rq%'
             GROUP BY track.name
         """)
-
         self.summary.runqueue_stats = [
             {
-                'name': r.get('counter_name', 'unknown'),
-                'avg': float(r.get('avg_value', 0) or 0),
-                'max': float(r.get('max_value', 0) or 0),
-                'min': float(r.get('min_value', 0) or 0),
-                'samples': int(r.get('sample_count', 0) or 0),
+                'name': r.get('counter_name') or 'unknown',
+                'avg': float(r.get('avg_value') or 0),
+                'max': float(r.get('max_value') or 0),
+                'min': float(r.get('min_value') or 0),
+                'samples': int(r.get('sample_count') or 0),
             }
             for r in rows
         ]
 
-        # Perf counters
-        rows = self.tp.query("""
+        rows = self.db.query("""
             SELECT
                 track.name as counter_name,
                 AVG(counter.value) as avg_value,
@@ -700,23 +741,20 @@ class TraceAnalyzer:
             ORDER BY total_value DESC
             LIMIT 20
         """)
-
         self.summary.perf_counters = [
             {
-                'name': r.get('counter_name', 'unknown'),
-                'avg': float(r.get('avg_value', 0) or 0),
-                'max': float(r.get('max_value', 0) or 0),
-                'total': float(r.get('total_value', 0) or 0),
-                'samples': int(r.get('sample_count', 0) or 0),
+                'name': r.get('counter_name') or 'unknown',
+                'avg': float(r.get('avg_value') or 0),
+                'max': float(r.get('max_value') or 0),
+                'total': float(r.get('total_value') or 0),
+                'samples': int(r.get('sample_count') or 0),
             }
             for r in rows
         ]
 
     def _analyze_custom_events(self):
-        """Analyze custom slice events (from --trace-event)"""
-        print("  - Custom events...", file=sys.stderr)
-
-        rows = self.tp.query("""
+        """Analyze custom trace events"""
+        rows = self.db.query("""
             SELECT
                 name,
                 COUNT(*) as count,
@@ -730,26 +768,22 @@ class TraceAnalyzer:
             ORDER BY count DESC
             LIMIT 30
         """)
-
         self.summary.custom_events = [
             {
-                'name': r.get('name', 'unknown'),
-                'count': int(r.get('count', 0) or 0),
-                'avg_us': float(r.get('avg_us', 0) or 0),
-                'max_us': float(r.get('max_us', 0) or 0),
-                'min_us': float(r.get('min_us', 0) or 0),
-                'total_us': float(r.get('total_us', 0) or 0),
+                'name': r.get('name') or 'unknown',
+                'count': int(r.get('count') or 0),
+                'avg_us': float(r.get('avg_us') or 0),
+                'max_us': float(r.get('max_us') or 0),
+                'min_us': float(r.get('min_us') or 0),
+                'total_us': float(r.get('total_us') or 0),
             }
             for r in rows
         ]
 
     def _detect_anomalies(self):
         """Detect potential issues in the trace"""
-        print("  - Anomaly detection...", file=sys.stderr)
-
         anomalies = []
 
-        # Check for very long scheduling delays (> 100ms)
         if self.summary.system_latency.max_us > 100000:
             anomalies.append({
                 'severity': 'warning',
@@ -757,7 +791,6 @@ class TraceAnalyzer:
                 'message': f"Maximum scheduling delay of {self.summary.system_latency.max_us / 1000:.1f}ms detected",
             })
 
-        # Check for high p99 latency (> 50ms)
         if self.summary.system_latency.p99_us > 50000:
             anomalies.append({
                 'severity': 'warning',
@@ -765,16 +798,14 @@ class TraceAnalyzer:
                 'message': f"P99 scheduling latency is {self.summary.system_latency.p99_us / 1000:.1f}ms",
             })
 
-        # Check for processes with excessive blocking
         for proc in self.summary.uninterruptible_sleep_stacks[:5]:
-            if proc.get('total_blocked_us', 0) > 1000000:  # > 1 second total
+            if proc.get('total_blocked_us', 0) > 1000000:
                 anomalies.append({
                     'severity': 'info',
                     'type': 'excessive_blocking',
                     'message': f"Process '{proc['process']}' (PID {proc['pid']}) spent {proc['total_blocked_us'] / 1e6:.2f}s blocked",
                 })
 
-        # Check for CPU imbalance
         if self.summary.per_cpu_stats:
             cpu_times = [c.get('total_time_sec', 0) for c in self.summary.per_cpu_stats]
             if cpu_times:
@@ -809,8 +840,8 @@ def format_markdown(summary: TraceSummary) -> str:
     if summary.anomalies:
         lines.append("## Anomalies Detected\n")
         for a in summary.anomalies:
-            icon = "⚠️" if a['severity'] == 'warning' else "ℹ️"
-            lines.append(f"- {icon} **{a['type']}**: {a['message']}")
+            icon = "!" if a['severity'] == 'warning' else "i"
+            lines.append(f"- [{icon}] **{a['type']}**: {a['message']}")
         lines.append("")
 
     # System-wide scheduling latency
@@ -819,18 +850,18 @@ def format_markdown(summary: TraceSummary) -> str:
     lines.append("| Metric | Value |")
     lines.append("|--------|-------|")
     lines.append(f"| Samples | {lat.count:,} |")
-    lines.append(f"| Min | {lat.min_us:.1f} µs |")
-    lines.append(f"| Avg | {lat.avg_us:.1f} µs |")
-    lines.append(f"| P50 | {lat.p50_us:.1f} µs |")
-    lines.append(f"| P95 | {lat.p95_us:.1f} µs |")
-    lines.append(f"| P99 | {lat.p99_us:.1f} µs |")
-    lines.append(f"| Max | {lat.max_us:.1f} µs |")
+    lines.append(f"| Min | {lat.min_us:.1f} us |")
+    lines.append(f"| Avg | {lat.avg_us:.1f} us |")
+    lines.append(f"| P50 | {lat.p50_us:.1f} us |")
+    lines.append(f"| P95 | {lat.p95_us:.1f} us |")
+    lines.append(f"| P99 | {lat.p99_us:.1f} us |")
+    lines.append(f"| Max | {lat.max_us:.1f} us |")
     lines.append("")
 
     # Per-CPU stats
     if summary.per_cpu_stats:
         lines.append("## Per-CPU Statistics\n")
-        lines.append("| CPU | Context Switches | Avg Latency (µs) | Max Latency (µs) | Total Time (s) |")
+        lines.append("| CPU | Context Switches | Avg Latency (us) | Max Latency (us) | Total Time (s) |")
         lines.append("|-----|------------------|------------------|------------------|----------------|")
         for cpu in summary.per_cpu_stats:
             lines.append(f"| {cpu['cpu']} | {cpu['context_switches']:,} | {cpu['avg_latency_us']:.1f} | {cpu['max_latency_us']:.1f} | {cpu['total_time_sec']:.2f} |")
@@ -839,7 +870,7 @@ def format_markdown(summary: TraceSummary) -> str:
     # Top processes by latency
     if summary.top_processes_by_latency:
         lines.append("## Top Processes by Scheduling Latency\n")
-        lines.append("| Process | PID | Samples | Avg (µs) | Max (µs) | Total (ms) |")
+        lines.append("| Process | PID | Samples | Avg (us) | Max (us) | Total (ms) |")
         lines.append("|---------|-----|---------|----------|----------|------------|")
         for p in summary.top_processes_by_latency[:15]:
             lines.append(f"| {p['name'][:20]} | {p['pid']} | {p['samples']:,} | {p['avg_us']:.1f} | {p['max_us']:.1f} | {p['total_us'] / 1000:.1f} |")
@@ -848,7 +879,7 @@ def format_markdown(summary: TraceSummary) -> str:
     # Top threads by latency
     if summary.top_threads_by_latency:
         lines.append("## Top Threads by Scheduling Latency\n")
-        lines.append("| Process | Thread | TID | Max (µs) | Total (ms) |")
+        lines.append("| Process | Thread | TID | Max (us) | Total (ms) |")
         lines.append("|---------|--------|-----|----------|------------|")
         for t in summary.top_threads_by_latency[:15]:
             lines.append(f"| {t['process'][:15]} | {t['thread'][:15]} | {t['tid']} | {t['max_us']:.1f} | {t['total_us'] / 1000:.1f} |")
@@ -915,7 +946,6 @@ def format_markdown(summary: TraceSummary) -> str:
 
             lines.append(f"**{i}. Total: {sleep_ms:.1f}ms ({s['pct']:.1f}%) | Max: {max_ms:.1f}ms | State: {state_label} | Samples: {samples}**")
 
-            # Split stack by ' -> ' and format as indented list
             stack_parts = s['stack'].split(' -> ')
             if len(stack_parts) > 1:
                 lines.append("```")
@@ -947,7 +977,7 @@ def format_markdown(summary: TraceSummary) -> str:
     # Custom events
     if summary.custom_events:
         lines.append("## Custom Events\n")
-        lines.append("| Event | Count | Avg (µs) | Max (µs) | Total (ms) |")
+        lines.append("| Event | Count | Avg (us) | Max (us) | Total (ms) |")
         lines.append("|-------|-------|----------|----------|------------|")
         for e in summary.custom_events[:20]:
             lines.append(f"| {e['name'][:30]} | {e['count']:,} | {e['avg_us']:.1f} | {e['max_us']:.1f} | {e['total_us'] / 1000:.1f} |")
@@ -971,12 +1001,19 @@ Examples:
     %(prog)s trace.pb --format json          # Print JSON summary
     %(prog)s trace.pb -o summary.md          # Save to file
     %(prog)s trace.pb --format json -o summary.json
+    %(prog)s trace.pb --db /tmp/trace.sqlite # Use specific database path
+
+Performance notes:
+    - First run converts the trace to SQLite (may take a while for large traces)
+    - Subsequent runs reuse the database and are much faster
+    - Database is regenerated automatically if the trace file changes
         """
     )
-    parser.add_argument('trace', help='Path to Perfetto trace file (.pb)')
+    parser.add_argument('trace', help='Path to Perfetto trace file (.pb, .pb.gz)')
     parser.add_argument('--format', '-f', choices=['markdown', 'json'], default='markdown',
                         help='Output format (default: markdown)')
     parser.add_argument('--output', '-o', help='Output file (default: stdout)')
+    parser.add_argument('--db', help='Path to SQLite database (default: alongside trace file)')
 
     args = parser.parse_args()
 
@@ -985,7 +1022,7 @@ Examples:
         sys.exit(1)
 
     try:
-        analyzer = TraceAnalyzer(args.trace)
+        analyzer = TraceAnalyzer(args.trace, args.db)
         summary = analyzer.analyze()
 
         if args.format == 'json':
@@ -1005,6 +1042,8 @@ Examples:
         sys.exit(1)
     except Exception as e:
         print(f"Error analyzing trace: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
