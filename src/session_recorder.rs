@@ -231,6 +231,21 @@ impl SessionRecorder {
                 self.record_new_process(info);
             }
         } else {
+            // For threads, ensure the parent process is also recorded
+            let tgid = (info.tgidpid >> 32) as u64;
+            let parent_tgidpid = (tgid << 32) | tgid; // parent process has pid == tgid
+            if !self
+                .process_descriptors
+                .read()
+                .unwrap()
+                .contains_key(&parent_tgidpid)
+            {
+                // Create a synthetic task_info for the parent process
+                let mut parent_info = *info;
+                parent_info.tgidpid = parent_tgidpid;
+                self.record_new_process(&parent_info);
+            }
+
             // Check if thread already exists
             if !self.threads.read().unwrap().contains_key(&info.tgidpid) {
                 self.record_new_thread(info);
@@ -546,9 +561,11 @@ mod tests {
         assert_eq!(thread_desc.pid(), 1234);
         assert_eq!(thread_desc.thread_name(), "test_thread");
 
-        // Process descriptors should remain empty for threads
-        assert!(recorder.process_descriptors.read().unwrap().is_empty());
-        assert!(recorder.processes.read().unwrap().is_empty());
+        // Parent process should also be recorded when recording a thread
+        let process_descriptors = recorder.process_descriptors.read().unwrap();
+        assert_eq!(process_descriptors.len(), 1);
+        let parent_tgidpid = (1234u64 << 32) | 1234u64;
+        assert!(process_descriptors.contains_key(&parent_tgidpid));
     }
 
     #[test]

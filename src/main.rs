@@ -93,54 +93,6 @@ impl ShutdownSignal {
     }
 }
 
-/// Thread-local bloom filter for task deduplication.
-/// Each thread gets its own instance - no atomic operations needed.
-/// This trades a small increase in duplicate task_info messages
-/// (which the discovery thread handles anyway) for much lower CPU usage.
-struct ThreadLocalBloomFilter {
-    bits: Box<[u64]>,
-    num_bits: usize,
-}
-
-impl ThreadLocalBloomFilter {
-    const NUM_HASHES: usize = 3;
-
-    fn new(size_bytes: usize) -> Self {
-        let num_u64s = size_bytes / 8;
-        let bits: Vec<u64> = vec![0; num_u64s];
-        Self {
-            bits: bits.into_boxed_slice(),
-            num_bits: num_u64s * 64,
-        }
-    }
-
-    fn hash(&self, key: u64, seed: usize) -> usize {
-        let mut h = key.wrapping_add(seed as u64);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51afd7ed558ccd);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
-        h ^= h >> 33;
-        (h as usize) % self.num_bits
-    }
-
-    fn insert_and_check(&mut self, key: u64) -> bool {
-        let mut was_present = true;
-        for i in 0..Self::NUM_HASHES {
-            let bit_idx = self.hash(key, i);
-            let word_idx = bit_idx / 64;
-            let bit_offset = bit_idx % 64;
-            let mask = 1u64 << bit_offset;
-            let old = self.bits[word_idx];
-            if old & mask == 0 {
-                was_present = false;
-                self.bits[word_idx] = old | mask;
-            }
-        }
-        was_present
-    }
-}
-
 fn create_ringbuf_epoll(ringbuf_fd: RawFd, shutdown_fd: RawFd) -> io::Result<OwnedFd> {
     let epoll_fd = {
         let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
@@ -571,8 +523,9 @@ fn consume_loop<T, N>(
     T: SystingRecordEvent<N>,
     N: Plain + SystingEvent + Copy,
 {
-    // Each thread gets its own bloom filter - no atomic operations needed
-    let mut task_bloom = ThreadLocalBloomFilter::new(4096);
+    // Use a HashSet for deduplication - bloom filters have false positives which
+    // can cause threads to not be recorded if the filter incorrectly says "seen"
+    let mut seen_tasks: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     loop {
         let Ok(event) = rx.recv() else {
@@ -581,12 +534,12 @@ fn consume_loop<T, N>(
 
         // Send task_info to process discovery thread only if not already seen
         if let Some(task_info) = event.next_task_info() {
-            if !task_bloom.insert_and_check(task_info.tgidpid) {
+            if seen_tasks.insert(task_info.tgidpid) {
                 let _ = task_info_tx.send(*task_info);
             }
         }
         if let Some(task_info) = event.prev_task_info() {
-            if !task_bloom.insert_and_check(task_info.tgidpid) {
+            if seen_tasks.insert(task_info.tgidpid) {
                 let _ = task_info_tx.send(*task_info);
             }
         }
@@ -716,11 +669,12 @@ fn spawn_recorder_threads(
             thread::Builder::new()
                 .name("packet_recorder".to_string())
                 .spawn(move || {
-                    // Thread-local bloom filter for task deduplication
-                    let mut task_bloom = ThreadLocalBloomFilter::new(4096);
+                    // Use HashSet for deduplication - bloom filters have false positives
+                    let mut seen_tasks: std::collections::HashSet<u64> =
+                        std::collections::HashSet::new();
                     while let Ok(event) = packet_rx.recv() {
                         if let Some(task_info) = event.next_task_info() {
-                            if !task_bloom.insert_and_check(task_info.tgidpid) {
+                            if seen_tasks.insert(task_info.tgidpid) {
                                 session_recorder.maybe_record_task(task_info);
                             }
                         }
