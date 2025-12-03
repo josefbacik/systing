@@ -11,11 +11,13 @@ use indicatif::{ProgressBar, ProgressStyle};
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
 use perfetto_protos::trace::Trace;
 use protobuf::Message;
-use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -918,93 +920,90 @@ fn run_convert(
 
     create_schema(&conn)?;
 
-    let load_progress = ProgressBar::new(traces.len() as u64);
-    load_progress.set_style(
+    let progress = ProgressBar::new(traces.len() as u64);
+    progress.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} Loading traces...")
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} Processing traces...")
             .unwrap()
             .progress_chars("#>-"),
     );
 
-    let processed_results: Vec<Result<ProcessedTrace>> = traces
-        .par_iter()
-        .map(|trace| {
-            let result = load_and_extract_trace(trace);
-            load_progress.inc(1);
-            result
-        })
-        .collect();
+    // Bound parallelism to control memory: each trace ~17GB, 2 workers = ~34GB peak
+    let num_workers = 2.min(traces.len());
+    let num_traces = traces.len();
+    let (tx, rx) = mpsc::sync_channel::<(usize, Result<ProcessedTrace>)>(1);
+    let work_idx = AtomicUsize::new(0);
 
-    load_progress.finish_with_message("Loading complete");
+    thread::scope(|s| {
+        for _ in 0..num_workers {
+            let tx = tx.clone();
+            let work_idx = &work_idx;
+            let traces = &traces;
+            s.spawn(move || loop {
+                let idx = work_idx.fetch_add(1, Ordering::Relaxed);
+                if idx >= num_traces {
+                    break;
+                }
+                let result = load_and_extract_trace(&traces[idx]);
+                if tx.send((idx, result)).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(tx);
 
-    let t_load = Instant::now();
-    if verbose {
-        eprintln!(
-            "Parallel load/extract: {:.2}s",
-            t_load.duration_since(start_time).as_secs_f64()
-        );
-    }
+        let mut total_events = 0usize;
+        let mut errors: Vec<String> = Vec::new();
 
-    let insert_progress = ProgressBar::new(traces.len() as u64);
-    insert_progress.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} Inserting into database...",
-            )
-            .unwrap()
-            .progress_chars("#>-"),
-    );
-
-    let mut total_events = 0usize;
-    let mut errors: Vec<String> = Vec::new();
-
-    for (i, result) in processed_results.into_iter().enumerate() {
-        insert_progress.set_position(i as u64);
-
-        match result {
-            Ok(processed) => {
-                if let Err(e) = insert_processed_trace(&conn, &processed) {
-                    errors.push(format!("{}: {}", processed.source_path.display(), e));
-                } else {
-                    total_events += processed.event_count;
+        for (idx, result) in rx {
+            progress.inc(1);
+            match result {
+                Ok(processed) => {
+                    if let Err(e) = insert_processed_trace(&conn, &processed) {
+                        errors.push(format!("{}: {}", processed.source_path.display(), e));
+                    } else {
+                        total_events += processed.event_count;
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!("{}: {}", traces[idx].source_path.display(), e));
                 }
             }
-            Err(e) => {
-                errors.push(format!("{}: {}", traces[i].source_path.display(), e));
+        }
+
+        progress.finish_with_message("Import complete");
+
+        if verbose {
+            eprintln!(
+                "Processing time: {:.2}s",
+                start_time.elapsed().as_secs_f64()
+            );
+        }
+
+        if !errors.is_empty() {
+            eprintln!("\nConversion errors:");
+            for error in &errors {
+                eprintln!("  {}", error);
             }
         }
-    }
 
-    insert_progress.finish_with_message("Import complete");
+        let elapsed = start_time.elapsed();
+        let db_size = fs::metadata(&output)
+            .map(|m| m.len() as f64 / (1024.0 * 1024.0))
+            .unwrap_or(0.0);
 
-    if verbose {
         eprintln!(
-            "Sequential insert: {:.2}s",
-            Instant::now().duration_since(t_load).as_secs_f64()
+            "\nComplete! Created {} ({:.1} MB) in {:.1}s",
+            output.display(),
+            db_size,
+            elapsed.as_secs_f64()
         );
-    }
-
-    if !errors.is_empty() {
-        eprintln!("\nConversion errors:");
-        for error in &errors {
-            eprintln!("  {}", error);
-        }
-    }
-
-    let elapsed = start_time.elapsed();
-    let db_size = fs::metadata(&output)?.len() as f64 / (1024.0 * 1024.0);
-
-    eprintln!(
-        "\nComplete! Created {} ({:.1} MB) in {:.1}s",
-        output.display(),
-        db_size,
-        elapsed.as_secs_f64()
-    );
-    eprintln!(
-        "  {} traces imported, {} total events",
-        traces.len() - errors.len(),
-        total_events
-    );
+        eprintln!(
+            "  {} traces imported, {} total events",
+            num_traces - errors.len(),
+            total_events
+        );
+    });
 
     Ok(())
 }
