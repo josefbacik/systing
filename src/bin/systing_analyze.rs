@@ -11,6 +11,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
 use perfetto_protos::trace::Trace;
 use protobuf::Message;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
@@ -167,6 +168,14 @@ fn read_trace(path: &Path) -> Result<Trace> {
     };
 
     Trace::parse_from_bytes(&bytes).with_context(|| "Failed to parse Perfetto trace")
+}
+
+/// Processed trace data ready for database insertion
+struct ProcessedTrace {
+    trace_id: String,
+    source_path: PathBuf,
+    data: ExtractedData,
+    event_count: usize,
 }
 
 /// Data extracted from a trace for database insertion
@@ -909,11 +918,39 @@ fn run_convert(
 
     create_schema(&conn)?;
 
-    // Set up progress bar
-    let progress = ProgressBar::new(traces.len() as u64);
-    progress.set_style(
+    let load_progress = ProgressBar::new(traces.len() as u64);
+    load_progress.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} Loading traces...")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+
+    let processed_results: Vec<Result<ProcessedTrace>> = traces
+        .par_iter()
+        .map(|trace| {
+            let result = load_and_extract_trace(trace);
+            load_progress.inc(1);
+            result
+        })
+        .collect();
+
+    load_progress.finish_with_message("Loading complete");
+
+    let t_load = Instant::now();
+    if verbose {
+        eprintln!(
+            "Parallel load/extract: {:.2}s",
+            t_load.duration_since(start_time).as_secs_f64()
+        );
+    }
+
+    let insert_progress = ProgressBar::new(traces.len() as u64);
+    insert_progress.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} Inserting into database...",
+            )
             .unwrap()
             .progress_chars("#>-"),
     );
@@ -921,24 +958,32 @@ fn run_convert(
     let mut total_events = 0usize;
     let mut errors: Vec<String> = Vec::new();
 
-    // Process each trace
-    for (i, trace) in traces.iter().enumerate() {
-        progress.set_position(i as u64);
-        progress.set_message(format!("Processing: {}", trace.trace_id));
+    for (i, result) in processed_results.into_iter().enumerate() {
+        insert_progress.set_position(i as u64);
 
-        match process_trace(&conn, trace, verbose) {
-            Ok(event_count) => {
-                total_events += event_count;
+        match result {
+            Ok(processed) => {
+                if let Err(e) = insert_processed_trace(&conn, &processed) {
+                    errors.push(format!("{}: {}", processed.source_path.display(), e));
+                } else {
+                    total_events += processed.event_count;
+                }
             }
             Err(e) => {
-                errors.push(format!("{}: {}", trace.source_path.display(), e));
+                errors.push(format!("{}: {}", traces[i].source_path.display(), e));
             }
         }
     }
 
-    progress.finish_with_message("Import complete");
+    insert_progress.finish_with_message("Import complete");
 
-    // Report any errors
+    if verbose {
+        eprintln!(
+            "Sequential insert: {:.2}s",
+            Instant::now().duration_since(t_load).as_secs_f64()
+        );
+    }
+
     if !errors.is_empty() {
         eprintln!("\nConversion errors:");
         for error in &errors {
@@ -964,62 +1009,34 @@ fn run_convert(
     Ok(())
 }
 
-/// Process a single trace file
-fn process_trace(conn: &Connection, trace: &TraceInfo, verbose: bool) -> Result<usize> {
-    let t0 = Instant::now();
-
-    // Read and parse trace
+fn load_and_extract_trace(trace: &TraceInfo) -> Result<ProcessedTrace> {
     let parsed_trace = read_trace(&trace.source_path)?;
-    let t1 = Instant::now();
-    if verbose {
-        eprintln!("  Read/parse: {:.2}s", t1.duration_since(t0).as_secs_f64());
-    }
-
-    // Extract data
     let mut data = extract_trace_data_raw(&parsed_trace);
-    let t2 = Instant::now();
-    if verbose {
-        eprintln!(
-            "  Extract raw: {:.2}s ({} sched_slices, {} thread_states)",
-            t2.duration_since(t1).as_secs_f64(),
-            data.sched_slices.len(),
-            data.thread_states.len()
-        );
-    }
-
-    // Post-process: compute durations
     compute_sched_durations(&mut data.sched_slices);
-    let t3 = Instant::now();
-    if verbose {
-        eprintln!(
-            "  Compute durations: {:.2}s",
-            t3.duration_since(t2).as_secs_f64()
-        );
-    }
 
-    // Insert trace metadata
-    conn.execute(
-        "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
-        params![
-            trace.trace_id,
-            trace.source_path.to_string_lossy().to_string()
-        ],
-    )?;
-
-    // Insert data
-    insert_data(conn, &trace.trace_id, &data)?;
-    let t4 = Instant::now();
-    if verbose {
-        eprintln!("  Insert: {:.2}s", t4.duration_since(t3).as_secs_f64());
-    }
-
-    // Return event count
     let event_count = data.sched_slices.len()
         + data.thread_states.len()
         + data.counters.len()
         + data.slices.len();
 
-    Ok(event_count)
+    Ok(ProcessedTrace {
+        trace_id: trace.trace_id.clone(),
+        source_path: trace.source_path.clone(),
+        data,
+        event_count,
+    })
+}
+
+fn insert_processed_trace(conn: &Connection, processed: &ProcessedTrace) -> Result<()> {
+    conn.execute(
+        "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
+        params![
+            processed.trace_id,
+            processed.source_path.to_string_lossy().to_string()
+        ],
+    )?;
+    insert_data(conn, &processed.trace_id, &processed.data)?;
+    Ok(())
 }
 
 /// Run the query command
