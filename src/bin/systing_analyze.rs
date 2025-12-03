@@ -9,11 +9,11 @@ use duckdb::{params, Connection};
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
-use perfetto_protos::trace::Trace;
+use perfetto_protos::trace_packet::TracePacket;
 use protobuf::Message;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -71,6 +71,24 @@ enum Commands {
 struct TraceInfo {
     trace_id: String,
     source_path: PathBuf,
+}
+
+fn get_available_memory_gb() -> usize {
+    use std::fs::read_to_string;
+    // Try to read from /proc/meminfo (Linux)
+    if let Ok(meminfo) = read_to_string("/proc/meminfo") {
+        for line in meminfo.lines() {
+            if line.starts_with("MemAvailable:") {
+                if let Some(kb_str) = line.split_whitespace().nth(1) {
+                    if let Ok(kb) = kb_str.parse::<usize>() {
+                        return kb / 1024 / 1024; // Convert KB to GB
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: assume 32GB available
+    32
 }
 
 fn generate_trace_id(path: &Path) -> String {
@@ -149,27 +167,118 @@ fn is_trace_file(path: &Path) -> bool {
         || name.ends_with(".pftrace")
 }
 
-fn read_trace(path: &Path) -> Result<Trace> {
+/// Iterator that streams TracePackets from a Perfetto trace file without loading all into memory
+struct TracePacketIterator<R: BufRead> {
+    reader: R,
+    buffer: Vec<u8>,
+}
+
+impl<R: BufRead> TracePacketIterator<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buffer: Vec::with_capacity(64 * 1024),
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for TracePacketIterator<R> {
+    type Item = Result<TracePacket>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let mut tag_byte = [0u8; 1];
+            match self.reader.read_exact(&mut tag_byte) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+                Err(e) => return Some(Err(e.into())),
+            }
+
+            let wire_type = tag_byte[0] & 0x07;
+            let field_number = tag_byte[0] >> 3;
+
+            // Field 1 (packet), wire type 2 (length-delimited)
+            if field_number == 1 && wire_type == 2 {
+                let length = match read_varint(&mut self.reader) {
+                    Ok(len) => len as usize,
+                    Err(e) => return Some(Err(e)),
+                };
+
+                self.buffer.clear();
+                if self.buffer.capacity() < length {
+                    self.buffer.reserve(length - self.buffer.capacity());
+                }
+                self.buffer.resize(length, 0);
+
+                if let Err(e) = self.reader.read_exact(&mut self.buffer) {
+                    return Some(Err(e.into()));
+                }
+
+                return match TracePacket::parse_from_bytes(&self.buffer) {
+                    Ok(packet) => Some(Ok(packet)),
+                    Err(e) => Some(Err(e.into())),
+                };
+            }
+
+            // Skip non-packet fields
+            if let Err(e) = skip_field(&mut self.reader, wire_type) {
+                return Some(Err(e));
+            }
+        }
+    }
+}
+
+fn read_varint<R: Read>(reader: &mut R) -> Result<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0;
+    loop {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte)?;
+        result |= ((byte[0] & 0x7f) as u64) << shift;
+        if byte[0] & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift >= 64 {
+            bail!("Varint too large");
+        }
+    }
+    Ok(result)
+}
+
+fn skip_field<R: Read>(reader: &mut R, wire_type: u8) -> Result<()> {
+    match wire_type {
+        0 => {
+            read_varint(reader)?;
+        }
+        1 => {
+            let mut buf = [0u8; 8];
+            reader.read_exact(&mut buf)?;
+        }
+        2 => {
+            let len = read_varint(reader)? as usize;
+            std::io::copy(&mut reader.take(len as u64), &mut std::io::sink())?;
+        }
+        5 => {
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf)?;
+        }
+        _ => bail!("Unknown wire type: {}", wire_type),
+    }
+    Ok(())
+}
+
+fn open_trace_reader(path: &Path) -> Result<Box<dyn BufRead + Send>> {
     let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
-    let mut reader = BufReader::new(file);
+    let reader = BufReader::with_capacity(256 * 1024, file);
 
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    let bytes = if name.ends_with(".gz") {
-        let mut decoder = GzDecoder::new(reader);
-        let mut bytes = Vec::new();
-        decoder
-            .read_to_end(&mut bytes)
-            .with_context(|| "Failed to decompress gzip file")?;
-        bytes
+    if name.ends_with(".gz") {
+        let decoder = GzDecoder::new(reader);
+        Ok(Box::new(BufReader::with_capacity(256 * 1024, decoder)))
     } else {
-        let mut bytes = Vec::new();
-        reader
-            .read_to_end(&mut bytes)
-            .with_context(|| "Failed to read trace file")?;
-        bytes
-    };
-
-    Trace::parse_from_bytes(&bytes).with_context(|| "Failed to parse Perfetto trace")
+        Ok(Box::new(reader))
+    }
 }
 
 /// Processed trace data ready for database insertion
@@ -250,66 +359,81 @@ struct SliceRecord {
     depth: i32,
 }
 
-fn extract_trace_data_raw(trace: &Trace) -> ExtractedData {
-    let packet_count = trace.packet.len();
-    let estimated_slices = packet_count * 10;
+struct TraceExtractor {
+    data: ExtractedData,
+    pid_to_upid: HashMap<i32, i64>,
+    tid_to_utid: HashMap<i32, i64>,
+    track_uuid_to_id: HashMap<u64, i64>,
+    track_uuid_to_utid: HashMap<u64, i64>,
+    next_upid: i64,
+    next_utid: i64,
+    next_track_id: i64,
+}
 
-    let mut data = ExtractedData {
-        processes: Vec::with_capacity(1024),
-        threads: Vec::with_capacity(4096),
-        sched_slices: Vec::with_capacity(estimated_slices),
-        thread_states: Vec::with_capacity(estimated_slices / 2),
-        counters: Vec::with_capacity(packet_count),
-        counter_tracks: Vec::with_capacity(256),
-        slices: Vec::with_capacity(packet_count / 10),
-    };
+impl TraceExtractor {
+    fn new() -> Self {
+        Self {
+            data: ExtractedData {
+                processes: Vec::new(),
+                threads: Vec::new(),
+                sched_slices: Vec::new(),
+                thread_states: Vec::new(),
+                counters: Vec::new(),
+                counter_tracks: Vec::new(),
+                slices: Vec::new(),
+            },
+            pid_to_upid: HashMap::new(),
+            tid_to_utid: HashMap::new(),
+            track_uuid_to_id: HashMap::new(),
+            track_uuid_to_utid: HashMap::new(),
+            next_upid: 1,
+            next_utid: 1,
+            next_track_id: 1,
+        }
+    }
 
-    let mut pid_to_upid: HashMap<i32, i64> = HashMap::with_capacity(1024);
-    let mut tid_to_utid: HashMap<i32, i64> = HashMap::with_capacity(4096);
-    let mut track_uuid_to_id: HashMap<u64, i64> = HashMap::with_capacity(512);
-    let mut track_uuid_to_utid: HashMap<u64, i64> = HashMap::with_capacity(4096);
-    let mut next_upid: i64 = 1;
-    let mut next_utid: i64 = 1;
-    let mut next_track_id: i64 = 1;
+    fn into_data(self) -> ExtractedData {
+        self.data
+    }
 
-    // First pass: extract descriptors
-    for packet in &trace.packet {
+    fn process_packet(&mut self, packet: &TracePacket) {
+        self.process_descriptors(packet);
+        self.process_events(packet);
+    }
+
+    fn process_descriptors(&mut self, packet: &TracePacket) {
         if packet.has_track_descriptor() {
             let desc = packet.track_descriptor();
 
-            if desc.process.is_some() {
-                let proc = &desc.process;
+            if let Some(proc) = desc.process.as_ref() {
                 let pid = proc.pid();
-                if let std::collections::hash_map::Entry::Vacant(e) = pid_to_upid.entry(pid) {
-                    let upid = next_upid;
-                    next_upid += 1;
+                if let std::collections::hash_map::Entry::Vacant(e) = self.pid_to_upid.entry(pid) {
+                    let upid = self.next_upid;
+                    self.next_upid += 1;
                     e.insert(upid);
-                    data.processes.push(ProcessRecord {
+                    self.data.processes.push(ProcessRecord {
                         upid,
                         pid,
-                        name: if proc.has_process_name() {
-                            Some(proc.process_name().to_string())
-                        } else {
-                            None
-                        },
+                        name: proc.process_name.clone(),
                         parent_upid: None,
                     });
                 }
-                if let (true, Some(&upid)) = (desc.has_uuid(), pid_to_upid.get(&pid)) {
-                    track_uuid_to_id.insert(desc.uuid(), upid);
+                if desc.has_uuid() {
+                    if let Some(&upid) = self.pid_to_upid.get(&pid) {
+                        self.track_uuid_to_id.insert(desc.uuid(), upid);
+                    }
                 }
             }
 
-            if desc.thread.is_some() {
-                let thread = &desc.thread;
+            if let Some(thread) = desc.thread.as_ref() {
                 let tid = thread.tid();
                 let pid = thread.pid();
 
-                if let std::collections::hash_map::Entry::Vacant(e) = pid_to_upid.entry(pid) {
-                    let upid = next_upid;
-                    next_upid += 1;
+                if let std::collections::hash_map::Entry::Vacant(e) = self.pid_to_upid.entry(pid) {
+                    let upid = self.next_upid;
+                    self.next_upid += 1;
                     e.insert(upid);
-                    data.processes.push(ProcessRecord {
+                    self.data.processes.push(ProcessRecord {
                         upid,
                         pid,
                         name: None,
@@ -317,51 +441,43 @@ fn extract_trace_data_raw(trace: &Trace) -> ExtractedData {
                     });
                 }
 
-                if let std::collections::hash_map::Entry::Vacant(e) = tid_to_utid.entry(tid) {
-                    let utid = next_utid;
-                    next_utid += 1;
+                if let std::collections::hash_map::Entry::Vacant(e) = self.tid_to_utid.entry(tid) {
+                    let utid = self.next_utid;
+                    self.next_utid += 1;
                     e.insert(utid);
-                    data.threads.push(ThreadRecord {
+                    self.data.threads.push(ThreadRecord {
                         utid,
                         tid,
-                        name: if thread.has_thread_name() {
-                            Some(thread.thread_name().to_string())
-                        } else {
-                            None
-                        },
-                        upid: pid_to_upid.get(&pid).copied(),
+                        name: thread.thread_name.clone(),
+                        upid: self.pid_to_upid.get(&pid).copied(),
                     });
                 }
-                if let (true, Some(&utid)) = (desc.has_uuid(), tid_to_utid.get(&tid)) {
-                    track_uuid_to_utid.insert(desc.uuid(), utid);
+                if desc.has_uuid() {
+                    if let Some(&utid) = self.tid_to_utid.get(&tid) {
+                        self.track_uuid_to_utid.insert(desc.uuid(), utid);
+                    }
                 }
             }
 
-            if desc.counter.is_some() {
-                let track_id = next_track_id;
-                next_track_id += 1;
+            if let Some(counter) = desc.counter.as_ref() {
+                let track_id = self.next_track_id;
+                self.next_track_id += 1;
                 if desc.has_uuid() {
-                    track_uuid_to_id.insert(desc.uuid(), track_id);
+                    self.track_uuid_to_id.insert(desc.uuid(), track_id);
                 }
-                let counter = &desc.counter;
-                data.counter_tracks.push(CounterTrackRecord {
+                self.data.counter_tracks.push(CounterTrackRecord {
                     id: track_id,
                     name: if desc.has_name() {
                         desc.name().to_string()
                     } else {
                         format!("counter_{}", track_id)
                     },
-                    unit: if counter.has_unit_name() {
-                        Some(counter.unit_name().to_string())
-                    } else {
-                        None
-                    },
+                    unit: counter.unit_name.clone(),
                 });
             } else if desc.has_uuid() && desc.has_name() {
-                // Regular track (for slices)
-                let track_id = next_track_id;
-                next_track_id += 1;
-                track_uuid_to_id.insert(desc.uuid(), track_id);
+                let track_id = self.next_track_id;
+                self.next_track_id += 1;
+                self.track_uuid_to_id.insert(desc.uuid(), track_id);
             }
         }
 
@@ -369,31 +485,33 @@ fn extract_trace_data_raw(trace: &Trace) -> ExtractedData {
             let tree = packet.process_tree();
             for proc in &tree.processes {
                 let pid = proc.pid();
-                if let std::collections::hash_map::Entry::Vacant(e) = pid_to_upid.entry(pid) {
-                    let upid = next_upid;
-                    next_upid += 1;
+                if let std::collections::hash_map::Entry::Vacant(e) = self.pid_to_upid.entry(pid) {
+                    let upid = self.next_upid;
+                    self.next_upid += 1;
                     e.insert(upid);
-                    data.processes.push(ProcessRecord {
+                    self.data.processes.push(ProcessRecord {
                         upid,
                         pid,
                         name: proc.cmdline.first().cloned(),
-                        parent_upid: pid_to_upid.get(&proc.ppid()).copied(),
+                        parent_upid: self.pid_to_upid.get(&proc.ppid()).copied(),
                     });
                 }
             }
             for thread in &tree.threads {
                 let tid = thread.tid();
                 let tgid = thread.tgid();
-                if let std::collections::hash_map::Entry::Vacant(e) = tid_to_utid.entry(tid) {
-                    let utid = next_utid;
-                    next_utid += 1;
+                if let std::collections::hash_map::Entry::Vacant(e) = self.tid_to_utid.entry(tid) {
+                    let utid = self.next_utid;
+                    self.next_utid += 1;
                     e.insert(utid);
 
-                    if let std::collections::hash_map::Entry::Vacant(e) = pid_to_upid.entry(tgid) {
-                        let upid = next_upid;
-                        next_upid += 1;
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        self.pid_to_upid.entry(tgid)
+                    {
+                        let upid = self.next_upid;
+                        self.next_upid += 1;
                         e.insert(upid);
-                        data.processes.push(ProcessRecord {
+                        self.data.processes.push(ProcessRecord {
                             upid,
                             pid: tgid,
                             name: None,
@@ -401,7 +519,7 @@ fn extract_trace_data_raw(trace: &Trace) -> ExtractedData {
                         });
                     }
 
-                    data.threads.push(ThreadRecord {
+                    self.data.threads.push(ThreadRecord {
                         utid,
                         tid,
                         name: if thread.has_name() {
@@ -409,29 +527,20 @@ fn extract_trace_data_raw(trace: &Trace) -> ExtractedData {
                         } else {
                             None
                         },
-                        upid: pid_to_upid.get(&tgid).copied(),
+                        upid: self.pid_to_upid.get(&tgid).copied(),
                     });
                 }
             }
         }
     }
 
-    // Second pass: extract events
-    for packet in &trace.packet {
+    fn process_events(&mut self, packet: &TracePacket) {
         if packet.has_ftrace_events() {
             let bundle = packet.ftrace_events();
             let cpu = bundle.cpu() as i32;
 
             if let Some(compact) = bundle.compact_sched.as_ref() {
-                extract_compact_sched(
-                    compact,
-                    cpu,
-                    &mut data,
-                    &mut tid_to_utid,
-                    &mut pid_to_upid,
-                    &mut next_utid,
-                    &mut next_upid,
-                );
+                self.extract_compact_sched(compact, cpu);
             }
 
             for event in &bundle.event {
@@ -442,27 +551,11 @@ fn extract_trace_data_raw(trace: &Trace) -> ExtractedData {
                     let next_pid = switch.next_pid();
                     let prev_pid = switch.prev_pid();
 
-                    ensure_thread_exists(
-                        next_pid,
-                        Some(switch.next_comm()),
-                        &mut tid_to_utid,
-                        &mut pid_to_upid,
-                        &mut data,
-                        &mut next_utid,
-                        &mut next_upid,
-                    );
-                    ensure_thread_exists(
-                        prev_pid,
-                        Some(switch.prev_comm()),
-                        &mut tid_to_utid,
-                        &mut pid_to_upid,
-                        &mut data,
-                        &mut next_utid,
-                        &mut next_upid,
-                    );
+                    self.ensure_thread_exists(next_pid, Some(switch.next_comm()));
+                    self.ensure_thread_exists(prev_pid, Some(switch.prev_comm()));
 
-                    if let Some(&next_utid) = tid_to_utid.get(&next_pid) {
-                        data.sched_slices.push(SchedSliceRecord {
+                    if let Some(&next_utid) = self.tid_to_utid.get(&next_pid) {
+                        self.data.sched_slices.push(SchedSliceRecord {
                             ts,
                             dur: 0,
                             cpu,
@@ -476,18 +569,10 @@ fn extract_trace_data_raw(trace: &Trace) -> ExtractedData {
                 if event.has_sched_waking() {
                     let waking = event.sched_waking();
                     let pid = waking.pid();
-                    ensure_thread_exists(
-                        pid,
-                        Some(waking.comm()),
-                        &mut tid_to_utid,
-                        &mut pid_to_upid,
-                        &mut data,
-                        &mut next_utid,
-                        &mut next_upid,
-                    );
+                    self.ensure_thread_exists(pid, Some(waking.comm()));
 
-                    if let Some(&utid) = tid_to_utid.get(&pid) {
-                        data.thread_states.push(ThreadStateRecord {
+                    if let Some(&utid) = self.tid_to_utid.get(&pid) {
+                        self.data.thread_states.push(ThreadStateRecord {
                             ts,
                             dur: 0,
                             utid,
@@ -507,8 +592,8 @@ fn extract_trace_data_raw(trace: &Trace) -> ExtractedData {
                 let track_uuid = event.track_uuid();
 
                 if event.has_counter_value() {
-                    if let Some(&track_id) = track_uuid_to_id.get(&track_uuid) {
-                        data.counters.push(CounterRecord {
+                    if let Some(&track_id) = self.track_uuid_to_id.get(&track_uuid) {
+                        self.data.counters.push(CounterRecord {
                             ts,
                             track_id,
                             value: event.counter_value() as f64,
@@ -524,8 +609,8 @@ fn extract_trace_data_raw(trace: &Trace) -> ExtractedData {
                         } else {
                             "unknown".to_string()
                         };
-                        let track_id = track_uuid_to_id.get(&track_uuid).copied().unwrap_or(0);
-                        data.slices.push(SliceRecord {
+                        let track_id = self.track_uuid_to_id.get(&track_uuid).copied().unwrap_or(0);
+                        self.data.slices.push(SliceRecord {
                             ts,
                             dur: 0,
                             track_id,
@@ -539,135 +624,104 @@ fn extract_trace_data_raw(trace: &Trace) -> ExtractedData {
         }
     }
 
-    data
-}
+    fn extract_compact_sched(&mut self, compact: &CompactSched, cpu: i32) {
+        let mut switch_ts: i64 = 0;
+        for i in 0..compact.switch_timestamp.len() {
+            switch_ts += compact.switch_timestamp[i] as i64;
+            let next_pid = compact.switch_next_pid[i];
+            let next_prio = compact.switch_next_prio.get(i).copied().unwrap_or_default();
+            let comm_idx = compact
+                .switch_next_comm_index
+                .get(i)
+                .copied()
+                .unwrap_or_default() as usize;
+            let comm = compact.intern_table.get(comm_idx).map(|s| s.as_str());
 
-fn extract_compact_sched(
-    compact: &CompactSched,
-    cpu: i32,
-    data: &mut ExtractedData,
-    tid_to_utid: &mut HashMap<i32, i64>,
-    pid_to_upid: &mut HashMap<i32, i64>,
-    next_utid: &mut i64,
-    next_upid: &mut i64,
-) {
-    let mut switch_ts: i64 = 0;
-    for i in 0..compact.switch_timestamp.len() {
-        switch_ts += compact.switch_timestamp[i] as i64;
-        let next_pid = compact.switch_next_pid[i];
-        let next_prio = compact.switch_next_prio.get(i).copied().unwrap_or_default();
-        let comm_idx = compact
-            .switch_next_comm_index
-            .get(i)
-            .copied()
-            .unwrap_or_default() as usize;
-        let comm = compact.intern_table.get(comm_idx).map(|s| s.as_str());
+            self.ensure_thread_exists(next_pid, comm);
 
-        ensure_thread_exists(
-            next_pid,
-            comm,
-            tid_to_utid,
-            pid_to_upid,
-            data,
-            next_utid,
-            next_upid,
-        );
-
-        if let Some(&utid) = tid_to_utid.get(&next_pid) {
-            data.sched_slices.push(SchedSliceRecord {
-                ts: switch_ts,
-                dur: 0,
-                cpu,
-                utid,
-                end_state: None,
-                priority: next_prio,
-            });
+            if let Some(&utid) = self.tid_to_utid.get(&next_pid) {
+                self.data.sched_slices.push(SchedSliceRecord {
+                    ts: switch_ts,
+                    dur: 0,
+                    cpu,
+                    utid,
+                    end_state: None,
+                    priority: next_prio,
+                });
+            }
         }
-    }
 
-    let mut waking_ts: i64 = 0;
-    for i in 0..compact.waking_timestamp.len() {
-        waking_ts += compact.waking_timestamp[i] as i64;
-        let pid = compact.waking_pid[i];
-        let target_cpu = compact
-            .waking_target_cpu
-            .get(i)
-            .copied()
-            .unwrap_or_default();
-        let comm_idx = compact
-            .waking_comm_index
-            .get(i)
-            .copied()
-            .unwrap_or_default() as usize;
-        let comm = compact.intern_table.get(comm_idx).map(|s| s.as_str());
+        let mut waking_ts: i64 = 0;
+        for i in 0..compact.waking_timestamp.len() {
+            waking_ts += compact.waking_timestamp[i] as i64;
+            let pid = compact.waking_pid[i];
+            let target_cpu = compact
+                .waking_target_cpu
+                .get(i)
+                .copied()
+                .unwrap_or_default();
+            let comm_idx = compact
+                .waking_comm_index
+                .get(i)
+                .copied()
+                .unwrap_or_default() as usize;
+            let comm = compact.intern_table.get(comm_idx).map(|s| s.as_str());
 
-        ensure_thread_exists(
-            pid,
-            comm,
-            tid_to_utid,
-            pid_to_upid,
-            data,
-            next_utid,
-            next_upid,
-        );
+            self.ensure_thread_exists(pid, comm);
 
-        if let Some(&utid) = tid_to_utid.get(&pid) {
-            data.thread_states.push(ThreadStateRecord {
-                ts: waking_ts,
-                dur: 0,
-                utid,
-                state: "R".to_string(),
-                cpu: Some(target_cpu),
-            });
-        }
-    }
-}
-
-fn ensure_thread_exists(
-    tid: i32,
-    name: Option<&str>,
-    tid_to_utid: &mut HashMap<i32, i64>,
-    pid_to_upid: &mut HashMap<i32, i64>,
-    data: &mut ExtractedData,
-    next_utid: &mut i64,
-    next_upid: &mut i64,
-) {
-    if let std::collections::hash_map::Entry::Vacant(e) = tid_to_utid.entry(tid) {
-        let utid = *next_utid;
-        *next_utid += 1;
-        e.insert(utid);
-
-        // Assume tid == pid when process info unavailable
-        let upid = if let Some(&existing) = pid_to_upid.get(&tid) {
-            existing
-        } else {
-            let upid = *next_upid;
-            *next_upid += 1;
-            pid_to_upid.insert(tid, upid);
-            data.processes.push(ProcessRecord {
-                upid,
-                pid: tid,
-                name: name.map(|s| s.to_string()),
-                parent_upid: None,
-            });
-            upid
-        };
-
-        data.threads.push(ThreadRecord {
-            utid,
-            tid,
-            name: name.map(|s| s.to_string()),
-            upid: Some(upid),
-        });
-    } else if let Some(name_str) = name {
-        if let Some(&utid) = tid_to_utid.get(&tid) {
-            if let Some(thread) = data.threads.iter_mut().find(|t| t.utid == utid) {
-                if thread.name.is_none() {
-                    thread.name = Some(name_str.to_string());
-                }
+            if let Some(&utid) = self.tid_to_utid.get(&pid) {
+                self.data.thread_states.push(ThreadStateRecord {
+                    ts: waking_ts,
+                    dur: 0,
+                    utid,
+                    state: "R".to_string(),
+                    cpu: Some(target_cpu),
+                });
             }
         }
     }
+
+    fn ensure_thread_exists(&mut self, tid: i32, name: Option<&str>) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.tid_to_utid.entry(tid) {
+            let utid = self.next_utid;
+            self.next_utid += 1;
+            e.insert(utid);
+
+            let upid = if let Some(&existing) = self.pid_to_upid.get(&tid) {
+                existing
+            } else {
+                let upid = self.next_upid;
+                self.next_upid += 1;
+                self.pid_to_upid.insert(tid, upid);
+                self.data.processes.push(ProcessRecord {
+                    upid,
+                    pid: tid,
+                    name: name.map(|s| s.to_string()),
+                    parent_upid: None,
+                });
+                upid
+            };
+
+            self.data.threads.push(ThreadRecord {
+                utid,
+                tid,
+                name: name.map(|s| s.to_string()),
+                upid: Some(upid),
+            });
+        }
+    }
+}
+
+fn extract_trace_data_streaming<R: BufRead>(reader: R) -> Result<ExtractedData> {
+    let mut extractor = TraceExtractor::new();
+    let packet_iter = TracePacketIterator::new(reader);
+
+    for packet_result in packet_iter {
+        let packet = packet_result?;
+        extractor.process_packet(&packet);
+    }
+
+    Ok(extractor.into_data())
 }
 
 fn compute_sched_durations(slices: &mut [SchedSliceRecord]) {
@@ -928,10 +982,22 @@ fn run_convert(
             .progress_chars("#>-"),
     );
 
-    // Bound parallelism to control memory: each trace ~17GB, 2 workers = ~34GB peak
-    let num_workers = 2.min(traces.len());
+    // Bound parallelism based on available memory: each large trace ~15GB peak on average
+    // Use up to 80% of available memory, with minimum 2 and maximum 8 workers
+    let available_mem_gb = get_available_memory_gb();
+    let mem_per_worker_gb = 15;
+    let num_workers = ((available_mem_gb * 80 / 100) / mem_per_worker_gb)
+        .clamp(2, 8)
+        .min(traces.len());
+    if verbose {
+        eprintln!(
+            "Using {} parallel workers ({} GB available)",
+            num_workers, available_mem_gb
+        );
+    }
     let num_traces = traces.len();
-    let (tx, rx) = mpsc::sync_channel::<(usize, Result<ProcessedTrace>)>(1);
+    // Buffer 2 results to allow overlap between loading and insertion while limiting memory
+    let (tx, rx) = mpsc::sync_channel::<(usize, Result<ProcessedTrace>)>(2);
     let work_idx = AtomicUsize::new(0);
 
     thread::scope(|s| {
@@ -1009,8 +1075,8 @@ fn run_convert(
 }
 
 fn load_and_extract_trace(trace: &TraceInfo) -> Result<ProcessedTrace> {
-    let parsed_trace = read_trace(&trace.source_path)?;
-    let mut data = extract_trace_data_raw(&parsed_trace);
+    let reader = open_trace_reader(&trace.source_path)?;
+    let mut data = extract_trace_data_streaming(reader)?;
     compute_sched_durations(&mut data.sched_slices);
 
     let event_count = data.sched_slices.len()
