@@ -351,6 +351,8 @@ struct TraceExtractor {
     tid_to_utid: HashMap<i32, i64>,
     track_uuid_to_id: HashMap<u64, i64>,
     track_uuid_to_utid: HashMap<u64, i64>,
+    /// Interned event names: iid -> name string
+    interned_event_names: HashMap<u64, String>,
     next_upid: i64,
     next_utid: i64,
     next_track_id: i64,
@@ -372,6 +374,7 @@ impl TraceExtractor {
             tid_to_utid: HashMap::new(),
             track_uuid_to_id: HashMap::new(),
             track_uuid_to_utid: HashMap::new(),
+            interned_event_names: HashMap::new(),
             next_upid: 1,
             next_utid: 1,
             next_track_id: 1,
@@ -383,8 +386,20 @@ impl TraceExtractor {
     }
 
     fn process_packet(&mut self, packet: &TracePacket) {
+        self.process_interned_data(packet);
         self.process_descriptors(packet);
         self.process_events(packet);
+    }
+
+    fn process_interned_data(&mut self, packet: &TracePacket) {
+        if let Some(interned) = packet.interned_data.as_ref() {
+            for event_name in &interned.event_names {
+                if event_name.has_iid() && event_name.has_name() {
+                    self.interned_event_names
+                        .insert(event_name.iid(), event_name.name().to_string());
+                }
+            }
+        }
     }
 
     fn process_descriptors(&mut self, packet: &TracePacket) {
@@ -590,8 +605,14 @@ impl TraceExtractor {
                 if event.has_type() {
                     use perfetto_protos::track_event::track_event::Type;
                     if let Type::TYPE_SLICE_BEGIN = event.type_() {
+                        // Try inline name first, then interned name via name_iid
                         let name = if event.has_name() {
                             event.name().to_string()
+                        } else if event.has_name_iid() {
+                            self.interned_event_names
+                                .get(&event.name_iid())
+                                .cloned()
+                                .unwrap_or_else(|| "unknown".to_string())
                         } else {
                             "unknown".to_string()
                         };
@@ -1616,5 +1637,134 @@ fn main() -> Result<()> {
             sql,
             format,
         } => run_query(database, sql, format),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use perfetto_protos::interned_data::InternedData;
+    use perfetto_protos::track_event::track_event::Type;
+    use perfetto_protos::track_event::{EventName, TrackEvent};
+
+    #[test]
+    fn test_interned_event_names_are_decoded() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create an interned_data packet with event names
+        let mut interned_packet = TracePacket::default();
+        let mut interned_data = InternedData::default();
+
+        let mut event_name1 = EventName::default();
+        event_name1.set_iid(100);
+        event_name1.set_name("TCP packet_send".to_string());
+        interned_data.event_names.push(event_name1);
+
+        let mut event_name2 = EventName::default();
+        event_name2.set_iid(101);
+        event_name2.set_name("tcp_recv".to_string());
+        interned_data.event_names.push(event_name2);
+
+        interned_packet.interned_data = Some(interned_data).into();
+
+        // Process the interned data packet
+        extractor.process_packet(&interned_packet);
+
+        // Verify interned names are stored
+        assert_eq!(
+            extractor.interned_event_names.get(&100),
+            Some(&"TCP packet_send".to_string())
+        );
+        assert_eq!(
+            extractor.interned_event_names.get(&101),
+            Some(&"tcp_recv".to_string())
+        );
+
+        // Create a track descriptor so we have a valid track_uuid mapping
+        let mut track_desc_packet = TracePacket::default();
+        let mut track_desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+        track_desc.set_uuid(12345);
+        track_desc.set_name("test_track".to_string());
+        track_desc_packet.set_track_descriptor(track_desc);
+        extractor.process_packet(&track_desc_packet);
+
+        // Create a track_event that uses name_iid instead of inline name
+        let mut event_packet = TracePacket::default();
+        event_packet.set_timestamp(1000);
+
+        let mut track_event = TrackEvent::default();
+        track_event.set_type(Type::TYPE_SLICE_BEGIN);
+        track_event.set_track_uuid(12345);
+        track_event.set_name_iid(100); // References "TCP packet_send"
+
+        event_packet.set_track_event(track_event);
+
+        // Process the event packet
+        extractor.process_packet(&event_packet);
+
+        // Verify the slice was created with the correct interned name
+        assert_eq!(extractor.data.slices.len(), 1);
+        assert_eq!(extractor.data.slices[0].name, "TCP packet_send");
+        assert_eq!(extractor.data.slices[0].ts, 1000);
+    }
+
+    #[test]
+    fn test_inline_name_is_used_when_present() {
+        // Note: In Perfetto's protobuf schema, `name` and `name_iid` are in a oneof,
+        // so only one can be present at a time. This test verifies inline names work.
+        let mut extractor = TraceExtractor::new();
+
+        // Create a track descriptor
+        let mut track_desc_packet = TracePacket::default();
+        let mut track_desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+        track_desc.set_uuid(99999);
+        track_desc.set_name("test_track".to_string());
+        track_desc_packet.set_track_descriptor(track_desc);
+        extractor.process_packet(&track_desc_packet);
+
+        // Create a track_event with inline name (no name_iid)
+        let mut event_packet = TracePacket::default();
+        event_packet.set_timestamp(2000);
+
+        let mut track_event = TrackEvent::default();
+        track_event.set_type(Type::TYPE_SLICE_BEGIN);
+        track_event.set_track_uuid(99999);
+        track_event.set_name("inline_name".to_string());
+
+        event_packet.set_track_event(track_event);
+        extractor.process_packet(&event_packet);
+
+        // Verify inline name is used
+        assert_eq!(extractor.data.slices.len(), 1);
+        assert_eq!(extractor.data.slices[0].name, "inline_name");
+    }
+
+    #[test]
+    fn test_unknown_name_iid_falls_back_to_unknown() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create a track descriptor
+        let mut track_desc_packet = TracePacket::default();
+        let mut track_desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+        track_desc.set_uuid(77777);
+        track_desc.set_name("test_track".to_string());
+        track_desc_packet.set_track_descriptor(track_desc);
+        extractor.process_packet(&track_desc_packet);
+
+        // Create a track_event with a name_iid that doesn't exist in interned data
+        let mut event_packet = TracePacket::default();
+        event_packet.set_timestamp(3000);
+
+        let mut track_event = TrackEvent::default();
+        track_event.set_type(Type::TYPE_SLICE_BEGIN);
+        track_event.set_track_uuid(77777);
+        track_event.set_name_iid(99999); // Non-existent iid
+
+        event_packet.set_track_event(track_event);
+        extractor.process_packet(&event_packet);
+
+        // Verify fallback to "unknown"
+        assert_eq!(extractor.data.slices.len(), 1);
+        assert_eq!(extractor.data.slices[0].name, "unknown");
     }
 }
