@@ -63,6 +63,8 @@ struct NetworkEvent {
     end_ts: u64,
     bytes: u32,
     sendmsg_seq: u32,
+    sndbuf_used: u32,   // Bytes in send buffer after sendmsg (sk_wmem_queued)
+    sndbuf_limit: u32,  // Max send buffer size (sk_sndbuf)
 }
 
 #[derive(Clone, Copy)]
@@ -72,6 +74,8 @@ struct PacketEvent {
     seq: u32,
     length: u32,
     tcp_flags: u8,
+    sndbuf_used: u32,   // Bytes in send buffer (sk_wmem_queued) - shows buffer drain on ACK
+    sndbuf_limit: u32,  // Max send buffer size (sk_sndbuf)
 }
 
 enum EventEntry {
@@ -175,6 +179,7 @@ impl ConnectionEvents {
             _ => None,
         })
     }
+
 }
 
 #[derive(Default)]
@@ -261,6 +266,8 @@ impl NetworkRecorder {
             seq: event.seq,
             length: event.length,
             tcp_flags: event.tcp_flags,
+            sndbuf_used: event.sndbuf_used,
+            sndbuf_limit: event.sndbuf_limit,
         };
 
         let conn_events = self
@@ -379,6 +386,26 @@ impl NetworkRecorder {
                 flags_annotation.set_name("flags".to_string());
                 flags_annotation.set_string_value(Self::format_tcp_flags(pkt.tcp_flags));
                 begin_event.debug_annotations.push(flags_annotation);
+            }
+
+            // Add send buffer info (shows buffer drain on ACK receipt)
+            if pkt.sndbuf_limit > 0 {
+                let mut sndbuf_used_annotation = DebugAnnotation::default();
+                sndbuf_used_annotation.set_name("sndbuf_used".to_string());
+                sndbuf_used_annotation.set_uint_value(pkt.sndbuf_used as u64);
+                begin_event.debug_annotations.push(sndbuf_used_annotation);
+
+                let mut sndbuf_limit_annotation = DebugAnnotation::default();
+                sndbuf_limit_annotation.set_name("sndbuf_limit".to_string());
+                sndbuf_limit_annotation.set_uint_value(pkt.sndbuf_limit as u64);
+                begin_event.debug_annotations.push(sndbuf_limit_annotation);
+
+                // Add fill percentage for easier analysis
+                let fill_pct = (pkt.sndbuf_used as u64 * 100) / pkt.sndbuf_limit as u64;
+                let mut fill_annotation = DebugAnnotation::default();
+                fill_annotation.set_name("sndbuf_fill_pct".to_string());
+                fill_annotation.set_uint_value(fill_pct);
+                begin_event.debug_annotations.push(fill_annotation);
             }
 
             let mut begin_packet = TracePacket::default();
@@ -626,6 +653,26 @@ impl NetworkRecorder {
                             begin_event.debug_annotations.push(seq_annotation);
                         }
 
+                        // Add send buffer info (TCP only, when available)
+                        if event.sndbuf_limit > 0 {
+                            let mut sndbuf_used_annotation = DebugAnnotation::default();
+                            sndbuf_used_annotation.set_name("sndbuf_used".to_string());
+                            sndbuf_used_annotation.set_uint_value(event.sndbuf_used as u64);
+                            begin_event.debug_annotations.push(sndbuf_used_annotation);
+
+                            let mut sndbuf_limit_annotation = DebugAnnotation::default();
+                            sndbuf_limit_annotation.set_name("sndbuf_limit".to_string());
+                            sndbuf_limit_annotation.set_uint_value(event.sndbuf_limit as u64);
+                            begin_event.debug_annotations.push(sndbuf_limit_annotation);
+
+                            // Add fill percentage for easier analysis
+                            let fill_pct = (event.sndbuf_used as u64 * 100) / event.sndbuf_limit as u64;
+                            let mut fill_annotation = DebugAnnotation::default();
+                            fill_annotation.set_name("sndbuf_fill_pct".to_string());
+                            fill_annotation.set_uint_value(fill_pct);
+                            begin_event.debug_annotations.push(fill_annotation);
+                        }
+
                         let mut begin_packet = TracePacket::default();
                         begin_packet.set_timestamp(event.start_ts);
                         begin_packet.set_track_event(begin_event);
@@ -760,6 +807,7 @@ impl NetworkRecorder {
                             &buffer_queue_pkts,
                         );
                     }
+
                 }
 
                 // Create UDP Packets track if we have UDP packet events
@@ -885,6 +933,8 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
             end_ts: event.end_ts,
             bytes: event.bytes,
             sendmsg_seq: event.sendmsg_seq,
+            sndbuf_used: event.sndbuf_used,
+            sndbuf_limit: event.sndbuf_limit,
         };
 
         let conn_events = self
