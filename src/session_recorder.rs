@@ -144,7 +144,7 @@ impl SysinfoRecorder {
 }
 
 impl SessionRecorder {
-    pub fn new(enable_debuginfod: bool) -> Self {
+    pub fn new(enable_debuginfod: bool, resolve_network_addresses: bool) -> Self {
         Self {
             clock_snapshot: Mutex::new(ClockSnapshot::default()),
             event_recorder: Mutex::new(SchedEventRecorder::default()),
@@ -152,7 +152,7 @@ impl SessionRecorder {
             perf_counter_recorder: Mutex::new(PerfCounterRecorder::default()),
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::default()),
-            network_recorder: Mutex::new(NetworkRecorder::default()),
+            network_recorder: Mutex::new(NetworkRecorder::new(resolve_network_addresses)),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),

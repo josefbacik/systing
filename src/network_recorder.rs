@@ -244,7 +244,6 @@ impl DnsStats {
     }
 }
 
-#[derive(Default)]
 pub struct NetworkRecorder {
     pub ringbuf: RingBuffer<network_event>,
 
@@ -262,9 +261,34 @@ pub struct NetworkRecorder {
     event_name_ids: HashMap<String, u64>,
     hostname_cache: HashMap<IpAddr, String>,
     dns_stats: DnsStats,
+
+    /// Whether to resolve IP addresses to hostnames via DNS
+    resolve_addresses: bool,
+}
+
+impl Default for NetworkRecorder {
+    fn default() -> Self {
+        Self {
+            ringbuf: RingBuffer::default(),
+            syscall_events: HashMap::new(),
+            packet_events: HashMap::new(),
+            socket_metadata: HashMap::new(),
+            event_name_ids: HashMap::new(),
+            hostname_cache: HashMap::new(),
+            dns_stats: DnsStats::default(),
+            resolve_addresses: true,
+        }
+    }
 }
 
 impl NetworkRecorder {
+    pub fn new(resolve_addresses: bool) -> Self {
+        Self {
+            resolve_addresses,
+            ..Default::default()
+        }
+    }
+
     /// Load socket metadata from BPF map after tracing completes.
     /// This populates the socket_metadata cache with socket ID -> address info mapping.
     pub fn load_socket_metadata<M: libbpf_rs::MapCore>(&mut self, map: &M) {
@@ -407,7 +431,12 @@ impl NetworkRecorder {
     }
 
     fn resolve_hostname(&mut self, addr: IpAddr) -> &str {
+        let resolve = self.resolve_addresses;
         self.hostname_cache.entry(addr).or_insert_with(|| {
+            if !resolve {
+                return addr.to_canonical().to_string();
+            }
+
             self.dns_stats.attempted += 1;
 
             let lookup_addr = addr.to_canonical();

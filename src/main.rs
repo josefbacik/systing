@@ -295,6 +295,9 @@ struct Command {
     // Network recording enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     network: bool,
+    /// Skip DNS resolution for network addresses (show IP addresses instead of hostnames)
+    #[arg(long)]
+    no_resolve_addresses: bool,
     /// List all available recorders and their default states
     #[arg(long)]
     list_recorders: bool,
@@ -1789,7 +1792,10 @@ fn system(opts: Command) -> Result<()> {
 
     setup_perf_counters(&opts, &mut counters, &mut perf_counter_names)?;
 
-    let recorder = Arc::new(SessionRecorder::new(opts.enable_debuginfod));
+    let recorder = Arc::new(SessionRecorder::new(
+        opts.enable_debuginfod,
+        !opts.no_resolve_addresses,
+    ));
     configure_recorder(&opts, &recorder);
     recorder.snapshot_clocks();
     {
