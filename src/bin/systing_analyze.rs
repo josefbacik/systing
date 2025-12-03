@@ -4,10 +4,15 @@
 //! querying and analysis, supporting multiple traces aggregated into a single database.
 
 use anyhow::{bail, Context, Result};
+use arrow::array::{Float64Builder, Int32Builder, Int64Builder, RecordBatch, StringBuilder};
+use arrow::datatypes::{DataType, Field, Schema};
 use clap::{Parser, Subcommand};
 use duckdb::{params, Connection};
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
+use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
 use perfetto_protos::trace_packet::TracePacket;
 use protobuf::Message;
@@ -17,6 +22,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -73,22 +79,10 @@ struct TraceInfo {
     source_path: PathBuf,
 }
 
-fn get_available_memory_gb() -> usize {
-    use std::fs::read_to_string;
-    // Try to read from /proc/meminfo (Linux)
-    if let Ok(meminfo) = read_to_string("/proc/meminfo") {
-        for line in meminfo.lines() {
-            if line.starts_with("MemAvailable:") {
-                if let Some(kb_str) = line.split_whitespace().nth(1) {
-                    if let Ok(kb) = kb_str.parse::<usize>() {
-                        return kb / 1024 / 1024; // Convert KB to GB
-                    }
-                }
-            }
-        }
-    }
-    // Fallback: assume 32GB available
-    32
+fn get_num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
 }
 
 fn generate_trace_id(path: &Path) -> String {
@@ -279,14 +273,6 @@ fn open_trace_reader(path: &Path) -> Result<Box<dyn BufRead + Send>> {
     } else {
         Ok(Box::new(reader))
     }
-}
-
-/// Processed trace data ready for database insertion
-struct ProcessedTrace {
-    trace_id: String,
-    source_path: PathBuf,
-    data: ExtractedData,
-    event_count: usize,
 }
 
 /// Data extracted from a trace for database insertion
@@ -811,110 +797,349 @@ fn create_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Insert extracted data into DuckDB using Appender for bulk loading
-fn insert_data(conn: &Connection, trace_id: &str, data: &ExtractedData) -> Result<()> {
-    // Insert processes using appender
+/// Paths to Parquet files for a trace
+struct ParquetPaths {
+    process: PathBuf,
+    thread: PathBuf,
+    sched_slice: PathBuf,
+    thread_state: PathBuf,
+    counter_track: PathBuf,
+    counter: PathBuf,
+    slice: PathBuf,
+}
+
+impl ParquetPaths {
+    fn new(temp_dir: &Path, trace_id: &str) -> Self {
+        Self {
+            process: temp_dir.join(format!("{}_process.parquet", trace_id)),
+            thread: temp_dir.join(format!("{}_thread.parquet", trace_id)),
+            sched_slice: temp_dir.join(format!("{}_sched_slice.parquet", trace_id)),
+            thread_state: temp_dir.join(format!("{}_thread_state.parquet", trace_id)),
+            counter_track: temp_dir.join(format!("{}_counter_track.parquet", trace_id)),
+            counter: temp_dir.join(format!("{}_counter.parquet", trace_id)),
+            slice: temp_dir.join(format!("{}_slice.parquet", trace_id)),
+        }
+    }
+}
+
+const PARQUET_BATCH_SIZE: usize = 500_000;
+
+fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPaths) -> Result<()> {
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_max_row_group_size(1_000_000)
+        .build();
+
     if !data.processes.is_empty() {
-        let mut appender = conn.appender("process")?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("upid", DataType::Int64, false),
+            Field::new("pid", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("parent_upid", DataType::Int64, true),
+        ]));
+
+        let mut trace_id_builder = StringBuilder::new();
+        let mut upid_builder = Int64Builder::new();
+        let mut pid_builder = Int32Builder::new();
+        let mut name_builder = StringBuilder::new();
+        let mut parent_upid_builder = Int64Builder::new();
+
         for proc in &data.processes {
-            appender.append_row(params![
-                trace_id,
-                proc.upid,
-                proc.pid,
-                proc.name.as_deref(),
-                proc.parent_upid
-            ])?;
+            trace_id_builder.append_value(trace_id);
+            upid_builder.append_value(proc.upid);
+            pid_builder.append_value(proc.pid);
+            name_builder.append_option(proc.name.as_deref());
+            parent_upid_builder.append_option(proc.parent_upid);
         }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(upid_builder.finish()),
+                Arc::new(pid_builder.finish()),
+                Arc::new(name_builder.finish()),
+                Arc::new(parent_upid_builder.finish()),
+            ],
+        )?;
+
+        let file = File::create(&paths.process)?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props.clone()))?;
+        writer.write(&batch)?;
+        writer.close()?;
     }
 
-    // Insert threads using appender
     if !data.threads.is_empty() {
-        let mut appender = conn.appender("thread")?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("utid", DataType::Int64, false),
+            Field::new("tid", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("upid", DataType::Int64, true),
+        ]));
+
+        let mut trace_id_builder = StringBuilder::new();
+        let mut utid_builder = Int64Builder::new();
+        let mut tid_builder = Int32Builder::new();
+        let mut name_builder = StringBuilder::new();
+        let mut upid_builder = Int64Builder::new();
+
         for thread in &data.threads {
-            appender.append_row(params![
-                trace_id,
-                thread.utid,
-                thread.tid,
-                thread.name.as_deref(),
-                thread.upid
-            ])?;
+            trace_id_builder.append_value(trace_id);
+            utid_builder.append_value(thread.utid);
+            tid_builder.append_value(thread.tid);
+            name_builder.append_option(thread.name.as_deref());
+            upid_builder.append_option(thread.upid);
         }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(utid_builder.finish()),
+                Arc::new(tid_builder.finish()),
+                Arc::new(name_builder.finish()),
+                Arc::new(upid_builder.finish()),
+            ],
+        )?;
+
+        let file = File::create(&paths.thread)?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props.clone()))?;
+        writer.write(&batch)?;
+        writer.close()?;
     }
 
-    // Insert sched_slices using appender
     if !data.sched_slices.is_empty() {
-        let mut appender = conn.appender("sched_slice")?;
-        for slice in &data.sched_slices {
-            appender.append_row(params![
-                trace_id,
-                slice.ts,
-                slice.dur,
-                slice.cpu,
-                slice.utid,
-                slice.end_state.as_deref(),
-                slice.priority
-            ])?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("dur", DataType::Int64, false),
+            Field::new("cpu", DataType::Int32, false),
+            Field::new("utid", DataType::Int64, false),
+            Field::new("end_state", DataType::Utf8, true),
+            Field::new("priority", DataType::Int32, false),
+        ]));
+
+        let file = File::create(&paths.sched_slice)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+
+        for chunk in data.sched_slices.chunks(PARQUET_BATCH_SIZE) {
+            let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut ts_builder = Int64Builder::with_capacity(chunk.len());
+            let mut dur_builder = Int64Builder::with_capacity(chunk.len());
+            let mut cpu_builder = Int32Builder::with_capacity(chunk.len());
+            let mut utid_builder = Int64Builder::with_capacity(chunk.len());
+            let mut end_state_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 4);
+            let mut priority_builder = Int32Builder::with_capacity(chunk.len());
+
+            for slice in chunk {
+                trace_id_builder.append_value(trace_id);
+                ts_builder.append_value(slice.ts);
+                dur_builder.append_value(slice.dur);
+                cpu_builder.append_value(slice.cpu);
+                utid_builder.append_value(slice.utid);
+                end_state_builder.append_option(slice.end_state.as_deref());
+                priority_builder.append_value(slice.priority);
+            }
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(trace_id_builder.finish()),
+                    Arc::new(ts_builder.finish()),
+                    Arc::new(dur_builder.finish()),
+                    Arc::new(cpu_builder.finish()),
+                    Arc::new(utid_builder.finish()),
+                    Arc::new(end_state_builder.finish()),
+                    Arc::new(priority_builder.finish()),
+                ],
+            )?;
+            writer.write(&batch)?;
         }
+        writer.close()?;
     }
 
-    // Insert thread_states using appender
     if !data.thread_states.is_empty() {
-        let mut appender = conn.appender("thread_state")?;
-        for state in &data.thread_states {
-            appender.append_row(params![
-                trace_id,
-                state.ts,
-                state.dur,
-                state.utid,
-                state.state.as_str(),
-                state.cpu
-            ])?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("dur", DataType::Int64, false),
+            Field::new("utid", DataType::Int64, false),
+            Field::new("state", DataType::Utf8, false),
+            Field::new("cpu", DataType::Int32, true),
+        ]));
+
+        let file = File::create(&paths.thread_state)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+
+        for chunk in data.thread_states.chunks(PARQUET_BATCH_SIZE) {
+            let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut ts_builder = Int64Builder::with_capacity(chunk.len());
+            let mut dur_builder = Int64Builder::with_capacity(chunk.len());
+            let mut utid_builder = Int64Builder::with_capacity(chunk.len());
+            let mut state_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 4);
+            let mut cpu_builder = Int32Builder::with_capacity(chunk.len());
+
+            for state in chunk {
+                trace_id_builder.append_value(trace_id);
+                ts_builder.append_value(state.ts);
+                dur_builder.append_value(state.dur);
+                utid_builder.append_value(state.utid);
+                state_builder.append_value(&state.state);
+                cpu_builder.append_option(state.cpu);
+            }
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(trace_id_builder.finish()),
+                    Arc::new(ts_builder.finish()),
+                    Arc::new(dur_builder.finish()),
+                    Arc::new(utid_builder.finish()),
+                    Arc::new(state_builder.finish()),
+                    Arc::new(cpu_builder.finish()),
+                ],
+            )?;
+            writer.write(&batch)?;
         }
+        writer.close()?;
     }
 
-    // Insert counter_tracks using appender
     if !data.counter_tracks.is_empty() {
-        let mut appender = conn.appender("counter_track")?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("unit", DataType::Utf8, true),
+        ]));
+
+        let mut trace_id_builder = StringBuilder::new();
+        let mut id_builder = Int64Builder::new();
+        let mut name_builder = StringBuilder::new();
+        let mut unit_builder = StringBuilder::new();
+
         for track in &data.counter_tracks {
-            appender.append_row(params![
-                trace_id,
-                track.id,
-                track.name.as_str(),
-                track.unit.as_deref()
-            ])?;
+            trace_id_builder.append_value(trace_id);
+            id_builder.append_value(track.id);
+            name_builder.append_value(&track.name);
+            unit_builder.append_option(track.unit.as_deref());
         }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(id_builder.finish()),
+                Arc::new(name_builder.finish()),
+                Arc::new(unit_builder.finish()),
+            ],
+        )?;
+
+        let file = File::create(&paths.counter_track)?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props.clone()))?;
+        writer.write(&batch)?;
+        writer.close()?;
     }
 
-    // Insert counters using appender
     if !data.counters.is_empty() {
-        let mut appender = conn.appender("counter")?;
-        for counter in &data.counters {
-            appender.append_row(params![
-                trace_id,
-                counter.ts,
-                counter.track_id,
-                counter.value
-            ])?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("track_id", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+
+        let file = File::create(&paths.counter)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+
+        for chunk in data.counters.chunks(PARQUET_BATCH_SIZE) {
+            let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut ts_builder = Int64Builder::with_capacity(chunk.len());
+            let mut track_id_builder = Int64Builder::with_capacity(chunk.len());
+            let mut value_builder = Float64Builder::with_capacity(chunk.len());
+
+            for counter in chunk {
+                trace_id_builder.append_value(trace_id);
+                ts_builder.append_value(counter.ts);
+                track_id_builder.append_value(counter.track_id);
+                value_builder.append_value(counter.value);
+            }
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(trace_id_builder.finish()),
+                    Arc::new(ts_builder.finish()),
+                    Arc::new(track_id_builder.finish()),
+                    Arc::new(value_builder.finish()),
+                ],
+            )?;
+            writer.write(&batch)?;
         }
+        writer.close()?;
     }
 
-    // Insert slices using appender
     if !data.slices.is_empty() {
-        let mut appender = conn.appender("slice")?;
-        for slice in &data.slices {
-            appender.append_row(params![
-                trace_id,
-                slice.ts,
-                slice.dur,
-                slice.track_id,
-                slice.name.as_str(),
-                slice.category.as_deref(),
-                slice.depth
-            ])?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("dur", DataType::Int64, false),
+            Field::new("track_id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, true),
+            Field::new("depth", DataType::Int32, false),
+        ]));
+
+        let file = File::create(&paths.slice)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+
+        for chunk in data.slices.chunks(PARQUET_BATCH_SIZE) {
+            let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut ts_builder = Int64Builder::with_capacity(chunk.len());
+            let mut dur_builder = Int64Builder::with_capacity(chunk.len());
+            let mut track_id_builder = Int64Builder::with_capacity(chunk.len());
+            let mut name_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut category_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 16);
+            let mut depth_builder = Int32Builder::with_capacity(chunk.len());
+
+            for slice in chunk {
+                trace_id_builder.append_value(trace_id);
+                ts_builder.append_value(slice.ts);
+                dur_builder.append_value(slice.dur);
+                track_id_builder.append_value(slice.track_id);
+                name_builder.append_value(&slice.name);
+                category_builder.append_option(slice.category.as_deref());
+                depth_builder.append_value(slice.depth);
+            }
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(trace_id_builder.finish()),
+                    Arc::new(ts_builder.finish()),
+                    Arc::new(dur_builder.finish()),
+                    Arc::new(track_id_builder.finish()),
+                    Arc::new(name_builder.finish()),
+                    Arc::new(category_builder.finish()),
+                    Arc::new(depth_builder.finish()),
+                ],
+            )?;
+            writer.write(&batch)?;
         }
+        writer.close()?;
     }
 
     Ok(())
+}
+
+/// Result from processing a trace (used for parallel processing)
+struct TraceProcessingResult {
+    trace_id: String,
+    source_path: PathBuf,
+    parquet_paths: ParquetPaths,
+    event_count: usize,
+    error: Option<String>,
 }
 
 /// Run the convert command
@@ -961,18 +1186,18 @@ fn run_convert(
         fs::remove_file(&output)?;
     }
 
-    // Create DuckDB database and schema
-    let conn = Connection::open(&output)?;
+    // Create temp directory for Parquet files
+    let temp_dir = tempfile::tempdir()?;
+    let temp_path = temp_dir.path();
+    if verbose {
+        eprintln!("Using temp directory: {}", temp_path.display());
+    }
 
-    // Configure DuckDB for bulk loading performance
-    conn.execute_batch(
-        "
-        SET threads TO 4;
-        SET memory_limit = '2GB';
-        ",
-    )?;
-
-    create_schema(&conn)?;
+    let num_cpus = get_num_cpus();
+    let num_workers = num_cpus.min(traces.len());
+    if verbose {
+        eprintln!("Using {} parallel workers", num_workers);
+    }
 
     let progress = ProgressBar::new(traces.len() as u64);
     progress.set_style(
@@ -982,23 +1207,12 @@ fn run_convert(
             .progress_chars("#>-"),
     );
 
-    // Bound parallelism based on available memory: each large trace ~15GB peak on average
-    // Use up to 80% of available memory, with minimum 2 and maximum 8 workers
-    let available_mem_gb = get_available_memory_gb();
-    let mem_per_worker_gb = 15;
-    let num_workers = ((available_mem_gb * 80 / 100) / mem_per_worker_gb)
-        .clamp(2, 8)
-        .min(traces.len());
-    if verbose {
-        eprintln!(
-            "Using {} parallel workers ({} GB available)",
-            num_workers, available_mem_gb
-        );
-    }
+    // Phase 1: Process traces and write to Parquet files in parallel
+    let load_start = Instant::now();
     let num_traces = traces.len();
-    // Buffer 2 results to allow overlap between loading and insertion while limiting memory
-    let (tx, rx) = mpsc::sync_channel::<(usize, Result<ProcessedTrace>)>(2);
+    let (tx, rx) = mpsc::sync_channel::<TraceProcessingResult>(num_workers * 2);
     let work_idx = AtomicUsize::new(0);
+    let progress_ref = &progress;
 
     thread::scope(|s| {
         for _ in 0..num_workers {
@@ -1010,71 +1224,162 @@ fn run_convert(
                 if idx >= num_traces {
                     break;
                 }
-                let result = load_and_extract_trace(&traces[idx]);
-                if tx.send((idx, result)).is_err() {
+                let trace = &traces[idx];
+                let parquet_paths = ParquetPaths::new(temp_path, &trace.trace_id);
+
+                let result = process_trace_to_parquet(trace, &parquet_paths);
+                let processing_result = match result {
+                    Ok(event_count) => TraceProcessingResult {
+                        trace_id: trace.trace_id.clone(),
+                        source_path: trace.source_path.clone(),
+                        parquet_paths,
+                        event_count,
+                        error: None,
+                    },
+                    Err(e) => TraceProcessingResult {
+                        trace_id: trace.trace_id.clone(),
+                        source_path: trace.source_path.clone(),
+                        parquet_paths,
+                        event_count: 0,
+                        error: Some(e.to_string()),
+                    },
+                };
+                progress_ref.inc(1);
+                if tx.send(processing_result).is_err() {
                     break;
                 }
             });
         }
-        drop(tx);
+    });
+    drop(tx);
 
-        let mut total_events = 0usize;
-        let mut errors: Vec<String> = Vec::new();
+    // Collect results
+    let results: Vec<TraceProcessingResult> = rx.into_iter().collect();
+    progress.finish_with_message("Trace processing complete");
 
-        for (idx, result) in rx {
-            progress.inc(1);
-            match result {
-                Ok(processed) => {
-                    if let Err(e) = insert_processed_trace(&conn, &processed) {
-                        errors.push(format!("{}: {}", processed.source_path.display(), e));
-                    } else {
-                        total_events += processed.event_count;
-                    }
-                }
-                Err(e) => {
-                    errors.push(format!("{}: {}", traces[idx].source_path.display(), e));
-                }
+    let load_time = load_start.elapsed();
+    if verbose {
+        eprintln!("Trace processing time: {:.2}s", load_time.as_secs_f64());
+    }
+
+    // Count successes and failures
+    let mut total_events = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    let successful_results: Vec<&TraceProcessingResult> = results
+        .iter()
+        .filter(|r| {
+            if let Some(ref e) = r.error {
+                errors.push(format!("{}: {}", r.source_path.display(), e));
+                false
+            } else {
+                total_events += r.event_count;
+                true
             }
+        })
+        .collect();
+
+    if successful_results.is_empty() {
+        bail!("All traces failed to process");
+    }
+
+    // Phase 2: Create DuckDB database and bulk import Parquet files
+    if verbose {
+        eprintln!(
+            "Importing {} traces into DuckDB...",
+            successful_results.len()
+        );
+    }
+    let import_start = Instant::now();
+
+    let conn = Connection::open(&output)?;
+    conn.execute_batch(&format!("SET threads TO {};", num_cpus))?;
+    create_schema(&conn)?;
+
+    // Import _traces table
+    for result in &successful_results {
+        conn.execute(
+            "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
+            params![
+                result.trace_id,
+                result.source_path.to_string_lossy().to_string()
+            ],
+        )?;
+    }
+
+    // Import Parquet files for a table, filtering to only existing files
+    let import_table = |table_name: &str, get_path: fn(&ParquetPaths) -> &PathBuf| -> Result<()> {
+        let paths: Vec<String> = successful_results
+            .iter()
+            .map(|r| get_path(&r.parquet_paths))
+            .filter(|p| p.exists())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        if paths.is_empty() {
+            return Ok(());
         }
-
-        progress.finish_with_message("Import complete");
-
+        let start = Instant::now();
+        // Escape single quotes in paths for SQL safety
+        let paths_list = paths
+            .iter()
+            .map(|p| format!("'{}'", p.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute_batch(&format!(
+            "INSERT INTO {} SELECT * FROM read_parquet([{}])",
+            table_name, paths_list
+        ))?;
         if verbose {
             eprintln!(
-                "Processing time: {:.2}s",
-                start_time.elapsed().as_secs_f64()
+                "  {} import: {:.2}s",
+                table_name,
+                start.elapsed().as_secs_f64()
             );
         }
+        Ok(())
+    };
 
-        if !errors.is_empty() {
-            eprintln!("\nConversion errors:");
-            for error in &errors {
-                eprintln!("  {}", error);
-            }
+    import_table("process", |p| &p.process)?;
+    import_table("thread", |p| &p.thread)?;
+    import_table("sched_slice", |p| &p.sched_slice)?;
+    import_table("thread_state", |p| &p.thread_state)?;
+    import_table("counter_track", |p| &p.counter_track)?;
+    import_table("counter", |p| &p.counter)?;
+    import_table("slice", |p| &p.slice)?;
+
+    let import_time = import_start.elapsed();
+    if verbose {
+        eprintln!("Import time: {:.2}s", import_time.as_secs_f64());
+    }
+
+    if !errors.is_empty() {
+        eprintln!("\nConversion errors:");
+        for error in &errors {
+            eprintln!("  {}", error);
         }
+    }
 
-        let elapsed = start_time.elapsed();
-        let db_size = fs::metadata(&output)
-            .map(|m| m.len() as f64 / (1024.0 * 1024.0))
-            .unwrap_or(0.0);
+    let elapsed = start_time.elapsed();
+    let db_size = fs::metadata(&output)
+        .map(|m| m.len() as f64 / (1024.0 * 1024.0))
+        .unwrap_or(0.0);
 
-        eprintln!(
-            "\nComplete! Created {} ({:.1} MB) in {:.1}s",
-            output.display(),
-            db_size,
-            elapsed.as_secs_f64()
-        );
-        eprintln!(
-            "  {} traces imported, {} total events",
-            num_traces - errors.len(),
-            total_events
-        );
-    });
+    eprintln!(
+        "\nComplete! Created {} ({:.1} MB) in {:.1}s",
+        output.display(),
+        db_size,
+        elapsed.as_secs_f64()
+    );
+    eprintln!(
+        "  {} traces imported, {} total events",
+        successful_results.len(),
+        total_events
+    );
 
     Ok(())
 }
 
-fn load_and_extract_trace(trace: &TraceInfo) -> Result<ProcessedTrace> {
+/// Process a single trace: read, extract, compute durations, and write to Parquet
+fn process_trace_to_parquet(trace: &TraceInfo, paths: &ParquetPaths) -> Result<usize> {
     let reader = open_trace_reader(&trace.source_path)?;
     let mut data = extract_trace_data_streaming(reader)?;
     compute_sched_durations(&mut data.sched_slices);
@@ -1084,24 +1389,10 @@ fn load_and_extract_trace(trace: &TraceInfo) -> Result<ProcessedTrace> {
         + data.counters.len()
         + data.slices.len();
 
-    Ok(ProcessedTrace {
-        trace_id: trace.trace_id.clone(),
-        source_path: trace.source_path.clone(),
-        data,
-        event_count,
-    })
-}
+    write_data_to_parquet(&trace.trace_id, &data, paths)
+        .with_context(|| format!("Failed writing Parquet for trace {}", trace.trace_id))?;
 
-fn insert_processed_trace(conn: &Connection, processed: &ProcessedTrace) -> Result<()> {
-    conn.execute(
-        "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
-        params![
-            processed.trace_id,
-            processed.source_path.to_string_lossy().to_string()
-        ],
-    )?;
-    insert_data(conn, &processed.trace_id, &processed.data)?;
-    Ok(())
+    Ok(event_count)
 }
 
 /// Run the query command
