@@ -173,6 +173,7 @@ struct network_event {
 	u32 cpu;
 	u32 sndbuf_used;   // Bytes in send buffer after sendmsg (sk_wmem_queued)
 	u32 sndbuf_limit;  // Max send buffer size (sk_sndbuf)
+	u64 socket_id;     // Unique socket ID for correlation with packet events
 };
 
 enum packet_event_type {
@@ -201,6 +202,7 @@ struct packet_event {
 	u32 cpu;
 	u32 sndbuf_used;   // Bytes in send buffer (sk_wmem_queued) - shows buffer drain on ACK
 	u32 sndbuf_limit;  // Max send buffer size (sk_sndbuf)
+	u64 socket_id;     // Unique socket ID for correlation with network events
 };
 
 /*
@@ -289,6 +291,7 @@ struct network_send_info {
 	u64 start_ts;
 	u32 sendmsg_seq;  // Sequence number at sendmsg time
 	u64 sk_ptr;       // Socket pointer for reading buffer state on exit
+	u64 socket_id;    // Unique socket ID for correlation
 };
 
 // Tracks pending receive operations with peer address
@@ -298,7 +301,8 @@ struct network_recv_info {
 	u8 peer_addr[16];
 	u16 peer_port;
 	u64 start_ts;
-	u64 sk_ptr;  // Socket pointer for buffer queue latency tracking
+	u64 sk_ptr;       // Socket pointer for buffer queue latency tracking
+	u64 socket_id;    // Unique socket ID for correlation
 };
 
 struct {
@@ -333,6 +337,7 @@ struct packet_info {
 	u32 seq;
 	u32 length;
 	u8 tcp_flags;
+	u64 socket_id;    // Unique socket ID for correlation
 };
 
 // Key for pending_packets map - survives SKB cloning
@@ -367,6 +372,7 @@ struct buffer_queue_info {
 	u8 peer_addr[16];
 	u16 peer_port;
 	u32 length;         // Packet length for this entry
+	u64 socket_id;      // Unique socket ID for correlation
 };
 
 struct {
@@ -389,6 +395,7 @@ struct udp_packet_info {
 	enum network_address_family af;
 	u8 dest_addr[16];
 	u16 dest_port;
+	u64 socket_id;      // Unique socket ID for correlation
 };
 
 // Tracks UDP packets in transmit path (udp_send_skb -> ip_send_skb)
@@ -414,6 +421,41 @@ struct {
 	__type(value, struct udp_packet_info);
 	__uint(max_entries, 10240);
 } udp_buffer_queue SEC(".maps");
+
+// Socket identity key - identifies a unique socket+destination pair
+struct socket_identity_key {
+	u64 sk_ptr;           // struct sock * cast to u64
+	u8 dest_addr[16];     // Destination address (IPv4 in first 4 bytes)
+	u16 dest_port;        // Destination port
+	u16 _pad;             // Alignment padding
+};
+
+// Socket metadata stored in map, readable by userspace after tracing
+struct socket_metadata {
+	u64 socket_id;                    // Unique socket ID
+	enum network_protocol protocol;   // TCP or UDP
+	enum network_address_family af;   // IPv4 or IPv6
+	u8 dest_addr[16];                 // Destination address
+	u16 dest_port;                    // Destination port
+	u16 _pad;                         // Alignment padding
+	u64 tgidpid;                      // Process that created this connection
+};
+
+// Atomic counter for generating unique socket IDs (single-entry array)
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, u64);
+	__uint(max_entries, 1);
+} socket_id_counter SEC(".maps");
+
+// Maps socket identity to metadata
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct socket_identity_key);
+	__type(value, struct socket_metadata);
+	__uint(max_entries, 10240);
+} socket_metadata_map SEC(".maps");
 
 #define MISSED_SCHED_EVENT 0
 #define MISSED_STACK_EVENT 1
@@ -603,6 +645,76 @@ struct {
 		&ringbuf_packet_events_node7,
 	},
 };
+
+// Generate new socket ID atomically
+// Returns socket IDs starting from 1 (0 indicates failure)
+static __always_inline u64 generate_socket_id(void)
+{
+	u32 key = 0;
+	u64 *counter = bpf_map_lookup_elem(&socket_id_counter, &key);
+	if (!counter)
+		return 0;
+	return __sync_fetch_and_add(counter, 1) + 1;  // Start from 1, not 0
+}
+
+// Get or create socket ID for socket+destination pair
+// Returns 0 if socket metadata cannot be created
+static __always_inline u64 get_or_create_socket_id(
+	struct sock *sk,
+	enum network_protocol protocol,
+	enum network_address_family af,
+	u8 *dest_addr,
+	u16 dest_port,
+	u64 tgidpid)
+{
+	struct socket_identity_key identity_key = {0};
+	struct socket_metadata *existing;
+	struct socket_metadata metadata = {0};
+
+	identity_key.sk_ptr = (u64)sk;
+	__builtin_memcpy(identity_key.dest_addr, dest_addr, 16);
+	identity_key.dest_port = dest_port;
+
+	// Check if we already have metadata for this socket+destination
+	existing = bpf_map_lookup_elem(&socket_metadata_map, &identity_key);
+	if (existing)
+		return existing->socket_id;
+
+	// Create new socket metadata
+	metadata.socket_id = generate_socket_id();
+	if (metadata.socket_id == 0)
+		return 0;  // Counter lookup failed
+
+	metadata.protocol = protocol;
+	metadata.af = af;
+	__builtin_memcpy(metadata.dest_addr, dest_addr, 16);
+	metadata.dest_port = dest_port;
+	metadata.tgidpid = tgidpid;
+
+	bpf_map_update_elem(&socket_metadata_map, &identity_key, &metadata, BPF_NOEXIST);
+
+	// Re-lookup in case of race condition (another CPU inserted first)
+	existing = bpf_map_lookup_elem(&socket_metadata_map, &identity_key);
+	return existing ? existing->socket_id : 0;
+}
+
+// Lookup socket ID for an existing socket+destination pair
+// Returns 0 if not found
+static __always_inline u64 lookup_socket_id(
+	struct sock *sk,
+	u8 *dest_addr,
+	u16 dest_port)
+{
+	struct socket_identity_key identity_key = {0};
+	struct socket_metadata *existing;
+
+	identity_key.sk_ptr = (u64)sk;
+	__builtin_memcpy(identity_key.dest_addr, dest_addr, 16);
+	identity_key.dest_port = dest_port;
+
+	existing = bpf_map_lookup_elem(&socket_metadata_map, &identity_key);
+	return existing ? existing->socket_id : 0;
+}
 
 /*
  * Helper to determine wakeup flags based on ringbuf fill level.
@@ -1634,6 +1746,12 @@ static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum networ
 	// Store socket pointer for reading buffer state on exit
 	info.sk_ptr = (u64)sk;
 
+	// Get or create socket ID for this socket+destination pair
+	if (sk && info.dest_port != 0) {
+		info.socket_id = get_or_create_socket_id(sk, protocol, info.af,
+							  info.dest_addr, info.dest_port, tgidpid);
+	}
+
 	bpf_map_update_elem(&pending_network_sends, &tgidpid, &info, BPF_ANY);
 
 	return 0;
@@ -1689,6 +1807,9 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 		event->sndbuf_used = (u32)wmem_queued;
 		event->sndbuf_limit = (u32)sndbuf;
 	}
+
+	// Copy socket_id for correlation
+	event->socket_id = info->socket_id;
 
 	bpf_ringbuf_submit(event, flags);
 	bpf_map_delete_elem(&pending_network_sends, &tgidpid);
@@ -1750,6 +1871,11 @@ static int handle_tcp_recvmsg_entry(struct sock *sk, struct msghdr *msg)
 
 	if (sk) {
 		read_socket_dest_info(sk, &info.af, info.peer_addr, &info.peer_port);
+		// Get or create socket ID for this socket+destination pair
+		if (info.peer_port != 0) {
+			info.socket_id = get_or_create_socket_id(sk, NETWORK_TCP, info.af,
+								  info.peer_addr, info.peer_port, tgidpid);
+		}
 	}
 
 	bpf_map_update_elem(&pending_network_recvs, &tgidpid, &info, BPF_ANY);
@@ -1802,6 +1928,9 @@ static int handle_recvmsg_exit(void *ctx, int ret)
 	// Use the peer address that was extracted in the entry handler
 	__builtin_memcpy(event->dest_addr, info->peer_addr, 16);
 	event->dest_port = info->peer_port;
+
+	// Copy socket_id for correlation
+	event->socket_id = info->socket_id;
 
 	bpf_ringbuf_submit(event, flags);
 	bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
@@ -1919,6 +2048,17 @@ int BPF_KRETPROBE(skb_recv_udp_exit, struct sk_buff *skb)
 				info->peer_port = __builtin_bswap16(udp.source);
 			}
 		}
+
+		// Now that we have peer address/port, get or create socket ID
+		// Get the sock from the sk_buff
+		if (info->peer_port != 0) {
+			struct sock *sk = NULL;
+			bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+			if (sk) {
+				info->socket_id = get_or_create_socket_id(sk, NETWORK_UDP, info->af,
+									  info->peer_addr, info->peer_port, tgidpid);
+			}
+		}
 	}
 
 	return 0;
@@ -1995,6 +2135,9 @@ int BPF_KPROBE(udp_send_skb_entry, struct sk_buff *skb, struct flowi4 *fl4, stru
 	// Store dest address (in network byte order)
 	__builtin_memcpy(info.dest_addr, &daddr, 4);
 	info.dest_port = __builtin_bswap16(dport);  // Convert to host byte order for consistency
+
+	// Look up socket ID for this socket+destination pair
+	info.socket_id = lookup_socket_id(sk, info.dest_addr, info.dest_port);
 
 	bpf_map_update_elem(&pending_udp_tx_packets, &key, &info, BPF_ANY);
 
@@ -2091,6 +2234,9 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 	if (!rcv_event)
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
+	// Look up socket ID from the socket (already have sk from function parameter)
+	u64 socket_id = lookup_socket_id(sk, dest_addr, dest_port);
+
 	{
 		rcv_event->start_ts = ip_rcv_info->start_ts;  // From __udp4_lib_rcv
 		rcv_event->end_ts = now;                       // UDP processing complete
@@ -2103,6 +2249,7 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 		rcv_event->tcp_flags = 0;
 		rcv_event->event_type = PACKET_UDP_RCV;
 		rcv_event->cpu = bpf_get_smp_processor_id();
+		rcv_event->socket_id = socket_id;  // Socket ID for correlation
 
 		rcv_event->task.tgidpid = tgidpid;
 		__builtin_memset(rcv_event->task.comm, 0, TASK_COMM_LEN);
@@ -2118,6 +2265,7 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 	enqueue_info.tgidpid = tgidpid;
 	__builtin_memcpy(enqueue_info.dest_addr, dest_addr, 16);
 	enqueue_info.dest_port = dest_port;
+	enqueue_info.socket_id = socket_id;  // Carry socket ID for enqueue event
 
 	bpf_map_update_elem(&pending_udp_rx_packets, &key, &enqueue_info, BPF_ANY);
 
@@ -2173,6 +2321,7 @@ int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *
 		event->tcp_flags = 0;
 		event->event_type = PACKET_UDP_ENQUEUE;
 		event->cpu = bpf_get_smp_processor_id();
+		event->socket_id = pending->socket_id;  // Socket ID for correlation
 
 		// Set task info from socket owner (not from softirq context!)
 		event->task.tgidpid = tgidpid;
@@ -2254,6 +2403,9 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	pkt_info.seq = start_seq;
 	pkt_info.length = end_seq - start_seq;
 	pkt_info.tcp_flags = tcp_flags;
+
+	// Look up socket ID for this socket+destination pair
+	pkt_info.socket_id = lookup_socket_id(sk, pkt_info.dest_addr, pkt_info.dest_port);
 
 	// Use connection 5-tuple + seq as key instead of skb pointer
 	// because skb may be cloned during transmission
@@ -2338,6 +2490,7 @@ static __always_inline void populate_packet_event(struct packet_event *event,
 	event->length = pkt_info->length;
 	event->tcp_flags = pkt_info->tcp_flags;
 	event->event_type = event_type;
+	event->socket_id = pkt_info->socket_id;  // Copy socket ID for correlation
 
 	// Read send buffer state from socket (TCP only, when socket provided)
 	event->sndbuf_used = 0;
@@ -2385,6 +2538,7 @@ static __always_inline int handle_udp_tx_event(struct sk_buff *skb,
 	event->event_type = event_type;
 	event->cpu = bpf_get_smp_processor_id();
 	event->task.tgidpid = udp_info->tgidpid;
+	event->socket_id = udp_info->socket_id;  // Copy socket ID for correlation
 
 	bpf_ringbuf_submit(event, flags);
 
@@ -2601,6 +2755,9 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 	pkt_info.length = end_seq - start_seq;
 	pkt_info.tcp_flags = tcp_flags;
 
+	// Look up socket ID for this socket+destination pair
+	pkt_info.socket_id = lookup_socket_id(sk, pkt_info.dest_addr, pkt_info.dest_port);
+
 	struct packet_key key = {0};
 	key.tgidpid = tgidpid;
 	__builtin_memcpy(key.dest_addr, pkt_info.dest_addr, 16);
@@ -2683,6 +2840,7 @@ int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *
 	__builtin_memcpy(buf_info.peer_addr, src_addr, 16);
 	buf_info.peer_port = src_port;
 	buf_info.length = pkt_info->length;
+	buf_info.socket_id = pkt_info->socket_id;  // Carry socket_id for buffer queue event
 
 	bpf_map_update_elem(&socket_buffer_queue, &key, &buf_info, BPF_ANY);
 
@@ -2746,6 +2904,7 @@ int BPF_KPROBE(tcp_data_queue_entry, struct sock *sk, struct sk_buff *skb)
 	__builtin_memcpy(buf_info.peer_addr, src_addr, 16);
 	buf_info.peer_port = src_port;
 	buf_info.length = pkt_info->length;
+	buf_info.socket_id = pkt_info->socket_id;  // Carry socket_id for buffer queue event
 
 	bpf_map_update_elem(&socket_buffer_queue, &key, &buf_info, BPF_ANY);
 	bpf_map_delete_elem(&pending_recv_packets, &key);
@@ -2817,6 +2976,7 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 			pkt_event->tcp_flags = 0;
 			pkt_event->event_type = PACKET_BUFFER_QUEUE;
 			pkt_event->cpu = bpf_get_smp_processor_id();
+			pkt_event->socket_id = buf_info->socket_id;  // Socket ID for correlation
 
 			bpf_ringbuf_submit(pkt_event, flags);
 		}

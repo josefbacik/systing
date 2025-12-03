@@ -2066,6 +2066,16 @@ fn system(opts: Command) -> Result<()> {
             shutdown_signal,
             &mut skel,
         )?;
+
+        // Load socket metadata from BPF map after tracing completes
+        // This must be done while skel is still alive
+        if opts.network {
+            recorder
+                .network_recorder
+                .lock()
+                .unwrap()
+                .load_socket_metadata(&skel.maps.socket_metadata_map);
+        }
     }
 
     if opts.continuous > 0 {

@@ -6,6 +6,9 @@ use crate::ringbuf::RingBuffer;
 use crate::systing::types::network_event;
 use crate::SystingRecordEvent;
 
+/// Unique socket identifier assigned by BPF during tracing
+pub type SocketId = u64;
+
 use perfetto_protos::debug_annotation::DebugAnnotation;
 use perfetto_protos::interned_data::InternedData;
 use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
@@ -54,6 +57,43 @@ impl fmt::Display for ConnectionId {
         };
         let addr = self.ip_addr();
         write!(f, "{}:{}:{}", protocol_str, addr, self.dest_port)
+    }
+}
+
+/// Metadata for a socket connection, read from BPF map after tracing
+#[derive(Debug, Clone)]
+pub struct SocketMetadata {
+    pub protocol: u32,
+    pub af: u32,
+    pub dest_addr: [u8; 16],
+    pub dest_port: u16,
+    #[allow(dead_code)]
+    pub tgidpid: u64,
+}
+
+impl SocketMetadata {
+    fn connection_id(&self) -> ConnectionId {
+        ConnectionId {
+            protocol: self.protocol,
+            af: self.af,
+            dest_addr: self.dest_addr,
+            dest_port: self.dest_port,
+        }
+    }
+
+    fn ip_addr(&self) -> IpAddr {
+        self.connection_id().ip_addr()
+    }
+
+    fn protocol_str(&self) -> &'static str {
+        use crate::systing::types::network_protocol;
+        if self.protocol == network_protocol::NETWORK_TCP.0 {
+            "TCP"
+        } else if self.protocol == network_protocol::NETWORK_UDP.0 {
+            "UDP"
+        } else {
+            "UNKNOWN"
+        }
     }
 }
 
@@ -207,13 +247,56 @@ impl DnsStats {
 #[derive(Default)]
 pub struct NetworkRecorder {
     pub ringbuf: RingBuffer<network_event>,
-    network_events: HashMap<u64, HashMap<ConnectionId, ConnectionEvents>>,
+
+    /// Per-thread syscall events (sendmsg/recvmsg, buffer queue)
+    /// Key: tgidpid -> socket_id -> ConnectionEvents
+    syscall_events: HashMap<u64, HashMap<SocketId, ConnectionEvents>>,
+
+    /// Global packet events by socket_id (not per-thread)
+    /// Key: socket_id -> ConnectionEvents
+    packet_events: HashMap<SocketId, ConnectionEvents>,
+
+    /// Socket metadata cache (populated from BPF map after tracing)
+    socket_metadata: HashMap<SocketId, SocketMetadata>,
+
     event_name_ids: HashMap<String, u64>,
     hostname_cache: HashMap<IpAddr, String>,
     dns_stats: DnsStats,
 }
 
 impl NetworkRecorder {
+    /// Load socket metadata from BPF map after tracing completes.
+    /// This populates the socket_metadata cache with socket ID -> address info mapping.
+    pub fn load_socket_metadata<M: libbpf_rs::MapCore>(&mut self, map: &M) {
+        use crate::systing::types::socket_metadata;
+
+        let mut count = 0;
+        for key in map.keys() {
+            if let Ok(Some(value_bytes)) = map.lookup(&key, libbpf_rs::MapFlags::ANY) {
+                // Parse the value as socket_metadata
+                if value_bytes.len() >= std::mem::size_of::<socket_metadata>() {
+                    let bpf_meta: &socket_metadata =
+                        unsafe { &*(value_bytes.as_ptr() as *const socket_metadata) };
+
+                    let metadata = SocketMetadata {
+                        protocol: bpf_meta.protocol.0,
+                        af: bpf_meta.af.0,
+                        dest_addr: bpf_meta.dest_addr,
+                        dest_port: bpf_meta.dest_port,
+                        tgidpid: bpf_meta.tgidpid,
+                    };
+
+                    self.socket_metadata.insert(bpf_meta.socket_id, metadata);
+                    count += 1;
+                }
+            }
+        }
+
+        if count > 0 {
+            tracing::info!("Loaded {} socket metadata entries from BPF map", count);
+        }
+    }
+
     fn format_tcp_flags(flags: u8) -> String {
         if flags == 0 {
             return "NONE".to_string();
@@ -247,17 +330,13 @@ impl NetworkRecorder {
     pub fn handle_packet_event(&mut self, event: crate::systing::types::packet_event) {
         use crate::systing::types::packet_event_type;
 
+        let socket_id = event.socket_id;
         let tgidpid = event.task.tgidpid;
 
-        // Use protocol field from event (explicitly set in BPF code)
-        let protocol = event.protocol.0;
-
-        let conn_id = ConnectionId {
-            protocol,
-            af: event.af.0,
-            dest_addr: event.dest_addr,
-            dest_port: event.dest_port,
-        };
+        // Skip events without socket_id (shouldn't happen in normal operation)
+        if socket_id == 0 {
+            return;
+        }
 
         let pkt_event = PacketEvent {
             start_ts: event.start_ts,
@@ -269,37 +348,50 @@ impl NetworkRecorder {
             sndbuf_limit: event.sndbuf_limit,
         };
 
-        let conn_events = self
-            .network_events
-            .entry(tgidpid)
-            .or_default()
-            .entry(conn_id)
-            .or_default();
+        // Buffer queue events go to per-thread syscall_events (app-relevant)
+        // All other packet events go to global packet_events
+        let is_buffer_queue_event = event.event_type.0 == packet_event_type::PACKET_BUFFER_QUEUE.0
+            || event.event_type.0 == packet_event_type::PACKET_UDP_ENQUEUE.0;
 
-        // TCP packet events
-        if event.event_type.0 == packet_event_type::PACKET_ENQUEUE.0 {
-            conn_events.events.push(EventEntry::TcpEnqueue(pkt_event));
-        } else if event.event_type.0 == packet_event_type::PACKET_SEND.0 {
-            // PACKET_SEND is shared by TCP and UDP for qdisc->NIC transmission
-            conn_events.events.push(EventEntry::SharedSend(pkt_event));
-        } else if event.event_type.0 == packet_event_type::PACKET_RCV_ESTABLISHED.0 {
-            conn_events
-                .events
-                .push(EventEntry::TcpRcvEstablished(pkt_event));
-        } else if event.event_type.0 == packet_event_type::PACKET_QUEUE_RCV.0 {
-            conn_events.events.push(EventEntry::TcpQueueRcv(pkt_event));
-        } else if event.event_type.0 == packet_event_type::PACKET_BUFFER_QUEUE.0 {
-            conn_events
-                .events
-                .push(EventEntry::TcpBufferQueue(pkt_event));
-        }
-        // UDP packet events
-        else if event.event_type.0 == packet_event_type::PACKET_UDP_SEND.0 {
-            conn_events.events.push(EventEntry::UdpSend(pkt_event));
-        } else if event.event_type.0 == packet_event_type::PACKET_UDP_RCV.0 {
-            conn_events.events.push(EventEntry::UdpRcv(pkt_event));
-        } else if event.event_type.0 == packet_event_type::PACKET_UDP_ENQUEUE.0 {
-            conn_events.events.push(EventEntry::UdpEnqueue(pkt_event));
+        if is_buffer_queue_event {
+            // Route to per-thread syscall_events
+            let conn_events = self
+                .syscall_events
+                .entry(tgidpid)
+                .or_default()
+                .entry(socket_id)
+                .or_default();
+
+            if event.event_type.0 == packet_event_type::PACKET_BUFFER_QUEUE.0 {
+                conn_events
+                    .events
+                    .push(EventEntry::TcpBufferQueue(pkt_event));
+            } else {
+                conn_events.events.push(EventEntry::UdpEnqueue(pkt_event));
+            }
+        } else {
+            // Route to global packet_events
+            let conn_events = self.packet_events.entry(socket_id).or_default();
+
+            // TCP packet events
+            if event.event_type.0 == packet_event_type::PACKET_ENQUEUE.0 {
+                conn_events.events.push(EventEntry::TcpEnqueue(pkt_event));
+            } else if event.event_type.0 == packet_event_type::PACKET_SEND.0 {
+                // PACKET_SEND is shared by TCP and UDP for qdisc->NIC transmission
+                conn_events.events.push(EventEntry::SharedSend(pkt_event));
+            } else if event.event_type.0 == packet_event_type::PACKET_RCV_ESTABLISHED.0 {
+                conn_events
+                    .events
+                    .push(EventEntry::TcpRcvEstablished(pkt_event));
+            } else if event.event_type.0 == packet_event_type::PACKET_QUEUE_RCV.0 {
+                conn_events.events.push(EventEntry::TcpQueueRcv(pkt_event));
+            }
+            // UDP packet events
+            else if event.event_type.0 == packet_event_type::PACKET_UDP_SEND.0 {
+                conn_events.events.push(EventEntry::UdpSend(pkt_event));
+            } else if event.event_type.0 == packet_event_type::PACKET_UDP_RCV.0 {
+                conn_events.events.push(EventEntry::UdpRcv(pkt_event));
+            }
         }
     }
 
@@ -464,32 +556,35 @@ impl NetworkRecorder {
     }
 
     /// Prepares all metadata needed for packet generation, including:
-    /// - Collecting protocol operations used
-    /// - Resolving hostnames for all connections
+    /// - Resolving hostnames for all sockets
     /// - Creating IIDs for protocol operations and packet events
     /// - Building the event names array
     fn prepare_event_metadata(&mut self, id_counter: &Arc<AtomicUsize>) -> Vec<EventName> {
         use crate::systing::types::network_operation;
 
-        // Collect protocol operations used across all connections
-        let mut protocol_ops_used = std::collections::HashSet::new();
-        let mut connection_ids = Vec::new();
+        // Collect IP addresses first to avoid borrow issues
+        let ip_addrs: Vec<_> = self.socket_metadata.values().map(|m| m.ip_addr()).collect();
 
-        for connections in self.network_events.values() {
-            for (conn_id, events) in connections.iter() {
-                connection_ids.push(*conn_id);
-                if events.iter_sends().next().is_some() {
-                    protocol_ops_used.insert((conn_id.protocol, network_operation::NETWORK_SEND.0));
-                }
-                if events.iter_recvs().next().is_some() {
-                    protocol_ops_used.insert((conn_id.protocol, network_operation::NETWORK_RECV.0));
-                }
-            }
+        // Resolve hostnames for all sockets
+        for ip_addr in ip_addrs {
+            self.resolve_hostname(ip_addr);
         }
 
-        // Resolve hostnames for all connections
-        for conn_id in &connection_ids {
-            self.resolve_hostname(conn_id.ip_addr());
+        // Collect protocol operations used across all syscall events
+        let mut protocol_ops_used = std::collections::HashSet::new();
+        for connections in self.syscall_events.values() {
+            for (socket_id, events) in connections.iter() {
+                if let Some(metadata) = self.socket_metadata.get(socket_id) {
+                    if events.iter_sends().next().is_some() {
+                        protocol_ops_used
+                            .insert((metadata.protocol, network_operation::NETWORK_SEND.0));
+                    }
+                    if events.iter_recvs().next().is_some() {
+                        protocol_ops_used
+                            .insert((metadata.protocol, network_operation::NETWORK_RECV.0));
+                    }
+                }
+            }
         }
 
         // Create IIDs for all protocol/operation combinations that were used
@@ -532,6 +627,26 @@ impl NetworkRecorder {
         event_names
     }
 
+    /// Helper to get socket track name from metadata
+    fn socket_track_name(&self, socket_id: SocketId) -> String {
+        if let Some(metadata) = self.socket_metadata.get(&socket_id) {
+            let hostname = self
+                .hostname_cache
+                .get(&metadata.ip_addr())
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            format!(
+                "Socket {}:{}:{}:{}",
+                socket_id,
+                metadata.protocol_str(),
+                hostname,
+                metadata.dest_port
+            )
+        } else {
+            format!("Socket {}", socket_id)
+        }
+    }
+
     pub fn generate_trace_packets(
         &mut self,
         pid_uuids: &HashMap<i32, u64>,
@@ -560,20 +675,161 @@ impl NetworkRecorder {
             packets.push(interned_packet);
         }
 
-        // Generate per-thread network tracks
-        for (tgidpid, connections) in self.network_events.iter() {
+        // ====================================================================
+        // Phase 3: Generate global "Network Packets" root with per-socket tracks
+        // ====================================================================
+        if !self.packet_events.is_empty() {
+            // Create global "Network Packets" root track
+            let network_packets_root_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+
+            let mut root_track_desc = TrackDescriptor::default();
+            root_track_desc.set_uuid(network_packets_root_uuid);
+            root_track_desc.set_name("Network Packets".to_string());
+
+            let mut root_track_packet = TracePacket::default();
+            root_track_packet.set_track_descriptor(root_track_desc);
+            packets.push(root_track_packet);
+
+            // Create per-socket packet tracks (flat - events directly under socket)
+            for (socket_id, events) in self.packet_events.iter() {
+                if events.is_empty() {
+                    continue;
+                }
+
+                // Create socket track under root
+                let socket_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+
+                let mut socket_track_desc = TrackDescriptor::default();
+                socket_track_desc.set_uuid(socket_track_uuid);
+                socket_track_desc.set_name(self.socket_track_name(*socket_id));
+                socket_track_desc.set_parent_uuid(network_packets_root_uuid);
+
+                let mut socket_track_packet = TracePacket::default();
+                socket_track_packet.set_track_descriptor(socket_track_desc);
+                packets.push(socket_track_packet);
+
+                // Determine protocol for this socket
+                let is_tcp = self
+                    .socket_metadata
+                    .get(socket_id)
+                    .map(|m| m.protocol == crate::systing::types::network_protocol::NETWORK_TCP.0)
+                    .unwrap_or(false);
+
+                // Emit all packet events directly on this socket track (flat)
+                if is_tcp {
+                    // TCP packet events
+                    let enqueue_pkts: Vec<_> = events.iter_tcp_enqueue_packets().copied().collect();
+                    if !enqueue_pkts.is_empty() {
+                        let enqueue_iid = *self.event_name_ids.get("TCP packet_enqueue").unwrap();
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            socket_track_uuid,
+                            enqueue_iid,
+                            &enqueue_pkts,
+                        );
+                    }
+
+                    let send_pkts: Vec<_> = events.iter_shared_send_packets().copied().collect();
+                    if !send_pkts.is_empty() {
+                        let send_iid = *self.event_name_ids.get("TCP packet_send").unwrap();
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            socket_track_uuid,
+                            send_iid,
+                            &send_pkts,
+                        );
+                    }
+
+                    let rcv_est_pkts: Vec<_> =
+                        events.iter_tcp_rcv_established_packets().copied().collect();
+                    if !rcv_est_pkts.is_empty() {
+                        let rcv_established_iid = *self
+                            .event_name_ids
+                            .get("TCP packet_rcv_established")
+                            .unwrap();
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            socket_track_uuid,
+                            rcv_established_iid,
+                            &rcv_est_pkts,
+                        );
+                    }
+
+                    let queue_rcv_pkts: Vec<_> =
+                        events.iter_tcp_queue_rcv_packets().copied().collect();
+                    if !queue_rcv_pkts.is_empty() {
+                        let queue_rcv_iid =
+                            *self.event_name_ids.get("TCP packet_queue_rcv").unwrap();
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            socket_track_uuid,
+                            queue_rcv_iid,
+                            &queue_rcv_pkts,
+                        );
+                    }
+                } else {
+                    // UDP packet events
+                    let udp_send_pkts: Vec<_> = events.iter_udp_send_packets().copied().collect();
+                    if !udp_send_pkts.is_empty() {
+                        let send_iid = *self.event_name_ids.get("UDP send").unwrap();
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            socket_track_uuid,
+                            send_iid,
+                            &udp_send_pkts,
+                        );
+                    }
+
+                    let udp_rcv_pkts: Vec<_> = events.iter_udp_rcv_packets().copied().collect();
+                    if !udp_rcv_pkts.is_empty() {
+                        let rcv_iid = *self.event_name_ids.get("UDP receive").unwrap();
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            socket_track_uuid,
+                            rcv_iid,
+                            &udp_rcv_pkts,
+                        );
+                    }
+
+                    // UDP uses PACKET_SEND (SharedSend) for qdisc->NIC transmission
+                    let shared_send_pkts: Vec<_> =
+                        events.iter_shared_send_packets().copied().collect();
+                    if !shared_send_pkts.is_empty() {
+                        let send_iid = *self.event_name_ids.get("UDP packet_send").unwrap();
+                        self.add_packet_slice_events(
+                            &mut packets,
+                            sequence_id,
+                            socket_track_uuid,
+                            send_iid,
+                            &shared_send_pkts,
+                        );
+                    }
+                }
+            }
+        }
+
+        // ====================================================================
+        // Phase 4: Generate per-thread "Network Syscalls" tracks
+        // ====================================================================
+        for (tgidpid, connections) in self.syscall_events.iter() {
             if connections.is_empty() {
                 continue;
             }
 
-            // Create a "Network Connections" track group for this thread
+            // Create a "Network Syscalls" track group for this thread
             let thread_group_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
             let thread_group_desc = crate::perfetto::generate_pidtgid_track_descriptor(
                 pid_uuids,
                 thread_uuids,
                 tgidpid,
-                "Network Connections".to_string(),
+                "Network Syscalls".to_string(),
                 thread_group_uuid,
             );
 
@@ -581,63 +837,58 @@ impl NetworkRecorder {
             thread_group_packet.set_track_descriptor(thread_group_desc);
             packets.push(thread_group_packet);
 
-            // Create a track group for each unique connection
-            for (conn_id, events) in connections.iter() {
+            // Create per-socket syscall tracks
+            for (socket_id, events) in connections.iter() {
                 if events.is_empty() {
                     continue;
                 }
 
-                // Create connection track group
-                let conn_group_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+                // Create socket track group
+                let socket_group_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
-                let mut conn_group_desc = TrackDescriptor::default();
-                conn_group_desc.set_uuid(conn_group_uuid);
-                let protocol_str = if conn_id.protocol
-                    == crate::systing::types::network_protocol::NETWORK_TCP.0
-                {
-                    "TCP"
-                } else if conn_id.protocol == crate::systing::types::network_protocol::NETWORK_UDP.0
-                {
-                    "UDP"
-                } else {
-                    "UNKNOWN"
-                };
-                let hostname = self
-                    .hostname_cache
-                    .get(&conn_id.ip_addr())
-                    .map(|s| s.as_str())
-                    .unwrap_or_else(|| "unknown");
-                conn_group_desc.set_name(format!(
-                    "{}:{}:{}",
-                    protocol_str, hostname, conn_id.dest_port
-                ));
-                conn_group_desc.set_parent_uuid(thread_group_uuid);
+                let mut socket_group_desc = TrackDescriptor::default();
+                socket_group_desc.set_uuid(socket_group_uuid);
+                socket_group_desc.set_name(self.socket_track_name(*socket_id));
+                socket_group_desc.set_parent_uuid(thread_group_uuid);
 
-                let mut conn_group_packet = TracePacket::default();
-                conn_group_packet.set_track_descriptor(conn_group_desc);
-                packets.push(conn_group_packet);
+                let mut socket_group_packet = TracePacket::default();
+                socket_group_packet.set_track_descriptor(socket_group_desc);
+                packets.push(socket_group_packet);
 
-                // Create send track if we have send events
+                // Get protocol from metadata
+                let protocol = self
+                    .socket_metadata
+                    .get(socket_id)
+                    .map(|m| m.protocol)
+                    .unwrap_or(0);
+
+                // Create Sends track if we have send events
                 if events.iter_sends().next().is_some() {
                     let send_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
                     let mut send_track_desc = TrackDescriptor::default();
                     send_track_desc.set_uuid(send_track_uuid);
                     send_track_desc.set_name("Sends".to_string());
-                    send_track_desc.set_parent_uuid(conn_group_uuid);
+                    send_track_desc.set_parent_uuid(socket_group_uuid);
 
                     let mut send_track_packet = TracePacket::default();
                     send_track_packet.set_track_descriptor(send_track_desc);
                     packets.push(send_track_packet);
 
-                    let proto_str = Self::protocol_to_str(conn_id.protocol);
+                    let proto_str = Self::protocol_to_str(protocol);
                     let send_event_name = format!("{proto_str}_send");
-                    let send_name_iid = *self.event_name_ids.get(&send_event_name).unwrap();
+                    let send_name_iid = self
+                        .event_name_ids
+                        .get(&send_event_name)
+                        .copied()
+                        .unwrap_or(0);
 
                     for event in events.iter_sends() {
                         let mut begin_event = TrackEvent::default();
                         begin_event.set_type(Type::TYPE_SLICE_BEGIN);
-                        begin_event.set_name_iid(send_name_iid);
+                        if send_name_iid > 0 {
+                            begin_event.set_name_iid(send_name_iid);
+                        }
                         begin_event.set_track_uuid(send_track_uuid);
 
                         let mut debug_annotation = DebugAnnotation::default();
@@ -691,22 +942,26 @@ impl NetworkRecorder {
                     }
                 }
 
-                // Create receive track if we have receive events
+                // Create Receives track if we have receive events
                 if events.iter_recvs().next().is_some() {
                     let recv_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
                     let mut recv_track_desc = TrackDescriptor::default();
                     recv_track_desc.set_uuid(recv_track_uuid);
                     recv_track_desc.set_name("Receives".to_string());
-                    recv_track_desc.set_parent_uuid(conn_group_uuid);
+                    recv_track_desc.set_parent_uuid(socket_group_uuid);
 
                     let mut recv_track_packet = TracePacket::default();
                     recv_track_packet.set_track_descriptor(recv_track_desc);
                     packets.push(recv_track_packet);
 
-                    let proto_str = Self::protocol_to_str(conn_id.protocol);
+                    let proto_str = Self::protocol_to_str(protocol);
                     let recv_event_name = format!("{proto_str}_recv");
-                    let recv_name_iid = *self.event_name_ids.get(&recv_event_name).unwrap();
+                    let recv_name_iid = self
+                        .event_name_ids
+                        .get(&recv_event_name)
+                        .copied()
+                        .unwrap_or(0);
                     for event in events.iter_recvs() {
                         self.add_slice_events(
                             &mut packets,
@@ -718,82 +973,23 @@ impl NetworkRecorder {
                     }
                 }
 
-                // Create TCP Packets track if we have TCP packet events
-                let is_tcp =
-                    conn_id.protocol == crate::systing::types::network_protocol::NETWORK_TCP.0;
-                let has_tcp_packets = is_tcp
-                    && (events.iter_tcp_enqueue_packets().next().is_some()
-                        || events.iter_shared_send_packets().next().is_some()
-                        || events.iter_tcp_rcv_established_packets().next().is_some()
-                        || events.iter_tcp_queue_rcv_packets().next().is_some()
-                        || events.iter_tcp_buffer_queue_packets().next().is_some());
+                // Create Buffer Queue track if we have buffer queue events (app-relevant)
+                let has_buffer_queue = events.iter_tcp_buffer_queue_packets().next().is_some()
+                    || events.iter_udp_enqueue_packets().next().is_some();
 
-                if has_tcp_packets {
-                    let packets_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+                if has_buffer_queue {
+                    let buffer_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
-                    let mut packets_track_desc = TrackDescriptor::default();
-                    packets_track_desc.set_uuid(packets_track_uuid);
-                    packets_track_desc.set_name("Packets".to_string());
-                    packets_track_desc.set_parent_uuid(conn_group_uuid);
+                    let mut buffer_track_desc = TrackDescriptor::default();
+                    buffer_track_desc.set_uuid(buffer_track_uuid);
+                    buffer_track_desc.set_name("Buffer Queue".to_string());
+                    buffer_track_desc.set_parent_uuid(socket_group_uuid);
 
-                    let mut packets_track_packet = TracePacket::default();
-                    packets_track_packet.set_track_descriptor(packets_track_desc);
-                    packets.push(packets_track_packet);
+                    let mut buffer_track_packet = TracePacket::default();
+                    buffer_track_packet.set_track_descriptor(buffer_track_desc);
+                    packets.push(buffer_track_packet);
 
-                    let enqueue_pkts: Vec<_> = events.iter_tcp_enqueue_packets().copied().collect();
-                    if !enqueue_pkts.is_empty() {
-                        let enqueue_iid = *self.event_name_ids.get("TCP packet_enqueue").unwrap();
-                        self.add_packet_slice_events(
-                            &mut packets,
-                            sequence_id,
-                            packets_track_uuid,
-                            enqueue_iid,
-                            &enqueue_pkts,
-                        );
-                    }
-
-                    let send_pkts: Vec<_> = events.iter_shared_send_packets().copied().collect();
-                    if !send_pkts.is_empty() {
-                        let send_iid = *self.event_name_ids.get("TCP packet_send").unwrap();
-                        self.add_packet_slice_events(
-                            &mut packets,
-                            sequence_id,
-                            packets_track_uuid,
-                            send_iid,
-                            &send_pkts,
-                        );
-                    }
-
-                    let rcv_est_pkts: Vec<_> =
-                        events.iter_tcp_rcv_established_packets().copied().collect();
-                    if !rcv_est_pkts.is_empty() {
-                        let rcv_established_iid = *self
-                            .event_name_ids
-                            .get("TCP packet_rcv_established")
-                            .unwrap();
-                        self.add_packet_slice_events(
-                            &mut packets,
-                            sequence_id,
-                            packets_track_uuid,
-                            rcv_established_iid,
-                            &rcv_est_pkts,
-                        );
-                    }
-
-                    let queue_rcv_pkts: Vec<_> =
-                        events.iter_tcp_queue_rcv_packets().copied().collect();
-                    if !queue_rcv_pkts.is_empty() {
-                        let queue_rcv_iid =
-                            *self.event_name_ids.get("TCP packet_queue_rcv").unwrap();
-                        self.add_packet_slice_events(
-                            &mut packets,
-                            sequence_id,
-                            packets_track_uuid,
-                            queue_rcv_iid,
-                            &queue_rcv_pkts,
-                        );
-                    }
-
+                    // TCP buffer queue events
                     let buffer_queue_pkts: Vec<_> =
                         events.iter_tcp_buffer_queue_packets().copied().collect();
                     if !buffer_queue_pkts.is_empty() {
@@ -802,58 +998,13 @@ impl NetworkRecorder {
                         self.add_packet_slice_events(
                             &mut packets,
                             sequence_id,
-                            packets_track_uuid,
+                            buffer_track_uuid,
                             buffer_queue_iid,
                             &buffer_queue_pkts,
                         );
                     }
-                }
 
-                // Create UDP Packets track if we have UDP packet events
-                let is_udp =
-                    conn_id.protocol == crate::systing::types::network_protocol::NETWORK_UDP.0;
-                let has_udp_packets = is_udp
-                    && (events.iter_udp_send_packets().next().is_some()
-                        || events.iter_shared_send_packets().next().is_some()
-                        || events.iter_udp_rcv_packets().next().is_some()
-                        || events.iter_udp_enqueue_packets().next().is_some());
-
-                if has_udp_packets {
-                    let packets_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-
-                    let mut packets_track_desc = TrackDescriptor::default();
-                    packets_track_desc.set_uuid(packets_track_uuid);
-                    packets_track_desc.set_name("Packets".to_string());
-                    packets_track_desc.set_parent_uuid(conn_group_uuid);
-
-                    let mut packets_track_packet = TracePacket::default();
-                    packets_track_packet.set_track_descriptor(packets_track_desc);
-                    packets.push(packets_track_packet);
-
-                    let udp_send_pkts: Vec<_> = events.iter_udp_send_packets().copied().collect();
-                    if !udp_send_pkts.is_empty() {
-                        let send_iid = *self.event_name_ids.get("UDP send").unwrap();
-                        self.add_packet_slice_events(
-                            &mut packets,
-                            sequence_id,
-                            packets_track_uuid,
-                            send_iid,
-                            &udp_send_pkts,
-                        );
-                    }
-
-                    let udp_rcv_pkts: Vec<_> = events.iter_udp_rcv_packets().copied().collect();
-                    if !udp_rcv_pkts.is_empty() {
-                        let rcv_iid = *self.event_name_ids.get("UDP receive").unwrap();
-                        self.add_packet_slice_events(
-                            &mut packets,
-                            sequence_id,
-                            packets_track_uuid,
-                            rcv_iid,
-                            &udp_rcv_pkts,
-                        );
-                    }
-
+                    // UDP enqueue events
                     let udp_enqueue_pkts: Vec<_> =
                         events.iter_udp_enqueue_packets().copied().collect();
                     if !udp_enqueue_pkts.is_empty() {
@@ -861,23 +1012,9 @@ impl NetworkRecorder {
                         self.add_packet_slice_events(
                             &mut packets,
                             sequence_id,
-                            packets_track_uuid,
+                            buffer_track_uuid,
                             enqueue_iid,
                             &udp_enqueue_pkts,
-                        );
-                    }
-
-                    // UDP also uses PACKET_SEND (SharedSend) for qdisc->NIC transmission
-                    let shared_send_pkts: Vec<_> =
-                        events.iter_shared_send_packets().copied().collect();
-                    if !shared_send_pkts.is_empty() {
-                        let send_iid = *self.event_name_ids.get("UDP packet_send").unwrap();
-                        self.add_packet_slice_events(
-                            &mut packets,
-                            sequence_id,
-                            packets_track_uuid,
-                            send_iid,
-                            &shared_send_pkts,
                         );
                     }
                 }
@@ -897,7 +1034,9 @@ impl NetworkRecorder {
             );
         }
 
-        self.network_events.clear();
+        self.syscall_events.clear();
+        self.packet_events.clear();
+        self.socket_metadata.clear();
         self.event_name_ids.clear();
         self.hostname_cache.clear();
         self.dns_stats = Default::default();
@@ -919,13 +1058,12 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
         use crate::systing::types::network_operation;
 
         let tgidpid = event.task.tgidpid;
+        let socket_id = event.socket_id;
 
-        let conn_id = ConnectionId {
-            protocol: event.protocol.0,
-            af: event.af.0,
-            dest_addr: event.dest_addr,
-            dest_port: event.dest_port,
-        };
+        // Skip events without socket_id (shouldn't happen in normal operation)
+        if socket_id == 0 {
+            return;
+        }
 
         let net_event = NetworkEvent {
             start_ts: event.start_ts,
@@ -936,11 +1074,12 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
             sndbuf_limit: event.sndbuf_limit,
         };
 
+        // Route to per-thread syscall_events by tgidpid then socket_id
         let conn_events = self
-            .network_events
+            .syscall_events
             .entry(tgidpid)
             .or_default()
-            .entry(conn_id)
+            .entry(socket_id)
             .or_default();
 
         if event.operation.0 == network_operation::NETWORK_SEND.0 {
@@ -971,6 +1110,28 @@ mod tests {
         network_protocol::NETWORK_UDP
     }
 
+    /// Helper to insert socket metadata for tests
+    fn insert_test_socket_metadata(
+        recorder: &mut NetworkRecorder,
+        socket_id: SocketId,
+        protocol: u32,
+        af: u32,
+        dest_addr: [u8; 16],
+        dest_port: u16,
+        tgidpid: u64,
+    ) {
+        recorder.socket_metadata.insert(
+            socket_id,
+            SocketMetadata {
+                protocol,
+                af,
+                dest_addr,
+                dest_port,
+                tgidpid,
+            },
+        );
+    }
+
     #[test]
     fn test_network_recorder_tcp_send() {
         use crate::systing::types::{network_address_family, network_operation};
@@ -979,6 +1140,7 @@ mod tests {
 
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 in network byte order
+        let socket_id: SocketId = 1;
 
         let event = network_event {
             start_ts: 1000,
@@ -992,29 +1154,24 @@ mod tests {
             bytes: 1024,
             sendmsg_seq: 0,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
         recorder.handle_event(event);
 
         let tgidpid = (100u64 << 32) | 101u64;
-        assert_eq!(recorder.network_events.len(), 1);
-        assert!(recorder.network_events.contains_key(&tgidpid));
+        assert_eq!(recorder.syscall_events.len(), 1);
+        assert!(recorder.syscall_events.contains_key(&tgidpid));
 
-        let connections = &recorder.network_events[&tgidpid];
+        let connections = &recorder.syscall_events[&tgidpid];
         assert_eq!(connections.len(), 1);
 
-        let conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0,
-            af: network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            dest_port: 8080,
-        };
-        assert!(connections.contains_key(&conn_id));
-        let sends: Vec<_> = connections[&conn_id].iter_sends().collect();
+        assert!(connections.contains_key(&socket_id));
+        let sends: Vec<_> = connections[&socket_id].iter_sends().collect();
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].bytes, 1024);
-        assert_eq!(connections[&conn_id].iter_recvs().count(), 0);
+        assert_eq!(connections[&socket_id].iter_recvs().count(), 0);
     }
 
     #[test]
@@ -1025,8 +1182,8 @@ mod tests {
 
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 in network byte order
+        let socket_id: SocketId = 1;
 
-        // Send 1
         let event1 = network_event {
             start_ts: 1000,
             end_ts: 1500,
@@ -1039,10 +1196,10 @@ mod tests {
             bytes: 1024,
             sendmsg_seq: 0,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
-        // Send 2 to same connection
         let event2 = network_event {
             start_ts: 2000,
             end_ts: 2500,
@@ -1055,6 +1212,7 @@ mod tests {
             bytes: 2048,
             sendmsg_seq: 0,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
@@ -1062,15 +1220,9 @@ mod tests {
         recorder.handle_event(event2);
 
         let tgidpid = (100u64 << 32) | 101u64;
-        let connections = &recorder.network_events[&tgidpid];
-        let conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0,
-            af: network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            dest_port: 8080,
-        };
+        let connections = &recorder.syscall_events[&tgidpid];
 
-        let sends: Vec<_> = connections[&conn_id].iter_sends().collect();
+        let sends: Vec<_> = connections[&socket_id].iter_sends().collect();
         assert_eq!(sends.len(), 2);
         assert_eq!(sends[0].bytes, 1024);
         assert_eq!(sends[1].bytes, 2048);
@@ -1083,9 +1235,10 @@ mod tests {
         let mut recorder = NetworkRecorder::default();
 
         let mut dest_addr = [0u8; 16];
-        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 in network byte order
+        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]);
+        let tcp_socket_id: SocketId = 1;
+        let udp_socket_id: SocketId = 2;
 
-        // TCP send
         let event1 = network_event {
             start_ts: 1000,
             end_ts: 1500,
@@ -1098,10 +1251,10 @@ mod tests {
             bytes: 1024,
             sendmsg_seq: 0,
             cpu: 0,
+            socket_id: tcp_socket_id,
             ..Default::default()
         };
 
-        // UDP send
         let event2 = network_event {
             start_ts: 2000,
             end_ts: 2500,
@@ -1114,6 +1267,7 @@ mod tests {
             bytes: 512,
             sendmsg_seq: 0,
             cpu: 0,
+            socket_id: udp_socket_id,
             ..Default::default()
         };
 
@@ -1121,8 +1275,10 @@ mod tests {
         recorder.handle_event(event2);
 
         let tgidpid = (100u64 << 32) | 101u64;
-        let connections = &recorder.network_events[&tgidpid];
+        let connections = &recorder.syscall_events[&tgidpid];
         assert_eq!(connections.len(), 2);
+        assert!(connections.contains_key(&tcp_socket_id));
+        assert!(connections.contains_key(&udp_socket_id));
     }
 
     #[test]
@@ -1137,6 +1293,18 @@ mod tests {
 
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 in network byte order
+        let socket_id: SocketId = 1;
+        let tgidpid = (100u64 << 32) | 101u64;
+
+        insert_test_socket_metadata(
+            &mut recorder,
+            socket_id,
+            network_protocol::NETWORK_TCP.0,
+            network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            8080,
+            tgidpid,
+        );
 
         let event = network_event {
             start_ts: 1000,
@@ -1150,6 +1318,7 @@ mod tests {
             bytes: 1024,
             sendmsg_seq: 0,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
@@ -1157,40 +1326,29 @@ mod tests {
 
         let packets = recorder.generate_trace_packets(&pid_uuids, &thread_uuids, &id_counter);
 
-        // Should have:
-        // 1. Interned data packet with event names
-        // 2. Thread track group descriptor for "Network Connections"
-        // 3. Connection track group (e.g., "TCP:127.0.0.1:8080")
-        // 4. Send track descriptor ("Sends")
-        // 5. Slice begin event for the send
-        // 6. Slice end event for the send
+        // Packets: interned data, thread track group, socket track, send track, slice begin, slice end
         assert_eq!(packets.len(), 6);
 
-        // Check interned data
         let interned_packet = &packets[0];
         assert!(interned_packet.interned_data.is_some());
 
-        // Check thread track group
         let thread_group_packet = &packets[1];
         assert!(thread_group_packet.has_track_descriptor());
         let thread_group_desc = thread_group_packet.track_descriptor();
-        assert_eq!(thread_group_desc.name(), "Network Connections");
+        assert_eq!(thread_group_desc.name(), "Network Syscalls");
 
-        // Check connection track group
-        let conn_group_packet = &packets[2];
-        assert!(conn_group_packet.has_track_descriptor());
-        let conn_group_desc = conn_group_packet.track_descriptor();
-        assert!(conn_group_desc.name().starts_with("TCP:"));
-        assert_eq!(conn_group_desc.parent_uuid(), thread_group_desc.uuid());
+        let socket_group_packet = &packets[2];
+        assert!(socket_group_packet.has_track_descriptor());
+        let socket_group_desc = socket_group_packet.track_descriptor();
+        assert!(socket_group_desc.name().starts_with("Socket 1:TCP:"));
+        assert_eq!(socket_group_desc.parent_uuid(), thread_group_desc.uuid());
 
-        // Check send track
         let send_track_packet = &packets[3];
         assert!(send_track_packet.has_track_descriptor());
         let send_track_desc = send_track_packet.track_descriptor();
         assert_eq!(send_track_desc.name(), "Sends");
-        assert_eq!(send_track_desc.parent_uuid(), conn_group_desc.uuid());
+        assert_eq!(send_track_desc.parent_uuid(), socket_group_desc.uuid());
 
-        // Check slice begin event
         let begin_packet = &packets[4];
         assert!(begin_packet.has_track_event());
         assert_eq!(begin_packet.timestamp(), 1000);
@@ -1201,7 +1359,6 @@ mod tests {
         assert_eq!(begin_event.debug_annotations[0].name(), "bytes");
         assert_eq!(begin_event.debug_annotations[0].uint_value(), 1024);
 
-        // Check slice end event
         let end_packet = &packets[5];
         assert!(end_packet.has_track_event());
         assert_eq!(end_packet.timestamp(), 2000);
@@ -1209,8 +1366,7 @@ mod tests {
         assert_eq!(end_event.type_(), Type::TYPE_SLICE_END);
         assert_eq!(end_event.track_uuid(), send_track_desc.uuid());
 
-        // Events should be cleared after generating packets
-        assert!(recorder.network_events.is_empty());
+        assert!(recorder.syscall_events.is_empty());
     }
 
     #[test]
@@ -1220,9 +1376,9 @@ mod tests {
         let mut recorder = NetworkRecorder::default();
 
         let mut dest_addr = [0u8; 16];
-        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 in network byte order
+        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]);
+        let socket_id: SocketId = 1;
 
-        // TCP send
         let send_event = network_event {
             start_ts: 1000,
             end_ts: 1500,
@@ -1235,10 +1391,10 @@ mod tests {
             bytes: 1024,
             sendmsg_seq: 0,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
-        // TCP receive from same connection
         let recv_event = network_event {
             start_ts: 2000,
             end_ts: 2500,
@@ -1251,6 +1407,7 @@ mod tests {
             bytes: 512,
             sendmsg_seq: 0,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
@@ -1258,20 +1415,14 @@ mod tests {
         recorder.handle_event(recv_event);
 
         let tgidpid = (100u64 << 32) | 101u64;
-        let connections = &recorder.network_events[&tgidpid];
+        let connections = &recorder.syscall_events[&tgidpid];
         assert_eq!(connections.len(), 1);
 
-        let conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0,
-            af: network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            dest_port: 8080,
-        };
-        assert!(connections.contains_key(&conn_id));
-        let sends: Vec<_> = connections[&conn_id].iter_sends().collect();
+        assert!(connections.contains_key(&socket_id));
+        let sends: Vec<_> = connections[&socket_id].iter_sends().collect();
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].bytes, 1024);
-        let recvs: Vec<_> = connections[&conn_id].iter_recvs().collect();
+        let recvs: Vec<_> = connections[&socket_id].iter_recvs().collect();
         assert_eq!(recvs.len(), 1);
         assert_eq!(recvs[0].bytes, 512);
     }
@@ -1282,12 +1433,12 @@ mod tests {
 
         let mut recorder = NetworkRecorder::default();
 
-        // IPv6 address 2001:db8::1
-        let mut dest_addr = [0u8; 16];
+        let mut dest_addr = [0u8; 16]; // 2001:db8::1
         dest_addr.copy_from_slice(&[
             0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x01,
         ]);
+        let socket_id: SocketId = 1;
 
         let event = network_event {
             start_ts: 1000,
@@ -1301,34 +1452,24 @@ mod tests {
             bytes: 2048,
             sendmsg_seq: 0,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
         recorder.handle_event(event);
 
         let tgidpid = (100u64 << 32) | 101u64;
-        assert_eq!(recorder.network_events.len(), 1);
-        assert!(recorder.network_events.contains_key(&tgidpid));
+        assert_eq!(recorder.syscall_events.len(), 1);
+        assert!(recorder.syscall_events.contains_key(&tgidpid));
 
-        let connections = &recorder.network_events[&tgidpid];
+        let connections = &recorder.syscall_events[&tgidpid];
         assert_eq!(connections.len(), 1);
 
-        let conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0,
-            af: network_address_family::NETWORK_AF_INET6.0,
-            dest_addr,
-            dest_port: 8080,
-        };
-        assert!(connections.contains_key(&conn_id));
-        let sends: Vec<_> = connections[&conn_id].iter_sends().collect();
+        assert!(connections.contains_key(&socket_id));
+        let sends: Vec<_> = connections[&socket_id].iter_sends().collect();
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].bytes, 2048);
-        assert_eq!(connections[&conn_id].iter_recvs().count(), 0);
-
-        // Verify IPv6 address parsing
-        let ip = conn_id.ip_addr();
-        assert!(matches!(ip, IpAddr::V6(_)));
-        assert_eq!(ip.to_string(), "2001:db8::1");
+        assert_eq!(connections[&socket_id].iter_recvs().count(), 0);
     }
 
     #[test]
@@ -1337,9 +1478,9 @@ mod tests {
 
         let mut recorder = NetworkRecorder::default();
 
-        // IPv6 localhost ::1
         let mut dest_addr = [0u8; 16];
         dest_addr[15] = 1; // ::1
+        let socket_id: SocketId = 1;
 
         let event = network_event {
             start_ts: 1000,
@@ -1353,29 +1494,20 @@ mod tests {
             bytes: 512,
             sendmsg_seq: 0,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
         recorder.handle_event(event);
 
         let tgidpid = (100u64 << 32) | 101u64;
-        let connections = &recorder.network_events[&tgidpid];
+        let connections = &recorder.syscall_events[&tgidpid];
         assert_eq!(connections.len(), 1);
 
-        let conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_UDP.0,
-            af: network_address_family::NETWORK_AF_INET6.0,
-            dest_addr,
-            dest_port: 9090,
-        };
-        assert!(connections.contains_key(&conn_id));
-        let sends: Vec<_> = connections[&conn_id].iter_sends().collect();
+        assert!(connections.contains_key(&socket_id));
+        let sends: Vec<_> = connections[&socket_id].iter_sends().collect();
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].bytes, 512);
-
-        // Verify IPv6 localhost address
-        let ip = conn_id.ip_addr();
-        assert_eq!(ip.to_string(), "::1");
     }
 
     #[test]
@@ -1384,18 +1516,17 @@ mod tests {
 
         let mut recorder = NetworkRecorder::default();
 
-        // IPv4 address 127.0.0.1
         let mut ipv4_addr = [0u8; 16];
         ipv4_addr[0..4].copy_from_slice(&[127, 0, 0, 1]);
 
-        // IPv6 address 2001:db8::2
-        let mut ipv6_addr = [0u8; 16];
+        let mut ipv6_addr = [0u8; 16]; // 2001:db8::2
         ipv6_addr.copy_from_slice(&[
             0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x02,
         ]);
+        let ipv4_socket_id: SocketId = 1;
+        let ipv6_socket_id: SocketId = 2;
 
-        // IPv4 TCP send
         let ipv4_event = network_event {
             start_ts: 1000,
             end_ts: 1500,
@@ -1408,10 +1539,10 @@ mod tests {
             bytes: 1024,
             sendmsg_seq: 0,
             cpu: 0,
+            socket_id: ipv4_socket_id,
             ..Default::default()
         };
 
-        // IPv6 TCP send
         let ipv6_event = network_event {
             start_ts: 2000,
             end_ts: 2500,
@@ -1424,6 +1555,7 @@ mod tests {
             bytes: 2048,
             sendmsg_seq: 0,
             cpu: 0,
+            socket_id: ipv6_socket_id,
             ..Default::default()
         };
 
@@ -1431,31 +1563,19 @@ mod tests {
         recorder.handle_event(ipv6_event);
 
         let tgidpid = (100u64 << 32) | 101u64;
-        let connections = &recorder.network_events[&tgidpid];
+        let connections = &recorder.syscall_events[&tgidpid];
 
-        // Should have 2 distinct connections (IPv4 and IPv6 are different)
+        // Should have 2 distinct sockets (IPv4 and IPv6)
         assert_eq!(connections.len(), 2);
 
-        // Verify IPv4 connection
-        let ipv4_conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0,
-            af: network_address_family::NETWORK_AF_INET.0,
-            dest_addr: ipv4_addr,
-            dest_port: 8080,
-        };
-        assert!(connections.contains_key(&ipv4_conn_id));
-        let ipv4_sends: Vec<_> = connections[&ipv4_conn_id].iter_sends().collect();
+        // Verify IPv4 socket
+        assert!(connections.contains_key(&ipv4_socket_id));
+        let ipv4_sends: Vec<_> = connections[&ipv4_socket_id].iter_sends().collect();
         assert_eq!(ipv4_sends[0].bytes, 1024);
 
-        // Verify IPv6 connection
-        let ipv6_conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0,
-            af: network_address_family::NETWORK_AF_INET6.0,
-            dest_addr: ipv6_addr,
-            dest_port: 8080,
-        };
-        assert!(connections.contains_key(&ipv6_conn_id));
-        let ipv6_sends: Vec<_> = connections[&ipv6_conn_id].iter_sends().collect();
+        // Verify IPv6 socket
+        assert!(connections.contains_key(&ipv6_socket_id));
+        let ipv6_sends: Vec<_> = connections[&ipv6_socket_id].iter_sends().collect();
         assert_eq!(ipv6_sends[0].bytes, 2048);
     }
 
@@ -1510,14 +1630,13 @@ mod tests {
 
         let mut recorder = NetworkRecorder::default();
 
-        // IPv6 address 2001:db8::1
-        let mut dest_addr = [0u8; 16];
+        let mut dest_addr = [0u8; 16]; // 2001:db8::1
         dest_addr.copy_from_slice(&[
             0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x01,
         ]);
+        let socket_id: SocketId = 1;
 
-        // TCP send
         let send_event = network_event {
             start_ts: 1000,
             end_ts: 1500,
@@ -1530,10 +1649,10 @@ mod tests {
             bytes: 1024,
             sendmsg_seq: 0,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
-        // TCP receive from same connection
         let recv_event = network_event {
             start_ts: 2000,
             end_ts: 2500,
@@ -1546,6 +1665,7 @@ mod tests {
             bytes: 512,
             sendmsg_seq: 0,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
@@ -1553,20 +1673,14 @@ mod tests {
         recorder.handle_event(recv_event);
 
         let tgidpid = (100u64 << 32) | 101u64;
-        let connections = &recorder.network_events[&tgidpid];
+        let connections = &recorder.syscall_events[&tgidpid];
         assert_eq!(connections.len(), 1);
 
-        let conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0,
-            af: network_address_family::NETWORK_AF_INET6.0,
-            dest_addr,
-            dest_port: 8080,
-        };
-        assert!(connections.contains_key(&conn_id));
-        let sends: Vec<_> = connections[&conn_id].iter_sends().collect();
+        assert!(connections.contains_key(&socket_id));
+        let sends: Vec<_> = connections[&socket_id].iter_sends().collect();
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].bytes, 1024);
-        let recvs: Vec<_> = connections[&conn_id].iter_recvs().collect();
+        let recvs: Vec<_> = connections[&socket_id].iter_recvs().collect();
         assert_eq!(recvs.len(), 1);
         assert_eq!(recvs[0].bytes, 512);
     }
@@ -1579,6 +1693,7 @@ mod tests {
 
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+        let socket_id: SocketId = 1;
 
         let event = crate::systing::types::packet_event {
             start_ts: 1000,
@@ -1592,24 +1707,17 @@ mod tests {
             tcp_flags: 0x10,
             event_type: packet_event_type::PACKET_RCV_ESTABLISHED,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
         recorder.handle_packet_event(event);
 
-        let tgidpid = (200u64 << 32) | 201u64;
-        assert_eq!(recorder.network_events.len(), 1);
-        let connections = &recorder.network_events[&tgidpid];
-        assert_eq!(connections.len(), 1);
+        // PACKET_RCV_ESTABLISHED goes to global packet_events
+        assert_eq!(recorder.packet_events.len(), 1);
+        assert!(recorder.packet_events.contains_key(&socket_id));
 
-        let conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0,
-            af: network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            dest_port: 8080,
-        };
-        assert!(connections.contains_key(&conn_id));
-        let rcv_est: Vec<_> = connections[&conn_id]
+        let rcv_est: Vec<_> = recorder.packet_events[&socket_id]
             .iter_tcp_rcv_established_packets()
             .collect();
         assert_eq!(rcv_est.len(), 1);
@@ -1625,6 +1733,7 @@ mod tests {
 
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+        let socket_id: SocketId = 1;
 
         let event = crate::systing::types::packet_event {
             start_ts: 1100,
@@ -1638,20 +1747,17 @@ mod tests {
             tcp_flags: 0x10,
             event_type: packet_event_type::PACKET_QUEUE_RCV,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
         recorder.handle_packet_event(event);
 
-        let tgidpid = (200u64 << 32) | 201u64;
-        let connections = &recorder.network_events[&tgidpid];
-        let conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0,
-            af: network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            dest_port: 8080,
-        };
-        let queue_rcv: Vec<_> = connections[&conn_id].iter_tcp_queue_rcv_packets().collect();
+        // PACKET_QUEUE_RCV goes to global packet_events
+        assert!(recorder.packet_events.contains_key(&socket_id));
+        let queue_rcv: Vec<_> = recorder.packet_events[&socket_id]
+            .iter_tcp_queue_rcv_packets()
+            .collect();
         assert_eq!(queue_rcv.len(), 1);
         assert_eq!(queue_rcv[0].seq, 1000);
     }
@@ -1664,6 +1770,7 @@ mod tests {
 
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+        let socket_id: SocketId = 1;
 
         let event = crate::systing::types::packet_event {
             start_ts: 1110,
@@ -1677,20 +1784,18 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_BUFFER_QUEUE,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
         recorder.handle_packet_event(event);
 
+        // PACKET_BUFFER_QUEUE goes to per-thread syscall_events (app-relevant)
         let tgidpid = (200u64 << 32) | 201u64;
-        let connections = &recorder.network_events[&tgidpid];
-        let conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0,
-            af: network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            dest_port: 8080,
-        };
-        let buffer_queue: Vec<_> = connections[&conn_id]
+        let connections = &recorder.syscall_events[&tgidpid];
+        assert!(connections.contains_key(&socket_id));
+
+        let buffer_queue: Vec<_> = connections[&socket_id]
             .iter_tcp_buffer_queue_packets()
             .collect();
         assert_eq!(buffer_queue.len(), 1);
@@ -1706,6 +1811,18 @@ mod tests {
 
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+        let socket_id: SocketId = 1;
+        let tgidpid = (200u64 << 32) | 201u64;
+
+        insert_test_socket_metadata(
+            &mut recorder,
+            socket_id,
+            network_protocol::NETWORK_TCP.0,
+            network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            8080,
+            tgidpid,
+        );
 
         let rcv_est_event = crate::systing::types::packet_event {
             start_ts: 1000,
@@ -1719,6 +1836,7 @@ mod tests {
             tcp_flags: 0x10,
             event_type: packet_event_type::PACKET_RCV_ESTABLISHED,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
@@ -1734,6 +1852,7 @@ mod tests {
             tcp_flags: 0x10,
             event_type: packet_event_type::PACKET_QUEUE_RCV,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
@@ -1749,6 +1868,7 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_BUFFER_QUEUE,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
@@ -1756,29 +1876,28 @@ mod tests {
         recorder.handle_packet_event(queue_rcv_event);
         recorder.handle_packet_event(buffer_queue_event);
 
-        let tgidpid = (200u64 << 32) | 201u64;
-        let connections = &recorder.network_events[&tgidpid];
-        assert_eq!(connections.len(), 1);
-
-        let conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0,
-            af: network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            dest_port: 8080,
-        };
-        assert!(connections.contains_key(&conn_id));
+        // PACKET_RCV_ESTABLISHED and PACKET_QUEUE_RCV go to global packet_events
+        assert_eq!(recorder.packet_events.len(), 1);
+        assert!(recorder.packet_events.contains_key(&socket_id));
         assert_eq!(
-            connections[&conn_id]
+            recorder.packet_events[&socket_id]
                 .iter_tcp_rcv_established_packets()
                 .count(),
             1
         );
         assert_eq!(
-            connections[&conn_id].iter_tcp_queue_rcv_packets().count(),
+            recorder.packet_events[&socket_id]
+                .iter_tcp_queue_rcv_packets()
+                .count(),
             1
         );
+
+        // PACKET_BUFFER_QUEUE goes to per-thread syscall_events
+        let connections = &recorder.syscall_events[&tgidpid];
+        assert_eq!(connections.len(), 1);
+        assert!(connections.contains_key(&socket_id));
         assert_eq!(
-            connections[&conn_id]
+            connections[&socket_id]
                 .iter_tcp_buffer_queue_packets()
                 .count(),
             1
@@ -1793,6 +1912,18 @@ mod tests {
 
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+        let socket_id: SocketId = 1;
+        let tgidpid = (200u64 << 32) | 201u64;
+
+        insert_test_socket_metadata(
+            &mut recorder,
+            socket_id,
+            network_protocol::NETWORK_TCP.0,
+            network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            8080,
+            tgidpid,
+        );
 
         let packet1 = crate::systing::types::packet_event {
             start_ts: 1000,
@@ -1806,6 +1937,7 @@ mod tests {
             tcp_flags: 0x10,
             event_type: packet_event_type::PACKET_BUFFER_QUEUE,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
@@ -1821,21 +1953,17 @@ mod tests {
             tcp_flags: 0x10,
             event_type: packet_event_type::PACKET_BUFFER_QUEUE,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
         recorder.handle_packet_event(packet1);
         recorder.handle_packet_event(packet2);
 
-        let tgidpid = (200u64 << 32) | 201u64;
-        let connections = &recorder.network_events[&tgidpid];
-        let conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0,
-            af: network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            dest_port: 8080,
-        };
-        let buffer_queue: Vec<_> = connections[&conn_id]
+        // PACKET_BUFFER_QUEUE goes to per-thread syscall_events
+        let connections = &recorder.syscall_events[&tgidpid];
+        assert!(connections.contains_key(&socket_id));
+        let buffer_queue: Vec<_> = connections[&socket_id]
             .iter_tcp_buffer_queue_packets()
             .collect();
         assert_eq!(buffer_queue.len(), 2);
@@ -1855,6 +1983,18 @@ mod tests {
 
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+        let socket_id: SocketId = 1;
+        let tgidpid = (200u64 << 32) | 201u64;
+
+        insert_test_socket_metadata(
+            &mut recorder,
+            socket_id,
+            network_protocol::NETWORK_TCP.0,
+            network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            8080,
+            tgidpid,
+        );
 
         let rcv_est = crate::systing::types::packet_event {
             start_ts: 1000,
@@ -1868,6 +2008,7 @@ mod tests {
             tcp_flags: 0x10,
             event_type: packet_event_type::PACKET_RCV_ESTABLISHED,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
@@ -1883,6 +2024,7 @@ mod tests {
             tcp_flags: 0x10,
             event_type: packet_event_type::PACKET_QUEUE_RCV,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
@@ -1898,6 +2040,7 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_BUFFER_QUEUE,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
@@ -1911,14 +2054,18 @@ mod tests {
         let interned_packet = &packets[0];
         assert!(interned_packet.interned_data.is_some());
 
-        let thread_group_packet = &packets[1];
-        assert!(thread_group_packet.has_track_descriptor());
-        assert_eq!(
-            thread_group_packet.track_descriptor().name(),
-            "Network Connections"
+        let has_network_packets_track = packets
+            .iter()
+            .any(|p| p.has_track_descriptor() && p.track_descriptor().name() == "Network Packets");
+        assert!(
+            has_network_packets_track,
+            "Should have 'Network Packets' track"
         );
 
-        assert!(recorder.network_events.is_empty());
+        let has_syscall_track = packets
+            .iter()
+            .any(|p| p.has_track_descriptor() && p.track_descriptor().name() == "Network Syscalls");
+        assert!(has_syscall_track, "Should have 'Network Syscalls' track");
     }
 
     #[test]
@@ -1929,6 +2076,18 @@ mod tests {
 
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+        let socket_id: SocketId = 1;
+        let tgidpid = (200u64 << 32) | 201u64;
+
+        insert_test_socket_metadata(
+            &mut recorder,
+            socket_id,
+            network_protocol::NETWORK_TCP.0,
+            network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            8080,
+            tgidpid,
+        );
 
         let send_enqueue = crate::systing::types::packet_event {
             start_ts: 1000,
@@ -1942,6 +2101,7 @@ mod tests {
             tcp_flags: 0x18,
             event_type: packet_event_type::PACKET_ENQUEUE,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
@@ -1957,25 +2117,29 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_BUFFER_QUEUE,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
         recorder.handle_packet_event(send_enqueue);
         recorder.handle_packet_event(recv_buffer);
 
-        let tgidpid = (200u64 << 32) | 201u64;
-        let connections = &recorder.network_events[&tgidpid];
-        assert_eq!(connections.len(), 1);
-
-        let conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0,
-            af: network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            dest_port: 8080,
-        };
-        assert_eq!(connections[&conn_id].iter_tcp_enqueue_packets().count(), 1);
+        // PACKET_ENQUEUE goes to global packet_events
+        assert_eq!(recorder.packet_events.len(), 1);
+        assert!(recorder.packet_events.contains_key(&socket_id));
         assert_eq!(
-            connections[&conn_id]
+            recorder.packet_events[&socket_id]
+                .iter_tcp_enqueue_packets()
+                .count(),
+            1
+        );
+
+        // PACKET_BUFFER_QUEUE goes to per-thread syscall_events
+        let connections = &recorder.syscall_events[&tgidpid];
+        assert_eq!(connections.len(), 1);
+        assert!(connections.contains_key(&socket_id));
+        assert_eq!(
+            connections[&socket_id]
                 .iter_tcp_buffer_queue_packets()
                 .count(),
             1
@@ -1990,8 +2154,30 @@ mod tests {
 
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[8, 8, 8, 8]); // 8.8.8.8
+        let udp_socket_id: SocketId = 1;
+        let tcp_socket_id: SocketId = 2;
+        let tgidpid = (100u64 << 32) | 101u64;
 
-        // Create UDP PACKET_UDP_SEND event
+        insert_test_socket_metadata(
+            &mut recorder,
+            udp_socket_id,
+            network_protocol::NETWORK_UDP.0,
+            network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            53,
+            tgidpid,
+        );
+        insert_test_socket_metadata(
+            &mut recorder,
+            tcp_socket_id,
+            network_protocol::NETWORK_TCP.0,
+            network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            80,
+            tgidpid,
+        );
+
+        // Create UDP PACKET_UDP_SEND event - goes to global packet_events
         let udp_send_event = crate::systing::types::packet_event {
             start_ts: 1000,
             end_ts: 2000,
@@ -2005,10 +2191,11 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_UDP_SEND,
             cpu: 0,
+            socket_id: udp_socket_id,
             ..Default::default()
         };
 
-        // Create UDP PACKET_SEND event (qdisc->NIC, shared type)
+        // Create UDP PACKET_SEND event (qdisc->NIC, shared type) - goes to global packet_events
         let udp_packet_send_event = crate::systing::types::packet_event {
             start_ts: 2000,
             end_ts: 3000,
@@ -2022,10 +2209,11 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_SEND, // Shared with TCP!
             cpu: 0,
+            socket_id: udp_socket_id,
             ..Default::default()
         };
 
-        // Create TCP PACKET_SEND event for comparison
+        // Create TCP PACKET_SEND event for comparison - goes to global packet_events
         let tcp_packet_send_event = crate::systing::types::packet_event {
             start_ts: 4000,
             end_ts: 5000,
@@ -2039,6 +2227,7 @@ mod tests {
             tcp_flags: 0x10,
             event_type: packet_event_type::PACKET_SEND, // Same event type!
             cpu: 0,
+            socket_id: tcp_socket_id,
             ..Default::default()
         };
 
@@ -2046,35 +2235,13 @@ mod tests {
         recorder.handle_packet_event(udp_packet_send_event);
         recorder.handle_packet_event(tcp_packet_send_event);
 
-        let tgidpid = (100u64 << 32) | 101u64;
-        let connections = &recorder.network_events[&tgidpid];
+        // All these packet types go to global packet_events (not syscall_events)
+        assert_eq!(recorder.packet_events.len(), 2);
+        assert!(recorder.packet_events.contains_key(&udp_socket_id));
+        assert!(recorder.packet_events.contains_key(&tcp_socket_id));
 
-        // Verify UDP connection exists with correct protocol
-        let udp_conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_UDP.0,
-            af: network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            dest_port: 53,
-        };
-        assert!(
-            connections.contains_key(&udp_conn_id),
-            "UDP connection should exist"
-        );
-
-        // Verify TCP connection exists with correct protocol
-        let tcp_conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_TCP.0,
-            af: network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            dest_port: 80,
-        };
-        assert!(
-            connections.contains_key(&tcp_conn_id),
-            "TCP connection should exist"
-        );
-
-        // Verify UDP events went to UDP connection
-        let udp_events = &connections[&udp_conn_id];
+        // Verify UDP events went to UDP socket_id
+        let udp_events = &recorder.packet_events[&udp_socket_id];
         assert_eq!(
             udp_events.iter_udp_send_packets().count(),
             1,
@@ -2086,26 +2253,26 @@ mod tests {
             "Should have 1 UDP PACKET_SEND event (qdisc->NIC)"
         );
 
-        // Verify TCP events went to TCP connection
-        let tcp_events = &connections[&tcp_conn_id];
+        // Verify TCP events went to TCP socket_id
+        let tcp_events = &recorder.packet_events[&tcp_socket_id];
         assert_eq!(
             tcp_events.iter_shared_send_packets().count(),
             1,
             "Should have 1 TCP PACKET_SEND event"
         );
 
-        // Verify UDP connection doesn't have TCP events
+        // Verify UDP socket doesn't have TCP events
         assert_eq!(
             udp_events.iter_tcp_enqueue_packets().count(),
             0,
-            "UDP connection shouldn't have TCP enqueue events"
+            "UDP socket shouldn't have TCP enqueue events"
         );
 
-        // Verify TCP connection doesn't have UDP events
+        // Verify TCP socket doesn't have UDP events
         assert_eq!(
             tcp_events.iter_udp_send_packets().count(),
             0,
-            "TCP connection shouldn't have UDP send events"
+            "TCP socket shouldn't have UDP send events"
         );
     }
 
@@ -2117,8 +2284,20 @@ mod tests {
 
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[1, 1, 1, 1]); // 1.1.1.1
+        let socket_id: SocketId = 1;
+        let tgidpid = (200u64 << 32) | 201u64;
 
-        // UDP receive event (IP->UDP)
+        insert_test_socket_metadata(
+            &mut recorder,
+            socket_id,
+            network_protocol::NETWORK_UDP.0,
+            network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            443,
+            tgidpid,
+        );
+
+        // UDP receive event (IP->UDP) - goes to global packet_events
         let udp_rcv_event = crate::systing::types::packet_event {
             start_ts: 1000,
             end_ts: 1500,
@@ -2132,10 +2311,11 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_UDP_RCV,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
-        // UDP enqueue event (UDP->buffer)
+        // UDP enqueue event (UDP->buffer) - goes to per-thread syscall_events
         let udp_enqueue_event = crate::systing::types::packet_event {
             start_ts: 1500,
             end_ts: 2000,
@@ -2149,35 +2329,32 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_UDP_ENQUEUE,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
         recorder.handle_packet_event(udp_rcv_event);
         recorder.handle_packet_event(udp_enqueue_event);
 
-        let tgidpid = (200u64 << 32) | 201u64;
-        let connections = &recorder.network_events[&tgidpid];
-
-        let udp_conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_UDP.0,
-            af: network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            dest_port: 443,
-        };
-
-        assert!(
-            connections.contains_key(&udp_conn_id),
-            "UDP connection should exist"
-        );
-
-        let udp_events = &connections[&udp_conn_id];
+        // PACKET_UDP_RCV goes to global packet_events
+        assert_eq!(recorder.packet_events.len(), 1);
+        assert!(recorder.packet_events.contains_key(&socket_id));
         assert_eq!(
-            udp_events.iter_udp_rcv_packets().count(),
+            recorder.packet_events[&socket_id]
+                .iter_udp_rcv_packets()
+                .count(),
             1,
             "Should have 1 UDP receive event"
         );
+
+        // PACKET_UDP_ENQUEUE goes to per-thread syscall_events
+        let connections = &recorder.syscall_events[&tgidpid];
+        assert!(
+            connections.contains_key(&socket_id),
+            "UDP connection should exist"
+        );
         assert_eq!(
-            udp_events.iter_udp_enqueue_packets().count(),
+            connections[&socket_id].iter_udp_enqueue_packets().count(),
             1,
             "Should have 1 UDP enqueue event"
         );
@@ -2191,12 +2368,21 @@ mod tests {
 
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[8, 8, 8, 8]);
+        let socket_id: SocketId = 1;
+        let tgidpid = (100u64 << 32) | 101u64;
 
-        // Simulate UDP packet with application payload of 512 bytes
-        // At BPF level, this should be reported as 512 (not 512+8 or 512+28)
+        insert_test_socket_metadata(
+            &mut recorder,
+            socket_id,
+            network_protocol::NETWORK_UDP.0,
+            network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            53,
+            tgidpid,
+        );
+
         let payload_size = 512;
 
-        // UDP send event - length should be payload only (not including headers)
         let udp_send_event = crate::systing::types::packet_event {
             start_ts: 1000,
             end_ts: 2000,
@@ -2206,14 +2392,14 @@ mod tests {
             dest_addr,
             dest_port: 53,
             seq: 0,
-            length: payload_size, // Should be payload only (BPF subtracts 28 bytes)
+            length: payload_size,
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_UDP_SEND,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
-        // UDP receive event - length should be payload only (not including headers)
         let udp_rcv_event = crate::systing::types::packet_event {
             start_ts: 3000,
             end_ts: 4000,
@@ -2223,43 +2409,31 @@ mod tests {
             dest_addr,
             dest_port: 53,
             seq: 0,
-            length: payload_size, // Should be payload only (BPF subtracts 8 bytes)
+            length: payload_size,
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_UDP_RCV,
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
         recorder.handle_packet_event(udp_send_event);
         recorder.handle_packet_event(udp_rcv_event);
 
-        let tgidpid = (100u64 << 32) | 101u64;
-        let connections = &recorder.network_events[&tgidpid];
+        assert!(recorder.packet_events.contains_key(&socket_id));
+        let udp_events = &recorder.packet_events[&socket_id];
 
-        let udp_conn_id = ConnectionId {
-            protocol: network_protocol::NETWORK_UDP.0,
-            af: network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            dest_port: 53,
-        };
-
-        let udp_events = &connections[&udp_conn_id];
-
-        // Verify lengths are payload only (headers excluded)
         let udp_send: Vec<_> = udp_events.iter_udp_send_packets().collect();
         assert_eq!(
             udp_send[0].length, payload_size,
-            "UDP send packet length should be {payload_size} bytes (payload only, no IP+UDP headers)"
+            "Length should be payload only"
         );
 
         let udp_rcv: Vec<_> = udp_events.iter_udp_rcv_packets().collect();
         assert_eq!(
             udp_rcv[0].length, payload_size,
-            "UDP receive packet length should be {payload_size} bytes (payload only, no UDP header)"
+            "Length should be payload only"
         );
-
-        // Verify this matches what the application would see in sendto()/recvfrom()
-        // If app sends 512 bytes, that's what should be reported (not 512+8 or 512+28)
     }
 
     #[test]
@@ -2272,8 +2446,21 @@ mod tests {
 
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[8, 8, 8, 8]); // 8.8.8.8
+        let socket_id: SocketId = 1;
+        let tgidpid = (100u64 << 32) | 101u64;
+
+        insert_test_socket_metadata(
+            &mut recorder,
+            socket_id,
+            network_protocol::NETWORK_UDP.0,
+            network_address_family::NETWORK_AF_INET.0,
+            dest_addr,
+            53,
+            tgidpid,
+        );
 
         // Create UDP PACKET_SEND event (qdisc->NIC, shared event type with TCP)
+        // Goes to global packet_events
         let udp_packet_send_event = crate::systing::types::packet_event {
             start_ts: 1000,
             end_ts: 2000,
@@ -2287,34 +2474,38 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_SEND, // Shared with TCP!
             cpu: 0,
+            socket_id,
             ..Default::default()
         };
 
         recorder.handle_packet_event(udp_packet_send_event);
 
         let id_counter = Arc::new(AtomicUsize::new(1000));
-        let mut pid_uuids = std::collections::HashMap::new();
-        let mut thread_uuids = std::collections::HashMap::new();
-
-        // Add UUIDs for the test task
-        pid_uuids.insert(100, 5000); // tgid 100
-        thread_uuids.insert(101, 5001); // tid 101
+        let pid_uuids = std::collections::HashMap::new();
+        let thread_uuids = std::collections::HashMap::new();
 
         let packets = recorder.generate_trace_packets(&pid_uuids, &thread_uuids, &id_counter);
 
-        // Count track descriptors to ensure we don't have duplicate "Packets" tracks
-        let packets_tracks: Vec<_> = packets
+        // Find socket-level track descriptors
+        let socket_tracks: Vec<_> = packets
             .iter()
             .filter(|p| p.has_track_descriptor())
-            .filter(|p| p.track_descriptor().name() == "Packets")
+            .filter(|p| p.track_descriptor().name().starts_with("Socket "))
             .collect();
 
+        // Should have exactly 1 socket track for the UDP connection
         assert_eq!(
-            packets_tracks.len(), 1,
-            "Should only create ONE 'Packets' track for UDP connection, not duplicate TCP+UDP tracks"
+            socket_tracks.len(),
+            1,
+            "Should only create ONE socket track for UDP connection, not duplicate TCP+UDP tracks"
         );
 
-        // Note: Event name IIDs are now created unconditionally (only ~9 strings, so no overhead)
-        // The important check is that we don't create duplicate track descriptors above
+        // Verify it's identified as UDP
+        let socket_track_name = socket_tracks[0].track_descriptor().name();
+        assert!(
+            socket_track_name.contains("UDP"),
+            "Socket track should be identified as UDP: {}",
+            socket_track_name
+        );
     }
 }
