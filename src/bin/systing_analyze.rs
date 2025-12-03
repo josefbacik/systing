@@ -284,6 +284,12 @@ struct ExtractedData {
     counters: Vec<CounterRecord>,
     counter_tracks: Vec<CounterTrackRecord>,
     slices: Vec<SliceRecord>,
+    // Stack trace data
+    symbols: Vec<SymbolRecord>,
+    stack_mappings: Vec<StackMappingRecord>,
+    frames: Vec<FrameRecord>,
+    callsites: Vec<CallsiteRecord>,
+    perf_samples: Vec<PerfSampleRecord>,
 }
 
 #[derive(Clone)]
@@ -345,6 +351,41 @@ struct SliceRecord {
     depth: i32,
 }
 
+struct SymbolRecord {
+    id: i64,
+    name: String,
+}
+
+struct StackMappingRecord {
+    id: i64,
+    build_id: Option<String>,
+    name: Option<String>,
+    exact_offset: i64,
+    start_offset: i64,
+}
+
+struct FrameRecord {
+    id: i64,
+    name: Option<String>,
+    mapping_id: Option<i64>,
+    rel_pc: i64,
+    symbol_id: Option<i64>,
+}
+
+struct CallsiteRecord {
+    id: i64,
+    parent_id: Option<i64>,
+    frame_id: i64,
+    depth: i32,
+}
+
+struct PerfSampleRecord {
+    ts: i64,
+    utid: i64,
+    callsite_id: Option<i64>,
+    cpu: Option<i32>,
+}
+
 struct TraceExtractor {
     data: ExtractedData,
     pid_to_upid: HashMap<i32, i64>,
@@ -356,6 +397,13 @@ struct TraceExtractor {
     next_upid: i64,
     next_utid: i64,
     next_track_id: i64,
+
+    interned_function_names: HashMap<u64, String>,
+    interned_mappings: HashMap<u64, StackMappingRecord>,
+    interned_frames: HashMap<u64, FrameRecord>,
+    interned_callstacks: HashMap<u64, Vec<u64>>,
+    callsite_map: HashMap<Vec<u64>, i64>,
+    next_callsite_id: i64,
 }
 
 impl TraceExtractor {
@@ -369,6 +417,11 @@ impl TraceExtractor {
                 counters: Vec::new(),
                 counter_tracks: Vec::new(),
                 slices: Vec::new(),
+                symbols: Vec::new(),
+                stack_mappings: Vec::new(),
+                frames: Vec::new(),
+                callsites: Vec::new(),
+                perf_samples: Vec::new(),
             },
             pid_to_upid: HashMap::new(),
             tid_to_utid: HashMap::new(),
@@ -378,10 +431,17 @@ impl TraceExtractor {
             next_upid: 1,
             next_utid: 1,
             next_track_id: 1,
+            interned_function_names: HashMap::new(),
+            interned_mappings: HashMap::new(),
+            interned_frames: HashMap::new(),
+            interned_callstacks: HashMap::new(),
+            callsite_map: HashMap::new(),
+            next_callsite_id: 1,
         }
     }
 
-    fn into_data(self) -> ExtractedData {
+    fn into_data(mut self) -> ExtractedData {
+        self.finalize_stack_data();
         self.data
     }
 
@@ -389,14 +449,66 @@ impl TraceExtractor {
         self.process_interned_data(packet);
         self.process_descriptors(packet);
         self.process_events(packet);
+        self.process_perf_sample(packet);
     }
 
     fn process_interned_data(&mut self, packet: &TracePacket) {
         if let Some(interned) = packet.interned_data.as_ref() {
+            // Event names (existing)
             for event_name in &interned.event_names {
                 if event_name.has_iid() && event_name.has_name() {
                     self.interned_event_names
                         .insert(event_name.iid(), event_name.name().to_string());
+                }
+            }
+
+            for func_name in &interned.function_names {
+                if func_name.has_iid() && func_name.has_str() {
+                    let name = String::from_utf8_lossy(func_name.str()).to_string();
+                    self.interned_function_names.insert(func_name.iid(), name);
+                }
+            }
+
+            for mapping in &interned.mappings {
+                if mapping.has_iid() {
+                    let record = StackMappingRecord {
+                        id: mapping.iid() as i64,
+                        build_id: None,
+                        name: None,
+                        exact_offset: mapping.exact_offset() as i64,
+                        start_offset: mapping.start_offset() as i64,
+                    };
+                    self.interned_mappings.insert(mapping.iid(), record);
+                }
+            }
+
+            for frame in &interned.frames {
+                if frame.has_iid() {
+                    let name = frame
+                        .has_function_name_id()
+                        .then(|| {
+                            self.interned_function_names
+                                .get(&frame.function_name_id())
+                                .cloned()
+                        })
+                        .flatten();
+                    let record = FrameRecord {
+                        id: frame.iid() as i64,
+                        name,
+                        mapping_id: frame.has_mapping_id().then(|| frame.mapping_id() as i64),
+                        rel_pc: frame.rel_pc() as i64,
+                        symbol_id: frame
+                            .has_function_name_id()
+                            .then(|| frame.function_name_id() as i64),
+                    };
+                    self.interned_frames.insert(frame.iid(), record);
+                }
+            }
+
+            for callstack in &interned.callstacks {
+                if callstack.has_iid() {
+                    self.interned_callstacks
+                        .insert(callstack.iid(), callstack.frame_ids.clone());
                 }
             }
         }
@@ -717,6 +829,112 @@ impl TraceExtractor {
             });
         }
     }
+
+    /// Process PerfSample packets for stack trace data
+    fn process_perf_sample(&mut self, packet: &TracePacket) {
+        if packet.has_perf_sample() {
+            let sample = packet.perf_sample();
+            let ts = packet.timestamp() as i64;
+
+            let callsite_id = sample
+                .has_callstack_iid()
+                .then(|| {
+                    self.interned_callstacks
+                        .get(&sample.callstack_iid())
+                        .cloned()
+                        .map(|frame_ids| self.get_or_create_callsite(&frame_ids))
+                })
+                .flatten();
+
+            let tid = sample.tid() as i32;
+            let tgid = sample.pid() as i32;
+            if let std::collections::hash_map::Entry::Vacant(e) = self.pid_to_upid.entry(tgid) {
+                let upid = self.next_upid;
+                self.next_upid += 1;
+                e.insert(upid);
+                self.data.processes.push(ProcessRecord {
+                    upid,
+                    pid: tgid,
+                    name: None,
+                    parent_upid: None,
+                });
+            }
+
+            self.ensure_thread_exists(tid, None);
+
+            if let Some(&utid) = self.tid_to_utid.get(&tid) {
+                self.data.perf_samples.push(PerfSampleRecord {
+                    ts,
+                    utid,
+                    callsite_id,
+                    cpu: sample.cpu.map(|c| c as i32),
+                });
+            }
+        }
+    }
+
+    /// Convert flat frame_ids to parent-child callsite tree. Returns leaf callsite ID.
+    fn get_or_create_callsite(&mut self, frame_ids: &[u64]) -> i64 {
+        if frame_ids.is_empty() {
+            return 0;
+        }
+
+        let num_frames = frame_ids.len();
+
+        // Check if full stack already exists (reversed for root-to-leaf prefix matching)
+        let reversed_key: Vec<u64> = frame_ids.iter().rev().copied().collect();
+        if let Some(&id) = self.callsite_map.get(&reversed_key) {
+            return id;
+        }
+
+        let mut parent_id: Option<i64> = None;
+        let mut current_prefix: Vec<u64> = Vec::new();
+        let mut leaf_callsite_id: i64 = 0;
+
+        for (i, &frame_iid) in frame_ids.iter().rev().enumerate() {
+            current_prefix.push(frame_iid);
+
+            if let Some(&existing_id) = self.callsite_map.get(&current_prefix) {
+                parent_id = Some(existing_id);
+                leaf_callsite_id = existing_id;
+                continue;
+            }
+
+            let callsite_id = self.next_callsite_id;
+            self.next_callsite_id += 1;
+
+            self.data.callsites.push(CallsiteRecord {
+                id: callsite_id,
+                parent_id,
+                frame_id: frame_iid as i64,
+                depth: (num_frames - 1 - i) as i32,
+            });
+
+            self.callsite_map
+                .insert(current_prefix.clone(), callsite_id);
+            parent_id = Some(callsite_id);
+            leaf_callsite_id = callsite_id;
+        }
+
+        leaf_callsite_id
+    }
+
+    fn finalize_stack_data(&mut self) {
+        for (iid, name) in self.interned_function_names.drain() {
+            self.data.symbols.push(SymbolRecord {
+                id: iid as i64,
+                name,
+            });
+        }
+
+        for (_, mapping) in self.interned_mappings.drain() {
+            self.data.stack_mappings.push(mapping);
+        }
+
+        for (_, frame) in self.interned_frames.drain() {
+            self.data.frames.push(frame);
+        }
+    }
 }
 
 fn extract_trace_data_streaming<R: BufRead>(reader: R) -> Result<ExtractedData> {
@@ -812,6 +1030,48 @@ fn create_schema(conn: &Connection) -> Result<()> {
             category VARCHAR,
             depth INTEGER
         );
+
+        -- Stack trace tables
+
+        CREATE TABLE IF NOT EXISTS stack_profile_symbol (
+            trace_id VARCHAR,
+            id BIGINT,
+            name VARCHAR
+        );
+
+        CREATE TABLE IF NOT EXISTS stack_profile_mapping (
+            trace_id VARCHAR,
+            id BIGINT,
+            build_id VARCHAR,
+            name VARCHAR,
+            exact_offset BIGINT,
+            start_offset BIGINT
+        );
+
+        CREATE TABLE IF NOT EXISTS stack_profile_frame (
+            trace_id VARCHAR,
+            id BIGINT,
+            name VARCHAR,
+            mapping_id BIGINT,
+            rel_pc BIGINT,
+            symbol_id BIGINT
+        );
+
+        CREATE TABLE IF NOT EXISTS stack_profile_callsite (
+            trace_id VARCHAR,
+            id BIGINT,
+            parent_id BIGINT,
+            frame_id BIGINT,
+            depth INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS perf_sample (
+            trace_id VARCHAR,
+            ts BIGINT,
+            utid BIGINT,
+            callsite_id BIGINT,
+            cpu INTEGER
+        );
         ",
     )?;
 
@@ -827,6 +1087,12 @@ struct ParquetPaths {
     counter_track: PathBuf,
     counter: PathBuf,
     slice: PathBuf,
+    // Stack trace tables
+    symbol: PathBuf,
+    stack_mapping: PathBuf,
+    frame: PathBuf,
+    callsite: PathBuf,
+    perf_sample: PathBuf,
 }
 
 impl ParquetPaths {
@@ -839,6 +1105,12 @@ impl ParquetPaths {
             counter_track: temp_dir.join(format!("{}_counter_track.parquet", trace_id)),
             counter: temp_dir.join(format!("{}_counter.parquet", trace_id)),
             slice: temp_dir.join(format!("{}_slice.parquet", trace_id)),
+            // Stack trace tables
+            symbol: temp_dir.join(format!("{}_symbol.parquet", trace_id)),
+            stack_mapping: temp_dir.join(format!("{}_stack_mapping.parquet", trace_id)),
+            frame: temp_dir.join(format!("{}_frame.parquet", trace_id)),
+            callsite: temp_dir.join(format!("{}_callsite.parquet", trace_id)),
+            perf_sample: temp_dir.join(format!("{}_perf_sample.parquet", trace_id)),
         }
     }
 }
@@ -1151,6 +1423,217 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
         writer.close()?;
     }
 
+    // Stack trace tables
+
+    // Symbols (function names)
+    if !data.symbols.is_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let mut trace_id_builder = StringBuilder::new();
+        let mut id_builder = Int64Builder::new();
+        let mut name_builder = StringBuilder::new();
+
+        for symbol in &data.symbols {
+            trace_id_builder.append_value(trace_id);
+            id_builder.append_value(symbol.id);
+            name_builder.append_value(&symbol.name);
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(id_builder.finish()),
+                Arc::new(name_builder.finish()),
+            ],
+        )?;
+
+        let file = File::create(&paths.symbol)?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props.clone()))?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
+    // Stack mappings
+    if !data.stack_mappings.is_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("build_id", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("exact_offset", DataType::Int64, false),
+            Field::new("start_offset", DataType::Int64, false),
+        ]));
+
+        let mut trace_id_builder = StringBuilder::new();
+        let mut id_builder = Int64Builder::new();
+        let mut build_id_builder = StringBuilder::new();
+        let mut name_builder = StringBuilder::new();
+        let mut exact_offset_builder = Int64Builder::new();
+        let mut start_offset_builder = Int64Builder::new();
+
+        for mapping in &data.stack_mappings {
+            trace_id_builder.append_value(trace_id);
+            id_builder.append_value(mapping.id);
+            build_id_builder.append_option(mapping.build_id.as_deref());
+            name_builder.append_option(mapping.name.as_deref());
+            exact_offset_builder.append_value(mapping.exact_offset);
+            start_offset_builder.append_value(mapping.start_offset);
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(id_builder.finish()),
+                Arc::new(build_id_builder.finish()),
+                Arc::new(name_builder.finish()),
+                Arc::new(exact_offset_builder.finish()),
+                Arc::new(start_offset_builder.finish()),
+            ],
+        )?;
+
+        let file = File::create(&paths.stack_mapping)?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props.clone()))?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
+    // Frames
+    if !data.frames.is_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("mapping_id", DataType::Int64, true),
+            Field::new("rel_pc", DataType::Int64, false),
+            Field::new("symbol_id", DataType::Int64, true),
+        ]));
+
+        let mut trace_id_builder = StringBuilder::new();
+        let mut id_builder = Int64Builder::new();
+        let mut name_builder = StringBuilder::new();
+        let mut mapping_id_builder = Int64Builder::new();
+        let mut rel_pc_builder = Int64Builder::new();
+        let mut symbol_id_builder = Int64Builder::new();
+
+        for frame in &data.frames {
+            trace_id_builder.append_value(trace_id);
+            id_builder.append_value(frame.id);
+            name_builder.append_option(frame.name.as_deref());
+            mapping_id_builder.append_option(frame.mapping_id);
+            rel_pc_builder.append_value(frame.rel_pc);
+            symbol_id_builder.append_option(frame.symbol_id);
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(id_builder.finish()),
+                Arc::new(name_builder.finish()),
+                Arc::new(mapping_id_builder.finish()),
+                Arc::new(rel_pc_builder.finish()),
+                Arc::new(symbol_id_builder.finish()),
+            ],
+        )?;
+
+        let file = File::create(&paths.frame)?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props.clone()))?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
+    // Callsites
+    if !data.callsites.is_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("parent_id", DataType::Int64, true),
+            Field::new("frame_id", DataType::Int64, false),
+            Field::new("depth", DataType::Int32, false),
+        ]));
+
+        let file = File::create(&paths.callsite)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+
+        for chunk in data.callsites.chunks(PARQUET_BATCH_SIZE) {
+            let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut id_builder = Int64Builder::with_capacity(chunk.len());
+            let mut parent_id_builder = Int64Builder::with_capacity(chunk.len());
+            let mut frame_id_builder = Int64Builder::with_capacity(chunk.len());
+            let mut depth_builder = Int32Builder::with_capacity(chunk.len());
+
+            for callsite in chunk {
+                trace_id_builder.append_value(trace_id);
+                id_builder.append_value(callsite.id);
+                parent_id_builder.append_option(callsite.parent_id);
+                frame_id_builder.append_value(callsite.frame_id);
+                depth_builder.append_value(callsite.depth);
+            }
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(trace_id_builder.finish()),
+                    Arc::new(id_builder.finish()),
+                    Arc::new(parent_id_builder.finish()),
+                    Arc::new(frame_id_builder.finish()),
+                    Arc::new(depth_builder.finish()),
+                ],
+            )?;
+            writer.write(&batch)?;
+        }
+        writer.close()?;
+    }
+
+    // Perf samples
+    if !data.perf_samples.is_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("utid", DataType::Int64, false),
+            Field::new("callsite_id", DataType::Int64, true),
+            Field::new("cpu", DataType::Int32, true),
+        ]));
+
+        let file = File::create(&paths.perf_sample)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+
+        for chunk in data.perf_samples.chunks(PARQUET_BATCH_SIZE) {
+            let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut ts_builder = Int64Builder::with_capacity(chunk.len());
+            let mut utid_builder = Int64Builder::with_capacity(chunk.len());
+            let mut callsite_id_builder = Int64Builder::with_capacity(chunk.len());
+            let mut cpu_builder = Int32Builder::with_capacity(chunk.len());
+
+            for sample in chunk {
+                trace_id_builder.append_value(trace_id);
+                ts_builder.append_value(sample.ts);
+                utid_builder.append_value(sample.utid);
+                callsite_id_builder.append_option(sample.callsite_id);
+                cpu_builder.append_option(sample.cpu);
+            }
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(trace_id_builder.finish()),
+                    Arc::new(ts_builder.finish()),
+                    Arc::new(utid_builder.finish()),
+                    Arc::new(callsite_id_builder.finish()),
+                    Arc::new(cpu_builder.finish()),
+                ],
+            )?;
+            writer.write(&batch)?;
+        }
+        writer.close()?;
+    }
+
     Ok(())
 }
 
@@ -1366,6 +1849,12 @@ fn run_convert(
     import_table("counter_track", |p| &p.counter_track)?;
     import_table("counter", |p| &p.counter)?;
     import_table("slice", |p| &p.slice)?;
+    // Stack trace tables
+    import_table("stack_profile_symbol", |p| &p.symbol)?;
+    import_table("stack_profile_mapping", |p| &p.stack_mapping)?;
+    import_table("stack_profile_frame", |p| &p.frame)?;
+    import_table("stack_profile_callsite", |p| &p.callsite)?;
+    import_table("perf_sample", |p| &p.perf_sample)?;
 
     let import_time = import_start.elapsed();
     if verbose {
@@ -1408,7 +1897,8 @@ fn process_trace_to_parquet(trace: &TraceInfo, paths: &ParquetPaths) -> Result<u
     let event_count = data.sched_slices.len()
         + data.thread_states.len()
         + data.counters.len()
-        + data.slices.len();
+        + data.slices.len()
+        + data.perf_samples.len();
 
     write_data_to_parquet(&trace.trace_id, &data, paths)
         .with_context(|| format!("Failed writing Parquet for trace {}", trace.trace_id))?;
@@ -1766,5 +2256,305 @@ mod tests {
         // Verify fallback to "unknown"
         assert_eq!(extractor.data.slices.len(), 1);
         assert_eq!(extractor.data.slices[0].name, "unknown");
+    }
+
+    // ========================================================================
+    // Stack trace / callsite tree tests
+    // ========================================================================
+
+    #[test]
+    fn test_get_or_create_callsite_empty_frames() {
+        let mut extractor = TraceExtractor::new();
+
+        // Empty frame list should return 0
+        let result = extractor.get_or_create_callsite(&[]);
+        assert_eq!(result, 0);
+        assert!(extractor.data.callsites.is_empty());
+    }
+
+    #[test]
+    fn test_get_or_create_callsite_single_frame() {
+        let mut extractor = TraceExtractor::new();
+
+        // Single frame: frame_ids[0] is the leaf (and root)
+        let frame_ids = vec![100u64];
+        let callsite_id = extractor.get_or_create_callsite(&frame_ids);
+
+        assert_eq!(callsite_id, 1);
+        assert_eq!(extractor.data.callsites.len(), 1);
+
+        let callsite = &extractor.data.callsites[0];
+        assert_eq!(callsite.id, 1);
+        assert_eq!(callsite.parent_id, None); // Single frame has no parent
+        assert_eq!(callsite.frame_id, 100);
+        assert_eq!(callsite.depth, 0); // Leaf is depth 0
+    }
+
+    #[test]
+    fn test_get_or_create_callsite_multiple_frames() {
+        let mut extractor = TraceExtractor::new();
+
+        // frame_ids[0]=10 is leaf, frame_ids[2]=30 is root
+        let frame_ids = vec![10u64, 20, 30];
+        let callsite_id = extractor.get_or_create_callsite(&frame_ids);
+
+        assert_eq!(extractor.data.callsites.len(), 3);
+
+        let root = extractor
+            .data
+            .callsites
+            .iter()
+            .find(|c| c.frame_id == 30)
+            .unwrap();
+        assert_eq!(root.parent_id, None);
+        assert_eq!(root.depth, 2);
+
+        let middle = extractor
+            .data
+            .callsites
+            .iter()
+            .find(|c| c.frame_id == 20)
+            .unwrap();
+        assert_eq!(middle.parent_id, Some(root.id));
+        assert_eq!(middle.depth, 1);
+
+        let leaf = extractor
+            .data
+            .callsites
+            .iter()
+            .find(|c| c.frame_id == 10)
+            .unwrap();
+        assert_eq!(leaf.parent_id, Some(middle.id));
+        assert_eq!(leaf.depth, 0);
+
+        assert_eq!(callsite_id, leaf.id);
+    }
+
+    #[test]
+    fn test_get_or_create_callsite_deduplication() {
+        let mut extractor = TraceExtractor::new();
+
+        // First stack: [A, B, C] where C is root
+        let stack1 = vec![1u64, 2, 3];
+        let id1 = extractor.get_or_create_callsite(&stack1);
+
+        // Second stack with same frames should return same ID
+        let id2 = extractor.get_or_create_callsite(&stack1);
+        assert_eq!(id1, id2);
+        assert_eq!(extractor.data.callsites.len(), 3); // No new callsites created
+    }
+
+    #[test]
+    fn test_get_or_create_callsite_shared_prefix() {
+        let mut extractor = TraceExtractor::new();
+
+        let stack1 = vec![1u64, 2, 3]; // [leaf=1, 2, root=3]
+        let id1 = extractor.get_or_create_callsite(&stack1);
+        assert_eq!(extractor.data.callsites.len(), 3);
+
+        let stack2 = vec![4u64, 2, 3]; // [leaf=4, 2, root=3] shares [2, 3] suffix
+        let id2 = extractor.get_or_create_callsite(&stack2);
+
+        assert_eq!(extractor.data.callsites.len(), 4); // Only 1 new callsite for frame 4
+        assert_ne!(id1, id2);
+
+        let new_callsite = extractor
+            .data
+            .callsites
+            .iter()
+            .find(|c| c.frame_id == 4)
+            .unwrap();
+        assert_eq!(new_callsite.depth, 0);
+
+        let parent = extractor
+            .data
+            .callsites
+            .iter()
+            .find(|c| c.id == new_callsite.parent_id.unwrap())
+            .unwrap();
+        assert_eq!(parent.frame_id, 2);
+    }
+
+    #[test]
+    fn test_get_or_create_callsite_different_roots() {
+        let mut extractor = TraceExtractor::new();
+
+        extractor.get_or_create_callsite(&[1u64, 2]);
+        assert_eq!(extractor.data.callsites.len(), 2);
+
+        extractor.get_or_create_callsite(&[3u64, 4]); // Different root
+        assert_eq!(extractor.data.callsites.len(), 4);
+
+        let roots_count = extractor
+            .data
+            .callsites
+            .iter()
+            .filter(|c| c.parent_id.is_none())
+            .count();
+        assert_eq!(roots_count, 2);
+    }
+
+    #[test]
+    fn test_get_or_create_callsite_chain_integrity() {
+        let mut extractor = TraceExtractor::new();
+
+        let frame_ids: Vec<u64> = (0..10).collect();
+        let leaf_id = extractor.get_or_create_callsite(&frame_ids);
+
+        let callsites: HashMap<i64, &CallsiteRecord> =
+            extractor.data.callsites.iter().map(|c| (c.id, c)).collect();
+
+        let mut current_id = leaf_id;
+        let mut visited_frames = Vec::new();
+        loop {
+            let callsite = callsites.get(&current_id).unwrap();
+            visited_frames.push(callsite.frame_id as u64);
+            match callsite.parent_id {
+                Some(pid) => current_id = pid,
+                None => break,
+            }
+        }
+
+        assert_eq!(visited_frames, frame_ids);
+    }
+
+    #[test]
+    fn test_finalize_stack_data_converts_interned_data() {
+        let mut extractor = TraceExtractor::new();
+
+        extractor
+            .interned_function_names
+            .insert(1, "main".to_string());
+        extractor
+            .interned_function_names
+            .insert(2, "foo".to_string());
+
+        extractor.interned_mappings.insert(
+            10,
+            StackMappingRecord {
+                id: 10,
+                build_id: Some("abc123".to_string()),
+                name: Some("libc.so".to_string()),
+                exact_offset: 0,
+                start_offset: 0,
+            },
+        );
+
+        extractor.interned_frames.insert(
+            100,
+            FrameRecord {
+                id: 100,
+                name: Some("main".to_string()),
+                mapping_id: Some(10),
+                rel_pc: 0x1234,
+                symbol_id: Some(1),
+            },
+        );
+
+        extractor.finalize_stack_data();
+
+        assert_eq!(extractor.data.symbols.len(), 2);
+        let symbol_names: Vec<_> = extractor.data.symbols.iter().map(|s| &s.name).collect();
+        assert!(symbol_names.contains(&&"main".to_string()));
+        assert!(symbol_names.contains(&&"foo".to_string()));
+
+        assert_eq!(extractor.data.stack_mappings.len(), 1);
+        assert_eq!(extractor.data.stack_mappings[0].id, 10);
+        assert_eq!(
+            extractor.data.stack_mappings[0].name,
+            Some("libc.so".to_string())
+        );
+
+        assert_eq!(extractor.data.frames.len(), 1);
+        assert_eq!(extractor.data.frames[0].id, 100);
+        assert_eq!(extractor.data.frames[0].name, Some("main".to_string()));
+    }
+
+    #[test]
+    fn test_process_perf_sample_creates_sample_with_callsite() {
+        use perfetto_protos::interned_data::InternedData;
+        use perfetto_protos::profile_common::{Callstack, Frame};
+        use perfetto_protos::profile_packet::PerfSample;
+
+        let mut extractor = TraceExtractor::new();
+
+        let mut interned_packet = TracePacket::default();
+        let mut interned_data = InternedData::default();
+
+        let mut frame1 = Frame::default();
+        frame1.set_iid(1);
+        interned_data.frames.push(frame1);
+
+        let mut frame2 = Frame::default();
+        frame2.set_iid(2);
+        interned_data.frames.push(frame2);
+
+        let mut callstack = Callstack::default();
+        callstack.set_iid(100);
+        callstack.frame_ids = vec![1, 2];
+        interned_data.callstacks.push(callstack);
+
+        interned_packet.interned_data = Some(interned_data).into();
+        extractor.process_packet(&interned_packet);
+
+        let mut sample_packet = TracePacket::default();
+        sample_packet.set_timestamp(1000000);
+
+        let mut perf_sample = PerfSample::default();
+        perf_sample.set_pid(1234);
+        perf_sample.set_tid(5678);
+        perf_sample.set_callstack_iid(100);
+        perf_sample.cpu = Some(0);
+
+        sample_packet.set_perf_sample(perf_sample);
+        extractor.process_packet(&sample_packet);
+
+        assert_eq!(extractor.data.perf_samples.len(), 1);
+        let sample = &extractor.data.perf_samples[0];
+        assert_eq!(sample.ts, 1000000);
+        assert_eq!(sample.cpu, Some(0));
+        assert!(sample.callsite_id.is_some());
+        assert_eq!(extractor.data.callsites.len(), 2);
+        assert!(!extractor.data.threads.is_empty());
+    }
+
+    #[test]
+    fn test_process_perf_sample_without_callstack() {
+        use perfetto_protos::profile_packet::PerfSample;
+
+        let mut extractor = TraceExtractor::new();
+
+        let mut sample_packet = TracePacket::default();
+        sample_packet.set_timestamp(2000000);
+
+        let mut perf_sample = PerfSample::default();
+        perf_sample.set_pid(1234);
+        perf_sample.set_tid(5678);
+
+        sample_packet.set_perf_sample(perf_sample);
+        extractor.process_packet(&sample_packet);
+
+        assert_eq!(extractor.data.perf_samples.len(), 1);
+        let sample = &extractor.data.perf_samples[0];
+        assert_eq!(sample.ts, 2000000);
+        assert_eq!(sample.callsite_id, None);
+    }
+
+    #[test]
+    fn test_callsite_depth_correctness() {
+        let mut extractor = TraceExtractor::new();
+
+        let frame_ids: Vec<u64> = vec![100, 101, 102, 103, 104]; // leaf=100, root=104
+        extractor.get_or_create_callsite(&frame_ids);
+
+        for (i, &frame_id) in frame_ids.iter().enumerate() {
+            let callsite = extractor
+                .data
+                .callsites
+                .iter()
+                .find(|c| c.frame_id == frame_id as i64)
+                .unwrap();
+            assert_eq!(callsite.depth, i as i32);
+        }
     }
 }
