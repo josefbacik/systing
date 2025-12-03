@@ -63,8 +63,8 @@ struct NetworkEvent {
     end_ts: u64,
     bytes: u32,
     sendmsg_seq: u32,
-    sndbuf_used: u32,   // Bytes in send buffer after sendmsg (sk_wmem_queued)
-    sndbuf_limit: u32,  // Max send buffer size (sk_sndbuf)
+    sndbuf_used: u32,  // Bytes in send buffer after sendmsg (sk_wmem_queued)
+    sndbuf_limit: u32, // Max send buffer size (sk_sndbuf)
 }
 
 #[derive(Clone, Copy)]
@@ -74,8 +74,8 @@ struct PacketEvent {
     seq: u32,
     length: u32,
     tcp_flags: u8,
-    sndbuf_used: u32,   // Bytes in send buffer (sk_wmem_queued) - shows buffer drain on ACK
-    sndbuf_limit: u32,  // Max send buffer size (sk_sndbuf)
+    sndbuf_used: u32, // Bytes in send buffer (sk_wmem_queued) - shows buffer drain on ACK
+    sndbuf_limit: u32, // Max send buffer size (sk_sndbuf)
 }
 
 enum EventEntry {
@@ -179,7 +179,6 @@ impl ConnectionEvents {
             _ => None,
         })
     }
-
 }
 
 #[derive(Default)]
@@ -666,7 +665,8 @@ impl NetworkRecorder {
                             begin_event.debug_annotations.push(sndbuf_limit_annotation);
 
                             // Add fill percentage for easier analysis
-                            let fill_pct = (event.sndbuf_used as u64 * 100) / event.sndbuf_limit as u64;
+                            let fill_pct =
+                                (event.sndbuf_used as u64 * 100) / event.sndbuf_limit as u64;
                             let mut fill_annotation = DebugAnnotation::default();
                             fill_annotation.set_name("sndbuf_fill_pct".to_string());
                             fill_annotation.set_uint_value(fill_pct);
@@ -807,7 +807,6 @@ impl NetworkRecorder {
                             &buffer_queue_pkts,
                         );
                     }
-
                 }
 
                 // Create UDP Packets track if we have UDP packet events
@@ -2006,6 +2005,7 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_UDP_SEND,
             cpu: 0,
+            ..Default::default()
         };
 
         // Create UDP PACKET_SEND event (qdisc->NIC, shared type)
@@ -2022,6 +2022,7 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_SEND, // Shared with TCP!
             cpu: 0,
+            ..Default::default()
         };
 
         // Create TCP PACKET_SEND event for comparison
@@ -2038,6 +2039,7 @@ mod tests {
             tcp_flags: 0x10,
             event_type: packet_event_type::PACKET_SEND, // Same event type!
             cpu: 0,
+            ..Default::default()
         };
 
         recorder.handle_packet_event(udp_send_event);
@@ -2130,6 +2132,7 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_UDP_RCV,
             cpu: 0,
+            ..Default::default()
         };
 
         // UDP enqueue event (UDP->buffer)
@@ -2146,6 +2149,7 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_UDP_ENQUEUE,
             cpu: 0,
+            ..Default::default()
         };
 
         recorder.handle_packet_event(udp_rcv_event);
@@ -2206,6 +2210,7 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_UDP_SEND,
             cpu: 0,
+            ..Default::default()
         };
 
         // UDP receive event - length should be payload only (not including headers)
@@ -2222,6 +2227,7 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_UDP_RCV,
             cpu: 0,
+            ..Default::default()
         };
 
         recorder.handle_packet_event(udp_send_event);
@@ -2281,6 +2287,7 @@ mod tests {
             tcp_flags: 0,
             event_type: packet_event_type::PACKET_SEND, // Shared with TCP!
             cpu: 0,
+            ..Default::default()
         };
 
         recorder.handle_packet_event(udp_packet_send_event);

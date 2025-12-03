@@ -20,6 +20,7 @@ use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
 use perfetto_protos::process_tree::{process_tree::Process as ProtoProcess, ProcessTree};
+use perfetto_protos::system_info::{SystemInfo, Utsname};
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
@@ -59,6 +60,41 @@ pub fn get_clock_value(clock_id: libc::c_int) -> u64 {
         return 0;
     }
     (ts.tv_sec as u64 * 1_000_000_000) + ts.tv_nsec as u64
+}
+
+/// Retrieves system information using the POSIX uname() call.
+///
+/// Returns a Utsname structure containing system name, kernel release,
+/// kernel version, and machine architecture.
+///
+/// # Returns
+///
+/// Returns `Some(Utsname)` on success, or `None` if the uname() call fails.
+pub fn get_system_utsname() -> Option<Utsname> {
+    let mut utsname_buf: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut utsname_buf) } != 0 {
+        return None;
+    }
+
+    let mut utsname = Utsname::default();
+
+    // Helper macro to extract and set utsname fields
+    macro_rules! set_field {
+        ($field:ident, $setter:ident) => {
+            // SAFETY: utsname_buf is properly initialized by libc::uname, and the pointer
+            // points to a valid null-terminated C string within the utsname struct.
+            if let Ok(s) = unsafe { CStr::from_ptr(utsname_buf.$field.as_ptr()) }.to_str() {
+                utsname.$setter(s.to_string());
+            }
+        };
+    }
+
+    set_field!(sysname, set_sysname);
+    set_field!(release, set_release);
+    set_field!(version, set_version);
+    set_field!(machine, set_machine);
+
+    Some(utsname)
 }
 
 impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
@@ -232,7 +268,7 @@ impl SessionRecorder {
             }
         } else {
             // For threads, ensure the parent process is also recorded
-            let tgid = (info.tgidpid >> 32) as u64;
+            let tgid = info.tgidpid >> 32;
             let parent_tgidpid = (tgid << 32) | tgid; // parent process has pid == tgid
             if !self
                 .process_descriptors
@@ -306,6 +342,20 @@ impl SessionRecorder {
         packet.set_clock_snapshot(self.clock_snapshot.lock().unwrap().clone());
         packet.set_trusted_packet_sequence_id(id_counter.fetch_add(1, Ordering::Relaxed) as u32);
         packets.push(packet);
+
+        // Emit SystemInfo with UtsName in a separate packet (both are in oneof data)
+        if let Some(utsname) = get_system_utsname() {
+            let system_info = SystemInfo {
+                utsname: Some(utsname).into(),
+                ..Default::default()
+            };
+
+            let mut packet = TracePacket::default();
+            packet.set_system_info(system_info);
+            packet
+                .set_trusted_packet_sequence_id(id_counter.fetch_add(1, Ordering::Relaxed) as u32);
+            packets.push(packet);
+        }
 
         // Add the root Systing track descriptor
         let systing_desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
@@ -725,20 +775,25 @@ mod tests {
 
         let packets = recorder.generate_initial_packets(&id_counter);
 
-        // Should generate exactly 2 packets: clock snapshot + root descriptor
-        assert_eq!(packets.len(), 2);
+        // Should generate 2-3 packets depending on whether utsname is available
+        // (clock snapshot + [optional system info] + root descriptor)
+        assert!(packets.len() >= 2 && packets.len() <= 3);
 
         // First packet should be the clock snapshot
         let _clock_snapshot = packets[0].clock_snapshot();
         assert_eq!(packets[0].trusted_packet_sequence_id(), 100);
 
-        // Second packet should be the root track descriptor
-        let track_desc = packets[1].track_descriptor();
+        // Last packet should be the root track descriptor
+        let last_packet = packets.last().unwrap();
+        let track_desc = last_packet.track_descriptor();
         assert_eq!(track_desc.name(), "Systing");
-        assert_eq!(track_desc.uuid(), 101); // Should be incremented from 100
 
         // Verify id_counter was incremented appropriately
-        assert_eq!(id_counter.load(std::sync::atomic::Ordering::Relaxed), 102);
+        let expected_final = 100 + packets.len();
+        assert_eq!(
+            id_counter.load(std::sync::atomic::Ordering::Relaxed),
+            expected_final
+        );
     }
 
     #[test]
@@ -749,9 +804,65 @@ mod tests {
         // Don't set up clock snapshot - should still work with empty snapshot
         let packets = recorder.generate_initial_packets(&id_counter);
 
-        assert_eq!(packets.len(), 2);
+        // Should generate 2-3 packets even with empty clock
+        assert!(packets.len() >= 2 && packets.len() <= 3);
         let _clock_snapshot = packets[0].clock_snapshot();
-        let _track_desc = packets[1].track_descriptor();
+        let _track_desc = packets.last().unwrap().track_descriptor();
+    }
+
+    #[test]
+    fn test_generate_initial_packets_with_system_info() {
+        let recorder = create_test_session_recorder();
+        let id_counter = Arc::new(AtomicUsize::new(100));
+
+        // Set up clock snapshot
+        recorder.snapshot_clocks();
+
+        let packets = recorder.generate_initial_packets(&id_counter);
+
+        // Should generate 2-3 packets: clock snapshot + [optional system info] + root descriptor
+        assert!(packets.len() >= 2 && packets.len() <= 3);
+
+        // First packet should have clock snapshot
+        assert!(packets[0].has_clock_snapshot());
+        let clock_snapshot = packets[0].clock_snapshot();
+        assert!(!clock_snapshot.clocks.is_empty());
+
+        // If SystemInfo is available (should be on Unix-like systems), verify it
+        if packets.len() == 3 {
+            // Second packet should have system info (separate because both are in oneof data)
+            assert!(packets[1].has_system_info());
+            let system_info = packets[1].system_info();
+            assert!(system_info.utsname.is_some());
+
+            let utsname = system_info.utsname.as_ref().unwrap();
+            // Verify utsname has at least some fields set
+            assert!(utsname.has_sysname());
+            assert!(!utsname.sysname().is_empty());
+            assert!(utsname.has_release());
+            assert!(!utsname.release().is_empty());
+            assert!(utsname.has_machine());
+            assert!(!utsname.machine().is_empty());
+
+            // Verify it's a valid Unix-like system name (not platform-specific)
+            assert!(!utsname.sysname().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_get_system_utsname() {
+        let utsname = get_system_utsname();
+        assert!(utsname.is_some());
+
+        let utsname = utsname.unwrap();
+        // Verify all fields are populated
+        assert!(!utsname.sysname().is_empty());
+        assert!(!utsname.release().is_empty());
+        assert!(!utsname.version().is_empty());
+        assert!(!utsname.machine().is_empty());
+
+        // On Linux, sysname should be "Linux"
+        assert_eq!(utsname.sysname(), "Linux");
     }
 
     #[test]
