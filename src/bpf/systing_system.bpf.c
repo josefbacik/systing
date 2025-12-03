@@ -171,6 +171,8 @@ struct network_event {
 	u32 bytes;
 	u32 sendmsg_seq;   // TCP sequence number at sendmsg time (TCP only)
 	u32 cpu;
+	u32 sndbuf_used;   // Bytes in send buffer after sendmsg (sk_wmem_queued)
+	u32 sndbuf_limit;  // Max send buffer size (sk_sndbuf)
 };
 
 enum packet_event_type {
@@ -197,6 +199,8 @@ struct packet_event {
 	u8 tcp_flags;      // TCP flags (SYN, ACK, FIN, etc.)
 	enum packet_event_type event_type;  // Type of packet event (enqueue or send)
 	u32 cpu;
+	u32 sndbuf_used;   // Bytes in send buffer (sk_wmem_queued) - shows buffer drain on ACK
+	u32 sndbuf_limit;  // Max send buffer size (sk_sndbuf)
 };
 
 /*
@@ -284,6 +288,7 @@ struct network_send_info {
 	u16 dest_port;
 	u64 start_ts;
 	u32 sendmsg_seq;  // Sequence number at sendmsg time
+	u64 sk_ptr;       // Socket pointer for reading buffer state on exit
 };
 
 // Tracks pending receive operations with peer address
@@ -1626,6 +1631,9 @@ static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum networ
 		read_socket_dest_info(sk, &info.af, info.dest_addr, &info.dest_port);
 	}
 
+	// Store socket pointer for reading buffer state on exit
+	info.sk_ptr = (u64)sk;
+
 	bpf_map_update_elem(&pending_network_sends, &tgidpid, &info, BPF_ANY);
 
 	return 0;
@@ -1668,6 +1676,19 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 	event->dest_port = info->dest_port;
 	event->bytes = (u32)ret;  // Return value is number of bytes sent
 	event->sendmsg_seq = info->sendmsg_seq;  // TCP sequence at sendmsg time
+
+	// Read send buffer state from socket (TCP only)
+	event->sndbuf_used = 0;
+	event->sndbuf_limit = 0;
+	if (info->protocol == NETWORK_TCP && info->sk_ptr) {
+		struct sock *sk = (struct sock *)info->sk_ptr;
+		int wmem_queued = 0;
+		int sndbuf = 0;
+		bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+		bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+		event->sndbuf_used = (u32)wmem_queued;
+		event->sndbuf_limit = (u32)sndbuf;
+	}
 
 	bpf_ringbuf_submit(event, flags);
 	bpf_map_delete_elem(&pending_network_sends, &tgidpid);
@@ -2297,11 +2318,13 @@ static __always_inline int build_packet_key(struct sock *sk, u32 seq, u64 tgidpi
 }
 
 // Helper to populate packet event from packet info
+// sk can be NULL if sndbuf tracking is not needed for this event type
 static __always_inline void populate_packet_event(struct packet_event *event,
 						   struct packet_info *pkt_info,
 						   u64 end_ts,
 						   enum packet_event_type event_type,
-						   enum network_protocol protocol)
+						   enum network_protocol protocol,
+						   struct sock *sk)
 {
 	event->start_ts = pkt_info->start_ts;
 	event->end_ts = end_ts;
@@ -2315,6 +2338,18 @@ static __always_inline void populate_packet_event(struct packet_event *event,
 	event->length = pkt_info->length;
 	event->tcp_flags = pkt_info->tcp_flags;
 	event->event_type = event_type;
+
+	// Read send buffer state from socket (TCP only, when socket provided)
+	event->sndbuf_used = 0;
+	event->sndbuf_limit = 0;
+	if (sk && protocol == NETWORK_TCP) {
+		int wmem_queued = 0;
+		int sndbuf = 0;
+		bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+		bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+		event->sndbuf_used = (u32)wmem_queued;
+		event->sndbuf_limit = (u32)sndbuf;
+	}
 }
 
 // Helper to handle UDP TX events (shared between __dev_queue_xmit and net_dev_start_xmit)
@@ -2406,7 +2441,7 @@ int BPF_KPROBE(dev_queue_xmit_entry, struct sk_buff *skb)
 			return handle_missed_event(MISSED_PACKET_EVENT);
 		}
 
-		populate_packet_event(event, pkt_info, now, PACKET_ENQUEUE, NETWORK_TCP);
+		populate_packet_event(event, pkt_info, now, PACKET_ENQUEUE, NETWORK_TCP, NULL);
 		bpf_ringbuf_submit(event, flags);
 
 		pkt_info->start_ts = now;
@@ -2462,7 +2497,7 @@ int BPF_PROG(net_dev_start_xmit, struct sk_buff *skb, struct net_device *dev)
 			return handle_missed_event(MISSED_PACKET_EVENT);
 		}
 
-		populate_packet_event(event, pkt_info, now, PACKET_SEND, NETWORK_TCP);
+		populate_packet_event(event, pkt_info, now, PACKET_SEND, NETWORK_TCP, NULL);
 		bpf_ringbuf_submit(event, flags);
 		bpf_map_delete_elem(&pending_packets, &key);
 		return 0;
@@ -2582,7 +2617,7 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 	}
 
 	u64 now = bpf_ktime_get_boot_ns();
-	populate_packet_event(event, &pkt_info, now, PACKET_RCV_ESTABLISHED, NETWORK_TCP);
+	populate_packet_event(event, &pkt_info, now, PACKET_RCV_ESTABLISHED, NETWORK_TCP, sk);
 
 	bpf_ringbuf_submit(event, flags);
 
@@ -2636,7 +2671,7 @@ int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *
 	}
 
 	u64 now = bpf_ktime_get_boot_ns();
-	populate_packet_event(event, pkt_info, now, PACKET_QUEUE_RCV, NETWORK_TCP);
+	populate_packet_event(event, pkt_info, now, PACKET_QUEUE_RCV, NETWORK_TCP, NULL);
 
 	bpf_ringbuf_submit(event, flags);
 	bpf_map_delete_elem(&pending_recv_packets, &key);
@@ -2701,7 +2736,7 @@ int BPF_KPROBE(tcp_data_queue_entry, struct sock *sk, struct sk_buff *skb)
 	}
 
 	u64 now = bpf_ktime_get_boot_ns();
-	populate_packet_event(event, pkt_info, now, PACKET_QUEUE_RCV, NETWORK_TCP);
+	populate_packet_event(event, pkt_info, now, PACKET_QUEUE_RCV, NETWORK_TCP, NULL);
 	bpf_ringbuf_submit(event, flags);
 
 	struct buffer_queue_info buf_info = {0};
