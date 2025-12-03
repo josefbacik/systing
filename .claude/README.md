@@ -8,6 +8,7 @@ This directory contains Claude Code configuration and context files for the Syst
 - **`commands/`** - Custom slash commands for Claude Code
 - **`prompts/`** - Reusable prompts and templates
 - **`context/`** - Additional context files and documentation
+  - `stack-trace-schema.md` - Stack trace storage schema in DuckDB (tables, queries, design notes)
 
 ## Usage
 
