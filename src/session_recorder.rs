@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -28,7 +29,8 @@ use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
 use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::TrackEvent;
-use std::fs;
+use std::fs::{self, File};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 #[derive(Default)]
@@ -110,6 +112,123 @@ pub struct NetworkInterface {
     pub name: String,
     pub ipv4_addrs: Vec<Ipv4Addr>,
     pub ipv6_addrs: Vec<Ipv6Addr>,
+}
+
+/// Information about a network namespace for deduplication and naming.
+#[derive(Debug, Clone)]
+pub struct NetnsInfo {
+    /// The inode number of the network namespace (unique identifier).
+    pub inode: u64,
+    /// A representative PID from this namespace.
+    pub representative_pid: u32,
+    /// Container ID if detected from cgroup (e.g., Docker container ID).
+    pub container_id: Option<String>,
+    /// Process comm of the representative PID.
+    pub comm: String,
+    /// Whether this is the host (init) network namespace.
+    pub is_host: bool,
+}
+
+/// Gets the network namespace inode for a given PID.
+fn get_netns_inode(pid: u32) -> Option<u64> {
+    let ns_path = format!("/proc/{}/ns/net", pid);
+    fs::metadata(&ns_path).ok().map(|m| m.ino())
+}
+
+/// Gets the host (init) network namespace inode.
+fn get_host_netns_inode() -> Option<u64> {
+    get_netns_inode(1)
+}
+
+/// Attempts to extract a container ID from a process's cgroup information.
+/// Looks for Docker/containerd container IDs in the cgroup path.
+fn get_container_id(pid: u32) -> Option<String> {
+    let cgroup_path = format!("/proc/{}/cgroup", pid);
+    let content = fs::read_to_string(&cgroup_path).ok()?;
+
+    for line in content.lines() {
+        // Docker format: 0::/docker/<container_id>
+        // containerd format: 0::/system.slice/containerd.service/kubepods-.../<container_id>
+        // k8s format: various paths containing the container ID
+
+        // Look for 64-char hex strings (Docker container IDs)
+        if let Some(docker_idx) = line.find("/docker/") {
+            let id_start = docker_idx + 8;
+            if line.len() >= id_start + 12 {
+                let id = &line[id_start..];
+                let id = id.split('/').next().unwrap_or(id);
+                if id.len() >= 12 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(id[..12].to_string());
+                }
+            }
+        }
+
+        // Look for containerd/cri-o container IDs
+        if let Some(cri_idx) = line.find("/cri-containerd-") {
+            let id_start = cri_idx + 16;
+            if line.len() >= id_start + 12 {
+                let id = &line[id_start..];
+                let id = id.split('.').next().unwrap_or(id);
+                if id.len() >= 12 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(id[..12].to_string());
+                }
+            }
+        }
+
+        // Look for crio container IDs
+        if let Some(crio_idx) = line.find("/crio-") {
+            let id_start = crio_idx + 6;
+            if line.len() >= id_start + 12 {
+                let id = &line[id_start..];
+                let id = id.split('.').next().unwrap_or(id);
+                if id.len() >= 12 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(id[..12].to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Gets the comm (process name) for a given PID.
+fn get_comm(pid: u32) -> String {
+    let comm_path = format!("/proc/{}/comm", pid);
+    fs::read_to_string(&comm_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Retrieves network interfaces from within a specific network namespace.
+/// This function temporarily enters the target namespace, enumerates interfaces,
+/// and then returns to the original namespace.
+fn get_interfaces_in_netns(pid: u32) -> Vec<NetworkInterface> {
+    let self_netns = match File::open("/proc/self/ns/net") {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    let target_netns_path = format!("/proc/{}/ns/net", pid);
+    let target_netns = match File::open(&target_netns_path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    if unsafe { libc::setns(target_netns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+        return Vec::new();
+    }
+
+    let interfaces = get_network_interfaces();
+
+    if unsafe { libc::setns(self_netns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+        eprintln!(
+            "WARNING: Failed to restore original network namespace after enumerating interfaces for pid {}",
+            pid
+        );
+    }
+
+    interfaces
 }
 
 /// Retrieves all network interfaces and their IP addresses using getifaddrs.
@@ -517,21 +636,29 @@ impl SessionRecorder {
 
     /// Generates trace packets for network interface metadata.
     ///
-    /// Creates a "Network Interfaces" root track with child tracks for each interface.
-    /// Each interface track has an instant event with debug annotations containing
-    /// the interface's IP addresses.
+    /// Creates a hierarchical "Network Interfaces" track structure that includes:
+    /// - Host network namespace interfaces
+    /// - Container/process network namespace interfaces (deduplicated by namespace inode)
+    ///
+    /// The hierarchy looks like:
+    /// ```
+    /// Network Interfaces
+    /// ├── host
+    /// │   ├── eth0
+    /// │   └── docker0
+    /// ├── container:abc123 (nginx)
+    /// │   └── eth0
+    /// └── netns:4026532890 (java:1234)
+    ///     └── eth0
+    /// ```
     fn generate_network_interface_packets(
         &self,
         id_counter: &Arc<AtomicUsize>,
     ) -> Vec<TracePacket> {
-        let interfaces = get_network_interfaces();
-        if interfaces.is_empty() {
-            return Vec::new();
-        }
-
         let mut packets = Vec::new();
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
 
+        // Create root "Network Interfaces" track
         let root_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
         let mut root_desc = TrackDescriptor::default();
         root_desc.set_uuid(root_uuid);
@@ -541,47 +668,139 @@ impl SessionRecorder {
         root_packet.set_track_descriptor(root_desc);
         packets.push(root_packet);
 
-        // Create child tracks for each interface
-        for iface in interfaces {
-            let iface_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        // Get host network namespace inode for comparison
+        let host_netns_inode = get_host_netns_inode();
 
-            // Create track descriptor for this interface
-            let mut iface_desc = TrackDescriptor::default();
-            iface_desc.set_uuid(iface_uuid);
-            iface_desc.set_name(iface.name.clone());
-            iface_desc.set_parent_uuid(root_uuid);
+        // Build a map of unique network namespaces from recorded processes
+        let mut netns_map: HashMap<u64, NetnsInfo> = HashMap::new();
 
-            let mut iface_packet = TracePacket::default();
-            iface_packet.set_track_descriptor(iface_desc);
-            packets.push(iface_packet);
+        // First, add the host namespace
+        if let Some(host_inode) = host_netns_inode {
+            netns_map.insert(
+                host_inode,
+                NetnsInfo {
+                    inode: host_inode,
+                    representative_pid: 1,
+                    container_id: None,
+                    comm: "host".to_string(),
+                    is_host: true,
+                },
+            );
+        }
 
-            // Create an instant event with debug annotations for IP addresses
-            let mut track_event = TrackEvent::default();
-            track_event.set_type(Type::TYPE_INSTANT);
-            track_event.set_track_uuid(iface_uuid);
-            track_event.set_name(iface.name);
+        // Iterate through all recorded processes to find unique network namespaces
+        for tgidpid in self.process_descriptors.read().unwrap().keys() {
+            let pid = (*tgidpid >> 32) as u32;
 
-            // Add IPv4 addresses as debug annotations
-            for ipv4 in iface.ipv4_addrs {
-                let mut annotation = DebugAnnotation::default();
-                annotation.set_name("ipv4".to_string());
-                annotation.set_string_value(ipv4.to_string());
-                track_event.debug_annotations.push(annotation);
+            if let Some(inode) = get_netns_inode(pid) {
+                // Only add if we haven't seen this namespace yet
+                netns_map.entry(inode).or_insert_with(|| {
+                    let is_host = host_netns_inode == Some(inode);
+                    NetnsInfo {
+                        inode,
+                        representative_pid: pid,
+                        container_id: if is_host { None } else { get_container_id(pid) },
+                        comm: get_comm(pid),
+                        is_host,
+                    }
+                });
+            }
+        }
+
+        // Sort namespaces: host first, then by inode for consistent ordering
+        let mut namespaces: Vec<_> = netns_map.into_values().collect();
+        namespaces.sort_by(|a, b| match (a.is_host, b.is_host) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.inode.cmp(&b.inode),
+        });
+
+        // Generate tracks for each namespace
+        for netns_info in namespaces {
+            // Create namespace track name
+            let netns_name = if netns_info.is_host {
+                "host".to_string()
+            } else if let Some(ref container_id) = netns_info.container_id {
+                if netns_info.comm.is_empty() {
+                    format!("container:{}", container_id)
+                } else {
+                    format!("container:{} ({})", container_id, netns_info.comm)
+                }
+            } else if netns_info.comm.is_empty() {
+                format!("netns:{}", netns_info.inode)
+            } else {
+                format!(
+                    "netns:{} ({}:{})",
+                    netns_info.inode, netns_info.comm, netns_info.representative_pid
+                )
+            };
+
+            // Get interfaces for this namespace
+            let interfaces = if netns_info.is_host {
+                // For host namespace, we can use get_network_interfaces directly
+                get_network_interfaces()
+            } else {
+                // For other namespaces, enter the namespace to get interfaces
+                get_interfaces_in_netns(netns_info.representative_pid)
+            };
+
+            if interfaces.is_empty() {
+                continue;
             }
 
-            // Add IPv6 addresses as debug annotations
-            for ipv6 in iface.ipv6_addrs {
-                let mut annotation = DebugAnnotation::default();
-                annotation.set_name("ipv6".to_string());
-                annotation.set_string_value(ipv6.to_string());
-                track_event.debug_annotations.push(annotation);
-            }
+            // Create namespace track (child of root)
+            let netns_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+            let mut netns_desc = TrackDescriptor::default();
+            netns_desc.set_uuid(netns_uuid);
+            netns_desc.set_name(netns_name);
+            netns_desc.set_parent_uuid(root_uuid);
 
-            let mut event_packet = TracePacket::default();
-            event_packet.set_timestamp(0); // Metadata at trace start
-            event_packet.set_track_event(track_event);
-            event_packet.set_trusted_packet_sequence_id(sequence_id);
-            packets.push(event_packet);
+            let mut netns_packet = TracePacket::default();
+            netns_packet.set_track_descriptor(netns_desc);
+            packets.push(netns_packet);
+
+            // Create child tracks for each interface in this namespace
+            for iface in interfaces {
+                let iface_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+
+                // Create track descriptor for this interface (child of namespace track)
+                let mut iface_desc = TrackDescriptor::default();
+                iface_desc.set_uuid(iface_uuid);
+                iface_desc.set_name(iface.name.clone());
+                iface_desc.set_parent_uuid(netns_uuid);
+
+                let mut iface_packet = TracePacket::default();
+                iface_packet.set_track_descriptor(iface_desc);
+                packets.push(iface_packet);
+
+                // Create an instant event with debug annotations for IP addresses
+                let mut track_event = TrackEvent::default();
+                track_event.set_type(Type::TYPE_INSTANT);
+                track_event.set_track_uuid(iface_uuid);
+                track_event.set_name(iface.name);
+
+                // Add IPv4 addresses as debug annotations
+                for ipv4 in iface.ipv4_addrs {
+                    let mut annotation = DebugAnnotation::default();
+                    annotation.set_name("ipv4".to_string());
+                    annotation.set_string_value(ipv4.to_string());
+                    track_event.debug_annotations.push(annotation);
+                }
+
+                // Add IPv6 addresses as debug annotations
+                for ipv6 in iface.ipv6_addrs {
+                    let mut annotation = DebugAnnotation::default();
+                    annotation.set_name("ipv6".to_string());
+                    annotation.set_string_value(ipv6.to_string());
+                    track_event.debug_annotations.push(annotation);
+                }
+
+                let mut event_packet = TracePacket::default();
+                event_packet.set_timestamp(0); // Metadata at trace start
+                event_packet.set_track_event(track_event);
+                event_packet.set_trusted_packet_sequence_id(sequence_id);
+                packets.push(event_packet);
+            }
         }
 
         packets
