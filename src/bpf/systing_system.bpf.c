@@ -210,6 +210,7 @@ struct packet_event {
 	u32 sndbuf_used;   // Bytes in send buffer (sk_wmem_queued) - shows buffer drain on ACK
 	u32 sndbuf_limit;  // Max send buffer size (sk_sndbuf)
 	u64 socket_id;     // Unique socket ID for correlation with network events
+	u8 is_retransmit;  // 1 if this packet is a TCP retransmit, 0 otherwise
 };
 
 /*
@@ -345,6 +346,7 @@ struct packet_info {
 	u32 length;
 	u8 tcp_flags;
 	u64 socket_id;    // Unique socket ID for correlation
+	u8 is_retransmit; // Set if TCPCB_RETRANS flag (0x10) is set on the skb
 };
 
 // Key for pending_packets map - survives SKB cloning
@@ -2258,6 +2260,7 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 		rcv_event->event_type = PACKET_UDP_RCV;
 		rcv_event->cpu = bpf_get_smp_processor_id();
 		rcv_event->socket_id = socket_id;  // Socket ID for correlation
+		rcv_event->is_retransmit = 0;  // UDP doesn't have retransmits
 
 		rcv_event->task.tgidpid = tgidpid;
 		__builtin_memset(rcv_event->task.comm, 0, TASK_COMM_LEN);
@@ -2330,6 +2333,7 @@ int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *
 		event->event_type = PACKET_UDP_ENQUEUE;
 		event->cpu = bpf_get_smp_processor_id();
 		event->socket_id = pending->socket_id;  // Socket ID for correlation
+		event->is_retransmit = 0;  // UDP doesn't have retransmits
 
 		// Set task info from socket owner (not from softirq context!)
 		event->task.tgidpid = tgidpid;
@@ -2403,14 +2407,21 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	u32 start_seq = 0;
 	u32 end_seq = 0;
 	u8 tcp_flags = 0;
+	u8 sacked = 0;
 
 	bpf_probe_read_kernel(&start_seq, sizeof(start_seq), &tcb->seq);
 	bpf_probe_read_kernel(&end_seq, sizeof(end_seq), &tcb->end_seq);
 	bpf_probe_read_kernel(&tcp_flags, sizeof(tcp_flags), &tcb->tcp_flags);
+	bpf_probe_read_kernel(&sacked, sizeof(sacked), &tcb->sacked);
 
 	pkt_info.seq = start_seq;
 	pkt_info.length = end_seq - start_seq;
 	pkt_info.tcp_flags = tcp_flags;
+
+	// Check TCPCB_RETRANS flag (0x10) to detect retransmits
+	// This flag is set by tcp_retransmit_skb() before calling __tcp_transmit_skb
+	#define TCPCB_RETRANS 0x10
+	pkt_info.is_retransmit = (sacked & TCPCB_RETRANS) ? 1 : 0;
 
 	// Look up socket ID for this socket+destination pair
 	pkt_info.socket_id = lookup_socket_id(sk, pkt_info.dest_addr, pkt_info.dest_port);
@@ -2500,6 +2511,9 @@ static __always_inline void populate_packet_event(struct packet_event *event,
 	event->event_type = event_type;
 	event->socket_id = pkt_info->socket_id;  // Copy socket ID for correlation
 
+	// Copy retransmit flag (detected via TCPCB_RETRANS in __tcp_transmit_skb)
+	event->is_retransmit = pkt_info->is_retransmit;
+
 	// Read send buffer state from socket (TCP only, when socket provided)
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
@@ -2547,6 +2561,7 @@ static __always_inline int handle_udp_tx_event(struct sk_buff *skb,
 	event->cpu = bpf_get_smp_processor_id();
 	event->task.tgidpid = udp_info->tgidpid;
 	event->socket_id = udp_info->socket_id;  // Copy socket ID for correlation
+	event->is_retransmit = 0;  // UDP doesn't have retransmits
 
 	bpf_ringbuf_submit(event, flags);
 
@@ -2985,6 +3000,7 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 			pkt_event->event_type = PACKET_BUFFER_QUEUE;
 			pkt_event->cpu = bpf_get_smp_processor_id();
 			pkt_event->socket_id = buf_info->socket_id;  // Socket ID for correlation
+			pkt_event->is_retransmit = 0;  // Receive path - not applicable
 
 			bpf_ringbuf_submit(pkt_event, flags);
 		}

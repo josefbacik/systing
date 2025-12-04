@@ -116,6 +116,7 @@ struct PacketEvent {
     tcp_flags: u8,
     sndbuf_used: u32, // Bytes in send buffer (sk_wmem_queued) - shows buffer drain on ACK
     sndbuf_limit: u32, // Max send buffer size (sk_sndbuf)
+    is_retransmit: bool, // True if this packet is a TCP retransmit
 }
 
 enum EventEntry {
@@ -370,6 +371,7 @@ impl NetworkRecorder {
             tcp_flags: event.tcp_flags,
             sndbuf_used: event.sndbuf_used,
             sndbuf_limit: event.sndbuf_limit,
+            is_retransmit: event.is_retransmit != 0,
         };
 
         // Buffer queue events go to per-thread syscall_events (app-relevant)
@@ -526,6 +528,14 @@ impl NetworkRecorder {
                 fill_annotation.set_name("sndbuf_fill_pct".to_string());
                 fill_annotation.set_uint_value(fill_pct);
                 begin_event.debug_annotations.push(fill_annotation);
+            }
+
+            // Add retransmit flag if this packet is a TCP retransmit
+            if pkt.is_retransmit {
+                let mut retransmit_annotation = DebugAnnotation::default();
+                retransmit_annotation.set_name("is_retransmit".to_string());
+                retransmit_annotation.set_uint_value(1);
+                begin_event.debug_annotations.push(retransmit_annotation);
             }
 
             let mut begin_packet = TracePacket::default();

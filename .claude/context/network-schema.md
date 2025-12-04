@@ -74,6 +74,7 @@ Debug annotations containing event details. Multiple args can exist per slice.
 | `sndbuf_used` | int | TCP events | Current send buffer usage (sk_wmem_queued) |
 | `sndbuf_limit` | int | TCP events | Max send buffer size (sk_sndbuf) |
 | `sndbuf_fill_pct` | int | TCP events | Buffer fill percentage (used/limit * 100) |
+| `is_retransmit` | int | TCP packet events | 1 if this packet is a TCP retransmit (absent if not) |
 
 ### `network_interface`
 Local network interface metadata captured at trace start, organized by network namespace. This captures interfaces from:
@@ -251,6 +252,40 @@ WHERE s.name LIKE 'TCP packet%' AND t.name LIKE 'Socket%'
 GROUP BY t.name
 ORDER BY packet_events DESC
 LIMIT 20;
+```
+
+### 9. Find TCP Retransmitted Packets
+Find all packets that were retransmitted, grouped by socket:
+```sql
+SELECT t.name as socket,
+       COUNT(*) as retransmit_count,
+       SUM(CASE WHEN a_len.key = 'length' THEN a_len.int_value ELSE 0 END) as retransmit_bytes
+FROM slice s
+JOIN track t ON s.track_id = t.id AND s.trace_id = t.trace_id
+JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id AND a.key = 'is_retransmit' AND a.int_value = 1
+LEFT JOIN args a_len ON s.id = a_len.slice_id AND s.trace_id = a_len.trace_id AND a_len.key = 'length'
+WHERE s.name LIKE 'TCP packet%'
+GROUP BY t.name
+ORDER BY retransmit_count DESC;
+```
+
+### 10. Detailed Retransmit Analysis
+Show retransmit events with sequence numbers and timing:
+```sql
+SELECT s.ts / 1e9 as time_sec,
+       t.name as socket,
+       MAX(CASE WHEN a.key = 'seq' THEN a.int_value END) as seq,
+       MAX(CASE WHEN a.key = 'length' THEN a.int_value END) as length,
+       MAX(CASE WHEN a.key = 'flags' THEN a.string_value END) as flags
+FROM slice s
+JOIN track t ON s.track_id = t.id AND s.trace_id = t.trace_id
+JOIN args a_retrans ON s.id = a_retrans.slice_id AND s.trace_id = a_retrans.trace_id
+    AND a_retrans.key = 'is_retransmit' AND a_retrans.int_value = 1
+LEFT JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id
+WHERE s.name LIKE 'TCP packet%'
+GROUP BY s.id, s.ts, t.name
+ORDER BY s.ts
+LIMIT 100;
 ```
 
 ## Track Hierarchy
