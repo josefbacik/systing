@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -18,12 +19,15 @@ use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
 use perfetto_protos::clock_snapshot::ClockSnapshot;
 use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
+use perfetto_protos::debug_annotation::DebugAnnotation;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
 use perfetto_protos::process_tree::{process_tree::Process as ProtoProcess, ProcessTree};
 use perfetto_protos::system_info::{SystemInfo, Utsname};
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
+use perfetto_protos::track_event::track_event::Type;
+use perfetto_protos::track_event::TrackEvent;
 use std::fs;
 use std::path::Path;
 
@@ -95,6 +99,86 @@ pub fn get_system_utsname() -> Option<Utsname> {
     set_field!(machine, set_machine);
 
     Some(utsname)
+}
+
+/// Track name for network interface metadata in Perfetto traces.
+pub const NETWORK_INTERFACES_TRACK_NAME: &str = "Network Interfaces";
+
+/// Represents a network interface with its associated IP addresses.
+#[derive(Debug, Clone)]
+pub struct NetworkInterface {
+    pub name: String,
+    pub ipv4_addrs: Vec<Ipv4Addr>,
+    pub ipv6_addrs: Vec<Ipv6Addr>,
+}
+
+/// Retrieves all network interfaces and their IP addresses using getifaddrs.
+///
+/// # Returns
+///
+/// Returns a vector of NetworkInterface structs, one for each interface with at least one address.
+pub fn get_network_interfaces() -> Vec<NetworkInterface> {
+    let mut interfaces: HashMap<String, NetworkInterface> = HashMap::new();
+
+    unsafe {
+        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifaddrs) != 0 {
+            return Vec::new();
+        }
+
+        let mut current = ifaddrs;
+        while !current.is_null() {
+            let ifa = &*current;
+
+            // Get interface name
+            if let Ok(name) = CStr::from_ptr(ifa.ifa_name).to_str() {
+                let name = name.to_string();
+
+                // Get or create the interface entry
+                let iface = interfaces
+                    .entry(name.clone())
+                    .or_insert_with(|| NetworkInterface {
+                        name,
+                        ipv4_addrs: Vec::new(),
+                        ipv6_addrs: Vec::new(),
+                    });
+
+                // Parse address if present
+                if !ifa.ifa_addr.is_null() {
+                    let sa_family = (*ifa.ifa_addr).sa_family as i32;
+
+                    if sa_family == libc::AF_INET {
+                        let sockaddr_in = ifa.ifa_addr as *const libc::sockaddr_in;
+                        let addr_bytes = (*sockaddr_in).sin_addr.s_addr.to_ne_bytes();
+                        let ipv4 = Ipv4Addr::new(
+                            addr_bytes[0],
+                            addr_bytes[1],
+                            addr_bytes[2],
+                            addr_bytes[3],
+                        );
+                        iface.ipv4_addrs.push(ipv4);
+                    } else if sa_family == libc::AF_INET6 {
+                        let sockaddr_in6 = ifa.ifa_addr as *const libc::sockaddr_in6;
+                        let addr_bytes = (*sockaddr_in6).sin6_addr.s6_addr;
+                        let ipv6 = Ipv6Addr::from(addr_bytes);
+                        iface.ipv6_addrs.push(ipv6);
+                    }
+                }
+            }
+
+            current = ifa.ifa_next;
+        }
+
+        libc::freeifaddrs(ifaddrs);
+    }
+
+    // Filter out interfaces with no addresses and sort by name for consistent ordering
+    let mut result: Vec<NetworkInterface> = interfaces
+        .into_values()
+        .filter(|iface| !iface.ipv4_addrs.is_empty() || !iface.ipv6_addrs.is_empty())
+        .collect();
+    result.sort_by(|a, b| a.name.cmp(&b.name));
+    result
 }
 
 impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
@@ -431,6 +515,78 @@ impl SessionRecorder {
         packets
     }
 
+    /// Generates trace packets for network interface metadata.
+    ///
+    /// Creates a "Network Interfaces" root track with child tracks for each interface.
+    /// Each interface track has an instant event with debug annotations containing
+    /// the interface's IP addresses.
+    fn generate_network_interface_packets(
+        &self,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Vec<TracePacket> {
+        let interfaces = get_network_interfaces();
+        if interfaces.is_empty() {
+            return Vec::new();
+        }
+
+        let mut packets = Vec::new();
+        let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
+
+        let root_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        let mut root_desc = TrackDescriptor::default();
+        root_desc.set_uuid(root_uuid);
+        root_desc.set_name(NETWORK_INTERFACES_TRACK_NAME.to_string());
+
+        let mut root_packet = TracePacket::default();
+        root_packet.set_track_descriptor(root_desc);
+        packets.push(root_packet);
+
+        // Create child tracks for each interface
+        for iface in interfaces {
+            let iface_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+
+            // Create track descriptor for this interface
+            let mut iface_desc = TrackDescriptor::default();
+            iface_desc.set_uuid(iface_uuid);
+            iface_desc.set_name(iface.name.clone());
+            iface_desc.set_parent_uuid(root_uuid);
+
+            let mut iface_packet = TracePacket::default();
+            iface_packet.set_track_descriptor(iface_desc);
+            packets.push(iface_packet);
+
+            // Create an instant event with debug annotations for IP addresses
+            let mut track_event = TrackEvent::default();
+            track_event.set_type(Type::TYPE_INSTANT);
+            track_event.set_track_uuid(iface_uuid);
+            track_event.set_name(iface.name);
+
+            // Add IPv4 addresses as debug annotations
+            for ipv4 in iface.ipv4_addrs {
+                let mut annotation = DebugAnnotation::default();
+                annotation.set_name("ipv4".to_string());
+                annotation.set_string_value(ipv4.to_string());
+                track_event.debug_annotations.push(annotation);
+            }
+
+            // Add IPv6 addresses as debug annotations
+            for ipv6 in iface.ipv6_addrs {
+                let mut annotation = DebugAnnotation::default();
+                annotation.set_name("ipv6".to_string());
+                annotation.set_string_value(ipv6.to_string());
+                track_event.debug_annotations.push(annotation);
+            }
+
+            let mut event_packet = TracePacket::default();
+            event_packet.set_timestamp(0); // Metadata at trace start
+            event_packet.set_track_event(track_event);
+            event_packet.set_trusted_packet_sequence_id(sequence_id);
+            packets.push(event_packet);
+        }
+
+        packets
+    }
+
     /// Collects trace packets from all event recorders
     fn collect_recorder_traces(
         &self,
@@ -506,13 +662,16 @@ impl SessionRecorder {
         // Step 1: Generate initial packets (clock snapshot and root descriptor)
         packets.extend(self.generate_initial_packets(&id_counter));
 
-        // Step 2: Generate process-related packets
+        // Step 2: Generate network interface metadata packets
+        packets.extend(self.generate_network_interface_packets(&id_counter));
+
+        // Step 3: Generate process-related packets
         packets.extend(self.generate_process_packets(&id_counter, &mut pid_uuids));
 
-        // Step 3: Generate thread-related packets
+        // Step 4: Generate thread-related packets
         packets.extend(self.generate_thread_packets(&id_counter, &mut thread_uuids));
 
-        // Step 4: Collect traces from all recorders
+        // Step 5: Collect traces from all recorders
         packets.extend(self.collect_recorder_traces(&pid_uuids, &thread_uuids, &id_counter));
 
         packets

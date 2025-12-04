@@ -26,6 +26,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
+/// Track name for network interface metadata in Perfetto traces.
+const NETWORK_INTERFACES_TRACK_NAME: &str = "Network Interfaces";
+
 #[derive(Parser)]
 #[command(name = "systing-analyze")]
 #[command(about = "Convert and query Perfetto trace databases")]
@@ -292,6 +295,8 @@ struct ExtractedData {
     frames: Vec<FrameRecord>,
     callsites: Vec<CallsiteRecord>,
     perf_samples: Vec<PerfSampleRecord>,
+    // Network interface metadata
+    network_interfaces: Vec<NetworkInterfaceRecord>,
 }
 
 #[derive(Clone)]
@@ -406,6 +411,13 @@ struct PerfSampleRecord {
     cpu: Option<i32>,
 }
 
+#[derive(Clone)]
+struct NetworkInterfaceRecord {
+    interface_name: String,
+    ip_address: String,
+    address_type: String,
+}
+
 struct TraceExtractor {
     data: ExtractedData,
     pid_to_upid: HashMap<i32, i64>,
@@ -424,6 +436,9 @@ struct TraceExtractor {
     interned_callstacks: HashMap<u64, Vec<u64>>,
     callsite_map: HashMap<Vec<u64>, i64>,
     next_callsite_id: i64,
+
+    network_interfaces_root_uuid: Option<u64>,
+    network_interface_tracks: HashMap<u64, String>,
 }
 
 impl TraceExtractor {
@@ -444,6 +459,7 @@ impl TraceExtractor {
                 frames: Vec::new(),
                 callsites: Vec::new(),
                 perf_samples: Vec::new(),
+                network_interfaces: Vec::new(),
             },
             pid_to_upid: HashMap::new(),
             tid_to_utid: HashMap::new(),
@@ -459,6 +475,8 @@ impl TraceExtractor {
             interned_callstacks: HashMap::new(),
             callsite_map: HashMap::new(),
             next_callsite_id: 1,
+            network_interfaces_root_uuid: None,
+            network_interface_tracks: HashMap::new(),
         }
     }
 
@@ -623,6 +641,17 @@ impl TraceExtractor {
 
                 // Store track metadata if it has a name
                 if desc.has_name() {
+                    let name = desc.name().to_string();
+
+                    if name == NETWORK_INTERFACES_TRACK_NAME {
+                        self.network_interfaces_root_uuid = Some(desc.uuid());
+                    } else if desc.has_parent_uuid()
+                        && Some(desc.parent_uuid()) == self.network_interfaces_root_uuid
+                    {
+                        self.network_interface_tracks
+                            .insert(desc.uuid(), name.clone());
+                    }
+
                     let parent_id = if desc.has_parent_uuid() {
                         self.track_uuid_to_id.get(&desc.parent_uuid()).copied()
                     } else {
@@ -630,7 +659,7 @@ impl TraceExtractor {
                     };
                     self.data.tracks.push(TrackRecord {
                         id: track_id,
-                        name: desc.name().to_string(),
+                        name,
                         parent_id,
                     });
                 }
@@ -814,6 +843,26 @@ impl TraceExtractor {
                                 string_value: str_val,
                                 real_value: real_val,
                             });
+                        }
+                    }
+
+                    // Extract network interface metadata from TYPE_INSTANT events
+                    if let Type::TYPE_INSTANT = event.type_() {
+                        if let Some(interface_name) =
+                            self.network_interface_tracks.get(&track_uuid).cloned()
+                        {
+                            for annotation in &event.debug_annotations {
+                                if annotation.has_string_value() {
+                                    let key = annotation.name();
+                                    if key == "ipv4" || key == "ipv6" {
+                                        self.data.network_interfaces.push(NetworkInterfaceRecord {
+                                            interface_name: interface_name.clone(),
+                                            ip_address: annotation.string_value().to_string(),
+                                            address_type: key.to_string(),
+                                        });
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1167,6 +1216,14 @@ fn create_schema(conn: &Connection) -> Result<()> {
             callsite_id BIGINT,
             cpu INTEGER
         );
+
+        -- Network interface metadata
+        CREATE TABLE IF NOT EXISTS network_interface (
+            trace_id VARCHAR,
+            interface_name VARCHAR,
+            ip_address VARCHAR,
+            address_type VARCHAR
+        );
         ",
     )?;
 
@@ -1190,6 +1247,8 @@ struct ParquetPaths {
     frame: PathBuf,
     callsite: PathBuf,
     perf_sample: PathBuf,
+    // Network interface metadata
+    network_interface: PathBuf,
 }
 
 impl ParquetPaths {
@@ -1210,6 +1269,8 @@ impl ParquetPaths {
             frame: temp_dir.join(format!("{}_frame.parquet", trace_id)),
             callsite: temp_dir.join(format!("{}_callsite.parquet", trace_id)),
             perf_sample: temp_dir.join(format!("{}_perf_sample.parquet", trace_id)),
+            // Network interface metadata
+            network_interface: temp_dir.join(format!("{}_network_interface.parquet", trace_id)),
         }
     }
 }
@@ -1828,6 +1889,43 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
         writer.close()?;
     }
 
+    // Network interface table
+    if !data.network_interfaces.is_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("interface_name", DataType::Utf8, false),
+            Field::new("ip_address", DataType::Utf8, false),
+            Field::new("address_type", DataType::Utf8, false),
+        ]));
+
+        let mut trace_id_builder = StringBuilder::new();
+        let mut interface_name_builder = StringBuilder::new();
+        let mut ip_address_builder = StringBuilder::new();
+        let mut address_type_builder = StringBuilder::new();
+
+        for iface in &data.network_interfaces {
+            trace_id_builder.append_value(trace_id);
+            interface_name_builder.append_value(&iface.interface_name);
+            ip_address_builder.append_value(&iface.ip_address);
+            address_type_builder.append_value(&iface.address_type);
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(interface_name_builder.finish()),
+                Arc::new(ip_address_builder.finish()),
+                Arc::new(address_type_builder.finish()),
+            ],
+        )?;
+
+        let file = File::create(&paths.network_interface)?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props.clone()))?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
     Ok(())
 }
 
@@ -2051,6 +2149,8 @@ fn run_convert(
     import_table("stack_profile_frame", |p| &p.frame)?;
     import_table("stack_profile_callsite", |p| &p.callsite)?;
     import_table("perf_sample", |p| &p.perf_sample)?;
+    // Network interface metadata
+    import_table("network_interface", |p| &p.network_interface)?;
 
     let import_time = import_start.elapsed();
     if verbose {

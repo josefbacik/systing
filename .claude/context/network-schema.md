@@ -4,10 +4,11 @@ This document describes how network events are stored in DuckDB after conversion
 
 ## Overview
 
-Network events are tracked through three related tables:
+Network events are tracked through four related tables:
 - **`track`** - Track metadata including socket connection info
 - **`slice`** - Network events (tcp_send, tcp_recv, packet events, etc.)
 - **`args`** - Debug annotations containing event details (bytes, seq numbers, buffer info)
+- **`network_interface`** - Local network interface metadata (for cross-trace correlation)
 
 ## Tables
 
@@ -73,6 +74,27 @@ Debug annotations containing event details. Multiple args can exist per slice.
 | `sndbuf_used` | int | TCP events | Current send buffer usage (sk_wmem_queued) |
 | `sndbuf_limit` | int | TCP events | Max send buffer size (sk_sndbuf) |
 | `sndbuf_fill_pct` | int | TCP events | Buffer fill percentage (used/limit * 100) |
+
+### `network_interface`
+Local network interface metadata captured at trace start. Used for cross-trace correlation to identify which machine a trace came from and match destination IPs to source machines.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| trace_id | VARCHAR | Trace identifier |
+| interface_name | VARCHAR | Interface name (e.g., "eth0", "lo", "docker0") |
+| ip_address | VARCHAR | IP address assigned to the interface |
+| address_type | VARCHAR | Address type: "ipv4" or "ipv6" |
+
+**Example Data:**
+```
+trace_id | interface_name | ip_address              | address_type
+---------+----------------+-------------------------+-------------
+trace_a  | eth0           | 10.128.0.5              | ipv4
+trace_a  | eth0           | fe80::d40c:ff:feb8:f7f1 | ipv6
+trace_a  | lo             | 127.0.0.1               | ipv4
+trace_a  | lo             | ::1                     | ipv6
+trace_b  | eth0           | 10.128.0.10             | ipv4
+```
 
 ## Data Model
 
@@ -259,3 +281,59 @@ Available flags: FIN, SYN, RST, PSH, ACK, URG, ECE, CWR
 
 ### Socket ID
 The socket ID in track names is a unique identifier assigned by the BPF tracer during tracing. It's consistent within a single trace but not across traces.
+
+## Cross-Trace Correlation
+
+When analyzing traces from multiple machines, use the `network_interface` table to identify which machine each trace came from and correlate network connections.
+
+### List All Interfaces Across Traces
+```sql
+SELECT trace_id, interface_name, ip_address, address_type
+FROM network_interface
+WHERE address_type = 'ipv4' AND interface_name != 'lo'
+ORDER BY trace_id, interface_name;
+```
+
+### Find Which Trace Has a Specific IP
+```sql
+SELECT trace_id, interface_name
+FROM network_interface
+WHERE ip_address = '10.128.0.5';
+```
+
+### Correlate Sockets to Source Machines
+Find which machine (trace) owns the IP that appears in another trace's socket connections:
+```sql
+SELECT
+    ni.trace_id as source_trace,
+    ni.interface_name as source_interface,
+    ni.ip_address as source_ip,
+    t.trace_id as dest_trace,
+    t.name as socket_name
+FROM network_interface ni
+JOIN track t ON t.trace_id != ni.trace_id
+    AND t.name LIKE '%' || ni.ip_address || '%'
+WHERE ni.address_type = 'ipv4'
+  AND ni.interface_name != 'lo';
+```
+
+### Build a Connection Map Between Nodes
+```sql
+-- For each trace, find which other traces it communicated with
+WITH socket_destinations AS (
+    SELECT DISTINCT
+        trace_id,
+        -- Extract IP from socket name like "Socket 1:TCP:10.0.0.5:8080"
+        REGEXP_EXTRACT(name, 'Socket \d+:\w+:([^:]+):\d+', 1) as dest_ip
+    FROM track
+    WHERE name LIKE 'Socket%'
+)
+SELECT
+    sd.trace_id as from_trace,
+    ni.trace_id as to_trace,
+    sd.dest_ip
+FROM socket_destinations sd
+JOIN network_interface ni ON sd.dest_ip = ni.ip_address
+WHERE sd.trace_id != ni.trace_id
+  AND ni.address_type = 'ipv4';
+```
