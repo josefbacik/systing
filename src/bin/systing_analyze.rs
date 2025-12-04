@@ -413,6 +413,7 @@ struct PerfSampleRecord {
 
 #[derive(Clone)]
 struct NetworkInterfaceRecord {
+    namespace: String,
     interface_name: String,
     ip_address: String,
     address_type: String,
@@ -438,7 +439,10 @@ struct TraceExtractor {
     next_callsite_id: i64,
 
     network_interfaces_root_uuid: Option<u64>,
-    network_interface_tracks: HashMap<u64, String>,
+    /// Namespace tracks: uuid -> namespace name (e.g., "host", "container:abc123 (nginx)")
+    network_namespace_tracks: HashMap<u64, String>,
+    /// Interface tracks: uuid -> (namespace_name, interface_name)
+    network_interface_tracks: HashMap<u64, (String, String)>,
 }
 
 impl TraceExtractor {
@@ -476,6 +480,7 @@ impl TraceExtractor {
             callsite_map: HashMap::new(),
             next_callsite_id: 1,
             network_interfaces_root_uuid: None,
+            network_namespace_tracks: HashMap::new(),
             network_interface_tracks: HashMap::new(),
         }
     }
@@ -645,11 +650,21 @@ impl TraceExtractor {
 
                     if name == NETWORK_INTERFACES_TRACK_NAME {
                         self.network_interfaces_root_uuid = Some(desc.uuid());
-                    } else if desc.has_parent_uuid()
-                        && Some(desc.parent_uuid()) == self.network_interfaces_root_uuid
-                    {
-                        self.network_interface_tracks
-                            .insert(desc.uuid(), name.clone());
+                    } else if desc.has_parent_uuid() {
+                        let parent_uuid = desc.parent_uuid();
+
+                        // Check if this is a namespace track (child of root)
+                        if Some(parent_uuid) == self.network_interfaces_root_uuid {
+                            self.network_namespace_tracks
+                                .insert(desc.uuid(), name.clone());
+                        }
+                        // Check if this is an interface track (child of a namespace track)
+                        else if let Some(namespace_name) =
+                            self.network_namespace_tracks.get(&parent_uuid).cloned()
+                        {
+                            self.network_interface_tracks
+                                .insert(desc.uuid(), (namespace_name, name.clone()));
+                        }
                     }
 
                     let parent_id = if desc.has_parent_uuid() {
@@ -848,7 +863,7 @@ impl TraceExtractor {
 
                     // Extract network interface metadata from TYPE_INSTANT events
                     if let Type::TYPE_INSTANT = event.type_() {
-                        if let Some(interface_name) =
+                        if let Some((namespace_name, interface_name)) =
                             self.network_interface_tracks.get(&track_uuid).cloned()
                         {
                             for annotation in &event.debug_annotations {
@@ -856,6 +871,7 @@ impl TraceExtractor {
                                     let key = annotation.name();
                                     if key == "ipv4" || key == "ipv6" {
                                         self.data.network_interfaces.push(NetworkInterfaceRecord {
+                                            namespace: namespace_name.clone(),
                                             interface_name: interface_name.clone(),
                                             ip_address: annotation.string_value().to_string(),
                                             address_type: key.to_string(),
@@ -1220,6 +1236,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
         -- Network interface metadata
         CREATE TABLE IF NOT EXISTS network_interface (
             trace_id VARCHAR,
+            namespace VARCHAR,
             interface_name VARCHAR,
             ip_address VARCHAR,
             address_type VARCHAR
@@ -1893,18 +1910,21 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
     if !data.network_interfaces.is_empty() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("trace_id", DataType::Utf8, false),
+            Field::new("namespace", DataType::Utf8, false),
             Field::new("interface_name", DataType::Utf8, false),
             Field::new("ip_address", DataType::Utf8, false),
             Field::new("address_type", DataType::Utf8, false),
         ]));
 
         let mut trace_id_builder = StringBuilder::new();
+        let mut namespace_builder = StringBuilder::new();
         let mut interface_name_builder = StringBuilder::new();
         let mut ip_address_builder = StringBuilder::new();
         let mut address_type_builder = StringBuilder::new();
 
         for iface in &data.network_interfaces {
             trace_id_builder.append_value(trace_id);
+            namespace_builder.append_value(&iface.namespace);
             interface_name_builder.append_value(&iface.interface_name);
             ip_address_builder.append_value(&iface.ip_address);
             address_type_builder.append_value(&iface.address_type);
@@ -1914,6 +1934,7 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
             schema.clone(),
             vec![
                 Arc::new(trace_id_builder.finish()),
+                Arc::new(namespace_builder.finish()),
                 Arc::new(interface_name_builder.finish()),
                 Arc::new(ip_address_builder.finish()),
                 Arc::new(address_type_builder.finish()),

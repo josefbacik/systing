@@ -76,25 +76,40 @@ Debug annotations containing event details. Multiple args can exist per slice.
 | `sndbuf_fill_pct` | int | TCP events | Buffer fill percentage (used/limit * 100) |
 
 ### `network_interface`
-Local network interface metadata captured at trace start. Used for cross-trace correlation to identify which machine a trace came from and match destination IPs to source machines.
+Local network interface metadata captured at trace start, organized by network namespace. This captures interfaces from:
+- The host network namespace
+- Container network namespaces (Docker, containerd, cri-o)
+- Any other network namespaces used by traced processes
+
+Used for cross-trace correlation and to identify container-specific IP addresses.
 
 | Column | Type | Description |
 |--------|------|-------------|
 | trace_id | VARCHAR | Trace identifier |
+| namespace | VARCHAR | Network namespace name (see format below) |
 | interface_name | VARCHAR | Interface name (e.g., "eth0", "lo", "docker0") |
 | ip_address | VARCHAR | IP address assigned to the interface |
 | address_type | VARCHAR | Address type: "ipv4" or "ipv6" |
 
+**Namespace Name Format:**
+- `host` - The host (init) network namespace
+- `container:<id> (<comm>)` - Container namespace with detected container ID and process name
+  - Example: `container:2a104e5e92a3 (nginx)`
+- `netns:<inode> (<comm>:<pid>)` - Fallback for namespaces without container ID
+  - Example: `netns:4026532890 (java:12345)`
+
 **Example Data:**
 ```
-trace_id | interface_name | ip_address              | address_type
----------+----------------+-------------------------+-------------
-trace_a  | eth0           | 10.128.0.5              | ipv4
-trace_a  | eth0           | fe80::d40c:ff:feb8:f7f1 | ipv6
-trace_a  | lo             | 127.0.0.1               | ipv4
-trace_a  | lo             | ::1                     | ipv6
-trace_b  | eth0           | 10.128.0.10             | ipv4
+trace_id | namespace                       | interface_name | ip_address     | address_type
+---------+---------------------------------+----------------+----------------+-------------
+trace_a  | host                            | eth0           | 10.128.0.5     | ipv4
+trace_a  | host                            | docker0        | 172.17.0.1     | ipv4
+trace_a  | container:abc123 (nginx)        | eth0           | 172.17.0.2     | ipv4
+trace_a  | container:abc123 (nginx)        | lo             | 127.0.0.1      | ipv4
+trace_a  | container:def456 (redis)        | eth0           | 172.17.0.3     | ipv4
 ```
+
+**Note:** Network namespace deduplication is based on the namespace inode. Multiple processes sharing the same network namespace will only have their interfaces enumerated once.
 
 ## Data Model
 
@@ -242,6 +257,21 @@ LIMIT 20;
 
 Network tracks are organized hierarchically:
 
+**Network Interface Metadata:**
+```
+Network Interfaces (root)
+├── host
+│   ├── eth0 (instant event with ipv4/ipv6 annotations)
+│   ├── docker0
+│   └── lo
+├── container:abc123 (nginx)
+│   ├── eth0
+│   └── lo
+└── netns:4026532890 (java:12345)
+    ├── eth0
+    └── lo
+```
+
 **Packet Events (global, not per-thread):**
 ```
 Network Packets (root)
@@ -286,26 +316,43 @@ The socket ID in track names is a unique identifier assigned by the BPF tracer d
 
 When analyzing traces from multiple machines, use the `network_interface` table to identify which machine each trace came from and correlate network connections.
 
-### List All Interfaces Across Traces
+### List All Namespaces and Their Interfaces
 ```sql
-SELECT trace_id, interface_name, ip_address, address_type
+SELECT trace_id, namespace, interface_name, ip_address
 FROM network_interface
 WHERE address_type = 'ipv4' AND interface_name != 'lo'
-ORDER BY trace_id, interface_name;
+ORDER BY trace_id, namespace, interface_name;
 ```
 
-### Find Which Trace Has a Specific IP
+### List Unique Namespaces Per Trace
 ```sql
-SELECT trace_id, interface_name
+SELECT trace_id, namespace, COUNT(*) as interface_count
 FROM network_interface
-WHERE ip_address = '10.128.0.5';
+WHERE address_type = 'ipv4'
+GROUP BY trace_id, namespace
+ORDER BY trace_id, namespace;
 ```
 
-### Correlate Sockets to Source Machines
-Find which machine (trace) owns the IP that appears in another trace's socket connections:
+### Find Container IP Addresses
+```sql
+SELECT namespace, interface_name, ip_address
+FROM network_interface
+WHERE namespace LIKE 'container:%' AND address_type = 'ipv4';
+```
+
+### Find Which Trace/Namespace Has a Specific IP
+```sql
+SELECT trace_id, namespace, interface_name
+FROM network_interface
+WHERE ip_address = '172.17.0.2';
+```
+
+### Correlate Sockets to Source Machines/Containers
+Find which machine/container (trace+namespace) owns the IP that appears in another trace's socket connections:
 ```sql
 SELECT
     ni.trace_id as source_trace,
+    ni.namespace as source_namespace,
     ni.interface_name as source_interface,
     ni.ip_address as source_ip,
     t.trace_id as dest_trace,
@@ -317,9 +364,9 @@ WHERE ni.address_type = 'ipv4'
   AND ni.interface_name != 'lo';
 ```
 
-### Build a Connection Map Between Nodes
+### Build a Connection Map Between Nodes (Including Containers)
 ```sql
--- For each trace, find which other traces it communicated with
+-- For each trace, find which other traces/containers it communicated with
 WITH socket_destinations AS (
     SELECT DISTINCT
         trace_id,
@@ -331,9 +378,26 @@ WITH socket_destinations AS (
 SELECT
     sd.trace_id as from_trace,
     ni.trace_id as to_trace,
+    ni.namespace as to_namespace,
     sd.dest_ip
 FROM socket_destinations sd
 JOIN network_interface ni ON sd.dest_ip = ni.ip_address
-WHERE sd.trace_id != ni.trace_id
-  AND ni.address_type = 'ipv4';
+WHERE ni.address_type = 'ipv4';
+```
+
+### Find Cross-Container Communication Within a Trace
+```sql
+-- Find traffic between containers on the same host
+WITH container_ips AS (
+    SELECT namespace, ip_address
+    FROM network_interface
+    WHERE namespace LIKE 'container:%' AND address_type = 'ipv4'
+)
+SELECT DISTINCT
+    t.name as socket,
+    ci.namespace as destination_container,
+    ci.ip_address as destination_ip
+FROM track t
+JOIN container_ips ci ON t.name LIKE '%' || ci.ip_address || '%'
+WHERE t.name LIKE 'Socket%';
 ```
