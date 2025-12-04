@@ -9,6 +9,7 @@ This directory contains Claude Code configuration and context files for the Syst
 - **`prompts/`** - Reusable prompts and templates
 - **`context/`** - Additional context files and documentation
   - `stack-trace-schema.md` - Stack trace storage schema in DuckDB (tables, queries, design notes)
+  - `network-schema.md` - Network event schema in DuckDB (track metadata, debug annotations, query examples)
 
 ## Usage
 
