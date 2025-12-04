@@ -8,9 +8,16 @@
 #include "strobelight/bpf_lib/python/pystacks/pystacks.bpf.h"
 #endif
 
-#define TASK_RUNNING 0
-#define TASK_INTERRUPTIBLE 1
-#define TASK_UNINTERRUPTIBLE 2
+/* Task state definitions */
+#define TASK_RUNNING		0x00000000
+#define TASK_INTERRUPTIBLE	0x00000001
+#define TASK_UNINTERRUPTIBLE	0x00000002
+
+/* TASK_REPORT mask - valid task states for ftrace format (bits 0-6) */
+#define TASK_REPORT		0x0000007f
+
+/* Preemption flag in ftrace format */
+#define TASK_REPORT_MAX		0x00000100
 
 /* Address family constants (from linux/socket.h) */
 #define AF_INET 2
@@ -1155,7 +1162,8 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->next, next);
 	record_task_info(&event->prev, prev);
-	event->prev_state = prev->__state;
+	/* Convert raw task state to ftrace format (mask to TASK_REPORT bits + preemption) */
+	event->prev_state = preempt ? TASK_REPORT_MAX : (prev->__state & TASK_REPORT);
 	event->next_prio = next->prio;
 	event->prev_prio = prev->prio;
 	bpf_ringbuf_submit(event, flags);
