@@ -81,7 +81,7 @@ struct TraceInfo {
 
 fn get_num_cpus() -> usize {
     std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(std::num::NonZero::get)
         .unwrap_or(8)
 }
 
@@ -99,8 +99,8 @@ fn generate_trace_id(path: &Path) -> String {
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect();
 
-    if safe_id.chars().next().is_none_or(|c| c.is_numeric()) {
-        format!("trace_{}", safe_id)
+    if safe_id.chars().next().is_none_or(char::is_numeric) {
+        format!("trace_{safe_id}")
     } else {
         safe_id
     }
@@ -284,6 +284,8 @@ struct ExtractedData {
     counters: Vec<CounterRecord>,
     counter_tracks: Vec<CounterTrackRecord>,
     slices: Vec<SliceRecord>,
+    tracks: Vec<TrackRecord>,
+    args: Vec<ArgRecord>,
     // Stack trace data
     symbols: Vec<SymbolRecord>,
     stack_mappings: Vec<StackMappingRecord>,
@@ -343,12 +345,30 @@ struct CounterTrackRecord {
 
 #[derive(Clone)]
 struct SliceRecord {
+    id: i64,
     ts: i64,
     dur: i64,
     track_id: i64,
+    utid: Option<i64>,
     name: String,
     category: Option<String>,
     depth: i32,
+}
+
+#[derive(Clone)]
+struct TrackRecord {
+    id: i64,
+    name: String,
+    parent_id: Option<i64>,
+}
+
+#[derive(Clone)]
+struct ArgRecord {
+    slice_id: i64,
+    key: String,
+    int_value: Option<i64>,
+    string_value: Option<String>,
+    real_value: Option<f64>,
 }
 
 struct SymbolRecord {
@@ -417,6 +437,8 @@ impl TraceExtractor {
                 counters: Vec::new(),
                 counter_tracks: Vec::new(),
                 slices: Vec::new(),
+                tracks: Vec::new(),
+                args: Vec::new(),
                 symbols: Vec::new(),
                 stack_mappings: Vec::new(),
                 frames: Vec::new(),
@@ -484,14 +506,13 @@ impl TraceExtractor {
 
             for frame in &interned.frames {
                 if frame.has_iid() {
-                    let name = frame
-                        .has_function_name_id()
-                        .then(|| {
-                            self.interned_function_names
-                                .get(&frame.function_name_id())
-                                .cloned()
-                        })
-                        .flatten();
+                    let name = if frame.has_function_name_id() {
+                        self.interned_function_names
+                            .get(&frame.function_name_id())
+                            .cloned()
+                    } else {
+                        None
+                    };
                     let record = FrameRecord {
                         id: frame.iid() as i64,
                         name,
@@ -583,14 +604,36 @@ impl TraceExtractor {
                     name: if desc.has_name() {
                         desc.name().to_string()
                     } else {
-                        format!("counter_{}", track_id)
+                        format!("counter_{track_id}")
                     },
                     unit: counter.unit_name.clone(),
                 });
-            } else if desc.has_uuid() && desc.has_name() {
+            } else if desc.has_uuid() {
+                // Generic track descriptor (includes network tracks like "Socket 1:TCP:10.0.0.1:8080")
                 let track_id = self.next_track_id;
                 self.next_track_id += 1;
                 self.track_uuid_to_id.insert(desc.uuid(), track_id);
+
+                // Propagate utid from parent track (enables direct slice-to-thread correlation)
+                if desc.has_parent_uuid() {
+                    if let Some(&parent_utid) = self.track_uuid_to_utid.get(&desc.parent_uuid()) {
+                        self.track_uuid_to_utid.insert(desc.uuid(), parent_utid);
+                    }
+                }
+
+                // Store track metadata if it has a name
+                if desc.has_name() {
+                    let parent_id = if desc.has_parent_uuid() {
+                        self.track_uuid_to_id.get(&desc.parent_uuid()).copied()
+                    } else {
+                        None
+                    };
+                    self.data.tracks.push(TrackRecord {
+                        id: track_id,
+                        name: desc.name().to_string(),
+                        parent_id,
+                    });
+                }
             }
         }
 
@@ -717,6 +760,9 @@ impl TraceExtractor {
                 if event.has_type() {
                     use perfetto_protos::track_event::track_event::Type;
                     if let Type::TYPE_SLICE_BEGIN = event.type_() {
+                        // Assign slice ID before pushing
+                        let slice_id = self.data.slices.len() as i64;
+
                         // Try inline name first, then interned name via name_iid
                         let name = if event.has_name() {
                             event.name().to_string()
@@ -729,14 +775,46 @@ impl TraceExtractor {
                             "unknown".to_string()
                         };
                         let track_id = self.track_uuid_to_id.get(&track_uuid).copied().unwrap_or(0);
+                        let utid = self.track_uuid_to_utid.get(&track_uuid).copied();
                         self.data.slices.push(SliceRecord {
+                            id: slice_id,
                             ts,
                             dur: 0,
                             track_id,
+                            utid,
                             name,
                             category: event.categories.first().cloned(),
                             depth: 0,
                         });
+
+                        // Extract debug annotations
+                        for annotation in &event.debug_annotations {
+                            let key = if annotation.has_name() {
+                                annotation.name().to_string()
+                            } else {
+                                continue; // Skip unnamed annotations
+                            };
+
+                            let (int_val, str_val, real_val) = if annotation.has_uint_value() {
+                                (Some(annotation.uint_value() as i64), None, None)
+                            } else if annotation.has_int_value() {
+                                (Some(annotation.int_value()), None, None)
+                            } else if annotation.has_string_value() {
+                                (None, Some(annotation.string_value().to_string()), None)
+                            } else if annotation.has_double_value() {
+                                (None, None, Some(annotation.double_value()))
+                            } else {
+                                continue; // Skip annotations without values
+                            };
+
+                            self.data.args.push(ArgRecord {
+                                slice_id,
+                                key,
+                                int_value: int_val,
+                                string_value: str_val,
+                                real_value: real_val,
+                            });
+                        }
                     }
                 }
             }
@@ -754,7 +832,7 @@ impl TraceExtractor {
                 .get(i)
                 .copied()
                 .unwrap_or_default() as usize;
-            let comm = compact.intern_table.get(comm_idx).map(|s| s.as_str());
+            let comm = compact.intern_table.get(comm_idx).map(String::as_str);
 
             self.ensure_thread_exists(next_pid, comm);
 
@@ -784,7 +862,7 @@ impl TraceExtractor {
                 .get(i)
                 .copied()
                 .unwrap_or_default() as usize;
-            let comm = compact.intern_table.get(comm_idx).map(|s| s.as_str());
+            let comm = compact.intern_table.get(comm_idx).map(String::as_str);
 
             self.ensure_thread_exists(pid, comm);
 
@@ -815,7 +893,7 @@ impl TraceExtractor {
                 self.data.processes.push(ProcessRecord {
                     upid,
                     pid: tid,
-                    name: name.map(|s| s.to_string()),
+                    name: name.map(str::to_string),
                     parent_upid: None,
                 });
                 upid
@@ -824,7 +902,7 @@ impl TraceExtractor {
             self.data.threads.push(ThreadRecord {
                 utid,
                 tid,
-                name: name.map(|s| s.to_string()),
+                name: name.map(ToOwned::to_owned),
                 upid: Some(upid),
             });
         }
@@ -836,15 +914,14 @@ impl TraceExtractor {
             let sample = packet.perf_sample();
             let ts = packet.timestamp() as i64;
 
-            let callsite_id = sample
-                .has_callstack_iid()
-                .then(|| {
-                    self.interned_callstacks
-                        .get(&sample.callstack_iid())
-                        .cloned()
-                        .map(|frame_ids| self.get_or_create_callsite(&frame_ids))
-                })
-                .flatten();
+            let callsite_id = if sample.has_callstack_iid() {
+                self.interned_callstacks
+                    .get(&sample.callstack_iid())
+                    .cloned()
+                    .map(|frame_ids| self.get_or_create_callsite(&frame_ids))
+            } else {
+                None
+            };
 
             let tid = sample.tid() as i32;
             let tgid = sample.pid() as i32;
@@ -1023,12 +1100,30 @@ fn create_schema(conn: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS slice (
             trace_id VARCHAR,
+            id BIGINT,
             ts BIGINT,
             dur BIGINT,
             track_id BIGINT,
+            utid BIGINT,
             name VARCHAR,
             category VARCHAR,
             depth INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS track (
+            trace_id VARCHAR,
+            id BIGINT,
+            name VARCHAR,
+            parent_id BIGINT
+        );
+
+        CREATE TABLE IF NOT EXISTS args (
+            trace_id VARCHAR,
+            slice_id BIGINT,
+            key VARCHAR,
+            int_value BIGINT,
+            string_value VARCHAR,
+            real_value DOUBLE
         );
 
         -- Stack trace tables
@@ -1087,6 +1182,8 @@ struct ParquetPaths {
     counter_track: PathBuf,
     counter: PathBuf,
     slice: PathBuf,
+    track: PathBuf,
+    args: PathBuf,
     // Stack trace tables
     symbol: PathBuf,
     stack_mapping: PathBuf,
@@ -1105,6 +1202,8 @@ impl ParquetPaths {
             counter_track: temp_dir.join(format!("{}_counter_track.parquet", trace_id)),
             counter: temp_dir.join(format!("{}_counter.parquet", trace_id)),
             slice: temp_dir.join(format!("{}_slice.parquet", trace_id)),
+            track: temp_dir.join(format!("{}_track.parquet", trace_id)),
+            args: temp_dir.join(format!("{}_args.parquet", trace_id)),
             // Stack trace tables
             symbol: temp_dir.join(format!("{}_symbol.parquet", trace_id)),
             stack_mapping: temp_dir.join(format!("{}_stack_mapping.parquet", trace_id)),
@@ -1376,9 +1475,11 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
     if !data.slices.is_empty() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("trace_id", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
             Field::new("ts", DataType::Int64, false),
             Field::new("dur", DataType::Int64, false),
             Field::new("track_id", DataType::Int64, false),
+            Field::new("utid", DataType::Int64, true),
             Field::new("name", DataType::Utf8, false),
             Field::new("category", DataType::Utf8, true),
             Field::new("depth", DataType::Int32, false),
@@ -1389,18 +1490,22 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
 
         for chunk in data.slices.chunks(PARQUET_BATCH_SIZE) {
             let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut id_builder = Int64Builder::with_capacity(chunk.len());
             let mut ts_builder = Int64Builder::with_capacity(chunk.len());
             let mut dur_builder = Int64Builder::with_capacity(chunk.len());
             let mut track_id_builder = Int64Builder::with_capacity(chunk.len());
+            let mut utid_builder = Int64Builder::with_capacity(chunk.len());
             let mut name_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
             let mut category_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 16);
             let mut depth_builder = Int32Builder::with_capacity(chunk.len());
 
             for slice in chunk {
                 trace_id_builder.append_value(trace_id);
+                id_builder.append_value(slice.id);
                 ts_builder.append_value(slice.ts);
                 dur_builder.append_value(slice.dur);
                 track_id_builder.append_value(slice.track_id);
+                utid_builder.append_option(slice.utid);
                 name_builder.append_value(&slice.name);
                 category_builder.append_option(slice.category.as_deref());
                 depth_builder.append_value(slice.depth);
@@ -1410,12 +1515,101 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
                 schema.clone(),
                 vec![
                     Arc::new(trace_id_builder.finish()),
+                    Arc::new(id_builder.finish()),
                     Arc::new(ts_builder.finish()),
                     Arc::new(dur_builder.finish()),
                     Arc::new(track_id_builder.finish()),
+                    Arc::new(utid_builder.finish()),
                     Arc::new(name_builder.finish()),
                     Arc::new(category_builder.finish()),
                     Arc::new(depth_builder.finish()),
+                ],
+            )?;
+            writer.write(&batch)?;
+        }
+        writer.close()?;
+    }
+
+    // Track metadata table
+    if !data.tracks.is_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("parent_id", DataType::Int64, true),
+        ]));
+
+        let file = File::create(&paths.track)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+
+        for chunk in data.tracks.chunks(PARQUET_BATCH_SIZE) {
+            let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut id_builder = Int64Builder::with_capacity(chunk.len());
+            let mut name_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 64);
+            let mut parent_id_builder = Int64Builder::with_capacity(chunk.len());
+
+            for track in chunk {
+                trace_id_builder.append_value(trace_id);
+                id_builder.append_value(track.id);
+                name_builder.append_value(&track.name);
+                parent_id_builder.append_option(track.parent_id);
+            }
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(trace_id_builder.finish()),
+                    Arc::new(id_builder.finish()),
+                    Arc::new(name_builder.finish()),
+                    Arc::new(parent_id_builder.finish()),
+                ],
+            )?;
+            writer.write(&batch)?;
+        }
+        writer.close()?;
+    }
+
+    // Args (debug annotations) table
+    if !data.args.is_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("slice_id", DataType::Int64, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("int_value", DataType::Int64, true),
+            Field::new("string_value", DataType::Utf8, true),
+            Field::new("real_value", DataType::Float64, true),
+        ]));
+
+        let file = File::create(&paths.args)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+
+        for chunk in data.args.chunks(PARQUET_BATCH_SIZE) {
+            let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut slice_id_builder = Int64Builder::with_capacity(chunk.len());
+            let mut key_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut int_value_builder = Int64Builder::with_capacity(chunk.len());
+            let mut string_value_builder =
+                StringBuilder::with_capacity(chunk.len(), chunk.len() * 64);
+            let mut real_value_builder = Float64Builder::with_capacity(chunk.len());
+
+            for arg in chunk {
+                trace_id_builder.append_value(trace_id);
+                slice_id_builder.append_value(arg.slice_id);
+                key_builder.append_value(&arg.key);
+                int_value_builder.append_option(arg.int_value);
+                string_value_builder.append_option(arg.string_value.as_deref());
+                real_value_builder.append_option(arg.real_value);
+            }
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(trace_id_builder.finish()),
+                    Arc::new(slice_id_builder.finish()),
+                    Arc::new(key_builder.finish()),
+                    Arc::new(int_value_builder.finish()),
+                    Arc::new(string_value_builder.finish()),
+                    Arc::new(real_value_builder.finish()),
                 ],
             )?;
             writer.write(&batch)?;
@@ -1678,7 +1872,7 @@ fn run_convert(
         .map(|mut t| {
             let count = id_counts.entry(t.trace_id.clone()).or_insert(0);
             if *count > 0 {
-                t.trace_id = format!("{}_{}", t.trace_id, count);
+                t.trace_id = format!("{}_{count}", t.trace_id);
             }
             *count += 1;
             t
@@ -1816,7 +2010,7 @@ fn run_convert(
             .iter()
             .map(|r| get_path(&r.parquet_paths))
             .filter(|p| p.exists())
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|p| p.to_string_lossy().into_owned())
             .collect();
         if paths.is_empty() {
             return Ok(());
@@ -1849,6 +2043,8 @@ fn run_convert(
     import_table("counter_track", |p| &p.counter_track)?;
     import_table("counter", |p| &p.counter)?;
     import_table("slice", |p| &p.slice)?;
+    import_table("track", |p| &p.track)?;
+    import_table("args", |p| &p.args)?;
     // Stack trace tables
     import_table("stack_profile_symbol", |p| &p.symbol)?;
     import_table("stack_profile_mapping", |p| &p.stack_mapping)?;
@@ -1933,7 +2129,7 @@ fn execute_query(conn: &Connection, sql: &str, format: &str) -> Result<()> {
     let mut rows = stmt.query([])?;
 
     // Get column info from the first row or statement
-    let column_count = rows.as_ref().map(|r| r.column_count()).unwrap_or(0);
+    let column_count = rows.as_ref().map_or(0, |r| r.column_count());
     let column_names: Vec<String> = if let Some(row_ref) = rows.as_ref() {
         (0..column_count)
             .map(|i| {
@@ -2013,7 +2209,7 @@ fn print_table(headers: &[String], rows: &[Vec<String>]) {
         return;
     }
 
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    let mut widths: Vec<usize> = headers.iter().map(String::len).collect();
     for row in rows {
         for (i, val) in row.iter().enumerate() {
             if i < widths.len() {
@@ -2022,9 +2218,9 @@ fn print_table(headers: &[String], rows: &[Vec<String>]) {
         }
     }
 
-    widths
-        .iter_mut()
-        .for_each(|w| *w = (*w).min(MAX_COLUMN_WIDTH));
+    for w in &mut widths {
+        *w = (*w).min(MAX_COLUMN_WIDTH);
+    }
 
     let header_line: Vec<String> = headers
         .iter()
