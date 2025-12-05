@@ -4,11 +4,15 @@ This document describes how network events are stored in DuckDB after conversion
 
 ## Overview
 
-Network events are tracked through four related tables:
+Network events are tracked through six related tables:
 - **`track`** - Track metadata including socket connection info
-- **`slice`** - Network events (tcp_send, tcp_recv, packet events, etc.)
-- **`args`** - Debug annotations containing event details (bytes, seq numbers, buffer info)
+- **`slice`** - Network syscall events (tcp_send, tcp_recv, udp_send) - range-based with duration
+- **`args`** - Debug annotations for slice events (bytes, buffer info)
+- **`instant`** - Packet-level events (packet_enqueue, packet_send, etc.) - point-in-time events
+- **`instant_args`** - Debug annotations for instant events (seq numbers, length, flags)
 - **`network_interface`** - Local network interface metadata (for cross-trace correlation)
+
+**Note:** Syscall events (tcp_send, tcp_recv, etc.) are range-based slices with duration because they represent the time a thread spends in a syscall. Packet events are instant events because they represent discrete points in the kernel packet processing pipeline.
 
 ## Tables
 
@@ -30,29 +34,46 @@ Maps track IDs to descriptive names and maintains parent-child hierarchy.
 - Root tracks: `Network Packets`, `Network Syscalls`
 
 ### `slice`
-Individual network events. Each event has a track_id linking to the track table and optionally a utid for direct thread correlation.
+Network syscall events (range-based with duration). Each event has a track_id linking to the track table and a utid for direct thread correlation.
 
 | Column | Type | Description |
 |--------|------|-------------|
 | trace_id | VARCHAR | Trace identifier |
 | id | BIGINT | Unique slice ID (for joining with args) |
-| ts | BIGINT | Timestamp in nanoseconds |
-| dur | BIGINT | Duration (0 for instant events) |
+| ts | BIGINT | Start timestamp in nanoseconds |
+| dur | BIGINT | Duration in nanoseconds |
 | track_id | BIGINT | FK to `track.id` |
-| utid | BIGINT | FK to `thread.utid` (direct thread link, NULL for packet events) |
-| name | VARCHAR | Event type (see Event Types below) |
+| utid | BIGINT | FK to `thread.utid` (direct thread link) |
+| name | VARCHAR | Event type (see below) |
 | category | VARCHAR | Event category (usually NULL) |
 | depth | INTEGER | Nesting depth (always 0) |
 
-**Note:** The `utid` column enables direct correlation between network syscall events and threads/processes without traversing the track hierarchy. For syscall events (tcp_send, tcp_recv, etc.), utid links directly to the thread that performed the syscall.
+**Note:** The `utid` column enables direct correlation between network syscall events and threads/processes without traversing the track hierarchy.
 
-**Event Types:**
-- Syscall events: `tcp_send`, `tcp_recv`, `udp_send`
-- Packet events: `TCP packet_enqueue`, `TCP packet_send`, `TCP packet_rcv_established`, `TCP packet_queue_rcv`, `TCP buffer_queue`
-- UDP packet events: `UDP send`, `UDP receive`, `UDP enqueue`
+**Syscall Event Types:**
+- `tcp_send` - TCP send syscall (sendto, write, etc.)
+- `tcp_recv` - TCP receive syscall (recvfrom, read, etc.)
+- `udp_send` - UDP send syscall
+
+### `instant`
+Packet-level events (point-in-time). These represent discrete points in the kernel packet processing pipeline.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| trace_id | VARCHAR | Trace identifier |
+| id | BIGINT | Unique instant ID (for joining with instant_args) |
+| ts | BIGINT | Timestamp in nanoseconds |
+| track_id | BIGINT | FK to `track.id` |
+| utid | BIGINT | FK to `thread.utid` (NULL for most packet events) |
+| name | VARCHAR | Event type (see below) |
+| category | VARCHAR | Event category (usually NULL) |
+
+**Packet Event Types:**
+- TCP: `TCP packet_enqueue`, `TCP packet_send`, `TCP packet_rcv_established`, `TCP packet_queue_rcv`, `TCP buffer_queue`
+- UDP: `UDP send`, `UDP receive`, `UDP enqueue`
 
 ### `args`
-Debug annotations containing event details. Multiple args can exist per slice.
+Debug annotations for syscall slice events. Multiple args can exist per slice.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -60,21 +81,40 @@ Debug annotations containing event details. Multiple args can exist per slice.
 | slice_id | BIGINT | FK to `slice.id` |
 | key | VARCHAR | Annotation name |
 | int_value | BIGINT | Integer value (most common) |
-| string_value | VARCHAR | String value (e.g., TCP flags) |
+| string_value | VARCHAR | String value |
 | real_value | DOUBLE | Floating point value |
 
-**Available Annotation Keys:**
+**Available Annotation Keys (for syscall events):**
 
 | Key | Type | Events | Description |
 |-----|------|--------|-------------|
 | `bytes` | int | tcp_send, tcp_recv, udp_send | Bytes transferred |
-| `seq` | int | TCP events | TCP sequence number |
-| `length` | int | Packet events | Packet length in bytes |
+| `sndbuf_used` | int | tcp_send | Current send buffer usage (sk_wmem_queued) |
+| `sndbuf_limit` | int | tcp_send | Max send buffer size (sk_sndbuf) |
+| `sndbuf_fill_pct` | int | tcp_send | Buffer fill percentage (used/limit * 100) |
+
+### `instant_args`
+Debug annotations for packet instant events. Multiple args can exist per instant.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| trace_id | VARCHAR | Trace identifier |
+| instant_id | BIGINT | FK to `instant.id` |
+| key | VARCHAR | Annotation name |
+| int_value | BIGINT | Integer value (most common) |
+| string_value | VARCHAR | String value (e.g., TCP flags) |
+| real_value | DOUBLE | Floating point value |
+
+**Available Annotation Keys (for packet events):**
+
+| Key | Type | Events | Description |
+|-----|------|--------|-------------|
+| `seq` | int | TCP packets | TCP sequence number |
+| `length` | int | All packet events | Packet length in bytes |
 | `flags` | string | TCP packets | TCP flags (e.g., "SYN\|ACK") |
-| `sndbuf_used` | int | TCP events | Current send buffer usage (sk_wmem_queued) |
-| `sndbuf_limit` | int | TCP events | Max send buffer size (sk_sndbuf) |
-| `sndbuf_fill_pct` | int | TCP events | Buffer fill percentage (used/limit * 100) |
-| `is_retransmit` | int | TCP packet events | 1 if this packet is a TCP retransmit (absent if not) |
+| `sndbuf_used` | int | TCP TX packets | Current send buffer usage |
+| `sndbuf_limit` | int | TCP TX packets | Max send buffer size |
+| `is_retransmit` | int | TCP TX packets | 1 if this packet is a TCP retransmit (absent if not) |
 
 ### `network_interface`
 Local network interface metadata captured at trace start, organized by network namespace. This captures interfaces from:
@@ -117,20 +157,20 @@ trace_a  | container:def456 (redis)        | eth0           | 172.17.0.3     | i
 ```
 track (Root: "Network Packets")
 └── track (Socket 1:TCP:10.0.0.1:8080, parent_id = root)
-    ├── slice (TCP packet_enqueue, track_id = socket)
-    │   └── args (length=1460, seq=12345, flags="ACK")
-    ├── slice (TCP packet_send, track_id = socket)
-    │   └── args (length=1460, seq=12345)
-    └── slice (TCP packet_rcv_established, track_id = socket)
-        └── args (length=64, seq=67890)
+    ├── instant (TCP packet_enqueue, track_id = socket)
+    │   └── instant_args (length=1460, seq=12345, flags="ACK")
+    ├── instant (TCP packet_send, track_id = socket)
+    │   └── instant_args (length=1460, seq=12345)
+    └── instant (TCP packet_rcv_established, track_id = socket)
+        └── instant_args (length=64, seq=67890)
 
 track (Root: "Network Syscalls" per thread)
 └── track (Socket 1:TCP:10.0.0.1:8080, parent_id = thread_group)
     ├── track (Sends, parent_id = socket)
-    │   └── slice (tcp_send, track_id = sends)
+    │   └── slice (tcp_send, track_id = sends, dur=12345)
     │       └── args (bytes=4096, sndbuf_used=8192, sndbuf_limit=65536, sndbuf_fill_pct=12)
     └── track (Receives, parent_id = socket)
-        └── slice (tcp_recv, track_id = receives)
+        └── slice (tcp_recv, track_id = receives, dur=5678)
             └── args (bytes=2048)
 ```
 
@@ -226,16 +266,16 @@ ORDER BY avg_fill_pct DESC;
 
 ### 7. TCP Packet Flow for a Specific Connection
 ```sql
-SELECT s.ts, s.name as event,
+SELECT i.ts, i.name as event,
        MAX(CASE WHEN a.key = 'seq' THEN a.int_value END) as seq,
        MAX(CASE WHEN a.key = 'length' THEN a.int_value END) as length,
        MAX(CASE WHEN a.key = 'flags' THEN a.string_value END) as flags
-FROM slice s
-JOIN track t ON s.track_id = t.id AND s.trace_id = t.trace_id
-LEFT JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
 WHERE t.name = 'Socket 1:TCP:10.0.0.1:8080'
-GROUP BY s.id, s.ts, s.name
-ORDER BY s.ts
+GROUP BY i.id, i.ts, i.name
+ORDER BY i.ts
 LIMIT 100;
 ```
 
@@ -245,10 +285,10 @@ Connections with most packet events:
 SELECT t.name as socket,
        COUNT(*) as packet_events,
        SUM(CASE WHEN a.key = 'length' THEN a.int_value ELSE 0 END) / 1048576.0 as total_mb
-FROM slice s
-JOIN track t ON s.track_id = t.id AND s.trace_id = t.trace_id
-LEFT JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id AND a.key = 'length'
-WHERE s.name LIKE 'TCP packet%' AND t.name LIKE 'Socket%'
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id AND a.key = 'length'
+WHERE i.name LIKE 'TCP packet%' AND t.name LIKE 'Socket%'
 GROUP BY t.name
 ORDER BY packet_events DESC
 LIMIT 20;
@@ -260,11 +300,11 @@ Find all packets that were retransmitted, grouped by socket:
 SELECT t.name as socket,
        COUNT(*) as retransmit_count,
        SUM(CASE WHEN a_len.key = 'length' THEN a_len.int_value ELSE 0 END) as retransmit_bytes
-FROM slice s
-JOIN track t ON s.track_id = t.id AND s.trace_id = t.trace_id
-JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id AND a.key = 'is_retransmit' AND a.int_value = 1
-LEFT JOIN args a_len ON s.id = a_len.slice_id AND s.trace_id = a_len.trace_id AND a_len.key = 'length'
-WHERE s.name LIKE 'TCP packet%'
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id AND a.key = 'is_retransmit' AND a.int_value = 1
+LEFT JOIN instant_args a_len ON i.id = a_len.instant_id AND i.trace_id = a_len.trace_id AND a_len.key = 'length'
+WHERE i.name LIKE 'TCP packet%'
 GROUP BY t.name
 ORDER BY retransmit_count DESC;
 ```
@@ -272,19 +312,19 @@ ORDER BY retransmit_count DESC;
 ### 10. Detailed Retransmit Analysis
 Show retransmit events with sequence numbers and timing:
 ```sql
-SELECT s.ts / 1e9 as time_sec,
+SELECT i.ts / 1e9 as time_sec,
        t.name as socket,
        MAX(CASE WHEN a.key = 'seq' THEN a.int_value END) as seq,
        MAX(CASE WHEN a.key = 'length' THEN a.int_value END) as length,
        MAX(CASE WHEN a.key = 'flags' THEN a.string_value END) as flags
-FROM slice s
-JOIN track t ON s.track_id = t.id AND s.trace_id = t.trace_id
-JOIN args a_retrans ON s.id = a_retrans.slice_id AND s.trace_id = a_retrans.trace_id
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+JOIN instant_args a_retrans ON i.id = a_retrans.instant_id AND i.trace_id = a_retrans.trace_id
     AND a_retrans.key = 'is_retransmit' AND a_retrans.int_value = 1
-LEFT JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id
-WHERE s.name LIKE 'TCP packet%'
-GROUP BY s.id, s.ts, t.name
-ORDER BY s.ts
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE i.name LIKE 'TCP packet%'
+GROUP BY i.id, i.ts, t.name
+ORDER BY i.ts
 LIMIT 100;
 ```
 
@@ -307,27 +347,29 @@ Network Interfaces (root)
     └── lo
 ```
 
-**Packet Events (global, not per-thread):**
+**Packet Events (global, not per-thread, stored in `instant` table):**
 ```
 Network Packets (root)
 └── Socket {id}:{protocol}:{addr}:{port}
-    ├── TCP packet_enqueue events
-    ├── TCP packet_send events
-    ├── TCP packet_rcv_established events
-    └── TCP packet_queue_rcv events
+    ├── TCP packet_enqueue (instant)
+    ├── TCP packet_send (instant)
+    ├── TCP packet_rcv_established (instant)
+    ├── TCP packet_queue_rcv (instant)
+    ├── TCP buffer_queue (instant)
+    ├── UDP send (instant)
+    ├── UDP receive (instant)
+    └── UDP enqueue (instant)
 ```
 
-**Syscall Events (per-thread):**
+**Syscall Events (per-thread, stored in `slice` table):**
 ```
 Thread (from PID/TGID track descriptor)
 └── Network Syscalls
     └── Socket {id}:{protocol}:{addr}:{port}
         ├── Sends
-        │   └── tcp_send / udp_send events
-        ├── Receives
-        │   └── tcp_recv events
-        └── Buffer Queue
-            └── TCP buffer_queue / UDP enqueue events
+        │   └── tcp_send / udp_send (slice with duration)
+        └── Receives
+            └── tcp_recv (slice with duration)
 ```
 
 ## Notes

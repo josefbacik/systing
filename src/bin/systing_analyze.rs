@@ -289,6 +289,9 @@ struct ExtractedData {
     slices: Vec<SliceRecord>,
     tracks: Vec<TrackRecord>,
     args: Vec<ArgRecord>,
+    // Instant events (packet events, etc.)
+    instants: Vec<InstantRecord>,
+    instant_args: Vec<InstantArgRecord>,
     // Stack trace data
     symbols: Vec<SymbolRecord>,
     stack_mappings: Vec<StackMappingRecord>,
@@ -361,6 +364,16 @@ struct SliceRecord {
 }
 
 #[derive(Clone)]
+struct InstantRecord {
+    id: i64,
+    ts: i64,
+    track_id: i64,
+    utid: Option<i64>,
+    name: String,
+    category: Option<String>,
+}
+
+#[derive(Clone)]
 struct TrackRecord {
     id: i64,
     name: String,
@@ -370,6 +383,15 @@ struct TrackRecord {
 #[derive(Clone)]
 struct ArgRecord {
     slice_id: i64,
+    key: String,
+    int_value: Option<i64>,
+    string_value: Option<String>,
+    real_value: Option<f64>,
+}
+
+#[derive(Clone)]
+struct InstantArgRecord {
+    instant_id: i64,
     key: String,
     int_value: Option<i64>,
     string_value: Option<String>,
@@ -458,6 +480,8 @@ impl TraceExtractor {
                 slices: Vec::new(),
                 tracks: Vec::new(),
                 args: Vec::new(),
+                instants: Vec::new(),
+                instant_args: Vec::new(),
                 symbols: Vec::new(),
                 stack_mappings: Vec::new(),
                 frames: Vec::new(),
@@ -861,8 +885,9 @@ impl TraceExtractor {
                         }
                     }
 
-                    // Extract network interface metadata from TYPE_INSTANT events
+                    // Handle TYPE_INSTANT events (includes packet events and network interface metadata)
                     if let Type::TYPE_INSTANT = event.type_() {
+                        // Extract network interface metadata
                         if let Some((namespace_name, interface_name)) =
                             self.network_interface_tracks.get(&track_uuid).cloned()
                         {
@@ -879,6 +904,58 @@ impl TraceExtractor {
                                     }
                                 }
                             }
+                        }
+
+                        // Record instant event in the instant table
+                        let instant_id = self.data.instants.len() as i64;
+                        let name = if event.has_name() {
+                            event.name().to_string()
+                        } else if event.has_name_iid() {
+                            self.interned_event_names
+                                .get(&event.name_iid())
+                                .cloned()
+                                .unwrap_or_else(|| "unknown".to_string())
+                        } else {
+                            "unknown".to_string()
+                        };
+                        let track_id = self.track_uuid_to_id.get(&track_uuid).copied().unwrap_or(0);
+                        let utid = self.track_uuid_to_utid.get(&track_uuid).copied();
+                        self.data.instants.push(InstantRecord {
+                            id: instant_id,
+                            ts,
+                            track_id,
+                            utid,
+                            name,
+                            category: event.categories.first().cloned(),
+                        });
+
+                        // Extract debug annotations for instant events
+                        for annotation in &event.debug_annotations {
+                            let key = if annotation.has_name() {
+                                annotation.name().to_string()
+                            } else {
+                                continue;
+                            };
+
+                            let (int_val, str_val, real_val) = if annotation.has_uint_value() {
+                                (Some(annotation.uint_value() as i64), None, None)
+                            } else if annotation.has_int_value() {
+                                (Some(annotation.int_value()), None, None)
+                            } else if annotation.has_string_value() {
+                                (None, Some(annotation.string_value().to_string()), None)
+                            } else if annotation.has_double_value() {
+                                (None, None, Some(annotation.double_value()))
+                            } else {
+                                continue;
+                            };
+
+                            self.data.instant_args.push(InstantArgRecord {
+                                instant_id,
+                                key,
+                                int_value: int_val,
+                                string_value: str_val,
+                                real_value: real_val,
+                            });
                         }
                     }
                 }
@@ -1191,6 +1268,25 @@ fn create_schema(conn: &Connection) -> Result<()> {
             real_value DOUBLE
         );
 
+        CREATE TABLE IF NOT EXISTS instant (
+            trace_id VARCHAR,
+            id BIGINT,
+            ts BIGINT,
+            track_id BIGINT,
+            utid BIGINT,
+            name VARCHAR,
+            category VARCHAR
+        );
+
+        CREATE TABLE IF NOT EXISTS instant_args (
+            trace_id VARCHAR,
+            instant_id BIGINT,
+            key VARCHAR,
+            int_value BIGINT,
+            string_value VARCHAR,
+            real_value DOUBLE
+        );
+
         -- Stack trace tables
 
         CREATE TABLE IF NOT EXISTS stack_profile_symbol (
@@ -1258,6 +1354,9 @@ struct ParquetPaths {
     slice: PathBuf,
     track: PathBuf,
     args: PathBuf,
+    // Instant events (packet events, etc.)
+    instant: PathBuf,
+    instant_args: PathBuf,
     // Stack trace tables
     symbol: PathBuf,
     stack_mapping: PathBuf,
@@ -1280,6 +1379,9 @@ impl ParquetPaths {
             slice: temp_dir.join(format!("{}_slice.parquet", trace_id)),
             track: temp_dir.join(format!("{}_track.parquet", trace_id)),
             args: temp_dir.join(format!("{}_args.parquet", trace_id)),
+            // Instant events (packet events, etc.)
+            instant: temp_dir.join(format!("{}_instant.parquet", trace_id)),
+            instant_args: temp_dir.join(format!("{}_instant_args.parquet", trace_id)),
             // Stack trace tables
             symbol: temp_dir.join(format!("{}_symbol.parquet", trace_id)),
             stack_mapping: temp_dir.join(format!("{}_stack_mapping.parquet", trace_id)),
@@ -1684,6 +1786,105 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
                 vec![
                     Arc::new(trace_id_builder.finish()),
                     Arc::new(slice_id_builder.finish()),
+                    Arc::new(key_builder.finish()),
+                    Arc::new(int_value_builder.finish()),
+                    Arc::new(string_value_builder.finish()),
+                    Arc::new(real_value_builder.finish()),
+                ],
+            )?;
+            writer.write(&batch)?;
+        }
+        writer.close()?;
+    }
+
+    // Instant events (packet events, etc.)
+    if !data.instants.is_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("track_id", DataType::Int64, false),
+            Field::new("utid", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, true),
+        ]));
+
+        let file = File::create(&paths.instant)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+
+        for chunk in data.instants.chunks(PARQUET_BATCH_SIZE) {
+            let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut id_builder = Int64Builder::with_capacity(chunk.len());
+            let mut ts_builder = Int64Builder::with_capacity(chunk.len());
+            let mut track_id_builder = Int64Builder::with_capacity(chunk.len());
+            let mut utid_builder = Int64Builder::with_capacity(chunk.len());
+            let mut name_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut category_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 16);
+
+            for instant in chunk {
+                trace_id_builder.append_value(trace_id);
+                id_builder.append_value(instant.id);
+                ts_builder.append_value(instant.ts);
+                track_id_builder.append_value(instant.track_id);
+                utid_builder.append_option(instant.utid);
+                name_builder.append_value(&instant.name);
+                category_builder.append_option(instant.category.as_deref());
+            }
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(trace_id_builder.finish()),
+                    Arc::new(id_builder.finish()),
+                    Arc::new(ts_builder.finish()),
+                    Arc::new(track_id_builder.finish()),
+                    Arc::new(utid_builder.finish()),
+                    Arc::new(name_builder.finish()),
+                    Arc::new(category_builder.finish()),
+                ],
+            )?;
+            writer.write(&batch)?;
+        }
+        writer.close()?;
+    }
+
+    // Instant args (debug annotations for instant events)
+    if !data.instant_args.is_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("instant_id", DataType::Int64, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("int_value", DataType::Int64, true),
+            Field::new("string_value", DataType::Utf8, true),
+            Field::new("real_value", DataType::Float64, true),
+        ]));
+
+        let file = File::create(&paths.instant_args)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+
+        for chunk in data.instant_args.chunks(PARQUET_BATCH_SIZE) {
+            let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut instant_id_builder = Int64Builder::with_capacity(chunk.len());
+            let mut key_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+            let mut int_value_builder = Int64Builder::with_capacity(chunk.len());
+            let mut string_value_builder =
+                StringBuilder::with_capacity(chunk.len(), chunk.len() * 64);
+            let mut real_value_builder = Float64Builder::with_capacity(chunk.len());
+
+            for arg in chunk {
+                trace_id_builder.append_value(trace_id);
+                instant_id_builder.append_value(arg.instant_id);
+                key_builder.append_value(&arg.key);
+                int_value_builder.append_option(arg.int_value);
+                string_value_builder.append_option(arg.string_value.as_deref());
+                real_value_builder.append_option(arg.real_value);
+            }
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(trace_id_builder.finish()),
+                    Arc::new(instant_id_builder.finish()),
                     Arc::new(key_builder.finish()),
                     Arc::new(int_value_builder.finish()),
                     Arc::new(string_value_builder.finish()),
@@ -2164,6 +2365,9 @@ fn run_convert(
     import_table("slice", |p| &p.slice)?;
     import_table("track", |p| &p.track)?;
     import_table("args", |p| &p.args)?;
+    // Instant events (packet events, etc.)
+    import_table("instant", |p| &p.instant)?;
+    import_table("instant_args", |p| &p.instant_args)?;
     // Stack trace tables
     import_table("stack_profile_symbol", |p| &p.symbol)?;
     import_table("stack_profile_mapping", |p| &p.stack_mapping)?;
@@ -2215,6 +2419,7 @@ fn process_trace_to_parquet(trace: &TraceInfo, paths: &ParquetPaths) -> Result<u
         + data.thread_states.len()
         + data.counters.len()
         + data.slices.len()
+        + data.instants.len()
         + data.perf_samples.len();
 
     write_data_to_parquet(&trace.trace_id, &data, paths)
