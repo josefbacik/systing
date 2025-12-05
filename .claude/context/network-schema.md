@@ -69,7 +69,7 @@ Packet-level events (point-in-time). These represent discrete points in the kern
 | category | VARCHAR | Event category (usually NULL) |
 
 **Packet Event Types:**
-- TCP: `TCP packet_enqueue`, `TCP packet_send`, `TCP packet_rcv_established`, `TCP packet_queue_rcv`, `TCP buffer_queue`
+- TCP: `TCP packet_enqueue`, `TCP packet_send`, `TCP packet_rcv_established`, `TCP packet_queue_rcv`, `TCP buffer_queue`, `TCP zero_window_probe`
 - UDP: `UDP send`, `UDP receive`, `UDP enqueue`
 
 ### `args`
@@ -115,6 +115,9 @@ Debug annotations for packet instant events. Multiple args can exist per instant
 | `sndbuf_used` | int | TCP TX packets | Current send buffer usage |
 | `sndbuf_limit` | int | TCP TX packets | Max send buffer size |
 | `is_retransmit` | int | TCP TX packets | 1 if this packet is a TCP retransmit (absent if not) |
+| `is_zero_window_probe` | int | TCP zero_window_probe | Always 1 for zero window probe events |
+| `probe_count` | int | TCP zero_window_probe | Number of probes sent (icsk_probes_out) |
+| `snd_wnd` | int | TCP zero_window_probe | Current send window (typically 0) |
 
 ### `network_interface`
 Local network interface metadata captured at trace start, organized by network namespace. This captures interfaces from:
@@ -328,6 +331,60 @@ ORDER BY i.ts
 LIMIT 100;
 ```
 
+### 11. Find All Zero Window Probe Events
+Find all zero window probe events, grouped by socket:
+```sql
+SELECT t.name as socket,
+       COUNT(*) as probe_count,
+       MIN(i.ts) / 1e9 as first_probe_sec,
+       MAX(i.ts) / 1e9 as last_probe_sec,
+       (MAX(i.ts) - MIN(i.ts)) / 1e9 as duration_sec
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+WHERE i.name = 'TCP zero_window_probe'
+GROUP BY t.name
+ORDER BY probe_count DESC;
+```
+
+### 12. Zero Window Probe Timeline
+Show zero window probe events with probe count progression:
+```sql
+SELECT i.ts / 1e9 as time_sec,
+       t.name as socket,
+       MAX(CASE WHEN a.key = 'probe_count' THEN a.int_value END) as probe_num,
+       MAX(CASE WHEN a.key = 'snd_wnd' THEN a.int_value END) as snd_wnd,
+       MAX(CASE WHEN a.key = 'seq' THEN a.int_value END) as seq
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE i.name = 'TCP zero_window_probe'
+GROUP BY i.id, i.ts, t.name
+ORDER BY i.ts;
+```
+
+### 13. Correlate Zero Window Probes with High Buffer Utilization
+Find sockets that have both zero window probes and high send buffer utilization:
+```sql
+WITH zwp_sockets AS (
+    SELECT DISTINCT t.name as socket, i.trace_id
+    FROM instant i
+    JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+    WHERE i.name = 'TCP zero_window_probe'
+),
+high_buffer AS (
+    SELECT t.name as socket, s.trace_id, AVG(a.int_value) as avg_fill_pct
+    FROM slice s
+    JOIN track t ON s.track_id = t.id AND s.trace_id = t.trace_id
+    JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id
+    WHERE a.key = 'sndbuf_fill_pct'
+    GROUP BY t.name, s.trace_id
+    HAVING avg_fill_pct > 80
+)
+SELECT z.socket, h.avg_fill_pct
+FROM zwp_sockets z
+JOIN high_buffer h ON z.socket = h.socket AND z.trace_id = h.trace_id;
+```
+
 ## Track Hierarchy
 
 Network tracks are organized hierarchically:
@@ -356,6 +413,7 @@ Network Packets (root)
     ├── TCP packet_rcv_established (instant)
     ├── TCP packet_queue_rcv (instant)
     ├── TCP buffer_queue (instant)
+    ├── TCP zero_window_probe (instant)
     ├── UDP send (instant)
     ├── UDP receive (instant)
     └── UDP enqueue (instant)

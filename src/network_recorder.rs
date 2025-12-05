@@ -116,6 +116,9 @@ struct PacketEvent {
     sndbuf_used: u32, // Bytes in send buffer (sk_wmem_queued) - shows buffer drain on ACK
     sndbuf_limit: u32, // Max send buffer size (sk_sndbuf)
     is_retransmit: bool, // True if this packet is a TCP retransmit
+    is_zero_window_probe: bool, // True if this is a zero window probe
+    probe_count: u8,  // Number of probes sent (icsk_probes_out)
+    snd_wnd: u32,     // Current send window (0 for zero window condition)
 }
 
 enum EventEntry {
@@ -129,6 +132,7 @@ enum EventEntry {
     UdpRcv(PacketEvent),
     UdpEnqueue(PacketEvent),
     SharedSend(PacketEvent),
+    TcpZeroWindowProbe(PacketEvent), // Zero window probe sent
 }
 
 #[derive(Default)]
@@ -216,6 +220,13 @@ impl ConnectionEvents {
     fn iter_shared_send_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::SharedSend(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    fn iter_zero_window_probes(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::TcpZeroWindowProbe(pkt) => Some(pkt),
             _ => None,
         })
     }
@@ -370,6 +381,9 @@ impl NetworkRecorder {
             sndbuf_used: event.sndbuf_used,
             sndbuf_limit: event.sndbuf_limit,
             is_retransmit: event.is_retransmit != 0,
+            is_zero_window_probe: event.is_zero_window_probe != 0,
+            probe_count: event.probe_count,
+            snd_wnd: event.snd_wnd,
         };
 
         // Buffer queue events go to per-thread syscall_events (app-relevant)
@@ -415,6 +429,12 @@ impl NetworkRecorder {
                 conn_events.events.push(EventEntry::UdpSend(pkt_event));
             } else if event.event_type.0 == packet_event_type::PACKET_UDP_RCV.0 {
                 conn_events.events.push(EventEntry::UdpRcv(pkt_event));
+            }
+            // Zero window probe events
+            else if event.event_type.0 == packet_event_type::PACKET_ZERO_WINDOW_PROBE.0 {
+                conn_events
+                    .events
+                    .push(EventEntry::TcpZeroWindowProbe(pkt_event));
             }
         }
     }
@@ -538,6 +558,24 @@ impl NetworkRecorder {
                 instant_event.debug_annotations.push(retransmit_annotation);
             }
 
+            // Add zero window probe annotations
+            if pkt.is_zero_window_probe {
+                let mut zwp_annotation = DebugAnnotation::default();
+                zwp_annotation.set_name("is_zero_window_probe".to_string());
+                zwp_annotation.set_uint_value(1);
+                instant_event.debug_annotations.push(zwp_annotation);
+
+                let mut probe_count_annotation = DebugAnnotation::default();
+                probe_count_annotation.set_name("probe_count".to_string());
+                probe_count_annotation.set_uint_value(pkt.probe_count as u64);
+                instant_event.debug_annotations.push(probe_count_annotation);
+
+                let mut snd_wnd_annotation = DebugAnnotation::default();
+                snd_wnd_annotation.set_name("snd_wnd".to_string());
+                snd_wnd_annotation.set_uint_value(pkt.snd_wnd as u64);
+                instant_event.debug_annotations.push(snd_wnd_annotation);
+            }
+
             let mut packet = TracePacket::default();
             packet.set_timestamp(pkt.ts);
             packet.set_track_event(instant_event);
@@ -632,12 +670,13 @@ impl NetworkRecorder {
             self.get_or_create_event_name_iid(event_name, id_counter);
         }
 
-        // Create IIDs for packet event types unconditionally (only 9 strings)
+        // Create IIDs for packet event types unconditionally (only 10 strings)
         self.get_or_create_event_name_iid("TCP packet_enqueue".to_string(), id_counter);
         self.get_or_create_event_name_iid("TCP packet_send".to_string(), id_counter);
         self.get_or_create_event_name_iid("TCP packet_rcv_established".to_string(), id_counter);
         self.get_or_create_event_name_iid("TCP packet_queue_rcv".to_string(), id_counter);
         self.get_or_create_event_name_iid("TCP buffer_queue".to_string(), id_counter);
+        self.get_or_create_event_name_iid("TCP zero_window_probe".to_string(), id_counter);
         self.get_or_create_event_name_iid("UDP send".to_string(), id_counter);
         self.get_or_create_event_name_iid("UDP packet_send".to_string(), id_counter);
         self.get_or_create_event_name_iid("UDP receive".to_string(), id_counter);
@@ -798,6 +837,19 @@ impl NetworkRecorder {
                             socket_track_uuid,
                             queue_rcv_iid,
                             &queue_rcv_pkts,
+                        );
+                    }
+
+                    // Zero window probe events
+                    let zwp_pkts: Vec<_> = events.iter_zero_window_probes().copied().collect();
+                    if !zwp_pkts.is_empty() {
+                        let zwp_iid = *self.event_name_ids.get("TCP zero_window_probe").unwrap();
+                        self.add_packet_instant_events(
+                            &mut packets,
+                            sequence_id,
+                            socket_track_uuid,
+                            zwp_iid,
+                            &zwp_pkts,
                         );
                     }
                 } else {
