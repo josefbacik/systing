@@ -2787,17 +2787,32 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 	return 0;
 }
 
-// Trace tcp_send_probe0 to capture zero window probe events
-// Zero window probes are sent when the peer advertises a zero receive window
-// and the sender has data waiting to be transmitted
-SEC("kprobe/tcp_send_probe0")
-int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
+// Trace tcp_probe tracepoint to capture zero window conditions
+// This fires when receiving packets and includes snd_wnd (peer's advertised window).
+// We emit events when snd_wnd is zero or very low, indicating the peer has no receive buffer space.
+SEC("tp_btf/tcp_probe")
+int BPF_PROG(tcp_probe_handler, struct sock *sk, struct sk_buff *skb)
 {
 	if (!sk)
 		return 0;
 
 	u64 tgidpid = get_socket_tgidpid(sk);
 	if (!tgidpid)
+		return 0;
+
+	// Read TCP socket state to check send window
+	struct tcp_sock *tp = (struct tcp_sock *)sk;
+	u32 snd_wnd;
+	bpf_probe_read_kernel(&snd_wnd, sizeof(snd_wnd), &tp->snd_wnd);
+
+	// Read send buffer limit to calculate threshold
+	int sndbuf = 0;
+	bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+
+	// Only emit event if send window is zero or very low (< 1/16 of sndbuf)
+	// This filters out the vast majority of normal packets
+	u32 low_window_threshold = sndbuf > 0 ? (u32)sndbuf >> 4 : 0;
+	if (snd_wnd > low_window_threshold)
 		return 0;
 
 	long flags;
@@ -2811,7 +2826,7 @@ int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 	event->protocol = NETWORK_TCP;
 	event->event_type = PACKET_ZERO_WINDOW_PROBE;
 	event->cpu = bpf_get_smp_processor_id();
-	event->is_zero_window_probe = 1;
+	event->is_zero_window_probe = (snd_wnd == 0) ? 1 : 0;
 	event->is_retransmit = 0;
 
 	// Extract socket address info
@@ -2835,22 +2850,17 @@ int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 			      &sk->__sk_common.skc_dport);
 	event->dest_port = __builtin_bswap16(event->dest_port);
 
-	// Read TCP-specific info from tcp_sock
-	struct tcp_sock *tp = (struct tcp_sock *)sk;
+	// Read TCP sequence info
 	u32 snd_una;
 	bpf_probe_read_kernel(&snd_una, sizeof(snd_una), &tp->snd_una);
-	event->seq = snd_una - 1;  // Probe uses SND.UNA - 1
-	event->length = 0;  // Zero-length probe
+	event->seq = snd_una;
+	event->length = 0;
 	event->tcp_flags = 0x10;  // ACK flag
 
-	// Read current send window (should be 0 for zero window condition)
-	u32 snd_wnd;
-	bpf_probe_read_kernel(&snd_wnd, sizeof(snd_wnd), &tp->snd_wnd);
+	// Store the send window value
 	event->snd_wnd = snd_wnd;
 
 	// Read zero window probe count from inet_connection_sock
-	// Note: icsk_probes_out is incremented AFTER tcp_send_probe0 returns,
-	// so this value may be off by 1 (showing N-1 instead of N probes)
 	struct inet_connection_sock *icsk = (struct inet_connection_sock *)sk;
 	u8 probes_out;
 	bpf_probe_read_kernel(&probes_out, sizeof(probes_out), &icsk->icsk_probes_out);
@@ -2858,10 +2868,7 @@ int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 
 	// Read send buffer state from socket
 	int wmem_queued = 0;
-	int sndbuf = 0;
 	bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
-	bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
-	// Validate values to prevent negative/garbage data
 	event->sndbuf_used = wmem_queued > 0 ? (u32)wmem_queued : 0;
 	event->sndbuf_limit = sndbuf > 0 ? (u32)sndbuf : 0;
 
