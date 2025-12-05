@@ -198,6 +198,7 @@ enum packet_event_type {
 	PACKET_UDP_ENQUEUE,     // UDP: __udp_enqueue_schedule_skb (socket buffer enqueue)
 	PACKET_ZERO_WINDOW_PROBE, // TCP: Zero window probe sent (tcp_send_probe0)
 	PACKET_ZERO_WINDOW_ACK,   // TCP: Receiver advertising zero/low window (tcp_send_ack)
+	PACKET_RTO_TIMEOUT,       // TCP: RTO timer fired (tcp_retransmit_timer)
 };
 
 struct packet_event {
@@ -227,6 +228,13 @@ struct packet_event {
 	u32 window_clamp;         // Maximum window (tp->window_clamp)
 	u8 rcv_wscale;            // Receive window scale factor
 	u8 _padding[3];           // Alignment padding
+	// RTO-specific fields (for PACKET_RTO_TIMEOUT)
+	u32 rto_jiffies;          // Current RTO value in kernel jiffies (convert in userspace using HZ)
+	u32 srtt_us;              // Smoothed RTT in microseconds (tp->srtt_us >> 3)
+	u32 rttvar_us;            // RTT variance in microseconds (tp->rttvar_us, not shifted)
+	u8 retransmit_count;      // Number of consecutive RTO timeouts (icsk_retransmits + 1, see note)
+	u8 backoff;               // Exponential backoff multiplier (icsk_backoff)
+	u8 _rto_padding[2];       // Alignment padding
 };
 
 /*
@@ -2976,6 +2984,135 @@ int BPF_KPROBE(tcp_send_ack_entry, struct sock *sk)
 	event->seq = rcv_nxt;
 	event->length = 0;  // Pure ACK
 	event->tcp_flags = 0x10;  // ACK flag
+
+	// Get socket ID for correlation
+	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Trace tcp_retransmit_timer to capture RTO timeout events
+// RTO (Retransmission Timeout) fires when the sender hasn't received an ACK
+// within the expected timeout period, indicating possible packet loss
+//
+// TIMING NOTE: This kprobe fires at ENTRY of tcp_retransmit_timer, meaning:
+// - icsk_retransmits has NOT been incremented yet (we add 1 to compensate)
+// - icsk_backoff has NOT been incremented yet (we report the current value)
+// - The actual retransmission has NOT been sent yet
+// - RTO value is the CURRENT RTO before potential exponential backoff
+//
+// EDGE CASE: If snd_wnd==0, this RTO may be handling a zero-window condition
+// rather than a true loss-based retransmit. We set is_zero_window_probe=1 in
+// this case to distinguish from regular RTOs.
+SEC("kprobe/tcp_retransmit_timer")
+int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
+{
+	if (!sk)
+		return 0;
+
+	u64 tgidpid = get_socket_tgidpid(sk);
+	if (!tgidpid)
+		return 0;
+
+	// Read TCP socket state to check if there are packets in flight
+	struct tcp_sock *tp = (struct tcp_sock *)sk;
+	u32 packets_out;
+	bpf_probe_read_kernel(&packets_out, sizeof(packets_out), &tp->packets_out);
+
+	// Only emit if there are actually packets waiting (avoid spurious events)
+	if (packets_out == 0)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->task.tgidpid = tgidpid;
+	__builtin_memset(event->task.comm, 0, TASK_COMM_LEN);
+	event->protocol = NETWORK_TCP;
+	event->event_type = PACKET_RTO_TIMEOUT;
+	event->cpu = bpf_get_smp_processor_id();
+	event->is_retransmit = 1;  // RTO triggers retransmission
+	event->is_zero_window_probe = 0;
+	event->is_zero_window_ack = 0;
+
+	// Extract socket address info
+	u16 family;
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	if (family == AF_INET) {
+		event->af = NETWORK_AF_INET;
+		u32 addr;
+		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
+		__builtin_memcpy(event->dest_addr, &addr, 4);
+	} else if (family == AF_INET6) {
+		event->af = NETWORK_AF_INET6;
+		bpf_probe_read_kernel(event->dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
+	} else {
+		// Unknown address family, discard event
+		bpf_ringbuf_discard(event, flags);
+		return 0;
+	}
+	bpf_probe_read_kernel(&event->dest_port, sizeof(event->dest_port),
+			      &sk->__sk_common.skc_dport);
+	event->dest_port = __builtin_bswap16(event->dest_port);
+
+	// Read TCP-specific info
+	u32 snd_una;
+	bpf_probe_read_kernel(&snd_una, sizeof(snd_una), &tp->snd_una);
+	event->seq = snd_una;  // Sequence number of first unacknowledged byte
+	event->length = 0;  // This is an RTO event, not a packet
+	event->tcp_flags = 0;  // RTO timeout event, no specific flags
+
+	// Read current send window
+	u32 snd_wnd;
+	bpf_probe_read_kernel(&snd_wnd, sizeof(snd_wnd), &tp->snd_wnd);
+	event->snd_wnd = snd_wnd;
+
+	// If snd_wnd is 0, this RTO is handling a zero-window condition
+	if (snd_wnd == 0) {
+		event->is_zero_window_probe = 1;
+	}
+
+	// Read RTO-related fields from inet_connection_sock
+	struct inet_connection_sock *icsk = (struct inet_connection_sock *)sk;
+	u32 icsk_rto;
+	u8 icsk_retransmits;
+	u8 icsk_backoff;
+	bpf_probe_read_kernel(&icsk_rto, sizeof(icsk_rto), &icsk->icsk_rto);
+	bpf_probe_read_kernel(&icsk_retransmits, sizeof(icsk_retransmits), &icsk->icsk_retransmits);
+	bpf_probe_read_kernel(&icsk_backoff, sizeof(icsk_backoff), &icsk->icsk_backoff);
+
+	// Store RTO as raw jiffies - conversion to microseconds happens in userspace
+	// where we can read the system's actual HZ value from /proc/sys/kernel/sched_clock_tick_rate
+	event->rto_jiffies = icsk_rto;
+
+	// Add 1 to retransmit_count because we fire BEFORE the kernel increments it
+	// (tcp_retransmit_timer increments icsk_retransmits after our probe fires)
+	event->retransmit_count = icsk_retransmits + 1;
+
+	// backoff is not incremented until later in the function, so report current value
+	event->backoff = icsk_backoff;
+
+	// Read RTT measurements from tcp_sock
+	u32 srtt_us;
+	u32 rttvar_us;
+	bpf_probe_read_kernel(&srtt_us, sizeof(srtt_us), &tp->srtt_us);
+	bpf_probe_read_kernel(&rttvar_us, sizeof(rttvar_us), &tp->rttvar_us);
+	// srtt_us is stored shifted by 3 bits
+	event->srtt_us = srtt_us >> 3;
+	event->rttvar_us = rttvar_us;
+
+	// Read send buffer state from socket
+	int wmem_queued = 0;
+	int sndbuf = 0;
+	bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+	bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+	event->sndbuf_used = wmem_queued > 0 ? (u32)wmem_queued : 0;
+	event->sndbuf_limit = sndbuf > 0 ? (u32)sndbuf : 0;
 
 	// Get socket ID for correlation
 	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);

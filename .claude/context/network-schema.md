@@ -70,7 +70,7 @@ Packet-level events (point-in-time). These represent discrete points in the kern
 | category | VARCHAR | Event category (usually NULL) |
 
 **Packet Event Types:**
-- TCP: `TCP packet_enqueue`, `TCP packet_send`, `TCP packet_rcv_established`, `TCP packet_queue_rcv`, `TCP buffer_queue`, `TCP zero_window_probe`
+- TCP: `TCP packet_enqueue`, `TCP packet_send`, `TCP packet_rcv_established`, `TCP packet_queue_rcv`, `TCP buffer_queue`, `TCP zero_window_probe`, `TCP zero_window_ack`, `TCP rto_timeout`
 - UDP: `UDP send`, `UDP receive`, `UDP enqueue`
 
 ### `args`
@@ -120,9 +120,19 @@ Debug annotations for packet instant events. Multiple args can exist per instant
 | `sndbuf_used` | int | TCP TX packets | Current send buffer usage |
 | `sndbuf_limit` | int | TCP TX packets | Max send buffer size |
 | `is_retransmit` | int | `packet_enqueue` only | 1 if TCP retransmit (see note below) |
-| `is_zero_window_probe` | int | TCP zero_window_probe | Always 1 for zero window probe events |
+| `is_zero_window_probe` | int | TCP zero_window_probe, TCP rto_timeout | 1 for zero window probe events (also set on RTO if snd_wnd=0) |
 | `probe_count` | int | TCP zero_window_probe | Number of probes sent (icsk_probes_out) |
-| `snd_wnd` | int | TCP zero_window_probe | Current send window (typically 0) |
+| `snd_wnd` | int | TCP zero_window_probe, TCP rto_timeout | Current send window (0 for zero window condition) |
+| `rto_jiffies` | int | TCP rto_timeout | RTO value in kernel jiffies (raw kernel value) |
+| `rto_us` | int | TCP rto_timeout | RTO value in microseconds (converted using system HZ) |
+| `rto_ms` | int | TCP rto_timeout | RTO value in milliseconds (for easier reading) |
+| `srtt_us` | int | TCP rto_timeout | Smoothed RTT in microseconds |
+| `srtt_ms` | int | TCP rto_timeout | Smoothed RTT in milliseconds |
+| `rttvar_us` | int | TCP rto_timeout | RTT variance in microseconds |
+| `retransmit_count` | int | TCP rto_timeout | Number of consecutive RTO timeouts (1 = first timeout) |
+| `backoff` | int | TCP rto_timeout | Exponential backoff multiplier (0, 1, 2, 3, ...) |
+
+**Note on RTO Timeout Events:** RTO (Retransmission Timeout) events fire when the TCP retransmit timer expires because an ACK wasn't received in time. The `retransmit_count` shows how many consecutive RTOs have occurred (1 = first timeout). The `backoff` shows the exponential backoff multiplier applied to the RTO. If `snd_wnd=0`, the RTO is handling a zero-window condition rather than packet loss, and `is_zero_window_probe` will be set to 1.
 
 **Note on Retransmit Detection:** The `is_retransmit` field is only available on `TCP packet_enqueue` events, NOT on `TCP packet_send` events. This is because the retransmit flag (`TCPCB_RETRANS`) is read from the kernel's `tcp_skb_cb` control block, which is only accessible at the TCP layer probe point (`__tcp_transmit_skb`), not at the device layer (`net_dev_start_xmit`).
 
@@ -485,6 +495,108 @@ HAVING MAX(a_avail.int_value) > 0
 ORDER BY avg_unconsumed_bytes DESC;
 ```
 
+### 16. Find All RTO Timeout Events
+Find all RTO timeout events, grouped by socket with timing statistics:
+```sql
+SELECT t.name as socket,
+       COUNT(*) as rto_count,
+       MIN(i.ts) / 1e9 as first_rto_sec,
+       MAX(i.ts) / 1e9 as last_rto_sec,
+       (MAX(i.ts) - MIN(i.ts)) / 1e9 as duration_sec,
+       AVG(CASE WHEN a.key = 'rto_ms' THEN a.int_value END) as avg_rto_ms,
+       MAX(CASE WHEN a.key = 'retransmit_count' THEN a.int_value END) as max_retransmits
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE i.name = 'TCP rto_timeout'
+GROUP BY t.name
+ORDER BY rto_count DESC;
+```
+
+### 17. RTO Timeout Timeline with RTT Information
+Show RTO timeout events with RTO and RTT values to analyze retransmission behavior:
+```sql
+SELECT i.ts / 1e9 as time_sec,
+       t.name as socket,
+       MAX(CASE WHEN a.key = 'rto_ms' THEN a.int_value END) as rto_ms,
+       MAX(CASE WHEN a.key = 'srtt_ms' THEN a.int_value END) as srtt_ms,
+       MAX(CASE WHEN a.key = 'rttvar_us' THEN a.int_value END) / 1000.0 as rttvar_ms,
+       MAX(CASE WHEN a.key = 'retransmit_count' THEN a.int_value END) as retransmit_count,
+       MAX(CASE WHEN a.key = 'backoff' THEN a.int_value END) as backoff,
+       MAX(CASE WHEN a.key = 'snd_wnd' THEN a.int_value END) as snd_wnd
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE i.name = 'TCP rto_timeout'
+GROUP BY i.id, i.ts, t.name
+ORDER BY i.ts;
+```
+
+### 18. Correlate RTO Timeouts with Retransmitted Packets
+Find sockets with both RTO timeouts and packet retransmissions to understand the full retransmit picture:
+```sql
+WITH rto_sockets AS (
+    SELECT DISTINCT t.name as socket, i.trace_id,
+           COUNT(*) as rto_count
+    FROM instant i
+    JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+    WHERE i.name = 'TCP rto_timeout'
+    GROUP BY t.name, i.trace_id
+),
+retransmit_sockets AS (
+    SELECT t.name as socket, i.trace_id,
+           COUNT(*) as retransmit_count
+    FROM instant i
+    JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+    JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+        AND a.key = 'is_retransmit' AND a.int_value = 1
+    WHERE i.name LIKE 'TCP packet%'
+    GROUP BY t.name, i.trace_id
+)
+SELECT COALESCE(r.socket, rt.socket) as socket,
+       COALESCE(r.rto_count, 0) as rto_timeouts,
+       COALESCE(rt.retransmit_count, 0) as retransmit_packets
+FROM rto_sockets r
+FULL OUTER JOIN retransmit_sockets rt
+    ON r.socket = rt.socket AND r.trace_id = rt.trace_id
+ORDER BY COALESCE(r.rto_count, 0) + COALESCE(rt.retransmit_count, 0) DESC;
+```
+
+### 19. Identify RTO Events During Zero Window Conditions
+Find RTO timeouts that occurred during zero window conditions (when the receiver's window was exhausted):
+```sql
+SELECT t.name as socket,
+       i.ts / 1e9 as time_sec,
+       MAX(CASE WHEN a.key = 'rto_ms' THEN a.int_value END) as rto_ms,
+       MAX(CASE WHEN a.key = 'snd_wnd' THEN a.int_value END) as snd_wnd,
+       MAX(CASE WHEN a.key = 'is_zero_window_probe' THEN a.int_value END) as is_zwp,
+       MAX(CASE WHEN a.key = 'retransmit_count' THEN a.int_value END) as retransmit_count
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE i.name = 'TCP rto_timeout'
+GROUP BY i.id, i.ts, t.name
+HAVING MAX(CASE WHEN a.key = 'snd_wnd' THEN a.int_value END) = 0
+ORDER BY i.ts;
+```
+
+### 20. Analyze RTO Exponential Backoff
+Track how RTO values increase with exponential backoff during persistent failures:
+```sql
+SELECT t.name as socket,
+       MAX(CASE WHEN a.key = 'retransmit_count' THEN a.int_value END) as attempt,
+       MAX(CASE WHEN a.key = 'backoff' THEN a.int_value END) as backoff,
+       MAX(CASE WHEN a.key = 'rto_ms' THEN a.int_value END) as rto_ms,
+       MAX(CASE WHEN a.key = 'srtt_ms' THEN a.int_value END) as base_srtt_ms
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE i.name = 'TCP rto_timeout'
+GROUP BY i.id, t.name
+ORDER BY t.name,
+         MAX(CASE WHEN a.key = 'retransmit_count' THEN a.int_value END);
+```
+
 ## Track Hierarchy
 
 Network tracks are organized hierarchically:
@@ -514,6 +626,8 @@ Network Packets (root)
     ├── TCP packet_queue_rcv (instant)
     ├── TCP buffer_queue (instant)
     ├── TCP zero_window_probe (instant)
+    ├── TCP zero_window_ack (instant)
+    ├── TCP rto_timeout (instant)
     ├── UDP send (instant)
     ├── UDP receive (instant)
     └── UDP enqueue (instant)
