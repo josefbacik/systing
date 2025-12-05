@@ -465,6 +465,10 @@ struct TraceExtractor {
     network_namespace_tracks: HashMap<u64, String>,
     /// Interface tracks: uuid -> (namespace_name, interface_name)
     network_interface_tracks: HashMap<u64, (String, String)>,
+
+    /// Open slices per track: track_uuid -> stack of slice indices in self.data.slices
+    /// Used to match TYPE_SLICE_BEGIN with TYPE_SLICE_END and compute duration
+    open_slices: HashMap<u64, Vec<usize>>,
 }
 
 impl TraceExtractor {
@@ -506,6 +510,7 @@ impl TraceExtractor {
             network_interfaces_root_uuid: None,
             network_namespace_tracks: HashMap::new(),
             network_interface_tracks: HashMap::new(),
+            open_slices: HashMap::new(),
         }
     }
 
@@ -830,6 +835,7 @@ impl TraceExtractor {
                     if let Type::TYPE_SLICE_BEGIN = event.type_() {
                         // Assign slice ID before pushing
                         let slice_id = self.data.slices.len() as i64;
+                        let slice_index = self.data.slices.len();
 
                         // Try inline name first, then interned name via name_iid
                         let name = if event.has_name() {
@@ -854,6 +860,12 @@ impl TraceExtractor {
                             category: event.categories.first().cloned(),
                             depth: 0,
                         });
+
+                        // Track this open slice so we can match it with TYPE_SLICE_END
+                        self.open_slices
+                            .entry(track_uuid)
+                            .or_default()
+                            .push(slice_index);
 
                         // Extract debug annotations
                         for annotation in &event.debug_annotations {
@@ -883,6 +895,21 @@ impl TraceExtractor {
                                 real_value: real_val,
                             });
                         }
+                    }
+
+                    // Handle TYPE_SLICE_END events - match with begin and compute duration
+                    if let Type::TYPE_SLICE_END = event.type_() {
+                        if let Some(slice_stack) = self.open_slices.get_mut(&track_uuid) {
+                            if let Some(slice_index) = slice_stack.pop() {
+                                // Compute duration from begin timestamp to end timestamp
+                                // Note: If end timestamp < begin timestamp (malformed trace),
+                                // this will produce a negative duration which can be detected in analysis
+                                let begin_ts = self.data.slices[slice_index].ts;
+                                self.data.slices[slice_index].dur = ts - begin_ts;
+                            }
+                            // If stack is empty, this is an END without a matching BEGIN - silently ignore
+                        }
+                        // If track_uuid not found in open_slices, this is an END without a matching BEGIN - silently ignore
                     }
 
                     // Handle TYPE_INSTANT events (includes packet events and network interface metadata)
@@ -3077,6 +3104,277 @@ mod tests {
                 .find(|c| c.frame_id == frame_id as i64)
                 .unwrap();
             assert_eq!(callsite.depth, i as i32);
+        }
+    }
+
+    #[test]
+    fn test_slice_duration_from_begin_end_events() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create a track descriptor
+        let mut track_desc_packet = TracePacket::default();
+        let mut track_desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+        track_desc.set_uuid(55555);
+        track_desc.set_name("network_track".to_string());
+        track_desc_packet.set_track_descriptor(track_desc);
+        extractor.process_packet(&track_desc_packet);
+
+        // Create TYPE_SLICE_BEGIN event at timestamp 1000
+        let mut begin_packet = TracePacket::default();
+        begin_packet.set_timestamp(1000);
+
+        let mut begin_event = TrackEvent::default();
+        begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+        begin_event.set_track_uuid(55555);
+        begin_event.set_name("tcp_send".to_string());
+
+        begin_packet.set_track_event(begin_event);
+        extractor.process_packet(&begin_packet);
+
+        // Verify slice was created with dur=0 (not yet ended)
+        assert_eq!(extractor.data.slices.len(), 1);
+        assert_eq!(extractor.data.slices[0].name, "tcp_send");
+        assert_eq!(extractor.data.slices[0].ts, 1000);
+        assert_eq!(extractor.data.slices[0].dur, 0);
+
+        // Create TYPE_SLICE_END event at timestamp 5000
+        let mut end_packet = TracePacket::default();
+        end_packet.set_timestamp(5000);
+
+        let mut end_event = TrackEvent::default();
+        end_event.set_type(Type::TYPE_SLICE_END);
+        end_event.set_track_uuid(55555);
+
+        end_packet.set_track_event(end_event);
+        extractor.process_packet(&end_packet);
+
+        // Verify duration was computed: 5000 - 1000 = 4000
+        assert_eq!(extractor.data.slices.len(), 1);
+        assert_eq!(extractor.data.slices[0].dur, 4000);
+    }
+
+    #[test]
+    fn test_nested_slices_duration() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create a track descriptor
+        let mut track_desc_packet = TracePacket::default();
+        let mut track_desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+        track_desc.set_uuid(66666);
+        track_desc.set_name("nested_track".to_string());
+        track_desc_packet.set_track_descriptor(track_desc);
+        extractor.process_packet(&track_desc_packet);
+
+        // Begin outer slice at t=1000
+        let mut outer_begin = TracePacket::default();
+        outer_begin.set_timestamp(1000);
+        let mut outer_begin_event = TrackEvent::default();
+        outer_begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+        outer_begin_event.set_track_uuid(66666);
+        outer_begin_event.set_name("outer".to_string());
+        outer_begin.set_track_event(outer_begin_event);
+        extractor.process_packet(&outer_begin);
+
+        // Begin inner slice at t=2000
+        let mut inner_begin = TracePacket::default();
+        inner_begin.set_timestamp(2000);
+        let mut inner_begin_event = TrackEvent::default();
+        inner_begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+        inner_begin_event.set_track_uuid(66666);
+        inner_begin_event.set_name("inner".to_string());
+        inner_begin.set_track_event(inner_begin_event);
+        extractor.process_packet(&inner_begin);
+
+        // End inner slice at t=3000
+        let mut inner_end = TracePacket::default();
+        inner_end.set_timestamp(3000);
+        let mut inner_end_event = TrackEvent::default();
+        inner_end_event.set_type(Type::TYPE_SLICE_END);
+        inner_end_event.set_track_uuid(66666);
+        inner_end.set_track_event(inner_end_event);
+        extractor.process_packet(&inner_end);
+
+        // End outer slice at t=5000
+        let mut outer_end = TracePacket::default();
+        outer_end.set_timestamp(5000);
+        let mut outer_end_event = TrackEvent::default();
+        outer_end_event.set_type(Type::TYPE_SLICE_END);
+        outer_end_event.set_track_uuid(66666);
+        outer_end.set_track_event(outer_end_event);
+        extractor.process_packet(&outer_end);
+
+        // Verify both slices have correct durations
+        assert_eq!(extractor.data.slices.len(), 2);
+
+        // Outer slice: 5000 - 1000 = 4000
+        assert_eq!(extractor.data.slices[0].name, "outer");
+        assert_eq!(extractor.data.slices[0].dur, 4000);
+
+        // Inner slice: 3000 - 2000 = 1000
+        assert_eq!(extractor.data.slices[1].name, "inner");
+        assert_eq!(extractor.data.slices[1].dur, 1000);
+    }
+
+    #[test]
+    fn test_slice_end_without_begin() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create a track descriptor
+        let mut track_desc_packet = TracePacket::default();
+        let mut track_desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+        track_desc.set_uuid(77777);
+        track_desc.set_name("test_track".to_string());
+        track_desc_packet.set_track_descriptor(track_desc);
+        extractor.process_packet(&track_desc_packet);
+
+        // Send TYPE_SLICE_END without a corresponding BEGIN
+        let mut end_packet = TracePacket::default();
+        end_packet.set_timestamp(5000);
+        let mut end_event = TrackEvent::default();
+        end_event.set_type(Type::TYPE_SLICE_END);
+        end_event.set_track_uuid(77777);
+        end_packet.set_track_event(end_event);
+        extractor.process_packet(&end_packet);
+
+        // Should not create any slices or crash
+        assert_eq!(extractor.data.slices.len(), 0);
+    }
+
+    #[test]
+    fn test_unclosed_slice_keeps_zero_duration() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create a track descriptor
+        let mut track_desc_packet = TracePacket::default();
+        let mut track_desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+        track_desc.set_uuid(88888);
+        track_desc.set_name("unclosed_track".to_string());
+        track_desc_packet.set_track_descriptor(track_desc);
+        extractor.process_packet(&track_desc_packet);
+
+        // Create TYPE_SLICE_BEGIN but never send TYPE_SLICE_END
+        let mut begin_packet = TracePacket::default();
+        begin_packet.set_timestamp(1000);
+        let mut begin_event = TrackEvent::default();
+        begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+        begin_event.set_track_uuid(88888);
+        begin_event.set_name("unclosed_slice".to_string());
+        begin_packet.set_track_event(begin_event);
+        extractor.process_packet(&begin_packet);
+
+        // Verify slice exists with dur=0 (never closed)
+        assert_eq!(extractor.data.slices.len(), 1);
+        assert_eq!(extractor.data.slices[0].name, "unclosed_slice");
+        assert_eq!(extractor.data.slices[0].ts, 1000);
+        assert_eq!(extractor.data.slices[0].dur, 0);
+    }
+
+    #[test]
+    fn test_multiple_tracks_independent() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create two track descriptors
+        let mut track1_desc_packet = TracePacket::default();
+        let mut track1_desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+        track1_desc.set_uuid(11111);
+        track1_desc.set_name("track1".to_string());
+        track1_desc_packet.set_track_descriptor(track1_desc);
+        extractor.process_packet(&track1_desc_packet);
+
+        let mut track2_desc_packet = TracePacket::default();
+        let mut track2_desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+        track2_desc.set_uuid(22222);
+        track2_desc.set_name("track2".to_string());
+        track2_desc_packet.set_track_descriptor(track2_desc);
+        extractor.process_packet(&track2_desc_packet);
+
+        // Begin slice on track1
+        let mut track1_begin = TracePacket::default();
+        track1_begin.set_timestamp(1000);
+        let mut track1_begin_event = TrackEvent::default();
+        track1_begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+        track1_begin_event.set_track_uuid(11111);
+        track1_begin_event.set_name("slice1".to_string());
+        track1_begin.set_track_event(track1_begin_event);
+        extractor.process_packet(&track1_begin);
+
+        // Begin slice on track2
+        let mut track2_begin = TracePacket::default();
+        track2_begin.set_timestamp(2000);
+        let mut track2_begin_event = TrackEvent::default();
+        track2_begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+        track2_begin_event.set_track_uuid(22222);
+        track2_begin_event.set_name("slice2".to_string());
+        track2_begin.set_track_event(track2_begin_event);
+        extractor.process_packet(&track2_begin);
+
+        // End slice on track2
+        let mut track2_end = TracePacket::default();
+        track2_end.set_timestamp(3000);
+        let mut track2_end_event = TrackEvent::default();
+        track2_end_event.set_type(Type::TYPE_SLICE_END);
+        track2_end_event.set_track_uuid(22222);
+        track2_end.set_track_event(track2_end_event);
+        extractor.process_packet(&track2_end);
+
+        // End slice on track1
+        let mut track1_end = TracePacket::default();
+        track1_end.set_timestamp(4000);
+        let mut track1_end_event = TrackEvent::default();
+        track1_end_event.set_type(Type::TYPE_SLICE_END);
+        track1_end_event.set_track_uuid(11111);
+        track1_end.set_track_event(track1_end_event);
+        extractor.process_packet(&track1_end);
+
+        // Verify both slices have correct durations
+        assert_eq!(extractor.data.slices.len(), 2);
+        assert_eq!(extractor.data.slices[0].name, "slice1");
+        assert_eq!(extractor.data.slices[0].dur, 3000); // 4000 - 1000
+        assert_eq!(extractor.data.slices[1].name, "slice2");
+        assert_eq!(extractor.data.slices[1].dur, 1000); // 3000 - 2000
+    }
+
+    #[test]
+    fn test_deeply_nested_slices() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create a track descriptor
+        let mut track_desc_packet = TracePacket::default();
+        let mut track_desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+        track_desc.set_uuid(99999);
+        track_desc.set_name("deep_track".to_string());
+        track_desc_packet.set_track_descriptor(track_desc);
+        extractor.process_packet(&track_desc_packet);
+
+        // Begin 5 nested slices
+        for i in 0..5 {
+            let mut begin = TracePacket::default();
+            begin.set_timestamp(1000 + (i * 100));
+            let mut begin_event = TrackEvent::default();
+            begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+            begin_event.set_track_uuid(99999);
+            begin_event.set_name(format!("level_{}", i));
+            begin.set_track_event(begin_event);
+            extractor.process_packet(&begin);
+        }
+
+        // End all 5 slices in LIFO order
+        for i in (0..5).rev() {
+            let mut end = TracePacket::default();
+            end.set_timestamp(2000 + ((4 - i) * 100));
+            let mut end_event = TrackEvent::default();
+            end_event.set_type(Type::TYPE_SLICE_END);
+            end_event.set_track_uuid(99999);
+            end.set_track_event(end_event);
+            extractor.process_packet(&end);
+        }
+
+        // Verify all slices have correct durations
+        assert_eq!(extractor.data.slices.len(), 5);
+        for i in 0..5 {
+            assert_eq!(extractor.data.slices[i].name, format!("level_{}", i));
+            let expected_dur = 1000 + ((4 - i) * 100) - (i * 100);
+            assert_eq!(extractor.data.slices[i].dur, expected_dur as i64);
         }
     }
 }
