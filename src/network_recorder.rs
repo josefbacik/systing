@@ -103,8 +103,11 @@ struct NetworkEvent {
     end_ts: u64,
     bytes: u32,
     sendmsg_seq: u32,
-    sndbuf_used: u32,  // Bytes in send buffer after sendmsg (sk_wmem_queued)
-    sndbuf_limit: u32, // Max send buffer size (sk_sndbuf)
+    sndbuf_used: u32,      // Bytes in send buffer after sendmsg (sk_wmem_queued)
+    sndbuf_limit: u32,     // Max send buffer size (sk_sndbuf)
+    recv_seq_start: u32,   // TCP copied_seq at recvmsg entry (TCP recv only)
+    recv_seq_end: u32,     // TCP copied_seq at recvmsg exit (TCP recv only)
+    rcv_nxt_at_entry: u32, // TCP rcv_nxt at entry - kernel's next expected seq (TCP recv only)
 }
 
 #[derive(Clone, Copy)]
@@ -603,6 +606,37 @@ impl NetworkRecorder {
         debug_annotation.set_name("bytes".to_string());
         debug_annotation.set_uint_value(event.bytes as u64);
         begin_event.debug_annotations.push(debug_annotation);
+
+        // Add TCP receive sequence annotations (for tcp_recv only, when fields are non-zero)
+        if event.recv_seq_start > 0 || event.recv_seq_end > 0 {
+            let mut seq_start_annotation = DebugAnnotation::default();
+            seq_start_annotation.set_name("recv_seq_start".to_string());
+            seq_start_annotation.set_uint_value(event.recv_seq_start as u64);
+            begin_event.debug_annotations.push(seq_start_annotation);
+
+            let mut seq_end_annotation = DebugAnnotation::default();
+            seq_end_annotation.set_name("recv_seq_end".to_string());
+            seq_end_annotation.set_uint_value(event.recv_seq_end as u64);
+            begin_event.debug_annotations.push(seq_end_annotation);
+
+            if event.rcv_nxt_at_entry > 0 {
+                let mut rcv_nxt_annotation = DebugAnnotation::default();
+                rcv_nxt_annotation.set_name("rcv_nxt".to_string());
+                rcv_nxt_annotation.set_uint_value(event.rcv_nxt_at_entry as u64);
+                begin_event.debug_annotations.push(rcv_nxt_annotation);
+
+                // Calculate and add bytes_available (data buffered in kernel)
+                // Use wrapping subtraction to handle TCP sequence number wraparound
+                let bytes_available = event.rcv_nxt_at_entry.wrapping_sub(event.recv_seq_start);
+                // Only emit if reasonable (< 64MB, as larger values likely indicate wraparound issues)
+                if bytes_available > 0 && bytes_available < 64 * 1024 * 1024 {
+                    let mut available_annotation = DebugAnnotation::default();
+                    available_annotation.set_name("bytes_available".to_string());
+                    available_annotation.set_uint_value(bytes_available as u64);
+                    begin_event.debug_annotations.push(available_annotation);
+                }
+            }
+        }
 
         let mut begin_packet = TracePacket::default();
         begin_packet.set_timestamp(event.start_ts);
@@ -1153,6 +1187,9 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
             sendmsg_seq: event.sendmsg_seq,
             sndbuf_used: event.sndbuf_used,
             sndbuf_limit: event.sndbuf_limit,
+            recv_seq_start: event.recv_seq_start,
+            recv_seq_end: event.recv_seq_end,
+            rcv_nxt_at_entry: event.rcv_nxt_at_entry,
         };
 
         // Route to per-thread syscall_events by tgidpid then socket_id

@@ -92,6 +92,10 @@ Debug annotations for syscall slice events. Multiple args can exist per slice.
 | `sndbuf_used` | int | tcp_send | Current send buffer usage (sk_wmem_queued) |
 | `sndbuf_limit` | int | tcp_send | Max send buffer size (sk_sndbuf) |
 | `sndbuf_fill_pct` | int | tcp_send | Buffer fill percentage (used/limit * 100) |
+| `recv_seq_start` | int | tcp_recv | App's read position at recvmsg() entry (copied_seq) |
+| `recv_seq_end` | int | tcp_recv | App's read position after recvmsg() (start + bytes) |
+| `rcv_nxt` | int | tcp_recv | Kernel's next expected sequence at entry |
+| `bytes_available` | int | tcp_recv | Data buffered in kernel (rcv_nxt - recv_seq_start) |
 
 ### `instant_args`
 Debug annotations for packet instant events. Multiple args can exist per instant.
@@ -114,10 +118,12 @@ Debug annotations for packet instant events. Multiple args can exist per instant
 | `flags` | string | TCP packets | TCP flags (e.g., "SYN\|ACK") |
 | `sndbuf_used` | int | TCP TX packets | Current send buffer usage |
 | `sndbuf_limit` | int | TCP TX packets | Max send buffer size |
-| `is_retransmit` | int | TCP TX packets | 1 if this packet is a TCP retransmit (absent if not) |
+| `is_retransmit` | int | `packet_enqueue` only | 1 if TCP retransmit (see note below) |
 | `is_zero_window_probe` | int | TCP zero_window_probe | Always 1 for zero window probe events |
 | `probe_count` | int | TCP zero_window_probe | Number of probes sent (icsk_probes_out) |
 | `snd_wnd` | int | TCP zero_window_probe | Current send window (typically 0) |
+
+**Note on Retransmit Detection:** The `is_retransmit` field is only available on `TCP packet_enqueue` events, NOT on `TCP packet_send` events. This is because the retransmit flag (`TCPCB_RETRANS`) is read from the kernel's `tcp_skb_cb` control block, which is only accessible at the TCP layer probe point (`__tcp_transmit_skb`), not at the device layer (`net_dev_start_xmit`).
 
 ### `network_interface`
 Local network interface metadata captured at trace start, organized by network namespace. This captures interfaces from:
@@ -385,6 +391,45 @@ FROM zwp_sockets z
 JOIN high_buffer h ON z.socket = h.socket AND z.trace_id = h.trace_id;
 ```
 
+### 14. TCP Recv Sequence Tracking
+Show tcp_recv events with sequence progression to analyze receive buffering:
+```sql
+SELECT s.ts/1e9 as time_sec,
+       s.dur/1e6 as duration_ms,
+       t.name as socket,
+       MAX(CASE WHEN a.key = 'bytes' THEN a.int_value END) as bytes_read,
+       MAX(CASE WHEN a.key = 'recv_seq_start' THEN a.int_value END) as seq_start,
+       MAX(CASE WHEN a.key = 'recv_seq_end' THEN a.int_value END) as seq_end,
+       MAX(CASE WHEN a.key = 'rcv_nxt' THEN a.int_value END) as rcv_nxt,
+       MAX(CASE WHEN a.key = 'bytes_available' THEN a.int_value END) as buffered_bytes
+FROM slice s
+JOIN track t ON s.track_id = t.id AND s.trace_id = t.trace_id
+LEFT JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id
+WHERE s.name = 'tcp_recv'
+GROUP BY s.id, s.ts, s.dur, t.name
+ORDER BY s.ts;
+```
+
+### 15. Identify Receive Bottlenecks
+Find sockets where the kernel had more data buffered than the app consumed:
+```sql
+SELECT t.name as socket,
+       COUNT(*) as recv_calls,
+       AVG(CASE WHEN a_avail.int_value > a_bytes.int_value
+           THEN a_avail.int_value - a_bytes.int_value ELSE 0 END) as avg_unconsumed_bytes,
+       MAX(a_avail.int_value) as max_bytes_available
+FROM slice s
+JOIN track t ON s.track_id = t.id AND s.trace_id = t.trace_id
+LEFT JOIN args a_bytes ON s.id = a_bytes.slice_id AND s.trace_id = a_bytes.trace_id
+    AND a_bytes.key = 'bytes'
+LEFT JOIN args a_avail ON s.id = a_avail.slice_id AND s.trace_id = a_avail.trace_id
+    AND a_avail.key = 'bytes_available'
+WHERE s.name = 'tcp_recv'
+GROUP BY t.id, t.name
+HAVING MAX(a_avail.int_value) > 0
+ORDER BY avg_unconsumed_bytes DESC;
+```
+
 ## Track Hierarchy
 
 Network tracks are organized hierarchically:
@@ -438,6 +483,16 @@ Thread (from PID/TGID track descriptor)
 - `sndbuf_fill_pct`: Percentage of buffer used (can exceed 100% temporarily)
 
 High `sndbuf_fill_pct` values indicate potential backpressure - the application is sending faster than the network can transmit.
+
+### Receive Buffer Metrics (tcp_recv)
+- `recv_seq_start`: Application's read position at recvmsg() entry (from `tcp_sock->copied_seq`)
+- `recv_seq_end`: Application's read position after recvmsg() (`recv_seq_start + bytes`)
+- `rcv_nxt`: Kernel's next expected sequence at entry (from `tcp_sock->rcv_nxt`)
+- `bytes_available`: Data buffered in kernel (`rcv_nxt - recv_seq_start`)
+
+High `bytes_available` values indicate the application is reading slower than data is arriving. If `bytes_available` consistently exceeds `bytes` read, the receive buffer is building up.
+
+**Note:** `bytes_available` uses wrapping arithmetic to handle TCP sequence number wraparound and is only emitted when < 64MB.
 
 ### TCP Flags Format
 TCP flags are stored as pipe-separated strings: `SYN|ACK`, `FIN|ACK`, `PSH|ACK`, etc.
