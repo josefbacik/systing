@@ -197,6 +197,7 @@ enum packet_event_type {
 	PACKET_UDP_RCV,         // UDP: udp_queue_rcv_one_skb (UDP receive processing)
 	PACKET_UDP_ENQUEUE,     // UDP: __udp_enqueue_schedule_skb (socket buffer enqueue)
 	PACKET_ZERO_WINDOW_PROBE, // TCP: Zero window probe sent (tcp_send_probe0)
+	PACKET_ZERO_WINDOW_ACK,   // TCP: Receiver advertising zero/low window (tcp_send_ack)
 };
 
 struct packet_event {
@@ -215,10 +216,17 @@ struct packet_event {
 	u32 sndbuf_limit;  // Max send buffer size (sk_sndbuf)
 	u64 socket_id;     // Unique socket ID for correlation with network events
 	u8 is_retransmit;  // 1 if this packet is a TCP retransmit, 0 otherwise
-	u8 is_zero_window_probe;  // 1 if this is a zero window probe
+	u8 is_zero_window_probe;  // 1 if this is a zero window probe (sender-side)
 	u8 probe_count;           // Number of probes sent (icsk_probes_out)
-	u8 _padding;              // Alignment padding
+	u8 is_zero_window_ack;    // 1 if this is a zero window ACK (receiver-side)
 	u32 snd_wnd;              // Current send window (0 for zero window condition)
+	// Receiver-side fields (for PACKET_ZERO_WINDOW_ACK)
+	u32 rcv_wnd;              // Receiver's current advertised window
+	u32 rcv_buf_used;         // Receive buffer bytes used (sk_rmem_alloc)
+	u32 rcv_buf_limit;        // Receive buffer limit (sk_rcvbuf)
+	u32 window_clamp;         // Maximum window (tp->window_clamp)
+	u8 rcv_wscale;            // Receive window scale factor
+	u8 _padding[3];           // Alignment padding
 };
 
 /*
@@ -2898,6 +2906,125 @@ int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 	// Validate values to prevent negative/garbage data
 	event->sndbuf_used = wmem_queued > 0 ? (u32)wmem_queued : 0;
 	event->sndbuf_limit = sndbuf > 0 ? (u32)sndbuf : 0;
+
+	// Get socket ID for correlation
+	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Trace tcp_send_ack to capture receiver-side zero/low window ACK events
+// This fires when the receiver sends an ACK, which includes the advertised window.
+// We only emit events when the receive window is zero or very low (< 1/16 of buffer).
+SEC("kprobe/tcp_send_ack")
+int BPF_KPROBE(tcp_send_ack_entry, struct sock *sk)
+{
+	if (!sk)
+		return 0;
+
+	// Filter by tracked process
+	u64 sk_ptr = (u64)sk;
+	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
+	if (!tgidpid_ptr)
+		return 0;
+
+	u64 tgidpid = *tgidpid_ptr;
+	u32 tgid = tgidpid >> 32;
+	if (tgid == 0 || tgid == tool_config.my_tgid)
+		return 0;
+
+	// Read TCP socket state
+	struct tcp_sock *tp = (struct tcp_sock *)sk;
+
+	// Read receive window from socket (unscaled value in TCP header)
+	u32 rcv_wnd;
+	bpf_probe_read_kernel(&rcv_wnd, sizeof(rcv_wnd), &tp->rcv_wnd);
+
+	// Read window scale from rx_opt to calculate actual window size
+	// (rcv_wscale is a bit-field, so read the whole struct)
+	struct tcp_options_received rx_opt;
+	bpf_probe_read_kernel(&rx_opt, sizeof(rx_opt), &tp->rx_opt);
+	u8 rcv_wscale = rx_opt.rcv_wscale;
+
+	// Calculate actual window size accounting for scaling
+	// rcv_wnd is the unscaled value; actual window = rcv_wnd << rcv_wscale
+	u32 rcv_wnd_scaled = rcv_wnd << rcv_wscale;
+
+	// Read receive buffer state
+	int rmem_alloc = 0;
+	int rcvbuf = 0;
+	bpf_probe_read_kernel(&rmem_alloc, sizeof(rmem_alloc), &sk->sk_backlog.rmem_alloc.counter);
+	bpf_probe_read_kernel(&rcvbuf, sizeof(rcvbuf), &sk->sk_rcvbuf);
+
+	// Determine threshold for "low window" (e.g., < 1/16 of buffer)
+	u32 low_window_threshold = rcvbuf > 0 ? (u32)rcvbuf >> 4 : 0;
+
+	// Only emit event if scaled window is zero or very low
+	// This filters out the vast majority of normal ACKs
+	if (rcv_wnd_scaled > low_window_threshold)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->task.tgidpid = tgidpid;
+	__builtin_memset(event->task.comm, 0, TASK_COMM_LEN);
+	event->protocol = NETWORK_TCP;
+	event->event_type = PACKET_ZERO_WINDOW_ACK;
+	event->cpu = bpf_get_smp_processor_id();
+	event->is_zero_window_ack = (rcv_wnd == 0) ? 1 : 0;
+	event->is_zero_window_probe = 0;
+	event->is_retransmit = 0;
+	// Sender-side fields not applicable for receiver events
+	event->sndbuf_used = 0;
+	event->sndbuf_limit = 0;
+	event->snd_wnd = 0;
+	event->probe_count = 0;
+
+	// Extract socket address info (peer address - who we're sending the ACK to)
+	u16 family;
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	if (family == AF_INET) {
+		event->af = NETWORK_AF_INET;
+		u32 addr;
+		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
+		__builtin_memcpy(event->dest_addr, &addr, 4);
+	} else if (family == AF_INET6) {
+		event->af = NETWORK_AF_INET6;
+		bpf_probe_read_kernel(event->dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
+	} else {
+		// Unknown address family, discard event
+		bpf_ringbuf_discard(event, flags);
+		return 0;
+	}
+	bpf_probe_read_kernel(&event->dest_port, sizeof(event->dest_port),
+			      &sk->__sk_common.skc_dport);
+	event->dest_port = __builtin_bswap16(event->dest_port);
+
+	// Receiver-side metrics
+	event->rcv_wnd = rcv_wnd;
+	event->rcv_buf_used = rmem_alloc > 0 ? (u32)rmem_alloc : 0;
+	event->rcv_buf_limit = rcvbuf > 0 ? (u32)rcvbuf : 0;
+
+	// Read window clamp
+	u32 window_clamp;
+	bpf_probe_read_kernel(&window_clamp, sizeof(window_clamp), &tp->window_clamp);
+	event->window_clamp = window_clamp;
+
+	// Use rcv_wscale read earlier (before threshold check)
+	event->rcv_wscale = rcv_wscale;
+
+	// Read rcv_nxt as the sequence being ACKed
+	u32 rcv_nxt;
+	bpf_probe_read_kernel(&rcv_nxt, sizeof(rcv_nxt), &tp->rcv_nxt);
+	event->seq = rcv_nxt;
+	event->length = 0;  // Pure ACK
+	event->tcp_flags = 0x10;  // ACK flag
 
 	// Get socket ID for correlation
 	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);

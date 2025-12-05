@@ -119,9 +119,16 @@ struct PacketEvent {
     sndbuf_used: u32, // Bytes in send buffer (sk_wmem_queued) - shows buffer drain on ACK
     sndbuf_limit: u32, // Max send buffer size (sk_sndbuf)
     is_retransmit: bool, // True if this packet is a TCP retransmit
-    is_zero_window_probe: bool, // True if this is a zero window probe
+    is_zero_window_probe: bool, // True if this is a zero window probe (sender-side)
+    is_zero_window_ack: bool, // True if this is a zero window ACK (receiver-side)
     probe_count: u8,  // Number of probes sent (icsk_probes_out)
     snd_wnd: u32,     // Current send window (0 for zero window condition)
+    // Receiver-side fields (populated only for PACKET_ZERO_WINDOW_ACK events)
+    rcv_wnd: u32,       // Receiver's current advertised window (unscaled)
+    rcv_buf_used: u32,  // Receive buffer bytes used (sk_backlog.rmem_alloc)
+    rcv_buf_limit: u32, // Receive buffer limit (sk_rcvbuf)
+    window_clamp: u32,  // Maximum window (tp->window_clamp)
+    rcv_wscale: u8,     // Receive window scale (actual window = rcv_wnd << rcv_wscale)
 }
 
 enum EventEntry {
@@ -135,7 +142,8 @@ enum EventEntry {
     UdpRcv(PacketEvent),
     UdpEnqueue(PacketEvent),
     SharedSend(PacketEvent),
-    TcpZeroWindowProbe(PacketEvent), // Zero window probe sent
+    TcpZeroWindowProbe(PacketEvent), // Zero window probe sent (sender-side)
+    TcpZeroWindowAck(PacketEvent),   // Zero window ACK sent (receiver-side)
 }
 
 #[derive(Default)]
@@ -230,6 +238,13 @@ impl ConnectionEvents {
     fn iter_zero_window_probes(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::TcpZeroWindowProbe(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    fn iter_zero_window_acks(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::TcpZeroWindowAck(pkt) => Some(pkt),
             _ => None,
         })
     }
@@ -385,8 +400,14 @@ impl NetworkRecorder {
             sndbuf_limit: event.sndbuf_limit,
             is_retransmit: event.is_retransmit != 0,
             is_zero_window_probe: event.is_zero_window_probe != 0,
+            is_zero_window_ack: event.is_zero_window_ack != 0,
             probe_count: event.probe_count,
             snd_wnd: event.snd_wnd,
+            rcv_wnd: event.rcv_wnd,
+            rcv_buf_used: event.rcv_buf_used,
+            rcv_buf_limit: event.rcv_buf_limit,
+            window_clamp: event.window_clamp,
+            rcv_wscale: event.rcv_wscale,
         };
 
         // Buffer queue events go to per-thread syscall_events (app-relevant)
@@ -433,11 +454,17 @@ impl NetworkRecorder {
             } else if event.event_type.0 == packet_event_type::PACKET_UDP_RCV.0 {
                 conn_events.events.push(EventEntry::UdpRcv(pkt_event));
             }
-            // Zero window probe events
+            // Zero window probe events (sender-side)
             else if event.event_type.0 == packet_event_type::PACKET_ZERO_WINDOW_PROBE.0 {
                 conn_events
                     .events
                     .push(EventEntry::TcpZeroWindowProbe(pkt_event));
+            }
+            // Zero window ACK events (receiver-side)
+            else if event.event_type.0 == packet_event_type::PACKET_ZERO_WINDOW_ACK.0 {
+                conn_events
+                    .events
+                    .push(EventEntry::TcpZeroWindowAck(pkt_event));
             }
         }
     }
@@ -561,7 +588,7 @@ impl NetworkRecorder {
                 instant_event.debug_annotations.push(retransmit_annotation);
             }
 
-            // Add zero window probe annotations
+            // Add zero window probe annotations (sender-side)
             if pkt.is_zero_window_probe {
                 let mut zwp_annotation = DebugAnnotation::default();
                 zwp_annotation.set_name("is_zero_window_probe".to_string());
@@ -577,6 +604,54 @@ impl NetworkRecorder {
                 snd_wnd_annotation.set_name("snd_wnd".to_string());
                 snd_wnd_annotation.set_uint_value(pkt.snd_wnd as u64);
                 instant_event.debug_annotations.push(snd_wnd_annotation);
+            }
+
+            // Add zero window ACK annotations (receiver-side)
+            if pkt.is_zero_window_ack {
+                let mut zwa_annotation = DebugAnnotation::default();
+                zwa_annotation.set_name("is_zero_window_ack".to_string());
+                zwa_annotation.set_uint_value(1);
+                instant_event.debug_annotations.push(zwa_annotation);
+
+                let mut rcv_wnd_annotation = DebugAnnotation::default();
+                rcv_wnd_annotation.set_name("rcv_wnd".to_string());
+                rcv_wnd_annotation.set_uint_value(pkt.rcv_wnd as u64);
+                instant_event.debug_annotations.push(rcv_wnd_annotation);
+
+                let mut rcv_buf_used_annotation = DebugAnnotation::default();
+                rcv_buf_used_annotation.set_name("rcv_buf_used".to_string());
+                rcv_buf_used_annotation.set_uint_value(pkt.rcv_buf_used as u64);
+                instant_event
+                    .debug_annotations
+                    .push(rcv_buf_used_annotation);
+
+                let mut rcv_buf_limit_annotation = DebugAnnotation::default();
+                rcv_buf_limit_annotation.set_name("rcv_buf_limit".to_string());
+                rcv_buf_limit_annotation.set_uint_value(pkt.rcv_buf_limit as u64);
+                instant_event
+                    .debug_annotations
+                    .push(rcv_buf_limit_annotation);
+
+                // Calculate and emit buffer fill percentage
+                if pkt.rcv_buf_limit > 0 {
+                    let fill_pct = (pkt.rcv_buf_used as u64 * 100) / pkt.rcv_buf_limit as u64;
+                    let mut fill_annotation = DebugAnnotation::default();
+                    fill_annotation.set_name("rcv_buf_fill_pct".to_string());
+                    fill_annotation.set_uint_value(fill_pct);
+                    instant_event.debug_annotations.push(fill_annotation);
+                }
+
+                let mut window_clamp_annotation = DebugAnnotation::default();
+                window_clamp_annotation.set_name("window_clamp".to_string());
+                window_clamp_annotation.set_uint_value(pkt.window_clamp as u64);
+                instant_event
+                    .debug_annotations
+                    .push(window_clamp_annotation);
+
+                let mut rcv_wscale_annotation = DebugAnnotation::default();
+                rcv_wscale_annotation.set_name("rcv_wscale".to_string());
+                rcv_wscale_annotation.set_uint_value(pkt.rcv_wscale as u64);
+                instant_event.debug_annotations.push(rcv_wscale_annotation);
             }
 
             let mut packet = TracePacket::default();
@@ -711,6 +786,7 @@ impl NetworkRecorder {
         self.get_or_create_event_name_iid("TCP packet_queue_rcv".to_string(), id_counter);
         self.get_or_create_event_name_iid("TCP buffer_queue".to_string(), id_counter);
         self.get_or_create_event_name_iid("TCP zero_window_probe".to_string(), id_counter);
+        self.get_or_create_event_name_iid("TCP zero_window_ack".to_string(), id_counter);
         self.get_or_create_event_name_iid("UDP send".to_string(), id_counter);
         self.get_or_create_event_name_iid("UDP packet_send".to_string(), id_counter);
         self.get_or_create_event_name_iid("UDP receive".to_string(), id_counter);
@@ -874,7 +950,7 @@ impl NetworkRecorder {
                         );
                     }
 
-                    // Zero window probe events
+                    // Zero window probe events (sender-side)
                     let zwp_pkts: Vec<_> = events.iter_zero_window_probes().copied().collect();
                     if !zwp_pkts.is_empty() {
                         let zwp_iid = *self.event_name_ids.get("TCP zero_window_probe").unwrap();
@@ -884,6 +960,19 @@ impl NetworkRecorder {
                             socket_track_uuid,
                             zwp_iid,
                             &zwp_pkts,
+                        );
+                    }
+
+                    // Zero window ACK events (receiver-side)
+                    let zwa_pkts: Vec<_> = events.iter_zero_window_acks().copied().collect();
+                    if !zwa_pkts.is_empty() {
+                        let zwa_iid = *self.event_name_ids.get("TCP zero_window_ack").unwrap();
+                        self.add_packet_instant_events(
+                            &mut packets,
+                            sequence_id,
+                            socket_track_uuid,
+                            zwa_iid,
+                            &zwa_pkts,
                         );
                     }
                 } else {
