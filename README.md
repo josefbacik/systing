@@ -58,10 +58,16 @@ sudo ./target/debug/systing --list-recorders
 This will display all available recorders and their default states:
 - `sched` - Scheduler event tracing (on by default)
 - `syscalls` - Syscall tracing
-- `sleep-stacks` - Sleep stack traces (on by default)
+- `sleep-stacks` - Sleep stack traces for all sleep states (on by default)
+- `interruptible-stacks` - Interruptible sleep stack traces (on by default, requires sleep-stacks)
 - `cpu-stacks` - CPU perf stack traces (on by default)
 - `network` - Network traffic recording (TCP/UDP send/receive and packet-level latency)
 - `pystacks` - Python stack tracing (requires pystacks feature)
+
+Note: `sleep-stacks` acts as a master switch for all sleep stack collection. When enabled,
+both uninterruptible (D state) and interruptible (S state) sleep stacks are collected by
+default. Use `--no-interruptible-stack-traces` or disable the `interruptible-stacks`
+recorder to collect only uninterruptible sleep stacks.
 
 #### Add Specific Recorders
 

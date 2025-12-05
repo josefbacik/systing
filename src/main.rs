@@ -162,6 +162,11 @@ fn get_available_recorders() -> Vec<RecorderInfo> {
             default_enabled: true,
         },
         RecorderInfo {
+            name: "interruptible-stacks",
+            description: "Interruptible sleep stack traces",
+            default_enabled: true,
+        },
+        RecorderInfo {
             name: "cpu-stacks",
             description: "CPU perf stack traces",
             default_enabled: true,
@@ -204,6 +209,7 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
         "syscalls" => opts.syscalls = enable,
         "sched" => opts.no_sched = !enable,
         "sleep-stacks" => opts.no_sleep_stack_traces = !enable,
+        "interruptible-stacks" => opts.no_interruptible_stack_traces = !enable,
         "cpu-stacks" => opts.no_cpu_stack_traces = !enable,
         "network" => opts.network = enable,
         #[cfg(feature = "pystacks")]
@@ -221,6 +227,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         opts.no_sched = true;
         opts.syscalls = false;
         opts.no_sleep_stack_traces = true;
+        opts.no_interruptible_stack_traces = true;
         opts.no_cpu_stack_traces = true;
         opts.network = false;
         #[cfg(feature = "pystacks")]
@@ -276,6 +283,8 @@ struct Command {
     no_cpu_stack_traces: bool,
     #[arg(long)]
     no_sleep_stack_traces: bool,
+    #[arg(long)]
+    no_interruptible_stack_traces: bool,
     #[arg(long)]
     trace_event_config: Vec<String>,
     #[arg(long, default_value = "0")]
@@ -1110,6 +1119,8 @@ fn configure_bpf_skeleton(
         rodata.tool_config.my_ino = my_ino;
         rodata.tool_config.no_cpu_stack_traces = opts.no_cpu_stack_traces as u32;
         rodata.tool_config.no_sleep_stack_traces = opts.no_sleep_stack_traces as u32;
+        rodata.tool_config.no_interruptible_stack_traces =
+            opts.no_interruptible_stack_traces as u32;
         rodata.tool_config.confidentiality_mode = detect_confidentiality_mode();
         if !opts.cgroup.is_empty() {
             rodata.tool_config.filter_cgroup = 1;

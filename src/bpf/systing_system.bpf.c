@@ -49,6 +49,7 @@ const volatile struct {
 	u32 no_stack_traces;
 	u32 no_cpu_stack_traces;
 	u32 no_sleep_stack_traces;
+	u32 no_interruptible_stack_traces;
 	u32 num_perf_counters;
 	u32 num_cpus;
 	u32 my_tgid;
@@ -1074,9 +1075,19 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 	event->prev_prio = prev->prio;
 	bpf_ringbuf_submit(event, flags);
 
-	/* Record the blocked stack trace. */
-	if (!tool_config.no_sleep_stack_traces && prev->__state & TASK_UNINTERRUPTIBLE)
-		emit_stack_event(ctx, prev, STACK_SLEEP);
+	/*
+	 * Record the blocked stack trace for sleep states.
+	 * TASK_INTERRUPTIBLE and TASK_UNINTERRUPTIBLE are mutually exclusive.
+	 * sleep-stacks controls all sleep stacks; interruptible-stacks adds
+	 * additional control for interruptible sleep specifically.
+	 */
+	if (!tool_config.no_sleep_stack_traces) {
+		if (prev->__state & TASK_UNINTERRUPTIBLE)
+			emit_stack_event(ctx, prev, STACK_SLEEP);
+		else if (!tool_config.no_interruptible_stack_traces &&
+			 prev->__state & TASK_INTERRUPTIBLE)
+			emit_stack_event(ctx, prev, STACK_SLEEP);
+	}
 	return 0;
 }
 
