@@ -353,6 +353,40 @@ struct {
 	__uint(max_entries, 10240);
 } sk_to_tgidpid SEC(".maps");
 
+// Helper to get tgidpid for a socket, with fallback for timer/softirq context.
+// Returns 0 if the socket should be filtered out (matches our tool).
+// Otherwise returns the tgidpid to use for the event.
+static __always_inline u64 get_socket_tgidpid(struct sock *sk)
+{
+	u64 sk_ptr = (u64)sk;
+	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
+
+	if (tgidpid_ptr) {
+		u64 tgidpid = *tgidpid_ptr;
+		u32 tgid = tgidpid >> 32;
+		// Filter out our own tool's sockets
+		if (tgid == tool_config.my_tgid)
+			return 0;
+		return tgidpid;
+	}
+
+	// Socket not in map - try current task context
+	// This handles cases where we're called from application context
+	// but the socket wasn't previously tracked (e.g., first recv on a socket)
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	u32 tgid = tgidpid >> 32;
+
+	// Filter out our own tool's sockets
+	if (tgid == tool_config.my_tgid)
+		return 0;
+
+	// Only add to map if we have a valid user process context
+	// Don't pollute map with tgid=0 (kernel/idle context)
+	if (tgid != 0)
+		bpf_map_update_elem(&sk_to_tgidpid, &sk_ptr, &tgidpid, BPF_ANY);
+
+	return tgidpid;
+}
 
 // Socket identity key - identifies a unique socket+destination pair
 struct socket_identity_key {
@@ -2055,20 +2089,8 @@ int BPF_KPROBE(udp_send_skb_entry, struct sk_buff *skb, struct flowi4 *fl4, stru
 	if (!sk)
 		return 0;
 
-	u64 sk_ptr = (u64)sk;
-	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
-
-	u64 tgidpid;
-	if (tgidpid_ptr) {
-		tgidpid = *tgidpid_ptr;
-	} else {
-		// Socket not yet tracked - use current task (may be kernel thread)
-		tgidpid = bpf_get_current_pid_tgid();
-		bpf_map_update_elem(&sk_to_tgidpid, &sk_ptr, &tgidpid, BPF_ANY);
-	}
-
-	u32 tgid = tgidpid >> 32;
-	if (tgid == 0 || tgid == tool_config.my_tgid)
+	u64 tgidpid = get_socket_tgidpid(sk);
+	if (!tgidpid)
 		return 0;
 
 	long flags;
@@ -2130,15 +2152,8 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 	if (!sk || !skb)
 		return 0;
 
-	// Get tgidpid from socket
-	u64 sk_ptr = (u64)sk;
-	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
-	if (!tgidpid_ptr)
-		return 0;
-
-	u64 tgidpid = *tgidpid_ptr;
-	u32 tgid = tgidpid >> 32;
-	if (tgid == 0 || tgid == tool_config.my_tgid)
+	u64 tgidpid = get_socket_tgidpid(sk);
+	if (!tgidpid)
 		return 0;
 
 	// Extract headers from skb
@@ -2203,15 +2218,8 @@ int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *
 	if (!sk || !skb)
 		return 0;
 
-	// Get tgidpid from socket (we're in softirq context)
-	u64 sk_ptr = (u64)sk;
-	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
-	if (!tgidpid_ptr)
-		return 0;
-
-	u64 tgidpid = *tgidpid_ptr;
-	u32 tgid = tgidpid >> 32;
-	if (tgid == 0 || tgid == tool_config.my_tgid)
+	u64 tgidpid = get_socket_tgidpid(sk);
+	if (!tgidpid)
 		return 0;
 
 	// Extract headers from skb
@@ -2276,21 +2284,8 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	if (!sk || !skb)
 		return 0;
 
-	u64 sk_ptr = (u64)sk;
-	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
-
-	u64 tgidpid;
-	if (tgidpid_ptr) {
-		tgidpid = *tgidpid_ptr;
-	} else {
-		// Socket not yet tracked - use current task (may be kernel thread)
-		tgidpid = bpf_get_current_pid_tgid();
-		bpf_map_update_elem(&sk_to_tgidpid, &sk_ptr, &tgidpid, BPF_ANY);
-	}
-
-	// Filter based on tgidpid from socket (may differ from current task due to TSQ/softirq)
-	u32 tgid = tgidpid >> 32;
-	if (tgid == 0 || tgid == tool_config.my_tgid)
+	u64 tgidpid = get_socket_tgidpid(sk);
+	if (!tgidpid)
 		return 0;
 
 	long flags;
@@ -2499,14 +2494,8 @@ int BPF_PROG(net_dev_start_xmit, struct sk_buff *skb, struct net_device *dev)
 	if (!sk)
 		return 0;
 
-	u64 sk_ptr = (u64)sk;
-	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
-	if (!tgidpid_ptr)
-		return 0;
-
-	u64 tgidpid = *tgidpid_ptr;
-	u32 tgid = tgidpid >> 32;
-	if (tgid == 0 || tgid == tool_config.my_tgid)
+	u64 tgidpid = get_socket_tgidpid(sk);
+	if (!tgidpid)
 		return 0;
 
 	// Check protocol type from socket
@@ -2585,14 +2574,8 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 	if (!sk || !skb)
 		return 0;
 
-	u64 sk_ptr = (u64)sk;
-	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
-	if (!tgidpid_ptr)
-		return 0;
-
-	u64 tgidpid = *tgidpid_ptr;
-	u32 tgid = tgidpid >> 32;
-	if (tgid == 0 || tgid == tool_config.my_tgid)
+	u64 tgidpid = get_socket_tgidpid(sk);
+	if (!tgidpid)
 		return 0;
 
 	long flags;
@@ -2644,14 +2627,8 @@ int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *
 	if (!sk || !skb)
 		return 0;
 
-	u64 sk_ptr = (u64)sk;
-	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
-	if (!tgidpid_ptr)
-		return 0;
-
-	u64 tgidpid = *tgidpid_ptr;
-	u32 tgid = tgidpid >> 32;
-	if (tgid == 0 || tgid == tool_config.my_tgid)
+	u64 tgidpid = get_socket_tgidpid(sk);
+	if (!tgidpid)
 		return 0;
 
 	long flags;
@@ -2705,14 +2682,8 @@ int BPF_KPROBE(tcp_data_queue_entry, struct sock *sk, struct sk_buff *skb)
 	if (!sk || !skb)
 		return 0;
 
-	u64 sk_ptr = (u64)sk;
-	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
-	if (!tgidpid_ptr)
-		return 0;
-
-	u64 tgidpid = *tgidpid_ptr;
-	u32 tgid = tgidpid >> 32;
-	if (tgid == 0 || tgid == tool_config.my_tgid)
+	u64 tgidpid = get_socket_tgidpid(sk);
+	if (!tgidpid)
 		return 0;
 
 	long flags;
@@ -2775,14 +2746,8 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 	if (!sk)
 		return 0;
 
-	u64 sk_ptr = (u64)sk;
-	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
-	if (!tgidpid_ptr)
-		return 0;
-
-	u64 tgidpid = *tgidpid_ptr;
-	u32 tgid = tgidpid >> 32;
-	if (tgid == 0 || tgid == tool_config.my_tgid)
+	u64 tgidpid = get_socket_tgidpid(sk);
+	if (!tgidpid)
 		return 0;
 
 	long flags;
@@ -2831,15 +2796,8 @@ int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 	if (!sk)
 		return 0;
 
-	// Filter by tracked process
-	u64 sk_ptr = (u64)sk;
-	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
-	if (!tgidpid_ptr)
-		return 0;
-
-	u64 tgidpid = *tgidpid_ptr;
-	u32 tgid = tgidpid >> 32;
-	if (tgid == 0 || tgid == tool_config.my_tgid)
+	u64 tgidpid = get_socket_tgidpid(sk);
+	if (!tgidpid)
 		return 0;
 
 	long flags;
@@ -2923,15 +2881,8 @@ int BPF_KPROBE(tcp_send_ack_entry, struct sock *sk)
 	if (!sk)
 		return 0;
 
-	// Filter by tracked process
-	u64 sk_ptr = (u64)sk;
-	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
-	if (!tgidpid_ptr)
-		return 0;
-
-	u64 tgidpid = *tgidpid_ptr;
-	u32 tgid = tgidpid >> 32;
-	if (tgid == 0 || tgid == tool_config.my_tgid)
+	u64 tgidpid = get_socket_tgidpid(sk);
+	if (!tgidpid)
 		return 0;
 
 	// Read TCP socket state
