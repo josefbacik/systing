@@ -182,6 +182,9 @@ struct network_event {
 	u32 sndbuf_used;   // Bytes in send buffer after sendmsg (sk_wmem_queued)
 	u32 sndbuf_limit;  // Max send buffer size (sk_sndbuf)
 	u64 socket_id;     // Unique socket ID for correlation with packet events
+	u32 recv_seq_start;    // TCP copied_seq at recvmsg entry (TCP recv only)
+	u32 recv_seq_end;      // TCP copied_seq at recvmsg exit (TCP recv only)
+	u32 rcv_nxt_at_entry;  // TCP rcv_nxt at entry - kernel's next expected seq (TCP recv only)
 };
 
 enum packet_event_type {
@@ -316,6 +319,8 @@ struct network_recv_info {
 	u64 start_ts;
 	u64 sk_ptr;       // Socket pointer for buffer queue latency tracking
 	u64 socket_id;    // Unique socket ID for correlation
+	u32 recv_seq_start;    // TCP copied_seq at recvmsg entry (app read position)
+	u32 rcv_nxt_at_entry;  // TCP rcv_nxt at entry (kernel's next expected seq)
 };
 
 struct {
@@ -1741,6 +1746,11 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 	// Copy socket_id for correlation
 	event->socket_id = info->socket_id;
 
+	// Zero recv sequence fields for SEND events (these are TCP recv only)
+	event->recv_seq_start = 0;
+	event->recv_seq_end = 0;
+	event->rcv_nxt_at_entry = 0;
+
 	bpf_ringbuf_submit(event, flags);
 	bpf_map_delete_elem(&pending_network_sends, &tgidpid);
 
@@ -1806,6 +1816,15 @@ static int handle_tcp_recvmsg_entry(struct sock *sk, struct msghdr *msg)
 			info.socket_id = get_or_create_socket_id(sk, NETWORK_TCP, info.af,
 								  info.peer_addr, info.peer_port, tgidpid);
 		}
+
+		// Capture TCP receive sequence info at entry
+		struct tcp_sock *tp = (struct tcp_sock *)sk;
+		u32 copied_seq = 0;
+		u32 rcv_nxt = 0;
+		bpf_probe_read_kernel(&copied_seq, sizeof(copied_seq), &tp->copied_seq);
+		bpf_probe_read_kernel(&rcv_nxt, sizeof(rcv_nxt), &tp->rcv_nxt);
+		info.recv_seq_start = copied_seq;
+		info.rcv_nxt_at_entry = rcv_nxt;
 	}
 
 	bpf_map_update_elem(&pending_network_recvs, &tgidpid, &info, BPF_ANY);
@@ -1861,6 +1880,19 @@ static int handle_recvmsg_exit(void *ctx, int ret)
 
 	// Copy socket_id for correlation
 	event->socket_id = info->socket_id;
+
+	// Copy TCP receive sequence tracking fields (TCP only)
+	if (info->protocol == NETWORK_TCP) {
+		event->recv_seq_start = info->recv_seq_start;
+		event->rcv_nxt_at_entry = info->rcv_nxt_at_entry;
+		// Calculate end sequence: start + bytes consumed
+		event->recv_seq_end = info->recv_seq_start + (u32)ret;
+	} else {
+		// Zero recv sequence fields for non-TCP (UDP) events
+		event->recv_seq_start = 0;
+		event->recv_seq_end = 0;
+		event->rcv_nxt_at_entry = 0;
+	}
 
 	bpf_ringbuf_submit(event, flags);
 	bpf_map_delete_elem(&pending_network_recvs, &tgidpid);
