@@ -4,13 +4,14 @@ This document describes how network events are stored in DuckDB after conversion
 
 ## Overview
 
-Network events are tracked through six related tables:
+Network events are tracked through seven related tables:
 - **`track`** - Track metadata including socket connection info
 - **`slice`** - Network syscall events (tcp_send, tcp_recv, udp_send) - range-based with duration
 - **`args`** - Debug annotations for slice events (bytes, buffer info)
 - **`instant`** - Packet-level events (packet_enqueue, packet_send, etc.) - point-in-time events
 - **`instant_args`** - Debug annotations for instant events (seq numbers, length, flags)
 - **`network_interface`** - Local network interface metadata (for cross-trace correlation)
+- **`clock_snapshot`** - Clock correlation data for timestamp conversion between clock domains
 
 **Note:** Syscall events (tcp_send, tcp_recv, etc.) are range-based slices with duration because they represent the time a thread spends in a syscall. Packet events are instant events because they represent discrete points in the kernel packet processing pipeline.
 
@@ -160,6 +161,60 @@ trace_a  | container:def456 (redis)        | eth0           | 172.17.0.3     | i
 ```
 
 **Note:** Network namespace deduplication is based on the namespace inode. Multiple processes sharing the same network namespace will only have their interfaces enumerated once.
+
+### `clock_snapshot`
+Clock snapshot data for correlating timestamps between different clock domains. Each trace typically has one clock snapshot at the start, containing simultaneous readings from multiple clock sources.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| trace_id | VARCHAR | Trace identifier |
+| clock_id | INTEGER | Clock type ID (see table below) |
+| clock_name | VARCHAR | Human-readable clock name |
+| timestamp_ns | BIGINT | Timestamp in nanoseconds for this clock |
+| is_primary | BOOLEAN | True if this is the primary trace clock |
+
+**Clock Types:**
+
+| ID | Name | Description |
+|----|------|-------------|
+| 0 | UNKNOWN | Unknown clock type |
+| 1 | REALTIME | Wall clock time (can jump due to NTP) |
+| 2 | REALTIME_COARSE | Coarse-grained wall clock |
+| 3 | MONOTONIC | Monotonic clock (excludes suspend time) |
+| 4 | MONOTONIC_COARSE | Coarse-grained monotonic |
+| 5 | MONOTONIC_RAW | Raw hardware monotonic |
+| 6 | BOOTTIME | Time since boot (includes suspend) |
+| 9 | TSC | CPU timestamp counter |
+| 10 | PERF | perf_event clock |
+
+**Use Cases:**
+- Convert trace timestamps (typically BOOTTIME) to wall clock time (REALTIME)
+- Compare start times across traces from different machines
+- Correlate events from multiple traces captured at the same time
+
+**Example: Get trace start time in wall clock:**
+```sql
+SELECT trace_id,
+       to_timestamp(timestamp_ns / 1e9) as start_time
+FROM clock_snapshot
+WHERE clock_name = 'REALTIME'
+ORDER BY timestamp_ns;
+```
+
+**Example: Find gaps between trace starts:**
+```sql
+WITH ordered AS (
+    SELECT trace_id, timestamp_ns,
+           LAG(timestamp_ns) OVER (ORDER BY timestamp_ns) as prev_ts
+    FROM clock_snapshot
+    WHERE clock_name = 'REALTIME'
+)
+SELECT trace_id,
+       (timestamp_ns - prev_ts) / 1e9 as gap_sec
+FROM ordered
+WHERE prev_ts IS NOT NULL
+ORDER BY gap_sec DESC;
+```
 
 ## Data Model
 

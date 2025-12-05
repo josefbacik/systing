@@ -4,7 +4,9 @@
 //! querying and analysis, supporting multiple traces aggregated into a single database.
 
 use anyhow::{bail, Context, Result};
-use arrow::array::{Float64Builder, Int32Builder, Int64Builder, RecordBatch, StringBuilder};
+use arrow::array::{
+    BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, RecordBatch, StringBuilder,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use clap::{Parser, Subcommand};
 use duckdb::{params, Connection};
@@ -300,6 +302,8 @@ struct ExtractedData {
     perf_samples: Vec<PerfSampleRecord>,
     // Network interface metadata
     network_interfaces: Vec<NetworkInterfaceRecord>,
+    // Clock snapshot data
+    clock_snapshots: Vec<ClockSnapshotRecord>,
 }
 
 #[derive(Clone)]
@@ -441,6 +445,21 @@ struct NetworkInterfaceRecord {
     address_type: String,
 }
 
+/// Clock snapshot record from a trace packet.
+/// Used for correlating timestamps between different clock domains
+/// (e.g., MONOTONIC vs BOOTTIME vs REALTIME).
+#[derive(Clone)]
+struct ClockSnapshotRecord {
+    /// Clock ID (0-6 for builtin clocks, 9-10 for TSC/PERF, 64-127 for user-defined)
+    clock_id: i32,
+    /// Human-readable clock name (REALTIME, BOOTTIME, MONOTONIC, etc.)
+    clock_name: String,
+    /// Timestamp value in nanoseconds for this clock domain
+    timestamp_ns: i64,
+    /// True if this is the primary trace clock (authoritative time domain)
+    is_primary: bool,
+}
+
 struct TraceExtractor {
     data: ExtractedData,
     pid_to_upid: HashMap<i32, i64>,
@@ -492,6 +511,7 @@ impl TraceExtractor {
                 callsites: Vec::new(),
                 perf_samples: Vec::new(),
                 network_interfaces: Vec::new(),
+                clock_snapshots: Vec::new(),
             },
             pid_to_upid: HashMap::new(),
             tid_to_utid: HashMap::new(),
@@ -520,10 +540,59 @@ impl TraceExtractor {
     }
 
     fn process_packet(&mut self, packet: &TracePacket) {
+        self.process_clock_snapshot(packet);
         self.process_interned_data(packet);
         self.process_descriptors(packet);
         self.process_events(packet);
         self.process_perf_sample(packet);
+    }
+
+    /// Extract clock snapshot data from a trace packet.
+    ///
+    /// Clock snapshots provide timestamp correlation between different clock domains:
+    /// - REALTIME: Wall clock time (affected by NTP adjustments)
+    /// - BOOTTIME: Time since boot (monotonic, includes suspend time)
+    /// - MONOTONIC: Time since arbitrary point (monotonic, excludes suspend)
+    ///
+    /// Multiple clock snapshots may appear in a trace (emitted periodically)
+    /// to track clock drift over time.
+    fn process_clock_snapshot(&mut self, packet: &TracePacket) {
+        if !packet.has_clock_snapshot() {
+            return;
+        }
+
+        let snapshot = packet.clock_snapshot();
+        // primary_trace_clock indicates which clock domain is authoritative for the trace
+        // Defaults to UNKNOWN (0) if not set
+        let primary_clock_id = snapshot.primary_trace_clock() as i32;
+
+        for clock in &snapshot.clocks {
+            let clock_id = clock.clock_id() as i32;
+            // Map clock IDs to human-readable names per BuiltinClock enum
+            let clock_name = match clock_id {
+                0 => "UNKNOWN",
+                1 => "REALTIME",
+                2 => "REALTIME_COARSE",
+                3 => "MONOTONIC",
+                4 => "MONOTONIC_COARSE",
+                5 => "MONOTONIC_RAW",
+                6 => "BOOTTIME",
+                9 => "TSC",   // CPU timestamp counter
+                10 => "PERF", // perf_event clock
+                // IDs 64-127 are user-defined sequence-scoped clocks
+                _ => "UNKNOWN",
+            }
+            .to_string();
+
+            let timestamp = clock.timestamp.unwrap_or(0) as i64;
+
+            self.data.clock_snapshots.push(ClockSnapshotRecord {
+                clock_id,
+                clock_name,
+                timestamp_ns: timestamp,
+                is_primary: clock_id == primary_clock_id,
+            });
+        }
     }
 
     fn process_interned_data(&mut self, packet: &TracePacket) {
@@ -1364,6 +1433,14 @@ fn create_schema(conn: &Connection) -> Result<()> {
             ip_address VARCHAR,
             address_type VARCHAR
         );
+
+        CREATE TABLE IF NOT EXISTS clock_snapshot (
+            trace_id VARCHAR,
+            clock_id INTEGER,
+            clock_name VARCHAR,
+            timestamp_ns BIGINT,
+            is_primary BOOLEAN
+        );
         ",
     )?;
 
@@ -1392,6 +1469,8 @@ struct ParquetPaths {
     perf_sample: PathBuf,
     // Network interface metadata
     network_interface: PathBuf,
+    // Clock snapshot data
+    clock_snapshot: PathBuf,
 }
 
 impl ParquetPaths {
@@ -1417,6 +1496,8 @@ impl ParquetPaths {
             perf_sample: temp_dir.join(format!("{}_perf_sample.parquet", trace_id)),
             // Network interface metadata
             network_interface: temp_dir.join(format!("{}_network_interface.parquet", trace_id)),
+            // Clock snapshot data
+            clock_snapshot: temp_dir.join(format!("{}_clock_snapshot.parquet", trace_id)),
         }
     }
 }
@@ -2175,6 +2256,47 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
         writer.close()?;
     }
 
+    // Clock snapshot table
+    if !data.clock_snapshots.is_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("clock_id", DataType::Int32, false),
+            Field::new("clock_name", DataType::Utf8, false),
+            Field::new("timestamp_ns", DataType::Int64, false),
+            Field::new("is_primary", DataType::Boolean, false),
+        ]));
+
+        let mut trace_id_builder = StringBuilder::new();
+        let mut clock_id_builder = Int32Builder::new();
+        let mut clock_name_builder = StringBuilder::new();
+        let mut timestamp_ns_builder = Int64Builder::new();
+        let mut is_primary_builder = BooleanBuilder::new();
+
+        for clock in &data.clock_snapshots {
+            trace_id_builder.append_value(trace_id);
+            clock_id_builder.append_value(clock.clock_id);
+            clock_name_builder.append_value(&clock.clock_name);
+            timestamp_ns_builder.append_value(clock.timestamp_ns);
+            is_primary_builder.append_value(clock.is_primary);
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(clock_id_builder.finish()),
+                Arc::new(clock_name_builder.finish()),
+                Arc::new(timestamp_ns_builder.finish()),
+                Arc::new(is_primary_builder.finish()),
+            ],
+        )?;
+
+        let file = File::create(&paths.clock_snapshot)?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props.clone()))?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
     Ok(())
 }
 
@@ -2403,6 +2525,8 @@ fn run_convert(
     import_table("perf_sample", |p| &p.perf_sample)?;
     // Network interface metadata
     import_table("network_interface", |p| &p.network_interface)?;
+    // Clock snapshot data
+    import_table("clock_snapshot", |p| &p.clock_snapshot)?;
 
     let import_time = import_start.elapsed();
     if verbose {
