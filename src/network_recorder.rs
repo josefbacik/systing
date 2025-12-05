@@ -129,6 +129,12 @@ struct PacketEvent {
     rcv_buf_limit: u32, // Receive buffer limit (sk_rcvbuf)
     window_clamp: u32,  // Maximum window (tp->window_clamp)
     rcv_wscale: u8,     // Receive window scale (actual window = rcv_wnd << rcv_wscale)
+    // RTO-specific fields (populated only for PACKET_RTO_TIMEOUT events)
+    rto_jiffies: u32,     // Current RTO value in kernel jiffies
+    srtt_us: u32,         // Smoothed RTT in microseconds
+    rttvar_us: u32,       // RTT variance in microseconds
+    retransmit_count: u8, // Number of consecutive RTO timeouts (icsk_retransmits + 1)
+    backoff: u8,          // Exponential backoff multiplier (icsk_backoff)
 }
 
 enum EventEntry {
@@ -144,6 +150,7 @@ enum EventEntry {
     SharedSend(PacketEvent),
     TcpZeroWindowProbe(PacketEvent), // Zero window probe sent (sender-side)
     TcpZeroWindowAck(PacketEvent),   // Zero window ACK sent (receiver-side)
+    TcpRtoTimeout(PacketEvent),      // RTO timeout fired (tcp_retransmit_timer)
 }
 
 #[derive(Default)]
@@ -245,6 +252,13 @@ impl ConnectionEvents {
     fn iter_zero_window_acks(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::TcpZeroWindowAck(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    fn iter_rto_timeouts(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::TcpRtoTimeout(pkt) => Some(pkt),
             _ => None,
         })
     }
@@ -408,6 +422,11 @@ impl NetworkRecorder {
             rcv_buf_limit: event.rcv_buf_limit,
             window_clamp: event.window_clamp,
             rcv_wscale: event.rcv_wscale,
+            rto_jiffies: event.rto_jiffies,
+            srtt_us: event.srtt_us,
+            rttvar_us: event.rttvar_us,
+            retransmit_count: event.retransmit_count,
+            backoff: event.backoff,
         };
 
         // Buffer queue events go to per-thread syscall_events (app-relevant)
@@ -465,6 +484,12 @@ impl NetworkRecorder {
                 conn_events
                     .events
                     .push(EventEntry::TcpZeroWindowAck(pkt_event));
+            }
+            // RTO timeout events
+            else if event.event_type.0 == packet_event_type::PACKET_RTO_TIMEOUT.0 {
+                conn_events
+                    .events
+                    .push(EventEntry::TcpRtoTimeout(pkt_event));
             }
         }
     }
@@ -654,6 +679,62 @@ impl NetworkRecorder {
                 instant_event.debug_annotations.push(rcv_wscale_annotation);
             }
 
+            // Add RTO timeout annotations
+            if pkt.rto_jiffies > 0 {
+                // Convert jiffies to microseconds using system HZ
+                // HZ is typically 100 on modern Linux (1 jiffy = 10000us)
+                // We read it at runtime via sysconf(_SC_CLK_TCK)
+                let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+                let hz = if hz > 0 { hz } else { 100 }; // fallback to 100
+                let rto_us = (pkt.rto_jiffies as u64 * 1_000_000) / hz;
+
+                let mut rto_jiffies_annotation = DebugAnnotation::default();
+                rto_jiffies_annotation.set_name("rto_jiffies".to_string());
+                rto_jiffies_annotation.set_uint_value(pkt.rto_jiffies as u64);
+                instant_event.debug_annotations.push(rto_jiffies_annotation);
+
+                let mut rto_annotation = DebugAnnotation::default();
+                rto_annotation.set_name("rto_us".to_string());
+                rto_annotation.set_uint_value(rto_us);
+                instant_event.debug_annotations.push(rto_annotation);
+
+                let mut srtt_annotation = DebugAnnotation::default();
+                srtt_annotation.set_name("srtt_us".to_string());
+                srtt_annotation.set_uint_value(pkt.srtt_us as u64);
+                instant_event.debug_annotations.push(srtt_annotation);
+
+                let mut rttvar_annotation = DebugAnnotation::default();
+                rttvar_annotation.set_name("rttvar_us".to_string());
+                rttvar_annotation.set_uint_value(pkt.rttvar_us as u64);
+                instant_event.debug_annotations.push(rttvar_annotation);
+
+                let mut retransmit_count_annotation = DebugAnnotation::default();
+                retransmit_count_annotation.set_name("retransmit_count".to_string());
+                retransmit_count_annotation.set_uint_value(pkt.retransmit_count as u64);
+                instant_event
+                    .debug_annotations
+                    .push(retransmit_count_annotation);
+
+                let mut backoff_annotation = DebugAnnotation::default();
+                backoff_annotation.set_name("backoff".to_string());
+                backoff_annotation.set_uint_value(pkt.backoff as u64);
+                instant_event.debug_annotations.push(backoff_annotation);
+
+                // Convert RTO to milliseconds for easier reading
+                let mut rto_ms_annotation = DebugAnnotation::default();
+                rto_ms_annotation.set_name("rto_ms".to_string());
+                rto_ms_annotation.set_uint_value(rto_us / 1000);
+                instant_event.debug_annotations.push(rto_ms_annotation);
+
+                // Convert SRTT to milliseconds for easier reading
+                if pkt.srtt_us > 0 {
+                    let mut srtt_ms_annotation = DebugAnnotation::default();
+                    srtt_ms_annotation.set_name("srtt_ms".to_string());
+                    srtt_ms_annotation.set_uint_value((pkt.srtt_us / 1000) as u64);
+                    instant_event.debug_annotations.push(srtt_ms_annotation);
+                }
+            }
+
             let mut packet = TracePacket::default();
             packet.set_timestamp(pkt.ts);
             packet.set_track_event(instant_event);
@@ -787,6 +868,7 @@ impl NetworkRecorder {
         self.get_or_create_event_name_iid("TCP buffer_queue".to_string(), id_counter);
         self.get_or_create_event_name_iid("TCP zero_window_probe".to_string(), id_counter);
         self.get_or_create_event_name_iid("TCP zero_window_ack".to_string(), id_counter);
+        self.get_or_create_event_name_iid("TCP rto_timeout".to_string(), id_counter);
         self.get_or_create_event_name_iid("UDP send".to_string(), id_counter);
         self.get_or_create_event_name_iid("UDP packet_send".to_string(), id_counter);
         self.get_or_create_event_name_iid("UDP receive".to_string(), id_counter);
@@ -973,6 +1055,19 @@ impl NetworkRecorder {
                             socket_track_uuid,
                             zwa_iid,
                             &zwa_pkts,
+                        );
+                    }
+
+                    // RTO timeout events
+                    let rto_pkts: Vec<_> = events.iter_rto_timeouts().copied().collect();
+                    if !rto_pkts.is_empty() {
+                        let rto_iid = *self.event_name_ids.get("TCP rto_timeout").unwrap();
+                        self.add_packet_instant_events(
+                            &mut packets,
+                            sequence_id,
+                            socket_track_uuid,
+                            rto_iid,
+                            &rto_pkts,
                         );
                     }
                 } else {
