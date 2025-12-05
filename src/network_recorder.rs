@@ -109,8 +109,7 @@ struct NetworkEvent {
 
 #[derive(Clone, Copy)]
 struct PacketEvent {
-    start_ts: u64,
-    end_ts: u64,
+    ts: u64, // Instant event timestamp
     seq: u32,
     length: u32,
     tcp_flags: u8,
@@ -364,8 +363,7 @@ impl NetworkRecorder {
         }
 
         let pkt_event = PacketEvent {
-            start_ts: event.start_ts,
-            end_ts: event.end_ts,
+            ts: event.ts,
             seq: event.seq,
             length: event.length,
             tcp_flags: event.tcp_flags,
@@ -475,7 +473,7 @@ impl NetworkRecorder {
         iid
     }
 
-    fn add_packet_slice_events(
+    fn add_packet_instant_events(
         &self,
         packets: &mut Vec<TracePacket>,
         sequence_id: u32,
@@ -484,30 +482,30 @@ impl NetworkRecorder {
         packet_events: &[PacketEvent],
     ) {
         for pkt in packet_events {
-            let mut begin_event = TrackEvent::default();
-            begin_event.set_type(Type::TYPE_SLICE_BEGIN);
-            begin_event.set_name_iid(name_iid);
-            begin_event.set_track_uuid(track_uuid);
+            let mut instant_event = TrackEvent::default();
+            instant_event.set_type(Type::TYPE_INSTANT);
+            instant_event.set_name_iid(name_iid);
+            instant_event.set_track_uuid(track_uuid);
 
             // Only show seq annotation for TCP packets (where seq != 0)
             if pkt.seq != 0 {
                 let mut seq_annotation = DebugAnnotation::default();
                 seq_annotation.set_name("seq".to_string());
                 seq_annotation.set_uint_value(pkt.seq as u64);
-                begin_event.debug_annotations.push(seq_annotation);
+                instant_event.debug_annotations.push(seq_annotation);
             }
 
             let mut len_annotation = DebugAnnotation::default();
             len_annotation.set_name("length".to_string());
             len_annotation.set_uint_value(pkt.length as u64);
-            begin_event.debug_annotations.push(len_annotation);
+            instant_event.debug_annotations.push(len_annotation);
 
             // Only show TCP flags annotation for TCP packets (where flags != 0)
             if pkt.tcp_flags != 0 {
                 let mut flags_annotation = DebugAnnotation::default();
                 flags_annotation.set_name("flags".to_string());
                 flags_annotation.set_string_value(Self::format_tcp_flags(pkt.tcp_flags));
-                begin_event.debug_annotations.push(flags_annotation);
+                instant_event.debug_annotations.push(flags_annotation);
             }
 
             // Add send buffer info (shows buffer drain on ACK receipt)
@@ -515,19 +513,21 @@ impl NetworkRecorder {
                 let mut sndbuf_used_annotation = DebugAnnotation::default();
                 sndbuf_used_annotation.set_name("sndbuf_used".to_string());
                 sndbuf_used_annotation.set_uint_value(pkt.sndbuf_used as u64);
-                begin_event.debug_annotations.push(sndbuf_used_annotation);
+                instant_event.debug_annotations.push(sndbuf_used_annotation);
 
                 let mut sndbuf_limit_annotation = DebugAnnotation::default();
                 sndbuf_limit_annotation.set_name("sndbuf_limit".to_string());
                 sndbuf_limit_annotation.set_uint_value(pkt.sndbuf_limit as u64);
-                begin_event.debug_annotations.push(sndbuf_limit_annotation);
+                instant_event
+                    .debug_annotations
+                    .push(sndbuf_limit_annotation);
 
                 // Add fill percentage for easier analysis
                 let fill_pct = (pkt.sndbuf_used as u64 * 100) / pkt.sndbuf_limit as u64;
                 let mut fill_annotation = DebugAnnotation::default();
                 fill_annotation.set_name("sndbuf_fill_pct".to_string());
                 fill_annotation.set_uint_value(fill_pct);
-                begin_event.debug_annotations.push(fill_annotation);
+                instant_event.debug_annotations.push(fill_annotation);
             }
 
             // Add retransmit flag if this packet is a TCP retransmit
@@ -535,24 +535,14 @@ impl NetworkRecorder {
                 let mut retransmit_annotation = DebugAnnotation::default();
                 retransmit_annotation.set_name("is_retransmit".to_string());
                 retransmit_annotation.set_uint_value(1);
-                begin_event.debug_annotations.push(retransmit_annotation);
+                instant_event.debug_annotations.push(retransmit_annotation);
             }
 
-            let mut begin_packet = TracePacket::default();
-            begin_packet.set_timestamp(pkt.start_ts);
-            begin_packet.set_track_event(begin_event);
-            begin_packet.set_trusted_packet_sequence_id(sequence_id);
-            packets.push(begin_packet);
-
-            let mut end_event = TrackEvent::default();
-            end_event.set_type(Type::TYPE_SLICE_END);
-            end_event.set_track_uuid(track_uuid);
-
-            let mut end_packet = TracePacket::default();
-            end_packet.set_timestamp(pkt.end_ts);
-            end_packet.set_track_event(end_event);
-            end_packet.set_trusted_packet_sequence_id(sequence_id);
-            packets.push(end_packet);
+            let mut packet = TracePacket::default();
+            packet.set_timestamp(pkt.ts);
+            packet.set_track_event(instant_event);
+            packet.set_trusted_packet_sequence_id(sequence_id);
+            packets.push(packet);
         }
     }
 
@@ -760,7 +750,7 @@ impl NetworkRecorder {
                     let enqueue_pkts: Vec<_> = events.iter_tcp_enqueue_packets().copied().collect();
                     if !enqueue_pkts.is_empty() {
                         let enqueue_iid = *self.event_name_ids.get("TCP packet_enqueue").unwrap();
-                        self.add_packet_slice_events(
+                        self.add_packet_instant_events(
                             &mut packets,
                             sequence_id,
                             socket_track_uuid,
@@ -772,7 +762,7 @@ impl NetworkRecorder {
                     let send_pkts: Vec<_> = events.iter_shared_send_packets().copied().collect();
                     if !send_pkts.is_empty() {
                         let send_iid = *self.event_name_ids.get("TCP packet_send").unwrap();
-                        self.add_packet_slice_events(
+                        self.add_packet_instant_events(
                             &mut packets,
                             sequence_id,
                             socket_track_uuid,
@@ -788,7 +778,7 @@ impl NetworkRecorder {
                             .event_name_ids
                             .get("TCP packet_rcv_established")
                             .unwrap();
-                        self.add_packet_slice_events(
+                        self.add_packet_instant_events(
                             &mut packets,
                             sequence_id,
                             socket_track_uuid,
@@ -802,7 +792,7 @@ impl NetworkRecorder {
                     if !queue_rcv_pkts.is_empty() {
                         let queue_rcv_iid =
                             *self.event_name_ids.get("TCP packet_queue_rcv").unwrap();
-                        self.add_packet_slice_events(
+                        self.add_packet_instant_events(
                             &mut packets,
                             sequence_id,
                             socket_track_uuid,
@@ -815,7 +805,7 @@ impl NetworkRecorder {
                     let udp_send_pkts: Vec<_> = events.iter_udp_send_packets().copied().collect();
                     if !udp_send_pkts.is_empty() {
                         let send_iid = *self.event_name_ids.get("UDP send").unwrap();
-                        self.add_packet_slice_events(
+                        self.add_packet_instant_events(
                             &mut packets,
                             sequence_id,
                             socket_track_uuid,
@@ -827,7 +817,7 @@ impl NetworkRecorder {
                     let udp_rcv_pkts: Vec<_> = events.iter_udp_rcv_packets().copied().collect();
                     if !udp_rcv_pkts.is_empty() {
                         let rcv_iid = *self.event_name_ids.get("UDP receive").unwrap();
-                        self.add_packet_slice_events(
+                        self.add_packet_instant_events(
                             &mut packets,
                             sequence_id,
                             socket_track_uuid,
@@ -841,7 +831,7 @@ impl NetworkRecorder {
                         events.iter_shared_send_packets().copied().collect();
                     if !shared_send_pkts.is_empty() {
                         let send_iid = *self.event_name_ids.get("UDP packet_send").unwrap();
-                        self.add_packet_slice_events(
+                        self.add_packet_instant_events(
                             &mut packets,
                             sequence_id,
                             socket_track_uuid,
@@ -1034,7 +1024,7 @@ impl NetworkRecorder {
                     if !buffer_queue_pkts.is_empty() {
                         let buffer_queue_iid =
                             *self.event_name_ids.get("TCP buffer_queue").unwrap();
-                        self.add_packet_slice_events(
+                        self.add_packet_instant_events(
                             &mut packets,
                             sequence_id,
                             buffer_track_uuid,
@@ -1048,7 +1038,7 @@ impl NetworkRecorder {
                         events.iter_udp_enqueue_packets().copied().collect();
                     if !udp_enqueue_pkts.is_empty() {
                         let enqueue_iid = *self.event_name_ids.get("UDP enqueue").unwrap();
-                        self.add_packet_slice_events(
+                        self.add_packet_instant_events(
                             &mut packets,
                             sequence_id,
                             buffer_track_uuid,
@@ -1735,8 +1725,7 @@ mod tests {
         let socket_id: SocketId = 1;
 
         let event = crate::systing::types::packet_event {
-            start_ts: 1000,
-            end_ts: 1100,
+            ts: 1000,
             task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -1775,8 +1764,7 @@ mod tests {
         let socket_id: SocketId = 1;
 
         let event = crate::systing::types::packet_event {
-            start_ts: 1100,
-            end_ts: 1110,
+            ts: 1100,
             task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -1812,8 +1800,7 @@ mod tests {
         let socket_id: SocketId = 1;
 
         let event = crate::systing::types::packet_event {
-            start_ts: 1110,
-            end_ts: 50000000,
+            ts: 1110,
             task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -1838,8 +1825,7 @@ mod tests {
             .iter_tcp_buffer_queue_packets()
             .collect();
         assert_eq!(buffer_queue.len(), 1);
-        assert_eq!(buffer_queue[0].start_ts, 1110);
-        assert_eq!(buffer_queue[0].end_ts, 50000000);
+        assert_eq!(buffer_queue[0].ts, 1110);
     }
 
     #[test]
@@ -1864,8 +1850,7 @@ mod tests {
         );
 
         let rcv_est_event = crate::systing::types::packet_event {
-            start_ts: 1000,
-            end_ts: 1100,
+            ts: 1000,
             task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -1880,8 +1865,7 @@ mod tests {
         };
 
         let queue_rcv_event = crate::systing::types::packet_event {
-            start_ts: 1100,
-            end_ts: 1110,
+            ts: 1100,
             task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -1896,8 +1880,7 @@ mod tests {
         };
 
         let buffer_queue_event = crate::systing::types::packet_event {
-            start_ts: 1110,
-            end_ts: 100000000,
+            ts: 1110,
             task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -1965,8 +1948,7 @@ mod tests {
         );
 
         let packet1 = crate::systing::types::packet_event {
-            start_ts: 1000,
-            end_ts: 2000,
+            ts: 1000,
             task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -1981,8 +1963,7 @@ mod tests {
         };
 
         let packet2 = crate::systing::types::packet_event {
-            start_ts: 1100,
-            end_ts: 2100,
+            ts: 1100,
             task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -2036,8 +2017,7 @@ mod tests {
         );
 
         let rcv_est = crate::systing::types::packet_event {
-            start_ts: 1000,
-            end_ts: 1100,
+            ts: 1000,
             task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -2052,8 +2032,7 @@ mod tests {
         };
 
         let queue_rcv = crate::systing::types::packet_event {
-            start_ts: 1100,
-            end_ts: 1110,
+            ts: 1100,
             task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -2068,8 +2047,7 @@ mod tests {
         };
 
         let buffer_queue = crate::systing::types::packet_event {
-            start_ts: 1110,
-            end_ts: 100000000,
+            ts: 1110,
             task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -2129,8 +2107,7 @@ mod tests {
         );
 
         let send_enqueue = crate::systing::types::packet_event {
-            start_ts: 1000,
-            end_ts: 1010,
+            ts: 1000,
             task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -2145,8 +2122,7 @@ mod tests {
         };
 
         let recv_buffer = crate::systing::types::packet_event {
-            start_ts: 2000,
-            end_ts: 50000000,
+            ts: 2000,
             task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -2218,8 +2194,7 @@ mod tests {
 
         // Create UDP PACKET_UDP_SEND event - goes to global packet_events
         let udp_send_event = crate::systing::types::packet_event {
-            start_ts: 1000,
-            end_ts: 2000,
+            ts: 1000,
             task: create_test_task_info(100, 101),
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
@@ -2236,8 +2211,7 @@ mod tests {
 
         // Create UDP PACKET_SEND event (qdisc->NIC, shared type) - goes to global packet_events
         let udp_packet_send_event = crate::systing::types::packet_event {
-            start_ts: 2000,
-            end_ts: 3000,
+            ts: 2000,
             task: create_test_task_info(100, 101),
             protocol: network_protocol::NETWORK_UDP, // Explicit protocol field
             af: network_address_family::NETWORK_AF_INET,
@@ -2254,8 +2228,7 @@ mod tests {
 
         // Create TCP PACKET_SEND event for comparison - goes to global packet_events
         let tcp_packet_send_event = crate::systing::types::packet_event {
-            start_ts: 4000,
-            end_ts: 5000,
+            ts: 4000,
             task: create_test_task_info(100, 101),
             protocol: network_protocol::NETWORK_TCP, // Explicit protocol field
             af: network_address_family::NETWORK_AF_INET,
@@ -2338,8 +2311,7 @@ mod tests {
 
         // UDP receive event (IP->UDP) - goes to global packet_events
         let udp_rcv_event = crate::systing::types::packet_event {
-            start_ts: 1000,
-            end_ts: 1500,
+            ts: 1000,
             task: create_test_task_info(200, 201),
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
@@ -2356,8 +2328,7 @@ mod tests {
 
         // UDP enqueue event (UDP->buffer) - goes to per-thread syscall_events
         let udp_enqueue_event = crate::systing::types::packet_event {
-            start_ts: 1500,
-            end_ts: 2000,
+            ts: 1500,
             task: create_test_task_info(200, 201),
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
@@ -2423,8 +2394,7 @@ mod tests {
         let payload_size = 512;
 
         let udp_send_event = crate::systing::types::packet_event {
-            start_ts: 1000,
-            end_ts: 2000,
+            ts: 1000,
             task: create_test_task_info(100, 101),
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
@@ -2440,8 +2410,7 @@ mod tests {
         };
 
         let udp_rcv_event = crate::systing::types::packet_event {
-            start_ts: 3000,
-            end_ts: 4000,
+            ts: 3000,
             task: create_test_task_info(100, 101),
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
@@ -2501,8 +2470,7 @@ mod tests {
         // Create UDP PACKET_SEND event (qdisc->NIC, shared event type with TCP)
         // Goes to global packet_events
         let udp_packet_send_event = crate::systing::types::packet_event {
-            start_ts: 1000,
-            end_ts: 2000,
+            ts: 1000,
             task: create_test_task_info(100, 101),
             protocol: network_protocol::NETWORK_UDP, // UDP protocol
             af: network_address_family::NETWORK_AF_INET,

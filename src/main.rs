@@ -489,7 +489,7 @@ impl SystingEvent for network_event {
 
 impl SystingEvent for packet_event {
     fn ts(&self) -> u64 {
-        self.start_ts
+        self.ts
     }
     fn next_task_info(&self) -> Option<&task_info> {
         Some(&self.task)
@@ -1245,7 +1245,6 @@ fn configure_bpf_skeleton(
         open_skel.progs.udp_recvmsg_entry.set_autoload(false);
         open_skel.progs.udp_recvmsg_exit.set_autoload(false);
         open_skel.progs.udp_send_skb_entry.set_autoload(false);
-        open_skel.progs.udp4_lib_rcv_entry.set_autoload(false);
         open_skel
             .progs
             .udp_queue_rcv_one_skb_entry
@@ -1255,7 +1254,6 @@ fn configure_bpf_skeleton(
             .udp_enqueue_schedule_skb_entry
             .set_autoload(false);
         open_skel.progs.tcp_transmit_skb_entry.set_autoload(false);
-        open_skel.progs.dev_queue_xmit_entry.set_autoload(false);
         open_skel
             .progs
             .tcp_rcv_established_entry
@@ -1775,9 +1773,10 @@ fn run_tracing_loop(
     println!("Missed sched/IRQ events: {}", dump_missed_events(skel, 0));
     println!("Missed stack events: {}", dump_missed_events(skel, 1));
     println!("Missed probe events: {}", dump_missed_events(skel, 2));
-    println!("Missed perf events: {}", dump_missed_events(skel, 3));
-    if opts.syscalls {
-        println!("Missed syscall events: {}", dump_missed_events(skel, 4));
+    println!("Missed cache events: {}", dump_missed_events(skel, 3));
+    if opts.network {
+        println!("Missed network events: {}", dump_missed_events(skel, 4));
+        println!("Missed packet events: {}", dump_missed_events(skel, 5));
     }
 
     Ok(())
