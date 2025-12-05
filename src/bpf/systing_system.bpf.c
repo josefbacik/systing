@@ -193,6 +193,7 @@ enum packet_event_type {
 	PACKET_UDP_SEND,        // UDP: udp_send_skb (UDP layer processing)
 	PACKET_UDP_RCV,         // UDP: udp_queue_rcv_one_skb (UDP receive processing)
 	PACKET_UDP_ENQUEUE,     // UDP: __udp_enqueue_schedule_skb (socket buffer enqueue)
+	PACKET_ZERO_WINDOW_PROBE, // TCP: Zero window probe sent (tcp_send_probe0)
 };
 
 struct packet_event {
@@ -211,6 +212,10 @@ struct packet_event {
 	u32 sndbuf_limit;  // Max send buffer size (sk_sndbuf)
 	u64 socket_id;     // Unique socket ID for correlation with network events
 	u8 is_retransmit;  // 1 if this packet is a TCP retransmit, 0 otherwise
+	u8 is_zero_window_probe;  // 1 if this is a zero window probe
+	u8 probe_count;           // Number of probes sent (icsk_probes_out)
+	u8 _padding;              // Alignment padding
+	u32 snd_wnd;              // Current send window (0 for zero window condition)
 };
 
 /*
@@ -2774,6 +2779,98 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 	pkt_event->sndbuf_limit = 0;
 
 	bpf_ringbuf_submit(pkt_event, flags);
+	return 0;
+}
+
+// Trace tcp_send_probe0 to capture zero window probe events
+// Zero window probes are sent when the peer advertises a zero receive window
+// and the sender has data waiting to be transmitted
+SEC("kprobe/tcp_send_probe0")
+int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
+{
+	if (!sk)
+		return 0;
+
+	// Filter by tracked process
+	u64 sk_ptr = (u64)sk;
+	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
+	if (!tgidpid_ptr)
+		return 0;
+
+	u64 tgidpid = *tgidpid_ptr;
+	u32 tgid = tgidpid >> 32;
+	if (tgid == 0 || tgid == tool_config.my_tgid)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->task.tgidpid = tgidpid;
+	__builtin_memset(event->task.comm, 0, TASK_COMM_LEN);
+	event->protocol = NETWORK_TCP;
+	event->event_type = PACKET_ZERO_WINDOW_PROBE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->is_zero_window_probe = 1;
+	event->is_retransmit = 0;
+
+	// Extract socket address info
+	u16 family;
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	if (family == AF_INET) {
+		event->af = NETWORK_AF_INET;
+		u32 addr;
+		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
+		__builtin_memcpy(event->dest_addr, &addr, 4);
+	} else if (family == AF_INET6) {
+		event->af = NETWORK_AF_INET6;
+		bpf_probe_read_kernel(event->dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
+	} else {
+		// Unknown address family, discard event
+		bpf_ringbuf_discard(event, flags);
+		return 0;
+	}
+	bpf_probe_read_kernel(&event->dest_port, sizeof(event->dest_port),
+			      &sk->__sk_common.skc_dport);
+	event->dest_port = __builtin_bswap16(event->dest_port);
+
+	// Read TCP-specific info from tcp_sock
+	struct tcp_sock *tp = (struct tcp_sock *)sk;
+	u32 snd_una;
+	bpf_probe_read_kernel(&snd_una, sizeof(snd_una), &tp->snd_una);
+	event->seq = snd_una - 1;  // Probe uses SND.UNA - 1
+	event->length = 0;  // Zero-length probe
+	event->tcp_flags = 0x10;  // ACK flag
+
+	// Read current send window (should be 0 for zero window condition)
+	u32 snd_wnd;
+	bpf_probe_read_kernel(&snd_wnd, sizeof(snd_wnd), &tp->snd_wnd);
+	event->snd_wnd = snd_wnd;
+
+	// Read zero window probe count from inet_connection_sock
+	// Note: icsk_probes_out is incremented AFTER tcp_send_probe0 returns,
+	// so this value may be off by 1 (showing N-1 instead of N probes)
+	struct inet_connection_sock *icsk = (struct inet_connection_sock *)sk;
+	u8 probes_out;
+	bpf_probe_read_kernel(&probes_out, sizeof(probes_out), &icsk->icsk_probes_out);
+	event->probe_count = probes_out;
+
+	// Read send buffer state from socket
+	int wmem_queued = 0;
+	int sndbuf = 0;
+	bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+	bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+	// Validate values to prevent negative/garbage data
+	event->sndbuf_used = wmem_queued > 0 ? (u32)wmem_queued : 0;
+	event->sndbuf_limit = sndbuf > 0 ? (u32)sndbuf : 0;
+
+	// Get socket ID for correlation
+	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+
+	bpf_ringbuf_submit(event, flags);
 	return 0;
 }
 
