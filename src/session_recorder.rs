@@ -344,6 +344,15 @@ impl SysinfoRecorder {
         }
         packets
     }
+
+    /// Returns the minimum timestamp from all frequency events, or None if no events recorded.
+    pub fn min_timestamp(&self) -> Option<u64> {
+        self.frequency
+            .values()
+            .filter_map(|counters| counters.first())
+            .map(|c| c.ts)
+            .min()
+    }
 }
 
 impl SessionRecorder {
@@ -536,6 +545,27 @@ impl SessionRecorder {
         clock_snapshot.clocks.push(clock);
     }
 
+    /// Gets the minimum timestamp from all recorded events across all recorders.
+    ///
+    /// This is used to set the timestamp for metadata events (like network interface
+    /// descriptors) so they don't affect Perfetto's trace_bounds. By using the first
+    /// actual event timestamp, these metadata events will appear at the trace start
+    /// without pushing the timeline back to 0.
+    fn get_min_event_timestamp(&self) -> u64 {
+        [
+            self.event_recorder.lock().unwrap().min_timestamp(),
+            self.stack_recorder.lock().unwrap().min_timestamp(),
+            self.perf_counter_recorder.lock().unwrap().min_timestamp(),
+            self.sysinfo_recorder.lock().unwrap().min_timestamp(),
+            self.probe_recorder.lock().unwrap().min_timestamp(),
+            self.network_recorder.lock().unwrap().min_timestamp(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or_else(|| get_clock_value(libc::CLOCK_BOOTTIME))
+    }
+
     /// Generates the initial trace packets including clock snapshot and root descriptor
     fn generate_initial_packets(&self, id_counter: &Arc<AtomicUsize>) -> Vec<TracePacket> {
         let mut packets = Vec::new();
@@ -640,6 +670,11 @@ impl SessionRecorder {
     /// - Host network namespace interfaces
     /// - Container/process network namespace interfaces (deduplicated by namespace inode)
     ///
+    /// # Arguments
+    ///
+    /// * `id_counter` - Atomic counter for generating unique track UUIDs
+    /// * `trace_start_ts` - BOOTTIME timestamp for when the trace began (used for metadata events)
+    ///
     /// The hierarchy looks like:
     /// ```
     /// Network Interfaces
@@ -654,6 +689,7 @@ impl SessionRecorder {
     fn generate_network_interface_packets(
         &self,
         id_counter: &Arc<AtomicUsize>,
+        trace_start_ts: u64,
     ) -> Vec<TracePacket> {
         let mut packets = Vec::new();
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
@@ -796,7 +832,8 @@ impl SessionRecorder {
                 }
 
                 let mut event_packet = TracePacket::default();
-                event_packet.set_timestamp(0); // Metadata at trace start
+                // Use trace start timestamp so these don't affect trace_bounds
+                event_packet.set_timestamp(trace_start_ts);
                 event_packet.set_track_event(track_event);
                 event_packet.set_trusted_packet_sequence_id(sequence_id);
                 packets.push(event_packet);
@@ -881,8 +918,11 @@ impl SessionRecorder {
         // Step 1: Generate initial packets (clock snapshot and root descriptor)
         packets.extend(self.generate_initial_packets(&id_counter));
 
+        // Get the trace start timestamp for metadata events (first actual event timestamp)
+        let trace_start_ts = self.get_min_event_timestamp();
+
         // Step 2: Generate network interface metadata packets
-        packets.extend(self.generate_network_interface_packets(&id_counter));
+        packets.extend(self.generate_network_interface_packets(&id_counter, trace_start_ts));
 
         // Step 3: Generate process-related packets
         packets.extend(self.generate_process_packets(&id_counter, &mut pid_uuids));
@@ -1455,5 +1495,56 @@ mod tests {
         // Verify UUID mapping
         assert_eq!(thread_uuids.get(&8888), Some(&400));
         assert_eq!(track_desc.uuid(), 400);
+    }
+
+    #[test]
+    fn test_get_min_event_timestamp_no_events() {
+        let recorder = create_test_session_recorder();
+
+        let ts = recorder.get_min_event_timestamp();
+
+        // Should return a fallback non-zero value (current BOOTTIME) when no events recorded
+        assert!(
+            ts > 0,
+            "Should return current BOOTTIME when no events recorded"
+        );
+    }
+
+    #[test]
+    fn test_get_min_event_timestamp_with_sched_events() {
+        let recorder = create_test_session_recorder();
+
+        // Add a sched event with a known timestamp
+        {
+            let mut event_recorder = recorder.event_recorder.lock().unwrap();
+            // Enable stats to generate runqueue entries
+            event_recorder.set_cpu_sched_stats(true);
+
+            let mut task = task_info {
+                tgidpid: ((1234u64) << 32) | 5678u64,
+                comm: [0; 16],
+            };
+            task.comm[0..4].copy_from_slice(b"test");
+
+            // Create a wakeup event which adds to runqueue
+            let event = crate::systing::types::task_event {
+                ts: 1_000_000_000, // 1 second
+                r#type: crate::systing::types::event_type::SCHED_WAKEUP,
+                cpu: 0,
+                target_cpu: 0,
+                prev_prio: 0,
+                next_prio: 0,
+                latency: 0,
+                prev: task,
+                next: task,
+                ..Default::default()
+            };
+            event_recorder.handle_event(event);
+        }
+
+        let ts = recorder.get_min_event_timestamp();
+
+        // Should return the timestamp of the recorded event
+        assert_eq!(ts, 1_000_000_000, "Should return min event timestamp");
     }
 }

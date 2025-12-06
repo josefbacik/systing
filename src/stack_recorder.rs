@@ -414,6 +414,15 @@ impl StackRecorder {
 
         all_packets
     }
+
+    /// Returns the minimum timestamp from all stacks, or None if no stacks recorded.
+    pub fn min_timestamp(&self) -> Option<u64> {
+        self.stacks
+            .values()
+            .flatten()
+            .map(|stack| stack.ts_start)
+            .min()
+    }
 }
 
 /// Holds the resolved stack information after symbolization

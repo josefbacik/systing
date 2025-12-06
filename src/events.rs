@@ -1374,6 +1374,46 @@ impl SystingProbeRecorder {
 
         self.load_config_from_json(&buf, rng)
     }
+
+    /// Returns the minimum timestamp from all events, or None if no events recorded.
+    pub fn min_timestamp(&self) -> Option<u64> {
+        let instant_min = self
+            .events
+            .values()
+            .flat_map(|track| track.values())
+            .filter_map(|events| events.first())
+            .map(|e| e.ts)
+            .min();
+
+        let cpu_instant_min = self
+            .cpu_events
+            .values()
+            .flat_map(|track| track.values())
+            .filter_map(|events| events.first())
+            .map(|e| e.ts)
+            .min();
+
+        let range_min = self
+            .recorded_ranges
+            .values()
+            .flat_map(|track| track.values())
+            .filter_map(|ranges| ranges.first())
+            .map(|r| r.start)
+            .min();
+
+        let cpu_range_min = self
+            .cpu_ranges
+            .values()
+            .flat_map(|track| track.values())
+            .filter_map(|ranges| ranges.first())
+            .map(|r| r.start)
+            .min();
+
+        [instant_min, cpu_instant_min, range_min, cpu_range_min]
+            .into_iter()
+            .flatten()
+            .min()
+    }
 }
 
 #[cfg(test)]
