@@ -424,6 +424,7 @@ pub trait SystingEvent {
 use systing::types::arg_desc;
 use systing::types::arg_desc_array;
 use systing::types::arg_type;
+use systing::types::epoll_event_bpf;
 use systing::types::event_type;
 use systing::types::network_event;
 use systing::types::packet_event;
@@ -439,6 +440,7 @@ unsafe impl Plain for perf_counter_event {}
 unsafe impl Plain for probe_event {}
 unsafe impl Plain for network_event {}
 unsafe impl Plain for packet_event {}
+unsafe impl Plain for epoll_event_bpf {}
 unsafe impl Plain for arg_desc {}
 unsafe impl Plain for arg_desc_array {}
 
@@ -502,6 +504,15 @@ impl SystingEvent for packet_event {
     }
     fn next_task_info(&self) -> Option<&task_info> {
         None
+    }
+}
+
+impl SystingEvent for epoll_event_bpf {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+    fn next_task_info(&self) -> Option<&task_info> {
+        Some(&self.task)
     }
 }
 
@@ -587,6 +598,7 @@ fn spawn_recorder_threads(
         probe_rx,
         network_rx,
         packet_rx,
+        epoll_rx,
     } = channels;
 
     let mut threads = Vec::new();
@@ -695,6 +707,31 @@ fn spawn_recorder_threads(
                             .lock()
                             .unwrap()
                             .handle_packet_event(event);
+                    }
+                    0
+                })?,
+        );
+
+        // Epoll recorder thread
+        let session_recorder = recorder.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("epoll_recorder".to_string())
+                .spawn(move || {
+                    // Use HashSet for deduplication
+                    let mut seen_tasks: std::collections::HashSet<u64> =
+                        std::collections::HashSet::new();
+                    while let Ok(event) = epoll_rx.recv() {
+                        if let Some(task_info) = event.next_task_info() {
+                            if seen_tasks.insert(task_info.tgidpid) {
+                                session_recorder.maybe_record_task(task_info);
+                            }
+                        }
+                        session_recorder
+                            .network_recorder
+                            .lock()
+                            .unwrap()
+                            .handle_epoll_event(event);
                     }
                     0
                 })?,
@@ -1042,6 +1079,7 @@ struct RecorderChannels {
     probe_rx: Receiver<probe_event>,
     network_rx: Receiver<network_event>,
     packet_rx: Receiver<packet_event>,
+    epoll_rx: Receiver<epoll_event_bpf>,
 }
 
 fn setup_ringbuffers<'a>(
@@ -1056,6 +1094,7 @@ fn setup_ringbuffers<'a>(
     let (probe_tx, probe_rx) = channel();
     let (network_tx, network_rx) = channel();
     let (packet_tx, packet_rx) = channel();
+    let (epoll_tx, epoll_rx) = channel();
 
     let object = skel.object();
 
@@ -1081,6 +1120,9 @@ fn setup_ringbuffers<'a>(
         } else if name.starts_with("ringbuf_packet") && opts.network {
             let ring = create_ring::<packet_event>(&map, packet_tx.clone())?;
             rings.push((name.to_string(), ring));
+        } else if name.starts_with("ringbuf_epoll") && opts.network {
+            let ring = create_ring::<epoll_event_bpf>(&map, epoll_tx.clone())?;
+            rings.push((name.to_string(), ring));
         }
     }
 
@@ -1091,6 +1133,7 @@ fn setup_ringbuffers<'a>(
         probe_rx,
         network_rx,
         packet_rx,
+        epoll_rx,
     };
 
     Ok((rings, channels))
@@ -1158,6 +1201,9 @@ fn warn_failed_probe_attachments(skel: &systing::SystingSystemSkel) {
             "tcp_send_probe0_entry" => skel.links.tcp_send_probe0_entry.is_none(),
             "tcp_send_ack_entry" => skel.links.tcp_send_ack_entry.is_none(),
             "tcp_retransmit_timer_entry" => skel.links.tcp_retransmit_timer_entry.is_none(),
+            // Socket poll probes (for epoll/poll/select tracking)
+            "tcp_poll_entry" => skel.links.tcp_poll_entry.is_none(),
+            "tcp_poll_exit" => skel.links.tcp_poll_exit.is_none(),
             // Programs that are manually attached (skip auto-attach check)
             // These include: systing_usdt, systing_uprobe, systing_kprobe,
             // systing_tracepoint, systing_raw_tracepoint, systing_perf_event_clock
@@ -1258,6 +1304,7 @@ fn configure_bpf_skeleton(
             let name = map.name().to_str().unwrap().to_string();
             if name.starts_with("ringbuf_network_events_")
                 || name.starts_with("ringbuf_packet_events_")
+                || name.starts_with("ringbuf_epoll_events_")
             {
                 map.set_max_entries(1).with_context(|| {
                     format!("Failed to set network ringbuf map '{name}' to zero capacity")
@@ -1366,6 +1413,9 @@ fn configure_bpf_skeleton(
             .progs
             .tcp_retransmit_timer_entry
             .set_autoload(false);
+        // Disable socket poll probes when network is disabled
+        open_skel.progs.tcp_poll_entry.set_autoload(false);
+        open_skel.progs.tcp_poll_exit.set_autoload(false);
     }
 
     Ok(())
@@ -1881,6 +1931,7 @@ fn run_tracing_loop(
     if opts.network {
         println!("Missed network events: {}", dump_missed_events(skel, 4));
         println!("Missed packet events: {}", dump_missed_events(skel, 5));
+        println!("Missed poll events: {}", dump_missed_events(skel, 6));
     }
 
     Ok(())
