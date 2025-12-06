@@ -31,7 +31,7 @@ Maps track IDs to descriptive names and maintains parent-child hierarchy.
 - Socket tracks: `Socket {socket_id}:{protocol}:{hostname/IP}:{port}`
   - Example: `Socket 42:TCP:10.128.0.5:8080`
   - Example: `Socket 15:UDP:api.example.com:53`
-- Sub-tracks: `Sends`, `Receives`, `Buffer Queue`
+- Sub-tracks: `Sends`, `Receives`
 - Root tracks: `Network Packets`, `Network Syscalls`
 
 ### `slice`
@@ -244,8 +244,10 @@ track (Root: "Network Packets")
     │   └── instant_args (length=1460, seq=12345, flags="ACK")
     ├── instant (TCP packet_send, track_id = socket)
     │   └── instant_args (length=1460, seq=12345)
-    └── instant (TCP packet_rcv_established, track_id = socket)
-        └── instant_args (length=64, seq=67890)
+    ├── instant (TCP packet_rcv_established, track_id = socket)
+    │   └── instant_args (length=64, seq=67890)
+    └── instant (TCP buffer_queue, track_id = socket)
+        └── instant_args (length=4096, sndbuf_used=8192, sndbuf_limit=65536)
 
 track (Root: "Network Syscalls" per thread)
 └── track (Socket 1:TCP:10.0.0.1:8080, parent_id = thread_group)

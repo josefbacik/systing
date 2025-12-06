@@ -67,8 +67,6 @@ pub struct SocketMetadata {
     pub af: u32,
     pub dest_addr: [u8; 16],
     pub dest_port: u16,
-    #[allow(dead_code)]
-    pub tgidpid: u64,
 }
 
 impl SocketMetadata {
@@ -353,7 +351,6 @@ impl NetworkRecorder {
                         af: bpf_meta.af.0,
                         dest_addr: bpf_meta.dest_addr,
                         dest_port: bpf_meta.dest_port,
-                        tgidpid: bpf_meta.tgidpid,
                     };
 
                     self.socket_metadata.insert(bpf_meta.socket_id, metadata);
@@ -401,7 +398,6 @@ impl NetworkRecorder {
         use crate::systing::types::packet_event_type;
 
         let socket_id = event.socket_id;
-        let tgidpid = event.task.tgidpid;
 
         // Skip events without socket_id (shouldn't happen in normal operation)
         if socket_id == 0 {
@@ -434,68 +430,51 @@ impl NetworkRecorder {
             icsk_timeout: event.icsk_timeout,
         };
 
-        // Buffer queue events go to per-thread syscall_events (app-relevant)
-        // All other packet events go to global packet_events
-        let is_buffer_queue_event = event.event_type.0 == packet_event_type::PACKET_BUFFER_QUEUE.0
-            || event.event_type.0 == packet_event_type::PACKET_UDP_ENQUEUE.0;
+        // All packet events go to global packet_events
+        let conn_events = self.packet_events.entry(socket_id).or_default();
 
-        if is_buffer_queue_event {
-            // Route to per-thread syscall_events
-            let conn_events = self
-                .syscall_events
-                .entry(tgidpid)
-                .or_default()
-                .entry(socket_id)
-                .or_default();
-
-            if event.event_type.0 == packet_event_type::PACKET_BUFFER_QUEUE.0 {
-                conn_events
-                    .events
-                    .push(EventEntry::TcpBufferQueue(pkt_event));
-            } else {
-                conn_events.events.push(EventEntry::UdpEnqueue(pkt_event));
-            }
-        } else {
-            // Route to global packet_events
-            let conn_events = self.packet_events.entry(socket_id).or_default();
-
-            // TCP packet events
-            if event.event_type.0 == packet_event_type::PACKET_ENQUEUE.0 {
-                conn_events.events.push(EventEntry::TcpEnqueue(pkt_event));
-            } else if event.event_type.0 == packet_event_type::PACKET_SEND.0 {
-                // PACKET_SEND is shared by TCP and UDP for qdisc->NIC transmission
-                conn_events.events.push(EventEntry::SharedSend(pkt_event));
-            } else if event.event_type.0 == packet_event_type::PACKET_RCV_ESTABLISHED.0 {
-                conn_events
-                    .events
-                    .push(EventEntry::TcpRcvEstablished(pkt_event));
-            } else if event.event_type.0 == packet_event_type::PACKET_QUEUE_RCV.0 {
-                conn_events.events.push(EventEntry::TcpQueueRcv(pkt_event));
-            }
-            // UDP packet events
-            else if event.event_type.0 == packet_event_type::PACKET_UDP_SEND.0 {
-                conn_events.events.push(EventEntry::UdpSend(pkt_event));
-            } else if event.event_type.0 == packet_event_type::PACKET_UDP_RCV.0 {
-                conn_events.events.push(EventEntry::UdpRcv(pkt_event));
-            }
-            // Zero window probe events (sender-side)
-            else if event.event_type.0 == packet_event_type::PACKET_ZERO_WINDOW_PROBE.0 {
-                conn_events
-                    .events
-                    .push(EventEntry::TcpZeroWindowProbe(pkt_event));
-            }
-            // Zero window ACK events (receiver-side)
-            else if event.event_type.0 == packet_event_type::PACKET_ZERO_WINDOW_ACK.0 {
-                conn_events
-                    .events
-                    .push(EventEntry::TcpZeroWindowAck(pkt_event));
-            }
-            // RTO timeout events
-            else if event.event_type.0 == packet_event_type::PACKET_RTO_TIMEOUT.0 {
-                conn_events
-                    .events
-                    .push(EventEntry::TcpRtoTimeout(pkt_event));
-            }
+        // TCP packet events
+        if event.event_type.0 == packet_event_type::PACKET_ENQUEUE.0 {
+            conn_events.events.push(EventEntry::TcpEnqueue(pkt_event));
+        } else if event.event_type.0 == packet_event_type::PACKET_SEND.0 {
+            // PACKET_SEND is shared by TCP and UDP for qdisc->NIC transmission
+            conn_events.events.push(EventEntry::SharedSend(pkt_event));
+        } else if event.event_type.0 == packet_event_type::PACKET_RCV_ESTABLISHED.0 {
+            conn_events
+                .events
+                .push(EventEntry::TcpRcvEstablished(pkt_event));
+        } else if event.event_type.0 == packet_event_type::PACKET_QUEUE_RCV.0 {
+            conn_events.events.push(EventEntry::TcpQueueRcv(pkt_event));
+        } else if event.event_type.0 == packet_event_type::PACKET_BUFFER_QUEUE.0 {
+            conn_events
+                .events
+                .push(EventEntry::TcpBufferQueue(pkt_event));
+        }
+        // UDP packet events
+        else if event.event_type.0 == packet_event_type::PACKET_UDP_SEND.0 {
+            conn_events.events.push(EventEntry::UdpSend(pkt_event));
+        } else if event.event_type.0 == packet_event_type::PACKET_UDP_RCV.0 {
+            conn_events.events.push(EventEntry::UdpRcv(pkt_event));
+        } else if event.event_type.0 == packet_event_type::PACKET_UDP_ENQUEUE.0 {
+            conn_events.events.push(EventEntry::UdpEnqueue(pkt_event));
+        }
+        // Zero window probe events (sender-side)
+        else if event.event_type.0 == packet_event_type::PACKET_ZERO_WINDOW_PROBE.0 {
+            conn_events
+                .events
+                .push(EventEntry::TcpZeroWindowProbe(pkt_event));
+        }
+        // Zero window ACK events (receiver-side)
+        else if event.event_type.0 == packet_event_type::PACKET_ZERO_WINDOW_ACK.0 {
+            conn_events
+                .events
+                .push(EventEntry::TcpZeroWindowAck(pkt_event));
+        }
+        // RTO timeout events
+        else if event.event_type.0 == packet_event_type::PACKET_RTO_TIMEOUT.0 {
+            conn_events
+                .events
+                .push(EventEntry::TcpRtoTimeout(pkt_event));
         }
     }
 
@@ -1110,6 +1089,21 @@ impl NetworkRecorder {
                             &rto_pkts,
                         );
                     }
+
+                    // TCP buffer queue events
+                    let buffer_queue_pkts: Vec<_> =
+                        events.iter_tcp_buffer_queue_packets().copied().collect();
+                    if !buffer_queue_pkts.is_empty() {
+                        let buffer_queue_iid =
+                            *self.event_name_ids.get("TCP buffer_queue").unwrap();
+                        self.add_packet_instant_events(
+                            &mut packets,
+                            sequence_id,
+                            socket_track_uuid,
+                            buffer_queue_iid,
+                            &buffer_queue_pkts,
+                        );
+                    }
                 } else {
                     // UDP packet events
                     let udp_send_pkts: Vec<_> = events.iter_udp_send_packets().copied().collect();
@@ -1147,6 +1141,20 @@ impl NetworkRecorder {
                             socket_track_uuid,
                             send_iid,
                             &shared_send_pkts,
+                        );
+                    }
+
+                    // UDP enqueue events
+                    let udp_enqueue_pkts: Vec<_> =
+                        events.iter_udp_enqueue_packets().copied().collect();
+                    if !udp_enqueue_pkts.is_empty() {
+                        let enqueue_iid = *self.event_name_ids.get("UDP enqueue").unwrap();
+                        self.add_packet_instant_events(
+                            &mut packets,
+                            sequence_id,
+                            socket_track_uuid,
+                            enqueue_iid,
+                            &udp_enqueue_pkts,
                         );
                     }
                 }
@@ -1311,52 +1319,6 @@ impl NetworkRecorder {
                         );
                     }
                 }
-
-                // Create Buffer Queue track if we have buffer queue events (app-relevant)
-                let has_buffer_queue = events.iter_tcp_buffer_queue_packets().next().is_some()
-                    || events.iter_udp_enqueue_packets().next().is_some();
-
-                if has_buffer_queue {
-                    let buffer_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-
-                    let mut buffer_track_desc = TrackDescriptor::default();
-                    buffer_track_desc.set_uuid(buffer_track_uuid);
-                    buffer_track_desc.set_name("Buffer Queue".to_string());
-                    buffer_track_desc.set_parent_uuid(socket_group_uuid);
-
-                    let mut buffer_track_packet = TracePacket::default();
-                    buffer_track_packet.set_track_descriptor(buffer_track_desc);
-                    packets.push(buffer_track_packet);
-
-                    // TCP buffer queue events
-                    let buffer_queue_pkts: Vec<_> =
-                        events.iter_tcp_buffer_queue_packets().copied().collect();
-                    if !buffer_queue_pkts.is_empty() {
-                        let buffer_queue_iid =
-                            *self.event_name_ids.get("TCP buffer_queue").unwrap();
-                        self.add_packet_instant_events(
-                            &mut packets,
-                            sequence_id,
-                            buffer_track_uuid,
-                            buffer_queue_iid,
-                            &buffer_queue_pkts,
-                        );
-                    }
-
-                    // UDP enqueue events
-                    let udp_enqueue_pkts: Vec<_> =
-                        events.iter_udp_enqueue_packets().copied().collect();
-                    if !udp_enqueue_pkts.is_empty() {
-                        let enqueue_iid = *self.event_name_ids.get("UDP enqueue").unwrap();
-                        self.add_packet_instant_events(
-                            &mut packets,
-                            sequence_id,
-                            buffer_track_uuid,
-                            enqueue_iid,
-                            &udp_enqueue_pkts,
-                        );
-                    }
-                }
             }
         }
 
@@ -1460,7 +1422,6 @@ mod tests {
         af: u32,
         dest_addr: [u8; 16],
         dest_port: u16,
-        tgidpid: u64,
     ) {
         recorder.socket_metadata.insert(
             socket_id,
@@ -1469,7 +1430,6 @@ mod tests {
                 af,
                 dest_addr,
                 dest_port,
-                tgidpid,
             },
         );
     }
@@ -1636,7 +1596,6 @@ mod tests {
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 in network byte order
         let socket_id: SocketId = 1;
-        let tgidpid = (100u64 << 32) | 101u64;
 
         insert_test_socket_metadata(
             &mut recorder,
@@ -1645,7 +1604,6 @@ mod tests {
             network_address_family::NETWORK_AF_INET.0,
             dest_addr,
             8080,
-            tgidpid,
         );
 
         let event = network_event {
@@ -2039,7 +1997,6 @@ mod tests {
 
         let event = crate::systing::types::packet_event {
             ts: 1000,
-            task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
             dest_port: 8080,
@@ -2078,7 +2035,6 @@ mod tests {
 
         let event = crate::systing::types::packet_event {
             ts: 1100,
-            task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
             dest_port: 8080,
@@ -2114,7 +2070,6 @@ mod tests {
 
         let event = crate::systing::types::packet_event {
             ts: 1110,
-            task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
             dest_port: 8080,
@@ -2150,7 +2105,6 @@ mod tests {
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
         let socket_id: SocketId = 1;
-        let tgidpid = (200u64 << 32) | 201u64;
 
         insert_test_socket_metadata(
             &mut recorder,
@@ -2159,12 +2113,10 @@ mod tests {
             network_address_family::NETWORK_AF_INET.0,
             dest_addr,
             8080,
-            tgidpid,
         );
 
         let rcv_est_event = crate::systing::types::packet_event {
             ts: 1000,
-            task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
             dest_port: 8080,
@@ -2179,7 +2131,6 @@ mod tests {
 
         let queue_rcv_event = crate::systing::types::packet_event {
             ts: 1100,
-            task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
             dest_port: 8080,
@@ -2194,7 +2145,6 @@ mod tests {
 
         let buffer_queue_event = crate::systing::types::packet_event {
             ts: 1110,
-            task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
             dest_port: 8080,
@@ -2227,12 +2177,9 @@ mod tests {
             1
         );
 
-        // PACKET_BUFFER_QUEUE goes to per-thread syscall_events
-        let connections = &recorder.syscall_events[&tgidpid];
-        assert_eq!(connections.len(), 1);
-        assert!(connections.contains_key(&socket_id));
+        // PACKET_BUFFER_QUEUE also goes to global packet_events (no longer per-thread)
         assert_eq!(
-            connections[&socket_id]
+            recorder.packet_events[&socket_id]
                 .iter_tcp_buffer_queue_packets()
                 .count(),
             1
@@ -2248,7 +2195,6 @@ mod tests {
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
         let socket_id: SocketId = 1;
-        let tgidpid = (200u64 << 32) | 201u64;
 
         insert_test_socket_metadata(
             &mut recorder,
@@ -2257,12 +2203,10 @@ mod tests {
             network_address_family::NETWORK_AF_INET.0,
             dest_addr,
             8080,
-            tgidpid,
         );
 
         let packet1 = crate::systing::types::packet_event {
             ts: 1000,
-            task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
             dest_port: 8080,
@@ -2277,7 +2221,6 @@ mod tests {
 
         let packet2 = crate::systing::types::packet_event {
             ts: 1100,
-            task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
             dest_port: 8080,
@@ -2293,10 +2236,9 @@ mod tests {
         recorder.handle_packet_event(packet1);
         recorder.handle_packet_event(packet2);
 
-        // PACKET_BUFFER_QUEUE goes to per-thread syscall_events
-        let connections = &recorder.syscall_events[&tgidpid];
-        assert!(connections.contains_key(&socket_id));
-        let buffer_queue: Vec<_> = connections[&socket_id]
+        // PACKET_BUFFER_QUEUE goes to global packet_events (no longer per-thread)
+        assert!(recorder.packet_events.contains_key(&socket_id));
+        let buffer_queue: Vec<_> = recorder.packet_events[&socket_id]
             .iter_tcp_buffer_queue_packets()
             .collect();
         assert_eq!(buffer_queue.len(), 2);
@@ -2317,7 +2259,6 @@ mod tests {
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
         let socket_id: SocketId = 1;
-        let tgidpid = (200u64 << 32) | 201u64;
 
         insert_test_socket_metadata(
             &mut recorder,
@@ -2326,12 +2267,10 @@ mod tests {
             network_address_family::NETWORK_AF_INET.0,
             dest_addr,
             8080,
-            tgidpid,
         );
 
         let rcv_est = crate::systing::types::packet_event {
             ts: 1000,
-            task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
             dest_port: 8080,
@@ -2346,7 +2285,6 @@ mod tests {
 
         let queue_rcv = crate::systing::types::packet_event {
             ts: 1100,
-            task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
             dest_port: 8080,
@@ -2361,7 +2299,6 @@ mod tests {
 
         let buffer_queue = crate::systing::types::packet_event {
             ts: 1110,
-            task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
             dest_port: 8080,
@@ -2407,7 +2344,6 @@ mod tests {
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
         let socket_id: SocketId = 1;
-        let tgidpid = (200u64 << 32) | 201u64;
 
         insert_test_socket_metadata(
             &mut recorder,
@@ -2416,12 +2352,10 @@ mod tests {
             network_address_family::NETWORK_AF_INET.0,
             dest_addr,
             8080,
-            tgidpid,
         );
 
         let send_enqueue = crate::systing::types::packet_event {
             ts: 1000,
-            task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
             dest_port: 8080,
@@ -2436,7 +2370,6 @@ mod tests {
 
         let recv_buffer = crate::systing::types::packet_event {
             ts: 2000,
-            task: create_test_task_info(200, 201),
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
             dest_port: 8080,
@@ -2462,12 +2395,9 @@ mod tests {
             1
         );
 
-        // PACKET_BUFFER_QUEUE goes to per-thread syscall_events
-        let connections = &recorder.syscall_events[&tgidpid];
-        assert_eq!(connections.len(), 1);
-        assert!(connections.contains_key(&socket_id));
+        // PACKET_BUFFER_QUEUE also goes to global packet_events (no longer per-thread)
         assert_eq!(
-            connections[&socket_id]
+            recorder.packet_events[&socket_id]
                 .iter_tcp_buffer_queue_packets()
                 .count(),
             1
@@ -2484,7 +2414,6 @@ mod tests {
         dest_addr[0..4].copy_from_slice(&[8, 8, 8, 8]); // 8.8.8.8
         let udp_socket_id: SocketId = 1;
         let tcp_socket_id: SocketId = 2;
-        let tgidpid = (100u64 << 32) | 101u64;
 
         insert_test_socket_metadata(
             &mut recorder,
@@ -2493,7 +2422,6 @@ mod tests {
             network_address_family::NETWORK_AF_INET.0,
             dest_addr,
             53,
-            tgidpid,
         );
         insert_test_socket_metadata(
             &mut recorder,
@@ -2502,13 +2430,11 @@ mod tests {
             network_address_family::NETWORK_AF_INET.0,
             dest_addr,
             80,
-            tgidpid,
         );
 
         // Create UDP PACKET_UDP_SEND event - goes to global packet_events
         let udp_send_event = crate::systing::types::packet_event {
             ts: 1000,
-            task: create_test_task_info(100, 101),
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -2525,7 +2451,6 @@ mod tests {
         // Create UDP PACKET_SEND event (qdisc->NIC, shared type) - goes to global packet_events
         let udp_packet_send_event = crate::systing::types::packet_event {
             ts: 2000,
-            task: create_test_task_info(100, 101),
             protocol: network_protocol::NETWORK_UDP, // Explicit protocol field
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -2542,7 +2467,6 @@ mod tests {
         // Create TCP PACKET_SEND event for comparison - goes to global packet_events
         let tcp_packet_send_event = crate::systing::types::packet_event {
             ts: 4000,
-            task: create_test_task_info(100, 101),
             protocol: network_protocol::NETWORK_TCP, // Explicit protocol field
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -2619,13 +2543,11 @@ mod tests {
             network_address_family::NETWORK_AF_INET.0,
             dest_addr,
             443,
-            tgidpid,
         );
 
         // UDP receive event (IP->UDP) - goes to global packet_events
         let udp_rcv_event = crate::systing::types::packet_event {
             ts: 1000,
-            task: create_test_task_info(200, 201),
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -2642,7 +2564,6 @@ mod tests {
         // UDP enqueue event (UDP->buffer) - goes to per-thread syscall_events
         let udp_enqueue_event = crate::systing::types::packet_event {
             ts: 1500,
-            task: create_test_task_info(200, 201),
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -2692,7 +2613,6 @@ mod tests {
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[8, 8, 8, 8]);
         let socket_id: SocketId = 1;
-        let tgidpid = (100u64 << 32) | 101u64;
 
         insert_test_socket_metadata(
             &mut recorder,
@@ -2701,14 +2621,12 @@ mod tests {
             network_address_family::NETWORK_AF_INET.0,
             dest_addr,
             53,
-            tgidpid,
         );
 
         let payload_size = 512;
 
         let udp_send_event = crate::systing::types::packet_event {
             ts: 1000,
-            task: create_test_task_info(100, 101),
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -2724,7 +2642,6 @@ mod tests {
 
         let udp_rcv_event = crate::systing::types::packet_event {
             ts: 3000,
-            task: create_test_task_info(100, 101),
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -2768,7 +2685,6 @@ mod tests {
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[8, 8, 8, 8]); // 8.8.8.8
         let socket_id: SocketId = 1;
-        let tgidpid = (100u64 << 32) | 101u64;
 
         insert_test_socket_metadata(
             &mut recorder,
@@ -2777,14 +2693,12 @@ mod tests {
             network_address_family::NETWORK_AF_INET.0,
             dest_addr,
             53,
-            tgidpid,
         );
 
         // Create UDP PACKET_SEND event (qdisc->NIC, shared event type with TCP)
         // Goes to global packet_events
         let udp_packet_send_event = crate::systing::types::packet_event {
             ts: 1000,
-            task: create_test_task_info(100, 101),
             protocol: network_protocol::NETWORK_UDP, // UDP protocol
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,

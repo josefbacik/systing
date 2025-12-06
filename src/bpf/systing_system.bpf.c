@@ -203,7 +203,6 @@ enum packet_event_type {
 
 struct packet_event {
 	u64 ts;            // Instant event timestamp
-	struct task_info task;
 	enum network_protocol protocol;  // TCP or UDP
 	enum network_address_family af;  // Address family (IPv4 or IPv6)
 	u8 dest_addr[16];  // IPv4 (first 4 bytes) or IPv6 (all 16 bytes) in network byte order
@@ -356,49 +355,6 @@ struct {
 	__uint(max_entries, 10240);
 } pending_network_recvs SEC(".maps");
 
-// Map sk pointer to tgidpid for associating packets with threads
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, u64);  // struct sock * (cast to u64)
-	__type(value, u64);  // tgidpid
-	__uint(max_entries, 10240);
-} sk_to_tgidpid SEC(".maps");
-
-// Helper to get tgidpid for a socket, with fallback for timer/softirq context.
-// Returns 0 if the socket should be filtered out (matches our tool).
-// Otherwise returns the tgidpid to use for the event.
-static __always_inline u64 get_socket_tgidpid(struct sock *sk)
-{
-	u64 sk_ptr = (u64)sk;
-	u64 *tgidpid_ptr = bpf_map_lookup_elem(&sk_to_tgidpid, &sk_ptr);
-
-	if (tgidpid_ptr) {
-		u64 tgidpid = *tgidpid_ptr;
-		u32 tgid = tgidpid >> 32;
-		// Filter out our own tool's sockets
-		if (tgid == tool_config.my_tgid)
-			return 0;
-		return tgidpid;
-	}
-
-	// Socket not in map - try current task context
-	// This handles cases where we're called from application context
-	// but the socket wasn't previously tracked (e.g., first recv on a socket)
-	u64 tgidpid = bpf_get_current_pid_tgid();
-	u32 tgid = tgidpid >> 32;
-
-	// Filter out our own tool's sockets
-	if (tgid == tool_config.my_tgid)
-		return 0;
-
-	// Only add to map if we have a valid user process context
-	// Don't pollute map with tgid=0 (kernel/idle context)
-	if (tgid != 0)
-		bpf_map_update_elem(&sk_to_tgidpid, &sk_ptr, &tgidpid, BPF_ANY);
-
-	return tgidpid;
-}
-
 // Socket identity key - identifies a unique socket+destination pair
 struct socket_identity_key {
 	u64 sk_ptr;           // struct sock * cast to u64
@@ -415,7 +371,6 @@ struct socket_metadata {
 	u8 dest_addr[16];                 // Destination address
 	u16 dest_port;                    // Destination port
 	u16 _pad;                         // Alignment padding
-	u64 tgidpid;                      // Process that created this connection
 };
 
 // Atomic counter for generating unique socket IDs (single-entry array)
@@ -666,7 +621,6 @@ static __always_inline u64 get_or_create_socket_id(
 	metadata.af = af;
 	__builtin_memcpy(metadata.dest_addr, dest_addr, 16);
 	metadata.dest_port = dest_port;
-	metadata.tgidpid = tgidpid;
 
 	bpf_map_update_elem(&socket_metadata_map, &identity_key, &metadata, BPF_NOEXIST);
 
@@ -1813,12 +1767,6 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 SEC("kprobe/tcp_sendmsg")
 int BPF_KPROBE(tcp_sendmsg_entry, struct sock *sk, struct msghdr *msg, size_t size)
 {
-	if (sk) {
-		u64 sk_ptr = (u64)sk;
-		u64 tgidpid = bpf_get_current_pid_tgid();
-		bpf_map_update_elem(&sk_to_tgidpid, &sk_ptr, &tgidpid, BPF_ANY);
-	}
-
 	return handle_sendmsg_entry(sk, msg, NETWORK_TCP);
 }
 
@@ -1831,12 +1779,6 @@ int BPF_KRETPROBE(tcp_sendmsg_exit, int ret)
 SEC("kprobe/udp_sendmsg")
 int BPF_KPROBE(udp_sendmsg_entry, struct sock *sk, struct msghdr *msg, size_t size)
 {
-	if (sk) {
-		u64 sk_ptr = (u64)sk;
-		u64 tgidpid = bpf_get_current_pid_tgid();
-		bpf_map_update_elem(&sk_to_tgidpid, &sk_ptr, &tgidpid, BPF_ANY);
-	}
-
 	return handle_sendmsg_entry(sk, msg, NETWORK_UDP);
 }
 
@@ -1977,13 +1919,6 @@ int BPF_KPROBE(udp_recvmsg_entry, struct sock *sk, struct msghdr *msg, size_t le
 	if (!trace_task(task))
 		return 0;
 
-	// Track socket -> tgidpid for UDP receive packets (same as UDP send)
-	if (sk) {
-		u64 sk_ptr = (u64)sk;
-		u64 tgidpid = bpf_get_current_pid_tgid();
-		bpf_map_update_elem(&sk_to_tgidpid, &sk_ptr, &tgidpid, BPF_ANY);
-	}
-
 	u64 tgidpid = bpf_get_current_pid_tgid();
 	struct network_recv_info info = {0};
 
@@ -2100,17 +2035,12 @@ int BPF_KPROBE(udp_send_skb_entry, struct sk_buff *skb, struct flowi4 *fl4, stru
 	if (!sk)
 		return 0;
 
-	u64 tgidpid = get_socket_tgidpid(sk);
-	if (!tgidpid)
-		return 0;
-
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
 	event->ts = bpf_ktime_get_boot_ns();
-	event->task.tgidpid = tgidpid;
 	event->protocol = NETWORK_UDP;
 	event->event_type = PACKET_UDP_SEND;
 	event->cpu = bpf_get_smp_processor_id();
@@ -2170,10 +2100,6 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 	if (!sk || !skb)
 		return 0;
 
-	u64 tgidpid = get_socket_tgidpid(sk);
-	if (!tgidpid)
-		return 0;
-
 	// Extract headers from skb
 	unsigned char *head = NULL;
 	u16 network_header = 0;
@@ -2192,8 +2118,6 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
 	event->ts = bpf_ktime_get_boot_ns();
-	event->task.tgidpid = tgidpid;
-	__builtin_memset(event->task.comm, 0, TASK_COMM_LEN);
 	event->protocol = NETWORK_UDP;
 	event->event_type = PACKET_UDP_RCV;
 	event->cpu = bpf_get_smp_processor_id();
@@ -2243,10 +2167,6 @@ int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *
 	if (!sk || !skb)
 		return 0;
 
-	u64 tgidpid = get_socket_tgidpid(sk);
-	if (!tgidpid)
-		return 0;
-
 	// Extract headers from skb
 	unsigned char *head = NULL;
 	u16 network_header = 0;
@@ -2265,8 +2185,6 @@ int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
 	event->ts = bpf_ktime_get_boot_ns();
-	event->task.tgidpid = tgidpid;
-	__builtin_memset(event->task.comm, 0, TASK_COMM_LEN);
 	event->protocol = NETWORK_UDP;
 	event->event_type = PACKET_UDP_ENQUEUE;
 	event->cpu = bpf_get_smp_processor_id();
@@ -2316,17 +2234,12 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	if (!sk || !skb)
 		return 0;
 
-	u64 tgidpid = get_socket_tgidpid(sk);
-	if (!tgidpid)
-		return 0;
-
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
 	event->ts = bpf_ktime_get_boot_ns();
-	event->task.tgidpid = tgidpid;
 	event->protocol = NETWORK_TCP;
 	event->event_type = PACKET_ENQUEUE;
 	event->cpu = bpf_get_smp_processor_id();
@@ -2415,7 +2328,7 @@ static __always_inline int read_tcp_seq_from_skb(struct sk_buff *skb, u32 *seq)
 
 // Helper to emit instant packet event for TCP with full socket metadata
 static __always_inline int emit_tcp_packet_event(struct sock *sk, struct sk_buff *skb,
-						  u64 tgidpid, enum packet_event_type event_type)
+						  enum packet_event_type event_type)
 {
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
@@ -2423,7 +2336,6 @@ static __always_inline int emit_tcp_packet_event(struct sock *sk, struct sk_buff
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
 	event->ts = bpf_ktime_get_boot_ns();
-	event->task.tgidpid = tgidpid;
 	event->protocol = NETWORK_TCP;
 	event->event_type = event_type;
 	event->cpu = bpf_get_smp_processor_id();
@@ -2480,8 +2392,7 @@ static __always_inline int emit_tcp_packet_event(struct sock *sk, struct sk_buff
 
 // Helper to emit instant packet event for UDP with socket metadata
 static __always_inline int emit_udp_packet_event(struct sock *sk, struct sk_buff *skb,
-						  u64 tgidpid, u32 length,
-						  enum packet_event_type event_type)
+						  u32 length, enum packet_event_type event_type)
 {
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
@@ -2489,7 +2400,6 @@ static __always_inline int emit_udp_packet_event(struct sock *sk, struct sk_buff
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
 	event->ts = bpf_ktime_get_boot_ns();
-	event->task.tgidpid = tgidpid;
 	event->protocol = NETWORK_UDP;
 	event->event_type = event_type;
 	event->cpu = bpf_get_smp_processor_id();
@@ -2548,22 +2458,18 @@ int BPF_PROG(net_dev_start_xmit, struct sk_buff *skb, struct net_device *dev)
 	if (!sk)
 		return 0;
 
-	u64 tgidpid = get_socket_tgidpid(sk);
-	if (!tgidpid)
-		return 0;
-
 	// Check protocol type from socket
 	u16 protocol = 0;
 	bpf_probe_read_kernel(&protocol, sizeof(protocol), &sk->sk_protocol);
 
 	// Emit PACKET_SEND instant event
 	if (protocol == IPPROTO_TCP) {
-		return emit_tcp_packet_event(sk, skb, tgidpid, PACKET_SEND);
+		return emit_tcp_packet_event(sk, skb, PACKET_SEND);
 	} else if (protocol == IPPROTO_UDP) {
 		// Get packet length from skb
 		u32 len = 0;
 		bpf_probe_read_kernel(&len, sizeof(len), &skb->len);
-		return emit_udp_packet_event(sk, skb, tgidpid, len, PACKET_SEND);
+		return emit_udp_packet_event(sk, skb, len, PACKET_SEND);
 	}
 
 	return 0;
@@ -2628,17 +2534,12 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 	if (!sk || !skb)
 		return 0;
 
-	u64 tgidpid = get_socket_tgidpid(sk);
-	if (!tgidpid)
-		return 0;
-
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
 	event->ts = bpf_ktime_get_boot_ns();
-	event->task.tgidpid = tgidpid;
 	event->protocol = NETWORK_TCP;
 	event->event_type = PACKET_RCV_ESTABLISHED;
 	event->cpu = bpf_get_smp_processor_id();
@@ -2688,17 +2589,12 @@ int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *
 	if (!sk || !skb)
 		return 0;
 
-	u64 tgidpid = get_socket_tgidpid(sk);
-	if (!tgidpid)
-		return 0;
-
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
 	event->ts = bpf_ktime_get_boot_ns();
-	event->task.tgidpid = tgidpid;
 	event->protocol = NETWORK_TCP;
 	event->event_type = PACKET_QUEUE_RCV;
 	event->cpu = bpf_get_smp_processor_id();
@@ -2750,17 +2646,12 @@ int BPF_KPROBE(tcp_data_queue_entry, struct sock *sk, struct sk_buff *skb)
 	if (!sk || !skb)
 		return 0;
 
-	u64 tgidpid = get_socket_tgidpid(sk);
-	if (!tgidpid)
-		return 0;
-
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
 	event->ts = bpf_ktime_get_boot_ns();
-	event->task.tgidpid = tgidpid;
 	event->protocol = NETWORK_TCP;
 	event->event_type = PACKET_QUEUE_RCV;
 	event->cpu = bpf_get_smp_processor_id();
@@ -2821,19 +2712,12 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 	if (!sk)
 		return 0;
 
-	u64 tgidpid = get_socket_tgidpid(sk);
-	if (!tgidpid)
-		return 0;
-
 	long flags;
 	struct packet_event *pkt_event = reserve_packet_event(&flags);
 	if (!pkt_event)
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
 	pkt_event->ts = bpf_ktime_get_boot_ns();
-	pkt_event->task.tgidpid = tgidpid;
-	__builtin_memset(pkt_event->task.comm, 0, TASK_COMM_LEN);
-	record_task_info(&pkt_event->task, task);
 	pkt_event->protocol = NETWORK_TCP;
 	pkt_event->event_type = PACKET_BUFFER_QUEUE;
 	pkt_event->cpu = bpf_get_smp_processor_id();
@@ -2878,18 +2762,12 @@ int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 	if (!sk)
 		return 0;
 
-	u64 tgidpid = get_socket_tgidpid(sk);
-	if (!tgidpid)
-		return 0;
-
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
 	event->ts = bpf_ktime_get_boot_ns();
-	event->task.tgidpid = tgidpid;
-	__builtin_memset(event->task.comm, 0, TASK_COMM_LEN);
 	event->protocol = NETWORK_TCP;
 	event->event_type = PACKET_ZERO_WINDOW_PROBE;
 	event->cpu = bpf_get_smp_processor_id();
@@ -2969,10 +2847,6 @@ int BPF_KPROBE(tcp_send_ack_entry, struct sock *sk)
 	if (!sk)
 		return 0;
 
-	u64 tgidpid = get_socket_tgidpid(sk);
-	if (!tgidpid)
-		return 0;
-
 	// Read TCP socket state
 	struct tcp_sock *tp = (struct tcp_sock *)sk;
 
@@ -3010,8 +2884,6 @@ int BPF_KPROBE(tcp_send_ack_entry, struct sock *sk)
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
 	event->ts = bpf_ktime_get_boot_ns();
-	event->task.tgidpid = tgidpid;
-	__builtin_memset(event->task.comm, 0, TASK_COMM_LEN);
 	event->protocol = NETWORK_TCP;
 	event->event_type = PACKET_ZERO_WINDOW_ACK;
 	event->cpu = bpf_get_smp_processor_id();
@@ -3098,10 +2970,6 @@ int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 	if (!sk)
 		return 0;
 
-	u64 tgidpid = get_socket_tgidpid(sk);
-	if (!tgidpid)
-		return 0;
-
 	// Read TCP socket state to check if there are packets in flight
 	struct tcp_sock *tp = (struct tcp_sock *)sk;
 	u32 packets_out;
@@ -3117,8 +2985,6 @@ int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 		return handle_missed_event(MISSED_PACKET_EVENT);
 
 	event->ts = bpf_ktime_get_boot_ns();
-	event->task.tgidpid = tgidpid;
-	__builtin_memset(event->task.comm, 0, TASK_COMM_LEN);
 	event->protocol = NETWORK_TCP;
 	event->event_type = PACKET_RTO_TIMEOUT;
 	event->cpu = bpf_get_smp_processor_id();
