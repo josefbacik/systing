@@ -74,6 +74,7 @@ Packet-level events (point-in-time). These represent discrete points in the kern
 **Packet Event Types:**
 - TCP: `TCP packet_enqueue`, `TCP packet_send`, `TCP packet_rcv_established`, `TCP packet_queue_rcv`, `TCP buffer_queue`, `TCP zero_window_probe`, `TCP zero_window_ack`, `TCP rto_timeout`
 - UDP: `UDP send`, `UDP receive`, `UDP enqueue`
+- Poll: `poll_ready` - Socket became ready during poll/epoll/select
 
 ### `args`
 Debug annotations for syscall slice events. Multiple args can exist per slice.
@@ -137,6 +138,19 @@ Debug annotations for packet instant events. Multiple args can exist per instant
 | `backoff` | int | TCP rto_timeout, TCP packet_enqueue | Exponential backoff multiplier (0, 1, 2, 3, ...) |
 | `icsk_pending` | int | TCP packet_enqueue | Timer pending: 0=none, 1=retrans, 2=delack, 3=probe/persist |
 | `icsk_timeout` | int | TCP packet_enqueue | When timer fires (jiffies, lower 32 bits) |
+| `socket_id` | int | poll_ready | Unique socket identifier (for correlation with other events) |
+| `socket` | string | poll_ready | Socket info string: "Socket {id}:{protocol}:{host}:{port}" |
+| `requested` | string | poll_ready | Poll events requested (e.g., "IN\|OUT") |
+| `returned` | string | poll_ready | Poll events returned (e.g., "IN") |
+
+**Poll Event Flags:**
+The `requested` and `returned` fields use pipe-separated poll event names:
+- `IN` - Data available to read (POLLIN/EPOLLIN)
+- `OUT` - Ready to write (POLLOUT/EPOLLOUT)
+- `PRI` - Priority data available (POLLPRI/EPOLLPRI)
+- `ERR` - Error condition (POLLERR/EPOLLERR)
+- `HUP` - Hang up (POLLHUP/EPOLLHUP)
+- `RDHUP` - Peer closed connection (EPOLLRDHUP)
 
 **Note on Persist Timer Fields:** The `icsk_pending`, `icsk_timeout`, `rto_jiffies`, `backoff`, and `probe_count` fields are populated on TCP packet_enqueue events when a timer is pending (`icsk_pending > 0`). These fields help understand TCP persist timer behavior during zero-window conditions:
 - `icsk_pending=3` indicates the persist (probe) timer is armed
@@ -653,6 +667,80 @@ HAVING MAX(CASE WHEN a.key = 'icsk_pending' THEN a.int_value END) = 3
 ORDER BY max_backoff DESC;
 ```
 
+### 23. Find All Poll Ready Events
+Find all poll_ready events grouped by socket to see which sockets are most frequently polled:
+```sql
+SELECT MAX(CASE WHEN a.key = 'socket' THEN a.string_value END) as socket,
+       COUNT(*) as poll_count,
+       COUNT(DISTINCT i.utid) as threads_polling
+FROM instant i
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE i.name = 'poll_ready'
+GROUP BY MAX(CASE WHEN a.key = 'socket_id' THEN a.int_value END)
+ORDER BY poll_count DESC;
+```
+
+### 24. Poll Events by Thread
+Find which threads are doing the most polling:
+```sql
+SELECT t.name as thread, p.name as process,
+       COUNT(*) as poll_events,
+       COUNT(DISTINCT CASE WHEN a.key = 'socket_id' THEN a.int_value END) as sockets_polled
+FROM instant i
+JOIN thread t ON i.utid = t.utid AND i.trace_id = t.trace_id
+JOIN process p ON t.upid = p.upid AND t.trace_id = p.trace_id
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE i.name = 'poll_ready'
+GROUP BY t.name, p.name
+ORDER BY poll_events DESC;
+```
+
+### 25. Poll Event Timeline for a Socket
+Show poll events for a specific socket with the events that triggered them:
+```sql
+SELECT i.ts / 1e9 as time_sec,
+       MAX(CASE WHEN a.key = 'socket' THEN a.string_value END) as socket,
+       MAX(CASE WHEN a.key = 'requested' THEN a.string_value END) as requested,
+       MAX(CASE WHEN a.key = 'returned' THEN a.string_value END) as returned
+FROM instant i
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE i.name = 'poll_ready'
+GROUP BY i.id, i.ts
+ORDER BY i.ts
+LIMIT 100;
+```
+
+### 26. Correlate Poll Events with Subsequent Reads
+Find poll events followed by tcp_recv on the same socket within 1ms:
+```sql
+WITH poll_events AS (
+    SELECT i.ts, i.utid,
+           MAX(CASE WHEN a.key = 'socket_id' THEN a.int_value END) as socket_id
+    FROM instant i
+    LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+    WHERE i.name = 'poll_ready'
+    GROUP BY i.id, i.ts, i.utid
+),
+recv_events AS (
+    SELECT s.ts, s.utid,
+           MAX(CASE WHEN a.key = 'socket_id' THEN a.int_value END) as socket_id,
+           MAX(CASE WHEN a.key = 'bytes' THEN a.int_value END) as bytes
+    FROM slice s
+    LEFT JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id
+    WHERE s.name = 'tcp_recv'
+    GROUP BY s.id, s.ts, s.utid
+)
+SELECT p.ts / 1e9 as poll_time_sec,
+       (r.ts - p.ts) / 1e6 as delay_ms,
+       r.bytes
+FROM poll_events p
+JOIN recv_events r ON p.socket_id = r.socket_id
+    AND p.utid = r.utid
+    AND r.ts > p.ts
+    AND r.ts < p.ts + 1000000  -- within 1ms
+ORDER BY p.ts;
+```
+
 ## Track Hierarchy
 
 Network tracks are organized hierarchically:
@@ -695,10 +783,11 @@ Thread (from PID/TGID track descriptor)
 └── Network
     ├── tcp_send (slice with socket_id, socket annotations)
     ├── tcp_recv (slice with socket_id, socket annotations)
-    └── udp_send (slice with socket_id, socket annotations)
+    ├── udp_send (slice with socket_id, socket annotations)
+    └── poll_ready (instant with socket_id, requested, returned)
 ```
 
-**Note:** All syscall events from a thread are on a single "Network" track. Socket information is stored in the `args` table:
+**Note:** All syscall events from a thread are on a single "Network" track. Socket information is stored in the `args` table (for slices) or `instant_args` table (for poll_ready):
 - `socket_id`: numeric socket identifier (for grouping/filtering)
 - `socket`: human-readable string like "Socket 1:TCP:10.0.0.1:8080"
 
