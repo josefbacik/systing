@@ -501,7 +501,7 @@ impl SystingEvent for packet_event {
         self.ts
     }
     fn next_task_info(&self) -> Option<&task_info> {
-        Some(&self.task)
+        None
     }
 }
 
