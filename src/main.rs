@@ -1096,6 +1096,92 @@ fn setup_ringbuffers<'a>(
     Ok((rings, channels))
 }
 
+/// Checks for probes that failed to attach and warns about them.
+/// Uses the program's autoload() status to determine if it was expected to load,
+/// eliminating the need to duplicate autoload conditions from configure_bpf_skeleton.
+fn warn_failed_probe_attachments(skel: &systing::SystingSystemSkel) {
+    use libbpf_rs::skel::Skel;
+
+    let mut failed_count = 0;
+
+    // Iterate over all programs and check if they were expected to load but failed to attach
+    for prog in skel.object().progs() {
+        let name = prog.name().to_string_lossy();
+
+        // Skip programs that weren't set to autoload (they were intentionally disabled)
+        if !prog.autoload() {
+            continue;
+        }
+
+        // Check if this program's link exists in the skeleton
+        // Programs that don't support auto-attach (like generic kprobe/uprobe/usdt handlers)
+        // are skipped since they're attached manually
+        let link_is_none = match name.as_ref() {
+            // Scheduler probes
+            "systing_sched_wakeup" => skel.links.systing_sched_wakeup.is_none(),
+            "systing_sched_wakeup_new" => skel.links.systing_sched_wakeup_new.is_none(),
+            "systing_sched_switch" => skel.links.systing_sched_switch.is_none(),
+            "systing_sched_waking" => skel.links.systing_sched_waking.is_none(),
+            "systing_sched_process_exit" => skel.links.systing_sched_process_exit.is_none(),
+            "systing_sched_process_fork" => skel.links.systing_sched_process_fork.is_none(),
+            // IRQ probes
+            "systing_irq_handler_entry" => skel.links.systing_irq_handler_entry.is_none(),
+            "systing_irq_handler_exit" => skel.links.systing_irq_handler_exit.is_none(),
+            "systing_softirq_entry" => skel.links.systing_softirq_entry.is_none(),
+            "systing_softirq_exit" => skel.links.systing_softirq_exit.is_none(),
+            // Syscall probes
+            "tracepoint__raw_syscalls__sys_enter" => {
+                skel.links.tracepoint__raw_syscalls__sys_enter.is_none()
+            }
+            "tracepoint__raw_syscalls__sys_exit" => {
+                skel.links.tracepoint__raw_syscalls__sys_exit.is_none()
+            }
+            // Network probes
+            "tcp_sendmsg_entry" => skel.links.tcp_sendmsg_entry.is_none(),
+            "tcp_sendmsg_exit" => skel.links.tcp_sendmsg_exit.is_none(),
+            "udp_sendmsg_entry" => skel.links.udp_sendmsg_entry.is_none(),
+            "udp_sendmsg_exit" => skel.links.udp_sendmsg_exit.is_none(),
+            "tcp_recvmsg_entry" => skel.links.tcp_recvmsg_entry.is_none(),
+            "tcp_recvmsg_exit" => skel.links.tcp_recvmsg_exit.is_none(),
+            "udp_recvmsg_entry" => skel.links.udp_recvmsg_entry.is_none(),
+            "udp_recvmsg_exit" => skel.links.udp_recvmsg_exit.is_none(),
+            "skb_recv_udp_exit" => skel.links.skb_recv_udp_exit.is_none(),
+            "udp_send_skb_entry" => skel.links.udp_send_skb_entry.is_none(),
+            "udp_queue_rcv_one_skb_entry" => skel.links.udp_queue_rcv_one_skb_entry.is_none(),
+            "udp_enqueue_schedule_skb_entry" => skel.links.udp_enqueue_schedule_skb_entry.is_none(),
+            "tcp_transmit_skb_entry" => skel.links.tcp_transmit_skb_entry.is_none(),
+            "net_dev_start_xmit" => skel.links.net_dev_start_xmit.is_none(),
+            "tcp_rcv_established_entry" => skel.links.tcp_rcv_established_entry.is_none(),
+            "tcp_queue_rcv_entry" => skel.links.tcp_queue_rcv_entry.is_none(),
+            "tcp_data_queue_entry" => skel.links.tcp_data_queue_entry.is_none(),
+            "skb_copy_datagram_iovec" => skel.links.skb_copy_datagram_iovec.is_none(),
+            "tcp_send_probe0_entry" => skel.links.tcp_send_probe0_entry.is_none(),
+            "tcp_send_ack_entry" => skel.links.tcp_send_ack_entry.is_none(),
+            "tcp_retransmit_timer_entry" => skel.links.tcp_retransmit_timer_entry.is_none(),
+            // Programs that are manually attached (skip auto-attach check)
+            // These include: systing_usdt, systing_uprobe, systing_kprobe,
+            // systing_tracepoint, systing_raw_tracepoint, systing_perf_event_clock
+            _ => continue,
+        };
+
+        if link_is_none {
+            eprintln!(
+                "Warning: Probe '{}' ({}) failed to attach - some data may be missing",
+                name,
+                prog.section().to_string_lossy()
+            );
+            failed_count += 1;
+        }
+    }
+
+    if failed_count > 0 {
+        eprintln!(
+            "Warning: {} probe(s) failed to attach. Check dmesg for BPF errors.",
+            failed_count
+        );
+    }
+}
+
 fn configure_bpf_skeleton(
     open_skel: &mut systing::OpenSystingSystemSkel,
     opts: &Command,
@@ -1273,6 +1359,13 @@ fn configure_bpf_skeleton(
         open_skel.progs.tcp_data_queue_entry.set_autoload(false);
         open_skel.progs.net_dev_start_xmit.set_autoload(false);
         open_skel.progs.skb_copy_datagram_iovec.set_autoload(false);
+        open_skel.progs.skb_recv_udp_exit.set_autoload(false);
+        open_skel.progs.tcp_send_probe0_entry.set_autoload(false);
+        open_skel.progs.tcp_send_ack_entry.set_autoload(false);
+        open_skel
+            .progs
+            .tcp_retransmit_timer_entry
+            .set_autoload(false);
     }
 
     Ok(())
@@ -1983,6 +2076,9 @@ fn system(opts: Command) -> Result<()> {
         skel.attach().with_context(|| {
             "Failed to attach BPF programs to tracepoints. Check if tracepoints are enabled."
         })?;
+
+        // Check for any probes that failed to attach and warn about them
+        warn_failed_probe_attachments(&skel);
 
         // Attach any usdt's that we may have
         let _probe_links = attach_probes(&mut skel, &recorder, &opts, old_kernel)?;
