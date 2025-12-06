@@ -123,14 +123,23 @@ Debug annotations for packet instant events. Multiple args can exist per instant
 | `is_zero_window_probe` | int | TCP zero_window_probe, TCP rto_timeout | 1 for zero window probe events (also set on RTO if snd_wnd=0) |
 | `probe_count` | int | TCP zero_window_probe | Number of probes sent (icsk_probes_out) |
 | `snd_wnd` | int | TCP zero_window_probe, TCP rto_timeout | Current send window (0 for zero window condition) |
-| `rto_jiffies` | int | TCP rto_timeout | RTO value in kernel jiffies (raw kernel value) |
+| `rto_jiffies` | int | TCP rto_timeout, TCP packet_enqueue | RTO value in kernel jiffies (raw kernel value) |
 | `rto_us` | int | TCP rto_timeout | RTO value in microseconds (converted using system HZ) |
 | `rto_ms` | int | TCP rto_timeout | RTO value in milliseconds (for easier reading) |
 | `srtt_us` | int | TCP rto_timeout | Smoothed RTT in microseconds |
 | `srtt_ms` | int | TCP rto_timeout | Smoothed RTT in milliseconds |
 | `rttvar_us` | int | TCP rto_timeout | RTT variance in microseconds |
 | `retransmit_count` | int | TCP rto_timeout | Number of consecutive RTO timeouts (1 = first timeout) |
-| `backoff` | int | TCP rto_timeout | Exponential backoff multiplier (0, 1, 2, 3, ...) |
+| `backoff` | int | TCP rto_timeout, TCP packet_enqueue | Exponential backoff multiplier (0, 1, 2, 3, ...) |
+| `icsk_pending` | int | TCP packet_enqueue | Timer pending: 0=none, 1=retrans, 2=delack, 3=probe/persist |
+| `icsk_timeout` | int | TCP packet_enqueue | When timer fires (jiffies, lower 32 bits) |
+
+**Note on Persist Timer Fields:** The `icsk_pending`, `icsk_timeout`, `rto_jiffies`, `backoff`, and `probe_count` fields are populated on TCP packet_enqueue events when a timer is pending (`icsk_pending > 0`). These fields help understand TCP persist timer behavior during zero-window conditions:
+- `icsk_pending=3` indicates the persist (probe) timer is armed
+- `icsk_timeout` shows when the timer will fire (compare with packet timestamp to calculate time remaining)
+- `rto_jiffies` shows the current RTO value (persist timer uses this as base interval)
+- `backoff` shows how many times the timer has doubled due to exponential backoff
+- `probe_count` shows how many zero-window probes have been sent
 
 **Note on RTO Timeout Events:** RTO (Retransmission Timeout) events fire when the TCP retransmit timer expires because an ACK wasn't received in time. The `retransmit_count` shows how many consecutive RTOs have occurred (1 = first timeout). The `backoff` shows the exponential backoff multiplier applied to the RTO. If `snd_wnd=0`, the RTO is handling a zero-window condition rather than packet loss, and `is_zero_window_probe` will be set to 1.
 
@@ -595,6 +604,45 @@ WHERE i.name = 'TCP rto_timeout'
 GROUP BY i.id, t.name
 ORDER BY t.name,
          MAX(CASE WHEN a.key = 'retransmit_count' THEN a.int_value END);
+```
+
+### 21. Analyze Persist Timer State on Packet Send Events
+Track TCP persist timer behavior during zero-window conditions to understand why ZWP probes have long gaps:
+```sql
+SELECT t.name as socket,
+       ROUND(i.ts/1e9, 3) as time_sec,
+       MAX(CASE WHEN a.key = 'sndbuf_fill_pct' THEN a.int_value END) as sndbuf_pct,
+       MAX(CASE WHEN a.key = 'icsk_pending' THEN a.int_value END) as timer_pending,
+       MAX(CASE WHEN a.key = 'icsk_timeout' THEN a.int_value END) as timeout_jiffies,
+       MAX(CASE WHEN a.key = 'rto_jiffies' THEN a.int_value END) as rto_jiffies,
+       MAX(CASE WHEN a.key = 'backoff' THEN a.int_value END) as backoff,
+       MAX(CASE WHEN a.key = 'probe_count' THEN a.int_value END) as probes_sent
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE i.name = 'TCP packet_enqueue'
+  AND t.name LIKE 'Socket%'
+GROUP BY i.id, i.ts, t.name
+HAVING MAX(CASE WHEN a.key = 'icsk_pending' THEN a.int_value END) = 3  -- Persist timer armed
+ORDER BY i.ts;
+```
+
+### 22. Find Sockets with Long Persist Timer Backoff
+Identify connections where the persist timer has backed off significantly (indicating prolonged zero-window conditions):
+```sql
+SELECT t.name as socket,
+       COUNT(*) as packets_with_persist,
+       MAX(CASE WHEN a.key = 'backoff' THEN a.int_value END) as max_backoff,
+       MAX(CASE WHEN a.key = 'probe_count' THEN a.int_value END) as max_probes,
+       MAX(CASE WHEN a.key = 'rto_jiffies' THEN a.int_value END) as max_rto_jiffies
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE i.name = 'TCP packet_enqueue'
+GROUP BY t.name
+HAVING MAX(CASE WHEN a.key = 'icsk_pending' THEN a.int_value END) = 3
+   AND MAX(CASE WHEN a.key = 'backoff' THEN a.int_value END) >= 2
+ORDER BY max_backoff DESC;
 ```
 
 ## Track Hierarchy

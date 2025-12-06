@@ -135,6 +135,9 @@ struct PacketEvent {
     rttvar_us: u32,       // RTT variance in microseconds
     retransmit_count: u8, // Number of consecutive RTO timeouts (icsk_retransmits + 1)
     backoff: u8,          // Exponential backoff multiplier (icsk_backoff)
+    // Persist timer fields (populated on packet send events)
+    icsk_pending: u8, // What timer is pending: 0=none, 1=retrans, 2=delack, 3=probe/persist
+    icsk_timeout: u64, // When timer fires (jiffies)
 }
 
 enum EventEntry {
@@ -427,6 +430,8 @@ impl NetworkRecorder {
             rttvar_us: event.rttvar_us,
             retransmit_count: event.retransmit_count,
             backoff: event.backoff,
+            icsk_pending: event.icsk_pending,
+            icsk_timeout: event.icsk_timeout,
         };
 
         // Buffer queue events go to per-thread syscall_events (app-relevant)
@@ -603,6 +608,41 @@ impl NetworkRecorder {
                 fill_annotation.set_name("sndbuf_fill_pct".to_string());
                 fill_annotation.set_uint_value(fill_pct);
                 instant_event.debug_annotations.push(fill_annotation);
+            }
+
+            // Add persist timer state (icsk_pending: 0=none, 1=retrans, 2=delack, 3=probe/persist)
+            if pkt.icsk_pending > 0 {
+                let mut pending_annotation = DebugAnnotation::default();
+                pending_annotation.set_name("icsk_pending".to_string());
+                pending_annotation.set_uint_value(pkt.icsk_pending as u64);
+                instant_event.debug_annotations.push(pending_annotation);
+
+                let mut timeout_annotation = DebugAnnotation::default();
+                timeout_annotation.set_name("icsk_timeout".to_string());
+                timeout_annotation.set_uint_value(pkt.icsk_timeout);
+                instant_event.debug_annotations.push(timeout_annotation);
+
+                // Also add RTO and backoff for context
+                if pkt.rto_jiffies > 0 {
+                    let mut rto_annotation = DebugAnnotation::default();
+                    rto_annotation.set_name("rto_jiffies".to_string());
+                    rto_annotation.set_uint_value(pkt.rto_jiffies as u64);
+                    instant_event.debug_annotations.push(rto_annotation);
+                }
+
+                if pkt.backoff > 0 {
+                    let mut backoff_annotation = DebugAnnotation::default();
+                    backoff_annotation.set_name("backoff".to_string());
+                    backoff_annotation.set_uint_value(pkt.backoff as u64);
+                    instant_event.debug_annotations.push(backoff_annotation);
+                }
+
+                if pkt.probe_count > 0 {
+                    let mut probes_annotation = DebugAnnotation::default();
+                    probes_annotation.set_name("probe_count".to_string());
+                    probes_annotation.set_uint_value(pkt.probe_count as u64);
+                    instant_event.debug_annotations.push(probes_annotation);
+                }
             }
 
             // Add retransmit flag if this packet is a TCP retransmit
