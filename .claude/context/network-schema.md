@@ -5,15 +5,17 @@ This document describes how network events are stored in DuckDB after conversion
 ## Overview
 
 Network events are tracked through seven related tables:
-- **`track`** - Track metadata including socket connection info
+- **`track`** - Track metadata (per-thread "Network" track for syscalls, per-socket for packets)
 - **`slice`** - Network syscall events (tcp_send, tcp_recv, udp_send) - range-based with duration
-- **`args`** - Debug annotations for slice events (bytes, buffer info)
+- **`args`** - Debug annotations for slice events (socket_id, socket, bytes, buffer info)
 - **`instant`** - Packet-level events (packet_enqueue, packet_send, etc.) - point-in-time events
 - **`instant_args`** - Debug annotations for instant events (seq numbers, length, flags)
 - **`network_interface`** - Local network interface metadata (for cross-trace correlation)
 - **`clock_snapshot`** - Clock correlation data for timestamp conversion between clock domains
 
 **Note:** Syscall events (tcp_send, tcp_recv, etc.) are range-based slices with duration because they represent the time a thread spends in a syscall. Packet events are instant events because they represent discrete points in the kernel packet processing pipeline.
+
+**Track Structure:** Syscall events are stored on a single "Network" track per thread, with socket information embedded in each event's annotations. Packet events are stored on per-socket tracks under a global "Network Packets" root.
 
 ## Tables
 
@@ -24,15 +26,15 @@ Maps track IDs to descriptive names and maintains parent-child hierarchy.
 |--------|------|-------------|
 | trace_id | VARCHAR | Trace identifier |
 | id | BIGINT | Unique track ID (matches `slice.track_id`) |
-| name | VARCHAR | Track name (e.g., "Socket 1:TCP:10.0.0.1:8080") |
+| name | VARCHAR | Track name (e.g., "Network" or "Socket 1:TCP:10.0.0.1:8080") |
 | parent_id | BIGINT | FK to parent track's ID (for hierarchy) |
 
 **Track Name Format:**
-- Socket tracks: `Socket {socket_id}:{protocol}:{hostname/IP}:{port}`
+- Per-thread syscall track: `Network` - single track per thread for all network syscall events
+- Per-socket packet tracks: `Socket {socket_id}:{protocol}:{hostname/IP}:{port}`
   - Example: `Socket 42:TCP:10.128.0.5:8080`
   - Example: `Socket 15:UDP:api.example.com:53`
-- Sub-tracks: `Sends`, `Receives`
-- Root tracks: `Network Packets`, `Network Syscalls`
+- Root packet track: `Network Packets`
 
 ### `slice`
 Network syscall events (range-based with duration). Each event has a track_id linking to the track table and a utid for direct thread correlation.
@@ -89,6 +91,8 @@ Debug annotations for syscall slice events. Multiple args can exist per slice.
 
 | Key | Type | Events | Description |
 |-----|------|--------|-------------|
+| `socket_id` | int | All syscall events | Unique socket identifier (for grouping events by socket) |
+| `socket` | string | All syscall events | Socket info string: "Socket {id}:{protocol}:{host}:{port}" |
 | `bytes` | int | tcp_send, tcp_recv, udp_send | Bytes transferred |
 | `sndbuf_used` | int | tcp_send | Current send buffer usage (sk_wmem_queued) |
 | `sndbuf_limit` | int | tcp_send | Max send buffer size (sk_sndbuf) |
@@ -249,14 +253,14 @@ track (Root: "Network Packets")
     └── instant (TCP buffer_queue, track_id = socket)
         └── instant_args (length=4096, sndbuf_used=8192, sndbuf_limit=65536)
 
-track (Root: "Network Syscalls" per thread)
-└── track (Socket 1:TCP:10.0.0.1:8080, parent_id = thread_group)
-    ├── track (Sends, parent_id = socket)
-    │   └── slice (tcp_send, track_id = sends, dur=12345)
-    │       └── args (bytes=4096, sndbuf_used=8192, sndbuf_limit=65536, sndbuf_fill_pct=12)
-    └── track (Receives, parent_id = socket)
-        └── slice (tcp_recv, track_id = receives, dur=5678)
-            └── args (bytes=2048)
+track (Thread, parent of "Network" track)
+└── track (Network, parent_id = thread)
+    ├── slice (tcp_send, track_id = network, dur=12345)
+    │   └── args (socket_id=1, socket="Socket 1:TCP:10.0.0.1:8080", bytes=4096, ...)
+    ├── slice (tcp_recv, track_id = network, dur=5678)
+    │   └── args (socket_id=1, socket="Socket 1:TCP:10.0.0.1:8080", bytes=2048, ...)
+    └── slice (tcp_send, track_id = network, dur=3000)
+        └── args (socket_id=2, socket="Socket 2:TCP:10.0.0.2:443", bytes=1024, ...)
 ```
 
 ## Common Queries
@@ -280,15 +284,14 @@ LIMIT 20;
 ### 2. Network Traffic by Process with Socket Count
 ```sql
 SELECT p.name as process, p.pid,
-       COUNT(DISTINCT CASE WHEN ptr.name LIKE 'Socket%' THEN ptr.name END) as sockets,
+       COUNT(DISTINCT a_socket.int_value) as sockets,
        COUNT(s.id) as events,
        SUM(CASE WHEN a.key = 'bytes' THEN a.int_value ELSE 0 END) / 1073741824.0 as total_gb
 FROM slice s
 JOIN thread t ON s.utid = t.utid AND s.trace_id = t.trace_id
 JOIN process p ON t.upid = p.upid AND t.trace_id = p.trace_id
-JOIN track tr ON s.track_id = tr.id AND s.trace_id = tr.trace_id
-LEFT JOIN track ptr ON tr.parent_id = ptr.id AND tr.trace_id = ptr.trace_id
 LEFT JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id AND a.key = 'bytes'
+LEFT JOIN args a_socket ON s.id = a_socket.slice_id AND s.trace_id = a_socket.trace_id AND a_socket.key = 'socket_id'
 WHERE s.name IN ('tcp_send', 'tcp_recv')
 GROUP BY p.name, p.pid
 ORDER BY total_gb DESC
@@ -297,21 +300,26 @@ LIMIT 20;
 
 ### 3. Find Network Traffic for a Specific Thread
 ```sql
-SELECT ptr.name as socket, s.name as event_type,
+SELECT a_socket.string_value as socket, s.name as event_type,
        COUNT(*) as events,
        SUM(CASE WHEN a.key = 'bytes' THEN a.int_value ELSE 0 END) / 1048576.0 as total_mb
 FROM slice s
 JOIN thread t ON s.utid = t.utid AND s.trace_id = t.trace_id
-JOIN track tr ON s.track_id = tr.id AND s.trace_id = tr.trace_id
-LEFT JOIN track ptr ON tr.parent_id = ptr.id AND tr.trace_id = ptr.trace_id
 LEFT JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id AND a.key = 'bytes'
+LEFT JOIN args a_socket ON s.id = a_socket.slice_id AND s.trace_id = a_socket.trace_id AND a_socket.key = 'socket'
 WHERE t.name = 'loco-run:0' AND s.name IN ('tcp_send', 'tcp_recv')
-GROUP BY ptr.name, s.name
+GROUP BY a_socket.string_value, s.name
 ORDER BY total_mb DESC;
 ```
 
 ### 4. Find All TCP Connections
 ```sql
+-- From syscall events (using args)
+SELECT DISTINCT a.string_value as socket
+FROM args a
+WHERE a.key = 'socket' AND a.string_value LIKE 'Socket%TCP%';
+
+-- OR from packet events (using track names)
 SELECT DISTINCT name
 FROM track
 WHERE name LIKE 'Socket%TCP%';
@@ -319,15 +327,14 @@ WHERE name LIKE 'Socket%TCP%';
 
 ### 5. Total Bytes Transferred Per Socket
 ```sql
-SELECT parent.name as socket,
-       SUM(a.int_value) / 1048576.0 as total_mb,
+SELECT a_socket.string_value as socket,
+       SUM(a_bytes.int_value) / 1048576.0 as total_mb,
        COUNT(*) as events
 FROM slice s
-JOIN track t ON s.track_id = t.id AND s.trace_id = t.trace_id
-JOIN track parent ON t.parent_id = parent.id AND t.trace_id = parent.trace_id
-JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id AND a.key = 'bytes'
-WHERE parent.name LIKE 'Socket%'
-GROUP BY parent.name
+JOIN args a_socket ON s.id = a_socket.slice_id AND s.trace_id = a_socket.trace_id AND a_socket.key = 'socket'
+JOIN args a_bytes ON s.id = a_bytes.slice_id AND s.trace_id = a_bytes.trace_id AND a_bytes.key = 'bytes'
+WHERE s.name IN ('tcp_send', 'tcp_recv', 'udp_send')
+GROUP BY a_socket.string_value
 ORDER BY total_mb DESC
 LIMIT 20;
 ```
@@ -335,16 +342,15 @@ LIMIT 20;
 ### 6. Analyze Send Buffer Pressure
 Find sockets with high send buffer utilization:
 ```sql
-SELECT parent.name as socket,
-       AVG(a.int_value) as avg_fill_pct,
-       MAX(a.int_value) as max_fill_pct,
+SELECT a_socket.string_value as socket,
+       AVG(a_fill.int_value) as avg_fill_pct,
+       MAX(a_fill.int_value) as max_fill_pct,
        COUNT(*) as events
 FROM slice s
-JOIN track t ON s.track_id = t.id AND s.trace_id = t.trace_id
-JOIN track parent ON t.parent_id = parent.id AND t.trace_id = parent.trace_id
-JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id
-WHERE a.key = 'sndbuf_fill_pct' AND parent.name LIKE 'Socket%'
-GROUP BY parent.name
+JOIN args a_socket ON s.id = a_socket.slice_id AND s.trace_id = a_socket.trace_id AND a_socket.key = 'socket'
+JOIN args a_fill ON s.id = a_fill.slice_id AND s.trace_id = a_fill.trace_id AND a_fill.key = 'sndbuf_fill_pct'
+WHERE s.name = 'tcp_send'
+GROUP BY a_socket.string_value
 HAVING avg_fill_pct > 50
 ORDER BY avg_fill_pct DESC;
 ```
@@ -454,12 +460,12 @@ WITH zwp_sockets AS (
     WHERE i.name = 'TCP zero_window_probe'
 ),
 high_buffer AS (
-    SELECT t.name as socket, s.trace_id, AVG(a.int_value) as avg_fill_pct
+    SELECT a_socket.string_value as socket, s.trace_id, AVG(a_fill.int_value) as avg_fill_pct
     FROM slice s
-    JOIN track t ON s.track_id = t.id AND s.trace_id = t.trace_id
-    JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id
-    WHERE a.key = 'sndbuf_fill_pct'
-    GROUP BY t.name, s.trace_id
+    JOIN args a_socket ON s.id = a_socket.slice_id AND s.trace_id = a_socket.trace_id AND a_socket.key = 'socket'
+    JOIN args a_fill ON s.id = a_fill.slice_id AND s.trace_id = a_fill.trace_id AND a_fill.key = 'sndbuf_fill_pct'
+    WHERE s.name = 'tcp_send'
+    GROUP BY a_socket.string_value, s.trace_id
     HAVING avg_fill_pct > 80
 )
 SELECT z.socket, h.avg_fill_pct
@@ -472,36 +478,36 @@ Show tcp_recv events with sequence progression to analyze receive buffering:
 ```sql
 SELECT s.ts/1e9 as time_sec,
        s.dur/1e6 as duration_ms,
-       t.name as socket,
+       MAX(CASE WHEN a.key = 'socket' THEN a.string_value END) as socket,
        MAX(CASE WHEN a.key = 'bytes' THEN a.int_value END) as bytes_read,
        MAX(CASE WHEN a.key = 'recv_seq_start' THEN a.int_value END) as seq_start,
        MAX(CASE WHEN a.key = 'recv_seq_end' THEN a.int_value END) as seq_end,
        MAX(CASE WHEN a.key = 'rcv_nxt' THEN a.int_value END) as rcv_nxt,
        MAX(CASE WHEN a.key = 'bytes_available' THEN a.int_value END) as buffered_bytes
 FROM slice s
-JOIN track t ON s.track_id = t.id AND s.trace_id = t.trace_id
 LEFT JOIN args a ON s.id = a.slice_id AND s.trace_id = a.trace_id
 WHERE s.name = 'tcp_recv'
-GROUP BY s.id, s.ts, s.dur, t.name
+GROUP BY s.id, s.ts, s.dur
 ORDER BY s.ts;
 ```
 
 ### 15. Identify Receive Bottlenecks
 Find sockets where the kernel had more data buffered than the app consumed:
 ```sql
-SELECT t.name as socket,
+SELECT a_socket.string_value as socket,
        COUNT(*) as recv_calls,
        AVG(CASE WHEN a_avail.int_value > a_bytes.int_value
            THEN a_avail.int_value - a_bytes.int_value ELSE 0 END) as avg_unconsumed_bytes,
        MAX(a_avail.int_value) as max_bytes_available
 FROM slice s
-JOIN track t ON s.track_id = t.id AND s.trace_id = t.trace_id
+LEFT JOIN args a_socket ON s.id = a_socket.slice_id AND s.trace_id = a_socket.trace_id
+    AND a_socket.key = 'socket'
 LEFT JOIN args a_bytes ON s.id = a_bytes.slice_id AND s.trace_id = a_bytes.trace_id
     AND a_bytes.key = 'bytes'
 LEFT JOIN args a_avail ON s.id = a_avail.slice_id AND s.trace_id = a_avail.trace_id
     AND a_avail.key = 'bytes_available'
 WHERE s.name = 'tcp_recv'
-GROUP BY t.id, t.name
+GROUP BY a_socket.string_value
 HAVING MAX(a_avail.int_value) > 0
 ORDER BY avg_unconsumed_bytes DESC;
 ```
@@ -686,13 +692,15 @@ Network Packets (root)
 **Syscall Events (per-thread, stored in `slice` table):**
 ```
 Thread (from PID/TGID track descriptor)
-└── Network Syscalls
-    └── Socket {id}:{protocol}:{addr}:{port}
-        ├── Sends
-        │   └── tcp_send / udp_send (slice with duration)
-        └── Receives
-            └── tcp_recv (slice with duration)
+└── Network
+    ├── tcp_send (slice with socket_id, socket annotations)
+    ├── tcp_recv (slice with socket_id, socket annotations)
+    └── udp_send (slice with socket_id, socket annotations)
 ```
+
+**Note:** All syscall events from a thread are on a single "Network" track. Socket information is stored in the `args` table:
+- `socket_id`: numeric socket identifier (for grouping/filtering)
+- `socket`: human-readable string like "Socket 1:TCP:10.0.0.1:8080"
 
 ## Notes
 

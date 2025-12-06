@@ -106,6 +106,7 @@ struct NetworkEvent {
     recv_seq_start: u32,   // TCP copied_seq at recvmsg entry (TCP recv only)
     recv_seq_end: u32,     // TCP copied_seq at recvmsg exit (TCP recv only)
     rcv_nxt_at_entry: u32, // TCP rcv_nxt at entry - kernel's next expected seq (TCP recv only)
+    socket_id: SocketId,   // Socket identifier for this event
 }
 
 #[derive(Clone, Copy)]
@@ -164,22 +165,6 @@ impl ConnectionEvents {
         self.events.is_empty()
     }
 
-    fn iter_sends(&self) -> impl Iterator<Item = &NetworkEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::Send(evt) => Some(evt),
-            _ => None,
-        })
-    }
-
-    #[allow(dead_code)]
-    fn iter_recvs(&self) -> impl Iterator<Item = &NetworkEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::Recv(evt) => Some(evt),
-            _ => None,
-        })
-    }
-
-    #[allow(dead_code)]
     fn iter_tcp_enqueue_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::TcpEnqueue(pkt) => Some(pkt),
@@ -187,7 +172,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_tcp_rcv_established_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::TcpRcvEstablished(pkt) => Some(pkt),
@@ -195,7 +179,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_tcp_queue_rcv_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::TcpQueueRcv(pkt) => Some(pkt),
@@ -203,7 +186,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_tcp_buffer_queue_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::TcpBufferQueue(pkt) => Some(pkt),
@@ -211,7 +193,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_udp_send_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::UdpSend(pkt) => Some(pkt),
@@ -219,7 +200,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_udp_rcv_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::UdpRcv(pkt) => Some(pkt),
@@ -227,7 +207,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_udp_enqueue_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::UdpEnqueue(pkt) => Some(pkt),
@@ -235,7 +214,6 @@ impl ConnectionEvents {
         })
     }
 
-    #[allow(dead_code)]
     fn iter_shared_send_packets(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::SharedSend(pkt) => Some(pkt),
@@ -291,9 +269,13 @@ impl DnsStats {
 pub struct NetworkRecorder {
     pub ringbuf: RingBuffer<network_event>,
 
-    /// Per-thread syscall events (sendmsg/recvmsg, buffer queue)
-    /// Key: tgidpid -> socket_id -> ConnectionEvents
-    syscall_events: HashMap<u64, HashMap<SocketId, ConnectionEvents>>,
+    /// Per-thread syscall events (sendmsg/recvmsg)
+    /// Key: tgidpid -> list of events (each event includes socket_id)
+    ///
+    /// Uses a flat Vec<EventEntry> per thread rather than nested HashMap<SocketId, Events>
+    /// because: better cache locality (single contiguous allocation), less HashMap overhead,
+    /// and acceptable linear scan cost during trace generation (not recording hot path).
+    syscall_events: HashMap<u64, Vec<EventEntry>>,
 
     /// Global packet events by socket_id (not per-thread)
     /// Key: socket_id -> ConnectionEvents
@@ -762,75 +744,6 @@ impl NetworkRecorder {
         }
     }
 
-    fn add_slice_events(
-        &self,
-        packets: &mut Vec<TracePacket>,
-        sequence_id: u32,
-        track_uuid: u64,
-        name_iid: u64,
-        event: &NetworkEvent,
-    ) {
-        // Slice begin event
-        let mut begin_event = TrackEvent::default();
-        begin_event.set_type(Type::TYPE_SLICE_BEGIN);
-        begin_event.set_name_iid(name_iid);
-        begin_event.set_track_uuid(track_uuid);
-
-        // Add debug annotation for the size on begin event
-        let mut debug_annotation = DebugAnnotation::default();
-        debug_annotation.set_name("bytes".to_string());
-        debug_annotation.set_uint_value(event.bytes as u64);
-        begin_event.debug_annotations.push(debug_annotation);
-
-        // Add TCP receive sequence annotations (for tcp_recv only, when fields are non-zero)
-        if event.recv_seq_start > 0 || event.recv_seq_end > 0 {
-            let mut seq_start_annotation = DebugAnnotation::default();
-            seq_start_annotation.set_name("recv_seq_start".to_string());
-            seq_start_annotation.set_uint_value(event.recv_seq_start as u64);
-            begin_event.debug_annotations.push(seq_start_annotation);
-
-            let mut seq_end_annotation = DebugAnnotation::default();
-            seq_end_annotation.set_name("recv_seq_end".to_string());
-            seq_end_annotation.set_uint_value(event.recv_seq_end as u64);
-            begin_event.debug_annotations.push(seq_end_annotation);
-
-            if event.rcv_nxt_at_entry > 0 {
-                let mut rcv_nxt_annotation = DebugAnnotation::default();
-                rcv_nxt_annotation.set_name("rcv_nxt".to_string());
-                rcv_nxt_annotation.set_uint_value(event.rcv_nxt_at_entry as u64);
-                begin_event.debug_annotations.push(rcv_nxt_annotation);
-
-                // Calculate and add bytes_available (data buffered in kernel)
-                // Use wrapping subtraction to handle TCP sequence number wraparound
-                let bytes_available = event.rcv_nxt_at_entry.wrapping_sub(event.recv_seq_start);
-                // Only emit if reasonable (< 64MB, as larger values likely indicate wraparound issues)
-                if bytes_available > 0 && bytes_available < 64 * 1024 * 1024 {
-                    let mut available_annotation = DebugAnnotation::default();
-                    available_annotation.set_name("bytes_available".to_string());
-                    available_annotation.set_uint_value(bytes_available as u64);
-                    begin_event.debug_annotations.push(available_annotation);
-                }
-            }
-        }
-
-        let mut begin_packet = TracePacket::default();
-        begin_packet.set_timestamp(event.start_ts);
-        begin_packet.set_track_event(begin_event);
-        begin_packet.set_trusted_packet_sequence_id(sequence_id);
-        packets.push(begin_packet);
-
-        // Slice end event
-        let mut end_event = TrackEvent::default();
-        end_event.set_type(Type::TYPE_SLICE_END);
-        end_event.set_track_uuid(track_uuid);
-
-        let mut end_packet = TracePacket::default();
-        end_packet.set_timestamp(event.end_ts);
-        end_packet.set_track_event(end_event);
-        end_packet.set_trusted_packet_sequence_id(sequence_id);
-        packets.push(end_packet);
-    }
-
     /// Prepares all metadata needed for packet generation, including:
     /// - Resolving hostnames for all sockets
     /// - Creating IIDs for protocol operations and packet events
@@ -848,16 +761,23 @@ impl NetworkRecorder {
 
         // Collect protocol operations used across all syscall events
         let mut protocol_ops_used = std::collections::HashSet::new();
-        for connections in self.syscall_events.values() {
-            for (socket_id, events) in connections.iter() {
-                if let Some(metadata) = self.socket_metadata.get(socket_id) {
-                    if events.iter_sends().next().is_some() {
-                        protocol_ops_used
-                            .insert((metadata.protocol, network_operation::NETWORK_SEND.0));
-                    }
-                    if events.iter_recvs().next().is_some() {
-                        protocol_ops_used
-                            .insert((metadata.protocol, network_operation::NETWORK_RECV.0));
+        for events in self.syscall_events.values() {
+            for event in events.iter() {
+                let socket_id = match event {
+                    EventEntry::Send(e) | EventEntry::Recv(e) => e.socket_id,
+                    _ => continue,
+                };
+                if let Some(metadata) = self.socket_metadata.get(&socket_id) {
+                    match event {
+                        EventEntry::Send(_) => {
+                            protocol_ops_used
+                                .insert((metadata.protocol, network_operation::NETWORK_SEND.0));
+                        }
+                        EventEntry::Recv(_) => {
+                            protocol_ops_used
+                                .insert((metadata.protocol, network_operation::NETWORK_RECV.0));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1162,86 +1082,74 @@ impl NetworkRecorder {
         }
 
         // ====================================================================
-        // Phase 4: Generate per-thread "Network Syscalls" tracks
+        // Phase 4: Generate per-thread "Network" tracks (single flat track per thread)
         // ====================================================================
-        for (tgidpid, connections) in self.syscall_events.iter() {
-            if connections.is_empty() {
+        for (tgidpid, events) in self.syscall_events.iter() {
+            if events.is_empty() {
                 continue;
             }
 
-            // Create a "Network Syscalls" track group for this thread
-            let thread_group_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+            // Create a single "Network" track for this thread
+            let network_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
-            let thread_group_desc = crate::perfetto::generate_pidtgid_track_descriptor(
+            let network_track_desc = crate::perfetto::generate_pidtgid_track_descriptor(
                 pid_uuids,
                 thread_uuids,
                 tgidpid,
-                "Network Syscalls".to_string(),
-                thread_group_uuid,
+                "Network".to_string(),
+                network_track_uuid,
             );
 
-            let mut thread_group_packet = TracePacket::default();
-            thread_group_packet.set_track_descriptor(thread_group_desc);
-            packets.push(thread_group_packet);
+            let mut network_track_packet = TracePacket::default();
+            network_track_packet.set_track_descriptor(network_track_desc);
+            packets.push(network_track_packet);
 
-            // Create per-socket syscall tracks
-            for (socket_id, events) in connections.iter() {
-                if events.is_empty() {
-                    continue;
-                }
+            // Emit all events directly on this single track
+            for event_entry in events.iter() {
+                match event_entry {
+                    EventEntry::Send(event) => {
+                        let protocol = match self.socket_metadata.get(&event.socket_id) {
+                            Some(m) => m.protocol,
+                            None => {
+                                tracing::debug!(
+                                    "Missing socket metadata for socket_id {}",
+                                    event.socket_id
+                                );
+                                0
+                            }
+                        };
+                        let proto_str = Self::protocol_to_str(protocol);
+                        let send_event_name = format!("{proto_str}_send");
+                        let send_name_iid = self
+                            .event_name_ids
+                            .get(&send_event_name)
+                            .copied()
+                            .unwrap_or(0);
 
-                // Create socket track group
-                let socket_group_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-
-                let mut socket_group_desc = TrackDescriptor::default();
-                socket_group_desc.set_uuid(socket_group_uuid);
-                socket_group_desc.set_name(self.socket_track_name(*socket_id));
-                socket_group_desc.set_parent_uuid(thread_group_uuid);
-
-                let mut socket_group_packet = TracePacket::default();
-                socket_group_packet.set_track_descriptor(socket_group_desc);
-                packets.push(socket_group_packet);
-
-                // Get protocol from metadata
-                let protocol = self
-                    .socket_metadata
-                    .get(socket_id)
-                    .map(|m| m.protocol)
-                    .unwrap_or(0);
-
-                // Create Sends track if we have send events
-                if events.iter_sends().next().is_some() {
-                    let send_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-
-                    let mut send_track_desc = TrackDescriptor::default();
-                    send_track_desc.set_uuid(send_track_uuid);
-                    send_track_desc.set_name("Sends".to_string());
-                    send_track_desc.set_parent_uuid(socket_group_uuid);
-
-                    let mut send_track_packet = TracePacket::default();
-                    send_track_packet.set_track_descriptor(send_track_desc);
-                    packets.push(send_track_packet);
-
-                    let proto_str = Self::protocol_to_str(protocol);
-                    let send_event_name = format!("{proto_str}_send");
-                    let send_name_iid = self
-                        .event_name_ids
-                        .get(&send_event_name)
-                        .copied()
-                        .unwrap_or(0);
-
-                    for event in events.iter_sends() {
                         let mut begin_event = TrackEvent::default();
                         begin_event.set_type(Type::TYPE_SLICE_BEGIN);
                         if send_name_iid > 0 {
                             begin_event.set_name_iid(send_name_iid);
                         }
-                        begin_event.set_track_uuid(send_track_uuid);
+                        begin_event.set_track_uuid(network_track_uuid);
 
-                        let mut debug_annotation = DebugAnnotation::default();
-                        debug_annotation.set_name("bytes".to_string());
-                        debug_annotation.set_uint_value(event.bytes as u64);
-                        begin_event.debug_annotations.push(debug_annotation);
+                        // Add socket_id annotation
+                        let mut socket_annotation = DebugAnnotation::default();
+                        socket_annotation.set_name("socket_id".to_string());
+                        socket_annotation.set_uint_value(event.socket_id);
+                        begin_event.debug_annotations.push(socket_annotation);
+
+                        // Add socket info string for readability
+                        let socket_info = self.socket_track_name(event.socket_id);
+                        let mut socket_info_annotation = DebugAnnotation::default();
+                        socket_info_annotation.set_name("socket".to_string());
+                        socket_info_annotation.set_string_value(socket_info);
+                        begin_event.debug_annotations.push(socket_info_annotation);
+
+                        let mut bytes_annotation = DebugAnnotation::default();
+                        bytes_annotation.set_name("bytes".to_string());
+                        bytes_annotation.set_uint_value(event.bytes as u64);
+                        begin_event.debug_annotations.push(bytes_annotation);
 
                         if event.sendmsg_seq > 0 {
                             let mut seq_annotation = DebugAnnotation::default();
@@ -1279,7 +1187,7 @@ impl NetworkRecorder {
 
                         let mut end_event = TrackEvent::default();
                         end_event.set_type(Type::TYPE_SLICE_END);
-                        end_event.set_track_uuid(send_track_uuid);
+                        end_event.set_track_uuid(network_track_uuid);
 
                         let mut end_packet = TracePacket::default();
                         end_packet.set_timestamp(event.end_ts);
@@ -1287,36 +1195,99 @@ impl NetworkRecorder {
                         end_packet.set_trusted_packet_sequence_id(sequence_id);
                         packets.push(end_packet);
                     }
-                }
+                    EventEntry::Recv(event) => {
+                        let protocol = match self.socket_metadata.get(&event.socket_id) {
+                            Some(m) => m.protocol,
+                            None => {
+                                tracing::debug!(
+                                    "Missing socket metadata for socket_id {}",
+                                    event.socket_id
+                                );
+                                0
+                            }
+                        };
+                        let proto_str = Self::protocol_to_str(protocol);
+                        let recv_event_name = format!("{proto_str}_recv");
+                        let recv_name_iid = self
+                            .event_name_ids
+                            .get(&recv_event_name)
+                            .copied()
+                            .unwrap_or(0);
 
-                // Create Receives track if we have receive events
-                if events.iter_recvs().next().is_some() {
-                    let recv_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+                        let mut begin_event = TrackEvent::default();
+                        begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+                        if recv_name_iid > 0 {
+                            begin_event.set_name_iid(recv_name_iid);
+                        }
+                        begin_event.set_track_uuid(network_track_uuid);
 
-                    let mut recv_track_desc = TrackDescriptor::default();
-                    recv_track_desc.set_uuid(recv_track_uuid);
-                    recv_track_desc.set_name("Receives".to_string());
-                    recv_track_desc.set_parent_uuid(socket_group_uuid);
+                        // Add socket_id annotation
+                        let mut socket_annotation = DebugAnnotation::default();
+                        socket_annotation.set_name("socket_id".to_string());
+                        socket_annotation.set_uint_value(event.socket_id);
+                        begin_event.debug_annotations.push(socket_annotation);
 
-                    let mut recv_track_packet = TracePacket::default();
-                    recv_track_packet.set_track_descriptor(recv_track_desc);
-                    packets.push(recv_track_packet);
+                        // Add socket info string for readability
+                        let socket_info = self.socket_track_name(event.socket_id);
+                        let mut socket_info_annotation = DebugAnnotation::default();
+                        socket_info_annotation.set_name("socket".to_string());
+                        socket_info_annotation.set_string_value(socket_info);
+                        begin_event.debug_annotations.push(socket_info_annotation);
 
-                    let proto_str = Self::protocol_to_str(protocol);
-                    let recv_event_name = format!("{proto_str}_recv");
-                    let recv_name_iid = self
-                        .event_name_ids
-                        .get(&recv_event_name)
-                        .copied()
-                        .unwrap_or(0);
-                    for event in events.iter_recvs() {
-                        self.add_slice_events(
-                            &mut packets,
-                            sequence_id,
-                            recv_track_uuid,
-                            recv_name_iid,
-                            event,
-                        );
+                        // Add bytes annotation
+                        let mut bytes_annotation = DebugAnnotation::default();
+                        bytes_annotation.set_name("bytes".to_string());
+                        bytes_annotation.set_uint_value(event.bytes as u64);
+                        begin_event.debug_annotations.push(bytes_annotation);
+
+                        // Add TCP receive sequence annotations (when fields are non-zero)
+                        if event.recv_seq_start > 0 || event.recv_seq_end > 0 {
+                            let mut seq_start_annotation = DebugAnnotation::default();
+                            seq_start_annotation.set_name("recv_seq_start".to_string());
+                            seq_start_annotation.set_uint_value(event.recv_seq_start as u64);
+                            begin_event.debug_annotations.push(seq_start_annotation);
+
+                            let mut seq_end_annotation = DebugAnnotation::default();
+                            seq_end_annotation.set_name("recv_seq_end".to_string());
+                            seq_end_annotation.set_uint_value(event.recv_seq_end as u64);
+                            begin_event.debug_annotations.push(seq_end_annotation);
+
+                            if event.rcv_nxt_at_entry > 0 {
+                                let mut rcv_nxt_annotation = DebugAnnotation::default();
+                                rcv_nxt_annotation.set_name("rcv_nxt".to_string());
+                                rcv_nxt_annotation.set_uint_value(event.rcv_nxt_at_entry as u64);
+                                begin_event.debug_annotations.push(rcv_nxt_annotation);
+
+                                // Calculate and add bytes_available (data buffered in kernel)
+                                let bytes_available =
+                                    event.rcv_nxt_at_entry.wrapping_sub(event.recv_seq_start);
+                                if bytes_available > 0 && bytes_available < 64 * 1024 * 1024 {
+                                    let mut available_annotation = DebugAnnotation::default();
+                                    available_annotation.set_name("bytes_available".to_string());
+                                    available_annotation.set_uint_value(bytes_available as u64);
+                                    begin_event.debug_annotations.push(available_annotation);
+                                }
+                            }
+                        }
+
+                        let mut begin_packet = TracePacket::default();
+                        begin_packet.set_timestamp(event.start_ts);
+                        begin_packet.set_track_event(begin_event);
+                        begin_packet.set_trusted_packet_sequence_id(sequence_id);
+                        packets.push(begin_packet);
+
+                        let mut end_event = TrackEvent::default();
+                        end_event.set_type(Type::TYPE_SLICE_END);
+                        end_event.set_track_uuid(network_track_uuid);
+
+                        let mut end_packet = TracePacket::default();
+                        end_packet.set_timestamp(event.end_ts);
+                        end_packet.set_track_event(end_event);
+                        end_packet.set_trusted_packet_sequence_id(sequence_id);
+                        packets.push(end_packet);
+                    }
+                    _ => {
+                        // Packet events are handled separately in Phase 3
                     }
                 }
             }
@@ -1376,20 +1347,19 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
             recv_seq_start: event.recv_seq_start,
             recv_seq_end: event.recv_seq_end,
             rcv_nxt_at_entry: event.rcv_nxt_at_entry,
+            socket_id,
         };
 
-        // Route to per-thread syscall_events by tgidpid then socket_id
-        let conn_events = self
+        // Route to per-thread syscall_events list (pre-allocate to reduce reallocations)
+        let thread_events = self
             .syscall_events
             .entry(tgidpid)
-            .or_default()
-            .entry(socket_id)
-            .or_default();
+            .or_insert_with(|| Vec::with_capacity(64));
 
         if event.operation.0 == network_operation::NETWORK_SEND.0 {
-            conn_events.events.push(EventEntry::Send(net_event));
+            thread_events.push(EventEntry::Send(net_event));
         } else if event.operation.0 == network_operation::NETWORK_RECV.0 {
-            conn_events.events.push(EventEntry::Recv(net_event));
+            thread_events.push(EventEntry::Recv(net_event));
         }
     }
 }
@@ -1466,14 +1436,20 @@ mod tests {
         assert_eq!(recorder.syscall_events.len(), 1);
         assert!(recorder.syscall_events.contains_key(&tgidpid));
 
-        let connections = &recorder.syscall_events[&tgidpid];
-        assert_eq!(connections.len(), 1);
+        let events = &recorder.syscall_events[&tgidpid];
+        assert_eq!(events.len(), 1);
 
-        assert!(connections.contains_key(&socket_id));
-        let sends: Vec<_> = connections[&socket_id].iter_sends().collect();
+        // Check the send event
+        let sends: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                EventEntry::Send(evt) => Some(evt),
+                _ => None,
+            })
+            .collect();
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].bytes, 1024);
-        assert_eq!(connections[&socket_id].iter_recvs().count(), 0);
+        assert_eq!(sends[0].socket_id, socket_id);
     }
 
     #[test]
@@ -1522,9 +1498,15 @@ mod tests {
         recorder.handle_event(event2);
 
         let tgidpid = (100u64 << 32) | 101u64;
-        let connections = &recorder.syscall_events[&tgidpid];
+        let events = &recorder.syscall_events[&tgidpid];
 
-        let sends: Vec<_> = connections[&socket_id].iter_sends().collect();
+        let sends: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                EventEntry::Send(evt) => Some(evt),
+                _ => None,
+            })
+            .collect();
         assert_eq!(sends.len(), 2);
         assert_eq!(sends[0].bytes, 1024);
         assert_eq!(sends[1].bytes, 2048);
@@ -1577,10 +1559,20 @@ mod tests {
         recorder.handle_event(event2);
 
         let tgidpid = (100u64 << 32) | 101u64;
-        let connections = &recorder.syscall_events[&tgidpid];
-        assert_eq!(connections.len(), 2);
-        assert!(connections.contains_key(&tcp_socket_id));
-        assert!(connections.contains_key(&udp_socket_id));
+        let events = &recorder.syscall_events[&tgidpid];
+        // Now we have 2 events in a single list (not separate by socket)
+        assert_eq!(events.len(), 2);
+
+        // Check that both socket IDs are present
+        let socket_ids: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                EventEntry::Send(evt) => Some(evt.socket_id),
+                _ => None,
+            })
+            .collect();
+        assert!(socket_ids.contains(&tcp_socket_id));
+        assert!(socket_ids.contains(&udp_socket_id));
     }
 
     #[test]
@@ -1626,45 +1618,46 @@ mod tests {
 
         let packets = recorder.generate_trace_packets(&pid_uuids, &thread_uuids, &id_counter);
 
-        // Packets: interned data, thread track group, socket track, send track, slice begin, slice end
-        assert_eq!(packets.len(), 6);
+        // Packets: interned data, network track, slice begin, slice end
+        assert_eq!(packets.len(), 4);
 
         let interned_packet = &packets[0];
         assert!(interned_packet.interned_data.is_some());
 
-        let thread_group_packet = &packets[1];
-        assert!(thread_group_packet.has_track_descriptor());
-        let thread_group_desc = thread_group_packet.track_descriptor();
-        assert_eq!(thread_group_desc.name(), "Network Syscalls");
+        let network_track_packet = &packets[1];
+        assert!(network_track_packet.has_track_descriptor());
+        let network_track_desc = network_track_packet.track_descriptor();
+        assert_eq!(network_track_desc.name(), "Network");
 
-        let socket_group_packet = &packets[2];
-        assert!(socket_group_packet.has_track_descriptor());
-        let socket_group_desc = socket_group_packet.track_descriptor();
-        assert!(socket_group_desc.name().starts_with("Socket 1:TCP:"));
-        assert_eq!(socket_group_desc.parent_uuid(), thread_group_desc.uuid());
-
-        let send_track_packet = &packets[3];
-        assert!(send_track_packet.has_track_descriptor());
-        let send_track_desc = send_track_packet.track_descriptor();
-        assert_eq!(send_track_desc.name(), "Sends");
-        assert_eq!(send_track_desc.parent_uuid(), socket_group_desc.uuid());
-
-        let begin_packet = &packets[4];
+        let begin_packet = &packets[2];
         assert!(begin_packet.has_track_event());
         assert_eq!(begin_packet.timestamp(), 1000);
         let begin_event = begin_packet.track_event();
         assert_eq!(begin_event.type_(), Type::TYPE_SLICE_BEGIN);
-        assert_eq!(begin_event.track_uuid(), send_track_desc.uuid());
-        assert_eq!(begin_event.debug_annotations.len(), 1);
-        assert_eq!(begin_event.debug_annotations[0].name(), "bytes");
-        assert_eq!(begin_event.debug_annotations[0].uint_value(), 1024);
+        assert_eq!(begin_event.track_uuid(), network_track_desc.uuid());
 
-        let end_packet = &packets[5];
+        // Check debug annotations include socket_id, socket, and bytes
+        assert!(begin_event.debug_annotations.len() >= 3);
+        let socket_id_annotation = begin_event
+            .debug_annotations
+            .iter()
+            .find(|a| a.name() == "socket_id");
+        assert!(socket_id_annotation.is_some());
+        assert_eq!(socket_id_annotation.unwrap().uint_value(), socket_id);
+
+        let bytes_annotation = begin_event
+            .debug_annotations
+            .iter()
+            .find(|a| a.name() == "bytes");
+        assert!(bytes_annotation.is_some());
+        assert_eq!(bytes_annotation.unwrap().uint_value(), 1024);
+
+        let end_packet = &packets[3];
         assert!(end_packet.has_track_event());
         assert_eq!(end_packet.timestamp(), 2000);
         let end_event = end_packet.track_event();
         assert_eq!(end_event.type_(), Type::TYPE_SLICE_END);
-        assert_eq!(end_event.track_uuid(), send_track_desc.uuid());
+        assert_eq!(end_event.track_uuid(), network_track_desc.uuid());
 
         assert!(recorder.syscall_events.is_empty());
     }
@@ -1715,14 +1708,27 @@ mod tests {
         recorder.handle_event(recv_event);
 
         let tgidpid = (100u64 << 32) | 101u64;
-        let connections = &recorder.syscall_events[&tgidpid];
-        assert_eq!(connections.len(), 1);
+        let events = &recorder.syscall_events[&tgidpid];
+        // 2 events: 1 send + 1 recv
+        assert_eq!(events.len(), 2);
 
-        assert!(connections.contains_key(&socket_id));
-        let sends: Vec<_> = connections[&socket_id].iter_sends().collect();
+        let sends: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                EventEntry::Send(evt) => Some(evt),
+                _ => None,
+            })
+            .collect();
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].bytes, 1024);
-        let recvs: Vec<_> = connections[&socket_id].iter_recvs().collect();
+
+        let recvs: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                EventEntry::Recv(evt) => Some(evt),
+                _ => None,
+            })
+            .collect();
         assert_eq!(recvs.len(), 1);
         assert_eq!(recvs[0].bytes, 512);
     }
@@ -1762,14 +1768,19 @@ mod tests {
         assert_eq!(recorder.syscall_events.len(), 1);
         assert!(recorder.syscall_events.contains_key(&tgidpid));
 
-        let connections = &recorder.syscall_events[&tgidpid];
-        assert_eq!(connections.len(), 1);
+        let events = &recorder.syscall_events[&tgidpid];
+        assert_eq!(events.len(), 1);
 
-        assert!(connections.contains_key(&socket_id));
-        let sends: Vec<_> = connections[&socket_id].iter_sends().collect();
+        let sends: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                EventEntry::Send(evt) => Some(evt),
+                _ => None,
+            })
+            .collect();
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].bytes, 2048);
-        assert_eq!(connections[&socket_id].iter_recvs().count(), 0);
+        assert_eq!(sends[0].socket_id, socket_id);
     }
 
     #[test]
@@ -1801,13 +1812,19 @@ mod tests {
         recorder.handle_event(event);
 
         let tgidpid = (100u64 << 32) | 101u64;
-        let connections = &recorder.syscall_events[&tgidpid];
-        assert_eq!(connections.len(), 1);
+        let events = &recorder.syscall_events[&tgidpid];
+        assert_eq!(events.len(), 1);
 
-        assert!(connections.contains_key(&socket_id));
-        let sends: Vec<_> = connections[&socket_id].iter_sends().collect();
+        let sends: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                EventEntry::Send(evt) => Some(evt),
+                _ => None,
+            })
+            .collect();
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].bytes, 512);
+        assert_eq!(sends[0].socket_id, socket_id);
     }
 
     #[test]
@@ -1863,20 +1880,29 @@ mod tests {
         recorder.handle_event(ipv6_event);
 
         let tgidpid = (100u64 << 32) | 101u64;
-        let connections = &recorder.syscall_events[&tgidpid];
+        let events = &recorder.syscall_events[&tgidpid];
 
-        // Should have 2 distinct sockets (IPv4 and IPv6)
-        assert_eq!(connections.len(), 2);
+        // Should have 2 events (both sockets have sends)
+        assert_eq!(events.len(), 2);
+
+        // Collect sends by socket_id
+        let sends: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                EventEntry::Send(evt) => Some(evt),
+                _ => None,
+            })
+            .collect();
 
         // Verify IPv4 socket
-        assert!(connections.contains_key(&ipv4_socket_id));
-        let ipv4_sends: Vec<_> = connections[&ipv4_socket_id].iter_sends().collect();
-        assert_eq!(ipv4_sends[0].bytes, 1024);
+        let ipv4_send = sends.iter().find(|s| s.socket_id == ipv4_socket_id);
+        assert!(ipv4_send.is_some());
+        assert_eq!(ipv4_send.unwrap().bytes, 1024);
 
         // Verify IPv6 socket
-        assert!(connections.contains_key(&ipv6_socket_id));
-        let ipv6_sends: Vec<_> = connections[&ipv6_socket_id].iter_sends().collect();
-        assert_eq!(ipv6_sends[0].bytes, 2048);
+        let ipv6_send = sends.iter().find(|s| s.socket_id == ipv6_socket_id);
+        assert!(ipv6_send.is_some());
+        assert_eq!(ipv6_send.unwrap().bytes, 2048);
     }
 
     #[test]
@@ -1973,16 +1999,31 @@ mod tests {
         recorder.handle_event(recv_event);
 
         let tgidpid = (100u64 << 32) | 101u64;
-        let connections = &recorder.syscall_events[&tgidpid];
-        assert_eq!(connections.len(), 1);
+        let events = &recorder.syscall_events[&tgidpid];
+        // 2 events: 1 send + 1 recv
+        assert_eq!(events.len(), 2);
 
-        assert!(connections.contains_key(&socket_id));
-        let sends: Vec<_> = connections[&socket_id].iter_sends().collect();
+        let sends: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                EventEntry::Send(evt) => Some(evt),
+                _ => None,
+            })
+            .collect();
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].bytes, 1024);
-        let recvs: Vec<_> = connections[&socket_id].iter_recvs().collect();
+        assert_eq!(sends[0].socket_id, socket_id);
+
+        let recvs: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                EventEntry::Recv(evt) => Some(evt),
+                _ => None,
+            })
+            .collect();
         assert_eq!(recvs.len(), 1);
         assert_eq!(recvs[0].bytes, 512);
+        assert_eq!(recvs[0].socket_id, socket_id);
     }
 
     #[test]
@@ -2084,12 +2125,10 @@ mod tests {
 
         recorder.handle_packet_event(event);
 
-        // PACKET_BUFFER_QUEUE goes to per-thread syscall_events (app-relevant)
-        let tgidpid = (200u64 << 32) | 201u64;
-        let connections = &recorder.syscall_events[&tgidpid];
-        assert!(connections.contains_key(&socket_id));
+        // PACKET_BUFFER_QUEUE goes to global packet_events
+        assert!(recorder.packet_events.contains_key(&socket_id));
 
-        let buffer_queue: Vec<_> = connections[&socket_id]
+        let buffer_queue: Vec<_> = recorder.packet_events[&socket_id]
             .iter_tcp_buffer_queue_packets()
             .collect();
         assert_eq!(buffer_queue.len(), 1);
@@ -2329,10 +2368,8 @@ mod tests {
             "Should have 'Network Packets' track"
         );
 
-        let has_syscall_track = packets
-            .iter()
-            .any(|p| p.has_track_descriptor() && p.track_descriptor().name() == "Network Syscalls");
-        assert!(has_syscall_track, "Should have 'Network Syscalls' track");
+        // No syscall events in this test, so no "Network" track should be created
+        // (only packet events are present)
     }
 
     #[test]
@@ -2534,7 +2571,6 @@ mod tests {
         let mut dest_addr = [0u8; 16];
         dest_addr[0..4].copy_from_slice(&[1, 1, 1, 1]); // 1.1.1.1
         let socket_id: SocketId = 1;
-        let tgidpid = (200u64 << 32) | 201u64;
 
         insert_test_socket_metadata(
             &mut recorder,
@@ -2561,7 +2597,7 @@ mod tests {
             ..Default::default()
         };
 
-        // UDP enqueue event (UDP->buffer) - goes to per-thread syscall_events
+        // UDP enqueue event (UDP->buffer) - goes to global packet_events
         let udp_enqueue_event = crate::systing::types::packet_event {
             ts: 1500,
             protocol: network_protocol::NETWORK_UDP,
@@ -2580,7 +2616,7 @@ mod tests {
         recorder.handle_packet_event(udp_rcv_event);
         recorder.handle_packet_event(udp_enqueue_event);
 
-        // PACKET_UDP_RCV goes to global packet_events
+        // Both PACKET_UDP_RCV and PACKET_UDP_ENQUEUE go to global packet_events
         assert_eq!(recorder.packet_events.len(), 1);
         assert!(recorder.packet_events.contains_key(&socket_id));
         assert_eq!(
@@ -2591,14 +2627,10 @@ mod tests {
             "Should have 1 UDP receive event"
         );
 
-        // PACKET_UDP_ENQUEUE goes to per-thread syscall_events
-        let connections = &recorder.syscall_events[&tgidpid];
-        assert!(
-            connections.contains_key(&socket_id),
-            "UDP connection should exist"
-        );
         assert_eq!(
-            connections[&socket_id].iter_udp_enqueue_packets().count(),
+            recorder.packet_events[&socket_id]
+                .iter_udp_enqueue_packets()
+                .count(),
             1,
             "Should have 1 UDP enqueue event"
         );
