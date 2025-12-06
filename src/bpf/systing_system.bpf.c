@@ -671,7 +671,10 @@ static struct task_event *reserve_task_event(long *flags)
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
-	return bpf_ringbuf_reserve(rb, sizeof(struct task_event), 0);
+	struct task_event *event = bpf_ringbuf_reserve(rb, sizeof(struct task_event), 0);
+	if (event)
+		__builtin_memset(event, 0, sizeof(*event));
+	return event;
 }
 
 static struct stack_event *reserve_stack_event(long *flags)
@@ -683,7 +686,22 @@ static struct stack_event *reserve_stack_event(long *flags)
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
-	return bpf_ringbuf_reserve(rb, sizeof(struct stack_event), 0);
+	struct stack_event *event = bpf_ringbuf_reserve(rb, sizeof(struct stack_event), 0);
+	if (event) {
+		/*
+		 * When SYSTING_PYSTACKS is enabled, stack_event includes a large
+		 * pystacks_message buffer (~1KB). Zero only the base fields to avoid
+		 * emitting a memset call that BPF doesn't support for large sizes.
+		 * The py_msg_buffer is populated by pystacks_read_stacks() and doesn't
+		 * need pre-zeroing.
+		 */
+#ifdef SYSTING_PYSTACKS
+		__builtin_memset(event, 0, offsetof(struct stack_event, py_msg_buffer));
+#else
+		__builtin_memset(event, 0, sizeof(*event));
+#endif
+	}
+	return event;
 }
 
 static struct perf_counter_event *reserve_perf_counter_event(long *flags)
@@ -695,7 +713,10 @@ static struct perf_counter_event *reserve_perf_counter_event(long *flags)
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
-	return bpf_ringbuf_reserve(rb, sizeof(struct perf_counter_event), 0);
+	struct perf_counter_event *event = bpf_ringbuf_reserve(rb, sizeof(struct perf_counter_event), 0);
+	if (event)
+		__builtin_memset(event, 0, sizeof(*event));
+	return event;
 }
 
 static struct probe_event *reserve_probe_event(long *flags)
@@ -707,7 +728,10 @@ static struct probe_event *reserve_probe_event(long *flags)
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
-	return bpf_ringbuf_reserve(rb, sizeof(struct probe_event), 0);
+	struct probe_event *event = bpf_ringbuf_reserve(rb, sizeof(struct probe_event), 0);
+	if (event)
+		__builtin_memset(event, 0, sizeof(*event));
+	return event;
 }
 
 static struct network_event *reserve_network_event(long *flags)
@@ -719,7 +743,10 @@ static struct network_event *reserve_network_event(long *flags)
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
-	return bpf_ringbuf_reserve(rb, sizeof(struct network_event), 0);
+	struct network_event *event = bpf_ringbuf_reserve(rb, sizeof(struct network_event), 0);
+	if (event)
+		__builtin_memset(event, 0, sizeof(*event));
+	return event;
 }
 
 static struct packet_event *reserve_packet_event(long *flags)
@@ -731,7 +758,10 @@ static struct packet_event *reserve_packet_event(long *flags)
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
-	return bpf_ringbuf_reserve(rb, sizeof(struct packet_event), 0);
+	struct packet_event *event = bpf_ringbuf_reserve(rb, sizeof(struct packet_event), 0);
+	if (event)
+		__builtin_memset(event, 0, sizeof(*event));
+	return event;
 }
 
 static u32 task_cpu(struct task_struct *task)
@@ -1738,8 +1768,6 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 	event->sendmsg_seq = info->sendmsg_seq;  // TCP sequence at sendmsg time
 
 	// Read send buffer state from socket (TCP only)
-	event->sndbuf_used = 0;
-	event->sndbuf_limit = 0;
 	if (info->protocol == NETWORK_TCP && info->sk_ptr) {
 		struct sock *sk = (struct sock *)info->sk_ptr;
 		int wmem_queued = 0;
@@ -1752,11 +1780,6 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 
 	// Copy socket_id for correlation
 	event->socket_id = info->socket_id;
-
-	// Zero recv sequence fields for SEND events (these are TCP recv only)
-	event->recv_seq_start = 0;
-	event->recv_seq_end = 0;
-	event->rcv_nxt_at_entry = 0;
 
 	bpf_ringbuf_submit(event, flags);
 	bpf_map_delete_elem(&pending_network_sends, &tgidpid);
@@ -2045,9 +2068,6 @@ int BPF_KPROBE(udp_send_skb_entry, struct sk_buff *skb, struct flowi4 *fl4, stru
 	event->event_type = PACKET_UDP_SEND;
 	event->cpu = bpf_get_smp_processor_id();
 	event->af = NETWORK_AF_INET;
-	event->seq = 0;
-	event->tcp_flags = 0;
-	event->is_retransmit = 0;
 
 	// Calculate UDP payload length like kernel does (udp.c:1126-1127)
 	u32 skb_len = 0;
@@ -2122,9 +2142,6 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 	event->event_type = PACKET_UDP_RCV;
 	event->cpu = bpf_get_smp_processor_id();
 	event->af = NETWORK_AF_INET;
-	event->seq = 0;
-	event->tcp_flags = 0;
-	event->is_retransmit = 0;
 
 	// Read IP and UDP headers to get peer address and payload length
 	struct iphdr ip = {0};
@@ -2189,9 +2206,6 @@ int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *
 	event->event_type = PACKET_UDP_ENQUEUE;
 	event->cpu = bpf_get_smp_processor_id();
 	event->af = NETWORK_AF_INET;
-	event->seq = 0;
-	event->tcp_flags = 0;
-	event->is_retransmit = 0;
 
 	// Read IP and UDP headers to get peer address and payload length
 	struct iphdr ip = {0};
@@ -2403,10 +2417,7 @@ static __always_inline int emit_udp_packet_event(struct sock *sk, struct sk_buff
 	event->protocol = NETWORK_UDP;
 	event->event_type = event_type;
 	event->cpu = bpf_get_smp_processor_id();
-	event->seq = 0;
 	event->length = length;
-	event->tcp_flags = 0;
-	event->is_retransmit = 0;
 
 	// Extract destination address and port from the socket
 	u16 family;
@@ -2543,7 +2554,6 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 	event->protocol = NETWORK_TCP;
 	event->event_type = PACKET_RCV_ESTABLISHED;
 	event->cpu = bpf_get_smp_processor_id();
-	event->is_retransmit = 0;
 
 	// For receive: dest_addr/port are actually the peer who sent to us
 	if (read_src_addr_from_skb(skb, &event->af, event->dest_addr, &event->dest_port) != 0) {
@@ -2598,7 +2608,6 @@ int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *
 	event->protocol = NETWORK_TCP;
 	event->event_type = PACKET_QUEUE_RCV;
 	event->cpu = bpf_get_smp_processor_id();
-	event->is_retransmit = 0;
 
 	// Read source (peer) address from skb
 	if (read_src_addr_from_skb(skb, &event->af, event->dest_addr, &event->dest_port) != 0) {
@@ -2655,7 +2664,6 @@ int BPF_KPROBE(tcp_data_queue_entry, struct sock *sk, struct sk_buff *skb)
 	event->protocol = NETWORK_TCP;
 	event->event_type = PACKET_QUEUE_RCV;
 	event->cpu = bpf_get_smp_processor_id();
-	event->is_retransmit = 0;
 
 	// Read source (peer) address from skb
 	if (read_src_addr_from_skb(skb, &event->af, event->dest_addr, &event->dest_port) != 0) {
@@ -2721,7 +2729,6 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 	pkt_event->protocol = NETWORK_TCP;
 	pkt_event->event_type = PACKET_BUFFER_QUEUE;
 	pkt_event->cpu = bpf_get_smp_processor_id();
-	pkt_event->is_retransmit = 0;
 
 	// Read peer address from socket
 	if (read_socket_dest_info(sk, &pkt_event->af, pkt_event->dest_addr, &pkt_event->dest_port) != 0) {
@@ -2772,7 +2779,6 @@ int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 	event->event_type = PACKET_ZERO_WINDOW_PROBE;
 	event->cpu = bpf_get_smp_processor_id();
 	event->is_zero_window_probe = 1;
-	event->is_retransmit = 0;
 
 	// Extract socket address info
 	u16 family;
@@ -2888,13 +2894,6 @@ int BPF_KPROBE(tcp_send_ack_entry, struct sock *sk)
 	event->event_type = PACKET_ZERO_WINDOW_ACK;
 	event->cpu = bpf_get_smp_processor_id();
 	event->is_zero_window_ack = (rcv_wnd == 0) ? 1 : 0;
-	event->is_zero_window_probe = 0;
-	event->is_retransmit = 0;
-	// Sender-side fields not applicable for receiver events
-	event->sndbuf_used = 0;
-	event->sndbuf_limit = 0;
-	event->snd_wnd = 0;
-	event->probe_count = 0;
 
 	// Extract socket address info (peer address - who we're sending the ACK to)
 	u16 family;
@@ -2989,8 +2988,6 @@ int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 	event->event_type = PACKET_RTO_TIMEOUT;
 	event->cpu = bpf_get_smp_processor_id();
 	event->is_retransmit = 1;  // RTO triggers retransmission
-	event->is_zero_window_probe = 0;
-	event->is_zero_window_ack = 0;
 
 	// Extract socket address info
 	u16 family;
