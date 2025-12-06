@@ -230,6 +230,54 @@ impl SchedEventRecorder {
     pub fn set_process_sched_stats(&mut self, enabled: bool) {
         self.process_sched_stats = enabled;
     }
+
+    /// Returns the minimum timestamp from all events, or None if no events recorded.
+    pub fn min_timestamp(&self) -> Option<u64> {
+        let compact_min = self
+            .compact_sched
+            .values()
+            .filter_map(|cs| cs.compact_sched.switch_timestamp.first().copied())
+            .min();
+
+        // BTreeMap is sorted by key, so first key is min
+        let events_min = self
+            .events
+            .values()
+            .filter_map(|e| e.keys().next().copied())
+            .min();
+
+        let runqueue_min = self
+            .runqueue
+            .values()
+            .filter_map(|c| c.first())
+            .map(|c| c.ts)
+            .min();
+
+        let cpu_lat_min = self
+            .cpu_latencies
+            .values()
+            .filter_map(|c| c.first())
+            .map(|c| c.ts)
+            .min();
+
+        let proc_lat_min = self
+            .process_latencies
+            .values()
+            .filter_map(|c| c.first())
+            .map(|c| c.ts)
+            .min();
+
+        [
+            compact_min,
+            events_min,
+            runqueue_min,
+            cpu_lat_min,
+            proc_lat_min,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
 }
 
 impl From<&task_event> for FtraceEvent {

@@ -95,6 +95,15 @@ impl PerfCounterRecorder {
 
         packets
     }
+
+    /// Returns the minimum timestamp from all perf counter events, or None if no events recorded.
+    pub fn min_timestamp(&self) -> Option<u64> {
+        self.perf_events
+            .values()
+            .filter_map(|counters| counters.first())
+            .map(|c| c.ts)
+            .min()
+    }
 }
 
 #[cfg(test)]

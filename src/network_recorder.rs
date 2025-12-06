@@ -155,6 +155,25 @@ enum EventEntry {
     TcpRtoTimeout(PacketEvent),      // RTO timeout fired (tcp_retransmit_timer)
 }
 
+impl EventEntry {
+    fn ts(&self) -> u64 {
+        match self {
+            EventEntry::Send(e) | EventEntry::Recv(e) => e.start_ts,
+            EventEntry::TcpEnqueue(e)
+            | EventEntry::TcpRcvEstablished(e)
+            | EventEntry::TcpQueueRcv(e)
+            | EventEntry::TcpBufferQueue(e)
+            | EventEntry::UdpSend(e)
+            | EventEntry::UdpRcv(e)
+            | EventEntry::UdpEnqueue(e)
+            | EventEntry::SharedSend(e)
+            | EventEntry::TcpZeroWindowProbe(e)
+            | EventEntry::TcpZeroWindowAck(e)
+            | EventEntry::TcpRtoTimeout(e) => e.ts,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ConnectionEvents {
     events: Vec<EventEntry>,
@@ -1314,6 +1333,25 @@ impl NetworkRecorder {
         self.dns_stats = Default::default();
 
         packets
+    }
+
+    /// Returns the minimum timestamp from all network events, or None if no events recorded.
+    pub fn min_timestamp(&self) -> Option<u64> {
+        let syscall_min = self
+            .syscall_events
+            .values()
+            .filter_map(|events| events.first())
+            .map(|e| e.ts())
+            .min();
+
+        let packet_min = self
+            .packet_events
+            .values()
+            .filter_map(|conn| conn.events.first())
+            .map(|e| e.ts())
+            .min();
+
+        syscall_min.into_iter().chain(packet_min).min()
     }
 }
 
