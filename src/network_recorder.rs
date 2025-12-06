@@ -139,6 +139,14 @@ struct PacketEvent {
     icsk_timeout: u64, // When timer fires (jiffies)
 }
 
+#[derive(Clone, Copy)]
+struct PollEvent {
+    ts: u64,
+    socket_id: SocketId,
+    requested_events: u32,
+    returned_events: u32,
+}
+
 enum EventEntry {
     Send(NetworkEvent),
     Recv(NetworkEvent),
@@ -152,7 +160,8 @@ enum EventEntry {
     SharedSend(PacketEvent),
     TcpZeroWindowProbe(PacketEvent), // Zero window probe sent (sender-side)
     TcpZeroWindowAck(PacketEvent),   // Zero window ACK sent (receiver-side)
-    TcpRtoTimeout(PacketEvent),      // RTO timeout fired (tcp_retransmit_timer)
+    TcpRtoTimeout(PacketEvent),
+    PollReady(PollEvent),
 }
 
 impl EventEntry {
@@ -170,6 +179,7 @@ impl EventEntry {
             | EventEntry::TcpZeroWindowProbe(e)
             | EventEntry::TcpZeroWindowAck(e)
             | EventEntry::TcpRtoTimeout(e) => e.ts,
+            EventEntry::PollReady(e) => e.ts,
         }
     }
 }
@@ -395,6 +405,33 @@ impl NetworkRecorder {
         result
     }
 
+    fn poll_events_to_str(events: u32) -> String {
+        const FLAGS: [(u32, &str); 6] = [
+            (0x001, "IN"),
+            (0x002, "PRI"),
+            (0x004, "OUT"),
+            (0x008, "ERR"),
+            (0x010, "HUP"),
+            (0x2000, "RDHUP"),
+        ];
+
+        let parts: Vec<&str> = FLAGS
+            .iter()
+            .filter(|(mask, _)| events & mask != 0)
+            .map(|(_, name)| *name)
+            .collect();
+
+        if parts.is_empty() {
+            if events == 0 {
+                "NONE".to_string()
+            } else {
+                format!("0x{:x}", events)
+            }
+        } else {
+            parts.join("|")
+        }
+    }
+
     pub fn handle_packet_event(&mut self, event: crate::systing::types::packet_event) {
         use crate::systing::types::packet_event_type;
 
@@ -477,6 +514,25 @@ impl NetworkRecorder {
                 .events
                 .push(EventEntry::TcpRtoTimeout(pkt_event));
         }
+    }
+
+    pub fn handle_epoll_event(&mut self, event: crate::systing::types::epoll_event_bpf) {
+        let socket_id = event.socket_id;
+        if socket_id == 0 {
+            return;
+        }
+
+        let poll_event = PollEvent {
+            ts: event.ts,
+            socket_id,
+            requested_events: event.requested_events,
+            returned_events: event.returned_events,
+        };
+
+        self.syscall_events
+            .entry(event.task.tgidpid)
+            .or_insert_with(|| Vec::with_capacity(64))
+            .push(EventEntry::PollReady(poll_event));
     }
 
     fn protocol_to_str(protocol: u32) -> &'static str {
@@ -831,6 +887,7 @@ impl NetworkRecorder {
         self.get_or_create_event_name_iid("UDP packet_send".to_string(), id_counter);
         self.get_or_create_event_name_iid("UDP receive".to_string(), id_counter);
         self.get_or_create_event_name_iid("UDP enqueue".to_string(), id_counter);
+        self.get_or_create_event_name_iid("poll_ready".to_string(), id_counter);
 
         // Build and sort event names array
         let mut event_names = Vec::new();
@@ -1304,6 +1361,43 @@ impl NetworkRecorder {
                         end_packet.set_track_event(end_event);
                         end_packet.set_trusted_packet_sequence_id(sequence_id);
                         packets.push(end_packet);
+                    }
+                    EventEntry::PollReady(event) => {
+                        let poll_name_iid = *self.event_name_ids.get("poll_ready").unwrap_or(&0);
+
+                        let mut instant_event = TrackEvent::default();
+                        instant_event.set_type(Type::TYPE_INSTANT);
+                        instant_event.set_name_iid(poll_name_iid);
+                        instant_event.set_track_uuid(network_track_uuid);
+
+                        let mut socket_annotation = DebugAnnotation::default();
+                        socket_annotation.set_name("socket_id".to_string());
+                        socket_annotation.set_uint_value(event.socket_id);
+                        instant_event.debug_annotations.push(socket_annotation);
+
+                        let socket_info = self.socket_track_name(event.socket_id);
+                        let mut socket_info_annotation = DebugAnnotation::default();
+                        socket_info_annotation.set_name("socket".to_string());
+                        socket_info_annotation.set_string_value(socket_info);
+                        instant_event.debug_annotations.push(socket_info_annotation);
+
+                        let mut requested_annotation = DebugAnnotation::default();
+                        requested_annotation.set_name("requested".to_string());
+                        requested_annotation
+                            .set_string_value(Self::poll_events_to_str(event.requested_events));
+                        instant_event.debug_annotations.push(requested_annotation);
+
+                        let mut returned_annotation = DebugAnnotation::default();
+                        returned_annotation.set_name("returned".to_string());
+                        returned_annotation
+                            .set_string_value(Self::poll_events_to_str(event.returned_events));
+                        instant_event.debug_annotations.push(returned_annotation);
+
+                        let mut instant_packet = TracePacket::default();
+                        instant_packet.set_timestamp(event.ts);
+                        instant_packet.set_track_event(instant_event);
+                        instant_packet.set_trusted_packet_sequence_id(sequence_id);
+                        packets.push(instant_packet);
                     }
                     _ => {
                         // Packet events are handled separately in Phase 3

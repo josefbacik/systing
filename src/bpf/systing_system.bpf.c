@@ -239,6 +239,15 @@ struct packet_event {
 	u64 icsk_timeout;         // When timer fires (jiffies)
 };
 
+struct epoll_event_bpf {
+	u64 ts;
+	struct task_info task;
+	u64 socket_id;
+	u32 requested_events;
+	u32 returned_events;
+	u32 cpu;
+};
+
 /*
  * Dummy instance to get skeleton to generate definition for
  * `struct task_event`
@@ -248,6 +257,7 @@ struct stack_event _stack_event = {0};
 struct perf_counter_event _perf_counter_event = {0};
 struct network_event _network_event = {0};
 struct packet_event _packet_event = {0};
+struct epoll_event_bpf _epoll_event = {0};
 struct task_info _task_info = {0};
 struct probe_event _uprobe_event = {0};
 struct arg_desc _arg_desc = {0};
@@ -355,6 +365,18 @@ struct {
 	__uint(max_entries, 10240);
 } pending_network_recvs SEC(".maps");
 
+struct epoll_poll_info {
+	u32 requested_events;
+	u64 socket_id;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);  // tgidpid
+	__type(value, struct epoll_poll_info);
+	__uint(max_entries, 10240);
+} pending_epoll_polls SEC(".maps");
+
 // Socket identity key - identifies a unique socket+destination pair
 struct socket_identity_key {
 	u64 sk_ptr;           // struct sock * cast to u64
@@ -395,7 +417,8 @@ struct {
 #define MISSED_CACHE_EVENT 3
 #define MISSED_NETWORK_EVENT 4
 #define MISSED_PACKET_EVENT 5
-#define MISSED_EVENT_MAX 6
+#define MISSED_EPOLL_EVENT 6
+#define MISSED_EVENT_MAX 7
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
@@ -469,6 +492,18 @@ struct packet_ringbuf_map {
 	ringbuf_packet_events_node5 SEC(".maps"),
 	ringbuf_packet_events_node6 SEC(".maps"),
 	ringbuf_packet_events_node7 SEC(".maps");
+
+struct epoll_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
+} ringbuf_epoll_events_node0 SEC(".maps"),
+	ringbuf_epoll_events_node1 SEC(".maps"),
+	ringbuf_epoll_events_node2 SEC(".maps"),
+	ringbuf_epoll_events_node3 SEC(".maps"),
+	ringbuf_epoll_events_node4 SEC(".maps"),
+	ringbuf_epoll_events_node5 SEC(".maps"),
+	ringbuf_epoll_events_node6 SEC(".maps"),
+	ringbuf_epoll_events_node7 SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
@@ -575,6 +610,24 @@ struct {
 		&ringbuf_packet_events_node5,
 		&ringbuf_packet_events_node6,
 		&ringbuf_packet_events_node7,
+	},
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS);
+	__type(key, u32);
+	__array(values, struct epoll_ringbuf_map);
+} epoll_ringbufs SEC(".maps") = {
+	.values = {
+		&ringbuf_epoll_events_node0,
+		&ringbuf_epoll_events_node1,
+		&ringbuf_epoll_events_node2,
+		&ringbuf_epoll_events_node3,
+		&ringbuf_epoll_events_node4,
+		&ringbuf_epoll_events_node5,
+		&ringbuf_epoll_events_node6,
+		&ringbuf_epoll_events_node7,
 	},
 };
 
@@ -759,6 +812,21 @@ static struct packet_event *reserve_packet_event(long *flags)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
 	struct packet_event *event = bpf_ringbuf_reserve(rb, sizeof(struct packet_event), 0);
+	if (event)
+		__builtin_memset(event, 0, sizeof(*event));
+	return event;
+}
+
+static struct epoll_event_bpf *reserve_epoll_event(long *flags)
+{
+	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&epoll_ringbufs, &node);
+	if (!rb)
+		return NULL;
+	*flags = get_ringbuf_flags(rb);
+	struct epoll_event_bpf *event = bpf_ringbuf_reserve(rb, sizeof(struct epoll_event_bpf), 0);
 	if (event)
 		__builtin_memset(event, 0, sizeof(*event));
 	return event;
@@ -3072,6 +3140,122 @@ int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 	bpf_probe_read_kernel(&event->icsk_timeout, sizeof(event->icsk_timeout), &icsk->icsk_timeout);
 
 	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// ============================================================================
+// Epoll Tracking (ep_item_poll)
+// ============================================================================
+
+// S_IFSOCK from linux/stat.h
+#define S_IFSOCK 0140000
+#define S_IFMT   0170000
+
+// Extract socket from file, returns NULL if file is not a socket
+static __always_inline struct sock *get_sock_from_file(struct file *file)
+{
+	if (!file)
+		return NULL;
+
+	// Check if this is a socket file by checking inode mode
+	struct inode *inode = NULL;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
+	if (!inode)
+		return NULL;
+
+	umode_t i_mode = 0;
+	bpf_probe_read_kernel(&i_mode, sizeof(i_mode), &inode->i_mode);
+
+	// Check if it's a socket (S_IFSOCK)
+	if ((i_mode & S_IFMT) != S_IFSOCK)
+		return NULL;
+
+	// For socket files, private_data points to struct socket
+	struct socket *socket = NULL;
+	bpf_probe_read_kernel(&socket, sizeof(socket), &file->private_data);
+	if (!socket)
+		return NULL;
+
+	// Get struct sock from socket
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &socket->sk);
+	return sk;
+}
+
+SEC("kprobe/tcp_poll")
+int BPF_KPROBE(tcp_poll_entry, struct file *file, struct socket *sock, poll_table *wait)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &sock->sk);
+	if (!sk)
+		return 0;
+
+	u32 requested_events = 0;
+	if (wait) {
+		bpf_probe_read_kernel(&requested_events, sizeof(requested_events), &wait->_key);
+	}
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+
+	enum network_address_family af = NETWORK_AF_INET;
+	u8 dest_addr[16] = {0};
+	u16 dest_port = 0;
+	read_socket_dest_info(sk, &af, dest_addr, &dest_port);
+
+	if (dest_port == 0)
+		return 0;
+
+	u64 socket_id = get_or_create_socket_id(sk, NETWORK_TCP, af, dest_addr, dest_port, tgidpid);
+	if (socket_id == 0)
+		return 0;
+
+	struct epoll_poll_info info = {
+		.requested_events = requested_events,
+		.socket_id = socket_id,
+	};
+	bpf_map_update_elem(&pending_epoll_polls, &tgidpid, &info, BPF_ANY);
+	return 0;
+}
+
+SEC("kretprobe/tcp_poll")
+int BPF_KRETPROBE(tcp_poll_exit, __poll_t ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct epoll_poll_info *info = bpf_map_lookup_elem(&pending_epoll_polls, &tgidpid);
+	if (!info)
+		return 0;
+
+	if (ret == 0) {
+		bpf_map_delete_elem(&pending_epoll_polls, &tgidpid);
+		return 0;
+	}
+
+	long flags;
+	struct epoll_event_bpf *event = reserve_epoll_event(&flags);
+	if (!event) {
+		bpf_map_delete_elem(&pending_epoll_polls, &tgidpid);
+		return handle_missed_event(MISSED_EPOLL_EVENT);
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->socket_id = info->socket_id;
+	event->requested_events = info->requested_events;
+	event->returned_events = (u32)ret;
+
+	bpf_ringbuf_submit(event, flags);
+	bpf_map_delete_elem(&pending_epoll_polls, &tgidpid);
 	return 0;
 }
 
