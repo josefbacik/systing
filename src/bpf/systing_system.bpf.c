@@ -234,7 +234,10 @@ struct packet_event {
 	u32 rttvar_us;            // RTT variance in microseconds (tp->rttvar_us, not shifted)
 	u8 retransmit_count;      // Number of consecutive RTO timeouts (icsk_retransmits + 1, see note)
 	u8 backoff;               // Exponential backoff multiplier (icsk_backoff)
-	u8 _rto_padding[2];       // Alignment padding
+	// Persist timer fields (populated on TCP packet enqueue events)
+	u8 icsk_pending;          // What timer is pending: 0=none, 1=retrans, 2=delack, 3=probe/persist
+	u8 _persist_padding[7];   // Alignment padding for u64
+	u64 icsk_timeout;         // When timer fires (jiffies)
 };
 
 /*
@@ -2148,6 +2151,13 @@ int BPF_KPROBE(udp_send_skb_entry, struct sk_buff *skb, struct flowi4 *fl4, stru
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
 
+	// Initialize TCP-only fields (not applicable for UDP)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
+
 	bpf_ringbuf_submit(event, flags);
 	return 0;
 }
@@ -2214,6 +2224,13 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
 
+	// Initialize TCP-only fields (not applicable for UDP)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
+
 	bpf_ringbuf_submit(event, flags);
 	return 0;
 }
@@ -2279,6 +2296,13 @@ int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
+
+	// Initialize TCP-only fields (not applicable for UDP)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
@@ -2356,6 +2380,14 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
 	event->sndbuf_used = (u32)wmem_queued;
 	event->sndbuf_limit = (u32)sndbuf;
+
+	// Read persist timer state from inet_connection_sock
+	struct inet_connection_sock *icsk = (struct inet_connection_sock *)sk;
+	bpf_probe_read_kernel(&event->icsk_pending, sizeof(event->icsk_pending), &icsk->icsk_pending);
+	bpf_probe_read_kernel(&event->icsk_timeout, sizeof(event->icsk_timeout), &icsk->icsk_timeout);
+	bpf_probe_read_kernel(&event->rto_jiffies, sizeof(event->rto_jiffies), &icsk->icsk_rto);
+	bpf_probe_read_kernel(&event->probe_count, sizeof(event->probe_count), &icsk->icsk_probes_out);
+	bpf_probe_read_kernel(&event->backoff, sizeof(event->backoff), &icsk->icsk_backoff);
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
@@ -2435,6 +2467,13 @@ static __always_inline int emit_tcp_packet_event(struct sock *sk, struct sk_buff
 	event->sndbuf_used = (u32)wmem_queued;
 	event->sndbuf_limit = (u32)sndbuf;
 
+	// Initialize persist timer fields (not available at this probe point)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
+
 	bpf_ringbuf_submit(event, flags);
 	return 0;
 }
@@ -2484,6 +2523,13 @@ static __always_inline int emit_udp_packet_event(struct sock *sk, struct sk_buff
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
+
+	// Initialize TCP-only fields (not applicable for UDP)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
@@ -2623,6 +2669,13 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
 
+	// Initialize persist timer fields (receive events don't have this info)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
+
 	bpf_ringbuf_submit(event, flags);
 	return 0;
 }
@@ -2676,6 +2729,13 @@ int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
+
+	// Initialize persist timer fields (receive events don't have this info)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
@@ -2731,6 +2791,13 @@ int BPF_KPROBE(tcp_data_queue_entry, struct sock *sk, struct sk_buff *skb)
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
+
+	// Initialize persist timer fields (receive events don't have this info)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
@@ -2790,6 +2857,13 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 
 	pkt_event->sndbuf_used = 0;
 	pkt_event->sndbuf_limit = 0;
+
+	// Initialize persist timer fields (buffer queue events don't have this info)
+	pkt_event->icsk_pending = 0;
+	pkt_event->icsk_timeout = 0;
+	pkt_event->rto_jiffies = 0;
+	pkt_event->probe_count = 0;
+	pkt_event->backoff = 0;
 
 	bpf_ringbuf_submit(pkt_event, flags);
 	return 0;
@@ -2872,6 +2946,12 @@ int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 	// Validate values to prevent negative/garbage data
 	event->sndbuf_used = wmem_queued > 0 ? (u32)wmem_queued : 0;
 	event->sndbuf_limit = sndbuf > 0 ? (u32)sndbuf : 0;
+
+	// Read persist timer state (since this is a zero window probe, timer is active)
+	bpf_probe_read_kernel(&event->icsk_pending, sizeof(event->icsk_pending), &icsk->icsk_pending);
+	bpf_probe_read_kernel(&event->icsk_timeout, sizeof(event->icsk_timeout), &icsk->icsk_timeout);
+	bpf_probe_read_kernel(&event->rto_jiffies, sizeof(event->rto_jiffies), &icsk->icsk_rto);
+	bpf_probe_read_kernel(&event->backoff, sizeof(event->backoff), &icsk->icsk_backoff);
 
 	// Get socket ID for correlation
 	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
@@ -2987,6 +3067,13 @@ int BPF_KPROBE(tcp_send_ack_entry, struct sock *sk)
 
 	// Get socket ID for correlation
 	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+
+	// Initialize persist timer fields (receiver-side ACK events don't have this info)
+	event->icsk_pending = 0;
+	event->icsk_timeout = 0;
+	event->rto_jiffies = 0;
+	event->probe_count = 0;
+	event->backoff = 0;
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
@@ -3116,6 +3203,10 @@ int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 
 	// Get socket ID for correlation
 	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+
+	// Read persist timer state
+	bpf_probe_read_kernel(&event->icsk_pending, sizeof(event->icsk_pending), &icsk->icsk_pending);
+	bpf_probe_read_kernel(&event->icsk_timeout, sizeof(event->icsk_timeout), &icsk->icsk_timeout);
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
