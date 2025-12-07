@@ -490,6 +490,9 @@ struct TraceExtractor {
     /// Open slices per track: track_uuid -> stack of slice indices in self.data.slices
     /// Used to match TYPE_SLICE_BEGIN with TYPE_SLICE_END and compute duration
     open_slices: HashMap<u64, Vec<usize>>,
+
+    /// Streaming writer for instant events (if streaming mode enabled)
+    streaming_instant_writer: Option<StreamingInstantWriter>,
 }
 
 impl TraceExtractor {
@@ -534,20 +537,59 @@ impl TraceExtractor {
             network_namespace_tracks: HashMap::new(),
             network_interface_tracks: HashMap::new(),
             open_slices: HashMap::new(),
+            streaming_instant_writer: None,
         }
     }
 
-    fn into_data(mut self) -> ExtractedData {
-        self.finalize_stack_data();
-        self.data
+    /// Create a new TraceExtractor with streaming enabled for instant events
+    fn new_with_streaming(trace_id: &str, paths: &ParquetPaths) -> Result<Self> {
+        let mut extractor = Self::new();
+        extractor.streaming_instant_writer = Some(StreamingInstantWriter::new(trace_id, paths)?);
+        Ok(extractor)
     }
 
-    fn process_packet(&mut self, packet: &TracePacket) {
+    /// Finish streaming and return data. If streaming was enabled, instants/instant_args
+    /// will be empty (already written to parquet).
+    fn into_data_streaming(mut self) -> Result<(ExtractedData, usize)> {
+        self.finalize_stack_data();
+        let streamed_count = if let Some(writer) = self.streaming_instant_writer.take() {
+            let (instants, args) = writer.finish()?;
+            instants + args
+        } else {
+            0
+        };
+        Ok((self.data, streamed_count))
+    }
+
+    /// Push an instant record - uses streaming writer if available, otherwise stores in memory.
+    /// Returns error if streaming write fails.
+    fn push_instant(&mut self, record: InstantRecord) -> Result<()> {
+        if let Some(ref mut writer) = self.streaming_instant_writer {
+            writer.push_instant(record)
+        } else {
+            self.data.instants.push(record);
+            Ok(())
+        }
+    }
+
+    /// Push an instant arg record - uses streaming writer if available, otherwise stores in memory.
+    /// Returns error if streaming write fails.
+    fn push_instant_arg(&mut self, record: InstantArgRecord) -> Result<()> {
+        if let Some(ref mut writer) = self.streaming_instant_writer {
+            writer.push_instant_arg(record)
+        } else {
+            self.data.instant_args.push(record);
+            Ok(())
+        }
+    }
+
+    fn process_packet(&mut self, packet: &TracePacket) -> Result<()> {
         self.process_clock_snapshot(packet);
         self.process_interned_data(packet);
         self.process_descriptors(packet);
-        self.process_events(packet);
+        self.process_events(packet)?;
         self.process_perf_sample(packet);
+        Ok(())
     }
 
     /// Extract clock snapshot data from a trace packet.
@@ -838,7 +880,7 @@ impl TraceExtractor {
         }
     }
 
-    fn process_events(&mut self, packet: &TracePacket) {
+    fn process_events(&mut self, packet: &TracePacket) -> Result<()> {
         if packet.has_ftrace_events() {
             let bundle = packet.ftrace_events();
             let cpu = bundle.cpu() as i32;
@@ -1022,14 +1064,14 @@ impl TraceExtractor {
                         };
                         let track_id = self.track_uuid_to_id.get(&track_uuid).copied().unwrap_or(0);
                         let utid = self.track_uuid_to_utid.get(&track_uuid).copied();
-                        self.data.instants.push(InstantRecord {
+                        self.push_instant(InstantRecord {
                             id: instant_id,
                             ts,
                             track_id,
                             utid,
                             name,
                             category: event.categories.first().cloned(),
-                        });
+                        })?;
 
                         // Extract debug annotations for instant events
                         for annotation in &event.debug_annotations {
@@ -1051,18 +1093,19 @@ impl TraceExtractor {
                                 continue;
                             };
 
-                            self.data.instant_args.push(InstantArgRecord {
+                            self.push_instant_arg(InstantArgRecord {
                                 instant_id,
                                 key,
                                 int_value: int_val,
                                 string_value: str_val,
                                 real_value: real_val,
-                            });
+                            })?;
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     fn extract_compact_sched(&mut self, compact: &CompactSched, cpu: i32) {
@@ -1266,16 +1309,23 @@ impl TraceExtractor {
     }
 }
 
-fn extract_trace_data_streaming<R: BufRead>(reader: R) -> Result<ExtractedData> {
-    let mut extractor = TraceExtractor::new();
+/// Extract trace data with streaming writes for instant events
+/// Returns (ExtractedData, streamed_event_count) - instants/instant_args will be empty
+/// as they're written directly to parquet during extraction
+fn extract_trace_data_with_streaming<R: BufRead>(
+    reader: R,
+    trace_id: &str,
+    paths: &ParquetPaths,
+) -> Result<(ExtractedData, usize)> {
+    let mut extractor = TraceExtractor::new_with_streaming(trace_id, paths)?;
     let packet_iter = TracePacketIterator::new(reader);
 
     for packet_result in packet_iter {
         let packet = packet_result?;
-        extractor.process_packet(&packet);
+        extractor.process_packet(&packet)?;
     }
 
-    Ok(extractor.into_data())
+    extractor.into_data_streaming()
 }
 
 fn compute_sched_durations(slices: &mut [SchedSliceRecord]) {
@@ -1517,6 +1567,206 @@ impl ParquetPaths {
 }
 
 const PARQUET_BATCH_SIZE: usize = 500_000;
+/// Batch size for streaming writes (smaller for more frequent flushing to reduce memory)
+const STREAMING_BATCH_SIZE: usize = 50_000;
+
+/// Streaming writer for instant events - buffers and writes to parquet incrementally
+struct StreamingInstantWriter {
+    writer: Option<ArrowWriter<File>>,
+    args_writer: Option<ArrowWriter<File>>,
+    schema: Arc<Schema>,
+    args_schema: Arc<Schema>,
+    trace_id: String,
+    instant_buffer: Vec<InstantRecord>,
+    args_buffer: Vec<InstantArgRecord>,
+    total_instants_written: usize,
+    total_args_written: usize,
+}
+
+impl StreamingInstantWriter {
+    fn new(trace_id: &str, paths: &ParquetPaths) -> Result<Self> {
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_size(1_000_000)
+            .build();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("track_id", DataType::Int64, false),
+            Field::new("utid", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, true),
+        ]));
+
+        let args_schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("instant_id", DataType::Int64, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("int_value", DataType::Int64, true),
+            Field::new("string_value", DataType::Utf8, true),
+            Field::new("real_value", DataType::Float64, true),
+        ]));
+
+        let file = File::create(&paths.instant)?;
+        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+
+        let args_file = File::create(&paths.instant_args)?;
+        let args_writer = ArrowWriter::try_new(args_file, args_schema.clone(), Some(props))?;
+
+        Ok(Self {
+            writer: Some(writer),
+            args_writer: Some(args_writer),
+            schema,
+            args_schema,
+            trace_id: trace_id.to_string(),
+            instant_buffer: Vec::with_capacity(STREAMING_BATCH_SIZE),
+            args_buffer: Vec::with_capacity(STREAMING_BATCH_SIZE),
+            total_instants_written: 0,
+            total_args_written: 0,
+        })
+    }
+
+    fn push_instant(&mut self, instant: InstantRecord) -> Result<()> {
+        self.instant_buffer.push(instant);
+        if self.instant_buffer.len() >= STREAMING_BATCH_SIZE {
+            self.flush_instants()?;
+        }
+        Ok(())
+    }
+
+    fn push_instant_arg(&mut self, arg: InstantArgRecord) -> Result<()> {
+        self.args_buffer.push(arg);
+        if self.args_buffer.len() >= STREAMING_BATCH_SIZE {
+            self.flush_args()?;
+        }
+        Ok(())
+    }
+
+    fn flush_instants(&mut self) -> Result<()> {
+        if self.instant_buffer.is_empty() {
+            return Ok(());
+        }
+
+        let chunk = &self.instant_buffer;
+        let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+        let mut id_builder = Int64Builder::with_capacity(chunk.len());
+        let mut ts_builder = Int64Builder::with_capacity(chunk.len());
+        let mut track_id_builder = Int64Builder::with_capacity(chunk.len());
+        let mut utid_builder = Int64Builder::with_capacity(chunk.len());
+        let mut name_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+        let mut category_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 16);
+
+        for instant in chunk {
+            trace_id_builder.append_value(&self.trace_id);
+            id_builder.append_value(instant.id);
+            ts_builder.append_value(instant.ts);
+            track_id_builder.append_value(instant.track_id);
+            utid_builder.append_option(instant.utid);
+            name_builder.append_value(&instant.name);
+            category_builder.append_option(instant.category.as_deref());
+        }
+
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(id_builder.finish()),
+                Arc::new(ts_builder.finish()),
+                Arc::new(track_id_builder.finish()),
+                Arc::new(utid_builder.finish()),
+                Arc::new(name_builder.finish()),
+                Arc::new(category_builder.finish()),
+            ],
+        )?;
+        if let Some(ref mut writer) = self.writer {
+            writer.write(&batch)?;
+        }
+        self.total_instants_written += self.instant_buffer.len();
+        self.instant_buffer.clear();
+        Ok(())
+    }
+
+    fn flush_args(&mut self) -> Result<()> {
+        if self.args_buffer.is_empty() {
+            return Ok(());
+        }
+
+        let chunk = &self.args_buffer;
+        let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+        let mut instant_id_builder = Int64Builder::with_capacity(chunk.len());
+        let mut key_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
+        let mut int_value_builder = Int64Builder::with_capacity(chunk.len());
+        let mut string_value_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 64);
+        let mut real_value_builder = Float64Builder::with_capacity(chunk.len());
+
+        for arg in chunk {
+            trace_id_builder.append_value(&self.trace_id);
+            instant_id_builder.append_value(arg.instant_id);
+            key_builder.append_value(&arg.key);
+            int_value_builder.append_option(arg.int_value);
+            string_value_builder.append_option(arg.string_value.as_deref());
+            real_value_builder.append_option(arg.real_value);
+        }
+
+        let batch = RecordBatch::try_new(
+            self.args_schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(instant_id_builder.finish()),
+                Arc::new(key_builder.finish()),
+                Arc::new(int_value_builder.finish()),
+                Arc::new(string_value_builder.finish()),
+                Arc::new(real_value_builder.finish()),
+            ],
+        )?;
+        if let Some(ref mut writer) = self.args_writer {
+            writer.write(&batch)?;
+        }
+        self.total_args_written += self.args_buffer.len();
+        self.args_buffer.clear();
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(usize, usize)> {
+        self.flush_instants()?;
+        self.flush_args()?;
+        if let Some(writer) = self.writer.take() {
+            writer.close()?;
+        }
+        if let Some(writer) = self.args_writer.take() {
+            writer.close()?;
+        }
+        Ok((self.total_instants_written, self.total_args_written))
+    }
+
+    /// Returns true if there's unflushed data in the buffers
+    fn has_unflushed_data(&self) -> bool {
+        !self.instant_buffer.is_empty() || !self.args_buffer.is_empty()
+    }
+}
+
+impl Drop for StreamingInstantWriter {
+    fn drop(&mut self) {
+        // Warn if dropped with unflushed data - this indicates finish() wasn't called
+        if self.has_unflushed_data() {
+            eprintln!(
+                "Warning: StreamingInstantWriter dropped with {} unflushed instants and {} unflushed args. \
+                 Call finish() to ensure all data is written.",
+                self.instant_buffer.len(),
+                self.args_buffer.len()
+            );
+            // Attempt to flush remaining data (best effort, can't propagate errors in Drop)
+            if let Err(e) = self.flush_instants() {
+                eprintln!("Error flushing instants on drop: {e}");
+            }
+            if let Err(e) = self.flush_args() {
+                eprintln!("Error flushing args on drop: {e}");
+            }
+        }
+    }
+}
 
 fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPaths) -> Result<()> {
     let props = WriterProperties::builder()
@@ -2577,16 +2827,21 @@ fn run_convert(
 /// Process a single trace: read, extract, compute durations, and write to Parquet
 fn process_trace_to_parquet(trace: &TraceInfo, paths: &ParquetPaths) -> Result<usize> {
     let reader = open_trace_reader(&trace.source_path)?;
-    let mut data = extract_trace_data_streaming(reader)?;
+
+    // Use streaming extraction - instants/instant_args are written directly to parquet
+    let (mut data, streamed_count) =
+        extract_trace_data_with_streaming(reader, &trace.trace_id, paths)?;
+
     compute_sched_durations(&mut data.sched_slices);
 
     let event_count = data.sched_slices.len()
         + data.thread_states.len()
         + data.counters.len()
         + data.slices.len()
-        + data.instants.len()
-        + data.perf_samples.len();
+        + data.perf_samples.len()
+        + streamed_count; // Add streamed instants/instant_args to count
 
+    // Write remaining data (instants/instant_args already written via streaming)
     write_data_to_parquet(&trace.trace_id, &data, paths)
         .with_context(|| format!("Failed writing Parquet for trace {}", trace.trace_id))?;
 
@@ -2845,7 +3100,7 @@ mod tests {
         interned_packet.interned_data = Some(interned_data).into();
 
         // Process the interned data packet
-        extractor.process_packet(&interned_packet);
+        extractor.process_packet(&interned_packet).unwrap();
 
         // Verify interned names are stored
         assert_eq!(
@@ -2863,7 +3118,7 @@ mod tests {
         track_desc.set_uuid(12345);
         track_desc.set_name("test_track".to_string());
         track_desc_packet.set_track_descriptor(track_desc);
-        extractor.process_packet(&track_desc_packet);
+        extractor.process_packet(&track_desc_packet).unwrap();
 
         // Create a track_event that uses name_iid instead of inline name
         let mut event_packet = TracePacket::default();
@@ -2877,7 +3132,7 @@ mod tests {
         event_packet.set_track_event(track_event);
 
         // Process the event packet
-        extractor.process_packet(&event_packet);
+        extractor.process_packet(&event_packet).unwrap();
 
         // Verify the slice was created with the correct interned name
         assert_eq!(extractor.data.slices.len(), 1);
@@ -2897,7 +3152,7 @@ mod tests {
         track_desc.set_uuid(99999);
         track_desc.set_name("test_track".to_string());
         track_desc_packet.set_track_descriptor(track_desc);
-        extractor.process_packet(&track_desc_packet);
+        extractor.process_packet(&track_desc_packet).unwrap();
 
         // Create a track_event with inline name (no name_iid)
         let mut event_packet = TracePacket::default();
@@ -2909,7 +3164,7 @@ mod tests {
         track_event.set_name("inline_name".to_string());
 
         event_packet.set_track_event(track_event);
-        extractor.process_packet(&event_packet);
+        extractor.process_packet(&event_packet).unwrap();
 
         // Verify inline name is used
         assert_eq!(extractor.data.slices.len(), 1);
@@ -2926,7 +3181,7 @@ mod tests {
         track_desc.set_uuid(77777);
         track_desc.set_name("test_track".to_string());
         track_desc_packet.set_track_descriptor(track_desc);
-        extractor.process_packet(&track_desc_packet);
+        extractor.process_packet(&track_desc_packet).unwrap();
 
         // Create a track_event with a name_iid that doesn't exist in interned data
         let mut event_packet = TracePacket::default();
@@ -2938,7 +3193,7 @@ mod tests {
         track_event.set_name_iid(99999); // Non-existent iid
 
         event_packet.set_track_event(track_event);
-        extractor.process_packet(&event_packet);
+        extractor.process_packet(&event_packet).unwrap();
 
         // Verify fallback to "unknown"
         assert_eq!(extractor.data.slices.len(), 1);
@@ -3182,7 +3437,7 @@ mod tests {
         interned_data.callstacks.push(callstack);
 
         interned_packet.interned_data = Some(interned_data).into();
-        extractor.process_packet(&interned_packet);
+        extractor.process_packet(&interned_packet).unwrap();
 
         let mut sample_packet = TracePacket::default();
         sample_packet.set_timestamp(1000000);
@@ -3194,7 +3449,7 @@ mod tests {
         perf_sample.cpu = Some(0);
 
         sample_packet.set_perf_sample(perf_sample);
-        extractor.process_packet(&sample_packet);
+        extractor.process_packet(&sample_packet).unwrap();
 
         assert_eq!(extractor.data.perf_samples.len(), 1);
         let sample = &extractor.data.perf_samples[0];
@@ -3219,7 +3474,7 @@ mod tests {
         perf_sample.set_tid(5678);
 
         sample_packet.set_perf_sample(perf_sample);
-        extractor.process_packet(&sample_packet);
+        extractor.process_packet(&sample_packet).unwrap();
 
         assert_eq!(extractor.data.perf_samples.len(), 1);
         let sample = &extractor.data.perf_samples[0];
@@ -3255,7 +3510,7 @@ mod tests {
         track_desc.set_uuid(55555);
         track_desc.set_name("network_track".to_string());
         track_desc_packet.set_track_descriptor(track_desc);
-        extractor.process_packet(&track_desc_packet);
+        extractor.process_packet(&track_desc_packet).unwrap();
 
         // Create TYPE_SLICE_BEGIN event at timestamp 1000
         let mut begin_packet = TracePacket::default();
@@ -3267,7 +3522,7 @@ mod tests {
         begin_event.set_name("tcp_send".to_string());
 
         begin_packet.set_track_event(begin_event);
-        extractor.process_packet(&begin_packet);
+        extractor.process_packet(&begin_packet).unwrap();
 
         // Verify slice was created with dur=0 (not yet ended)
         assert_eq!(extractor.data.slices.len(), 1);
@@ -3284,7 +3539,7 @@ mod tests {
         end_event.set_track_uuid(55555);
 
         end_packet.set_track_event(end_event);
-        extractor.process_packet(&end_packet);
+        extractor.process_packet(&end_packet).unwrap();
 
         // Verify duration was computed: 5000 - 1000 = 4000
         assert_eq!(extractor.data.slices.len(), 1);
@@ -3301,7 +3556,7 @@ mod tests {
         track_desc.set_uuid(66666);
         track_desc.set_name("nested_track".to_string());
         track_desc_packet.set_track_descriptor(track_desc);
-        extractor.process_packet(&track_desc_packet);
+        extractor.process_packet(&track_desc_packet).unwrap();
 
         // Begin outer slice at t=1000
         let mut outer_begin = TracePacket::default();
@@ -3311,7 +3566,7 @@ mod tests {
         outer_begin_event.set_track_uuid(66666);
         outer_begin_event.set_name("outer".to_string());
         outer_begin.set_track_event(outer_begin_event);
-        extractor.process_packet(&outer_begin);
+        extractor.process_packet(&outer_begin).unwrap();
 
         // Begin inner slice at t=2000
         let mut inner_begin = TracePacket::default();
@@ -3321,7 +3576,7 @@ mod tests {
         inner_begin_event.set_track_uuid(66666);
         inner_begin_event.set_name("inner".to_string());
         inner_begin.set_track_event(inner_begin_event);
-        extractor.process_packet(&inner_begin);
+        extractor.process_packet(&inner_begin).unwrap();
 
         // End inner slice at t=3000
         let mut inner_end = TracePacket::default();
@@ -3330,7 +3585,7 @@ mod tests {
         inner_end_event.set_type(Type::TYPE_SLICE_END);
         inner_end_event.set_track_uuid(66666);
         inner_end.set_track_event(inner_end_event);
-        extractor.process_packet(&inner_end);
+        extractor.process_packet(&inner_end).unwrap();
 
         // End outer slice at t=5000
         let mut outer_end = TracePacket::default();
@@ -3339,7 +3594,7 @@ mod tests {
         outer_end_event.set_type(Type::TYPE_SLICE_END);
         outer_end_event.set_track_uuid(66666);
         outer_end.set_track_event(outer_end_event);
-        extractor.process_packet(&outer_end);
+        extractor.process_packet(&outer_end).unwrap();
 
         // Verify both slices have correct durations
         assert_eq!(extractor.data.slices.len(), 2);
@@ -3363,7 +3618,7 @@ mod tests {
         track_desc.set_uuid(77777);
         track_desc.set_name("test_track".to_string());
         track_desc_packet.set_track_descriptor(track_desc);
-        extractor.process_packet(&track_desc_packet);
+        extractor.process_packet(&track_desc_packet).unwrap();
 
         // Send TYPE_SLICE_END without a corresponding BEGIN
         let mut end_packet = TracePacket::default();
@@ -3372,7 +3627,7 @@ mod tests {
         end_event.set_type(Type::TYPE_SLICE_END);
         end_event.set_track_uuid(77777);
         end_packet.set_track_event(end_event);
-        extractor.process_packet(&end_packet);
+        extractor.process_packet(&end_packet).unwrap();
 
         // Should not create any slices or crash
         assert_eq!(extractor.data.slices.len(), 0);
@@ -3388,7 +3643,7 @@ mod tests {
         track_desc.set_uuid(88888);
         track_desc.set_name("unclosed_track".to_string());
         track_desc_packet.set_track_descriptor(track_desc);
-        extractor.process_packet(&track_desc_packet);
+        extractor.process_packet(&track_desc_packet).unwrap();
 
         // Create TYPE_SLICE_BEGIN but never send TYPE_SLICE_END
         let mut begin_packet = TracePacket::default();
@@ -3398,7 +3653,7 @@ mod tests {
         begin_event.set_track_uuid(88888);
         begin_event.set_name("unclosed_slice".to_string());
         begin_packet.set_track_event(begin_event);
-        extractor.process_packet(&begin_packet);
+        extractor.process_packet(&begin_packet).unwrap();
 
         // Verify slice exists with dur=0 (never closed)
         assert_eq!(extractor.data.slices.len(), 1);
@@ -3417,14 +3672,14 @@ mod tests {
         track1_desc.set_uuid(11111);
         track1_desc.set_name("track1".to_string());
         track1_desc_packet.set_track_descriptor(track1_desc);
-        extractor.process_packet(&track1_desc_packet);
+        extractor.process_packet(&track1_desc_packet).unwrap();
 
         let mut track2_desc_packet = TracePacket::default();
         let mut track2_desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
         track2_desc.set_uuid(22222);
         track2_desc.set_name("track2".to_string());
         track2_desc_packet.set_track_descriptor(track2_desc);
-        extractor.process_packet(&track2_desc_packet);
+        extractor.process_packet(&track2_desc_packet).unwrap();
 
         // Begin slice on track1
         let mut track1_begin = TracePacket::default();
@@ -3434,7 +3689,7 @@ mod tests {
         track1_begin_event.set_track_uuid(11111);
         track1_begin_event.set_name("slice1".to_string());
         track1_begin.set_track_event(track1_begin_event);
-        extractor.process_packet(&track1_begin);
+        extractor.process_packet(&track1_begin).unwrap();
 
         // Begin slice on track2
         let mut track2_begin = TracePacket::default();
@@ -3444,7 +3699,7 @@ mod tests {
         track2_begin_event.set_track_uuid(22222);
         track2_begin_event.set_name("slice2".to_string());
         track2_begin.set_track_event(track2_begin_event);
-        extractor.process_packet(&track2_begin);
+        extractor.process_packet(&track2_begin).unwrap();
 
         // End slice on track2
         let mut track2_end = TracePacket::default();
@@ -3453,7 +3708,7 @@ mod tests {
         track2_end_event.set_type(Type::TYPE_SLICE_END);
         track2_end_event.set_track_uuid(22222);
         track2_end.set_track_event(track2_end_event);
-        extractor.process_packet(&track2_end);
+        extractor.process_packet(&track2_end).unwrap();
 
         // End slice on track1
         let mut track1_end = TracePacket::default();
@@ -3462,7 +3717,7 @@ mod tests {
         track1_end_event.set_type(Type::TYPE_SLICE_END);
         track1_end_event.set_track_uuid(11111);
         track1_end.set_track_event(track1_end_event);
-        extractor.process_packet(&track1_end);
+        extractor.process_packet(&track1_end).unwrap();
 
         // Verify both slices have correct durations
         assert_eq!(extractor.data.slices.len(), 2);
@@ -3482,7 +3737,7 @@ mod tests {
         track_desc.set_uuid(99999);
         track_desc.set_name("deep_track".to_string());
         track_desc_packet.set_track_descriptor(track_desc);
-        extractor.process_packet(&track_desc_packet);
+        extractor.process_packet(&track_desc_packet).unwrap();
 
         // Begin 5 nested slices
         for i in 0..5 {
@@ -3493,7 +3748,7 @@ mod tests {
             begin_event.set_track_uuid(99999);
             begin_event.set_name(format!("level_{}", i));
             begin.set_track_event(begin_event);
-            extractor.process_packet(&begin);
+            extractor.process_packet(&begin).unwrap();
         }
 
         // End all 5 slices in LIFO order
@@ -3504,7 +3759,7 @@ mod tests {
             end_event.set_type(Type::TYPE_SLICE_END);
             end_event.set_track_uuid(99999);
             end.set_track_event(end_event);
-            extractor.process_packet(&end);
+            extractor.process_packet(&end).unwrap();
         }
 
         // Verify all slices have correct durations
