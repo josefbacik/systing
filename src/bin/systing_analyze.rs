@@ -495,6 +495,7 @@ struct TraceExtractor {
     streaming_perf_sample_writer: Option<StreamingWriter<PerfSampleRecord>>,
     streaming_thread_state_writer: Option<StreamingWriter<ThreadStateRecord>>,
     streaming_sched_slice_writer: Option<StreamingSchedSliceWriter>,
+    streaming_args_writer: Option<StreamingWriter<ArgRecord>>,
 }
 
 impl TraceExtractor {
@@ -543,6 +544,7 @@ impl TraceExtractor {
             streaming_perf_sample_writer: None,
             streaming_thread_state_writer: None,
             streaming_sched_slice_writer: None,
+            streaming_args_writer: None,
         }
     }
 
@@ -558,6 +560,7 @@ impl TraceExtractor {
             trace_id,
             &paths.sched_slice,
         )?);
+        extractor.streaming_args_writer = Some(StreamingWriter::new(trace_id, &paths.args)?);
         Ok(extractor)
     }
 
@@ -576,6 +579,9 @@ impl TraceExtractor {
             streamed_count += writer.finish()?;
         }
         if let Some(writer) = self.streaming_sched_slice_writer.take() {
+            streamed_count += writer.finish()?;
+        }
+        if let Some(writer) = self.streaming_args_writer.take() {
             streamed_count += writer.finish()?;
         }
         Ok((self.data, streamed_count))
@@ -622,6 +628,15 @@ impl TraceExtractor {
             writer.push(record)
         } else {
             self.data.sched_slices.push(record);
+            Ok(())
+        }
+    }
+
+    fn push_arg(&mut self, record: ArgRecord) -> Result<()> {
+        if let Some(ref mut writer) = self.streaming_args_writer {
+            writer.push(record)
+        } else {
+            self.data.args.push(record);
             Ok(())
         }
     }
@@ -1047,13 +1062,13 @@ impl TraceExtractor {
                                 continue; // Skip annotations without values
                             };
 
-                            self.data.args.push(ArgRecord {
+                            self.push_arg(ArgRecord {
                                 slice_id,
                                 key,
                                 int_value: int_val,
                                 string_value: str_val,
                                 real_value: real_val,
-                            });
+                            })?;
                         }
                     }
 
@@ -1815,6 +1830,50 @@ impl StreamableRecord for InstantArgRecord {
             vec![
                 Arc::new(trace_id_builder.finish()),
                 Arc::new(instant_id_builder.finish()),
+                Arc::new(key_builder.finish()),
+                Arc::new(int_value_builder.finish()),
+                Arc::new(string_value_builder.finish()),
+                Arc::new(real_value_builder.finish()),
+            ],
+        )?)
+    }
+}
+
+impl StreamableRecord for ArgRecord {
+    fn schema() -> Schema {
+        Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("slice_id", DataType::Int64, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("int_value", DataType::Int64, true),
+            Field::new("string_value", DataType::Utf8, true),
+            Field::new("real_value", DataType::Float64, true),
+        ])
+    }
+
+    fn build_batch(records: &[Self], trace_id: &str, schema: &Arc<Schema>) -> Result<RecordBatch> {
+        let mut trace_id_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
+        let mut slice_id_builder = Int64Builder::with_capacity(records.len());
+        let mut key_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
+        let mut int_value_builder = Int64Builder::with_capacity(records.len());
+        let mut string_value_builder =
+            StringBuilder::with_capacity(records.len(), records.len() * 64);
+        let mut real_value_builder = Float64Builder::with_capacity(records.len());
+
+        for record in records {
+            trace_id_builder.append_value(trace_id);
+            slice_id_builder.append_value(record.slice_id);
+            key_builder.append_value(&record.key);
+            int_value_builder.append_option(record.int_value);
+            string_value_builder.append_option(record.string_value.as_deref());
+            real_value_builder.append_option(record.real_value);
+        }
+
+        Ok(RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(slice_id_builder.finish()),
                 Arc::new(key_builder.finish()),
                 Arc::new(int_value_builder.finish()),
                 Arc::new(string_value_builder.finish()),
