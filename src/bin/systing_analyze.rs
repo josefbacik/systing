@@ -494,6 +494,7 @@ struct TraceExtractor {
     streaming_instant_writer: Option<StreamingInstantWriter>,
     streaming_perf_sample_writer: Option<StreamingWriter<PerfSampleRecord>>,
     streaming_thread_state_writer: Option<StreamingWriter<ThreadStateRecord>>,
+    streaming_sched_slice_writer: Option<StreamingSchedSliceWriter>,
 }
 
 impl TraceExtractor {
@@ -541,6 +542,7 @@ impl TraceExtractor {
             streaming_instant_writer: None,
             streaming_perf_sample_writer: None,
             streaming_thread_state_writer: None,
+            streaming_sched_slice_writer: None,
         }
     }
 
@@ -552,6 +554,10 @@ impl TraceExtractor {
             Some(StreamingWriter::new(trace_id, &paths.perf_sample)?);
         extractor.streaming_thread_state_writer =
             Some(StreamingWriter::new(trace_id, &paths.thread_state)?);
+        extractor.streaming_sched_slice_writer = Some(StreamingSchedSliceWriter::new(
+            trace_id,
+            &paths.sched_slice,
+        )?);
         Ok(extractor)
     }
 
@@ -567,6 +573,9 @@ impl TraceExtractor {
             streamed_count += writer.finish()?;
         }
         if let Some(writer) = self.streaming_thread_state_writer.take() {
+            streamed_count += writer.finish()?;
+        }
+        if let Some(writer) = self.streaming_sched_slice_writer.take() {
             streamed_count += writer.finish()?;
         }
         Ok((self.data, streamed_count))
@@ -604,6 +613,15 @@ impl TraceExtractor {
             writer.push(record)
         } else {
             self.data.thread_states.push(record);
+            Ok(())
+        }
+    }
+
+    fn push_sched_slice(&mut self, record: SchedSliceRecord) -> Result<()> {
+        if let Some(ref mut writer) = self.streaming_sched_slice_writer {
+            writer.push(record)
+        } else {
+            self.data.sched_slices.push(record);
             Ok(())
         }
     }
@@ -926,14 +944,14 @@ impl TraceExtractor {
                     self.ensure_thread_exists(prev_pid, Some(switch.prev_comm()));
 
                     if let Some(&next_utid) = self.tid_to_utid.get(&next_pid) {
-                        self.data.sched_slices.push(SchedSliceRecord {
+                        self.push_sched_slice(SchedSliceRecord {
                             ts,
                             dur: 0,
                             cpu,
                             utid: next_utid,
                             end_state: None,
                             priority: switch.next_prio(),
-                        });
+                        })?;
                     }
                 }
 
@@ -1149,14 +1167,14 @@ impl TraceExtractor {
             self.ensure_thread_exists(next_pid, comm);
 
             if let Some(&utid) = self.tid_to_utid.get(&next_pid) {
-                self.data.sched_slices.push(SchedSliceRecord {
+                self.push_sched_slice(SchedSliceRecord {
                     ts: switch_ts,
                     dur: 0,
                     cpu,
                     utid,
                     end_state: None,
                     priority: next_prio,
-                });
+                })?;
             }
         }
 
@@ -1351,20 +1369,6 @@ fn extract_trace_data_with_streaming<R: BufRead>(
     }
 
     extractor.into_data_streaming()
-}
-
-fn compute_sched_durations(slices: &mut [SchedSliceRecord]) {
-    if slices.is_empty() {
-        return;
-    }
-
-    slices.sort_unstable_by(|a, b| a.cpu.cmp(&b.cpu).then_with(|| a.ts.cmp(&b.ts)));
-
-    for i in 0..slices.len() - 1 {
-        if slices[i].cpu == slices[i + 1].cpu {
-            slices[i].dur = slices[i + 1].ts - slices[i].ts;
-        }
-    }
 }
 
 fn create_schema(conn: &Connection) -> Result<()> {
@@ -1682,6 +1686,53 @@ impl StreamableRecord for ThreadStateRecord {
     }
 }
 
+impl StreamableRecord for SchedSliceRecord {
+    fn schema() -> Schema {
+        Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("dur", DataType::Int64, false),
+            Field::new("cpu", DataType::Int32, false),
+            Field::new("utid", DataType::Int64, false),
+            Field::new("end_state", DataType::Utf8, true),
+            Field::new("priority", DataType::Int32, false),
+        ])
+    }
+
+    fn build_batch(records: &[Self], trace_id: &str, schema: &Arc<Schema>) -> Result<RecordBatch> {
+        let mut trace_id_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
+        let mut ts_builder = Int64Builder::with_capacity(records.len());
+        let mut dur_builder = Int64Builder::with_capacity(records.len());
+        let mut cpu_builder = Int32Builder::with_capacity(records.len());
+        let mut utid_builder = Int64Builder::with_capacity(records.len());
+        let mut end_state_builder = StringBuilder::with_capacity(records.len(), records.len() * 4);
+        let mut priority_builder = Int32Builder::with_capacity(records.len());
+
+        for slice in records {
+            trace_id_builder.append_value(trace_id);
+            ts_builder.append_value(slice.ts);
+            dur_builder.append_value(slice.dur);
+            cpu_builder.append_value(slice.cpu);
+            utid_builder.append_value(slice.utid);
+            end_state_builder.append_option(slice.end_state.as_deref());
+            priority_builder.append_value(slice.priority);
+        }
+
+        Ok(RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(ts_builder.finish()),
+                Arc::new(dur_builder.finish()),
+                Arc::new(cpu_builder.finish()),
+                Arc::new(utid_builder.finish()),
+                Arc::new(end_state_builder.finish()),
+                Arc::new(priority_builder.finish()),
+            ],
+        )?)
+    }
+}
+
 impl StreamableRecord for InstantRecord {
     fn schema() -> Schema {
         Schema::new(vec![
@@ -1874,6 +1925,38 @@ impl StreamingInstantWriter {
         let instants = self.instants.finish()?;
         let args = self.args.finish()?;
         Ok((instants, args))
+    }
+}
+
+/// Buffers sched_slice events per-CPU to compute durations between consecutive slices.
+struct StreamingSchedSliceWriter {
+    writer: StreamingWriter<SchedSliceRecord>,
+    pending_per_cpu: HashMap<i32, SchedSliceRecord>,
+}
+
+impl StreamingSchedSliceWriter {
+    fn new(trace_id: &str, path: &Path) -> Result<Self> {
+        Ok(Self {
+            writer: StreamingWriter::new(trace_id, path)?,
+            pending_per_cpu: HashMap::new(),
+        })
+    }
+
+    fn push(&mut self, record: SchedSliceRecord) -> Result<()> {
+        let cpu = record.cpu;
+        let ts = record.ts;
+        if let Some(mut prev) = self.pending_per_cpu.insert(cpu, record) {
+            prev.dur = ts - prev.ts;
+            self.writer.push(prev)?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<usize> {
+        for (_, slice) in self.pending_per_cpu.drain() {
+            self.writer.push(slice)?;
+        }
+        self.writer.finish()
     }
 }
 
@@ -2937,11 +3020,8 @@ fn run_convert(
 fn process_trace_to_parquet(trace: &TraceInfo, paths: &ParquetPaths) -> Result<usize> {
     let reader = open_trace_reader(&trace.source_path)?;
 
-    // Use streaming extraction - instants/instant_args are written directly to parquet
-    let (mut data, streamed_count) =
-        extract_trace_data_with_streaming(reader, &trace.trace_id, paths)?;
-
-    compute_sched_durations(&mut data.sched_slices);
+    // Use streaming extraction - streamable types are written directly to parquet
+    let (data, streamed_count) = extract_trace_data_with_streaming(reader, &trace.trace_id, paths)?;
 
     let event_count = data.sched_slices.len()
         + data.thread_states.len()
