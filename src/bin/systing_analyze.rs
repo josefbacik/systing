@@ -491,8 +491,9 @@ struct TraceExtractor {
     /// Used to match TYPE_SLICE_BEGIN with TYPE_SLICE_END and compute duration
     open_slices: HashMap<u64, Vec<usize>>,
 
-    /// Streaming writer for instant events (if streaming mode enabled)
     streaming_instant_writer: Option<StreamingInstantWriter>,
+    streaming_perf_sample_writer: Option<StreamingWriter<PerfSampleRecord>>,
+    streaming_thread_state_writer: Option<StreamingWriter<ThreadStateRecord>>,
 }
 
 impl TraceExtractor {
@@ -538,31 +539,39 @@ impl TraceExtractor {
             network_interface_tracks: HashMap::new(),
             open_slices: HashMap::new(),
             streaming_instant_writer: None,
+            streaming_perf_sample_writer: None,
+            streaming_thread_state_writer: None,
         }
     }
 
-    /// Create a new TraceExtractor with streaming enabled for instant events
+    /// Create a new TraceExtractor with streaming enabled for streamable data types
     fn new_with_streaming(trace_id: &str, paths: &ParquetPaths) -> Result<Self> {
         let mut extractor = Self::new();
         extractor.streaming_instant_writer = Some(StreamingInstantWriter::new(trace_id, paths)?);
+        extractor.streaming_perf_sample_writer =
+            Some(StreamingWriter::new(trace_id, &paths.perf_sample)?);
+        extractor.streaming_thread_state_writer =
+            Some(StreamingWriter::new(trace_id, &paths.thread_state)?);
         Ok(extractor)
     }
 
-    /// Finish streaming and return data. If streaming was enabled, instants/instant_args
-    /// will be empty (already written to parquet).
+    /// Finishes streaming writers and returns data with streamed record count.
     fn into_data_streaming(mut self) -> Result<(ExtractedData, usize)> {
         self.finalize_stack_data();
-        let streamed_count = if let Some(writer) = self.streaming_instant_writer.take() {
+        let mut streamed_count = 0;
+        if let Some(writer) = self.streaming_instant_writer.take() {
             let (instants, args) = writer.finish()?;
-            instants + args
-        } else {
-            0
-        };
+            streamed_count += instants + args;
+        }
+        if let Some(writer) = self.streaming_perf_sample_writer.take() {
+            streamed_count += writer.finish()?;
+        }
+        if let Some(writer) = self.streaming_thread_state_writer.take() {
+            streamed_count += writer.finish()?;
+        }
         Ok((self.data, streamed_count))
     }
 
-    /// Push an instant record - uses streaming writer if available, otherwise stores in memory.
-    /// Returns error if streaming write fails.
     fn push_instant(&mut self, record: InstantRecord) -> Result<()> {
         if let Some(ref mut writer) = self.streaming_instant_writer {
             writer.push_instant(record)
@@ -572,8 +581,6 @@ impl TraceExtractor {
         }
     }
 
-    /// Push an instant arg record - uses streaming writer if available, otherwise stores in memory.
-    /// Returns error if streaming write fails.
     fn push_instant_arg(&mut self, record: InstantArgRecord) -> Result<()> {
         if let Some(ref mut writer) = self.streaming_instant_writer {
             writer.push_instant_arg(record)
@@ -583,12 +590,30 @@ impl TraceExtractor {
         }
     }
 
+    fn push_perf_sample(&mut self, record: PerfSampleRecord) -> Result<()> {
+        if let Some(ref mut writer) = self.streaming_perf_sample_writer {
+            writer.push(record)
+        } else {
+            self.data.perf_samples.push(record);
+            Ok(())
+        }
+    }
+
+    fn push_thread_state(&mut self, record: ThreadStateRecord) -> Result<()> {
+        if let Some(ref mut writer) = self.streaming_thread_state_writer {
+            writer.push(record)
+        } else {
+            self.data.thread_states.push(record);
+            Ok(())
+        }
+    }
+
     fn process_packet(&mut self, packet: &TracePacket) -> Result<()> {
         self.process_clock_snapshot(packet);
         self.process_interned_data(packet);
         self.process_descriptors(packet);
         self.process_events(packet)?;
-        self.process_perf_sample(packet);
+        self.process_perf_sample(packet)?;
         Ok(())
     }
 
@@ -886,7 +911,7 @@ impl TraceExtractor {
             let cpu = bundle.cpu() as i32;
 
             if let Some(compact) = bundle.compact_sched.as_ref() {
-                self.extract_compact_sched(compact, cpu);
+                self.extract_compact_sched(compact, cpu)?;
             }
 
             for event in &bundle.event {
@@ -918,13 +943,13 @@ impl TraceExtractor {
                     self.ensure_thread_exists(pid, Some(waking.comm()));
 
                     if let Some(&utid) = self.tid_to_utid.get(&pid) {
-                        self.data.thread_states.push(ThreadStateRecord {
+                        self.push_thread_state(ThreadStateRecord {
                             ts,
                             dur: 0,
                             utid,
                             state: "R".to_string(),
                             cpu: Some(waking.target_cpu()),
-                        });
+                        })?;
                     }
                 }
             }
@@ -1108,7 +1133,7 @@ impl TraceExtractor {
         Ok(())
     }
 
-    fn extract_compact_sched(&mut self, compact: &CompactSched, cpu: i32) {
+    fn extract_compact_sched(&mut self, compact: &CompactSched, cpu: i32) -> Result<()> {
         let mut switch_ts: i64 = 0;
         for i in 0..compact.switch_timestamp.len() {
             switch_ts += compact.switch_timestamp[i] as i64;
@@ -1154,15 +1179,16 @@ impl TraceExtractor {
             self.ensure_thread_exists(pid, comm);
 
             if let Some(&utid) = self.tid_to_utid.get(&pid) {
-                self.data.thread_states.push(ThreadStateRecord {
+                self.push_thread_state(ThreadStateRecord {
                     ts: waking_ts,
                     dur: 0,
                     utid,
                     state: "R".to_string(),
                     cpu: Some(target_cpu),
-                });
+                })?;
             }
         }
+        Ok(())
     }
 
     fn ensure_thread_exists(&mut self, tid: i32, name: Option<&str>) {
@@ -1196,7 +1222,7 @@ impl TraceExtractor {
     }
 
     /// Process PerfSample packets for stack trace data
-    fn process_perf_sample(&mut self, packet: &TracePacket) {
+    fn process_perf_sample(&mut self, packet: &TracePacket) -> Result<()> {
         if packet.has_perf_sample() {
             let sample = packet.perf_sample();
             let ts = packet.timestamp() as i64;
@@ -1235,14 +1261,15 @@ impl TraceExtractor {
             self.ensure_thread_exists(tid, None);
 
             if let Some(&utid) = self.tid_to_utid.get(&tid) {
-                self.data.perf_samples.push(PerfSampleRecord {
+                self.push_perf_sample(PerfSampleRecord {
                     ts,
                     utid,
                     callsite_id,
                     cpu: sample.cpu.map(|c| c as i32),
-                });
+                })?;
             }
         }
+        Ok(())
     }
 
     /// Convert flat frame_ids to parent-child callsite tree. Returns leaf callsite ID.
@@ -1309,9 +1336,7 @@ impl TraceExtractor {
     }
 }
 
-/// Extract trace data with streaming writes for instant events
-/// Returns (ExtractedData, streamed_event_count) - instants/instant_args will be empty
-/// as they're written directly to parquet during extraction
+/// Extract trace data, streaming some record types directly to parquet.
 fn extract_trace_data_with_streaming<R: BufRead>(
     reader: R,
     trace_id: &str,
@@ -1567,30 +1592,99 @@ impl ParquetPaths {
 }
 
 const PARQUET_BATCH_SIZE: usize = 500_000;
-/// Batch size for streaming writes (smaller for more frequent flushing to reduce memory)
 const STREAMING_BATCH_SIZE: usize = 50_000;
 
-/// Streaming writer for instant events - buffers and writes to parquet incrementally
-struct StreamingInstantWriter {
-    writer: Option<ArrowWriter<File>>,
-    args_writer: Option<ArrowWriter<File>>,
-    schema: Arc<Schema>,
-    args_schema: Arc<Schema>,
-    trace_id: String,
-    instant_buffer: Vec<InstantRecord>,
-    args_buffer: Vec<InstantArgRecord>,
-    total_instants_written: usize,
-    total_args_written: usize,
+/// Trait for records that can be streamed to parquet
+trait StreamableRecord: Sized {
+    fn schema() -> Schema;
+    fn build_batch(records: &[Self], trace_id: &str, schema: &Arc<Schema>) -> Result<RecordBatch>;
 }
 
-impl StreamingInstantWriter {
-    fn new(trace_id: &str, paths: &ParquetPaths) -> Result<Self> {
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .set_max_row_group_size(1_000_000)
-            .build();
+impl StreamableRecord for PerfSampleRecord {
+    fn schema() -> Schema {
+        Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("utid", DataType::Int64, false),
+            Field::new("callsite_id", DataType::Int64, true),
+            Field::new("cpu", DataType::Int32, true),
+        ])
+    }
 
-        let schema = Arc::new(Schema::new(vec![
+    fn build_batch(records: &[Self], trace_id: &str, schema: &Arc<Schema>) -> Result<RecordBatch> {
+        let mut trace_id_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
+        let mut ts_builder = Int64Builder::with_capacity(records.len());
+        let mut utid_builder = Int64Builder::with_capacity(records.len());
+        let mut callsite_id_builder = Int64Builder::with_capacity(records.len());
+        let mut cpu_builder = Int32Builder::with_capacity(records.len());
+
+        for sample in records {
+            trace_id_builder.append_value(trace_id);
+            ts_builder.append_value(sample.ts);
+            utid_builder.append_value(sample.utid);
+            callsite_id_builder.append_option(sample.callsite_id);
+            cpu_builder.append_option(sample.cpu);
+        }
+
+        Ok(RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(ts_builder.finish()),
+                Arc::new(utid_builder.finish()),
+                Arc::new(callsite_id_builder.finish()),
+                Arc::new(cpu_builder.finish()),
+            ],
+        )?)
+    }
+}
+
+impl StreamableRecord for ThreadStateRecord {
+    fn schema() -> Schema {
+        Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("dur", DataType::Int64, false),
+            Field::new("utid", DataType::Int64, false),
+            Field::new("state", DataType::Utf8, false),
+            Field::new("cpu", DataType::Int32, true),
+        ])
+    }
+
+    fn build_batch(records: &[Self], trace_id: &str, schema: &Arc<Schema>) -> Result<RecordBatch> {
+        let mut trace_id_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
+        let mut ts_builder = Int64Builder::with_capacity(records.len());
+        let mut dur_builder = Int64Builder::with_capacity(records.len());
+        let mut utid_builder = Int64Builder::with_capacity(records.len());
+        let mut state_builder = StringBuilder::with_capacity(records.len(), records.len() * 4);
+        let mut cpu_builder = Int32Builder::with_capacity(records.len());
+
+        for state in records {
+            trace_id_builder.append_value(trace_id);
+            ts_builder.append_value(state.ts);
+            dur_builder.append_value(state.dur);
+            utid_builder.append_value(state.utid);
+            state_builder.append_value(&state.state);
+            cpu_builder.append_option(state.cpu);
+        }
+
+        Ok(RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(ts_builder.finish()),
+                Arc::new(dur_builder.finish()),
+                Arc::new(utid_builder.finish()),
+                Arc::new(state_builder.finish()),
+                Arc::new(cpu_builder.finish()),
+            ],
+        )?)
+    }
+}
+
+impl StreamableRecord for InstantRecord {
+    fn schema() -> Schema {
+        Schema::new(vec![
             Field::new("trace_id", DataType::Utf8, false),
             Field::new("id", DataType::Int64, false),
             Field::new("ts", DataType::Int64, false),
@@ -1598,78 +1692,30 @@ impl StreamingInstantWriter {
             Field::new("utid", DataType::Int64, true),
             Field::new("name", DataType::Utf8, false),
             Field::new("category", DataType::Utf8, true),
-        ]));
-
-        let args_schema = Arc::new(Schema::new(vec![
-            Field::new("trace_id", DataType::Utf8, false),
-            Field::new("instant_id", DataType::Int64, false),
-            Field::new("key", DataType::Utf8, false),
-            Field::new("int_value", DataType::Int64, true),
-            Field::new("string_value", DataType::Utf8, true),
-            Field::new("real_value", DataType::Float64, true),
-        ]));
-
-        let file = File::create(&paths.instant)?;
-        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
-
-        let args_file = File::create(&paths.instant_args)?;
-        let args_writer = ArrowWriter::try_new(args_file, args_schema.clone(), Some(props))?;
-
-        Ok(Self {
-            writer: Some(writer),
-            args_writer: Some(args_writer),
-            schema,
-            args_schema,
-            trace_id: trace_id.to_string(),
-            instant_buffer: Vec::with_capacity(STREAMING_BATCH_SIZE),
-            args_buffer: Vec::with_capacity(STREAMING_BATCH_SIZE),
-            total_instants_written: 0,
-            total_args_written: 0,
-        })
+        ])
     }
 
-    fn push_instant(&mut self, instant: InstantRecord) -> Result<()> {
-        self.instant_buffer.push(instant);
-        if self.instant_buffer.len() >= STREAMING_BATCH_SIZE {
-            self.flush_instants()?;
-        }
-        Ok(())
-    }
+    fn build_batch(records: &[Self], trace_id: &str, schema: &Arc<Schema>) -> Result<RecordBatch> {
+        let mut trace_id_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
+        let mut id_builder = Int64Builder::with_capacity(records.len());
+        let mut ts_builder = Int64Builder::with_capacity(records.len());
+        let mut track_id_builder = Int64Builder::with_capacity(records.len());
+        let mut utid_builder = Int64Builder::with_capacity(records.len());
+        let mut name_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
+        let mut category_builder = StringBuilder::with_capacity(records.len(), records.len() * 16);
 
-    fn push_instant_arg(&mut self, arg: InstantArgRecord) -> Result<()> {
-        self.args_buffer.push(arg);
-        if self.args_buffer.len() >= STREAMING_BATCH_SIZE {
-            self.flush_args()?;
-        }
-        Ok(())
-    }
-
-    fn flush_instants(&mut self) -> Result<()> {
-        if self.instant_buffer.is_empty() {
-            return Ok(());
+        for record in records {
+            trace_id_builder.append_value(trace_id);
+            id_builder.append_value(record.id);
+            ts_builder.append_value(record.ts);
+            track_id_builder.append_value(record.track_id);
+            utid_builder.append_option(record.utid);
+            name_builder.append_value(&record.name);
+            category_builder.append_option(record.category.as_deref());
         }
 
-        let chunk = &self.instant_buffer;
-        let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
-        let mut id_builder = Int64Builder::with_capacity(chunk.len());
-        let mut ts_builder = Int64Builder::with_capacity(chunk.len());
-        let mut track_id_builder = Int64Builder::with_capacity(chunk.len());
-        let mut utid_builder = Int64Builder::with_capacity(chunk.len());
-        let mut name_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
-        let mut category_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 16);
-
-        for instant in chunk {
-            trace_id_builder.append_value(&self.trace_id);
-            id_builder.append_value(instant.id);
-            ts_builder.append_value(instant.ts);
-            track_id_builder.append_value(instant.track_id);
-            utid_builder.append_option(instant.utid);
-            name_builder.append_value(&instant.name);
-            category_builder.append_option(instant.category.as_deref());
-        }
-
-        let batch = RecordBatch::try_new(
-            self.schema.clone(),
+        Ok(RecordBatch::try_new(
+            schema.clone(),
             vec![
                 Arc::new(trace_id_builder.finish()),
                 Arc::new(id_builder.finish()),
@@ -1679,39 +1725,42 @@ impl StreamingInstantWriter {
                 Arc::new(name_builder.finish()),
                 Arc::new(category_builder.finish()),
             ],
-        )?;
-        if let Some(ref mut writer) = self.writer {
-            writer.write(&batch)?;
-        }
-        self.total_instants_written += self.instant_buffer.len();
-        self.instant_buffer.clear();
-        Ok(())
+        )?)
+    }
+}
+
+impl StreamableRecord for InstantArgRecord {
+    fn schema() -> Schema {
+        Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("instant_id", DataType::Int64, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("int_value", DataType::Int64, true),
+            Field::new("string_value", DataType::Utf8, true),
+            Field::new("real_value", DataType::Float64, true),
+        ])
     }
 
-    fn flush_args(&mut self) -> Result<()> {
-        if self.args_buffer.is_empty() {
-            return Ok(());
+    fn build_batch(records: &[Self], trace_id: &str, schema: &Arc<Schema>) -> Result<RecordBatch> {
+        let mut trace_id_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
+        let mut instant_id_builder = Int64Builder::with_capacity(records.len());
+        let mut key_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
+        let mut int_value_builder = Int64Builder::with_capacity(records.len());
+        let mut string_value_builder =
+            StringBuilder::with_capacity(records.len(), records.len() * 64);
+        let mut real_value_builder = Float64Builder::with_capacity(records.len());
+
+        for record in records {
+            trace_id_builder.append_value(trace_id);
+            instant_id_builder.append_value(record.instant_id);
+            key_builder.append_value(&record.key);
+            int_value_builder.append_option(record.int_value);
+            string_value_builder.append_option(record.string_value.as_deref());
+            real_value_builder.append_option(record.real_value);
         }
 
-        let chunk = &self.args_buffer;
-        let mut trace_id_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
-        let mut instant_id_builder = Int64Builder::with_capacity(chunk.len());
-        let mut key_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 32);
-        let mut int_value_builder = Int64Builder::with_capacity(chunk.len());
-        let mut string_value_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 64);
-        let mut real_value_builder = Float64Builder::with_capacity(chunk.len());
-
-        for arg in chunk {
-            trace_id_builder.append_value(&self.trace_id);
-            instant_id_builder.append_value(arg.instant_id);
-            key_builder.append_value(&arg.key);
-            int_value_builder.append_option(arg.int_value);
-            string_value_builder.append_option(arg.string_value.as_deref());
-            real_value_builder.append_option(arg.real_value);
-        }
-
-        let batch = RecordBatch::try_new(
-            self.args_schema.clone(),
+        Ok(RecordBatch::try_new(
+            schema.clone(),
             vec![
                 Arc::new(trace_id_builder.finish()),
                 Arc::new(instant_id_builder.finish()),
@@ -1720,51 +1769,111 @@ impl StreamingInstantWriter {
                 Arc::new(string_value_builder.finish()),
                 Arc::new(real_value_builder.finish()),
             ],
-        )?;
-        if let Some(ref mut writer) = self.args_writer {
-            writer.write(&batch)?;
-        }
-        self.total_args_written += self.args_buffer.len();
-        self.args_buffer.clear();
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<(usize, usize)> {
-        self.flush_instants()?;
-        self.flush_args()?;
-        if let Some(writer) = self.writer.take() {
-            writer.close()?;
-        }
-        if let Some(writer) = self.args_writer.take() {
-            writer.close()?;
-        }
-        Ok((self.total_instants_written, self.total_args_written))
-    }
-
-    /// Returns true if there's unflushed data in the buffers
-    fn has_unflushed_data(&self) -> bool {
-        !self.instant_buffer.is_empty() || !self.args_buffer.is_empty()
+        )?)
     }
 }
 
-impl Drop for StreamingInstantWriter {
+/// Generic streaming writer for any record type implementing StreamableRecord
+struct StreamingWriter<T: StreamableRecord> {
+    writer: Option<ArrowWriter<File>>,
+    schema: Arc<Schema>,
+    trace_id: String,
+    buffer: Vec<T>,
+    total_written: usize,
+}
+
+impl<T: StreamableRecord> StreamingWriter<T> {
+    fn new(trace_id: &str, path: &Path) -> Result<Self> {
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_size(1_000_000)
+            .build();
+
+        let schema = Arc::new(T::schema());
+        let file = File::create(path)?;
+        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+
+        Ok(Self {
+            writer: Some(writer),
+            schema,
+            trace_id: trace_id.to_string(),
+            buffer: Vec::with_capacity(STREAMING_BATCH_SIZE),
+            total_written: 0,
+        })
+    }
+
+    fn push(&mut self, record: T) -> Result<()> {
+        self.buffer.push(record);
+        if self.buffer.len() >= STREAMING_BATCH_SIZE {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let batch = T::build_batch(&self.buffer, &self.trace_id, &self.schema)?;
+        if let Some(ref mut writer) = self.writer {
+            writer.write(&batch)?;
+        }
+        self.total_written += self.buffer.len();
+        self.buffer.clear();
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<usize> {
+        self.flush()?;
+        if let Some(writer) = self.writer.take() {
+            writer.close()?;
+        }
+        Ok(self.total_written)
+    }
+
+    fn has_unflushed_data(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+}
+
+impl<T: StreamableRecord> Drop for StreamingWriter<T> {
     fn drop(&mut self) {
-        // Warn if dropped with unflushed data - this indicates finish() wasn't called
         if self.has_unflushed_data() {
             eprintln!(
-                "Warning: StreamingInstantWriter dropped with {} unflushed instants and {} unflushed args. \
-                 Call finish() to ensure all data is written.",
-                self.instant_buffer.len(),
-                self.args_buffer.len()
+                "Warning: StreamingWriter dropped with {} unflushed records",
+                self.buffer.len()
             );
-            // Attempt to flush remaining data (best effort, can't propagate errors in Drop)
-            if let Err(e) = self.flush_instants() {
-                eprintln!("Error flushing instants on drop: {e}");
-            }
-            if let Err(e) = self.flush_args() {
-                eprintln!("Error flushing args on drop: {e}");
-            }
         }
+    }
+}
+
+/// Writer for instant events and their args.
+struct StreamingInstantWriter {
+    instants: StreamingWriter<InstantRecord>,
+    args: StreamingWriter<InstantArgRecord>,
+}
+
+impl StreamingInstantWriter {
+    fn new(trace_id: &str, paths: &ParquetPaths) -> Result<Self> {
+        Ok(Self {
+            instants: StreamingWriter::new(trace_id, &paths.instant)?,
+            args: StreamingWriter::new(trace_id, &paths.instant_args)?,
+        })
+    }
+
+    fn push_instant(&mut self, record: InstantRecord) -> Result<()> {
+        self.instants.push(record)
+    }
+
+    fn push_instant_arg(&mut self, record: InstantArgRecord) -> Result<()> {
+        self.args.push(record)
+    }
+
+    fn finish(self) -> Result<(usize, usize)> {
+        let instants = self.instants.finish()?;
+        let args = self.args.finish()?;
+        Ok((instants, args))
     }
 }
 
