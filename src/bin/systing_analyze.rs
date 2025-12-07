@@ -477,6 +477,8 @@ struct TraceExtractor {
     interned_frames: HashMap<u64, FrameRecord>,
     interned_callstacks: HashMap<u64, Vec<u64>>,
     callsite_map: HashMap<Vec<u64>, i64>,
+    /// Cache: callstack_iid -> callsite_id (avoids repeated Vec cloning)
+    callstack_iid_to_callsite: HashMap<u64, i64>,
     next_callsite_id: i64,
 
     network_interfaces_root_uuid: Option<u64>,
@@ -526,6 +528,7 @@ impl TraceExtractor {
             interned_frames: HashMap::new(),
             interned_callstacks: HashMap::new(),
             callsite_map: HashMap::new(),
+            callstack_iid_to_callsite: HashMap::new(),
             next_callsite_id: 1,
             network_interfaces_root_uuid: None,
             network_namespace_tracks: HashMap::new(),
@@ -649,8 +652,11 @@ impl TraceExtractor {
 
             for callstack in &interned.callstacks {
                 if callstack.has_iid() {
+                    let iid = callstack.iid();
+                    // Invalidate cache if redefining this IID (rare but possible)
+                    self.callstack_iid_to_callsite.remove(&iid);
                     self.interned_callstacks
-                        .insert(callstack.iid(), callstack.frame_ids.clone());
+                        .insert(iid, callstack.frame_ids.clone());
                 }
             }
         }
@@ -1153,10 +1159,18 @@ impl TraceExtractor {
             let ts = packet.timestamp() as i64;
 
             let callsite_id = if sample.has_callstack_iid() {
-                self.interned_callstacks
-                    .get(&sample.callstack_iid())
-                    .cloned()
-                    .map(|frame_ids| self.get_or_create_callsite(&frame_ids))
+                let iid = sample.callstack_iid();
+                // Check cache first to avoid Vec cloning
+                if let Some(&cached) = self.callstack_iid_to_callsite.get(&iid) {
+                    Some(cached)
+                } else if let Some(frame_ids) = self.interned_callstacks.get(&iid).cloned() {
+                    // Clone only on cache miss, then cache the result
+                    let id = self.get_or_create_callsite(&frame_ids);
+                    self.callstack_iid_to_callsite.insert(iid, id);
+                    Some(id)
+                } else {
+                    None
+                }
             } else {
                 None
             };
