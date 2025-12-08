@@ -574,14 +574,31 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
         };
         let mut arg_data: Vec<(String, ArgValue)> = Vec::new();
 
+        // For marker events, args[0] is always socket_id (injected by BPF),
+        // and user-configured args start at args[1]
+        let is_marker = matches!(systing_event.event, EventProbe::Marker(_));
+        let arg_offset: usize = if is_marker { 1 } else { 0 };
+
+        // For marker events, extract socket_id from args[0]
+        if is_marker && event.num_args > 0 {
+            let bpf_arg = &event.args[0];
+            if bpf_arg.r#type == crate::systing::types::arg_type::ARG_LONG {
+                let mut bytes: [u8; 8] = [0; 8];
+                let _ = bytes.copy_from_bytes(&bpf_arg.value[..8]);
+                let val = u64::from_ne_bytes(bytes);
+                arg_data.push(("socket_id".to_string(), ArgValue::Long(val)));
+            }
+        }
+
         let num_args = event.num_args.min(event.args.len() as u8);
-        for i in 0..num_args as usize {
-            if i >= systing_event.args.len() {
+        for i in arg_offset..num_args as usize {
+            let config_idx = i - arg_offset;
+            if config_idx >= systing_event.args.len() {
                 break;
             }
 
             let bpf_arg = &event.args[i];
-            let event_key = &systing_event.args[i];
+            let event_key = &systing_event.args[config_idx];
 
             match bpf_arg.r#type {
                 crate::systing::types::arg_type::ARG_LONG => {
