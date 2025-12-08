@@ -1786,6 +1786,16 @@ static __always_inline int handle_marker_event(struct trace_event_raw_sys_enter 
 	u8 num_configured_args = match->num_args < (MAX_ARGS - 1) ? match->num_args : (MAX_ARGS - 1);
 	event->num_args = 1 + num_configured_args;
 
+	// Copy ctx->args to a local array to allow variable indexing
+	// (BPF verifier doesn't allow variable indexing into ctx directly)
+	u64 syscall_args[6];
+	syscall_args[0] = ctx->args[0];
+	syscall_args[1] = ctx->args[1];
+	syscall_args[2] = ctx->args[2];
+	syscall_args[3] = ctx->args[3];
+	syscall_args[4] = ctx->args[4];
+	syscall_args[5] = ctx->args[5];
+
 	#pragma unroll
 	for (int i = 0; i < MAX_ARGS - 1; i++) {
 		if (i >= num_configured_args)
@@ -1795,7 +1805,7 @@ static __always_inline int handle_marker_event(struct trace_event_raw_sys_enter 
 		if (desc->arg_index < 0 || desc->arg_index > 5)
 			continue;
 
-		u64 arg = ctx->args[desc->arg_index];
+		u64 arg = syscall_args[desc->arg_index];
 		int out_idx = i + 1; // Shift by 1 since socket_id is at index 0
 
 		if (desc->arg_type == ARG_LONG) {
