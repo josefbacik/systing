@@ -171,12 +171,20 @@ pub struct TracepointEvent {
     pub name: String,
 }
 
+// Format is
+// marker:<match_string>
+#[derive(Clone, Default)]
+pub struct MarkerEvent {
+    pub match_string: String,
+}
+
 #[derive(Clone, Default)]
 pub enum EventProbe {
     UProbe(UProbeEvent),
     Usdt(UsdtProbeEvent),
     KProbe(KProbeEvent),
     Tracepoint(TracepointEvent),
+    Marker(MarkerEvent),
     #[default]
     Undefined,
 }
@@ -238,6 +246,21 @@ pub struct SystingEvent {
 //
 //   The "stack" field is optional (defaults to false). When set to true, systing will
 //   capture and emit a stack trace whenever this event fires.
+//
+//   Supported event formats:
+//     - "usdt:<path>:<provider>:<name>" - User Statically Defined Tracepoint
+//     - "uprobe:<path>:<symbol>" or "uprobe:<path>:<symbol>+<offset>" - User probe
+//     - "uretprobe:<path>:<symbol>" - User return probe
+//     - "kprobe:<symbol>" or "kprobe:<symbol>+<offset>" - Kernel probe
+//     - "kretprobe:<symbol>" - Kernel return probe
+//     - "tracepoint:<category>:<name>" - Kernel tracepoint
+//     - "marker:<match_string>" - Userspace marker via faccessat2 syscall
+//
+//   Marker events allow userspace code to emit trace events by calling:
+//     faccessat2(fd, "<match_string>", F_OK, 0)
+//   The fd argument and other syscall args can be captured using the "args" field.
+//   For markers, arg_index refers to the faccessat2 syscall arguments:
+//     0 = dfd, 1 = filename (the match string), 2 = mode, 3 = flags
 //
 //   "tracks": [
 //     {
@@ -471,9 +494,28 @@ impl TracepointEvent {
     }
 }
 
+impl MarkerEvent {
+    fn from_parts(parts: Vec<&str>) -> Result<Self, anyhow::Error> {
+        if parts.len() < 2 {
+            return Err(anyhow::anyhow!(
+                "Invalid marker format, expected marker:<match_string>"
+            ));
+        }
+        // Join with colons since match_string can contain colons
+        let match_string = parts[1..].join(":");
+        Ok(MarkerEvent { match_string })
+    }
+}
+
 impl fmt::Display for TracepointEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "tracepoint:{}:{}", self.category, self.name)
+    }
+}
+
+impl fmt::Display for MarkerEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "marker:{}", self.match_string)
     }
 }
 
@@ -506,6 +548,7 @@ impl fmt::Display for SystingEvent {
             EventProbe::Usdt(usdt) => write!(f, "{usdt}"),
             EventProbe::KProbe(kprobe) => write!(f, "{kprobe}"),
             EventProbe::Tracepoint(tracepoint) => write!(f, "{tracepoint}"),
+            EventProbe::Marker(marker) => write!(f, "{marker}"),
             _ => write!(f, "Invalid event"),
         }
     }
@@ -1167,6 +1210,7 @@ impl SystingProbeRecorder {
             "uprobe" | "uretprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
             "kprobe" | "kretprobe" => EventProbe::KProbe(KProbeEvent::from_parts(parts)?),
             "tracepoint" => EventProbe::Tracepoint(TracepointEvent::from_parts(parts)?),
+            "marker" => EventProbe::Marker(MarkerEvent::from_parts(parts)?),
             _ => return Err(anyhow::anyhow!("Invalid event type")),
         };
 
@@ -1197,6 +1241,12 @@ impl SystingProbeRecorder {
                     EventProbe::Tracepoint(_) => {
                         return Err(anyhow::anyhow!(
                             "retval arg type is not supported for tracepoint events: {}",
+                            event.name
+                        ));
+                    }
+                    EventProbe::Marker(_) => {
+                        return Err(anyhow::anyhow!(
+                            "retval arg type is not supported for marker events: {}",
                             event.name
                         ));
                     }
@@ -3621,5 +3671,326 @@ mod tests {
         assert_eq!(iid1, iid2);
         assert_ne!(iid1, iid3);
         assert_eq!(recorder.syscall_iids.len(), 2);
+    }
+
+    #[test]
+    fn test_marker_event_basic() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "my_marker",
+                    "event": "marker:myapp:start"
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "markers",
+                    "instants": [
+                      {
+                        "event": "my_marker"
+                      }
+                    ]
+                }
+            ]
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        assert_eq!(recorder.config_events.len(), 1);
+
+        let event = recorder.config_events.get("my_marker").unwrap();
+        match &event.event {
+            EventProbe::Marker(marker) => {
+                assert_eq!(marker.match_string, "myapp:start");
+            }
+            _ => panic!("Expected Marker event"),
+        }
+    }
+
+    #[test]
+    fn test_marker_event_with_colons_in_match_string() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "complex_marker",
+                    "event": "marker:myapp:api:v2:request:start"
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        let event = recorder.config_events.get("complex_marker").unwrap();
+        match &event.event {
+            EventProbe::Marker(marker) => {
+                assert_eq!(marker.match_string, "myapp:api:v2:request:start");
+            }
+            _ => panic!("Expected Marker event"),
+        }
+    }
+
+    #[test]
+    fn test_marker_event_with_args() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "marker_with_args",
+                    "event": "marker:myapp:request",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "long",
+                        "arg_name": "request_id"
+                      },
+                      {
+                        "arg_index": 3,
+                        "arg_type": "long",
+                        "arg_name": "flags"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        let event = recorder.config_events.get("marker_with_args").unwrap();
+        assert_eq!(event.args.len(), 2);
+        assert_eq!(event.args[0].arg_index, 0);
+        assert_eq!(event.args[0].arg_name, "request_id");
+        assert_eq!(event.args[1].arg_index, 3);
+        assert_eq!(event.args[1].arg_name, "flags");
+    }
+
+    #[test]
+    fn test_marker_event_retval_not_supported() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "marker_with_retval",
+                    "event": "marker:myapp:request",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "retval arg type is not supported for marker events: marker_with_retval"
+        );
+    }
+
+    #[test]
+    fn test_marker_event_invalid_format_missing_match_string() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "invalid_marker",
+                    "event": "marker"
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid marker format"));
+    }
+
+    #[test]
+    fn test_marker_event_as_range_start_end() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "request_start",
+                    "event": "marker:myapp:request:start"
+                },
+                {
+                    "name": "request_end",
+                    "event": "marker:myapp:request:end"
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "requests",
+                    "ranges": [
+                        {
+                            "name": "request",
+                            "start": "request_start",
+                            "end": "request_end"
+                        }
+                    ]
+                }
+            ]
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        assert_eq!(recorder.config_events.len(), 2);
+        assert!(recorder.start_events.contains_key("request_start"));
+        assert!(recorder.stop_events.contains_key("request_end"));
+        assert_eq!(
+            recorder.ranges.get("request"),
+            Some(&"requests".to_string())
+        );
+    }
+
+    #[test]
+    fn test_marker_event_generates_instant_packet() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "checkpoint",
+                    "event": "marker:myapp:checkpoint"
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "checkpoints",
+                    "instants": [
+                      {
+                        "event": "checkpoint"
+                      }
+                    ]
+                }
+            ]
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+
+        let cookie = recorder.config_events.get("checkpoint").unwrap().cookie;
+        let event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
+            ts: 5000,
+            cookie,
+            ..Default::default()
+        };
+        recorder.handle_event(event);
+
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &Arc::new(AtomicUsize::new(0)),
+        );
+
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].track_descriptor().name(), "checkpoints");
+        assert_eq!(packets[1].track_event().name(), "marker:myapp:checkpoint");
+    }
+
+    #[test]
+    fn test_marker_event_generates_range_packets() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "span_start",
+                    "event": "marker:myapp:span:begin"
+                },
+                {
+                    "name": "span_end",
+                    "event": "marker:myapp:span:end"
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "spans",
+                    "ranges": [
+                        {
+                            "name": "my_span",
+                            "start": "span_start",
+                            "end": "span_end"
+                        }
+                    ]
+                }
+            ]
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+
+        let start_cookie = recorder.config_events.get("span_start").unwrap().cookie;
+        let end_cookie = recorder.config_events.get("span_end").unwrap().cookie;
+
+        let start_event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
+            ts: 1000,
+            cookie: start_cookie,
+            ..Default::default()
+        };
+        recorder.handle_event(start_event);
+
+        let end_event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
+            ts: 2000,
+            cookie: end_cookie,
+            ..Default::default()
+        };
+        recorder.handle_event(end_event);
+
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        let packets = recorder.generate_trace(
+            &HashMap::new(),
+            &thread_uuids,
+            &Arc::new(AtomicUsize::new(0)),
+        );
+
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0].track_descriptor().name(), "spans");
+        assert_eq!(packets[1].track_event().type_(), Type::TYPE_SLICE_BEGIN);
+        assert_eq!(packets[1].track_event().name(), "my_span");
+        assert_eq!(packets[2].track_event().type_(), Type::TYPE_SLICE_END);
     }
 }
