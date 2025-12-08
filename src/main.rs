@@ -1237,6 +1237,32 @@ fn configure_bpf_skeleton(
     collect_pystacks: bool,
     recorder: &Arc<SessionRecorder>,
 ) -> Result<()> {
+    // Setup probe recorder with trace events FIRST
+    // We need to know if any marker events are configured before setting up rodata
+    let has_markers = {
+        let mut probe_recorder = recorder.probe_recorder.lock().unwrap();
+        let mut rng = rand::rng();
+        for tracepoint in opts.trace_event.iter() {
+            probe_recorder
+                .add_event_from_str(tracepoint, &mut rng)
+                .with_context(|| format!("Failed to parse trace event: '{tracepoint}'"))?;
+        }
+
+        for config in opts.trace_event_config.iter() {
+            probe_recorder
+                .load_config(config, &mut rng)
+                .with_context(|| format!("Failed to load trace event config file: '{config}'"))?;
+        }
+
+        // UPROBE/USDT validation removed: PIDs are now auto-discovered if not specified
+
+        // Check if any marker events are configured
+        probe_recorder
+            .cookies
+            .values()
+            .any(|e| matches!(e.event, EventProbe::Marker(_)))
+    };
+
     // Configure rodata with tool settings
     {
         let rodata = open_skel
@@ -1271,16 +1297,9 @@ fn configure_bpf_skeleton(
             rodata.tool_config.collect_syscalls = 1;
         }
 
-        {
+        if has_markers {
             use syscalls::Sysno;
-            let probe_recorder = recorder.probe_recorder.lock().unwrap();
-            let has_markers = probe_recorder
-                .cookies
-                .values()
-                .any(|e| matches!(e.event, EventProbe::Marker(_)));
-            if has_markers {
-                rodata.tool_config.marker_syscall_nr = Sysno::faccessat2 as u32;
-            }
+            rodata.tool_config.marker_syscall_nr = Sysno::faccessat2 as u32;
         }
 
         // Set wakeup threshold to 50% of ringbuf size for batched wakeups
@@ -1326,25 +1345,6 @@ fn configure_bpf_skeleton(
         }
     }
 
-    // Setup probe recorder with trace events
-    {
-        let mut probe_recorder = recorder.probe_recorder.lock().unwrap();
-        let mut rng = rand::rng();
-        for tracepoint in opts.trace_event.iter() {
-            probe_recorder
-                .add_event_from_str(tracepoint, &mut rng)
-                .with_context(|| format!("Failed to parse trace event: '{tracepoint}'"))?;
-        }
-
-        for config in opts.trace_event_config.iter() {
-            probe_recorder
-                .load_config(config, &mut rng)
-                .with_context(|| format!("Failed to load trace event config file: '{config}'"))?;
-        }
-
-        // UPROBE/USDT validation removed: PIDs are now auto-discovered if not specified
-    }
-
     // Configure program autoload based on kernel version and options
     // If we're on an older kernel we can't use the raw_tracepoint version since it doesn't
     // have the cookie support. Newer kernels will use the raw_tracepoint version so don't need
@@ -1377,9 +1377,10 @@ fn configure_bpf_skeleton(
             .set_autoload(false);
     }
 
-    // Only load syscall tracepoints when syscall tracing is enabled
+    // Only load syscall tracepoints when syscall tracing is enabled OR marker events are configured
+    // Marker events use the sys_enter tracepoint to intercept faccessat2 syscalls
     // This prevents unnecessary overhead from loading unused tracepoints
-    if !opts.syscalls {
+    if !opts.syscalls && !has_markers {
         open_skel
             .progs
             .tracepoint__raw_syscalls__sys_enter
