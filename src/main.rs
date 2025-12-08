@@ -426,6 +426,7 @@ use systing::types::arg_desc_array;
 use systing::types::arg_type;
 use systing::types::epoll_event_bpf;
 use systing::types::event_type;
+use systing::types::marker_match;
 use systing::types::network_event;
 use systing::types::packet_event;
 use systing::types::perf_counter_event;
@@ -1270,6 +1271,18 @@ fn configure_bpf_skeleton(
             rodata.tool_config.collect_syscalls = 1;
         }
 
+        {
+            use syscalls::Sysno;
+            let probe_recorder = recorder.probe_recorder.lock().unwrap();
+            let has_markers = probe_recorder
+                .cookies
+                .values()
+                .any(|e| matches!(e.event, EventProbe::Marker(_)));
+            if has_markers {
+                rodata.tool_config.marker_syscall_nr = Sysno::faccessat2 as u32;
+            }
+        }
+
         // Set wakeup threshold to 50% of ringbuf size for batched wakeups
         // Default ringbuf size is 50 MiB if not specified
         let ringbuf_size = if opts.ringbuf_size_mib > 0 {
@@ -1848,6 +1861,40 @@ fn attach_probes(
                     tracepoint.category, tracepoint.name, tracepoint.category, tracepoint.name
                 ))?;
                 probe_links.push(link);
+            }
+            EventProbe::Marker(marker) => {
+                let mut key = [0u8; 64];
+                let bytes = marker.match_string.as_bytes();
+                let len = bytes.len().min(63);
+                key[..len].copy_from_slice(&bytes[..len]);
+
+                let mut args = [arg_desc {
+                    arg_type: arg_type::ARG_NONE,
+                    arg_index: 0,
+                }; 4];
+                for (i, arg) in event.args.iter().enumerate() {
+                    let bpf_arg_type = match arg.arg_type {
+                        EventKeyType::String => arg_type::ARG_STRING,
+                        EventKeyType::Long => arg_type::ARG_LONG,
+                        EventKeyType::Retval => arg_type::ARG_RETVAL,
+                    };
+                    args[i] = arg_desc {
+                        arg_type: bpf_arg_type,
+                        arg_index: arg.arg_index as i32,
+                    };
+                }
+
+                let marker_match_value = marker_match {
+                    cookie: event.cookie,
+                    num_args: event.args.len() as u8,
+                    args,
+                    ..Default::default()
+                };
+
+                let value_data = unsafe { plain::as_bytes(&marker_match_value) };
+                skel.maps
+                    .marker_matches
+                    .update(&key, value_data, libbpf_rs::MapFlags::ANY)?;
             }
             _ => {}
         }

@@ -59,6 +59,7 @@ const volatile struct {
 	u32 collect_syscalls;
 	u32 confidentiality_mode;
 	u64 wakeup_data_size;  /* Ringbuf fill threshold for wakeup (0 = default) */
+	u32 marker_syscall_nr; /* Syscall number for marker events (0 = disabled) */
 } tool_config = {};
 
 enum event_type {
@@ -324,6 +325,23 @@ struct {
 	__type(value, u8);
 	__uint(max_entries, 10240);
 } event_stack_capture SEC(".maps");
+
+#define MAX_MARKER_LEN 64
+#define MAX_MARKERS 64
+
+struct marker_match {
+	u64 cookie;
+	u8 num_args;
+	u8 pad[3];
+	struct arg_desc args[MAX_ARGS];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_MARKERS);
+	__type(key, char[MAX_MARKER_LEN]);
+	__type(value, struct marker_match);
+} marker_matches SEC(".maps");
 
 struct arg_desc_array _arg_desc_array = {0};
 
@@ -1632,14 +1650,81 @@ int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
 	return 0;
 }
 
+// Helper function to handle marker events from syscalls (e.g., faccessat2)
+static __always_inline int handle_marker_event(struct trace_event_raw_sys_enter *ctx,
+					       struct task_struct *task)
+{
+	// Read filename from arg[1] (the marker string)
+	char marker[MAX_MARKER_LEN] = {};
+	int len = bpf_probe_read_user_str(marker, sizeof(marker),
+					  (void *)ctx->args[1]);
+	if (len <= 0)
+		return 0;
+
+	// Look up in marker_matches map
+	struct marker_match *match = bpf_map_lookup_elem(&marker_matches, marker);
+	if (!match)
+		return 0;
+
+	// Emit probe_event with cookie and captured args
+	long flags;
+	struct probe_event *event = reserve_probe_event(&flags);
+	if (!event) {
+		handle_missed_event(MISSED_PROBE_EVENT);
+		return 0;
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->cookie = match->cookie;
+	event->num_args = match->num_args;
+
+	// Capture configured args from ctx->args[]
+	#pragma unroll
+	for (int i = 0; i < MAX_ARGS; i++) {
+		if (i >= match->num_args)
+			break;
+
+		struct arg_desc *desc = &match->args[i];
+		if (desc->arg_index < 0 || desc->arg_index > 5)
+			continue;
+
+		u64 arg = ctx->args[desc->arg_index];
+
+		if (desc->arg_type == ARG_LONG) {
+			event->args[i].type = ARG_LONG;
+			event->args[i].size = sizeof(u64);
+			__builtin_memcpy(&event->args[i].value, &arg, sizeof(u64));
+		} else if (desc->arg_type == ARG_STRING) {
+			// Read string from userspace pointer
+			int slen = bpf_probe_read_user_str(
+				event->args[i].value,
+				sizeof(event->args[i].value),
+				(void *)arg);
+			event->args[i].type = ARG_STRING;
+			event->args[i].size = slen > 0 ? slen : 0;
+		}
+	}
+
+	bpf_ringbuf_submit(event, flags);
+	return 1; // Marker was handled
+}
+
 SEC("tracepoint/raw_syscalls/sys_enter")
 int tracepoint__raw_syscalls__sys_enter(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!tool_config.collect_syscalls)
-		return 0;
-
 	struct task_struct *task = bpf_get_current_task_btf();
 	if (!trace_task(task))
+		return 0;
+
+	// Check for marker syscall (e.g., faccessat2)
+	if (tool_config.marker_syscall_nr && ctx->id == tool_config.marker_syscall_nr) {
+		handle_marker_event(ctx, task);
+		// Don't return - continue to record syscall if collect_syscalls is enabled
+	}
+
+	if (!tool_config.collect_syscalls)
 		return 0;
 
 	long flags;
