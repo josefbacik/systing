@@ -429,6 +429,15 @@ struct {
 	__uint(max_entries, 10240);
 } socket_metadata_map SEC(".maps");
 
+// Maps sk_ptr directly to socket_id for fast fd-based lookups
+// Used by marker events to resolve fd -> socket_id
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);   // sk_ptr (struct sock * cast to u64)
+	__type(value, u64); // socket_id
+	__uint(max_entries, 10240);
+} sk_socket_id_map SEC(".maps");
+
 #define MISSED_SCHED_EVENT 0
 #define MISSED_STACK_EVENT 1
 #define MISSED_PROBE_EVENT 2
@@ -697,7 +706,16 @@ static __always_inline u64 get_or_create_socket_id(
 
 	// Re-lookup in case of race condition (another CPU inserted first)
 	existing = bpf_map_lookup_elem(&socket_metadata_map, &identity_key);
-	return existing ? existing->socket_id : 0;
+	u64 socket_id = existing ? existing->socket_id : 0;
+
+	// Also update sk_socket_id_map for fast fd-based lookups
+	// This maps sk_ptr -> socket_id directly (without needing dest info)
+	if (socket_id) {
+		u64 sk_ptr = (u64)sk;
+		bpf_map_update_elem(&sk_socket_id_map, &sk_ptr, &socket_id, BPF_ANY);
+	}
+
+	return socket_id;
 }
 
 // Lookup socket ID for an existing socket+destination pair
@@ -716,6 +734,73 @@ static __always_inline u64 lookup_socket_id(
 
 	existing = bpf_map_lookup_elem(&socket_metadata_map, &identity_key);
 	return existing ? existing->socket_id : 0;
+}
+
+// Lookup socket_id from a file descriptor by walking the task's fd table
+// Returns 0 if fd is not a socket or socket_id is not found
+//
+// Walk: task->files->fdt->fd[fd] -> file -> private_data -> socket -> sk
+// Then lookup sk_ptr in sk_socket_id_map
+static __always_inline u64 lookup_socket_id_from_fd(struct task_struct *task, u32 fd)
+{
+	struct files_struct *files;
+	struct fdtable *fdt;
+	struct file *file;
+	struct file **fd_array;
+	void *private_data;
+	struct socket *socket;
+	struct sock *sk;
+	u64 sk_ptr;
+	u64 *socket_id;
+
+	// Read task->files
+	files = BPF_CORE_READ(task, files);
+	if (!files)
+		return 0;
+
+	// Read files->fdt
+	fdt = BPF_CORE_READ(files, fdt);
+	if (!fdt)
+		return 0;
+
+	// Check fd is within bounds
+	u32 max_fds = BPF_CORE_READ(fdt, max_fds);
+	if (fd >= max_fds)
+		return 0;
+
+	// Read fdt->fd (the file descriptor array)
+	fd_array = BPF_CORE_READ(fdt, fd);
+	if (!fd_array)
+		return 0;
+
+	// Read file pointer from fd array
+	bpf_probe_read_kernel(&file, sizeof(file), &fd_array[fd]);
+	if (!file)
+		return 0;
+
+	// Read file->private_data (this is struct socket* for socket files)
+	// Note: We can't easily verify f_op == &socket_file_ops in BPF,
+	// but if private_data contains a valid socket, we can verify by
+	// checking the socket->sk pointer is valid
+	private_data = BPF_CORE_READ(file, private_data);
+	if (!private_data)
+		return 0;
+
+	// Treat private_data as struct socket*
+	socket = (struct socket *)private_data;
+
+	// Read socket->sk
+	sk = BPF_CORE_READ(socket, sk);
+	if (!sk)
+		return 0;
+
+	// Lookup sk_ptr in sk_socket_id_map
+	sk_ptr = (u64)sk;
+	socket_id = bpf_map_lookup_elem(&sk_socket_id_map, &sk_ptr);
+	if (!socket_id)
+		return 0;
+
+	return *socket_id;
 }
 
 /*
@@ -1651,6 +1736,9 @@ int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
 }
 
 // Helper function to handle marker events from syscalls (e.g., faccessat2)
+// faccessat2(dfd, pathname, mode, flags) - we use:
+//   dfd (arg[0]): file descriptor to resolve socket_id from
+//   pathname (arg[1]): the marker string to match
 static __always_inline int handle_marker_event(struct trace_event_raw_sys_enter *ctx,
 					       struct task_struct *task)
 {
@@ -1666,6 +1754,16 @@ static __always_inline int handle_marker_event(struct trace_event_raw_sys_enter 
 	if (!match)
 		return 0;
 
+	// Resolve socket_id from the dfd (arg[0])
+	// If dfd is a valid socket fd that we've seen before, we'll get its socket_id
+	u32 dfd = (u32)ctx->args[0];
+	u64 socket_id = 0;
+
+	// Only try to resolve if dfd looks like a valid fd (not AT_FDCWD which is -100)
+	if ((s32)dfd >= 0) {
+		socket_id = lookup_socket_id_from_fd(task, dfd);
+	}
+
 	// Emit probe_event with cookie and captured args
 	long flags;
 	struct probe_event *event = reserve_probe_event(&flags);
@@ -1678,12 +1776,19 @@ static __always_inline int handle_marker_event(struct trace_event_raw_sys_enter 
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
 	event->cookie = match->cookie;
-	event->num_args = match->num_args;
 
-	// Capture configured args from ctx->args[]
+	// First arg is always the socket_id (0 if not found/not a socket)
+	event->args[0].type = ARG_LONG;
+	event->args[0].size = sizeof(u64);
+	__builtin_memcpy(&event->args[0].value, &socket_id, sizeof(u64));
+
+	// Remaining args from the configured match (shifted by 1)
+	u8 num_configured_args = match->num_args < (MAX_ARGS - 1) ? match->num_args : (MAX_ARGS - 1);
+	event->num_args = 1 + num_configured_args;
+
 	#pragma unroll
-	for (int i = 0; i < MAX_ARGS; i++) {
-		if (i >= match->num_args)
+	for (int i = 0; i < MAX_ARGS - 1; i++) {
+		if (i >= num_configured_args)
 			break;
 
 		struct arg_desc *desc = &match->args[i];
@@ -1691,19 +1796,20 @@ static __always_inline int handle_marker_event(struct trace_event_raw_sys_enter 
 			continue;
 
 		u64 arg = ctx->args[desc->arg_index];
+		int out_idx = i + 1; // Shift by 1 since socket_id is at index 0
 
 		if (desc->arg_type == ARG_LONG) {
-			event->args[i].type = ARG_LONG;
-			event->args[i].size = sizeof(u64);
-			__builtin_memcpy(&event->args[i].value, &arg, sizeof(u64));
+			event->args[out_idx].type = ARG_LONG;
+			event->args[out_idx].size = sizeof(u64);
+			__builtin_memcpy(&event->args[out_idx].value, &arg, sizeof(u64));
 		} else if (desc->arg_type == ARG_STRING) {
 			// Read string from userspace pointer
 			int slen = bpf_probe_read_user_str(
-				event->args[i].value,
-				sizeof(event->args[i].value),
+				event->args[out_idx].value,
+				sizeof(event->args[out_idx].value),
 				(void *)arg);
-			event->args[i].type = ARG_STRING;
-			event->args[i].size = slen > 0 ? slen : 0;
+			event->args[out_idx].type = ARG_STRING;
+			event->args[out_idx].size = slen > 0 ? slen : 0;
 		}
 	}
 
