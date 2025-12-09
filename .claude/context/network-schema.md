@@ -76,6 +76,7 @@ Packet-level events (point-in-time). These represent discrete points in the kern
 - TCP: `TCP packet_enqueue`, `TCP packet_send`, `TCP packet_rcv_established`, `TCP packet_queue_rcv`, `TCP buffer_queue`, `TCP zero_window_probe`, `TCP zero_window_ack`, `TCP rto_timeout`
 - UDP: `UDP send`, `UDP receive`, `UDP enqueue`
 - Poll: `poll_ready` - Socket became ready during poll/epoll/select
+- Drop/Throttle: `packet_drop`, `cpu_backlog_drop`, `TCP tsq_throttle`, `TCP mem_pressure`, `qdisc_enqueue`, `qdisc_drop`
 
 ### `args`
 Debug annotations for syscall slice events. Multiple args can exist per slice.
@@ -143,6 +144,13 @@ Debug annotations for packet instant events. Multiple args can exist per instant
 | `socket` | string | poll_ready | Socket info string: "Socket {id}:{protocol}:{src_host}:{src_port}->{dest_host}:{dest_port}" |
 | `requested` | string | poll_ready | Poll events requested (e.g., "IN\|OUT") |
 | `returned` | string | poll_ready | Poll events returned (e.g., "IN") |
+| `drop_reason` | int | packet_drop, cpu_backlog_drop, qdisc_drop | SKB_DROP_REASON_* code from kfree_skb tracepoint |
+| `drop_reason_str` | string | packet_drop, cpu_backlog_drop, qdisc_drop | Human-readable drop reason (e.g., "QDISC_DROP", "CPU_BACKLOG") |
+| `drop_location` | int | packet_drop | Kernel code address that dropped the packet |
+| `qlen` | int | cpu_backlog_drop, qdisc_enqueue, qdisc_drop | Queue length at time of event |
+| `qlen_limit` | int | cpu_backlog_drop, qdisc_enqueue, qdisc_drop | Queue limit (for backlog: netdev_max_backlog, default 1000) |
+| `sk_wmem_alloc` | int | TCP tsq_throttle, TCP mem_pressure | Current sk_wmem_alloc (TSQ allocated memory) |
+| `tsq_limit` | int | TCP tsq_throttle | TCP Small Queue limit that was exceeded |
 
 **Poll Event Flags:**
 The `requested` and `returned` fields use pipe-separated poll event names:
@@ -163,6 +171,18 @@ The `requested` and `returned` fields use pipe-separated poll event names:
 **Note on RTO Timeout Events:** RTO (Retransmission Timeout) events fire when the TCP retransmit timer expires because an ACK wasn't received in time. The `retransmit_count` shows how many consecutive RTOs have occurred (1 = first timeout). The `backoff` shows the exponential backoff multiplier applied to the RTO. If `snd_wnd=0`, the RTO is handling a zero-window condition rather than packet loss, and `is_zero_window_probe` will be set to 1.
 
 **Note on Retransmit Detection:** The `is_retransmit` field is only available on `TCP packet_enqueue` events, NOT on `TCP packet_send` events. This is because the retransmit flag (`TCPCB_RETRANS`) is read from the kernel's `tcp_skb_cb` control block, which is only accessible at the TCP layer probe point (`__tcp_transmit_skb`), not at the device layer (`net_dev_start_xmit`).
+
+**Note on Packet Drop Events:** The `packet_drop` event captures all packet drops via the `kfree_skb` kernel tracepoint. The `drop_reason` field contains the SKB_DROP_REASON_* enum value, and `drop_reason_str` provides the human-readable string. Common drop reasons include:
+- `QDISC_DROP` (59) - Queue discipline dropped packet (queue overflow)
+- `CPU_BACKLOG` (66) - CPU backlog queue was full
+- `NOMEM` (76) - Memory allocation failed
+- `PROTO_MEM` (20) - Protocol memory pressure
+- `SOCKET_RCVBUFF` (6) - Socket receive buffer full
+- `FULL_RING` (75) - NIC ring buffer full
+
+**Note on TSQ Throttle Events:** TSQ (TCP Small Queue) events fire when `tcp_tsq_write` is called with significant data queued. The `sk_wmem_alloc` field shows current allocated memory in the qdisc, and `tsq_limit` shows the estimated limit. High values indicate the TCP layer is throttling transmission to prevent qdisc overflow.
+
+**Note on Memory Pressure Events:** These events fire when `sk_stream_wait_memory` is called, indicating the application's write is blocked waiting for send buffer space. The `sndbuf_used` and `sndbuf_limit` fields show current buffer state. Frequent memory pressure events indicate the receiver cannot keep up with the sender.
 
 ### `network_interface`
 Local network interface metadata captured at trace start, organized by network namespace. This captures interfaces from:
@@ -884,7 +904,13 @@ Network Packets (root)
     ├── TCP rto_timeout (instant)
     ├── UDP send (instant)
     ├── UDP receive (instant)
-    └── UDP enqueue (instant)
+    ├── UDP enqueue (instant)
+    ├── packet_drop (instant) - SKB dropped via kfree_skb
+    ├── cpu_backlog_drop (instant) - CPU backlog queue overflow
+    ├── TCP tsq_throttle (instant) - TSQ throttling
+    ├── TCP mem_pressure (instant) - Send buffer blocked
+    ├── qdisc_enqueue (instant) - Qdisc enqueue state
+    └── qdisc_drop (instant) - Qdisc drop
 ```
 
 **Syscall Events (per-thread, stored in `slice` table):**
@@ -1030,4 +1056,95 @@ SELECT DISTINCT
 FROM track t
 JOIN container_ips ci ON t.name LIKE '%' || ci.ip_address || '%'
 WHERE t.name LIKE 'Socket%';
+```
+
+### 33. Find All Packet Drop Events
+Find all packet drops grouped by socket and drop reason:
+```sql
+SELECT t.name as socket,
+       MAX(CASE WHEN a.key = 'drop_reason_str' THEN a.string_value END) as drop_reason,
+       COUNT(*) as drop_count,
+       SUM(CASE WHEN a.key = 'length' THEN a.int_value ELSE 0 END) as dropped_bytes
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE i.name = 'packet_drop'
+GROUP BY t.name, MAX(CASE WHEN a.key = 'drop_reason_str' THEN a.string_value END)
+ORDER BY drop_count DESC;
+```
+
+### 34. Packet Drop Timeline
+Show packet drops with reason codes and timing:
+```sql
+SELECT i.ts / 1e9 as time_sec,
+       t.name as socket,
+       MAX(CASE WHEN a.key = 'drop_reason' THEN a.int_value END) as reason_code,
+       MAX(CASE WHEN a.key = 'drop_reason_str' THEN a.string_value END) as reason,
+       MAX(CASE WHEN a.key = 'length' THEN a.int_value END) as length
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE i.name = 'packet_drop'
+GROUP BY i.id, i.ts, t.name
+ORDER BY i.ts;
+```
+
+### 35. Find Memory Pressure Events
+Find sockets experiencing send buffer pressure:
+```sql
+SELECT t.name as socket,
+       COUNT(*) as pressure_events,
+       AVG(CASE WHEN a_used.key = 'sndbuf_used' THEN a_used.int_value END) as avg_sndbuf_used,
+       MAX(CASE WHEN a_used.key = 'sndbuf_used' THEN a_used.int_value END) as max_sndbuf_used,
+       MAX(CASE WHEN a_limit.key = 'sndbuf_limit' THEN a_limit.int_value END) as sndbuf_limit
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+LEFT JOIN instant_args a_used ON i.id = a_used.instant_id AND i.trace_id = a_used.trace_id AND a_used.key = 'sndbuf_used'
+LEFT JOIN instant_args a_limit ON i.id = a_limit.instant_id AND i.trace_id = a_limit.trace_id AND a_limit.key = 'sndbuf_limit'
+WHERE i.name = 'TCP mem_pressure'
+GROUP BY t.name
+ORDER BY pressure_events DESC;
+```
+
+### 36. Correlate Drops with Memory Pressure
+Find sockets with both drops and memory pressure:
+```sql
+WITH drop_sockets AS (
+    SELECT DISTINCT t.name as socket, i.trace_id,
+           COUNT(*) as drop_count
+    FROM instant i
+    JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+    WHERE i.name = 'packet_drop'
+    GROUP BY t.name, i.trace_id
+),
+pressure_sockets AS (
+    SELECT DISTINCT t.name as socket, i.trace_id,
+           COUNT(*) as pressure_count
+    FROM instant i
+    JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+    WHERE i.name = 'TCP mem_pressure'
+    GROUP BY t.name, i.trace_id
+)
+SELECT COALESCE(d.socket, p.socket) as socket,
+       COALESCE(d.drop_count, 0) as drops,
+       COALESCE(p.pressure_count, 0) as pressure_events
+FROM drop_sockets d
+FULL OUTER JOIN pressure_sockets p ON d.socket = p.socket AND d.trace_id = p.trace_id
+WHERE d.drop_count > 0 OR p.pressure_count > 0
+ORDER BY COALESCE(d.drop_count, 0) + COALESCE(p.pressure_count, 0) DESC;
+```
+
+### 37. TSQ Throttle Analysis
+Find sockets experiencing TSQ throttling:
+```sql
+SELECT t.name as socket,
+       COUNT(*) as throttle_events,
+       AVG(CASE WHEN a.key = 'sk_wmem_alloc' THEN a.int_value END) as avg_wmem_alloc,
+       MAX(CASE WHEN a.key = 'sk_wmem_alloc' THEN a.int_value END) as max_wmem_alloc
+FROM instant i
+JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE i.name = 'TCP tsq_throttle'
+GROUP BY t.name
+ORDER BY throttle_events DESC;
 ```

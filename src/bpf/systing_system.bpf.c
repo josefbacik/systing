@@ -202,6 +202,10 @@ enum packet_event_type {
 	PACKET_ZERO_WINDOW_PROBE, // TCP: Zero window probe sent (tcp_send_probe0)
 	PACKET_ZERO_WINDOW_ACK,   // TCP: Receiver advertising zero/low window (tcp_send_ack)
 	PACKET_RTO_TIMEOUT,       // TCP: RTO timer fired (tcp_retransmit_timer)
+	// New drop/throttle events (Phase 1-2)
+	PACKET_SKB_DROP,          // SKB dropped (kfree_skb tracepoint)
+	PACKET_CPU_BACKLOG_DROP,  // CPU backlog queue drop (enqueue_to_backlog)
+	PACKET_MEM_PRESSURE,      // TCP memory pressure (send buffer blocked)
 };
 
 struct packet_event {
@@ -242,6 +246,14 @@ struct packet_event {
 	u8 icsk_pending;          // What timer is pending: 0=none, 1=retrans, 2=delack, 3=probe/persist
 	u8 _persist_padding[5];   // Alignment padding for u64
 	u64 icsk_timeout;         // When timer fires (jiffies)
+	// Drop event fields (for PACKET_SKB_DROP, PACKET_CPU_BACKLOG_DROP, etc.)
+	u32 drop_reason;          // SKB_DROP_REASON_* code (from kfree_skb tracepoint)
+	u32 qlen;                 // Queue length at time of event (qdisc/backlog)
+	u32 qlen_limit;           // Queue limit (for backlog: netdev_max_backlog)
+	u64 drop_location;        // Kernel code address that dropped the packet
+	// TSQ/memory pressure fields
+	u32 sk_wmem_alloc;        // TCP Small Queue: current allocated memory
+	u32 tsq_limit;            // TCP Small Queue: limit that was exceeded
 };
 
 struct epoll_event_bpf {
@@ -3547,5 +3559,258 @@ int BPF_KRETPROBE(tcp_poll_exit, __poll_t ret)
 	bpf_map_delete_elem(&pending_epoll_polls, &tgidpid);
 	return 0;
 }
+
+// ========== Packet Drop Tracing (Phase 1) ==========
+
+// Helper to check if an SKB belongs to a TCP/UDP socket we're tracking
+static __always_inline u64 get_socket_id_from_skb(struct sk_buff *skb)
+{
+	if (!skb)
+		return 0;
+
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (!sk)
+		return 0;
+
+	// Read socket family to check if it's TCP or UDP
+	u16 sk_family = 0;
+	u8 sk_protocol = 0;
+	bpf_probe_read_kernel(&sk_family, sizeof(sk_family), &sk->__sk_common.skc_family);
+	bpf_probe_read_kernel(&sk_protocol, sizeof(sk_protocol), &sk->sk_protocol);
+
+	// Only trace TCP (IPPROTO_TCP=6) and UDP (IPPROTO_UDP=17) sockets
+	if (sk_protocol != 6 && sk_protocol != 17)
+		return 0;
+
+	// Only trace AF_INET (2) and AF_INET6 (10)
+	if (sk_family != AF_INET && sk_family != AF_INET6)
+		return 0;
+
+	// Look up socket_id from our sk_socket_id_map
+	u64 sk_ptr = (u64)sk;
+	u64 *socket_id_ptr = bpf_map_lookup_elem(&sk_socket_id_map, &sk_ptr);
+	if (socket_id_ptr)
+		return *socket_id_ptr;
+
+	return 0;
+}
+
+// Trace kfree_skb to capture all packet drops with reason codes
+// This is the most comprehensive drop tracing point in the kernel
+SEC("tracepoint/skb/kfree_skb")
+int tracepoint__skb__kfree_skb(struct trace_event_raw_kfree_skb *ctx)
+{
+	// Get the SKB and check if it's associated with a tracked socket
+	struct sk_buff *skb = (struct sk_buff *)ctx->skbaddr;
+	u64 socket_id = get_socket_id_from_skb(skb);
+
+	// Only emit events for sockets we're tracking
+	if (socket_id == 0)
+		return 0;
+
+	// Skip SKB_CONSUMED and SKB_NOT_DROPPED_YET - these aren't real drops
+	if (ctx->reason <= 1)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->event_type = PACKET_SKB_DROP;
+	event->cpu = bpf_get_smp_processor_id();
+	event->socket_id = socket_id;
+
+	// Record drop reason and location
+	event->drop_reason = (u32)ctx->reason;
+	event->drop_location = (u64)ctx->location;
+
+	// Try to extract protocol from skb
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (sk) {
+		u8 sk_protocol = 0;
+		bpf_probe_read_kernel(&sk_protocol, sizeof(sk_protocol), &sk->sk_protocol);
+		event->protocol = (sk_protocol == 6) ? NETWORK_TCP : NETWORK_UDP;
+
+		// Read socket addresses
+		read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+				  event->dest_addr, &event->dest_port);
+
+		// Read buffer state
+		int wmem_queued = 0;
+		int sndbuf = 0;
+		bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+		bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+		event->sndbuf_used = (u32)wmem_queued;
+		event->sndbuf_limit = (u32)sndbuf;
+	} else {
+		event->protocol = NETWORK_TCP;  // Default when sk is NULL
+	}
+
+	// Try to get packet length from skb
+	u32 skb_len = 0;
+	bpf_probe_read_kernel(&skb_len, sizeof(skb_len), &skb->len);
+	event->length = skb_len;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Track pending enqueue_to_backlog calls for correlation with kretprobe
+struct backlog_entry {
+	struct sk_buff *skb;
+	u32 cpu;
+	u64 socket_id;  // Store socket_id to avoid duplicate lookup in kretprobe
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);  // pid_tgid
+	__type(value, struct backlog_entry);
+	__uint(max_entries, 10240);
+} pending_backlog SEC(".maps");
+
+// Trace enqueue_to_backlog entry to capture queue state before potential drop
+SEC("kprobe/enqueue_to_backlog")
+int BPF_KPROBE(enqueue_to_backlog_entry, struct sk_buff *skb, int cpu, unsigned int *qtail)
+{
+	u64 socket_id = get_socket_id_from_skb(skb);
+	if (socket_id == 0)
+		return 0;
+
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct backlog_entry entry = {
+		.skb = skb,
+		.cpu = (u32)cpu,
+		.socket_id = socket_id,
+	};
+	bpf_map_update_elem(&pending_backlog, &pid_tgid, &entry, BPF_ANY);
+	return 0;
+}
+
+// Trace enqueue_to_backlog exit to detect drops (NET_RX_DROP return)
+SEC("kretprobe/enqueue_to_backlog")
+int BPF_KRETPROBE(enqueue_to_backlog_exit, int ret)
+{
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct backlog_entry *entry = bpf_map_lookup_elem(&pending_backlog, &pid_tgid);
+	if (!entry) {
+		return 0;
+	}
+
+	struct sk_buff *skb = entry->skb;
+	u32 target_cpu = entry->cpu;
+	u64 socket_id = entry->socket_id;  // Use stored socket_id instead of re-looking up
+	bpf_map_delete_elem(&pending_backlog, &pid_tgid);
+
+	// NET_RX_DROP = 1 indicates the packet was dropped
+	if (ret != 1)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->event_type = PACKET_CPU_BACKLOG_DROP;
+	event->cpu = bpf_get_smp_processor_id();
+	event->socket_id = socket_id;
+
+	// The drop reason is SKB_DROP_REASON_CPU_BACKLOG (66)
+	event->drop_reason = 66;  // SKB_DROP_REASON_CPU_BACKLOG
+
+	// Record which CPU's backlog was full in qlen field
+	// Note: qlen_limit=1000 is the default netdev_max_backlog, but may differ
+	// if sysctl net.core.netdev_max_backlog has been tuned
+	event->qlen = target_cpu;
+	event->qlen_limit = 1000;
+
+	// Extract socket info
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (sk) {
+		u8 sk_protocol = 0;
+		bpf_probe_read_kernel(&sk_protocol, sizeof(sk_protocol), &sk->sk_protocol);
+		event->protocol = (sk_protocol == 6) ? NETWORK_TCP : NETWORK_UDP;
+
+		read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+				  event->dest_addr, &event->dest_port);
+	} else {
+		event->protocol = NETWORK_TCP;  // Default when sk is NULL
+	}
+
+	// Get packet length
+	u32 skb_len = 0;
+	bpf_probe_read_kernel(&skb_len, sizeof(skb_len), &skb->len);
+	event->length = skb_len;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// ========== TCP Memory Pressure / TSQ Throttling (Phase 2) ==========
+
+// Trace sk_stream_wait_memory to detect when TCP is blocked on send buffer
+// This is called when the application's write is blocked waiting for buffer space
+SEC("kprobe/sk_stream_wait_memory")
+int BPF_KPROBE(sk_stream_wait_memory_entry, struct sock *sk, long *timeo)
+{
+	if (!sk)
+		return 0;
+
+	// Check if this is a TCP socket
+	u8 sk_protocol = 0;
+	bpf_probe_read_kernel(&sk_protocol, sizeof(sk_protocol), &sk->sk_protocol);
+	if (sk_protocol != 6)  // IPPROTO_TCP
+		return 0;
+
+	// Look up socket_id
+	u64 sk_ptr = (u64)sk;
+	u64 *socket_id_ptr = bpf_map_lookup_elem(&sk_socket_id_map, &sk_ptr);
+	if (!socket_id_ptr)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->event_type = PACKET_MEM_PRESSURE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->socket_id = *socket_id_ptr;
+	event->protocol = NETWORK_TCP;
+
+	// Read socket addresses
+	read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+			  event->dest_addr, &event->dest_port);
+
+	// Read buffer state - this is the key info for memory pressure
+	int wmem_queued = 0;
+	int sndbuf = 0;
+	bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+	bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+	event->sndbuf_used = (u32)wmem_queued;
+	event->sndbuf_limit = (u32)sndbuf;
+
+	// Read sk_wmem_alloc for TSQ tracking
+	int wmem_alloc = 0;
+	bpf_probe_read_kernel(&wmem_alloc, sizeof(wmem_alloc), &sk->sk_wmem_alloc.refs.counter);
+	event->sk_wmem_alloc = (u32)wmem_alloc;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Note: tcp_tsq_write probe removed - function is often inlined/split by compiler
+// (appears as tcp_tsq_write.part.0). Memory pressure is captured by sk_stream_wait_memory.
+
+// Note: Qdisc probes (__dev_xmit_skb) removed - function is not attachable via kprobe
+// on many kernels. Qdisc drops are still captured by the kfree_skb tracepoint with
+// SKB_DROP_REASON_QDISC_DROP (59).
 
 char LICENSE[] SEC("license") = "GPL";
