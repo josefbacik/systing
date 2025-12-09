@@ -175,8 +175,10 @@ struct network_event {
 	enum network_protocol protocol;
 	enum network_operation operation;
 	enum network_address_family af;  // Address family (IPv4 or IPv6)
-	u8 dest_addr[16];  // IPv4 (first 4 bytes) or IPv6 (all 16 bytes) in network byte order
-	u16 dest_port;     // Port in host byte order
+	u8 src_addr[16];   // Source/local IPv4 (first 4 bytes) or IPv6 (all 16 bytes)
+	u16 src_port;      // Source/local port in host byte order
+	u8 dest_addr[16];  // Dest/remote IPv4 (first 4 bytes) or IPv6 (all 16 bytes) in network byte order
+	u16 dest_port;     // Dest/remote port in host byte order
 	u32 bytes;
 	u32 sendmsg_seq;   // TCP sequence number at sendmsg time (TCP only)
 	u32 cpu;
@@ -206,8 +208,10 @@ struct packet_event {
 	u64 ts;            // Instant event timestamp
 	enum network_protocol protocol;  // TCP or UDP
 	enum network_address_family af;  // Address family (IPv4 or IPv6)
-	u8 dest_addr[16];  // IPv4 (first 4 bytes) or IPv6 (all 16 bytes) in network byte order
-	u16 dest_port;     // Port in host byte order
+	u8 src_addr[16];   // Source/local IPv4 (first 4 bytes) or IPv6 (all 16 bytes)
+	u16 src_port;      // Source/local port in host byte order
+	u8 dest_addr[16];  // Dest/remote IPv4 (first 4 bytes) or IPv6 (all 16 bytes) in network byte order
+	u16 dest_port;     // Dest/remote port in host byte order
 	u32 seq;           // TCP sequence number at transmit time
 	u32 length;        // Packet length (calculated from end_seq - seq)
 	u8 tcp_flags;      // TCP flags (SYN, ACK, FIN, etc.)
@@ -236,7 +240,7 @@ struct packet_event {
 	u8 backoff;               // Exponential backoff multiplier (icsk_backoff)
 	// Persist timer fields (populated on TCP packet enqueue events)
 	u8 icsk_pending;          // What timer is pending: 0=none, 1=retrans, 2=delack, 3=probe/persist
-	u8 _persist_padding[7];   // Alignment padding for u64
+	u8 _persist_padding[5];   // Alignment padding for u64
 	u64 icsk_timeout;         // When timer fires (jiffies)
 };
 
@@ -348,8 +352,10 @@ struct arg_desc_array _arg_desc_array = {0};
 struct network_send_info {
 	enum network_protocol protocol;
 	enum network_address_family af;
-	u8 dest_addr[16];
-	u16 dest_port;
+	u8 src_addr[16];   // Source/local address
+	u16 src_port;      // Source/local port
+	u8 dest_addr[16];  // Dest/remote address
+	u16 dest_port;     // Dest/remote port
 	u64 start_ts;
 	u32 sendmsg_seq;  // Sequence number at sendmsg time
 	u64 sk_ptr;       // Socket pointer for reading buffer state on exit
@@ -360,8 +366,10 @@ struct network_send_info {
 struct network_recv_info {
 	enum network_protocol protocol;
 	enum network_address_family af;
-	u8 peer_addr[16];
-	u16 peer_port;
+	u8 src_addr[16];   // Source/local address (our side)
+	u16 src_port;      // Source/local port (our side)
+	u8 peer_addr[16];  // Peer/remote address (dest_addr from socket perspective)
+	u16 peer_port;     // Peer/remote port
 	u64 start_ts;
 	u64 sk_ptr;       // Socket pointer for buffer queue latency tracking
 	u64 socket_id;    // Unique socket ID for correlation
@@ -395,12 +403,13 @@ struct {
 	__uint(max_entries, 10240);
 } pending_epoll_polls SEC(".maps");
 
-// Socket identity key - identifies a unique socket+destination pair
+// Socket identity key - identifies a unique socket by full 4-tuple
 struct socket_identity_key {
 	u64 sk_ptr;           // struct sock * cast to u64
-	u8 dest_addr[16];     // Destination address (IPv4 in first 4 bytes)
-	u16 dest_port;        // Destination port
-	u16 _pad;             // Alignment padding
+	u8 src_addr[16];      // Source/local address (IPv4 in first 4 bytes)
+	u16 src_port;         // Source/local port
+	u8 dest_addr[16];     // Destination/remote address (IPv4 in first 4 bytes)
+	u16 dest_port;        // Destination/remote port
 };
 
 // Socket metadata stored in map, readable by userspace after tracing
@@ -408,9 +417,10 @@ struct socket_metadata {
 	u64 socket_id;                    // Unique socket ID
 	enum network_protocol protocol;   // TCP or UDP
 	enum network_address_family af;   // IPv4 or IPv6
-	u8 dest_addr[16];                 // Destination address
-	u16 dest_port;                    // Destination port
-	u16 _pad;                         // Alignment padding
+	u8 src_addr[16];                  // Source/local address
+	u16 src_port;                     // Source/local port
+	u8 dest_addr[16];                 // Destination/remote address
+	u16 dest_port;                    // Destination/remote port
 };
 
 // Atomic counter for generating unique socket IDs (single-entry array)
@@ -669,12 +679,14 @@ static __always_inline u64 generate_socket_id(void)
 	return __sync_fetch_and_add(counter, 1) + 1;  // Start from 1, not 0
 }
 
-// Get or create socket ID for socket+destination pair
+// Get or create socket ID for socket with full 4-tuple
 // Returns 0 if socket metadata cannot be created
 static __always_inline u64 get_or_create_socket_id(
 	struct sock *sk,
 	enum network_protocol protocol,
 	enum network_address_family af,
+	u8 *src_addr,
+	u16 src_port,
 	u8 *dest_addr,
 	u16 dest_port,
 	u64 tgidpid)
@@ -684,10 +696,12 @@ static __always_inline u64 get_or_create_socket_id(
 	struct socket_metadata metadata = {0};
 
 	identity_key.sk_ptr = (u64)sk;
+	__builtin_memcpy(identity_key.src_addr, src_addr, 16);
+	identity_key.src_port = src_port;
 	__builtin_memcpy(identity_key.dest_addr, dest_addr, 16);
 	identity_key.dest_port = dest_port;
 
-	// Check if we already have metadata for this socket+destination
+	// Check if we already have metadata for this socket
 	existing = bpf_map_lookup_elem(&socket_metadata_map, &identity_key);
 	if (existing)
 		return existing->socket_id;
@@ -699,6 +713,8 @@ static __always_inline u64 get_or_create_socket_id(
 
 	metadata.protocol = protocol;
 	metadata.af = af;
+	__builtin_memcpy(metadata.src_addr, src_addr, 16);
+	metadata.src_port = src_port;
 	__builtin_memcpy(metadata.dest_addr, dest_addr, 16);
 	metadata.dest_port = dest_port;
 
@@ -709,7 +725,7 @@ static __always_inline u64 get_or_create_socket_id(
 	u64 socket_id = existing ? existing->socket_id : 0;
 
 	// Also update sk_socket_id_map for fast fd-based lookups
-	// This maps sk_ptr -> socket_id directly (without needing dest info)
+	// This maps sk_ptr -> socket_id directly (without needing addr info)
 	if (socket_id) {
 		u64 sk_ptr = (u64)sk;
 		bpf_map_update_elem(&sk_socket_id_map, &sk_ptr, &socket_id, BPF_ANY);
@@ -718,10 +734,12 @@ static __always_inline u64 get_or_create_socket_id(
 	return socket_id;
 }
 
-// Lookup socket ID for an existing socket+destination pair
+// Lookup socket ID for an existing socket with full 4-tuple
 // Returns 0 if not found
 static __always_inline u64 lookup_socket_id(
 	struct sock *sk,
+	u8 *src_addr,
+	u16 src_port,
 	u8 *dest_addr,
 	u16 dest_port)
 {
@@ -729,6 +747,8 @@ static __always_inline u64 lookup_socket_id(
 	struct socket_metadata *existing;
 
 	identity_key.sk_ptr = (u64)sk;
+	__builtin_memcpy(identity_key.src_addr, src_addr, 16);
+	identity_key.src_port = src_port;
 	__builtin_memcpy(identity_key.dest_addr, dest_addr, 16);
 	identity_key.dest_port = dest_port;
 
@@ -1924,6 +1944,77 @@ static __always_inline int read_socket_dest_info(struct sock *sk,
 	return -1;
 }
 
+// Read source/local address from socket
+static __always_inline int read_socket_src_info(struct sock *sk,
+						 enum network_address_family *af,
+						 u8 *src_addr,
+						 u16 *src_port)
+{
+	u16 family;
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	if (family == AF_INET) {
+		*af = NETWORK_AF_INET;
+		u32 addr;
+		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_rcv_saddr);
+		__builtin_memcpy(src_addr, &addr, 4);
+		u16 port;
+		bpf_probe_read_kernel(&port, sizeof(port), &sk->__sk_common.skc_num);
+		*src_port = port;  // skc_num is already in host byte order
+		return 0;
+	} else if (family == AF_INET6) {
+		*af = NETWORK_AF_INET6;
+		bpf_probe_read_kernel(src_addr, 16, &sk->__sk_common.skc_v6_rcv_saddr);
+		u16 port;
+		bpf_probe_read_kernel(&port, sizeof(port), &sk->__sk_common.skc_num);
+		*src_port = port;  // skc_num is already in host byte order
+		return 0;
+	}
+	return -1;
+}
+
+// Read both source and destination address from socket (full 4-tuple)
+static __always_inline int read_socket_addrs(struct sock *sk,
+					      enum network_address_family *af,
+					      u8 *src_addr,
+					      u16 *src_port,
+					      u8 *dest_addr,
+					      u16 *dest_port)
+{
+	u16 family;
+	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+	if (family == AF_INET) {
+		*af = NETWORK_AF_INET;
+		u32 saddr, daddr;
+		u16 sport, dport;
+
+		bpf_probe_read_kernel(&saddr, sizeof(saddr), &sk->__sk_common.skc_rcv_saddr);
+		bpf_probe_read_kernel(&daddr, sizeof(daddr), &sk->__sk_common.skc_daddr);
+		bpf_probe_read_kernel(&sport, sizeof(sport), &sk->__sk_common.skc_num);
+		bpf_probe_read_kernel(&dport, sizeof(dport), &sk->__sk_common.skc_dport);
+
+		__builtin_memcpy(src_addr, &saddr, 4);
+		__builtin_memcpy(dest_addr, &daddr, 4);
+		*src_port = sport;  // skc_num is already in host byte order
+		*dest_port = __builtin_bswap16(dport);
+		return 0;
+	} else if (family == AF_INET6) {
+		*af = NETWORK_AF_INET6;
+		u16 sport, dport;
+
+		bpf_probe_read_kernel(src_addr, 16, &sk->__sk_common.skc_v6_rcv_saddr);
+		bpf_probe_read_kernel(dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
+		bpf_probe_read_kernel(&sport, sizeof(sport), &sk->__sk_common.skc_num);
+		bpf_probe_read_kernel(&dport, sizeof(dport), &sk->__sk_common.skc_dport);
+
+		*src_port = sport;  // skc_num is already in host byte order
+		*dest_port = __builtin_bswap16(dport);
+		return 0;
+	}
+	return -1;
+}
+
 static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum network_protocol protocol)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
@@ -1984,12 +2075,18 @@ static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum networ
 		read_socket_dest_info(sk, &info.af, info.dest_addr, &info.dest_port);
 	}
 
+	// Read source address from socket
+	if (sk) {
+		read_socket_src_info(sk, &info.af, info.src_addr, &info.src_port);
+	}
+
 	// Store socket pointer for reading buffer state on exit
 	info.sk_ptr = (u64)sk;
 
-	// Get or create socket ID for this socket+destination pair
+	// Get or create socket ID for this socket with full 4-tuple
 	if (sk && info.dest_port != 0) {
 		info.socket_id = get_or_create_socket_id(sk, protocol, info.af,
+							  info.src_addr, info.src_port,
 							  info.dest_addr, info.dest_port, tgidpid);
 	}
 
@@ -2031,6 +2128,8 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 	event->protocol = info->protocol;
 	event->operation = NETWORK_SEND;
 	event->af = info->af;
+	__builtin_memcpy(event->src_addr, info->src_addr, 16);
+	event->src_port = info->src_port;
 	__builtin_memcpy(event->dest_addr, info->dest_addr, 16);
 	event->dest_port = info->dest_port;
 	event->bytes = (u32)ret;  // Return value is number of bytes sent
@@ -2097,10 +2196,14 @@ static int handle_tcp_recvmsg_entry(struct sock *sk, struct msghdr *msg)
 	info.sk_ptr = (u64)sk;  // Store socket pointer for buffer queue latency
 
 	if (sk) {
+		// Read both source and destination addresses
+		read_socket_src_info(sk, &info.af, info.src_addr, &info.src_port);
 		read_socket_dest_info(sk, &info.af, info.peer_addr, &info.peer_port);
-		// Get or create socket ID for this socket+destination pair
+
+		// Get or create socket ID for this socket with full 4-tuple
 		if (info.peer_port != 0) {
 			info.socket_id = get_or_create_socket_id(sk, NETWORK_TCP, info.af,
+								  info.src_addr, info.src_port,
 								  info.peer_addr, info.peer_port, tgidpid);
 		}
 
@@ -2160,6 +2263,10 @@ static int handle_recvmsg_exit(void *ctx, int ret)
 	event->operation = NETWORK_RECV;
 	event->af = info->af;
 	event->bytes = (u32)ret;  // Return value is number of bytes received
+
+	// Copy source address (our local address)
+	__builtin_memcpy(event->src_addr, info->src_addr, 16);
+	event->src_port = info->src_port;
 
 	// Use the peer address that was extracted in the entry handler
 	__builtin_memcpy(event->dest_addr, info->peer_addr, 16);
@@ -2292,12 +2399,15 @@ int BPF_KRETPROBE(skb_recv_udp_exit, struct sk_buff *skb)
 		}
 
 		// Now that we have peer address/port, get or create socket ID
-		// Get the sock from the sk_buff
+		// Get the sock from the sk_buff and read source address
 		if (info->peer_port != 0) {
 			struct sock *sk = NULL;
 			bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
 			if (sk) {
+				// Read our local source address from socket
+				read_socket_src_info(sk, &info->af, info->src_addr, &info->src_port);
 				info->socket_id = get_or_create_socket_id(sk, NETWORK_UDP, info->af,
+									  info->src_addr, info->src_port,
 									  info->peer_addr, info->peer_port, tgidpid);
 			}
 		}
@@ -2364,8 +2474,12 @@ int BPF_KPROBE(udp_send_skb_entry, struct sk_buff *skb, struct flowi4 *fl4, stru
 	__builtin_memcpy(event->dest_addr, &daddr, 4);
 	event->dest_port = __builtin_bswap16(dport);
 
-	// Look up socket ID for this socket+destination pair
-	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+	// Read source address from socket
+	read_socket_src_info(sk, &event->af, event->src_addr, &event->src_port);
+
+	// Look up socket ID for this socket with full 4-tuple
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
@@ -2428,8 +2542,12 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 			: 0;
 	}
 
+	// Read source address from socket
+	read_socket_src_info(sk, &event->af, event->src_addr, &event->src_port);
+
 	// Look up socket ID
-	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
@@ -2492,8 +2610,12 @@ int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *
 			: 0;
 	}
 
+	// Read source address from socket
+	read_socket_src_info(sk, &event->af, event->src_addr, &event->src_port);
+
 	// Look up socket ID
-	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
@@ -2527,25 +2649,9 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	event->event_type = PACKET_ENQUEUE;
 	event->cpu = bpf_get_smp_processor_id();
 
-	// Extract destination address and port from the socket
-	u16 family;
-	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
-
-	if (family == AF_INET) {
-		event->af = NETWORK_AF_INET;
-		u32 addr;
-		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
-		__builtin_memcpy(event->dest_addr, &addr, 4);
-		bpf_probe_read_kernel(&event->dest_port, sizeof(event->dest_port),
-				      &sk->__sk_common.skc_dport);
-		event->dest_port = __builtin_bswap16(event->dest_port);
-	} else if (family == AF_INET6) {
-		event->af = NETWORK_AF_INET6;
-		bpf_probe_read_kernel(event->dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
-		bpf_probe_read_kernel(&event->dest_port, sizeof(event->dest_port),
-				      &sk->__sk_common.skc_dport);
-		event->dest_port = __builtin_bswap16(event->dest_port);
-	}
+	// Extract source and destination address from the socket (full 4-tuple)
+	read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+			  event->dest_addr, &event->dest_port);
 
 	struct tcp_skb_cb *tcb = (struct tcp_skb_cb *)&skb->cb[0];
 	u32 start_seq = 0;
@@ -2566,8 +2672,9 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	#define TCPCB_RETRANS 0x10
 	event->is_retransmit = (sacked & TCPCB_RETRANS) ? 1 : 0;
 
-	// Look up socket ID for this socket+destination pair
-	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+	// Look up socket ID for this socket with full 4-tuple
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
 
 	// Read send buffer state from socket
 	int wmem_queued = 0;
@@ -2651,8 +2758,9 @@ static __always_inline int emit_tcp_packet_event(struct sock *sk, struct sk_buff
 	event->tcp_flags = 0;  // tcp_skb_cb not available at this probe point
 	event->is_retransmit = 0;  // TCPCB_RETRANS not available at this probe point
 
-	// Look up socket ID for this socket+destination pair
-	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+	// Look up socket ID for this socket with full 4-tuple
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
 
 	// Read send buffer state from socket
 	int wmem_queued = 0;
@@ -2689,27 +2797,13 @@ static __always_inline int emit_udp_packet_event(struct sock *sk, struct sk_buff
 	event->length = length;
 
 	// Extract destination address and port from the socket
-	u16 family;
-	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+	// Read source and destination address from socket (full 4-tuple)
+	read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+			  event->dest_addr, &event->dest_port);
 
-	if (family == AF_INET) {
-		event->af = NETWORK_AF_INET;
-		u32 addr;
-		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
-		__builtin_memcpy(event->dest_addr, &addr, 4);
-		bpf_probe_read_kernel(&event->dest_port, sizeof(event->dest_port),
-				      &sk->__sk_common.skc_dport);
-		event->dest_port = __builtin_bswap16(event->dest_port);
-	} else if (family == AF_INET6) {
-		event->af = NETWORK_AF_INET6;
-		bpf_probe_read_kernel(event->dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
-		bpf_probe_read_kernel(&event->dest_port, sizeof(event->dest_port),
-				      &sk->__sk_common.skc_dport);
-		event->dest_port = __builtin_bswap16(event->dest_port);
-	}
-
-	// Look up socket ID for this socket+destination pair
-	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+	// Look up socket ID for this socket with full 4-tuple
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
@@ -2830,6 +2924,9 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 		return 0;
 	}
 
+	// Read our local source address from the socket
+	read_socket_src_info(sk, &event->af, event->src_addr, &event->src_port);
+
 	struct tcp_skb_cb *tcb = (struct tcp_skb_cb *)&skb->cb[0];
 	u32 start_seq = 0;
 	u32 end_seq = 0;
@@ -2843,8 +2940,9 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 	event->length = end_seq - start_seq;
 	event->tcp_flags = tcp_flags;
 
-	// Look up socket ID for this socket+destination pair
-	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+	// Look up socket ID for this socket with full 4-tuple
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
@@ -2884,6 +2982,9 @@ int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *
 		return 0;
 	}
 
+	// Read our local source address from the socket
+	read_socket_src_info(sk, &event->af, event->src_addr, &event->src_port);
+
 	// Read seq from TCP header
 	u32 seq = 0;
 	read_tcp_seq_from_skb(skb, &seq);
@@ -2899,7 +3000,8 @@ int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *
 	event->tcp_flags = 0;
 
 	// Look up socket ID
-	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
@@ -2940,6 +3042,9 @@ int BPF_KPROBE(tcp_data_queue_entry, struct sock *sk, struct sk_buff *skb)
 		return 0;
 	}
 
+	// Read our local source address from the socket
+	read_socket_src_info(sk, &event->af, event->src_addr, &event->src_port);
+
 	// Read seq from TCP header
 	u32 seq = 0;
 	read_tcp_seq_from_skb(skb, &seq);
@@ -2955,7 +3060,8 @@ int BPF_KPROBE(tcp_data_queue_entry, struct sock *sk, struct sk_buff *skb)
 	event->tcp_flags = 0;
 
 	// Look up socket ID
-	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
@@ -3005,6 +3111,9 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 		return 0;
 	}
 
+	// Read our local source address from the socket
+	read_socket_src_info(sk, &pkt_event->af, pkt_event->src_addr, &pkt_event->src_port);
+
 	// Read seq from TCP header
 	u32 seq = 0;
 	read_tcp_seq_from_skb(skb, &seq);
@@ -3013,7 +3122,8 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 	pkt_event->tcp_flags = 0;
 
 	// Look up socket ID
-	pkt_event->socket_id = lookup_socket_id(sk, pkt_event->dest_addr, pkt_event->dest_port);
+	pkt_event->socket_id = lookup_socket_id(sk, pkt_event->src_addr, pkt_event->src_port,
+						 pkt_event->dest_addr, pkt_event->dest_port);
 
 	pkt_event->sndbuf_used = 0;
 	pkt_event->sndbuf_limit = 0;
@@ -3049,26 +3159,12 @@ int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 	event->cpu = bpf_get_smp_processor_id();
 	event->is_zero_window_probe = 1;
 
-	// Extract socket address info
-	u16 family;
-	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
-
-	if (family == AF_INET) {
-		event->af = NETWORK_AF_INET;
-		u32 addr;
-		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
-		__builtin_memcpy(event->dest_addr, &addr, 4);
-	} else if (family == AF_INET6) {
-		event->af = NETWORK_AF_INET6;
-		bpf_probe_read_kernel(event->dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
-	} else {
-		// Unknown address family, discard event
+	// Extract socket address info (full 4-tuple)
+	if (read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+			       event->dest_addr, &event->dest_port) != 0) {
 		bpf_ringbuf_discard(event, flags);
 		return 0;
 	}
-	bpf_probe_read_kernel(&event->dest_port, sizeof(event->dest_port),
-			      &sk->__sk_common.skc_dport);
-	event->dest_port = __builtin_bswap16(event->dest_port);
 
 	// Read TCP-specific info from tcp_sock
 	struct tcp_sock *tp = (struct tcp_sock *)sk;
@@ -3107,7 +3203,8 @@ int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 	bpf_probe_read_kernel(&event->backoff, sizeof(event->backoff), &icsk->icsk_backoff);
 
 	// Get socket ID for correlation
-	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
@@ -3206,7 +3303,8 @@ int BPF_KPROBE(tcp_send_ack_entry, struct sock *sk)
 	event->tcp_flags = 0x10;  // ACK flag
 
 	// Get socket ID for correlation
-	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
 
 	// Initialize persist timer fields (receiver-side ACK events don't have this info)
 	event->icsk_pending = 0;
@@ -3258,26 +3356,12 @@ int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 	event->cpu = bpf_get_smp_processor_id();
 	event->is_retransmit = 1;  // RTO triggers retransmission
 
-	// Extract socket address info
-	u16 family;
-	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
-
-	if (family == AF_INET) {
-		event->af = NETWORK_AF_INET;
-		u32 addr;
-		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
-		__builtin_memcpy(event->dest_addr, &addr, 4);
-	} else if (family == AF_INET6) {
-		event->af = NETWORK_AF_INET6;
-		bpf_probe_read_kernel(event->dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
-	} else {
-		// Unknown address family, discard event
+	// Extract socket address info (full 4-tuple)
+	if (read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+			       event->dest_addr, &event->dest_port) != 0) {
 		bpf_ringbuf_discard(event, flags);
 		return 0;
 	}
-	bpf_probe_read_kernel(&event->dest_port, sizeof(event->dest_port),
-			      &sk->__sk_common.skc_dport);
-	event->dest_port = __builtin_bswap16(event->dest_port);
 
 	// Read TCP-specific info
 	u32 snd_una;
@@ -3334,7 +3418,8 @@ int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 	event->sndbuf_limit = sndbuf > 0 ? (u32)sndbuf : 0;
 
 	// Get socket ID for correlation
-	event->socket_id = lookup_socket_id(sk, event->dest_addr, event->dest_port);
+	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
+					     event->dest_addr, event->dest_port);
 
 	// Read persist timer state
 	bpf_probe_read_kernel(&event->icsk_pending, sizeof(event->icsk_pending), &icsk->icsk_pending);
@@ -3404,14 +3489,17 @@ int BPF_KPROBE(tcp_poll_entry, struct file *file, struct socket *sock, poll_tabl
 	u64 tgidpid = bpf_get_current_pid_tgid();
 
 	enum network_address_family af = NETWORK_AF_INET;
+	u8 src_addr[16] = {0};
+	u16 src_port = 0;
 	u8 dest_addr[16] = {0};
 	u16 dest_port = 0;
+	read_socket_src_info(sk, &af, src_addr, &src_port);
 	read_socket_dest_info(sk, &af, dest_addr, &dest_port);
 
 	if (dest_port == 0)
 		return 0;
 
-	u64 socket_id = get_or_create_socket_id(sk, NETWORK_TCP, af, dest_addr, dest_port, tgidpid);
+	u64 socket_id = get_or_create_socket_id(sk, NETWORK_TCP, af, src_addr, src_port, dest_addr, dest_port, tgidpid);
 	if (socket_id == 0)
 		return 0;
 

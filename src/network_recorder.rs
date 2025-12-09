@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -20,43 +21,66 @@ use perfetto_protos::track_event::{EventName, TrackEvent};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-// Unique identifier for a network connection
+/// Unique identifier for a network connection (full 4-tuple).
+/// Used for testing Display formatting and IP address parsing.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 struct ConnectionId {
-    protocol: u32,       // Cast from network_protocol enum
-    af: u32,             // Cast from network_address_family enum
-    dest_addr: [u8; 16], // IPv4 (first 4 bytes) or IPv6 (all 16 bytes) in network byte order
+    protocol: u32,
+    af: u32,
+    src_addr: [u8; 16],
+    src_port: u16,
+    dest_addr: [u8; 16],
     dest_port: u16,
 }
 
-impl ConnectionId {
-    fn ip_addr(&self) -> IpAddr {
-        use crate::systing::types::network_address_family;
-        if self.af == network_address_family::NETWORK_AF_INET.0 {
-            let mut bytes = [0u8; 4];
-            bytes.copy_from_slice(&self.dest_addr[0..4]);
-            IpAddr::V4(Ipv4Addr::from(bytes))
-        } else if self.af == network_address_family::NETWORK_AF_INET6.0 {
-            IpAddr::V6(Ipv6Addr::from(self.dest_addr))
-        } else {
-            // Invalid af value - default to IPv4
-            IpAddr::V4(Ipv4Addr::from([0, 0, 0, 0]))
-        }
+fn parse_ip_addr(af: u32, addr: &[u8; 16]) -> IpAddr {
+    use crate::systing::types::network_address_family;
+    if af == network_address_family::NETWORK_AF_INET.0 {
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&addr[0..4]);
+        IpAddr::V4(Ipv4Addr::from(bytes))
+    } else if af == network_address_family::NETWORK_AF_INET6.0 {
+        IpAddr::V6(Ipv6Addr::from(*addr))
+    } else {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     }
 }
 
+fn protocol_str(protocol: u32) -> &'static str {
+    use crate::systing::types::network_protocol;
+    if protocol == network_protocol::NETWORK_TCP.0 {
+        "TCP"
+    } else if protocol == network_protocol::NETWORK_UDP.0 {
+        "UDP"
+    } else {
+        "UNKNOWN"
+    }
+}
+
+#[cfg(test)]
+impl ConnectionId {
+    fn src_ip_addr(&self) -> IpAddr {
+        parse_ip_addr(self.af, &self.src_addr)
+    }
+
+    fn dest_ip_addr(&self) -> IpAddr {
+        parse_ip_addr(self.af, &self.dest_addr)
+    }
+}
+
+#[cfg(test)]
 impl fmt::Display for ConnectionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use crate::systing::types::network_protocol;
-        let protocol_str = if self.protocol == network_protocol::NETWORK_TCP.0 {
-            "TCP"
-        } else if self.protocol == network_protocol::NETWORK_UDP.0 {
-            "UDP"
-        } else {
-            "UNKNOWN"
-        };
-        let addr = self.ip_addr();
-        write!(f, "{}:{}:{}", protocol_str, addr, self.dest_port)
+        write!(
+            f,
+            "{}:{}:{}->{}:{}",
+            protocol_str(self.protocol),
+            self.src_ip_addr(),
+            self.src_port,
+            self.dest_ip_addr(),
+            self.dest_port
+        )
     }
 }
 
@@ -65,33 +89,23 @@ impl fmt::Display for ConnectionId {
 pub struct SocketMetadata {
     pub protocol: u32,
     pub af: u32,
+    pub src_addr: [u8; 16],
+    pub src_port: u16,
     pub dest_addr: [u8; 16],
     pub dest_port: u16,
 }
 
 impl SocketMetadata {
-    fn connection_id(&self) -> ConnectionId {
-        ConnectionId {
-            protocol: self.protocol,
-            af: self.af,
-            dest_addr: self.dest_addr,
-            dest_port: self.dest_port,
-        }
+    fn src_ip_addr(&self) -> IpAddr {
+        parse_ip_addr(self.af, &self.src_addr)
     }
 
-    fn ip_addr(&self) -> IpAddr {
-        self.connection_id().ip_addr()
+    fn dest_ip_addr(&self) -> IpAddr {
+        parse_ip_addr(self.af, &self.dest_addr)
     }
 
     fn protocol_str(&self) -> &'static str {
-        use crate::systing::types::network_protocol;
-        if self.protocol == network_protocol::NETWORK_TCP.0 {
-            "TCP"
-        } else if self.protocol == network_protocol::NETWORK_UDP.0 {
-            "UDP"
-        } else {
-            "UNKNOWN"
-        }
+        protocol_str(self.protocol)
     }
 }
 
@@ -360,6 +374,8 @@ impl NetworkRecorder {
                     let metadata = SocketMetadata {
                         protocol: bpf_meta.protocol.0,
                         af: bpf_meta.af.0,
+                        src_addr: bpf_meta.src_addr,
+                        src_port: bpf_meta.src_port,
                         dest_addr: bpf_meta.dest_addr,
                         dest_port: bpf_meta.dest_port,
                     };
@@ -827,7 +843,12 @@ impl NetworkRecorder {
         use crate::systing::types::network_operation;
 
         // Collect IP addresses first to avoid borrow issues
-        let ip_addrs: Vec<_> = self.socket_metadata.values().map(|m| m.ip_addr()).collect();
+        // We resolve both src and dest addresses for potential hostname lookups
+        let ip_addrs: Vec<_> = self
+            .socket_metadata
+            .values()
+            .flat_map(|m| [m.src_ip_addr(), m.dest_ip_addr()])
+            .collect();
 
         // Resolve hostnames for all sockets
         for ip_addr in ip_addrs {
@@ -902,19 +923,27 @@ impl NetworkRecorder {
         event_names
     }
 
-    /// Helper to get socket track name from metadata
     fn socket_track_name(&self, socket_id: SocketId) -> String {
         if let Some(metadata) = self.socket_metadata.get(&socket_id) {
-            let hostname = self
+            let src_ip = metadata.src_ip_addr();
+            let dest_ip = metadata.dest_ip_addr();
+            let src_host = self
                 .hostname_cache
-                .get(&metadata.ip_addr())
-                .map(|s| s.as_str())
-                .unwrap_or("unknown");
+                .get(&src_ip)
+                .cloned()
+                .unwrap_or_else(|| src_ip.to_string());
+            let dest_host = self
+                .hostname_cache
+                .get(&dest_ip)
+                .cloned()
+                .unwrap_or_else(|| dest_ip.to_string());
             format!(
-                "Socket {}:{}:{}:{}",
+                "Socket {}:{}:{}:{}->{}:{}",
                 socket_id,
                 metadata.protocol_str(),
-                hostname,
+                src_host,
+                metadata.src_port,
+                dest_host,
                 metadata.dest_port
             )
         } else {
@@ -1516,7 +1545,14 @@ mod tests {
         network_protocol::NETWORK_UDP
     }
 
-    /// Helper to insert socket metadata for tests
+    /// Helper to get a default test source address (10.0.0.1)
+    fn test_src_addr() -> [u8; 16] {
+        let mut addr = [0u8; 16];
+        addr[0..4].copy_from_slice(&[10, 0, 0, 1]);
+        addr
+    }
+
+    /// Helper to insert socket metadata for tests (uses default src addr/port)
     fn insert_test_socket_metadata(
         recorder: &mut NetworkRecorder,
         socket_id: SocketId,
@@ -1530,6 +1566,8 @@ mod tests {
             SocketMetadata {
                 protocol,
                 af,
+                src_addr: test_src_addr(),
+                src_port: 12345,
                 dest_addr,
                 dest_port,
             },
@@ -1543,7 +1581,7 @@ mod tests {
         let mut recorder = NetworkRecorder::default();
 
         let mut dest_addr = [0u8; 16];
-        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 in network byte order
+        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]);
         let socket_id: SocketId = 1;
 
         let event = network_event {
@@ -1591,7 +1629,7 @@ mod tests {
         let mut recorder = NetworkRecorder::default();
 
         let mut dest_addr = [0u8; 16];
-        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 in network byte order
+        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]);
         let socket_id: SocketId = 1;
 
         let event1 = network_event {
@@ -1718,7 +1756,7 @@ mod tests {
         let id_counter = Arc::new(AtomicUsize::new(1000));
 
         let mut dest_addr = [0u8; 16];
-        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]); // 127.0.0.1 in network byte order
+        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]);
         let socket_id: SocketId = 1;
 
         insert_test_socket_metadata(
@@ -2067,11 +2105,13 @@ mod tests {
             let conn_id = ConnectionId {
                 protocol: network_protocol::NETWORK_TCP.0,
                 af: network_address_family::NETWORK_AF_INET6.0,
+                src_addr: [0; 16], // Use zeroed source for this test
+                src_port: 12345,
                 dest_addr: addr_bytes,
                 dest_port: 443,
             };
 
-            let ip = conn_id.ip_addr();
+            let ip = conn_id.dest_ip_addr();
             assert_eq!(ip.to_string(), expected_str);
 
             // Test Display formatting for ConnectionId
