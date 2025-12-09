@@ -58,6 +58,129 @@ fn protocol_str(protocol: u32) -> &'static str {
     }
 }
 
+/// Convert SKB_DROP_REASON_* code to human-readable string
+/// Based on enum skb_drop_reason from include/net/dropreason-core.h
+fn drop_reason_str(reason: u32) -> &'static str {
+    match reason {
+        0 => "NOT_DROPPED_YET",
+        1 => "CONSUMED",
+        2 => "NOT_SPECIFIED",
+        3 => "NO_SOCKET",
+        4 => "SOCKET_CLOSE",
+        5 => "SOCKET_FILTER",
+        6 => "SOCKET_RCVBUFF",
+        7 => "UNIX_DISCONNECT",
+        8 => "UNIX_SKIP_OOB",
+        9 => "PKT_TOO_SMALL",
+        10 => "TCP_CSUM",
+        11 => "UDP_CSUM",
+        12 => "NETFILTER_DROP",
+        13 => "OTHERHOST",
+        14 => "IP_CSUM",
+        15 => "IP_INHDR",
+        16 => "IP_RPFILTER",
+        17 => "UNICAST_IN_L2_MULTICAST",
+        18 => "XFRM_POLICY",
+        19 => "IP_NOPROTO",
+        20 => "PROTO_MEM",
+        21 => "TCP_AUTH_HDR",
+        22 => "TCP_MD5NOTFOUND",
+        23 => "TCP_MD5UNEXPECTED",
+        24 => "TCP_MD5FAILURE",
+        25 => "TCP_AONOTFOUND",
+        26 => "TCP_AOUNEXPECTED",
+        27 => "TCP_AOKEYNOTFOUND",
+        28 => "TCP_AOFAILURE",
+        29 => "SOCKET_BACKLOG",
+        30 => "TCP_FLAGS",
+        31 => "TCP_ABORT_ON_DATA",
+        32 => "TCP_ZEROWINDOW",
+        33 => "TCP_OLD_DATA",
+        34 => "TCP_OVERWINDOW",
+        35 => "TCP_OFOMERGE",
+        36 => "TCP_RFC7323_PAWS",
+        37 => "TCP_RFC7323_PAWS_ACK",
+        38 => "TCP_OLD_SEQUENCE",
+        39 => "TCP_INVALID_SEQUENCE",
+        40 => "TCP_INVALID_ACK_SEQUENCE",
+        41 => "TCP_RESET",
+        42 => "TCP_INVALID_SYN",
+        43 => "TCP_CLOSE",
+        44 => "TCP_FASTOPEN",
+        45 => "TCP_OLD_ACK",
+        46 => "TCP_TOO_OLD_ACK",
+        47 => "TCP_ACK_UNSENT_DATA",
+        48 => "TCP_OFO_QUEUE_PRUNE",
+        49 => "TCP_OFO_DROP",
+        50 => "IP_OUTNOROUTES",
+        51 => "BPF_CGROUP_EGRESS",
+        52 => "IPV6DISABLED",
+        53 => "NEIGH_CREATEFAIL",
+        54 => "NEIGH_FAILED",
+        55 => "NEIGH_QUEUEFULL",
+        56 => "NEIGH_DEAD",
+        57 => "TC_EGRESS",
+        58 => "SECURITY_HOOK",
+        59 => "QDISC_DROP",
+        60 => "QDISC_OVERLIMIT",
+        61 => "QDISC_CONGESTED",
+        62 => "CAKE_FLOOD",
+        63 => "FQ_BAND_LIMIT",
+        64 => "FQ_HORIZON_LIMIT",
+        65 => "FQ_FLOW_LIMIT",
+        66 => "CPU_BACKLOG",
+        67 => "XDP",
+        68 => "TC_INGRESS",
+        69 => "UNHANDLED_PROTO",
+        70 => "SKB_CSUM",
+        71 => "SKB_GSO_SEG",
+        72 => "SKB_UCOPY_FAULT",
+        73 => "DEV_HDR",
+        74 => "DEV_READY",
+        75 => "FULL_RING",
+        76 => "NOMEM",
+        77 => "HDR_TRUNC",
+        78 => "TAP_FILTER",
+        79 => "TAP_TXFILTER",
+        80 => "ICMP_CSUM",
+        81 => "INVALID_PROTO",
+        82 => "IP_INADDRERRORS",
+        83 => "IP_INNOROUTES",
+        84 => "IP_LOCAL_SOURCE",
+        85 => "IP_INVALID_SOURCE",
+        86 => "IP_LOCALNET",
+        87 => "IP_INVALID_DEST",
+        88 => "PKT_TOO_BIG",
+        89 => "DUP_FRAG",
+        90 => "FRAG_REASM_TIMEOUT",
+        91 => "FRAG_TOO_FAR",
+        92 => "TCP_MINTTL",
+        93 => "IPV6_BAD_EXTHDR",
+        94 => "IPV6_NDISC_FRAG",
+        95 => "IPV6_NDISC_HOP_LIMIT",
+        96 => "IPV6_NDISC_BAD_CODE",
+        97 => "IPV6_NDISC_BAD_OPTIONS",
+        98 => "IPV6_NDISC_NS_OTHERHOST",
+        99 => "QUEUE_PURGE",
+        100 => "TC_COOKIE_ERROR",
+        101 => "PACKET_SOCK_ERROR",
+        102 => "TC_CHAIN_NOTFOUND",
+        103 => "TC_RECLASSIFY_LOOP",
+        104 => "VXLAN_INVALID_HDR",
+        105 => "VXLAN_VNI_NOT_FOUND",
+        106 => "MAC_INVALID_SOURCE",
+        107 => "VXLAN_ENTRY_EXISTS",
+        108 => "NO_TX_TARGET",
+        109 => "IP_TUNNEL_ECN",
+        110 => "TUNNEL_TXINFO",
+        111 => "LOCAL_MAC",
+        112 => "ARP_PVLAN_DISABLE",
+        113 => "MAC_IEEE_MAC_CONTROL",
+        114 => "BRIDGE_INGRESS_STP_STATE",
+        _ => "UNKNOWN",
+    }
+}
+
 #[cfg(test)]
 impl ConnectionId {
     fn src_ip_addr(&self) -> IpAddr {
@@ -151,6 +274,14 @@ struct PacketEvent {
     // Persist timer fields (populated on packet send events)
     icsk_pending: u8, // What timer is pending: 0=none, 1=retrans, 2=delack, 3=probe/persist
     icsk_timeout: u64, // When timer fires (jiffies)
+    // Drop event fields (for PACKET_SKB_DROP, PACKET_CPU_BACKLOG_DROP, etc.)
+    drop_reason: u32,   // SKB_DROP_REASON_* code
+    drop_location: u64, // Kernel code address that dropped the packet
+    qlen: u32,          // Queue length at time of event
+    qlen_limit: u32,    // Queue limit (for backlog: netdev_max_backlog)
+    // TSQ/memory pressure fields
+    sk_wmem_alloc: u32, // TCP Small Queue: current allocated memory
+    tsq_limit: u32,     // TCP Small Queue: limit that was exceeded
 }
 
 #[derive(Clone, Copy)]
@@ -176,6 +307,10 @@ enum EventEntry {
     TcpZeroWindowAck(PacketEvent),   // Zero window ACK sent (receiver-side)
     TcpRtoTimeout(PacketEvent),
     PollReady(PollEvent),
+    // New drop/throttle events
+    SkbDrop(PacketEvent),        // SKB dropped (kfree_skb tracepoint)
+    CpuBacklogDrop(PacketEvent), // CPU backlog queue drop
+    MemPressure(PacketEvent),    // TCP memory pressure (send buffer blocked)
 }
 
 impl EventEntry {
@@ -192,7 +327,10 @@ impl EventEntry {
             | EventEntry::SharedSend(e)
             | EventEntry::TcpZeroWindowProbe(e)
             | EventEntry::TcpZeroWindowAck(e)
-            | EventEntry::TcpRtoTimeout(e) => e.ts,
+            | EventEntry::TcpRtoTimeout(e)
+            | EventEntry::SkbDrop(e)
+            | EventEntry::CpuBacklogDrop(e)
+            | EventEntry::MemPressure(e) => e.ts,
             EventEntry::PollReady(e) => e.ts,
         }
     }
@@ -281,6 +419,27 @@ impl ConnectionEvents {
     fn iter_rto_timeouts(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::TcpRtoTimeout(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    fn iter_skb_drops(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::SkbDrop(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    fn iter_cpu_backlog_drops(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::CpuBacklogDrop(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    fn iter_mem_pressure(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::MemPressure(pkt) => Some(pkt),
             _ => None,
         })
     }
@@ -482,54 +641,59 @@ impl NetworkRecorder {
             backoff: event.backoff,
             icsk_pending: event.icsk_pending,
             icsk_timeout: event.icsk_timeout,
+            // Drop event fields
+            drop_reason: event.drop_reason,
+            drop_location: event.drop_location,
+            qlen: event.qlen,
+            qlen_limit: event.qlen_limit,
+            // TSQ/memory pressure fields
+            sk_wmem_alloc: event.sk_wmem_alloc,
+            tsq_limit: event.tsq_limit,
         };
 
         // All packet events go to global packet_events
         let conn_events = self.packet_events.entry(socket_id).or_default();
 
-        // TCP packet events
-        if event.event_type.0 == packet_event_type::PACKET_ENQUEUE.0 {
-            conn_events.events.push(EventEntry::TcpEnqueue(pkt_event));
-        } else if event.event_type.0 == packet_event_type::PACKET_SEND.0 {
-            // PACKET_SEND is shared by TCP and UDP for qdisc->NIC transmission
-            conn_events.events.push(EventEntry::SharedSend(pkt_event));
-        } else if event.event_type.0 == packet_event_type::PACKET_RCV_ESTABLISHED.0 {
-            conn_events
-                .events
-                .push(EventEntry::TcpRcvEstablished(pkt_event));
-        } else if event.event_type.0 == packet_event_type::PACKET_QUEUE_RCV.0 {
-            conn_events.events.push(EventEntry::TcpQueueRcv(pkt_event));
-        } else if event.event_type.0 == packet_event_type::PACKET_BUFFER_QUEUE.0 {
-            conn_events
-                .events
-                .push(EventEntry::TcpBufferQueue(pkt_event));
-        }
-        // UDP packet events
-        else if event.event_type.0 == packet_event_type::PACKET_UDP_SEND.0 {
-            conn_events.events.push(EventEntry::UdpSend(pkt_event));
-        } else if event.event_type.0 == packet_event_type::PACKET_UDP_RCV.0 {
-            conn_events.events.push(EventEntry::UdpRcv(pkt_event));
-        } else if event.event_type.0 == packet_event_type::PACKET_UDP_ENQUEUE.0 {
-            conn_events.events.push(EventEntry::UdpEnqueue(pkt_event));
-        }
-        // Zero window probe events (sender-side)
-        else if event.event_type.0 == packet_event_type::PACKET_ZERO_WINDOW_PROBE.0 {
-            conn_events
-                .events
-                .push(EventEntry::TcpZeroWindowProbe(pkt_event));
-        }
-        // Zero window ACK events (receiver-side)
-        else if event.event_type.0 == packet_event_type::PACKET_ZERO_WINDOW_ACK.0 {
-            conn_events
-                .events
-                .push(EventEntry::TcpZeroWindowAck(pkt_event));
-        }
-        // RTO timeout events
-        else if event.event_type.0 == packet_event_type::PACKET_RTO_TIMEOUT.0 {
-            conn_events
-                .events
-                .push(EventEntry::TcpRtoTimeout(pkt_event));
-        }
+        // Dispatch based on event type using match for clearer code
+        let event_entry = match event.event_type.0 {
+            // TCP packet events
+            x if x == packet_event_type::PACKET_ENQUEUE.0 => EventEntry::TcpEnqueue(pkt_event),
+            x if x == packet_event_type::PACKET_SEND.0 => EventEntry::SharedSend(pkt_event),
+            x if x == packet_event_type::PACKET_RCV_ESTABLISHED.0 => {
+                EventEntry::TcpRcvEstablished(pkt_event)
+            }
+            x if x == packet_event_type::PACKET_QUEUE_RCV.0 => EventEntry::TcpQueueRcv(pkt_event),
+            x if x == packet_event_type::PACKET_BUFFER_QUEUE.0 => {
+                EventEntry::TcpBufferQueue(pkt_event)
+            }
+            // UDP packet events
+            x if x == packet_event_type::PACKET_UDP_SEND.0 => EventEntry::UdpSend(pkt_event),
+            x if x == packet_event_type::PACKET_UDP_RCV.0 => EventEntry::UdpRcv(pkt_event),
+            x if x == packet_event_type::PACKET_UDP_ENQUEUE.0 => EventEntry::UdpEnqueue(pkt_event),
+            // Zero window events
+            x if x == packet_event_type::PACKET_ZERO_WINDOW_PROBE.0 => {
+                EventEntry::TcpZeroWindowProbe(pkt_event)
+            }
+            x if x == packet_event_type::PACKET_ZERO_WINDOW_ACK.0 => {
+                EventEntry::TcpZeroWindowAck(pkt_event)
+            }
+            // RTO timeout events
+            x if x == packet_event_type::PACKET_RTO_TIMEOUT.0 => {
+                EventEntry::TcpRtoTimeout(pkt_event)
+            }
+            // Drop/throttle events
+            x if x == packet_event_type::PACKET_SKB_DROP.0 => EventEntry::SkbDrop(pkt_event),
+            x if x == packet_event_type::PACKET_CPU_BACKLOG_DROP.0 => {
+                EventEntry::CpuBacklogDrop(pkt_event)
+            }
+            x if x == packet_event_type::PACKET_MEM_PRESSURE.0 => {
+                EventEntry::MemPressure(pkt_event)
+            }
+            // Unknown event type - skip
+            _ => return,
+        };
+
+        conn_events.events.push(event_entry);
     }
 
     pub fn handle_epoll_event(&mut self, event: crate::systing::types::epoll_event_bpf) {
@@ -827,6 +991,57 @@ impl NetworkRecorder {
                 }
             }
 
+            // Add drop event annotations (for packet_drop, cpu_backlog_drop)
+            if pkt.drop_reason > 0 {
+                let mut reason_annotation = DebugAnnotation::default();
+                reason_annotation.set_name("drop_reason".to_string());
+                reason_annotation.set_uint_value(pkt.drop_reason as u64);
+                instant_event.debug_annotations.push(reason_annotation);
+
+                let mut reason_str_annotation = DebugAnnotation::default();
+                reason_str_annotation.set_name("drop_reason_str".to_string());
+                reason_str_annotation
+                    .set_string_value(drop_reason_str(pkt.drop_reason).to_string());
+                instant_event.debug_annotations.push(reason_str_annotation);
+
+                if pkt.drop_location != 0 {
+                    let mut location_annotation = DebugAnnotation::default();
+                    location_annotation.set_name("drop_location".to_string());
+                    location_annotation.set_uint_value(pkt.drop_location);
+                    instant_event.debug_annotations.push(location_annotation);
+                }
+            }
+
+            // Add queue state annotations (for cpu_backlog_drop)
+            if pkt.qlen > 0 || pkt.qlen_limit > 0 {
+                let mut qlen_annotation = DebugAnnotation::default();
+                qlen_annotation.set_name("qlen".to_string());
+                qlen_annotation.set_uint_value(pkt.qlen as u64);
+                instant_event.debug_annotations.push(qlen_annotation);
+
+                if pkt.qlen_limit > 0 {
+                    let mut qlen_limit_annotation = DebugAnnotation::default();
+                    qlen_limit_annotation.set_name("qlen_limit".to_string());
+                    qlen_limit_annotation.set_uint_value(pkt.qlen_limit as u64);
+                    instant_event.debug_annotations.push(qlen_limit_annotation);
+                }
+            }
+
+            // Add TSQ/memory pressure annotations
+            if pkt.sk_wmem_alloc > 0 {
+                let mut wmem_alloc_annotation = DebugAnnotation::default();
+                wmem_alloc_annotation.set_name("sk_wmem_alloc".to_string());
+                wmem_alloc_annotation.set_uint_value(pkt.sk_wmem_alloc as u64);
+                instant_event.debug_annotations.push(wmem_alloc_annotation);
+
+                if pkt.tsq_limit > 0 {
+                    let mut tsq_limit_annotation = DebugAnnotation::default();
+                    tsq_limit_annotation.set_name("tsq_limit".to_string());
+                    tsq_limit_annotation.set_uint_value(pkt.tsq_limit as u64);
+                    instant_event.debug_annotations.push(tsq_limit_annotation);
+                }
+            }
+
             let mut packet = TracePacket::default();
             packet.set_timestamp(pkt.ts);
             packet.set_track_event(instant_event);
@@ -909,6 +1124,10 @@ impl NetworkRecorder {
         self.get_or_create_event_name_iid("UDP receive".to_string(), id_counter);
         self.get_or_create_event_name_iid("UDP enqueue".to_string(), id_counter);
         self.get_or_create_event_name_iid("poll_ready".to_string(), id_counter);
+        // New drop/throttle event types
+        self.get_or_create_event_name_iid("packet_drop".to_string(), id_counter);
+        self.get_or_create_event_name_iid("cpu_backlog_drop".to_string(), id_counter);
+        self.get_or_create_event_name_iid("TCP mem_pressure".to_string(), id_counter);
 
         // Build and sort event names array
         let mut event_names = Vec::new();
@@ -1182,6 +1401,46 @@ impl NetworkRecorder {
                             &udp_enqueue_pkts,
                         );
                     }
+                }
+
+                // Drop/throttle events (apply to both TCP and UDP)
+                // SKB drop events
+                let skb_drop_pkts: Vec<_> = events.iter_skb_drops().copied().collect();
+                if !skb_drop_pkts.is_empty() {
+                    let drop_iid = *self.event_name_ids.get("packet_drop").unwrap();
+                    self.add_packet_instant_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        drop_iid,
+                        &skb_drop_pkts,
+                    );
+                }
+
+                // CPU backlog drop events
+                let backlog_drop_pkts: Vec<_> = events.iter_cpu_backlog_drops().copied().collect();
+                if !backlog_drop_pkts.is_empty() {
+                    let drop_iid = *self.event_name_ids.get("cpu_backlog_drop").unwrap();
+                    self.add_packet_instant_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        drop_iid,
+                        &backlog_drop_pkts,
+                    );
+                }
+
+                // Memory pressure events
+                let mem_pressure_pkts: Vec<_> = events.iter_mem_pressure().copied().collect();
+                if !mem_pressure_pkts.is_empty() {
+                    let pressure_iid = *self.event_name_ids.get("TCP mem_pressure").unwrap();
+                    self.add_packet_instant_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        pressure_iid,
+                        &mem_pressure_pkts,
+                    );
                 }
             }
         }
