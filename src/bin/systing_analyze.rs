@@ -18,6 +18,7 @@ use parquet::file::properties::WriterProperties;
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
 use perfetto_protos::trace_packet::TracePacket;
 use protobuf::Message;
+use regex::Regex;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
@@ -25,11 +26,20 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::thread;
 use std::time::Instant;
 
 /// Track name for network interface metadata in Perfetto traces.
 const NETWORK_INTERFACES_TRACK_NAME: &str = "Network Interfaces";
+
+/// Static regex for parsing socket track names. Compiled once at first use.
+/// Pattern: Socket {socket_id}:{protocol}:{src_ip}:{src_port}->{dest_ip}:{dest_port}
+/// Uses non-greedy matching (.+?) to correctly handle IPv6 addresses with colons.
+static SOCKET_TRACK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^Socket (\d+):([A-Z]+):(.+?):(\d+)->(.+?):(\d+)$")
+        .expect("Invalid socket track regex pattern")
+});
 
 #[derive(Parser)]
 #[command(name = "systing-analyze")]
@@ -302,6 +312,8 @@ struct ExtractedData {
     perf_samples: Vec<PerfSampleRecord>,
     // Network interface metadata
     network_interfaces: Vec<NetworkInterfaceRecord>,
+    // Socket connection metadata (extracted from socket track names)
+    socket_connections: Vec<SocketConnectionRecord>,
     // Clock snapshot data
     clock_snapshots: Vec<ClockSnapshotRecord>,
 }
@@ -445,6 +457,19 @@ struct NetworkInterfaceRecord {
     address_type: String,
 }
 
+/// Socket connection 4-tuple extracted from socket track names.
+#[derive(Clone)]
+struct SocketConnectionRecord {
+    socket_id: i64,
+    track_id: i64,
+    protocol: &'static str,
+    src_ip: String,
+    src_port: i32,
+    dest_ip: String,
+    dest_port: i32,
+    address_family: &'static str,
+}
+
 /// Clock snapshot record from a trace packet.
 /// Used for correlating timestamps between different clock domains
 /// (e.g., MONOTONIC vs BOOTTIME vs REALTIME).
@@ -458,6 +483,49 @@ struct ClockSnapshotRecord {
     timestamp_ns: i64,
     /// True if this is the primary trace clock (authoritative time domain)
     is_primary: bool,
+}
+
+/// Parse socket track name format: "Socket {id}:{protocol}:{src}:{src_port}->{dest}:{dest_port}"
+/// Returns None if the name doesn't match the expected socket track format.
+fn parse_socket_track_name(name: &str, track_id: i64) -> Option<SocketConnectionRecord> {
+    let caps = SOCKET_TRACK_RE.captures(name)?;
+
+    let socket_id: i64 = caps.get(1)?.as_str().parse().ok()?;
+
+    // Validate protocol is known (TCP or UDP)
+    let protocol: &'static str = match caps.get(2)?.as_str() {
+        "TCP" => "TCP",
+        "UDP" => "UDP",
+        _ => return None,
+    };
+
+    let src_ip = caps.get(3)?.as_str().to_string();
+    let src_port: i32 = caps.get(4)?.as_str().parse().ok()?;
+    let dest_ip = caps.get(5)?.as_str().to_string();
+    let dest_port: i32 = caps.get(6)?.as_str().parse().ok()?;
+
+    // Validate port ranges (0-65535)
+    if !(0..=65535).contains(&src_port) || !(0..=65535).contains(&dest_port) {
+        return None;
+    }
+
+    // Infer address family: IPv6 addresses contain colons
+    let address_family: &'static str = if src_ip.contains(':') || dest_ip.contains(':') {
+        "IPv6"
+    } else {
+        "IPv4"
+    };
+
+    Some(SocketConnectionRecord {
+        socket_id,
+        track_id,
+        protocol,
+        src_ip,
+        src_port,
+        dest_ip,
+        dest_port,
+        address_family,
+    })
 }
 
 struct TraceExtractor {
@@ -519,6 +587,7 @@ impl TraceExtractor {
                 callsites: Vec::new(),
                 perf_samples: Vec::new(),
                 network_interfaces: Vec::new(),
+                socket_connections: Vec::new(),
                 clock_snapshots: Vec::new(),
             },
             pid_to_upid: HashMap::new(),
@@ -836,7 +905,7 @@ impl TraceExtractor {
                     unit: counter.unit_name.clone(),
                 });
             } else if desc.has_uuid() {
-                // Generic track descriptor (includes network tracks like "Socket 1:TCP:10.0.0.1:8080")
+                // Generic track descriptor (includes network tracks like "Socket 1:TCP:10.0.0.1:12345->10.0.0.2:8080")
                 let track_id = self.next_track_id;
                 self.next_track_id += 1;
                 self.track_uuid_to_id.insert(desc.uuid(), track_id);
@@ -876,6 +945,12 @@ impl TraceExtractor {
                     } else {
                         None
                     };
+
+                    // Extract socket connection info if this is a socket track
+                    if let Some(socket_conn) = parse_socket_track_name(&name, track_id) {
+                        self.data.socket_connections.push(socket_conn);
+                    }
+
                     self.data.tracks.push(TrackRecord {
                         id: track_id,
                         name,
@@ -1542,6 +1617,19 @@ fn create_schema(conn: &Connection) -> Result<()> {
             address_type VARCHAR
         );
 
+        -- Socket connection metadata (extracted from socket track names)
+        CREATE TABLE IF NOT EXISTS socket_connection (
+            trace_id VARCHAR,
+            socket_id BIGINT,
+            track_id BIGINT,
+            protocol VARCHAR,
+            src_ip VARCHAR,
+            src_port INTEGER,
+            dest_ip VARCHAR,
+            dest_port INTEGER,
+            address_family VARCHAR
+        );
+
         CREATE TABLE IF NOT EXISTS clock_snapshot (
             trace_id VARCHAR,
             clock_id INTEGER,
@@ -1577,6 +1665,8 @@ struct ParquetPaths {
     perf_sample: PathBuf,
     // Network interface metadata
     network_interface: PathBuf,
+    // Socket connection metadata
+    socket_connection: PathBuf,
     // Clock snapshot data
     clock_snapshot: PathBuf,
 }
@@ -1604,6 +1694,8 @@ impl ParquetPaths {
             perf_sample: temp_dir.join(format!("{}_perf_sample.parquet", trace_id)),
             // Network interface metadata
             network_interface: temp_dir.join(format!("{}_network_interface.parquet", trace_id)),
+            // Socket connection metadata
+            socket_connection: temp_dir.join(format!("{}_socket_connection.parquet", trace_id)),
             // Clock snapshot data
             clock_snapshot: temp_dir.join(format!("{}_clock_snapshot.parquet", trace_id)),
         }
@@ -2771,6 +2863,63 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
         writer.close()?;
     }
 
+    // Socket connection table
+    if !data.socket_connections.is_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("socket_id", DataType::Int64, false),
+            Field::new("track_id", DataType::Int64, false),
+            Field::new("protocol", DataType::Utf8, false),
+            Field::new("src_ip", DataType::Utf8, false),
+            Field::new("src_port", DataType::Int32, false),
+            Field::new("dest_ip", DataType::Utf8, false),
+            Field::new("dest_port", DataType::Int32, false),
+            Field::new("address_family", DataType::Utf8, false),
+        ]));
+
+        let mut trace_id_builder = StringBuilder::new();
+        let mut socket_id_builder = Int64Builder::new();
+        let mut track_id_builder = Int64Builder::new();
+        let mut protocol_builder = StringBuilder::new();
+        let mut src_ip_builder = StringBuilder::new();
+        let mut src_port_builder = Int32Builder::new();
+        let mut dest_ip_builder = StringBuilder::new();
+        let mut dest_port_builder = Int32Builder::new();
+        let mut address_family_builder = StringBuilder::new();
+
+        for conn in &data.socket_connections {
+            trace_id_builder.append_value(trace_id);
+            socket_id_builder.append_value(conn.socket_id);
+            track_id_builder.append_value(conn.track_id);
+            protocol_builder.append_value(conn.protocol);
+            src_ip_builder.append_value(&conn.src_ip);
+            src_port_builder.append_value(conn.src_port);
+            dest_ip_builder.append_value(&conn.dest_ip);
+            dest_port_builder.append_value(conn.dest_port);
+            address_family_builder.append_value(conn.address_family);
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(trace_id_builder.finish()),
+                Arc::new(socket_id_builder.finish()),
+                Arc::new(track_id_builder.finish()),
+                Arc::new(protocol_builder.finish()),
+                Arc::new(src_ip_builder.finish()),
+                Arc::new(src_port_builder.finish()),
+                Arc::new(dest_ip_builder.finish()),
+                Arc::new(dest_port_builder.finish()),
+                Arc::new(address_family_builder.finish()),
+            ],
+        )?;
+
+        let file = File::create(&paths.socket_connection)?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props.clone()))?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
     // Clock snapshot table
     if !data.clock_snapshots.is_empty() {
         let schema = Arc::new(Schema::new(vec![
@@ -3040,6 +3189,8 @@ fn run_convert(
     import_table("perf_sample", |p| &p.perf_sample)?;
     // Network interface metadata
     import_table("network_interface", |p| &p.network_interface)?;
+    // Socket connection metadata
+    import_table("socket_connection", |p| &p.socket_connection)?;
     // Clock snapshot data
     import_table("clock_snapshot", |p| &p.clock_snapshot)?;
 
