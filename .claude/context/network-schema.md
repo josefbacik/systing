@@ -4,7 +4,7 @@ This document describes how network events are stored in DuckDB after conversion
 
 ## Overview
 
-Network events are tracked through seven related tables:
+Network events are tracked through eight related tables:
 - **`track`** - Track metadata (per-thread "Network" track for syscalls, per-socket for packets)
 - **`slice`** - Network syscall events (tcp_send, tcp_recv, udp_send) - range-based with duration
 - **`args`** - Debug annotations for slice events (socket_id, socket, bytes, buffer info)
@@ -12,6 +12,7 @@ Network events are tracked through seven related tables:
 - **`instant_args`** - Debug annotations for instant events (seq numbers, length, flags)
 - **`network_interface`** - Local network interface metadata (for cross-trace correlation)
 - **`clock_snapshot`** - Clock correlation data for timestamp conversion between clock domains
+- **`socket_connection`** - Structured socket connection data (protocol, src/dest IP:port, address family)
 
 **Note:** Syscall events (tcp_send, tcp_recv, etc.) are range-based slices with duration because they represent the time a thread spends in a syscall. Packet events are instant events because they represent discrete points in the kernel packet processing pipeline.
 
@@ -31,9 +32,9 @@ Maps track IDs to descriptive names and maintains parent-child hierarchy.
 
 **Track Name Format:**
 - Per-thread syscall track: `Network` - single track per thread for all network syscall events
-- Per-socket packet tracks: `Socket {socket_id}:{protocol}:{hostname/IP}:{port}`
-  - Example: `Socket 42:TCP:10.128.0.5:8080`
-  - Example: `Socket 15:UDP:api.example.com:53`
+- Per-socket packet tracks: `Socket {socket_id}:{protocol}:{src_host}:{src_port}->{dest_host}:{dest_port}`
+  - Example: `Socket 42:TCP:10.128.0.5:12345->192.168.1.100:8080`
+  - Example: `Socket 15:UDP:api.example.com:54321->dns.example.com:53`
 - Root packet track: `Network Packets`
 
 ### `slice`
@@ -93,7 +94,7 @@ Debug annotations for syscall slice events. Multiple args can exist per slice.
 | Key | Type | Events | Description |
 |-----|------|--------|-------------|
 | `socket_id` | int | All syscall events | Unique socket identifier (for grouping events by socket) |
-| `socket` | string | All syscall events | Socket info string: "Socket {id}:{protocol}:{host}:{port}" |
+| `socket` | string | All syscall events | Socket info string: "Socket {id}:{protocol}:{src_host}:{src_port}->{dest_host}:{dest_port}" |
 | `bytes` | int | tcp_send, tcp_recv, udp_send | Bytes transferred |
 | `sndbuf_used` | int | tcp_send | Current send buffer usage (sk_wmem_queued) |
 | `sndbuf_limit` | int | tcp_send | Max send buffer size (sk_sndbuf) |
@@ -139,7 +140,7 @@ Debug annotations for packet instant events. Multiple args can exist per instant
 | `icsk_pending` | int | TCP packet_enqueue | Timer pending: 0=none, 1=retrans, 2=delack, 3=probe/persist |
 | `icsk_timeout` | int | TCP packet_enqueue | When timer fires (jiffies, lower 32 bits) |
 | `socket_id` | int | poll_ready | Unique socket identifier (for correlation with other events) |
-| `socket` | string | poll_ready | Socket info string: "Socket {id}:{protocol}:{host}:{port}" |
+| `socket` | string | poll_ready | Socket info string: "Socket {id}:{protocol}:{src_host}:{src_port}->{dest_host}:{dest_port}" |
 | `requested` | string | poll_ready | Poll events requested (e.g., "IN\|OUT") |
 | `returned` | string | poll_ready | Poll events returned (e.g., "IN") |
 
@@ -253,11 +254,37 @@ WHERE prev_ts IS NOT NULL
 ORDER BY gap_sec DESC;
 ```
 
+### `socket_connection`
+Structured socket connection data extracted from track names for efficient querying. This table provides direct access to the 4-tuple (src_ip, src_port, dest_ip, dest_port) without needing to parse track names.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| trace_id | VARCHAR | Trace identifier |
+| socket_id | BIGINT | Unique socket identifier (from track name) |
+| track_id | BIGINT | FK to `track.id` |
+| protocol | VARCHAR | Protocol: "TCP" or "UDP" |
+| src_ip | VARCHAR | Source IP address or hostname |
+| src_port | INTEGER | Source port number |
+| dest_ip | VARCHAR | Destination IP address or hostname |
+| dest_port | INTEGER | Destination port number |
+| address_family | VARCHAR | "IPv4" or "IPv6" (inferred from IP format) |
+
+**Example Data:**
+```
+trace_id | socket_id | track_id | protocol | src_ip     | src_port | dest_ip       | dest_port | address_family
+---------+-----------+----------+----------+------------+----------+---------------+-----------+---------------
+trace_a  | 42        | 100      | TCP      | 10.128.0.5 | 12345    | 192.168.1.100 | 8080      | IPv4
+trace_a  | 15        | 101      | UDP      | 10.128.0.5 | 54321    | 8.8.8.8       | 53        | IPv4
+trace_b  | 1         | 200      | TCP      | ::1        | 40000    | ::1           | 6379      | IPv6
+```
+
+**Note:** This table is populated by parsing socket track names during trace conversion. Each row corresponds to a socket track under "Network Packets". Use this table for efficient filtering and joins instead of parsing track names with regex.
+
 ## Data Model
 
 ```
 track (Root: "Network Packets")
-└── track (Socket 1:TCP:10.0.0.1:8080, parent_id = root)
+└── track (Socket 1:TCP:10.0.0.1:12345->10.0.0.2:8080, parent_id = root)
     ├── instant (TCP packet_enqueue, track_id = socket)
     │   └── instant_args (length=1460, seq=12345, flags="ACK")
     ├── instant (TCP packet_send, track_id = socket)
@@ -267,14 +294,17 @@ track (Root: "Network Packets")
     └── instant (TCP buffer_queue, track_id = socket)
         └── instant_args (length=4096, sndbuf_used=8192, sndbuf_limit=65536)
 
+socket_connection (extracted from track names)
+└── (trace_id, socket_id=1, track_id, protocol="TCP", src_ip="10.0.0.1", src_port=12345, dest_ip="10.0.0.2", dest_port=8080, address_family="IPv4")
+
 track (Thread, parent of "Network" track)
 └── track (Network, parent_id = thread)
     ├── slice (tcp_send, track_id = network, dur=12345)
-    │   └── args (socket_id=1, socket="Socket 1:TCP:10.0.0.1:8080", bytes=4096, ...)
+    │   └── args (socket_id=1, socket="Socket 1:TCP:10.0.0.1:12345->10.0.0.2:8080", bytes=4096, ...)
     ├── slice (tcp_recv, track_id = network, dur=5678)
-    │   └── args (socket_id=1, socket="Socket 1:TCP:10.0.0.1:8080", bytes=2048, ...)
+    │   └── args (socket_id=1, socket="Socket 1:TCP:10.0.0.1:12345->10.0.0.2:8080", bytes=2048, ...)
     └── slice (tcp_send, track_id = network, dur=3000)
-        └── args (socket_id=2, socket="Socket 2:TCP:10.0.0.2:443", bytes=1024, ...)
+        └── args (socket_id=2, socket="Socket 2:TCP:10.0.0.1:23456->10.0.0.3:443", bytes=1024, ...)
 ```
 
 ## Common Queries
@@ -378,7 +408,7 @@ SELECT i.ts, i.name as event,
 FROM instant i
 JOIN track t ON i.track_id = t.id AND i.trace_id = t.trace_id
 LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
-WHERE t.name = 'Socket 1:TCP:10.0.0.1:8080'
+WHERE t.name = 'Socket 1:TCP:10.0.0.1:12345->10.0.0.2:8080'
 GROUP BY i.id, i.ts, i.name
 ORDER BY i.ts
 LIMIT 100;
@@ -741,6 +771,86 @@ JOIN recv_events r ON p.socket_id = r.socket_id
 ORDER BY p.ts;
 ```
 
+### 27. Find Connections by Destination Port (Using socket_connection)
+Find all TCP connections to a specific port:
+```sql
+SELECT trace_id, socket_id, src_ip, src_port, dest_ip, dest_port
+FROM socket_connection
+WHERE protocol = 'TCP' AND dest_port = 8080
+ORDER BY trace_id, socket_id;
+```
+
+### 28. Find Connections from a Specific Source IP
+```sql
+SELECT protocol, src_port, dest_ip, dest_port
+FROM socket_connection
+WHERE src_ip = '10.0.0.1'
+ORDER BY protocol, dest_port;
+```
+
+### 29. Correlate Sender and Receiver Traces (4-tuple Match)
+Find matching connections between two traces (one sending, one receiving):
+```sql
+SELECT
+    s.trace_id as sender_trace,
+    r.trace_id as receiver_trace,
+    s.protocol,
+    s.src_ip || ':' || s.src_port as sender_endpoint,
+    s.dest_ip || ':' || s.dest_port as receiver_endpoint
+FROM socket_connection s
+JOIN socket_connection r
+    ON s.src_ip = r.dest_ip
+    AND s.src_port = r.dest_port
+    AND s.dest_ip = r.src_ip
+    AND s.dest_port = r.src_port
+    AND s.protocol = r.protocol
+WHERE s.trace_id != r.trace_id;
+```
+
+### 30. Join socket_connection with Packet Events
+Get timing info for packets on a specific connection:
+```sql
+SELECT
+    sc.protocol, sc.src_ip, sc.src_port, sc.dest_ip, sc.dest_port,
+    i.name as event_name,
+    i.ts / 1e9 as time_sec,
+    MAX(CASE WHEN a.key = 'length' THEN a.int_value END) as length,
+    MAX(CASE WHEN a.key = 'seq' THEN a.int_value END) as seq
+FROM socket_connection sc
+JOIN instant i ON i.track_id = sc.track_id AND i.trace_id = sc.trace_id
+LEFT JOIN instant_args a ON i.id = a.instant_id AND i.trace_id = a.trace_id
+WHERE sc.protocol = 'TCP' AND sc.dest_port = 8080
+GROUP BY sc.protocol, sc.src_ip, sc.src_port, sc.dest_ip, sc.dest_port, i.id, i.name, i.ts
+ORDER BY i.ts
+LIMIT 50;
+```
+
+### 31. Connection Summary by Address Family
+```sql
+SELECT address_family, protocol, COUNT(*) as connection_count
+FROM socket_connection
+GROUP BY address_family, protocol
+ORDER BY connection_count DESC;
+```
+
+### 32. Find All Connections to External IPs (Non-Private)
+```sql
+SELECT *
+FROM socket_connection
+WHERE dest_ip NOT LIKE '10.%'
+  AND dest_ip NOT LIKE '172.16.%'
+  AND dest_ip NOT LIKE '172.17.%'
+  AND dest_ip NOT LIKE '172.18.%'
+  AND dest_ip NOT LIKE '172.19.%'
+  AND dest_ip NOT LIKE '172.2_.%'
+  AND dest_ip NOT LIKE '172.30.%'
+  AND dest_ip NOT LIKE '172.31.%'
+  AND dest_ip NOT LIKE '192.168.%'
+  AND dest_ip NOT LIKE '127.%'
+  AND dest_ip NOT LIKE '::%'
+  AND dest_ip != '::1';
+```
+
 ## Track Hierarchy
 
 Network tracks are organized hierarchically:
@@ -763,7 +873,7 @@ Network Interfaces (root)
 **Packet Events (global, not per-thread, stored in `instant` table):**
 ```
 Network Packets (root)
-└── Socket {id}:{protocol}:{addr}:{port}
+└── Socket {id}:{protocol}:{src}:{src_port}->{dest}:{dest_port}
     ├── TCP packet_enqueue (instant)
     ├── TCP packet_send (instant)
     ├── TCP packet_rcv_established (instant)
@@ -789,7 +899,7 @@ Thread (from PID/TGID track descriptor)
 
 **Note:** All syscall events from a thread are on a single "Network" track. Socket information is stored in the `args` table (for slices) or `instant_args` table (for poll_ready):
 - `socket_id`: numeric socket identifier (for grouping/filtering)
-- `socket`: human-readable string like "Socket 1:TCP:10.0.0.1:8080"
+- `socket`: human-readable string like "Socket 1:TCP:10.0.0.1:12345->10.0.0.2:8080"
 
 ## Notes
 
@@ -873,11 +983,25 @@ WHERE ni.address_type = 'ipv4'
 ### Build a Connection Map Between Nodes (Including Containers)
 ```sql
 -- For each trace, find which other traces/containers it communicated with
+-- Using the socket_connection table for easier querying
+SELECT DISTINCT
+    sc.trace_id as from_trace,
+    ni.trace_id as to_trace,
+    ni.namespace as to_namespace,
+    sc.dest_ip
+FROM socket_connection sc
+JOIN network_interface ni ON sc.dest_ip = ni.ip_address
+WHERE ni.address_type = 'ipv4'
+  AND sc.trace_id != ni.trace_id;
+```
+
+**Alternative using REGEXP_EXTRACT on track names (for backward compatibility):**
+```sql
 WITH socket_destinations AS (
     SELECT DISTINCT
         trace_id,
-        -- Extract IP from socket name like "Socket 1:TCP:10.0.0.5:8080"
-        REGEXP_EXTRACT(name, 'Socket \d+:\w+:([^:]+):\d+', 1) as dest_ip
+        -- Extract dest_ip from socket name like "Socket 1:TCP:10.0.0.5:12345->10.0.0.6:8080"
+        REGEXP_EXTRACT(name, 'Socket \d+:\w+:[^:]+:\d+->([^:]+):\d+', 1) as dest_ip
     FROM track
     WHERE name LIKE 'Socket%'
 )
