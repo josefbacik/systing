@@ -2753,25 +2753,9 @@ static __always_inline int emit_tcp_packet_event(struct sock *sk, struct sk_buff
 	event->event_type = event_type;
 	event->cpu = bpf_get_smp_processor_id();
 
-	// Extract destination address and port from the socket
-	u16 family;
-	bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
-
-	if (family == AF_INET) {
-		event->af = NETWORK_AF_INET;
-		u32 addr;
-		bpf_probe_read_kernel(&addr, sizeof(addr), &sk->__sk_common.skc_daddr);
-		__builtin_memcpy(event->dest_addr, &addr, 4);
-		bpf_probe_read_kernel(&event->dest_port, sizeof(event->dest_port),
-				      &sk->__sk_common.skc_dport);
-		event->dest_port = __builtin_bswap16(event->dest_port);
-	} else if (family == AF_INET6) {
-		event->af = NETWORK_AF_INET6;
-		bpf_probe_read_kernel(event->dest_addr, 16, &sk->__sk_common.skc_v6_daddr);
-		bpf_probe_read_kernel(&event->dest_port, sizeof(event->dest_port),
-				      &sk->__sk_common.skc_dport);
-		event->dest_port = __builtin_bswap16(event->dest_port);
-	}
+	// Extract full 4-tuple from socket (src and dest addresses/ports)
+	read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+			  event->dest_addr, &event->dest_port);
 
 	// Read seq from TCP header in skb
 	u32 seq = 0;
