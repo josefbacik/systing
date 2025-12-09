@@ -76,7 +76,8 @@ Packet-level events (point-in-time). These represent discrete points in the kern
 - TCP: `TCP packet_enqueue`, `TCP packet_send`, `TCP packet_rcv_established`, `TCP packet_queue_rcv`, `TCP buffer_queue`, `TCP zero_window_probe`, `TCP zero_window_ack`, `TCP rto_timeout`
 - UDP: `UDP send`, `UDP receive`, `UDP enqueue`
 - Poll: `poll_ready` - Socket became ready during poll/epoll/select
-- Drop/Throttle: `packet_drop`, `cpu_backlog_drop`, `TCP tsq_throttle`, `TCP mem_pressure`, `qdisc_enqueue`, `qdisc_drop`
+- Drop/Throttle: `packet_drop`, `cpu_backlog_drop`, `TCP tsq_throttle`, `TCP mem_pressure`
+- Qdisc: `qdisc_enqueue`, `qdisc_dequeue`, `TX queue_stop`, `TX queue_wake`
 
 ### `args`
 Debug annotations for syscall slice events. Multiple args can exist per slice.
@@ -151,6 +152,10 @@ Debug annotations for packet instant events. Multiple args can exist per instant
 | `qlen_limit` | int | cpu_backlog_drop, qdisc_enqueue, qdisc_drop | Queue limit (for backlog: netdev_max_backlog, default 1000) |
 | `sk_wmem_alloc` | int | TCP tsq_throttle, TCP mem_pressure | Current sk_wmem_alloc (TSQ allocated memory) |
 | `tsq_limit` | int | TCP tsq_throttle | TCP Small Queue limit that was exceeded |
+| `txq_state` | int | qdisc_enqueue, qdisc_dequeue | TX queue state flags (XOFF, FROZEN bits) |
+| `qdisc_state` | int | qdisc_enqueue, qdisc_dequeue | Qdisc state flags (MISSED, DRAINING bits) |
+| `qdisc_backlog` | int | qdisc_enqueue, qdisc_dequeue | Bytes queued in qdisc |
+| `skb_addr` | int | qdisc_enqueue, qdisc_dequeue | SKB address for packet correlation |
 
 **Poll Event Flags:**
 The `requested` and `returned` fields use pipe-separated poll event names:
@@ -183,6 +188,28 @@ The `requested` and `returned` fields use pipe-separated poll event names:
 **Note on TSQ Throttle Events:** TSQ (TCP Small Queue) events fire when `tcp_tsq_write` is called with significant data queued. The `sk_wmem_alloc` field shows current allocated memory in the qdisc, and `tsq_limit` shows the estimated limit. High values indicate the TCP layer is throttling transmission to prevent qdisc overflow.
 
 **Note on Memory Pressure Events:** These events fire when `sk_stream_wait_memory` is called, indicating the application's write is blocked waiting for send buffer space. The `sndbuf_used` and `sndbuf_limit` fields show current buffer state. Frequent memory pressure events indicate the receiver cannot keep up with the sender.
+
+**Note on Qdisc Events:** Qdisc (queue discipline) events track packets as they flow through the kernel's traffic control layer:
+- `qdisc_enqueue` - Packet entered the qdisc queue. The `qlen` field shows queue depth, `txq_state` shows TX queue state (XOFF/FROZEN bits), and `qdisc_state` shows qdisc state (MISSED/DRAINING bits).
+- `qdisc_dequeue` - Packet left the qdisc queue. The `rto_jiffies` field contains the qdisc residence time in microseconds (time between enqueue and dequeue).
+- `TX queue_stop` - Driver stopped the TX queue (NIC ring buffer full). The `qlen` field contains the queue index.
+- `TX queue_wake` - Driver resumed the TX queue. The `qlen` field contains the queue index.
+
+The TX queue state flags (`txq_state`) are:
+- Bit 0 (`__QUEUE_STATE_DRV_XOFF`) - Driver stopped queue (NIC ring full)
+- Bit 1 (`__QUEUE_STATE_STACK_XOFF`) - Stack stopped queue (BQL limit)
+- Bit 2 (`__QUEUE_STATE_FROZEN`) - Queue is frozen
+
+The qdisc state flags (`qdisc_state`) are:
+- Bit 0 (`__QDISC_STATE_SCHED`) - Qdisc is scheduled for execution
+- Bit 1 (`__QDISC_STATE_DEACTIVATED`) - Qdisc is deactivated
+- Bit 2 (`__QDISC_STATE_MISSED`) - Dequeue was missed (queue not empty but couldn't drain)
+- Bit 3 (`__QDISC_STATE_DRAINING`) - Queue is draining
+
+When `qdisc_enqueue` is seen but no `qdisc_dequeue` follows, the packet is stuck in the qdisc. Common causes:
+1. TX queue stopped (`txq_state` has XOFF bits set)
+2. High qdisc backlog (`qdisc_backlog` approaching queue limit)
+3. Qdisc in MISSED state (queue couldn't drain due to stopped TX queue)
 
 ### `network_interface`
 Local network interface metadata captured at trace start, organized by network namespace. This captures interfaces from:

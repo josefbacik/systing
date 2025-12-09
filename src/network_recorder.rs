@@ -282,6 +282,12 @@ struct PacketEvent {
     // TSQ/memory pressure fields
     sk_wmem_alloc: u32, // TCP Small Queue: current allocated memory
     tsq_limit: u32,     // TCP Small Queue: limit that was exceeded
+    // Qdisc tracing fields (for PACKET_QDISC_* events)
+    txq_state: u32,        // TX queue state: XOFF (driver stopped), FROZEN, etc.
+    qdisc_state: u32,      // Qdisc state: MISSED, DRAINING, etc.
+    qdisc_backlog: u32,    // Bytes queued in qdisc
+    skb_addr: u64,         // SKB address for packet correlation
+    qdisc_latency_us: u32, // Qdisc residence time in microseconds (dequeue only)
 }
 
 #[derive(Clone, Copy)]
@@ -311,6 +317,9 @@ enum EventEntry {
     SkbDrop(PacketEvent),        // SKB dropped (kfree_skb tracepoint)
     CpuBacklogDrop(PacketEvent), // CPU backlog queue drop
     MemPressure(PacketEvent),    // TCP memory pressure (send buffer blocked)
+    // Qdisc tracing events
+    QdiscEnqueue(PacketEvent), // Packet entered qdisc queue
+    QdiscDequeue(PacketEvent), // Packet left qdisc queue
 }
 
 impl EventEntry {
@@ -330,7 +339,9 @@ impl EventEntry {
             | EventEntry::TcpRtoTimeout(e)
             | EventEntry::SkbDrop(e)
             | EventEntry::CpuBacklogDrop(e)
-            | EventEntry::MemPressure(e) => e.ts,
+            | EventEntry::MemPressure(e)
+            | EventEntry::QdiscEnqueue(e)
+            | EventEntry::QdiscDequeue(e) => e.ts,
             EventEntry::PollReady(e) => e.ts,
         }
     }
@@ -440,6 +451,20 @@ impl ConnectionEvents {
     fn iter_mem_pressure(&self) -> impl Iterator<Item = &PacketEvent> {
         self.events.iter().filter_map(|e| match e {
             EventEntry::MemPressure(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    fn iter_qdisc_enqueue(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::QdiscEnqueue(pkt) => Some(pkt),
+            _ => None,
+        })
+    }
+
+    fn iter_qdisc_dequeue(&self) -> impl Iterator<Item = &PacketEvent> {
+        self.events.iter().filter_map(|e| match e {
+            EventEntry::QdiscDequeue(pkt) => Some(pkt),
             _ => None,
         })
     }
@@ -649,6 +674,12 @@ impl NetworkRecorder {
             // TSQ/memory pressure fields
             sk_wmem_alloc: event.sk_wmem_alloc,
             tsq_limit: event.tsq_limit,
+            // Qdisc tracing fields
+            txq_state: event.txq_state,
+            qdisc_state: event.qdisc_state,
+            qdisc_backlog: event.qdisc_backlog,
+            skb_addr: event.skb_addr,
+            qdisc_latency_us: event.qdisc_latency_us,
         };
 
         // All packet events go to global packet_events
@@ -688,6 +719,13 @@ impl NetworkRecorder {
             }
             x if x == packet_event_type::PACKET_MEM_PRESSURE.0 => {
                 EventEntry::MemPressure(pkt_event)
+            }
+            // Qdisc tracing events
+            x if x == packet_event_type::PACKET_QDISC_ENQUEUE.0 => {
+                EventEntry::QdiscEnqueue(pkt_event)
+            }
+            x if x == packet_event_type::PACKET_QDISC_DEQUEUE.0 => {
+                EventEntry::QdiscDequeue(pkt_event)
             }
             // Unknown event type - skip
             _ => return,
@@ -1042,6 +1080,45 @@ impl NetworkRecorder {
                 }
             }
 
+            // Add qdisc-specific annotations
+            if pkt.txq_state > 0 {
+                let mut txq_state_annotation = DebugAnnotation::default();
+                txq_state_annotation.set_name("txq_state".to_string());
+                txq_state_annotation.set_uint_value(pkt.txq_state as u64);
+                instant_event.debug_annotations.push(txq_state_annotation);
+            }
+
+            if pkt.qdisc_state > 0 {
+                let mut qdisc_state_annotation = DebugAnnotation::default();
+                qdisc_state_annotation.set_name("qdisc_state".to_string());
+                qdisc_state_annotation.set_uint_value(pkt.qdisc_state as u64);
+                instant_event.debug_annotations.push(qdisc_state_annotation);
+            }
+
+            if pkt.qdisc_backlog > 0 {
+                let mut qdisc_backlog_annotation = DebugAnnotation::default();
+                qdisc_backlog_annotation.set_name("qdisc_backlog".to_string());
+                qdisc_backlog_annotation.set_uint_value(pkt.qdisc_backlog as u64);
+                instant_event
+                    .debug_annotations
+                    .push(qdisc_backlog_annotation);
+            }
+
+            if pkt.skb_addr > 0 {
+                let mut skb_addr_annotation = DebugAnnotation::default();
+                skb_addr_annotation.set_name("skb_addr".to_string());
+                skb_addr_annotation.set_uint_value(pkt.skb_addr);
+                instant_event.debug_annotations.push(skb_addr_annotation);
+            }
+
+            // Qdisc latency annotation (for qdisc_dequeue events)
+            if pkt.qdisc_latency_us > 0 {
+                let mut latency_annotation = DebugAnnotation::default();
+                latency_annotation.set_name("qdisc_latency_us".to_string());
+                latency_annotation.set_uint_value(pkt.qdisc_latency_us as u64);
+                instant_event.debug_annotations.push(latency_annotation);
+            }
+
             let mut packet = TracePacket::default();
             packet.set_timestamp(pkt.ts);
             packet.set_track_event(instant_event);
@@ -1128,6 +1205,9 @@ impl NetworkRecorder {
         self.get_or_create_event_name_iid("packet_drop".to_string(), id_counter);
         self.get_or_create_event_name_iid("cpu_backlog_drop".to_string(), id_counter);
         self.get_or_create_event_name_iid("TCP mem_pressure".to_string(), id_counter);
+        // Qdisc tracing event types
+        self.get_or_create_event_name_iid("qdisc_enqueue".to_string(), id_counter);
+        self.get_or_create_event_name_iid("qdisc_dequeue".to_string(), id_counter);
 
         // Build and sort event names array
         let mut event_names = Vec::new();
@@ -1440,6 +1520,32 @@ impl NetworkRecorder {
                         socket_track_uuid,
                         pressure_iid,
                         &mem_pressure_pkts,
+                    );
+                }
+
+                // Qdisc enqueue events
+                let qdisc_enqueue_pkts: Vec<_> = events.iter_qdisc_enqueue().copied().collect();
+                if !qdisc_enqueue_pkts.is_empty() {
+                    let enqueue_iid = *self.event_name_ids.get("qdisc_enqueue").unwrap();
+                    self.add_packet_instant_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        enqueue_iid,
+                        &qdisc_enqueue_pkts,
+                    );
+                }
+
+                // Qdisc dequeue events
+                let qdisc_dequeue_pkts: Vec<_> = events.iter_qdisc_dequeue().copied().collect();
+                if !qdisc_dequeue_pkts.is_empty() {
+                    let dequeue_iid = *self.event_name_ids.get("qdisc_dequeue").unwrap();
+                    self.add_packet_instant_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        dequeue_iid,
+                        &qdisc_dequeue_pkts,
                     );
                 }
             }

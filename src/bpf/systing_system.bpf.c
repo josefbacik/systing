@@ -206,6 +206,11 @@ enum packet_event_type {
 	PACKET_SKB_DROP,          // SKB dropped (kfree_skb tracepoint)
 	PACKET_CPU_BACKLOG_DROP,  // CPU backlog queue drop (enqueue_to_backlog)
 	PACKET_MEM_PRESSURE,      // TCP memory pressure (send buffer blocked)
+	// Qdisc tracing events (Phase 3)
+	PACKET_QDISC_ENQUEUE,     // Packet entered qdisc queue
+	PACKET_QDISC_DEQUEUE,     // Packet left qdisc queue
+	PACKET_TX_QUEUE_STOP,     // TX queue stopped by driver (NIC ring full)
+	PACKET_TX_QUEUE_WAKE,     // TX queue resumed by driver
 };
 
 struct packet_event {
@@ -254,6 +259,12 @@ struct packet_event {
 	// TSQ/memory pressure fields
 	u32 sk_wmem_alloc;        // TCP Small Queue: current allocated memory
 	u32 tsq_limit;            // TCP Small Queue: limit that was exceeded
+	// Qdisc tracing fields (for PACKET_QDISC_* events)
+	u32 txq_state;            // TX queue state: XOFF (driver stopped), FROZEN, etc.
+	u32 qdisc_state;          // Qdisc state: MISSED, DRAINING, etc.
+	u32 qdisc_backlog;        // Bytes queued in qdisc
+	u64 skb_addr;             // SKB address for packet correlation
+	u32 qdisc_latency_us;     // Qdisc residence time in microseconds (dequeue only)
 };
 
 struct epoll_event_bpf {
@@ -3809,8 +3820,198 @@ int BPF_KPROBE(sk_stream_wait_memory_entry, struct sock *sk, long *timeo)
 // Note: tcp_tsq_write probe removed - function is often inlined/split by compiler
 // (appears as tcp_tsq_write.part.0). Memory pressure is captured by sk_stream_wait_memory.
 
-// Note: Qdisc probes (__dev_xmit_skb) removed - function is not attachable via kprobe
-// on many kernels. Qdisc drops are still captured by the kfree_skb tracepoint with
-// SKB_DROP_REASON_QDISC_DROP (59).
+// ========== Qdisc Tracing (Phase 3) ==========
+// Track packets in qdisc queue to detect where packets get stuck
+
+// Helper to populate packet event from socket and skb (reduces code duplication)
+static __always_inline void populate_qdisc_event_from_skb(
+	struct packet_event *event,
+	struct sock *sk,
+	struct sk_buff *skb)
+{
+	// Read protocol from socket
+	u8 sk_protocol = 0;
+	bpf_probe_read_kernel(&sk_protocol, sizeof(sk_protocol), &sk->sk_protocol);
+	event->protocol = (sk_protocol == 6) ? NETWORK_TCP : NETWORK_UDP;
+
+	// Read socket addresses
+	read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
+			  event->dest_addr, &event->dest_port);
+
+	// Read send buffer state
+	int wmem_queued = 0;
+	int sndbuf = 0;
+	bpf_probe_read_kernel(&wmem_queued, sizeof(wmem_queued), &sk->sk_wmem_queued);
+	bpf_probe_read_kernel(&sndbuf, sizeof(sndbuf), &sk->sk_sndbuf);
+	event->sndbuf_used = (u32)wmem_queued;
+	event->sndbuf_limit = (u32)sndbuf;
+
+	// Read packet length from skb
+	u32 skb_len = 0;
+	bpf_probe_read_kernel(&skb_len, sizeof(skb_len), &skb->len);
+	event->length = skb_len;
+}
+
+// Map to track packets in qdisc for latency calculation
+struct qdisc_packet_entry {
+	u64 socket_id;
+	u64 enqueue_ts;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);  // skb address
+	__type(value, struct qdisc_packet_entry);
+	__uint(max_entries, 65536);
+} pending_qdisc_packets SEC(".maps");
+
+// Trace qdisc_enqueue tracepoint - packet entering qdisc queue
+SEC("tracepoint/qdisc/qdisc_enqueue")
+int tracepoint__qdisc__qdisc_enqueue(struct trace_event_raw_qdisc_enqueue *ctx)
+{
+	struct sk_buff *skb = (struct sk_buff *)ctx->skbaddr;
+	if (!skb)
+		return 0;
+
+	// Get socket from skb
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (!sk)
+		return 0;
+
+	// Check if we're tracking this socket
+	u64 sk_ptr = (u64)sk;
+	u64 *socket_id_ptr = bpf_map_lookup_elem(&sk_socket_id_map, &sk_ptr);
+	if (!socket_id_ptr)
+		return 0;
+
+	u64 socket_id = *socket_id_ptr;
+
+	// Read qdisc state
+	struct Qdisc *qdisc = (struct Qdisc *)ctx->qdisc;
+	u32 qlen = 0;
+	u32 backlog = 0;
+	unsigned long qdisc_state = 0;
+
+	if (qdisc) {
+		// Read qdisc queue length from q.qlen
+		bpf_probe_read_kernel(&qlen, sizeof(qlen), &qdisc->q.qlen);
+		// Read qdisc state
+		bpf_probe_read_kernel(&qdisc_state, sizeof(qdisc_state), &qdisc->state);
+		// Read backlog from qstats
+		bpf_probe_read_kernel(&backlog, sizeof(backlog), &qdisc->qstats.backlog);
+	}
+
+	// Read TX queue state
+	const struct netdev_queue *txq = (const struct netdev_queue *)ctx->txq;
+	unsigned long txq_state = 0;
+	if (txq) {
+		bpf_probe_read_kernel(&txq_state, sizeof(txq_state), &txq->state);
+	}
+
+	// Store entry for latency tracking
+	u64 skb_addr = (u64)skb;
+	struct qdisc_packet_entry entry = {
+		.socket_id = socket_id,
+		.enqueue_ts = bpf_ktime_get_boot_ns(),
+	};
+	bpf_map_update_elem(&pending_qdisc_packets, &skb_addr, &entry, BPF_ANY);
+
+	// Emit qdisc enqueue event
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = entry.enqueue_ts;
+	event->event_type = PACKET_QDISC_ENQUEUE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->socket_id = socket_id;
+	event->qlen = qlen;
+	event->qdisc_backlog = backlog;
+	event->qdisc_state = (u32)qdisc_state;
+	event->txq_state = (u32)txq_state;
+	event->skb_addr = skb_addr;
+
+	// Populate socket and skb info using helper
+	populate_qdisc_event_from_skb(event, sk, skb);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Trace qdisc_dequeue tracepoint - packet leaving qdisc queue
+SEC("tracepoint/qdisc/qdisc_dequeue")
+int tracepoint__qdisc__qdisc_dequeue(struct trace_event_raw_qdisc_dequeue *ctx)
+{
+	// skb can be NULL if dequeue was attempted but queue was empty
+	struct sk_buff *skb = (struct sk_buff *)ctx->skbaddr;
+	if (!skb)
+		return 0;
+
+	u64 skb_addr = (u64)skb;
+
+	// Look up the enqueue entry
+	struct qdisc_packet_entry *entry = bpf_map_lookup_elem(&pending_qdisc_packets, &skb_addr);
+	if (!entry)
+		return 0;
+
+	u64 socket_id = entry->socket_id;
+	u64 enqueue_ts = entry->enqueue_ts;
+
+	// Remove from tracking map
+	bpf_map_delete_elem(&pending_qdisc_packets, &skb_addr);
+
+	// Get socket from skb
+	struct sock *sk = NULL;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
+	if (!sk)
+		return 0;
+
+	// Read qdisc state
+	struct Qdisc *qdisc = (struct Qdisc *)ctx->qdisc;
+	u32 qlen = 0;
+	u32 backlog = 0;
+	unsigned long qdisc_state = 0;
+
+	if (qdisc) {
+		bpf_probe_read_kernel(&qlen, sizeof(qlen), &qdisc->q.qlen);
+		bpf_probe_read_kernel(&qdisc_state, sizeof(qdisc_state), &qdisc->state);
+		bpf_probe_read_kernel(&backlog, sizeof(backlog), &qdisc->qstats.backlog);
+	}
+
+	// Read TX queue state from tracepoint context
+	unsigned long txq_state = ctx->txq_state;
+
+	// Emit qdisc dequeue event
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	u64 now = bpf_ktime_get_boot_ns();
+	event->ts = now;
+	event->event_type = PACKET_QDISC_DEQUEUE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->socket_id = socket_id;
+	event->qlen = qlen;
+	event->qdisc_backlog = backlog;
+	event->qdisc_state = (u32)qdisc_state;
+	event->txq_state = (u32)txq_state;
+	event->skb_addr = skb_addr;
+
+	// Store qdisc residence time in dedicated field (microseconds)
+	event->qdisc_latency_us = (u32)((now - enqueue_ts) / 1000);
+
+	// Populate socket and skb info using helper
+	populate_qdisc_event_from_skb(event, sk, skb);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// Note: netif_tx_stop_queue and netif_tx_wake_queue probes removed because they are
+// inline functions on most kernels. TX queue state is captured via the txq_state field
+// in qdisc_enqueue and qdisc_dequeue events instead.
 
 char LICENSE[] SEC("license") = "GPL";
