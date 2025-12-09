@@ -631,7 +631,7 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
         if systing_event.percpu {
             self.handle_cpu_event(event, arg_data);
         } else {
-            self.handle_process_event(event, arg_data);
+            self.handle_process_event(event, arg_data, is_marker);
         }
     }
 
@@ -810,7 +810,12 @@ impl SystingProbeRecorder {
         }
     }
 
-    fn handle_process_event(&mut self, event: probe_event, arg_data: Vec<(String, ArgValue)>) {
+    fn handle_process_event(
+        &mut self,
+        event: probe_event,
+        arg_data: Vec<(String, ArgValue)>,
+        is_marker: bool,
+    ) {
         let systing_event = self.cookies.get(&event.cookie).unwrap();
 
         // If this is an instant event just add it to the list of events
@@ -826,11 +831,36 @@ impl SystingProbeRecorder {
             return;
         }
 
+        // For marker events, use TGID (process ID) instead of TGIDPID (thread ID) as the key.
+        // This allows matching start/end markers when async tasks migrate between threads.
+        // We also include socket_id in the range key to distinguish concurrent operations
+        // on different sockets within the same process.
+        let range_key = if is_marker {
+            event.task.tgidpid >> 32 // Use TGID only
+        } else {
+            event.task.tgidpid // Use full TGIDPID for non-marker events
+        };
+
+        // For marker events, include socket_id in the range name to handle concurrent
+        // operations on different sockets within the same process
+        let get_range_lookup_key = |range_name: &str, args: &[(String, ArgValue)]| -> String {
+            if is_marker {
+                // Extract socket_id from args if present
+                if let Some((_, ArgValue::Long(socket_id))) =
+                    args.iter().find(|(k, _)| k == "socket_id")
+                {
+                    return format!("{}:{}", range_name, socket_id);
+                }
+            }
+            range_name.to_string()
+        };
+
         // First check to see if this is an end event, since we can have the same event for a start
         // event and an end event
         if let Some(range_name) = self.stop_events.get(&systing_event.name) {
-            if let Some(ranges) = self.outstanding_ranges.get_mut(&event.task.tgidpid) {
-                if let Some(mut range) = ranges.remove(range_name) {
+            let lookup_key = get_range_lookup_key(range_name, &arg_data);
+            if let Some(ranges) = self.outstanding_ranges.get_mut(&range_key) {
+                if let Some(mut range) = ranges.remove(&lookup_key) {
                     let track_name = self.ranges.get(range_name).unwrap().clone();
                     range.end = event.ts;
                     let track_hash = self.recorded_ranges.entry(event.task.tgidpid).or_default();
@@ -842,8 +872,9 @@ impl SystingProbeRecorder {
 
         // Now handle the start event case
         if let Some(range_name) = self.start_events.get(&systing_event.name) {
-            if let Some(ranges) = self.outstanding_ranges.get_mut(&event.task.tgidpid) {
-                if let Some(range) = ranges.get_mut(range_name) {
+            let lookup_key = get_range_lookup_key(range_name, &arg_data);
+            if let Some(ranges) = self.outstanding_ranges.get_mut(&range_key) {
+                if let Some(range) = ranges.get_mut(&lookup_key) {
                     range.start = event.ts;
                     range.args = arg_data;
                 } else {
@@ -853,7 +884,7 @@ impl SystingProbeRecorder {
                         end: 0,
                         args: arg_data,
                     };
-                    ranges.insert(range_name.clone(), range);
+                    ranges.insert(lookup_key, range);
                 }
             } else {
                 let mut ranges = HashMap::new();
@@ -863,8 +894,8 @@ impl SystingProbeRecorder {
                     end: 0,
                     args: arg_data,
                 };
-                ranges.insert(range_name.clone(), range);
-                self.outstanding_ranges.insert(event.task.tgidpid, ranges);
+                ranges.insert(lookup_key, range);
+                self.outstanding_ranges.insert(range_key, ranges);
             }
         }
     }
