@@ -539,6 +539,7 @@ struct TraceExtractor {
     next_upid: i64,
     next_utid: i64,
     next_track_id: i64,
+    next_instant_id: i64,
 
     interned_function_names: HashMap<u64, String>,
     interned_mappings: HashMap<u64, StackMappingRecord>,
@@ -598,6 +599,7 @@ impl TraceExtractor {
             next_upid: 1,
             next_utid: 1,
             next_track_id: 1,
+            next_instant_id: 0,
             interned_function_names: HashMap::new(),
             interned_mappings: HashMap::new(),
             interned_frames: HashMap::new(),
@@ -1184,7 +1186,8 @@ impl TraceExtractor {
                         }
 
                         // Record instant event in the instant table
-                        let instant_id = self.data.instants.len() as i64;
+                        let instant_id = self.next_instant_id;
+                        self.next_instant_id += 1;
                         let name = if event.has_name() {
                             event.name().to_string()
                         } else if event.has_name_iid() {
