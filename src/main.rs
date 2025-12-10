@@ -45,10 +45,9 @@ use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{
     MapCore, RawTracepointOpts, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts,
 };
-use perfetto_protos::trace::Trace;
 
 use plain::Plain;
-use protobuf::Message;
+use protobuf::CodedOutputStream;
 
 /// Sample period for perf clock events (1ms = 1000 samples/sec)
 const PERF_CLOCK_SAMPLE_PERIOD: u64 = 1000;
@@ -2295,13 +2294,26 @@ fn system(opts: Command) -> Result<()> {
     }
 
     println!("Generating trace...");
-    let mut trace = Trace::default();
-    trace.packet.extend(recorder.generate_trace());
-    let mut file = std::fs::File::create("trace.pb")
+    let packets = recorder.generate_trace();
+
+    println!("Writing {} trace packets to trace.pb...", packets.len());
+    let file = std::fs::File::create("trace.pb")
         .with_context(|| "Failed to create output file 'trace.pb' in current directory")?;
-    trace
-        .write_to_writer(&mut file)
-        .with_context(|| "Failed to write trace data to 'trace.pb'")?;
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+    let mut os = CodedOutputStream::new(&mut writer);
+
+    // Write packets in streaming Perfetto format. Each packet is written as a
+    // repeated field of a Trace message: [field_tag] [varint length] [packet data]
+    // Field number 1 = Trace.packet
+    for (i, packet) in packets.into_iter().enumerate() {
+        os.write_message(1, &packet)
+            .with_context(|| format!("Failed to write packet {i} to trace.pb"))?;
+    }
+
+    os.flush()
+        .with_context(|| "Failed to flush trace data to 'trace.pb'")?;
+
+    println!("Successfully wrote trace to trace.pb");
     Ok(())
 }
 
