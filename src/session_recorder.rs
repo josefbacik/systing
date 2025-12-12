@@ -131,7 +131,7 @@ pub struct NetnsInfo {
 
 /// Gets the network namespace inode for a given PID.
 fn get_netns_inode(pid: u32) -> Option<u64> {
-    let ns_path = format!("/proc/{}/ns/net", pid);
+    let ns_path = format!("/proc/{pid}/ns/net");
     fs::metadata(&ns_path).ok().map(|m| m.ino())
 }
 
@@ -143,7 +143,7 @@ fn get_host_netns_inode() -> Option<u64> {
 /// Attempts to extract a container ID from a process's cgroup information.
 /// Looks for Docker/containerd container IDs in the cgroup path.
 fn get_container_id(pid: u32) -> Option<String> {
-    let cgroup_path = format!("/proc/{}/cgroup", pid);
+    let cgroup_path = format!("/proc/{pid}/cgroup");
     let content = fs::read_to_string(&cgroup_path).ok()?;
 
     for line in content.lines() {
@@ -193,7 +193,7 @@ fn get_container_id(pid: u32) -> Option<String> {
 
 /// Gets the comm (process name) for a given PID.
 fn get_comm(pid: u32) -> String {
-    let comm_path = format!("/proc/{}/comm", pid);
+    let comm_path = format!("/proc/{pid}/comm");
     fs::read_to_string(&comm_path)
         .ok()
         .map(|s| s.trim().to_string())
@@ -209,7 +209,7 @@ fn get_interfaces_in_netns(pid: u32) -> Vec<NetworkInterface> {
         Err(_) => return Vec::new(),
     };
 
-    let target_netns_path = format!("/proc/{}/ns/net", pid);
+    let target_netns_path = format!("/proc/{pid}/ns/net");
     let target_netns = match File::open(&target_netns_path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
@@ -223,8 +223,7 @@ fn get_interfaces_in_netns(pid: u32) -> Vec<NetworkInterface> {
 
     if unsafe { libc::setns(self_netns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
         eprintln!(
-            "WARNING: Failed to restore original network namespace after enumerating interfaces for pid {}",
-            pid
+            "WARNING: Failed to restore original network namespace after enumerating interfaces for pid {pid}"
         );
     }
 
@@ -758,7 +757,7 @@ impl SessionRecorder {
                 "host".to_string()
             } else if let Some(ref container_id) = netns_info.container_id {
                 if netns_info.comm.is_empty() {
-                    format!("container:{}", container_id)
+                    format!("container:{container_id}")
                 } else {
                     format!("container:{} ({})", container_id, netns_info.comm)
                 }

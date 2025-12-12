@@ -1221,10 +1221,7 @@ fn warn_failed_probe_attachments(skel: &systing::SystingSystemSkel) {
     }
 
     if failed_count > 0 {
-        eprintln!(
-            "Warning: {} probe(s) failed to attach. Check dmesg for BPF errors.",
-            failed_count
-        );
+        eprintln!("Warning: {failed_count} probe(s) failed to attach. Check dmesg for BPF errors.");
     }
 }
 

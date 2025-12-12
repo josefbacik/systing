@@ -19,7 +19,60 @@ use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::{EventName, TrackEvent};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// Cached system HZ value (clock ticks per second).
+/// This is constant for the lifetime of the process.
+static SYSTEM_HZ: OnceLock<u64> = OnceLock::new();
+
+/// Get the system HZ value, caching it on first call.
+fn system_hz() -> u64 {
+    *SYSTEM_HZ.get_or_init(|| {
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        if hz > 0 {
+            hz
+        } else {
+            100
+        }
+    })
+}
+
+/// Extension trait for easier debug annotation building on TrackEvent.
+/// Reduces the 4-line annotation pattern to a single method call.
+trait DebugAnnotationBuilder {
+    fn add_uint(&mut self, name: &str, value: u64);
+    fn add_string(&mut self, name: &str, value: String);
+    fn add_uint_nonzero(&mut self, name: &str, value: u64);
+    fn add_bool(&mut self, name: &str, value: bool);
+}
+
+impl DebugAnnotationBuilder for TrackEvent {
+    fn add_uint(&mut self, name: &str, value: u64) {
+        let mut annotation = DebugAnnotation::default();
+        annotation.set_name(name.to_string());
+        annotation.set_uint_value(value);
+        self.debug_annotations.push(annotation);
+    }
+
+    fn add_string(&mut self, name: &str, value: String) {
+        let mut annotation = DebugAnnotation::default();
+        annotation.set_name(name.to_string());
+        annotation.set_string_value(value);
+        self.debug_annotations.push(annotation);
+    }
+
+    fn add_uint_nonzero(&mut self, name: &str, value: u64) {
+        if value > 0 {
+            self.add_uint(name, value);
+        }
+    }
+
+    fn add_bool(&mut self, name: &str, value: bool) {
+        if value {
+            self.add_uint(name, 1);
+        }
+    }
+}
 
 /// Unique identifier for a network connection (full 4-tuple).
 /// Used for testing Display formatting and IP address parsing.
@@ -347,6 +400,18 @@ impl EventEntry {
     }
 }
 
+/// Macro to generate iterator methods for ConnectionEvents that filter by event type.
+macro_rules! packet_event_iter {
+    ($fn_name:ident, $variant:ident) => {
+        fn $fn_name(&self) -> impl Iterator<Item = &PacketEvent> {
+            self.events.iter().filter_map(|e| match e {
+                EventEntry::$variant(pkt) => Some(pkt),
+                _ => None,
+            })
+        }
+    };
+}
+
 #[derive(Default)]
 struct ConnectionEvents {
     events: Vec<EventEntry>,
@@ -357,117 +422,31 @@ impl ConnectionEvents {
         self.events.is_empty()
     }
 
-    fn iter_tcp_enqueue_packets(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::TcpEnqueue(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
+    // TCP packet events
+    packet_event_iter!(iter_tcp_enqueue_packets, TcpEnqueue);
+    packet_event_iter!(iter_tcp_rcv_established_packets, TcpRcvEstablished);
+    packet_event_iter!(iter_tcp_queue_rcv_packets, TcpQueueRcv);
+    packet_event_iter!(iter_tcp_buffer_queue_packets, TcpBufferQueue);
+    packet_event_iter!(iter_zero_window_probes, TcpZeroWindowProbe);
+    packet_event_iter!(iter_zero_window_acks, TcpZeroWindowAck);
+    packet_event_iter!(iter_rto_timeouts, TcpRtoTimeout);
 
-    fn iter_tcp_rcv_established_packets(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::TcpRcvEstablished(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
+    // UDP packet events
+    packet_event_iter!(iter_udp_send_packets, UdpSend);
+    packet_event_iter!(iter_udp_rcv_packets, UdpRcv);
+    packet_event_iter!(iter_udp_enqueue_packets, UdpEnqueue);
 
-    fn iter_tcp_queue_rcv_packets(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::TcpQueueRcv(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
+    // Shared events
+    packet_event_iter!(iter_shared_send_packets, SharedSend);
 
-    fn iter_tcp_buffer_queue_packets(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::TcpBufferQueue(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
+    // Drop/throttle events
+    packet_event_iter!(iter_skb_drops, SkbDrop);
+    packet_event_iter!(iter_cpu_backlog_drops, CpuBacklogDrop);
+    packet_event_iter!(iter_mem_pressure, MemPressure);
 
-    fn iter_udp_send_packets(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::UdpSend(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
-
-    fn iter_udp_rcv_packets(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::UdpRcv(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
-
-    fn iter_udp_enqueue_packets(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::UdpEnqueue(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
-
-    fn iter_shared_send_packets(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::SharedSend(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
-
-    fn iter_zero_window_probes(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::TcpZeroWindowProbe(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
-
-    fn iter_zero_window_acks(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::TcpZeroWindowAck(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
-
-    fn iter_rto_timeouts(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::TcpRtoTimeout(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
-
-    fn iter_skb_drops(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::SkbDrop(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
-
-    fn iter_cpu_backlog_drops(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::CpuBacklogDrop(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
-
-    fn iter_mem_pressure(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::MemPressure(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
-
-    fn iter_qdisc_enqueue(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::QdiscEnqueue(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
-
-    fn iter_qdisc_dequeue(&self) -> impl Iterator<Item = &PacketEvent> {
-        self.events.iter().filter_map(|e| match e {
-            EventEntry::QdiscDequeue(pkt) => Some(pkt),
-            _ => None,
-        })
-    }
+    // Qdisc events
+    packet_event_iter!(iter_qdisc_enqueue, QdiscEnqueue);
+    packet_event_iter!(iter_qdisc_dequeue, QdiscDequeue);
 }
 
 #[derive(Default)]
@@ -606,29 +585,34 @@ impl NetworkRecorder {
     }
 
     fn poll_events_to_str(events: u32) -> String {
-        const FLAGS: [(u32, &str); 6] = [
+        if events == 0 {
+            return "NONE".to_string();
+        }
+
+        let mut result = String::with_capacity(32);
+        let mut first = true;
+
+        for (mask, name) in [
             (0x001, "IN"),
             (0x002, "PRI"),
             (0x004, "OUT"),
             (0x008, "ERR"),
             (0x010, "HUP"),
             (0x2000, "RDHUP"),
-        ];
-
-        let parts: Vec<&str> = FLAGS
-            .iter()
-            .filter(|(mask, _)| events & mask != 0)
-            .map(|(_, name)| *name)
-            .collect();
-
-        if parts.is_empty() {
-            if events == 0 {
-                "NONE".to_string()
-            } else {
-                format!("0x{:x}", events)
+        ] {
+            if events & mask != 0 {
+                if !first {
+                    result.push('|');
+                }
+                result.push_str(name);
+                first = false;
             }
+        }
+
+        if result.is_empty() {
+            format!("0x{events:x}")
         } else {
-            parts.join("|")
+            result
         }
     }
 
@@ -807,324 +791,287 @@ impl NetworkRecorder {
         iid
     }
 
-    fn add_packet_instant_events(
+    /// Add basic packet annotations: seq, length, flags
+    fn add_basic_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
+        event.add_uint_nonzero("seq", pkt.seq as u64);
+        event.add_uint("length", pkt.length as u64);
+        if pkt.tcp_flags != 0 {
+            event.add_string("flags", Self::format_tcp_flags(pkt.tcp_flags));
+        }
+    }
+
+    /// Add send buffer annotations: sndbuf_used, sndbuf_limit, fill_pct
+    fn add_sndbuf_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
+        if pkt.sndbuf_limit > 0 {
+            event.add_uint("sndbuf_used", pkt.sndbuf_used as u64);
+            event.add_uint("sndbuf_limit", pkt.sndbuf_limit as u64);
+            let fill_pct = (pkt.sndbuf_used as u64 * 100) / pkt.sndbuf_limit as u64;
+            event.add_uint("sndbuf_fill_pct", fill_pct);
+        }
+    }
+
+    /// Add persist timer state annotations (icsk_pending, icsk_timeout, etc.)
+    fn add_timer_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
+        if pkt.icsk_pending > 0 {
+            event.add_uint("icsk_pending", pkt.icsk_pending as u64);
+            event.add_uint("icsk_timeout", pkt.icsk_timeout);
+            event.add_uint_nonzero("rto_jiffies", pkt.rto_jiffies as u64);
+            event.add_uint_nonzero("backoff", pkt.backoff as u64);
+            event.add_uint_nonzero("probe_count", pkt.probe_count as u64);
+        }
+    }
+
+    /// Add retransmit flag annotation
+    fn add_retransmit_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
+        event.add_bool("is_retransmit", pkt.is_retransmit);
+    }
+
+    /// Add zero window probe annotations (sender-side)
+    fn add_zero_window_probe_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
+        if pkt.is_zero_window_probe {
+            event.add_bool("is_zero_window_probe", true);
+            event.add_uint("probe_count", pkt.probe_count as u64);
+            event.add_uint("snd_wnd", pkt.snd_wnd as u64);
+        }
+    }
+
+    /// Add zero window ACK annotations (receiver-side)
+    fn add_zero_window_ack_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
+        if pkt.is_zero_window_ack {
+            event.add_bool("is_zero_window_ack", true);
+            event.add_uint("rcv_wnd", pkt.rcv_wnd as u64);
+            event.add_uint("rcv_buf_used", pkt.rcv_buf_used as u64);
+            event.add_uint("rcv_buf_limit", pkt.rcv_buf_limit as u64);
+            if pkt.rcv_buf_limit > 0 {
+                let fill_pct = (pkt.rcv_buf_used as u64 * 100) / pkt.rcv_buf_limit as u64;
+                event.add_uint("rcv_buf_fill_pct", fill_pct);
+            }
+            event.add_uint("window_clamp", pkt.window_clamp as u64);
+            event.add_uint("rcv_wscale", pkt.rcv_wscale as u64);
+        }
+    }
+
+    /// Add RTO timeout annotations with jiffies-to-microseconds conversion
+    fn add_rto_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
+        if pkt.rto_jiffies > 0 {
+            // Convert jiffies to microseconds using cached system HZ
+            let rto_us = (pkt.rto_jiffies as u64 * 1_000_000) / system_hz();
+
+            event.add_uint("rto_jiffies", pkt.rto_jiffies as u64);
+            event.add_uint("rto_us", rto_us);
+            event.add_uint("srtt_us", pkt.srtt_us as u64);
+            event.add_uint("rttvar_us", pkt.rttvar_us as u64);
+            event.add_uint("retransmit_count", pkt.retransmit_count as u64);
+            event.add_uint("backoff", pkt.backoff as u64);
+            event.add_uint("rto_ms", rto_us / 1000);
+            event.add_uint_nonzero("srtt_ms", (pkt.srtt_us / 1000) as u64);
+        }
+    }
+
+    /// Add drop event annotations (drop_reason, drop_location)
+    fn add_drop_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
+        if pkt.drop_reason > 0 {
+            event.add_uint("drop_reason", pkt.drop_reason as u64);
+            event.add_string(
+                "drop_reason_str",
+                drop_reason_str(pkt.drop_reason).to_string(),
+            );
+            event.add_uint_nonzero("drop_location", pkt.drop_location);
+        }
+    }
+
+    /// Add queue state annotations (qlen, qlen_limit)
+    fn add_queue_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
+        if pkt.qlen > 0 || pkt.qlen_limit > 0 {
+            event.add_uint("qlen", pkt.qlen as u64);
+            event.add_uint_nonzero("qlen_limit", pkt.qlen_limit as u64);
+        }
+    }
+
+    /// Add TSQ/memory pressure annotations
+    fn add_memory_pressure_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
+        if pkt.sk_wmem_alloc > 0 {
+            event.add_uint("sk_wmem_alloc", pkt.sk_wmem_alloc as u64);
+            event.add_uint_nonzero("tsq_limit", pkt.tsq_limit as u64);
+        }
+    }
+
+    /// Add qdisc-specific annotations
+    fn add_qdisc_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
+        event.add_uint_nonzero("txq_state", pkt.txq_state as u64);
+        event.add_uint_nonzero("qdisc_state", pkt.qdisc_state as u64);
+        event.add_uint_nonzero("qdisc_backlog", pkt.qdisc_backlog as u64);
+        event.add_uint_nonzero("skb_addr", pkt.skb_addr);
+        event.add_uint_nonzero("qdisc_latency_us", pkt.qdisc_latency_us as u64);
+    }
+
+    /// Helper to emit packet events for a given event type.
+    /// Uses peekable to check emptiness without collecting, then emits events directly.
+    fn emit_packet_events<'a>(
+        &self,
+        packets: &mut Vec<TracePacket>,
+        sequence_id: u32,
+        track_uuid: u64,
+        event_name: &str,
+        pkt_iter: impl Iterator<Item = &'a PacketEvent>,
+    ) {
+        let mut pkt_iter = pkt_iter.peekable();
+        if pkt_iter.peek().is_none() {
+            return;
+        }
+        let iid = self.event_name_ids.get(event_name).copied().unwrap_or(0);
+        if iid == 0 {
+            tracing::warn!("Missing event name IID for: {}", event_name);
+            return;
+        }
+        for pkt in pkt_iter {
+            self.emit_single_packet_event(packets, sequence_id, track_uuid, iid, pkt);
+        }
+    }
+
+    /// Emit a single packet instant event
+    fn emit_single_packet_event(
         &self,
         packets: &mut Vec<TracePacket>,
         sequence_id: u32,
         track_uuid: u64,
         name_iid: u64,
-        packet_events: &[PacketEvent],
+        pkt: &PacketEvent,
     ) {
-        for pkt in packet_events {
-            let mut instant_event = TrackEvent::default();
-            instant_event.set_type(Type::TYPE_INSTANT);
-            instant_event.set_name_iid(name_iid);
-            instant_event.set_track_uuid(track_uuid);
+        let mut instant_event = TrackEvent::default();
+        instant_event.set_type(Type::TYPE_INSTANT);
+        instant_event.set_name_iid(name_iid);
+        instant_event.set_track_uuid(track_uuid);
 
-            // Only show seq annotation for TCP packets (where seq != 0)
-            if pkt.seq != 0 {
-                let mut seq_annotation = DebugAnnotation::default();
-                seq_annotation.set_name("seq".to_string());
-                seq_annotation.set_uint_value(pkt.seq as u64);
-                instant_event.debug_annotations.push(seq_annotation);
-            }
+        // Add all annotation groups
+        Self::add_basic_annotations(&mut instant_event, pkt);
+        Self::add_sndbuf_annotations(&mut instant_event, pkt);
+        Self::add_timer_annotations(&mut instant_event, pkt);
+        Self::add_retransmit_annotations(&mut instant_event, pkt);
+        Self::add_zero_window_probe_annotations(&mut instant_event, pkt);
+        Self::add_zero_window_ack_annotations(&mut instant_event, pkt);
+        Self::add_rto_annotations(&mut instant_event, pkt);
+        Self::add_drop_annotations(&mut instant_event, pkt);
+        Self::add_queue_annotations(&mut instant_event, pkt);
+        Self::add_memory_pressure_annotations(&mut instant_event, pkt);
+        Self::add_qdisc_annotations(&mut instant_event, pkt);
 
-            let mut len_annotation = DebugAnnotation::default();
-            len_annotation.set_name("length".to_string());
-            len_annotation.set_uint_value(pkt.length as u64);
-            instant_event.debug_annotations.push(len_annotation);
+        let mut packet = TracePacket::default();
+        packet.set_timestamp(pkt.ts);
+        packet.set_track_event(instant_event);
+        packet.set_trusted_packet_sequence_id(sequence_id);
+        packets.push(packet);
+    }
 
-            // Only show TCP flags annotation for TCP packets (where flags != 0)
-            if pkt.tcp_flags != 0 {
-                let mut flags_annotation = DebugAnnotation::default();
-                flags_annotation.set_name("flags".to_string());
-                flags_annotation.set_string_value(Self::format_tcp_flags(pkt.tcp_flags));
-                instant_event.debug_annotations.push(flags_annotation);
-            }
+    /// Emit a syscall slice event (Send or Recv) with begin and end packets.
+    fn emit_syscall_slice(
+        &self,
+        packets: &mut Vec<TracePacket>,
+        sequence_id: u32,
+        track_uuid: u64,
+        event: &NetworkEvent,
+        is_send: bool,
+    ) {
+        let protocol = self
+            .socket_metadata
+            .get(&event.socket_id)
+            .map(|m| m.protocol)
+            .unwrap_or_else(|| {
+                tracing::debug!("Missing socket metadata for socket_id {}", event.socket_id);
+                0
+            });
 
-            // Add send buffer info (shows buffer drain on ACK receipt)
-            if pkt.sndbuf_limit > 0 {
-                let mut sndbuf_used_annotation = DebugAnnotation::default();
-                sndbuf_used_annotation.set_name("sndbuf_used".to_string());
-                sndbuf_used_annotation.set_uint_value(pkt.sndbuf_used as u64);
-                instant_event.debug_annotations.push(sndbuf_used_annotation);
+        let proto_str = Self::protocol_to_str(protocol);
+        let event_name = if is_send {
+            format!("{proto_str}_send")
+        } else {
+            format!("{proto_str}_recv")
+        };
+        let name_iid = self.event_name_ids.get(&event_name).copied().unwrap_or(0);
 
-                let mut sndbuf_limit_annotation = DebugAnnotation::default();
-                sndbuf_limit_annotation.set_name("sndbuf_limit".to_string());
-                sndbuf_limit_annotation.set_uint_value(pkt.sndbuf_limit as u64);
-                instant_event
-                    .debug_annotations
-                    .push(sndbuf_limit_annotation);
-
-                // Add fill percentage for easier analysis
-                let fill_pct = (pkt.sndbuf_used as u64 * 100) / pkt.sndbuf_limit as u64;
-                let mut fill_annotation = DebugAnnotation::default();
-                fill_annotation.set_name("sndbuf_fill_pct".to_string());
-                fill_annotation.set_uint_value(fill_pct);
-                instant_event.debug_annotations.push(fill_annotation);
-            }
-
-            // Add persist timer state (icsk_pending: 0=none, 1=retrans, 2=delack, 3=probe/persist)
-            if pkt.icsk_pending > 0 {
-                let mut pending_annotation = DebugAnnotation::default();
-                pending_annotation.set_name("icsk_pending".to_string());
-                pending_annotation.set_uint_value(pkt.icsk_pending as u64);
-                instant_event.debug_annotations.push(pending_annotation);
-
-                let mut timeout_annotation = DebugAnnotation::default();
-                timeout_annotation.set_name("icsk_timeout".to_string());
-                timeout_annotation.set_uint_value(pkt.icsk_timeout);
-                instant_event.debug_annotations.push(timeout_annotation);
-
-                // Also add RTO and backoff for context
-                if pkt.rto_jiffies > 0 {
-                    let mut rto_annotation = DebugAnnotation::default();
-                    rto_annotation.set_name("rto_jiffies".to_string());
-                    rto_annotation.set_uint_value(pkt.rto_jiffies as u64);
-                    instant_event.debug_annotations.push(rto_annotation);
-                }
-
-                if pkt.backoff > 0 {
-                    let mut backoff_annotation = DebugAnnotation::default();
-                    backoff_annotation.set_name("backoff".to_string());
-                    backoff_annotation.set_uint_value(pkt.backoff as u64);
-                    instant_event.debug_annotations.push(backoff_annotation);
-                }
-
-                if pkt.probe_count > 0 {
-                    let mut probes_annotation = DebugAnnotation::default();
-                    probes_annotation.set_name("probe_count".to_string());
-                    probes_annotation.set_uint_value(pkt.probe_count as u64);
-                    instant_event.debug_annotations.push(probes_annotation);
-                }
-            }
-
-            // Add retransmit flag if this packet is a TCP retransmit
-            if pkt.is_retransmit {
-                let mut retransmit_annotation = DebugAnnotation::default();
-                retransmit_annotation.set_name("is_retransmit".to_string());
-                retransmit_annotation.set_uint_value(1);
-                instant_event.debug_annotations.push(retransmit_annotation);
-            }
-
-            // Add zero window probe annotations (sender-side)
-            if pkt.is_zero_window_probe {
-                let mut zwp_annotation = DebugAnnotation::default();
-                zwp_annotation.set_name("is_zero_window_probe".to_string());
-                zwp_annotation.set_uint_value(1);
-                instant_event.debug_annotations.push(zwp_annotation);
-
-                let mut probe_count_annotation = DebugAnnotation::default();
-                probe_count_annotation.set_name("probe_count".to_string());
-                probe_count_annotation.set_uint_value(pkt.probe_count as u64);
-                instant_event.debug_annotations.push(probe_count_annotation);
-
-                let mut snd_wnd_annotation = DebugAnnotation::default();
-                snd_wnd_annotation.set_name("snd_wnd".to_string());
-                snd_wnd_annotation.set_uint_value(pkt.snd_wnd as u64);
-                instant_event.debug_annotations.push(snd_wnd_annotation);
-            }
-
-            // Add zero window ACK annotations (receiver-side)
-            if pkt.is_zero_window_ack {
-                let mut zwa_annotation = DebugAnnotation::default();
-                zwa_annotation.set_name("is_zero_window_ack".to_string());
-                zwa_annotation.set_uint_value(1);
-                instant_event.debug_annotations.push(zwa_annotation);
-
-                let mut rcv_wnd_annotation = DebugAnnotation::default();
-                rcv_wnd_annotation.set_name("rcv_wnd".to_string());
-                rcv_wnd_annotation.set_uint_value(pkt.rcv_wnd as u64);
-                instant_event.debug_annotations.push(rcv_wnd_annotation);
-
-                let mut rcv_buf_used_annotation = DebugAnnotation::default();
-                rcv_buf_used_annotation.set_name("rcv_buf_used".to_string());
-                rcv_buf_used_annotation.set_uint_value(pkt.rcv_buf_used as u64);
-                instant_event
-                    .debug_annotations
-                    .push(rcv_buf_used_annotation);
-
-                let mut rcv_buf_limit_annotation = DebugAnnotation::default();
-                rcv_buf_limit_annotation.set_name("rcv_buf_limit".to_string());
-                rcv_buf_limit_annotation.set_uint_value(pkt.rcv_buf_limit as u64);
-                instant_event
-                    .debug_annotations
-                    .push(rcv_buf_limit_annotation);
-
-                // Calculate and emit buffer fill percentage
-                if pkt.rcv_buf_limit > 0 {
-                    let fill_pct = (pkt.rcv_buf_used as u64 * 100) / pkt.rcv_buf_limit as u64;
-                    let mut fill_annotation = DebugAnnotation::default();
-                    fill_annotation.set_name("rcv_buf_fill_pct".to_string());
-                    fill_annotation.set_uint_value(fill_pct);
-                    instant_event.debug_annotations.push(fill_annotation);
-                }
-
-                let mut window_clamp_annotation = DebugAnnotation::default();
-                window_clamp_annotation.set_name("window_clamp".to_string());
-                window_clamp_annotation.set_uint_value(pkt.window_clamp as u64);
-                instant_event
-                    .debug_annotations
-                    .push(window_clamp_annotation);
-
-                let mut rcv_wscale_annotation = DebugAnnotation::default();
-                rcv_wscale_annotation.set_name("rcv_wscale".to_string());
-                rcv_wscale_annotation.set_uint_value(pkt.rcv_wscale as u64);
-                instant_event.debug_annotations.push(rcv_wscale_annotation);
-            }
-
-            // Add RTO timeout annotations
-            if pkt.rto_jiffies > 0 {
-                // Convert jiffies to microseconds using system HZ
-                // HZ is typically 100 on modern Linux (1 jiffy = 10000us)
-                // We read it at runtime via sysconf(_SC_CLK_TCK)
-                let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-                let hz = if hz > 0 { hz } else { 100 }; // fallback to 100
-                let rto_us = (pkt.rto_jiffies as u64 * 1_000_000) / hz;
-
-                let mut rto_jiffies_annotation = DebugAnnotation::default();
-                rto_jiffies_annotation.set_name("rto_jiffies".to_string());
-                rto_jiffies_annotation.set_uint_value(pkt.rto_jiffies as u64);
-                instant_event.debug_annotations.push(rto_jiffies_annotation);
-
-                let mut rto_annotation = DebugAnnotation::default();
-                rto_annotation.set_name("rto_us".to_string());
-                rto_annotation.set_uint_value(rto_us);
-                instant_event.debug_annotations.push(rto_annotation);
-
-                let mut srtt_annotation = DebugAnnotation::default();
-                srtt_annotation.set_name("srtt_us".to_string());
-                srtt_annotation.set_uint_value(pkt.srtt_us as u64);
-                instant_event.debug_annotations.push(srtt_annotation);
-
-                let mut rttvar_annotation = DebugAnnotation::default();
-                rttvar_annotation.set_name("rttvar_us".to_string());
-                rttvar_annotation.set_uint_value(pkt.rttvar_us as u64);
-                instant_event.debug_annotations.push(rttvar_annotation);
-
-                let mut retransmit_count_annotation = DebugAnnotation::default();
-                retransmit_count_annotation.set_name("retransmit_count".to_string());
-                retransmit_count_annotation.set_uint_value(pkt.retransmit_count as u64);
-                instant_event
-                    .debug_annotations
-                    .push(retransmit_count_annotation);
-
-                let mut backoff_annotation = DebugAnnotation::default();
-                backoff_annotation.set_name("backoff".to_string());
-                backoff_annotation.set_uint_value(pkt.backoff as u64);
-                instant_event.debug_annotations.push(backoff_annotation);
-
-                // Convert RTO to milliseconds for easier reading
-                let mut rto_ms_annotation = DebugAnnotation::default();
-                rto_ms_annotation.set_name("rto_ms".to_string());
-                rto_ms_annotation.set_uint_value(rto_us / 1000);
-                instant_event.debug_annotations.push(rto_ms_annotation);
-
-                // Convert SRTT to milliseconds for easier reading
-                if pkt.srtt_us > 0 {
-                    let mut srtt_ms_annotation = DebugAnnotation::default();
-                    srtt_ms_annotation.set_name("srtt_ms".to_string());
-                    srtt_ms_annotation.set_uint_value((pkt.srtt_us / 1000) as u64);
-                    instant_event.debug_annotations.push(srtt_ms_annotation);
-                }
-            }
-
-            // Add drop event annotations (for packet_drop, cpu_backlog_drop)
-            if pkt.drop_reason > 0 {
-                let mut reason_annotation = DebugAnnotation::default();
-                reason_annotation.set_name("drop_reason".to_string());
-                reason_annotation.set_uint_value(pkt.drop_reason as u64);
-                instant_event.debug_annotations.push(reason_annotation);
-
-                let mut reason_str_annotation = DebugAnnotation::default();
-                reason_str_annotation.set_name("drop_reason_str".to_string());
-                reason_str_annotation
-                    .set_string_value(drop_reason_str(pkt.drop_reason).to_string());
-                instant_event.debug_annotations.push(reason_str_annotation);
-
-                if pkt.drop_location != 0 {
-                    let mut location_annotation = DebugAnnotation::default();
-                    location_annotation.set_name("drop_location".to_string());
-                    location_annotation.set_uint_value(pkt.drop_location);
-                    instant_event.debug_annotations.push(location_annotation);
-                }
-            }
-
-            // Add queue state annotations (for cpu_backlog_drop)
-            if pkt.qlen > 0 || pkt.qlen_limit > 0 {
-                let mut qlen_annotation = DebugAnnotation::default();
-                qlen_annotation.set_name("qlen".to_string());
-                qlen_annotation.set_uint_value(pkt.qlen as u64);
-                instant_event.debug_annotations.push(qlen_annotation);
-
-                if pkt.qlen_limit > 0 {
-                    let mut qlen_limit_annotation = DebugAnnotation::default();
-                    qlen_limit_annotation.set_name("qlen_limit".to_string());
-                    qlen_limit_annotation.set_uint_value(pkt.qlen_limit as u64);
-                    instant_event.debug_annotations.push(qlen_limit_annotation);
-                }
-            }
-
-            // Add TSQ/memory pressure annotations
-            if pkt.sk_wmem_alloc > 0 {
-                let mut wmem_alloc_annotation = DebugAnnotation::default();
-                wmem_alloc_annotation.set_name("sk_wmem_alloc".to_string());
-                wmem_alloc_annotation.set_uint_value(pkt.sk_wmem_alloc as u64);
-                instant_event.debug_annotations.push(wmem_alloc_annotation);
-
-                if pkt.tsq_limit > 0 {
-                    let mut tsq_limit_annotation = DebugAnnotation::default();
-                    tsq_limit_annotation.set_name("tsq_limit".to_string());
-                    tsq_limit_annotation.set_uint_value(pkt.tsq_limit as u64);
-                    instant_event.debug_annotations.push(tsq_limit_annotation);
-                }
-            }
-
-            // Add qdisc-specific annotations
-            if pkt.txq_state > 0 {
-                let mut txq_state_annotation = DebugAnnotation::default();
-                txq_state_annotation.set_name("txq_state".to_string());
-                txq_state_annotation.set_uint_value(pkt.txq_state as u64);
-                instant_event.debug_annotations.push(txq_state_annotation);
-            }
-
-            if pkt.qdisc_state > 0 {
-                let mut qdisc_state_annotation = DebugAnnotation::default();
-                qdisc_state_annotation.set_name("qdisc_state".to_string());
-                qdisc_state_annotation.set_uint_value(pkt.qdisc_state as u64);
-                instant_event.debug_annotations.push(qdisc_state_annotation);
-            }
-
-            if pkt.qdisc_backlog > 0 {
-                let mut qdisc_backlog_annotation = DebugAnnotation::default();
-                qdisc_backlog_annotation.set_name("qdisc_backlog".to_string());
-                qdisc_backlog_annotation.set_uint_value(pkt.qdisc_backlog as u64);
-                instant_event
-                    .debug_annotations
-                    .push(qdisc_backlog_annotation);
-            }
-
-            if pkt.skb_addr > 0 {
-                let mut skb_addr_annotation = DebugAnnotation::default();
-                skb_addr_annotation.set_name("skb_addr".to_string());
-                skb_addr_annotation.set_uint_value(pkt.skb_addr);
-                instant_event.debug_annotations.push(skb_addr_annotation);
-            }
-
-            // Qdisc latency annotation (for qdisc_dequeue events)
-            if pkt.qdisc_latency_us > 0 {
-                let mut latency_annotation = DebugAnnotation::default();
-                latency_annotation.set_name("qdisc_latency_us".to_string());
-                latency_annotation.set_uint_value(pkt.qdisc_latency_us as u64);
-                instant_event.debug_annotations.push(latency_annotation);
-            }
-
-            let mut packet = TracePacket::default();
-            packet.set_timestamp(pkt.ts);
-            packet.set_track_event(instant_event);
-            packet.set_trusted_packet_sequence_id(sequence_id);
-            packets.push(packet);
+        // Build begin event
+        let mut begin_event = TrackEvent::default();
+        begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+        if name_iid > 0 {
+            begin_event.set_name_iid(name_iid);
         }
+        begin_event.set_track_uuid(track_uuid);
+
+        // Common annotations
+        begin_event.add_uint("socket_id", event.socket_id);
+        begin_event.add_string("socket", self.socket_track_name(event.socket_id));
+        begin_event.add_uint("bytes", event.bytes as u64);
+
+        if is_send {
+            // Send-specific annotations
+            begin_event.add_uint_nonzero("seq", event.sendmsg_seq as u64);
+            if event.sndbuf_limit > 0 {
+                begin_event.add_uint("sndbuf_used", event.sndbuf_used as u64);
+                begin_event.add_uint("sndbuf_limit", event.sndbuf_limit as u64);
+                let fill_pct = (event.sndbuf_used as u64 * 100) / event.sndbuf_limit as u64;
+                begin_event.add_uint("sndbuf_fill_pct", fill_pct);
+            }
+        } else {
+            // Recv-specific annotations
+            if event.recv_seq_start > 0 || event.recv_seq_end > 0 {
+                begin_event.add_uint("recv_seq_start", event.recv_seq_start as u64);
+                begin_event.add_uint("recv_seq_end", event.recv_seq_end as u64);
+                if event.rcv_nxt_at_entry > 0 {
+                    begin_event.add_uint("rcv_nxt", event.rcv_nxt_at_entry as u64);
+                    let bytes_available = event.rcv_nxt_at_entry.wrapping_sub(event.recv_seq_start);
+                    if bytes_available > 0 && bytes_available < 64 * 1024 * 1024 {
+                        begin_event.add_uint("bytes_available", bytes_available as u64);
+                    }
+                }
+            }
+        }
+
+        let mut begin_packet = TracePacket::default();
+        begin_packet.set_timestamp(event.start_ts);
+        begin_packet.set_track_event(begin_event);
+        begin_packet.set_trusted_packet_sequence_id(sequence_id);
+        packets.push(begin_packet);
+
+        // Build end event
+        let mut end_event = TrackEvent::default();
+        end_event.set_type(Type::TYPE_SLICE_END);
+        end_event.set_track_uuid(track_uuid);
+
+        let mut end_packet = TracePacket::default();
+        end_packet.set_timestamp(event.end_ts);
+        end_packet.set_track_event(end_event);
+        end_packet.set_trusted_packet_sequence_id(sequence_id);
+        packets.push(end_packet);
+    }
+
+    /// Emit a poll_ready instant event
+    fn emit_poll_ready(
+        &self,
+        packets: &mut Vec<TracePacket>,
+        sequence_id: u32,
+        track_uuid: u64,
+        event: &PollEvent,
+    ) {
+        let poll_name_iid = *self.event_name_ids.get("poll_ready").unwrap_or(&0);
+
+        let mut instant_event = TrackEvent::default();
+        instant_event.set_type(Type::TYPE_INSTANT);
+        instant_event.set_name_iid(poll_name_iid);
+        instant_event.set_track_uuid(track_uuid);
+
+        instant_event.add_uint("socket_id", event.socket_id);
+        instant_event.add_string("socket", self.socket_track_name(event.socket_id));
+        instant_event.add_string(
+            "requested",
+            Self::poll_events_to_str(event.requested_events),
+        );
+        instant_event.add_string("returned", Self::poll_events_to_str(event.returned_events));
+
+        let mut instant_packet = TracePacket::default();
+        instant_packet.set_timestamp(event.ts);
+        instant_packet.set_track_event(instant_event);
+        instant_packet.set_trusted_packet_sequence_id(sequence_id);
+        packets.push(instant_packet);
     }
 
     /// Prepares all metadata needed for packet generation, including:
@@ -1246,7 +1193,7 @@ impl NetworkRecorder {
                 metadata.dest_port
             )
         } else {
-            format!("Socket {}", socket_id)
+            format!("Socket {socket_id}")
         }
     }
 
@@ -1321,233 +1268,130 @@ impl NetworkRecorder {
                 // Emit all packet events directly on this socket track (flat)
                 if is_tcp {
                     // TCP packet events
-                    let enqueue_pkts: Vec<_> = events.iter_tcp_enqueue_packets().copied().collect();
-                    if !enqueue_pkts.is_empty() {
-                        let enqueue_iid = *self.event_name_ids.get("TCP packet_enqueue").unwrap();
-                        self.add_packet_instant_events(
-                            &mut packets,
-                            sequence_id,
-                            socket_track_uuid,
-                            enqueue_iid,
-                            &enqueue_pkts,
-                        );
-                    }
-
-                    let send_pkts: Vec<_> = events.iter_shared_send_packets().copied().collect();
-                    if !send_pkts.is_empty() {
-                        let send_iid = *self.event_name_ids.get("TCP packet_send").unwrap();
-                        self.add_packet_instant_events(
-                            &mut packets,
-                            sequence_id,
-                            socket_track_uuid,
-                            send_iid,
-                            &send_pkts,
-                        );
-                    }
-
-                    let rcv_est_pkts: Vec<_> =
-                        events.iter_tcp_rcv_established_packets().copied().collect();
-                    if !rcv_est_pkts.is_empty() {
-                        let rcv_established_iid = *self
-                            .event_name_ids
-                            .get("TCP packet_rcv_established")
-                            .unwrap();
-                        self.add_packet_instant_events(
-                            &mut packets,
-                            sequence_id,
-                            socket_track_uuid,
-                            rcv_established_iid,
-                            &rcv_est_pkts,
-                        );
-                    }
-
-                    let queue_rcv_pkts: Vec<_> =
-                        events.iter_tcp_queue_rcv_packets().copied().collect();
-                    if !queue_rcv_pkts.is_empty() {
-                        let queue_rcv_iid =
-                            *self.event_name_ids.get("TCP packet_queue_rcv").unwrap();
-                        self.add_packet_instant_events(
-                            &mut packets,
-                            sequence_id,
-                            socket_track_uuid,
-                            queue_rcv_iid,
-                            &queue_rcv_pkts,
-                        );
-                    }
-
-                    // Zero window probe events (sender-side)
-                    let zwp_pkts: Vec<_> = events.iter_zero_window_probes().copied().collect();
-                    if !zwp_pkts.is_empty() {
-                        let zwp_iid = *self.event_name_ids.get("TCP zero_window_probe").unwrap();
-                        self.add_packet_instant_events(
-                            &mut packets,
-                            sequence_id,
-                            socket_track_uuid,
-                            zwp_iid,
-                            &zwp_pkts,
-                        );
-                    }
-
-                    // Zero window ACK events (receiver-side)
-                    let zwa_pkts: Vec<_> = events.iter_zero_window_acks().copied().collect();
-                    if !zwa_pkts.is_empty() {
-                        let zwa_iid = *self.event_name_ids.get("TCP zero_window_ack").unwrap();
-                        self.add_packet_instant_events(
-                            &mut packets,
-                            sequence_id,
-                            socket_track_uuid,
-                            zwa_iid,
-                            &zwa_pkts,
-                        );
-                    }
-
-                    // RTO timeout events
-                    let rto_pkts: Vec<_> = events.iter_rto_timeouts().copied().collect();
-                    if !rto_pkts.is_empty() {
-                        let rto_iid = *self.event_name_ids.get("TCP rto_timeout").unwrap();
-                        self.add_packet_instant_events(
-                            &mut packets,
-                            sequence_id,
-                            socket_track_uuid,
-                            rto_iid,
-                            &rto_pkts,
-                        );
-                    }
-
-                    // TCP buffer queue events
-                    let buffer_queue_pkts: Vec<_> =
-                        events.iter_tcp_buffer_queue_packets().copied().collect();
-                    if !buffer_queue_pkts.is_empty() {
-                        let buffer_queue_iid =
-                            *self.event_name_ids.get("TCP buffer_queue").unwrap();
-                        self.add_packet_instant_events(
-                            &mut packets,
-                            sequence_id,
-                            socket_track_uuid,
-                            buffer_queue_iid,
-                            &buffer_queue_pkts,
-                        );
-                    }
+                    self.emit_packet_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        "TCP packet_enqueue",
+                        events.iter_tcp_enqueue_packets(),
+                    );
+                    self.emit_packet_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        "TCP packet_send",
+                        events.iter_shared_send_packets(),
+                    );
+                    self.emit_packet_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        "TCP packet_rcv_established",
+                        events.iter_tcp_rcv_established_packets(),
+                    );
+                    self.emit_packet_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        "TCP packet_queue_rcv",
+                        events.iter_tcp_queue_rcv_packets(),
+                    );
+                    self.emit_packet_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        "TCP zero_window_probe",
+                        events.iter_zero_window_probes(),
+                    );
+                    self.emit_packet_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        "TCP zero_window_ack",
+                        events.iter_zero_window_acks(),
+                    );
+                    self.emit_packet_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        "TCP rto_timeout",
+                        events.iter_rto_timeouts(),
+                    );
+                    self.emit_packet_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        "TCP buffer_queue",
+                        events.iter_tcp_buffer_queue_packets(),
+                    );
                 } else {
                     // UDP packet events
-                    let udp_send_pkts: Vec<_> = events.iter_udp_send_packets().copied().collect();
-                    if !udp_send_pkts.is_empty() {
-                        let send_iid = *self.event_name_ids.get("UDP send").unwrap();
-                        self.add_packet_instant_events(
-                            &mut packets,
-                            sequence_id,
-                            socket_track_uuid,
-                            send_iid,
-                            &udp_send_pkts,
-                        );
-                    }
-
-                    let udp_rcv_pkts: Vec<_> = events.iter_udp_rcv_packets().copied().collect();
-                    if !udp_rcv_pkts.is_empty() {
-                        let rcv_iid = *self.event_name_ids.get("UDP receive").unwrap();
-                        self.add_packet_instant_events(
-                            &mut packets,
-                            sequence_id,
-                            socket_track_uuid,
-                            rcv_iid,
-                            &udp_rcv_pkts,
-                        );
-                    }
-
-                    // UDP uses PACKET_SEND (SharedSend) for qdisc->NIC transmission
-                    let shared_send_pkts: Vec<_> =
-                        events.iter_shared_send_packets().copied().collect();
-                    if !shared_send_pkts.is_empty() {
-                        let send_iid = *self.event_name_ids.get("UDP packet_send").unwrap();
-                        self.add_packet_instant_events(
-                            &mut packets,
-                            sequence_id,
-                            socket_track_uuid,
-                            send_iid,
-                            &shared_send_pkts,
-                        );
-                    }
-
-                    // UDP enqueue events
-                    let udp_enqueue_pkts: Vec<_> =
-                        events.iter_udp_enqueue_packets().copied().collect();
-                    if !udp_enqueue_pkts.is_empty() {
-                        let enqueue_iid = *self.event_name_ids.get("UDP enqueue").unwrap();
-                        self.add_packet_instant_events(
-                            &mut packets,
-                            sequence_id,
-                            socket_track_uuid,
-                            enqueue_iid,
-                            &udp_enqueue_pkts,
-                        );
-                    }
+                    self.emit_packet_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        "UDP send",
+                        events.iter_udp_send_packets(),
+                    );
+                    self.emit_packet_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        "UDP receive",
+                        events.iter_udp_rcv_packets(),
+                    );
+                    self.emit_packet_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        "UDP packet_send",
+                        events.iter_shared_send_packets(),
+                    );
+                    self.emit_packet_events(
+                        &mut packets,
+                        sequence_id,
+                        socket_track_uuid,
+                        "UDP enqueue",
+                        events.iter_udp_enqueue_packets(),
+                    );
                 }
 
                 // Drop/throttle events (apply to both TCP and UDP)
-                // SKB drop events
-                let skb_drop_pkts: Vec<_> = events.iter_skb_drops().copied().collect();
-                if !skb_drop_pkts.is_empty() {
-                    let drop_iid = *self.event_name_ids.get("packet_drop").unwrap();
-                    self.add_packet_instant_events(
-                        &mut packets,
-                        sequence_id,
-                        socket_track_uuid,
-                        drop_iid,
-                        &skb_drop_pkts,
-                    );
-                }
-
-                // CPU backlog drop events
-                let backlog_drop_pkts: Vec<_> = events.iter_cpu_backlog_drops().copied().collect();
-                if !backlog_drop_pkts.is_empty() {
-                    let drop_iid = *self.event_name_ids.get("cpu_backlog_drop").unwrap();
-                    self.add_packet_instant_events(
-                        &mut packets,
-                        sequence_id,
-                        socket_track_uuid,
-                        drop_iid,
-                        &backlog_drop_pkts,
-                    );
-                }
-
-                // Memory pressure events
-                let mem_pressure_pkts: Vec<_> = events.iter_mem_pressure().copied().collect();
-                if !mem_pressure_pkts.is_empty() {
-                    let pressure_iid = *self.event_name_ids.get("TCP mem_pressure").unwrap();
-                    self.add_packet_instant_events(
-                        &mut packets,
-                        sequence_id,
-                        socket_track_uuid,
-                        pressure_iid,
-                        &mem_pressure_pkts,
-                    );
-                }
-
-                // Qdisc enqueue events
-                let qdisc_enqueue_pkts: Vec<_> = events.iter_qdisc_enqueue().copied().collect();
-                if !qdisc_enqueue_pkts.is_empty() {
-                    let enqueue_iid = *self.event_name_ids.get("qdisc_enqueue").unwrap();
-                    self.add_packet_instant_events(
-                        &mut packets,
-                        sequence_id,
-                        socket_track_uuid,
-                        enqueue_iid,
-                        &qdisc_enqueue_pkts,
-                    );
-                }
-
-                // Qdisc dequeue events
-                let qdisc_dequeue_pkts: Vec<_> = events.iter_qdisc_dequeue().copied().collect();
-                if !qdisc_dequeue_pkts.is_empty() {
-                    let dequeue_iid = *self.event_name_ids.get("qdisc_dequeue").unwrap();
-                    self.add_packet_instant_events(
-                        &mut packets,
-                        sequence_id,
-                        socket_track_uuid,
-                        dequeue_iid,
-                        &qdisc_dequeue_pkts,
-                    );
-                }
+                self.emit_packet_events(
+                    &mut packets,
+                    sequence_id,
+                    socket_track_uuid,
+                    "packet_drop",
+                    events.iter_skb_drops(),
+                );
+                self.emit_packet_events(
+                    &mut packets,
+                    sequence_id,
+                    socket_track_uuid,
+                    "cpu_backlog_drop",
+                    events.iter_cpu_backlog_drops(),
+                );
+                self.emit_packet_events(
+                    &mut packets,
+                    sequence_id,
+                    socket_track_uuid,
+                    "TCP mem_pressure",
+                    events.iter_mem_pressure(),
+                );
+                self.emit_packet_events(
+                    &mut packets,
+                    sequence_id,
+                    socket_track_uuid,
+                    "qdisc_enqueue",
+                    events.iter_qdisc_enqueue(),
+                );
+                self.emit_packet_events(
+                    &mut packets,
+                    sequence_id,
+                    socket_track_uuid,
+                    "qdisc_dequeue",
+                    events.iter_qdisc_dequeue(),
+                );
             }
         }
 
@@ -1578,220 +1422,25 @@ impl NetworkRecorder {
             for event_entry in events.iter() {
                 match event_entry {
                     EventEntry::Send(event) => {
-                        let protocol = match self.socket_metadata.get(&event.socket_id) {
-                            Some(m) => m.protocol,
-                            None => {
-                                tracing::debug!(
-                                    "Missing socket metadata for socket_id {}",
-                                    event.socket_id
-                                );
-                                0
-                            }
-                        };
-                        let proto_str = Self::protocol_to_str(protocol);
-                        let send_event_name = format!("{proto_str}_send");
-                        let send_name_iid = self
-                            .event_name_ids
-                            .get(&send_event_name)
-                            .copied()
-                            .unwrap_or(0);
-
-                        let mut begin_event = TrackEvent::default();
-                        begin_event.set_type(Type::TYPE_SLICE_BEGIN);
-                        if send_name_iid > 0 {
-                            begin_event.set_name_iid(send_name_iid);
-                        }
-                        begin_event.set_track_uuid(network_track_uuid);
-
-                        // Add socket_id annotation
-                        let mut socket_annotation = DebugAnnotation::default();
-                        socket_annotation.set_name("socket_id".to_string());
-                        socket_annotation.set_uint_value(event.socket_id);
-                        begin_event.debug_annotations.push(socket_annotation);
-
-                        // Add socket info string for readability
-                        let socket_info = self.socket_track_name(event.socket_id);
-                        let mut socket_info_annotation = DebugAnnotation::default();
-                        socket_info_annotation.set_name("socket".to_string());
-                        socket_info_annotation.set_string_value(socket_info);
-                        begin_event.debug_annotations.push(socket_info_annotation);
-
-                        let mut bytes_annotation = DebugAnnotation::default();
-                        bytes_annotation.set_name("bytes".to_string());
-                        bytes_annotation.set_uint_value(event.bytes as u64);
-                        begin_event.debug_annotations.push(bytes_annotation);
-
-                        if event.sendmsg_seq > 0 {
-                            let mut seq_annotation = DebugAnnotation::default();
-                            seq_annotation.set_name("seq".to_string());
-                            seq_annotation.set_uint_value(event.sendmsg_seq as u64);
-                            begin_event.debug_annotations.push(seq_annotation);
-                        }
-
-                        // Add send buffer info (TCP only, when available)
-                        if event.sndbuf_limit > 0 {
-                            let mut sndbuf_used_annotation = DebugAnnotation::default();
-                            sndbuf_used_annotation.set_name("sndbuf_used".to_string());
-                            sndbuf_used_annotation.set_uint_value(event.sndbuf_used as u64);
-                            begin_event.debug_annotations.push(sndbuf_used_annotation);
-
-                            let mut sndbuf_limit_annotation = DebugAnnotation::default();
-                            sndbuf_limit_annotation.set_name("sndbuf_limit".to_string());
-                            sndbuf_limit_annotation.set_uint_value(event.sndbuf_limit as u64);
-                            begin_event.debug_annotations.push(sndbuf_limit_annotation);
-
-                            // Add fill percentage for easier analysis
-                            let fill_pct =
-                                (event.sndbuf_used as u64 * 100) / event.sndbuf_limit as u64;
-                            let mut fill_annotation = DebugAnnotation::default();
-                            fill_annotation.set_name("sndbuf_fill_pct".to_string());
-                            fill_annotation.set_uint_value(fill_pct);
-                            begin_event.debug_annotations.push(fill_annotation);
-                        }
-
-                        let mut begin_packet = TracePacket::default();
-                        begin_packet.set_timestamp(event.start_ts);
-                        begin_packet.set_track_event(begin_event);
-                        begin_packet.set_trusted_packet_sequence_id(sequence_id);
-                        packets.push(begin_packet);
-
-                        let mut end_event = TrackEvent::default();
-                        end_event.set_type(Type::TYPE_SLICE_END);
-                        end_event.set_track_uuid(network_track_uuid);
-
-                        let mut end_packet = TracePacket::default();
-                        end_packet.set_timestamp(event.end_ts);
-                        end_packet.set_track_event(end_event);
-                        end_packet.set_trusted_packet_sequence_id(sequence_id);
-                        packets.push(end_packet);
+                        self.emit_syscall_slice(
+                            &mut packets,
+                            sequence_id,
+                            network_track_uuid,
+                            event,
+                            true,
+                        );
                     }
                     EventEntry::Recv(event) => {
-                        let protocol = match self.socket_metadata.get(&event.socket_id) {
-                            Some(m) => m.protocol,
-                            None => {
-                                tracing::debug!(
-                                    "Missing socket metadata for socket_id {}",
-                                    event.socket_id
-                                );
-                                0
-                            }
-                        };
-                        let proto_str = Self::protocol_to_str(protocol);
-                        let recv_event_name = format!("{proto_str}_recv");
-                        let recv_name_iid = self
-                            .event_name_ids
-                            .get(&recv_event_name)
-                            .copied()
-                            .unwrap_or(0);
-
-                        let mut begin_event = TrackEvent::default();
-                        begin_event.set_type(Type::TYPE_SLICE_BEGIN);
-                        if recv_name_iid > 0 {
-                            begin_event.set_name_iid(recv_name_iid);
-                        }
-                        begin_event.set_track_uuid(network_track_uuid);
-
-                        // Add socket_id annotation
-                        let mut socket_annotation = DebugAnnotation::default();
-                        socket_annotation.set_name("socket_id".to_string());
-                        socket_annotation.set_uint_value(event.socket_id);
-                        begin_event.debug_annotations.push(socket_annotation);
-
-                        // Add socket info string for readability
-                        let socket_info = self.socket_track_name(event.socket_id);
-                        let mut socket_info_annotation = DebugAnnotation::default();
-                        socket_info_annotation.set_name("socket".to_string());
-                        socket_info_annotation.set_string_value(socket_info);
-                        begin_event.debug_annotations.push(socket_info_annotation);
-
-                        // Add bytes annotation
-                        let mut bytes_annotation = DebugAnnotation::default();
-                        bytes_annotation.set_name("bytes".to_string());
-                        bytes_annotation.set_uint_value(event.bytes as u64);
-                        begin_event.debug_annotations.push(bytes_annotation);
-
-                        // Add TCP receive sequence annotations (when fields are non-zero)
-                        if event.recv_seq_start > 0 || event.recv_seq_end > 0 {
-                            let mut seq_start_annotation = DebugAnnotation::default();
-                            seq_start_annotation.set_name("recv_seq_start".to_string());
-                            seq_start_annotation.set_uint_value(event.recv_seq_start as u64);
-                            begin_event.debug_annotations.push(seq_start_annotation);
-
-                            let mut seq_end_annotation = DebugAnnotation::default();
-                            seq_end_annotation.set_name("recv_seq_end".to_string());
-                            seq_end_annotation.set_uint_value(event.recv_seq_end as u64);
-                            begin_event.debug_annotations.push(seq_end_annotation);
-
-                            if event.rcv_nxt_at_entry > 0 {
-                                let mut rcv_nxt_annotation = DebugAnnotation::default();
-                                rcv_nxt_annotation.set_name("rcv_nxt".to_string());
-                                rcv_nxt_annotation.set_uint_value(event.rcv_nxt_at_entry as u64);
-                                begin_event.debug_annotations.push(rcv_nxt_annotation);
-
-                                // Calculate and add bytes_available (data buffered in kernel)
-                                let bytes_available =
-                                    event.rcv_nxt_at_entry.wrapping_sub(event.recv_seq_start);
-                                if bytes_available > 0 && bytes_available < 64 * 1024 * 1024 {
-                                    let mut available_annotation = DebugAnnotation::default();
-                                    available_annotation.set_name("bytes_available".to_string());
-                                    available_annotation.set_uint_value(bytes_available as u64);
-                                    begin_event.debug_annotations.push(available_annotation);
-                                }
-                            }
-                        }
-
-                        let mut begin_packet = TracePacket::default();
-                        begin_packet.set_timestamp(event.start_ts);
-                        begin_packet.set_track_event(begin_event);
-                        begin_packet.set_trusted_packet_sequence_id(sequence_id);
-                        packets.push(begin_packet);
-
-                        let mut end_event = TrackEvent::default();
-                        end_event.set_type(Type::TYPE_SLICE_END);
-                        end_event.set_track_uuid(network_track_uuid);
-
-                        let mut end_packet = TracePacket::default();
-                        end_packet.set_timestamp(event.end_ts);
-                        end_packet.set_track_event(end_event);
-                        end_packet.set_trusted_packet_sequence_id(sequence_id);
-                        packets.push(end_packet);
+                        self.emit_syscall_slice(
+                            &mut packets,
+                            sequence_id,
+                            network_track_uuid,
+                            event,
+                            false,
+                        );
                     }
                     EventEntry::PollReady(event) => {
-                        let poll_name_iid = *self.event_name_ids.get("poll_ready").unwrap_or(&0);
-
-                        let mut instant_event = TrackEvent::default();
-                        instant_event.set_type(Type::TYPE_INSTANT);
-                        instant_event.set_name_iid(poll_name_iid);
-                        instant_event.set_track_uuid(network_track_uuid);
-
-                        let mut socket_annotation = DebugAnnotation::default();
-                        socket_annotation.set_name("socket_id".to_string());
-                        socket_annotation.set_uint_value(event.socket_id);
-                        instant_event.debug_annotations.push(socket_annotation);
-
-                        let socket_info = self.socket_track_name(event.socket_id);
-                        let mut socket_info_annotation = DebugAnnotation::default();
-                        socket_info_annotation.set_name("socket".to_string());
-                        socket_info_annotation.set_string_value(socket_info);
-                        instant_event.debug_annotations.push(socket_info_annotation);
-
-                        let mut requested_annotation = DebugAnnotation::default();
-                        requested_annotation.set_name("requested".to_string());
-                        requested_annotation
-                            .set_string_value(Self::poll_events_to_str(event.requested_events));
-                        instant_event.debug_annotations.push(requested_annotation);
-
-                        let mut returned_annotation = DebugAnnotation::default();
-                        returned_annotation.set_name("returned".to_string());
-                        returned_annotation
-                            .set_string_value(Self::poll_events_to_str(event.returned_events));
-                        instant_event.debug_annotations.push(returned_annotation);
-
-                        let mut instant_packet = TracePacket::default();
-                        instant_packet.set_timestamp(event.ts);
-                        instant_packet.set_track_event(instant_event);
-                        instant_packet.set_trusted_packet_sequence_id(sequence_id);
-                        packets.push(instant_packet);
+                        self.emit_poll_ready(&mut packets, sequence_id, network_track_uuid, event);
                     }
                     _ => {
                         // Packet events are handled separately in Phase 3
@@ -3307,8 +2956,7 @@ mod tests {
         let socket_track_name = socket_tracks[0].track_descriptor().name();
         assert!(
             socket_track_name.contains("UDP"),
-            "Socket track should be identified as UDP: {}",
-            socket_track_name
+            "Socket track should be identified as UDP: {socket_track_name}"
         );
     }
 }
