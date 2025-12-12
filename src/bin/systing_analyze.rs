@@ -1677,30 +1677,30 @@ struct ParquetPaths {
 impl ParquetPaths {
     fn new(temp_dir: &Path, trace_id: &str) -> Self {
         Self {
-            process: temp_dir.join(format!("{}_process.parquet", trace_id)),
-            thread: temp_dir.join(format!("{}_thread.parquet", trace_id)),
-            sched_slice: temp_dir.join(format!("{}_sched_slice.parquet", trace_id)),
-            thread_state: temp_dir.join(format!("{}_thread_state.parquet", trace_id)),
-            counter_track: temp_dir.join(format!("{}_counter_track.parquet", trace_id)),
-            counter: temp_dir.join(format!("{}_counter.parquet", trace_id)),
-            slice: temp_dir.join(format!("{}_slice.parquet", trace_id)),
-            track: temp_dir.join(format!("{}_track.parquet", trace_id)),
-            args: temp_dir.join(format!("{}_args.parquet", trace_id)),
+            process: temp_dir.join(format!("{trace_id}_process.parquet")),
+            thread: temp_dir.join(format!("{trace_id}_thread.parquet")),
+            sched_slice: temp_dir.join(format!("{trace_id}_sched_slice.parquet")),
+            thread_state: temp_dir.join(format!("{trace_id}_thread_state.parquet")),
+            counter_track: temp_dir.join(format!("{trace_id}_counter_track.parquet")),
+            counter: temp_dir.join(format!("{trace_id}_counter.parquet")),
+            slice: temp_dir.join(format!("{trace_id}_slice.parquet")),
+            track: temp_dir.join(format!("{trace_id}_track.parquet")),
+            args: temp_dir.join(format!("{trace_id}_args.parquet")),
             // Instant events (packet events, etc.)
-            instant: temp_dir.join(format!("{}_instant.parquet", trace_id)),
-            instant_args: temp_dir.join(format!("{}_instant_args.parquet", trace_id)),
+            instant: temp_dir.join(format!("{trace_id}_instant.parquet")),
+            instant_args: temp_dir.join(format!("{trace_id}_instant_args.parquet")),
             // Stack trace tables
-            symbol: temp_dir.join(format!("{}_symbol.parquet", trace_id)),
-            stack_mapping: temp_dir.join(format!("{}_stack_mapping.parquet", trace_id)),
-            frame: temp_dir.join(format!("{}_frame.parquet", trace_id)),
-            callsite: temp_dir.join(format!("{}_callsite.parquet", trace_id)),
-            perf_sample: temp_dir.join(format!("{}_perf_sample.parquet", trace_id)),
+            symbol: temp_dir.join(format!("{trace_id}_symbol.parquet")),
+            stack_mapping: temp_dir.join(format!("{trace_id}_stack_mapping.parquet")),
+            frame: temp_dir.join(format!("{trace_id}_frame.parquet")),
+            callsite: temp_dir.join(format!("{trace_id}_callsite.parquet")),
+            perf_sample: temp_dir.join(format!("{trace_id}_perf_sample.parquet")),
             // Network interface metadata
-            network_interface: temp_dir.join(format!("{}_network_interface.parquet", trace_id)),
+            network_interface: temp_dir.join(format!("{trace_id}_network_interface.parquet")),
             // Socket connection metadata
-            socket_connection: temp_dir.join(format!("{}_socket_connection.parquet", trace_id)),
+            socket_connection: temp_dir.join(format!("{trace_id}_socket_connection.parquet")),
             // Clock snapshot data
-            clock_snapshot: temp_dir.join(format!("{}_clock_snapshot.parquet", trace_id)),
+            clock_snapshot: temp_dir.join(format!("{trace_id}_clock_snapshot.parquet")),
         }
     }
 }
@@ -3030,7 +3030,7 @@ fn run_convert(
     let num_cpus = get_num_cpus();
     let num_workers = num_cpus.min(traces.len());
     if verbose {
-        eprintln!("Using {} parallel workers", num_workers);
+        eprintln!("Using {num_workers} parallel workers");
     }
 
     let progress = ProgressBar::new(traces.len() as u64);
@@ -3126,7 +3126,7 @@ fn run_convert(
     let import_start = Instant::now();
 
     let conn = Connection::open(&output)?;
-    conn.execute_batch(&format!("SET threads TO {};", num_cpus))?;
+    conn.execute_batch(&format!("SET threads TO {num_cpus};"))?;
     create_schema(&conn)?;
 
     // Import _traces table
@@ -3159,8 +3159,7 @@ fn run_convert(
             .collect::<Vec<_>>()
             .join(", ");
         conn.execute_batch(&format!(
-            "INSERT INTO {} SELECT * FROM read_parquet([{}])",
-            table_name, paths_list
+            "INSERT INTO {table_name} SELECT * FROM read_parquet([{paths_list}])"
         ))?;
         if verbose {
             eprintln!(
@@ -3205,7 +3204,7 @@ fn run_convert(
     if !errors.is_empty() {
         eprintln!("\nConversion errors:");
         for error in &errors {
-            eprintln!("  {}", error);
+            eprintln!("  {error}");
         }
     }
 
@@ -3311,7 +3310,7 @@ fn execute_query(conn: &Connection, sql: &str, format: &str) -> Result<()> {
                 duckdb::types::Value::Float(n) => n.to_string(),
                 duckdb::types::Value::Double(n) => n.to_string(),
                 duckdb::types::Value::Text(s) => s,
-                _ => format!("{:?}", value),
+                _ => format!("{value:?}"),
             };
             row_values.push(str_value);
         }
@@ -3391,7 +3390,7 @@ fn print_table(headers: &[String], rows: &[Vec<String>]) {
                 } else {
                     v.clone()
                 };
-                format!("{:width$}", truncated, width = width)
+                format!("{truncated:width$}")
             })
             .collect();
         println!("{}", row_line.join(" | "));
@@ -3412,7 +3411,7 @@ fn run_interactive(conn: &Connection, format: &str) -> Result<()> {
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let name: String = row.get(0)?;
-        eprintln!("  {}", name);
+        eprintln!("  {name}");
     }
     eprintln!();
 
@@ -3425,7 +3424,7 @@ fn run_interactive(conn: &Connection, format: &str) -> Result<()> {
         } else {
             "...> "
         };
-        eprint!("{}", prompt);
+        eprint!("{prompt}");
         io::stderr().flush()?;
 
         let mut line = String::new();
@@ -3446,7 +3445,7 @@ fn run_interactive(conn: &Connection, format: &str) -> Result<()> {
 
             if !query.is_empty() {
                 if let Err(e) = execute_query(conn, &query, format) {
-                    eprintln!("Error: {}", e);
+                    eprintln!("Error: {e}");
                 }
             }
             println!();
@@ -4148,7 +4147,7 @@ mod tests {
             let mut begin_event = TrackEvent::default();
             begin_event.set_type(Type::TYPE_SLICE_BEGIN);
             begin_event.set_track_uuid(99999);
-            begin_event.set_name(format!("level_{}", i));
+            begin_event.set_name(format!("level_{i}"));
             begin.set_track_event(begin_event);
             extractor.process_packet(&begin).unwrap();
         }
@@ -4167,7 +4166,7 @@ mod tests {
         // Verify all slices have correct durations
         assert_eq!(extractor.data.slices.len(), 5);
         for i in 0..5 {
-            assert_eq!(extractor.data.slices[i].name, format!("level_{}", i));
+            assert_eq!(extractor.data.slices[i].name, format!("level_{i}"));
             let expected_dur = 1000 + ((4 - i) * 100) - (i * 100);
             assert_eq!(extractor.data.slices[i].dur, expected_dur as i64);
         }

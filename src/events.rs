@@ -849,7 +849,7 @@ impl SystingProbeRecorder {
                 if let Some((_, ArgValue::Long(socket_id))) =
                     args.iter().find(|(k, _)| k == "socket_id")
                 {
-                    return format!("{}:{}", range_name, socket_id);
+                    return format!("{range_name}:{socket_id}");
                 }
             }
             range_name.to_string()
