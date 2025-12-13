@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use anyhow::Result;
+
+use crate::perfetto::TraceWriter;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::network_event;
 use crate::SystingRecordEvent;
@@ -907,37 +910,38 @@ impl NetworkRecorder {
 
     /// Helper to emit packet events for a given event type.
     /// Uses peekable to check emptiness without collecting, then emits events directly.
-    fn emit_packet_events<'a>(
+    fn write_packet_events<'a>(
         &self,
-        packets: &mut Vec<TracePacket>,
+        writer: &mut dyn TraceWriter,
         sequence_id: u32,
         track_uuid: u64,
         event_name: &str,
         pkt_iter: impl Iterator<Item = &'a PacketEvent>,
-    ) {
+    ) -> Result<()> {
         let mut pkt_iter = pkt_iter.peekable();
         if pkt_iter.peek().is_none() {
-            return;
+            return Ok(());
         }
         let iid = self.event_name_ids.get(event_name).copied().unwrap_or(0);
         if iid == 0 {
             tracing::warn!("Missing event name IID for: {}", event_name);
-            return;
+            return Ok(());
         }
         for pkt in pkt_iter {
-            self.emit_single_packet_event(packets, sequence_id, track_uuid, iid, pkt);
+            self.write_single_packet_event(writer, sequence_id, track_uuid, iid, pkt)?;
         }
+        Ok(())
     }
 
-    /// Emit a single packet instant event
-    fn emit_single_packet_event(
+    /// Write a single packet instant event
+    fn write_single_packet_event(
         &self,
-        packets: &mut Vec<TracePacket>,
+        writer: &mut dyn TraceWriter,
         sequence_id: u32,
         track_uuid: u64,
         name_iid: u64,
         pkt: &PacketEvent,
-    ) {
+    ) -> Result<()> {
         let mut instant_event = TrackEvent::default();
         instant_event.set_type(Type::TYPE_INSTANT);
         instant_event.set_name_iid(name_iid);
@@ -960,18 +964,18 @@ impl NetworkRecorder {
         packet.set_timestamp(pkt.ts);
         packet.set_track_event(instant_event);
         packet.set_trusted_packet_sequence_id(sequence_id);
-        packets.push(packet);
+        writer.write_packet(&packet)
     }
 
-    /// Emit a syscall slice event (Send or Recv) with begin and end packets.
-    fn emit_syscall_slice(
+    /// Write a syscall slice event (Send or Recv) with begin and end packets.
+    fn write_syscall_slice(
         &self,
-        packets: &mut Vec<TracePacket>,
+        writer: &mut dyn TraceWriter,
         sequence_id: u32,
         track_uuid: u64,
         event: &NetworkEvent,
         is_send: bool,
-    ) {
+    ) -> Result<()> {
         let protocol = self
             .socket_metadata
             .get(&event.socket_id)
@@ -1030,7 +1034,7 @@ impl NetworkRecorder {
         begin_packet.set_timestamp(event.start_ts);
         begin_packet.set_track_event(begin_event);
         begin_packet.set_trusted_packet_sequence_id(sequence_id);
-        packets.push(begin_packet);
+        writer.write_packet(&begin_packet)?;
 
         // Build end event
         let mut end_event = TrackEvent::default();
@@ -1041,17 +1045,17 @@ impl NetworkRecorder {
         end_packet.set_timestamp(event.end_ts);
         end_packet.set_track_event(end_event);
         end_packet.set_trusted_packet_sequence_id(sequence_id);
-        packets.push(end_packet);
+        writer.write_packet(&end_packet)
     }
 
-    /// Emit a poll_ready instant event
-    fn emit_poll_ready(
+    /// Write a poll_ready instant event
+    fn write_poll_ready(
         &self,
-        packets: &mut Vec<TracePacket>,
+        writer: &mut dyn TraceWriter,
         sequence_id: u32,
         track_uuid: u64,
         event: &PollEvent,
-    ) {
+    ) -> Result<()> {
         let poll_name_iid = *self.event_name_ids.get("poll_ready").unwrap_or(&0);
 
         let mut instant_event = TrackEvent::default();
@@ -1071,7 +1075,7 @@ impl NetworkRecorder {
         instant_packet.set_timestamp(event.ts);
         instant_packet.set_track_event(instant_event);
         instant_packet.set_trusted_packet_sequence_id(sequence_id);
-        packets.push(instant_packet);
+        writer.write_packet(&instant_packet)
     }
 
     /// Prepares all metadata needed for packet generation, including:
@@ -1197,13 +1201,13 @@ impl NetworkRecorder {
         }
     }
 
-    pub fn generate_trace_packets(
+    pub fn write_trace_packets(
         &mut self,
+        writer: &mut dyn TraceWriter,
         pid_uuids: &HashMap<i32, u64>,
         thread_uuids: &HashMap<i32, u64>,
         id_counter: &Arc<AtomicUsize>,
-    ) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
+    ) -> Result<()> {
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
 
         // Phase 1: Prepare all metadata (event names, IIDs, DNS resolution)
@@ -1222,7 +1226,7 @@ impl NetworkRecorder {
                 SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
                     | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
             );
-            packets.push(interned_packet);
+            writer.write_packet(&interned_packet)?;
         }
 
         // ====================================================================
@@ -1238,7 +1242,7 @@ impl NetworkRecorder {
 
             let mut root_track_packet = TracePacket::default();
             root_track_packet.set_track_descriptor(root_track_desc);
-            packets.push(root_track_packet);
+            writer.write_packet(&root_track_packet)?;
 
             // Create per-socket packet tracks (flat - events directly under socket)
             for (socket_id, events) in self.packet_events.iter() {
@@ -1256,7 +1260,7 @@ impl NetworkRecorder {
 
                 let mut socket_track_packet = TracePacket::default();
                 socket_track_packet.set_track_descriptor(socket_track_desc);
-                packets.push(socket_track_packet);
+                writer.write_packet(&socket_track_packet)?;
 
                 // Determine protocol for this socket
                 let is_tcp = self
@@ -1268,130 +1272,130 @@ impl NetworkRecorder {
                 // Emit all packet events directly on this socket track (flat)
                 if is_tcp {
                     // TCP packet events
-                    self.emit_packet_events(
-                        &mut packets,
+                    self.write_packet_events(
+                        writer,
                         sequence_id,
                         socket_track_uuid,
                         "TCP packet_enqueue",
                         events.iter_tcp_enqueue_packets(),
-                    );
-                    self.emit_packet_events(
-                        &mut packets,
+                    )?;
+                    self.write_packet_events(
+                        writer,
                         sequence_id,
                         socket_track_uuid,
                         "TCP packet_send",
                         events.iter_shared_send_packets(),
-                    );
-                    self.emit_packet_events(
-                        &mut packets,
+                    )?;
+                    self.write_packet_events(
+                        writer,
                         sequence_id,
                         socket_track_uuid,
                         "TCP packet_rcv_established",
                         events.iter_tcp_rcv_established_packets(),
-                    );
-                    self.emit_packet_events(
-                        &mut packets,
+                    )?;
+                    self.write_packet_events(
+                        writer,
                         sequence_id,
                         socket_track_uuid,
                         "TCP packet_queue_rcv",
                         events.iter_tcp_queue_rcv_packets(),
-                    );
-                    self.emit_packet_events(
-                        &mut packets,
+                    )?;
+                    self.write_packet_events(
+                        writer,
                         sequence_id,
                         socket_track_uuid,
                         "TCP zero_window_probe",
                         events.iter_zero_window_probes(),
-                    );
-                    self.emit_packet_events(
-                        &mut packets,
+                    )?;
+                    self.write_packet_events(
+                        writer,
                         sequence_id,
                         socket_track_uuid,
                         "TCP zero_window_ack",
                         events.iter_zero_window_acks(),
-                    );
-                    self.emit_packet_events(
-                        &mut packets,
+                    )?;
+                    self.write_packet_events(
+                        writer,
                         sequence_id,
                         socket_track_uuid,
                         "TCP rto_timeout",
                         events.iter_rto_timeouts(),
-                    );
-                    self.emit_packet_events(
-                        &mut packets,
+                    )?;
+                    self.write_packet_events(
+                        writer,
                         sequence_id,
                         socket_track_uuid,
                         "TCP buffer_queue",
                         events.iter_tcp_buffer_queue_packets(),
-                    );
+                    )?;
                 } else {
                     // UDP packet events
-                    self.emit_packet_events(
-                        &mut packets,
+                    self.write_packet_events(
+                        writer,
                         sequence_id,
                         socket_track_uuid,
                         "UDP send",
                         events.iter_udp_send_packets(),
-                    );
-                    self.emit_packet_events(
-                        &mut packets,
+                    )?;
+                    self.write_packet_events(
+                        writer,
                         sequence_id,
                         socket_track_uuid,
                         "UDP receive",
                         events.iter_udp_rcv_packets(),
-                    );
-                    self.emit_packet_events(
-                        &mut packets,
+                    )?;
+                    self.write_packet_events(
+                        writer,
                         sequence_id,
                         socket_track_uuid,
                         "UDP packet_send",
                         events.iter_shared_send_packets(),
-                    );
-                    self.emit_packet_events(
-                        &mut packets,
+                    )?;
+                    self.write_packet_events(
+                        writer,
                         sequence_id,
                         socket_track_uuid,
                         "UDP enqueue",
                         events.iter_udp_enqueue_packets(),
-                    );
+                    )?;
                 }
 
                 // Drop/throttle events (apply to both TCP and UDP)
-                self.emit_packet_events(
-                    &mut packets,
+                self.write_packet_events(
+                    writer,
                     sequence_id,
                     socket_track_uuid,
                     "packet_drop",
                     events.iter_skb_drops(),
-                );
-                self.emit_packet_events(
-                    &mut packets,
+                )?;
+                self.write_packet_events(
+                    writer,
                     sequence_id,
                     socket_track_uuid,
                     "cpu_backlog_drop",
                     events.iter_cpu_backlog_drops(),
-                );
-                self.emit_packet_events(
-                    &mut packets,
+                )?;
+                self.write_packet_events(
+                    writer,
                     sequence_id,
                     socket_track_uuid,
                     "TCP mem_pressure",
                     events.iter_mem_pressure(),
-                );
-                self.emit_packet_events(
-                    &mut packets,
+                )?;
+                self.write_packet_events(
+                    writer,
                     sequence_id,
                     socket_track_uuid,
                     "qdisc_enqueue",
                     events.iter_qdisc_enqueue(),
-                );
-                self.emit_packet_events(
-                    &mut packets,
+                )?;
+                self.write_packet_events(
+                    writer,
                     sequence_id,
                     socket_track_uuid,
                     "qdisc_dequeue",
                     events.iter_qdisc_dequeue(),
-                );
+                )?;
             }
         }
 
@@ -1416,31 +1420,31 @@ impl NetworkRecorder {
 
             let mut network_track_packet = TracePacket::default();
             network_track_packet.set_track_descriptor(network_track_desc);
-            packets.push(network_track_packet);
+            writer.write_packet(&network_track_packet)?;
 
             // Emit all events directly on this single track
             for event_entry in events.iter() {
                 match event_entry {
                     EventEntry::Send(event) => {
-                        self.emit_syscall_slice(
-                            &mut packets,
+                        self.write_syscall_slice(
+                            writer,
                             sequence_id,
                             network_track_uuid,
                             event,
                             true,
-                        );
+                        )?;
                     }
                     EventEntry::Recv(event) => {
-                        self.emit_syscall_slice(
-                            &mut packets,
+                        self.write_syscall_slice(
+                            writer,
                             sequence_id,
                             network_track_uuid,
                             event,
                             false,
-                        );
+                        )?;
                     }
                     EventEntry::PollReady(event) => {
-                        self.emit_poll_ready(&mut packets, sequence_id, network_track_uuid, event);
+                        self.write_poll_ready(writer, sequence_id, network_track_uuid, event)?;
                     }
                     _ => {
                         // Packet events are handled separately in Phase 3
@@ -1469,7 +1473,7 @@ impl NetworkRecorder {
         self.hostname_cache.clear();
         self.dns_stats = Default::default();
 
-        packets
+        Ok(())
     }
 
     /// Returns the minimum timestamp from all network events, or None if no events recorded.
@@ -1542,7 +1546,23 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::perfetto::VecTraceWriter;
     use crate::systing::types::{network_protocol, task_info};
+    use perfetto_protos::trace_packet::TracePacket;
+
+    /// Helper to collect packets from NetworkRecorder for tests
+    fn generate_trace_packets(
+        recorder: &mut NetworkRecorder,
+        pid_uuids: &HashMap<i32, u64>,
+        thread_uuids: &HashMap<i32, u64>,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Vec<TracePacket> {
+        let mut writer = VecTraceWriter::new();
+        recorder
+            .write_trace_packets(&mut writer, pid_uuids, thread_uuids, id_counter)
+            .unwrap();
+        writer.packets
+    }
 
     fn create_test_task_info(tgid: u32, pid: u32) -> task_info {
         task_info {
@@ -1800,7 +1820,7 @@ mod tests {
 
         recorder.handle_event(event);
 
-        let packets = recorder.generate_trace_packets(&pid_uuids, &thread_uuids, &id_counter);
+        let packets = generate_trace_packets(&mut recorder, &pid_uuids, &thread_uuids, &id_counter);
 
         // Packets: interned data, network track, slice begin, slice end
         assert_eq!(packets.len(), 4);
@@ -2540,7 +2560,7 @@ mod tests {
         recorder.handle_packet_event(queue_rcv);
         recorder.handle_packet_event(buffer_queue);
 
-        let packets = recorder.generate_trace_packets(&pid_uuids, &thread_uuids, &id_counter);
+        let packets = generate_trace_packets(&mut recorder, &pid_uuids, &thread_uuids, &id_counter);
 
         assert!(!packets.is_empty());
         let interned_packet = &packets[0];
@@ -2936,7 +2956,7 @@ mod tests {
         let pid_uuids = std::collections::HashMap::new();
         let thread_uuids = std::collections::HashMap::new();
 
-        let packets = recorder.generate_trace_packets(&pid_uuids, &thread_uuids, &id_counter);
+        let packets = generate_trace_packets(&mut recorder, &pid_uuids, &thread_uuids, &id_counter);
 
         // Find socket-level track descriptors
         let socket_tracks: Vec<_> = packets

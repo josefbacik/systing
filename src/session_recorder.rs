@@ -5,10 +5,12 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use anyhow::Result;
+
 use crate::events::SystingProbeRecorder;
 use crate::network_recorder::NetworkRecorder;
 use crate::perf_recorder::PerfCounterRecorder;
-use crate::perfetto::TrackCounter;
+use crate::perfetto::{TraceWriter, TrackCounter};
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::stack_recorder::StackRecorder;
@@ -316,9 +318,11 @@ impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
 }
 
 impl SysinfoRecorder {
-    pub fn generate_trace(&self, id_counter: &Arc<AtomicUsize>) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
-
+    pub fn write_trace(
+        &self,
+        writer: &mut dyn TraceWriter,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Result<()> {
         // Populate the sysinfo events
         for (cpu, events) in self.frequency.iter() {
             let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
@@ -334,14 +338,14 @@ impl SysinfoRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
-            packets.push(packet);
+            writer.write_packet(&packet)?;
 
             let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
             for event in events.iter() {
-                packets.push(event.to_track_event(desc_uuid, seq));
+                writer.write_packet(&event.to_track_event(desc_uuid, seq))?;
             }
         }
-        packets
+        Ok(())
     }
 
     /// Returns the minimum timestamp from all frequency events, or None if no events recorded.
@@ -565,15 +569,17 @@ impl SessionRecorder {
         .unwrap_or_else(|| get_clock_value(libc::CLOCK_BOOTTIME))
     }
 
-    /// Generates the initial trace packets including clock snapshot and root descriptor
-    fn generate_initial_packets(&self, id_counter: &Arc<AtomicUsize>) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
-
+    /// Writes the initial trace packets including clock snapshot and root descriptor
+    fn write_initial_packets(
+        &self,
+        writer: &mut dyn TraceWriter,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Result<()> {
         // Emit the clock snapshot
         let mut packet = TracePacket::default();
         packet.set_clock_snapshot(self.clock_snapshot.lock().unwrap().clone());
         packet.set_trusted_packet_sequence_id(id_counter.fetch_add(1, Ordering::Relaxed) as u32);
-        packets.push(packet);
+        writer.write_packet(&packet)?;
 
         // Emit SystemInfo with UtsName in a separate packet (both are in oneof data)
         if let Some(utsname) = get_system_utsname() {
@@ -586,7 +592,7 @@ impl SessionRecorder {
             packet.set_system_info(system_info);
             packet
                 .set_trusted_packet_sequence_id(id_counter.fetch_add(1, Ordering::Relaxed) as u32);
-            packets.push(packet);
+            writer.write_packet(&packet)?;
         }
 
         // Add the root Systing track descriptor
@@ -597,19 +603,18 @@ impl SessionRecorder {
 
         let mut packet = TracePacket::default();
         packet.set_track_descriptor(desc);
-        packets.push(packet);
+        writer.write_packet(&packet)?;
 
-        packets
+        Ok(())
     }
 
-    /// Generates trace packets for all processes
-    fn generate_process_packets(
+    /// Writes trace packets for all processes
+    fn write_process_packets(
         &self,
+        writer: &mut dyn TraceWriter,
         id_counter: &Arc<AtomicUsize>,
         pid_uuids: &mut HashMap<i32, u64>,
-    ) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
-
+    ) -> Result<()> {
         // Generate process track descriptors
         for process in self.process_descriptors.read().unwrap().values() {
             let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
@@ -621,7 +626,7 @@ impl SessionRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
-            packets.push(packet);
+            writer.write_packet(&packet)?;
         }
 
         // Generate process trees
@@ -633,20 +638,19 @@ impl SessionRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_process_tree(process_tree);
-            packets.push(packet);
+            writer.write_packet(&packet)?;
         }
 
-        packets
+        Ok(())
     }
 
-    /// Generates trace packets for all threads
-    fn generate_thread_packets(
+    /// Writes trace packets for all threads
+    fn write_thread_packets(
         &self,
+        writer: &mut dyn TraceWriter,
         id_counter: &Arc<AtomicUsize>,
         thread_uuids: &mut HashMap<i32, u64>,
-    ) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
-
+    ) -> Result<()> {
         for thread in self.threads.read().unwrap().values() {
             let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             thread_uuids.insert(thread.tid(), uuid);
@@ -657,13 +661,13 @@ impl SessionRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
-            packets.push(packet);
+            writer.write_packet(&packet)?;
         }
 
-        packets
+        Ok(())
     }
 
-    /// Generates trace packets for network interface metadata.
+    /// Writes trace packets for network interface metadata.
     ///
     /// Creates a hierarchical "Network Interfaces" track structure that includes:
     /// - Host network namespace interfaces
@@ -671,6 +675,7 @@ impl SessionRecorder {
     ///
     /// # Arguments
     ///
+    /// * `writer` - The TraceWriter to write packets to
     /// * `id_counter` - Atomic counter for generating unique track UUIDs
     /// * `trace_start_ts` - BOOTTIME timestamp for when the trace began (used for metadata events)
     ///
@@ -685,12 +690,12 @@ impl SessionRecorder {
     /// └── netns:4026532890 (java:1234)
     ///     └── eth0
     /// ```
-    fn generate_network_interface_packets(
+    fn write_network_interface_packets(
         &self,
+        writer: &mut dyn TraceWriter,
         id_counter: &Arc<AtomicUsize>,
         trace_start_ts: u64,
-    ) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
+    ) -> Result<()> {
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
 
         // Create root "Network Interfaces" track
@@ -701,7 +706,7 @@ impl SessionRecorder {
 
         let mut root_packet = TracePacket::default();
         root_packet.set_track_descriptor(root_desc);
-        packets.push(root_packet);
+        writer.write_packet(&root_packet)?;
 
         // Get host network namespace inode for comparison
         let host_netns_inode = get_host_netns_inode();
@@ -792,7 +797,7 @@ impl SessionRecorder {
 
             let mut netns_packet = TracePacket::default();
             netns_packet.set_track_descriptor(netns_desc);
-            packets.push(netns_packet);
+            writer.write_packet(&netns_packet)?;
 
             // Create child tracks for each interface in this namespace
             for iface in interfaces {
@@ -806,7 +811,7 @@ impl SessionRecorder {
 
                 let mut iface_packet = TracePacket::default();
                 iface_packet.set_track_descriptor(iface_desc);
-                packets.push(iface_packet);
+                writer.write_packet(&iface_packet)?;
 
                 // Create an instant event with debug annotations for IP addresses
                 let mut track_event = TrackEvent::default();
@@ -835,104 +840,97 @@ impl SessionRecorder {
                 event_packet.set_timestamp(trace_start_ts);
                 event_packet.set_track_event(track_event);
                 event_packet.set_trusted_packet_sequence_id(sequence_id);
-                packets.push(event_packet);
+                writer.write_packet(&event_packet)?;
             }
         }
 
-        packets
+        Ok(())
     }
 
-    /// Collects trace packets from all event recorders
-    fn collect_recorder_traces(
+    /// Writes trace packets from all event recorders directly to the writer
+    fn write_recorder_traces(
         &self,
+        writer: &mut dyn TraceWriter,
         pid_uuids: &HashMap<i32, u64>,
         thread_uuids: &HashMap<i32, u64>,
         id_counter: &Arc<AtomicUsize>,
-    ) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
-
+    ) -> Result<()> {
         // Event recorder
         eprintln!("Generating scheduler trace packets...");
-        packets.extend(self.event_recorder.lock().unwrap().generate_trace(
+        self.event_recorder.lock().unwrap().write_trace(
+            writer,
             pid_uuids,
             thread_uuids,
             id_counter,
-        ));
+        )?;
 
         // Stack recorder - it has its own detailed progress bar for symbol resolution
         eprintln!("Generating stack trace packets...");
-        packets.extend(
-            self.stack_recorder
-                .lock()
-                .unwrap()
-                .generate_trace(id_counter),
-        );
+        self.stack_recorder
+            .lock()
+            .unwrap()
+            .write_trace(writer, id_counter)?;
 
         // Performance counter recorder
         eprintln!("Generating perf counter trace packets...");
-        packets.extend(
-            self.perf_counter_recorder
-                .lock()
-                .unwrap()
-                .generate_trace(id_counter),
-        );
+        self.perf_counter_recorder
+            .lock()
+            .unwrap()
+            .write_trace(writer, id_counter)?;
 
         // System info recorder
         eprintln!("Generating sysinfo trace packets...");
-        packets.extend(
-            self.sysinfo_recorder
-                .lock()
-                .unwrap()
-                .generate_trace(id_counter),
-        );
+        self.sysinfo_recorder
+            .lock()
+            .unwrap()
+            .write_trace(writer, id_counter)?;
 
         eprintln!("Generating probe trace packets...");
-        packets.extend(self.probe_recorder.lock().unwrap().generate_trace(
+        self.probe_recorder.lock().unwrap().write_trace(
+            writer,
             pid_uuids,
             thread_uuids,
             id_counter,
-        ));
+        )?;
 
         eprintln!("Generating syscall trace packets...");
 
         // Network recorder
         eprintln!("Generating network trace packets...");
-        packets.extend(
-            self.network_recorder
-                .lock()
-                .unwrap()
-                .generate_trace_packets(pid_uuids, thread_uuids, id_counter),
-        );
+        self.network_recorder.lock().unwrap().write_trace_packets(
+            writer,
+            pid_uuids,
+            thread_uuids,
+            id_counter,
+        )?;
 
-        packets
+        Ok(())
     }
 
-    pub fn generate_trace(&self) -> Vec<TracePacket> {
+    pub fn generate_trace(&self, writer: &mut dyn TraceWriter) -> Result<()> {
         let id_counter = Arc::new(AtomicUsize::new(1));
         let mut pid_uuids = HashMap::new();
         let mut thread_uuids = HashMap::new();
 
-        let mut packets = Vec::new();
-
         // Step 1: Generate initial packets (clock snapshot and root descriptor)
-        packets.extend(self.generate_initial_packets(&id_counter));
+        self.write_initial_packets(writer, &id_counter)?;
 
         // Get the trace start timestamp for metadata events (first actual event timestamp)
         let trace_start_ts = self.get_min_event_timestamp();
 
         // Step 2: Generate network interface metadata packets
-        packets.extend(self.generate_network_interface_packets(&id_counter, trace_start_ts));
+        self.write_network_interface_packets(writer, &id_counter, trace_start_ts)?;
 
         // Step 3: Generate process-related packets
-        packets.extend(self.generate_process_packets(&id_counter, &mut pid_uuids));
+        self.write_process_packets(writer, &id_counter, &mut pid_uuids)?;
 
         // Step 4: Generate thread-related packets
-        packets.extend(self.generate_thread_packets(&id_counter, &mut thread_uuids));
+        self.write_thread_packets(writer, &id_counter, &mut thread_uuids)?;
 
         // Step 5: Collect traces from all recorders
-        packets.extend(self.collect_recorder_traces(&pid_uuids, &thread_uuids, &id_counter));
+        self.write_recorder_traces(writer, &pid_uuids, &thread_uuids, &id_counter)?;
 
-        packets
+        Ok(())
     }
 }
 
@@ -945,7 +943,47 @@ impl crate::SystingEvent for SysInfoEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::perfetto::VecTraceWriter;
+    use perfetto_protos::trace_packet::TracePacket;
     use std::sync::{Mutex, RwLock};
+
+    /// Helper to collect process packets for tests
+    fn generate_process_packets(
+        recorder: &SessionRecorder,
+        id_counter: &Arc<AtomicUsize>,
+        pid_uuids: &mut HashMap<i32, u64>,
+    ) -> Vec<TracePacket> {
+        let mut writer = VecTraceWriter::new();
+        recorder
+            .write_process_packets(&mut writer, id_counter, pid_uuids)
+            .unwrap();
+        writer.packets
+    }
+
+    /// Helper to collect thread packets for tests
+    fn generate_thread_packets(
+        recorder: &SessionRecorder,
+        id_counter: &Arc<AtomicUsize>,
+        thread_uuids: &mut HashMap<i32, u64>,
+    ) -> Vec<TracePacket> {
+        let mut writer = VecTraceWriter::new();
+        recorder
+            .write_thread_packets(&mut writer, id_counter, thread_uuids)
+            .unwrap();
+        writer.packets
+    }
+
+    /// Helper to collect initial packets for tests
+    fn generate_initial_packets(
+        recorder: &SessionRecorder,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Vec<TracePacket> {
+        let mut writer = VecTraceWriter::new();
+        recorder
+            .write_initial_packets(&mut writer, id_counter)
+            .unwrap();
+        writer.packets
+    }
 
     fn create_test_task_info(tgid: u32, pid: u32, comm: &str) -> task_info {
         let mut task = task_info {
@@ -1190,7 +1228,7 @@ mod tests {
         // Set up a clock snapshot
         recorder.snapshot_clocks();
 
-        let packets = recorder.generate_initial_packets(&id_counter);
+        let packets = generate_initial_packets(&recorder, &id_counter);
 
         // Should generate 2-3 packets depending on whether utsname is available
         // (clock snapshot + [optional system info] + root descriptor)
@@ -1219,7 +1257,7 @@ mod tests {
         let id_counter = Arc::new(AtomicUsize::new(50));
 
         // Don't set up clock snapshot - should still work with empty snapshot
-        let packets = recorder.generate_initial_packets(&id_counter);
+        let packets = generate_initial_packets(&recorder, &id_counter);
 
         // Should generate 2-3 packets even with empty clock
         assert!(packets.len() >= 2 && packets.len() <= 3);
@@ -1235,7 +1273,7 @@ mod tests {
         // Set up clock snapshot
         recorder.snapshot_clocks();
 
-        let packets = recorder.generate_initial_packets(&id_counter);
+        let packets = generate_initial_packets(&recorder, &id_counter);
 
         // Should generate 2-3 packets: clock snapshot + [optional system info] + root descriptor
         assert!(packets.len() >= 2 && packets.len() <= 3);
@@ -1288,7 +1326,7 @@ mod tests {
         let id_counter = Arc::new(AtomicUsize::new(100));
         let mut pid_uuids = HashMap::new();
 
-        let packets = recorder.generate_process_packets(&id_counter, &mut pid_uuids);
+        let packets = generate_process_packets(&recorder, &id_counter, &mut pid_uuids);
 
         // Should generate no packets when no processes are recorded
         assert!(packets.is_empty());
@@ -1308,7 +1346,7 @@ mod tests {
         let task = create_test_task_info(1234, 1234, "test_process");
         recorder.maybe_record_task(&task);
 
-        let packets = recorder.generate_process_packets(&id_counter, &mut pid_uuids);
+        let packets = generate_process_packets(&recorder, &id_counter, &mut pid_uuids);
 
         // Should generate 2 packets: process track descriptor + process tree
         assert_eq!(packets.len(), 2);
@@ -1345,7 +1383,7 @@ mod tests {
         recorder.maybe_record_task(&task1);
         recorder.maybe_record_task(&task2);
 
-        let packets = recorder.generate_process_packets(&id_counter, &mut pid_uuids);
+        let packets = generate_process_packets(&recorder, &id_counter, &mut pid_uuids);
 
         // Should generate 4 packets: 2 process track descriptors + 2 process trees
         assert_eq!(packets.len(), 4);
@@ -1385,7 +1423,7 @@ mod tests {
         let id_counter = Arc::new(AtomicUsize::new(100));
         let mut thread_uuids = HashMap::new();
 
-        let packets = recorder.generate_thread_packets(&id_counter, &mut thread_uuids);
+        let packets = generate_thread_packets(&recorder, &id_counter, &mut thread_uuids);
 
         // Should generate no packets when no threads are recorded
         assert!(packets.is_empty());
@@ -1405,7 +1443,7 @@ mod tests {
         let task = create_test_task_info(1234, 5678, "test_thread");
         recorder.maybe_record_task(&task);
 
-        let packets = recorder.generate_thread_packets(&id_counter, &mut thread_uuids);
+        let packets = generate_thread_packets(&recorder, &id_counter, &mut thread_uuids);
 
         // Should generate 1 packet: thread track descriptor
         assert_eq!(packets.len(), 1);
@@ -1440,7 +1478,7 @@ mod tests {
         recorder.maybe_record_task(&task2);
         recorder.maybe_record_task(&task3);
 
-        let packets = recorder.generate_thread_packets(&id_counter, &mut thread_uuids);
+        let packets = generate_thread_packets(&recorder, &id_counter, &mut thread_uuids);
 
         // Should generate 3 packets: 3 thread track descriptors
         assert_eq!(packets.len(), 3);
@@ -1479,7 +1517,7 @@ mod tests {
         let task = create_test_task_info(9999, 8888, "special_thread");
         recorder.maybe_record_task(&task);
 
-        let packets = recorder.generate_thread_packets(&id_counter, &mut thread_uuids);
+        let packets = generate_thread_packets(&recorder, &id_counter, &mut thread_uuids);
 
         assert_eq!(packets.len(), 1);
 

@@ -2,6 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
+use anyhow::Result;
+
+use crate::perfetto::TraceWriter;
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::stack_event;
@@ -241,7 +244,9 @@ impl StackRecorder {
         }
     }
 
-    /// Process stacks for a single process and collect the interned data
+    /// Process stacks for a single process and collect the interned data.
+    /// Returns interned data and a closure that can write sample packets later
+    /// (samples must be written after the interned data packet).
     fn process_tgid_stacks(
         &self,
         symbolizer: &mut Symbolizer,
@@ -249,7 +254,12 @@ impl StackRecorder {
         stacks: &[StackEvent],
         global_kernel_frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
         ctx: &TraceContext,
-    ) -> (Vec<Callstack>, Vec<Frame>, Vec<Mapping>, Vec<TracePacket>) {
+    ) -> (
+        Vec<Callstack>,
+        Vec<Frame>,
+        Vec<Mapping>,
+        HashMap<Stack, Callstack>,
+    ) {
         // Step 1: Symbolize all stacks
         let resolved_info = self.symbolize_stacks(
             symbolizer,
@@ -269,11 +279,13 @@ impl StackRecorder {
         let user_frames = collect_frames(&resolved_info.user_frame_map);
         let user_mappings = collect_mappings(&resolved_info.user_frame_map);
 
-        // Step 3: Generate sample packets for this process
-        let sample_packets =
-            generate_sample_packets(stacks, &deduplicated_data.callstacks, ctx.sequence_id);
-
-        (callstacks, user_frames, user_mappings, sample_packets)
+        // Return the callstack map so samples can be written later (after interned data)
+        (
+            callstacks,
+            user_frames,
+            user_mappings,
+            deduplicated_data.callstacks,
+        )
     }
 
     /// Create the interned data packet with all collected data
@@ -306,7 +318,11 @@ impl StackRecorder {
         Some(interned_packet)
     }
 
-    pub fn generate_trace(&self, id_counter: &Arc<AtomicUsize>) -> Vec<TracePacket> {
+    pub fn write_trace(
+        &self,
+        writer: &mut dyn TraceWriter,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Result<()> {
         // Get a unique sequence ID for this trace
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
 
@@ -346,14 +362,14 @@ impl StackRecorder {
             None
         };
 
-        // Process all stacks synchronously to avoid the interleaving issue
-        let mut all_packets = Vec::new();
-        let mut all_sample_packets = Vec::new();
-
         // Collect all interned data from all processes
+        // We still need to collect these in memory as they go into a single packet
         let mut all_callstacks = Vec::new();
         let mut all_user_frames = Vec::new();
         let mut all_user_mappings = Vec::new();
+
+        // Store callstack maps per-tgid so we can write samples after interned data
+        let mut tgid_callstack_maps: Vec<(i32, HashMap<Stack, Callstack>)> = Vec::new();
 
         // Global kernel frame map shared across all processes
         let mut global_kernel_frame_map = HashMap::new();
@@ -361,27 +377,26 @@ impl StackRecorder {
         // Create trace context to pass common parameters
         let ctx = TraceContext {
             id_counter,
-            sequence_id,
             progress_bar: &progress_bar,
         };
 
-        // Process each tgid's stacks
+        // Phase 1: Process each tgid's stacks and collect interned data
+        // (sample packets will be written after interned data)
         for (tgid, stacks) in self.stacks.iter() {
-            let tgid = *tgid as u32;
+            let tgid_u32 = *tgid as u32;
 
-            let (callstacks, user_frames, user_mappings, sample_packets) = self
-                .process_tgid_stacks(
-                    &mut symbolizer,
-                    tgid,
-                    stacks,
-                    &mut global_kernel_frame_map,
-                    &ctx,
-                );
+            let (callstacks, user_frames, user_mappings, callstack_map) = self.process_tgid_stacks(
+                &mut symbolizer,
+                tgid_u32,
+                stacks,
+                &mut global_kernel_frame_map,
+                &ctx,
+            );
 
             all_callstacks.extend(callstacks);
             all_user_frames.extend(user_frames);
             all_user_mappings.extend(user_mappings);
-            all_sample_packets.extend(sample_packets);
+            tgid_callstack_maps.push((*tgid, callstack_map));
         }
 
         // Extract kernel frames and mappings from the global kernel frame map
@@ -397,22 +412,28 @@ impl StackRecorder {
         all_mappings.extend(kernel_mappings);
         all_mappings.extend(all_user_mappings);
 
-        // Create a single interned data packet with everything
+        // Phase 2: Write the interned data packet FIRST (before sample packets)
         if let Some(interned_packet) =
             self.create_interned_packet(all_callstacks, all_frames, all_mappings, sequence_id)
         {
-            all_packets.push(interned_packet);
+            writer.write_packet(&interned_packet)?;
         }
 
-        // Then add all the sample packets
-        all_packets.extend(all_sample_packets);
+        // Phase 3: Now write sample packets (they reference IIDs from interned data)
+        for (tgid, callstack_map) in tgid_callstack_maps {
+            let stacks = self
+                .stacks
+                .get(&tgid)
+                .expect("tgid must exist since we just collected from self.stacks");
+            write_sample_packets(writer, stacks, &callstack_map, sequence_id)?;
+        }
 
         // Finish the progress bar
         if let Some(pb) = progress_bar {
             pb.finish_with_message("Stack symbol resolution complete");
         }
 
-        all_packets
+        Ok(())
     }
 
     /// Returns the minimum timestamp from all stacks, or None if no stacks recorded.
@@ -647,7 +668,6 @@ fn dispatch_process_with_client(
 /// Context for trace generation shared across symbolization calls
 struct TraceContext<'a> {
     id_counter: &'a Arc<AtomicUsize>,
-    sequence_id: u32,
     progress_bar: &'a Option<ProgressBar>,
 }
 
@@ -772,14 +792,13 @@ fn deduplicate_stacks(
 
 /// Generates PerfSample packets from the deduplicated stacks
 /// Skips stacks that don't have a callstack (e.g., filtered out due to empty frames)
-fn generate_sample_packets(
+fn write_sample_packets(
+    writer: &mut dyn TraceWriter,
     stacks: &[StackEvent],
     callstack_map: &HashMap<Stack, Callstack>,
     sequence_id: u32,
-) -> Vec<TracePacket> {
-    let mut packets = Vec::new();
-
-    // Generate sample packets for each stack
+) -> Result<()> {
+    // Generate and write sample packets for each stack
     for stack in stacks.iter() {
         // Skip stacks that were filtered out during deduplication (empty callstacks)
         let callstack = match callstack_map.get(&stack.stack) {
@@ -798,9 +817,9 @@ fn generate_sample_packets(
         sample.set_tid(pid);
         packet.set_perf_sample(sample);
         packet.set_trusted_packet_sequence_id(sequence_id);
-        packets.push(packet);
+        writer.write_packet(&packet)?;
     }
-    packets
+    Ok(())
 }
 
 impl SystingRecordEvent<stack_event> for StackRecorder {
@@ -862,6 +881,7 @@ mod tests {
     //! generation pipeline works end-to-end despite fake data.
 
     use super::*;
+    use crate::perfetto::VecTraceWriter;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
@@ -1088,9 +1108,14 @@ mod tests {
         recorder.handle_event(event);
 
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
@@ -1116,9 +1141,14 @@ mod tests {
         recorder.handle_event(event2);
 
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
@@ -1136,22 +1166,28 @@ mod tests {
         recorder.handle_event(event2);
 
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
     #[test]
-    fn test_generate_sample_packets_empty() {
+    fn test_write_sample_packets_empty() {
         // Test packet generation with no stacks
         let stacks = vec![];
         let callstack_map = HashMap::new();
 
-        let packets = generate_sample_packets(&stacks, &callstack_map, 1);
+        let mut writer = VecTraceWriter::new();
+        write_sample_packets(&mut writer, &stacks, &callstack_map, 1).unwrap();
 
         // Should have no packets since there are no stacks
-        assert!(packets.is_empty());
+        assert!(writer.packets.is_empty());
     }
 
     #[test]
@@ -1168,9 +1204,14 @@ mod tests {
         recorder.handle_event(event);
 
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
@@ -1188,9 +1229,14 @@ mod tests {
         recorder.handle_event(event2);
 
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
@@ -1210,9 +1256,14 @@ mod tests {
 
         // Generate trace using the mock resolver
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
@@ -1232,9 +1283,14 @@ mod tests {
 
         // Generate trace with mock resolver
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
@@ -1262,9 +1318,14 @@ mod tests {
 
         // Generate trace
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
@@ -1282,9 +1343,14 @@ mod tests {
         recorder.handle_event(event2);
 
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 }
