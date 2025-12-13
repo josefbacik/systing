@@ -3,7 +3,9 @@ use std::ffi::CStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::perfetto::TrackCounter;
+use anyhow::Result;
+
+use crate::perfetto::{TraceWriter, TrackCounter};
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::event_type;
 use crate::systing::types::task_event;
@@ -120,14 +122,13 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
 }
 
 impl SchedEventRecorder {
-    pub fn generate_trace(
+    pub fn write_trace(
         &self,
+        writer: &mut dyn TraceWriter,
         pid_uuids: &HashMap<i32, u64>,
         thread_uuids: &HashMap<i32, u64>,
         id_counter: &Arc<AtomicUsize>,
-    ) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
-
+    ) -> Result<()> {
         // Pull all the compact scheduling events
         for (cpu, compact_sched) in self.compact_sched.iter() {
             let mut event_bundle = FtraceEventBundle::default();
@@ -135,7 +136,7 @@ impl SchedEventRecorder {
             event_bundle.compact_sched = Some(compact_sched.compact_sched.clone()).into();
             let mut packet = TracePacket::default();
             packet.set_ftrace_events(event_bundle);
-            packets.push(packet);
+            writer.write_packet(&packet)?;
         }
 
         // Pull all the scheduling events.
@@ -145,7 +146,7 @@ impl SchedEventRecorder {
             event_bundle.event = events.values().cloned().collect();
             let mut packet = TracePacket::default();
             packet.set_ftrace_events(event_bundle);
-            packets.push(packet);
+            writer.write_packet(&packet)?;
         }
 
         // Populate the per-cpu runqueue sizes
@@ -163,11 +164,11 @@ impl SchedEventRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
-            packets.push(packet);
+            writer.write_packet(&packet)?;
 
             let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
             for event in runqueue.iter() {
-                packets.push(event.to_track_event(desc_uuid, seq));
+                writer.write_packet(&event.to_track_event(desc_uuid, seq))?;
             }
         }
 
@@ -186,11 +187,11 @@ impl SchedEventRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
-            packets.push(packet);
+            writer.write_packet(&packet)?;
 
             let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
             for event in events.iter() {
-                packets.push(event.to_track_event(desc_uuid, seq));
+                writer.write_packet(&event.to_track_event(desc_uuid, seq))?;
             }
         }
 
@@ -213,14 +214,14 @@ impl SchedEventRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
-            packets.push(packet);
+            writer.write_packet(&packet)?;
 
             let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
             for event in events.iter() {
-                packets.push(event.to_track_event(desc_uuid, seq));
+                writer.write_packet(&event.to_track_event(desc_uuid, seq))?;
             }
         }
-        packets
+        Ok(())
     }
 
     pub fn set_cpu_sched_stats(&mut self, enabled: bool) {
@@ -418,12 +419,28 @@ impl LocalCompactSched {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::perfetto::VecTraceWriter;
     use crate::systing::types::event_type;
     use crate::systing::types::task_info;
+    use perfetto_protos::trace_packet::TracePacket;
 
     fn copy_to_comm(comm: &mut [u8], value: &CStr) {
         let bytes = value.to_bytes_with_nul();
         comm[..bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// Helper to collect packets from SchedEventRecorder for tests
+    fn generate_trace(
+        recorder: &SchedEventRecorder,
+        pid_uuids: &HashMap<i32, u64>,
+        thread_uuids: &HashMap<i32, u64>,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Vec<TracePacket> {
+        let mut writer = VecTraceWriter::new();
+        recorder
+            .write_trace(&mut writer, pid_uuids, thread_uuids, id_counter)
+            .unwrap();
+        writer.packets
     }
 
     #[test]
@@ -463,7 +480,8 @@ mod tests {
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
         thread_uuids.insert(5678, 2);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -508,7 +526,8 @@ mod tests {
 
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -548,7 +567,8 @@ mod tests {
 
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -588,7 +608,8 @@ mod tests {
 
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -619,7 +640,8 @@ mod tests {
         assert_eq!(recorder.events.len(), 1);
         assert!(recorder.events.contains_key(&0));
 
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &recorder,
             &HashMap::new(),
             &HashMap::new(),
             &Arc::new(AtomicUsize::new(0)),
@@ -650,7 +672,8 @@ mod tests {
         assert_eq!(recorder.events.len(), 1);
         assert!(recorder.events.contains_key(&0));
 
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &recorder,
             &HashMap::new(),
             &HashMap::new(),
             &Arc::new(AtomicUsize::new(0)),
@@ -688,7 +711,8 @@ mod tests {
 
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -721,7 +745,8 @@ mod tests {
         };
         recorder.handle_event(event);
 
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &recorder,
             &HashMap::new(),
             &HashMap::new(),
             &Arc::new(AtomicUsize::new(0)),
@@ -757,7 +782,8 @@ mod tests {
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
 
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),

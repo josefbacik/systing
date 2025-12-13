@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::perfetto::TraceWriter;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::probe_event;
 use crate::SystingRecordEvent;
@@ -900,14 +901,13 @@ impl SystingProbeRecorder {
         }
     }
 
-    pub fn generate_trace(
+    pub fn write_trace(
         &mut self,
+        writer: &mut dyn TraceWriter,
         pid_uuids: &HashMap<i32, u64>,
         thread_uuids: &HashMap<i32, u64>,
         id_counter: &Arc<AtomicUsize>,
-    ) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
-
+    ) -> Result<()> {
         // Populate the instant events
         for (pidtgid, events) in self.events.iter() {
             for (track_name, track_events) in events.iter() {
@@ -921,7 +921,7 @@ impl SystingProbeRecorder {
                 );
                 let mut packet = TracePacket::default();
                 packet.set_track_descriptor(desc);
-                packets.push(packet);
+                writer.write_packet(&packet)?;
 
                 let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
                 for event in track_events.iter() {
@@ -935,7 +935,7 @@ impl SystingProbeRecorder {
                     packet.set_timestamp(event.ts);
                     packet.set_track_event(tevent);
                     packet.set_trusted_packet_sequence_id(seq);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
                 }
             }
         }
@@ -953,7 +953,7 @@ impl SystingProbeRecorder {
                 );
                 let mut packet = TracePacket::default();
                 packet.set_track_descriptor(desc);
-                packets.push(packet);
+                writer.write_packet(&packet)?;
 
                 let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
                 for range in ranges.iter() {
@@ -967,7 +967,7 @@ impl SystingProbeRecorder {
                     packet.set_timestamp(range.start);
                     packet.set_track_event(tevent);
                     packet.set_trusted_packet_sequence_id(seq);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
 
                     let mut tevent = TrackEvent::default();
                     tevent.set_type(Type::TYPE_SLICE_END);
@@ -978,7 +978,7 @@ impl SystingProbeRecorder {
                     packet.set_timestamp(range.end);
                     packet.set_track_event(tevent);
                     packet.set_trusted_packet_sequence_id(seq);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
                 }
             }
         }
@@ -1000,12 +1000,12 @@ impl SystingProbeRecorder {
                 if let Some(new_desc) = descs.pop() {
                     let mut packet = TracePacket::default();
                     packet.set_track_descriptor(new_desc);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
                 }
 
                 let mut packet = TracePacket::default();
                 packet.set_track_descriptor(desc);
-                packets.push(packet);
+                writer.write_packet(&packet)?;
 
                 let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
                 for range in ranges.iter() {
@@ -1019,7 +1019,7 @@ impl SystingProbeRecorder {
                     packet.set_timestamp(range.start);
                     packet.set_track_event(tevent);
                     packet.set_trusted_packet_sequence_id(seq);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
 
                     let mut tevent = TrackEvent::default();
                     tevent.set_type(Type::TYPE_SLICE_END);
@@ -1030,7 +1030,7 @@ impl SystingProbeRecorder {
                     packet.set_timestamp(range.end);
                     packet.set_track_event(tevent);
                     packet.set_trusted_packet_sequence_id(seq);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
                 }
             }
         }
@@ -1051,12 +1051,12 @@ impl SystingProbeRecorder {
                 if let Some(new_desc) = descs.pop() {
                     let mut packet = TracePacket::default();
                     packet.set_track_descriptor(new_desc);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
                 }
 
                 let mut packet = TracePacket::default();
                 packet.set_track_descriptor(desc);
-                packets.push(packet);
+                writer.write_packet(&packet)?;
 
                 let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
                 for event in track_events.iter() {
@@ -1070,7 +1070,7 @@ impl SystingProbeRecorder {
                     packet.set_timestamp(event.ts);
                     packet.set_track_event(tevent);
                     packet.set_trusted_packet_sequence_id(seq);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
                 }
             }
         }
@@ -1113,7 +1113,7 @@ impl SystingProbeRecorder {
                 SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
                     | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
             );
-            packets.push(interned_packet);
+            writer.write_packet(&interned_packet)?;
         }
 
         // Generate per-thread syscall tracks and events
@@ -1133,7 +1133,7 @@ impl SystingProbeRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
-            packets.push(packet);
+            writer.write_packet(&packet)?;
 
             for (start_ts, end_ts, syscall_nr) in syscalls {
                 let name_iid = *self.syscall_iids.get(syscall_nr).unwrap();
@@ -1147,7 +1147,7 @@ impl SystingProbeRecorder {
                 begin_packet.set_timestamp(*start_ts);
                 begin_packet.set_track_event(begin_event);
                 begin_packet.set_trusted_packet_sequence_id(sequence_id);
-                packets.push(begin_packet);
+                writer.write_packet(&begin_packet)?;
 
                 let mut end_event = TrackEvent::default();
                 end_event.set_type(Type::TYPE_SLICE_END);
@@ -1157,7 +1157,7 @@ impl SystingProbeRecorder {
                 end_packet.set_timestamp(*end_ts);
                 end_packet.set_track_event(end_event);
                 end_packet.set_trusted_packet_sequence_id(sequence_id);
-                packets.push(end_packet);
+                writer.write_packet(&end_packet)?;
             }
         }
 
@@ -1167,7 +1167,7 @@ impl SystingProbeRecorder {
         self.syscall_iids.clear();
         self.syscall_name_ids.clear();
 
-        packets
+        Ok(())
     }
 
     pub fn add_event_from_str(&mut self, event: &str, rng: &mut dyn rand::RngCore) -> Result<()> {
@@ -1517,8 +1517,24 @@ impl SystingProbeRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::perfetto::VecTraceWriter;
     use crate::systing::types::task_info;
+    use perfetto_protos::trace_packet::TracePacket;
     use rand::rngs::mock::StepRng;
+
+    /// Helper to collect packets from SystingProbeRecorder for tests
+    fn generate_trace(
+        recorder: &mut SystingProbeRecorder,
+        pid_uuids: &HashMap<i32, u64>,
+        thread_uuids: &HashMap<i32, u64>,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Vec<TracePacket> {
+        let mut writer = VecTraceWriter::new();
+        recorder
+            .write_trace(&mut writer, pid_uuids, thread_uuids, id_counter)
+            .unwrap();
+        writer.packets
+    }
 
     #[test]
     fn test_add_event() {
@@ -1961,7 +1977,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2020,7 +2037,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2086,7 +2104,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2138,7 +2157,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2204,7 +2224,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2312,7 +2333,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2422,7 +2444,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2469,7 +2492,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2868,7 +2892,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2915,7 +2940,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2962,7 +2988,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -3429,7 +3456,8 @@ mod tests {
         };
         recorder.handle_event(event);
         assert!(recorder.cpu_events.contains_key(&1));
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &HashMap::new(),
             &Arc::new(AtomicUsize::new(0)),
@@ -3686,7 +3714,7 @@ mod tests {
         recorder.handle_event(enter);
         recorder.handle_event(exit);
 
-        let packets = recorder.generate_trace(&pid_uuids, &thread_uuids, &id_counter);
+        let packets = generate_trace(&mut recorder, &pid_uuids, &thread_uuids, &id_counter);
 
         let syscall_packets: Vec<_> = packets
             .iter()
@@ -3958,7 +3986,8 @@ mod tests {
 
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -4029,7 +4058,8 @@ mod tests {
 
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),

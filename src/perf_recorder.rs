@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::perfetto::TrackCounter;
+use anyhow::Result;
+
+use crate::perfetto::{TraceWriter, TrackCounter};
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::perf_counter_event;
 use crate::SystingRecordEvent;
@@ -57,8 +59,11 @@ impl SystingRecordEvent<perf_counter_event> for PerfCounterRecorder {
 }
 
 impl PerfCounterRecorder {
-    pub fn generate_trace(&self, id_counter: &Arc<AtomicUsize>) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
+    pub fn write_trace(
+        &self,
+        writer: &mut dyn TraceWriter,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Result<()> {
         let mut desc_uuids: HashMap<String, u64> = HashMap::new();
 
         // Populate the cache counter events
@@ -80,20 +85,20 @@ impl PerfCounterRecorder {
             if let Some(new_desc) = descs.pop() {
                 let mut packet = TracePacket::default();
                 packet.set_track_descriptor(new_desc);
-                packets.push(packet);
+                writer.write_packet(&packet)?;
             }
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
-            packets.push(packet);
+            writer.write_packet(&packet)?;
 
             let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
             for event in counters.iter() {
-                packets.push(event.to_track_event(uuid, seq));
+                writer.write_packet(&event.to_track_event(uuid, seq))?;
             }
         }
 
-        packets
+        Ok(())
     }
 
     /// Returns the minimum timestamp from all perf counter events, or None if no events recorded.
@@ -109,6 +114,18 @@ impl PerfCounterRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::perfetto::VecTraceWriter;
+    use perfetto_protos::trace_packet::TracePacket;
+
+    /// Helper to collect packets from PerfCounterRecorder for tests
+    fn generate_trace(
+        recorder: &PerfCounterRecorder,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Vec<TracePacket> {
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, id_counter).unwrap();
+        writer.packets
+    }
 
     #[test]
     fn test_perf_counter_recorder() {
@@ -129,7 +146,7 @@ mod tests {
         recorder.handle_event(event);
         assert_eq!(recorder.perf_events.len(), 1);
 
-        let packets = recorder.generate_trace(&Arc::new(AtomicUsize::new(0)));
+        let packets = generate_trace(&recorder, &Arc::new(AtomicUsize::new(0)));
         assert!(!packets.is_empty());
         assert_eq!(packets[0].track_descriptor().name(), "test_counter");
         assert_eq!(packets[0].track_descriptor().parent_uuid(), 1);
