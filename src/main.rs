@@ -1,5 +1,7 @@
 mod events;
 mod network_recorder;
+mod parquet_to_perfetto;
+mod parquet_writer;
 mod perf;
 mod perf_recorder;
 mod perfetto;
@@ -11,11 +13,13 @@ mod stack_recorder;
 
 use std::collections::HashMap;
 use std::env;
+use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
+use std::path::PathBuf;
 use std::process;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,7 +50,7 @@ use libbpf_rs::{
     MapCore, RawTracepointOpts, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts,
 };
 
-use crate::perfetto::StreamingTraceWriter;
+use crate::parquet_writer::ParquetTraceWriter;
 use plain::Plain;
 
 /// Sample period for perf clock events (1ms = 1000 samples/sec)
@@ -315,6 +319,17 @@ struct Command {
     /// Disable all recorders and only enable the specified ones (can be specified multiple times)
     #[arg(long)]
     only_recorder: Vec<String>,
+    /// Directory for parquet trace files
+    #[arg(long, default_value = "./traces")]
+    output_dir: PathBuf,
+
+    /// Path for the Perfetto trace file
+    #[arg(long, default_value = "trace.pb")]
+    output: PathBuf,
+
+    /// Skip Perfetto trace generation, keep only parquet files
+    #[arg(long)]
+    parquet_only: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -334,11 +349,32 @@ fn bump_memlock_rlimit() -> Result<()> {
     Ok(())
 }
 
+/// Prepare the output directory for parquet files.
+/// Creates the directory if it doesn't exist.
+/// Renames existing .parquet files to .parquet.old (removing any previous .old files).
+fn prepare_output_dir(dir: &std::path::Path) -> Result<()> {
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+        return Ok(());
+    }
+
+    // Rename existing .parquet files to .parquet.old
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension() == Some(std::ffi::OsStr::new("parquet")) {
+            let old_path = path.with_extension("parquet.old");
+            if old_path.exists() {
+                fs::remove_file(&old_path)?;
+            }
+            fs::rename(&path, &old_path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Get the device and inode number of our PID namespace
 /// Returns (dev, ino) or (0, 0) if the file doesn't exist or fails
 fn detect_confidentiality_mode() -> u32 {
-    use std::fs;
-
     // Read /sys/kernel/security/lockdown to check if confidentiality mode is enabled
     match fs::read_to_string("/sys/kernel/security/lockdown") {
         Ok(content) => {
@@ -2290,25 +2326,32 @@ fn system(opts: Command) -> Result<()> {
         recorder.drain_all_ringbufs();
     }
 
-    println!("Generating and writing trace to trace.pb...");
-    let file = std::fs::File::create("trace.pb")
-        .with_context(|| "Failed to create output file 'trace.pb' in current directory")?;
-    let mut buf_writer = std::io::BufWriter::with_capacity(64 * 1024, file);
-    let mut writer = StreamingTraceWriter::new(&mut buf_writer);
+    // Prepare output directory
+    prepare_output_dir(&opts.output_dir)?;
 
-    // Stream trace packets directly to the file
-    recorder
-        .generate_trace(&mut writer)
-        .with_context(|| "Failed to generate trace")?;
-
-    writer
-        .flush()
-        .with_context(|| "Failed to flush trace data to 'trace.pb'")?;
-
+    // Write parquet files
     println!(
-        "Successfully wrote {} trace packets to trace.pb",
-        writer.packet_count()
+        "Writing parquet trace files to {}...",
+        opts.output_dir.display()
     );
+    let mut parquet_writer = ParquetTraceWriter::new(&opts.output_dir)?;
+    recorder.generate_trace(&mut parquet_writer)?;
+    let _paths = parquet_writer.flush()?;
+    println!(
+        "Successfully wrote {} trace packets to parquet files",
+        parquet_writer.packet_count()
+    );
+
+    // Convert to Perfetto (unless --parquet-only)
+    if !opts.parquet_only {
+        println!(
+            "Converting to Perfetto format: {}...",
+            opts.output.display()
+        );
+        parquet_to_perfetto::convert(&opts.output_dir, &opts.output)?;
+        println!("Successfully wrote {}", opts.output.display());
+    }
+
     Ok(())
 }
 
