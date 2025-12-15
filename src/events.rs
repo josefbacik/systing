@@ -8,8 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::perfetto::TraceWriter;
+use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::probe_event;
+use crate::trace::{ArgRecord, InstantArgRecord, InstantRecord, SliceRecord, TrackRecord};
 use crate::SystingRecordEvent;
 
 use anyhow::Result;
@@ -901,6 +903,248 @@ impl SystingProbeRecorder {
         }
     }
 
+    /// Write trace data directly to a RecordCollector (Parquet-first path).
+    ///
+    /// This method outputs probe events as native records without going through Perfetto format.
+    pub fn write_records(
+        &self,
+        collector: &mut dyn RecordCollector,
+        tid_to_utid: &HashMap<i32, i64>,
+        track_id_counter: &mut i64,
+        slice_id_counter: &mut i64,
+        instant_id_counter: &mut i64,
+    ) -> Result<()> {
+        // Helper to convert ArgValue to record fields
+        let convert_arg = |arg: &(String, ArgValue)| -> (String, Option<i64>, Option<String>) {
+            match &arg.1 {
+                ArgValue::String(s) => (arg.0.clone(), None, Some(s.clone())),
+                ArgValue::Long(v) => (arg.0.clone(), Some(*v as i64), None),
+            }
+        };
+
+        // Process thread instant events
+        for (pidtgid, tracks) in self.events.iter() {
+            let tid = *pidtgid as i32;
+            let utid = tid_to_utid.get(&tid).copied();
+
+            for (track_name, track_events) in tracks.iter() {
+                let track_id = *track_id_counter;
+                *track_id_counter += 1;
+
+                collector.add_track(TrackRecord {
+                    id: track_id,
+                    name: track_name.clone(),
+                    parent_id: None,
+                })?;
+
+                for event in track_events.iter() {
+                    let instant_id = *instant_id_counter;
+                    *instant_id_counter += 1;
+
+                    collector.add_instant(InstantRecord {
+                        id: instant_id,
+                        ts: event.ts as i64,
+                        track_id,
+                        utid,
+                        name: event.name.clone(),
+                        category: None,
+                    })?;
+
+                    // Output args
+                    for arg in &event.args {
+                        let (key, int_value, string_value) = convert_arg(arg);
+                        collector.add_instant_arg(InstantArgRecord {
+                            instant_id,
+                            key,
+                            int_value,
+                            string_value,
+                            real_value: None,
+                        })?;
+                    }
+                }
+            }
+        }
+
+        // Process thread range events (slices)
+        for (pidtgid, tracks) in self.recorded_ranges.iter() {
+            let tid = *pidtgid as i32;
+            let utid = tid_to_utid.get(&tid).copied();
+
+            for (track_name, ranges) in tracks.iter() {
+                let track_id = *track_id_counter;
+                *track_id_counter += 1;
+
+                collector.add_track(TrackRecord {
+                    id: track_id,
+                    name: track_name.clone(),
+                    parent_id: None,
+                })?;
+
+                for range in ranges.iter() {
+                    let slice_id = *slice_id_counter;
+                    *slice_id_counter += 1;
+
+                    collector.add_slice(SliceRecord {
+                        id: slice_id,
+                        ts: range.start as i64,
+                        dur: (range.end - range.start) as i64,
+                        track_id,
+                        utid,
+                        name: range.range_name.clone(),
+                        category: None,
+                        depth: 0,
+                    })?;
+
+                    // Output args
+                    for arg in &range.args {
+                        let (key, int_value, string_value) = convert_arg(arg);
+                        collector.add_arg(ArgRecord {
+                            slice_id,
+                            key,
+                            int_value,
+                            string_value,
+                            real_value: None,
+                        })?;
+                    }
+                }
+            }
+        }
+
+        // Process CPU range events
+        for (cpu, tracks) in self.cpu_ranges.iter() {
+            for (track_name, ranges) in tracks.iter() {
+                let track_id = *track_id_counter;
+                *track_id_counter += 1;
+
+                collector.add_track(TrackRecord {
+                    id: track_id,
+                    name: format!("{track_name} CPU {cpu}"),
+                    parent_id: None,
+                })?;
+
+                for range in ranges.iter() {
+                    let slice_id = *slice_id_counter;
+                    *slice_id_counter += 1;
+
+                    collector.add_slice(SliceRecord {
+                        id: slice_id,
+                        ts: range.start as i64,
+                        dur: (range.end - range.start) as i64,
+                        track_id,
+                        utid: None,
+                        name: range.range_name.clone(),
+                        category: None,
+                        depth: 0,
+                    })?;
+
+                    // Output args
+                    for arg in &range.args {
+                        let (key, int_value, string_value) = convert_arg(arg);
+                        collector.add_arg(ArgRecord {
+                            slice_id,
+                            key,
+                            int_value,
+                            string_value,
+                            real_value: None,
+                        })?;
+                    }
+                }
+            }
+        }
+
+        // Process CPU instant events
+        for (cpu, tracks) in self.cpu_events.iter() {
+            for (track_name, track_events) in tracks.iter() {
+                let track_id = *track_id_counter;
+                *track_id_counter += 1;
+
+                collector.add_track(TrackRecord {
+                    id: track_id,
+                    name: format!("{track_name} CPU {cpu}"),
+                    parent_id: None,
+                })?;
+
+                for event in track_events.iter() {
+                    let instant_id = *instant_id_counter;
+                    *instant_id_counter += 1;
+
+                    collector.add_instant(InstantRecord {
+                        id: instant_id,
+                        ts: event.ts as i64,
+                        track_id,
+                        utid: None,
+                        name: event.name.clone(),
+                        category: None,
+                    })?;
+
+                    // Output args
+                    for arg in &event.args {
+                        let (key, int_value, string_value) = convert_arg(arg);
+                        collector.add_instant_arg(InstantArgRecord {
+                            instant_id,
+                            key,
+                            int_value,
+                            string_value,
+                            real_value: None,
+                        })?;
+                    }
+                }
+            }
+        }
+
+        // Process syscalls
+        for (pidtgid, syscalls) in self.completed_syscalls.iter() {
+            let tid = *pidtgid as i32;
+            let utid = tid_to_utid.get(&tid).copied();
+
+            // Create track for this thread's syscalls if we have any
+            if !syscalls.is_empty() {
+                let track_id = *track_id_counter;
+                *track_id_counter += 1;
+
+                collector.add_track(TrackRecord {
+                    id: track_id,
+                    name: "syscalls".to_string(),
+                    parent_id: None,
+                })?;
+
+                for (start_ts, end_ts, syscall_nr) in syscalls.iter() {
+                    let slice_id = *slice_id_counter;
+                    *slice_id_counter += 1;
+
+                    use syscalls::Sysno;
+                    let syscall_name = match Sysno::new(*syscall_nr as usize) {
+                        Some(sysno) => sysno.name().to_string(),
+                        None => format!("syscall_{syscall_nr}"),
+                    };
+
+                    collector.add_slice(SliceRecord {
+                        id: slice_id,
+                        ts: *start_ts as i64,
+                        dur: (*end_ts - *start_ts) as i64,
+                        track_id,
+                        utid,
+                        name: syscall_name,
+                        category: Some("syscall".to_string()),
+                        depth: 0,
+                    })?;
+
+                    // Add syscall number as arg
+                    collector.add_arg(ArgRecord {
+                        slice_id,
+                        key: "nr".to_string(),
+                        int_value: Some(*syscall_nr as i64),
+                        string_value: None,
+                        real_value: None,
+                    })?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write trace data to Perfetto format (legacy path).
     pub fn write_trace(
         &mut self,
         writer: &mut dyn TraceWriter,

@@ -1043,11 +1043,27 @@ impl ParquetToPerfettoConverter {
     }
 
     /// Write perf sample packets
+    ///
+    /// Supports both new schema (stack_sample.parquet) and legacy schema (perf_sample.parquet).
+    ///
+    /// **Note:** When reading from the new schema, stack information is not yet reconstructed
+    /// into Perfetto callsite format. The perf samples will be written without callstack
+    /// references. Full callsite reconstruction from `stack.parquet` is a future enhancement.
     fn write_perf_samples(&mut self, input_dir: &Path, writer: &mut dyn TraceWriter) -> Result<()> {
+        // Try new schema first (stack_sample.parquet), fall back to legacy (perf_sample.parquet)
+        let stack_sample_path = input_dir.join("stack_sample.parquet");
         let perf_path = input_dir.join("perf_sample.parquet");
-        if !perf_path.exists() {
+
+        let sample_path = if stack_sample_path.exists() {
+            &stack_sample_path
+        } else if perf_path.exists() {
+            &perf_path
+        } else {
             return Ok(());
-        }
+        };
+
+        // Determine column name based on which file we're reading
+        let uses_new_schema = stack_sample_path.exists();
 
         // Need thread table to map utid -> (tid, pid)
         let thread_path = input_dir.join("thread.parquet");
@@ -1057,7 +1073,12 @@ impl ParquetToPerfettoConverter {
             HashMap::new()
         };
 
-        let batches = read_parquet_file(&perf_path)?;
+        let batches = read_parquet_file(sample_path)?;
+
+        // TODO: When uses_new_schema is true, read stack.parquet and reconstruct
+        // callsite chains from frame_ids arrays for full Perfetto compatibility.
+        // Currently, new schema perf samples are written without callstack info.
+        let _ = uses_new_schema;
 
         for batch in &batches {
             let timestamps = batch

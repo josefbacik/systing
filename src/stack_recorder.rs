@@ -6,8 +6,13 @@ use anyhow::Result;
 
 use crate::perfetto::TraceWriter;
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
+use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::stack_event;
+use crate::trace::{
+    CallsiteRecord, FrameRecord, MappingRecord, PerfSampleRecord, StackRecord, StackSampleRecord,
+    SymbolRecord,
+};
 use crate::SystingRecordEvent;
 
 use blazesym::helper::{read_elf_build_id, ElfResolver};
@@ -318,6 +323,398 @@ impl StackRecorder {
         Some(interned_packet)
     }
 
+    /// Write trace data directly to a RecordCollector (Parquet-first path).
+    ///
+    /// This method outputs stack profiling data as native records. It performs
+    /// symbolization and outputs the results directly without Perfetto format.
+    ///
+    /// Uses the query-friendly schema with StackRecord (containing frame arrays)
+    /// instead of CallsiteRecord (linked list).
+    pub fn write_records(
+        &self,
+        collector: &mut dyn RecordCollector,
+        tid_to_utid: &HashMap<i32, i64>,
+        symbol_id_counter: &mut i64,
+        mapping_id_counter: &mut i64,
+        frame_id_counter: &mut i64,
+        stack_id_counter: &mut i64,
+    ) -> Result<()> {
+        // Symbol deduplication cache
+        let mut symbol_map: HashMap<String, i64> = HashMap::new();
+
+        // Mapping deduplication cache
+        let mut mapping_map: HashMap<String, i64> = HashMap::new();
+
+        // Frame deduplication cache (key: (mapping_id, rel_pc))
+        let mut frame_map: HashMap<(Option<i64>, u64), i64> = HashMap::new();
+
+        // Stack deduplication cache (key: hash of frame_ids)
+        let mut stack_cache: HashMap<Vec<i64>, i64> = HashMap::new();
+
+        // Process each unique stack
+        for (tgid, events) in self.stacks.iter() {
+            let pid = tgid >> 32;
+
+            // Create a symbolizer for this process
+            let symbolizer = if let Some(dispatcher) = &self.process_dispatcher {
+                let dispatcher = dispatcher.clone();
+                Symbolizer::builder()
+                    .enable_code_info(true)
+                    .enable_inlined_fns(true)
+                    .set_process_dispatcher(move |info| dispatcher(info))
+                    .build()
+            } else {
+                Symbolizer::builder()
+                    .enable_code_info(true)
+                    .enable_inlined_fns(true)
+                    .build()
+            };
+
+            // Process each unique stack for this tgid
+            let unique_stacks: HashSet<_> = events.iter().map(|e| &e.stack).collect();
+
+            // Stack ID cache for this tgid (maps Stack -> stack_id)
+            let mut tgid_stack_cache: HashMap<&Stack, i64> = HashMap::new();
+
+            for stack in unique_stacks.iter() {
+                // Collect addresses for symbolization (user first, then kernel)
+                // This gives us leaf-to-root order in the arrays
+                let addr_count = stack.user_stack.len() + stack.kernel_stack.len();
+                let mut all_addrs = Vec::with_capacity(addr_count);
+
+                // Add user addresses first (leaf)
+                for &addr in &stack.user_stack {
+                    all_addrs.push((addr, false)); // is_kernel=false
+                }
+
+                // Add kernel addresses (root)
+                for &addr in &stack.kernel_stack {
+                    all_addrs.push((addr, true)); // is_kernel=true
+                }
+
+                // Build frame_names and frame_ids arrays (pre-allocated)
+                let mut frame_names: Vec<String> = Vec::with_capacity(addr_count);
+                let mut frame_ids: Vec<i64> = Vec::with_capacity(addr_count);
+
+                for (addr, is_kernel) in all_addrs.iter() {
+                    // Try to symbolize
+                    let sym_name = if *is_kernel {
+                        let kernel_src = Source::Kernel(Kernel::default());
+                        let sym_result =
+                            symbolizer.symbolize_single(&kernel_src, Input::VirtOffset(*addr));
+                        sym_result
+                            .ok()
+                            .and_then(|s| s.into_sym())
+                            .map(|s| s.name.to_string())
+                    } else {
+                        let proc_src = Source::Process(Process::new(Pid::from(pid as u32)));
+                        let sym_result =
+                            symbolizer.symbolize_single(&proc_src, Input::VirtOffset(*addr));
+                        sym_result
+                            .ok()
+                            .and_then(|s| s.into_sym())
+                            .map(|s| s.name.to_string())
+                    };
+
+                    // Get or create symbol
+                    let symbol_id = if let Some(name) = &sym_name {
+                        if let Some(&id) = symbol_map.get(name) {
+                            Some(id)
+                        } else {
+                            let id = *symbol_id_counter;
+                            *symbol_id_counter += 1;
+                            symbol_map.insert(name.clone(), id);
+                            collector.add_symbol(SymbolRecord {
+                                id,
+                                name: name.clone(),
+                            })?;
+                            Some(id)
+                        }
+                    } else {
+                        None
+                    };
+
+                    // For now, use a simple mapping - just the process or kernel
+                    let mapping_name = if *is_kernel {
+                        "[kernel]".to_string()
+                    } else {
+                        format!("[pid:{pid}]")
+                    };
+
+                    let mapping_id = if let Some(&id) = mapping_map.get(&mapping_name) {
+                        id
+                    } else {
+                        let id = *mapping_id_counter;
+                        *mapping_id_counter += 1;
+                        mapping_map.insert(mapping_name.clone(), id);
+                        collector.add_mapping(MappingRecord {
+                            id,
+                            build_id: None,
+                            name: Some(mapping_name),
+                            exact_offset: 0,
+                            start_offset: 0,
+                        })?;
+                        id
+                    };
+
+                    // Get or create frame
+                    let frame_key = (Some(mapping_id), *addr);
+                    let frame_id = if let Some(&id) = frame_map.get(&frame_key) {
+                        id
+                    } else {
+                        let id = *frame_id_counter;
+                        *frame_id_counter += 1;
+                        frame_map.insert(frame_key, id);
+                        collector.add_frame(FrameRecord {
+                            id,
+                            name: sym_name.clone(),
+                            mapping_id: Some(mapping_id),
+                            rel_pc: *addr as i64,
+                            symbol_id,
+                        })?;
+                        id
+                    };
+
+                    // Add to arrays
+                    frame_names.push(sym_name.unwrap_or_else(|| format!("0x{addr:x}")));
+                    frame_ids.push(frame_id);
+                }
+
+                // Skip empty stacks
+                if frame_ids.is_empty() {
+                    continue;
+                }
+
+                // Check if this exact stack already exists (global deduplication)
+                let stack_id = if let Some(&id) = stack_cache.get(&frame_ids) {
+                    id
+                } else {
+                    let id = *stack_id_counter;
+                    *stack_id_counter += 1;
+
+                    let leaf_name = frame_names.first().cloned().unwrap_or_default();
+                    // Safe conversion: clamp to i32::MAX for extremely deep stacks
+                    let depth = frame_ids.len().min(i32::MAX as usize) as i32;
+
+                    // Clone frame_ids for the cache key before moving into StackRecord
+                    let cache_key = frame_ids.clone();
+
+                    collector.add_stack(StackRecord {
+                        id,
+                        frame_names,
+                        frame_ids,
+                        depth,
+                        leaf_name,
+                    })?;
+
+                    stack_cache.insert(cache_key, id);
+                    id
+                };
+
+                tgid_stack_cache.insert(stack, stack_id);
+            }
+
+            // Now output stack samples with stack references
+            for event in events.iter() {
+                let tid = event.tgidpid as i32;
+                let utid = tid_to_utid.get(&tid).copied().unwrap_or(tid as i64);
+
+                if let Some(&stack_id) = tgid_stack_cache.get(&event.stack) {
+                    collector.add_stack_sample(StackSampleRecord {
+                        ts: event.ts_start as i64,
+                        utid,
+                        cpu: None,
+                        stack_id,
+                    })?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write trace data using the legacy callsite schema (for Perfetto compatibility).
+    ///
+    /// This method outputs stack profiling data using the callsite linked-list schema.
+    #[allow(dead_code)]
+    pub fn write_records_legacy(
+        &self,
+        collector: &mut dyn RecordCollector,
+        tid_to_utid: &HashMap<i32, i64>,
+        symbol_id_counter: &mut i64,
+        mapping_id_counter: &mut i64,
+        frame_id_counter: &mut i64,
+        callsite_id_counter: &mut i64,
+    ) -> Result<()> {
+        // Symbol deduplication cache
+        let mut symbol_map: HashMap<String, i64> = HashMap::new();
+
+        // Mapping deduplication cache
+        let mut mapping_map: HashMap<String, i64> = HashMap::new();
+
+        // Frame deduplication cache (key: (mapping_id, rel_pc))
+        let mut frame_map: HashMap<(Option<i64>, u64), i64> = HashMap::new();
+
+        // Process each unique stack
+        for (tgid, events) in self.stacks.iter() {
+            let pid = tgid >> 32;
+
+            // Create a symbolizer for this process
+            let symbolizer = if let Some(dispatcher) = &self.process_dispatcher {
+                let dispatcher = dispatcher.clone();
+                Symbolizer::builder()
+                    .enable_code_info(true)
+                    .enable_inlined_fns(true)
+                    .set_process_dispatcher(move |info| dispatcher(info))
+                    .build()
+            } else {
+                Symbolizer::builder()
+                    .enable_code_info(true)
+                    .enable_inlined_fns(true)
+                    .build()
+            };
+
+            // Process each unique stack for this tgid
+            let unique_stacks: HashSet<_> = events.iter().map(|e| &e.stack).collect();
+
+            // Callstack map for this tgid
+            let mut callsite_cache: HashMap<&Stack, i64> = HashMap::new();
+
+            for stack in unique_stacks.iter() {
+                // Collect addresses for symbolization
+                let mut all_addrs = Vec::new();
+
+                // Add kernel addresses with kernel source
+                for &addr in &stack.kernel_stack {
+                    all_addrs.push((addr, true)); // is_kernel=true
+                }
+
+                // Add user addresses
+                for &addr in &stack.user_stack {
+                    all_addrs.push((addr, false)); // is_kernel=false
+                }
+
+                // Build callsite chain
+                let mut parent_callsite_id: Option<i64> = None;
+
+                for (depth, (addr, is_kernel)) in all_addrs.iter().enumerate() {
+                    // Try to symbolize
+                    let sym_name = if *is_kernel {
+                        let kernel_src = Source::Kernel(Kernel::default());
+                        let sym_result =
+                            symbolizer.symbolize_single(&kernel_src, Input::VirtOffset(*addr));
+                        sym_result
+                            .ok()
+                            .and_then(|s| s.into_sym())
+                            .map(|s| s.name.to_string())
+                    } else {
+                        let proc_src = Source::Process(Process::new(Pid::from(pid as u32)));
+                        let sym_result =
+                            symbolizer.symbolize_single(&proc_src, Input::VirtOffset(*addr));
+                        sym_result
+                            .ok()
+                            .and_then(|s| s.into_sym())
+                            .map(|s| s.name.to_string())
+                    };
+
+                    // Get or create symbol
+                    let symbol_id = if let Some(name) = &sym_name {
+                        if let Some(&id) = symbol_map.get(name) {
+                            Some(id)
+                        } else {
+                            let id = *symbol_id_counter;
+                            *symbol_id_counter += 1;
+                            symbol_map.insert(name.clone(), id);
+                            collector.add_symbol(SymbolRecord {
+                                id,
+                                name: name.clone(),
+                            })?;
+                            Some(id)
+                        }
+                    } else {
+                        None
+                    };
+
+                    // For now, use a simple mapping - just the process or kernel
+                    let mapping_name = if *is_kernel {
+                        "[kernel]".to_string()
+                    } else {
+                        format!("[pid:{pid}]")
+                    };
+
+                    let mapping_id = if let Some(&id) = mapping_map.get(&mapping_name) {
+                        id
+                    } else {
+                        let id = *mapping_id_counter;
+                        *mapping_id_counter += 1;
+                        mapping_map.insert(mapping_name.clone(), id);
+                        collector.add_mapping(MappingRecord {
+                            id,
+                            build_id: None,
+                            name: Some(mapping_name),
+                            exact_offset: 0,
+                            start_offset: 0,
+                        })?;
+                        id
+                    };
+
+                    // Get or create frame
+                    let frame_key = (Some(mapping_id), *addr);
+                    let frame_id = if let Some(&id) = frame_map.get(&frame_key) {
+                        id
+                    } else {
+                        let id = *frame_id_counter;
+                        *frame_id_counter += 1;
+                        frame_map.insert(frame_key, id);
+                        collector.add_frame(FrameRecord {
+                            id,
+                            name: sym_name.clone(),
+                            mapping_id: Some(mapping_id),
+                            rel_pc: *addr as i64,
+                            symbol_id,
+                        })?;
+                        id
+                    };
+
+                    // Create callsite
+                    let callsite_id = *callsite_id_counter;
+                    *callsite_id_counter += 1;
+
+                    collector.add_callsite(CallsiteRecord {
+                        id: callsite_id,
+                        parent_id: parent_callsite_id,
+                        frame_id,
+                        depth: depth as i32,
+                    })?;
+
+                    parent_callsite_id = Some(callsite_id);
+                }
+
+                // Cache the leaf callsite for this stack
+                if let Some(leaf_id) = parent_callsite_id {
+                    callsite_cache.insert(stack, leaf_id);
+                }
+            }
+
+            // Now output perf samples with callsite references
+            for event in events.iter() {
+                let tid = event.tgidpid as i32;
+                let utid = tid_to_utid.get(&tid).copied().unwrap_or(tid as i64);
+                let callsite_id = callsite_cache.get(&event.stack).copied();
+
+                collector.add_perf_sample(PerfSampleRecord {
+                    ts: event.ts_start as i64,
+                    utid,
+                    callsite_id,
+                    cpu: None,
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write trace data to Perfetto format (legacy path).
     pub fn write_trace(
         &self,
         writer: &mut dyn TraceWriter,

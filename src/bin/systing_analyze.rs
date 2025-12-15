@@ -121,37 +121,6 @@ fn generate_trace_id(path: &Path) -> String {
     }
 }
 
-/// Find all trace files in the given inputs
-fn find_trace_files(inputs: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
-    let mut traces = Vec::new();
-
-    for input in inputs {
-        if input.is_file() {
-            traces.push(input.clone());
-        } else if input.is_dir() {
-            if recursive {
-                for entry in walkdir(input)? {
-                    if is_trace_file(&entry) {
-                        traces.push(entry);
-                    }
-                }
-            } else {
-                for entry in fs::read_dir(input)? {
-                    let entry = entry?;
-                    let path = entry.path();
-                    if path.is_file() && is_trace_file(&path) {
-                        traces.push(path);
-                    }
-                }
-            }
-        } else {
-            bail!("Input path does not exist: {}", input.display());
-        }
-    }
-
-    Ok(traces)
-}
-
 fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut results = Vec::new();
 
@@ -174,6 +143,96 @@ fn is_trace_file(path: &Path) -> bool {
         || name.ends_with(".pb.gz")
         || name.ends_with(".perfetto-trace")
         || name.ends_with(".pftrace")
+}
+
+/// Check if a directory contains Parquet trace files (output from `systing --parquet`).
+/// A valid Parquet trace directory must contain the core trace tables.
+fn is_parquet_dir(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    // Check for essential Parquet files - process, thread, and sched_slice are core tables
+    // that should always be present in a valid systing trace
+    path.join("process.parquet").exists()
+        && path.join("thread.parquet").exists()
+        && path.join("sched_slice.parquet").exists()
+}
+
+/// Input type for trace conversion - either a Perfetto .pb file or a Parquet directory.
+#[derive(Clone, Debug)]
+enum TraceInput {
+    /// Perfetto protobuf trace file (.pb, .pb.gz, .perfetto-trace, .pftrace)
+    PbFile(PathBuf),
+    /// Directory containing Parquet trace files (from `systing --parquet`)
+    ParquetDir(PathBuf),
+}
+
+impl TraceInput {
+    fn path(&self) -> &Path {
+        match self {
+            TraceInput::PbFile(p) | TraceInput::ParquetDir(p) => p,
+        }
+    }
+}
+
+/// Generate a unique trace ID, appending a numeric suffix if the base ID already exists.
+fn make_unique_trace_id(base_id: String, id_counts: &mut HashMap<String, usize>) -> String {
+    let count = id_counts.entry(base_id.clone()).or_insert(0);
+    let result = if *count > 0 {
+        format!("{base_id}_{count}")
+    } else {
+        base_id
+    };
+    *count += 1;
+    result
+}
+
+/// Find all trace inputs (both .pb files and Parquet directories) in the given inputs
+fn find_trace_inputs(inputs: &[PathBuf], recursive: bool) -> Result<Vec<TraceInput>> {
+    let mut traces = Vec::new();
+
+    for input in inputs {
+        if input.is_file() {
+            if is_trace_file(input) {
+                traces.push(TraceInput::PbFile(input.clone()));
+            } else {
+                // Warn about explicitly-provided files that aren't recognized trace formats
+                eprintln!(
+                    "Warning: {} is not a recognized trace format (expected .pb, .pb.gz, .perfetto-trace, or .pftrace)",
+                    input.display()
+                );
+            }
+        } else if input.is_dir() {
+            // First check if this directory itself is a Parquet trace directory
+            if is_parquet_dir(input) {
+                traces.push(TraceInput::ParquetDir(input.clone()));
+            } else if recursive {
+                // Recursively search for .pb files and Parquet directories
+                for entry in walkdir(input)? {
+                    if entry.is_file() && is_trace_file(&entry) {
+                        traces.push(TraceInput::PbFile(entry));
+                    } else if entry.is_dir() && is_parquet_dir(&entry) {
+                        traces.push(TraceInput::ParquetDir(entry));
+                    }
+                }
+            } else {
+                // Non-recursive: check immediate children
+                for entry in fs::read_dir(input)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_file() && is_trace_file(&path) {
+                        traces.push(TraceInput::PbFile(path));
+                    } else if path.is_dir() && is_parquet_dir(&path) {
+                        traces.push(TraceInput::ParquetDir(path));
+                    }
+                }
+            }
+        } else {
+            bail!("Input path does not exist: {}", input.display());
+        }
+    }
+
+    Ok(traces)
 }
 
 /// Iterator that streams TracePackets from a Perfetto trace file without loading all into memory
@@ -1611,6 +1670,24 @@ fn create_schema(conn: &Connection) -> Result<()> {
             cpu INTEGER
         );
 
+        -- Query-friendly stack tables (new schema)
+        CREATE TABLE IF NOT EXISTS stack (
+            trace_id VARCHAR,
+            id BIGINT,
+            frame_names VARCHAR[],
+            frame_ids BIGINT[],
+            depth INTEGER,
+            leaf_name VARCHAR
+        );
+
+        CREATE TABLE IF NOT EXISTS stack_sample (
+            trace_id VARCHAR,
+            ts BIGINT,
+            utid BIGINT,
+            cpu INTEGER,
+            stack_id BIGINT
+        );
+
         -- Network interface metadata
         CREATE TABLE IF NOT EXISTS network_interface (
             trace_id VARCHAR,
@@ -1666,6 +1743,9 @@ struct ParquetPaths {
     frame: PathBuf,
     callsite: PathBuf,
     perf_sample: PathBuf,
+    // New query-friendly stack tables
+    stack: PathBuf,
+    stack_sample: PathBuf,
     // Network interface metadata
     network_interface: PathBuf,
     // Socket connection metadata
@@ -1695,12 +1775,45 @@ impl ParquetPaths {
             frame: temp_dir.join(format!("{trace_id}_frame.parquet")),
             callsite: temp_dir.join(format!("{trace_id}_callsite.parquet")),
             perf_sample: temp_dir.join(format!("{trace_id}_perf_sample.parquet")),
+            // New query-friendly stack tables
+            stack: temp_dir.join(format!("{trace_id}_stack.parquet")),
+            stack_sample: temp_dir.join(format!("{trace_id}_stack_sample.parquet")),
             // Network interface metadata
             network_interface: temp_dir.join(format!("{trace_id}_network_interface.parquet")),
             // Socket connection metadata
             socket_connection: temp_dir.join(format!("{trace_id}_socket_connection.parquet")),
             // Clock snapshot data
             clock_snapshot: temp_dir.join(format!("{trace_id}_clock_snapshot.parquet")),
+        }
+    }
+
+    /// Create paths from a Parquet directory (output from `systing --parquet`).
+    /// Files use simple names like `process.parquet` without trace_id prefix.
+    fn from_parquet_dir(dir: &Path) -> Self {
+        Self {
+            process: dir.join("process.parquet"),
+            thread: dir.join("thread.parquet"),
+            sched_slice: dir.join("sched_slice.parquet"),
+            thread_state: dir.join("thread_state.parquet"),
+            counter_track: dir.join("counter_track.parquet"),
+            counter: dir.join("counter.parquet"),
+            slice: dir.join("slice.parquet"),
+            track: dir.join("track.parquet"),
+            args: dir.join("args.parquet"),
+            instant: dir.join("instant.parquet"),
+            instant_args: dir.join("instant_args.parquet"),
+            symbol: dir.join("symbol.parquet"),
+            // systing --parquet uses "mapping.parquet" while .pb extraction uses "stack_mapping.parquet"
+            stack_mapping: dir.join("mapping.parquet"),
+            frame: dir.join("frame.parquet"),
+            callsite: dir.join("callsite.parquet"),
+            perf_sample: dir.join("perf_sample.parquet"),
+            // New query-friendly stack tables
+            stack: dir.join("stack.parquet"),
+            stack_sample: dir.join("stack_sample.parquet"),
+            network_interface: dir.join("network_interface.parquet"),
+            socket_connection: dir.join("socket_connection.parquet"),
+            clock_snapshot: dir.join("clock_snapshot.parquet"),
         }
     }
 }
@@ -2974,6 +3087,9 @@ struct TraceProcessingResult {
     parquet_paths: ParquetPaths,
     event_count: usize,
     error: Option<String>,
+    /// If true, the Parquet files don't have a trace_id column and need it injected during import.
+    /// This is the case for Parquet directories from `systing --parquet`.
+    needs_trace_id_injection: bool,
 }
 
 /// Run the convert command
@@ -2985,55 +3101,70 @@ fn run_convert(
 ) -> Result<()> {
     let start_time = Instant::now();
 
-    // Find all trace files
-    let trace_files = find_trace_files(&inputs, recursive)?;
-    if trace_files.is_empty() {
-        bail!("No trace files found in the specified inputs");
+    // Find all trace inputs (both .pb files and Parquet directories)
+    let trace_inputs = find_trace_inputs(&inputs, recursive)?;
+    if trace_inputs.is_empty() {
+        bail!("No trace files or Parquet directories found in the specified inputs");
     }
-    eprintln!("Found {} trace files", trace_files.len());
 
-    // Prepare trace info
-    let traces: Vec<TraceInfo> = trace_files
+    // Separate inputs by type
+    let (pb_files, parquet_dirs): (Vec<_>, Vec<_>) = trace_inputs
+        .into_iter()
+        .partition(|t| matches!(t, TraceInput::PbFile(_)));
+
+    eprintln!(
+        "Found {} Perfetto trace files and {} Parquet directories",
+        pb_files.len(),
+        parquet_dirs.len()
+    );
+
+    // Prepare trace info for .pb files
+    let pb_traces: Vec<TraceInfo> = pb_files
         .iter()
-        .map(|path| TraceInfo {
-            trace_id: generate_trace_id(path),
-            source_path: path.clone(),
+        .map(|input| TraceInfo {
+            trace_id: generate_trace_id(input.path()),
+            source_path: input.path().to_path_buf(),
         })
         .collect();
 
     // Make trace IDs unique if there are duplicates
     let mut id_counts: HashMap<String, usize> = HashMap::new();
-    let traces: Vec<TraceInfo> = traces
+    let pb_traces: Vec<TraceInfo> = pb_traces
         .into_iter()
         .map(|mut t| {
-            let count = id_counts.entry(t.trace_id.clone()).or_insert(0);
-            if *count > 0 {
-                t.trace_id = format!("{}_{count}", t.trace_id);
-            }
-            *count += 1;
+            t.trace_id = make_unique_trace_id(t.trace_id, &mut id_counts);
             t
         })
         .collect();
+
+    // Prepare trace info for Parquet directories (with unique IDs)
+    let parquet_traces: Vec<TraceInfo> = parquet_dirs
+        .iter()
+        .map(|input| {
+            let base_id = generate_trace_id(input.path());
+            let trace_id = make_unique_trace_id(base_id, &mut id_counts);
+            TraceInfo {
+                trace_id,
+                source_path: input.path().to_path_buf(),
+            }
+        })
+        .collect();
+
+    let total_traces = pb_traces.len() + parquet_traces.len();
 
     // Remove existing output database
     if output.exists() {
         fs::remove_file(&output)?;
     }
 
-    // Create temp directory for Parquet files
+    // Create temp directory for Parquet files (only needed for .pb processing)
     let temp_dir = tempfile::tempdir()?;
     let temp_path = temp_dir.path();
-    if verbose {
+    if verbose && !pb_traces.is_empty() {
         eprintln!("Using temp directory: {}", temp_path.display());
     }
 
-    let num_cpus = get_num_cpus();
-    let num_workers = num_cpus.min(traces.len());
-    if verbose {
-        eprintln!("Using {num_workers} parallel workers");
-    }
-
-    let progress = ProgressBar::new(traces.len() as u64);
+    let progress = ProgressBar::new(total_traces as u64);
     progress.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} Processing traces...")
@@ -3041,54 +3172,80 @@ fn run_convert(
             .progress_chars("#>-"),
     );
 
-    // Phase 1: Process traces and write to Parquet files in parallel
+    // Phase 1a: Process .pb files in parallel (if any)
     let load_start = Instant::now();
-    let num_traces = traces.len();
-    let (tx, rx) = mpsc::sync_channel::<TraceProcessingResult>(num_workers * 2);
-    let work_idx = AtomicUsize::new(0);
-    let progress_ref = &progress;
+    let mut results: Vec<TraceProcessingResult> = Vec::new();
+    let num_cpus = get_num_cpus();
 
-    thread::scope(|s| {
-        for _ in 0..num_workers {
-            let tx = tx.clone();
-            let work_idx = &work_idx;
-            let traces = &traces;
-            s.spawn(move || loop {
-                let idx = work_idx.fetch_add(1, Ordering::Relaxed);
-                if idx >= num_traces {
-                    break;
-                }
-                let trace = &traces[idx];
-                let parquet_paths = ParquetPaths::new(temp_path, &trace.trace_id);
-
-                let result = process_trace_to_parquet(trace, &parquet_paths);
-                let processing_result = match result {
-                    Ok(event_count) => TraceProcessingResult {
-                        trace_id: trace.trace_id.clone(),
-                        source_path: trace.source_path.clone(),
-                        parquet_paths,
-                        event_count,
-                        error: None,
-                    },
-                    Err(e) => TraceProcessingResult {
-                        trace_id: trace.trace_id.clone(),
-                        source_path: trace.source_path.clone(),
-                        parquet_paths,
-                        event_count: 0,
-                        error: Some(e.to_string()),
-                    },
-                };
-                progress_ref.inc(1);
-                if tx.send(processing_result).is_err() {
-                    break;
-                }
-            });
+    if !pb_traces.is_empty() {
+        let num_workers = num_cpus.min(pb_traces.len());
+        if verbose {
+            eprintln!("Using {num_workers} parallel workers for .pb extraction");
         }
-    });
-    drop(tx);
 
-    // Collect results
-    let results: Vec<TraceProcessingResult> = rx.into_iter().collect();
+        let num_pb_traces = pb_traces.len();
+        let (tx, rx) = mpsc::sync_channel::<TraceProcessingResult>(num_workers * 2);
+        let work_idx = AtomicUsize::new(0);
+        let progress_ref = &progress;
+
+        thread::scope(|s| {
+            for _ in 0..num_workers {
+                let tx = tx.clone();
+                let work_idx = &work_idx;
+                let traces = &pb_traces;
+                s.spawn(move || loop {
+                    let idx = work_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= num_pb_traces {
+                        break;
+                    }
+                    let trace = &traces[idx];
+                    let parquet_paths = ParquetPaths::new(temp_path, &trace.trace_id);
+
+                    let result = process_trace_to_parquet(trace, &parquet_paths);
+                    let processing_result = match result {
+                        Ok(event_count) => TraceProcessingResult {
+                            trace_id: trace.trace_id.clone(),
+                            source_path: trace.source_path.clone(),
+                            parquet_paths,
+                            event_count,
+                            error: None,
+                            needs_trace_id_injection: false, // Extracted files have trace_id
+                        },
+                        Err(e) => TraceProcessingResult {
+                            trace_id: trace.trace_id.clone(),
+                            source_path: trace.source_path.clone(),
+                            parquet_paths,
+                            event_count: 0,
+                            error: Some(e.to_string()),
+                            needs_trace_id_injection: false,
+                        },
+                    };
+                    progress_ref.inc(1);
+                    if tx.send(processing_result).is_err() {
+                        break;
+                    }
+                });
+            }
+        });
+        drop(tx);
+
+        results.extend(rx);
+    }
+
+    // Phase 1b: Process Parquet directories (no extraction needed - just create results)
+    for trace in &parquet_traces {
+        let parquet_paths = ParquetPaths::from_parquet_dir(&trace.source_path);
+        results.push(TraceProcessingResult {
+            trace_id: trace.trace_id.clone(),
+            source_path: trace.source_path.clone(),
+            parquet_paths,
+            event_count: 0, // Unknown for pre-existing Parquet files
+            error: None,
+            needs_trace_id_injection: true, // Parquet dirs don't have trace_id column
+        });
+        progress.inc(1);
+    }
+
     progress.finish_with_message("Trace processing complete");
 
     let load_time = load_start.elapsed();
@@ -3140,27 +3297,48 @@ fn run_convert(
         )?;
     }
 
-    // Import Parquet files for a table, filtering to only existing files
+    // Import Parquet files for a table, filtering to only existing files.
+    // Handles trace_id injection for Parquet directories (which don't have trace_id column).
     let import_table = |table_name: &str, get_path: fn(&ParquetPaths) -> &PathBuf| -> Result<()> {
-        let paths: Vec<String> = successful_results
-            .iter()
-            .map(|r| get_path(&r.parquet_paths))
-            .filter(|p| p.exists())
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        if paths.is_empty() {
-            return Ok(());
-        }
         let start = Instant::now();
-        // Escape single quotes in paths for SQL safety
-        let paths_list = paths
-            .iter()
-            .map(|p| format!("'{}'", p.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(", ");
-        conn.execute_batch(&format!(
-            "INSERT INTO {table_name} SELECT * FROM read_parquet([{paths_list}])"
-        ))?;
+
+        // Separate paths by whether they need trace_id injection
+        let mut with_trace_id: Vec<String> = Vec::new();
+        let mut needs_injection: Vec<(&str, String)> = Vec::new();
+
+        for result in successful_results.iter() {
+            let path = get_path(&result.parquet_paths);
+            if path.exists() {
+                let path_str = path.to_string_lossy().into_owned();
+                if result.needs_trace_id_injection {
+                    needs_injection.push((&result.trace_id, path_str));
+                } else {
+                    with_trace_id.push(path_str);
+                }
+            }
+        }
+
+        // Import files that already have trace_id
+        if !with_trace_id.is_empty() {
+            let paths_list = with_trace_id
+                .iter()
+                .map(|p| format!("'{}'", p.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            conn.execute_batch(&format!(
+                "INSERT INTO {table_name} SELECT * FROM read_parquet([{paths_list}])"
+            ))?;
+        }
+
+        // Import files that need trace_id injection (one at a time to add trace_id)
+        for (trace_id, path) in needs_injection {
+            let escaped_path = path.replace('\'', "''");
+            let escaped_trace_id = trace_id.replace('\'', "''");
+            conn.execute_batch(&format!(
+                "INSERT INTO {table_name} SELECT '{escaped_trace_id}' as trace_id, * FROM read_parquet('{escaped_path}')"
+            ))?;
+        }
+
         if verbose {
             eprintln!(
                 "  {} import: {:.2}s",
@@ -3189,6 +3367,9 @@ fn run_convert(
     import_table("stack_profile_frame", |p| &p.frame)?;
     import_table("stack_profile_callsite", |p| &p.callsite)?;
     import_table("perf_sample", |p| &p.perf_sample)?;
+    // New query-friendly stack tables
+    import_table("stack", |p| &p.stack)?;
+    import_table("stack_sample", |p| &p.stack_sample)?;
     // Network interface metadata
     import_table("network_interface", |p| &p.network_interface)?;
     // Socket connection metadata
@@ -3219,11 +3400,41 @@ fn run_convert(
         db_size,
         elapsed.as_secs_f64()
     );
-    eprintln!(
-        "  {} traces imported, {} total events",
-        successful_results.len(),
-        total_events
-    );
+
+    // Event counts are unknown for Parquet directory imports
+    let parquet_dir_count = successful_results
+        .iter()
+        .filter(|r| r.needs_trace_id_injection)
+        .count();
+    let pb_file_count = successful_results.len() - parquet_dir_count;
+
+    match (parquet_dir_count, pb_file_count, total_events) {
+        (_, 0, _) => {
+            // All traces were from Parquet directories
+            let s = if parquet_dir_count == 1 { "" } else { "s" };
+            eprintln!(
+                "  {} trace{} imported from Parquet director{}",
+                parquet_dir_count,
+                s,
+                if parquet_dir_count == 1 { "y" } else { "ies" }
+            );
+        }
+        (0, _, events) => {
+            // All traces were from .pb files
+            let s = if pb_file_count == 1 { "" } else { "s" };
+            eprintln!("  {pb_file_count} trace{s} imported, {events} total events");
+        }
+        (parquet, pb, events) => {
+            // Mixed sources
+            eprintln!(
+                "  {} traces imported ({} from Parquet, {} from .pb with {} events)",
+                successful_results.len(),
+                parquet,
+                pb,
+                events
+            );
+        }
+    }
 
     Ok(())
 }

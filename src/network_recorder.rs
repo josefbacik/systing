@@ -6,8 +6,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use anyhow::Result;
 
 use crate::perfetto::TraceWriter;
+use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::network_event;
+use crate::trace::{
+    InstantArgRecord, InstantRecord, SliceRecord, SocketConnectionRecord, TrackRecord,
+};
 use crate::SystingRecordEvent;
 
 /// Unique socket identifier assigned by BPF during tracing
@@ -1201,6 +1205,226 @@ impl NetworkRecorder {
         }
     }
 
+    /// Write trace data directly to a RecordCollector (Parquet-first path).
+    ///
+    /// This method outputs network events as native records without going through Perfetto format.
+    pub fn write_records(
+        &mut self,
+        collector: &mut dyn RecordCollector,
+        tid_to_utid: &HashMap<i32, i64>,
+        track_id_counter: &mut i64,
+        slice_id_counter: &mut i64,
+        instant_id_counter: &mut i64,
+    ) -> Result<()> {
+        // Resolve hostnames if configured
+        if self.resolve_addresses {
+            let ip_addrs: Vec<_> = self
+                .socket_metadata
+                .values()
+                .flat_map(|m| [m.src_ip_addr(), m.dest_ip_addr()])
+                .collect();
+
+            for ip_addr in ip_addrs {
+                self.resolve_hostname(ip_addr);
+            }
+        }
+
+        // Output socket connection records
+        for (socket_id, metadata) in self.socket_metadata.iter() {
+            let src_ip = metadata.src_ip_addr();
+            let dest_ip = metadata.dest_ip_addr();
+
+            let socket_track_id = *track_id_counter;
+            *track_id_counter += 1;
+
+            let track_name = self.socket_track_name(*socket_id);
+
+            collector.add_track(TrackRecord {
+                id: socket_track_id,
+                name: track_name,
+                parent_id: None,
+            })?;
+
+            collector.add_socket_connection(SocketConnectionRecord {
+                socket_id: *socket_id as i64,
+                track_id: socket_track_id,
+                protocol: metadata.protocol_str().to_string(),
+                src_ip: src_ip.to_string(),
+                src_port: metadata.src_port as i32,
+                dest_ip: dest_ip.to_string(),
+                dest_port: metadata.dest_port as i32,
+                address_family: if metadata.af
+                    == crate::systing::types::network_address_family::NETWORK_AF_INET.0
+                {
+                    "IPv4".to_string()
+                } else {
+                    "IPv6".to_string()
+                },
+            })?;
+
+            // Output packet events for this socket
+            if let Some(conn_events) = self.packet_events.get(socket_id) {
+                let is_tcp =
+                    metadata.protocol == crate::systing::types::network_protocol::NETWORK_TCP.0;
+
+                if is_tcp {
+                    self.write_packet_events_records(
+                        collector,
+                        socket_track_id,
+                        instant_id_counter,
+                        "TCP packet_enqueue",
+                        conn_events.iter_tcp_enqueue_packets(),
+                    )?;
+                    self.write_packet_events_records(
+                        collector,
+                        socket_track_id,
+                        instant_id_counter,
+                        "TCP packet_send",
+                        conn_events.iter_shared_send_packets(),
+                    )?;
+                    self.write_packet_events_records(
+                        collector,
+                        socket_track_id,
+                        instant_id_counter,
+                        "TCP packet_rcv_established",
+                        conn_events.iter_tcp_rcv_established_packets(),
+                    )?;
+                    self.write_packet_events_records(
+                        collector,
+                        socket_track_id,
+                        instant_id_counter,
+                        "TCP packet_queue_rcv",
+                        conn_events.iter_tcp_queue_rcv_packets(),
+                    )?;
+                } else {
+                    self.write_packet_events_records(
+                        collector,
+                        socket_track_id,
+                        instant_id_counter,
+                        "UDP send",
+                        conn_events.iter_udp_send_packets(),
+                    )?;
+                    self.write_packet_events_records(
+                        collector,
+                        socket_track_id,
+                        instant_id_counter,
+                        "UDP receive",
+                        conn_events.iter_udp_rcv_packets(),
+                    )?;
+                }
+
+                // Drop events for both TCP and UDP
+                self.write_packet_events_records(
+                    collector,
+                    socket_track_id,
+                    instant_id_counter,
+                    "packet_drop",
+                    conn_events.iter_skb_drops(),
+                )?;
+            }
+        }
+
+        // Output syscall events (sendmsg/recvmsg slices)
+        for (pidtgid, events) in self.syscall_events.iter() {
+            let tid = *pidtgid as i32;
+            let utid = tid_to_utid.get(&tid).copied();
+
+            for event in events.iter() {
+                let (socket_id, syscall_event) = match event {
+                    EventEntry::Send(e) => (e.socket_id, e),
+                    EventEntry::Recv(e) => (e.socket_id, e),
+                    _ => continue,
+                };
+
+                let slice_id = *slice_id_counter;
+                *slice_id_counter += 1;
+
+                let is_send = matches!(event, EventEntry::Send(_));
+                let protocol = self
+                    .socket_metadata
+                    .get(&socket_id)
+                    .map(|m| m.protocol)
+                    .unwrap_or(0);
+
+                let proto_str = Self::protocol_to_str(protocol);
+                let event_name = if is_send {
+                    format!("{proto_str}_send")
+                } else {
+                    format!("{proto_str}_recv")
+                };
+
+                // Get track for this socket
+                let track_id = *track_id_counter;
+                *track_id_counter += 1;
+
+                collector.add_track(TrackRecord {
+                    id: track_id,
+                    name: format!("Syscall {event_name}"),
+                    parent_id: None,
+                })?;
+
+                collector.add_slice(SliceRecord {
+                    id: slice_id,
+                    ts: syscall_event.start_ts as i64,
+                    dur: (syscall_event.end_ts - syscall_event.start_ts) as i64,
+                    track_id,
+                    utid,
+                    name: event_name,
+                    category: Some("network".to_string()),
+                    depth: 0,
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Helper to write packet events as InstantRecords
+    fn write_packet_events_records<'a>(
+        &self,
+        collector: &mut dyn RecordCollector,
+        track_id: i64,
+        instant_id_counter: &mut i64,
+        event_name: &str,
+        pkt_iter: impl Iterator<Item = &'a PacketEvent>,
+    ) -> Result<()> {
+        for pkt in pkt_iter {
+            let instant_id = *instant_id_counter;
+            *instant_id_counter += 1;
+
+            collector.add_instant(InstantRecord {
+                id: instant_id,
+                ts: pkt.ts as i64,
+                track_id,
+                utid: None,
+                name: event_name.to_string(),
+                category: Some("network".to_string()),
+            })?;
+
+            // Add packet length as arg
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "length".to_string(),
+                int_value: Some(pkt.length as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+
+            // Add sequence number for TCP
+            if pkt.seq > 0 {
+                collector.add_instant_arg(InstantArgRecord {
+                    instant_id,
+                    key: "seq".to_string(),
+                    int_value: Some(pkt.seq as i64),
+                    string_value: None,
+                    real_value: None,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write trace data to Perfetto format (legacy path).
     pub fn write_trace_packets(
         &mut self,
         writer: &mut dyn TraceWriter,
