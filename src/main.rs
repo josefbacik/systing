@@ -1,15 +1,18 @@
 mod events;
 mod network_recorder;
+mod parquet;
 mod parquet_to_perfetto;
 mod parquet_writer;
 mod perf;
 mod perf_recorder;
 mod perfetto;
 mod pystacks;
+mod record;
 mod ringbuf;
 mod sched;
 mod session_recorder;
 mod stack_recorder;
+mod trace;
 
 use std::collections::HashMap;
 use std::env;
@@ -330,6 +333,13 @@ struct Command {
     /// Skip Perfetto trace generation, keep only parquet files
     #[arg(long)]
     parquet_only: bool,
+
+    /// Use Parquet-first trace generation (writes Parquet directly during recording).
+    /// This is faster for large traces as it avoids intermediate Perfetto protobuf
+    /// generation. By default, Parquet files are still converted to Perfetto format
+    /// for compatibility; use --parquet-only to skip this conversion step.
+    #[arg(long)]
+    parquet_first: bool,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -2329,18 +2339,29 @@ fn system(opts: Command) -> Result<()> {
     // Prepare output directory
     prepare_output_dir(&opts.output_dir)?;
 
-    // Write parquet files
-    println!(
-        "Writing parquet trace files to {}...",
-        opts.output_dir.display()
-    );
-    let mut parquet_writer = ParquetTraceWriter::new(&opts.output_dir)?;
-    recorder.generate_trace(&mut parquet_writer)?;
-    let _paths = parquet_writer.flush()?;
-    println!(
-        "Successfully wrote {} trace packets to parquet files",
-        parquet_writer.packet_count()
-    );
+    // Write trace files using either Parquet-first or legacy path
+    if opts.parquet_first {
+        // Parquet-first path: write directly to Parquet files
+        println!(
+            "Writing Parquet trace files (direct) to {}...",
+            opts.output_dir.display()
+        );
+        recorder.generate_parquet_trace(&opts.output_dir)?;
+        println!("Successfully wrote Parquet trace files");
+    } else {
+        // Legacy path: generate TracePackets, extract to Parquet
+        println!(
+            "Writing parquet trace files to {}...",
+            opts.output_dir.display()
+        );
+        let mut parquet_writer = ParquetTraceWriter::new(&opts.output_dir)?;
+        recorder.generate_trace(&mut parquet_writer)?;
+        let _paths = parquet_writer.flush()?;
+        println!(
+            "Successfully wrote {} trace packets to parquet files",
+            parquet_writer.packet_count()
+        );
+    }
 
     // Convert to Perfetto (unless --parquet-only)
     if !opts.parquet_only {

@@ -9,12 +9,17 @@ use anyhow::Result;
 
 use crate::events::SystingProbeRecorder;
 use crate::network_recorder::NetworkRecorder;
+use crate::parquet::StreamingParquetWriter;
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::perfetto::{TraceWriter, TrackCounter};
+use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::stack_recorder::StackRecorder;
 use crate::systing::types::task_info;
+use crate::trace::{
+    ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ProcessRecord, ThreadRecord,
+};
 use crate::SystingRecordEvent;
 
 use perfetto_protos::builtin_clock::BuiltinClock;
@@ -318,6 +323,36 @@ impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
 }
 
 impl SysinfoRecorder {
+    /// Write trace data directly to a RecordCollector (Parquet-first path).
+    ///
+    /// This method outputs CPU frequency counter records directly.
+    pub fn write_records(
+        &self,
+        collector: &mut dyn RecordCollector,
+        track_id_counter: &mut i64,
+    ) -> Result<()> {
+        for (cpu, events) in self.frequency.iter() {
+            let track_id = *track_id_counter;
+            *track_id_counter += 1;
+
+            collector.add_counter_track(CounterTrackRecord {
+                id: track_id,
+                name: format!("CPU {cpu} frequency"),
+                unit: Some("Hz".to_string()),
+            })?;
+
+            for event in events.iter() {
+                collector.add_counter(CounterRecord {
+                    ts: event.ts as i64,
+                    track_id,
+                    value: event.count as f64,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write trace data to Perfetto format (legacy path).
     pub fn write_trace(
         &self,
         writer: &mut dyn TraceWriter,
@@ -930,6 +965,175 @@ impl SessionRecorder {
         // Step 5: Collect traces from all recorders
         self.write_recorder_traces(writer, &pid_uuids, &thread_uuids, &id_counter)?;
 
+        Ok(())
+    }
+
+    /// Generate trace data directly to Parquet files (Parquet-first path).
+    ///
+    /// This method outputs trace data directly to Parquet files without going through
+    /// the Perfetto format. It uses the StreamingParquetWriter and calls write_records()
+    /// on each recorder.
+    ///
+    /// # Arguments
+    /// * `output_dir` - Directory to write Parquet files to
+    pub fn generate_parquet_trace(&self, output_dir: &Path) -> Result<()> {
+        eprintln!("Generating Parquet trace to {output_dir:?}...");
+
+        let mut writer = StreamingParquetWriter::new(output_dir)?;
+
+        // ID counters for generating unique IDs across all records
+        let mut track_id_counter: i64 = 1;
+        let mut slice_id_counter: i64 = 1;
+        let mut instant_id_counter: i64 = 1;
+        let mut symbol_id_counter: i64 = 1;
+        let mut mapping_id_counter: i64 = 1;
+        let mut frame_id_counter: i64 = 1;
+        let mut stack_id_counter: i64 = 1;
+
+        // Step 1: Generate clock snapshot records
+        eprintln!("Writing clock snapshot...");
+        let clock_snapshot = self.clock_snapshot.lock().unwrap();
+        for clock in clock_snapshot.clocks.iter() {
+            let clock_name = if clock.has_clock_id() {
+                match clock.clock_id() as i32 {
+                    x if x == BuiltinClock::BUILTIN_CLOCK_BOOTTIME as i32 => "boottime".to_string(),
+                    x if x == BuiltinClock::BUILTIN_CLOCK_MONOTONIC as i32 => {
+                        "monotonic".to_string()
+                    }
+                    x if x == BuiltinClock::BUILTIN_CLOCK_REALTIME as i32 => "realtime".to_string(),
+                    other => format!("clock_{other}"),
+                }
+            } else {
+                "unknown".to_string()
+            };
+
+            // BOOTTIME is the primary trace clock (as set in write_initial_packets)
+            let is_primary = clock.clock_id() == BuiltinClock::BUILTIN_CLOCK_BOOTTIME as u32;
+
+            writer.add_clock_snapshot(ClockSnapshotRecord {
+                clock_id: clock.clock_id() as i32,
+                clock_name,
+                timestamp_ns: clock.timestamp() as i64,
+                is_primary,
+            })?;
+        }
+        drop(clock_snapshot);
+
+        // Step 2: Generate process and thread records
+        eprintln!("Writing process and thread data...");
+        let mut upid_map: HashMap<i32, i64> = HashMap::new(); // pid -> upid
+        let mut tid_to_utid: HashMap<i32, i64> = HashMap::new(); // tid -> utid
+
+        let mut upid_counter: i64 = 1;
+        let mut utid_counter: i64 = 1;
+
+        // Write process records
+        for process in self.process_descriptors.read().unwrap().values() {
+            let pid = process.pid();
+            let upid = upid_counter;
+            upid_counter += 1;
+            upid_map.insert(pid, upid);
+
+            let name = if process.has_process_name() {
+                Some(process.process_name().to_string())
+            } else {
+                None
+            };
+
+            writer.add_process(ProcessRecord {
+                upid,
+                pid,
+                name,
+                parent_upid: None, // Could be set from parent_pid if needed
+            })?;
+        }
+
+        // Write thread records
+        for thread in self.threads.read().unwrap().values() {
+            let tid = thread.tid();
+            let utid = utid_counter;
+            utid_counter += 1;
+            tid_to_utid.insert(tid, utid);
+
+            let name = if thread.has_thread_name() {
+                Some(thread.thread_name().to_string())
+            } else {
+                None
+            };
+
+            // Get upid from process mapping (pid in ThreadDescriptor is the tgid/process id)
+            let upid = if thread.has_pid() {
+                upid_map.get(&thread.pid()).copied()
+            } else {
+                None
+            };
+
+            writer.add_thread(ThreadRecord {
+                utid,
+                tid,
+                name,
+                upid,
+            })?;
+        }
+
+        // Step 3: Generate network interface metadata
+        // Network interface metadata is complex (requires netns enumeration)
+        // For now, we skip this in the Parquet-first path and rely on socket_connection records
+        // from the NetworkRecorder for network context.
+
+        // Step 4: Write records from all recorders
+        eprintln!("Writing scheduler trace records...");
+        self.event_recorder.lock().unwrap().write_records(
+            &mut writer,
+            &tid_to_utid,
+            &mut track_id_counter,
+        )?;
+
+        eprintln!("Writing stack trace records...");
+        self.stack_recorder.lock().unwrap().write_records(
+            &mut writer,
+            &tid_to_utid,
+            &mut symbol_id_counter,
+            &mut mapping_id_counter,
+            &mut frame_id_counter,
+            &mut stack_id_counter,
+        )?;
+
+        eprintln!("Writing perf counter records...");
+        self.perf_counter_recorder
+            .lock()
+            .unwrap()
+            .write_records(&mut writer, &mut track_id_counter)?;
+
+        eprintln!("Writing sysinfo records...");
+        self.sysinfo_recorder
+            .lock()
+            .unwrap()
+            .write_records(&mut writer, &mut track_id_counter)?;
+
+        eprintln!("Writing probe trace records...");
+        self.probe_recorder.lock().unwrap().write_records(
+            &mut writer,
+            &tid_to_utid,
+            &mut track_id_counter,
+            &mut slice_id_counter,
+            &mut instant_id_counter,
+        )?;
+
+        eprintln!("Writing network trace records...");
+        self.network_recorder.lock().unwrap().write_records(
+            &mut writer,
+            &tid_to_utid,
+            &mut track_id_counter,
+            &mut slice_id_counter,
+            &mut instant_id_counter,
+        )?;
+
+        // Step 5: Finish writing and close all files
+        eprintln!("Finishing Parquet trace...");
+        writer.finish()?;
+
+        eprintln!("Parquet trace generation complete.");
         Ok(())
     }
 }

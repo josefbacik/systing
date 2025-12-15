@@ -5,15 +5,17 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::perfetto::{TraceWriter, TrackCounter};
+use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::perf_counter_event;
+use crate::trace::{CounterRecord, CounterTrackRecord};
 use crate::SystingRecordEvent;
 
 use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
 use perfetto_protos::trace_packet::TracePacket;
 
-#[derive(Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 struct PerfCounterKey {
     cpu: u32,
     index: usize,
@@ -59,6 +61,46 @@ impl SystingRecordEvent<perf_counter_event> for PerfCounterRecorder {
 }
 
 impl PerfCounterRecorder {
+    /// Write trace data directly to a RecordCollector (Parquet-first path).
+    ///
+    /// This method outputs records directly without going through Perfetto format.
+    pub fn write_records(
+        &self,
+        collector: &mut dyn RecordCollector,
+        track_id_counter: &mut i64,
+    ) -> Result<()> {
+        // Track IDs we've already created for each (cpu, counter) combination
+        let mut track_ids: HashMap<PerfCounterKey, i64> = HashMap::new();
+
+        for (key, counters) in self.perf_events.iter() {
+            // Create a track for this counter
+            let track_id = *track_id_counter;
+            *track_id_counter += 1;
+            track_ids.insert(key.clone(), track_id);
+
+            let counter_name = &self.perf_counters[key.index];
+            let track_name = format!("{} CPU {}", counter_name, key.cpu);
+
+            collector.add_counter_track(CounterTrackRecord {
+                id: track_id,
+                name: track_name,
+                unit: Some("count".to_string()),
+            })?;
+
+            // Output all counter values for this track
+            for event in counters.iter() {
+                collector.add_counter(CounterRecord {
+                    ts: event.ts as i64,
+                    track_id,
+                    value: event.count as f64,
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write trace data to Perfetto format (legacy path).
     pub fn write_trace(
         &self,
         writer: &mut dyn TraceWriter,

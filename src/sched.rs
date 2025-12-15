@@ -6,9 +6,11 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::perfetto::{TraceWriter, TrackCounter};
+use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::event_type;
 use crate::systing::types::task_event;
+use crate::trace::{CounterRecord, CounterTrackRecord, SchedSliceRecord, ThreadStateRecord};
 use crate::SystingRecordEvent;
 
 use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
@@ -122,6 +124,145 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
 }
 
 impl SchedEventRecorder {
+    /// Write trace data directly to a RecordCollector (Parquet-first path).
+    ///
+    /// This method outputs records directly without going through Perfetto format.
+    /// It converts the delta-encoded CompactSched data back to absolute timestamps.
+    pub fn write_records(
+        &self,
+        collector: &mut dyn RecordCollector,
+        tid_to_utid: &HashMap<i32, i64>,
+        track_id_counter: &mut i64,
+    ) -> Result<()> {
+        // Process compact sched events (SCHED_SWITCH, SCHED_WAKING)
+        for (cpu, local_compact) in self.compact_sched.iter() {
+            let compact = &local_compact.compact_sched;
+
+            // Decode switch events to SchedSliceRecord
+            let mut switch_ts: i64 = 0;
+            for i in 0..compact.switch_timestamp.len() {
+                switch_ts += compact.switch_timestamp[i] as i64;
+                let next_pid = compact.switch_next_pid[i];
+                let next_prio = compact.switch_next_prio.get(i).copied().unwrap_or(0);
+                let prev_state = compact.switch_prev_state.get(i).copied().unwrap_or(0);
+
+                // Get or create utid for this thread
+                let utid = tid_to_utid
+                    .get(&next_pid)
+                    .copied()
+                    .unwrap_or(next_pid as i64);
+
+                // Convert prev_state to string representation.
+                // These values match the Linux kernel task state flags from include/linux/sched.h.
+                // States can be combined (e.g., TASK_INTERRUPTIBLE | TASK_WAKEKILL).
+                // Common single-bit states are mapped to Perfetto-compatible short codes.
+                let end_state = match prev_state {
+                    0 => None,                          // TASK_RUNNING - no end state when preempted
+                    1 => Some("S".to_string()), // TASK_INTERRUPTIBLE - sleeping, can be woken by signal
+                    2 => Some("D".to_string()), // TASK_UNINTERRUPTIBLE - sleeping, waiting for I/O
+                    4 => Some("T".to_string()), // __TASK_STOPPED - stopped by signal (SIGSTOP, etc.)
+                    8 => Some("t".to_string()), // __TASK_TRACED - stopped by debugger (ptrace)
+                    16 => Some("X".to_string()), // EXIT_DEAD - final state, being reaped
+                    32 => Some("Z".to_string()), // EXIT_ZOMBIE - terminated, waiting for parent
+                    64 => Some("P".to_string()), // TASK_PARKED - parked kthread
+                    128 => Some("I".to_string()), // TASK_IDLE - idle kthread
+                    _ => Some(format!("{prev_state}")), // Compound states shown as numeric
+                };
+
+                collector.add_sched_slice(SchedSliceRecord {
+                    ts: switch_ts,
+                    dur: 0, // Duration computed later or left as 0 for streaming
+                    cpu: *cpu as i32,
+                    utid,
+                    end_state,
+                    priority: next_prio,
+                })?;
+            }
+
+            // Decode waking events to ThreadStateRecord
+            let mut waking_ts: i64 = 0;
+            for i in 0..compact.waking_timestamp.len() {
+                waking_ts += compact.waking_timestamp[i] as i64;
+                let pid = compact.waking_pid[i];
+                let target_cpu = compact.waking_target_cpu.get(i).copied().unwrap_or(0);
+
+                let utid = tid_to_utid.get(&pid).copied().unwrap_or(pid as i64);
+
+                collector.add_thread_state(ThreadStateRecord {
+                    ts: waking_ts,
+                    dur: 0,
+                    utid,
+                    state: "R".to_string(), // Runnable
+                    cpu: Some(target_cpu),
+                })?;
+            }
+        }
+
+        // Runqueue counters
+        for (cpu, runqueue) in self.runqueue.iter() {
+            let track_id = *track_id_counter;
+            *track_id_counter += 1;
+
+            collector.add_counter_track(CounterTrackRecord {
+                id: track_id,
+                name: format!("runqueue_size_cpu{cpu}"),
+                unit: Some("count".to_string()),
+            })?;
+
+            for event in runqueue.iter() {
+                collector.add_counter(CounterRecord {
+                    ts: event.ts as i64,
+                    track_id,
+                    value: event.count as f64,
+                })?;
+            }
+        }
+
+        // CPU latency counters
+        for (cpu, events) in self.cpu_latencies.iter() {
+            let track_id = *track_id_counter;
+            *track_id_counter += 1;
+
+            collector.add_counter_track(CounterTrackRecord {
+                id: track_id,
+                name: format!("latency_cpu{cpu}"),
+                unit: Some("ns".to_string()),
+            })?;
+
+            for event in events.iter() {
+                collector.add_counter(CounterRecord {
+                    ts: event.ts as i64,
+                    track_id,
+                    value: event.count as f64,
+                })?;
+            }
+        }
+
+        // Process latency counters
+        for (pidtgid, events) in self.process_latencies.iter() {
+            let track_id = *track_id_counter;
+            *track_id_counter += 1;
+
+            let tid = *pidtgid as i32;
+            collector.add_counter_track(CounterTrackRecord {
+                id: track_id,
+                name: format!("wake_latency_tid{tid}"),
+                unit: Some("ns".to_string()),
+            })?;
+
+            for event in events.iter() {
+                collector.add_counter(CounterRecord {
+                    ts: event.ts as i64,
+                    track_id,
+                    value: event.count as f64,
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write trace data to Perfetto format (legacy path).
     pub fn write_trace(
         &self,
         writer: &mut dyn TraceWriter,
