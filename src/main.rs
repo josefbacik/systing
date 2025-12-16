@@ -278,10 +278,6 @@ struct Command {
     #[arg(short, long)]
     sw_event: bool,
     #[arg(long)]
-    process_sched_stats: bool,
-    #[arg(long)]
-    cpu_sched_stats: bool,
-    #[arg(long)]
     cpu_frequency: bool,
     #[arg(long)]
     perf_counter: Vec<String>,
@@ -914,10 +910,6 @@ fn configure_recorder(opts: &Command, recorder: &Arc<SessionRecorder>) {
         let duration_nanos = Duration::from_secs(opts.continuous).as_nanos() as u64;
         set_ringbuf_duration(recorder, duration_nanos);
     }
-
-    let mut event_recorder = recorder.event_recorder.lock().unwrap();
-    event_recorder.set_process_sched_stats(opts.process_sched_stats);
-    event_recorder.set_cpu_sched_stats(opts.cpu_sched_stats);
 }
 
 fn sd_notify() -> Result<()> {
