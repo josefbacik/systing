@@ -2034,6 +2034,17 @@ fn system(opts: Command) -> Result<()> {
     ));
     configure_recorder(&opts, &recorder);
     recorder.snapshot_clocks();
+
+    // If using parquet_first mode, initialize streaming parquet output BEFORE recording starts
+    if opts.parquet_first {
+        prepare_output_dir(&opts.output_dir)?;
+        recorder.init_streaming_parquet(&opts.output_dir)?;
+        eprintln!(
+            "Initialized streaming parquet output to {:?}",
+            opts.output_dir
+        );
+    }
+
     {
         let mut skel_builder = systing::SystingSystemSkelBuilder::default();
         if opts.verbosity > 0 {
@@ -2328,8 +2339,10 @@ fn system(opts: Command) -> Result<()> {
         recorder.drain_all_ringbufs();
     }
 
-    // Prepare output directory
-    prepare_output_dir(&opts.output_dir)?;
+    // Prepare output directory (if not already done for streaming)
+    if !opts.parquet_first {
+        prepare_output_dir(&opts.output_dir)?;
+    }
 
     // Write trace files using either Parquet-first or legacy path
     if opts.parquet_first {

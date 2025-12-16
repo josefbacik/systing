@@ -963,6 +963,21 @@ impl SessionRecorder {
         Ok(())
     }
 
+    /// Initialize streaming parquet output for the scheduler event recorder.
+    /// This must be called BEFORE recording starts to enable streaming of scheduler
+    /// events directly to parquet files.
+    ///
+    /// # Arguments
+    /// * `output_dir` - Directory to write Parquet files to
+    pub fn init_streaming_parquet(&self, output_dir: &Path) -> Result<()> {
+        let writer = StreamingParquetWriter::new(output_dir)?;
+        self.event_recorder
+            .lock()
+            .unwrap()
+            .set_streaming_collector(Box::new(writer));
+        Ok(())
+    }
+
     /// Generate trace data directly to Parquet files (Parquet-first path).
     ///
     /// This method outputs trace data directly to Parquet files without going through
@@ -974,7 +989,27 @@ impl SessionRecorder {
     pub fn generate_parquet_trace(&self, output_dir: &Path) -> Result<()> {
         eprintln!("Generating Parquet trace to {output_dir:?}...");
 
-        let mut writer = StreamingParquetWriter::new(output_dir)?;
+        // Get the end timestamp for flushing streaming data
+        let end_ts = get_clock_value(libc::CLOCK_BOOTTIME) as i64;
+
+        // Step 1: Finish streaming collection in the event recorder and retrieve the collector
+        eprintln!("Flushing scheduler trace records from streaming...");
+        let collector_opt = {
+            let mut event_recorder = self.event_recorder.lock().unwrap();
+            event_recorder.finish(end_ts)?
+        };
+
+        // Track whether we got a collector from streaming
+        let has_streaming_collector = collector_opt.is_some();
+
+        // Use the streaming collector if available, otherwise create a new writer
+        let mut writer: Box<dyn RecordCollector> = if let Some(collector) = collector_opt {
+            // We have a streaming collector with scheduler data already written
+            collector
+        } else {
+            // Streaming wasn't enabled, create a new writer
+            Box::new(StreamingParquetWriter::new(output_dir)?)
+        };
 
         // ID counters for generating unique IDs across all records
         let mut track_id_counter: i64 = 1;
@@ -982,7 +1017,7 @@ impl SessionRecorder {
         let mut instant_id_counter: i64 = 1;
         let mut stack_id_counter: i64 = 1;
 
-        // Step 1: Generate clock snapshot records
+        // Step 2: Generate clock snapshot records
         eprintln!("Writing clock snapshot...");
         let clock_snapshot = self.clock_snapshot.lock().unwrap();
         for clock in clock_snapshot.clocks.iter() {
@@ -1074,15 +1109,20 @@ impl SessionRecorder {
         // from the NetworkRecorder for network context.
 
         // Step 4: Write records from all recorders
-        eprintln!("Writing scheduler trace records...");
-        self.event_recorder
-            .lock()
-            .unwrap()
-            .write_records(&mut writer, &tid_to_utid)?;
+        // Note: We skip the scheduler trace records here because they were already written
+        // via streaming (if streaming was enabled), or will be written via write_records (if not).
+        // Only write scheduler records if streaming was not enabled.
+        if !has_streaming_collector {
+            eprintln!("Writing scheduler trace records...");
+            self.event_recorder
+                .lock()
+                .unwrap()
+                .write_records(&mut *writer, &tid_to_utid)?;
+        }
 
         eprintln!("Writing stack trace records...");
         self.stack_recorder.lock().unwrap().write_records(
-            &mut writer,
+            &mut *writer,
             &tid_to_utid,
             &mut stack_id_counter,
         )?;
@@ -1091,17 +1131,17 @@ impl SessionRecorder {
         self.perf_counter_recorder
             .lock()
             .unwrap()
-            .write_records(&mut writer, &mut track_id_counter)?;
+            .write_records(&mut *writer, &mut track_id_counter)?;
 
         eprintln!("Writing sysinfo records...");
         self.sysinfo_recorder
             .lock()
             .unwrap()
-            .write_records(&mut writer, &mut track_id_counter)?;
+            .write_records(&mut *writer, &mut track_id_counter)?;
 
         eprintln!("Writing probe trace records...");
         self.probe_recorder.lock().unwrap().write_records(
-            &mut writer,
+            &mut *writer,
             &tid_to_utid,
             &mut track_id_counter,
             &mut slice_id_counter,
@@ -1110,7 +1150,7 @@ impl SessionRecorder {
 
         eprintln!("Writing network trace records...");
         self.network_recorder.lock().unwrap().write_records(
-            &mut writer,
+            &mut *writer,
             &tid_to_utid,
             &mut track_id_counter,
             &mut slice_id_counter,
@@ -1119,7 +1159,8 @@ impl SessionRecorder {
 
         // Step 5: Finish writing and close all files
         eprintln!("Finishing Parquet trace...");
-        writer.finish()?;
+        // Flush and properly close all Parquet writers
+        writer.finish_boxed()?;
 
         eprintln!("Parquet trace generation complete.");
         Ok(())

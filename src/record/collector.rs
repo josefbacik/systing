@@ -93,7 +93,12 @@ pub trait RecordCollector {
     fn flush(&mut self) -> Result<()>;
 
     /// Finish writing and close all files.
+    /// Takes self by value to properly close resources.
     fn finish(self) -> Result<()>;
+
+    /// Finish writing and close all files (boxed version for trait objects).
+    /// This is the same as finish() but takes a Box to work with trait objects.
+    fn finish_boxed(self: Box<Self>) -> Result<()>;
 }
 
 /// A simple in-memory collector that stores all records in `ExtractedData`.
@@ -233,5 +238,9 @@ impl RecordCollector for InMemoryCollector {
     fn finish(self) -> Result<()> {
         // Nothing to do for in-memory collector
         Ok(())
+    }
+
+    fn finish_boxed(self: Box<Self>) -> Result<()> {
+        (*self).finish()
     }
 }
