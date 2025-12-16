@@ -892,12 +892,7 @@ impl SessionRecorder {
     ) -> Result<()> {
         // Event recorder
         eprintln!("Generating scheduler trace packets...");
-        self.event_recorder.lock().unwrap().write_trace(
-            writer,
-            pid_uuids,
-            thread_uuids,
-            id_counter,
-        )?;
+        self.event_recorder.lock().unwrap().write_trace(writer)?;
 
         // Stack recorder - it has its own detailed progress bar for symbol resolution
         eprintln!("Generating stack trace packets...");
@@ -1080,11 +1075,10 @@ impl SessionRecorder {
 
         // Step 4: Write records from all recorders
         eprintln!("Writing scheduler trace records...");
-        self.event_recorder.lock().unwrap().write_records(
-            &mut writer,
-            &tid_to_utid,
-            &mut track_id_counter,
-        )?;
+        self.event_recorder
+            .lock()
+            .unwrap()
+            .write_records(&mut writer, &tid_to_utid)?;
 
         eprintln!("Writing stack trace records...");
         self.stack_recorder.lock().unwrap().write_records(
@@ -1752,8 +1746,6 @@ mod tests {
         // Add a sched event with a known timestamp
         {
             let mut event_recorder = recorder.event_recorder.lock().unwrap();
-            // Enable stats to generate runqueue entries
-            event_recorder.set_cpu_sched_stats(true);
 
             let mut task = task_info {
                 tgidpid: ((1234u64) << 32) | 5678u64,
@@ -1761,15 +1753,14 @@ mod tests {
             };
             task.comm[0..4].copy_from_slice(b"test");
 
-            // Create a wakeup event which adds to runqueue
+            // Create a switch event which is stored in compact_sched
             let event = crate::systing::types::task_event {
                 ts: 1_000_000_000, // 1 second
-                r#type: crate::systing::types::event_type::SCHED_WAKEUP,
+                r#type: crate::systing::types::event_type::SCHED_SWITCH,
                 cpu: 0,
                 target_cpu: 0,
                 prev_prio: 0,
                 next_prio: 0,
-                latency: 0,
                 prev: task,
                 next: task,
                 ..Default::default()

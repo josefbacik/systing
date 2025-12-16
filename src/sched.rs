@@ -1,20 +1,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::perfetto::{TraceWriter, TrackCounter};
+use crate::perfetto::TraceWriter;
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::event_type;
 use crate::systing::types::task_event;
-use crate::trace::{CounterRecord, CounterTrackRecord, SchedSliceRecord, ThreadStateRecord};
+use crate::trace::{SchedSliceRecord, ThreadStateRecord};
 use crate::SystingRecordEvent;
 
-use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
-use perfetto_protos::counter_descriptor::CounterDescriptor;
 use perfetto_protos::ftrace_event::FtraceEvent;
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
 use perfetto_protos::ftrace_event_bundle::FtraceEventBundle;
@@ -24,7 +20,6 @@ use perfetto_protos::irq::{
 };
 use perfetto_protos::sched::{SchedProcessExitFtraceEvent, SchedWakeupNewFtraceEvent};
 use perfetto_protos::trace_packet::TracePacket;
-use perfetto_protos::track_descriptor::TrackDescriptor;
 
 #[derive(Default)]
 struct LocalCompactSched {
@@ -39,12 +34,6 @@ pub struct SchedEventRecorder {
     pub ringbuf: RingBuffer<task_event>,
     events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
     compact_sched: HashMap<u32, LocalCompactSched>,
-    runqueue: HashMap<i32, Vec<TrackCounter>>,
-    cpu_latencies: HashMap<u32, Vec<TrackCounter>>,
-    process_latencies: HashMap<u64, Vec<TrackCounter>>,
-    rq_counters: HashMap<i32, i64>,
-    cpu_sched_stats: bool,
-    process_sched_stats: bool,
 }
 
 impl SystingRecordEvent<task_event> for SchedEventRecorder {
@@ -58,7 +47,7 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
 
     fn handle_event(&mut self, event: task_event) {
         // SCHED_SWITCH and SCHED_WAKING are handled in compact sched events.
-        // We skip SCHED_WAKEUP because we're just using that for runqueue tracking.
+        // We skip SCHED_WAKEUP as it's only used for waking events, not switch.
         if event.r#type == event_type::SCHED_SWITCH || event.r#type == event_type::SCHED_WAKING {
             let compact_sched = self.compact_sched.entry(event.cpu).or_default();
             compact_sched.add_task_event(&event);
@@ -66,59 +55,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
             let ftrace_event = FtraceEvent::from(&event);
             let cpu_event = self.events.entry(event.cpu).or_default();
             cpu_event.insert(event.ts, ftrace_event);
-        }
-
-        // We want to keep a running count of the per-cpu runqueue size. We could do this
-        // inside of BPF, but that's a map lookup and runnning counter, so we'll just keep the
-        // complexity here instead of adding it to the BPF hook.
-        if self.cpu_sched_stats
-            && (event.r#type == event_type::SCHED_SWITCH
-                || event.r#type == event_type::SCHED_WAKEUP
-                || event.r#type == event_type::SCHED_WAKEUP_NEW)
-        {
-            let cpu = if event.r#type == event_type::SCHED_SWITCH {
-                event.cpu as i32
-            } else {
-                event.target_cpu as i32
-            };
-            let rq = self.runqueue.entry(cpu).or_default();
-            let count = self.rq_counters.entry(cpu).or_insert(0);
-
-            if event.r#type == event_type::SCHED_SWITCH {
-                // If we haven't seen a wakeup event yet we could have a runqueue size of 0, so
-                // we need to make sure we don't go negative.
-                if *count > 0 {
-                    *count -= 1;
-                }
-            } else {
-                *count += 1;
-            }
-
-            rq.push(TrackCounter {
-                ts: event.ts,
-                count: *count,
-            });
-        }
-
-        // SCHED_SWITCH is going to have latency for this CPU and TGIDPID
-        if self.process_sched_stats && event.r#type == event_type::SCHED_SWITCH && event.latency > 0
-        {
-            let cpu = event.cpu;
-            let lat = self.cpu_latencies.entry(cpu).or_default();
-            let plat = self
-                .process_latencies
-                .entry(event.next.tgidpid)
-                .or_default();
-
-            plat.push(TrackCounter {
-                ts: event.ts,
-                count: event.latency as i64,
-            });
-
-            lat.push(TrackCounter {
-                ts: event.ts,
-                count: event.latency as i64,
-            });
         }
     }
 }
@@ -132,7 +68,6 @@ impl SchedEventRecorder {
         &self,
         collector: &mut dyn RecordCollector,
         tid_to_utid: &HashMap<i32, i64>,
-        track_id_counter: &mut i64,
     ) -> Result<()> {
         // Process compact sched events (SCHED_SWITCH, SCHED_WAKING)
         for (cpu, local_compact) in self.compact_sched.iter() {
@@ -198,78 +133,11 @@ impl SchedEventRecorder {
             }
         }
 
-        // Runqueue counters
-        for (cpu, runqueue) in self.runqueue.iter() {
-            let track_id = *track_id_counter;
-            *track_id_counter += 1;
-
-            collector.add_counter_track(CounterTrackRecord {
-                id: track_id,
-                name: format!("runqueue_size_cpu{cpu}"),
-                unit: Some("count".to_string()),
-            })?;
-
-            for event in runqueue.iter() {
-                collector.add_counter(CounterRecord {
-                    ts: event.ts as i64,
-                    track_id,
-                    value: event.count as f64,
-                })?;
-            }
-        }
-
-        // CPU latency counters
-        for (cpu, events) in self.cpu_latencies.iter() {
-            let track_id = *track_id_counter;
-            *track_id_counter += 1;
-
-            collector.add_counter_track(CounterTrackRecord {
-                id: track_id,
-                name: format!("latency_cpu{cpu}"),
-                unit: Some("ns".to_string()),
-            })?;
-
-            for event in events.iter() {
-                collector.add_counter(CounterRecord {
-                    ts: event.ts as i64,
-                    track_id,
-                    value: event.count as f64,
-                })?;
-            }
-        }
-
-        // Process latency counters
-        for (pidtgid, events) in self.process_latencies.iter() {
-            let track_id = *track_id_counter;
-            *track_id_counter += 1;
-
-            let tid = *pidtgid as i32;
-            collector.add_counter_track(CounterTrackRecord {
-                id: track_id,
-                name: format!("wake_latency_tid{tid}"),
-                unit: Some("ns".to_string()),
-            })?;
-
-            for event in events.iter() {
-                collector.add_counter(CounterRecord {
-                    ts: event.ts as i64,
-                    track_id,
-                    value: event.count as f64,
-                })?;
-            }
-        }
-
         Ok(())
     }
 
     /// Write trace data to Perfetto format (legacy path).
-    pub fn write_trace(
-        &self,
-        writer: &mut dyn TraceWriter,
-        pid_uuids: &HashMap<i32, u64>,
-        thread_uuids: &HashMap<i32, u64>,
-        id_counter: &Arc<AtomicUsize>,
-    ) -> Result<()> {
+    pub fn write_trace(&self, writer: &mut dyn TraceWriter) -> Result<()> {
         // Pull all the compact scheduling events
         for (cpu, compact_sched) in self.compact_sched.iter() {
             let mut event_bundle = FtraceEventBundle::default();
@@ -290,87 +158,7 @@ impl SchedEventRecorder {
             writer.write_packet(&packet)?;
         }
 
-        // Populate the per-cpu runqueue sizes
-        for (cpu, runqueue) in self.runqueue.iter() {
-            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-
-            let mut counter_desc = CounterDescriptor::default();
-            counter_desc.set_unit(Unit::UNIT_COUNT);
-            counter_desc.set_is_incremental(false);
-
-            let mut desc = TrackDescriptor::default();
-            desc.set_name(format!("runqueue_size_cpu{cpu}"));
-            desc.set_uuid(desc_uuid);
-            desc.counter = Some(counter_desc).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            writer.write_packet(&packet)?;
-
-            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-            for event in runqueue.iter() {
-                writer.write_packet(&event.to_track_event(desc_uuid, seq))?;
-            }
-        }
-
-        // Populate the per-cpu latencies
-        for (cpu, events) in self.cpu_latencies.iter() {
-            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-
-            let mut counter_desc = CounterDescriptor::default();
-            counter_desc.set_unit(Unit::UNIT_TIME_NS);
-            counter_desc.set_is_incremental(false);
-
-            let mut desc = TrackDescriptor::default();
-            desc.set_name(format!("latency_cpu{cpu}"));
-            desc.set_uuid(desc_uuid);
-            desc.counter = Some(counter_desc).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            writer.write_packet(&packet)?;
-
-            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-            for event in events.iter() {
-                writer.write_packet(&event.to_track_event(desc_uuid, seq))?;
-            }
-        }
-
-        // Populate the per-process latencies
-        for (pidtgid, events) in self.process_latencies.iter() {
-            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-
-            let mut counter_desc = CounterDescriptor::default();
-            counter_desc.set_unit(Unit::UNIT_TIME_NS);
-            counter_desc.set_is_incremental(false);
-
-            let mut desc = crate::perfetto::generate_pidtgid_track_descriptor(
-                pid_uuids,
-                thread_uuids,
-                pidtgid,
-                "Wake latency".to_string(),
-                desc_uuid,
-            );
-            desc.counter = Some(counter_desc).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            writer.write_packet(&packet)?;
-
-            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-            for event in events.iter() {
-                writer.write_packet(&event.to_track_event(desc_uuid, seq))?;
-            }
-        }
         Ok(())
-    }
-
-    pub fn set_cpu_sched_stats(&mut self, enabled: bool) {
-        self.cpu_sched_stats = enabled;
-    }
-
-    pub fn set_process_sched_stats(&mut self, enabled: bool) {
-        self.process_sched_stats = enabled;
     }
 
     /// Returns the minimum timestamp from all events, or None if no events recorded.
@@ -388,37 +176,7 @@ impl SchedEventRecorder {
             .filter_map(|e| e.keys().next().copied())
             .min();
 
-        let runqueue_min = self
-            .runqueue
-            .values()
-            .filter_map(|c| c.first())
-            .map(|c| c.ts)
-            .min();
-
-        let cpu_lat_min = self
-            .cpu_latencies
-            .values()
-            .filter_map(|c| c.first())
-            .map(|c| c.ts)
-            .min();
-
-        let proc_lat_min = self
-            .process_latencies
-            .values()
-            .filter_map(|c| c.first())
-            .map(|c| c.ts)
-            .min();
-
-        [
-            compact_min,
-            events_min,
-            runqueue_min,
-            cpu_lat_min,
-            proc_lat_min,
-        ]
-        .into_iter()
-        .flatten()
-        .min()
+        [compact_min, events_min].into_iter().flatten().min()
     }
 }
 
@@ -571,16 +329,9 @@ mod tests {
     }
 
     /// Helper to collect packets from SchedEventRecorder for tests
-    fn generate_trace(
-        recorder: &SchedEventRecorder,
-        pid_uuids: &HashMap<i32, u64>,
-        thread_uuids: &HashMap<i32, u64>,
-        id_counter: &Arc<AtomicUsize>,
-    ) -> Vec<TracePacket> {
+    fn generate_trace(recorder: &SchedEventRecorder) -> Vec<TracePacket> {
         let mut writer = VecTraceWriter::new();
-        recorder
-            .write_trace(&mut writer, pid_uuids, thread_uuids, id_counter)
-            .unwrap();
+        recorder.write_trace(&mut writer).unwrap();
         writer.packets
     }
 
@@ -618,15 +369,7 @@ mod tests {
 
         assert_eq!(recorder.compact_sched.len(), 1);
 
-        let mut thread_uuids = HashMap::new();
-        thread_uuids.insert(1234, 1);
-        thread_uuids.insert(5678, 2);
-        let packets = generate_trace(
-            &recorder,
-            &HashMap::new(),
-            &thread_uuids,
-            &Arc::new(AtomicUsize::new(0)),
-        );
+        let packets = generate_trace(&recorder);
         assert_eq!(packets.len(), 1);
 
         let packet = &packets[0];
@@ -665,14 +408,7 @@ mod tests {
         assert_eq!(recorder.events.len(), 1);
         assert!(recorder.events.contains_key(&0));
 
-        let mut thread_uuids = HashMap::new();
-        thread_uuids.insert(1234, 1);
-        let packets = generate_trace(
-            &recorder,
-            &HashMap::new(),
-            &thread_uuids,
-            &Arc::new(AtomicUsize::new(0)),
-        );
+        let packets = generate_trace(&recorder);
         assert_eq!(packets.len(), 1);
 
         let packet = &packets[0];
@@ -706,14 +442,7 @@ mod tests {
         assert_eq!(recorder.events.len(), 1);
         assert!(recorder.events.contains_key(&0));
 
-        let mut thread_uuids = HashMap::new();
-        thread_uuids.insert(1234, 1);
-        let packets = generate_trace(
-            &recorder,
-            &HashMap::new(),
-            &thread_uuids,
-            &Arc::new(AtomicUsize::new(0)),
-        );
+        let packets = generate_trace(&recorder);
         assert_eq!(packets.len(), 1);
 
         let packet = &packets[0];
@@ -747,14 +476,7 @@ mod tests {
         assert_eq!(recorder.events.len(), 1);
         assert!(recorder.events.contains_key(&0));
 
-        let mut thread_uuids = HashMap::new();
-        thread_uuids.insert(1234, 1);
-        let packets = generate_trace(
-            &recorder,
-            &HashMap::new(),
-            &thread_uuids,
-            &Arc::new(AtomicUsize::new(0)),
-        );
+        let packets = generate_trace(&recorder);
         assert_eq!(packets.len(), 1);
 
         let packet = &packets[0];
@@ -781,12 +503,7 @@ mod tests {
         assert_eq!(recorder.events.len(), 1);
         assert!(recorder.events.contains_key(&0));
 
-        let packets = generate_trace(
-            &recorder,
-            &HashMap::new(),
-            &HashMap::new(),
-            &Arc::new(AtomicUsize::new(0)),
-        );
+        let packets = generate_trace(&recorder);
         assert_eq!(packets.len(), 1);
 
         let packet = &packets[0];
@@ -813,12 +530,7 @@ mod tests {
         assert_eq!(recorder.events.len(), 1);
         assert!(recorder.events.contains_key(&0));
 
-        let packets = generate_trace(
-            &recorder,
-            &HashMap::new(),
-            &HashMap::new(),
-            &Arc::new(AtomicUsize::new(0)),
-        );
+        let packets = generate_trace(&recorder);
         assert_eq!(packets.len(), 1);
 
         let packet = &packets[0];
@@ -850,14 +562,7 @@ mod tests {
         assert_eq!(recorder.events.len(), 1);
         assert!(recorder.events.contains_key(&0));
 
-        let mut thread_uuids = HashMap::new();
-        thread_uuids.insert(1234, 1);
-        let packets = generate_trace(
-            &recorder,
-            &HashMap::new(),
-            &thread_uuids,
-            &Arc::new(AtomicUsize::new(0)),
-        );
+        let packets = generate_trace(&recorder);
         assert_eq!(packets.len(), 1);
 
         let packet = &packets[0];
@@ -866,74 +571,5 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(events[0].has_sched_process_exit());
         assert_eq!(events[0].sched_process_exit().comm(), "prev");
-    }
-
-    #[test]
-    fn test_runqueue_size_tracking() {
-        let mut recorder = SchedEventRecorder::default();
-        recorder.set_cpu_sched_stats(true);
-
-        let event = task_event {
-            r#type: event_type::SCHED_WAKEUP,
-            ts: 1000,
-            target_cpu: 0,
-            next: task_info {
-                tgidpid: 1234,
-                ..Default::default()
-            },
-            next_prio: 10,
-            ..Default::default()
-        };
-        recorder.handle_event(event);
-
-        let packets = generate_trace(
-            &recorder,
-            &HashMap::new(),
-            &HashMap::new(),
-            &Arc::new(AtomicUsize::new(0)),
-        );
-        assert_eq!(packets.len(), 2);
-        assert!(packets[0].has_track_descriptor());
-    }
-
-    #[test]
-    fn test_process_latency_tracking() {
-        let mut recorder = SchedEventRecorder::default();
-        recorder.set_process_sched_stats(true);
-
-        let event = task_event {
-            r#type: event_type::SCHED_SWITCH,
-            ts: 1000,
-            cpu: 0,
-            next: task_info {
-                tgidpid: 1234,
-                ..Default::default()
-            },
-            prev: task_info {
-                tgidpid: 5678,
-                ..Default::default()
-            },
-            latency: 500,
-            next_prio: 10,
-            prev_state: 0,
-            ..Default::default()
-        };
-        recorder.handle_event(event);
-
-        let mut thread_uuids = HashMap::new();
-        thread_uuids.insert(1234, 1);
-
-        let packets = generate_trace(
-            &recorder,
-            &HashMap::new(),
-            &thread_uuids,
-            &Arc::new(AtomicUsize::new(0)),
-        );
-        assert_eq!(packets.len(), 5);
-        assert!(packets[0].has_ftrace_events());
-        assert!(packets[1].has_track_descriptor());
-        assert_eq!(packets[2].track_event().counter_value(), 500);
-        assert!(packets[3].has_track_descriptor());
-        assert_eq!(packets[4].track_event().counter_value(), 500);
     }
 }

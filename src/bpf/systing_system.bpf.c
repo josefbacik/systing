@@ -92,7 +92,6 @@ struct task_event {
 	enum event_type type;
 	u32 cpu;
 	u64 ts;
-	u64 latency;
 	u64 prev_state;
 	u32 target_cpu;
 	u32 next_prio;
@@ -304,13 +303,6 @@ struct {
 	__type(value, u32);
 	__uint(max_entries, 10240);
 } perf_counters SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, u64);
-	__type(value, u64);
-	__uint(max_entries, 10240);
-} wake_ts SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -1251,10 +1243,6 @@ static int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 	struct task_event *event;
 	long flags;
 	u64 ts = bpf_ktime_get_boot_ns();
-	u64 key = task_key(wakee);
-
-	if (type == SCHED_WAKING || type == SCHED_WAKEUP_NEW)
-		bpf_map_update_elem(&wake_ts, &key, &ts, BPF_ANY);
 
 	event = reserve_task_event(&flags);
 	if (!event)
@@ -1305,20 +1293,10 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 {
 	struct task_event *event;
 	long flags;
-	u64 next_key = task_key(next);
 	u64 ts = bpf_ktime_get_boot_ns();
-	u64 latency = 0;
-	u64 *start_ns;
 
 	if (!trace_task(prev) && !trace_task(next))
 		return 0;
-
-	start_ns = bpf_map_lookup_elem(&wake_ts, &next_key);
-	if (start_ns) {
-		if (ts > *start_ns)
-			latency = ts - *start_ns;
-		bpf_map_delete_elem(&wake_ts, &next_key);
-	}
 
 	event = reserve_task_event(&flags);
 	if (!event)
@@ -1326,7 +1304,6 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 
 	event->ts = ts;
 	event->type = SCHED_SWITCH;
-	event->latency = latency;
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->next, next);
 	record_task_info(&event->prev, prev);
