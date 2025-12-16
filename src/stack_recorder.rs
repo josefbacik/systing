@@ -9,9 +9,7 @@ use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::stack_event;
-use crate::trace::{
-    CallsiteRecord, FrameRecord, PerfSampleRecord, StackRecord, StackSampleRecord, SymbolRecord,
-};
+use crate::trace::{StackRecord, StackSampleRecord};
 use crate::SystingRecordEvent;
 
 use blazesym::helper::{read_elf_build_id, ElfResolver};
@@ -327,24 +325,18 @@ impl StackRecorder {
     /// This method outputs stack profiling data as native records. It performs
     /// symbolization and outputs the results directly without Perfetto format.
     ///
-    /// Uses the query-friendly schema with StackRecord (containing frame arrays)
-    /// instead of CallsiteRecord (linked list).
+    /// Uses a simplified schema where StackRecord contains only frame_names
+    /// (with embedded module and location info) - no separate frame/symbol tables.
+    ///
+    /// Frame names are formatted as: `function_name (module_name [file:line]) <0xaddr>`
     pub fn write_records(
         &self,
         collector: &mut dyn RecordCollector,
         tid_to_utid: &HashMap<i32, i64>,
-        symbol_id_counter: &mut i64,
-        frame_id_counter: &mut i64,
         stack_id_counter: &mut i64,
     ) -> Result<()> {
-        // Symbol deduplication cache
-        let mut symbol_map: HashMap<String, i64> = HashMap::new();
-
-        // Frame deduplication cache (key: (module_name, addr))
-        let mut frame_map: HashMap<(Option<String>, u64), i64> = HashMap::new();
-
-        // Stack deduplication cache (key: hash of frame_ids)
-        let mut stack_cache: HashMap<Vec<i64>, i64> = HashMap::new();
+        // Stack deduplication cache (key: frame_names as a comparable key)
+        let mut stack_cache: HashMap<Vec<String>, i64> = HashMap::new();
 
         // Process each unique stack
         for (tgid, events) in self.stacks.iter() {
@@ -387,13 +379,12 @@ impl StackRecorder {
                     all_addrs.push((addr, true)); // is_kernel=true
                 }
 
-                // Build frame_names and frame_ids arrays (pre-allocated)
+                // Build frame_names array with embedded module/location info
                 let mut frame_names: Vec<String> = Vec::with_capacity(addr_count);
-                let mut frame_ids: Vec<i64> = Vec::with_capacity(addr_count);
 
                 for (addr, is_kernel) in all_addrs.iter() {
-                    // Try to symbolize - extract both name and module
-                    let (sym_name, module_name) = if *is_kernel {
+                    // Symbolize and format frame name with embedded info
+                    let frame_name = if *is_kernel {
                         let kernel_src = Source::Kernel(Kernel::default());
                         let sym_result =
                             symbolizer.symbolize_single(&kernel_src, Input::VirtOffset(*addr));
@@ -401,14 +392,20 @@ impl StackRecorder {
                             .ok()
                             .and_then(|s| s.into_sym())
                             .map(|s| {
-                                let name = s.name.to_string();
-                                let module = s
+                                let module_name = s
                                     .module
-                                    .and_then(|m| m.to_str().map(String::from))
-                                    .unwrap_or_else(|| "[kernel]".to_string());
-                                (Some(name), Some(module))
+                                    .as_ref()
+                                    .and_then(|m| m.to_str())
+                                    .and_then(|m| std::path::Path::new(m).file_name())
+                                    .and_then(|f| f.to_str())
+                                    .unwrap_or("[kernel]");
+                                let location_info = format_location_info(&s.code_info);
+                                format!(
+                                    "{} ({}{}) <{:#x}>",
+                                    s.name, module_name, location_info, *addr
+                                )
                             })
-                            .unwrap_or((None, Some("[kernel]".to_string())))
+                            .unwrap_or_else(|| format!("unknown ([kernel]) <{:#x}>", *addr))
                     } else {
                         let proc_src = Source::Process(Process::new(Pid::from(pid as u32)));
                         let sym_result =
@@ -417,76 +414,46 @@ impl StackRecorder {
                             .ok()
                             .and_then(|s| s.into_sym())
                             .map(|s| {
-                                let name = s.name.to_string();
-                                let module = s.module.and_then(|m| m.to_str().map(String::from));
-                                (Some(name), module)
+                                let module_name = s
+                                    .module
+                                    .as_ref()
+                                    .and_then(|m| m.to_str())
+                                    .and_then(|m| std::path::Path::new(m).file_name())
+                                    .and_then(|f| f.to_str())
+                                    .unwrap_or("unknown");
+                                let location_info = format_location_info(&s.code_info);
+                                format!(
+                                    "{} ({}{}) <{:#x}>",
+                                    s.name, module_name, location_info, *addr
+                                )
                             })
-                            .unwrap_or((None, None))
+                            .unwrap_or_else(|| format!("0x{:x}", *addr))
                     };
 
-                    // Get or create symbol
-                    let symbol_id = if let Some(name) = &sym_name {
-                        if let Some(&id) = symbol_map.get(name) {
-                            Some(id)
-                        } else {
-                            let id = *symbol_id_counter;
-                            *symbol_id_counter += 1;
-                            symbol_map.insert(name.clone(), id);
-                            collector.add_symbol(SymbolRecord {
-                                id,
-                                name: name.clone(),
-                            })?;
-                            Some(id)
-                        }
-                    } else {
-                        None
-                    };
-
-                    // Get or create frame (keyed by module+addr for deduplication)
-                    let frame_key = (module_name.clone(), *addr);
-                    let frame_id = if let Some(&id) = frame_map.get(&frame_key) {
-                        id
-                    } else {
-                        let id = *frame_id_counter;
-                        *frame_id_counter += 1;
-                        frame_map.insert(frame_key, id);
-                        collector.add_frame(FrameRecord {
-                            id,
-                            name: sym_name.clone(),
-                            module_name,
-                            symbol_id,
-                        })?;
-                        id
-                    };
-
-                    // Add to arrays
-                    frame_names.push(sym_name.unwrap_or_else(|| format!("0x{addr:x}")));
-                    frame_ids.push(frame_id);
+                    frame_names.push(frame_name);
                 }
 
                 // Skip empty stacks
-                if frame_ids.is_empty() {
+                if frame_names.is_empty() {
                     continue;
                 }
 
-                // Check if this exact stack already exists (global deduplication)
-                let stack_id = if let Some(&id) = stack_cache.get(&frame_ids) {
+                // Check if this exact stack already exists (global deduplication by frame_names)
+                let stack_id = if let Some(&id) = stack_cache.get(&frame_names) {
                     id
                 } else {
                     let id = *stack_id_counter;
                     *stack_id_counter += 1;
 
                     let leaf_name = frame_names.first().cloned().unwrap_or_default();
-                    // Safe conversion: clamp to i32::MAX for extremely deep stacks
-                    let depth = frame_ids.len().min(i32::MAX as usize) as i32;
+                    let depth = frame_names.len().min(i32::MAX as usize) as i32;
 
-                    // Clone frame_ids for the cache key before moving into StackRecord
-                    let cache_key = frame_ids.clone();
+                    // Clone frame_names for the cache key before moving into StackRecord
+                    let cache_key = frame_names.clone();
 
                     collector.add_stack(StackRecord {
                         id,
                         frame_names,
-                        frame_ids,
                         depth,
                         leaf_name,
                     })?;
@@ -511,172 +478,6 @@ impl StackRecorder {
                         stack_id,
                     })?;
                 }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Write trace data using the legacy callsite schema (for Perfetto compatibility).
-    ///
-    /// This method outputs stack profiling data using the callsite linked-list schema.
-    #[allow(dead_code)]
-    pub fn write_records_legacy(
-        &self,
-        collector: &mut dyn RecordCollector,
-        tid_to_utid: &HashMap<i32, i64>,
-        symbol_id_counter: &mut i64,
-        frame_id_counter: &mut i64,
-        callsite_id_counter: &mut i64,
-    ) -> Result<()> {
-        // Symbol deduplication cache
-        let mut symbol_map: HashMap<String, i64> = HashMap::new();
-
-        // Frame deduplication cache (key: (module_name, addr))
-        let mut frame_map: HashMap<(Option<String>, u64), i64> = HashMap::new();
-
-        // Process each unique stack
-        for (tgid, events) in self.stacks.iter() {
-            let pid = tgid >> 32;
-
-            // Create a symbolizer for this process
-            let symbolizer = if let Some(dispatcher) = &self.process_dispatcher {
-                let dispatcher = dispatcher.clone();
-                Symbolizer::builder()
-                    .enable_code_info(true)
-                    .enable_inlined_fns(true)
-                    .set_process_dispatcher(move |info| dispatcher(info))
-                    .build()
-            } else {
-                Symbolizer::builder()
-                    .enable_code_info(true)
-                    .enable_inlined_fns(true)
-                    .build()
-            };
-
-            // Process each unique stack for this tgid
-            let unique_stacks: HashSet<_> = events.iter().map(|e| &e.stack).collect();
-
-            // Callstack map for this tgid
-            let mut callsite_cache: HashMap<&Stack, i64> = HashMap::new();
-
-            for stack in unique_stacks.iter() {
-                // Collect addresses for symbolization
-                let mut all_addrs = Vec::new();
-
-                // Add kernel addresses with kernel source
-                for &addr in &stack.kernel_stack {
-                    all_addrs.push((addr, true)); // is_kernel=true
-                }
-
-                // Add user addresses
-                for &addr in &stack.user_stack {
-                    all_addrs.push((addr, false)); // is_kernel=false
-                }
-
-                // Build callsite chain
-                let mut parent_callsite_id: Option<i64> = None;
-
-                for (depth, (addr, is_kernel)) in all_addrs.iter().enumerate() {
-                    // Try to symbolize - extract both name and module
-                    let (sym_name, module_name) = if *is_kernel {
-                        let kernel_src = Source::Kernel(Kernel::default());
-                        let sym_result =
-                            symbolizer.symbolize_single(&kernel_src, Input::VirtOffset(*addr));
-                        sym_result
-                            .ok()
-                            .and_then(|s| s.into_sym())
-                            .map(|s| {
-                                let name = s.name.to_string();
-                                let module = s
-                                    .module
-                                    .and_then(|m| m.to_str().map(String::from))
-                                    .unwrap_or_else(|| "[kernel]".to_string());
-                                (Some(name), Some(module))
-                            })
-                            .unwrap_or((None, Some("[kernel]".to_string())))
-                    } else {
-                        let proc_src = Source::Process(Process::new(Pid::from(pid as u32)));
-                        let sym_result =
-                            symbolizer.symbolize_single(&proc_src, Input::VirtOffset(*addr));
-                        sym_result
-                            .ok()
-                            .and_then(|s| s.into_sym())
-                            .map(|s| {
-                                let name = s.name.to_string();
-                                let module = s.module.and_then(|m| m.to_str().map(String::from));
-                                (Some(name), module)
-                            })
-                            .unwrap_or((None, None))
-                    };
-
-                    // Get or create symbol
-                    let symbol_id = if let Some(name) = &sym_name {
-                        if let Some(&id) = symbol_map.get(name) {
-                            Some(id)
-                        } else {
-                            let id = *symbol_id_counter;
-                            *symbol_id_counter += 1;
-                            symbol_map.insert(name.clone(), id);
-                            collector.add_symbol(SymbolRecord {
-                                id,
-                                name: name.clone(),
-                            })?;
-                            Some(id)
-                        }
-                    } else {
-                        None
-                    };
-
-                    // Get or create frame (keyed by module+addr for deduplication)
-                    let frame_key = (module_name.clone(), *addr);
-                    let frame_id = if let Some(&id) = frame_map.get(&frame_key) {
-                        id
-                    } else {
-                        let id = *frame_id_counter;
-                        *frame_id_counter += 1;
-                        frame_map.insert(frame_key, id);
-                        collector.add_frame(FrameRecord {
-                            id,
-                            name: sym_name.clone(),
-                            module_name,
-                            symbol_id,
-                        })?;
-                        id
-                    };
-
-                    // Create callsite
-                    let callsite_id = *callsite_id_counter;
-                    *callsite_id_counter += 1;
-
-                    collector.add_callsite(CallsiteRecord {
-                        id: callsite_id,
-                        parent_id: parent_callsite_id,
-                        frame_id,
-                        depth: depth as i32,
-                    })?;
-
-                    parent_callsite_id = Some(callsite_id);
-                }
-
-                // Cache the leaf callsite for this stack
-                if let Some(leaf_id) = parent_callsite_id {
-                    callsite_cache.insert(stack, leaf_id);
-                }
-            }
-
-            // Now output perf samples with callsite references
-            for event in events.iter() {
-                let tid = event.tgidpid as i32;
-                let utid = tid_to_utid.get(&tid).copied().unwrap_or(tid as i64);
-                let callsite_id = callsite_cache.get(&event.stack).copied();
-
-                collector.add_perf_sample(PerfSampleRecord {
-                    ts: event.ts_start as i64,
-                    utid,
-                    callsite_id,
-                    cpu: None,
-                })?;
             }
         }
 

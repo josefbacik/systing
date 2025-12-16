@@ -7,10 +7,10 @@
 use anyhow::Result;
 
 use crate::trace::{
-    ArgRecord, CallsiteRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord,
-    ExtractedData, FrameRecord, InstantArgRecord, InstantRecord, NetworkInterfaceRecord,
-    PerfSampleRecord, ProcessRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord,
-    StackRecord, StackSampleRecord, SymbolRecord, ThreadRecord, ThreadStateRecord, TrackRecord,
+    ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ExtractedData,
+    InstantArgRecord, InstantRecord, NetworkInterfaceRecord, ProcessRecord, SchedSliceRecord,
+    SliceRecord, SocketConnectionRecord, StackRecord, StackSampleRecord, ThreadRecord,
+    ThreadStateRecord, TrackRecord,
 };
 
 /// Trait for collecting trace records during recording.
@@ -61,18 +61,6 @@ pub trait RecordCollector {
 
     /// Add an argument record for an instant.
     fn add_instant_arg(&mut self, record: InstantArgRecord) -> Result<()>;
-
-    /// Add a performance sample record.
-    fn add_perf_sample(&mut self, record: PerfSampleRecord) -> Result<()>;
-
-    /// Add a symbol record.
-    fn add_symbol(&mut self, record: SymbolRecord) -> Result<()>;
-
-    /// Add a frame record.
-    fn add_frame(&mut self, record: FrameRecord) -> Result<()>;
-
-    /// Add a callsite record.
-    fn add_callsite(&mut self, record: CallsiteRecord) -> Result<()>;
 
     /// Add a network interface record.
     fn add_network_interface(&mut self, record: NetworkInterfaceRecord) -> Result<()>;
@@ -177,26 +165,6 @@ impl RecordCollector for InMemoryCollector {
 
     fn add_instant_arg(&mut self, record: InstantArgRecord) -> Result<()> {
         self.data.instant_args.push(record);
-        Ok(())
-    }
-
-    fn add_perf_sample(&mut self, record: PerfSampleRecord) -> Result<()> {
-        self.data.perf_samples.push(record);
-        Ok(())
-    }
-
-    fn add_symbol(&mut self, record: SymbolRecord) -> Result<()> {
-        self.data.symbols.push(record);
-        Ok(())
-    }
-
-    fn add_frame(&mut self, record: FrameRecord) -> Result<()> {
-        self.data.frames.push(record);
-        Ok(())
-    }
-
-    fn add_callsite(&mut self, record: CallsiteRecord) -> Result<()> {
-        self.data.callsites.push(record);
         Ok(())
     }
 

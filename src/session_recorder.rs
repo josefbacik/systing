@@ -985,8 +985,6 @@ impl SessionRecorder {
         let mut track_id_counter: i64 = 1;
         let mut slice_id_counter: i64 = 1;
         let mut instant_id_counter: i64 = 1;
-        let mut symbol_id_counter: i64 = 1;
-        let mut frame_id_counter: i64 = 1;
         let mut stack_id_counter: i64 = 1;
 
         // Step 1: Generate clock snapshot records
@@ -1092,8 +1090,6 @@ impl SessionRecorder {
         self.stack_recorder.lock().unwrap().write_records(
             &mut writer,
             &tid_to_utid,
-            &mut symbol_id_counter,
-            &mut frame_id_counter,
             &mut stack_id_counter,
         )?;
 

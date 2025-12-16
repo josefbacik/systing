@@ -6,7 +6,7 @@
 //!
 //! # Module Organization
 //!
-//! - [`models`]: Record structs for all 19 Parquet tables
+//! - [`models`]: Record structs for all 16 Parquet tables
 //! - [`schema`]: Arrow schema definitions matching each record type
 //! - [`constants`]: Shared constants (batch sizes, regex patterns)
 

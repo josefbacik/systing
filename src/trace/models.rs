@@ -143,59 +143,26 @@ pub struct InstantArgRecord {
     pub real_value: Option<f64>,
 }
 
-/// Performance sample record.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PerfSampleRecord {
-    pub ts: i64,
-    pub utid: i64,
-    pub callsite_id: Option<i64>,
-    pub cpu: Option<i32>,
-}
-
 // Stack profiling records
-
-/// Symbol record - function name.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct SymbolRecord {
-    pub id: i64,
-    pub name: String,
-}
-
-/// Frame record - stack frame information.
-/// module_name is stored directly on frame (from blazesym Sym.module).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct FrameRecord {
-    pub id: i64,
-    pub name: Option<String>,
-    pub module_name: Option<String>,
-    pub symbol_id: Option<i64>,
-}
-
-/// Callsite record - represents a position in a call stack.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CallsiteRecord {
-    pub id: i64,
-    pub parent_id: Option<i64>,
-    pub frame_id: i64,
-    pub depth: i32,
-}
 
 /// Stack record - represents a complete call stack as arrays.
 ///
 /// This is a query-friendly representation that stores the entire stack
 /// in arrays, avoiding the need for recursive CTEs to reconstruct stacks.
 ///
+/// Frame names contain embedded information in the format:
+/// `function_name (module_name [file:line]) <0xaddr>`
+/// This allows Perfetto conversion to extract module names on-the-fly.
+///
 /// # Fields
 /// - `id`: Unique stack ID
-/// - `frame_names`: Function names from leaf to root
-/// - `frame_ids`: Frame IDs for Perfetto generation
+/// - `frame_names`: Function names from leaf to root (with embedded module/location info)
 /// - `depth`: Number of frames in the stack
 /// - `leaf_name`: Leaf function name (redundant but enables fast filtering)
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StackRecord {
     pub id: i64,
     pub frame_names: Vec<String>,
-    pub frame_ids: Vec<i64>,
     pub depth: i32,
     pub leaf_name: String,
 }
@@ -264,10 +231,6 @@ pub struct ExtractedData {
     pub instants: Vec<InstantRecord>,
     pub args: Vec<ArgRecord>,
     pub instant_args: Vec<InstantArgRecord>,
-    pub perf_samples: Vec<PerfSampleRecord>,
-    pub symbols: Vec<SymbolRecord>,
-    pub frames: Vec<FrameRecord>,
-    pub callsites: Vec<CallsiteRecord>,
     pub stacks: Vec<StackRecord>,
     pub stack_samples: Vec<StackSampleRecord>,
     pub network_interfaces: Vec<NetworkInterfaceRecord>,

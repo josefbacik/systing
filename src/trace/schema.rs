@@ -1,31 +1,19 @@
 //! Arrow schema definitions for trace data.
 //!
-//! These schemas define the structure of Parquet files written by systing
-//! and read by systing-analyze.
+//! These schemas define the structure of Parquet files written by systing.
 //!
-//! # Stack Trace Schemas
+//! # Stack Trace Schema
 //!
-//! There are two parallel schemas for stack trace data:
-//!
-//! ## Legacy Schema (Perfetto-compatible)
-//! - `callsite.parquet` - Linked-list of callsites with `parent_id` chains
-//! - `perf_sample.parquet` - Samples referencing leaf `callsite_id`
-//!
-//! This schema mirrors Perfetto's internal representation and requires recursive
-//! CTEs to reconstruct full stack traces for queries.
-//!
-//! ## Query-Friendly Schema (New)
-//! - `stack.parquet` - Complete stacks with `frame_names[]` and `frame_ids[]` arrays
+//! Stack traces use a query-friendly schema:
+//! - `stack.parquet` - Complete stacks with `frame_names[]` array
 //! - `stack_sample.parquet` - Samples referencing `stack_id`
 //!
-//! This schema stores complete stacks as arrays, enabling simple JOINs and
-//! `list_contains()` queries without recursive CTEs.
+//! This schema stores complete stacks as arrays with embedded module/location
+//! info in each frame name string. Frame names are formatted as:
+//! `function_name (module_name [file:line]) <0xaddr>`
 //!
-//! ## Usage
-//! - The `--parquet-first` flag uses the new query-friendly schema
-//! - The default Perfetto path still generates the legacy schema
-//! - When converting new schema to Perfetto format, callsite chains are
-//!   reconstructed on-the-fly from the `frame_ids` arrays
+//! When converting to Perfetto format, frames and mappings are generated
+//! on-the-fly by parsing module names from frame_names strings.
 
 use std::sync::Arc;
 
@@ -149,45 +137,6 @@ pub fn instant_args_schema() -> Arc<Schema> {
     ]))
 }
 
-/// Schema for perf_sample.parquet
-pub fn perf_sample_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("ts", DataType::Int64, false),
-        Field::new("utid", DataType::Int64, false),
-        Field::new("callsite_id", DataType::Int64, true),
-        Field::new("cpu", DataType::Int32, true),
-    ]))
-}
-
-/// Schema for symbol.parquet
-pub fn symbol_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, false),
-    ]))
-}
-
-/// Schema for frame.parquet
-/// module_name stored directly on frame (from blazesym Sym.module).
-pub fn frame_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, true),
-        Field::new("module_name", DataType::Utf8, true),
-        Field::new("symbol_id", DataType::Int64, true),
-    ]))
-}
-
-/// Schema for callsite.parquet
-pub fn callsite_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("parent_id", DataType::Int64, true),
-        Field::new("frame_id", DataType::Int64, false),
-        Field::new("depth", DataType::Int32, false),
-    ]))
-}
-
 /// Schema for network_interface.parquet
 pub fn network_interface_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -224,18 +173,15 @@ pub fn clock_snapshot_schema() -> Arc<Schema> {
 
 /// Schema for stack.parquet
 ///
-/// Stores complete stack traces with frame information denormalized into lists.
+/// Stores complete stack traces with frame names denormalized into a list.
+/// Frame names contain embedded module and location information in the format:
+/// `function_name (module_name [file:line]) <0xaddr>`
 pub fn stack_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new(
             "frame_names",
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-            false,
-        ),
-        Field::new(
-            "frame_ids",
-            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
             false,
         ),
         Field::new("depth", DataType::Int32, false),
