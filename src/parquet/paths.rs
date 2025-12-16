@@ -15,12 +15,7 @@ pub struct ParquetPaths {
     pub instant: PathBuf,
     pub args: PathBuf,
     pub instant_args: PathBuf,
-    pub perf_sample: PathBuf,
-    // Stack profiling tables
-    pub symbol: PathBuf,
-    pub frame: PathBuf,
-    pub callsite: PathBuf,
-    // Query-friendly stack tables
+    // Stack tables
     pub stack: PathBuf,
     pub stack_sample: PathBuf,
     // Network metadata tables
@@ -52,12 +47,7 @@ impl ParquetPaths {
             instant: dir.join("instant.parquet"),
             args: dir.join("args.parquet"),
             instant_args: dir.join("instant_args.parquet"),
-            perf_sample: dir.join("perf_sample.parquet"),
-            // Stack profiling tables
-            symbol: dir.join("symbol.parquet"),
-            frame: dir.join("frame.parquet"),
-            callsite: dir.join("callsite.parquet"),
-            // Query-friendly stack tables
+            // Stack tables
             stack: dir.join("stack.parquet"),
             stack_sample: dir.join("stack_sample.parquet"),
             // Network metadata tables
@@ -69,7 +59,7 @@ impl ParquetPaths {
     }
 
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 20] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 16] {
         [
             PathEntry {
                 path: &self.process,
@@ -114,22 +104,6 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.instant_args,
                 name: "instant_args",
-            },
-            PathEntry {
-                path: &self.perf_sample,
-                name: "perf_sample",
-            },
-            PathEntry {
-                path: &self.symbol,
-                name: "symbol",
-            },
-            PathEntry {
-                path: &self.frame,
-                name: "frame",
-            },
-            PathEntry {
-                path: &self.callsite,
-                name: "callsite",
             },
             PathEntry {
                 path: &self.stack,

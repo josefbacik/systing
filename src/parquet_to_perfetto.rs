@@ -3,7 +3,7 @@
 //! This module reads parquet files from a directory and reconstructs a valid
 //! Perfetto trace (.pb file). It is the inverse of the parquet_writer module.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -986,10 +986,9 @@ impl ParquetToPerfettoConverter {
         // For new schema, build InternedData with Frame and Callstack protos
         let (stack_to_callstack_iid, sequence_id) = if uses_new_schema {
             let stack_data = read_stack_data(input_dir)?;
-            let frame_data = read_frame_data(input_dir)?;
 
             if !stack_data.is_empty() {
-                self.write_interned_stack_data(writer, &stack_data, &frame_data)?
+                self.write_interned_stack_data(writer, &stack_data)?
             } else {
                 (HashMap::new(), 0)
             }
@@ -1071,28 +1070,28 @@ impl ParquetToPerfettoConverter {
     ///
     /// Returns a map from stack_id to callstack_iid, and the sequence ID used.
     ///
-    /// Generates mappings on-the-fly from unique module_names.
-    /// Offset fields are set to 0 since the UI ignores them anyway.
+    /// Generates frames and mappings on-the-fly from frame_names strings.
+    /// Module names are parsed from the embedded format in frame_names:
+    /// `function_name (module_name [file:line]) <0xaddr>`
     fn write_interned_stack_data(
         &mut self,
         writer: &mut dyn TraceWriter,
         stack_data: &HashMap<i64, StackData>,
-        frame_data: &HashMap<i64, FrameData>,
     ) -> Result<(HashMap<i64, u64>, u32)> {
         let sequence_id = self.alloc_seq_id();
 
-        // Build Frame protos for each unique frame_id
-        // Map: frame_id -> frame iid (we use frame_id as iid for simplicity)
+        // Deduplicate frames by their full name string
+        // Map: frame_name -> frame iid
         let mut frames: Vec<Frame> = Vec::new();
-        let mut seen_frame_ids: HashMap<i64, u64> = HashMap::new();
+        let mut frame_name_to_iid: HashMap<String, u64> = HashMap::new();
+        let mut next_frame_iid: u64 = 1;
 
         // Track unique module names and assign mapping IDs
         let mut module_to_mapping_id: HashMap<String, u64> = HashMap::new();
         let mut next_mapping_id: u64 = 1;
 
-        // Build function names alongside frames (avoids second pass over stack_data)
+        // Build function names alongside frames
         let mut function_names: Vec<perfetto_protos::profile_common::InternedString> = Vec::new();
-        let mut added_function_name_iids: HashSet<u64> = HashSet::new();
 
         // Build Callstack protos for each stack
         // Map: stack_id -> callstack_iid
@@ -1101,61 +1100,45 @@ impl ParquetToPerfettoConverter {
         let mut next_callstack_iid: u64 = 1;
 
         for (&stack_id, stack) in stack_data {
-            if stack.frame_ids.is_empty() {
+            if stack.frame_names.is_empty() {
                 continue;
             }
 
             // Collect frame iids for this callstack
             let mut callstack_frame_ids: Vec<u64> = Vec::new();
 
-            for (idx, &frame_id) in stack.frame_ids.iter().enumerate() {
-                // Get or create frame entry
-                let frame_iid = match seen_frame_ids.get(&frame_id) {
+            for frame_name in &stack.frame_names {
+                // Get or create frame entry (deduplicated by full frame_name string)
+                let frame_iid = match frame_name_to_iid.get(frame_name) {
                     Some(&iid) => iid,
                     None => {
-                        let iid = frame_id as u64;
-                        seen_frame_ids.insert(frame_id, iid);
+                        let iid = next_frame_iid;
+                        next_frame_iid += 1;
+                        frame_name_to_iid.insert(frame_name.clone(), iid);
 
                         // Build Frame proto
                         let mut frame = Frame::default();
                         frame.set_iid(iid);
+                        frame.set_function_name_id(iid);
+                        frame.set_rel_pc(0);
 
-                        // Determine function name: prefer frame_data, fall back to stack's frame_names
-                        let function_name = if let Some(fd) = frame_data.get(&frame_id) {
-                            if fd.name.is_some() {
-                                frame.set_function_name_id(iid);
-                            }
-                            // Generate mapping ID from module_name
-                            if let Some(ref module_name) = fd.module_name {
-                                let mapping_id = *module_to_mapping_id
-                                    .entry(module_name.clone())
-                                    .or_insert_with(|| {
-                                        let id = next_mapping_id;
-                                        next_mapping_id += 1;
-                                        id
-                                    });
-                                frame.set_mapping_id(mapping_id);
-                            }
-                            // rel_pc set to 0 - UI ignores it
-                            frame.set_rel_pc(0);
-                            fd.name.clone()
-                        } else if idx < stack.frame_names.len() {
-                            frame.set_function_name_id(iid);
-                            Some(stack.frame_names[idx].clone())
-                        } else {
-                            None
-                        };
-
-                        // Add function name to interned strings (O(1) HashSet check)
-                        if let Some(name) = function_name {
-                            if added_function_name_iids.insert(iid) {
-                                let mut interned_str =
-                                    perfetto_protos::profile_common::InternedString::default();
-                                interned_str.set_iid(iid);
-                                interned_str.set_str(name.into_bytes());
-                                function_names.push(interned_str);
-                            }
+                        // Parse module name from frame_name and generate mapping ID
+                        if let Some(module_name) = parse_module_name(frame_name) {
+                            let mapping_id =
+                                *module_to_mapping_id.entry(module_name).or_insert_with(|| {
+                                    let id = next_mapping_id;
+                                    next_mapping_id += 1;
+                                    id
+                                });
+                            frame.set_mapping_id(mapping_id);
                         }
+
+                        // Add function name to interned strings
+                        let mut interned_str =
+                            perfetto_protos::profile_common::InternedString::default();
+                        interned_str.set_iid(iid);
+                        interned_str.set_str(frame_name.as_bytes().to_vec());
+                        function_names.push(interned_str);
 
                         frames.push(frame);
                         iid
@@ -1288,16 +1271,33 @@ fn get_optional_f64(arr: Option<&Float64Array>, i: usize) -> Option<f64> {
 
 /// Helper struct for stack records from stack.parquet
 struct StackData {
-    /// Frame IDs in leaf-to-root order
-    frame_ids: Vec<i64>,
-    /// Frame names in leaf-to-root order (for fallback if frame.parquet is missing)
+    /// Frame names in leaf-to-root order.
+    /// Each name contains embedded module and location info in format:
+    /// `function_name (module_name [file:line]) <0xaddr>`
     frame_names: Vec<String>,
 }
 
-/// Helper struct for frame records from frame.parquet
-struct FrameData {
-    name: Option<String>,
-    module_name: Option<String>,
+/// Parse module name from a frame name string.
+///
+/// Frame names are formatted as: `function_name (module_name [file:line]) <0xaddr>`
+/// Returns the module name (e.g., "libc.so.6") or None if not found.
+fn parse_module_name(frame_name: &str) -> Option<String> {
+    // Find first '(' and extract content until ' [' or ')'
+    let start = frame_name.find('(')?;
+    let rest = &frame_name[start + 1..];
+
+    // Find end of module name (either ' [' for source location or ')' for end)
+    let end = rest
+        .find(" [")
+        .or_else(|| rest.find(')'))
+        .unwrap_or(rest.len());
+
+    let module = rest[..end].trim();
+    if module.is_empty() || module == "unknown" {
+        None
+    } else {
+        Some(module.to_string())
+    }
 }
 
 /// Read stack.parquet and return a map of stack_id -> StackData
@@ -1316,11 +1316,6 @@ fn read_stack_data(input_dir: &Path) -> Result<HashMap<i64, StackData>> {
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
             .context("Missing id column in stack.parquet")?;
 
-        let frame_ids_col = batch
-            .column_by_name("frame_ids")
-            .and_then(|c| c.as_any().downcast_ref::<ListArray>())
-            .context("Missing frame_ids column in stack.parquet")?;
-
         let frame_names_col = batch
             .column_by_name("frame_names")
             .and_then(|c| c.as_any().downcast_ref::<ListArray>())
@@ -1328,26 +1323,6 @@ fn read_stack_data(input_dir: &Path) -> Result<HashMap<i64, StackData>> {
 
         for i in 0..batch.num_rows() {
             let id = ids.value(i);
-
-            // Extract frame_ids list
-            let frame_ids: Vec<i64> = if frame_ids_col.is_null(i) {
-                Vec::new()
-            } else {
-                let inner = frame_ids_col.value(i);
-                let int_array = inner
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .context("frame_ids inner array is not Int64Array")?;
-                (0..int_array.len())
-                    .filter_map(|j| {
-                        if int_array.is_null(j) {
-                            None
-                        } else {
-                            Some(int_array.value(j))
-                        }
-                    })
-                    .collect()
-            };
 
             // Extract frame_names list
             let frame_names: Vec<String> = if frame_names_col.is_null(i) {
@@ -1369,51 +1344,67 @@ fn read_stack_data(input_dir: &Path) -> Result<HashMap<i64, StackData>> {
                     .collect()
             };
 
-            stack_map.insert(
-                id,
-                StackData {
-                    frame_ids,
-                    frame_names,
-                },
-            );
+            stack_map.insert(id, StackData { frame_names });
         }
     }
 
     Ok(stack_map)
 }
 
-/// Read frame.parquet and return a map of frame_id -> FrameData
-fn read_frame_data(input_dir: &Path) -> Result<HashMap<i64, FrameData>> {
-    let path = input_dir.join("frame.parquet");
-    if !path.exists() {
-        return Ok(HashMap::new());
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_module_name_with_source_location() {
+        assert_eq!(
+            parse_module_name("main (myprogram [main.rs:10]) <0x1234>"),
+            Some("myprogram".to_string())
+        );
     }
 
-    let mut frame_map = HashMap::new();
-    let batches = read_parquet_file(&path)?;
-
-    for batch in &batches {
-        let ids = batch
-            .column_by_name("id")
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-            .context("Missing id column in frame.parquet")?;
-
-        let names = batch
-            .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-
-        let module_names = batch
-            .column_by_name("module_name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-
-        for i in 0..batch.num_rows() {
-            let id = ids.value(i);
-            let name = get_optional_string(names, i);
-            let module_name = get_optional_string(module_names, i);
-
-            frame_map.insert(id, FrameData { name, module_name });
-        }
+    #[test]
+    fn test_parse_module_name_without_source_location() {
+        assert_eq!(
+            parse_module_name("func (libc.so.6) <0x5678>"),
+            Some("libc.so.6".to_string())
+        );
     }
 
-    Ok(frame_map)
+    #[test]
+    fn test_parse_module_name_kernel() {
+        assert_eq!(
+            parse_module_name("schedule ([kernel]) <0xffffffff81234567>"),
+            Some("[kernel]".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_module_name_no_parens() {
+        // Frame names without parentheses (e.g., unsymbolized addresses)
+        assert_eq!(parse_module_name("0x9abc"), None);
+    }
+
+    #[test]
+    fn test_parse_module_name_unknown_module() {
+        // "unknown" module should return None
+        assert_eq!(parse_module_name("some_func (unknown) <0x1234>"), None);
+    }
+
+    #[test]
+    fn test_parse_module_name_empty_module() {
+        // Empty module between parens
+        assert_eq!(parse_module_name("some_func () <0x1234>"), None);
+    }
+
+    #[test]
+    fn test_parse_module_name_complex_path() {
+        // Module with complex characters
+        assert_eq!(
+            parse_module_name(
+                "_ZN4core3fmt5Write9write_fmt (libstd-abc123.so [fmt.rs:200]) <0xdead>"
+            ),
+            Some("libstd-abc123.so".to_string())
+        );
+    }
 }
