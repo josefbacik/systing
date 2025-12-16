@@ -69,6 +69,68 @@ pub struct ThreadStateRecord {
     pub cpu: Option<i32>,
 }
 
+/// IRQ slice record - represents time an IRQ handler ran on a CPU.
+///
+/// # Fields
+/// - `ts`: Start timestamp in nanoseconds (handler entry)
+/// - `dur`: Duration in nanoseconds
+/// - `cpu`: CPU core number where the IRQ was handled
+/// - `irq`: IRQ number
+/// - `name`: IRQ handler name (e.g., "ahci", "xhci_hcd")
+/// - `ret`: Return value from the handler
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IrqSliceRecord {
+    pub ts: i64,
+    pub dur: i64,
+    pub cpu: i32,
+    pub irq: i32,
+    pub name: Option<String>,
+    pub ret: Option<i32>,
+}
+
+/// Softirq slice record - represents time a softirq ran on a CPU.
+///
+/// # Fields
+/// - `ts`: Start timestamp in nanoseconds
+/// - `dur`: Duration in nanoseconds
+/// - `cpu`: CPU core number where the softirq ran
+/// - `vec`: Softirq vector (0=HI, 1=TIMER, 2=NET_TX, 3=NET_RX, 4=BLOCK, etc.)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SoftirqSliceRecord {
+    pub ts: i64,
+    pub dur: i64,
+    pub cpu: i32,
+    pub vec: i32,
+}
+
+/// Wakeup new record - represents a new process/thread being woken for the first time.
+///
+/// # Fields
+/// - `ts`: Wakeup timestamp in nanoseconds
+/// - `cpu`: CPU where the wakeup event was processed
+/// - `utid`: Unique thread ID of the new thread
+/// - `target_cpu`: CPU where the new thread will run
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WakeupNewRecord {
+    pub ts: i64,
+    pub cpu: i32,
+    pub utid: i64,
+    pub target_cpu: i32,
+}
+
+/// Process exit record - represents a process/thread exiting.
+///
+/// # Fields
+/// - `ts`: Exit timestamp in nanoseconds
+/// - `cpu`: CPU where the exit occurred
+/// - `utid`: Unique thread ID of the exiting thread
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessExitRecord {
+    pub ts: i64,
+    pub cpu: i32,
+    pub utid: i64,
+}
+
 /// Counter value record.
 ///
 /// Note: Cannot derive `Eq` because `value` is `f64`.
@@ -224,6 +286,10 @@ pub struct ExtractedData {
     pub threads: Vec<ThreadRecord>,
     pub sched_slices: Vec<SchedSliceRecord>,
     pub thread_states: Vec<ThreadStateRecord>,
+    pub irq_slices: Vec<IrqSliceRecord>,
+    pub softirq_slices: Vec<SoftirqSliceRecord>,
+    pub wakeup_news: Vec<WakeupNewRecord>,
+    pub process_exits: Vec<ProcessExitRecord>,
     pub counters: Vec<CounterRecord>,
     pub counter_tracks: Vec<CounterTrackRecord>,
     pub slices: Vec<SliceRecord>,

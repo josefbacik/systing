@@ -1567,6 +1567,39 @@ fn create_schema(conn: &Connection) -> Result<()> {
             cpu INTEGER
         );
 
+        CREATE TABLE IF NOT EXISTS irq_slice (
+            trace_id VARCHAR,
+            ts BIGINT,
+            dur BIGINT,
+            cpu INTEGER,
+            irq INTEGER,
+            name VARCHAR,
+            ret INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS softirq_slice (
+            trace_id VARCHAR,
+            ts BIGINT,
+            dur BIGINT,
+            cpu INTEGER,
+            vec INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS wakeup_new (
+            trace_id VARCHAR,
+            ts BIGINT,
+            cpu INTEGER,
+            utid BIGINT,
+            target_cpu INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS process_exit (
+            trace_id VARCHAR,
+            ts BIGINT,
+            cpu INTEGER,
+            utid BIGINT
+        );
+
         CREATE TABLE IF NOT EXISTS counter_track (
             trace_id VARCHAR,
             id BIGINT,
@@ -1729,6 +1762,11 @@ struct ParquetPaths {
     thread: PathBuf,
     sched_slice: PathBuf,
     thread_state: PathBuf,
+    // IRQ/softirq tables
+    irq_slice: PathBuf,
+    softirq_slice: PathBuf,
+    wakeup_new: PathBuf,
+    process_exit: PathBuf,
     counter_track: PathBuf,
     counter: PathBuf,
     slice: PathBuf,
@@ -1761,6 +1799,10 @@ impl ParquetPaths {
             thread: temp_dir.join(format!("{trace_id}_thread.parquet")),
             sched_slice: temp_dir.join(format!("{trace_id}_sched_slice.parquet")),
             thread_state: temp_dir.join(format!("{trace_id}_thread_state.parquet")),
+            irq_slice: temp_dir.join(format!("{trace_id}_irq_slice.parquet")),
+            softirq_slice: temp_dir.join(format!("{trace_id}_softirq_slice.parquet")),
+            wakeup_new: temp_dir.join(format!("{trace_id}_wakeup_new.parquet")),
+            process_exit: temp_dir.join(format!("{trace_id}_process_exit.parquet")),
             counter_track: temp_dir.join(format!("{trace_id}_counter_track.parquet")),
             counter: temp_dir.join(format!("{trace_id}_counter.parquet")),
             slice: temp_dir.join(format!("{trace_id}_slice.parquet")),
@@ -1795,6 +1837,10 @@ impl ParquetPaths {
             thread: dir.join("thread.parquet"),
             sched_slice: dir.join("sched_slice.parquet"),
             thread_state: dir.join("thread_state.parquet"),
+            irq_slice: dir.join("irq_slice.parquet"),
+            softirq_slice: dir.join("softirq_slice.parquet"),
+            wakeup_new: dir.join("wakeup_new.parquet"),
+            process_exit: dir.join("process_exit.parquet"),
             counter_track: dir.join("counter_track.parquet"),
             counter: dir.join("counter.parquet"),
             slice: dir.join("slice.parquet"),
@@ -3353,6 +3399,10 @@ fn run_convert(
     import_table("thread", |p| &p.thread)?;
     import_table("sched_slice", |p| &p.sched_slice)?;
     import_table("thread_state", |p| &p.thread_state)?;
+    import_table("irq_slice", |p| &p.irq_slice)?;
+    import_table("softirq_slice", |p| &p.softirq_slice)?;
+    import_table("wakeup_new", |p| &p.wakeup_new)?;
+    import_table("process_exit", |p| &p.process_exit)?;
     import_table("counter_track", |p| &p.counter_track)?;
     import_table("counter", |p| &p.counter)?;
     import_table("slice", |p| &p.slice)?;

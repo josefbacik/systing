@@ -62,6 +62,47 @@ pub fn thread_state_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Schema for irq_slice.parquet
+pub fn irq_slice_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("dur", DataType::Int64, false),
+        Field::new("cpu", DataType::Int32, false),
+        Field::new("irq", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("ret", DataType::Int32, true),
+    ]))
+}
+
+/// Schema for softirq_slice.parquet
+pub fn softirq_slice_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("dur", DataType::Int64, false),
+        Field::new("cpu", DataType::Int32, false),
+        Field::new("vec", DataType::Int32, false),
+    ]))
+}
+
+/// Schema for wakeup_new.parquet
+pub fn wakeup_new_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("cpu", DataType::Int32, false),
+        Field::new("utid", DataType::Int64, false),
+        Field::new("target_cpu", DataType::Int32, false),
+    ]))
+}
+
+/// Schema for process_exit.parquet
+pub fn process_exit_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("cpu", DataType::Int32, false),
+        Field::new("utid", DataType::Int64, false),
+    ]))
+}
+
 /// Schema for counter.parquet
 pub fn counter_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
