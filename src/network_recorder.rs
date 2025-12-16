@@ -10,7 +10,7 @@ use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::network_event;
 use crate::trace::{
-    InstantArgRecord, InstantRecord, SliceRecord, SocketConnectionRecord, TrackRecord,
+    ArgRecord, InstantArgRecord, InstantRecord, SliceRecord, SocketConnectionRecord, TrackRecord,
 };
 use crate::SystingRecordEvent;
 
@@ -912,6 +912,455 @@ impl NetworkRecorder {
         event.add_uint_nonzero("qdisc_latency_us", pkt.qdisc_latency_us as u64);
     }
 
+    // ========================================================================
+    // Parquet arg helper functions (mirror add_*_annotations for RecordCollector)
+    // ========================================================================
+
+    /// Add basic packet args: seq, length, flags (parquet version)
+    fn add_basic_arg(
+        collector: &mut dyn RecordCollector,
+        instant_id: i64,
+        pkt: &PacketEvent,
+    ) -> Result<()> {
+        if pkt.seq > 0 {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "seq".to_string(),
+                int_value: Some(pkt.seq as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+        }
+        collector.add_instant_arg(InstantArgRecord {
+            instant_id,
+            key: "length".to_string(),
+            int_value: Some(pkt.length as i64),
+            string_value: None,
+            real_value: None,
+        })?;
+        if pkt.tcp_flags != 0 {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "flags".to_string(),
+                int_value: None,
+                string_value: Some(Self::format_tcp_flags(pkt.tcp_flags)),
+                real_value: None,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Add send buffer args: sndbuf_used, sndbuf_limit, fill_pct (parquet version)
+    fn add_sndbuf_arg(
+        collector: &mut dyn RecordCollector,
+        instant_id: i64,
+        pkt: &PacketEvent,
+    ) -> Result<()> {
+        if pkt.sndbuf_limit > 0 {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "sndbuf_used".to_string(),
+                int_value: Some(pkt.sndbuf_used as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "sndbuf_limit".to_string(),
+                int_value: Some(pkt.sndbuf_limit as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            let fill_pct = (pkt.sndbuf_used as u64 * 100) / pkt.sndbuf_limit as u64;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "sndbuf_fill_pct".to_string(),
+                int_value: Some(fill_pct as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Add timer args: icsk_pending, icsk_timeout, etc. (parquet version)
+    fn add_timer_arg(
+        collector: &mut dyn RecordCollector,
+        instant_id: i64,
+        pkt: &PacketEvent,
+    ) -> Result<()> {
+        if pkt.icsk_pending > 0 {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "icsk_pending".to_string(),
+                int_value: Some(pkt.icsk_pending as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "icsk_timeout".to_string(),
+                int_value: Some(pkt.icsk_timeout as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            if pkt.rto_jiffies > 0 {
+                collector.add_instant_arg(InstantArgRecord {
+                    instant_id,
+                    key: "rto_jiffies".to_string(),
+                    int_value: Some(pkt.rto_jiffies as i64),
+                    string_value: None,
+                    real_value: None,
+                })?;
+            }
+            if pkt.backoff > 0 {
+                collector.add_instant_arg(InstantArgRecord {
+                    instant_id,
+                    key: "backoff".to_string(),
+                    int_value: Some(pkt.backoff as i64),
+                    string_value: None,
+                    real_value: None,
+                })?;
+            }
+            if pkt.probe_count > 0 {
+                collector.add_instant_arg(InstantArgRecord {
+                    instant_id,
+                    key: "probe_count".to_string(),
+                    int_value: Some(pkt.probe_count as i64),
+                    string_value: None,
+                    real_value: None,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Add retransmit flag arg (parquet version)
+    fn add_retransmit_arg(
+        collector: &mut dyn RecordCollector,
+        instant_id: i64,
+        pkt: &PacketEvent,
+    ) -> Result<()> {
+        if pkt.is_retransmit {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "is_retransmit".to_string(),
+                int_value: Some(1),
+                string_value: None,
+                real_value: None,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Add zero window probe args (sender-side, parquet version)
+    fn add_zero_window_probe_arg(
+        collector: &mut dyn RecordCollector,
+        instant_id: i64,
+        pkt: &PacketEvent,
+    ) -> Result<()> {
+        if pkt.is_zero_window_probe {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "is_zero_window_probe".to_string(),
+                int_value: Some(1),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "probe_count".to_string(),
+                int_value: Some(pkt.probe_count as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "snd_wnd".to_string(),
+                int_value: Some(pkt.snd_wnd as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Add zero window ACK args (receiver-side, parquet version)
+    fn add_zero_window_ack_arg(
+        collector: &mut dyn RecordCollector,
+        instant_id: i64,
+        pkt: &PacketEvent,
+    ) -> Result<()> {
+        if pkt.is_zero_window_ack {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "is_zero_window_ack".to_string(),
+                int_value: Some(1),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "rcv_wnd".to_string(),
+                int_value: Some(pkt.rcv_wnd as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "rcv_buf_used".to_string(),
+                int_value: Some(pkt.rcv_buf_used as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "rcv_buf_limit".to_string(),
+                int_value: Some(pkt.rcv_buf_limit as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            if pkt.rcv_buf_limit > 0 {
+                let fill_pct = (pkt.rcv_buf_used as u64 * 100) / pkt.rcv_buf_limit as u64;
+                collector.add_instant_arg(InstantArgRecord {
+                    instant_id,
+                    key: "rcv_buf_fill_pct".to_string(),
+                    int_value: Some(fill_pct as i64),
+                    string_value: None,
+                    real_value: None,
+                })?;
+            }
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "window_clamp".to_string(),
+                int_value: Some(pkt.window_clamp as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "rcv_wscale".to_string(),
+                int_value: Some(pkt.rcv_wscale as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Add RTO timeout args with jiffies-to-microseconds conversion (parquet version)
+    fn add_rto_arg(
+        collector: &mut dyn RecordCollector,
+        instant_id: i64,
+        pkt: &PacketEvent,
+    ) -> Result<()> {
+        if pkt.rto_jiffies > 0 {
+            let rto_us = (pkt.rto_jiffies as u64 * 1_000_000) / system_hz();
+
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "rto_jiffies".to_string(),
+                int_value: Some(pkt.rto_jiffies as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "rto_us".to_string(),
+                int_value: Some(rto_us as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "srtt_us".to_string(),
+                int_value: Some(pkt.srtt_us as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "rttvar_us".to_string(),
+                int_value: Some(pkt.rttvar_us as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "retransmit_count".to_string(),
+                int_value: Some(pkt.retransmit_count as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "backoff".to_string(),
+                int_value: Some(pkt.backoff as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "rto_ms".to_string(),
+                int_value: Some((rto_us / 1000) as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            if pkt.srtt_us >= 1000 {
+                collector.add_instant_arg(InstantArgRecord {
+                    instant_id,
+                    key: "srtt_ms".to_string(),
+                    int_value: Some((pkt.srtt_us / 1000) as i64),
+                    string_value: None,
+                    real_value: None,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Add drop event args: drop_reason, drop_reason_str, drop_location (parquet version)
+    fn add_drop_arg(
+        collector: &mut dyn RecordCollector,
+        instant_id: i64,
+        pkt: &PacketEvent,
+    ) -> Result<()> {
+        if pkt.drop_reason > 0 {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "drop_reason".to_string(),
+                int_value: Some(pkt.drop_reason as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "drop_reason_str".to_string(),
+                int_value: None,
+                string_value: Some(drop_reason_str(pkt.drop_reason).to_string()),
+                real_value: None,
+            })?;
+            if pkt.drop_location > 0 {
+                collector.add_instant_arg(InstantArgRecord {
+                    instant_id,
+                    key: "drop_location".to_string(),
+                    int_value: Some(pkt.drop_location as i64),
+                    string_value: None,
+                    real_value: None,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Add queue state args: qlen, qlen_limit (parquet version)
+    fn add_queue_arg(
+        collector: &mut dyn RecordCollector,
+        instant_id: i64,
+        pkt: &PacketEvent,
+    ) -> Result<()> {
+        if pkt.qlen > 0 || pkt.qlen_limit > 0 {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "qlen".to_string(),
+                int_value: Some(pkt.qlen as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            if pkt.qlen_limit > 0 {
+                collector.add_instant_arg(InstantArgRecord {
+                    instant_id,
+                    key: "qlen_limit".to_string(),
+                    int_value: Some(pkt.qlen_limit as i64),
+                    string_value: None,
+                    real_value: None,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Add TSQ/memory pressure args (parquet version)
+    fn add_memory_pressure_arg(
+        collector: &mut dyn RecordCollector,
+        instant_id: i64,
+        pkt: &PacketEvent,
+    ) -> Result<()> {
+        if pkt.sk_wmem_alloc > 0 {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "sk_wmem_alloc".to_string(),
+                int_value: Some(pkt.sk_wmem_alloc as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+            if pkt.tsq_limit > 0 {
+                collector.add_instant_arg(InstantArgRecord {
+                    instant_id,
+                    key: "tsq_limit".to_string(),
+                    int_value: Some(pkt.tsq_limit as i64),
+                    string_value: None,
+                    real_value: None,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Add qdisc-specific args (parquet version)
+    fn add_qdisc_arg(
+        collector: &mut dyn RecordCollector,
+        instant_id: i64,
+        pkt: &PacketEvent,
+    ) -> Result<()> {
+        if pkt.txq_state > 0 {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "txq_state".to_string(),
+                int_value: Some(pkt.txq_state as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+        }
+        if pkt.qdisc_state > 0 {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "qdisc_state".to_string(),
+                int_value: Some(pkt.qdisc_state as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+        }
+        if pkt.qdisc_backlog > 0 {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "qdisc_backlog".to_string(),
+                int_value: Some(pkt.qdisc_backlog as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+        }
+        if pkt.skb_addr > 0 {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "skb_addr".to_string(),
+                int_value: Some(pkt.skb_addr as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+        }
+        if pkt.qdisc_latency_us > 0 {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "qdisc_latency_us".to_string(),
+                int_value: Some(pkt.qdisc_latency_us as i64),
+                string_value: None,
+                real_value: None,
+            })?;
+        }
+        Ok(())
+    }
+
     /// Helper to emit packet events for a given event type.
     /// Uses peekable to check emptiness without collecting, then emits events directly.
     fn write_packet_events<'a>(
@@ -1229,6 +1678,16 @@ impl NetworkRecorder {
             }
         }
 
+        // Create "Network Packets" root track for socket packet events
+        let network_packets_root_id = *track_id_counter;
+        *track_id_counter += 1;
+
+        collector.add_track(TrackRecord {
+            id: network_packets_root_id,
+            name: "Network Packets".to_string(),
+            parent_id: None,
+        })?;
+
         // Output socket connection records
         for (socket_id, metadata) in self.socket_metadata.iter() {
             let src_ip = metadata.src_ip_addr();
@@ -1242,7 +1701,7 @@ impl NetworkRecorder {
             collector.add_track(TrackRecord {
                 id: socket_track_id,
                 name: track_name,
-                parent_id: None,
+                parent_id: Some(network_packets_root_id),
             })?;
 
             collector.add_socket_connection(SocketConnectionRecord {
@@ -1296,6 +1755,34 @@ impl NetworkRecorder {
                         "TCP packet_queue_rcv",
                         conn_events.iter_tcp_queue_rcv_packets(),
                     )?;
+                    self.write_packet_events_records(
+                        collector,
+                        socket_track_id,
+                        instant_id_counter,
+                        "TCP zero_window_probe",
+                        conn_events.iter_zero_window_probes(),
+                    )?;
+                    self.write_packet_events_records(
+                        collector,
+                        socket_track_id,
+                        instant_id_counter,
+                        "TCP zero_window_ack",
+                        conn_events.iter_zero_window_acks(),
+                    )?;
+                    self.write_packet_events_records(
+                        collector,
+                        socket_track_id,
+                        instant_id_counter,
+                        "TCP rto_timeout",
+                        conn_events.iter_rto_timeouts(),
+                    )?;
+                    self.write_packet_events_records(
+                        collector,
+                        socket_track_id,
+                        instant_id_counter,
+                        "TCP buffer_queue",
+                        conn_events.iter_tcp_buffer_queue_packets(),
+                    )?;
                 } else {
                     self.write_packet_events_records(
                         collector,
@@ -1311,9 +1798,23 @@ impl NetworkRecorder {
                         "UDP receive",
                         conn_events.iter_udp_rcv_packets(),
                     )?;
+                    self.write_packet_events_records(
+                        collector,
+                        socket_track_id,
+                        instant_id_counter,
+                        "UDP packet_send",
+                        conn_events.iter_shared_send_packets(),
+                    )?;
+                    self.write_packet_events_records(
+                        collector,
+                        socket_track_id,
+                        instant_id_counter,
+                        "UDP enqueue",
+                        conn_events.iter_udp_enqueue_packets(),
+                    )?;
                 }
 
-                // Drop events for both TCP and UDP
+                // Drop/throttle events for both TCP and UDP
                 self.write_packet_events_records(
                     collector,
                     socket_track_id,
@@ -1321,65 +1822,240 @@ impl NetworkRecorder {
                     "packet_drop",
                     conn_events.iter_skb_drops(),
                 )?;
+                self.write_packet_events_records(
+                    collector,
+                    socket_track_id,
+                    instant_id_counter,
+                    "cpu_backlog_drop",
+                    conn_events.iter_cpu_backlog_drops(),
+                )?;
+                self.write_packet_events_records(
+                    collector,
+                    socket_track_id,
+                    instant_id_counter,
+                    "TCP mem_pressure",
+                    conn_events.iter_mem_pressure(),
+                )?;
+                self.write_packet_events_records(
+                    collector,
+                    socket_track_id,
+                    instant_id_counter,
+                    "qdisc_enqueue",
+                    conn_events.iter_qdisc_enqueue(),
+                )?;
+                self.write_packet_events_records(
+                    collector,
+                    socket_track_id,
+                    instant_id_counter,
+                    "qdisc_dequeue",
+                    conn_events.iter_qdisc_dequeue(),
+                )?;
             }
         }
 
-        // Output syscall events (sendmsg/recvmsg slices)
+        // Output syscall events (sendmsg/recvmsg slices) and poll_ready events
         for (pidtgid, events) in self.syscall_events.iter() {
             let tid = *pidtgid as i32;
             let utid = tid_to_utid.get(&tid).copied();
 
+            // Create a per-thread Network track for syscall and poll events
+            let network_track_id = *track_id_counter;
+            *track_id_counter += 1;
+
+            collector.add_track(TrackRecord {
+                id: network_track_id,
+                name: format!("Network (tid {tid})"),
+                parent_id: None,
+            })?;
+
             for event in events.iter() {
-                let (socket_id, syscall_event) = match event {
-                    EventEntry::Send(e) => (e.socket_id, e),
-                    EventEntry::Recv(e) => (e.socket_id, e),
+                match event {
+                    EventEntry::Send(syscall_event) | EventEntry::Recv(syscall_event) => {
+                        let socket_id = syscall_event.socket_id;
+                        let is_send = matches!(event, EventEntry::Send(_));
+
+                        let slice_id = *slice_id_counter;
+                        *slice_id_counter += 1;
+
+                        let protocol = self
+                            .socket_metadata
+                            .get(&socket_id)
+                            .map(|m| m.protocol)
+                            .unwrap_or(0);
+
+                        let proto_str = Self::protocol_to_str(protocol);
+                        let event_name = if is_send {
+                            format!("{proto_str}_send")
+                        } else {
+                            format!("{proto_str}_recv")
+                        };
+
+                        collector.add_slice(SliceRecord {
+                            id: slice_id,
+                            ts: syscall_event.start_ts as i64,
+                            dur: (syscall_event.end_ts - syscall_event.start_ts) as i64,
+                            track_id: network_track_id,
+                            utid,
+                            name: event_name,
+                            category: Some("network".to_string()),
+                            depth: 0,
+                        })?;
+
+                        // Add common annotations
+                        collector.add_arg(ArgRecord {
+                            slice_id,
+                            key: "socket_id".to_string(),
+                            int_value: Some(socket_id as i64),
+                            string_value: None,
+                            real_value: None,
+                        })?;
+                        collector.add_arg(ArgRecord {
+                            slice_id,
+                            key: "socket".to_string(),
+                            int_value: None,
+                            string_value: Some(self.socket_track_name(socket_id)),
+                            real_value: None,
+                        })?;
+                        collector.add_arg(ArgRecord {
+                            slice_id,
+                            key: "bytes".to_string(),
+                            int_value: Some(syscall_event.bytes as i64),
+                            string_value: None,
+                            real_value: None,
+                        })?;
+
+                        if is_send {
+                            // Send-specific annotations
+                            if syscall_event.sendmsg_seq > 0 {
+                                collector.add_arg(ArgRecord {
+                                    slice_id,
+                                    key: "seq".to_string(),
+                                    int_value: Some(syscall_event.sendmsg_seq as i64),
+                                    string_value: None,
+                                    real_value: None,
+                                })?;
+                            }
+                            if syscall_event.sndbuf_limit > 0 {
+                                collector.add_arg(ArgRecord {
+                                    slice_id,
+                                    key: "sndbuf_used".to_string(),
+                                    int_value: Some(syscall_event.sndbuf_used as i64),
+                                    string_value: None,
+                                    real_value: None,
+                                })?;
+                                collector.add_arg(ArgRecord {
+                                    slice_id,
+                                    key: "sndbuf_limit".to_string(),
+                                    int_value: Some(syscall_event.sndbuf_limit as i64),
+                                    string_value: None,
+                                    real_value: None,
+                                })?;
+                                let fill_pct = (syscall_event.sndbuf_used as u64 * 100)
+                                    / syscall_event.sndbuf_limit as u64;
+                                collector.add_arg(ArgRecord {
+                                    slice_id,
+                                    key: "sndbuf_fill_pct".to_string(),
+                                    int_value: Some(fill_pct as i64),
+                                    string_value: None,
+                                    real_value: None,
+                                })?;
+                            }
+                        } else {
+                            // Recv-specific annotations
+                            if syscall_event.recv_seq_start > 0 || syscall_event.recv_seq_end > 0 {
+                                collector.add_arg(ArgRecord {
+                                    slice_id,
+                                    key: "recv_seq_start".to_string(),
+                                    int_value: Some(syscall_event.recv_seq_start as i64),
+                                    string_value: None,
+                                    real_value: None,
+                                })?;
+                                collector.add_arg(ArgRecord {
+                                    slice_id,
+                                    key: "recv_seq_end".to_string(),
+                                    int_value: Some(syscall_event.recv_seq_end as i64),
+                                    string_value: None,
+                                    real_value: None,
+                                })?;
+                                if syscall_event.rcv_nxt_at_entry > 0 {
+                                    collector.add_arg(ArgRecord {
+                                        slice_id,
+                                        key: "rcv_nxt".to_string(),
+                                        int_value: Some(syscall_event.rcv_nxt_at_entry as i64),
+                                        string_value: None,
+                                        real_value: None,
+                                    })?;
+                                    let bytes_available = syscall_event
+                                        .rcv_nxt_at_entry
+                                        .wrapping_sub(syscall_event.recv_seq_start);
+                                    if bytes_available > 0 && bytes_available < 64 * 1024 * 1024 {
+                                        collector.add_arg(ArgRecord {
+                                            slice_id,
+                                            key: "bytes_available".to_string(),
+                                            int_value: Some(bytes_available as i64),
+                                            string_value: None,
+                                            real_value: None,
+                                        })?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    EventEntry::PollReady(poll_event) => {
+                        let instant_id = *instant_id_counter;
+                        *instant_id_counter += 1;
+
+                        collector.add_instant(InstantRecord {
+                            id: instant_id,
+                            ts: poll_event.ts as i64,
+                            track_id: network_track_id,
+                            utid,
+                            name: "poll_ready".to_string(),
+                            category: Some("network".to_string()),
+                        })?;
+
+                        collector.add_instant_arg(InstantArgRecord {
+                            instant_id,
+                            key: "socket_id".to_string(),
+                            int_value: Some(poll_event.socket_id as i64),
+                            string_value: None,
+                            real_value: None,
+                        })?;
+                        collector.add_instant_arg(InstantArgRecord {
+                            instant_id,
+                            key: "socket".to_string(),
+                            int_value: None,
+                            string_value: Some(self.socket_track_name(poll_event.socket_id)),
+                            real_value: None,
+                        })?;
+                        collector.add_instant_arg(InstantArgRecord {
+                            instant_id,
+                            key: "requested".to_string(),
+                            int_value: None,
+                            string_value: Some(Self::poll_events_to_str(
+                                poll_event.requested_events,
+                            )),
+                            real_value: None,
+                        })?;
+                        collector.add_instant_arg(InstantArgRecord {
+                            instant_id,
+                            key: "returned".to_string(),
+                            int_value: None,
+                            string_value: Some(Self::poll_events_to_str(
+                                poll_event.returned_events,
+                            )),
+                            real_value: None,
+                        })?;
+                    }
                     _ => continue,
-                };
-
-                let slice_id = *slice_id_counter;
-                *slice_id_counter += 1;
-
-                let is_send = matches!(event, EventEntry::Send(_));
-                let protocol = self
-                    .socket_metadata
-                    .get(&socket_id)
-                    .map(|m| m.protocol)
-                    .unwrap_or(0);
-
-                let proto_str = Self::protocol_to_str(protocol);
-                let event_name = if is_send {
-                    format!("{proto_str}_send")
-                } else {
-                    format!("{proto_str}_recv")
-                };
-
-                // Get track for this socket
-                let track_id = *track_id_counter;
-                *track_id_counter += 1;
-
-                collector.add_track(TrackRecord {
-                    id: track_id,
-                    name: format!("Syscall {event_name}"),
-                    parent_id: None,
-                })?;
-
-                collector.add_slice(SliceRecord {
-                    id: slice_id,
-                    ts: syscall_event.start_ts as i64,
-                    dur: (syscall_event.end_ts - syscall_event.start_ts) as i64,
-                    track_id,
-                    utid,
-                    name: event_name,
-                    category: Some("network".to_string()),
-                    depth: 0,
-                })?;
+                }
             }
         }
 
         Ok(())
     }
 
-    /// Helper to write packet events as InstantRecords
+    /// Helper to write packet events as InstantRecords with full annotations
     fn write_packet_events_records<'a>(
         &self,
         collector: &mut dyn RecordCollector,
@@ -1401,25 +2077,18 @@ impl NetworkRecorder {
                 category: Some("network".to_string()),
             })?;
 
-            // Add packet length as arg
-            collector.add_instant_arg(InstantArgRecord {
-                instant_id,
-                key: "length".to_string(),
-                int_value: Some(pkt.length as i64),
-                string_value: None,
-                real_value: None,
-            })?;
-
-            // Add sequence number for TCP
-            if pkt.seq > 0 {
-                collector.add_instant_arg(InstantArgRecord {
-                    instant_id,
-                    key: "seq".to_string(),
-                    int_value: Some(pkt.seq as i64),
-                    string_value: None,
-                    real_value: None,
-                })?;
-            }
+            // Add all packet annotations using the helper functions
+            Self::add_basic_arg(collector, instant_id, pkt)?;
+            Self::add_sndbuf_arg(collector, instant_id, pkt)?;
+            Self::add_timer_arg(collector, instant_id, pkt)?;
+            Self::add_retransmit_arg(collector, instant_id, pkt)?;
+            Self::add_zero_window_probe_arg(collector, instant_id, pkt)?;
+            Self::add_zero_window_ack_arg(collector, instant_id, pkt)?;
+            Self::add_rto_arg(collector, instant_id, pkt)?;
+            Self::add_drop_arg(collector, instant_id, pkt)?;
+            Self::add_queue_arg(collector, instant_id, pkt)?;
+            Self::add_memory_pressure_arg(collector, instant_id, pkt)?;
+            Self::add_qdisc_arg(collector, instant_id, pkt)?;
         }
         Ok(())
     }
