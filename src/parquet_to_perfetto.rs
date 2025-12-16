@@ -361,6 +361,60 @@ impl ParquetToPerfettoConverter {
             }
         }
 
+        // Build track_id -> utid mapping by scanning slices and instants
+        // This lets us parent tracks to their owning thread
+        let track_to_utid = self.build_track_to_utid_map(input_dir)?;
+
+        // Detect CPU tracks and build hierarchy:
+        // CPU tracks have names like "MyTrack CPU 0", "MyTrack CPU 1"
+        // We create: Systing -> MyTrack -> CPU 0, CPU 1, ...
+        let cpu_track_regex = regex::Regex::new(r"^(.+) CPU (\d+)$").unwrap();
+        let mut base_track_uuids: HashMap<String, u64> = HashMap::new();
+        let mut cpu_track_parents: HashMap<i64, u64> = HashMap::new();
+        let mut systing_root_uuid: Option<u64> = None;
+
+        // First, identify CPU tracks and create parent structure
+        for (&id, name) in &track_names {
+            if let Some(caps) = cpu_track_regex.captures(name) {
+                let base_name = caps.get(1).unwrap().as_str().to_string();
+
+                // Create Systing root track if not already created
+                if systing_root_uuid.is_none() {
+                    let root_uuid = self.alloc_uuid();
+                    systing_root_uuid = Some(root_uuid);
+
+                    let mut root_desc = TrackDescriptor::default();
+                    root_desc.set_uuid(root_uuid);
+                    root_desc.set_name("Systing".to_string());
+
+                    let mut packet = TracePacket::default();
+                    packet.set_track_descriptor(root_desc);
+                    writer.write_packet(&packet)?;
+                }
+
+                // Allocate UUID for this base track name if not already created
+                let parent_uuid = *base_track_uuids
+                    .entry(base_name)
+                    .or_insert_with(|| self.alloc_uuid());
+
+                cpu_track_parents.insert(id, parent_uuid);
+            }
+        }
+
+        // Write base track descriptors for CPU tracks
+        if let Some(root_uuid) = systing_root_uuid {
+            for (base_name, uuid) in &base_track_uuids {
+                let mut desc = TrackDescriptor::default();
+                desc.set_uuid(*uuid);
+                desc.set_name(base_name.clone());
+                desc.set_parent_uuid(root_uuid);
+
+                let mut packet = TracePacket::default();
+                packet.set_track_descriptor(desc);
+                writer.write_packet(&packet)?;
+            }
+        }
+
         // Second pass: write track descriptors with proper parent UUIDs
         for (&id, &parent_id) in &track_parent_map {
             let uuid = *self.track_id_to_uuid.get(&id).unwrap();
@@ -368,11 +422,28 @@ impl ParquetToPerfettoConverter {
 
             let mut desc = TrackDescriptor::default();
             desc.set_uuid(uuid);
-            desc.set_name(name.clone());
 
-            if let Some(pid) = parent_id {
-                if let Some(&parent_uuid) = self.track_id_to_uuid.get(&pid) {
+            // For CPU tracks, use just "CPU N" as the name and parent to base track
+            if let Some(caps) = cpu_track_regex.captures(name) {
+                let cpu_num = caps.get(2).unwrap().as_str();
+                desc.set_name(format!("CPU {cpu_num}"));
+
+                if let Some(&parent_uuid) = cpu_track_parents.get(&id) {
                     desc.set_parent_uuid(parent_uuid);
+                }
+            } else {
+                desc.set_name(name.clone());
+
+                // Try to find parent: first check explicit parent_id, then check utid
+                if let Some(pid) = parent_id {
+                    if let Some(&parent_uuid) = self.track_id_to_uuid.get(&pid) {
+                        desc.set_parent_uuid(parent_uuid);
+                    }
+                } else if let Some(&utid) = track_to_utid.get(&id) {
+                    // Parent this track to its thread
+                    if let Some(&thread_uuid) = self.utid_to_uuid.get(&utid) {
+                        desc.set_parent_uuid(thread_uuid);
+                    }
                 }
             }
 
@@ -382,6 +453,28 @@ impl ParquetToPerfettoConverter {
         }
 
         Ok(())
+    }
+
+    /// Build a map from track_id to utid by scanning slices and instants.
+    ///
+    /// For each track, finds the first utid associated with events on that track.
+    /// This allows us to parent tracks to their owning thread.
+    ///
+    /// Note: If multiple events on the same track have different utids, the first
+    /// one encountered wins. This matches the expectation that a track belongs to
+    /// a single thread (mixed-thread tracks would be unusual).
+    fn build_track_to_utid_map(&self, input_dir: &Path) -> Result<HashMap<i64, i64>> {
+        let mut track_to_utid: HashMap<i64, i64> = HashMap::new();
+
+        // Scan both slice.parquet and instant.parquet for track-to-utid mappings
+        for filename in ["slice.parquet", "instant.parquet"] {
+            let path = input_dir.join(filename);
+            if path.exists() {
+                scan_parquet_for_track_utids(&path, &mut track_to_utid)?;
+            }
+        }
+
+        Ok(track_to_utid)
     }
 
     /// Write scheduling data as FtraceEventBundle with compact_sched
@@ -1527,6 +1620,31 @@ fn read_parquet_file(path: &Path) -> Result<Vec<RecordBatch>> {
 
     let batches: Result<Vec<_>, _> = reader.collect();
     batches.with_context(|| format!("Failed to read batches from: {}", path.display()))
+}
+
+/// Scan a parquet file for track_id -> utid mappings.
+///
+/// Populates the provided map with the first utid found for each track_id.
+fn scan_parquet_for_track_utids(path: &Path, track_to_utid: &mut HashMap<i64, i64>) -> Result<()> {
+    let batches = read_parquet_file(path)?;
+    for batch in &batches {
+        let track_ids = batch
+            .column_by_name("track_id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+        let utids = batch
+            .column_by_name("utid")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+
+        if let (Some(track_ids), Some(utids)) = (track_ids, utids) {
+            for i in 0..batch.num_rows() {
+                let track_id = track_ids.value(i);
+                if let Some(utid) = get_optional_i64(Some(utids), i) {
+                    track_to_utid.entry(track_id).or_insert(utid);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Get optional string value from a nullable StringArray column
