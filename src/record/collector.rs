@@ -8,10 +8,9 @@ use anyhow::Result;
 
 use crate::trace::{
     ArgRecord, CallsiteRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord,
-    ExtractedData, FrameRecord, InstantArgRecord, InstantRecord, MappingRecord,
-    NetworkInterfaceRecord, PerfSampleRecord, ProcessRecord, SchedSliceRecord, SliceRecord,
-    SocketConnectionRecord, StackRecord, StackSampleRecord, SymbolRecord, ThreadRecord,
-    ThreadStateRecord, TrackRecord,
+    ExtractedData, FrameRecord, InstantArgRecord, InstantRecord, NetworkInterfaceRecord,
+    PerfSampleRecord, ProcessRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord,
+    StackRecord, StackSampleRecord, SymbolRecord, ThreadRecord, ThreadStateRecord, TrackRecord,
 };
 
 /// Trait for collecting trace records during recording.
@@ -68,9 +67,6 @@ pub trait RecordCollector {
 
     /// Add a symbol record.
     fn add_symbol(&mut self, record: SymbolRecord) -> Result<()>;
-
-    /// Add a mapping record.
-    fn add_mapping(&mut self, record: MappingRecord) -> Result<()>;
 
     /// Add a frame record.
     fn add_frame(&mut self, record: FrameRecord) -> Result<()>;
@@ -191,11 +187,6 @@ impl RecordCollector for InMemoryCollector {
 
     fn add_symbol(&mut self, record: SymbolRecord) -> Result<()> {
         self.data.symbols.push(record);
-        Ok(())
-    }
-
-    fn add_mapping(&mut self, record: MappingRecord) -> Result<()> {
-        self.data.mappings.push(record);
         Ok(())
     }
 

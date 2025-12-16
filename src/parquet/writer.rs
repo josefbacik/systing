@@ -26,9 +26,9 @@ use crate::parquet::ParquetPaths;
 use crate::record::RecordCollector;
 use crate::trace::{
     self, ArgRecord, CallsiteRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord,
-    FrameRecord, InstantArgRecord, InstantRecord, MappingRecord, NetworkInterfaceRecord,
-    PerfSampleRecord, ProcessRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord,
-    StackRecord, StackSampleRecord, SymbolRecord, ThreadRecord, ThreadStateRecord, TrackRecord,
+    FrameRecord, InstantArgRecord, InstantRecord, NetworkInterfaceRecord, PerfSampleRecord,
+    ProcessRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord, StackRecord,
+    StackSampleRecord, SymbolRecord, ThreadRecord, ThreadStateRecord, TrackRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -63,7 +63,6 @@ pub struct StreamingParquetWriter {
     instant_args: Vec<InstantArgRecord>,
     perf_samples: Vec<PerfSampleRecord>,
     symbols: Vec<SymbolRecord>,
-    mappings: Vec<MappingRecord>,
     frames: Vec<FrameRecord>,
     callsites: Vec<CallsiteRecord>,
     stacks: Vec<StackRecord>,
@@ -86,7 +85,6 @@ pub struct StreamingParquetWriter {
     instant_args_writer: Option<ArrowWriter<File>>,
     perf_sample_writer: Option<ArrowWriter<File>>,
     symbol_writer: Option<ArrowWriter<File>>,
-    mapping_writer: Option<ArrowWriter<File>>,
     frame_writer: Option<ArrowWriter<File>>,
     callsite_writer: Option<ArrowWriter<File>>,
     stack_writer: Option<ArrowWriter<File>>,
@@ -149,7 +147,6 @@ impl StreamingParquetWriter {
             instant_args: Vec::with_capacity(batch_size), // High volume
             perf_samples: Vec::with_capacity(batch_size), // High volume
             symbols: Vec::with_capacity(4096),   // Medium volume
-            mappings: Vec::with_capacity(256),   // Low volume
             frames: Vec::with_capacity(4096),    // Medium volume
             callsites: Vec::with_capacity(4096), // Medium volume
             stacks: Vec::with_capacity(4096),    // Medium volume (unique stacks)
@@ -171,7 +168,6 @@ impl StreamingParquetWriter {
             instant_args_writer: None,
             perf_sample_writer: None,
             symbol_writer: None,
-            mapping_writer: None,
             frame_writer: None,
             callsite_writer: None,
             stack_writer: None,
@@ -485,26 +481,6 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
-    // Flush mappings buffer
-    fn flush_mappings(&mut self) -> Result<()> {
-        if self.mappings.is_empty() {
-            return Ok(());
-        }
-
-        let schema = trace::mapping_schema();
-        let writer = Self::get_or_create_writer(
-            &mut self.mapping_writer,
-            &self.paths.mapping,
-            schema.clone(),
-            &self.writer_props,
-        )?;
-
-        let batch = build_mapping_batch(&self.mappings, &schema)?;
-        writer.write(&batch)?;
-        self.mappings.clear();
-        Ok(())
-    }
-
     // Flush frames buffer
     fn flush_frames(&mut self) -> Result<()> {
         if self.frames.is_empty() {
@@ -675,7 +651,6 @@ impl StreamingParquetWriter {
         close_writer!(self.instant_args_writer);
         close_writer!(self.perf_sample_writer);
         close_writer!(self.symbol_writer);
-        close_writer!(self.mapping_writer);
         close_writer!(self.frame_writer);
         close_writer!(self.callsite_writer);
         close_writer!(self.stack_writer);
@@ -707,7 +682,6 @@ impl Drop for StreamingParquetWriter {
             || self.instant_args_writer.is_some()
             || self.perf_sample_writer.is_some()
             || self.symbol_writer.is_some()
-            || self.mapping_writer.is_some()
             || self.frame_writer.is_some()
             || self.callsite_writer.is_some()
             || self.stack_writer.is_some()
@@ -848,15 +822,6 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
-    fn add_mapping(&mut self, record: MappingRecord) -> Result<()> {
-        self.mappings.push(record);
-        self.total_records += 1;
-        if Self::should_flush(&self.mappings, self.batch_size) {
-            self.flush_mappings()?;
-        }
-        Ok(())
-    }
-
     fn add_frame(&mut self, record: FrameRecord) -> Result<()> {
         self.frames.push(record);
         self.total_records += 1;
@@ -934,7 +899,6 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_instant_args()?;
         self.flush_perf_samples()?;
         self.flush_symbols()?;
-        self.flush_mappings()?;
         self.flush_frames()?;
         self.flush_callsites()?;
         self.flush_stacks()?;
@@ -1304,45 +1268,16 @@ fn build_symbol_batch(records: &[SymbolRecord], schema: &Arc<Schema>) -> Result<
     )?)
 }
 
-fn build_mapping_batch(records: &[MappingRecord], schema: &Arc<Schema>) -> Result<RecordBatch> {
-    let mut id_builder = Int64Builder::with_capacity(records.len());
-    let mut build_id_builder = StringBuilder::with_capacity(records.len(), records.len() * 40);
-    let mut name_builder = StringBuilder::with_capacity(records.len(), records.len() * 64);
-    let mut exact_offset_builder = Int64Builder::with_capacity(records.len());
-    let mut start_offset_builder = Int64Builder::with_capacity(records.len());
-
-    for record in records {
-        id_builder.append_value(record.id);
-        build_id_builder.append_option(record.build_id.as_deref());
-        name_builder.append_option(record.name.as_deref());
-        exact_offset_builder.append_value(record.exact_offset);
-        start_offset_builder.append_value(record.start_offset);
-    }
-
-    Ok(RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(id_builder.finish()),
-            Arc::new(build_id_builder.finish()),
-            Arc::new(name_builder.finish()),
-            Arc::new(exact_offset_builder.finish()),
-            Arc::new(start_offset_builder.finish()),
-        ],
-    )?)
-}
-
 fn build_frame_batch(records: &[FrameRecord], schema: &Arc<Schema>) -> Result<RecordBatch> {
     let mut id_builder = Int64Builder::with_capacity(records.len());
     let mut name_builder = StringBuilder::with_capacity(records.len(), records.len() * 64);
-    let mut mapping_id_builder = Int64Builder::with_capacity(records.len());
-    let mut rel_pc_builder = Int64Builder::with_capacity(records.len());
+    let mut module_name_builder = StringBuilder::with_capacity(records.len(), records.len() * 64);
     let mut symbol_id_builder = Int64Builder::with_capacity(records.len());
 
     for record in records {
         id_builder.append_value(record.id);
         name_builder.append_option(record.name.as_deref());
-        mapping_id_builder.append_option(record.mapping_id);
-        rel_pc_builder.append_value(record.rel_pc);
+        module_name_builder.append_option(record.module_name.as_deref());
         symbol_id_builder.append_option(record.symbol_id);
     }
 
@@ -1351,8 +1286,7 @@ fn build_frame_batch(records: &[FrameRecord], schema: &Arc<Schema>) -> Result<Re
         vec![
             Arc::new(id_builder.finish()),
             Arc::new(name_builder.finish()),
-            Arc::new(mapping_id_builder.finish()),
-            Arc::new(rel_pc_builder.finish()),
+            Arc::new(module_name_builder.finish()),
             Arc::new(symbol_id_builder.finish()),
         ],
     )?)

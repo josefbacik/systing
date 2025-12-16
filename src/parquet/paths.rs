@@ -18,7 +18,6 @@ pub struct ParquetPaths {
     pub perf_sample: PathBuf,
     // Stack profiling tables
     pub symbol: PathBuf,
-    pub mapping: PathBuf,
     pub frame: PathBuf,
     pub callsite: PathBuf,
     // Query-friendly stack tables
@@ -56,7 +55,6 @@ impl ParquetPaths {
             perf_sample: dir.join("perf_sample.parquet"),
             // Stack profiling tables
             symbol: dir.join("symbol.parquet"),
-            mapping: dir.join("mapping.parquet"),
             frame: dir.join("frame.parquet"),
             callsite: dir.join("callsite.parquet"),
             // Query-friendly stack tables
@@ -71,7 +69,7 @@ impl ParquetPaths {
     }
 
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 21] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 20] {
         [
             PathEntry {
                 path: &self.process,
@@ -124,10 +122,6 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.symbol,
                 name: "symbol",
-            },
-            PathEntry {
-                path: &self.mapping,
-                name: "mapping",
             },
             PathEntry {
                 path: &self.frame,

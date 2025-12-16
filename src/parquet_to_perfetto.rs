@@ -987,10 +987,9 @@ impl ParquetToPerfettoConverter {
         let (stack_to_callstack_iid, sequence_id) = if uses_new_schema {
             let stack_data = read_stack_data(input_dir)?;
             let frame_data = read_frame_data(input_dir)?;
-            let mapping_data = read_mapping_data(input_dir)?;
 
             if !stack_data.is_empty() {
-                self.write_interned_stack_data(writer, &stack_data, &frame_data, &mapping_data)?
+                self.write_interned_stack_data(writer, &stack_data, &frame_data)?
             } else {
                 (HashMap::new(), 0)
             }
@@ -1072,15 +1071,13 @@ impl ParquetToPerfettoConverter {
     ///
     /// Returns a map from stack_id to callstack_iid, and the sequence ID used.
     ///
-    /// Note: `mapping_data` is currently unused. Perfetto's Mapping proto requires
-    /// interned IDs for build_id and path, which would require additional interning
-    /// infrastructure. The mapping IDs are still emitted to satisfy frame references.
+    /// Generates mappings on-the-fly from unique module_names.
+    /// Offset fields are set to 0 since the UI ignores them anyway.
     fn write_interned_stack_data(
         &mut self,
         writer: &mut dyn TraceWriter,
         stack_data: &HashMap<i64, StackData>,
         frame_data: &HashMap<i64, FrameData>,
-        _mapping_data: &HashMap<i64, MappingData>,
     ) -> Result<(HashMap<i64, u64>, u32)> {
         let sequence_id = self.alloc_seq_id();
 
@@ -1088,7 +1085,10 @@ impl ParquetToPerfettoConverter {
         // Map: frame_id -> frame iid (we use frame_id as iid for simplicity)
         let mut frames: Vec<Frame> = Vec::new();
         let mut seen_frame_ids: HashMap<i64, u64> = HashMap::new();
-        let mut used_mapping_ids: HashSet<i64> = HashSet::new();
+
+        // Track unique module names and assign mapping IDs
+        let mut module_to_mapping_id: HashMap<String, u64> = HashMap::new();
+        let mut next_mapping_id: u64 = 1;
 
         // Build function names alongside frames (avoids second pass over stack_data)
         let mut function_names: Vec<perfetto_protos::profile_common::InternedString> = Vec::new();
@@ -1125,11 +1125,19 @@ impl ParquetToPerfettoConverter {
                             if fd.name.is_some() {
                                 frame.set_function_name_id(iid);
                             }
-                            if let Some(mapping_id) = fd.mapping_id {
-                                frame.set_mapping_id(mapping_id as u64);
-                                used_mapping_ids.insert(mapping_id);
+                            // Generate mapping ID from module_name
+                            if let Some(ref module_name) = fd.module_name {
+                                let mapping_id = *module_to_mapping_id
+                                    .entry(module_name.clone())
+                                    .or_insert_with(|| {
+                                        let id = next_mapping_id;
+                                        next_mapping_id += 1;
+                                        id
+                                    });
+                                frame.set_mapping_id(mapping_id);
                             }
-                            frame.set_rel_pc(fd.rel_pc as u64);
+                            // rel_pc set to 0 - UI ignores it
+                            frame.set_rel_pc(0);
                             fd.name.clone()
                         } else if idx < stack.frame_names.len() {
                             frame.set_function_name_id(iid);
@@ -1169,12 +1177,15 @@ impl ParquetToPerfettoConverter {
             stack_to_callstack_iid.insert(stack_id, callstack_iid);
         }
 
-        // Build Mapping protos for all used mappings
-        let mappings: Vec<Mapping> = used_mapping_ids
+        // Build Mapping protos from unique module names
+        // All offsets set to 0 - UI ignores them
+        let mappings: Vec<Mapping> = module_to_mapping_id
             .iter()
-            .map(|&mapping_id| {
+            .map(|(_module_name, &mapping_id)| {
                 let mut mapping = Mapping::default();
-                mapping.set_iid(mapping_id as u64);
+                mapping.set_iid(mapping_id);
+                mapping.set_exact_offset(0);
+                mapping.set_start_offset(0);
                 mapping
             })
             .collect();
@@ -1286,18 +1297,7 @@ struct StackData {
 /// Helper struct for frame records from frame.parquet
 struct FrameData {
     name: Option<String>,
-    mapping_id: Option<i64>,
-    rel_pc: i64,
-}
-
-/// Helper struct for mapping records from mapping.parquet
-///
-/// Note: Fields are currently unused but kept for future enhancement when
-/// we add proper interning support for build_id and path in Perfetto output.
-#[allow(dead_code)]
-struct MappingData {
-    build_id: Option<String>,
-    name: Option<String>,
+    module_name: Option<String>,
 }
 
 /// Read stack.parquet and return a map of stack_id -> StackData
@@ -1402,67 +1402,18 @@ fn read_frame_data(input_dir: &Path) -> Result<HashMap<i64, FrameData>> {
             .column_by_name("name")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
-        let mapping_ids = batch
-            .column_by_name("mapping_id")
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-
-        let rel_pcs = batch
-            .column_by_name("rel_pc")
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-            .context("Missing rel_pc column in frame.parquet")?;
+        let module_names = batch
+            .column_by_name("module_name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
         for i in 0..batch.num_rows() {
             let id = ids.value(i);
             let name = get_optional_string(names, i);
-            let mapping_id = get_optional_i64(mapping_ids, i);
-            let rel_pc = rel_pcs.value(i);
+            let module_name = get_optional_string(module_names, i);
 
-            frame_map.insert(
-                id,
-                FrameData {
-                    name,
-                    mapping_id,
-                    rel_pc,
-                },
-            );
+            frame_map.insert(id, FrameData { name, module_name });
         }
     }
 
     Ok(frame_map)
-}
-
-/// Read mapping.parquet and return a map of mapping_id -> MappingData
-fn read_mapping_data(input_dir: &Path) -> Result<HashMap<i64, MappingData>> {
-    let path = input_dir.join("mapping.parquet");
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-
-    let mut mapping_map = HashMap::new();
-    let batches = read_parquet_file(&path)?;
-
-    for batch in &batches {
-        let ids = batch
-            .column_by_name("id")
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-            .context("Missing id column in mapping.parquet")?;
-
-        let build_ids = batch
-            .column_by_name("build_id")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-
-        let names = batch
-            .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-
-        for i in 0..batch.num_rows() {
-            let id = ids.value(i);
-            let build_id = get_optional_string(build_ids, i);
-            let name = get_optional_string(names, i);
-
-            mapping_map.insert(id, MappingData { build_id, name });
-        }
-    }
-
-    Ok(mapping_map)
 }
