@@ -167,24 +167,13 @@ pub fn symbol_schema() -> Arc<Schema> {
     ]))
 }
 
-/// Schema for mapping.parquet
-pub fn mapping_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("build_id", DataType::Utf8, true),
-        Field::new("name", DataType::Utf8, true),
-        Field::new("exact_offset", DataType::Int64, false),
-        Field::new("start_offset", DataType::Int64, false),
-    ]))
-}
-
 /// Schema for frame.parquet
+/// module_name stored directly on frame (from blazesym Sym.module).
 pub fn frame_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("name", DataType::Utf8, true),
-        Field::new("mapping_id", DataType::Int64, true),
-        Field::new("rel_pc", DataType::Int64, false),
+        Field::new("module_name", DataType::Utf8, true),
         Field::new("symbol_id", DataType::Int64, true),
     ]))
 }

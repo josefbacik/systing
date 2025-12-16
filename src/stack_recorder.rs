@@ -10,8 +10,7 @@ use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::stack_event;
 use crate::trace::{
-    CallsiteRecord, FrameRecord, MappingRecord, PerfSampleRecord, StackRecord, StackSampleRecord,
-    SymbolRecord,
+    CallsiteRecord, FrameRecord, PerfSampleRecord, StackRecord, StackSampleRecord, SymbolRecord,
 };
 use crate::SystingRecordEvent;
 
@@ -335,18 +334,14 @@ impl StackRecorder {
         collector: &mut dyn RecordCollector,
         tid_to_utid: &HashMap<i32, i64>,
         symbol_id_counter: &mut i64,
-        mapping_id_counter: &mut i64,
         frame_id_counter: &mut i64,
         stack_id_counter: &mut i64,
     ) -> Result<()> {
         // Symbol deduplication cache
         let mut symbol_map: HashMap<String, i64> = HashMap::new();
 
-        // Mapping deduplication cache
-        let mut mapping_map: HashMap<String, i64> = HashMap::new();
-
-        // Frame deduplication cache (key: (mapping_id, rel_pc))
-        let mut frame_map: HashMap<(Option<i64>, u64), i64> = HashMap::new();
+        // Frame deduplication cache (key: (module_name, addr))
+        let mut frame_map: HashMap<(Option<String>, u64), i64> = HashMap::new();
 
         // Stack deduplication cache (key: hash of frame_ids)
         let mut stack_cache: HashMap<Vec<i64>, i64> = HashMap::new();
@@ -397,15 +392,23 @@ impl StackRecorder {
                 let mut frame_ids: Vec<i64> = Vec::with_capacity(addr_count);
 
                 for (addr, is_kernel) in all_addrs.iter() {
-                    // Try to symbolize
-                    let sym_name = if *is_kernel {
+                    // Try to symbolize - extract both name and module
+                    let (sym_name, module_name) = if *is_kernel {
                         let kernel_src = Source::Kernel(Kernel::default());
                         let sym_result =
                             symbolizer.symbolize_single(&kernel_src, Input::VirtOffset(*addr));
                         sym_result
                             .ok()
                             .and_then(|s| s.into_sym())
-                            .map(|s| s.name.to_string())
+                            .map(|s| {
+                                let name = s.name.to_string();
+                                let module = s
+                                    .module
+                                    .and_then(|m| m.to_str().map(String::from))
+                                    .unwrap_or_else(|| "[kernel]".to_string());
+                                (Some(name), Some(module))
+                            })
+                            .unwrap_or((None, Some("[kernel]".to_string())))
                     } else {
                         let proc_src = Source::Process(Process::new(Pid::from(pid as u32)));
                         let sym_result =
@@ -413,7 +416,12 @@ impl StackRecorder {
                         sym_result
                             .ok()
                             .and_then(|s| s.into_sym())
-                            .map(|s| s.name.to_string())
+                            .map(|s| {
+                                let name = s.name.to_string();
+                                let module = s.module.and_then(|m| m.to_str().map(String::from));
+                                (Some(name), module)
+                            })
+                            .unwrap_or((None, None))
                     };
 
                     // Get or create symbol
@@ -434,31 +442,8 @@ impl StackRecorder {
                         None
                     };
 
-                    // For now, use a simple mapping - just the process or kernel
-                    let mapping_name = if *is_kernel {
-                        "[kernel]".to_string()
-                    } else {
-                        format!("[pid:{pid}]")
-                    };
-
-                    let mapping_id = if let Some(&id) = mapping_map.get(&mapping_name) {
-                        id
-                    } else {
-                        let id = *mapping_id_counter;
-                        *mapping_id_counter += 1;
-                        mapping_map.insert(mapping_name.clone(), id);
-                        collector.add_mapping(MappingRecord {
-                            id,
-                            build_id: None,
-                            name: Some(mapping_name),
-                            exact_offset: 0,
-                            start_offset: 0,
-                        })?;
-                        id
-                    };
-
-                    // Get or create frame
-                    let frame_key = (Some(mapping_id), *addr);
+                    // Get or create frame (keyed by module+addr for deduplication)
+                    let frame_key = (module_name.clone(), *addr);
                     let frame_id = if let Some(&id) = frame_map.get(&frame_key) {
                         id
                     } else {
@@ -468,8 +453,7 @@ impl StackRecorder {
                         collector.add_frame(FrameRecord {
                             id,
                             name: sym_name.clone(),
-                            mapping_id: Some(mapping_id),
-                            rel_pc: *addr as i64,
+                            module_name,
                             symbol_id,
                         })?;
                         id
@@ -542,18 +526,14 @@ impl StackRecorder {
         collector: &mut dyn RecordCollector,
         tid_to_utid: &HashMap<i32, i64>,
         symbol_id_counter: &mut i64,
-        mapping_id_counter: &mut i64,
         frame_id_counter: &mut i64,
         callsite_id_counter: &mut i64,
     ) -> Result<()> {
         // Symbol deduplication cache
         let mut symbol_map: HashMap<String, i64> = HashMap::new();
 
-        // Mapping deduplication cache
-        let mut mapping_map: HashMap<String, i64> = HashMap::new();
-
-        // Frame deduplication cache (key: (mapping_id, rel_pc))
-        let mut frame_map: HashMap<(Option<i64>, u64), i64> = HashMap::new();
+        // Frame deduplication cache (key: (module_name, addr))
+        let mut frame_map: HashMap<(Option<String>, u64), i64> = HashMap::new();
 
         // Process each unique stack
         for (tgid, events) in self.stacks.iter() {
@@ -598,15 +578,23 @@ impl StackRecorder {
                 let mut parent_callsite_id: Option<i64> = None;
 
                 for (depth, (addr, is_kernel)) in all_addrs.iter().enumerate() {
-                    // Try to symbolize
-                    let sym_name = if *is_kernel {
+                    // Try to symbolize - extract both name and module
+                    let (sym_name, module_name) = if *is_kernel {
                         let kernel_src = Source::Kernel(Kernel::default());
                         let sym_result =
                             symbolizer.symbolize_single(&kernel_src, Input::VirtOffset(*addr));
                         sym_result
                             .ok()
                             .and_then(|s| s.into_sym())
-                            .map(|s| s.name.to_string())
+                            .map(|s| {
+                                let name = s.name.to_string();
+                                let module = s
+                                    .module
+                                    .and_then(|m| m.to_str().map(String::from))
+                                    .unwrap_or_else(|| "[kernel]".to_string());
+                                (Some(name), Some(module))
+                            })
+                            .unwrap_or((None, Some("[kernel]".to_string())))
                     } else {
                         let proc_src = Source::Process(Process::new(Pid::from(pid as u32)));
                         let sym_result =
@@ -614,7 +602,12 @@ impl StackRecorder {
                         sym_result
                             .ok()
                             .and_then(|s| s.into_sym())
-                            .map(|s| s.name.to_string())
+                            .map(|s| {
+                                let name = s.name.to_string();
+                                let module = s.module.and_then(|m| m.to_str().map(String::from));
+                                (Some(name), module)
+                            })
+                            .unwrap_or((None, None))
                     };
 
                     // Get or create symbol
@@ -635,31 +628,8 @@ impl StackRecorder {
                         None
                     };
 
-                    // For now, use a simple mapping - just the process or kernel
-                    let mapping_name = if *is_kernel {
-                        "[kernel]".to_string()
-                    } else {
-                        format!("[pid:{pid}]")
-                    };
-
-                    let mapping_id = if let Some(&id) = mapping_map.get(&mapping_name) {
-                        id
-                    } else {
-                        let id = *mapping_id_counter;
-                        *mapping_id_counter += 1;
-                        mapping_map.insert(mapping_name.clone(), id);
-                        collector.add_mapping(MappingRecord {
-                            id,
-                            build_id: None,
-                            name: Some(mapping_name),
-                            exact_offset: 0,
-                            start_offset: 0,
-                        })?;
-                        id
-                    };
-
-                    // Get or create frame
-                    let frame_key = (Some(mapping_id), *addr);
+                    // Get or create frame (keyed by module+addr for deduplication)
+                    let frame_key = (module_name.clone(), *addr);
                     let frame_id = if let Some(&id) = frame_map.get(&frame_key) {
                         id
                     } else {
@@ -669,8 +639,7 @@ impl StackRecorder {
                         collector.add_frame(FrameRecord {
                             id,
                             name: sym_name.clone(),
-                            mapping_id: Some(mapping_id),
-                            rel_pc: *addr as i64,
+                            module_name,
                             symbol_id,
                         })?;
                         id

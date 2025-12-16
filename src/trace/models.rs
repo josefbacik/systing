@@ -161,23 +161,13 @@ pub struct SymbolRecord {
     pub name: String,
 }
 
-/// Mapping record - binary/library information.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MappingRecord {
-    pub id: i64,
-    pub build_id: Option<String>,
-    pub name: Option<String>,
-    pub exact_offset: i64,
-    pub start_offset: i64,
-}
-
 /// Frame record - stack frame information.
+/// module_name is stored directly on frame (from blazesym Sym.module).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FrameRecord {
     pub id: i64,
     pub name: Option<String>,
-    pub mapping_id: Option<i64>,
-    pub rel_pc: i64,
+    pub module_name: Option<String>,
     pub symbol_id: Option<i64>,
 }
 
@@ -276,7 +266,6 @@ pub struct ExtractedData {
     pub instant_args: Vec<InstantArgRecord>,
     pub perf_samples: Vec<PerfSampleRecord>,
     pub symbols: Vec<SymbolRecord>,
-    pub mappings: Vec<MappingRecord>,
     pub frames: Vec<FrameRecord>,
     pub callsites: Vec<CallsiteRecord>,
     pub stacks: Vec<StackRecord>,

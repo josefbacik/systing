@@ -986,7 +986,6 @@ impl SessionRecorder {
         let mut slice_id_counter: i64 = 1;
         let mut instant_id_counter: i64 = 1;
         let mut symbol_id_counter: i64 = 1;
-        let mut mapping_id_counter: i64 = 1;
         let mut frame_id_counter: i64 = 1;
         let mut stack_id_counter: i64 = 1;
 
@@ -1094,7 +1093,6 @@ impl SessionRecorder {
             &mut writer,
             &tid_to_utid,
             &mut symbol_id_counter,
-            &mut mapping_id_counter,
             &mut frame_id_counter,
             &mut stack_id_counter,
         )?;
