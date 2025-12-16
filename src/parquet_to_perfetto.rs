@@ -3,22 +3,27 @@
 //! This module reads parquet files from a directory and reconstructs a valid
 //! Perfetto trace (.pb file). It is the inverse of the parquet_writer module.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use arrow::array::{Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{
+    Array, Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
+};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
 use perfetto_protos::clock_snapshot::ClockSnapshot;
 use perfetto_protos::debug_annotation::DebugAnnotation;
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
 use perfetto_protos::ftrace_event_bundle::FtraceEventBundle;
+use perfetto_protos::interned_data::InternedData;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
+use perfetto_protos::profile_common::{Callstack, Frame, Mapping};
 use perfetto_protos::profile_packet::PerfSample;
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
+use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
 use perfetto_protos::track_event::track_event::Type;
@@ -135,7 +140,6 @@ impl ParquetToPerfettoConverter {
 
         // Group clocks by snapshot (all clocks in a single ClockSnapshot packet)
         let mut clocks: Vec<Clock> = Vec::new();
-        let mut _primary_clock_id: Option<i32> = None;
 
         for batch in &batches {
             let clock_ids = batch
@@ -146,23 +150,15 @@ impl ParquetToPerfettoConverter {
                 .column_by_name("timestamp_ns")
                 .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
                 .context("Missing timestamp_ns column")?;
-            let is_primaries = batch
-                .column_by_name("is_primary")
-                .and_then(|c| c.as_any().downcast_ref::<arrow::array::BooleanArray>());
 
             for i in 0..batch.num_rows() {
                 let clock_id = clock_ids.value(i);
                 let timestamp = timestamps.value(i);
-                let is_primary = is_primaries.map(|arr| arr.value(i)).unwrap_or(false);
 
                 let mut clock = Clock::default();
                 clock.set_clock_id(clock_id as u32);
                 clock.timestamp = Some(timestamp as u64);
                 clocks.push(clock);
-
-                if is_primary {
-                    _primary_clock_id = Some(clock_id);
-                }
             }
         }
 
@@ -211,13 +207,7 @@ impl ParquetToPerfettoConverter {
             for i in 0..batch.num_rows() {
                 let upid = upids.value(i);
                 let pid = pids.value(i);
-                let name = names.and_then(|arr| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i).to_string())
-                    }
-                });
+                let name = get_optional_string(names, i);
 
                 let uuid = self.alloc_uuid();
                 self.upid_to_uuid.insert(upid, uuid);
@@ -275,20 +265,8 @@ impl ParquetToPerfettoConverter {
             for i in 0..batch.num_rows() {
                 let utid = utids.value(i);
                 let tid = tids.value(i);
-                let name = names.and_then(|arr| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i).to_string())
-                    }
-                });
-                let upid = upids.and_then(|arr| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                });
+                let name = get_optional_string(names, i);
+                let upid = get_optional_i64(upids, i);
 
                 let uuid = self.alloc_uuid();
                 self.utid_to_uuid.insert(utid, uuid);
@@ -358,13 +336,7 @@ impl ParquetToPerfettoConverter {
             for i in 0..batch.num_rows() {
                 let id = ids.value(i);
                 let name = names.value(i).to_string();
-                let parent_id = parent_ids.and_then(|arr| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                });
+                let parent_id = get_optional_i64(parent_ids, i);
 
                 // Allocate UUID for this track
                 let uuid = self.alloc_uuid();
@@ -488,15 +460,7 @@ impl ParquetToPerfettoConverter {
             for i in 0..batch.num_rows() {
                 let ts = timestamps.value(i);
                 let utid = utids.value(i);
-                let target_cpu = cpus
-                    .and_then(|arr| {
-                        if arr.is_null(i) {
-                            None
-                        } else {
-                            Some(arr.value(i))
-                        }
-                    })
-                    .unwrap_or(0);
+                let target_cpu = get_optional_i32(cpus, i).unwrap_or(0);
 
                 let (tid, comm) = utid_to_thread
                     .get(&utid)
@@ -608,15 +572,7 @@ impl ParquetToPerfettoConverter {
             for i in 0..batch.num_rows() {
                 let utid = utids.value(i);
                 let tid = tids.value(i);
-                let name = names
-                    .and_then(|arr| {
-                        if arr.is_null(i) {
-                            None
-                        } else {
-                            Some(arr.value(i).to_string())
-                        }
-                    })
-                    .unwrap_or_default();
+                let name = get_optional_string(names, i).unwrap_or_default();
                 map.insert(utid, (tid, name));
             }
         }
@@ -674,13 +630,7 @@ impl ParquetToPerfettoConverter {
                 let dur = durations.value(i);
                 let track_id = track_ids.value(i);
                 let name = names.value(i).to_string();
-                let category = categories.and_then(|arr| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i).to_string())
-                    }
-                });
+                let category = get_optional_string(categories, i);
 
                 // Get track UUID
                 let track_uuid = self.track_id_to_uuid.get(&track_id).copied().unwrap_or(0);
@@ -759,27 +709,9 @@ impl ParquetToPerfettoConverter {
             for i in 0..batch.num_rows() {
                 let slice_id = slice_ids.value(i);
                 let key = keys.value(i).to_string();
-                let int_value = int_values.and_then(|arr| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                });
-                let string_value = string_values.and_then(|arr| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i).to_string())
-                    }
-                });
-                let real_value = real_values.and_then(|arr| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                });
+                let int_value = get_optional_i64(int_values, i);
+                let string_value = get_optional_string(string_values, i);
+                let real_value = get_optional_f64(real_values, i);
 
                 args_map.entry(slice_id).or_default().push(ArgRecord {
                     key,
@@ -842,13 +774,7 @@ impl ParquetToPerfettoConverter {
                 let ts = timestamps.value(i);
                 let track_id = track_ids.value(i);
                 let name = names.value(i).to_string();
-                let category = categories.and_then(|arr| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i).to_string())
-                    }
-                });
+                let category = get_optional_string(categories, i);
 
                 let track_uuid = self.track_id_to_uuid.get(&track_id).copied().unwrap_or(0);
 
@@ -914,27 +840,9 @@ impl ParquetToPerfettoConverter {
             for i in 0..batch.num_rows() {
                 let instant_id = instant_ids.value(i);
                 let key = keys.value(i).to_string();
-                let int_value = int_values.and_then(|arr| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                });
-                let string_value = string_values.and_then(|arr| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i).to_string())
-                    }
-                });
-                let real_value = real_values.and_then(|arr| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                });
+                let int_value = get_optional_i64(int_values, i);
+                let string_value = get_optional_string(string_values, i);
+                let real_value = get_optional_f64(real_values, i);
 
                 args_map.entry(instant_id).or_default().push(ArgRecord {
                     key,
@@ -979,12 +887,13 @@ impl ParquetToPerfettoConverter {
                     let name = names.value(i).to_string();
 
                     // Allocate UUID if not already done
-                    if !self.track_id_to_uuid.contains_key(&id) {
-                        let uuid = self.alloc_uuid();
-                        self.track_id_to_uuid.insert(id, uuid);
-                    }
-
-                    let uuid = *self.track_id_to_uuid.get(&id).unwrap();
+                    let uuid = if let Some(&existing) = self.track_id_to_uuid.get(&id) {
+                        existing
+                    } else {
+                        let new_uuid = self.alloc_uuid();
+                        self.track_id_to_uuid.insert(id, new_uuid);
+                        new_uuid
+                    };
 
                     let mut desc = TrackDescriptor::default();
                     desc.set_uuid(uuid);
@@ -1046,9 +955,9 @@ impl ParquetToPerfettoConverter {
     ///
     /// Supports both new schema (stack_sample.parquet) and legacy schema (perf_sample.parquet).
     ///
-    /// **Note:** When reading from the new schema, stack information is not yet reconstructed
-    /// into Perfetto callsite format. The perf samples will be written without callstack
-    /// references. Full callsite reconstruction from `stack.parquet` is a future enhancement.
+    /// When reading from the new schema, stack information is reconstructed into Perfetto
+    /// InternedData format with Frame and Callstack protos. Samples reference callstacks
+    /// via callstack_iid.
     fn write_perf_samples(&mut self, input_dir: &Path, writer: &mut dyn TraceWriter) -> Result<()> {
         // Try new schema first (stack_sample.parquet), fall back to legacy (perf_sample.parquet)
         let stack_sample_path = input_dir.join("stack_sample.parquet");
@@ -1062,7 +971,6 @@ impl ParquetToPerfettoConverter {
             return Ok(());
         };
 
-        // Determine column name based on which file we're reading
         let uses_new_schema = stack_sample_path.exists();
 
         // Need thread table to map utid -> (tid, pid)
@@ -1075,12 +983,36 @@ impl ParquetToPerfettoConverter {
 
         let batches = read_parquet_file(sample_path)?;
 
-        // TODO: When uses_new_schema is true, read stack.parquet and reconstruct
-        // callsite chains from frame_ids arrays for full Perfetto compatibility.
-        // Currently, new schema perf samples are written without callstack info.
-        let _ = uses_new_schema;
+        // For new schema, build InternedData with Frame and Callstack protos
+        let (stack_to_callstack_iid, sequence_id) = if uses_new_schema {
+            let stack_data = read_stack_data(input_dir)?;
+            let frame_data = read_frame_data(input_dir)?;
+            let mapping_data = read_mapping_data(input_dir)?;
 
-        for batch in &batches {
+            if !stack_data.is_empty() {
+                self.write_interned_stack_data(writer, &stack_data, &frame_data, &mapping_data)?
+            } else {
+                (HashMap::new(), 0)
+            }
+        } else {
+            (HashMap::new(), 0)
+        };
+
+        // Get stack_id column for new schema
+        let stack_ids_by_batch: Vec<Option<&Int64Array>> = if uses_new_schema {
+            batches
+                .iter()
+                .map(|batch| {
+                    batch
+                        .column_by_name("stack_id")
+                        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                })
+                .collect()
+        } else {
+            vec![None; batches.len()]
+        };
+
+        for (batch_idx, batch) in batches.iter().enumerate() {
             let timestamps = batch
                 .column_by_name("ts")
                 .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
@@ -1092,17 +1024,12 @@ impl ParquetToPerfettoConverter {
             let cpus = batch
                 .column_by_name("cpu")
                 .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+            let stack_ids = stack_ids_by_batch[batch_idx];
 
             for i in 0..batch.num_rows() {
                 let ts = timestamps.value(i);
                 let utid = utids.value(i);
-                let cpu = cpus.and_then(|arr| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i) as u32)
-                    }
-                });
+                let cpu = get_optional_i32(cpus, i).map(|c| c as u32);
 
                 let (tid, _) = utid_to_thread
                     .get(&utid)
@@ -1116,14 +1043,167 @@ impl ParquetToPerfettoConverter {
                     sample.set_cpu(c);
                 }
 
+                // Set callstack_iid for new schema samples
+                if let Some(stack_id_arr) = stack_ids {
+                    if !stack_id_arr.is_null(i) {
+                        let stack_id = stack_id_arr.value(i);
+                        if let Some(&callstack_iid) = stack_to_callstack_iid.get(&stack_id) {
+                            sample.set_callstack_iid(callstack_iid);
+                        }
+                    }
+                }
+
                 let mut packet = TracePacket::default();
                 packet.set_timestamp(ts as u64);
+                // Set sequence ID for samples that have callstack references
+                let has_callstack = sample.has_callstack_iid();
                 packet.set_perf_sample(sample);
+                if sequence_id > 0 && has_callstack {
+                    packet.set_trusted_packet_sequence_id(sequence_id);
+                }
                 writer.write_packet(&packet)?;
             }
         }
 
         Ok(())
+    }
+
+    /// Write InternedData packet with Frame, Callstack, and Mapping protos.
+    ///
+    /// Returns a map from stack_id to callstack_iid, and the sequence ID used.
+    ///
+    /// Note: `mapping_data` is currently unused. Perfetto's Mapping proto requires
+    /// interned IDs for build_id and path, which would require additional interning
+    /// infrastructure. The mapping IDs are still emitted to satisfy frame references.
+    fn write_interned_stack_data(
+        &mut self,
+        writer: &mut dyn TraceWriter,
+        stack_data: &HashMap<i64, StackData>,
+        frame_data: &HashMap<i64, FrameData>,
+        _mapping_data: &HashMap<i64, MappingData>,
+    ) -> Result<(HashMap<i64, u64>, u32)> {
+        let sequence_id = self.alloc_seq_id();
+
+        // Build Frame protos for each unique frame_id
+        // Map: frame_id -> frame iid (we use frame_id as iid for simplicity)
+        let mut frames: Vec<Frame> = Vec::new();
+        let mut seen_frame_ids: HashMap<i64, u64> = HashMap::new();
+        let mut used_mapping_ids: HashSet<i64> = HashSet::new();
+
+        // Build function names alongside frames (avoids second pass over stack_data)
+        let mut function_names: Vec<perfetto_protos::profile_common::InternedString> = Vec::new();
+        let mut added_function_name_iids: HashSet<u64> = HashSet::new();
+
+        // Build Callstack protos for each stack
+        // Map: stack_id -> callstack_iid
+        let mut callstacks: Vec<Callstack> = Vec::new();
+        let mut stack_to_callstack_iid: HashMap<i64, u64> = HashMap::new();
+        let mut next_callstack_iid: u64 = 1;
+
+        for (&stack_id, stack) in stack_data {
+            if stack.frame_ids.is_empty() {
+                continue;
+            }
+
+            // Collect frame iids for this callstack
+            let mut callstack_frame_ids: Vec<u64> = Vec::new();
+
+            for (idx, &frame_id) in stack.frame_ids.iter().enumerate() {
+                // Get or create frame entry
+                let frame_iid = match seen_frame_ids.get(&frame_id) {
+                    Some(&iid) => iid,
+                    None => {
+                        let iid = frame_id as u64;
+                        seen_frame_ids.insert(frame_id, iid);
+
+                        // Build Frame proto
+                        let mut frame = Frame::default();
+                        frame.set_iid(iid);
+
+                        // Determine function name: prefer frame_data, fall back to stack's frame_names
+                        let function_name = if let Some(fd) = frame_data.get(&frame_id) {
+                            if fd.name.is_some() {
+                                frame.set_function_name_id(iid);
+                            }
+                            if let Some(mapping_id) = fd.mapping_id {
+                                frame.set_mapping_id(mapping_id as u64);
+                                used_mapping_ids.insert(mapping_id);
+                            }
+                            frame.set_rel_pc(fd.rel_pc as u64);
+                            fd.name.clone()
+                        } else if idx < stack.frame_names.len() {
+                            frame.set_function_name_id(iid);
+                            Some(stack.frame_names[idx].clone())
+                        } else {
+                            None
+                        };
+
+                        // Add function name to interned strings (O(1) HashSet check)
+                        if let Some(name) = function_name {
+                            if added_function_name_iids.insert(iid) {
+                                let mut interned_str =
+                                    perfetto_protos::profile_common::InternedString::default();
+                                interned_str.set_iid(iid);
+                                interned_str.set_str(name.into_bytes());
+                                function_names.push(interned_str);
+                            }
+                        }
+
+                        frames.push(frame);
+                        iid
+                    }
+                };
+
+                callstack_frame_ids.push(frame_iid);
+            }
+
+            // Build Callstack proto
+            let callstack_iid = next_callstack_iid;
+            next_callstack_iid += 1;
+
+            let mut callstack = Callstack::default();
+            callstack.set_iid(callstack_iid);
+            callstack.frame_ids = callstack_frame_ids;
+
+            callstacks.push(callstack);
+            stack_to_callstack_iid.insert(stack_id, callstack_iid);
+        }
+
+        // Build Mapping protos for all used mappings
+        let mappings: Vec<Mapping> = used_mapping_ids
+            .iter()
+            .map(|&mapping_id| {
+                let mut mapping = Mapping::default();
+                mapping.set_iid(mapping_id as u64);
+                mapping
+            })
+            .collect();
+
+        // Write InternedData packet
+        if !frames.is_empty() || !callstacks.is_empty() {
+            let interned_data = InternedData {
+                frames,
+                callstacks,
+                function_names,
+                mappings,
+                ..Default::default()
+            };
+
+            #[allow(clippy::field_reassign_with_default)]
+            let packet = {
+                let mut p = TracePacket::default();
+                p.interned_data = Some(interned_data).into();
+                p.set_trusted_packet_sequence_id(sequence_id);
+                p.sequence_flags = Some(
+                    SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
+                        | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
+                );
+                p
+            };
+            writer.write_packet(&packet)?;
+        }
+
+        Ok((stack_to_callstack_iid, sequence_id))
     }
 }
 
@@ -1167,4 +1247,222 @@ fn read_parquet_file(path: &Path) -> Result<Vec<RecordBatch>> {
 
     let batches: Result<Vec<_>, _> = reader.collect();
     batches.with_context(|| format!("Failed to read batches from: {}", path.display()))
+}
+
+/// Get optional string value from a nullable StringArray column
+fn get_optional_string(arr: Option<&StringArray>, i: usize) -> Option<String> {
+    arr.and_then(|a| {
+        if a.is_null(i) {
+            None
+        } else {
+            Some(a.value(i).to_string())
+        }
+    })
+}
+
+/// Get optional i64 value from a nullable Int64Array column
+fn get_optional_i64(arr: Option<&Int64Array>, i: usize) -> Option<i64> {
+    arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+}
+
+/// Get optional i32 value from a nullable Int32Array column
+fn get_optional_i32(arr: Option<&Int32Array>, i: usize) -> Option<i32> {
+    arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+}
+
+/// Get optional f64 value from a nullable Float64Array column
+fn get_optional_f64(arr: Option<&Float64Array>, i: usize) -> Option<f64> {
+    arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+}
+
+/// Helper struct for stack records from stack.parquet
+struct StackData {
+    /// Frame IDs in leaf-to-root order
+    frame_ids: Vec<i64>,
+    /// Frame names in leaf-to-root order (for fallback if frame.parquet is missing)
+    frame_names: Vec<String>,
+}
+
+/// Helper struct for frame records from frame.parquet
+struct FrameData {
+    name: Option<String>,
+    mapping_id: Option<i64>,
+    rel_pc: i64,
+}
+
+/// Helper struct for mapping records from mapping.parquet
+///
+/// Note: Fields are currently unused but kept for future enhancement when
+/// we add proper interning support for build_id and path in Perfetto output.
+#[allow(dead_code)]
+struct MappingData {
+    build_id: Option<String>,
+    name: Option<String>,
+}
+
+/// Read stack.parquet and return a map of stack_id -> StackData
+fn read_stack_data(input_dir: &Path) -> Result<HashMap<i64, StackData>> {
+    let path = input_dir.join("stack.parquet");
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let mut stack_map = HashMap::new();
+    let batches = read_parquet_file(&path)?;
+
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .context("Missing id column in stack.parquet")?;
+
+        let frame_ids_col = batch
+            .column_by_name("frame_ids")
+            .and_then(|c| c.as_any().downcast_ref::<ListArray>())
+            .context("Missing frame_ids column in stack.parquet")?;
+
+        let frame_names_col = batch
+            .column_by_name("frame_names")
+            .and_then(|c| c.as_any().downcast_ref::<ListArray>())
+            .context("Missing frame_names column in stack.parquet")?;
+
+        for i in 0..batch.num_rows() {
+            let id = ids.value(i);
+
+            // Extract frame_ids list
+            let frame_ids: Vec<i64> = if frame_ids_col.is_null(i) {
+                Vec::new()
+            } else {
+                let inner = frame_ids_col.value(i);
+                let int_array = inner
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .context("frame_ids inner array is not Int64Array")?;
+                (0..int_array.len())
+                    .filter_map(|j| {
+                        if int_array.is_null(j) {
+                            None
+                        } else {
+                            Some(int_array.value(j))
+                        }
+                    })
+                    .collect()
+            };
+
+            // Extract frame_names list
+            let frame_names: Vec<String> = if frame_names_col.is_null(i) {
+                Vec::new()
+            } else {
+                let inner = frame_names_col.value(i);
+                let str_array = inner
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .context("frame_names inner array is not StringArray")?;
+                (0..str_array.len())
+                    .map(|j| {
+                        if str_array.is_null(j) {
+                            String::new()
+                        } else {
+                            str_array.value(j).to_string()
+                        }
+                    })
+                    .collect()
+            };
+
+            stack_map.insert(
+                id,
+                StackData {
+                    frame_ids,
+                    frame_names,
+                },
+            );
+        }
+    }
+
+    Ok(stack_map)
+}
+
+/// Read frame.parquet and return a map of frame_id -> FrameData
+fn read_frame_data(input_dir: &Path) -> Result<HashMap<i64, FrameData>> {
+    let path = input_dir.join("frame.parquet");
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let mut frame_map = HashMap::new();
+    let batches = read_parquet_file(&path)?;
+
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .context("Missing id column in frame.parquet")?;
+
+        let names = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+        let mapping_ids = batch
+            .column_by_name("mapping_id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+
+        let rel_pcs = batch
+            .column_by_name("rel_pc")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .context("Missing rel_pc column in frame.parquet")?;
+
+        for i in 0..batch.num_rows() {
+            let id = ids.value(i);
+            let name = get_optional_string(names, i);
+            let mapping_id = get_optional_i64(mapping_ids, i);
+            let rel_pc = rel_pcs.value(i);
+
+            frame_map.insert(
+                id,
+                FrameData {
+                    name,
+                    mapping_id,
+                    rel_pc,
+                },
+            );
+        }
+    }
+
+    Ok(frame_map)
+}
+
+/// Read mapping.parquet and return a map of mapping_id -> MappingData
+fn read_mapping_data(input_dir: &Path) -> Result<HashMap<i64, MappingData>> {
+    let path = input_dir.join("mapping.parquet");
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let mut mapping_map = HashMap::new();
+    let batches = read_parquet_file(&path)?;
+
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .context("Missing id column in mapping.parquet")?;
+
+        let build_ids = batch
+            .column_by_name("build_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+        let names = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+        for i in 0..batch.num_rows() {
+            let id = ids.value(i);
+            let build_id = get_optional_string(build_ids, i);
+            let name = get_optional_string(names, i);
+
+            mapping_map.insert(id, MappingData { build_id, name });
+        }
+    }
+
+    Ok(mapping_map)
 }
