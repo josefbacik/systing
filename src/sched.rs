@@ -8,7 +8,10 @@ use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::event_type;
 use crate::systing::types::task_event;
-use crate::trace::{SchedSliceRecord, ThreadStateRecord};
+use crate::trace::{
+    IrqSliceRecord, ProcessExitRecord, SchedSliceRecord, SoftirqSliceRecord, ThreadStateRecord,
+    WakeupNewRecord,
+};
 use crate::SystingRecordEvent;
 
 use perfetto_protos::ftrace_event::FtraceEvent;
@@ -29,11 +32,70 @@ struct LocalCompactSched {
     last_switch_ts: u64,
 }
 
+/// Pending IRQ entry waiting for matching exit.
+#[derive(Clone)]
+struct PendingIrq {
+    ts: u64,
+    irq: i32,
+    name: String,
+}
+
+/// Pending softirq entry waiting for matching exit.
+#[derive(Clone)]
+struct PendingSoftirq {
+    ts: u64,
+    vec: i32,
+}
+
+/// Completed IRQ slice (entry + exit paired).
+struct CompletedIrq {
+    ts: i64,
+    dur: i64,
+    cpu: i32,
+    irq: i32,
+    name: Option<String>,
+    ret: Option<i32>,
+}
+
+/// Completed softirq slice (entry + exit paired).
+struct CompletedSoftirq {
+    ts: i64,
+    dur: i64,
+    cpu: i32,
+    vec: i32,
+}
+
+/// Wakeup new event data.
+struct WakeupNewEvent {
+    ts: i64,
+    cpu: i32,
+    pid: i32,
+    target_cpu: i32,
+}
+
+/// Process exit event data.
+struct ProcessExitEvent {
+    ts: i64,
+    cpu: i32,
+    pid: i32,
+}
+
 #[derive(Default)]
 pub struct SchedEventRecorder {
     pub ringbuf: RingBuffer<task_event>,
     events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
     compact_sched: HashMap<u32, LocalCompactSched>,
+    // Pending IRQ/softirq events keyed by (cpu, irq/vec).
+    // IRQs and softirqs cannot nest on the same CPU with the same IRQ number or
+    // softirq vector, so (cpu, irq/vec) uniquely identifies a pending entry.
+    // When we receive an exit event, we look up the matching entry by this key.
+    pending_irqs: HashMap<(u32, i32), PendingIrq>,
+    pending_softirqs: HashMap<(u32, i32), PendingSoftirq>,
+    // Completed events for Parquet output
+    completed_irqs: Vec<CompletedIrq>,
+    completed_softirqs: Vec<CompletedSoftirq>,
+    wakeup_news: Vec<WakeupNewEvent>,
+    process_exits: Vec<ProcessExitEvent>,
 }
 
 impl SystingRecordEvent<task_event> for SchedEventRecorder {
@@ -46,20 +108,115 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
     }
 
     fn handle_event(&mut self, event: task_event) {
-        // SCHED_SWITCH and SCHED_WAKING are handled in compact sched events.
-        // We skip SCHED_WAKEUP as it's only used for waking events, not switch.
-        if event.r#type == event_type::SCHED_SWITCH || event.r#type == event_type::SCHED_WAKING {
-            let compact_sched = self.compact_sched.entry(event.cpu).or_default();
-            compact_sched.add_task_event(&event);
-        } else if event.r#type != event_type::SCHED_WAKEUP {
-            let ftrace_event = FtraceEvent::from(&event);
-            let cpu_event = self.events.entry(event.cpu).or_default();
-            cpu_event.insert(event.ts, ftrace_event);
+        match event.r#type {
+            // SCHED_SWITCH and SCHED_WAKING use compact sched format
+            event_type::SCHED_SWITCH | event_type::SCHED_WAKING => {
+                let compact_sched = self.compact_sched.entry(event.cpu).or_default();
+                compact_sched.add_task_event(&event);
+            }
+
+            // IRQ handler entry - track for pairing with exit
+            event_type::SCHED_IRQ_ENTER => {
+                let irq = event.target_cpu as i32;
+                let name = CStr::from_bytes_until_nul(&event.next.comm)
+                    .map(|c| c.to_str().unwrap_or("").to_string())
+                    .unwrap_or_default();
+                self.pending_irqs.insert(
+                    (event.cpu, irq),
+                    PendingIrq {
+                        ts: event.ts,
+                        irq,
+                        name,
+                    },
+                );
+                self.add_ftrace_event(&event);
+            }
+
+            // IRQ handler exit - pair with entry to create slice
+            event_type::SCHED_IRQ_EXIT => {
+                let irq = event.target_cpu as i32;
+                let ret = event.next_prio as i32;
+                if let Some(pending) = self.pending_irqs.remove(&(event.cpu, irq)) {
+                    let dur = event.ts.saturating_sub(pending.ts) as i64;
+                    self.completed_irqs.push(CompletedIrq {
+                        ts: pending.ts as i64,
+                        dur,
+                        cpu: event.cpu as i32,
+                        irq: pending.irq,
+                        name: if pending.name.is_empty() {
+                            None
+                        } else {
+                            Some(pending.name)
+                        },
+                        ret: Some(ret),
+                    });
+                }
+                self.add_ftrace_event(&event);
+            }
+
+            // Softirq entry - track for pairing with exit
+            event_type::SCHED_SOFTIRQ_ENTER => {
+                let vec = event.target_cpu as i32;
+                self.pending_softirqs
+                    .insert((event.cpu, vec), PendingSoftirq { ts: event.ts, vec });
+                self.add_ftrace_event(&event);
+            }
+
+            // Softirq exit - pair with entry to create slice
+            event_type::SCHED_SOFTIRQ_EXIT => {
+                let vec = event.target_cpu as i32;
+                if let Some(pending) = self.pending_softirqs.remove(&(event.cpu, vec)) {
+                    let dur = event.ts.saturating_sub(pending.ts) as i64;
+                    self.completed_softirqs.push(CompletedSoftirq {
+                        ts: pending.ts as i64,
+                        dur,
+                        cpu: event.cpu as i32,
+                        vec: pending.vec,
+                    });
+                }
+                self.add_ftrace_event(&event);
+            }
+
+            // New process wakeup
+            event_type::SCHED_WAKEUP_NEW => {
+                self.wakeup_news.push(WakeupNewEvent {
+                    ts: event.ts as i64,
+                    cpu: event.cpu as i32,
+                    pid: event.next.tgidpid as i32,
+                    target_cpu: event.target_cpu as i32,
+                });
+                self.add_ftrace_event(&event);
+            }
+
+            // Process exit
+            event_type::SCHED_PROCESS_EXIT => {
+                self.process_exits.push(ProcessExitEvent {
+                    ts: event.ts as i64,
+                    cpu: event.cpu as i32,
+                    pid: event.prev.tgidpid as i32,
+                });
+                self.add_ftrace_event(&event);
+            }
+
+            // Skip SCHED_WAKEUP (redundant with SCHED_WAKING)
+            event_type::SCHED_WAKEUP => {}
+
+            // Other events go directly to ftrace
+            _ => {
+                self.add_ftrace_event(&event);
+            }
         }
     }
 }
 
 impl SchedEventRecorder {
+    /// Add an event to the ftrace events map for Perfetto output.
+    fn add_ftrace_event(&mut self, event: &task_event) {
+        let ftrace_event = FtraceEvent::from(event);
+        let cpu_event = self.events.entry(event.cpu).or_default();
+        cpu_event.insert(event.ts, ftrace_event);
+    }
+
     /// Write trace data directly to a RecordCollector (Parquet-first path).
     ///
     /// This method outputs records directly without going through Perfetto format.
@@ -131,6 +288,82 @@ impl SchedEventRecorder {
                     cpu: Some(target_cpu),
                 })?;
             }
+        }
+
+        // Emit completed IRQ slices
+        for irq in &self.completed_irqs {
+            collector.add_irq_slice(IrqSliceRecord {
+                ts: irq.ts,
+                dur: irq.dur,
+                cpu: irq.cpu,
+                irq: irq.irq,
+                name: irq.name.clone(),
+                ret: irq.ret,
+            })?;
+        }
+
+        // Emit pending (unpaired) IRQ entries with dur=0 to indicate incomplete
+        // These represent IRQs that started but didn't finish before tracing ended
+        for ((cpu, _irq), pending) in &self.pending_irqs {
+            collector.add_irq_slice(IrqSliceRecord {
+                ts: pending.ts as i64,
+                dur: 0, // Incomplete - no exit event received
+                cpu: *cpu as i32,
+                irq: pending.irq,
+                name: if pending.name.is_empty() {
+                    None
+                } else {
+                    Some(pending.name.clone())
+                },
+                ret: None, // No return value without exit
+            })?;
+        }
+
+        // Emit completed softirq slices
+        for softirq in &self.completed_softirqs {
+            collector.add_softirq_slice(SoftirqSliceRecord {
+                ts: softirq.ts,
+                dur: softirq.dur,
+                cpu: softirq.cpu,
+                vec: softirq.vec,
+            })?;
+        }
+
+        // Emit pending (unpaired) softirq entries with dur=0
+        for ((cpu, _vec), pending) in &self.pending_softirqs {
+            collector.add_softirq_slice(SoftirqSliceRecord {
+                ts: pending.ts as i64,
+                dur: 0, // Incomplete - no exit event received
+                cpu: *cpu as i32,
+                vec: pending.vec,
+            })?;
+        }
+
+        // Emit wakeup_new events
+        for wakeup in &self.wakeup_news {
+            let utid = tid_to_utid
+                .get(&wakeup.pid)
+                .copied()
+                .unwrap_or(wakeup.pid as i64);
+            collector.add_wakeup_new(WakeupNewRecord {
+                ts: wakeup.ts,
+                cpu: wakeup.cpu,
+                utid,
+                target_cpu: wakeup.target_cpu,
+            })?;
+        }
+
+        // Emit process exit events
+        for exit in &self.process_exits {
+            let utid = tid_to_utid
+                .get(&exit.pid)
+                .copied()
+                .unwrap_or(exit.pid as i64);
+            collector.add_process_exit(ProcessExitRecord {
+                ts: exit.ts,
+                cpu: exit.cpu,
+                utid,
+            })?;
         }
 
         Ok(())

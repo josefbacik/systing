@@ -8,6 +8,11 @@ pub struct ParquetPaths {
     pub thread: PathBuf,
     pub sched_slice: PathBuf,
     pub thread_state: PathBuf,
+    // IRQ/softirq tables
+    pub irq_slice: PathBuf,
+    pub softirq_slice: PathBuf,
+    pub wakeup_new: PathBuf,
+    pub process_exit: PathBuf,
     pub counter: PathBuf,
     pub counter_track: PathBuf,
     pub slice: PathBuf,
@@ -40,6 +45,11 @@ impl ParquetPaths {
             thread: dir.join("thread.parquet"),
             sched_slice: dir.join("sched_slice.parquet"),
             thread_state: dir.join("thread_state.parquet"),
+            // IRQ/softirq tables
+            irq_slice: dir.join("irq_slice.parquet"),
+            softirq_slice: dir.join("softirq_slice.parquet"),
+            wakeup_new: dir.join("wakeup_new.parquet"),
+            process_exit: dir.join("process_exit.parquet"),
             counter: dir.join("counter.parquet"),
             counter_track: dir.join("counter_track.parquet"),
             slice: dir.join("slice.parquet"),
@@ -59,7 +69,7 @@ impl ParquetPaths {
     }
 
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 16] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 20] {
         [
             PathEntry {
                 path: &self.process,
@@ -76,6 +86,22 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.thread_state,
                 name: "thread_state",
+            },
+            PathEntry {
+                path: &self.irq_slice,
+                name: "irq_slice",
+            },
+            PathEntry {
+                path: &self.softirq_slice,
+                name: "softirq_slice",
+            },
+            PathEntry {
+                path: &self.wakeup_new,
+                name: "wakeup_new",
+            },
+            PathEntry {
+                path: &self.process_exit,
+                name: "process_exit",
             },
             PathEntry {
                 path: &self.counter,

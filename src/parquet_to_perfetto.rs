@@ -16,12 +16,18 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
 use perfetto_protos::clock_snapshot::ClockSnapshot;
 use perfetto_protos::debug_annotation::DebugAnnotation;
+use perfetto_protos::ftrace_event::FtraceEvent;
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
 use perfetto_protos::ftrace_event_bundle::FtraceEventBundle;
 use perfetto_protos::interned_data::InternedData;
+use perfetto_protos::irq::{
+    IrqHandlerEntryFtraceEvent, IrqHandlerExitFtraceEvent, SoftirqEntryFtraceEvent,
+    SoftirqExitFtraceEvent,
+};
 use perfetto_protos::process_descriptor::ProcessDescriptor;
 use perfetto_protos::profile_common::{Callstack, Frame, Mapping};
 use perfetto_protos::profile_packet::PerfSample;
+use perfetto_protos::sched::{SchedProcessExitFtraceEvent, SchedWakeupNewFtraceEvent};
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
 use perfetto_protos::trace_packet::TracePacket;
@@ -30,6 +36,9 @@ use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::TrackEvent;
 
 use crate::perfetto::{StreamingTraceWriter, TraceWriter};
+
+/// Default process priority (nice value 0 = priority 120 in kernel).
+const DEFAULT_PRIORITY: i32 = 120;
 
 /// Convert parquet files in input_dir to a Perfetto trace at output_file.
 pub fn convert(input_dir: &Path, output_file: &Path) -> Result<()> {
@@ -105,6 +114,12 @@ impl ParquetToPerfettoConverter {
 
         // 5. Write sched data (compact_sched format)
         self.write_sched_data(input_dir, writer)?;
+
+        // 5b. Write IRQ/softirq data as FtraceEvents
+        self.write_irq_softirq_data(input_dir, writer)?;
+
+        // 5c. Write wakeup_new and process_exit as FtraceEvents
+        self.write_misc_sched_events(input_dir, writer)?;
 
         // 6. Write slice events (TYPE_SLICE_BEGIN/END)
         self.write_slice_events(input_dir, writer)?;
@@ -475,7 +490,7 @@ impl ParquetToPerfettoConverter {
                     ts,
                     pid: tid,
                     target_cpu,
-                    prio: 120, // Default priority
+                    prio: DEFAULT_PRIORITY,
                     comm,
                 });
             }
@@ -541,6 +556,277 @@ impl ParquetToPerfettoConverter {
                 let mut bundle = FtraceEventBundle::default();
                 bundle.set_cpu(cpu as u32);
                 bundle.compact_sched = Some(compact_sched).into();
+
+                let mut packet = TracePacket::default();
+                packet.set_ftrace_events(bundle);
+                writer.write_packet(&packet)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write IRQ and softirq data as FtraceEvents
+    fn write_irq_softirq_data(
+        &mut self,
+        input_dir: &Path,
+        writer: &mut dyn TraceWriter,
+    ) -> Result<()> {
+        let irq_path = input_dir.join("irq_slice.parquet");
+        let softirq_path = input_dir.join("softirq_slice.parquet");
+
+        // Collect all FtraceEvents keyed by (cpu, timestamp)
+        let mut cpu_events: HashMap<i32, Vec<(i64, FtraceEvent)>> = HashMap::new();
+
+        // Process IRQ slices -> generate entry and exit events
+        if irq_path.exists() {
+            let batches = read_parquet_file(&irq_path)?;
+            for batch in &batches {
+                let timestamps = batch
+                    .column_by_name("ts")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing ts column in irq_slice")?;
+                let durs = batch
+                    .column_by_name("dur")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing dur column in irq_slice")?;
+                let cpus = batch
+                    .column_by_name("cpu")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing cpu column in irq_slice")?;
+                let irqs = batch
+                    .column_by_name("irq")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing irq column in irq_slice")?;
+                let names = batch
+                    .column_by_name("name")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+                let rets = batch
+                    .column_by_name("ret")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+
+                for i in 0..batch.num_rows() {
+                    let ts = timestamps.value(i);
+                    let dur = durs.value(i);
+                    let cpu = cpus.value(i);
+                    let irq = irqs.value(i);
+                    let name = get_optional_string(names, i).unwrap_or_default();
+                    let ret = get_optional_i32(rets, i).unwrap_or(0);
+
+                    // Create entry event
+                    let mut entry_event = FtraceEvent::default();
+                    entry_event.set_timestamp(ts as u64);
+                    entry_event.set_pid(0); // IRQs don't have a pid, use 0
+                    let mut entry = IrqHandlerEntryFtraceEvent::default();
+                    entry.set_irq(irq);
+                    entry.set_name(name);
+                    entry_event.set_irq_handler_entry(entry);
+
+                    // Create exit event
+                    let mut exit_event = FtraceEvent::default();
+                    exit_event.set_timestamp((ts + dur) as u64);
+                    exit_event.set_pid(0);
+                    let mut exit = IrqHandlerExitFtraceEvent::default();
+                    exit.set_irq(irq);
+                    exit.set_ret(ret);
+                    exit_event.set_irq_handler_exit(exit);
+
+                    let events_for_cpu = cpu_events.entry(cpu).or_default();
+                    events_for_cpu.push((ts, entry_event));
+                    events_for_cpu.push((ts + dur, exit_event));
+                }
+            }
+        }
+
+        // Process softirq slices -> generate entry and exit events
+        if softirq_path.exists() {
+            let batches = read_parquet_file(&softirq_path)?;
+            for batch in &batches {
+                let timestamps = batch
+                    .column_by_name("ts")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing ts column in softirq_slice")?;
+                let durs = batch
+                    .column_by_name("dur")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing dur column in softirq_slice")?;
+                let cpus = batch
+                    .column_by_name("cpu")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing cpu column in softirq_slice")?;
+                let vecs = batch
+                    .column_by_name("vec")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing vec column in softirq_slice")?;
+
+                for i in 0..batch.num_rows() {
+                    let ts = timestamps.value(i);
+                    let dur = durs.value(i);
+                    let cpu = cpus.value(i);
+                    let vec = vecs.value(i);
+
+                    // Create entry event
+                    let mut entry_event = FtraceEvent::default();
+                    entry_event.set_timestamp(ts as u64);
+                    entry_event.set_pid(0); // Softirqs don't have a pid, use 0
+                    let mut entry = SoftirqEntryFtraceEvent::default();
+                    entry.set_vec(vec as u32);
+                    entry_event.set_softirq_entry(entry);
+
+                    // Create exit event
+                    let mut exit_event = FtraceEvent::default();
+                    exit_event.set_timestamp((ts + dur) as u64);
+                    exit_event.set_pid(0);
+                    let mut exit = SoftirqExitFtraceEvent::default();
+                    exit.set_vec(vec as u32);
+                    exit_event.set_softirq_exit(exit);
+
+                    let events_for_cpu = cpu_events.entry(cpu).or_default();
+                    events_for_cpu.push((ts, entry_event));
+                    events_for_cpu.push((ts + dur, exit_event));
+                }
+            }
+        }
+
+        // Write FtraceEventBundle for each CPU
+        for (cpu, mut events) in cpu_events {
+            // Sort by timestamp
+            events.sort_by_key(|(ts, _)| *ts);
+
+            let ftrace_events: Vec<FtraceEvent> = events.into_iter().map(|(_, e)| e).collect();
+
+            if !ftrace_events.is_empty() {
+                let mut bundle = FtraceEventBundle::default();
+                bundle.set_cpu(cpu as u32);
+                bundle.event = ftrace_events;
+
+                let mut packet = TracePacket::default();
+                packet.set_ftrace_events(bundle);
+                writer.write_packet(&packet)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write wakeup_new and process_exit as FtraceEvents
+    fn write_misc_sched_events(
+        &mut self,
+        input_dir: &Path,
+        writer: &mut dyn TraceWriter,
+    ) -> Result<()> {
+        let wakeup_path = input_dir.join("wakeup_new.parquet");
+        let exit_path = input_dir.join("process_exit.parquet");
+
+        // Need thread/process info for the events
+        let thread_path = input_dir.join("thread.parquet");
+        let utid_to_thread = if thread_path.exists() {
+            self.build_utid_to_thread_map(&thread_path)?
+        } else {
+            HashMap::new()
+        };
+
+        let mut cpu_events: HashMap<i32, Vec<(i64, FtraceEvent)>> = HashMap::new();
+
+        // Process wakeup_new events
+        if wakeup_path.exists() {
+            let batches = read_parquet_file(&wakeup_path)?;
+            for batch in &batches {
+                let timestamps = batch
+                    .column_by_name("ts")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing ts column in wakeup_new")?;
+                let cpus = batch
+                    .column_by_name("cpu")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing cpu column in wakeup_new")?;
+                let utids = batch
+                    .column_by_name("utid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing utid column in wakeup_new")?;
+                let target_cpus = batch
+                    .column_by_name("target_cpu")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing target_cpu column in wakeup_new")?;
+
+                for i in 0..batch.num_rows() {
+                    let ts = timestamps.value(i);
+                    let cpu = cpus.value(i);
+                    let utid = utids.value(i);
+                    let target_cpu = target_cpus.value(i);
+
+                    let (pid, comm) = utid_to_thread
+                        .get(&utid)
+                        .cloned()
+                        .unwrap_or((utid as i32, String::new()));
+
+                    let mut ftrace_event = FtraceEvent::default();
+                    ftrace_event.set_timestamp(ts as u64);
+                    ftrace_event.set_pid(pid as u32);
+                    let mut wakeup = SchedWakeupNewFtraceEvent::default();
+                    wakeup.set_pid(pid);
+                    wakeup.set_comm(comm);
+                    wakeup.set_target_cpu(target_cpu);
+                    wakeup.set_prio(DEFAULT_PRIORITY);
+                    ftrace_event.set_sched_wakeup_new(wakeup);
+
+                    cpu_events.entry(cpu).or_default().push((ts, ftrace_event));
+                }
+            }
+        }
+
+        // Process process_exit events
+        if exit_path.exists() {
+            let batches = read_parquet_file(&exit_path)?;
+            for batch in &batches {
+                let timestamps = batch
+                    .column_by_name("ts")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing ts column in process_exit")?;
+                let cpus = batch
+                    .column_by_name("cpu")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing cpu column in process_exit")?;
+                let utids = batch
+                    .column_by_name("utid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing utid column in process_exit")?;
+
+                for i in 0..batch.num_rows() {
+                    let ts = timestamps.value(i);
+                    let cpu = cpus.value(i);
+                    let utid = utids.value(i);
+
+                    let (pid, comm) = utid_to_thread
+                        .get(&utid)
+                        .cloned()
+                        .unwrap_or((utid as i32, String::new()));
+
+                    let mut ftrace_event = FtraceEvent::default();
+                    ftrace_event.set_timestamp(ts as u64);
+                    ftrace_event.set_pid(pid as u32);
+                    let mut exit = SchedProcessExitFtraceEvent::default();
+                    exit.set_pid(pid);
+                    exit.set_tgid(pid); // Use pid as tgid (we don't have separate tgid)
+                    exit.set_comm(comm);
+                    exit.set_prio(DEFAULT_PRIORITY);
+                    ftrace_event.set_sched_process_exit(exit);
+
+                    cpu_events.entry(cpu).or_default().push((ts, ftrace_event));
+                }
+            }
+        }
+
+        // Write FtraceEventBundle for each CPU
+        for (cpu, mut events) in cpu_events {
+            events.sort_by_key(|(ts, _)| *ts);
+
+            let ftrace_events: Vec<FtraceEvent> = events.into_iter().map(|(_, e)| e).collect();
+
+            if !ftrace_events.is_empty() {
+                let mut bundle = FtraceEventBundle::default();
+                bundle.set_cpu(cpu as u32);
+                bundle.event = ftrace_events;
 
                 let mut packet = TracePacket::default();
                 packet.set_ftrace_events(bundle);

@@ -26,9 +26,9 @@ use crate::parquet::ParquetPaths;
 use crate::record::RecordCollector;
 use crate::trace::{
     self, ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, InstantArgRecord,
-    InstantRecord, NetworkInterfaceRecord, ProcessRecord, SchedSliceRecord, SliceRecord,
-    SocketConnectionRecord, StackRecord, StackSampleRecord, ThreadRecord, ThreadStateRecord,
-    TrackRecord,
+    InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, ProcessExitRecord, ProcessRecord,
+    SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord,
+    StackSampleRecord, ThreadRecord, ThreadStateRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -54,6 +54,10 @@ pub struct StreamingParquetWriter {
     threads: Vec<ThreadRecord>,
     sched_slices: Vec<SchedSliceRecord>,
     thread_states: Vec<ThreadStateRecord>,
+    irq_slices: Vec<IrqSliceRecord>,
+    softirq_slices: Vec<SoftirqSliceRecord>,
+    wakeup_news: Vec<WakeupNewRecord>,
+    process_exits: Vec<ProcessExitRecord>,
     counters: Vec<CounterRecord>,
     counter_tracks: Vec<CounterTrackRecord>,
     slices: Vec<SliceRecord>,
@@ -72,6 +76,10 @@ pub struct StreamingParquetWriter {
     thread_writer: Option<ArrowWriter<File>>,
     sched_slice_writer: Option<ArrowWriter<File>>,
     thread_state_writer: Option<ArrowWriter<File>>,
+    irq_slice_writer: Option<ArrowWriter<File>>,
+    softirq_slice_writer: Option<ArrowWriter<File>>,
+    wakeup_new_writer: Option<ArrowWriter<File>>,
+    process_exit_writer: Option<ArrowWriter<File>>,
     counter_writer: Option<ArrowWriter<File>>,
     counter_track_writer: Option<ArrowWriter<File>>,
     slice_writer: Option<ArrowWriter<File>>,
@@ -130,6 +138,10 @@ impl StreamingParquetWriter {
             threads: Vec::with_capacity(1024),   // Low volume
             sched_slices: Vec::with_capacity(batch_size), // High volume
             thread_states: Vec::with_capacity(batch_size), // High volume
+            irq_slices: Vec::with_capacity(batch_size), // High volume
+            softirq_slices: Vec::with_capacity(batch_size), // High volume
+            wakeup_news: Vec::with_capacity(1024), // Medium volume
+            process_exits: Vec::with_capacity(1024), // Medium volume
             counters: Vec::with_capacity(batch_size), // High volume
             counter_tracks: Vec::with_capacity(256), // Low volume
             slices: Vec::with_capacity(batch_size), // High volume
@@ -147,6 +159,10 @@ impl StreamingParquetWriter {
             thread_writer: None,
             sched_slice_writer: None,
             thread_state_writer: None,
+            irq_slice_writer: None,
+            softirq_slice_writer: None,
+            wakeup_new_writer: None,
+            process_exit_writer: None,
             counter_writer: None,
             counter_track_writer: None,
             slice_writer: None,
@@ -282,6 +298,86 @@ impl StreamingParquetWriter {
         let batch = build_thread_state_batch(&self.thread_states, &schema)?;
         writer.write(&batch)?;
         self.thread_states.clear();
+        Ok(())
+    }
+
+    // Flush irq_slices buffer
+    fn flush_irq_slices(&mut self) -> Result<()> {
+        if self.irq_slices.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::irq_slice_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.irq_slice_writer,
+            &self.paths.irq_slice,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_irq_slice_batch(&self.irq_slices, &schema)?;
+        writer.write(&batch)?;
+        self.irq_slices.clear();
+        Ok(())
+    }
+
+    // Flush softirq_slices buffer
+    fn flush_softirq_slices(&mut self) -> Result<()> {
+        if self.softirq_slices.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::softirq_slice_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.softirq_slice_writer,
+            &self.paths.softirq_slice,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_softirq_slice_batch(&self.softirq_slices, &schema)?;
+        writer.write(&batch)?;
+        self.softirq_slices.clear();
+        Ok(())
+    }
+
+    // Flush wakeup_news buffer
+    fn flush_wakeup_news(&mut self) -> Result<()> {
+        if self.wakeup_news.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::wakeup_new_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.wakeup_new_writer,
+            &self.paths.wakeup_new,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_wakeup_new_batch(&self.wakeup_news, &schema)?;
+        writer.write(&batch)?;
+        self.wakeup_news.clear();
+        Ok(())
+    }
+
+    // Flush process_exits buffer
+    fn flush_process_exits(&mut self) -> Result<()> {
+        if self.process_exits.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::process_exit_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.process_exit_writer,
+            &self.paths.process_exit,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_process_exit_batch(&self.process_exits, &schema)?;
+        writer.write(&batch)?;
+        self.process_exits.clear();
         Ok(())
     }
 
@@ -546,6 +642,10 @@ impl StreamingParquetWriter {
         close_writer!(self.thread_writer);
         close_writer!(self.sched_slice_writer);
         close_writer!(self.thread_state_writer);
+        close_writer!(self.irq_slice_writer);
+        close_writer!(self.softirq_slice_writer);
+        close_writer!(self.wakeup_new_writer);
+        close_writer!(self.process_exit_writer);
         close_writer!(self.counter_writer);
         close_writer!(self.counter_track_writer);
         close_writer!(self.slice_writer);
@@ -573,6 +673,10 @@ impl Drop for StreamingParquetWriter {
             || self.thread_writer.is_some()
             || self.sched_slice_writer.is_some()
             || self.thread_state_writer.is_some()
+            || self.irq_slice_writer.is_some()
+            || self.softirq_slice_writer.is_some()
+            || self.wakeup_new_writer.is_some()
+            || self.process_exit_writer.is_some()
             || self.counter_writer.is_some()
             || self.counter_track_writer.is_some()
             || self.slice_writer.is_some()
@@ -633,6 +737,42 @@ impl RecordCollector for StreamingParquetWriter {
         self.total_records += 1;
         if Self::should_flush(&self.thread_states, self.batch_size) {
             self.flush_thread_states()?;
+        }
+        Ok(())
+    }
+
+    fn add_irq_slice(&mut self, record: IrqSliceRecord) -> Result<()> {
+        self.irq_slices.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.irq_slices, self.batch_size) {
+            self.flush_irq_slices()?;
+        }
+        Ok(())
+    }
+
+    fn add_softirq_slice(&mut self, record: SoftirqSliceRecord) -> Result<()> {
+        self.softirq_slices.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.softirq_slices, self.batch_size) {
+            self.flush_softirq_slices()?;
+        }
+        Ok(())
+    }
+
+    fn add_wakeup_new(&mut self, record: WakeupNewRecord) -> Result<()> {
+        self.wakeup_news.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.wakeup_news, self.batch_size) {
+            self.flush_wakeup_news()?;
+        }
+        Ok(())
+    }
+
+    fn add_process_exit(&mut self, record: ProcessExitRecord) -> Result<()> {
+        self.process_exits.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.process_exits, self.batch_size) {
+            self.flush_process_exits()?;
         }
         Ok(())
     }
@@ -750,6 +890,10 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_threads()?;
         self.flush_sched_slices()?;
         self.flush_thread_states()?;
+        self.flush_irq_slices()?;
+        self.flush_softirq_slices()?;
+        self.flush_wakeup_news()?;
+        self.flush_process_exits()?;
         self.flush_counters()?;
         self.flush_counter_tracks()?;
         self.flush_slices()?;
@@ -886,6 +1030,114 @@ fn build_thread_state_batch(
             Arc::new(utid_builder.finish()),
             Arc::new(state_builder.finish()),
             Arc::new(cpu_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_irq_slice_batch(records: &[IrqSliceRecord], schema: &Arc<Schema>) -> Result<RecordBatch> {
+    let mut ts_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_builder = Int64Builder::with_capacity(records.len());
+    let mut cpu_builder = Int32Builder::with_capacity(records.len());
+    let mut irq_builder = Int32Builder::with_capacity(records.len());
+    let mut name_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
+    let mut ret_builder = Int32Builder::with_capacity(records.len());
+
+    for record in records {
+        ts_builder.append_value(record.ts);
+        dur_builder.append_value(record.dur);
+        cpu_builder.append_value(record.cpu);
+        irq_builder.append_value(record.irq);
+        name_builder.append_option(record.name.as_deref());
+        ret_builder.append_option(record.ret);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(ts_builder.finish()),
+            Arc::new(dur_builder.finish()),
+            Arc::new(cpu_builder.finish()),
+            Arc::new(irq_builder.finish()),
+            Arc::new(name_builder.finish()),
+            Arc::new(ret_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_softirq_slice_batch(
+    records: &[SoftirqSliceRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut ts_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_builder = Int64Builder::with_capacity(records.len());
+    let mut cpu_builder = Int32Builder::with_capacity(records.len());
+    let mut vec_builder = Int32Builder::with_capacity(records.len());
+
+    for record in records {
+        ts_builder.append_value(record.ts);
+        dur_builder.append_value(record.dur);
+        cpu_builder.append_value(record.cpu);
+        vec_builder.append_value(record.vec);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(ts_builder.finish()),
+            Arc::new(dur_builder.finish()),
+            Arc::new(cpu_builder.finish()),
+            Arc::new(vec_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_wakeup_new_batch(
+    records: &[WakeupNewRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut ts_builder = Int64Builder::with_capacity(records.len());
+    let mut cpu_builder = Int32Builder::with_capacity(records.len());
+    let mut utid_builder = Int64Builder::with_capacity(records.len());
+    let mut target_cpu_builder = Int32Builder::with_capacity(records.len());
+
+    for record in records {
+        ts_builder.append_value(record.ts);
+        cpu_builder.append_value(record.cpu);
+        utid_builder.append_value(record.utid);
+        target_cpu_builder.append_value(record.target_cpu);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(ts_builder.finish()),
+            Arc::new(cpu_builder.finish()),
+            Arc::new(utid_builder.finish()),
+            Arc::new(target_cpu_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_process_exit_batch(
+    records: &[ProcessExitRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut ts_builder = Int64Builder::with_capacity(records.len());
+    let mut cpu_builder = Int32Builder::with_capacity(records.len());
+    let mut utid_builder = Int64Builder::with_capacity(records.len());
+
+    for record in records {
+        ts_builder.append_value(record.ts);
+        cpu_builder.append_value(record.cpu);
+        utid_builder.append_value(record.utid);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(ts_builder.finish()),
+            Arc::new(cpu_builder.finish()),
+            Arc::new(utid_builder.finish()),
         ],
     )?)
 }

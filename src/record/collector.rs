@@ -8,9 +8,9 @@ use anyhow::Result;
 
 use crate::trace::{
     ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ExtractedData,
-    InstantArgRecord, InstantRecord, NetworkInterfaceRecord, ProcessRecord, SchedSliceRecord,
-    SliceRecord, SocketConnectionRecord, StackRecord, StackSampleRecord, ThreadRecord,
-    ThreadStateRecord, TrackRecord,
+    InstantArgRecord, InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, ProcessExitRecord,
+    ProcessRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord,
+    StackRecord, StackSampleRecord, ThreadRecord, ThreadStateRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Trait for collecting trace records during recording.
@@ -40,6 +40,18 @@ pub trait RecordCollector {
 
     /// Add a thread state record.
     fn add_thread_state(&mut self, record: ThreadStateRecord) -> Result<()>;
+
+    /// Add an IRQ slice record.
+    fn add_irq_slice(&mut self, record: IrqSliceRecord) -> Result<()>;
+
+    /// Add a softirq slice record.
+    fn add_softirq_slice(&mut self, record: SoftirqSliceRecord) -> Result<()>;
+
+    /// Add a wakeup new record.
+    fn add_wakeup_new(&mut self, record: WakeupNewRecord) -> Result<()>;
+
+    /// Add a process exit record.
+    fn add_process_exit(&mut self, record: ProcessExitRecord) -> Result<()>;
 
     /// Add a counter record.
     fn add_counter(&mut self, record: CounterRecord) -> Result<()>;
@@ -130,6 +142,26 @@ impl RecordCollector for InMemoryCollector {
 
     fn add_thread_state(&mut self, record: ThreadStateRecord) -> Result<()> {
         self.data.thread_states.push(record);
+        Ok(())
+    }
+
+    fn add_irq_slice(&mut self, record: IrqSliceRecord) -> Result<()> {
+        self.data.irq_slices.push(record);
+        Ok(())
+    }
+
+    fn add_softirq_slice(&mut self, record: SoftirqSliceRecord) -> Result<()> {
+        self.data.softirq_slices.push(record);
+        Ok(())
+    }
+
+    fn add_wakeup_new(&mut self, record: WakeupNewRecord) -> Result<()> {
+        self.data.wakeup_news.push(record);
+        Ok(())
+    }
+
+    fn add_process_exit(&mut self, record: ProcessExitRecord) -> Result<()> {
+        self.data.process_exits.push(record);
         Ok(())
     }
 
