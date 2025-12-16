@@ -16,6 +16,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_event::track_event::Type;
@@ -715,6 +716,14 @@ impl TraceExtractor {
             if let Some(counter) = track_desc.counter.as_ref() {
                 let unit = if counter.has_unit_name() {
                     Some(counter.unit_name().to_string())
+                } else if counter.has_unit() {
+                    // Convert enum to string for storage
+                    match counter.unit() {
+                        Unit::UNIT_COUNT => Some("count".to_string()),
+                        Unit::UNIT_TIME_NS => Some("time_ns".to_string()),
+                        Unit::UNIT_SIZE_BYTES => Some("size_bytes".to_string()),
+                        Unit::UNIT_UNSPECIFIED => None,
+                    }
                 } else {
                     None
                 };
