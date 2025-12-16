@@ -15,6 +15,8 @@ use arrow::array::{
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
 use perfetto_protos::clock_snapshot::ClockSnapshot;
+use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
+use perfetto_protos::counter_descriptor::CounterDescriptor;
 use perfetto_protos::debug_annotation::DebugAnnotation;
 use perfetto_protos::ftrace_event::FtraceEvent;
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
@@ -1260,10 +1262,14 @@ impl ParquetToPerfettoConverter {
                     .column_by_name("name")
                     .and_then(|c| c.as_any().downcast_ref::<StringArray>())
                     .context("Missing name column")?;
+                let units = batch
+                    .column_by_name("unit")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
                 for i in 0..batch.num_rows() {
                     let id = ids.value(i);
                     let name = names.value(i).to_string();
+                    let unit = get_optional_string(units, i);
 
                     // Allocate UUID if not already done
                     let uuid = if let Some(&existing) = self.track_id_to_uuid.get(&id) {
@@ -1278,9 +1284,20 @@ impl ParquetToPerfettoConverter {
                     desc.set_uuid(uuid);
                     desc.set_name(name);
 
-                    // Mark as counter track
-                    let counter = perfetto_protos::counter_descriptor::CounterDescriptor::default();
-                    desc.counter = Some(counter).into();
+                    // Mark as counter track with unit
+                    let mut counter_desc = CounterDescriptor::default();
+                    if let Some(unit_str) = unit {
+                        // Map known unit strings to enum values
+                        match unit_str.as_str() {
+                            "" | "unspecified" => {} // Leave unit unset
+                            "count" => counter_desc.set_unit(Unit::UNIT_COUNT),
+                            "ns" | "time_ns" => counter_desc.set_unit(Unit::UNIT_TIME_NS),
+                            "bytes" | "size_bytes" => counter_desc.set_unit(Unit::UNIT_SIZE_BYTES),
+                            // For unknown units, use unit_name for custom display
+                            other => counter_desc.set_unit_name(other.to_string()),
+                        }
+                    }
+                    desc.counter = Some(counter_desc).into();
 
                     let mut packet = TracePacket::default();
                     packet.set_track_descriptor(desc);
