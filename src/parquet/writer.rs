@@ -32,7 +32,7 @@ use crate::trace::{
 };
 
 /// Default batch size for streaming writes.
-const DEFAULT_BATCH_SIZE: usize = 50_000;
+const DEFAULT_BATCH_SIZE: usize = 200_000;
 
 /// A streaming Parquet writer that implements `RecordCollector`.
 ///
@@ -918,6 +918,10 @@ impl RecordCollector for StreamingParquetWriter {
         // Return first error encountered, but ensure both operations were attempted
         flush_result?;
         close_result
+    }
+
+    fn finish_boxed(self: Box<Self>) -> Result<()> {
+        (*self).finish()
     }
 }
 

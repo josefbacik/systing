@@ -24,6 +24,34 @@ use perfetto_protos::irq::{
 use perfetto_protos::sched::{SchedProcessExitFtraceEvent, SchedWakeupNewFtraceEvent};
 use perfetto_protos::trace_packet::TracePacket;
 
+/// Threshold for flushing streaming sched slices to the collector.
+/// Lower than Parquet batch size (200K) to reduce peak memory while maintaining I/O efficiency.
+const STREAMING_SCHED_FLUSH_THRESHOLD: usize = 10_000;
+
+/// Convert kernel task state to Perfetto-compatible string representation.
+fn task_state_to_string(state: u64) -> Option<String> {
+    match state {
+        0 => None,                     // TASK_RUNNING - no end state when preempted
+        1 => Some("S".to_string()),    // TASK_INTERRUPTIBLE
+        2 => Some("D".to_string()),    // TASK_UNINTERRUPTIBLE
+        4 => Some("T".to_string()),    // __TASK_STOPPED
+        8 => Some("t".to_string()),    // __TASK_TRACED
+        16 => Some("X".to_string()),   // EXIT_DEAD
+        32 => Some("Z".to_string()),   // EXIT_ZOMBIE
+        64 => Some("P".to_string()),   // TASK_PARKED
+        128 => Some("I".to_string()),  // TASK_IDLE
+        _ => Some(format!("{state}")), // Compound states
+    }
+}
+
+/// Per-CPU state tracking for streaming scheduler events.
+/// Stores information about the currently running task on each CPU.
+struct CpuRunningState {
+    start_ts: i64,
+    tid: i32,
+    prio: i32,
+}
+
 #[derive(Default)]
 struct LocalCompactSched {
     compact_sched: CompactSched,
@@ -38,6 +66,13 @@ struct PendingIrq {
     ts: u64,
     irq: i32,
     name: String,
+}
+
+impl PendingIrq {
+    /// Returns the name as Option, converting empty string to None.
+    fn name_option(&self) -> Option<String> {
+        (!self.name.is_empty()).then(|| self.name.clone())
+    }
 }
 
 /// Pending softirq entry waiting for matching exit.
@@ -96,6 +131,10 @@ pub struct SchedEventRecorder {
     completed_softirqs: Vec<CompletedSoftirq>,
     wakeup_news: Vec<WakeupNewEvent>,
     process_exits: Vec<ProcessExitEvent>,
+    // Streaming support: per-CPU state tracking
+    cpu_states: HashMap<u32, CpuRunningState>,
+    pending_slices: Vec<SchedSliceRecord>,
+    streaming_collector: Option<Box<dyn RecordCollector + Send>>,
 }
 
 impl SystingRecordEvent<task_event> for SchedEventRecorder {
@@ -111,6 +150,45 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
         match event.r#type {
             // SCHED_SWITCH and SCHED_WAKING use compact sched format
             event_type::SCHED_SWITCH | event_type::SCHED_WAKING => {
+                // Handle streaming mode for SCHED_SWITCH
+                if event.r#type == event_type::SCHED_SWITCH && self.streaming_collector.is_some() {
+                    // Emit completed slice for previous running task
+                    if let Some(prev_state) = self.cpu_states.get(&event.cpu) {
+                        let dur = event.ts as i64 - prev_state.start_ts;
+                        let end_state = task_state_to_string(event.prev_state);
+
+                        self.pending_slices.push(SchedSliceRecord {
+                            ts: prev_state.start_ts,
+                            dur,
+                            cpu: event.cpu as i32,
+                            utid: prev_state.tid as i64, // Using tid as utid for streaming
+                            end_state,
+                            priority: prev_state.prio,
+                        });
+
+                        // Flush if we have accumulated enough slices
+                        if self.pending_slices.len() >= STREAMING_SCHED_FLUSH_THRESHOLD {
+                            if let Some(collector) = &mut self.streaming_collector {
+                                for slice in self.pending_slices.drain(..) {
+                                    if let Err(e) = collector.add_sched_slice(slice) {
+                                        eprintln!("Warning: Failed to stream sched slice: {e}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Update state for next task
+                    self.cpu_states.insert(
+                        event.cpu,
+                        CpuRunningState {
+                            start_ts: event.ts as i64,
+                            tid: event.next.tgidpid as i32,
+                            prio: event.next_prio as i32,
+                        },
+                    );
+                }
+
                 let compact_sched = self.compact_sched.entry(event.cpu).or_default();
                 compact_sched.add_task_event(&event);
             }
@@ -138,18 +216,30 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                 let ret = event.next_prio as i32;
                 if let Some(pending) = self.pending_irqs.remove(&(event.cpu, irq)) {
                     let dur = event.ts.saturating_sub(pending.ts) as i64;
-                    self.completed_irqs.push(CompletedIrq {
-                        ts: pending.ts as i64,
-                        dur,
-                        cpu: event.cpu as i32,
-                        irq: pending.irq,
-                        name: if pending.name.is_empty() {
-                            None
-                        } else {
-                            Some(pending.name)
-                        },
-                        ret: Some(ret),
-                    });
+
+                    // If streaming, emit immediately and skip memory storage
+                    if let Some(collector) = &mut self.streaming_collector {
+                        if let Err(e) = collector.add_irq_slice(IrqSliceRecord {
+                            ts: pending.ts as i64,
+                            dur,
+                            cpu: event.cpu as i32,
+                            irq: pending.irq,
+                            name: pending.name_option(),
+                            ret: Some(ret),
+                        }) {
+                            eprintln!("Warning: Failed to stream IRQ slice: {e}");
+                        }
+                    } else {
+                        // Non-streaming: store in memory for later write_records()
+                        self.completed_irqs.push(CompletedIrq {
+                            ts: pending.ts as i64,
+                            dur,
+                            cpu: event.cpu as i32,
+                            irq: pending.irq,
+                            name: pending.name_option(),
+                            ret: Some(ret),
+                        });
+                    }
                 }
                 self.add_ftrace_event(&event);
             }
@@ -167,12 +257,26 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                 let vec = event.target_cpu as i32;
                 if let Some(pending) = self.pending_softirqs.remove(&(event.cpu, vec)) {
                     let dur = event.ts.saturating_sub(pending.ts) as i64;
-                    self.completed_softirqs.push(CompletedSoftirq {
-                        ts: pending.ts as i64,
-                        dur,
-                        cpu: event.cpu as i32,
-                        vec: pending.vec,
-                    });
+
+                    // If streaming, emit immediately and skip memory storage
+                    if let Some(collector) = &mut self.streaming_collector {
+                        if let Err(e) = collector.add_softirq_slice(SoftirqSliceRecord {
+                            ts: pending.ts as i64,
+                            dur,
+                            cpu: event.cpu as i32,
+                            vec: pending.vec,
+                        }) {
+                            eprintln!("Warning: Failed to stream softirq slice: {e}");
+                        }
+                    } else {
+                        // Non-streaming: store in memory for later write_records()
+                        self.completed_softirqs.push(CompletedSoftirq {
+                            ts: pending.ts as i64,
+                            dur,
+                            cpu: event.cpu as i32,
+                            vec: pending.vec,
+                        });
+                    }
                 }
                 self.add_ftrace_event(&event);
             }
@@ -210,6 +314,11 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
 }
 
 impl SchedEventRecorder {
+    /// Set the streaming collector for real-time event emission.
+    pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
+        self.streaming_collector = Some(collector);
+    }
+
     /// Add an event to the ftrace events map for Perfetto output.
     fn add_ftrace_event(&mut self, event: &task_event) {
         let ftrace_event = FtraceEvent::from(event);
@@ -367,6 +476,64 @@ impl SchedEventRecorder {
         }
 
         Ok(())
+    }
+
+    /// Finish streaming and emit final records for incomplete events.
+    ///
+    /// This method should be called at the end of recording to:
+    /// 1. Emit final slices for still-running tasks on each CPU
+    /// 2. Emit unpaired IRQs/softirqs with dur=0
+    /// 3. Flush any remaining pending_slices to collector
+    ///
+    /// Returns the streaming collector so the caller can call finish() on it.
+    pub fn finish(&mut self, end_ts: i64) -> Result<Option<Box<dyn RecordCollector + Send>>> {
+        if let Some(collector) = &mut self.streaming_collector {
+            // Emit final slices for still-running tasks on each CPU
+            for (cpu, state) in &self.cpu_states {
+                let dur = end_ts - state.start_ts;
+                collector.add_sched_slice(SchedSliceRecord {
+                    ts: state.start_ts,
+                    dur,
+                    cpu: *cpu as i32,
+                    utid: state.tid as i64,
+                    end_state: None, // Still running at trace end
+                    priority: state.prio,
+                })?;
+            }
+
+            // Flush any remaining pending slices
+            for slice in self.pending_slices.drain(..) {
+                collector.add_sched_slice(slice)?;
+            }
+
+            // Emit unpaired IRQs with dur=0 to indicate incomplete
+            for ((cpu, _irq), pending) in &self.pending_irqs {
+                collector.add_irq_slice(IrqSliceRecord {
+                    ts: pending.ts as i64,
+                    dur: 0, // Incomplete - no exit event received
+                    cpu: *cpu as i32,
+                    irq: pending.irq,
+                    name: pending.name_option(),
+                    ret: None, // No return value without exit
+                })?;
+            }
+
+            // Emit unpaired softirqs with dur=0
+            for ((cpu, _vec), pending) in &self.pending_softirqs {
+                collector.add_softirq_slice(SoftirqSliceRecord {
+                    ts: pending.ts as i64,
+                    dur: 0, // Incomplete - no exit event received
+                    cpu: *cpu as i32,
+                    vec: pending.vec,
+                })?;
+            }
+
+            // Flush buffers before returning collector
+            collector.flush()?;
+        }
+
+        // Take ownership of the collector and return it
+        Ok(self.streaming_collector.take())
     }
 
     /// Write trace data to Perfetto format (legacy path).
