@@ -994,6 +994,16 @@ impl SessionRecorder {
             .unwrap()
             .set_streaming_collector(Box::new(probe_writer));
 
+        // Set up streaming collector for perf counter recorder (events emitted immediately).
+        // Perf counters get their own writer because counter tracks are self-contained and
+        // the local track_id counter (starting at 1) is safe since each writer outputs to
+        // separate parquet files (counter.parquet, counter_track.parquet).
+        let perf_writer = StreamingParquetWriter::new(output_dir)?;
+        self.perf_counter_recorder
+            .lock()
+            .unwrap()
+            .set_streaming_collector(Box::new(perf_writer));
+
         Ok(())
     }
 
@@ -1174,11 +1184,20 @@ impl SessionRecorder {
             )?;
         }
 
-        eprintln!("Writing perf counter records...");
-        self.perf_counter_recorder
-            .lock()
-            .unwrap()
-            .write_records(&mut *writer, &mut track_id_counter)?;
+        // Handle perf counter records (streaming or non-streaming)
+        let perf_streaming = self.perf_counter_recorder.lock().unwrap().is_streaming();
+        if perf_streaming {
+            eprintln!("Flushing perf counter records from streaming...");
+            if let Some(perf_collector) = self.perf_counter_recorder.lock().unwrap().finish()? {
+                perf_collector.finish_boxed()?;
+            }
+        } else {
+            eprintln!("Writing perf counter records...");
+            self.perf_counter_recorder
+                .lock()
+                .unwrap()
+                .write_records(&mut *writer, &mut track_id_counter)?;
+        }
 
         eprintln!("Writing sysinfo records...");
         self.sysinfo_recorder
