@@ -142,31 +142,36 @@ impl StreamingParquetWriter {
             paths,
             batch_size,
             writer_props,
-            // Buffers with appropriate capacities
-            processes: Vec::with_capacity(1024), // Low volume
-            threads: Vec::with_capacity(1024),   // Low volume
-            sched_slices: Vec::with_capacity(batch_size), // High volume
-            thread_states: Vec::with_capacity(batch_size), // High volume
-            irq_slices: Vec::with_capacity(batch_size), // High volume
-            softirq_slices: Vec::with_capacity(batch_size), // High volume
-            wakeup_news: Vec::with_capacity(1024), // Medium volume
-            process_exits: Vec::with_capacity(1024), // Medium volume
-            counters: Vec::with_capacity(batch_size), // High volume
-            counter_tracks: Vec::with_capacity(256), // Low volume
-            slices: Vec::with_capacity(batch_size), // High volume
-            tracks: Vec::with_capacity(256),     // Low volume
-            instants: Vec::with_capacity(batch_size), // High volume
-            args: Vec::with_capacity(batch_size), // High volume
-            instant_args: Vec::with_capacity(batch_size), // High volume
-            stacks: Vec::with_capacity(4096),    // Medium volume (unique stacks)
-            stack_samples: Vec::with_capacity(batch_size), // High volume
-            network_interfaces: Vec::with_capacity(64), // Very low volume
-            socket_connections: Vec::with_capacity(256), // Low volume
-            network_syscalls: Vec::with_capacity(batch_size), // High volume
-            network_packets: Vec::with_capacity(batch_size), // High volume
-            network_sockets: Vec::with_capacity(256), // Low volume
-            network_polls: Vec::with_capacity(batch_size), // High volume
-            clock_snapshots: Vec::with_capacity(16), // Very low volume
+            // Buffers use lazy allocation - they grow as needed to minimize
+            // upfront memory usage. This is important because multiple
+            // StreamingParquetWriter instances may be created for different
+            // recorders, and each only uses a subset of buffer types.
+            // High-volume buffers reserve batch_size capacity on first use
+            // (see reserve_if_empty) to avoid repeated reallocations.
+            processes: Vec::new(),
+            threads: Vec::new(),
+            sched_slices: Vec::new(),
+            thread_states: Vec::new(),
+            irq_slices: Vec::new(),
+            softirq_slices: Vec::new(),
+            wakeup_news: Vec::new(),
+            process_exits: Vec::new(),
+            counters: Vec::new(),
+            counter_tracks: Vec::new(),
+            slices: Vec::new(),
+            tracks: Vec::new(),
+            instants: Vec::new(),
+            args: Vec::new(),
+            instant_args: Vec::new(),
+            stacks: Vec::new(),
+            stack_samples: Vec::new(),
+            network_interfaces: Vec::new(),
+            socket_connections: Vec::new(),
+            network_syscalls: Vec::new(),
+            network_packets: Vec::new(),
+            network_sockets: Vec::new(),
+            network_polls: Vec::new(),
+            clock_snapshots: Vec::new(),
             // Writers start as None, created lazily
             process_writer: None,
             thread_writer: None,
@@ -217,6 +222,16 @@ impl StreamingParquetWriter {
     // Helper to check if a buffer needs flushing
     fn should_flush<T>(buffer: &[T], batch_size: usize) -> bool {
         buffer.len() >= batch_size
+    }
+
+    // Helper to reserve capacity for high-volume buffers on first use.
+    // This gives us lazy allocation (no memory until first record) while
+    // avoiding repeated reallocations for buffers that will be heavily used.
+    #[inline]
+    fn reserve_if_empty<T>(buffer: &mut Vec<T>, capacity: usize) {
+        if buffer.is_empty() {
+            buffer.reserve(capacity);
+        }
     }
 
     // Helper to create or get a writer
@@ -829,6 +844,7 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_sched_slice(&mut self, record: SchedSliceRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.sched_slices, self.batch_size);
         self.sched_slices.push(record);
         self.total_records += 1;
         if Self::should_flush(&self.sched_slices, self.batch_size) {
@@ -838,6 +854,7 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_thread_state(&mut self, record: ThreadStateRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.thread_states, self.batch_size);
         self.thread_states.push(record);
         self.total_records += 1;
         if Self::should_flush(&self.thread_states, self.batch_size) {
@@ -847,6 +864,7 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_irq_slice(&mut self, record: IrqSliceRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.irq_slices, self.batch_size);
         self.irq_slices.push(record);
         self.total_records += 1;
         if Self::should_flush(&self.irq_slices, self.batch_size) {
@@ -856,6 +874,7 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_softirq_slice(&mut self, record: SoftirqSliceRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.softirq_slices, self.batch_size);
         self.softirq_slices.push(record);
         self.total_records += 1;
         if Self::should_flush(&self.softirq_slices, self.batch_size) {
@@ -883,6 +902,7 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_counter(&mut self, record: CounterRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.counters, self.batch_size);
         self.counters.push(record);
         self.total_records += 1;
         if Self::should_flush(&self.counters, self.batch_size) {
@@ -901,6 +921,7 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_slice(&mut self, record: SliceRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.slices, self.batch_size);
         self.slices.push(record);
         self.total_records += 1;
         if Self::should_flush(&self.slices, self.batch_size) {
@@ -919,6 +940,7 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_instant(&mut self, record: InstantRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.instants, self.batch_size);
         self.instants.push(record);
         self.total_records += 1;
         if Self::should_flush(&self.instants, self.batch_size) {
@@ -928,6 +950,7 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_arg(&mut self, record: ArgRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.args, self.batch_size);
         self.args.push(record);
         self.total_records += 1;
         if Self::should_flush(&self.args, self.batch_size) {
@@ -937,6 +960,7 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_instant_arg(&mut self, record: InstantArgRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.instant_args, self.batch_size);
         self.instant_args.push(record);
         self.total_records += 1;
         if Self::should_flush(&self.instant_args, self.batch_size) {
@@ -955,6 +979,7 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_stack_sample(&mut self, record: StackSampleRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.stack_samples, self.batch_size);
         self.stack_samples.push(record);
         self.total_records += 1;
         if Self::should_flush(&self.stack_samples, self.batch_size) {
@@ -991,6 +1016,7 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_network_syscall(&mut self, record: NetworkSyscallRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.network_syscalls, self.batch_size);
         self.network_syscalls.push(record);
         self.total_records += 1;
         if Self::should_flush(&self.network_syscalls, self.batch_size) {
@@ -1000,6 +1026,7 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_network_packet(&mut self, record: NetworkPacketRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.network_packets, self.batch_size);
         self.network_packets.push(record);
         self.total_records += 1;
         if Self::should_flush(&self.network_packets, self.batch_size) {
@@ -1018,6 +1045,7 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_network_poll(&mut self, record: NetworkPollRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.network_polls, self.batch_size);
         self.network_polls.push(record);
         self.total_records += 1;
         if Self::should_flush(&self.network_polls, self.batch_size) {
@@ -1481,17 +1509,14 @@ fn build_instant_arg_batch(
 }
 
 fn build_stack_batch(records: &[StackRecord], schema: &Arc<Schema>) -> Result<RecordBatch> {
-    // Estimate average stack depth for capacity hints (typical stacks are 20-50 frames)
-    const AVG_STACK_DEPTH: usize = 32;
-    let estimated_total_frames = records.len() * AVG_STACK_DEPTH;
-
+    // Use minimal capacity hints and let Arrow grow buffers as needed.
+    // This significantly reduces peak memory usage during stack flushing.
+    // The previous aggressive estimates (32 frames * 64 bytes * num_records)
+    // could allocate hundreds of MB upfront.
     let mut id_builder = Int64Builder::with_capacity(records.len());
-    let mut frame_names_builder = ListBuilder::with_capacity(
-        StringBuilder::with_capacity(estimated_total_frames, estimated_total_frames * 64),
-        records.len(),
-    );
+    let mut frame_names_builder = ListBuilder::new(StringBuilder::new());
     let mut depth_builder = Int32Builder::with_capacity(records.len());
-    let mut leaf_name_builder = StringBuilder::with_capacity(records.len(), records.len() * 64);
+    let mut leaf_name_builder = StringBuilder::new();
 
     for record in records {
         id_builder.append_value(record.id);
