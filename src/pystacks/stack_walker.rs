@@ -432,6 +432,34 @@ impl StackWalkerRun {
             self.init(bpf_object.as_libbpf_object(), &mut pid_opts);
         }
     }
+
+    /// Get Python frame names as formatted strings for streaming mode.
+    /// Returns a vector of frame name strings in the format:
+    /// "function_name (python) [filename:line]"
+    pub fn get_python_frame_names(&self, py_stack: &[PyAddr]) -> Vec<String> {
+        if !self.initialized() || py_stack.is_empty() {
+            return Vec::new();
+        }
+
+        py_stack
+            .iter()
+            .map(|frame| {
+                let func_name = self.symbolize_function(frame);
+                let (filename, line_number) = self.symbolize_filename_line(frame);
+
+                // Extract just the base filename
+                let base_filename = std::path::Path::new(&filename)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(&filename);
+
+                match line_number {
+                    Some(line) => format!("{func_name} (python) [{base_filename}:{line}]"),
+                    None => format!("{func_name} (python) [{base_filename}]"),
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(feature = "pystacks")]
@@ -509,6 +537,11 @@ impl StackWalkerRun {
 
     pub fn init_pystacks(&mut self, _pids: &[u32], _bpf_object: &Object) {
         // Stub implementation when pystacks feature is disabled
+    }
+
+    pub fn get_python_frame_names(&self, _py_stack: &[PyAddr]) -> Vec<String> {
+        // Stub implementation when pystacks feature is disabled
+        Vec::new()
     }
 }
 
