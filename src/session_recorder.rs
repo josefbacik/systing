@@ -963,7 +963,7 @@ impl SessionRecorder {
         Ok(())
     }
 
-    /// Initialize streaming parquet output for the scheduler and stack recorders.
+    /// Initialize streaming parquet output for the scheduler, stack, and network recorders.
     /// This must be called BEFORE recording starts to enable streaming of events
     /// directly to parquet files.
     ///
@@ -979,6 +979,9 @@ impl SessionRecorder {
 
         // Enable streaming mode for stack recorder (samples buffered, written at end)
         self.stack_recorder.lock().unwrap().enable_streaming();
+
+        // Enable streaming mode for network recorder (events buffered, written at end)
+        self.network_recorder.lock().unwrap().enable_streaming();
 
         Ok(())
     }
@@ -1140,6 +1143,23 @@ impl SessionRecorder {
             )?;
         }
 
+        // Handle network records - streaming mode uses finish(), non-streaming uses write_records()
+        let network_streaming = self.network_recorder.lock().unwrap().is_streaming();
+        if network_streaming {
+            eprintln!("Flushing network trace records...");
+            // Pass ownership to finish(), which returns it after writing
+            writer = self.network_recorder.lock().unwrap().finish(writer)?;
+        } else {
+            eprintln!("Writing network trace records...");
+            self.network_recorder.lock().unwrap().write_records(
+                &mut *writer,
+                &tid_to_utid,
+                &mut track_id_counter,
+                &mut slice_id_counter,
+                &mut instant_id_counter,
+            )?;
+        }
+
         eprintln!("Writing perf counter records...");
         self.perf_counter_recorder
             .lock()
@@ -1154,15 +1174,6 @@ impl SessionRecorder {
 
         eprintln!("Writing probe trace records...");
         self.probe_recorder.lock().unwrap().write_records(
-            &mut *writer,
-            &tid_to_utid,
-            &mut track_id_counter,
-            &mut slice_id_counter,
-            &mut instant_id_counter,
-        )?;
-
-        eprintln!("Writing network trace records...");
-        self.network_recorder.lock().unwrap().write_records(
             &mut *writer,
             &tid_to_utid,
             &mut track_id_counter,
