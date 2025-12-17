@@ -260,30 +260,65 @@ impl StackRecorder {
 
         let mut symbolizer = self.create_symbolizer();
 
-        // Iterate over unique_stacks - key is (Stack, tgid), value is stack_id
+        // Create kernel source once - it's shared across all processes
+        let kernel_src = Source::Kernel(Kernel::default());
+
+        // Address cache: blazesym caches metadata (KASLR, ELF parsing) but not individual
+        // symbolization results. We cache (addr, tgid) -> frame_name to avoid re-symbolizing
+        // the same address across different stacks.
+        let mut addr_cache: HashMap<(u64, i32), String> = HashMap::new();
+
+        // Group stacks by tgid to reuse process sources efficiently
+        let mut stacks_by_tgid: HashMap<i32, Vec<(&Stack, i64)>> = HashMap::new();
         for ((stack, tgid), stack_id) in self.unique_stacks.iter() {
-            // Symbolize this stack using the stored tgid
-            let frame_names = self.symbolize_stack_to_names(&mut symbolizer, stack, *tgid as u32);
+            stacks_by_tgid
+                .entry(*tgid)
+                .or_default()
+                .push((stack, *stack_id));
+        }
 
-            // Update progress bar
-            if let Some(ref pb) = progress_bar {
-                pb.inc(1);
+        // Process each tgid group with a single Source per process
+        for (tgid, stacks) in stacks_by_tgid.iter() {
+            // Create process source once per tgid
+            let proc_src = Source::Process(Process::new(Pid::from(*tgid as u32)));
+
+            // Pre-cache process metadata for this tgid (best-effort optimization;
+            // result is ignored as caching failure doesn't affect correctness)
+            let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(
+                (*tgid as u32).into(),
+            )));
+
+            for (stack, stack_id) in stacks {
+                // Symbolize this stack using the shared sources and address cache
+                let frame_names = self.symbolize_stack_with_sources_cached(
+                    &mut symbolizer,
+                    stack,
+                    &proc_src,
+                    &kernel_src,
+                    *tgid,
+                    &mut addr_cache,
+                );
+
+                // Update progress bar
+                if let Some(ref pb) = progress_bar {
+                    pb.inc(1);
+                }
+
+                // Skip empty stacks
+                if frame_names.is_empty() {
+                    continue;
+                }
+
+                let leaf_name = frame_names.first().cloned().unwrap_or_default();
+                let depth = frame_names.len().min(i32::MAX as usize) as i32;
+
+                collector.add_stack(StackRecord {
+                    id: *stack_id,
+                    frame_names,
+                    depth,
+                    leaf_name,
+                })?;
             }
-
-            // Skip empty stacks
-            if frame_names.is_empty() {
-                continue;
-            }
-
-            let leaf_name = frame_names.first().cloned().unwrap_or_default();
-            let depth = frame_names.len().min(i32::MAX as usize) as i32;
-
-            collector.add_stack(StackRecord {
-                id: *stack_id,
-                frame_names,
-                depth,
-                leaf_name,
-            })?;
         }
 
         // Finish the progress bar
@@ -302,74 +337,57 @@ impl StackRecorder {
     }
 
     /// Symbolize a single stack and return frame names.
-    /// This is a simplified version of the symbolization logic for streaming.
-    /// Handles user, kernel, and Python stacks.
-    fn symbolize_stack_to_names(
+    /// Takes pre-created Source objects and an address cache for efficiency.
+    /// Blazesym caches metadata (KASLR, ELF parsing) but not symbolization results,
+    /// so we maintain our own cache for individual addresses.
+    fn symbolize_stack_with_sources_cached(
         &self,
         symbolizer: &mut Symbolizer,
         stack: &Stack,
-        tgid: u32,
+        proc_src: &Source<'_>,
+        kernel_src: &Source<'_>,
+        tgid: i32,
+        addr_cache: &mut HashMap<(u64, i32), String>,
     ) -> Vec<String> {
         let mut frame_names = Vec::with_capacity(
             stack.user_stack.len() + stack.kernel_stack.len() + stack.py_stack.len(),
         );
 
-        // Cache process metadata for this specific process (required for symbolization)
-        let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(tgid.into())));
-
         // Symbolize Python stack first (if present)
-        // Note: For simplicity, we prepend Python frames rather than merging them
-        // into the user stack at the correct locations like the non-streaming path does
         let python_frames = self.psr.get_python_frame_names(&stack.py_stack);
         frame_names.extend(python_frames);
 
-        // Symbolize user addresses (leaf)
-        let proc_src = Source::Process(Process::new(Pid::from(tgid)));
+        // Symbolize user addresses (leaf) - use tgid for cache key
         for &addr in &stack.user_stack {
-            let frame_name = symbolizer
-                .symbolize_single(&proc_src, Input::AbsAddr(addr))
-                .ok()
-                .and_then(|s| s.into_sym())
-                .map(|s| {
-                    let module_name = s
-                        .module
-                        .as_ref()
-                        .and_then(|m| m.to_str())
-                        .and_then(|m| std::path::Path::new(m).file_name())
-                        .and_then(|f| f.to_str())
-                        .unwrap_or("unknown");
-                    let location_info = format_location_info(&s.code_info);
-                    format!(
-                        "{} ({}{}) <{:#x}>",
-                        s.name, module_name, location_info, addr
-                    )
+            let frame_name = addr_cache
+                .entry((addr, tgid))
+                .or_insert_with(|| {
+                    symbolizer
+                        .symbolize_single(proc_src, Input::AbsAddr(addr))
+                        .ok()
+                        .and_then(|s| s.into_sym())
+                        .map(|s| format_symbolized_frame(&s, addr, "unknown"))
+                        .unwrap_or_else(|| format!("0x{addr:x}"))
                 })
-                .unwrap_or_else(|| format!("0x{addr:x}"));
+                .clone();
             frame_names.push(frame_name);
         }
 
-        // Symbolize kernel addresses (root)
-        let kernel_src = Source::Kernel(Kernel::default());
+        // Symbolize kernel addresses (root).
+        // Use tgid=0 since KASLR offset is system-wide; the same kernel address
+        // resolves identically for all processes.
         for &addr in &stack.kernel_stack {
-            let frame_name = symbolizer
-                .symbolize_single(&kernel_src, Input::AbsAddr(addr))
-                .ok()
-                .and_then(|s| s.into_sym())
-                .map(|s| {
-                    let module_name = s
-                        .module
-                        .as_ref()
-                        .and_then(|m| m.to_str())
-                        .and_then(|m| std::path::Path::new(m).file_name())
-                        .and_then(|f| f.to_str())
-                        .unwrap_or("[kernel]");
-                    let location_info = format_location_info(&s.code_info);
-                    format!(
-                        "{} ({}{}) <{:#x}>",
-                        s.name, module_name, location_info, addr
-                    )
+            let frame_name = addr_cache
+                .entry((addr, 0))
+                .or_insert_with(|| {
+                    symbolizer
+                        .symbolize_single(kernel_src, Input::AbsAddr(addr))
+                        .ok()
+                        .and_then(|s| s.into_sym())
+                        .map(|s| format_symbolized_frame(&s, addr, "[kernel]"))
+                        .unwrap_or_else(|| format!("unknown ([kernel]) <{addr:#x}>"))
                 })
-                .unwrap_or_else(|| format!("unknown ([kernel]) <{addr:#x}>"));
+                .clone();
             frame_names.push(frame_name);
         }
 
@@ -842,6 +860,23 @@ fn format_location_info(code_info: &Option<blazesym::symbolize::CodeInfo>) -> St
             format!(" [{file_name}]")
         }
     })
+}
+
+/// Formats a symbolized frame as a string with module and location info.
+/// Format: "function_name (module_name [file:line]) <0xaddr>"
+fn format_symbolized_frame(sym: &Sym, addr: u64, default_module: &str) -> String {
+    let module_name = sym
+        .module
+        .as_ref()
+        .and_then(|m| m.to_str())
+        .and_then(|m| std::path::Path::new(m).file_name())
+        .and_then(|f| f.to_str())
+        .unwrap_or(default_module);
+    let location_info = format_location_info(&sym.code_info);
+    format!(
+        "{} ({}{}) <{:#x}>",
+        sym.name, module_name, location_info, addr
+    )
 }
 
 pub fn stack_to_frames_mapping<'a, I>(
