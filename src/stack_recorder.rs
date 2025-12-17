@@ -133,6 +133,18 @@ pub struct StackRecorder {
     pub psr: Arc<StackWalkerRun>,
     pub process_dispatcher: Option<Arc<ProcessDispatcher>>,
     pub global_func_manager: Arc<GlobalFunctionManager>,
+    // Streaming support
+    /// Whether streaming mode is enabled. When true, stacks are deduplicated during
+    /// recording and samples are buffered for later writing via finish().
+    streaming_enabled: bool,
+    /// Maps (Stack, tgid) to stack_id for deduplication during streaming.
+    /// The tgid is included in the key because the same addresses in different processes
+    /// may resolve to different symbols (e.g., shared libraries at fixed addresses).
+    unique_stacks: HashMap<(Stack, i32), i64>,
+    /// Next stack_id to assign for new unique stacks.
+    next_stack_id: i64,
+    /// Pending samples buffer for streaming.
+    pending_samples: Vec<StackSampleRecord>,
 }
 
 impl Default for StackRecorder {
@@ -144,6 +156,10 @@ impl Default for StackRecorder {
             psr: Arc::new(StackWalkerRun::default()),
             process_dispatcher: None,
             global_func_manager: Arc::new(GlobalFunctionManager::new(id_counter)),
+            streaming_enabled: false,
+            unique_stacks: HashMap::new(),
+            next_stack_id: 1,
+            pending_samples: Vec::new(),
         }
     }
 }
@@ -163,7 +179,201 @@ impl StackRecorder {
             psr: Arc::new(StackWalkerRun::default()),
             process_dispatcher,
             global_func_manager: Arc::new(GlobalFunctionManager::new(id_counter)),
+            streaming_enabled: false,
+            unique_stacks: HashMap::new(),
+            next_stack_id: 1,
+            pending_samples: Vec::new(),
         }
+    }
+
+    /// Enable streaming mode for stack recording.
+    /// When enabled, stacks are deduplicated during recording and samples are
+    /// buffered for later writing via finish().
+    pub fn enable_streaming(&mut self) {
+        self.streaming_enabled = true;
+    }
+
+    /// Create a symbolizer with the configured process dispatcher.
+    fn create_symbolizer(&self) -> Symbolizer {
+        if let Some(dispatcher) = &self.process_dispatcher {
+            let dispatcher = dispatcher.clone();
+            Symbolizer::builder()
+                .enable_code_info(true)
+                .enable_inlined_fns(true)
+                .set_process_dispatcher(move |info| dispatcher(info))
+                .build()
+        } else {
+            Symbolizer::builder()
+                .enable_code_info(true)
+                .enable_inlined_fns(true)
+                .build()
+        }
+    }
+
+    /// Finish streaming and symbolize all unique stacks.
+    ///
+    /// This method should be called at the end of recording to:
+    /// 1. Flush any remaining pending samples to the collector
+    /// 2. Symbolize all unique stacks collected during recording
+    /// 3. Stream StackRecords for each unique stack
+    ///
+    /// # Arguments
+    /// * `collector` - The collector to write samples and stacks to. This is typically
+    ///   the collector returned by sched recorder's finish().
+    ///
+    /// Returns the collector so it can be passed to other recorders or finished.
+    pub fn finish(
+        &mut self,
+        mut collector: Box<dyn RecordCollector + Send>,
+    ) -> Result<Box<dyn RecordCollector + Send>> {
+        // Check if streaming was enabled (we have pending samples/unique stacks)
+        if self.unique_stacks.is_empty() {
+            return Ok(collector);
+        }
+
+        // Flush pending samples to the collector
+        eprintln!(
+            "Flushing {} pending stack samples...",
+            self.pending_samples.len()
+        );
+        for sample in self.pending_samples.drain(..) {
+            collector.add_stack_sample(sample)?;
+        }
+
+        // Now symbolize all unique stacks and stream StackRecords
+        let total_stacks = self.unique_stacks.len();
+        let progress_bar = if total_stacks > 0 {
+            let pb = ProgressBar::new(total_stacks as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(
+                        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} stacks ({per_sec}, {eta})"
+                    )
+                    .expect("Failed to set progress bar template")
+                    .progress_chars("#>-"),
+            );
+            pb.set_message("Symbolizing stacks");
+            Some(pb)
+        } else {
+            None
+        };
+
+        let mut symbolizer = self.create_symbolizer();
+
+        // Iterate over unique_stacks - key is (Stack, tgid), value is stack_id
+        for ((stack, tgid), stack_id) in self.unique_stacks.iter() {
+            // Symbolize this stack using the stored tgid
+            let frame_names = self.symbolize_stack_to_names(&mut symbolizer, stack, *tgid as u32);
+
+            // Update progress bar
+            if let Some(ref pb) = progress_bar {
+                pb.inc(1);
+            }
+
+            // Skip empty stacks
+            if frame_names.is_empty() {
+                continue;
+            }
+
+            let leaf_name = frame_names.first().cloned().unwrap_or_default();
+            let depth = frame_names.len().min(i32::MAX as usize) as i32;
+
+            collector.add_stack(StackRecord {
+                id: *stack_id,
+                frame_names,
+                depth,
+                leaf_name,
+            })?;
+        }
+
+        // Finish the progress bar
+        if let Some(pb) = progress_bar {
+            pb.finish_with_message("Stack symbolization complete");
+        }
+
+        // Flush and return the collector
+        collector.flush()?;
+        Ok(collector)
+    }
+
+    /// Check if streaming mode is enabled.
+    pub fn is_streaming(&self) -> bool {
+        self.streaming_enabled
+    }
+
+    /// Symbolize a single stack and return frame names.
+    /// This is a simplified version of the symbolization logic for streaming.
+    /// Handles user, kernel, and Python stacks.
+    fn symbolize_stack_to_names(
+        &self,
+        symbolizer: &mut Symbolizer,
+        stack: &Stack,
+        tgid: u32,
+    ) -> Vec<String> {
+        let mut frame_names = Vec::with_capacity(
+            stack.user_stack.len() + stack.kernel_stack.len() + stack.py_stack.len(),
+        );
+
+        // Cache process metadata for this specific process (required for symbolization)
+        let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(tgid.into())));
+
+        // Symbolize Python stack first (if present)
+        // Note: For simplicity, we prepend Python frames rather than merging them
+        // into the user stack at the correct locations like the non-streaming path does
+        let python_frames = self.psr.get_python_frame_names(&stack.py_stack);
+        frame_names.extend(python_frames);
+
+        // Symbolize user addresses (leaf)
+        let proc_src = Source::Process(Process::new(Pid::from(tgid)));
+        for &addr in &stack.user_stack {
+            let frame_name = symbolizer
+                .symbolize_single(&proc_src, Input::AbsAddr(addr))
+                .ok()
+                .and_then(|s| s.into_sym())
+                .map(|s| {
+                    let module_name = s
+                        .module
+                        .as_ref()
+                        .and_then(|m| m.to_str())
+                        .and_then(|m| std::path::Path::new(m).file_name())
+                        .and_then(|f| f.to_str())
+                        .unwrap_or("unknown");
+                    let location_info = format_location_info(&s.code_info);
+                    format!(
+                        "{} ({}{}) <{:#x}>",
+                        s.name, module_name, location_info, addr
+                    )
+                })
+                .unwrap_or_else(|| format!("0x{addr:x}"));
+            frame_names.push(frame_name);
+        }
+
+        // Symbolize kernel addresses (root)
+        let kernel_src = Source::Kernel(Kernel::default());
+        for &addr in &stack.kernel_stack {
+            let frame_name = symbolizer
+                .symbolize_single(&kernel_src, Input::AbsAddr(addr))
+                .ok()
+                .and_then(|s| s.into_sym())
+                .map(|s| {
+                    let module_name = s
+                        .module
+                        .as_ref()
+                        .and_then(|m| m.to_str())
+                        .and_then(|m| std::path::Path::new(m).file_name())
+                        .and_then(|f| f.to_str())
+                        .unwrap_or("[kernel]");
+                    let location_info = format_location_info(&s.code_info);
+                    format!(
+                        "{} ({}{}) <{:#x}>",
+                        s.name, module_name, location_info, addr
+                    )
+                })
+                .unwrap_or_else(|| format!("unknown ([kernel]) <{addr:#x}>"));
+            frame_names.push(frame_name);
+        }
+
+        frame_names
     }
 
     pub fn init_pystacks(&mut self, pids: &[u32], bpf_object: &libbpf_rs::Object) {
@@ -340,22 +550,7 @@ impl StackRecorder {
 
         // Process each unique stack
         for (tgid, events) in self.stacks.iter() {
-            let pid = tgid >> 32;
-
-            // Create a symbolizer for this process
-            let symbolizer = if let Some(dispatcher) = &self.process_dispatcher {
-                let dispatcher = dispatcher.clone();
-                Symbolizer::builder()
-                    .enable_code_info(true)
-                    .enable_inlined_fns(true)
-                    .set_process_dispatcher(move |info| dispatcher(info))
-                    .build()
-            } else {
-                Symbolizer::builder()
-                    .enable_code_info(true)
-                    .enable_inlined_fns(true)
-                    .build()
-            };
+            let symbolizer = self.create_symbolizer();
 
             // Process each unique stack for this tgid
             let unique_stacks: HashSet<_> = events.iter().map(|e| &e.stack).collect();
@@ -387,7 +582,7 @@ impl StackRecorder {
                     let frame_name = if *is_kernel {
                         let kernel_src = Source::Kernel(Kernel::default());
                         let sym_result =
-                            symbolizer.symbolize_single(&kernel_src, Input::VirtOffset(*addr));
+                            symbolizer.symbolize_single(&kernel_src, Input::AbsAddr(*addr));
                         sym_result
                             .ok()
                             .and_then(|s| s.into_sym())
@@ -407,9 +602,9 @@ impl StackRecorder {
                             })
                             .unwrap_or_else(|| format!("unknown ([kernel]) <{:#x}>", *addr))
                     } else {
-                        let proc_src = Source::Process(Process::new(Pid::from(pid as u32)));
+                        let proc_src = Source::Process(Process::new(Pid::from(*tgid as u32)));
                         let sym_result =
-                            symbolizer.symbolize_single(&proc_src, Input::VirtOffset(*addr));
+                            symbolizer.symbolize_single(&proc_src, Input::AbsAddr(*addr));
                         sym_result
                             .ok()
                             .and_then(|s| s.into_sym())
@@ -498,19 +693,7 @@ impl StackRecorder {
 
         // Create a single symbolizer to reuse across all processes
         // This avoids the ~60ms initialization overhead per process
-        let mut symbolizer = if let Some(dispatcher) = &self.process_dispatcher {
-            let dispatcher = dispatcher.clone();
-            Symbolizer::builder()
-                .enable_code_info(true)
-                .enable_inlined_fns(true)
-                .set_process_dispatcher(move |info| dispatcher(info))
-                .build()
-        } else {
-            Symbolizer::builder()
-                .enable_code_info(true)
-                .enable_inlined_fns(true)
-                .build()
-        };
+        let mut symbolizer = self.create_symbolizer();
 
         // Create a progress bar if we have addresses to process
         let progress_bar = if total_addresses > 0 {
@@ -1011,16 +1194,42 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
             let stack_key = (event.task.tgidpid >> 32) as i32;
             let py_stack = self.psr.get_pystack_from_event(&event);
 
-            let stack = StackEvent {
-                tgidpid: event.task.tgidpid,
-                ts_start: event.ts,
-                stack: Stack::new(&kstack_vec, &ustack_vec, &py_stack),
-            };
-            let stacks = self.stacks.entry(stack_key).or_default();
-            stacks.push(stack);
-        }
+            let stack = Stack::new(&kstack_vec, &ustack_vec, &py_stack);
+            let tid = event.task.tgidpid as i32;
+            let tgid = stack_key; // tgid for process-specific symbolization
 
-        // Symbol loading will be handled by dedicated thread via channel
+            // Streaming mode: dedupe stacks and buffer samples for streaming
+            if self.streaming_enabled {
+                // Get or assign stack_id for this (stack, tgid) pair
+                // Include tgid in key since same addresses may resolve differently per-process
+                let key = (stack, tgid);
+                let stack_id = if let Some(&id) = self.unique_stacks.get(&key) {
+                    id
+                } else {
+                    let id = self.next_stack_id;
+                    self.next_stack_id += 1;
+                    self.unique_stacks.insert(key, id);
+                    id
+                };
+
+                // Buffer the sample for streaming (will be flushed in finish())
+                self.pending_samples.push(StackSampleRecord {
+                    ts: event.ts as i64,
+                    utid: tid as i64, // Using tid as utid for streaming (like sched recorder)
+                    cpu: None,
+                    stack_id,
+                });
+            } else {
+                // Non-streaming mode: store all events for later processing
+                let stack_event = StackEvent {
+                    tgidpid: event.task.tgidpid,
+                    ts_start: event.ts,
+                    stack,
+                };
+                let stacks = self.stacks.entry(stack_key).or_default();
+                stacks.push(stack_event);
+            }
+        }
     }
 }
 

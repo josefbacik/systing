@@ -963,18 +963,23 @@ impl SessionRecorder {
         Ok(())
     }
 
-    /// Initialize streaming parquet output for the scheduler event recorder.
-    /// This must be called BEFORE recording starts to enable streaming of scheduler
-    /// events directly to parquet files.
+    /// Initialize streaming parquet output for the scheduler and stack recorders.
+    /// This must be called BEFORE recording starts to enable streaming of events
+    /// directly to parquet files.
     ///
     /// # Arguments
     /// * `output_dir` - Directory to write Parquet files to
     pub fn init_streaming_parquet(&self, output_dir: &Path) -> Result<()> {
+        // Set up streaming collector for scheduler events
         let writer = StreamingParquetWriter::new(output_dir)?;
         self.event_recorder
             .lock()
             .unwrap()
             .set_streaming_collector(Box::new(writer));
+
+        // Enable streaming mode for stack recorder (samples buffered, written at end)
+        self.stack_recorder.lock().unwrap().enable_streaming();
+
         Ok(())
     }
 
@@ -1003,7 +1008,7 @@ impl SessionRecorder {
         let has_streaming_collector = collector_opt.is_some();
 
         // Use the streaming collector if available, otherwise create a new writer
-        let mut writer: Box<dyn RecordCollector> = if let Some(collector) = collector_opt {
+        let mut writer: Box<dyn RecordCollector + Send> = if let Some(collector) = collector_opt {
             // We have a streaming collector with scheduler data already written
             collector
         } else {
@@ -1120,12 +1125,20 @@ impl SessionRecorder {
                 .write_records(&mut *writer, &tid_to_utid)?;
         }
 
-        eprintln!("Writing stack trace records...");
-        self.stack_recorder.lock().unwrap().write_records(
-            &mut *writer,
-            &tid_to_utid,
-            &mut stack_id_counter,
-        )?;
+        // Handle stack records - streaming mode uses finish(), non-streaming uses write_records()
+        let stack_streaming = self.stack_recorder.lock().unwrap().is_streaming();
+        if stack_streaming {
+            eprintln!("Flushing stack samples and symbolizing stacks...");
+            // Pass ownership to finish(), which returns it after writing
+            writer = self.stack_recorder.lock().unwrap().finish(writer)?;
+        } else {
+            eprintln!("Writing stack trace records...");
+            self.stack_recorder.lock().unwrap().write_records(
+                &mut *writer,
+                &tid_to_utid,
+                &mut stack_id_counter,
+            )?;
+        }
 
         eprintln!("Writing perf counter records...");
         self.perf_counter_recorder
