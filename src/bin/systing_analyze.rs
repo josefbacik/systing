@@ -1708,7 +1708,6 @@ fn create_schema(conn: &Connection) -> Result<()> {
             trace_id VARCHAR,
             id BIGINT,
             frame_names VARCHAR[],
-            frame_ids BIGINT[],
             depth INTEGER,
             leaf_name VARCHAR
         );
