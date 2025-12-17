@@ -987,6 +987,13 @@ impl SessionRecorder {
             .unwrap()
             .set_streaming_collector(Box::new(network_writer));
 
+        // Set up streaming collector for probe recorder (events emitted on completion)
+        let probe_writer = StreamingParquetWriter::new(output_dir)?;
+        self.probe_recorder
+            .lock()
+            .unwrap()
+            .set_streaming_collector(Box::new(probe_writer));
+
         Ok(())
     }
 
@@ -1179,14 +1186,23 @@ impl SessionRecorder {
             .unwrap()
             .write_records(&mut *writer, &mut track_id_counter)?;
 
-        eprintln!("Writing probe trace records...");
-        self.probe_recorder.lock().unwrap().write_records(
-            &mut *writer,
-            &tid_to_utid,
-            &mut track_id_counter,
-            &mut slice_id_counter,
-            &mut instant_id_counter,
-        )?;
+        // Handle probe records - streaming mode uses finish(), non-streaming uses write_records()
+        let probe_streaming = self.probe_recorder.lock().unwrap().is_streaming();
+        if probe_streaming {
+            eprintln!("Flushing probe trace records...");
+            if let Some(probe_collector) = self.probe_recorder.lock().unwrap().finish()? {
+                probe_collector.finish_boxed()?;
+            }
+        } else {
+            eprintln!("Writing probe trace records...");
+            self.probe_recorder.lock().unwrap().write_records(
+                &mut *writer,
+                &tid_to_utid,
+                &mut track_id_counter,
+                &mut slice_id_counter,
+                &mut instant_id_counter,
+            )?;
+        }
 
         // Step 5: Finish writing and close all files
         eprintln!("Finishing Parquet trace...");
