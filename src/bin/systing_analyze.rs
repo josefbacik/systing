@@ -1743,6 +1743,73 @@ fn create_schema(conn: &Connection) -> Result<()> {
             address_family VARCHAR
         );
 
+        -- New network tables (Phase 1 of network recorder refactor)
+        CREATE TABLE IF NOT EXISTS network_syscall (
+            trace_id VARCHAR,
+            id BIGINT,
+            ts BIGINT,
+            dur BIGINT,
+            tid INTEGER,
+            pid INTEGER,
+            event_type VARCHAR,
+            socket_id BIGINT,
+            bytes BIGINT,
+            seq BIGINT,
+            sndbuf_used BIGINT,
+            sndbuf_limit BIGINT,
+            sndbuf_fill_pct SMALLINT,
+            recv_seq_start BIGINT,
+            recv_seq_end BIGINT,
+            rcv_nxt BIGINT,
+            bytes_available BIGINT
+        );
+
+        CREATE TABLE IF NOT EXISTS network_packet (
+            trace_id VARCHAR,
+            id BIGINT,
+            ts BIGINT,
+            socket_id BIGINT,
+            event_type VARCHAR,
+            seq BIGINT,
+            length INTEGER,
+            tcp_flags VARCHAR,
+            sndbuf_used BIGINT,
+            sndbuf_limit BIGINT,
+            sndbuf_fill_pct SMALLINT,
+            is_retransmit BOOLEAN,
+            retransmit_count SMALLINT,
+            rto_ms INTEGER,
+            srtt_ms INTEGER,
+            rttvar_us INTEGER,
+            backoff SMALLINT,
+            is_zero_window_probe BOOLEAN,
+            zero_window_probe_count SMALLINT
+        );
+
+        CREATE TABLE IF NOT EXISTS network_socket (
+            trace_id VARCHAR,
+            socket_id BIGINT,
+            protocol VARCHAR,
+            address_family VARCHAR,
+            src_ip VARCHAR,
+            src_port INTEGER,
+            dest_ip VARCHAR,
+            dest_port INTEGER,
+            first_seen_ts BIGINT,
+            last_seen_ts BIGINT
+        );
+
+        CREATE TABLE IF NOT EXISTS network_poll (
+            trace_id VARCHAR,
+            id BIGINT,
+            ts BIGINT,
+            tid INTEGER,
+            pid INTEGER,
+            socket_id BIGINT,
+            requested_events VARCHAR,
+            returned_events VARCHAR
+        );
+
         CREATE TABLE IF NOT EXISTS clock_snapshot (
             trace_id VARCHAR,
             clock_id INTEGER,
@@ -1788,6 +1855,11 @@ struct ParquetPaths {
     network_interface: PathBuf,
     // Socket connection metadata
     socket_connection: PathBuf,
+    // New network tables (Phase 1 of network recorder refactor)
+    network_syscall: PathBuf,
+    network_packet: PathBuf,
+    network_socket: PathBuf,
+    network_poll: PathBuf,
     // Clock snapshot data
     clock_snapshot: PathBuf,
 }
@@ -1824,6 +1896,11 @@ impl ParquetPaths {
             network_interface: temp_dir.join(format!("{trace_id}_network_interface.parquet")),
             // Socket connection metadata
             socket_connection: temp_dir.join(format!("{trace_id}_socket_connection.parquet")),
+            // New network tables
+            network_syscall: temp_dir.join(format!("{trace_id}_network_syscall.parquet")),
+            network_packet: temp_dir.join(format!("{trace_id}_network_packet.parquet")),
+            network_socket: temp_dir.join(format!("{trace_id}_network_socket.parquet")),
+            network_poll: temp_dir.join(format!("{trace_id}_network_poll.parquet")),
             // Clock snapshot data
             clock_snapshot: temp_dir.join(format!("{trace_id}_clock_snapshot.parquet")),
         }
@@ -1859,6 +1936,10 @@ impl ParquetPaths {
             stack_sample: dir.join("stack_sample.parquet"),
             network_interface: dir.join("network_interface.parquet"),
             socket_connection: dir.join("socket_connection.parquet"),
+            network_syscall: dir.join("network_syscall.parquet"),
+            network_packet: dir.join("network_packet.parquet"),
+            network_socket: dir.join("network_socket.parquet"),
+            network_poll: dir.join("network_poll.parquet"),
             clock_snapshot: dir.join("clock_snapshot.parquet"),
         }
     }
@@ -3424,6 +3505,11 @@ fn run_convert(
     import_table("network_interface", |p| &p.network_interface)?;
     // Socket connection metadata
     import_table("socket_connection", |p| &p.socket_connection)?;
+    // New network tables
+    import_table("network_syscall", |p| &p.network_syscall)?;
+    import_table("network_packet", |p| &p.network_packet)?;
+    import_table("network_socket", |p| &p.network_socket)?;
+    import_table("network_poll", |p| &p.network_poll)?;
     // Clock snapshot data
     import_table("clock_snapshot", |p| &p.clock_snapshot)?;
 

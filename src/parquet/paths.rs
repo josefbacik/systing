@@ -23,9 +23,14 @@ pub struct ParquetPaths {
     // Stack tables
     pub stack: PathBuf,
     pub stack_sample: PathBuf,
-    // Network metadata tables
+    // Network metadata tables (legacy)
     pub network_interface: PathBuf,
     pub socket_connection: PathBuf,
+    // New network tables (Phase 1 of network recorder refactor)
+    pub network_syscall: PathBuf,
+    pub network_packet: PathBuf,
+    pub network_socket: PathBuf,
+    pub network_poll: PathBuf,
     // Clock snapshot table
     pub clock_snapshot: PathBuf,
 }
@@ -60,16 +65,21 @@ impl ParquetPaths {
             // Stack tables
             stack: dir.join("stack.parquet"),
             stack_sample: dir.join("stack_sample.parquet"),
-            // Network metadata tables
+            // Network metadata tables (legacy)
             network_interface: dir.join("network_interface.parquet"),
             socket_connection: dir.join("socket_connection.parquet"),
+            // New network tables
+            network_syscall: dir.join("network_syscall.parquet"),
+            network_packet: dir.join("network_packet.parquet"),
+            network_socket: dir.join("network_socket.parquet"),
+            network_poll: dir.join("network_poll.parquet"),
             // Clock snapshot table
             clock_snapshot: dir.join("clock_snapshot.parquet"),
         }
     }
 
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 20] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 24] {
         [
             PathEntry {
                 path: &self.process,
@@ -146,6 +156,22 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.socket_connection,
                 name: "socket_connection",
+            },
+            PathEntry {
+                path: &self.network_syscall,
+                name: "network_syscall",
+            },
+            PathEntry {
+                path: &self.network_packet,
+                name: "network_packet",
+            },
+            PathEntry {
+                path: &self.network_socket,
+                name: "network_socket",
+            },
+            PathEntry {
+                path: &self.network_poll,
+                name: "network_poll",
             },
             PathEntry {
                 path: &self.clock_snapshot,
