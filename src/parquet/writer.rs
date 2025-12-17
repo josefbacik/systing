@@ -26,9 +26,10 @@ use crate::parquet::ParquetPaths;
 use crate::record::RecordCollector;
 use crate::trace::{
     self, ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, InstantArgRecord,
-    InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, ProcessExitRecord, ProcessRecord,
-    SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord,
-    StackSampleRecord, ThreadRecord, ThreadStateRecord, TrackRecord, WakeupNewRecord,
+    InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, NetworkPacketRecord, NetworkPollRecord,
+    NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord, SchedSliceRecord,
+    SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord,
+    ThreadRecord, ThreadStateRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -69,6 +70,10 @@ pub struct StreamingParquetWriter {
     stack_samples: Vec<StackSampleRecord>,
     network_interfaces: Vec<NetworkInterfaceRecord>,
     socket_connections: Vec<SocketConnectionRecord>,
+    network_syscalls: Vec<NetworkSyscallRecord>,
+    network_packets: Vec<NetworkPacketRecord>,
+    network_sockets: Vec<NetworkSocketRecord>,
+    network_polls: Vec<NetworkPollRecord>,
     clock_snapshots: Vec<ClockSnapshotRecord>,
 
     // Persistent writers (created lazily on first flush, kept alive until finish)
@@ -91,6 +96,10 @@ pub struct StreamingParquetWriter {
     stack_sample_writer: Option<ArrowWriter<File>>,
     network_interface_writer: Option<ArrowWriter<File>>,
     socket_connection_writer: Option<ArrowWriter<File>>,
+    network_syscall_writer: Option<ArrowWriter<File>>,
+    network_packet_writer: Option<ArrowWriter<File>>,
+    network_socket_writer: Option<ArrowWriter<File>>,
+    network_poll_writer: Option<ArrowWriter<File>>,
     clock_snapshot_writer: Option<ArrowWriter<File>>,
 
     // Track counts for statistics
@@ -153,6 +162,10 @@ impl StreamingParquetWriter {
             stack_samples: Vec::with_capacity(batch_size), // High volume
             network_interfaces: Vec::with_capacity(64), // Very low volume
             socket_connections: Vec::with_capacity(256), // Low volume
+            network_syscalls: Vec::with_capacity(batch_size), // High volume
+            network_packets: Vec::with_capacity(batch_size), // High volume
+            network_sockets: Vec::with_capacity(256), // Low volume
+            network_polls: Vec::with_capacity(batch_size), // High volume
             clock_snapshots: Vec::with_capacity(16), // Very low volume
             // Writers start as None, created lazily
             process_writer: None,
@@ -174,6 +187,10 @@ impl StreamingParquetWriter {
             stack_sample_writer: None,
             network_interface_writer: None,
             socket_connection_writer: None,
+            network_syscall_writer: None,
+            network_packet_writer: None,
+            network_socket_writer: None,
+            network_poll_writer: None,
             clock_snapshot_writer: None,
             total_records: 0,
         })
@@ -621,6 +638,86 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    // Flush network_syscalls buffer
+    fn flush_network_syscalls(&mut self) -> Result<()> {
+        if self.network_syscalls.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::network_syscall_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.network_syscall_writer,
+            &self.paths.network_syscall,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_network_syscall_batch(&self.network_syscalls, &schema)?;
+        writer.write(&batch)?;
+        self.network_syscalls.clear();
+        Ok(())
+    }
+
+    // Flush network_packets buffer
+    fn flush_network_packets(&mut self) -> Result<()> {
+        if self.network_packets.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::network_packet_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.network_packet_writer,
+            &self.paths.network_packet,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_network_packet_batch(&self.network_packets, &schema)?;
+        writer.write(&batch)?;
+        self.network_packets.clear();
+        Ok(())
+    }
+
+    // Flush network_sockets buffer
+    fn flush_network_sockets(&mut self) -> Result<()> {
+        if self.network_sockets.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::network_socket_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.network_socket_writer,
+            &self.paths.network_socket,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_network_socket_batch(&self.network_sockets, &schema)?;
+        writer.write(&batch)?;
+        self.network_sockets.clear();
+        Ok(())
+    }
+
+    // Flush network_polls buffer
+    fn flush_network_polls(&mut self) -> Result<()> {
+        if self.network_polls.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::network_poll_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.network_poll_writer,
+            &self.paths.network_poll,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_network_poll_batch(&self.network_polls, &schema)?;
+        writer.write(&batch)?;
+        self.network_polls.clear();
+        Ok(())
+    }
+
     // Close all writers, attempting to close all even if some fail
     fn close_writers(&mut self) -> Result<()> {
         let mut first_error: Option<anyhow::Error> = None;
@@ -657,6 +754,10 @@ impl StreamingParquetWriter {
         close_writer!(self.stack_sample_writer);
         close_writer!(self.network_interface_writer);
         close_writer!(self.socket_connection_writer);
+        close_writer!(self.network_syscall_writer);
+        close_writer!(self.network_packet_writer);
+        close_writer!(self.network_socket_writer);
+        close_writer!(self.network_poll_writer);
         close_writer!(self.clock_snapshot_writer);
 
         match first_error {
@@ -688,6 +789,10 @@ impl Drop for StreamingParquetWriter {
             || self.stack_sample_writer.is_some()
             || self.network_interface_writer.is_some()
             || self.socket_connection_writer.is_some()
+            || self.network_syscall_writer.is_some()
+            || self.network_packet_writer.is_some()
+            || self.network_socket_writer.is_some()
+            || self.network_poll_writer.is_some()
             || self.clock_snapshot_writer.is_some();
 
         if has_open_writers {
@@ -885,6 +990,42 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn add_network_syscall(&mut self, record: NetworkSyscallRecord) -> Result<()> {
+        self.network_syscalls.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.network_syscalls, self.batch_size) {
+            self.flush_network_syscalls()?;
+        }
+        Ok(())
+    }
+
+    fn add_network_packet(&mut self, record: NetworkPacketRecord) -> Result<()> {
+        self.network_packets.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.network_packets, self.batch_size) {
+            self.flush_network_packets()?;
+        }
+        Ok(())
+    }
+
+    fn add_network_socket(&mut self, record: NetworkSocketRecord) -> Result<()> {
+        self.network_sockets.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.network_sockets, self.batch_size) {
+            self.flush_network_sockets()?;
+        }
+        Ok(())
+    }
+
+    fn add_network_poll(&mut self, record: NetworkPollRecord) -> Result<()> {
+        self.network_polls.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.network_polls, self.batch_size) {
+            self.flush_network_polls()?;
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<()> {
         self.flush_processes()?;
         self.flush_threads()?;
@@ -905,6 +1046,10 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_stack_samples()?;
         self.flush_network_interfaces()?;
         self.flush_socket_connections()?;
+        self.flush_network_syscalls()?;
+        self.flush_network_packets()?;
+        self.flush_network_sockets()?;
+        self.flush_network_polls()?;
         self.flush_clock_snapshots()?;
         Ok(())
     }
@@ -1489,6 +1634,286 @@ fn build_clock_snapshot_batch(
             Arc::new(clock_name_builder.finish()),
             Arc::new(timestamp_ns_builder.finish()),
             Arc::new(is_primary_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_network_syscall_batch(
+    records: &[NetworkSyscallRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    use arrow::array::Int16Builder;
+
+    let mut id_builder = Int64Builder::with_capacity(records.len());
+    let mut ts_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_builder = Int64Builder::with_capacity(records.len());
+    let mut tid_builder = Int32Builder::with_capacity(records.len());
+    let mut pid_builder = Int32Builder::with_capacity(records.len());
+    let mut event_type_builder = StringBuilder::with_capacity(records.len(), records.len() * 16);
+    let mut socket_id_builder = Int64Builder::with_capacity(records.len());
+    let mut bytes_builder = Int64Builder::with_capacity(records.len());
+    let mut seq_builder = Int64Builder::with_capacity(records.len());
+    let mut sndbuf_used_builder = Int64Builder::with_capacity(records.len());
+    let mut sndbuf_limit_builder = Int64Builder::with_capacity(records.len());
+    let mut sndbuf_fill_pct_builder = Int16Builder::with_capacity(records.len());
+    let mut recv_seq_start_builder = Int64Builder::with_capacity(records.len());
+    let mut recv_seq_end_builder = Int64Builder::with_capacity(records.len());
+    let mut rcv_nxt_builder = Int64Builder::with_capacity(records.len());
+    let mut bytes_available_builder = Int64Builder::with_capacity(records.len());
+
+    for record in records {
+        id_builder.append_value(record.id);
+        ts_builder.append_value(record.ts);
+        dur_builder.append_value(record.dur);
+        tid_builder.append_value(record.tid);
+        pid_builder.append_value(record.pid);
+        event_type_builder.append_value(&record.event_type);
+        socket_id_builder.append_value(record.socket_id);
+        bytes_builder.append_value(record.bytes);
+        seq_builder.append_option(record.seq);
+        sndbuf_used_builder.append_option(record.sndbuf_used);
+        sndbuf_limit_builder.append_option(record.sndbuf_limit);
+        sndbuf_fill_pct_builder.append_option(record.sndbuf_fill_pct);
+        recv_seq_start_builder.append_option(record.recv_seq_start);
+        recv_seq_end_builder.append_option(record.recv_seq_end);
+        rcv_nxt_builder.append_option(record.rcv_nxt);
+        bytes_available_builder.append_option(record.bytes_available);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_builder.finish()),
+            Arc::new(ts_builder.finish()),
+            Arc::new(dur_builder.finish()),
+            Arc::new(tid_builder.finish()),
+            Arc::new(pid_builder.finish()),
+            Arc::new(event_type_builder.finish()),
+            Arc::new(socket_id_builder.finish()),
+            Arc::new(bytes_builder.finish()),
+            Arc::new(seq_builder.finish()),
+            Arc::new(sndbuf_used_builder.finish()),
+            Arc::new(sndbuf_limit_builder.finish()),
+            Arc::new(sndbuf_fill_pct_builder.finish()),
+            Arc::new(recv_seq_start_builder.finish()),
+            Arc::new(recv_seq_end_builder.finish()),
+            Arc::new(rcv_nxt_builder.finish()),
+            Arc::new(bytes_available_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_network_packet_batch(
+    records: &[NetworkPacketRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    use arrow::array::Int16Builder;
+
+    let mut id_builder = Int64Builder::with_capacity(records.len());
+    let mut ts_builder = Int64Builder::with_capacity(records.len());
+    let mut socket_id_builder = Int64Builder::with_capacity(records.len());
+    let mut event_type_builder = StringBuilder::with_capacity(records.len(), records.len() * 24);
+    let mut seq_builder = Int64Builder::with_capacity(records.len());
+    let mut length_builder = Int32Builder::with_capacity(records.len());
+    let mut tcp_flags_builder = StringBuilder::with_capacity(records.len(), records.len() * 8);
+    let mut sndbuf_used_builder = Int64Builder::with_capacity(records.len());
+    let mut sndbuf_limit_builder = Int64Builder::with_capacity(records.len());
+    let mut sndbuf_fill_pct_builder = Int16Builder::with_capacity(records.len());
+    let mut is_retransmit_builder = BooleanBuilder::with_capacity(records.len());
+    let mut retransmit_count_builder = Int16Builder::with_capacity(records.len());
+    let mut rto_ms_builder = Int32Builder::with_capacity(records.len());
+    let mut srtt_ms_builder = Int32Builder::with_capacity(records.len());
+    let mut rttvar_us_builder = Int32Builder::with_capacity(records.len());
+    let mut backoff_builder = Int16Builder::with_capacity(records.len());
+    let mut is_zero_window_probe_builder = BooleanBuilder::with_capacity(records.len());
+    let mut is_zero_window_ack_builder = BooleanBuilder::with_capacity(records.len());
+    let mut probe_count_builder = Int16Builder::with_capacity(records.len());
+    let mut snd_wnd_builder = Int32Builder::with_capacity(records.len());
+    let mut rcv_wnd_builder = Int32Builder::with_capacity(records.len());
+    let mut rcv_buf_used_builder = Int64Builder::with_capacity(records.len());
+    let mut rcv_buf_limit_builder = Int64Builder::with_capacity(records.len());
+    let mut window_clamp_builder = Int32Builder::with_capacity(records.len());
+    let mut rcv_wscale_builder = Int16Builder::with_capacity(records.len());
+    let mut icsk_pending_builder = Int16Builder::with_capacity(records.len());
+    let mut icsk_timeout_builder = Int64Builder::with_capacity(records.len());
+    let mut drop_reason_builder = Int32Builder::with_capacity(records.len());
+    let mut drop_reason_str_builder =
+        StringBuilder::with_capacity(records.len(), records.len() * 32);
+    let mut drop_location_builder = Int64Builder::with_capacity(records.len());
+    let mut qlen_builder = Int32Builder::with_capacity(records.len());
+    let mut qlen_limit_builder = Int32Builder::with_capacity(records.len());
+    let mut sk_wmem_alloc_builder = Int64Builder::with_capacity(records.len());
+    let mut tsq_limit_builder = Int64Builder::with_capacity(records.len());
+    let mut txq_state_builder = Int32Builder::with_capacity(records.len());
+    let mut qdisc_state_builder = Int32Builder::with_capacity(records.len());
+    let mut qdisc_backlog_builder = Int64Builder::with_capacity(records.len());
+    let mut skb_addr_builder = Int64Builder::with_capacity(records.len());
+    let mut qdisc_latency_us_builder = Int32Builder::with_capacity(records.len());
+
+    for record in records {
+        id_builder.append_value(record.id);
+        ts_builder.append_value(record.ts);
+        socket_id_builder.append_value(record.socket_id);
+        event_type_builder.append_value(&record.event_type);
+        seq_builder.append_option(record.seq);
+        length_builder.append_value(record.length);
+        tcp_flags_builder.append_option(record.tcp_flags.as_deref());
+        sndbuf_used_builder.append_option(record.sndbuf_used);
+        sndbuf_limit_builder.append_option(record.sndbuf_limit);
+        sndbuf_fill_pct_builder.append_option(record.sndbuf_fill_pct);
+        is_retransmit_builder.append_value(record.is_retransmit);
+        retransmit_count_builder.append_option(record.retransmit_count);
+        rto_ms_builder.append_option(record.rto_ms);
+        srtt_ms_builder.append_option(record.srtt_ms);
+        rttvar_us_builder.append_option(record.rttvar_us);
+        backoff_builder.append_option(record.backoff);
+        is_zero_window_probe_builder.append_value(record.is_zero_window_probe);
+        is_zero_window_ack_builder.append_value(record.is_zero_window_ack);
+        probe_count_builder.append_option(record.probe_count);
+        snd_wnd_builder.append_option(record.snd_wnd);
+        rcv_wnd_builder.append_option(record.rcv_wnd);
+        rcv_buf_used_builder.append_option(record.rcv_buf_used);
+        rcv_buf_limit_builder.append_option(record.rcv_buf_limit);
+        window_clamp_builder.append_option(record.window_clamp);
+        rcv_wscale_builder.append_option(record.rcv_wscale);
+        icsk_pending_builder.append_option(record.icsk_pending);
+        icsk_timeout_builder.append_option(record.icsk_timeout);
+        drop_reason_builder.append_option(record.drop_reason);
+        drop_reason_str_builder.append_option(record.drop_reason_str.as_deref());
+        drop_location_builder.append_option(record.drop_location);
+        qlen_builder.append_option(record.qlen);
+        qlen_limit_builder.append_option(record.qlen_limit);
+        sk_wmem_alloc_builder.append_option(record.sk_wmem_alloc);
+        tsq_limit_builder.append_option(record.tsq_limit);
+        txq_state_builder.append_option(record.txq_state);
+        qdisc_state_builder.append_option(record.qdisc_state);
+        qdisc_backlog_builder.append_option(record.qdisc_backlog);
+        skb_addr_builder.append_option(record.skb_addr);
+        qdisc_latency_us_builder.append_option(record.qdisc_latency_us);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_builder.finish()),
+            Arc::new(ts_builder.finish()),
+            Arc::new(socket_id_builder.finish()),
+            Arc::new(event_type_builder.finish()),
+            Arc::new(seq_builder.finish()),
+            Arc::new(length_builder.finish()),
+            Arc::new(tcp_flags_builder.finish()),
+            Arc::new(sndbuf_used_builder.finish()),
+            Arc::new(sndbuf_limit_builder.finish()),
+            Arc::new(sndbuf_fill_pct_builder.finish()),
+            Arc::new(is_retransmit_builder.finish()),
+            Arc::new(retransmit_count_builder.finish()),
+            Arc::new(rto_ms_builder.finish()),
+            Arc::new(srtt_ms_builder.finish()),
+            Arc::new(rttvar_us_builder.finish()),
+            Arc::new(backoff_builder.finish()),
+            Arc::new(is_zero_window_probe_builder.finish()),
+            Arc::new(is_zero_window_ack_builder.finish()),
+            Arc::new(probe_count_builder.finish()),
+            Arc::new(snd_wnd_builder.finish()),
+            Arc::new(rcv_wnd_builder.finish()),
+            Arc::new(rcv_buf_used_builder.finish()),
+            Arc::new(rcv_buf_limit_builder.finish()),
+            Arc::new(window_clamp_builder.finish()),
+            Arc::new(rcv_wscale_builder.finish()),
+            Arc::new(icsk_pending_builder.finish()),
+            Arc::new(icsk_timeout_builder.finish()),
+            Arc::new(drop_reason_builder.finish()),
+            Arc::new(drop_reason_str_builder.finish()),
+            Arc::new(drop_location_builder.finish()),
+            Arc::new(qlen_builder.finish()),
+            Arc::new(qlen_limit_builder.finish()),
+            Arc::new(sk_wmem_alloc_builder.finish()),
+            Arc::new(tsq_limit_builder.finish()),
+            Arc::new(txq_state_builder.finish()),
+            Arc::new(qdisc_state_builder.finish()),
+            Arc::new(qdisc_backlog_builder.finish()),
+            Arc::new(skb_addr_builder.finish()),
+            Arc::new(qdisc_latency_us_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_network_socket_batch(
+    records: &[NetworkSocketRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut socket_id_builder = Int64Builder::with_capacity(records.len());
+    let mut protocol_builder = StringBuilder::with_capacity(records.len(), records.len() * 3);
+    let mut address_family_builder = StringBuilder::with_capacity(records.len(), records.len() * 4);
+    let mut src_ip_builder = StringBuilder::with_capacity(records.len(), records.len() * 45);
+    let mut src_port_builder = Int32Builder::with_capacity(records.len());
+    let mut dest_ip_builder = StringBuilder::with_capacity(records.len(), records.len() * 45);
+    let mut dest_port_builder = Int32Builder::with_capacity(records.len());
+    let mut first_seen_ts_builder = Int64Builder::with_capacity(records.len());
+    let mut last_seen_ts_builder = Int64Builder::with_capacity(records.len());
+
+    for record in records {
+        socket_id_builder.append_value(record.socket_id);
+        protocol_builder.append_value(&record.protocol);
+        address_family_builder.append_value(&record.address_family);
+        src_ip_builder.append_value(&record.src_ip);
+        src_port_builder.append_value(record.src_port);
+        dest_ip_builder.append_value(&record.dest_ip);
+        dest_port_builder.append_value(record.dest_port);
+        first_seen_ts_builder.append_option(record.first_seen_ts);
+        last_seen_ts_builder.append_option(record.last_seen_ts);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(socket_id_builder.finish()),
+            Arc::new(protocol_builder.finish()),
+            Arc::new(address_family_builder.finish()),
+            Arc::new(src_ip_builder.finish()),
+            Arc::new(src_port_builder.finish()),
+            Arc::new(dest_ip_builder.finish()),
+            Arc::new(dest_port_builder.finish()),
+            Arc::new(first_seen_ts_builder.finish()),
+            Arc::new(last_seen_ts_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_network_poll_batch(
+    records: &[NetworkPollRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut id_builder = Int64Builder::with_capacity(records.len());
+    let mut ts_builder = Int64Builder::with_capacity(records.len());
+    let mut tid_builder = Int32Builder::with_capacity(records.len());
+    let mut pid_builder = Int32Builder::with_capacity(records.len());
+    let mut socket_id_builder = Int64Builder::with_capacity(records.len());
+    let mut requested_events_builder =
+        StringBuilder::with_capacity(records.len(), records.len() * 16);
+    let mut returned_events_builder =
+        StringBuilder::with_capacity(records.len(), records.len() * 16);
+
+    for record in records {
+        id_builder.append_value(record.id);
+        ts_builder.append_value(record.ts);
+        tid_builder.append_value(record.tid);
+        pid_builder.append_value(record.pid);
+        socket_id_builder.append_value(record.socket_id);
+        requested_events_builder.append_value(&record.requested_events);
+        returned_events_builder.append_value(&record.returned_events);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_builder.finish()),
+            Arc::new(ts_builder.finish()),
+            Arc::new(tid_builder.finish()),
+            Arc::new(pid_builder.finish()),
+            Arc::new(socket_id_builder.finish()),
+            Arc::new(requested_events_builder.finish()),
+            Arc::new(returned_events_builder.finish()),
         ],
     )?)
 }

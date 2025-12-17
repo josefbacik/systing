@@ -270,6 +270,163 @@ pub struct SocketConnectionRecord {
     pub address_family: String,
 }
 
+// New network schema records (Phase 1 of network recorder refactor)
+
+/// Network syscall record - represents network syscalls with flattened fields.
+///
+/// Replaces slice + args for network events, enabling direct column access
+/// instead of key-value pivot queries.
+///
+/// # Fields
+/// - `id`: Unique event ID
+/// - `ts`: Start timestamp in nanoseconds
+/// - `dur`: Duration in nanoseconds
+/// - `tid`: Thread ID (from tgidpid)
+/// - `pid`: Process ID (from tgidpid)
+/// - `event_type`: Type like "tcp_send", "tcp_recv", "udp_send"
+/// - `socket_id`: Socket identifier (FK to network_socket)
+/// - `bytes`: Bytes transferred
+/// - `seq`: TCP sequence number (optional)
+/// - `sndbuf_used`: Send buffer usage (optional)
+/// - `sndbuf_limit`: Send buffer limit (optional)
+/// - `sndbuf_fill_pct`: Buffer fill percentage (optional)
+/// - `recv_seq_start`: TCP recv: copied_seq at entry (optional)
+/// - `recv_seq_end`: TCP recv: copied_seq at exit (optional)
+/// - `rcv_nxt`: TCP recv: next expected seq (optional)
+/// - `bytes_available`: TCP recv: data buffered (optional)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkSyscallRecord {
+    pub id: i64,
+    pub ts: i64,
+    pub dur: i64,
+    pub tid: i32,
+    pub pid: i32,
+    pub event_type: String,
+    pub socket_id: i64,
+    pub bytes: i64,
+    pub seq: Option<i64>,
+    pub sndbuf_used: Option<i64>,
+    pub sndbuf_limit: Option<i64>,
+    pub sndbuf_fill_pct: Option<i16>,
+    pub recv_seq_start: Option<i64>,
+    pub recv_seq_end: Option<i64>,
+    pub rcv_nxt: Option<i64>,
+    pub bytes_available: Option<i64>,
+}
+
+/// Network packet record - represents packet-level events with flattened fields.
+///
+/// Replaces instant + instant_args for network events. Single table for all packet
+/// event types with nullable fields (Parquet handles sparse columns efficiently).
+///
+/// Event types: packet_enqueue, packet_send, packet_rcv_established, packet_queue_rcv,
+/// buffer_queue, zero_window_probe, zero_window_ack, rto_timeout, udp_send, udp_receive,
+/// udp_enqueue, packet_drop, cpu_backlog_drop, mem_pressure, tsq_throttle, qdisc_enqueue,
+/// qdisc_dequeue, tx_queue_stop, tx_queue_wake
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkPacketRecord {
+    pub id: i64,
+    pub ts: i64,
+    pub socket_id: i64,
+    pub event_type: String,
+    pub seq: Option<i64>,
+    pub length: i32,
+    pub tcp_flags: Option<String>,
+    // Send buffer fields
+    pub sndbuf_used: Option<i64>,
+    pub sndbuf_limit: Option<i64>,
+    pub sndbuf_fill_pct: Option<i16>,
+    // Retransmit fields
+    pub is_retransmit: bool,
+    pub retransmit_count: Option<i16>,
+    pub rto_ms: Option<i32>,
+    pub srtt_ms: Option<i32>,
+    pub rttvar_us: Option<i32>,
+    pub backoff: Option<i16>,
+    // Zero window fields
+    pub is_zero_window_probe: bool,
+    pub is_zero_window_ack: bool,
+    pub probe_count: Option<i16>,
+    // Window fields
+    pub snd_wnd: Option<i32>,
+    pub rcv_wnd: Option<i32>,
+    pub rcv_buf_used: Option<i64>,
+    pub rcv_buf_limit: Option<i64>,
+    pub window_clamp: Option<i32>,
+    pub rcv_wscale: Option<i16>,
+    // Timer fields
+    pub icsk_pending: Option<i16>,
+    pub icsk_timeout: Option<i64>,
+    // Drop fields
+    pub drop_reason: Option<i32>,
+    pub drop_reason_str: Option<String>,
+    pub drop_location: Option<i64>,
+    // Queue fields
+    pub qlen: Option<i32>,
+    pub qlen_limit: Option<i32>,
+    // TSQ fields
+    pub sk_wmem_alloc: Option<i64>,
+    pub tsq_limit: Option<i64>,
+    // TX queue fields
+    pub txq_state: Option<i32>,
+    pub qdisc_state: Option<i32>,
+    pub qdisc_backlog: Option<i64>,
+    // SKB correlation
+    pub skb_addr: Option<i64>,
+    pub qdisc_latency_us: Option<i32>,
+}
+
+/// Network socket record - represents socket metadata.
+///
+/// Replaces socket_connection with a cleaner schema (no track_id needed).
+/// Socket info extracted directly from BPF events for true streaming.
+///
+/// # Fields
+/// - `socket_id`: Unique socket ID (primary key)
+/// - `protocol`: "TCP" or "UDP"
+/// - `address_family`: "IPv4" or "IPv6"
+/// - `src_ip`: Source IP address
+/// - `src_port`: Source port
+/// - `dest_ip`: Destination IP address
+/// - `dest_port`: Destination port
+/// - `first_seen_ts`: First event timestamp (optional)
+/// - `last_seen_ts`: Last event timestamp (optional)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkSocketRecord {
+    pub socket_id: i64,
+    pub protocol: String,
+    pub address_family: String,
+    pub src_ip: String,
+    pub src_port: i32,
+    pub dest_ip: String,
+    pub dest_port: i32,
+    pub first_seen_ts: Option<i64>,
+    pub last_seen_ts: Option<i64>,
+}
+
+/// Network poll record - represents socket poll events.
+///
+/// Dedicated table for poll events that were previously mixed with other events.
+///
+/// # Fields
+/// - `id`: Unique event ID
+/// - `ts`: Timestamp in nanoseconds
+/// - `tid`: Thread ID
+/// - `pid`: Process ID
+/// - `socket_id`: Socket identifier
+/// - `requested_events`: Events requested (e.g., "IN|OUT|PRI")
+/// - `returned_events`: Events returned (e.g., "IN")
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkPollRecord {
+    pub id: i64,
+    pub ts: i64,
+    pub tid: i32,
+    pub pid: i32,
+    pub socket_id: i64,
+    pub requested_events: String,
+    pub returned_events: String,
+}
+
 /// Clock snapshot record - for timestamp correlation between clock domains.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClockSnapshotRecord {
@@ -301,5 +458,9 @@ pub struct ExtractedData {
     pub stack_samples: Vec<StackSampleRecord>,
     pub network_interfaces: Vec<NetworkInterfaceRecord>,
     pub socket_connections: Vec<SocketConnectionRecord>,
+    pub network_syscalls: Vec<NetworkSyscallRecord>,
+    pub network_packets: Vec<NetworkPacketRecord>,
+    pub network_sockets: Vec<NetworkSocketRecord>,
+    pub network_polls: Vec<NetworkPollRecord>,
     pub clock_snapshots: Vec<ClockSnapshotRecord>,
 }

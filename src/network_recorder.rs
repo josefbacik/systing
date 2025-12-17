@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -10,7 +10,8 @@ use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::network_event;
 use crate::trace::{
-    ArgRecord, InstantArgRecord, InstantRecord, SliceRecord, SocketConnectionRecord, TrackRecord,
+    ArgRecord, InstantArgRecord, InstantRecord, NetworkPacketRecord, NetworkPollRecord,
+    NetworkSocketRecord, NetworkSyscallRecord, SliceRecord, SocketConnectionRecord, TrackRecord,
 };
 use crate::SystingRecordEvent;
 
@@ -505,28 +506,14 @@ pub struct NetworkRecorder {
     resolve_addresses: bool,
 
     // Streaming support fields
-    //
-    // Note: In streaming mode, these buffers grow unboundedly during recording and are
-    // flushed in finish(). For very long traces, this could consume significant memory.
-    // This is a tradeoff for simplicity - the alternative would be periodic flushing to
-    // a collector during recording, but that requires more complex collector management.
-    // The stack recorder uses the same pattern.
-    /// Flag to indicate streaming mode is enabled
-    streaming_enabled: bool,
-    /// Buffered instant records for streaming
-    pending_instants: Vec<InstantRecord>,
-    pending_instant_args: Vec<InstantArgRecord>,
-    /// Buffered slice records for streaming
-    pending_slices: Vec<SliceRecord>,
-    pending_args: Vec<ArgRecord>,
-    /// Track socket_id -> assigned track_id for streaming
-    socket_track_ids: HashMap<SocketId, i64>,
-    /// Next track ID to assign
-    next_track_id: i64,
-    /// Next instant ID to assign
-    next_instant_id: i64,
-    /// Next slice ID to assign
-    next_slice_id: i64,
+    /// Track which sockets have had their NetworkSocketRecord emitted
+    seen_sockets: HashSet<SocketId>,
+    /// Collector for streaming records during recording
+    streaming_collector: Option<Box<dyn RecordCollector + Send>>,
+    /// Next record ID counters for streaming
+    next_syscall_id: i64,
+    next_packet_id: i64,
+    next_poll_id: i64,
 }
 
 impl Default for NetworkRecorder {
@@ -540,15 +527,11 @@ impl Default for NetworkRecorder {
             hostname_cache: HashMap::new(),
             dns_stats: DnsStats::default(),
             resolve_addresses: true,
-            streaming_enabled: false,
-            pending_instants: Vec::new(),
-            pending_instant_args: Vec::new(),
-            pending_slices: Vec::new(),
-            pending_args: Vec::new(),
-            socket_track_ids: HashMap::new(),
-            next_track_id: 1, // Start at 1 to leave room for root track
-            next_instant_id: 1,
-            next_slice_id: 1,
+            seen_sockets: HashSet::new(),
+            streaming_collector: None,
+            next_syscall_id: 1,
+            next_packet_id: 1,
+            next_poll_id: 1,
         }
     }
 }
@@ -566,520 +549,442 @@ impl NetworkRecorder {
     /// When streaming is enabled, events are buffered in memory and written
     /// to the collector at finish() time. This is similar to how the stack
     /// recorder works - it buffers during recording and writes at the end.
-    pub fn enable_streaming(&mut self) {
-        // We use streaming_collector.is_some() as the streaming flag
-        // Create a placeholder that will be replaced in finish()
-        // For now, we just mark that streaming is enabled by setting a flag
-        // The actual collector will be provided in finish()
-        self.streaming_enabled = true;
+    /// Set the streaming collector for real-time event emission.
+    pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
+        self.streaming_collector = Some(collector);
     }
 
     /// Check if streaming mode is enabled.
     pub fn is_streaming(&self) -> bool {
-        self.streaming_enabled
+        self.streaming_collector.is_some()
     }
 
-    /// Get or create track ID for a socket, assigning new ones as needed.
-    fn get_or_create_socket_track_id(&mut self, socket_id: SocketId) -> i64 {
-        if let Some(&track_id) = self.socket_track_ids.get(&socket_id) {
-            track_id
+    /// Helper to emit NetworkSocketRecord if not yet seen for this socket.
+    /// Returns true if a new socket record was emitted.
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_emit_socket_record(
+        &mut self,
+        socket_id: SocketId,
+        protocol: u32,
+        af: u32,
+        src_addr: &[u8; 16],
+        src_port: u16,
+        dest_addr: &[u8; 16],
+        dest_port: u16,
+        ts: i64,
+    ) -> Result<bool> {
+        use crate::systing::types::{network_address_family, network_protocol};
+
+        // Check if we've already emitted a record for this socket
+        if self.seen_sockets.contains(&socket_id) {
+            return Ok(false);
+        }
+
+        // Mark as seen
+        self.seen_sockets.insert(socket_id);
+
+        // Get collector (must be present in streaming mode)
+        let collector = self.streaming_collector.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("Streaming collector not set in maybe_emit_socket_record")
+        })?;
+
+        // Convert protocol
+        let protocol_str = if protocol == network_protocol::NETWORK_TCP.0 {
+            "TCP"
+        } else if protocol == network_protocol::NETWORK_UDP.0 {
+            "UDP"
         } else {
-            let track_id = self.next_track_id;
-            self.next_track_id += 1;
-            self.socket_track_ids.insert(socket_id, track_id);
-            track_id
+            "UNKNOWN"
         }
+        .to_string();
+
+        // Convert address family
+        let af_str = if af == network_address_family::NETWORK_AF_INET.0 {
+            "IPv4"
+        } else if af == network_address_family::NETWORK_AF_INET6.0 {
+            "IPv6"
+        } else {
+            "UNKNOWN"
+        }
+        .to_string();
+
+        // Convert addresses to strings
+        let src_ip = parse_ip_addr(af, src_addr).to_string();
+        let dest_ip = parse_ip_addr(af, dest_addr).to_string();
+
+        // Emit NetworkSocketRecord
+        collector.add_network_socket(NetworkSocketRecord {
+            socket_id: socket_id as i64,
+            protocol: protocol_str,
+            address_family: af_str,
+            src_ip,
+            src_port: src_port as i32,
+            dest_ip,
+            dest_port: dest_port as i32,
+            first_seen_ts: Some(ts),
+            last_seen_ts: Some(ts),
+        })?;
+
+        Ok(true)
     }
 
-    /// Add buffered instant arg for streaming.
-    fn add_buffered_instant_arg(
+    /// Helper to format TCP flags for packet records. Returns None if no flags set.
+    fn format_tcp_flags_str(flags: u8) -> Option<String> {
+        if flags == 0 {
+            return None;
+        }
+        Some(Self::format_tcp_flags(flags))
+    }
+
+    /// Helper function to convert kernel jiffies to microseconds for streaming.
+    fn jiffies_to_us(jiffies: u64) -> i64 {
+        ((jiffies * 1000000) / system_hz()) as i64
+    }
+
+    /// Helper function to convert kernel jiffies to milliseconds for streaming.
+    fn jiffies_to_ms(jiffies: u32) -> i32 {
+        ((jiffies as u64 * 1000) / system_hz()) as i32
+    }
+
+    /// Stream a syscall event (send/recv) - emit NetworkSyscallRecord immediately.
+    /// Also emits NetworkSocketRecord if this is the first event for this socket.
+    fn stream_syscall_event(
         &mut self,
-        instant_id: i64,
-        key: &str,
-        int_value: Option<i64>,
-        string_value: Option<String>,
-    ) {
-        self.pending_instant_args.push(InstantArgRecord {
-            instant_id,
-            key: key.to_string(),
-            int_value,
-            string_value,
-            real_value: None,
-        });
-    }
+        event: &crate::systing::types::network_event,
+        is_send: bool,
+    ) -> Result<()> {
+        let socket_id = event.socket_id;
+        let ts = event.start_ts as i64;
+        let tid = (event.task.tgidpid & 0xFFFFFFFF) as i32;
+        let pid = (event.task.tgidpid >> 32) as i32;
 
-    /// Buffer args for a packet event (mirrors add_*_arg helpers but buffers instead of writing).
-    fn buffer_packet_args(&mut self, instant_id: i64, pkt: &PacketEvent) {
-        // Basic args: seq, length, flags
-        if pkt.seq > 0 {
-            self.add_buffered_instant_arg(instant_id, "seq", Some(pkt.seq as i64), None);
-        }
-        self.add_buffered_instant_arg(instant_id, "length", Some(pkt.length as i64), None);
-        if pkt.tcp_flags != 0 {
-            self.add_buffered_instant_arg(
-                instant_id,
-                "flags",
-                None,
-                Some(Self::format_tcp_flags(pkt.tcp_flags)),
-            );
-        }
+        // Emit NetworkSocketRecord if first time seeing this socket
+        self.maybe_emit_socket_record(
+            socket_id,
+            event.protocol.0,
+            event.af.0,
+            &event.src_addr,
+            event.src_port,
+            &event.dest_addr,
+            event.dest_port,
+            ts,
+        )?;
 
-        // Send buffer args
-        if pkt.sndbuf_limit > 0 {
-            self.add_buffered_instant_arg(
-                instant_id,
-                "sndbuf_used",
-                Some(pkt.sndbuf_used as i64),
-                None,
-            );
-            self.add_buffered_instant_arg(
-                instant_id,
-                "sndbuf_limit",
-                Some(pkt.sndbuf_limit as i64),
-                None,
-            );
-            let fill_pct = (pkt.sndbuf_used as u64 * 100) / pkt.sndbuf_limit as u64;
-            self.add_buffered_instant_arg(
-                instant_id,
-                "sndbuf_fill_pct",
-                Some(fill_pct as i64),
-                None,
-            );
-        }
+        // Get collector
+        let collector = self.streaming_collector.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("Streaming collector not set in stream_syscall_event")
+        })?;
 
-        // Timer args
-        if pkt.icsk_pending != 0 {
-            let timer_name = match pkt.icsk_pending {
-                1 => "ICSK_TIME_RETRANS",
-                2 => "ICSK_TIME_DACK",
-                3 => "ICSK_TIME_PROBE0",
-                4 => "ICSK_TIME_EARLY_RETRANS",
-                5 => "ICSK_TIME_LOSS_PROBE",
-                6 => "ICSK_TIME_REO_TIMEOUT",
-                _ => "UNKNOWN",
-            };
-            self.add_buffered_instant_arg(instant_id, "timer", None, Some(timer_name.to_string()));
-            if pkt.icsk_timeout > 0 {
-                // Convert jiffies to milliseconds using system HZ
-                let timeout_ms = (pkt.icsk_timeout * 1000) / system_hz();
-                self.add_buffered_instant_arg(
-                    instant_id,
-                    "timeout_ms",
-                    Some(timeout_ms as i64),
-                    None,
-                );
-            }
-            if pkt.rto_jiffies > 0 {
-                let rto_ms = (pkt.rto_jiffies as u64 * 1000) / system_hz();
-                self.add_buffered_instant_arg(instant_id, "rto_ms", Some(rto_ms as i64), None);
-            }
-            if pkt.backoff > 0 {
-                self.add_buffered_instant_arg(
-                    instant_id,
-                    "backoff",
-                    Some(pkt.backoff as i64),
-                    None,
-                );
-            }
-        }
+        // Get ID and increment
+        let id = self.next_syscall_id;
+        self.next_syscall_id += 1;
 
-        // Retransmit flag
-        if pkt.is_retransmit {
-            self.add_buffered_instant_arg(instant_id, "retransmit", Some(1), None);
-            if pkt.retransmit_count > 0 {
-                self.add_buffered_instant_arg(
-                    instant_id,
-                    "retransmit_count",
-                    Some(pkt.retransmit_count as i64),
-                    None,
-                );
-            }
-        }
+        // Build syscall record
+        let event_type = if is_send { "sendmsg" } else { "recvmsg" }.to_string();
+        let dur = (event.end_ts as i64)
+            .saturating_sub(event.start_ts as i64)
+            .max(0);
 
-        // Zero window probe
-        if pkt.is_zero_window_probe {
-            self.add_buffered_instant_arg(
-                instant_id,
-                "probe_count",
-                Some(pkt.probe_count as i64),
-                None,
-            );
-            self.add_buffered_instant_arg(instant_id, "snd_wnd", Some(pkt.snd_wnd as i64), None);
-            self.add_buffered_instant_arg(instant_id, "rcv_wnd", Some(pkt.rcv_wnd as i64), None);
-        }
-
-        // Zero window ack
-        if pkt.is_zero_window_ack {
-            self.add_buffered_instant_arg(instant_id, "rcv_wnd", Some(pkt.rcv_wnd as i64), None);
-            self.add_buffered_instant_arg(
-                instant_id,
-                "window_clamp",
-                Some(pkt.window_clamp as i64),
-                None,
-            );
-            self.add_buffered_instant_arg(
-                instant_id,
-                "rcv_wscale",
-                Some(pkt.rcv_wscale as i64),
-                None,
-            );
-        }
-
-        // RTO timeout
-        if pkt.rto_jiffies > 0 && pkt.icsk_pending == 0 {
-            let rto_ms = (pkt.rto_jiffies as u64 * 1000) / system_hz();
-            self.add_buffered_instant_arg(instant_id, "rto_ms", Some(rto_ms as i64), None);
-        }
-
-        // Drop args
-        if pkt.drop_reason != 0 {
-            self.add_buffered_instant_arg(
-                instant_id,
-                "drop_reason",
-                Some(pkt.drop_reason as i64),
-                None,
-            );
-        }
-        if pkt.drop_location != 0 {
-            self.add_buffered_instant_arg(
-                instant_id,
-                "drop_location",
-                Some(pkt.drop_location as i64),
-                None,
-            );
-        }
-
-        // Queue args
-        if pkt.qlen > 0 || pkt.qlen_limit > 0 {
-            self.add_buffered_instant_arg(instant_id, "qlen", Some(pkt.qlen as i64), None);
-            if pkt.qlen_limit > 0 {
-                self.add_buffered_instant_arg(
-                    instant_id,
-                    "qlen_limit",
-                    Some(pkt.qlen_limit as i64),
-                    None,
-                );
-            }
-        }
-
-        // Memory pressure
-        if pkt.sk_wmem_alloc > 0 || pkt.tsq_limit > 0 {
-            self.add_buffered_instant_arg(
-                instant_id,
-                "sk_wmem_alloc",
-                Some(pkt.sk_wmem_alloc as i64),
-                None,
-            );
-            if pkt.tsq_limit > 0 {
-                self.add_buffered_instant_arg(
-                    instant_id,
-                    "tsq_limit",
-                    Some(pkt.tsq_limit as i64),
-                    None,
-                );
-            }
-        }
-
-        // Qdisc args
-        if pkt.txq_state > 0 {
-            self.add_buffered_instant_arg(
-                instant_id,
-                "txq_state",
-                Some(pkt.txq_state as i64),
-                None,
-            );
-        }
-        if pkt.qdisc_state > 0 {
-            self.add_buffered_instant_arg(
-                instant_id,
-                "qdisc_state",
-                Some(pkt.qdisc_state as i64),
-                None,
-            );
-        }
-        if pkt.qdisc_backlog > 0 {
-            self.add_buffered_instant_arg(
-                instant_id,
-                "qdisc_backlog",
-                Some(pkt.qdisc_backlog as i64),
-                None,
-            );
-        }
-        if pkt.skb_addr > 0 {
-            self.add_buffered_instant_arg(instant_id, "skb_addr", Some(pkt.skb_addr as i64), None);
-        }
-        if pkt.qdisc_latency_us > 0 {
-            self.add_buffered_instant_arg(
-                instant_id,
-                "qdisc_latency_us",
-                Some(pkt.qdisc_latency_us as i64),
-                None,
-            );
-        }
-    }
-
-    /// Stream a packet event as an instant record with args.
-    fn stream_packet_event(&mut self, socket_id: SocketId, event_name: &str, pkt: &PacketEvent) {
-        let track_id = self.get_or_create_socket_track_id(socket_id);
-        let instant_id = self.next_instant_id;
-        self.next_instant_id += 1;
-
-        // Buffer the instant record
-        self.pending_instants.push(InstantRecord {
-            id: instant_id,
-            ts: pkt.ts as i64,
-            track_id,
-            utid: None,
-            name: event_name.to_string(),
-            category: Some("network".to_string()),
-        });
-
-        // Buffer all the args
-        self.buffer_packet_args(instant_id, pkt);
-    }
-
-    /// Stream a poll event as an instant record with args.
-    fn stream_poll_event(&mut self, socket_id: SocketId, poll_event: &PollEvent, tgidpid: u64) {
-        let track_id = self.get_or_create_socket_track_id(socket_id);
-        let instant_id = self.next_instant_id;
-        self.next_instant_id += 1;
-
-        // Buffer the instant record
-        self.pending_instants.push(InstantRecord {
-            id: instant_id,
-            ts: poll_event.ts as i64,
-            track_id,
-            utid: None,
-            name: "poll_ready".to_string(),
-            category: Some("network".to_string()),
-        });
-
-        // Buffer args
-        self.add_buffered_instant_arg(instant_id, "socket_id", Some(socket_id as i64), None);
-        self.add_buffered_instant_arg(
-            instant_id,
-            "requested",
-            None,
-            Some(Self::poll_events_to_str(poll_event.requested_events)),
-        );
-        self.add_buffered_instant_arg(
-            instant_id,
-            "returned",
-            None,
-            Some(Self::poll_events_to_str(poll_event.returned_events)),
-        );
-        // Store thread info for later association
-        let tid = (tgidpid & 0xFFFFFFFF) as i32;
-        self.add_buffered_instant_arg(instant_id, "tid", Some(tid as i64), None);
-    }
-
-    /// Add buffered arg for streaming slices.
-    fn add_buffered_arg(
-        &mut self,
-        slice_id: i64,
-        key: &str,
-        int_value: Option<i64>,
-        string_value: Option<String>,
-    ) {
-        self.pending_args.push(ArgRecord {
-            slice_id,
-            key: key.to_string(),
-            int_value,
-            string_value,
-            real_value: None,
-        });
-    }
-
-    /// Stream a syscall event (send/recv) as a slice record with args.
-    fn stream_syscall_event(&mut self, net_event: &NetworkEvent, is_send: bool, tgidpid: u64) {
-        let socket_id = net_event.socket_id;
-        let track_id = self.get_or_create_socket_track_id(socket_id);
-        let slice_id = self.next_slice_id;
-        self.next_slice_id += 1;
-
-        let dur = (net_event.end_ts as i64).saturating_sub(net_event.start_ts as i64);
-        let name = if is_send { "sendmsg" } else { "recvmsg" };
-
-        // Buffer the slice record
-        self.pending_slices.push(SliceRecord {
-            id: slice_id,
-            ts: net_event.start_ts as i64,
+        let mut record = NetworkSyscallRecord {
+            id,
+            ts,
             dur,
-            track_id,
-            utid: None,
-            name: name.to_string(),
-            category: Some("network".to_string()),
-            depth: 0,
-        });
-
-        // Buffer common args
-        self.add_buffered_arg(slice_id, "socket_id", Some(socket_id as i64), None);
-        self.add_buffered_arg(slice_id, "bytes", Some(net_event.bytes as i64), None);
-
-        // Store thread info for later association
-        let tid = (tgidpid & 0xFFFFFFFF) as i32;
-        self.add_buffered_arg(slice_id, "tid", Some(tid as i64), None);
+            tid,
+            pid,
+            event_type,
+            socket_id: socket_id as i64,
+            bytes: event.bytes as i64,
+            seq: None,
+            sndbuf_used: None,
+            sndbuf_limit: None,
+            sndbuf_fill_pct: None,
+            recv_seq_start: None,
+            recv_seq_end: None,
+            rcv_nxt: None,
+            bytes_available: None,
+        };
 
         if is_send {
-            // Send-specific args
-            if net_event.sendmsg_seq > 0 {
-                self.add_buffered_arg(slice_id, "seq", Some(net_event.sendmsg_seq as i64), None);
+            // Send-specific fields
+            if event.sendmsg_seq > 0 {
+                record.seq = Some(event.sendmsg_seq as i64);
             }
-            if net_event.sndbuf_limit > 0 {
-                self.add_buffered_arg(
-                    slice_id,
-                    "sndbuf_used",
-                    Some(net_event.sndbuf_used as i64),
-                    None,
-                );
-                self.add_buffered_arg(
-                    slice_id,
-                    "sndbuf_limit",
-                    Some(net_event.sndbuf_limit as i64),
-                    None,
-                );
-                let fill_pct = (net_event.sndbuf_used as u64 * 100) / net_event.sndbuf_limit as u64;
-                self.add_buffered_arg(slice_id, "sndbuf_fill_pct", Some(fill_pct as i64), None);
+            if event.sndbuf_limit > 0 {
+                record.sndbuf_used = Some(event.sndbuf_used as i64);
+                record.sndbuf_limit = Some(event.sndbuf_limit as i64);
+                let fill_pct =
+                    ((event.sndbuf_used as u64 * 100) / event.sndbuf_limit as u64) as i16;
+                record.sndbuf_fill_pct = Some(fill_pct);
             }
         } else {
-            // Recv-specific args
-            if net_event.recv_seq_start > 0 || net_event.recv_seq_end > 0 {
-                self.add_buffered_arg(
-                    slice_id,
-                    "recv_seq_start",
-                    Some(net_event.recv_seq_start as i64),
-                    None,
-                );
-                self.add_buffered_arg(
-                    slice_id,
-                    "recv_seq_end",
-                    Some(net_event.recv_seq_end as i64),
-                    None,
-                );
-                if net_event.rcv_nxt_at_entry > 0 {
-                    self.add_buffered_arg(
-                        slice_id,
-                        "rcv_nxt",
-                        Some(net_event.rcv_nxt_at_entry as i64),
-                        None,
-                    );
-                    let bytes_available = net_event
-                        .rcv_nxt_at_entry
-                        .wrapping_sub(net_event.recv_seq_start);
+            // Recv-specific fields
+            if event.recv_seq_start > 0 || event.recv_seq_end > 0 {
+                record.recv_seq_start = Some(event.recv_seq_start as i64);
+                record.recv_seq_end = Some(event.recv_seq_end as i64);
+                if event.rcv_nxt_at_entry > 0 {
+                    record.rcv_nxt = Some(event.rcv_nxt_at_entry as i64);
+                    let bytes_available = event.rcv_nxt_at_entry.wrapping_sub(event.recv_seq_start);
                     if bytes_available > 0 && bytes_available < 64 * 1024 * 1024 {
-                        self.add_buffered_arg(
-                            slice_id,
-                            "bytes_available",
-                            Some(bytes_available as i64),
-                            None,
-                        );
+                        record.bytes_available = Some(bytes_available as i64);
                     }
                 }
             }
         }
+
+        // Emit the record
+        collector.add_network_syscall(record)?;
+        Ok(())
     }
 
-    /// Finish streaming and emit final records.
+    /// Stream a packet event - emit NetworkPacketRecord immediately.
+    /// Also emits NetworkSocketRecord if this is the first event for this socket.
+    fn stream_packet_event(
+        &mut self,
+        event: &crate::systing::types::packet_event,
+        event_name: &str,
+    ) -> Result<()> {
+        let socket_id = event.socket_id;
+        let ts = event.ts as i64;
+
+        // Emit NetworkSocketRecord if first time seeing this socket
+        self.maybe_emit_socket_record(
+            socket_id,
+            event.protocol.0,
+            event.af.0,
+            &event.src_addr,
+            event.src_port,
+            &event.dest_addr,
+            event.dest_port,
+            ts,
+        )?;
+
+        // Get collector
+        let collector = self
+            .streaming_collector
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Streaming collector not set in stream_packet_event"))?;
+
+        // Get ID and increment
+        let id = self.next_packet_id;
+        self.next_packet_id += 1;
+
+        // Build packet record
+        let mut record = NetworkPacketRecord {
+            id,
+            ts,
+            socket_id: socket_id as i64,
+            event_type: event_name.to_string(),
+            seq: if event.seq > 0 {
+                Some(event.seq as i64)
+            } else {
+                None
+            },
+            length: event.length as i32,
+            tcp_flags: Self::format_tcp_flags_str(event.tcp_flags),
+            sndbuf_used: None,
+            sndbuf_limit: None,
+            sndbuf_fill_pct: None,
+            is_retransmit: event.is_retransmit != 0,
+            retransmit_count: if event.retransmit_count > 0 {
+                Some(event.retransmit_count as i16)
+            } else {
+                None
+            },
+            rto_ms: if event.rto_jiffies > 0 {
+                Some(Self::jiffies_to_ms(event.rto_jiffies))
+            } else {
+                None
+            },
+            srtt_ms: if event.srtt_us > 0 {
+                Some((event.srtt_us / 1000) as i32)
+            } else {
+                None
+            },
+            rttvar_us: if event.rttvar_us > 0 {
+                Some(event.rttvar_us as i32)
+            } else {
+                None
+            },
+            backoff: if event.backoff > 0 {
+                Some(event.backoff as i16)
+            } else {
+                None
+            },
+            is_zero_window_probe: event.is_zero_window_probe != 0,
+            probe_count: if event.probe_count > 0 {
+                Some(event.probe_count as i16)
+            } else {
+                None
+            },
+            snd_wnd: if event.snd_wnd > 0 || event.is_zero_window_probe != 0 {
+                Some(event.snd_wnd as i32)
+            } else {
+                None
+            },
+            is_zero_window_ack: event.is_zero_window_ack != 0,
+            rcv_wnd: if event.rcv_wnd > 0 || event.is_zero_window_ack != 0 {
+                Some(event.rcv_wnd as i32)
+            } else {
+                None
+            },
+            rcv_buf_used: if event.rcv_buf_used > 0 {
+                Some(event.rcv_buf_used as i64)
+            } else {
+                None
+            },
+            rcv_buf_limit: if event.rcv_buf_limit > 0 {
+                Some(event.rcv_buf_limit as i64)
+            } else {
+                None
+            },
+            window_clamp: if event.window_clamp > 0 {
+                Some(event.window_clamp as i32)
+            } else {
+                None
+            },
+            rcv_wscale: if event.rcv_wscale > 0 {
+                Some(event.rcv_wscale as i16)
+            } else {
+                None
+            },
+            // Timer fields
+            icsk_pending: if event.icsk_pending > 0 {
+                Some(event.icsk_pending as i16)
+            } else {
+                None
+            },
+            icsk_timeout: if event.icsk_timeout > 0 {
+                Some(Self::jiffies_to_us(event.icsk_timeout))
+            } else {
+                None
+            },
+            // Drop fields
+            drop_reason: if event.drop_reason > 0 {
+                Some(event.drop_reason as i32)
+            } else {
+                None
+            },
+            drop_reason_str: if event.drop_reason > 0 {
+                Some(drop_reason_str(event.drop_reason).to_string())
+            } else {
+                None
+            },
+            drop_location: if event.drop_location > 0 {
+                Some(event.drop_location as i64)
+            } else {
+                None
+            },
+            qlen: if event.qlen > 0 {
+                Some(event.qlen as i32)
+            } else {
+                None
+            },
+            qlen_limit: if event.qlen_limit > 0 {
+                Some(event.qlen_limit as i32)
+            } else {
+                None
+            },
+            sk_wmem_alloc: if event.sk_wmem_alloc > 0 {
+                Some(event.sk_wmem_alloc as i64)
+            } else {
+                None
+            },
+            tsq_limit: if event.tsq_limit > 0 {
+                Some(event.tsq_limit as i64)
+            } else {
+                None
+            },
+            txq_state: if event.txq_state > 0 {
+                Some(event.txq_state as i32)
+            } else {
+                None
+            },
+            qdisc_state: if event.qdisc_state > 0 {
+                Some(event.qdisc_state as i32)
+            } else {
+                None
+            },
+            qdisc_backlog: if event.qdisc_backlog > 0 {
+                Some(event.qdisc_backlog as i64)
+            } else {
+                None
+            },
+            qdisc_latency_us: if event.qdisc_latency_us > 0 {
+                Some(event.qdisc_latency_us as i32)
+            } else {
+                None
+            },
+            skb_addr: if event.skb_addr > 0 {
+                Some(event.skb_addr as i64)
+            } else {
+                None
+            },
+        };
+
+        // Add send buffer fields
+        if event.sndbuf_limit > 0 {
+            record.sndbuf_used = Some(event.sndbuf_used as i64);
+            record.sndbuf_limit = Some(event.sndbuf_limit as i64);
+            let fill_pct = ((event.sndbuf_used as u64 * 100) / event.sndbuf_limit as u64) as i16;
+            record.sndbuf_fill_pct = Some(fill_pct);
+        }
+
+        // Emit the record
+        collector.add_network_packet(record)?;
+        Ok(())
+    }
+
+    /// Stream a poll event - emit NetworkPollRecord immediately.
+    fn stream_poll_event(&mut self, event: &crate::systing::types::epoll_event_bpf) -> Result<()> {
+        let socket_id = event.socket_id;
+        let ts = event.ts as i64;
+        let tid = (event.task.tgidpid & 0xFFFFFFFF) as i32;
+        let pid = (event.task.tgidpid >> 32) as i32;
+
+        // Note: Poll events don't have socket metadata (src/dest), so we can't emit NetworkSocketRecord here
+
+        // Get collector
+        let collector = self
+            .streaming_collector
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Streaming collector not set in stream_poll_event"))?;
+
+        // Get ID and increment
+        let id = self.next_poll_id;
+        self.next_poll_id += 1;
+
+        // Build poll record
+        let record = NetworkPollRecord {
+            id,
+            ts,
+            tid,
+            pid,
+            socket_id: socket_id as i64,
+            requested_events: Self::poll_events_to_str(event.requested_events),
+            returned_events: Self::poll_events_to_str(event.returned_events),
+        };
+
+        // Emit the record
+        collector.add_network_poll(record)?;
+        Ok(())
+    }
+
+    /// Finish streaming and flush the collector.
     ///
-    /// This method should be called at the end of recording to:
-    /// 1. Flush any remaining pending records
-    /// 2. Create "Network Packets" root track and child socket tracks
-    /// 3. Add socket connection records with metadata
+    /// In the new streaming architecture, records are emitted immediately during recording.
+    /// This method just flushes the collector and returns it.
     ///
     /// Returns the collector so the caller can chain or finish it.
-    pub fn finish(
-        &mut self,
-        mut collector: Box<dyn RecordCollector + Send>,
-    ) -> Result<Box<dyn RecordCollector + Send>> {
-        // If streaming was not enabled, return collector unchanged
-        if !self.streaming_enabled {
-            return Ok(collector);
+    pub fn finish(&mut self) -> Result<Option<Box<dyn RecordCollector + Send>>> {
+        // Take ownership of the streaming collector if present
+        if let Some(mut collector) = self.streaming_collector.take() {
+            // Flush the collector
+            collector.flush()?;
+            Ok(Some(collector))
+        } else {
+            // No streaming collector - return None
+            Ok(None)
         }
-
-        let writer = collector.as_mut();
-
-        // Flush any remaining pending records
-        for instant in self.pending_instants.drain(..) {
-            writer.add_instant(instant)?;
-        }
-        for arg in self.pending_instant_args.drain(..) {
-            writer.add_instant_arg(arg)?;
-        }
-        for slice in self.pending_slices.drain(..) {
-            writer.add_slice(slice)?;
-        }
-        for arg in self.pending_args.drain(..) {
-            writer.add_arg(arg)?;
-        }
-
-        // Resolve hostnames if configured (socket_metadata is now available)
-        if self.resolve_addresses {
-            let ip_addrs: Vec<_> = self
-                .socket_metadata
-                .values()
-                .flat_map(|m| [m.src_ip_addr(), m.dest_ip_addr()])
-                .collect();
-
-            for ip_addr in ip_addrs {
-                self.resolve_hostname(ip_addr);
-            }
-        }
-
-        // Create "Network Packets" root track
-        let network_root_id = self.next_track_id;
-        self.next_track_id += 1;
-
-        writer.add_track(TrackRecord {
-            id: network_root_id,
-            name: "Network Packets".to_string(),
-            parent_id: None,
-        })?;
-
-        // Collect socket info upfront to avoid borrow issues
-        let socket_infos: Vec<_> = self
-            .socket_track_ids
-            .iter()
-            .map(|(&socket_id, &track_id)| {
-                let track_name = self.socket_track_name(socket_id);
-                let metadata = self.socket_metadata.get(&socket_id).cloned();
-                (socket_id, track_id, track_name, metadata)
-            })
-            .collect();
-
-        // Create child tracks for each socket and add socket connection records
-        for (socket_id, track_id, track_name, metadata) in socket_infos {
-            writer.add_track(TrackRecord {
-                id: track_id,
-                name: track_name,
-                parent_id: Some(network_root_id),
-            })?;
-
-            // Add socket connection record if metadata is available
-            if let Some(metadata) = metadata {
-                let src_ip = metadata.src_ip_addr();
-                let dest_ip = metadata.dest_ip_addr();
-
-                writer.add_socket_connection(SocketConnectionRecord {
-                    socket_id: socket_id as i64,
-                    track_id,
-                    protocol: metadata.protocol_str().to_string(),
-                    src_ip: src_ip.to_string(),
-                    src_port: metadata.src_port as i32,
-                    dest_ip: dest_ip.to_string(),
-                    dest_port: metadata.dest_port as i32,
-                    address_family: if metadata.af
-                        == crate::systing::types::network_address_family::NETWORK_AF_INET.0
-                    {
-                        "IPv4".to_string()
-                    } else {
-                        "IPv6".to_string()
-                    },
-                })?;
-            }
-        }
-
-        writer.flush()?;
-        Ok(collector)
     }
 
     /// Load socket metadata from BPF map after tracing completes.
@@ -1291,9 +1196,11 @@ impl NetworkRecorder {
             _ => return,
         };
 
-        // If streaming is enabled, buffer the event and return
+        // If streaming is enabled, emit records immediately and return
         if self.is_streaming() {
-            self.stream_packet_event(socket_id, event_name, &pkt_event);
+            if let Err(e) = self.stream_packet_event(&event, event_name) {
+                eprintln!("Warning: Failed to stream network packet event: {e}");
+            }
             return;
         }
 
@@ -1318,9 +1225,11 @@ impl NetworkRecorder {
             returned_events: event.returned_events,
         };
 
-        // If streaming is enabled, buffer the event and return
+        // If streaming is enabled, emit records immediately and return
         if self.is_streaming() {
-            self.stream_poll_event(socket_id, &poll_event, event.task.tgidpid);
+            if let Err(e) = self.stream_poll_event(&event) {
+                eprintln!("Warning: Failed to stream network poll event: {e}");
+            }
             return;
         }
 
@@ -2973,16 +2882,7 @@ impl NetworkRecorder {
             .map(|e| e.ts())
             .min();
 
-        // Streaming path: also check pending buffers
-        let pending_instant_min = self.pending_instants.first().map(|i| i.ts as u64);
-        let pending_slice_min = self.pending_slices.first().map(|s| s.ts as u64);
-
-        syscall_min
-            .into_iter()
-            .chain(packet_min)
-            .chain(pending_instant_min)
-            .chain(pending_slice_min)
-            .min()
+        syscall_min.into_iter().chain(packet_min).min()
     }
 }
 
@@ -3022,10 +2922,12 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
         let is_send = event.operation.0 == network_operation::NETWORK_SEND.0;
         let is_recv = event.operation.0 == network_operation::NETWORK_RECV.0;
 
-        // If streaming is enabled, buffer the event and return
+        // If streaming is enabled, emit records immediately and return
         if self.is_streaming() {
             if is_send || is_recv {
-                self.stream_syscall_event(&net_event, is_send, tgidpid);
+                if let Err(e) = self.stream_syscall_event(&event, is_send) {
+                    eprintln!("Warning: Failed to stream network syscall event: {e}");
+                }
             }
             return;
         }

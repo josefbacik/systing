@@ -241,3 +241,116 @@ pub fn stack_sample_schema() -> Arc<Schema> {
         Field::new("stack_id", DataType::Int64, false),
     ]))
 }
+
+/// Schema for network_syscall.parquet
+///
+/// Network syscall records with flattened fields for direct column access.
+pub fn network_syscall_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("dur", DataType::Int64, false),
+        Field::new("tid", DataType::Int32, false),
+        Field::new("pid", DataType::Int32, false),
+        Field::new("event_type", DataType::Utf8, false),
+        Field::new("socket_id", DataType::Int64, false),
+        Field::new("bytes", DataType::Int64, false),
+        Field::new("seq", DataType::Int64, true),
+        Field::new("sndbuf_used", DataType::Int64, true),
+        Field::new("sndbuf_limit", DataType::Int64, true),
+        Field::new("sndbuf_fill_pct", DataType::Int16, true),
+        Field::new("recv_seq_start", DataType::Int64, true),
+        Field::new("recv_seq_end", DataType::Int64, true),
+        Field::new("rcv_nxt", DataType::Int64, true),
+        Field::new("bytes_available", DataType::Int64, true),
+    ]))
+}
+
+/// Schema for network_packet.parquet
+///
+/// Network packet records with flattened fields for all event types.
+pub fn network_packet_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("socket_id", DataType::Int64, false),
+        Field::new("event_type", DataType::Utf8, false),
+        Field::new("seq", DataType::Int64, true),
+        Field::new("length", DataType::Int32, false),
+        Field::new("tcp_flags", DataType::Utf8, true),
+        // Send buffer fields
+        Field::new("sndbuf_used", DataType::Int64, true),
+        Field::new("sndbuf_limit", DataType::Int64, true),
+        Field::new("sndbuf_fill_pct", DataType::Int16, true),
+        // Retransmit fields
+        Field::new("is_retransmit", DataType::Boolean, false),
+        Field::new("retransmit_count", DataType::Int16, true),
+        Field::new("rto_ms", DataType::Int32, true),
+        Field::new("srtt_ms", DataType::Int32, true),
+        Field::new("rttvar_us", DataType::Int32, true),
+        Field::new("backoff", DataType::Int16, true),
+        // Zero window fields
+        Field::new("is_zero_window_probe", DataType::Boolean, false),
+        Field::new("is_zero_window_ack", DataType::Boolean, false),
+        Field::new("probe_count", DataType::Int16, true),
+        // Window fields
+        Field::new("snd_wnd", DataType::Int32, true),
+        Field::new("rcv_wnd", DataType::Int32, true),
+        Field::new("rcv_buf_used", DataType::Int64, true),
+        Field::new("rcv_buf_limit", DataType::Int64, true),
+        Field::new("window_clamp", DataType::Int32, true),
+        Field::new("rcv_wscale", DataType::Int16, true),
+        // Timer fields
+        Field::new("icsk_pending", DataType::Int16, true),
+        Field::new("icsk_timeout", DataType::Int64, true),
+        // Drop fields
+        Field::new("drop_reason", DataType::Int32, true),
+        Field::new("drop_reason_str", DataType::Utf8, true),
+        Field::new("drop_location", DataType::Int64, true),
+        // Queue fields
+        Field::new("qlen", DataType::Int32, true),
+        Field::new("qlen_limit", DataType::Int32, true),
+        // TSQ fields
+        Field::new("sk_wmem_alloc", DataType::Int64, true),
+        Field::new("tsq_limit", DataType::Int64, true),
+        // TX queue fields
+        Field::new("txq_state", DataType::Int32, true),
+        Field::new("qdisc_state", DataType::Int32, true),
+        Field::new("qdisc_backlog", DataType::Int64, true),
+        // SKB correlation
+        Field::new("skb_addr", DataType::Int64, true),
+        Field::new("qdisc_latency_us", DataType::Int32, true),
+    ]))
+}
+
+/// Schema for network_socket.parquet
+///
+/// Network socket metadata records.
+pub fn network_socket_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("socket_id", DataType::Int64, false),
+        Field::new("protocol", DataType::Utf8, false),
+        Field::new("address_family", DataType::Utf8, false),
+        Field::new("src_ip", DataType::Utf8, false),
+        Field::new("src_port", DataType::Int32, false),
+        Field::new("dest_ip", DataType::Utf8, false),
+        Field::new("dest_port", DataType::Int32, false),
+        Field::new("first_seen_ts", DataType::Int64, true),
+        Field::new("last_seen_ts", DataType::Int64, true),
+    ]))
+}
+
+/// Schema for network_poll.parquet
+///
+/// Network poll event records.
+pub fn network_poll_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("tid", DataType::Int32, false),
+        Field::new("pid", DataType::Int32, false),
+        Field::new("socket_id", DataType::Int64, false),
+        Field::new("requested_events", DataType::Utf8, false),
+        Field::new("returned_events", DataType::Utf8, false),
+    ]))
+}

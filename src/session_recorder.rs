@@ -980,8 +980,12 @@ impl SessionRecorder {
         // Enable streaming mode for stack recorder (samples buffered, written at end)
         self.stack_recorder.lock().unwrap().enable_streaming();
 
-        // Enable streaming mode for network recorder (events buffered, written at end)
-        self.network_recorder.lock().unwrap().enable_streaming();
+        // Set up streaming collector for network recorder (events emitted immediately)
+        let network_writer = StreamingParquetWriter::new(output_dir)?;
+        self.network_recorder
+            .lock()
+            .unwrap()
+            .set_streaming_collector(Box::new(network_writer));
 
         Ok(())
     }
@@ -1147,8 +1151,11 @@ impl SessionRecorder {
         let network_streaming = self.network_recorder.lock().unwrap().is_streaming();
         if network_streaming {
             eprintln!("Flushing network trace records...");
-            // Pass ownership to finish(), which returns it after writing
-            writer = self.network_recorder.lock().unwrap().finish(writer)?;
+            // Finish returns the collector it was using for streaming
+            // We need to properly close it to finalize the Parquet files
+            if let Some(network_collector) = self.network_recorder.lock().unwrap().finish()? {
+                network_collector.finish_boxed()?;
+            }
         } else {
             eprintln!("Writing network trace records...");
             self.network_recorder.lock().unwrap().write_records(

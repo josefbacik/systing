@@ -8,9 +8,10 @@ use anyhow::Result;
 
 use crate::trace::{
     ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ExtractedData,
-    InstantArgRecord, InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, ProcessExitRecord,
-    ProcessRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord,
-    StackRecord, StackSampleRecord, ThreadRecord, ThreadStateRecord, TrackRecord, WakeupNewRecord,
+    InstantArgRecord, InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, NetworkPacketRecord,
+    NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord,
+    SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord,
+    StackSampleRecord, ThreadRecord, ThreadStateRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Trait for collecting trace records during recording.
@@ -88,6 +89,18 @@ pub trait RecordCollector {
 
     /// Add a stack sample record (links sample to stack).
     fn add_stack_sample(&mut self, record: StackSampleRecord) -> Result<()>;
+
+    /// Add a network syscall record.
+    fn add_network_syscall(&mut self, record: NetworkSyscallRecord) -> Result<()>;
+
+    /// Add a network packet record.
+    fn add_network_packet(&mut self, record: NetworkPacketRecord) -> Result<()>;
+
+    /// Add a network socket record.
+    fn add_network_socket(&mut self, record: NetworkSocketRecord) -> Result<()>;
+
+    /// Add a network poll record.
+    fn add_network_poll(&mut self, record: NetworkPollRecord) -> Result<()>;
 
     /// Flush any buffered records to storage.
     fn flush(&mut self) -> Result<()>;
@@ -227,6 +240,26 @@ impl RecordCollector for InMemoryCollector {
 
     fn add_stack_sample(&mut self, record: StackSampleRecord) -> Result<()> {
         self.data.stack_samples.push(record);
+        Ok(())
+    }
+
+    fn add_network_syscall(&mut self, record: NetworkSyscallRecord) -> Result<()> {
+        self.data.network_syscalls.push(record);
+        Ok(())
+    }
+
+    fn add_network_packet(&mut self, record: NetworkPacketRecord) -> Result<()> {
+        self.data.network_packets.push(record);
+        Ok(())
+    }
+
+    fn add_network_socket(&mut self, record: NetworkSocketRecord) -> Result<()> {
+        self.data.network_sockets.push(record);
+        Ok(())
+    }
+
+    fn add_network_poll(&mut self, record: NetworkPollRecord) -> Result<()> {
+        self.data.network_polls.push(record);
         Ok(())
     }
 
