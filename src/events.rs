@@ -26,10 +26,27 @@ use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::{EventName, TrackEvent};
 
 const SYS_ENTER_COOKIE: u64 = 0xFFFFFFFFFFFFFFFE;
+const SYSCALLS_TRACK_NAME: &str = "syscalls";
 
 enum ArgValue {
     String(String),
     Long(u64),
+}
+
+/// Convert ArgValue to record fields (key, int_value, string_value).
+fn convert_arg(arg: &(String, ArgValue)) -> (String, Option<i64>, Option<String>) {
+    match &arg.1 {
+        ArgValue::String(s) => (arg.0.clone(), None, Some(s.clone())),
+        ArgValue::Long(v) => (arg.0.clone(), Some(*v as i64), None),
+    }
+}
+
+/// Get the name for a syscall number.
+fn syscall_name(nr: u64) -> String {
+    use syscalls::Sysno;
+    Sysno::new(nr as usize)
+        .map(|sysno| sysno.name().to_string())
+        .unwrap_or_else(|| format!("syscall_{nr}"))
 }
 
 struct TrackInstant {
@@ -48,6 +65,13 @@ struct TrackRange {
 struct ThresholdStopTrigger {
     start_cookie: u64,
     duration_us: u64,
+}
+
+/// Key for track ID caching during streaming.
+#[derive(Hash, Eq, PartialEq, Clone)]
+enum TrackCacheKey {
+    Thread { tgidpid: u64, track_name: String },
+    Cpu { cpu: u32, track_name: String },
 }
 
 // This is the main recorder struct, we keep track of the configuration for the events, as well as
@@ -127,6 +151,14 @@ pub struct SystingProbeRecorder {
     completed_syscalls: HashMap<u64, Vec<(u64, u64, u64)>>,
     syscall_iids: HashMap<u64, u64>,
     syscall_name_ids: HashMap<String, u64>,
+
+    // Streaming mode support
+    streaming_collector: Option<Box<dyn RecordCollector + Send>>,
+    streaming_enabled: bool, // Track if streaming was ever enabled (survives finish())
+    track_id_counter: i64,
+    slice_id_counter: i64,
+    instant_id_counter: i64,
+    track_cache: HashMap<TrackCacheKey, i64>,
 }
 
 // usdt:<path>:<provider>:<name>
@@ -689,6 +721,57 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
 }
 
 impl SystingProbeRecorder {
+    /// Set the streaming collector for Parquet output during recording.
+    pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
+        self.streaming_collector = Some(collector);
+        self.streaming_enabled = true;
+    }
+
+    /// Check if streaming mode is currently active (collector present).
+    pub fn is_streaming(&self) -> bool {
+        self.streaming_collector.is_some()
+    }
+
+    /// Get or create a track ID, caching to avoid duplicates.
+    fn get_or_create_track(
+        &mut self,
+        key: TrackCacheKey,
+        collector: &mut dyn RecordCollector,
+    ) -> Result<i64> {
+        if let Some(&id) = self.track_cache.get(&key) {
+            return Ok(id);
+        }
+
+        self.track_id_counter += 1;
+        let track_id = self.track_id_counter;
+
+        let name = match &key {
+            TrackCacheKey::Thread { track_name, .. } => track_name.clone(),
+            TrackCacheKey::Cpu { cpu, track_name } => format!("{track_name} CPU {cpu}"),
+        };
+
+        collector.add_track(TrackRecord {
+            id: track_id,
+            name,
+            parent_id: None,
+        })?;
+
+        self.track_cache.insert(key, track_id);
+        Ok(track_id)
+    }
+
+    /// Finish streaming and return the collector.
+    /// Incomplete events (outstanding_ranges, pending_syscalls) are discarded,
+    /// matching current write_records() behavior.
+    pub fn finish(&mut self) -> Result<Option<Box<dyn RecordCollector + Send>>> {
+        if let Some(mut collector) = self.streaming_collector.take() {
+            collector.flush()?;
+            Ok(Some(collector))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn handle_syscall_event(&mut self, event: probe_event) {
         if event.num_args == 0 {
             return;
@@ -706,10 +789,50 @@ impl SystingProbeRecorder {
                 .insert(syscall_nr, event.ts);
         } else if let Some(pid_pending) = self.pending_syscalls.get_mut(&tgidpid) {
             if let Some(enter_ts) = pid_pending.remove(&syscall_nr) {
-                self.completed_syscalls
-                    .entry(tgidpid)
-                    .or_default()
-                    .push((enter_ts, event.ts, syscall_nr));
+                // Stream the completed syscall if streaming is enabled
+                if let Some(mut collector) = self.streaming_collector.take() {
+                    let key = TrackCacheKey::Thread {
+                        tgidpid,
+                        track_name: SYSCALLS_TRACK_NAME.to_string(),
+                    };
+                    if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
+                        self.slice_id_counter += 1;
+                        let slice_id = self.slice_id_counter;
+
+                        // Use tid as utid for streaming (same approach as SchedEventRecorder)
+                        let utid = Some(tgidpid as i32 as i64);
+
+                        if let Err(e) = collector.add_slice(SliceRecord {
+                            id: slice_id,
+                            ts: enter_ts as i64,
+                            dur: (event.ts - enter_ts) as i64,
+                            track_id,
+                            utid,
+                            name: syscall_name(syscall_nr),
+                            category: Some("syscall".to_string()),
+                            depth: 0,
+                        }) {
+                            eprintln!("Warning: Failed to stream syscall slice: {e}");
+                        }
+
+                        if let Err(e) = collector.add_arg(ArgRecord {
+                            slice_id,
+                            key: "nr".to_string(),
+                            int_value: Some(syscall_nr as i64),
+                            string_value: None,
+                            real_value: None,
+                        }) {
+                            eprintln!("Warning: Failed to stream syscall arg: {e}");
+                        }
+                    }
+                    self.streaming_collector = Some(collector);
+                } else {
+                    // Non-streaming path: store for batch write
+                    self.completed_syscalls
+                        .entry(tgidpid)
+                        .or_default()
+                        .push((enter_ts, event.ts, syscall_nr));
+                }
             }
         }
     }
@@ -719,22 +842,17 @@ impl SystingProbeRecorder {
         syscall_nr: u64,
         id_counter: &Arc<AtomicUsize>,
     ) -> u64 {
-        use syscalls::Sysno;
-
         if let Some(&iid) = self.syscall_iids.get(&syscall_nr) {
             return iid;
         }
 
-        let syscall_name = match Sysno::new(syscall_nr as usize) {
-            Some(sysno) => sysno.name().to_string(),
-            None => format!("syscall_{syscall_nr}"),
-        };
+        let name = syscall_name(syscall_nr);
 
-        let iid = if let Some(&existing_iid) = self.syscall_name_ids.get(&syscall_name) {
+        let iid = if let Some(&existing_iid) = self.syscall_name_ids.get(&name) {
             existing_iid
         } else {
             let new_iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            self.syscall_name_ids.insert(syscall_name, new_iid);
+            self.syscall_name_ids.insert(name, new_iid);
             new_iid
         };
 
@@ -755,37 +873,125 @@ impl SystingProbeRecorder {
     }
 
     fn handle_cpu_event(&mut self, event: probe_event, arg_data: Vec<(String, ArgValue)>) {
+        // Clone data we need from systing_event early to avoid borrow conflicts
         let systing_event = self.cookies.get(&event.cookie).unwrap();
+        let systing_event_name = systing_event.name.clone();
+        let event_display_name = format!("{systing_event}");
 
         // If this is an instant event just add it to the list of events
-        if self.instant_events.contains_key(&systing_event.name) {
-            let instant_track = self.instant_events.get(&systing_event.name).unwrap();
-            let entry = self.cpu_events.entry(event.cpu).or_default();
-            let entry = entry.entry(instant_track.clone()).or_default();
-            entry.push(TrackInstant {
-                ts: event.ts,
-                name: format!("{systing_event}"),
-                args: arg_data,
-            });
+        if self.instant_events.contains_key(&systing_event_name) {
+            let instant_track = self
+                .instant_events
+                .get(&systing_event_name)
+                .unwrap()
+                .clone();
+
+            // Stream if enabled
+            if let Some(mut collector) = self.streaming_collector.take() {
+                let key = TrackCacheKey::Cpu {
+                    cpu: event.cpu,
+                    track_name: instant_track,
+                };
+                if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
+                    self.instant_id_counter += 1;
+                    let instant_id = self.instant_id_counter;
+
+                    if let Err(e) = collector.add_instant(InstantRecord {
+                        id: instant_id,
+                        ts: event.ts as i64,
+                        track_id,
+                        utid: None,
+                        name: event_display_name,
+                        category: None,
+                    }) {
+                        eprintln!("Warning: Failed to stream CPU instant: {e}");
+                    }
+
+                    for arg in &arg_data {
+                        let (key, int_value, string_value) = convert_arg(arg);
+                        if let Err(e) = collector.add_instant_arg(InstantArgRecord {
+                            instant_id,
+                            key,
+                            int_value,
+                            string_value,
+                            real_value: None,
+                        }) {
+                            eprintln!("Warning: Failed to stream CPU instant arg: {e}");
+                        }
+                    }
+                }
+                self.streaming_collector = Some(collector);
+            } else {
+                // Non-streaming path
+                let entry = self.cpu_events.entry(event.cpu).or_default();
+                let instant_track = self.instant_events.get(&systing_event_name).unwrap();
+                let entry = entry.entry(instant_track.clone()).or_default();
+                entry.push(TrackInstant {
+                    ts: event.ts,
+                    name: event_display_name,
+                    args: arg_data,
+                });
+            }
             return;
         }
 
         // First check to see if this is an end event, since we can have the same event for a start
         // event and an end event
-        if let Some(range_name) = self.stop_events.get(&systing_event.name) {
+        if let Some(range_name) = self.stop_events.get(&systing_event_name) {
             if let Some(ranges) = self.outstanding_cpu_ranges.get_mut(&event.cpu) {
                 if let Some(mut range) = ranges.remove(range_name) {
                     let track_name = self.ranges.get(range_name).unwrap().clone();
                     range.end = event.ts;
-                    let track_hash = self.cpu_ranges.entry(event.cpu).or_default();
-                    let entry = track_hash.entry(track_name).or_default();
-                    entry.push(range);
+
+                    // Stream if enabled
+                    if let Some(mut collector) = self.streaming_collector.take() {
+                        let key = TrackCacheKey::Cpu {
+                            cpu: event.cpu,
+                            track_name: track_name.clone(),
+                        };
+                        if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
+                            self.slice_id_counter += 1;
+                            let slice_id = self.slice_id_counter;
+
+                            if let Err(e) = collector.add_slice(SliceRecord {
+                                id: slice_id,
+                                ts: range.start as i64,
+                                dur: (range.end - range.start) as i64,
+                                track_id,
+                                utid: None,
+                                name: range.range_name.clone(),
+                                category: None,
+                                depth: 0,
+                            }) {
+                                eprintln!("Warning: Failed to stream CPU range slice: {e}");
+                            }
+
+                            for arg in &range.args {
+                                let (key, int_value, string_value) = convert_arg(arg);
+                                if let Err(e) = collector.add_arg(ArgRecord {
+                                    slice_id,
+                                    key,
+                                    int_value,
+                                    string_value,
+                                    real_value: None,
+                                }) {
+                                    eprintln!("Warning: Failed to stream CPU range arg: {e}");
+                                }
+                            }
+                        }
+                        self.streaming_collector = Some(collector);
+                    } else {
+                        // Non-streaming path
+                        let track_hash = self.cpu_ranges.entry(event.cpu).or_default();
+                        let entry = track_hash.entry(track_name).or_default();
+                        entry.push(range);
+                    }
                 }
             }
         }
 
         // Now handle the start event case
-        if let Some(range_name) = self.start_events.get(&systing_event.name) {
+        if let Some(range_name) = self.start_events.get(&systing_event_name) {
             if let Some(ranges) = self.outstanding_cpu_ranges.get_mut(&event.cpu) {
                 if let Some(range) = ranges.get_mut(range_name) {
                     range.start = event.ts;
@@ -819,18 +1025,67 @@ impl SystingProbeRecorder {
         arg_data: Vec<(String, ArgValue)>,
         is_marker: bool,
     ) {
+        // Clone data we need from systing_event early to avoid borrow conflicts
         let systing_event = self.cookies.get(&event.cookie).unwrap();
+        let systing_event_name = systing_event.name.clone();
+        let event_display_name = format!("{systing_event}");
 
         // If this is an instant event just add it to the list of events
-        if self.instant_events.contains_key(&systing_event.name) {
-            let instant_track = self.instant_events.get(&systing_event.name).unwrap();
-            let entry = self.events.entry(event.task.tgidpid).or_default();
-            let entry = entry.entry(instant_track.clone()).or_default();
-            entry.push(TrackInstant {
-                ts: event.ts,
-                name: format!("{systing_event}"),
-                args: arg_data,
-            });
+        if self.instant_events.contains_key(&systing_event_name) {
+            let instant_track = self
+                .instant_events
+                .get(&systing_event_name)
+                .unwrap()
+                .clone();
+
+            // Stream if enabled
+            if let Some(mut collector) = self.streaming_collector.take() {
+                let key = TrackCacheKey::Thread {
+                    tgidpid: event.task.tgidpid,
+                    track_name: instant_track,
+                };
+                if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
+                    self.instant_id_counter += 1;
+                    let instant_id = self.instant_id_counter;
+                    // Use tid as utid for streaming (same approach as SchedEventRecorder)
+                    let utid = Some(event.task.tgidpid as i32 as i64);
+
+                    if let Err(e) = collector.add_instant(InstantRecord {
+                        id: instant_id,
+                        ts: event.ts as i64,
+                        track_id,
+                        utid,
+                        name: event_display_name,
+                        category: None,
+                    }) {
+                        eprintln!("Warning: Failed to stream instant: {e}");
+                    }
+
+                    for arg in &arg_data {
+                        let (key, int_value, string_value) = convert_arg(arg);
+                        if let Err(e) = collector.add_instant_arg(InstantArgRecord {
+                            instant_id,
+                            key,
+                            int_value,
+                            string_value,
+                            real_value: None,
+                        }) {
+                            eprintln!("Warning: Failed to stream instant arg: {e}");
+                        }
+                    }
+                }
+                self.streaming_collector = Some(collector);
+            } else {
+                // Non-streaming path
+                let entry = self.events.entry(event.task.tgidpid).or_default();
+                let instant_track = self.instant_events.get(&systing_event_name).unwrap();
+                let entry = entry.entry(instant_track.clone()).or_default();
+                entry.push(TrackInstant {
+                    ts: event.ts,
+                    name: event_display_name,
+                    args: arg_data,
+                });
+            }
             return;
         }
 
@@ -860,21 +1115,65 @@ impl SystingProbeRecorder {
 
         // First check to see if this is an end event, since we can have the same event for a start
         // event and an end event
-        if let Some(range_name) = self.stop_events.get(&systing_event.name) {
+        if let Some(range_name) = self.stop_events.get(&systing_event_name) {
             let lookup_key = get_range_lookup_key(range_name, &arg_data);
             if let Some(ranges) = self.outstanding_ranges.get_mut(&range_key) {
                 if let Some(mut range) = ranges.remove(&lookup_key) {
                     let track_name = self.ranges.get(range_name).unwrap().clone();
                     range.end = event.ts;
-                    let track_hash = self.recorded_ranges.entry(event.task.tgidpid).or_default();
-                    let entry = track_hash.entry(track_name).or_default();
-                    entry.push(range);
+
+                    // Stream if enabled (thread that receives END owns the track)
+                    if let Some(mut collector) = self.streaming_collector.take() {
+                        let key = TrackCacheKey::Thread {
+                            tgidpid: event.task.tgidpid,
+                            track_name: track_name.clone(),
+                        };
+                        if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
+                            self.slice_id_counter += 1;
+                            let slice_id = self.slice_id_counter;
+                            // Use tid as utid for streaming (same approach as SchedEventRecorder)
+                            let utid = Some(event.task.tgidpid as i32 as i64);
+
+                            if let Err(e) = collector.add_slice(SliceRecord {
+                                id: slice_id,
+                                ts: range.start as i64,
+                                dur: (range.end - range.start) as i64,
+                                track_id,
+                                utid,
+                                name: range.range_name.clone(),
+                                category: None,
+                                depth: 0,
+                            }) {
+                                eprintln!("Warning: Failed to stream range slice: {e}");
+                            }
+
+                            for arg in &range.args {
+                                let (key, int_value, string_value) = convert_arg(arg);
+                                if let Err(e) = collector.add_arg(ArgRecord {
+                                    slice_id,
+                                    key,
+                                    int_value,
+                                    string_value,
+                                    real_value: None,
+                                }) {
+                                    eprintln!("Warning: Failed to stream range arg: {e}");
+                                }
+                            }
+                        }
+                        self.streaming_collector = Some(collector);
+                    } else {
+                        // Non-streaming path
+                        let track_hash =
+                            self.recorded_ranges.entry(event.task.tgidpid).or_default();
+                        let entry = track_hash.entry(track_name).or_default();
+                        entry.push(range);
+                    }
                 }
             }
         }
 
         // Now handle the start event case
-        if let Some(range_name) = self.start_events.get(&systing_event.name) {
+        if let Some(range_name) = self.start_events.get(&systing_event_name) {
             let lookup_key = get_range_lookup_key(range_name, &arg_data);
             if let Some(ranges) = self.outstanding_ranges.get_mut(&range_key) {
                 if let Some(range) = ranges.get_mut(&lookup_key) {
@@ -906,6 +1205,7 @@ impl SystingProbeRecorder {
     /// Write trace data directly to a RecordCollector (Parquet-first path).
     ///
     /// This method outputs probe events as native records without going through Perfetto format.
+    /// If streaming mode was enabled, all data was already streamed and this returns early.
     pub fn write_records(
         &self,
         collector: &mut dyn RecordCollector,
@@ -914,13 +1214,10 @@ impl SystingProbeRecorder {
         slice_id_counter: &mut i64,
         instant_id_counter: &mut i64,
     ) -> Result<()> {
-        // Helper to convert ArgValue to record fields
-        let convert_arg = |arg: &(String, ArgValue)| -> (String, Option<i64>, Option<String>) {
-            match &arg.1 {
-                ArgValue::String(s) => (arg.0.clone(), None, Some(s.clone())),
-                ArgValue::Long(v) => (arg.0.clone(), Some(*v as i64), None),
-            }
-        };
+        // If streaming was enabled, all data was already streamed
+        if self.streaming_enabled {
+            return Ok(());
+        }
 
         // Process thread instant events
         for (pidtgid, tracks) in self.events.iter() {
@@ -1104,7 +1401,7 @@ impl SystingProbeRecorder {
 
                 collector.add_track(TrackRecord {
                     id: track_id,
-                    name: "syscalls".to_string(),
+                    name: SYSCALLS_TRACK_NAME.to_string(),
                     parent_id: None,
                 })?;
 
@@ -1112,19 +1409,13 @@ impl SystingProbeRecorder {
                     let slice_id = *slice_id_counter;
                     *slice_id_counter += 1;
 
-                    use syscalls::Sysno;
-                    let syscall_name = match Sysno::new(*syscall_nr as usize) {
-                        Some(sysno) => sysno.name().to_string(),
-                        None => format!("syscall_{syscall_nr}"),
-                    };
-
                     collector.add_slice(SliceRecord {
                         id: slice_id,
                         ts: *start_ts as i64,
                         dur: (*end_ts - *start_ts) as i64,
                         track_id,
                         utid,
-                        name: syscall_name,
+                        name: syscall_name(*syscall_nr),
                         category: Some("syscall".to_string()),
                         depth: 0,
                     })?;
