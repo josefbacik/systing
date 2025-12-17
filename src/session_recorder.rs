@@ -47,10 +47,25 @@ pub struct SysInfoEvent {
     pub frequency: i64,
 }
 
-#[derive(Default)]
 pub struct SysinfoRecorder {
     pub ringbuf: RingBuffer<SysInfoEvent>,
     pub frequency: HashMap<u32, Vec<TrackCounter>>,
+    // Streaming support
+    streaming_collector: Option<Box<dyn RecordCollector + Send>>,
+    track_ids: HashMap<u32, i64>,
+    next_track_id: i64,
+}
+
+impl Default for SysinfoRecorder {
+    fn default() -> Self {
+        Self {
+            ringbuf: RingBuffer::default(),
+            frequency: HashMap::new(),
+            streaming_collector: None,
+            track_ids: HashMap::new(),
+            next_track_id: 1,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -314,11 +329,42 @@ impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
         &mut self.ringbuf
     }
     fn handle_event(&mut self, event: SysInfoEvent) {
-        let freq = self.frequency.entry(event.cpu).or_default();
-        freq.push(TrackCounter {
-            ts: event.ts,
-            count: event.frequency,
-        });
+        if let Some(ref mut collector) = self.streaming_collector {
+            // STREAMING PATH: emit directly to collector
+            let cpu = event.cpu;
+            let track_id = if let Some(&id) = self.track_ids.get(&cpu) {
+                id
+            } else {
+                let track_id = self.next_track_id;
+                self.next_track_id += 1;
+
+                if let Err(e) = collector.add_counter_track(CounterTrackRecord {
+                    id: track_id,
+                    name: format!("CPU {cpu} frequency"),
+                    unit: Some("Hz".to_string()),
+                }) {
+                    eprintln!("Warning: Failed to create frequency track: {e}");
+                }
+
+                self.track_ids.insert(cpu, track_id);
+                track_id
+            };
+
+            if let Err(e) = collector.add_counter(CounterRecord {
+                ts: event.ts as i64,
+                track_id,
+                value: event.frequency as f64,
+            }) {
+                eprintln!("Warning: Failed to stream frequency record: {e}");
+            }
+        } else {
+            // NON-STREAMING PATH: accumulate (existing behavior)
+            let freq = self.frequency.entry(event.cpu).or_default();
+            freq.push(TrackCounter {
+                ts: event.ts,
+                count: event.frequency,
+            });
+        }
     }
 }
 
@@ -384,12 +430,51 @@ impl SysinfoRecorder {
     }
 
     /// Returns the minimum timestamp from all frequency events, or None if no events recorded.
+    ///
+    /// Note: In streaming mode, this returns `None` since events bypass the frequency HashMap.
     pub fn min_timestamp(&self) -> Option<u64> {
         self.frequency
             .values()
             .filter_map(|counters| counters.first())
             .map(|c| c.ts)
             .min()
+    }
+
+    /// Set the streaming collector for direct parquet output.
+    ///
+    /// When set, events will be streamed directly to the collector during
+    /// handle_event() instead of being accumulated in memory.
+    ///
+    /// Note: Each streaming recorder gets its own StreamingParquetWriter instance,
+    /// so local track IDs (starting at 1) are safe - they write to separate files.
+    pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
+        self.streaming_collector = Some(collector);
+    }
+
+    /// Returns true if streaming mode is enabled.
+    ///
+    /// When streaming is enabled, events are written directly to the collector
+    /// during `handle_event()` rather than being accumulated in memory.
+    /// Use `set_streaming_collector()` to enable streaming mode.
+    pub fn is_streaming(&self) -> bool {
+        self.streaming_collector.is_some()
+    }
+
+    /// Finish streaming and return the collector.
+    ///
+    /// Flushes pending data, clears internal state, and returns the collector
+    /// for finalization.
+    pub fn finish(&mut self) -> Result<Option<Box<dyn RecordCollector + Send>>> {
+        if let Some(mut collector) = self.streaming_collector.take() {
+            // Data already streamed during handle_event, just flush
+            collector.flush()?;
+            // Clear track_ids cache and reset counter
+            self.track_ids.clear();
+            self.next_track_id = 1;
+            Ok(Some(collector))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -1004,6 +1089,14 @@ impl SessionRecorder {
             .unwrap()
             .set_streaming_collector(Box::new(perf_writer));
 
+        // Set up streaming collector for sysinfo recorder (CPU frequency events).
+        // Like perf counters, sysinfo gets its own writer for counter tracks.
+        let sysinfo_writer = StreamingParquetWriter::new(output_dir)?;
+        self.sysinfo_recorder
+            .lock()
+            .unwrap()
+            .set_streaming_collector(Box::new(sysinfo_writer));
+
         Ok(())
     }
 
@@ -1199,11 +1292,20 @@ impl SessionRecorder {
                 .write_records(&mut *writer, &mut track_id_counter)?;
         }
 
-        eprintln!("Writing sysinfo records...");
-        self.sysinfo_recorder
-            .lock()
-            .unwrap()
-            .write_records(&mut *writer, &mut track_id_counter)?;
+        // Handle sysinfo records (streaming or non-streaming)
+        let sysinfo_streaming = self.sysinfo_recorder.lock().unwrap().is_streaming();
+        if sysinfo_streaming {
+            eprintln!("Flushing sysinfo records from streaming...");
+            if let Some(sysinfo_collector) = self.sysinfo_recorder.lock().unwrap().finish()? {
+                sysinfo_collector.finish_boxed()?;
+            }
+        } else {
+            eprintln!("Writing sysinfo records...");
+            self.sysinfo_recorder
+                .lock()
+                .unwrap()
+                .write_records(&mut *writer, &mut track_id_counter)?;
+        }
 
         // Handle probe records - streaming mode uses finish(), non-streaming uses write_records()
         let probe_streaming = self.probe_recorder.lock().unwrap().is_streaming();
