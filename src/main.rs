@@ -39,6 +39,9 @@ use crate::sched::SchedEventRecorder;
 use crate::session_recorder::{get_clock_value, SessionRecorder, SysInfoEvent};
 use crate::stack_recorder::StackRecorder;
 
+// Library imports for shared functionality
+use ::systing::duckdb as systing_duckdb;
+
 use anyhow::Result;
 use anyhow::{bail, Context};
 use clap::{ArgAction, Parser};
@@ -336,6 +339,15 @@ struct Command {
     /// for compatibility; use --parquet-only to skip this conversion step.
     #[arg(long)]
     parquet_first: bool,
+
+    /// Generate a DuckDB database from the parquet files after recording.
+    /// The database can be queried using standard SQL for trace analysis.
+    #[arg(long)]
+    with_duckdb: bool,
+
+    /// Path for the DuckDB database output (default: trace.duckdb in output-dir)
+    #[arg(long, default_value = "trace.duckdb")]
+    duckdb_output: PathBuf,
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -2376,6 +2388,26 @@ fn system(opts: Command) -> Result<()> {
         );
         parquet_to_perfetto::convert(&opts.output_dir, &opts.output)?;
         println!("Successfully wrote {}", opts.output.display());
+    }
+
+    // Generate DuckDB database (if --with-duckdb)
+    if opts.with_duckdb {
+        let db_path = if opts.duckdb_output.is_absolute() {
+            opts.duckdb_output.clone()
+        } else {
+            opts.output_dir.join(&opts.duckdb_output)
+        };
+
+        // Generate trace_id from output directory name
+        let trace_id = opts
+            .output_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "trace".to_string());
+
+        println!("Generating DuckDB database: {}...", db_path.display());
+        systing_duckdb::parquet_to_duckdb(&opts.output_dir, &db_path, &trace_id)?;
+        println!("Successfully wrote {}", db_path.display());
     }
 
     Ok(())
