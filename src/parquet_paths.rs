@@ -1,8 +1,13 @@
 //! Parquet file path management.
+//!
+//! This module provides the `ParquetPaths` struct for managing paths to all
+//! parquet output files. It is shared between the systing binary and
+//! systing-analyze tool.
 
 use std::path::{Path, PathBuf};
 
 /// Paths to all parquet output files.
+#[derive(Debug, Clone)]
 pub struct ParquetPaths {
     pub process: PathBuf,
     pub thread: PathBuf,
@@ -20,9 +25,15 @@ pub struct ParquetPaths {
     pub instant: PathBuf,
     pub args: PathBuf,
     pub instant_args: PathBuf,
-    // Stack tables
+    // Stack tables (query-friendly format, used by systing record)
     pub stack: PathBuf,
     pub stack_sample: PathBuf,
+    // Legacy stack profile tables (used by systing-analyze for Perfetto .pb extraction)
+    pub symbol: PathBuf,
+    pub stack_mapping: PathBuf,
+    pub frame: PathBuf,
+    pub callsite: PathBuf,
+    pub perf_sample: PathBuf,
     // Network metadata tables (legacy)
     pub network_interface: PathBuf,
     pub socket_connection: PathBuf,
@@ -62,9 +73,15 @@ impl ParquetPaths {
             instant: dir.join("instant.parquet"),
             args: dir.join("args.parquet"),
             instant_args: dir.join("instant_args.parquet"),
-            // Stack tables
+            // Stack tables (query-friendly format)
             stack: dir.join("stack.parquet"),
             stack_sample: dir.join("stack_sample.parquet"),
+            // Legacy stack profile tables (for Perfetto .pb extraction)
+            symbol: dir.join("symbol.parquet"),
+            stack_mapping: dir.join("mapping.parquet"),
+            frame: dir.join("frame.parquet"),
+            callsite: dir.join("callsite.parquet"),
+            perf_sample: dir.join("perf_sample.parquet"),
             // Network metadata tables (legacy)
             network_interface: dir.join("network_interface.parquet"),
             socket_connection: dir.join("socket_connection.parquet"),
@@ -78,8 +95,45 @@ impl ParquetPaths {
         }
     }
 
+    /// Create paths for parquet files with a trace_id prefix.
+    /// Files are named with the trace_id (e.g., `{trace_id}_process.parquet`).
+    /// Used by systing-analyze when extracting from Perfetto .pb files.
+    pub fn with_trace_prefix(dir: &Path, trace_id: &str) -> Self {
+        Self {
+            process: dir.join(format!("{trace_id}_process.parquet")),
+            thread: dir.join(format!("{trace_id}_thread.parquet")),
+            sched_slice: dir.join(format!("{trace_id}_sched_slice.parquet")),
+            thread_state: dir.join(format!("{trace_id}_thread_state.parquet")),
+            irq_slice: dir.join(format!("{trace_id}_irq_slice.parquet")),
+            softirq_slice: dir.join(format!("{trace_id}_softirq_slice.parquet")),
+            wakeup_new: dir.join(format!("{trace_id}_wakeup_new.parquet")),
+            process_exit: dir.join(format!("{trace_id}_process_exit.parquet")),
+            counter: dir.join(format!("{trace_id}_counter.parquet")),
+            counter_track: dir.join(format!("{trace_id}_counter_track.parquet")),
+            slice: dir.join(format!("{trace_id}_slice.parquet")),
+            track: dir.join(format!("{trace_id}_track.parquet")),
+            instant: dir.join(format!("{trace_id}_instant.parquet")),
+            args: dir.join(format!("{trace_id}_args.parquet")),
+            instant_args: dir.join(format!("{trace_id}_instant_args.parquet")),
+            stack: dir.join(format!("{trace_id}_stack.parquet")),
+            stack_sample: dir.join(format!("{trace_id}_stack_sample.parquet")),
+            symbol: dir.join(format!("{trace_id}_symbol.parquet")),
+            stack_mapping: dir.join(format!("{trace_id}_stack_mapping.parquet")),
+            frame: dir.join(format!("{trace_id}_frame.parquet")),
+            callsite: dir.join(format!("{trace_id}_callsite.parquet")),
+            perf_sample: dir.join(format!("{trace_id}_perf_sample.parquet")),
+            network_interface: dir.join(format!("{trace_id}_network_interface.parquet")),
+            socket_connection: dir.join(format!("{trace_id}_socket_connection.parquet")),
+            network_syscall: dir.join(format!("{trace_id}_network_syscall.parquet")),
+            network_packet: dir.join(format!("{trace_id}_network_packet.parquet")),
+            network_socket: dir.join(format!("{trace_id}_network_socket.parquet")),
+            network_poll: dir.join(format!("{trace_id}_network_poll.parquet")),
+            clock_snapshot: dir.join(format!("{trace_id}_clock_snapshot.parquet")),
+        }
+    }
+
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 24] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 29] {
         [
             PathEntry {
                 path: &self.process,
@@ -148,6 +202,27 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.stack_sample,
                 name: "stack_sample",
+            },
+            // Legacy stack profile tables
+            PathEntry {
+                path: &self.symbol,
+                name: "symbol",
+            },
+            PathEntry {
+                path: &self.stack_mapping,
+                name: "stack_mapping",
+            },
+            PathEntry {
+                path: &self.frame,
+                name: "frame",
+            },
+            PathEntry {
+                path: &self.callsite,
+                name: "callsite",
+            },
+            PathEntry {
+                path: &self.perf_sample,
+                name: "perf_sample",
             },
             PathEntry {
                 path: &self.network_interface,

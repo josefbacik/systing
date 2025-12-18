@@ -46,6 +46,10 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "time"] }
 generate-vmlinux-header = []
 pystacks = []
 
+[lib]
+name = "systing"
+path = "src/lib.rs"
+
 [[bin]]
 name = "systing-analyze"
 path = "src/bin/systing_analyze.rs"
