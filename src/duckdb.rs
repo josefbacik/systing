@@ -462,7 +462,7 @@ mod tests {
 
         // Verify some key tables exist
         let tables: Vec<String> = conn
-            .prepare("SELECT name FROM information_schema.tables WHERE table_schema = 'main'")
+            .prepare("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'")
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
