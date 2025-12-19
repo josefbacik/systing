@@ -329,8 +329,6 @@ fn main() -> Result<()> {
 
     set_global_subscriber(subscriber).expect("Failed to set tracing subscriber");
 
-    systing::bump_memlock_rlimit()?;
-
     let config = Config::from(opts);
     systing::systing(config)
 }
