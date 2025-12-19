@@ -61,6 +61,12 @@ pub fn convert(input_dir: &Path, output_file: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Thread info tuple: (tid, name, upid)
+/// - tid: Thread ID
+/// - name: Thread name
+/// - upid: Optional process ID reference (used to look up actual pid/tgid)
+type ThreadInfo = (i32, String, Option<i64>);
+
 /// Converter state for reconstructing Perfetto traces from parquet files.
 struct ParquetToPerfettoConverter {
     /// Counter for generating fresh UUIDs (starts at 1)
@@ -101,6 +107,16 @@ impl ParquetToPerfettoConverter {
         let seq = self.next_seq_id;
         self.next_seq_id += 1;
         seq
+    }
+
+    /// Look up the process ID (tgid) from a upid, falling back to the provided tid.
+    ///
+    /// This is used to resolve the actual process ID when we have a thread's upid
+    /// reference. If the upid is None or not found in upid_to_pid, we fall back
+    /// to using the tid (which is correct for main threads where tid == tgid).
+    fn resolve_tgid(&self, upid: Option<i64>, fallback_tid: i32) -> i32 {
+        upid.and_then(|u| self.upid_to_pid.get(&u).copied())
+            .unwrap_or(fallback_tid)
     }
 
     /// Convert parquet files to Perfetto trace
@@ -287,9 +303,7 @@ impl ParquetToPerfettoConverter {
                     let upid = get_optional_i64(upids, i);
 
                     // Look up the TGID from the parent process
-                    let tgid = upid
-                        .and_then(|u| self.upid_to_pid.get(&u).copied())
-                        .unwrap_or(tid);
+                    let tgid = self.resolve_tgid(upid, tid);
 
                     // Skip main threads (TID == TGID) - they're handled by ProcessDescriptor
                     if tid == tgid {
@@ -554,10 +568,11 @@ impl ParquetToPerfettoConverter {
                     0 // Default to TASK_RUNNING if no end_state column
                 };
 
-                let (tid, comm) = utid_to_thread
-                    .get(&utid)
-                    .cloned()
-                    .unwrap_or((0, String::new()));
+                let (tid, comm, _) =
+                    utid_to_thread
+                        .get(&utid)
+                        .cloned()
+                        .unwrap_or((0, String::new(), None));
 
                 let entry = cpu_events
                     .entry(cpu)
@@ -591,10 +606,11 @@ impl ParquetToPerfettoConverter {
                 let utid = utids.value(i);
                 let target_cpu = get_optional_i32(cpus, i).unwrap_or(0);
 
-                let (tid, comm) = utid_to_thread
-                    .get(&utid)
-                    .cloned()
-                    .unwrap_or((0, String::new()));
+                let (tid, comm, _) =
+                    utid_to_thread
+                        .get(&utid)
+                        .cloned()
+                        .unwrap_or((0, String::new(), None));
 
                 // Waking events go to CPU 0 by convention (they have target_cpu field)
                 let entry = cpu_events
@@ -869,10 +885,11 @@ impl ParquetToPerfettoConverter {
                     let utid = utids.value(i);
                     let target_cpu = target_cpus.value(i);
 
-                    let (pid, comm) = utid_to_thread
-                        .get(&utid)
-                        .cloned()
-                        .unwrap_or((utid as i32, String::new()));
+                    let (pid, comm, _) = utid_to_thread.get(&utid).cloned().unwrap_or((
+                        utid as i32,
+                        String::new(),
+                        None,
+                    ));
 
                     let mut ftrace_event = FtraceEvent::default();
                     ftrace_event.set_timestamp(ts as u64);
@@ -911,17 +928,21 @@ impl ParquetToPerfettoConverter {
                     let cpu = cpus.value(i);
                     let utid = utids.value(i);
 
-                    let (pid, comm) = utid_to_thread
-                        .get(&utid)
-                        .cloned()
-                        .unwrap_or((utid as i32, String::new()));
+                    let (tid, comm, upid) = utid_to_thread.get(&utid).cloned().unwrap_or((
+                        utid as i32,
+                        String::new(),
+                        None,
+                    ));
+
+                    // Look up the actual process ID (tgid) from upid, fallback to tid
+                    let tgid = self.resolve_tgid(upid, tid);
 
                     let mut ftrace_event = FtraceEvent::default();
                     ftrace_event.set_timestamp(ts as u64);
-                    ftrace_event.set_pid(pid as u32);
+                    ftrace_event.set_pid(tid as u32);
                     let mut exit = SchedProcessExitFtraceEvent::default();
-                    exit.set_pid(pid);
-                    exit.set_tgid(pid); // Use pid as tgid (we don't have separate tgid)
+                    exit.set_pid(tid);
+                    exit.set_tgid(tgid);
                     exit.set_comm(comm);
                     exit.set_prio(DEFAULT_PRIORITY);
                     ftrace_event.set_sched_process_exit(exit);
@@ -951,12 +972,14 @@ impl ParquetToPerfettoConverter {
         Ok(())
     }
 
-    /// Build utid -> (tid, name) mapping from thread table.
+    /// Build utid -> ThreadInfo mapping from thread table.
     ///
-    /// This also includes tid -> (tid, name) mappings because the streaming sched
+    /// This also includes tid -> ThreadInfo mappings because the streaming sched
     /// recorder uses `tid as utid` for efficiency. This allows lookups to work
     /// whether the caller has a real utid or a tid-as-utid.
-    fn build_utid_to_thread_map(&self, path: &Path) -> Result<HashMap<i64, (i32, String)>> {
+    ///
+    /// The upid in ThreadInfo can be used with `upid_to_pid` to get the actual process ID (tgid).
+    fn build_utid_to_thread_map(&self, path: &Path) -> Result<HashMap<i64, ThreadInfo>> {
         let mut map = HashMap::new();
         let batches = read_parquet_file(path)?;
 
@@ -972,15 +995,19 @@ impl ParquetToPerfettoConverter {
             let names = batch
                 .column_by_name("name")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let upids = batch
+                .column_by_name("upid")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
 
             for i in 0..batch.num_rows() {
                 let utid = utids.value(i);
                 let tid = tids.value(i);
                 let name = get_optional_string(names, i).unwrap_or_default();
+                let upid = get_optional_i64(upids, i);
                 // Insert by utid (for non-streaming cases)
-                map.insert(utid, (tid, name.clone()));
+                map.insert(utid, (tid, name.clone(), upid));
                 // Also insert by tid (for streaming cases where utid = tid)
-                map.insert(tid as i64, (tid, name));
+                map.insert(tid as i64, (tid, name, upid));
             }
         }
 
@@ -1451,14 +1478,18 @@ impl ParquetToPerfettoConverter {
                 let utid = utids.value(i);
                 let cpu = get_optional_i32(cpus, i).map(|c| c as u32);
 
-                let (tid, _) = utid_to_thread
-                    .get(&utid)
-                    .cloned()
-                    .unwrap_or((0, String::new()));
+                let (tid, _, upid) =
+                    utid_to_thread
+                        .get(&utid)
+                        .cloned()
+                        .unwrap_or((0, String::new(), None));
+
+                // Look up the actual process ID (tgid) from upid, fallback to tid
+                let pid = self.resolve_tgid(upid, tid);
 
                 let mut sample = PerfSample::default();
                 sample.set_tid(tid as u32);
-                sample.set_pid(tid as u32); // Use tid as pid approximation
+                sample.set_pid(pid as u32);
                 if let Some(c) = cpu {
                     sample.set_cpu(c);
                 }
@@ -1801,6 +1832,296 @@ fn read_stack_data(input_dir: &Path) -> Result<HashMap<i64, StackData>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    /// Helper to create a test parquet file with process records
+    fn create_test_process_parquet(dir: &Path, upid: i64, pid: i32) -> Result<()> {
+        let path = dir.join("process.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("upid", DataType::Int64, false),
+            Field::new("pid", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("parent_upid", DataType::Int64, true),
+        ]));
+
+        let upids = Int64Array::from(vec![upid]);
+        let pids = Int32Array::from(vec![pid]);
+        let names: StringArray = vec![Some("test_process")].into_iter().collect();
+        let parent_upids: Int64Array = vec![None::<i64>].into_iter().collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(upids),
+                Arc::new(pids),
+                Arc::new(names),
+                Arc::new(parent_upids),
+            ],
+        )?;
+
+        let file = File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    /// Helper to create a test parquet file with thread records
+    fn create_test_thread_parquet(
+        dir: &Path,
+        utid: i64,
+        tid: i32,
+        upid: Option<i64>,
+    ) -> Result<()> {
+        let path = dir.join("thread.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("utid", DataType::Int64, false),
+            Field::new("tid", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("upid", DataType::Int64, true),
+        ]));
+
+        let utids = Int64Array::from(vec![utid]);
+        let tids = Int32Array::from(vec![tid]);
+        let names: StringArray = vec![Some("test_thread")].into_iter().collect();
+        let upids: Int64Array = vec![upid].into_iter().collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(utids),
+                Arc::new(tids),
+                Arc::new(names),
+                Arc::new(upids),
+            ],
+        )?;
+
+        let file = File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    /// Helper to create a test parquet file with perf_sample records
+    fn create_test_perf_sample_parquet(dir: &Path, ts: i64, utid: i64, cpu: i32) -> Result<()> {
+        let path = dir.join("perf_sample.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("utid", DataType::Int64, false),
+            Field::new("callsite_id", DataType::Int64, true),
+            Field::new("cpu", DataType::Int32, true),
+        ]));
+
+        let timestamps = Int64Array::from(vec![ts]);
+        let utids = Int64Array::from(vec![utid]);
+        let callsite_ids: Int64Array = vec![None::<i64>].into_iter().collect();
+        let cpus = Int32Array::from(vec![Some(cpu)]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(timestamps),
+                Arc::new(utids),
+                Arc::new(callsite_ids),
+                Arc::new(cpus),
+            ],
+        )?;
+
+        let file = File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    /// Helper to create a test parquet file with process_exit records
+    fn create_test_process_exit_parquet(dir: &Path, ts: i64, cpu: i32, utid: i64) -> Result<()> {
+        let path = dir.join("process_exit.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("cpu", DataType::Int32, false),
+            Field::new("utid", DataType::Int64, false),
+        ]));
+
+        let timestamps = Int64Array::from(vec![ts]);
+        let cpus = Int32Array::from(vec![cpu]);
+        let utids = Int64Array::from(vec![utid]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(timestamps), Arc::new(cpus), Arc::new(utids)],
+        )?;
+
+        let file = File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_utid_to_thread_map_returns_upid() {
+        let dir = tempdir().unwrap();
+
+        // Create thread parquet with upid
+        create_test_thread_parquet(dir.path(), 100, 1234, Some(1)).unwrap();
+
+        let converter = ParquetToPerfettoConverter::new();
+        let thread_path = dir.path().join("thread.parquet");
+        let map = converter.build_utid_to_thread_map(&thread_path).unwrap();
+
+        // Verify the map contains the expected data
+        let (tid, name, upid) = map.get(&100).unwrap();
+        assert_eq!(*tid, 1234);
+        assert_eq!(name, "test_thread");
+        assert_eq!(*upid, Some(1));
+
+        // Also verify the tid-as-utid entry exists
+        let (tid2, name2, upid2) = map.get(&1234).unwrap();
+        assert_eq!(*tid2, 1234);
+        assert_eq!(name2, "test_thread");
+        assert_eq!(*upid2, Some(1));
+    }
+
+    #[test]
+    fn test_build_utid_to_thread_map_handles_missing_upid() {
+        let dir = tempdir().unwrap();
+
+        // Create thread parquet without upid
+        create_test_thread_parquet(dir.path(), 100, 1234, None).unwrap();
+
+        let converter = ParquetToPerfettoConverter::new();
+        let thread_path = dir.path().join("thread.parquet");
+        let map = converter.build_utid_to_thread_map(&thread_path).unwrap();
+
+        let (tid, _, upid) = map.get(&100).unwrap();
+        assert_eq!(*tid, 1234);
+        assert!(upid.is_none());
+    }
+
+    #[test]
+    fn test_perf_sample_uses_correct_pid_from_upid() {
+        use crate::perfetto::VecTraceWriter;
+
+        let dir = tempdir().unwrap();
+
+        // Create process with upid=1, pid=1000 (the tgid/process ID)
+        create_test_process_parquet(dir.path(), 1, 1000).unwrap();
+
+        // Create thread with tid=2000 (different from pid), linked to upid=1
+        create_test_thread_parquet(dir.path(), 100, 2000, Some(1)).unwrap();
+
+        // Create perf_sample referencing utid=100
+        create_test_perf_sample_parquet(dir.path(), 123456789, 100, 0).unwrap();
+
+        // Convert to Perfetto
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut writer = VecTraceWriter::default();
+
+        // First write process/thread descriptors to populate upid_to_pid
+        converter
+            .write_process_and_thread_descriptors(dir.path(), &mut writer)
+            .unwrap();
+
+        // Then write perf samples
+        converter
+            .write_perf_samples(dir.path(), &mut writer)
+            .unwrap();
+
+        // Find the PerfSample packet and verify pid/tid
+        let perf_sample_packet = writer.packets.iter().find(|p| p.has_perf_sample()).unwrap();
+        let sample = perf_sample_packet.perf_sample();
+
+        // tid should be 2000 (the thread ID)
+        assert_eq!(sample.tid(), 2000);
+        // pid should be 1000 (the process ID from upid lookup), NOT 2000
+        assert_eq!(sample.pid(), 1000);
+    }
+
+    #[test]
+    fn test_perf_sample_falls_back_to_tid_when_no_upid() {
+        use crate::perfetto::VecTraceWriter;
+
+        let dir = tempdir().unwrap();
+
+        // Create thread without upid (simulating missing process linkage)
+        create_test_thread_parquet(dir.path(), 100, 2000, None).unwrap();
+
+        // Create perf_sample referencing utid=100
+        create_test_perf_sample_parquet(dir.path(), 123456789, 100, 0).unwrap();
+
+        // Convert to Perfetto
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut writer = VecTraceWriter::default();
+
+        // Write perf samples (no process table, so upid_to_pid will be empty)
+        converter
+            .write_perf_samples(dir.path(), &mut writer)
+            .unwrap();
+
+        // Find the PerfSample packet
+        let perf_sample_packet = writer.packets.iter().find(|p| p.has_perf_sample()).unwrap();
+        let sample = perf_sample_packet.perf_sample();
+
+        // Both tid and pid should fall back to 2000 when upid lookup fails
+        assert_eq!(sample.tid(), 2000);
+        assert_eq!(sample.pid(), 2000);
+    }
+
+    #[test]
+    fn test_process_exit_uses_correct_tgid_from_upid() {
+        use crate::perfetto::VecTraceWriter;
+
+        let dir = tempdir().unwrap();
+
+        // Create process with upid=1, pid=1000 (the tgid/process ID)
+        create_test_process_parquet(dir.path(), 1, 1000).unwrap();
+
+        // Create thread with tid=2000 (different from pid), linked to upid=1
+        create_test_thread_parquet(dir.path(), 100, 2000, Some(1)).unwrap();
+
+        // Create process_exit event for utid=100
+        create_test_process_exit_parquet(dir.path(), 123456789, 0, 100).unwrap();
+
+        // Convert to Perfetto
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut writer = VecTraceWriter::default();
+
+        // First write process/thread descriptors to populate upid_to_pid
+        converter
+            .write_process_and_thread_descriptors(dir.path(), &mut writer)
+            .unwrap();
+
+        // Then write misc sched events (which includes process_exit)
+        converter
+            .write_misc_sched_events(dir.path(), &mut writer)
+            .unwrap();
+
+        // Find the FtraceEventBundle packet and extract the process_exit event
+        let ftrace_bundle = writer
+            .packets
+            .iter()
+            .find(|p| p.has_ftrace_events())
+            .expect("Should have ftrace_events packet");
+
+        let bundle = ftrace_bundle.ftrace_events();
+        let exit_event = bundle
+            .event
+            .iter()
+            .find(|e| e.has_sched_process_exit())
+            .expect("Should have sched_process_exit event");
+
+        let exit = exit_event.sched_process_exit();
+
+        // pid should be 2000 (the thread ID)
+        assert_eq!(exit.pid(), 2000);
+        // tgid should be 1000 (the process ID from upid lookup), NOT 2000
+        assert_eq!(exit.tgid(), 1000);
+    }
 
     #[test]
     fn test_parse_module_name_with_source_location() {
