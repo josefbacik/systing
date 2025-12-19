@@ -1,20 +1,3 @@
-mod events;
-mod network_recorder;
-mod parquet;
-mod parquet_to_perfetto;
-mod parquet_writer;
-mod perf;
-mod perf_recorder;
-mod perfetto;
-mod pystacks;
-mod record;
-mod ringbuf;
-mod sched;
-mod session_recorder;
-mod stack_recorder;
-mod systing;
-mod trace;
-
 use std::env;
 use std::path::PathBuf;
 use std::process;
@@ -29,7 +12,7 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::time::SystemTime;
 use tracing_subscriber::FmtSubscriber;
 
-use systing::Config;
+use systing::{get_available_recorders, systing, Config};
 
 /// Memory lock limit for BPF programs (128 MiB)
 const MEMLOCK_RLIMIT_BYTES: u64 = 128 << 20;
@@ -176,8 +159,8 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
 }
 
 fn process_recorder_options(opts: &mut Command) -> Result<()> {
-    systing::validate_recorder_names(&opts.add_recorder)?;
-    systing::validate_recorder_names(&opts.only_recorder)?;
+    systing::systing_core::validate_recorder_names(&opts.add_recorder)?;
+    systing::systing_core::validate_recorder_names(&opts.only_recorder)?;
 
     // If --only-recorder is specified, disable all recorders first
     if !opts.only_recorder.is_empty() {
@@ -298,7 +281,7 @@ fn main() -> Result<()> {
 
     if opts.list_recorders {
         println!("Available recorders:");
-        for recorder in systing::get_available_recorders() {
+        for recorder in get_available_recorders() {
             let default_text = if recorder.default_enabled {
                 " (on by default)"
             } else {
@@ -330,5 +313,5 @@ fn main() -> Result<()> {
     set_global_subscriber(subscriber).expect("Failed to set tracing subscriber");
 
     let config = Config::from(opts);
-    systing::systing(config)
+    systing(config)
 }

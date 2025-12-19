@@ -10,8 +10,8 @@ use std::time::Duration;
 use crate::perfetto::TraceWriter;
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
-use crate::systing::types::probe_event;
-use crate::systing::SystingRecordEvent;
+use crate::systing_core::types::probe_event;
+use crate::systing_core::SystingRecordEvent;
 use crate::trace::{ArgRecord, InstantArgRecord, InstantRecord, SliceRecord, TrackRecord};
 
 use anyhow::Result;
@@ -617,7 +617,7 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
         // For marker events, extract socket_id from args[0]
         if is_marker && event.num_args > 0 {
             let bpf_arg = &event.args[0];
-            if bpf_arg.r#type == crate::systing::types::arg_type::ARG_LONG {
+            if bpf_arg.r#type == crate::systing_core::types::arg_type::ARG_LONG {
                 let mut bytes: [u8; 8] = [0; 8];
                 let _ = bytes.copy_from_bytes(&bpf_arg.value[..8]);
                 let val = u64::from_ne_bytes(bytes);
@@ -636,19 +636,19 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
             let event_key = &systing_event.args[config_idx];
 
             match bpf_arg.r#type {
-                crate::systing::types::arg_type::ARG_LONG => {
+                crate::systing_core::types::arg_type::ARG_LONG => {
                     let mut bytes: [u8; 8] = [0; 8];
                     let _ = bytes.copy_from_bytes(&bpf_arg.value[..8]);
                     let val = u64::from_ne_bytes(bytes);
                     arg_data.push((event_key.arg_name.clone(), ArgValue::Long(val)));
                 }
-                crate::systing::types::arg_type::ARG_RETVAL => {
+                crate::systing_core::types::arg_type::ARG_RETVAL => {
                     let mut bytes: [u8; 8] = [0; 8];
                     let _ = bytes.copy_from_bytes(&bpf_arg.value[..8]);
                     let val = u64::from_ne_bytes(bytes);
                     arg_data.push((event_key.arg_name.clone(), ArgValue::Long(val)));
                 }
-                crate::systing::types::arg_type::ARG_STRING => {
+                crate::systing_core::types::arg_type::ARG_STRING => {
                     let arg_str = CStr::from_bytes_until_nul(&bpf_arg.value);
                     if let Ok(arg_str) = arg_str {
                         let bytes = arg_str.to_bytes();
@@ -2053,7 +2053,7 @@ impl SystingProbeRecorder {
 mod tests {
     use super::*;
     use crate::perfetto::VecTraceWriter;
-    use crate::systing::types::task_info;
+    use crate::systing_core::types::task_info;
     use perfetto_protos::trace_packet::TracePacket;
     use rand::rngs::mock::StepRng;
 
@@ -4137,7 +4137,7 @@ mod tests {
             num_args: 1,
             ..Default::default()
         };
-        event.args[0].r#type = crate::systing::types::arg_type::ARG_LONG;
+        event.args[0].r#type = crate::systing_core::types::arg_type::ARG_LONG;
         event.args[0].size = 8;
         let bytes = syscall_nr.to_ne_bytes();
         event.args[0].value[..8].copy_from_slice(&bytes);
@@ -4158,11 +4158,11 @@ mod tests {
             num_args: 2,
             ..Default::default()
         };
-        event.args[0].r#type = crate::systing::types::arg_type::ARG_LONG;
+        event.args[0].r#type = crate::systing_core::types::arg_type::ARG_LONG;
         event.args[0].size = 8;
         let bytes = syscall_nr.to_ne_bytes();
         event.args[0].value[..8].copy_from_slice(&bytes);
-        event.args[1].r#type = crate::systing::types::arg_type::ARG_LONG;
+        event.args[1].r#type = crate::systing_core::types::arg_type::ARG_LONG;
         event.args[1].size = 8;
         let ret_bytes = ret.to_ne_bytes();
         event.args[1].value[..8].copy_from_slice(&ret_bytes);

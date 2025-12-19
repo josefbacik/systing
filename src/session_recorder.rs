@@ -16,8 +16,8 @@ use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::stack_recorder::StackRecorder;
-use crate::systing::types::task_info;
-use crate::systing::SystingRecordEvent;
+use crate::systing_core::types::task_info;
+use crate::systing_core::SystingRecordEvent;
 use crate::trace::{
     ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ProcessRecord, ThreadRecord,
 };
@@ -800,7 +800,7 @@ impl SessionRecorder {
     /// * `trace_start_ts` - BOOTTIME timestamp for when the trace began (used for metadata events)
     ///
     /// The hierarchy looks like:
-    /// ```
+    /// ```text
     /// Network Interfaces
     /// ├── host
     /// │   ├── eth0
@@ -1335,7 +1335,7 @@ impl SessionRecorder {
     }
 }
 
-impl crate::systing::SystingEvent for SysInfoEvent {
+impl crate::systing_core::SystingEvent for SysInfoEvent {
     fn ts(&self) -> u64 {
         self.ts
     }
@@ -1963,9 +1963,9 @@ mod tests {
             task.comm[0..4].copy_from_slice(b"test");
 
             // Create a switch event which is stored in compact_sched
-            let event = crate::systing::types::task_event {
+            let event = crate::systing_core::types::task_event {
                 ts: 1_000_000_000, // 1 second
-                r#type: crate::systing::types::event_type::SCHED_SWITCH,
+                r#type: crate::systing_core::types::event_type::SCHED_SWITCH,
                 cpu: 0,
                 target_cpu: 0,
                 prev_prio: 0,
