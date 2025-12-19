@@ -350,6 +350,106 @@ struct Command {
     duckdb_output: PathBuf,
 }
 
+/// Configuration for the systing system tracing.
+/// This struct contains all the runtime options needed by the system() function
+/// and its helpers, separated from the CLI parsing concerns of Command.
+#[derive(Debug)]
+pub struct Config {
+    /// Verbosity level (0 = warn, 1 = info, 2 = debug, 3+ = trace)
+    pub verbosity: u8,
+    /// PIDs to trace
+    pub pid: Vec<u32>,
+    /// Cgroups to trace
+    pub cgroup: Vec<String>,
+    /// Duration in seconds (0 = indefinite)
+    pub duration: u64,
+    /// Disable all stack traces
+    pub no_stack_traces: bool,
+    /// Ring buffer size in MiB (0 = default)
+    pub ringbuf_size_mib: u32,
+    /// Trace events to attach
+    pub trace_event: Vec<String>,
+    /// PIDs for trace events
+    pub trace_event_pid: Vec<u32>,
+    /// Use software events instead of hardware
+    pub sw_event: bool,
+    /// Record CPU frequency
+    pub cpu_frequency: bool,
+    /// Perf counters to collect
+    pub perf_counter: Vec<String>,
+    /// Disable CPU stack traces
+    pub no_cpu_stack_traces: bool,
+    /// Disable sleep stack traces
+    pub no_sleep_stack_traces: bool,
+    /// Disable interruptible sleep stack traces
+    pub no_interruptible_stack_traces: bool,
+    /// Trace event config files
+    pub trace_event_config: Vec<String>,
+    /// Continuous mode duration in seconds (0 = disabled)
+    pub continuous: u64,
+    /// Collect Python stack traces
+    #[cfg(feature = "pystacks")]
+    pub collect_pystacks: bool,
+    /// Enable debuginfod for symbol resolution
+    pub enable_debuginfod: bool,
+    /// Disable scheduler tracing
+    pub no_sched: bool,
+    /// Enable syscall tracing
+    pub syscalls: bool,
+    /// Enable network recording
+    pub network: bool,
+    /// Skip DNS resolution for network addresses
+    pub no_resolve_addresses: bool,
+    /// Output directory for parquet files
+    pub output_dir: PathBuf,
+    /// Output path for Perfetto trace
+    pub output: PathBuf,
+    /// Skip Perfetto generation, keep only parquet
+    pub parquet_only: bool,
+    /// Use Parquet-first trace generation
+    pub parquet_first: bool,
+    /// Generate DuckDB database
+    pub with_duckdb: bool,
+    /// Path for DuckDB output
+    pub duckdb_output: PathBuf,
+}
+
+impl From<Command> for Config {
+    fn from(cmd: Command) -> Self {
+        Config {
+            verbosity: cmd.verbosity,
+            pid: cmd.pid,
+            cgroup: cmd.cgroup,
+            duration: cmd.duration,
+            no_stack_traces: cmd.no_stack_traces,
+            ringbuf_size_mib: cmd.ringbuf_size_mib,
+            trace_event: cmd.trace_event,
+            trace_event_pid: cmd.trace_event_pid,
+            sw_event: cmd.sw_event,
+            cpu_frequency: cmd.cpu_frequency,
+            perf_counter: cmd.perf_counter,
+            no_cpu_stack_traces: cmd.no_cpu_stack_traces,
+            no_sleep_stack_traces: cmd.no_sleep_stack_traces,
+            no_interruptible_stack_traces: cmd.no_interruptible_stack_traces,
+            trace_event_config: cmd.trace_event_config,
+            continuous: cmd.continuous,
+            #[cfg(feature = "pystacks")]
+            collect_pystacks: cmd.collect_pystacks,
+            enable_debuginfod: cmd.enable_debuginfod,
+            no_sched: cmd.no_sched,
+            syscalls: cmd.syscalls,
+            network: cmd.network,
+            no_resolve_addresses: cmd.no_resolve_addresses,
+            output_dir: cmd.output_dir,
+            output: cmd.output,
+            parquet_only: cmd.parquet_only,
+            parquet_first: cmd.parquet_first,
+            with_duckdb: cmd.with_duckdb,
+            duckdb_output: cmd.duckdb_output,
+        }
+    }
+}
+
 fn bump_memlock_rlimit() -> Result<()> {
     let rlimit = libc::rlimit {
         rlim_cur: MEMLOCK_RLIMIT_BYTES,
@@ -639,7 +739,7 @@ fn consume_loop<T, N>(
 fn spawn_recorder_threads(
     recorder: &Arc<SessionRecorder>,
     channels: RecorderChannels,
-    opts: &Command,
+    opts: &Config,
     stop_tx: &Sender<()>,
     perf_counter_names: &[String],
     task_info_tx: &Sender<task_info>,
@@ -855,7 +955,7 @@ fn is_old_kernel() -> bool {
 }
 
 fn setup_perf_counters(
-    opts: &Command,
+    opts: &Config,
     counters: &mut PerfCounters,
     perf_counter_names: &mut Vec<String>,
 ) -> Result<()> {
@@ -917,7 +1017,7 @@ fn set_ringbuf_duration(recorder: &Arc<SessionRecorder>, duration_nanos: u64) {
         .set_max_duration(duration_nanos);
 }
 
-fn configure_recorder(opts: &Command, recorder: &Arc<SessionRecorder>) {
+fn configure_recorder(opts: &Config, recorder: &Arc<SessionRecorder>) {
     if opts.continuous > 0 {
         let duration_nanos = Duration::from_secs(opts.continuous).as_nanos() as u64;
         set_ringbuf_duration(recorder, duration_nanos);
@@ -1134,7 +1234,7 @@ struct RecorderChannels {
 
 fn setup_ringbuffers<'a>(
     skel: &systing::SystingSystemSkel,
-    opts: &Command,
+    opts: &Config,
     perf_counter_names: &[String],
 ) -> Result<(Vec<(String, libbpf_rs::RingBuffer<'a>)>, RecorderChannels)> {
     let mut rings = Vec::new();
@@ -1277,7 +1377,7 @@ fn warn_failed_probe_attachments(skel: &systing::SystingSystemSkel) {
 
 fn configure_bpf_skeleton(
     open_skel: &mut systing::OpenSystingSystemSkel,
-    opts: &Command,
+    opts: &Config,
     num_cpus: u32,
     old_kernel: bool,
     collect_pystacks: bool,
@@ -1483,7 +1583,7 @@ fn configure_bpf_skeleton(
 
 fn setup_perf_events(
     skel: &mut systing::SystingSystemSkel,
-    opts: &Command,
+    opts: &Config,
     counters: &PerfCounters,
     perf_counter_names: &[String],
     num_cpus: u32,
@@ -1613,7 +1713,7 @@ fn setup_perf_events(
 /// Returns PIDs to attach probes to with their resolved library paths.
 /// Returns (pid_to_path_map, is_auto_discovered).
 fn resolve_pids_for_probe(
-    opts: &Command,
+    opts: &Config,
     target_path: &str,
     probe_type: &str,
     probe_name: &str,
@@ -1652,7 +1752,7 @@ fn resolve_pids_for_probe(
 fn attach_probes(
     skel: &mut systing::SystingSystemSkel,
     recorder: &Arc<SessionRecorder>,
-    opts: &Command,
+    opts: &Config,
     old_kernel: bool,
 ) -> Result<Vec<libbpf_rs::Link>> {
     let mut probe_links = Vec::new();
@@ -1962,7 +2062,7 @@ struct ThreadHandles {
 
 fn run_tracing_loop(
     handles: ThreadHandles,
-    opts: &Command,
+    opts: &Config,
     stop_tx: Sender<()>,
     stop_rx: Receiver<()>,
     ringbuf_shutdown: Arc<ShutdownSignal>,
@@ -2031,7 +2131,7 @@ fn run_tracing_loop(
     Ok(())
 }
 
-fn system(opts: Command) -> Result<()> {
+fn system(opts: Config) -> Result<()> {
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
     let mut counters = PerfCounters::default();
@@ -2537,5 +2637,6 @@ fn main() -> Result<()> {
 
     bump_memlock_rlimit()?;
 
-    system(opts)
+    let config = Config::from(opts);
+    system(config)
 }
