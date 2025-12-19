@@ -179,6 +179,28 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                     );
                 }
 
+                // Handle streaming mode for SCHED_WAKING: emit ThreadStateRecord immediately
+                if event.r#type == event_type::SCHED_WAKING {
+                    if let Some(collector) = &mut self.streaming_collector {
+                        // Extract tid from lower 32 bits of tgidpid, use as utid for streaming
+                        let utid = (event.next.tgidpid as i32) as i64;
+
+                        if let Err(e) = collector.add_thread_state(ThreadStateRecord {
+                            ts: event.ts as i64,
+                            dur: 0,
+                            utid,
+                            state: "R".to_string(), // Runnable
+                            cpu: Some(event.target_cpu as i32),
+                        }) {
+                            eprintln!("Warning: Failed to stream thread state: {e}");
+                        }
+                    }
+                }
+
+                // Always add to compact_sched for both SCHED_SWITCH and SCHED_WAKING.
+                // This is intentional even in streaming mode: compact_sched is used by
+                // write_trace() for Perfetto output, allowing both Parquet and Perfetto
+                // formats from a single recording session.
                 let compact_sched = self.compact_sched.entry(event.cpu).or_default();
                 compact_sched.add_task_event(&event);
             }
@@ -271,24 +293,53 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                 self.add_ftrace_event(&event);
             }
 
-            // New process wakeup
+            // New process wakeup - the `next` field contains the newly woken process info
             event_type::SCHED_WAKEUP_NEW => {
-                self.wakeup_news.push(WakeupNewEvent {
-                    ts: event.ts as i64,
-                    cpu: event.cpu as i32,
-                    pid: event.next.tgidpid as i32,
-                    target_cpu: event.target_cpu as i32,
-                });
+                // Stream immediately if streaming mode is enabled
+                if let Some(collector) = &mut self.streaming_collector {
+                    // Extract tid from lower 32 bits of tgidpid
+                    let utid = (event.next.tgidpid as i32) as i64;
+                    if let Err(e) = collector.add_wakeup_new(WakeupNewRecord {
+                        ts: event.ts as i64,
+                        cpu: event.cpu as i32,
+                        utid,
+                        target_cpu: event.target_cpu as i32,
+                    }) {
+                        eprintln!("Warning: Failed to stream wakeup_new: {e}");
+                    }
+                } else {
+                    // Non-streaming: buffer for later
+                    self.wakeup_news.push(WakeupNewEvent {
+                        ts: event.ts as i64,
+                        cpu: event.cpu as i32,
+                        pid: event.next.tgidpid as i32,
+                        target_cpu: event.target_cpu as i32,
+                    });
+                }
                 self.add_ftrace_event(&event);
             }
 
-            // Process exit
+            // Process exit - the `prev` field contains the exiting process info
             event_type::SCHED_PROCESS_EXIT => {
-                self.process_exits.push(ProcessExitEvent {
-                    ts: event.ts as i64,
-                    cpu: event.cpu as i32,
-                    pid: event.prev.tgidpid as i32,
-                });
+                // Stream immediately if streaming mode is enabled
+                if let Some(collector) = &mut self.streaming_collector {
+                    // Extract tid from lower 32 bits of tgidpid
+                    let utid = (event.prev.tgidpid as i32) as i64;
+                    if let Err(e) = collector.add_process_exit(ProcessExitRecord {
+                        ts: event.ts as i64,
+                        cpu: event.cpu as i32,
+                        utid,
+                    }) {
+                        eprintln!("Warning: Failed to stream process_exit: {e}");
+                    }
+                } else {
+                    // Non-streaming: buffer for later
+                    self.process_exits.push(ProcessExitEvent {
+                        ts: event.ts as i64,
+                        cpu: event.cpu as i32,
+                        pid: event.prev.tgidpid as i32,
+                    });
+                }
                 self.add_ftrace_event(&event);
             }
 
