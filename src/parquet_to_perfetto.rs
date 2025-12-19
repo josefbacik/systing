@@ -71,6 +71,8 @@ struct ParquetToPerfettoConverter {
     utid_to_uuid: HashMap<i64, u64>,
     /// Map from upid to process track UUID
     upid_to_uuid: HashMap<i64, u64>,
+    /// Map from upid to pid (process ID) for thread descriptors
+    upid_to_pid: HashMap<i64, i32>,
     /// Sequence ID counter for trusted_packet_sequence_id
     next_seq_id: u32,
 }
@@ -82,6 +84,7 @@ impl ParquetToPerfettoConverter {
             track_id_to_uuid: HashMap::new(),
             utid_to_uuid: HashMap::new(),
             upid_to_uuid: HashMap::new(),
+            upid_to_pid: HashMap::new(),
             next_seq_id: 1,
         }
     }
@@ -105,11 +108,9 @@ impl ParquetToPerfettoConverter {
         // 1. Write clock snapshots first (for timestamp correlation)
         self.write_clock_snapshots(input_dir, writer)?;
 
-        // 2. Write process descriptors (creates process track UUIDs)
-        self.write_process_descriptors(input_dir, writer)?;
-
-        // 3. Write thread descriptors (creates thread track UUIDs)
-        self.write_thread_descriptors(input_dir, writer)?;
+        // 2. Write TrackDescriptors for processes (ProcessDescriptor for each TGID)
+        // 3. Write TrackDescriptors for threads (ThreadDescriptor for each TID != TGID)
+        self.write_process_and_thread_descriptors(input_dir, writer)?;
 
         // 4. Write track descriptors
         self.write_track_descriptors(input_dir, writer)?;
@@ -196,125 +197,129 @@ impl ParquetToPerfettoConverter {
         Ok(())
     }
 
-    /// Write process track descriptors
-    fn write_process_descriptors(
+    /// Write TrackDescriptors for processes and threads.
+    ///
+    /// This creates:
+    /// - TrackDescriptor with ProcessDescriptor for each TGID (from process.parquet)
+    ///   The ProcessDescriptor.pid is set to the TGID.
+    /// - TrackDescriptor with ThreadDescriptor for each TID != TGID (from thread.parquet)
+    ///   The ThreadDescriptor.tid is set to the TID, and ThreadDescriptor.pid is set to the TGID.
+    ///
+    /// This is essential for Perfetto to associate sched events with the correct hierarchy.
+    fn write_process_and_thread_descriptors(
         &mut self,
         input_dir: &Path,
         writer: &mut dyn TraceWriter,
     ) -> Result<()> {
-        let path = input_dir.join("process.parquet");
-        if !path.exists() {
-            return Ok(());
-        }
+        let process_path = input_dir.join("process.parquet");
+        let thread_path = input_dir.join("thread.parquet");
 
-        let batches = read_parquet_file(&path)?;
-        for batch in &batches {
-            let upids = batch
-                .column_by_name("upid")
-                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                .context("Missing upid column")?;
-            let pids = batch
-                .column_by_name("pid")
-                .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-                .context("Missing pid column")?;
-            let names = batch
-                .column_by_name("name")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        // First: Create TrackDescriptor with ProcessDescriptor for each TGID
+        if process_path.exists() {
+            let batches = read_parquet_file(&process_path)?;
+            for batch in &batches {
+                let upids = batch
+                    .column_by_name("upid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing upid column")?;
+                let pids = batch
+                    .column_by_name("pid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing pid column")?;
+                let names = batch
+                    .column_by_name("name")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
-            for i in 0..batch.num_rows() {
-                let upid = upids.value(i);
-                let pid = pids.value(i);
-                let name = get_optional_string(names, i);
+                for i in 0..batch.num_rows() {
+                    let upid = upids.value(i);
+                    let tgid = pids.value(i); // This is the TGID (process ID)
+                    let name = get_optional_string(names, i);
 
-                let uuid = self.alloc_uuid();
-                self.upid_to_uuid.insert(upid, uuid);
+                    let uuid = self.alloc_uuid();
+                    self.upid_to_uuid.insert(upid, uuid);
+                    self.upid_to_pid.insert(upid, tgid);
 
-                let mut desc = TrackDescriptor::default();
-                desc.set_uuid(uuid);
-                if let Some(n) = &name {
-                    desc.set_name(n.clone());
+                    // Create TrackDescriptor with ProcessDescriptor
+                    let mut desc = TrackDescriptor::default();
+                    desc.set_uuid(uuid);
+                    if let Some(n) = &name {
+                        desc.set_name(n.clone());
+                    }
+
+                    let mut process = ProcessDescriptor::default();
+                    process.set_pid(tgid);
+                    if let Some(n) = &name {
+                        process.set_process_name(n.clone());
+                        process.cmdline.push(n.clone());
+                    }
+                    desc.process = Some(process).into();
+
+                    let mut packet = TracePacket::default();
+                    packet.set_track_descriptor(desc);
+                    writer.write_packet(&packet)?;
                 }
-
-                let mut process = ProcessDescriptor::default();
-                process.set_pid(pid);
-                if let Some(n) = name {
-                    process.set_process_name(n);
-                }
-                desc.process = Some(process).into();
-
-                let mut packet = TracePacket::default();
-                packet.set_track_descriptor(desc);
-                writer.write_packet(&packet)?;
             }
         }
 
-        Ok(())
-    }
+        // Second: Create TrackDescriptor with ThreadDescriptor for each TID != TGID
+        if thread_path.exists() {
+            let batches = read_parquet_file(&thread_path)?;
+            for batch in &batches {
+                let utids = batch
+                    .column_by_name("utid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing utid column")?;
+                let tids = batch
+                    .column_by_name("tid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing tid column")?;
+                let names = batch
+                    .column_by_name("name")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+                let upids = batch
+                    .column_by_name("upid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
 
-    /// Write thread track descriptors
-    fn write_thread_descriptors(
-        &mut self,
-        input_dir: &Path,
-        writer: &mut dyn TraceWriter,
-    ) -> Result<()> {
-        let path = input_dir.join("thread.parquet");
-        if !path.exists() {
-            return Ok(());
-        }
+                for i in 0..batch.num_rows() {
+                    let utid = utids.value(i);
+                    let tid = tids.value(i);
+                    let name = get_optional_string(names, i);
+                    let upid = get_optional_i64(upids, i);
 
-        let batches = read_parquet_file(&path)?;
-        for batch in &batches {
-            let utids = batch
-                .column_by_name("utid")
-                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                .context("Missing utid column")?;
-            let tids = batch
-                .column_by_name("tid")
-                .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-                .context("Missing tid column")?;
-            let names = batch
-                .column_by_name("name")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let upids = batch
-                .column_by_name("upid")
-                .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+                    // Look up the TGID from the parent process
+                    let tgid = upid
+                        .and_then(|u| self.upid_to_pid.get(&u).copied())
+                        .unwrap_or(tid);
 
-            for i in 0..batch.num_rows() {
-                let utid = utids.value(i);
-                let tid = tids.value(i);
-                let name = get_optional_string(names, i);
-                let upid = get_optional_i64(upids, i);
-
-                let uuid = self.alloc_uuid();
-                self.utid_to_uuid.insert(utid, uuid);
-
-                let mut desc = TrackDescriptor::default();
-                desc.set_uuid(uuid);
-                if let Some(n) = &name {
-                    desc.set_name(n.clone());
-                }
-
-                // Set parent UUID if we have a matching process
-                if let Some(u) = upid {
-                    if let Some(&parent_uuid) = self.upid_to_uuid.get(&u) {
-                        desc.set_parent_uuid(parent_uuid);
+                    // Skip main threads (TID == TGID) - they're handled by ProcessDescriptor
+                    if tid == tgid {
+                        continue;
                     }
+
+                    let uuid = self.alloc_uuid();
+                    self.utid_to_uuid.insert(utid, uuid);
+
+                    // Create TrackDescriptor with ThreadDescriptor
+                    // The pid field in ThreadDescriptor tells Perfetto the parent TGID
+                    // No need to set parent_uuid - that's only for custom tracks
+                    let mut desc = TrackDescriptor::default();
+                    desc.set_uuid(uuid);
+                    if let Some(n) = &name {
+                        desc.set_name(n.clone());
+                    }
+
+                    let mut thread = ThreadDescriptor::default();
+                    thread.set_tid(tid); // TID (the thread's PID in Linux terms)
+                    thread.set_pid(tgid); // TGID (the process ID) - this links to parent process
+                    if let Some(n) = name {
+                        thread.set_thread_name(n);
+                    }
+                    desc.thread = Some(thread).into();
+
+                    let mut packet = TracePacket::default();
+                    packet.set_track_descriptor(desc);
+                    writer.write_packet(&packet)?;
                 }
-
-                // Use tid as pid approximation (they match for main threads)
-                let pid = tid;
-
-                let mut thread = ThreadDescriptor::default();
-                thread.set_tid(tid);
-                thread.set_pid(pid);
-                if let Some(n) = name {
-                    thread.set_thread_name(n);
-                }
-                desc.thread = Some(thread).into();
-
-                let mut packet = TracePacket::default();
-                packet.set_track_descriptor(desc);
-                writer.write_packet(&packet)?;
             }
         }
 
@@ -528,12 +533,26 @@ impl ParquetToPerfettoConverter {
                 .column_by_name("priority")
                 .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
                 .context("Missing priority column")?;
+            let end_states = batch
+                .column_by_name("end_state")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
 
             for i in 0..batch.num_rows() {
                 let ts = timestamps.value(i);
                 let cpu = cpus.value(i);
                 let utid = utids.value(i);
                 let priority = priorities.value(i);
+
+                // Read end_state directly as the kernel task state value
+                let prev_state: i64 = if let Some(states) = end_states {
+                    if states.is_null(i) {
+                        0 // TASK_RUNNING
+                    } else {
+                        states.value(i) as i64
+                    }
+                } else {
+                    0 // Default to TASK_RUNNING if no end_state column
+                };
 
                 let (tid, comm) = utid_to_thread
                     .get(&utid)
@@ -548,7 +567,7 @@ impl ParquetToPerfettoConverter {
                     next_pid: tid,
                     next_prio: priority,
                     next_comm: comm,
-                    prev_state: 0, // Not stored in parquet, default to TASK_RUNNING
+                    prev_state,
                 });
             }
         }
@@ -932,7 +951,11 @@ impl ParquetToPerfettoConverter {
         Ok(())
     }
 
-    /// Build utid -> (tid, name) mapping from thread table
+    /// Build utid -> (tid, name) mapping from thread table.
+    ///
+    /// This also includes tid -> (tid, name) mappings because the streaming sched
+    /// recorder uses `tid as utid` for efficiency. This allows lookups to work
+    /// whether the caller has a real utid or a tid-as-utid.
     fn build_utid_to_thread_map(&self, path: &Path) -> Result<HashMap<i64, (i32, String)>> {
         let mut map = HashMap::new();
         let batches = read_parquet_file(path)?;
@@ -954,7 +977,10 @@ impl ParquetToPerfettoConverter {
                 let utid = utids.value(i);
                 let tid = tids.value(i);
                 let name = get_optional_string(names, i).unwrap_or_default();
-                map.insert(utid, (tid, name));
+                // Insert by utid (for non-streaming cases)
+                map.insert(utid, (tid, name.clone()));
+                // Also insert by tid (for streaming cases where utid = tid)
+                map.insert(tid as i64, (tid, name));
             }
         }
 

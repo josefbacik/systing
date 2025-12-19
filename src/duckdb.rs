@@ -50,7 +50,7 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             dur BIGINT,
             cpu INTEGER,
             utid BIGINT,
-            end_state VARCHAR,
+            end_state INTEGER,
             priority INTEGER
         );
 

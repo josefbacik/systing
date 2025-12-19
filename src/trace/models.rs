@@ -40,7 +40,9 @@ pub struct ThreadRecord {
 /// - `dur`: Duration in nanoseconds (0 if slice is still open)
 /// - `cpu`: CPU core number where the thread ran
 /// - `utid`: Unique thread ID (references `ThreadRecord.utid`)
-/// - `end_state`: Thread state when it stopped running (e.g., "S" for sleeping)
+/// - `end_state`: Raw kernel task state value when the thread stopped running.
+///   `None` means TASK_RUNNING (0), i.e., the thread was preempted while still runnable.
+///   Common values: 1=TASK_INTERRUPTIBLE, 2=TASK_UNINTERRUPTIBLE, 4=__TASK_STOPPED.
 /// - `priority`: Thread priority (nice value)
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SchedSliceRecord {
@@ -48,7 +50,7 @@ pub struct SchedSliceRecord {
     pub dur: i64,
     pub cpu: i32,
     pub utid: i64,
-    pub end_state: Option<String>,
+    pub end_state: Option<i32>,
     pub priority: i32,
 }
 
