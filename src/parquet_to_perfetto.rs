@@ -587,7 +587,8 @@ impl ParquetToPerfettoConverter {
             }
         }
 
-        // Process thread states (waking events)
+        // Process thread states (waking events only - state=0 means runnable)
+        // Sleep states (state != 0) are already captured in sched_slices.end_state
         for batch in &thread_state_batches {
             let timestamps = batch
                 .column_by_name("ts")
@@ -597,11 +598,23 @@ impl ParquetToPerfettoConverter {
                 .column_by_name("utid")
                 .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
                 .context("Missing utid column")?;
+            let states = batch
+                .column_by_name("state")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                .context("Missing state column")?;
             let cpus = batch
                 .column_by_name("cpu")
                 .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
 
             for i in 0..batch.num_rows() {
+                let state = states.value(i);
+
+                // Only create waking events for state=0 (TASK_RUNNING/runnable)
+                // Sleep states (state != 0) are informational and already in sched_slices
+                if state != 0 {
+                    continue;
+                }
+
                 let ts = timestamps.value(i);
                 let utid = utids.value(i);
                 let target_cpu = get_optional_i32(cpus, i).unwrap_or(0);

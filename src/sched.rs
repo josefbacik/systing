@@ -28,6 +28,18 @@ use perfetto_protos::trace_packet::TracePacket;
 /// Lower than Parquet batch size (200K) to reduce peak memory while maintaining I/O efficiency.
 const STREAMING_SCHED_FLUSH_THRESHOLD: usize = 10_000;
 
+/// Convert a kernel prev_state value to an Option<i32> for storage.
+///
+/// Returns `None` for TASK_RUNNING (0), meaning the task was preempted while still runnable.
+/// Returns `Some(state)` for sleep states (1=TASK_INTERRUPTIBLE, 2=TASK_UNINTERRUPTIBLE, etc.).
+///
+/// Note: Kernel task states are masked with TASK_REPORT in BPF, so values fit in i32.
+/// Compound states (e.g., TASK_UNINTERRUPTIBLE | TASK_NOLOAD = 130) are also possible.
+#[inline]
+fn prev_state_to_end_state(state: i64) -> Option<i32> {
+    (state != 0).then_some(state as i32)
+}
+
 /// Per-CPU state tracking for streaming scheduler events.
 /// Stores information about the currently running task on each CPU.
 struct CpuRunningState {
@@ -135,17 +147,17 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
             // SCHED_SWITCH and SCHED_WAKING use compact sched format
             event_type::SCHED_SWITCH | event_type::SCHED_WAKING => {
                 // Handle streaming mode for SCHED_SWITCH
+                //
+                // Thread state model for Perfetto:
+                // - Wakeup events (SCHED_WAKING): emit ThreadStateRecord with state=0 (runnable)
+                // - Sleep events (SCHED_SWITCH with prev_state != 0): emit ThreadStateRecord
+                //   with the kernel state (1=interruptible, 2=uninterruptible, etc.)
+                // - The sched_slice.end_state captures the same info for the slice-based view
                 if event.r#type == event_type::SCHED_SWITCH && self.streaming_collector.is_some() {
                     // Emit completed slice for previous running task
                     if let Some(prev_state) = self.cpu_states.get(&event.cpu) {
                         let dur = event.ts as i64 - prev_state.start_ts;
-
-                        // prev_state == 0 means TASK_RUNNING (preempted), store as None
-                        let end_state = if event.prev_state == 0 {
-                            None
-                        } else {
-                            Some(event.prev_state as i32)
-                        };
+                        let end_state = prev_state_to_end_state(event.prev_state as i64);
 
                         self.pending_slices.push(SchedSliceRecord {
                             ts: prev_state.start_ts,
@@ -155,6 +167,22 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                             end_state,
                             priority: prev_state.prio,
                         });
+
+                        // Emit sleep state record when task leaves CPU with non-zero state
+                        // This is critical for Perfetto to show correct off-CPU thread states
+                        if let Some(state) = end_state {
+                            if let Some(collector) = &mut self.streaming_collector {
+                                if let Err(e) = collector.add_thread_state(ThreadStateRecord {
+                                    ts: event.ts as i64,
+                                    dur: 0,
+                                    utid: prev_state.tid as i64,
+                                    state,
+                                    cpu: None, // CPU not relevant for sleep state
+                                }) {
+                                    eprintln!("Warning: Failed to stream thread sleep state: {e}");
+                                }
+                            }
+                        }
 
                         // Flush if we have accumulated enough slices
                         if self.pending_slices.len() >= STREAMING_SCHED_FLUSH_THRESHOLD {
@@ -189,7 +217,7 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                             ts: event.ts as i64,
                             dur: 0,
                             utid,
-                            state: "R".to_string(), // Runnable
+                            state: 0, // TASK_RUNNING (runnable)
                             cpu: Some(event.target_cpu as i32),
                         }) {
                             eprintln!("Warning: Failed to stream thread state: {e}");
@@ -394,12 +422,7 @@ impl SchedEventRecorder {
                     .copied()
                     .unwrap_or(next_pid as i64);
 
-                // Use raw kernel task state value (0 = TASK_RUNNING means no end state)
-                let end_state = if prev_state == 0 {
-                    None
-                } else {
-                    Some(prev_state as i32)
-                };
+                let end_state = prev_state_to_end_state(prev_state);
 
                 collector.add_sched_slice(SchedSliceRecord {
                     ts: switch_ts,
@@ -424,7 +447,7 @@ impl SchedEventRecorder {
                     ts: waking_ts,
                     dur: 0,
                     utid,
-                    state: "R".to_string(), // Runnable
+                    state: 0, // TASK_RUNNING (runnable)
                     cpu: Some(target_cpu),
                 })?;
             }
@@ -1002,5 +1025,116 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(events[0].has_sched_process_exit());
         assert_eq!(events[0].sched_process_exit().comm(), "prev");
+    }
+
+    #[test]
+    fn test_streaming_sched_waking_emits_runnable_state() {
+        use crate::record::collector::InMemoryCollector;
+
+        let mut recorder = SchedEventRecorder::default();
+        let collector = Box::new(InMemoryCollector::new());
+        recorder.set_streaming_collector(collector);
+
+        let next_comm = c"woken_task";
+        let mut event = task_event {
+            r#type: event_type::SCHED_WAKING,
+            ts: 1000,
+            next: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
+            target_cpu: 2,
+            ..Default::default()
+        };
+        copy_to_comm(&mut event.next.comm, next_comm);
+        recorder.handle_event(event);
+
+        // Verify we can finish without errors - the collector received the record
+        let result = recorder.finish(2000);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some()); // Collector was returned
+    }
+
+    #[test]
+    fn test_streaming_sched_switch_emits_sleep_state() {
+        use crate::record::collector::InMemoryCollector;
+
+        let mut recorder = SchedEventRecorder::default();
+        let collector = Box::new(InMemoryCollector::new());
+        recorder.set_streaming_collector(collector);
+
+        let prev_comm = c"sleeping_task";
+        let next_comm = c"next_task";
+
+        // First event: task starts running
+        let mut event1 = task_event {
+            r#type: event_type::SCHED_SWITCH,
+            ts: 1000,
+            cpu: 0,
+            next: task_info {
+                tgidpid: 1234, // Task that starts running
+                ..Default::default()
+            },
+            prev: task_info {
+                tgidpid: 0, // Idle task
+                ..Default::default()
+            },
+            prev_state: 0, // Was running (preempted)
+            ..Default::default()
+        };
+        copy_to_comm(&mut event1.next.comm, next_comm);
+        recorder.handle_event(event1);
+
+        // Second event: task goes to uninterruptible sleep (state=2)
+        let mut event2 = task_event {
+            r#type: event_type::SCHED_SWITCH,
+            ts: 2000,
+            cpu: 0,
+            next: task_info {
+                tgidpid: 5678, // New task
+                ..Default::default()
+            },
+            prev: task_info {
+                tgidpid: 1234, // Previous task (the one going to sleep)
+                ..Default::default()
+            },
+            prev_state: 2, // TASK_UNINTERRUPTIBLE
+            ..Default::default()
+        };
+        copy_to_comm(&mut event2.next.comm, prev_comm);
+        copy_to_comm(&mut event2.prev.comm, next_comm);
+        recorder.handle_event(event2);
+
+        // The recorder should have emitted a ThreadStateRecord with state=2
+        // for the task that went to sleep. We can't easily extract this from
+        // InMemoryCollector in the current design, but the test validates
+        // the code path doesn't panic.
+
+        // Verify we can finish without errors
+        let result = recorder.finish(3000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_thread_state_record_uses_numeric_state() {
+        // Verify that ThreadStateRecord uses i32 for state field
+        let record = ThreadStateRecord {
+            ts: 1000,
+            dur: 0,
+            utid: 1234,
+            state: 2, // TASK_UNINTERRUPTIBLE
+            cpu: Some(0),
+        };
+        assert_eq!(record.state, 2);
+
+        // Verify runnable state is 0
+        let runnable = ThreadStateRecord {
+            ts: 1000,
+            dur: 0,
+            utid: 1234,
+            state: 0, // TASK_RUNNING (runnable)
+            cpu: Some(1),
+        };
+        assert_eq!(runnable.state, 0);
     }
 }

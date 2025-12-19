@@ -412,7 +412,7 @@ struct ThreadStateRecord {
     ts: i64,
     dur: i64,
     utid: i64,
-    state: String,
+    state: i32,
     cpu: Option<i32>,
 }
 
@@ -1120,7 +1120,7 @@ impl TraceExtractor {
                             ts,
                             dur: 0,
                             utid,
-                            state: "R".to_string(),
+                            state: 0, // TASK_RUNNING (runnable)
                             cpu: Some(waking.target_cpu()),
                         })?;
                     }
@@ -1357,7 +1357,7 @@ impl TraceExtractor {
                     ts: waking_ts,
                     dur: 0,
                     utid,
-                    state: "R".to_string(),
+                    state: 0, // TASK_RUNNING (runnable)
                     cpu: Some(target_cpu),
                 })?;
             }
@@ -1584,7 +1584,7 @@ impl StreamableRecord for ThreadStateRecord {
             Field::new("ts", DataType::Int64, false),
             Field::new("dur", DataType::Int64, false),
             Field::new("utid", DataType::Int64, false),
-            Field::new("state", DataType::Utf8, false),
+            Field::new("state", DataType::Int32, false),
             Field::new("cpu", DataType::Int32, true),
         ])
     }
@@ -1594,7 +1594,7 @@ impl StreamableRecord for ThreadStateRecord {
         let mut ts_builder = Int64Builder::with_capacity(records.len());
         let mut dur_builder = Int64Builder::with_capacity(records.len());
         let mut utid_builder = Int64Builder::with_capacity(records.len());
-        let mut state_builder = StringBuilder::with_capacity(records.len(), records.len() * 4);
+        let mut state_builder = Int32Builder::with_capacity(records.len());
         let mut cpu_builder = Int32Builder::with_capacity(records.len());
 
         for state in records {
@@ -1602,7 +1602,7 @@ impl StreamableRecord for ThreadStateRecord {
             ts_builder.append_value(state.ts);
             dur_builder.append_value(state.dur);
             utid_builder.append_value(state.utid);
-            state_builder.append_value(&state.state);
+            state_builder.append_value(state.state);
             cpu_builder.append_option(state.cpu);
         }
 
@@ -2080,7 +2080,7 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
             Field::new("ts", DataType::Int64, false),
             Field::new("dur", DataType::Int64, false),
             Field::new("utid", DataType::Int64, false),
-            Field::new("state", DataType::Utf8, false),
+            Field::new("state", DataType::Int32, false),
             Field::new("cpu", DataType::Int32, true),
         ]));
 
@@ -2092,7 +2092,7 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
             let mut ts_builder = Int64Builder::with_capacity(chunk.len());
             let mut dur_builder = Int64Builder::with_capacity(chunk.len());
             let mut utid_builder = Int64Builder::with_capacity(chunk.len());
-            let mut state_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 4);
+            let mut state_builder = Int32Builder::with_capacity(chunk.len());
             let mut cpu_builder = Int32Builder::with_capacity(chunk.len());
 
             for state in chunk {
@@ -2100,7 +2100,7 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
                 ts_builder.append_value(state.ts);
                 dur_builder.append_value(state.dur);
                 utid_builder.append_value(state.utid);
-                state_builder.append_value(&state.state);
+                state_builder.append_value(state.state);
                 cpu_builder.append_option(state.cpu);
             }
 

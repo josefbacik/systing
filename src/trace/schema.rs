@@ -52,12 +52,21 @@ pub fn sched_slice_schema() -> Arc<Schema> {
 }
 
 /// Schema for thread_state.parquet
+///
+/// The `state` field contains raw kernel task state values:
+/// - 0 = TASK_RUNNING (runnable/woken)
+/// - 1 = TASK_INTERRUPTIBLE (sleeping)
+/// - 2 = TASK_UNINTERRUPTIBLE (disk sleep)
+/// - 4 = __TASK_STOPPED
+/// - 8 = __TASK_TRACED
+///
+/// Compound states are also possible (e.g., 130 = TASK_UNINTERRUPTIBLE | TASK_NOLOAD).
 pub fn thread_state_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Int64, false),
         Field::new("dur", DataType::Int64, false),
         Field::new("utid", DataType::Int64, false),
-        Field::new("state", DataType::Utf8, false),
+        Field::new("state", DataType::Int32, false),
         Field::new("cpu", DataType::Int32, true),
     ]))
 }

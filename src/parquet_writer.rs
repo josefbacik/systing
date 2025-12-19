@@ -70,7 +70,7 @@ struct ThreadStateRecord {
     ts: i64,
     dur: i64,
     utid: i64,
-    state: String,
+    state: i32,
     cpu: Option<i32>,
 }
 
@@ -934,7 +934,7 @@ impl TraceExtractor {
                             ts,
                             dur: 0,
                             utid,
-                            state: "R".to_string(),
+                            state: 0, // TASK_RUNNING (runnable)
                             cpu: Some(waking.target_cpu()),
                         });
                     }
@@ -994,7 +994,7 @@ impl TraceExtractor {
                     ts: waking_ts,
                     dur: 0,
                     utid,
-                    state: "R".to_string(),
+                    state: 0, // TASK_RUNNING (runnable)
                     cpu: Some(target_cpu),
                 });
             }
@@ -1722,7 +1722,7 @@ fn write_thread_states(
         Field::new("ts", DataType::Int64, false),
         Field::new("dur", DataType::Int64, false),
         Field::new("utid", DataType::Int64, false),
-        Field::new("state", DataType::Utf8, false),
+        Field::new("state", DataType::Int32, false),
         Field::new("cpu", DataType::Int32, true),
     ]));
 
@@ -1733,14 +1733,14 @@ fn write_thread_states(
         let mut ts_builder = Int64Builder::with_capacity(chunk.len());
         let mut dur_builder = Int64Builder::with_capacity(chunk.len());
         let mut utid_builder = Int64Builder::with_capacity(chunk.len());
-        let mut state_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 4);
+        let mut state_builder = Int32Builder::with_capacity(chunk.len());
         let mut cpu_builder = Int32Builder::with_capacity(chunk.len());
 
         for record in chunk {
             ts_builder.append_value(record.ts);
             dur_builder.append_value(record.dur);
             utid_builder.append_value(record.utid);
-            state_builder.append_value(&record.state);
+            state_builder.append_value(record.state);
             cpu_builder.append_option(record.cpu);
         }
 
