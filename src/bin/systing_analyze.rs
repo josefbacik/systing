@@ -89,6 +89,21 @@ enum Commands {
         #[arg(short, long, default_value = "table")]
         format: String,
     },
+
+    /// Validate trace data for correctness
+    Validate {
+        /// Path to Parquet directory or Perfetto trace file
+        #[arg(required = true)]
+        path: PathBuf,
+
+        /// Verbose output (show all checks)
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Information about a trace being processed
@@ -3386,6 +3401,73 @@ fn run_interactive(conn: &Connection, format: &str) -> Result<()> {
     Ok(())
 }
 
+/// Run the validate command
+fn run_validate(path: PathBuf, verbose: bool, json: bool) -> Result<()> {
+    use systing::{validate_parquet_dir, validate_perfetto_trace, ValidationResult};
+
+    if !path.exists() {
+        bail!("Path not found: {}", path.display());
+    }
+
+    let result: ValidationResult = if path.is_dir() {
+        // Validate Parquet directory
+        if verbose {
+            eprintln!("Validating Parquet directory: {}", path.display());
+        }
+        validate_parquet_dir(&path)
+    } else {
+        // Validate Perfetto trace file
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name.ends_with(".pb") || name.ends_with(".pb.gz") {
+            if verbose {
+                eprintln!("Validating Perfetto trace: {}", path.display());
+            }
+            validate_perfetto_trace(&path)
+        } else {
+            bail!("Unrecognized file type. Use a Parquet directory or .pb/.pb.gz trace file.");
+        }
+    };
+
+    if json {
+        // Output as JSON
+        let output = serde_json::json!({
+            "valid": result.is_valid(),
+            "errors": result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+            "warnings": result.warnings.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        // Output as text
+        if result.is_valid() {
+            if verbose {
+                eprintln!("All validation checks passed.");
+            }
+            println!("Validation: PASSED");
+        } else {
+            println!("Validation: FAILED");
+            println!();
+            println!("Errors ({}):", result.errors.len());
+            for error in &result.errors {
+                println!("  - {error}");
+            }
+        }
+
+        if !result.warnings.is_empty() {
+            println!();
+            println!("Warnings ({}):", result.warnings.len());
+            for warning in &result.warnings {
+                println!("  - {warning}");
+            }
+        }
+    }
+
+    if result.is_valid() {
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -3401,6 +3483,11 @@ fn main() -> Result<()> {
             sql,
             format,
         } => run_query(database, sql, format),
+        Commands::Validate {
+            path,
+            verbose,
+            json,
+        } => run_validate(path, verbose, json),
     }
 }
 

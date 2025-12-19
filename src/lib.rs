@@ -27,6 +27,11 @@
 
 pub mod duckdb;
 pub mod parquet_paths;
+pub mod validate;
 
 // Re-export for convenience
 pub use parquet_paths::ParquetPaths;
+pub use validate::{
+    validate_parquet_dir, validate_perfetto_trace, ValidationError, ValidationResult,
+    ValidationWarning,
+};
