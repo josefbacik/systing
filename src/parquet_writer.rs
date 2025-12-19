@@ -104,7 +104,7 @@ struct SchedSliceRecord {
     dur: i64,
     cpu: i32,
     utid: i64,
-    end_state: Option<String>,
+    end_state: Option<i32>,
     priority: i32,
 }
 
@@ -1347,7 +1347,7 @@ fn write_sched_slices(
         Field::new("dur", DataType::Int64, false),
         Field::new("cpu", DataType::Int32, false),
         Field::new("utid", DataType::Int64, false),
-        Field::new("end_state", DataType::Utf8, true),
+        Field::new("end_state", DataType::Int32, true),
         Field::new("priority", DataType::Int32, false),
     ]));
 
@@ -1359,7 +1359,7 @@ fn write_sched_slices(
         let mut dur_builder = Int64Builder::with_capacity(chunk.len());
         let mut cpu_builder = Int32Builder::with_capacity(chunk.len());
         let mut utid_builder = Int64Builder::with_capacity(chunk.len());
-        let mut end_state_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 4);
+        let mut end_state_builder = Int32Builder::with_capacity(chunk.len());
         let mut priority_builder = Int32Builder::with_capacity(chunk.len());
 
         for record in chunk {
@@ -1367,7 +1367,7 @@ fn write_sched_slices(
             dur_builder.append_value(record.dur);
             cpu_builder.append_value(record.cpu);
             utid_builder.append_value(record.utid);
-            end_state_builder.append_option(record.end_state.as_deref());
+            end_state_builder.append_option(record.end_state);
             priority_builder.append_value(record.priority);
         }
 

@@ -1156,7 +1156,7 @@ fn build_sched_slice_batch(
     let mut dur_builder = Int64Builder::with_capacity(records.len());
     let mut cpu_builder = Int32Builder::with_capacity(records.len());
     let mut utid_builder = Int64Builder::with_capacity(records.len());
-    let mut end_state_builder = StringBuilder::with_capacity(records.len(), records.len() * 4);
+    let mut end_state_builder = Int32Builder::with_capacity(records.len());
     let mut priority_builder = Int32Builder::with_capacity(records.len());
 
     for record in records {
@@ -1164,7 +1164,7 @@ fn build_sched_slice_batch(
         dur_builder.append_value(record.dur);
         cpu_builder.append_value(record.cpu);
         utid_builder.append_value(record.utid);
-        end_state_builder.append_option(record.end_state.as_deref());
+        end_state_builder.append_option(record.end_state);
         priority_builder.append_value(record.priority);
     }
 

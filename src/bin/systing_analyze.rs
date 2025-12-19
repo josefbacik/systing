@@ -403,7 +403,7 @@ struct SchedSliceRecord {
     dur: i64,
     cpu: i32,
     utid: i64,
-    end_state: Option<String>,
+    end_state: Option<i32>,
     priority: i32,
 }
 
@@ -1628,7 +1628,7 @@ impl StreamableRecord for SchedSliceRecord {
             Field::new("dur", DataType::Int64, false),
             Field::new("cpu", DataType::Int32, false),
             Field::new("utid", DataType::Int64, false),
-            Field::new("end_state", DataType::Utf8, true),
+            Field::new("end_state", DataType::Int32, true),
             Field::new("priority", DataType::Int32, false),
         ])
     }
@@ -1639,7 +1639,7 @@ impl StreamableRecord for SchedSliceRecord {
         let mut dur_builder = Int64Builder::with_capacity(records.len());
         let mut cpu_builder = Int32Builder::with_capacity(records.len());
         let mut utid_builder = Int64Builder::with_capacity(records.len());
-        let mut end_state_builder = StringBuilder::with_capacity(records.len(), records.len() * 4);
+        let mut end_state_builder = Int32Builder::with_capacity(records.len());
         let mut priority_builder = Int32Builder::with_capacity(records.len());
 
         for slice in records {
@@ -1648,7 +1648,7 @@ impl StreamableRecord for SchedSliceRecord {
             dur_builder.append_value(slice.dur);
             cpu_builder.append_value(slice.cpu);
             utid_builder.append_value(slice.utid);
-            end_state_builder.append_option(slice.end_state.as_deref());
+            end_state_builder.append_option(slice.end_state);
             priority_builder.append_value(slice.priority);
         }
 
@@ -2031,7 +2031,7 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
             Field::new("dur", DataType::Int64, false),
             Field::new("cpu", DataType::Int32, false),
             Field::new("utid", DataType::Int64, false),
-            Field::new("end_state", DataType::Utf8, true),
+            Field::new("end_state", DataType::Int32, true),
             Field::new("priority", DataType::Int32, false),
         ]));
 
@@ -2044,7 +2044,7 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
             let mut dur_builder = Int64Builder::with_capacity(chunk.len());
             let mut cpu_builder = Int32Builder::with_capacity(chunk.len());
             let mut utid_builder = Int64Builder::with_capacity(chunk.len());
-            let mut end_state_builder = StringBuilder::with_capacity(chunk.len(), chunk.len() * 4);
+            let mut end_state_builder = Int32Builder::with_capacity(chunk.len());
             let mut priority_builder = Int32Builder::with_capacity(chunk.len());
 
             for slice in chunk {
@@ -2053,7 +2053,7 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
                 dur_builder.append_value(slice.dur);
                 cpu_builder.append_value(slice.cpu);
                 utid_builder.append_value(slice.utid);
-                end_state_builder.append_option(slice.end_state.as_deref());
+                end_state_builder.append_option(slice.end_state);
                 priority_builder.append_value(slice.priority);
             }
 

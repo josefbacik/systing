@@ -46,7 +46,7 @@ pub fn sched_slice_schema() -> Arc<Schema> {
         Field::new("dur", DataType::Int64, false),
         Field::new("cpu", DataType::Int32, false),
         Field::new("utid", DataType::Int64, false),
-        Field::new("end_state", DataType::Utf8, true),
+        Field::new("end_state", DataType::Int32, true),
         Field::new("priority", DataType::Int32, false),
     ]))
 }

@@ -28,22 +28,6 @@ use perfetto_protos::trace_packet::TracePacket;
 /// Lower than Parquet batch size (200K) to reduce peak memory while maintaining I/O efficiency.
 const STREAMING_SCHED_FLUSH_THRESHOLD: usize = 10_000;
 
-/// Convert kernel task state to Perfetto-compatible string representation.
-fn task_state_to_string(state: u64) -> Option<String> {
-    match state {
-        0 => None,                     // TASK_RUNNING - no end state when preempted
-        1 => Some("S".to_string()),    // TASK_INTERRUPTIBLE
-        2 => Some("D".to_string()),    // TASK_UNINTERRUPTIBLE
-        4 => Some("T".to_string()),    // __TASK_STOPPED
-        8 => Some("t".to_string()),    // __TASK_TRACED
-        16 => Some("X".to_string()),   // EXIT_DEAD
-        32 => Some("Z".to_string()),   // EXIT_ZOMBIE
-        64 => Some("P".to_string()),   // TASK_PARKED
-        128 => Some("I".to_string()),  // TASK_IDLE
-        _ => Some(format!("{state}")), // Compound states
-    }
-}
-
 /// Per-CPU state tracking for streaming scheduler events.
 /// Stores information about the currently running task on each CPU.
 struct CpuRunningState {
@@ -155,7 +139,13 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                     // Emit completed slice for previous running task
                     if let Some(prev_state) = self.cpu_states.get(&event.cpu) {
                         let dur = event.ts as i64 - prev_state.start_ts;
-                        let end_state = task_state_to_string(event.prev_state);
+
+                        // prev_state == 0 means TASK_RUNNING (preempted), store as None
+                        let end_state = if event.prev_state == 0 {
+                            None
+                        } else {
+                            Some(event.prev_state as i32)
+                        };
 
                         self.pending_slices.push(SchedSliceRecord {
                             ts: prev_state.start_ts,
@@ -353,21 +343,11 @@ impl SchedEventRecorder {
                     .copied()
                     .unwrap_or(next_pid as i64);
 
-                // Convert prev_state to string representation.
-                // These values match the Linux kernel task state flags from include/linux/sched.h.
-                // States can be combined (e.g., TASK_INTERRUPTIBLE | TASK_WAKEKILL).
-                // Common single-bit states are mapped to Perfetto-compatible short codes.
-                let end_state = match prev_state {
-                    0 => None,                          // TASK_RUNNING - no end state when preempted
-                    1 => Some("S".to_string()), // TASK_INTERRUPTIBLE - sleeping, can be woken by signal
-                    2 => Some("D".to_string()), // TASK_UNINTERRUPTIBLE - sleeping, waiting for I/O
-                    4 => Some("T".to_string()), // __TASK_STOPPED - stopped by signal (SIGSTOP, etc.)
-                    8 => Some("t".to_string()), // __TASK_TRACED - stopped by debugger (ptrace)
-                    16 => Some("X".to_string()), // EXIT_DEAD - final state, being reaped
-                    32 => Some("Z".to_string()), // EXIT_ZOMBIE - terminated, waiting for parent
-                    64 => Some("P".to_string()), // TASK_PARKED - parked kthread
-                    128 => Some("I".to_string()), // TASK_IDLE - idle kthread
-                    _ => Some(format!("{prev_state}")), // Compound states shown as numeric
+                // Use raw kernel task state value (0 = TASK_RUNNING means no end state)
+                let end_state = if prev_state == 0 {
+                    None
+                } else {
+                    Some(prev_state as i32)
                 };
 
                 collector.add_sched_slice(SchedSliceRecord {
