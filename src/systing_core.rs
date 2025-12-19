@@ -31,7 +31,7 @@ use crate::session_recorder::{get_clock_value, SessionRecorder, SysInfoEvent};
 use crate::stack_recorder::StackRecorder;
 
 // Library imports for shared functionality
-use ::systing::duckdb as systing_duckdb;
+use crate::duckdb as systing_duckdb;
 
 use anyhow::Result;
 use anyhow::{bail, Context};
@@ -262,6 +262,42 @@ pub struct Config {
     pub with_duckdb: bool,
     /// Path for DuckDB output
     pub duckdb_output: PathBuf,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            verbosity: 0,
+            pid: Vec::new(),
+            cgroup: Vec::new(),
+            duration: 0,
+            no_stack_traces: false,
+            ringbuf_size_mib: 0,
+            trace_event: Vec::new(),
+            trace_event_pid: Vec::new(),
+            sw_event: false,
+            cpu_frequency: false,
+            perf_counter: Vec::new(),
+            no_cpu_stack_traces: false,
+            no_sleep_stack_traces: false,
+            no_interruptible_stack_traces: false,
+            trace_event_config: Vec::new(),
+            continuous: 0,
+            #[cfg(feature = "pystacks")]
+            collect_pystacks: false,
+            enable_debuginfod: false,
+            no_sched: false,
+            syscalls: false,
+            network: false,
+            no_resolve_addresses: false,
+            output_dir: PathBuf::from("./traces"),
+            output: PathBuf::from("trace.pb"),
+            parquet_only: false,
+            parquet_first: false,
+            with_duckdb: false,
+            duckdb_output: PathBuf::from("trace.duckdb"),
+        }
+    }
 }
 
 /// Bump the memory lock rlimit for BPF programs.

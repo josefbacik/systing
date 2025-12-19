@@ -8,8 +8,8 @@ use anyhow::Result;
 use crate::perfetto::TraceWriter;
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
-use crate::systing::types::network_event;
-use crate::systing::SystingRecordEvent;
+use crate::systing_core::types::network_event;
+use crate::systing_core::SystingRecordEvent;
 use crate::trace::{
     ArgRecord, InstantArgRecord, InstantRecord, NetworkPacketRecord, NetworkPollRecord,
     NetworkSocketRecord, NetworkSyscallRecord, SliceRecord, SocketConnectionRecord, TrackRecord,
@@ -96,7 +96,7 @@ struct ConnectionId {
 }
 
 fn parse_ip_addr(af: u32, addr: &[u8; 16]) -> IpAddr {
-    use crate::systing::types::network_address_family;
+    use crate::systing_core::types::network_address_family;
     if af == network_address_family::NETWORK_AF_INET.0 {
         let mut bytes = [0u8; 4];
         bytes.copy_from_slice(&addr[0..4]);
@@ -109,7 +109,7 @@ fn parse_ip_addr(af: u32, addr: &[u8; 16]) -> IpAddr {
 }
 
 fn protocol_str(protocol: u32) -> &'static str {
-    use crate::systing::types::network_protocol;
+    use crate::systing_core::types::network_protocol;
     if protocol == network_protocol::NETWORK_TCP.0 {
         "TCP"
     } else if protocol == network_protocol::NETWORK_UDP.0 {
@@ -573,7 +573,7 @@ impl NetworkRecorder {
         dest_port: u16,
         ts: i64,
     ) -> Result<bool> {
-        use crate::systing::types::{network_address_family, network_protocol};
+        use crate::systing_core::types::{network_address_family, network_protocol};
 
         // Check if we've already emitted a record for this socket
         if self.seen_sockets.contains(&socket_id) {
@@ -650,7 +650,7 @@ impl NetworkRecorder {
     /// Also emits NetworkSocketRecord if this is the first event for this socket.
     fn stream_syscall_event(
         &mut self,
-        event: &crate::systing::types::network_event,
+        event: &crate::systing_core::types::network_event,
         is_send: bool,
     ) -> Result<()> {
         let socket_id = event.socket_id;
@@ -740,7 +740,7 @@ impl NetworkRecorder {
     /// Also emits NetworkSocketRecord if this is the first event for this socket.
     fn stream_packet_event(
         &mut self,
-        event: &crate::systing::types::packet_event,
+        event: &crate::systing_core::types::packet_event,
         event_name: &str,
     ) -> Result<()> {
         let socket_id = event.socket_id;
@@ -935,7 +935,10 @@ impl NetworkRecorder {
     }
 
     /// Stream a poll event - emit NetworkPollRecord immediately.
-    fn stream_poll_event(&mut self, event: &crate::systing::types::epoll_event_bpf) -> Result<()> {
+    fn stream_poll_event(
+        &mut self,
+        event: &crate::systing_core::types::epoll_event_bpf,
+    ) -> Result<()> {
         let socket_id = event.socket_id;
         let ts = event.ts as i64;
         let tid = (event.task.tgidpid & 0xFFFFFFFF) as i32;
@@ -990,7 +993,7 @@ impl NetworkRecorder {
     /// Load socket metadata from BPF map after tracing completes.
     /// This populates the socket_metadata cache with socket ID -> address info mapping.
     pub fn load_socket_metadata<M: libbpf_rs::MapCore>(&mut self, map: &M) {
-        use crate::systing::types::socket_metadata;
+        use crate::systing_core::types::socket_metadata;
 
         let mut count = 0;
         for key in map.keys() {
@@ -1082,8 +1085,8 @@ impl NetworkRecorder {
         }
     }
 
-    pub fn handle_packet_event(&mut self, event: crate::systing::types::packet_event) {
-        use crate::systing::types::packet_event_type;
+    pub fn handle_packet_event(&mut self, event: crate::systing_core::types::packet_event) {
+        use crate::systing_core::types::packet_event_type;
 
         let socket_id = event.socket_id;
 
@@ -1212,7 +1215,7 @@ impl NetworkRecorder {
             .push(event_entry);
     }
 
-    pub fn handle_epoll_event(&mut self, event: crate::systing::types::epoll_event_bpf) {
+    pub fn handle_epoll_event(&mut self, event: crate::systing_core::types::epoll_event_bpf) {
         let socket_id = event.socket_id;
         if socket_id == 0 {
             return;
@@ -1241,7 +1244,7 @@ impl NetworkRecorder {
     }
 
     fn protocol_to_str(protocol: u32) -> &'static str {
-        use crate::systing::types::network_protocol;
+        use crate::systing_core::types::network_protocol;
         if protocol == network_protocol::NETWORK_TCP.0 {
             "tcp"
         } else if protocol == network_protocol::NETWORK_UDP.0 {
@@ -2032,7 +2035,7 @@ impl NetworkRecorder {
     /// - Creating IIDs for protocol operations and packet events
     /// - Building the event names array
     fn prepare_event_metadata(&mut self, id_counter: &Arc<AtomicUsize>) -> Vec<EventName> {
-        use crate::systing::types::network_operation;
+        use crate::systing_core::types::network_operation;
 
         // Collect IP addresses first to avoid borrow issues
         // We resolve both src and dest addresses for potential hostname lookups
@@ -2209,7 +2212,7 @@ impl NetworkRecorder {
                 dest_ip: dest_ip.to_string(),
                 dest_port: metadata.dest_port as i32,
                 address_family: if metadata.af
-                    == crate::systing::types::network_address_family::NETWORK_AF_INET.0
+                    == crate::systing_core::types::network_address_family::NETWORK_AF_INET.0
                 {
                     "IPv4".to_string()
                 } else {
@@ -2219,8 +2222,8 @@ impl NetworkRecorder {
 
             // Output packet events for this socket
             if let Some(conn_events) = self.packet_events.get(socket_id) {
-                let is_tcp =
-                    metadata.protocol == crate::systing::types::network_protocol::NETWORK_TCP.0;
+                let is_tcp = metadata.protocol
+                    == crate::systing_core::types::network_protocol::NETWORK_TCP.0;
 
                 if is_tcp {
                     self.write_packet_events_records(
@@ -2655,7 +2658,9 @@ impl NetworkRecorder {
                 let is_tcp = self
                     .socket_metadata
                     .get(socket_id)
-                    .map(|m| m.protocol == crate::systing::types::network_protocol::NETWORK_TCP.0)
+                    .map(|m| {
+                        m.protocol == crate::systing_core::types::network_protocol::NETWORK_TCP.0
+                    })
                     .unwrap_or(false);
 
                 // Emit all packet events directly on this socket track (flat)
@@ -2896,7 +2901,7 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
     }
 
     fn handle_event(&mut self, event: network_event) {
-        use crate::systing::types::network_operation;
+        use crate::systing_core::types::network_operation;
 
         let tgidpid = event.task.tgidpid;
         let socket_id = event.socket_id;
@@ -2950,7 +2955,7 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
 mod tests {
     use super::*;
     use crate::perfetto::VecTraceWriter;
-    use crate::systing::types::{network_protocol, task_info};
+    use crate::systing_core::types::{network_protocol, task_info};
     use perfetto_protos::trace_packet::TracePacket;
 
     /// Helper to collect packets from NetworkRecorder for tests
@@ -3013,7 +3018,7 @@ mod tests {
 
     #[test]
     fn test_network_recorder_tcp_send() {
-        use crate::systing::types::{network_address_family, network_operation};
+        use crate::systing_core::types::{network_address_family, network_operation};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -3061,7 +3066,7 @@ mod tests {
 
     #[test]
     fn test_network_recorder_multiple_sends() {
-        use crate::systing::types::{network_address_family, network_operation};
+        use crate::systing_core::types::{network_address_family, network_operation};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -3121,7 +3126,7 @@ mod tests {
 
     #[test]
     fn test_network_recorder_multiple_connections() {
-        use crate::systing::types::{network_address_family, network_operation};
+        use crate::systing_core::types::{network_address_family, network_operation};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -3184,7 +3189,7 @@ mod tests {
 
     #[test]
     fn test_generate_trace_packets() {
-        use crate::systing::types::{network_address_family, network_operation};
+        use crate::systing_core::types::{network_address_family, network_operation};
 
         let mut recorder = NetworkRecorder::default();
         let mut thread_uuids = HashMap::new();
@@ -3271,7 +3276,7 @@ mod tests {
 
     #[test]
     fn test_network_recorder_sends_and_receives() {
-        use crate::systing::types::{network_address_family, network_operation};
+        use crate::systing_core::types::{network_address_family, network_operation};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -3342,7 +3347,7 @@ mod tests {
 
     #[test]
     fn test_network_recorder_ipv6_tcp_send() {
-        use crate::systing::types::{network_address_family, network_operation};
+        use crate::systing_core::types::{network_address_family, network_operation};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -3392,7 +3397,7 @@ mod tests {
 
     #[test]
     fn test_network_recorder_ipv6_udp_send() {
-        use crate::systing::types::{network_address_family, network_operation};
+        use crate::systing_core::types::{network_address_family, network_operation};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -3436,7 +3441,7 @@ mod tests {
 
     #[test]
     fn test_network_recorder_ipv6_and_ipv4_mixed() {
-        use crate::systing::types::{network_address_family, network_operation};
+        use crate::systing_core::types::{network_address_family, network_operation};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -3514,7 +3519,7 @@ mod tests {
 
     #[test]
     fn test_network_recorder_ipv6_address_formatting() {
-        use crate::systing::types::network_address_family;
+        use crate::systing_core::types::network_address_family;
 
         // Test various IPv6 addresses
         let test_cases = vec![
@@ -3561,7 +3566,7 @@ mod tests {
 
     #[test]
     fn test_network_recorder_ipv6_sends_and_receives() {
-        use crate::systing::types::{network_address_family, network_operation};
+        use crate::systing_core::types::{network_address_family, network_operation};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -3637,7 +3642,7 @@ mod tests {
 
     #[test]
     fn test_packet_event_rcv_established() {
-        use crate::systing::types::{network_address_family, packet_event_type};
+        use crate::systing_core::types::{network_address_family, packet_event_type};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -3645,7 +3650,7 @@ mod tests {
         dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
         let socket_id: SocketId = 1;
 
-        let event = crate::systing::types::packet_event {
+        let event = crate::systing_core::types::packet_event {
             ts: 1000,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -3675,7 +3680,7 @@ mod tests {
 
     #[test]
     fn test_packet_event_queue_rcv() {
-        use crate::systing::types::{network_address_family, packet_event_type};
+        use crate::systing_core::types::{network_address_family, packet_event_type};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -3683,7 +3688,7 @@ mod tests {
         dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
         let socket_id: SocketId = 1;
 
-        let event = crate::systing::types::packet_event {
+        let event = crate::systing_core::types::packet_event {
             ts: 1100,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -3710,7 +3715,7 @@ mod tests {
 
     #[test]
     fn test_packet_event_buffer_queue() {
-        use crate::systing::types::{network_address_family, packet_event_type};
+        use crate::systing_core::types::{network_address_family, packet_event_type};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -3718,7 +3723,7 @@ mod tests {
         dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
         let socket_id: SocketId = 1;
 
-        let event = crate::systing::types::packet_event {
+        let event = crate::systing_core::types::packet_event {
             ts: 1110,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -3746,7 +3751,7 @@ mod tests {
 
     #[test]
     fn test_multiple_receive_packet_events() {
-        use crate::systing::types::{network_address_family, packet_event_type};
+        use crate::systing_core::types::{network_address_family, packet_event_type};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -3763,7 +3768,7 @@ mod tests {
             8080,
         );
 
-        let rcv_est_event = crate::systing::types::packet_event {
+        let rcv_est_event = crate::systing_core::types::packet_event {
             ts: 1000,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -3777,7 +3782,7 @@ mod tests {
             ..Default::default()
         };
 
-        let queue_rcv_event = crate::systing::types::packet_event {
+        let queue_rcv_event = crate::systing_core::types::packet_event {
             ts: 1100,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -3791,7 +3796,7 @@ mod tests {
             ..Default::default()
         };
 
-        let buffer_queue_event = crate::systing::types::packet_event {
+        let buffer_queue_event = crate::systing_core::types::packet_event {
             ts: 1110,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -3836,7 +3841,7 @@ mod tests {
 
     #[test]
     fn test_multiple_packets_different_sequences() {
-        use crate::systing::types::{network_address_family, packet_event_type};
+        use crate::systing_core::types::{network_address_family, packet_event_type};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -3853,7 +3858,7 @@ mod tests {
             8080,
         );
 
-        let packet1 = crate::systing::types::packet_event {
+        let packet1 = crate::systing_core::types::packet_event {
             ts: 1000,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -3867,7 +3872,7 @@ mod tests {
             ..Default::default()
         };
 
-        let packet2 = crate::systing::types::packet_event {
+        let packet2 = crate::systing_core::types::packet_event {
             ts: 1100,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -3896,7 +3901,7 @@ mod tests {
 
     #[test]
     fn test_generate_trace_packets_with_receive_packets() {
-        use crate::systing::types::{network_address_family, packet_event_type};
+        use crate::systing_core::types::{network_address_family, packet_event_type};
 
         let mut recorder = NetworkRecorder::default();
         let mut thread_uuids = HashMap::new();
@@ -3917,7 +3922,7 @@ mod tests {
             8080,
         );
 
-        let rcv_est = crate::systing::types::packet_event {
+        let rcv_est = crate::systing_core::types::packet_event {
             ts: 1000,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -3931,7 +3936,7 @@ mod tests {
             ..Default::default()
         };
 
-        let queue_rcv = crate::systing::types::packet_event {
+        let queue_rcv = crate::systing_core::types::packet_event {
             ts: 1100,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -3945,7 +3950,7 @@ mod tests {
             ..Default::default()
         };
 
-        let buffer_queue = crate::systing::types::packet_event {
+        let buffer_queue = crate::systing_core::types::packet_event {
             ts: 1110,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -3983,7 +3988,7 @@ mod tests {
 
     #[test]
     fn test_packet_events_send_and_receive() {
-        use crate::systing::types::{network_address_family, packet_event_type};
+        use crate::systing_core::types::{network_address_family, packet_event_type};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -4000,7 +4005,7 @@ mod tests {
             8080,
         );
 
-        let send_enqueue = crate::systing::types::packet_event {
+        let send_enqueue = crate::systing_core::types::packet_event {
             ts: 1000,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -4014,7 +4019,7 @@ mod tests {
             ..Default::default()
         };
 
-        let recv_buffer = crate::systing::types::packet_event {
+        let recv_buffer = crate::systing_core::types::packet_event {
             ts: 2000,
             af: network_address_family::NETWORK_AF_INET,
             dest_addr,
@@ -4052,7 +4057,7 @@ mod tests {
 
     #[test]
     fn test_udp_packet_events_protocol_classification() {
-        use crate::systing::types::{network_address_family, packet_event_type};
+        use crate::systing_core::types::{network_address_family, packet_event_type};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -4079,7 +4084,7 @@ mod tests {
         );
 
         // Create UDP PACKET_UDP_SEND event - goes to global packet_events
-        let udp_send_event = crate::systing::types::packet_event {
+        let udp_send_event = crate::systing_core::types::packet_event {
             ts: 1000,
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
@@ -4095,7 +4100,7 @@ mod tests {
         };
 
         // Create UDP PACKET_SEND event (qdisc->NIC, shared type) - goes to global packet_events
-        let udp_packet_send_event = crate::systing::types::packet_event {
+        let udp_packet_send_event = crate::systing_core::types::packet_event {
             ts: 2000,
             protocol: network_protocol::NETWORK_UDP, // Explicit protocol field
             af: network_address_family::NETWORK_AF_INET,
@@ -4111,7 +4116,7 @@ mod tests {
         };
 
         // Create TCP PACKET_SEND event for comparison - goes to global packet_events
-        let tcp_packet_send_event = crate::systing::types::packet_event {
+        let tcp_packet_send_event = crate::systing_core::types::packet_event {
             ts: 4000,
             protocol: network_protocol::NETWORK_TCP, // Explicit protocol field
             af: network_address_family::NETWORK_AF_INET,
@@ -4173,7 +4178,7 @@ mod tests {
 
     #[test]
     fn test_udp_receive_packet_events() {
-        use crate::systing::types::{network_address_family, packet_event_type};
+        use crate::systing_core::types::{network_address_family, packet_event_type};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -4191,7 +4196,7 @@ mod tests {
         );
 
         // UDP receive event (IP->UDP) - goes to global packet_events
-        let udp_rcv_event = crate::systing::types::packet_event {
+        let udp_rcv_event = crate::systing_core::types::packet_event {
             ts: 1000,
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
@@ -4207,7 +4212,7 @@ mod tests {
         };
 
         // UDP enqueue event (UDP->buffer) - goes to global packet_events
-        let udp_enqueue_event = crate::systing::types::packet_event {
+        let udp_enqueue_event = crate::systing_core::types::packet_event {
             ts: 1500,
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
@@ -4247,7 +4252,7 @@ mod tests {
 
     #[test]
     fn test_udp_packet_length_excludes_headers() {
-        use crate::systing::types::{network_address_family, packet_event_type};
+        use crate::systing_core::types::{network_address_family, packet_event_type};
 
         let mut recorder = NetworkRecorder::default();
 
@@ -4266,7 +4271,7 @@ mod tests {
 
         let payload_size = 512;
 
-        let udp_send_event = crate::systing::types::packet_event {
+        let udp_send_event = crate::systing_core::types::packet_event {
             ts: 1000,
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
@@ -4281,7 +4286,7 @@ mod tests {
             ..Default::default()
         };
 
-        let udp_rcv_event = crate::systing::types::packet_event {
+        let udp_rcv_event = crate::systing_core::types::packet_event {
             ts: 3000,
             protocol: network_protocol::NETWORK_UDP,
             af: network_address_family::NETWORK_AF_INET,
@@ -4317,7 +4322,7 @@ mod tests {
 
     #[test]
     fn test_udp_packet_send_does_not_create_tcp_track() {
-        use crate::systing::types::{network_address_family, packet_event_type};
+        use crate::systing_core::types::{network_address_family, packet_event_type};
         use std::sync::atomic::AtomicUsize;
         use std::sync::Arc;
 
@@ -4338,7 +4343,7 @@ mod tests {
 
         // Create UDP PACKET_SEND event (qdisc->NIC, shared event type with TCP)
         // Goes to global packet_events
-        let udp_packet_send_event = crate::systing::types::packet_event {
+        let udp_packet_send_event = crate::systing_core::types::packet_event {
             ts: 1000,
             protocol: network_protocol::NETWORK_UDP, // UDP protocol
             af: network_address_family::NETWORK_AF_INET,

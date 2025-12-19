@@ -1,5 +1,5 @@
 use crate::stack_recorder::{LocalFrame, Stack};
-use crate::systing::types::stack_event;
+use crate::systing_core::types::stack_event;
 use libbpf_rs::Object;
 use std::collections::HashMap;
 #[cfg(feature = "pystacks")]
@@ -51,8 +51,8 @@ impl Hash for PyAddr {
 }
 
 #[cfg(feature = "pystacks")]
-impl From<&crate::systing::types::stack_walker_frame> for bindings::stack_walker_frame {
-    fn from(frame: &crate::systing::types::stack_walker_frame) -> Self {
+impl From<&crate::systing_core::types::stack_walker_frame> for bindings::stack_walker_frame {
+    fn from(frame: &crate::systing_core::types::stack_walker_frame) -> Self {
         bindings::stack_walker_frame {
             symbol_id: frame.symbol_id,
             inst_idx: frame.inst_idx,
@@ -61,7 +61,7 @@ impl From<&crate::systing::types::stack_walker_frame> for bindings::stack_walker
 }
 
 #[cfg(feature = "pystacks")]
-impl fmt::Display for crate::systing::types::stack_walker_frame {
+impl fmt::Display for crate::systing_core::types::stack_walker_frame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Customize the formatting as needed
         write!(

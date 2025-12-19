@@ -7,8 +7,8 @@ use anyhow::Result;
 use crate::perfetto::{TraceWriter, TrackCounter};
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
-use crate::systing::types::perf_counter_event;
-use crate::systing::SystingRecordEvent;
+use crate::systing_core::types::perf_counter_event;
+use crate::systing_core::SystingRecordEvent;
 use crate::trace::{CounterRecord, CounterTrackRecord};
 
 use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
@@ -278,7 +278,7 @@ mod tests {
             cpu: 0,
             counter_num: 0,
             ts: 123456789,
-            value: crate::systing::types::bpf_perf_event_value {
+            value: crate::systing_core::types::bpf_perf_event_value {
                 counter: 42,
                 ..Default::default()
             },
@@ -327,7 +327,7 @@ mod tests {
             cpu: 0,
             counter_num: 0,
             ts: 100000,
-            value: crate::systing::types::bpf_perf_event_value {
+            value: crate::systing_core::types::bpf_perf_event_value {
                 counter: 42,
                 ..Default::default()
             },
@@ -343,7 +343,7 @@ mod tests {
             cpu: 0,
             counter_num: 0,
             ts: 200000,
-            value: crate::systing::types::bpf_perf_event_value {
+            value: crate::systing_core::types::bpf_perf_event_value {
                 counter: 84,
                 ..Default::default()
             },
@@ -359,7 +359,7 @@ mod tests {
             cpu: 1,
             counter_num: 0,
             ts: 300000,
-            value: crate::systing::types::bpf_perf_event_value {
+            value: crate::systing_core::types::bpf_perf_event_value {
                 counter: 100,
                 ..Default::default()
             },
@@ -394,7 +394,7 @@ mod tests {
             cpu: 0,
             counter_num: 0,
             ts: 100000,
-            value: crate::systing::types::bpf_perf_event_value {
+            value: crate::systing_core::types::bpf_perf_event_value {
                 counter: 42,
                 ..Default::default()
             },

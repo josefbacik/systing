@@ -6,9 +6,9 @@ use anyhow::Result;
 use crate::perfetto::TraceWriter;
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
-use crate::systing::types::event_type;
-use crate::systing::types::task_event;
-use crate::systing::SystingRecordEvent;
+use crate::systing_core::types::event_type;
+use crate::systing_core::types::task_event;
+use crate::systing_core::SystingRecordEvent;
 use crate::trace::{
     IrqSliceRecord, ProcessExitRecord, SchedSliceRecord, SoftirqSliceRecord, ThreadStateRecord,
     WakeupNewRecord,
@@ -773,8 +773,8 @@ impl LocalCompactSched {
 mod tests {
     use super::*;
     use crate::perfetto::VecTraceWriter;
-    use crate::systing::types::event_type;
-    use crate::systing::types::task_info;
+    use crate::systing_core::types::event_type;
+    use crate::systing_core::types::task_info;
     use perfetto_protos::trace_packet::TracePacket;
 
     fn copy_to_comm(comm: &mut [u8], value: &CStr) {
