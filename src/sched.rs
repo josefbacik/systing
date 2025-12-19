@@ -8,11 +8,11 @@ use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::event_type;
 use crate::systing::types::task_event;
+use crate::systing::SystingRecordEvent;
 use crate::trace::{
     IrqSliceRecord, ProcessExitRecord, SchedSliceRecord, SoftirqSliceRecord, ThreadStateRecord,
     WakeupNewRecord,
 };
-use crate::SystingRecordEvent;
 
 use perfetto_protos::ftrace_event::FtraceEvent;
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;

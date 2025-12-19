@@ -17,10 +17,10 @@ use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::stack_recorder::StackRecorder;
 use crate::systing::types::task_info;
+use crate::systing::SystingRecordEvent;
 use crate::trace::{
     ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ProcessRecord, ThreadRecord,
 };
-use crate::SystingRecordEvent;
 
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
@@ -1335,7 +1335,7 @@ impl SessionRecorder {
     }
 }
 
-impl crate::SystingEvent for SysInfoEvent {
+impl crate::systing::SystingEvent for SysInfoEvent {
     fn ts(&self) -> u64 {
         self.ts
     }
