@@ -1,4 +1,4 @@
-use crate::SystingEvent;
+use crate::systing::SystingEvent;
 use std::collections::VecDeque;
 
 #[derive(Default)]
@@ -84,6 +84,7 @@ impl<T> RingBuffer<T> {
         self.max_duration
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
             || (self.buffer.len() == 1 && self.buffer.front().unwrap().is_empty())

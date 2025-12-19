@@ -9,11 +9,11 @@ use crate::perfetto::TraceWriter;
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::network_event;
+use crate::systing::SystingRecordEvent;
 use crate::trace::{
     ArgRecord, InstantArgRecord, InstantRecord, NetworkPacketRecord, NetworkPollRecord,
     NetworkSocketRecord, NetworkSyscallRecord, SliceRecord, SocketConnectionRecord, TrackRecord,
 };
-use crate::SystingRecordEvent;
 
 /// Unique socket identifier assigned by BPF during tracing
 pub type SocketId = u64;

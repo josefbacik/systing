@@ -9,8 +9,8 @@ use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::stack_event;
+use crate::systing::SystingRecordEvent;
 use crate::trace::{StackRecord, StackSampleRecord};
-use crate::SystingRecordEvent;
 
 use blazesym::helper::{read_elf_build_id, ElfResolver};
 use blazesym::symbolize::source::{Kernel, Process, Source};

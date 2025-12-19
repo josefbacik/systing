@@ -11,8 +11,8 @@ use crate::perfetto::TraceWriter;
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::probe_event;
+use crate::systing::SystingRecordEvent;
 use crate::trace::{ArgRecord, InstantArgRecord, InstantRecord, SliceRecord, TrackRecord};
-use crate::SystingRecordEvent;
 
 use anyhow::Result;
 use plain::Plain;

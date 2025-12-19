@@ -8,8 +8,8 @@ use crate::perfetto::{TraceWriter, TrackCounter};
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing::types::perf_counter_event;
+use crate::systing::SystingRecordEvent;
 use crate::trace::{CounterRecord, CounterTrackRecord};
-use crate::SystingRecordEvent;
 
 use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
