@@ -1959,6 +1959,8 @@ fn run_tracing_loop(
 
 /// Main tracing function that sets up and runs the BPF-based system tracer.
 pub fn systing(opts: Config) -> Result<()> {
+    bump_memlock_rlimit()?;
+
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
     let mut counters = PerfCounters::default();
