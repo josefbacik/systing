@@ -60,14 +60,16 @@ pub struct SchedSliceRecord {
 /// - `ts`: Timestamp when state change occurred
 /// - `dur`: Duration in this state (0 if still in state)
 /// - `utid`: Unique thread ID (references `ThreadRecord.utid`)
-/// - `state`: State string (e.g., "R" for running, "S" for sleeping)
-/// - `cpu`: Target CPU for wakeups
+/// - `state`: Raw kernel task state value.
+///   Common values: 0=TASK_RUNNING (runnable), 1=TASK_INTERRUPTIBLE,
+///   2=TASK_UNINTERRUPTIBLE, 4=__TASK_STOPPED, 8=__TASK_TRACED.
+/// - `cpu`: Target CPU for wakeups (only set for state=0/runnable)
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ThreadStateRecord {
     pub ts: i64,
     pub dur: i64,
     pub utid: i64,
-    pub state: String,
+    pub state: i32,
     pub cpu: Option<i32>,
 }
 

@@ -1188,14 +1188,14 @@ fn build_thread_state_batch(
     let mut ts_builder = Int64Builder::with_capacity(records.len());
     let mut dur_builder = Int64Builder::with_capacity(records.len());
     let mut utid_builder = Int64Builder::with_capacity(records.len());
-    let mut state_builder = StringBuilder::with_capacity(records.len(), records.len() * 4);
+    let mut state_builder = Int32Builder::with_capacity(records.len());
     let mut cpu_builder = Int32Builder::with_capacity(records.len());
 
     for record in records {
         ts_builder.append_value(record.ts);
         dur_builder.append_value(record.dur);
         utid_builder.append_value(record.utid);
-        state_builder.append_value(&record.state);
+        state_builder.append_value(record.state);
         cpu_builder.append_option(record.cpu);
     }
 
