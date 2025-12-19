@@ -351,7 +351,7 @@ struct Command {
 }
 
 /// Configuration for the systing system tracing.
-/// This struct contains all the runtime options needed by the system() function
+/// This struct contains all the runtime options needed by the systing() function
 /// and its helpers, separated from the CLI parsing concerns of Command.
 #[derive(Debug)]
 pub struct Config {
@@ -2131,7 +2131,7 @@ fn run_tracing_loop(
     Ok(())
 }
 
-fn system(opts: Config) -> Result<()> {
+fn systing(opts: Config) -> Result<()> {
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
     let mut counters = PerfCounters::default();
@@ -2638,5 +2638,5 @@ fn main() -> Result<()> {
     bump_memlock_rlimit()?;
 
     let config = Config::from(opts);
-    system(config)
+    systing(config)
 }
