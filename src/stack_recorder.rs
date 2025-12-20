@@ -11,6 +11,7 @@ use crate::ringbuf::RingBuffer;
 use crate::systing_core::types::stack_event;
 use crate::systing_core::SystingRecordEvent;
 use crate::trace::{StackRecord, StackSampleRecord};
+use crate::utid::UtidGenerator;
 
 use blazesym::helper::{read_elf_build_id, ElfResolver};
 use blazesym::symbolize::source::{Kernel, Process, Source};
@@ -145,27 +146,12 @@ pub struct StackRecorder {
     next_stack_id: i64,
     /// Pending samples buffer for streaming.
     pending_samples: Vec<StackSampleRecord>,
-}
-
-impl Default for StackRecorder {
-    fn default() -> Self {
-        let id_counter = Arc::new(AtomicUsize::new(1));
-        Self {
-            ringbuf: RingBuffer::default(),
-            stacks: HashMap::new(),
-            psr: Arc::new(StackWalkerRun::default()),
-            process_dispatcher: None,
-            global_func_manager: Arc::new(GlobalFunctionManager::new(id_counter)),
-            streaming_enabled: false,
-            unique_stacks: HashMap::new(),
-            next_stack_id: 1,
-            pending_samples: Vec::new(),
-        }
-    }
+    /// Shared utid generator for consistent thread IDs across all recorders.
+    utid_generator: Arc<UtidGenerator>,
 }
 
 impl StackRecorder {
-    pub fn new(enable_debuginfod: bool) -> Self {
+    pub fn new(enable_debuginfod: bool, utid_generator: Arc<UtidGenerator>) -> Self {
         let process_dispatcher = if enable_debuginfod {
             create_debuginfod_dispatcher()
         } else {
@@ -183,7 +169,13 @@ impl StackRecorder {
             unique_stacks: HashMap::new(),
             next_stack_id: 1,
             pending_samples: Vec::new(),
+            utid_generator,
         }
+    }
+
+    /// Get or create a utid for the given tid.
+    fn get_utid_for_tid(&self, tid: i32) -> i64 {
+        self.utid_generator.get_or_create_utid(tid)
     }
 
     /// Enable streaming mode for stack recording.
@@ -1250,7 +1242,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
                 // Buffer the sample for streaming (will be flushed in finish())
                 self.pending_samples.push(StackSampleRecord {
                     ts: event.ts as i64,
-                    utid: tid as i64, // Using tid as utid for streaming (like sched recorder)
+                    utid: self.get_utid_for_tid(tid),
                     cpu: None,
                     stack_id,
                 });
@@ -1293,8 +1285,13 @@ mod tests {
 
     use super::*;
     use crate::perfetto::VecTraceWriter;
+    use crate::utid::UtidGenerator;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
+
+    fn create_test_recorder() -> StackRecorder {
+        StackRecorder::new(false, Arc::new(UtidGenerator::new()))
+    }
 
     fn create_test_stack_event_raw(
         tgidpid: u64,
@@ -1507,7 +1504,7 @@ mod tests {
 
     #[test]
     fn test_deduplicate_stacks_single_stack() {
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create a single test event
         let event = create_test_stack_event_raw(
@@ -1532,7 +1529,7 @@ mod tests {
 
     #[test]
     fn test_deduplicate_stacks_duplicate_stacks() {
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create two events with identical stacks but different threads
         let event1 = create_test_stack_event_raw(
@@ -1565,7 +1562,7 @@ mod tests {
 
     #[test]
     fn test_deduplicate_stacks_different_stacks() {
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create two events with different stacks
         let event1 =
@@ -1603,7 +1600,7 @@ mod tests {
 
     #[test]
     fn test_generate_trace_packets_single_stack() {
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create a single test event
         let event = create_test_stack_event_raw(
@@ -1628,7 +1625,7 @@ mod tests {
 
     #[test]
     fn test_generate_trace_packets_multiple_stacks() {
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create two test events with different processes
         let event1 =
@@ -1654,7 +1651,7 @@ mod tests {
     #[test]
     fn test_symbolize_stacks_with_mock_resolver() {
         // Test symbolization pipeline with generate_trace
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create and handle a test event with addresses that MockResolver knows
         let event = create_test_stack_event_raw(
@@ -1681,7 +1678,7 @@ mod tests {
     #[test]
     fn test_stack_recorder_with_custom_dispatcher() {
         // Test multiple stack events through the pipeline
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create and handle multiple test events with different known addresses
         let event1 =
@@ -1708,7 +1705,7 @@ mod tests {
     #[test]
     fn test_deduplicate_stacks_with_mock_resolver() {
         // Test that duplicate stacks are properly deduplicated
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create and handle identical stacks from different threads - should be deduplicated
         let event1 = create_test_stack_event_raw(
@@ -1742,7 +1739,7 @@ mod tests {
 
     #[test]
     fn test_generate_trace_packets_timestamps() {
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create two test events with same stack but different timestamps
         let event1 =

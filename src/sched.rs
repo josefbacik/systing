@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CStr;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -13,6 +14,7 @@ use crate::trace::{
     IrqSliceRecord, ProcessExitRecord, SchedSliceRecord, SoftirqSliceRecord, ThreadStateRecord,
     WakeupNewRecord,
 };
+use crate::utid::UtidGenerator;
 
 use perfetto_protos::ftrace_event::FtraceEvent;
 use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
@@ -111,7 +113,6 @@ struct ProcessExitEvent {
     pid: i32,
 }
 
-#[derive(Default)]
 pub struct SchedEventRecorder {
     pub ringbuf: RingBuffer<task_event>,
     events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
@@ -131,6 +132,8 @@ pub struct SchedEventRecorder {
     cpu_states: HashMap<u32, CpuRunningState>,
     pending_slices: Vec<SchedSliceRecord>,
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
+    // Shared utid generator for consistent thread IDs across all recorders
+    utid_generator: Arc<UtidGenerator>,
 }
 
 impl SystingRecordEvent<task_event> for SchedEventRecorder {
@@ -163,7 +166,7 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                             ts: prev_state.start_ts,
                             dur,
                             cpu: event.cpu as i32,
-                            utid: prev_state.tid as i64, // Using tid as utid for streaming
+                            utid: self.get_utid_for_tid(prev_state.tid),
                             end_state,
                             priority: prev_state.prio,
                         });
@@ -171,11 +174,13 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                         // Emit sleep state record when task leaves CPU with non-zero state
                         // This is critical for Perfetto to show correct off-CPU thread states
                         if let Some(state) = end_state {
+                            // Get utid before borrowing collector mutably
+                            let utid = self.utid_generator.get_or_create_utid(prev_state.tid);
                             if let Some(collector) = &mut self.streaming_collector {
                                 if let Err(e) = collector.add_thread_state(ThreadStateRecord {
                                     ts: event.ts as i64,
                                     dur: 0,
-                                    utid: prev_state.tid as i64,
+                                    utid,
                                     state,
                                     cpu: None, // CPU not relevant for sleep state
                                 }) {
@@ -209,10 +214,12 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
 
                 // Handle streaming mode for SCHED_WAKING: emit ThreadStateRecord immediately
                 if event.r#type == event_type::SCHED_WAKING {
-                    if let Some(collector) = &mut self.streaming_collector {
-                        // Extract tid from lower 32 bits of tgidpid, use as utid for streaming
-                        let utid = (event.next.tgidpid as i32) as i64;
+                    // Extract tid from lower 32 bits of tgidpid
+                    // Get utid before borrowing collector mutably
+                    let tid = event.next.tgidpid as i32;
+                    let utid = self.utid_generator.get_or_create_utid(tid);
 
+                    if let Some(collector) = &mut self.streaming_collector {
                         if let Err(e) = collector.add_thread_state(ThreadStateRecord {
                             ts: event.ts as i64,
                             dur: 0,
@@ -323,10 +330,13 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
 
             // New process wakeup - the `next` field contains the newly woken process info
             event_type::SCHED_WAKEUP_NEW => {
+                // Extract tid from lower 32 bits of tgidpid
+                // Get utid before borrowing collector mutably
+                let tid = event.next.tgidpid as i32;
+                let utid = self.utid_generator.get_or_create_utid(tid);
+
                 // Stream immediately if streaming mode is enabled
                 if let Some(collector) = &mut self.streaming_collector {
-                    // Extract tid from lower 32 bits of tgidpid
-                    let utid = (event.next.tgidpid as i32) as i64;
                     if let Err(e) = collector.add_wakeup_new(WakeupNewRecord {
                         ts: event.ts as i64,
                         cpu: event.cpu as i32,
@@ -340,7 +350,7 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                     self.wakeup_news.push(WakeupNewEvent {
                         ts: event.ts as i64,
                         cpu: event.cpu as i32,
-                        pid: event.next.tgidpid as i32,
+                        pid: tid,
                         target_cpu: event.target_cpu as i32,
                     });
                 }
@@ -349,10 +359,13 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
 
             // Process exit - the `prev` field contains the exiting process info
             event_type::SCHED_PROCESS_EXIT => {
+                // Extract tid from lower 32 bits of tgidpid
+                // Get utid before borrowing collector mutably
+                let tid = event.prev.tgidpid as i32;
+                let utid = self.utid_generator.get_or_create_utid(tid);
+
                 // Stream immediately if streaming mode is enabled
                 if let Some(collector) = &mut self.streaming_collector {
-                    // Extract tid from lower 32 bits of tgidpid
-                    let utid = (event.prev.tgidpid as i32) as i64;
                     if let Err(e) = collector.add_process_exit(ProcessExitRecord {
                         ts: event.ts as i64,
                         cpu: event.cpu as i32,
@@ -365,7 +378,7 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                     self.process_exits.push(ProcessExitEvent {
                         ts: event.ts as i64,
                         cpu: event.cpu as i32,
-                        pid: event.prev.tgidpid as i32,
+                        pid: tid,
                     });
                 }
                 self.add_ftrace_event(&event);
@@ -383,6 +396,30 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
 }
 
 impl SchedEventRecorder {
+    /// Create a new SchedEventRecorder with the given utid generator.
+    pub fn new(utid_generator: Arc<UtidGenerator>) -> Self {
+        Self {
+            ringbuf: RingBuffer::default(),
+            events: HashMap::new(),
+            compact_sched: HashMap::new(),
+            pending_irqs: HashMap::new(),
+            pending_softirqs: HashMap::new(),
+            completed_irqs: Vec::new(),
+            completed_softirqs: Vec::new(),
+            wakeup_news: Vec::new(),
+            process_exits: Vec::new(),
+            cpu_states: HashMap::new(),
+            pending_slices: Vec::new(),
+            streaming_collector: None,
+            utid_generator,
+        }
+    }
+
+    /// Get or create a utid for the given tid.
+    fn get_utid_for_tid(&self, tid: i32) -> i64 {
+        self.utid_generator.get_or_create_utid(tid)
+    }
+
     /// Set the streaming collector for real-time event emission.
     pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
         self.streaming_collector = Some(collector);
@@ -543,16 +580,25 @@ impl SchedEventRecorder {
     pub fn finish(&mut self, end_ts: i64) -> Result<Option<Box<dyn RecordCollector + Send>>> {
         if let Some(collector) = &mut self.streaming_collector {
             // Emit final slices for still-running tasks on each CPU
-            for (cpu, state) in &self.cpu_states {
-                let dur = end_ts - state.start_ts;
-                collector.add_sched_slice(SchedSliceRecord {
-                    ts: state.start_ts,
-                    dur,
-                    cpu: *cpu as i32,
-                    utid: state.tid as i64,
-                    end_state: None, // Still running at trace end
-                    priority: state.prio,
-                })?;
+            // Pre-compute utids before borrowing collector mutably
+            let final_slices: Vec<_> = self
+                .cpu_states
+                .iter()
+                .map(|(cpu, state)| {
+                    let dur = end_ts - state.start_ts;
+                    SchedSliceRecord {
+                        ts: state.start_ts,
+                        dur,
+                        cpu: *cpu as i32,
+                        utid: self.utid_generator.get_or_create_utid(state.tid),
+                        end_state: None, // Still running at trace end
+                        priority: state.prio,
+                    }
+                })
+                .collect();
+
+            for slice in final_slices {
+                collector.add_sched_slice(slice)?;
             }
 
             // Flush any remaining pending slices
@@ -775,11 +821,16 @@ mod tests {
     use crate::perfetto::VecTraceWriter;
     use crate::systing_core::types::event_type;
     use crate::systing_core::types::task_info;
+    use crate::utid::UtidGenerator;
     use perfetto_protos::trace_packet::TracePacket;
 
     fn copy_to_comm(comm: &mut [u8], value: &CStr) {
         let bytes = value.to_bytes_with_nul();
         comm[..bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn create_test_recorder() -> SchedEventRecorder {
+        SchedEventRecorder::new(Arc::new(UtidGenerator::new()))
     }
 
     /// Helper to collect packets from SchedEventRecorder for tests
@@ -791,7 +842,7 @@ mod tests {
 
     #[test]
     fn test_handle_event() {
-        let mut recorder = SchedEventRecorder::default();
+        let mut recorder = create_test_recorder();
         let prev_comm = c"prev";
         let next_comm = c"next";
 
@@ -841,7 +892,7 @@ mod tests {
 
     #[test]
     fn test_wakeup_new() {
-        let mut recorder = SchedEventRecorder::default();
+        let mut recorder = create_test_recorder();
         let next_comm = c"next";
 
         let mut event = task_event {
@@ -875,7 +926,7 @@ mod tests {
 
     #[test]
     fn test_irq_handler_events() {
-        let mut recorder = SchedEventRecorder::default();
+        let mut recorder = create_test_recorder();
         let next_comm = c"irq_handler";
 
         let mut event = task_event {
@@ -909,7 +960,7 @@ mod tests {
 
     #[test]
     fn test_irq_exit_handler_events() {
-        let mut recorder = SchedEventRecorder::default();
+        let mut recorder = create_test_recorder();
         let next_comm = c"irq_handler";
 
         let mut event = task_event {
@@ -942,7 +993,7 @@ mod tests {
 
     #[test]
     fn test_softirq_events() {
-        let mut recorder = SchedEventRecorder::default();
+        let mut recorder = create_test_recorder();
 
         let event = task_event {
             r#type: event_type::SCHED_SOFTIRQ_ENTER,
@@ -969,7 +1020,7 @@ mod tests {
 
     #[test]
     fn test_softirq_exit_events() {
-        let mut recorder = SchedEventRecorder::default();
+        let mut recorder = create_test_recorder();
 
         let event = task_event {
             r#type: event_type::SCHED_SOFTIRQ_EXIT,
@@ -996,7 +1047,7 @@ mod tests {
 
     #[test]
     fn test_process_exit_event() {
-        let mut recorder = SchedEventRecorder::default();
+        let mut recorder = create_test_recorder();
         let prev_comm = c"prev";
 
         let mut event = task_event {
@@ -1031,7 +1082,7 @@ mod tests {
     fn test_streaming_sched_waking_emits_runnable_state() {
         use crate::record::collector::InMemoryCollector;
 
-        let mut recorder = SchedEventRecorder::default();
+        let mut recorder = create_test_recorder();
         let collector = Box::new(InMemoryCollector::new());
         recorder.set_streaming_collector(collector);
 
@@ -1059,7 +1110,7 @@ mod tests {
     fn test_streaming_sched_switch_emits_sleep_state() {
         use crate::record::collector::InMemoryCollector;
 
-        let mut recorder = SchedEventRecorder::default();
+        let mut recorder = create_test_recorder();
         let collector = Box::new(InMemoryCollector::new());
         recorder.set_streaming_collector(collector);
 
