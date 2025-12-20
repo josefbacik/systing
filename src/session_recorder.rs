@@ -598,35 +598,35 @@ impl SessionRecorder {
     }
 
     pub fn maybe_record_task(&self, info: &task_info) {
-        if Self::is_process(info) {
-            // Check if process already exists
-            if !self
-                .process_descriptors
-                .read()
-                .unwrap()
-                .contains_key(&info.tgidpid)
-            {
+        // Always record ALL tasks as threads - this ensures every tid that appears
+        // in sched events has a corresponding thread record in parquet files.
+        // For Perfetto output, write_thread_packets filters out main threads (tid == pid)
+        // since those are represented by ProcessDescriptor instead of ThreadDescriptor.
+        if !self.threads.read().unwrap().contains_key(&info.tgidpid) {
+            self.record_new_thread(info);
+        }
+
+        // Also maintain process metadata for Perfetto generation.
+        // Note: record_new_process only writes to process_descriptors, not to threads.
+        // The thread entry was already added above, so main threads end up in both
+        // collections (threads for parquet, process_descriptors for Perfetto).
+        let tgid = info.tgidpid >> 32;
+        let process_tgidpid = (tgid << 32) | tgid; // process has pid == tgid
+
+        if !self
+            .process_descriptors
+            .read()
+            .unwrap()
+            .contains_key(&process_tgidpid)
+        {
+            if Self::is_process(info) {
+                // This is the main thread - use its info directly
                 self.record_new_process(info);
-            }
-        } else {
-            // For threads, ensure the parent process is also recorded
-            let tgid = info.tgidpid >> 32;
-            let parent_tgidpid = (tgid << 32) | tgid; // parent process has pid == tgid
-            if !self
-                .process_descriptors
-                .read()
-                .unwrap()
-                .contains_key(&parent_tgidpid)
-            {
+            } else {
                 // Create a synthetic task_info for the parent process
                 let mut parent_info = *info;
-                parent_info.tgidpid = parent_tgidpid;
+                parent_info.tgidpid = process_tgidpid;
                 self.record_new_process(&parent_info);
-            }
-
-            // Check if thread already exists
-            if !self.threads.read().unwrap().contains_key(&info.tgidpid) {
-                self.record_new_thread(info);
             }
         }
     }
@@ -771,7 +771,11 @@ impl SessionRecorder {
         Ok(())
     }
 
-    /// Writes trace packets for all threads
+    /// Writes trace packets for all threads (excluding main threads).
+    ///
+    /// Main threads (where tid == pid) are represented by ProcessDescriptor in Perfetto,
+    /// not ThreadDescriptor. The Perfetto validation rejects ThreadDescriptor entries
+    /// where pid == tid. Main threads are already covered by `write_process_packets`.
     fn write_thread_packets(
         &self,
         writer: &mut dyn TraceWriter,
@@ -779,6 +783,13 @@ impl SessionRecorder {
         thread_uuids: &mut HashMap<i32, u64>,
     ) -> Result<()> {
         for thread in self.threads.read().unwrap().values() {
+            // Skip main threads - they're represented by ProcessDescriptor, not ThreadDescriptor.
+            // In Perfetto, when tid == pid, the thread is the main thread and should use
+            // ProcessDescriptor instead.
+            if thread.tid() == thread.pid() {
+                continue;
+            }
+
             let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
             thread_uuids.insert(thread.tid(), uuid);
 
@@ -1570,18 +1581,19 @@ mod tests {
         recorder.maybe_record_task(&thread_task1);
         recorder.maybe_record_task(&thread_task2);
 
-        // Should have one process and two threads
+        // Should have one process entry
         let process_descriptors = recorder.process_descriptors.read().unwrap();
         assert_eq!(process_descriptors.len(), 1);
 
+        // All tasks (including main thread) go to threads for parquet consistency
         let threads = recorder.threads.read().unwrap();
-        assert_eq!(threads.len(), 2);
+        assert_eq!(threads.len(), 3); // main thread + 2 worker threads
 
         // Verify the process
         let process_desc = process_descriptors.get(&process_task.tgidpid).unwrap();
         assert_eq!(process_desc.process_name(), "main_process");
 
-        // Verify the threads belong to the same process
+        // Verify all threads belong to the same process
         for thread in threads.values() {
             assert_eq!(thread.pid(), 1234);
         }
