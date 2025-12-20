@@ -791,6 +791,20 @@ fn validate_packet(
             validate_compact_sched(events.compact_sched.as_ref().unwrap(), context, result);
         }
     }
+
+    // Check for PerfSample with invalid pid/tid
+    if packet.has_perf_sample() {
+        let sample = packet.perf_sample();
+        // Only validate if both fields are explicitly set
+        if sample.has_pid() && sample.has_tid() && sample.pid() == 0 && sample.tid() == 0 {
+            result.add_error(ValidationError::PerfettoError {
+                message: format!(
+                    "PerfSample has both pid and tid set to 0 (timestamp={})",
+                    packet.timestamp()
+                ),
+            });
+        }
+    }
 }
 
 /// Validate CompactSched structure.
@@ -1309,5 +1323,77 @@ mod tests {
                 ..
             } if table == "thread" && column == "upid"
         )));
+    }
+
+    #[test]
+    fn test_perf_sample_zero_pid_tid() {
+        use perfetto_protos::profile_packet::PerfSample;
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create a PerfSample with pid=0 and tid=0
+        let mut sample = PerfSample::default();
+        sample.set_pid(0);
+        sample.set_tid(0);
+
+        let mut packet = TracePacket::default();
+        packet.set_perf_sample(sample);
+
+        validate_packet(&packet, &mut context, &mut result);
+
+        assert!(result.has_errors(), "Expected error for pid=0 and tid=0");
+        assert!(result.errors.iter().any(|e| matches!(
+            e,
+            ValidationError::PerfettoError { message } if message.starts_with("PerfSample has both pid and tid set to 0")
+        )));
+    }
+
+    #[test]
+    fn test_perf_sample_valid_pid_tid() {
+        use perfetto_protos::profile_packet::PerfSample;
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create a PerfSample with valid pid and tid
+        let mut sample = PerfSample::default();
+        sample.set_pid(1234);
+        sample.set_tid(5678);
+
+        let mut packet = TracePacket::default();
+        packet.set_perf_sample(sample);
+
+        validate_packet(&packet, &mut context, &mut result);
+
+        assert!(
+            !result.has_errors(),
+            "Expected no errors for valid PerfSample, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_perf_sample_zero_pid_nonzero_tid() {
+        use perfetto_protos::profile_packet::PerfSample;
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // pid=0 with valid tid is allowed (kernel thread scenario)
+        let mut sample = PerfSample::default();
+        sample.set_pid(0);
+        sample.set_tid(5678);
+
+        let mut packet = TracePacket::default();
+        packet.set_perf_sample(sample);
+
+        validate_packet(&packet, &mut context, &mut result);
+
+        assert!(
+            !result.has_errors(),
+            "Expected no errors when only pid is 0, got: {:?}",
+            result.errors
+        );
     }
 }
