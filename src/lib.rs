@@ -49,6 +49,7 @@ pub mod session_recorder;
 pub mod stack_recorder;
 pub mod systing_core;
 pub mod trace;
+pub mod utid;
 
 // Re-export for convenience
 pub use parquet_paths::ParquetPaths;

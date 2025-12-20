@@ -21,6 +21,7 @@ use crate::systing_core::SystingRecordEvent;
 use crate::trace::{
     ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ProcessRecord, ThreadRecord,
 };
+use crate::utid::UtidGenerator;
 
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
@@ -68,7 +69,6 @@ impl Default for SysinfoRecorder {
     }
 }
 
-#[derive(Default)]
 pub struct SessionRecorder {
     pub clock_snapshot: Mutex<ClockSnapshot>,
     pub event_recorder: Mutex<SchedEventRecorder>,
@@ -80,6 +80,8 @@ pub struct SessionRecorder {
     pub process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
     pub processes: RwLock<HashMap<u64, ProtoProcess>>,
     pub threads: RwLock<HashMap<u64, ThreadDescriptor>>,
+    /// Shared utid generator for consistent thread IDs across all recorders.
+    utid_generator: Arc<UtidGenerator>,
 }
 
 pub fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -480,10 +482,14 @@ impl SysinfoRecorder {
 
 impl SessionRecorder {
     pub fn new(enable_debuginfod: bool, resolve_network_addresses: bool) -> Self {
+        let utid_generator = Arc::new(UtidGenerator::new());
         Self {
             clock_snapshot: Mutex::new(ClockSnapshot::default()),
-            event_recorder: Mutex::new(SchedEventRecorder::default()),
-            stack_recorder: Mutex::new(StackRecorder::new(enable_debuginfod)),
+            event_recorder: Mutex::new(SchedEventRecorder::new(Arc::clone(&utid_generator))),
+            stack_recorder: Mutex::new(StackRecorder::new(
+                enable_debuginfod,
+                Arc::clone(&utid_generator),
+            )),
             perf_counter_recorder: Mutex::new(PerfCounterRecorder::default()),
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::default()),
@@ -491,6 +497,7 @@ impl SessionRecorder {
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
+            utid_generator,
         }
     }
 
@@ -1169,19 +1176,14 @@ impl SessionRecorder {
         drop(clock_snapshot);
 
         // Step 2: Generate process and thread records
+        // Use the shared UtidGenerator to get consistent utid/upid values that match
+        // what was used during streaming.
         eprintln!("Writing process and thread data...");
-        let mut upid_map: HashMap<i32, i64> = HashMap::new(); // pid -> upid
-        let mut tid_to_utid: HashMap<i32, i64> = HashMap::new(); // tid -> utid
 
-        let mut upid_counter: i64 = 1;
-        let mut utid_counter: i64 = 1;
-
-        // Write process records
+        // Write process records using the shared upid generator
         for process in self.process_descriptors.read().unwrap().values() {
             let pid = process.pid();
-            let upid = upid_counter;
-            upid_counter += 1;
-            upid_map.insert(pid, upid);
+            let upid = self.utid_generator.get_or_create_upid(pid);
 
             let name = if process.has_process_name() {
                 Some(process.process_name().to_string())
@@ -1197,12 +1199,12 @@ impl SessionRecorder {
             })?;
         }
 
-        // Write thread records
+        // Write thread records using the shared utid generator
+        // Threads seen during streaming already have utids assigned; new threads get new utids
         for thread in self.threads.read().unwrap().values() {
             let tid = thread.tid();
-            let utid = utid_counter;
-            utid_counter += 1;
-            tid_to_utid.insert(tid, utid);
+            // Use existing utid from streaming, or create new one if not seen during streaming
+            let utid = self.utid_generator.get_or_create_utid(tid);
 
             let name = if thread.has_thread_name() {
                 Some(thread.thread_name().to_string())
@@ -1210,9 +1212,9 @@ impl SessionRecorder {
                 None
             };
 
-            // Get upid from process mapping (pid in ThreadDescriptor is the tgid/process id)
+            // Get upid from generator (pid in ThreadDescriptor is the tgid/process id)
             let upid = if thread.has_pid() {
-                upid_map.get(&thread.pid()).copied()
+                self.utid_generator.get_upid(thread.pid())
             } else {
                 None
             };
@@ -1224,6 +1226,9 @@ impl SessionRecorder {
                 upid,
             })?;
         }
+
+        // Get the tid_to_utid mapping for non-streaming recorders
+        let tid_to_utid = self.utid_generator.get_tid_to_utid_map();
 
         // Step 3: Generate network interface metadata
         // Network interface metadata is complex (requires netns enumeration)
@@ -1402,10 +1407,11 @@ mod tests {
     }
 
     fn create_test_session_recorder() -> SessionRecorder {
+        let utid_generator = Arc::new(UtidGenerator::new());
         SessionRecorder {
             clock_snapshot: Mutex::new(ClockSnapshot::default()),
-            event_recorder: Mutex::new(SchedEventRecorder::default()),
-            stack_recorder: Mutex::new(StackRecorder::default()),
+            event_recorder: Mutex::new(SchedEventRecorder::new(Arc::clone(&utid_generator))),
+            stack_recorder: Mutex::new(StackRecorder::new(false, Arc::clone(&utid_generator))),
             perf_counter_recorder: Mutex::new(PerfCounterRecorder::default()),
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::default()),
@@ -1413,6 +1419,7 @@ mod tests {
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
+            utid_generator,
         }
     }
 
