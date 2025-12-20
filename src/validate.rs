@@ -757,6 +757,21 @@ fn validate_packet(
             let parent_uuid = desc.parent_uuid();
             context.parent_refs.insert(uuid, parent_uuid);
         }
+
+        // Check ThreadDescriptor: pid should not equal tid
+        // When pid == tid, it's the main thread and should use ProcessDescriptor instead
+        if let Some(thread) = desc.thread.as_ref() {
+            if thread.has_pid() && thread.has_tid() && thread.pid() == thread.tid() {
+                result.add_error(ValidationError::PerfettoError {
+                    message: format!(
+                        "ThreadDescriptor (track_uuid={}) has pid == tid ({}), main threads \
+                         should use ProcessDescriptor instead",
+                        uuid,
+                        thread.pid()
+                    ),
+                });
+            }
+        }
     }
 
     // Check for track events
