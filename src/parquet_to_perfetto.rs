@@ -43,6 +43,12 @@ use crate::perfetto::{StreamingTraceWriter, TraceWriter};
 /// Default process priority (nice value 0 = priority 120 in kernel).
 const DEFAULT_PRIORITY: i32 = 120;
 
+/// Track name for network packets root in Perfetto traces.
+const NETWORK_PACKETS_TRACK_NAME: &str = "Network Packets";
+
+/// Track name for network interfaces root in Perfetto traces.
+const NETWORK_INTERFACES_TRACK_NAME: &str = "Network Interfaces";
+
 /// Convert parquet files in input_dir to a Perfetto trace at output_file.
 pub fn convert(input_dir: &Path, output_file: &Path) -> Result<()> {
     let file = File::create(output_file)
@@ -155,6 +161,12 @@ impl ParquetToPerfettoConverter {
 
         // 9. Write perf samples
         self.write_perf_samples(input_dir, writer)?;
+
+        // 10. Write network data (sockets, packets, syscalls, polls)
+        self.write_network_data(input_dir, writer)?;
+
+        // 11. Write network interface metadata
+        self.write_network_interfaces(input_dir, writer)?;
 
         Ok(())
     }
@@ -1741,6 +1753,500 @@ impl ParquetToPerfettoConverter {
 
         Ok((stack_to_callstack_iid, sequence_id))
     }
+
+    /// Write network data: socket tracks, packet events, syscall slices, poll events.
+    ///
+    /// Creates a hierarchical track structure:
+    /// - "Network Packets" (root track)
+    ///   - "TCP 10.0.0.1:12345 → 10.0.0.2:80" (per-socket tracks)
+    ///   - "UDP 10.0.0.1:5000 → 10.0.0.2:5001"
+    ///
+    /// Packet events are written as instants on their socket tracks.
+    /// Syscall events are written as slices (with duration).
+    fn write_network_data(&mut self, input_dir: &Path, writer: &mut dyn TraceWriter) -> Result<()> {
+        let socket_path = input_dir.join("network_socket.parquet");
+        let packet_path = input_dir.join("network_packet.parquet");
+        let syscall_path = input_dir.join("network_syscall.parquet");
+        let poll_path = input_dir.join("network_poll.parquet");
+
+        // Check if any network files exist
+        if !socket_path.exists()
+            && !packet_path.exists()
+            && !syscall_path.exists()
+            && !poll_path.exists()
+        {
+            return Ok(());
+        }
+
+        // Create root "Network Packets" track
+        let root_uuid = self.alloc_uuid();
+        let mut root_desc = TrackDescriptor::default();
+        root_desc.set_uuid(root_uuid);
+        root_desc.set_name(NETWORK_PACKETS_TRACK_NAME.to_string());
+
+        let mut root_packet = TracePacket::default();
+        root_packet.set_track_descriptor(root_desc);
+        writer.write_packet(&root_packet)?;
+
+        // Load socket metadata and create per-socket tracks
+        let mut socket_to_uuid: HashMap<i64, u64> = HashMap::new();
+
+        if socket_path.exists() {
+            let batches = read_parquet_file(&socket_path)?;
+
+            for batch in &batches {
+                let socket_ids = batch
+                    .column_by_name("socket_id")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing socket_id column in network_socket")?;
+                let protocols = batch
+                    .column_by_name("protocol")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .context("Missing protocol column in network_socket")?;
+                let src_ips = batch
+                    .column_by_name("src_ip")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .context("Missing src_ip column in network_socket")?;
+                let src_ports = batch
+                    .column_by_name("src_port")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing src_port column in network_socket")?;
+                let dest_ips = batch
+                    .column_by_name("dest_ip")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .context("Missing dest_ip column in network_socket")?;
+                let dest_ports = batch
+                    .column_by_name("dest_port")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing dest_port column in network_socket")?;
+
+                for i in 0..batch.num_rows() {
+                    let socket_id = socket_ids.value(i);
+                    let protocol = protocols.value(i);
+                    let src_ip = src_ips.value(i);
+                    let src_port = src_ports.value(i);
+                    let dest_ip = dest_ips.value(i);
+                    let dest_port = dest_ports.value(i);
+
+                    // Create track for this socket
+                    let track_uuid = self.alloc_uuid();
+                    socket_to_uuid.insert(socket_id, track_uuid);
+
+                    let track_name =
+                        format!("{protocol} {src_ip}:{src_port} → {dest_ip}:{dest_port}");
+
+                    let mut track_desc = TrackDescriptor::default();
+                    track_desc.set_uuid(track_uuid);
+                    track_desc.set_name(track_name);
+                    track_desc.set_parent_uuid(root_uuid);
+
+                    let mut track_packet = TracePacket::default();
+                    track_packet.set_track_descriptor(track_desc);
+                    writer.write_packet(&track_packet)?;
+                }
+            }
+        }
+
+        // Write packet events as instants
+        if packet_path.exists() {
+            let batches = read_parquet_file(&packet_path)?;
+            let seq_id = self.alloc_seq_id();
+
+            for batch in &batches {
+                let timestamps = batch
+                    .column_by_name("ts")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing ts column in network_packet")?;
+                let socket_ids = batch
+                    .column_by_name("socket_id")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing socket_id column in network_packet")?;
+                let event_types = batch
+                    .column_by_name("event_type")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .context("Missing event_type column in network_packet")?;
+                let lengths = batch
+                    .column_by_name("length")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing length column in network_packet")?;
+                let seqs = batch
+                    .column_by_name("seq")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+                let tcp_flags = batch
+                    .column_by_name("tcp_flags")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+                for i in 0..batch.num_rows() {
+                    let ts = timestamps.value(i);
+                    let socket_id = socket_ids.value(i);
+                    let event_type = event_types.value(i);
+                    let length = lengths.value(i);
+
+                    // Get track UUID for this socket
+                    let track_uuid = match socket_to_uuid.get(&socket_id) {
+                        Some(&uuid) => uuid,
+                        None => {
+                            // Socket not found, create an ad-hoc track
+                            let uuid = self.alloc_uuid();
+                            socket_to_uuid.insert(socket_id, uuid);
+
+                            let track_name = format!("Socket {socket_id}");
+                            let mut track_desc = TrackDescriptor::default();
+                            track_desc.set_uuid(uuid);
+                            track_desc.set_name(track_name);
+                            track_desc.set_parent_uuid(root_uuid);
+
+                            let mut track_packet = TracePacket::default();
+                            track_packet.set_track_descriptor(track_desc);
+                            writer.write_packet(&track_packet)?;
+
+                            uuid
+                        }
+                    };
+
+                    let mut event = TrackEvent::default();
+                    event.set_type(Type::TYPE_INSTANT);
+                    event.set_track_uuid(track_uuid);
+                    event.set_name(event_type.to_string());
+                    event.categories.push("network".to_string());
+
+                    // Add debug annotations
+                    let mut len_ann = DebugAnnotation::default();
+                    len_ann.set_name("length".to_string());
+                    len_ann.set_int_value(length as i64);
+                    event.debug_annotations.push(len_ann);
+
+                    if let Some(seq) = get_optional_i64(seqs, i) {
+                        let mut seq_ann = DebugAnnotation::default();
+                        seq_ann.set_name("seq".to_string());
+                        seq_ann.set_int_value(seq);
+                        event.debug_annotations.push(seq_ann);
+                    }
+
+                    if let Some(flags) = get_optional_string(tcp_flags, i) {
+                        let mut flags_ann = DebugAnnotation::default();
+                        flags_ann.set_name("tcp_flags".to_string());
+                        flags_ann.set_string_value(flags);
+                        event.debug_annotations.push(flags_ann);
+                    }
+
+                    let mut packet = TracePacket::default();
+                    packet.set_timestamp(ts as u64);
+                    packet.set_track_event(event);
+                    packet.set_trusted_packet_sequence_id(seq_id);
+                    writer.write_packet(&packet)?;
+                }
+            }
+        }
+
+        // Write syscall events as slices
+        if syscall_path.exists() {
+            let batches = read_parquet_file(&syscall_path)?;
+            let seq_id = self.alloc_seq_id();
+
+            for batch in &batches {
+                let timestamps = batch
+                    .column_by_name("ts")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing ts column in network_syscall")?;
+                let durations = batch
+                    .column_by_name("dur")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing dur column in network_syscall")?;
+                let socket_ids = batch
+                    .column_by_name("socket_id")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing socket_id column in network_syscall")?;
+                let event_types = batch
+                    .column_by_name("event_type")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .context("Missing event_type column in network_syscall")?;
+                let bytes_col = batch
+                    .column_by_name("bytes")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing bytes column in network_syscall")?;
+                let tids = batch
+                    .column_by_name("tid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing tid column in network_syscall")?;
+
+                for i in 0..batch.num_rows() {
+                    let ts = timestamps.value(i);
+                    let dur = durations.value(i);
+                    let socket_id = socket_ids.value(i);
+                    let event_type = event_types.value(i);
+                    let bytes = bytes_col.value(i);
+                    let tid = tids.value(i);
+
+                    // Get track UUID for this socket
+                    let track_uuid = match socket_to_uuid.get(&socket_id) {
+                        Some(&uuid) => uuid,
+                        None => {
+                            // Socket not found, create an ad-hoc track
+                            let uuid = self.alloc_uuid();
+                            socket_to_uuid.insert(socket_id, uuid);
+
+                            let track_name = format!("Socket {socket_id}");
+                            let mut track_desc = TrackDescriptor::default();
+                            track_desc.set_uuid(uuid);
+                            track_desc.set_name(track_name);
+                            track_desc.set_parent_uuid(root_uuid);
+
+                            let mut track_packet = TracePacket::default();
+                            track_packet.set_track_descriptor(track_desc);
+                            writer.write_packet(&track_packet)?;
+
+                            uuid
+                        }
+                    };
+
+                    // Write TYPE_SLICE_BEGIN
+                    let mut begin_event = TrackEvent::default();
+                    begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+                    begin_event.set_track_uuid(track_uuid);
+                    begin_event.set_name(event_type.to_string());
+                    begin_event.categories.push("network".to_string());
+
+                    // Add debug annotations
+                    let mut bytes_ann = DebugAnnotation::default();
+                    bytes_ann.set_name("bytes".to_string());
+                    bytes_ann.set_int_value(bytes);
+                    begin_event.debug_annotations.push(bytes_ann);
+
+                    let mut tid_ann = DebugAnnotation::default();
+                    tid_ann.set_name("tid".to_string());
+                    tid_ann.set_int_value(tid as i64);
+                    begin_event.debug_annotations.push(tid_ann);
+
+                    let mut begin_packet = TracePacket::default();
+                    begin_packet.set_timestamp(ts as u64);
+                    begin_packet.set_track_event(begin_event);
+                    begin_packet.set_trusted_packet_sequence_id(seq_id);
+                    writer.write_packet(&begin_packet)?;
+
+                    // Write TYPE_SLICE_END
+                    let mut end_event = TrackEvent::default();
+                    end_event.set_type(Type::TYPE_SLICE_END);
+                    end_event.set_track_uuid(track_uuid);
+
+                    let mut end_packet = TracePacket::default();
+                    end_packet.set_timestamp((ts + dur) as u64);
+                    end_packet.set_track_event(end_event);
+                    end_packet.set_trusted_packet_sequence_id(seq_id);
+                    writer.write_packet(&end_packet)?;
+                }
+            }
+        }
+
+        // Write poll events as instants
+        if poll_path.exists() {
+            let batches = read_parquet_file(&poll_path)?;
+            let seq_id = self.alloc_seq_id();
+
+            for batch in &batches {
+                let timestamps = batch
+                    .column_by_name("ts")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing ts column in network_poll")?;
+                let socket_ids = batch
+                    .column_by_name("socket_id")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing socket_id column in network_poll")?;
+                let requested = batch
+                    .column_by_name("requested_events")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .context("Missing requested_events column in network_poll")?;
+                let returned = batch
+                    .column_by_name("returned_events")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .context("Missing returned_events column in network_poll")?;
+
+                for i in 0..batch.num_rows() {
+                    let ts = timestamps.value(i);
+                    let socket_id = socket_ids.value(i);
+                    let req_events = requested.value(i);
+                    let ret_events = returned.value(i);
+
+                    // Get track UUID for this socket
+                    let track_uuid = match socket_to_uuid.get(&socket_id) {
+                        Some(&uuid) => uuid,
+                        None => {
+                            // Socket not found, skip this event (poll without socket metadata)
+                            continue;
+                        }
+                    };
+
+                    let mut event = TrackEvent::default();
+                    event.set_type(Type::TYPE_INSTANT);
+                    event.set_track_uuid(track_uuid);
+                    event.set_name("poll".to_string());
+                    event.categories.push("network".to_string());
+
+                    // Add debug annotations
+                    let mut req_ann = DebugAnnotation::default();
+                    req_ann.set_name("requested".to_string());
+                    req_ann.set_string_value(req_events.to_string());
+                    event.debug_annotations.push(req_ann);
+
+                    let mut ret_ann = DebugAnnotation::default();
+                    ret_ann.set_name("returned".to_string());
+                    ret_ann.set_string_value(ret_events.to_string());
+                    event.debug_annotations.push(ret_ann);
+
+                    let mut packet = TracePacket::default();
+                    packet.set_timestamp(ts as u64);
+                    packet.set_track_event(event);
+                    packet.set_trusted_packet_sequence_id(seq_id);
+                    writer.write_packet(&packet)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write network interface metadata as tracks.
+    ///
+    /// Creates a hierarchical track structure:
+    /// - "Network Interfaces" (root track)
+    ///   - "host" (namespace track)
+    ///     - "eth0" (interface track with IP address annotations)
+    ///     - "lo"
+    fn write_network_interfaces(
+        &mut self,
+        input_dir: &Path,
+        writer: &mut dyn TraceWriter,
+    ) -> Result<()> {
+        let interface_path = input_dir.join("network_interface.parquet");
+
+        if !interface_path.exists() {
+            return Ok(());
+        }
+
+        let batches = read_parquet_file(&interface_path)?;
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        // Get trace start timestamp for metadata events
+        let trace_start_ts = get_trace_start_timestamp(input_dir);
+
+        // Create root "Network Interfaces" track
+        let root_uuid = self.alloc_uuid();
+        let mut root_desc = TrackDescriptor::default();
+        root_desc.set_uuid(root_uuid);
+        root_desc.set_name(NETWORK_INTERFACES_TRACK_NAME.to_string());
+
+        let mut root_packet = TracePacket::default();
+        root_packet.set_track_descriptor(root_desc);
+        writer.write_packet(&root_packet)?;
+
+        // Track namespace -> uuid mapping
+        let mut namespace_to_uuid: HashMap<String, u64> = HashMap::new();
+        // Track (namespace, interface) -> uuid mapping
+        let mut interface_to_uuid: HashMap<(String, String), u64> = HashMap::new();
+
+        // Collect all unique namespaces and interfaces first
+        for batch in &batches {
+            let namespaces = batch
+                .column_by_name("namespace")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .context("Missing namespace column in network_interface")?;
+            let interfaces = batch
+                .column_by_name("interface_name")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .context("Missing interface_name column in network_interface")?;
+
+            for i in 0..batch.num_rows() {
+                let namespace = namespaces.value(i).to_string();
+                let interface_name = interfaces.value(i).to_string();
+
+                // Create namespace track if not already created
+                if !namespace_to_uuid.contains_key(&namespace) {
+                    let ns_uuid = self.alloc_uuid();
+                    namespace_to_uuid.insert(namespace.clone(), ns_uuid);
+
+                    let mut ns_desc = TrackDescriptor::default();
+                    ns_desc.set_uuid(ns_uuid);
+                    ns_desc.set_name(namespace.clone());
+                    ns_desc.set_parent_uuid(root_uuid);
+
+                    let mut ns_packet = TracePacket::default();
+                    ns_packet.set_track_descriptor(ns_desc);
+                    writer.write_packet(&ns_packet)?;
+                }
+
+                // Create interface track if not already created
+                let key = (namespace.clone(), interface_name.clone());
+                if let std::collections::hash_map::Entry::Vacant(e) = interface_to_uuid.entry(key) {
+                    let iface_uuid = self.alloc_uuid();
+                    e.insert(iface_uuid);
+
+                    let ns_uuid = namespace_to_uuid[&namespace];
+                    let mut iface_desc = TrackDescriptor::default();
+                    iface_desc.set_uuid(iface_uuid);
+                    iface_desc.set_name(interface_name);
+                    iface_desc.set_parent_uuid(ns_uuid);
+
+                    let mut iface_packet = TracePacket::default();
+                    iface_packet.set_track_descriptor(iface_desc);
+                    writer.write_packet(&iface_packet)?;
+                }
+            }
+        }
+
+        // Now write IP address events as instants on interface tracks
+        let seq_id = self.alloc_seq_id();
+
+        for batch in &batches {
+            let namespaces = batch
+                .column_by_name("namespace")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .context("Missing namespace column")?;
+            let interfaces = batch
+                .column_by_name("interface_name")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .context("Missing interface_name column")?;
+            let ip_addresses = batch
+                .column_by_name("ip_address")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .context("Missing ip_address column")?;
+            let address_types = batch
+                .column_by_name("address_type")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .context("Missing address_type column")?;
+
+            for i in 0..batch.num_rows() {
+                let namespace = namespaces.value(i).to_string();
+                let interface_name = interfaces.value(i).to_string();
+                let ip_address = ip_addresses.value(i);
+                let address_type = address_types.value(i);
+
+                let key = (namespace, interface_name);
+                let track_uuid = interface_to_uuid[&key];
+
+                let mut event = TrackEvent::default();
+                event.set_type(Type::TYPE_INSTANT);
+                event.set_track_uuid(track_uuid);
+                event.set_name(format!("{address_type}: {ip_address}"));
+                event.categories.push("network".to_string());
+
+                // Add debug annotation for the address
+                let mut addr_ann = DebugAnnotation::default();
+                addr_ann.set_name(address_type.to_string());
+                addr_ann.set_string_value(ip_address.to_string());
+                event.debug_annotations.push(addr_ann);
+
+                let mut packet = TracePacket::default();
+                packet.set_timestamp(trace_start_ts);
+                packet.set_track_event(event);
+                packet.set_trusted_packet_sequence_id(seq_id);
+                writer.write_packet(&packet)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Helper struct for sched switch events
@@ -1834,6 +2340,54 @@ fn get_optional_i32(arr: Option<&Int32Array>, i: usize) -> Option<i32> {
 /// Get optional f64 value from a nullable Float64Array column
 fn get_optional_f64(arr: Option<&Float64Array>, i: usize) -> Option<f64> {
     arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+}
+
+/// Get the minimum timestamp from parquet files in the directory.
+///
+/// Scans sched_slice.parquet and thread_state.parquet for the minimum timestamp,
+/// which represents the trace start time. Returns 0 if no timestamps are found.
+fn get_trace_start_timestamp(input_dir: &Path) -> u64 {
+    let mut min_ts: Option<i64> = None;
+
+    // Try sched_slice.parquet first
+    let sched_path = input_dir.join("sched_slice.parquet");
+    if sched_path.exists() {
+        if let Ok(batches) = read_parquet_file(&sched_path) {
+            for batch in &batches {
+                if let Some(ts_col) = batch
+                    .column_by_name("ts")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                {
+                    for i in 0..batch.num_rows() {
+                        let ts = ts_col.value(i);
+                        min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
+                    }
+                }
+            }
+        }
+    }
+
+    // Try thread_state.parquet as fallback
+    if min_ts.is_none() {
+        let thread_state_path = input_dir.join("thread_state.parquet");
+        if thread_state_path.exists() {
+            if let Ok(batches) = read_parquet_file(&thread_state_path) {
+                for batch in &batches {
+                    if let Some(ts_col) = batch
+                        .column_by_name("ts")
+                        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    {
+                        for i in 0..batch.num_rows() {
+                            let ts = ts_col.value(i);
+                            min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    min_ts.unwrap_or(0) as u64
 }
 
 /// Helper struct for stack records from stack.parquet
@@ -2263,5 +2817,472 @@ mod tests {
             ),
             Some("libstd-abc123.so".to_string())
         );
+    }
+
+    /// Helper to create network_socket.parquet for tests
+    fn create_test_network_socket_parquet(
+        dir: &Path,
+        socket_id: i64,
+        protocol: &str,
+        src_ip: &str,
+        src_port: i32,
+        dest_ip: &str,
+        dest_port: i32,
+    ) -> Result<()> {
+        let path = dir.join("network_socket.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("socket_id", DataType::Int64, false),
+            Field::new("protocol", DataType::Utf8, false),
+            Field::new("address_family", DataType::Utf8, false),
+            Field::new("src_ip", DataType::Utf8, false),
+            Field::new("src_port", DataType::Int32, false),
+            Field::new("dest_ip", DataType::Utf8, false),
+            Field::new("dest_port", DataType::Int32, false),
+            Field::new("first_seen_ts", DataType::Int64, true),
+            Field::new("last_seen_ts", DataType::Int64, true),
+        ]));
+
+        let socket_ids = Int64Array::from(vec![socket_id]);
+        let protocols: StringArray = vec![Some(protocol)].into_iter().collect();
+        let address_families: StringArray = vec![Some("IPv4")].into_iter().collect();
+        let src_ips: StringArray = vec![Some(src_ip)].into_iter().collect();
+        let src_ports = Int32Array::from(vec![src_port]);
+        let dest_ips: StringArray = vec![Some(dest_ip)].into_iter().collect();
+        let dest_ports = Int32Array::from(vec![dest_port]);
+        let first_seen: Int64Array = vec![Some(1000000i64)].into_iter().collect();
+        let last_seen: Int64Array = vec![Some(2000000i64)].into_iter().collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(socket_ids),
+                Arc::new(protocols),
+                Arc::new(address_families),
+                Arc::new(src_ips),
+                Arc::new(src_ports),
+                Arc::new(dest_ips),
+                Arc::new(dest_ports),
+                Arc::new(first_seen),
+                Arc::new(last_seen),
+            ],
+        )?;
+
+        let file = File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    /// Helper to create network_packet.parquet for tests
+    fn create_test_network_packet_parquet(
+        dir: &Path,
+        socket_id: i64,
+        ts: i64,
+        event_type: &str,
+        length: i32,
+    ) -> Result<()> {
+        use arrow::datatypes::DataType::Boolean;
+
+        let path = dir.join("network_packet.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("socket_id", DataType::Int64, false),
+            Field::new("event_type", DataType::Utf8, false),
+            Field::new("seq", DataType::Int64, true),
+            Field::new("length", DataType::Int32, false),
+            Field::new("tcp_flags", DataType::Utf8, true),
+            Field::new("sndbuf_used", DataType::Int64, true),
+            Field::new("sndbuf_limit", DataType::Int64, true),
+            Field::new("sndbuf_fill_pct", DataType::Int16, true),
+            Field::new("is_retransmit", Boolean, false),
+            Field::new("retransmit_count", DataType::Int16, true),
+            Field::new("rto_ms", DataType::Int32, true),
+            Field::new("srtt_ms", DataType::Int32, true),
+            Field::new("rttvar_us", DataType::Int32, true),
+            Field::new("backoff", DataType::Int16, true),
+            Field::new("is_zero_window_probe", Boolean, false),
+            Field::new("is_zero_window_ack", Boolean, false),
+            Field::new("probe_count", DataType::Int16, true),
+            Field::new("snd_wnd", DataType::Int32, true),
+            Field::new("rcv_wnd", DataType::Int32, true),
+            Field::new("rcv_buf_used", DataType::Int64, true),
+            Field::new("rcv_buf_limit", DataType::Int64, true),
+            Field::new("window_clamp", DataType::Int32, true),
+            Field::new("rcv_wscale", DataType::Int16, true),
+            Field::new("icsk_pending", DataType::Int16, true),
+            Field::new("icsk_timeout", DataType::Int64, true),
+            Field::new("drop_reason", DataType::Int32, true),
+            Field::new("drop_reason_str", DataType::Utf8, true),
+            Field::new("drop_location", DataType::Int64, true),
+            Field::new("qlen", DataType::Int32, true),
+            Field::new("qlen_limit", DataType::Int32, true),
+            Field::new("sk_wmem_alloc", DataType::Int64, true),
+            Field::new("tsq_limit", DataType::Int64, true),
+            Field::new("txq_state", DataType::Int32, true),
+            Field::new("qdisc_state", DataType::Int32, true),
+            Field::new("qdisc_backlog", DataType::Int64, true),
+            Field::new("skb_addr", DataType::Int64, true),
+            Field::new("qdisc_latency_us", DataType::Int32, true),
+        ]));
+
+        use arrow::array::{BooleanArray, Int16Array};
+        let ids = Int64Array::from(vec![1i64]);
+        let timestamps = Int64Array::from(vec![ts]);
+        let socket_ids = Int64Array::from(vec![socket_id]);
+        let event_types: StringArray = vec![Some(event_type)].into_iter().collect();
+        let seqs: Int64Array = vec![Some(100i64)].into_iter().collect();
+        let lengths = Int32Array::from(vec![length]);
+        let tcp_flags: StringArray = vec![Some("SYN")].into_iter().collect();
+        let sndbuf_used: Int64Array = vec![None::<i64>].into_iter().collect();
+        let sndbuf_limit: Int64Array = vec![None::<i64>].into_iter().collect();
+        let sndbuf_fill_pct: Int16Array = vec![None::<i16>].into_iter().collect();
+        let is_retransmit = BooleanArray::from(vec![false]);
+        let retransmit_count: Int16Array = vec![None::<i16>].into_iter().collect();
+        let rto_ms: Int32Array = vec![None::<i32>].into_iter().collect();
+        let srtt_ms: Int32Array = vec![None::<i32>].into_iter().collect();
+        let rttvar_us: Int32Array = vec![None::<i32>].into_iter().collect();
+        let backoff: Int16Array = vec![None::<i16>].into_iter().collect();
+        let is_zero_window_probe = BooleanArray::from(vec![false]);
+        let is_zero_window_ack = BooleanArray::from(vec![false]);
+        let probe_count: Int16Array = vec![None::<i16>].into_iter().collect();
+        let snd_wnd: Int32Array = vec![None::<i32>].into_iter().collect();
+        let rcv_wnd: Int32Array = vec![None::<i32>].into_iter().collect();
+        let rcv_buf_used: Int64Array = vec![None::<i64>].into_iter().collect();
+        let rcv_buf_limit: Int64Array = vec![None::<i64>].into_iter().collect();
+        let window_clamp: Int32Array = vec![None::<i32>].into_iter().collect();
+        let rcv_wscale: Int16Array = vec![None::<i16>].into_iter().collect();
+        let icsk_pending: Int16Array = vec![None::<i16>].into_iter().collect();
+        let icsk_timeout: Int64Array = vec![None::<i64>].into_iter().collect();
+        let drop_reason: Int32Array = vec![None::<i32>].into_iter().collect();
+        let drop_reason_str: StringArray = vec![None::<&str>].into_iter().collect();
+        let drop_location: Int64Array = vec![None::<i64>].into_iter().collect();
+        let qlen: Int32Array = vec![None::<i32>].into_iter().collect();
+        let qlen_limit: Int32Array = vec![None::<i32>].into_iter().collect();
+        let sk_wmem_alloc: Int64Array = vec![None::<i64>].into_iter().collect();
+        let tsq_limit: Int64Array = vec![None::<i64>].into_iter().collect();
+        let txq_state: Int32Array = vec![None::<i32>].into_iter().collect();
+        let qdisc_state: Int32Array = vec![None::<i32>].into_iter().collect();
+        let qdisc_backlog: Int64Array = vec![None::<i64>].into_iter().collect();
+        let skb_addr: Int64Array = vec![None::<i64>].into_iter().collect();
+        let qdisc_latency_us: Int32Array = vec![None::<i32>].into_iter().collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(timestamps),
+                Arc::new(socket_ids),
+                Arc::new(event_types),
+                Arc::new(seqs),
+                Arc::new(lengths),
+                Arc::new(tcp_flags),
+                Arc::new(sndbuf_used),
+                Arc::new(sndbuf_limit),
+                Arc::new(sndbuf_fill_pct),
+                Arc::new(is_retransmit),
+                Arc::new(retransmit_count),
+                Arc::new(rto_ms),
+                Arc::new(srtt_ms),
+                Arc::new(rttvar_us),
+                Arc::new(backoff),
+                Arc::new(is_zero_window_probe),
+                Arc::new(is_zero_window_ack),
+                Arc::new(probe_count),
+                Arc::new(snd_wnd),
+                Arc::new(rcv_wnd),
+                Arc::new(rcv_buf_used),
+                Arc::new(rcv_buf_limit),
+                Arc::new(window_clamp),
+                Arc::new(rcv_wscale),
+                Arc::new(icsk_pending),
+                Arc::new(icsk_timeout),
+                Arc::new(drop_reason),
+                Arc::new(drop_reason_str),
+                Arc::new(drop_location),
+                Arc::new(qlen),
+                Arc::new(qlen_limit),
+                Arc::new(sk_wmem_alloc),
+                Arc::new(tsq_limit),
+                Arc::new(txq_state),
+                Arc::new(qdisc_state),
+                Arc::new(qdisc_backlog),
+                Arc::new(skb_addr),
+                Arc::new(qdisc_latency_us),
+            ],
+        )?;
+
+        let file = File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    /// Helper to create network_interface.parquet for tests
+    fn create_test_network_interface_parquet(
+        dir: &Path,
+        namespace: &str,
+        interface_name: &str,
+        ip_address: &str,
+        address_type: &str,
+    ) -> Result<()> {
+        let path = dir.join("network_interface.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("interface_name", DataType::Utf8, false),
+            Field::new("ip_address", DataType::Utf8, false),
+            Field::new("address_type", DataType::Utf8, false),
+        ]));
+
+        let namespaces: StringArray = vec![Some(namespace)].into_iter().collect();
+        let interface_names: StringArray = vec![Some(interface_name)].into_iter().collect();
+        let ip_addresses: StringArray = vec![Some(ip_address)].into_iter().collect();
+        let address_types: StringArray = vec![Some(address_type)].into_iter().collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(namespaces),
+                Arc::new(interface_names),
+                Arc::new(ip_addresses),
+                Arc::new(address_types),
+            ],
+        )?;
+
+        let file = File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_network_data_conversion_creates_socket_tracks() {
+        use crate::perfetto::VecTraceWriter;
+
+        let dir = tempdir().unwrap();
+
+        // Create network socket metadata
+        create_test_network_socket_parquet(
+            dir.path(),
+            42,              // socket_id
+            "TCP",           // protocol
+            "192.168.1.100", // src_ip
+            12345,           // src_port
+            "10.0.0.1",      // dest_ip
+            80,              // dest_port
+        )
+        .unwrap();
+
+        // Create network packet event
+        create_test_network_packet_parquet(
+            dir.path(),
+            42,                   // socket_id
+            1000000,              // timestamp
+            "TCP packet_enqueue", // event_type
+            1500,                 // length
+        )
+        .unwrap();
+
+        // Convert to Perfetto
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut writer = VecTraceWriter::default();
+
+        converter
+            .write_network_data(dir.path(), &mut writer)
+            .unwrap();
+
+        // Verify we have the expected tracks
+        let track_descriptors: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_track_descriptor())
+            .collect();
+
+        // Should have: "Network Packets" root track + socket track
+        assert!(
+            track_descriptors.len() >= 2,
+            "Expected at least 2 track descriptors, got {}",
+            track_descriptors.len()
+        );
+
+        // Check for "Network Packets" root track
+        let has_network_packets_root = track_descriptors
+            .iter()
+            .any(|p| p.track_descriptor().name() == "Network Packets");
+        assert!(
+            has_network_packets_root,
+            "Should have 'Network Packets' root track"
+        );
+
+        // Check for socket track with expected name format
+        let has_socket_track = track_descriptors.iter().any(|p| {
+            p.track_descriptor()
+                .name()
+                .contains("TCP 192.168.1.100:12345")
+        });
+        assert!(
+            has_socket_track,
+            "Should have socket track with TCP connection info"
+        );
+
+        // Check for packet event
+        let track_events: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_track_event())
+            .collect();
+
+        assert!(!track_events.is_empty(), "Should have packet events");
+
+        // Verify packet event is an instant with correct name
+        let packet_event = track_events
+            .iter()
+            .find(|p| p.track_event().name() == "TCP packet_enqueue")
+            .expect("Should have TCP packet_enqueue event");
+        assert_eq!(
+            packet_event.track_event().type_(),
+            Type::TYPE_INSTANT,
+            "Packet event should be TYPE_INSTANT"
+        );
+    }
+
+    #[test]
+    fn test_network_interface_conversion_creates_hierarchy() {
+        use crate::perfetto::VecTraceWriter;
+
+        let dir = tempdir().unwrap();
+
+        // Create network interface metadata
+        create_test_network_interface_parquet(
+            dir.path(),
+            "host",        // namespace
+            "eth0",        // interface_name
+            "192.168.1.1", // ip_address
+            "ipv4",        // address_type
+        )
+        .unwrap();
+
+        // Convert to Perfetto
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut writer = VecTraceWriter::default();
+
+        converter
+            .write_network_interfaces(dir.path(), &mut writer)
+            .unwrap();
+
+        // Verify we have the expected tracks
+        let track_descriptors: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_track_descriptor())
+            .collect();
+
+        // Should have: "Network Interfaces" root track + namespace track + interface track
+        assert!(
+            track_descriptors.len() >= 3,
+            "Expected at least 3 track descriptors, got {}",
+            track_descriptors.len()
+        );
+
+        // Check for "Network Interfaces" root track
+        let has_network_interfaces_root = track_descriptors
+            .iter()
+            .any(|p| p.track_descriptor().name() == "Network Interfaces");
+        assert!(
+            has_network_interfaces_root,
+            "Should have 'Network Interfaces' root track"
+        );
+
+        // Check for namespace track
+        let has_namespace_track = track_descriptors
+            .iter()
+            .any(|p| p.track_descriptor().name() == "host");
+        assert!(has_namespace_track, "Should have 'host' namespace track");
+
+        // Check for interface track
+        let has_interface_track = track_descriptors
+            .iter()
+            .any(|p| p.track_descriptor().name() == "eth0");
+        assert!(has_interface_track, "Should have 'eth0' interface track");
+
+        // Check that namespace track is parented to root
+        let root_uuid = track_descriptors
+            .iter()
+            .find(|p| p.track_descriptor().name() == "Network Interfaces")
+            .map(|p| p.track_descriptor().uuid())
+            .unwrap();
+
+        let namespace_track = track_descriptors
+            .iter()
+            .find(|p| p.track_descriptor().name() == "host")
+            .unwrap();
+        assert_eq!(
+            namespace_track.track_descriptor().parent_uuid(),
+            root_uuid,
+            "Namespace track should be parented to root"
+        );
+    }
+
+    #[test]
+    fn test_full_network_conversion_with_all_data_types() {
+        use crate::perfetto::VecTraceWriter;
+
+        let dir = tempdir().unwrap();
+
+        // Create network socket
+        create_test_network_socket_parquet(
+            dir.path(),
+            1,
+            "UDP",
+            "10.0.0.1",
+            5000,
+            "10.0.0.2",
+            5001,
+        )
+        .unwrap();
+
+        // Create network packet
+        create_test_network_packet_parquet(dir.path(), 1, 2000000, "UDP send", 100).unwrap();
+
+        // Create network interface
+        create_test_network_interface_parquet(dir.path(), "host", "lo", "127.0.0.1", "ipv4")
+            .unwrap();
+
+        // Full conversion
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut writer = VecTraceWriter::default();
+
+        converter.convert(dir.path(), &mut writer).unwrap();
+
+        // Verify both network data tracks exist
+        let has_network_packets = writer
+            .packets
+            .iter()
+            .any(|p| p.has_track_descriptor() && p.track_descriptor().name() == "Network Packets");
+        assert!(has_network_packets, "Should have 'Network Packets' track");
+
+        let has_network_interfaces = writer.packets.iter().any(|p| {
+            p.has_track_descriptor() && p.track_descriptor().name() == "Network Interfaces"
+        });
+        assert!(
+            has_network_interfaces,
+            "Should have 'Network Interfaces' track"
+        );
+
+        // Verify UDP socket track exists
+        let has_udp_track = writer.packets.iter().any(|p| {
+            p.has_track_descriptor() && p.track_descriptor().name().starts_with("UDP 10.0.0.1")
+        });
+        assert!(has_udp_track, "Should have UDP socket track");
+
+        // Verify UDP send event exists
+        let has_udp_event = writer
+            .packets
+            .iter()
+            .any(|p| p.has_track_event() && p.track_event().name() == "UDP send");
+        assert!(has_udp_event, "Should have 'UDP send' event");
     }
 }
