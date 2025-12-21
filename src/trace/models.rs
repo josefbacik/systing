@@ -440,6 +440,15 @@ pub struct ClockSnapshotRecord {
     pub is_primary: bool,
 }
 
+/// System info record - kernel version and machine information.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SysInfoRecord {
+    pub sysname: String,
+    pub release: String,
+    pub version: String,
+    pub machine: String,
+}
+
 /// Container for all extracted trace data.
 #[derive(Debug, Default)]
 pub struct ExtractedData {
@@ -467,4 +476,5 @@ pub struct ExtractedData {
     pub network_sockets: Vec<NetworkSocketRecord>,
     pub network_polls: Vec<NetworkPollRecord>,
     pub clock_snapshots: Vec<ClockSnapshotRecord>,
+    pub sysinfo: Option<SysInfoRecord>,
 }

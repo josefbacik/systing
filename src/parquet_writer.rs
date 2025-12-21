@@ -63,6 +63,8 @@ struct ExtractedData {
     socket_connections: Vec<SocketConnectionRecord>,
     // Clock snapshot data
     clock_snapshots: Vec<ClockSnapshotRecord>,
+    // System info data
+    sysinfo: Option<SysInfoRecord>,
 }
 
 #[derive(Clone)]
@@ -232,6 +234,15 @@ struct ClockSnapshotRecord {
     is_primary: bool,
 }
 
+// System info record
+#[derive(Clone)]
+struct SysInfoRecord {
+    sysname: String,
+    release: String,
+    version: String,
+    machine: String,
+}
+
 /// Paths to all parquet output files
 pub struct ParquetPaths {
     pub process: PathBuf,
@@ -256,6 +267,8 @@ pub struct ParquetPaths {
     pub socket_connection: PathBuf,
     // Clock snapshot table
     pub clock_snapshot: PathBuf,
+    // System info table
+    pub sysinfo: PathBuf,
 }
 
 impl ParquetPaths {
@@ -285,6 +298,8 @@ impl ParquetPaths {
             socket_connection: dir.join("socket_connection.parquet"),
             // Clock snapshot table
             clock_snapshot: dir.join("clock_snapshot.parquet"),
+            // System info table
+            sysinfo: dir.join("sysinfo.parquet"),
         }
     }
 
@@ -311,6 +326,7 @@ impl ParquetPaths {
             &self.network_interface,
             &self.socket_connection,
             &self.clock_snapshot,
+            &self.sysinfo,
         ];
 
         let mut total = 0u64;
@@ -345,6 +361,7 @@ impl ParquetPaths {
             (&self.network_interface, "network_interface"),
             (&self.socket_connection, "socket_connection"),
             (&self.clock_snapshot, "clock_snapshot"),
+            (&self.sysinfo, "sysinfo"),
         ];
 
         paths
@@ -512,12 +529,37 @@ impl TraceExtractor {
 
     fn process_packet(&mut self, packet: &TracePacket) -> Result<()> {
         self.process_clock_snapshot(packet);
+        self.process_system_info(packet);
         self.process_interned_data(packet);
         self.process_descriptors(packet);
         self.process_ftrace_events(packet)?;
         self.process_events(packet)?;
         self.process_perf_sample(packet)?;
         Ok(())
+    }
+
+    fn process_system_info(&mut self, packet: &TracePacket) {
+        // Only record the first system info packet (similar to validation logic)
+        if self.data.sysinfo.is_some() || !packet.has_system_info() {
+            return;
+        }
+
+        let system_info = packet.system_info();
+        if let Some(utsname) = system_info.utsname.as_ref() {
+            // Only record if all required fields are present
+            if utsname.has_sysname()
+                && utsname.has_release()
+                && utsname.has_version()
+                && utsname.has_machine()
+            {
+                self.data.sysinfo = Some(SysInfoRecord {
+                    sysname: utsname.sysname().to_string(),
+                    release: utsname.release().to_string(),
+                    version: utsname.version().to_string(),
+                    machine: utsname.machine().to_string(),
+                });
+            }
+        }
     }
 
     fn process_clock_snapshot(&mut self, packet: &TracePacket) {
@@ -1260,6 +1302,11 @@ fn write_data_to_parquet(data: &ExtractedData, paths: &ParquetPaths) -> Result<(
     // Write clock snapshots
     if !data.clock_snapshots.is_empty() {
         write_clock_snapshots(&data.clock_snapshots, &paths.clock_snapshot, &props)?;
+    }
+
+    // Write system info
+    if let Some(sysinfo) = &data.sysinfo {
+        write_sysinfo(sysinfo, &paths.sysinfo, &props)?;
     }
 
     Ok(())
@@ -2141,6 +2188,42 @@ fn write_clock_snapshots(
         writer.write(&batch)?;
     }
 
+    writer.close()?;
+    Ok(())
+}
+
+fn write_sysinfo(record: &SysInfoRecord, path: &PathBuf, props: &WriterProperties) -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("sysname", DataType::Utf8, false),
+        Field::new("release", DataType::Utf8, false),
+        Field::new("version", DataType::Utf8, false),
+        Field::new("machine", DataType::Utf8, false),
+    ]));
+
+    let file = File::create(path)?;
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
+
+    let mut sysname_builder = StringBuilder::with_capacity(1, record.sysname.len());
+    let mut release_builder = StringBuilder::with_capacity(1, record.release.len());
+    let mut version_builder = StringBuilder::with_capacity(1, record.version.len());
+    let mut machine_builder = StringBuilder::with_capacity(1, record.machine.len());
+
+    sysname_builder.append_value(&record.sysname);
+    release_builder.append_value(&record.release);
+    version_builder.append_value(&record.version);
+    machine_builder.append_value(&record.machine);
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(sysname_builder.finish()),
+            Arc::new(release_builder.finish()),
+            Arc::new(version_builder.finish()),
+            Arc::new(machine_builder.finish()),
+        ],
+    )?;
+
+    writer.write(&batch)?;
     writer.close()?;
     Ok(())
 }
