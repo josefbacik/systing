@@ -29,7 +29,7 @@ use crate::trace::{
     InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, NetworkPacketRecord, NetworkPollRecord,
     NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord, SchedSliceRecord,
     SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord,
-    ThreadRecord, ThreadStateRecord, TrackRecord, WakeupNewRecord,
+    SysInfoRecord, ThreadRecord, ThreadStateRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -75,6 +75,7 @@ pub struct StreamingParquetWriter {
     network_sockets: Vec<NetworkSocketRecord>,
     network_polls: Vec<NetworkPollRecord>,
     clock_snapshots: Vec<ClockSnapshotRecord>,
+    sysinfo: Option<SysInfoRecord>,
 
     // Persistent writers (created lazily on first flush, kept alive until finish)
     process_writer: Option<ArrowWriter<File>>,
@@ -101,6 +102,7 @@ pub struct StreamingParquetWriter {
     network_socket_writer: Option<ArrowWriter<File>>,
     network_poll_writer: Option<ArrowWriter<File>>,
     clock_snapshot_writer: Option<ArrowWriter<File>>,
+    sysinfo_writer: Option<ArrowWriter<File>>,
 
     // Track counts for statistics
     total_records: usize,
@@ -172,6 +174,7 @@ impl StreamingParquetWriter {
             network_sockets: Vec::new(),
             network_polls: Vec::new(),
             clock_snapshots: Vec::new(),
+            sysinfo: None,
             // Writers start as None, created lazily
             process_writer: None,
             thread_writer: None,
@@ -197,6 +200,7 @@ impl StreamingParquetWriter {
             network_socket_writer: None,
             network_poll_writer: None,
             clock_snapshot_writer: None,
+            sysinfo_writer: None,
             total_records: 0,
         })
     }
@@ -653,6 +657,26 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    // Flush sysinfo record (single record, not a buffer)
+    fn flush_sysinfo(&mut self) -> Result<()> {
+        let record = match self.sysinfo.take() {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let schema = trace::sysinfo_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.sysinfo_writer,
+            &self.paths.sysinfo,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_sysinfo_batch(&record, &schema)?;
+        writer.write(&batch)?;
+        Ok(())
+    }
+
     // Flush network_syscalls buffer
     fn flush_network_syscalls(&mut self) -> Result<()> {
         if self.network_syscalls.is_empty() {
@@ -774,6 +798,7 @@ impl StreamingParquetWriter {
         close_writer!(self.network_socket_writer);
         close_writer!(self.network_poll_writer);
         close_writer!(self.clock_snapshot_writer);
+        close_writer!(self.sysinfo_writer);
 
         match first_error {
             Some(e) => Err(e),
@@ -808,7 +833,8 @@ impl Drop for StreamingParquetWriter {
             || self.network_packet_writer.is_some()
             || self.network_socket_writer.is_some()
             || self.network_poll_writer.is_some()
-            || self.clock_snapshot_writer.is_some();
+            || self.clock_snapshot_writer.is_some()
+            || self.sysinfo_writer.is_some();
 
         if has_open_writers {
             eprintln!(
@@ -1054,6 +1080,12 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()> {
+        self.sysinfo = Some(record);
+        self.total_records += 1;
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<()> {
         self.flush_processes()?;
         self.flush_threads()?;
@@ -1079,6 +1111,7 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_network_sockets()?;
         self.flush_network_polls()?;
         self.flush_clock_snapshots()?;
+        self.flush_sysinfo()?;
         Ok(())
     }
 
@@ -1659,6 +1692,28 @@ fn build_clock_snapshot_batch(
             Arc::new(clock_name_builder.finish()),
             Arc::new(timestamp_ns_builder.finish()),
             Arc::new(is_primary_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<RecordBatch> {
+    let mut sysname_builder = StringBuilder::with_capacity(1, record.sysname.len());
+    let mut release_builder = StringBuilder::with_capacity(1, record.release.len());
+    let mut version_builder = StringBuilder::with_capacity(1, record.version.len());
+    let mut machine_builder = StringBuilder::with_capacity(1, record.machine.len());
+
+    sysname_builder.append_value(&record.sysname);
+    release_builder.append_value(&record.release);
+    version_builder.append_value(&record.version);
+    machine_builder.append_value(&record.machine);
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(sysname_builder.finish()),
+            Arc::new(release_builder.finish()),
+            Arc::new(version_builder.finish()),
+            Arc::new(machine_builder.finish()),
         ],
     )?)
 }

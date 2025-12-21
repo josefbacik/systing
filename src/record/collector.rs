@@ -11,7 +11,8 @@ use crate::trace::{
     InstantArgRecord, InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, NetworkPacketRecord,
     NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord,
     SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord,
-    StackSampleRecord, ThreadRecord, ThreadStateRecord, TrackRecord, WakeupNewRecord,
+    StackSampleRecord, SysInfoRecord, ThreadRecord, ThreadStateRecord, TrackRecord,
+    WakeupNewRecord,
 };
 
 /// Trait for collecting trace records during recording.
@@ -101,6 +102,9 @@ pub trait RecordCollector {
 
     /// Add a network poll record.
     fn add_network_poll(&mut self, record: NetworkPollRecord) -> Result<()>;
+
+    /// Set the system info record (only one per trace).
+    fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()>;
 
     /// Flush any buffered records to storage.
     fn flush(&mut self) -> Result<()>;
@@ -260,6 +264,11 @@ impl RecordCollector for InMemoryCollector {
 
     fn add_network_poll(&mut self, record: NetworkPollRecord) -> Result<()> {
         self.data.network_polls.push(record);
+        Ok(())
+    }
+
+    fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()> {
+        self.data.sysinfo = Some(record);
         Ok(())
     }
 

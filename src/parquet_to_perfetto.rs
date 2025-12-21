@@ -30,6 +30,7 @@ use perfetto_protos::process_descriptor::ProcessDescriptor;
 use perfetto_protos::profile_common::{Callstack, Frame, Mapping};
 use perfetto_protos::profile_packet::PerfSample;
 use perfetto_protos::sched::{SchedProcessExitFtraceEvent, SchedWakeupNewFtraceEvent};
+use perfetto_protos::system_info::{SystemInfo, Utsname};
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
 use perfetto_protos::trace_packet::TracePacket;
@@ -124,6 +125,9 @@ impl ParquetToPerfettoConverter {
         // 1. Write clock snapshots first (for timestamp correlation)
         self.write_clock_snapshots(input_dir, writer)?;
 
+        // 1b. Write system info (utsname)
+        self.write_system_info(input_dir, writer)?;
+
         // 2. Write TrackDescriptors for processes (ProcessDescriptor for each TGID)
         // 3. Write TrackDescriptors for threads (ThreadDescriptor for each TID != TGID)
         self.write_process_and_thread_descriptors(input_dir, writer)?;
@@ -209,6 +213,60 @@ impl ParquetToPerfettoConverter {
             packet.set_clock_snapshot(snapshot);
             writer.write_packet(&packet)?;
         }
+
+        Ok(())
+    }
+
+    /// Write SystemInfo packet with utsname data
+    fn write_system_info(&mut self, input_dir: &Path, writer: &mut dyn TraceWriter) -> Result<()> {
+        let path = input_dir.join("sysinfo.parquet");
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let batches = read_parquet_file(&path)?;
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        // Read the first (and typically only) row
+        let batch = &batches[0];
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let sysname = batch
+            .column_by_name("sysname")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .context("Missing sysname column")?;
+        let release = batch
+            .column_by_name("release")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .context("Missing release column")?;
+        let version = batch
+            .column_by_name("version")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .context("Missing version column")?;
+        let machine = batch
+            .column_by_name("machine")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .context("Missing machine column")?;
+
+        let mut utsname = Utsname::default();
+        utsname.set_sysname(sysname.value(0).to_string());
+        utsname.set_release(release.value(0).to_string());
+        utsname.set_version(version.value(0).to_string());
+        utsname.set_machine(machine.value(0).to_string());
+
+        let system_info = SystemInfo {
+            utsname: Some(utsname).into(),
+            ..Default::default()
+        };
+
+        let mut packet = TracePacket::default();
+        packet.set_system_info(system_info);
+        packet.set_trusted_packet_sequence_id(self.alloc_seq_id());
+        writer.write_packet(&packet)?;
 
         Ok(())
     }

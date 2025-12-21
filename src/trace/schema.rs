@@ -221,6 +221,16 @@ pub fn clock_snapshot_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Schema for sysinfo.parquet
+pub fn sysinfo_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("sysname", DataType::Utf8, false),
+        Field::new("release", DataType::Utf8, false),
+        Field::new("version", DataType::Utf8, false),
+        Field::new("machine", DataType::Utf8, false),
+    ]))
+}
+
 /// Schema for stack.parquet
 ///
 /// Stores complete stack traces with frame names denormalized into a list.

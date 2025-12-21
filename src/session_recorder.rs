@@ -1198,7 +1198,17 @@ impl SessionRecorder {
         }
         drop(clock_snapshot);
 
-        // Step 2: Generate process and thread records
+        // Write system info (utsname)
+        if let Some(utsname) = get_system_utsname() {
+            writer.set_sysinfo(crate::trace::SysInfoRecord {
+                sysname: utsname.sysname().to_string(),
+                release: utsname.release().to_string(),
+                version: utsname.version().to_string(),
+                machine: utsname.machine().to_string(),
+            })?;
+        }
+
+        // Step 3: Generate process and thread records
         // Use the shared UtidGenerator to get consistent utid/upid values that match
         // what was used during streaming.
         eprintln!("Writing process and thread data...");
@@ -1253,12 +1263,12 @@ impl SessionRecorder {
         // Get the tid_to_utid mapping for non-streaming recorders
         let tid_to_utid = self.utid_generator.get_tid_to_utid_map();
 
-        // Step 3: Generate network interface metadata
+        // Step 4: Generate network interface metadata
         // Network interface metadata is complex (requires netns enumeration)
         // For now, we skip this in the Parquet-first path and rely on socket_connection records
         // from the NetworkRecorder for network context.
 
-        // Step 4: Write records from all recorders
+        // Step 5: Write records from all recorders
         // Note: We skip the scheduler trace records here because they were already written
         // via streaming (if streaming was enabled), or will be written via write_records (if not).
         // Only write scheduler records if streaming was not enabled.
@@ -1353,7 +1363,7 @@ impl SessionRecorder {
             )?;
         }
 
-        // Step 5: Finish writing and close all files
+        // Step 6: Finish writing and close all files
         eprintln!("Finishing Parquet trace...");
         // Flush and properly close all Parquet writers
         writer.finish_boxed()?;

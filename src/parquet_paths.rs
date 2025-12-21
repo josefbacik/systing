@@ -44,6 +44,8 @@ pub struct ParquetPaths {
     pub network_poll: PathBuf,
     // Clock snapshot table
     pub clock_snapshot: PathBuf,
+    // System info table
+    pub sysinfo: PathBuf,
 }
 
 /// Named path entry for iteration with names.
@@ -92,6 +94,8 @@ impl ParquetPaths {
             network_poll: dir.join("network_poll.parquet"),
             // Clock snapshot table
             clock_snapshot: dir.join("clock_snapshot.parquet"),
+            // System info table
+            sysinfo: dir.join("sysinfo.parquet"),
         }
     }
 
@@ -129,11 +133,12 @@ impl ParquetPaths {
             network_socket: dir.join(format!("{trace_id}_network_socket.parquet")),
             network_poll: dir.join(format!("{trace_id}_network_poll.parquet")),
             clock_snapshot: dir.join(format!("{trace_id}_clock_snapshot.parquet")),
+            sysinfo: dir.join(format!("{trace_id}_sysinfo.parquet")),
         }
     }
 
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 29] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 30] {
         [
             PathEntry {
                 path: &self.process,
@@ -251,6 +256,10 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.clock_snapshot,
                 name: "clock_snapshot",
+            },
+            PathEntry {
+                path: &self.sysinfo,
+                name: "sysinfo",
             },
         ]
     }
