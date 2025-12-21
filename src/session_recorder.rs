@@ -544,10 +544,16 @@ impl SessionRecorder {
         let comm = Self::extract_comm(info);
         let pid = (info.tgidpid >> 32) as u32;
 
-        let process_name = if comm.is_empty() {
-            Self::fetch_name_from_proc(pid)
-        } else {
+        let process_name = if !comm.is_empty() {
             comm
+        } else {
+            let name_from_proc = Self::fetch_name_from_proc(pid);
+            if !name_from_proc.is_empty() {
+                name_from_proc
+            } else {
+                // Fallback to pid as name when both comm and /proc lookup fail
+                format!("<pid:{pid}>")
+            }
         };
 
         let cmdline = Self::fetch_cmdline_from_proc(pid);
@@ -579,10 +585,16 @@ impl SessionRecorder {
         let comm = Self::extract_comm(info);
         let tid = info.tgidpid as u32;
 
-        let thread_name = if comm.is_empty() {
-            Self::fetch_name_from_proc(tid)
-        } else {
+        let thread_name = if !comm.is_empty() {
             comm
+        } else {
+            let name_from_proc = Self::fetch_name_from_proc(tid);
+            if !name_from_proc.is_empty() {
+                name_from_proc
+            } else {
+                // Fallback to tid as name when both comm and /proc lookup fail
+                format!("<tid:{tid}>")
+            }
         };
 
         // Create and store ThreadDescriptor
@@ -1637,7 +1649,8 @@ mod tests {
 
         let process_descriptors = recorder.process_descriptors.read().unwrap();
         let process_desc = process_descriptors.get(&task.tgidpid).unwrap();
-        assert_eq!(process_desc.process_name(), "");
+        // When comm is empty and /proc lookup fails, fall back to pid-based name
+        assert_eq!(process_desc.process_name(), "<pid:1234>");
     }
 
     #[test]
