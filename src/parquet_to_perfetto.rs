@@ -703,6 +703,24 @@ impl ParquetToPerfettoConverter {
             switches.sort_by_key(|e| e.ts);
             wakings.sort_by_key(|e| e.ts);
 
+            // Fix prev_state values: In the Parquet slice model, each slice's end_state
+            // describes why THIS task left the CPU. In Perfetto's sched_switch event model,
+            // prev_state describes why the PREVIOUS task left (i.e., the state of the task
+            // being switched FROM). After sorting by timestamp, we shift values so that
+            // event[i].prev_state = event[i-1]'s original end_state.
+            //
+            // Note: This means the LAST slice's end_state is intentionally discarded, as
+            // there is no subsequent switch event to associate it with. For single-event
+            // traces per CPU, this means all end_state information is lost (prev_state=0).
+            if !switches.is_empty() {
+                // Iterate backwards to avoid overwriting values we still need
+                for i in (1..switches.len()).rev() {
+                    switches[i].prev_state = switches[i - 1].prev_state;
+                }
+                // First event: we don't know what was running before the trace started
+                switches[0].prev_state = 0;
+            }
+
             let mut compact_sched = CompactSched::default();
             let mut intern_table: Vec<String> = Vec::new();
             let mut comm_to_index: HashMap<String, u32> = HashMap::new();
