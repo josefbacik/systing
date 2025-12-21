@@ -185,6 +185,7 @@ impl fmt::Display for ValidationWarning {
 /// - Schema correctness (column types)
 /// - Reference integrity (foreign keys)
 /// - Data validity (ranges, enum values)
+/// - Required fields are set (names not empty)
 pub fn validate_parquet_dir(dir: &Path) -> ValidationResult {
     let mut result = ValidationResult::default();
     let paths = ParquetPaths::new(dir);
@@ -200,6 +201,10 @@ pub fn validate_parquet_dir(dir: &Path) -> ValidationResult {
 
     validate_thread_upid_refs(&paths, &process_upids, &mut result);
     validate_sched_utid_refs(&paths, &thread_utids, &mut result);
+
+    // Phase 3: Required field validation
+    validate_process_names(&paths, &mut result);
+    validate_thread_names(&paths, &mut result);
 
     result
 }
@@ -303,8 +308,8 @@ fn validate_counter_track_schema(paths: &ParquetPaths, result: &mut ValidationRe
     }
 }
 
-/// Valid counter unit values (from perfetto_protos CounterDescriptor::Unit).
-const VALID_COUNTER_UNITS: &[&str] = &["", "count", "time_ns", "size_bytes"];
+/// Valid counter unit values (from perfetto_protos CounterDescriptor::Unit and custom units).
+const VALID_COUNTER_UNITS: &[&str] = &["", "count", "time_ns", "size_bytes", "Hz"];
 
 /// Validate counter_track.unit values are in the known set.
 fn validate_counter_track_unit_values(path: &Path, result: &mut ValidationResult) {
@@ -648,6 +653,129 @@ fn validate_sched_utid_refs(
     }
 }
 
+/// Validate that all name values in a table are set (not null and not empty).
+///
+/// # Arguments
+/// * `path` - Path to the parquet file
+/// * `table` - Name of the table (for error messages)
+/// * `id_column` - Name of the ID column (e.g., "upid" or "utid")
+/// * `entity` - Name of the entity type (e.g., "process" or "thread")
+/// * `result` - Validation result to add errors to
+fn validate_names_not_empty(
+    path: &Path,
+    table: &str,
+    id_column: &str,
+    entity: &str,
+    result: &mut ValidationResult,
+) {
+    if !path.exists() {
+        return;
+    }
+
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            result.add_error(ValidationError::ReadError {
+                table: table.to_string(),
+                message: e.to_string(),
+            });
+            return;
+        }
+    };
+
+    let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
+        Ok(b) => b,
+        Err(e) => {
+            result.add_error(ValidationError::ReadError {
+                table: table.to_string(),
+                message: e.to_string(),
+            });
+            return;
+        }
+    };
+
+    let reader = match builder.build() {
+        Ok(r) => r,
+        Err(e) => {
+            result.add_error(ValidationError::ReadError {
+                table: table.to_string(),
+                message: e.to_string(),
+            });
+            return;
+        }
+    };
+
+    for batch_result in reader {
+        let batch = match batch_result {
+            Ok(b) => b,
+            Err(e) => {
+                result.add_error(ValidationError::ReadError {
+                    table: table.to_string(),
+                    message: e.to_string(),
+                });
+                continue;
+            }
+        };
+
+        let schema = batch.schema();
+        let name_idx = match schema.index_of("name") {
+            Ok(idx) => idx,
+            Err(_) => continue, // Column might be missing
+        };
+        let id_idx = match schema.index_of(id_column) {
+            Ok(idx) => idx,
+            Err(_) => continue,
+        };
+
+        let name_array = batch.column(name_idx);
+        let id_array = batch.column(id_idx);
+
+        if let (Some(string_array), Some(int_array)) = (
+            name_array
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>(),
+            id_array.as_any().downcast_ref::<arrow::array::Int64Array>(),
+        ) {
+            for i in 0..string_array.len() {
+                let id_value = if int_array.is_null(i) {
+                    -1
+                } else {
+                    int_array.value(i)
+                };
+
+                if string_array.is_null(i) {
+                    result.add_error(ValidationError::InvalidValue {
+                        table: table.to_string(),
+                        column: "name".to_string(),
+                        message: format!("{entity} name is null ({id_column}={id_value})"),
+                    });
+                    return;
+                }
+
+                let value = string_array.value(i);
+                if value.is_empty() {
+                    result.add_error(ValidationError::InvalidValue {
+                        table: table.to_string(),
+                        column: "name".to_string(),
+                        message: format!("{entity} name is empty ({id_column}={id_value})"),
+                    });
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Validate that all process.name values are set (not null and not empty).
+fn validate_process_names(paths: &ParquetPaths, result: &mut ValidationResult) {
+    validate_names_not_empty(&paths.process, "process", "upid", "process", result);
+}
+
+/// Validate that all thread.name values are set (not null and not empty).
+fn validate_thread_names(paths: &ParquetPaths, result: &mut ValidationResult) {
+    validate_names_not_empty(&paths.thread, "thread", "utid", "thread", result);
+}
+
 /// Collect all values from an Int64 column into a HashSet.
 fn collect_i64_column(path: &Path, column: &str, set: &mut HashSet<i64>) -> anyhow::Result<()> {
     let file = File::open(path)?;
@@ -768,6 +896,30 @@ fn validate_packet(
                          should use ProcessDescriptor instead",
                         uuid,
                         thread.pid()
+                    ),
+                });
+            }
+
+            // Check that thread_name is set and not empty
+            if !thread.has_thread_name() || thread.thread_name().is_empty() {
+                result.add_error(ValidationError::PerfettoError {
+                    message: format!(
+                        "ThreadDescriptor (track_uuid={}, tid={}) has empty or missing thread_name",
+                        uuid,
+                        thread.tid()
+                    ),
+                });
+            }
+        }
+
+        // Check ProcessDescriptor: process_name should be set and not empty
+        if let Some(process) = desc.process.as_ref() {
+            if !process.has_process_name() || process.process_name().is_empty() {
+                result.add_error(ValidationError::PerfettoError {
+                    message: format!(
+                        "ProcessDescriptor (track_uuid={}, pid={}) has empty or missing process_name",
+                        uuid,
+                        process.pid()
                     ),
                 });
             }
@@ -1393,6 +1545,307 @@ mod tests {
         assert!(
             !result.has_errors(),
             "Expected no errors when only pid is 0, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_empty_process_name_parquet() {
+        let dir = TempDir::new().unwrap();
+
+        // Create process.parquet with empty name
+        let process_schema = Arc::new(Schema::new(vec![
+            Field::new("upid", DataType::Int64, false),
+            Field::new("pid", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("parent_upid", DataType::Int64, true),
+        ]));
+
+        let mut name_builder = StringBuilder::new();
+        name_builder.append_value(""); // Empty name
+
+        let process_batch = RecordBatch::try_new(
+            process_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![1000])),
+                Arc::new(name_builder.finish()),
+                Arc::new(Int64Array::from(vec![None])),
+            ],
+        )
+        .unwrap();
+
+        create_test_parquet(dir.path(), "process.parquet", process_schema, process_batch).unwrap();
+
+        // Create thread.parquet with valid name
+        let thread_schema = Arc::new(Schema::new(vec![
+            Field::new("utid", DataType::Int64, false),
+            Field::new("tid", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("upid", DataType::Int64, true),
+        ]));
+
+        let mut name_builder = StringBuilder::new();
+        name_builder.append_value("main");
+
+        let thread_batch = RecordBatch::try_new(
+            thread_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![1000])),
+                Arc::new(name_builder.finish()),
+                Arc::new(Int64Array::from(vec![Some(1)])),
+            ],
+        )
+        .unwrap();
+
+        create_test_parquet(dir.path(), "thread.parquet", thread_schema, thread_batch).unwrap();
+
+        // Create sched_slice.parquet
+        let sched_schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("dur", DataType::Int64, false),
+            Field::new("cpu", DataType::Int32, false),
+            Field::new("utid", DataType::Int64, false),
+            Field::new("end_state", DataType::Int32, true),
+            Field::new("priority", DataType::Int32, false),
+        ]));
+
+        let sched_batch = RecordBatch::try_new(
+            sched_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1000])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int32Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![Some(0)])),
+                Arc::new(Int32Array::from(vec![120])),
+            ],
+        )
+        .unwrap();
+
+        create_test_parquet(dir.path(), "sched_slice.parquet", sched_schema, sched_batch).unwrap();
+
+        let result = validate_parquet_dir(dir.path());
+        assert!(
+            result.has_errors(),
+            "Expected errors for empty process name"
+        );
+        assert!(result.errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidValue {
+                table,
+                column,
+                message,
+            } if table == "process" && column == "name" && message.contains("empty")
+        )));
+    }
+
+    #[test]
+    fn test_empty_thread_name_parquet() {
+        let dir = TempDir::new().unwrap();
+
+        // Create process.parquet with valid name
+        let process_schema = Arc::new(Schema::new(vec![
+            Field::new("upid", DataType::Int64, false),
+            Field::new("pid", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("parent_upid", DataType::Int64, true),
+        ]));
+
+        let mut name_builder = StringBuilder::new();
+        name_builder.append_value("test");
+
+        let process_batch = RecordBatch::try_new(
+            process_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![1000])),
+                Arc::new(name_builder.finish()),
+                Arc::new(Int64Array::from(vec![None])),
+            ],
+        )
+        .unwrap();
+
+        create_test_parquet(dir.path(), "process.parquet", process_schema, process_batch).unwrap();
+
+        // Create thread.parquet with empty name
+        let thread_schema = Arc::new(Schema::new(vec![
+            Field::new("utid", DataType::Int64, false),
+            Field::new("tid", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("upid", DataType::Int64, true),
+        ]));
+
+        let mut name_builder = StringBuilder::new();
+        name_builder.append_value(""); // Empty name
+
+        let thread_batch = RecordBatch::try_new(
+            thread_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![1000])),
+                Arc::new(name_builder.finish()),
+                Arc::new(Int64Array::from(vec![Some(1)])),
+            ],
+        )
+        .unwrap();
+
+        create_test_parquet(dir.path(), "thread.parquet", thread_schema, thread_batch).unwrap();
+
+        // Create sched_slice.parquet
+        let sched_schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("dur", DataType::Int64, false),
+            Field::new("cpu", DataType::Int32, false),
+            Field::new("utid", DataType::Int64, false),
+            Field::new("end_state", DataType::Int32, true),
+            Field::new("priority", DataType::Int32, false),
+        ]));
+
+        let sched_batch = RecordBatch::try_new(
+            sched_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1000])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int32Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![Some(0)])),
+                Arc::new(Int32Array::from(vec![120])),
+            ],
+        )
+        .unwrap();
+
+        create_test_parquet(dir.path(), "sched_slice.parquet", sched_schema, sched_batch).unwrap();
+
+        let result = validate_parquet_dir(dir.path());
+        assert!(result.has_errors(), "Expected errors for empty thread name");
+        assert!(result.errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidValue {
+                table,
+                column,
+                message,
+            } if table == "thread" && column == "name" && message.contains("empty")
+        )));
+    }
+
+    #[test]
+    fn test_process_descriptor_empty_name() {
+        use perfetto_protos::process_descriptor::ProcessDescriptor;
+        use perfetto_protos::track_descriptor::TrackDescriptor;
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create a ProcessDescriptor with empty name
+        let mut process = ProcessDescriptor::default();
+        process.set_pid(1234);
+        process.set_process_name(String::new()); // Empty name
+
+        let mut desc = TrackDescriptor::default();
+        desc.set_uuid(1);
+        desc.process = Some(process).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(desc);
+
+        validate_packet(&packet, &mut context, &mut result);
+
+        assert!(result.has_errors(), "Expected error for empty process_name");
+        assert!(result.errors.iter().any(|e| matches!(
+            e,
+            ValidationError::PerfettoError { message }
+                if message.contains("ProcessDescriptor") && message.contains("empty")
+        )));
+    }
+
+    #[test]
+    fn test_thread_descriptor_empty_name() {
+        use perfetto_protos::thread_descriptor::ThreadDescriptor;
+        use perfetto_protos::track_descriptor::TrackDescriptor;
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create a ThreadDescriptor with empty name (pid != tid to avoid the main thread error)
+        let mut thread = ThreadDescriptor::default();
+        thread.set_pid(1234);
+        thread.set_tid(5678); // Different from pid
+        thread.set_thread_name(String::new()); // Empty name
+
+        let mut desc = TrackDescriptor::default();
+        desc.set_uuid(1);
+        desc.thread = Some(thread).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(desc);
+
+        validate_packet(&packet, &mut context, &mut result);
+
+        assert!(result.has_errors(), "Expected error for empty thread_name");
+        assert!(result.errors.iter().any(|e| matches!(
+            e,
+            ValidationError::PerfettoError { message }
+                if message.contains("ThreadDescriptor") && message.contains("empty")
+        )));
+    }
+
+    #[test]
+    fn test_process_descriptor_valid_name() {
+        use perfetto_protos::process_descriptor::ProcessDescriptor;
+        use perfetto_protos::track_descriptor::TrackDescriptor;
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create a ProcessDescriptor with valid name
+        let mut process = ProcessDescriptor::default();
+        process.set_pid(1234);
+        process.set_process_name("my_process".to_string());
+
+        let mut desc = TrackDescriptor::default();
+        desc.set_uuid(1);
+        desc.process = Some(process).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(desc);
+
+        validate_packet(&packet, &mut context, &mut result);
+
+        assert!(
+            !result.has_errors(),
+            "Expected no errors for valid process_name, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_thread_descriptor_valid_name() {
+        use perfetto_protos::thread_descriptor::ThreadDescriptor;
+        use perfetto_protos::track_descriptor::TrackDescriptor;
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create a ThreadDescriptor with valid name (pid != tid)
+        let mut thread = ThreadDescriptor::default();
+        thread.set_pid(1234);
+        thread.set_tid(5678); // Different from pid
+        thread.set_thread_name("my_thread".to_string());
+
+        let mut desc = TrackDescriptor::default();
+        desc.set_uuid(1);
+        desc.thread = Some(thread).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(desc);
+
+        validate_packet(&packet, &mut context, &mut result);
+
+        assert!(
+            !result.has_errors(),
+            "Expected no errors for valid thread_name, got: {:?}",
             result.errors
         );
     }

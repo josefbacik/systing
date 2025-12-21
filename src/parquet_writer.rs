@@ -677,14 +677,19 @@ impl TraceExtractor {
                     let upid = self.next_upid;
                     self.next_upid += 1;
                     self.pid_to_upid.insert(pid, upid);
-                    self.data.processes.push(ProcessRecord {
-                        upid,
-                        pid,
-                        name: if !name.is_empty() {
+                    // Use process_name from ProcessDescriptor, fall back to track name
+                    let process_name =
+                        if process.has_process_name() && !process.process_name().is_empty() {
+                            Some(process.process_name().to_string())
+                        } else if !name.is_empty() {
                             Some(name.clone())
                         } else {
                             None
-                        },
+                        };
+                    self.data.processes.push(ProcessRecord {
+                        upid,
+                        pid,
+                        name: process_name,
                         parent_upid: None,
                     });
                 }
@@ -703,10 +708,19 @@ impl TraceExtractor {
 
                     let upid = self.pid_to_upid.get(&pid).copied();
 
+                    // Use thread_name from ThreadDescriptor, fall back to track name
+                    let thread_name =
+                        if thread.has_thread_name() && !thread.thread_name().is_empty() {
+                            Some(thread.thread_name().to_string())
+                        } else if !name.is_empty() {
+                            Some(name)
+                        } else {
+                            None
+                        };
                     self.data.threads.push(ThreadRecord {
                         utid,
                         tid,
-                        name: if !name.is_empty() { Some(name) } else { None },
+                        name: thread_name,
                         upid,
                     });
                 }
@@ -2129,4 +2143,173 @@ fn write_clock_snapshots(
 
     writer.close()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use perfetto_protos::process_descriptor::ProcessDescriptor;
+    use perfetto_protos::thread_descriptor::ThreadDescriptor;
+    use perfetto_protos::track_descriptor::TrackDescriptor;
+
+    #[test]
+    fn test_process_name_from_process_descriptor() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create a TracePacket with ProcessDescriptor that has process_name set
+        let mut process = ProcessDescriptor::default();
+        process.set_pid(1234);
+        process.set_process_name("my_process".to_string());
+
+        let mut track_desc = TrackDescriptor::default();
+        track_desc.set_uuid(1);
+        // Track name is empty, but process_name is set
+        track_desc.set_name(String::new());
+        track_desc.process = Some(process).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(track_desc);
+
+        extractor.process_packet(&packet).unwrap();
+
+        // Should use process_name from ProcessDescriptor, not empty track name
+        assert_eq!(extractor.data.processes.len(), 1);
+        assert_eq!(
+            extractor.data.processes[0].name,
+            Some("my_process".to_string())
+        );
+    }
+
+    #[test]
+    fn test_process_name_fallback_to_track_name() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create a TracePacket with ProcessDescriptor that has empty process_name
+        let mut process = ProcessDescriptor::default();
+        process.set_pid(1234);
+        // process_name not set or empty
+
+        let mut track_desc = TrackDescriptor::default();
+        track_desc.set_uuid(1);
+        track_desc.set_name("track_based_name".to_string());
+        track_desc.process = Some(process).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(track_desc);
+
+        extractor.process_packet(&packet).unwrap();
+
+        // Should fall back to track name when process_name is empty
+        assert_eq!(extractor.data.processes.len(), 1);
+        assert_eq!(
+            extractor.data.processes[0].name,
+            Some("track_based_name".to_string())
+        );
+    }
+
+    #[test]
+    fn test_thread_name_from_thread_descriptor() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create a TracePacket with ThreadDescriptor that has thread_name set
+        let mut thread = ThreadDescriptor::default();
+        thread.set_tid(5678);
+        thread.set_pid(1234);
+        thread.set_thread_name("my_thread".to_string());
+
+        let mut track_desc = TrackDescriptor::default();
+        track_desc.set_uuid(1);
+        // Track name is empty, but thread_name is set
+        track_desc.set_name(String::new());
+        track_desc.thread = Some(thread).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(track_desc);
+
+        extractor.process_packet(&packet).unwrap();
+
+        // Should use thread_name from ThreadDescriptor, not empty track name
+        assert_eq!(extractor.data.threads.len(), 1);
+        assert_eq!(
+            extractor.data.threads[0].name,
+            Some("my_thread".to_string())
+        );
+    }
+
+    #[test]
+    fn test_thread_name_fallback_to_track_name() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create a TracePacket with ThreadDescriptor that has empty thread_name
+        let mut thread = ThreadDescriptor::default();
+        thread.set_tid(5678);
+        thread.set_pid(1234);
+        // thread_name not set or empty
+
+        let mut track_desc = TrackDescriptor::default();
+        track_desc.set_uuid(1);
+        track_desc.set_name("track_based_thread".to_string());
+        track_desc.thread = Some(thread).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(track_desc);
+
+        extractor.process_packet(&packet).unwrap();
+
+        // Should fall back to track name when thread_name is empty
+        assert_eq!(extractor.data.threads.len(), 1);
+        assert_eq!(
+            extractor.data.threads[0].name,
+            Some("track_based_thread".to_string())
+        );
+    }
+
+    #[test]
+    fn test_process_name_none_when_both_empty() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create a TracePacket with ProcessDescriptor where both names are empty
+        let mut process = ProcessDescriptor::default();
+        process.set_pid(1234);
+        // process_name not set
+
+        let mut track_desc = TrackDescriptor::default();
+        track_desc.set_uuid(1);
+        // track name also empty
+        track_desc.process = Some(process).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(track_desc);
+
+        extractor.process_packet(&packet).unwrap();
+
+        // Should be None when both are empty
+        assert_eq!(extractor.data.processes.len(), 1);
+        assert_eq!(extractor.data.processes[0].name, None);
+    }
+
+    #[test]
+    fn test_thread_name_none_when_both_empty() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create a TracePacket with ThreadDescriptor where both names are empty
+        let mut thread = ThreadDescriptor::default();
+        thread.set_tid(5678);
+        thread.set_pid(1234);
+        // thread_name not set
+
+        let mut track_desc = TrackDescriptor::default();
+        track_desc.set_uuid(1);
+        // track name also empty
+        track_desc.thread = Some(thread).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(track_desc);
+
+        extractor.process_packet(&packet).unwrap();
+
+        // Should be None when both are empty
+        assert_eq!(extractor.data.threads.len(), 1);
+        assert_eq!(extractor.data.threads[0].name, None);
+    }
 }
