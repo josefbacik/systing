@@ -153,6 +153,35 @@ pub struct NetnsInfo {
     pub is_host: bool,
 }
 
+impl NetnsInfo {
+    /// Returns a display name for this network namespace.
+    ///
+    /// Format examples:
+    /// - `"host"` for the host namespace
+    /// - `"container:abc123 (nginx)"` for a container with known comm
+    /// - `"container:abc123"` for a container without comm
+    /// - `"netns:4026532890 (java:1234)"` for a namespace with known comm and PID
+    /// - `"netns:4026532890"` for a namespace without comm
+    pub fn display_name(&self) -> String {
+        if self.is_host {
+            "host".to_string()
+        } else if let Some(ref container_id) = self.container_id {
+            if self.comm.is_empty() {
+                format!("container:{container_id}")
+            } else {
+                format!("container:{} ({})", container_id, self.comm)
+            }
+        } else if self.comm.is_empty() {
+            format!("netns:{}", self.inode)
+        } else {
+            format!(
+                "netns:{} ({}:{})",
+                self.inode, self.comm, self.representative_pid
+            )
+        }
+    }
+}
+
 /// Gets the network namespace inode for a given PID.
 fn get_netns_inode(pid: u32) -> Option<u64> {
     let ns_path = format!("/proc/{pid}/ns/net");
@@ -239,12 +268,17 @@ fn get_interfaces_in_netns(pid: u32) -> Vec<NetworkInterface> {
         Err(_) => return Vec::new(),
     };
 
+    // SAFETY: target_netns is a valid file descriptor obtained from File::open() on a
+    // namespace pseudo-file. CLONE_NEWNET is a valid namespace type. The setns syscall
+    // is safe to call with these arguments - it only changes the calling thread's namespace.
     if unsafe { libc::setns(target_netns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
         return Vec::new();
     }
 
     let interfaces = get_network_interfaces();
 
+    // SAFETY: self_netns is a valid file descriptor for our original namespace, obtained
+    // before switching. This restores the thread to its original network namespace.
     if unsafe { libc::setns(self_netns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
         eprintln!(
             "WARNING: Failed to restore original network namespace after enumerating interfaces for pid {pid}"
@@ -908,22 +942,7 @@ impl SessionRecorder {
         // Generate tracks for each namespace
         for netns_info in namespaces {
             // Create namespace track name
-            let netns_name = if netns_info.is_host {
-                "host".to_string()
-            } else if let Some(ref container_id) = netns_info.container_id {
-                if netns_info.comm.is_empty() {
-                    format!("container:{container_id}")
-                } else {
-                    format!("container:{} ({})", container_id, netns_info.comm)
-                }
-            } else if netns_info.comm.is_empty() {
-                format!("netns:{}", netns_info.inode)
-            } else {
-                format!(
-                    "netns:{} ({}:{})",
-                    netns_info.inode, netns_info.comm, netns_info.representative_pid
-                )
-            };
+            let netns_name = netns_info.display_name();
 
             // Get interfaces for this namespace
             let interfaces = if netns_info.is_host {
@@ -991,6 +1010,98 @@ impl SessionRecorder {
                 event_packet.set_track_event(track_event);
                 event_packet.set_trusted_packet_sequence_id(sequence_id);
                 writer.write_packet(&event_packet)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write network interface records to the RecordCollector (parquet-first path).
+    ///
+    /// Collects network interface metadata from all recorded processes' network namespaces
+    /// and writes them as NetworkInterfaceRecord entries.
+    fn write_network_interface_records(&self, writer: &mut dyn RecordCollector) -> Result<()> {
+        use crate::trace::NetworkInterfaceRecord;
+
+        // Get host network namespace inode for comparison
+        let host_netns_inode = get_host_netns_inode();
+
+        // Build a map of unique network namespaces from recorded processes
+        let mut netns_map: HashMap<u64, NetnsInfo> = HashMap::new();
+
+        // First, add the host namespace
+        if let Some(host_inode) = host_netns_inode {
+            netns_map.insert(
+                host_inode,
+                NetnsInfo {
+                    inode: host_inode,
+                    representative_pid: 1,
+                    container_id: None,
+                    comm: "host".to_string(),
+                    is_host: true,
+                },
+            );
+        }
+
+        // Iterate through all recorded processes to find unique network namespaces
+        for tgidpid in self.process_descriptors.read().unwrap().keys() {
+            let pid = (*tgidpid >> 32) as u32;
+
+            if let Some(inode) = get_netns_inode(pid) {
+                netns_map.entry(inode).or_insert_with(|| {
+                    let is_host = host_netns_inode == Some(inode);
+                    NetnsInfo {
+                        inode,
+                        representative_pid: pid,
+                        container_id: if is_host { None } else { get_container_id(pid) },
+                        comm: get_comm(pid),
+                        is_host,
+                    }
+                });
+            }
+        }
+
+        // Sort namespaces: host first, then by inode for consistent ordering
+        let mut namespaces: Vec<_> = netns_map.into_values().collect();
+        namespaces.sort_by(|a, b| match (a.is_host, b.is_host) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.inode.cmp(&b.inode),
+        });
+
+        // Generate records for each namespace
+        for netns_info in namespaces {
+            // Create namespace name
+            let netns_name = netns_info.display_name();
+
+            // Get interfaces for this namespace
+            let interfaces = if netns_info.is_host {
+                get_network_interfaces()
+            } else {
+                get_interfaces_in_netns(netns_info.representative_pid)
+            };
+
+            // Write a record for each interface and IP address
+            for iface in interfaces {
+                // Write IPv4 addresses
+                for ipv4 in iface.ipv4_addrs {
+                    writer.add_network_interface(NetworkInterfaceRecord {
+                        namespace: netns_name.clone(),
+                        interface_name: iface.name.clone(),
+                        ip_address: ipv4.to_string(),
+                        address_type: "ipv4".to_string(),
+                    })?;
+                }
+
+                // Write IPv6 addresses
+                for ipv6 in iface.ipv6_addrs {
+                    writer.add_network_interface(NetworkInterfaceRecord {
+                        namespace: netns_name.clone(),
+                        interface_name: iface.name.clone(),
+                        ip_address: ipv6.to_string(),
+                        address_type: "ipv6".to_string(),
+                    })?;
+                }
             }
         }
 
@@ -1264,9 +1375,8 @@ impl SessionRecorder {
         let tid_to_utid = self.utid_generator.get_tid_to_utid_map();
 
         // Step 4: Generate network interface metadata
-        // Network interface metadata is complex (requires netns enumeration)
-        // For now, we skip this in the Parquet-first path and rely on socket_connection records
-        // from the NetworkRecorder for network context.
+        eprintln!("Writing network interface metadata...");
+        self.write_network_interface_records(&mut *writer)?;
 
         // Step 5: Write records from all recorders
         // Note: We skip the scheduler trace records here because they were already written
