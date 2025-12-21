@@ -845,6 +845,7 @@ pub fn validate_perfetto_trace(path: &Path) -> ValidationResult {
     validate_track_uuid_refs(&context, &mut result);
     validate_parent_uuid_hierarchy(&context, &mut result);
     validate_clock_snapshot_exists(&context, &mut result);
+    validate_system_info_exists(&context, &mut result);
 
     result
 }
@@ -860,6 +861,8 @@ struct PerfettoValidationContext {
     parent_refs: HashMap<u64, u64>,
     /// Whether we've seen a clock snapshot
     has_clock_snapshot: bool,
+    /// Whether we've seen valid SystemInfo with utsname
+    has_valid_system_info: bool,
 }
 
 /// Validate a single TracePacket.
@@ -954,6 +957,48 @@ fn validate_packet(
                     "PerfSample has both pid and tid set to 0 (timestamp={})",
                     packet.timestamp()
                 ),
+            });
+        }
+    }
+
+    // Check for SystemInfo with valid utsname
+    // Note: We use "first valid wins" semantics - once we've seen a valid SystemInfo,
+    // we don't report errors for subsequent invalid ones. This handles traces that
+    // might have multiple SystemInfo packets.
+    if packet.has_system_info() && !context.has_valid_system_info {
+        let system_info = packet.system_info();
+        if let Some(utsname) = system_info.utsname.as_ref() {
+            // Validate that all required utsname fields are set.
+            // Note: We don't validate nodename as it contains the hostname,
+            // which may be intentionally omitted for privacy reasons.
+            let mut missing_fields = Vec::new();
+
+            if !utsname.has_sysname() || utsname.sysname().is_empty() {
+                missing_fields.push("sysname");
+            }
+            if !utsname.has_release() || utsname.release().is_empty() {
+                missing_fields.push("release");
+            }
+            if !utsname.has_version() || utsname.version().is_empty() {
+                missing_fields.push("version");
+            }
+            if !utsname.has_machine() || utsname.machine().is_empty() {
+                missing_fields.push("machine");
+            }
+
+            if missing_fields.is_empty() {
+                context.has_valid_system_info = true;
+            } else {
+                result.add_error(ValidationError::PerfettoError {
+                    message: format!(
+                        "SystemInfo.utsname is missing required fields: {}",
+                        missing_fields.join(", ")
+                    ),
+                });
+            }
+        } else {
+            result.add_error(ValidationError::PerfettoError {
+                message: "SystemInfo.utsname is not set".to_string(),
             });
         }
     }
@@ -1057,6 +1102,15 @@ fn validate_clock_snapshot_exists(
     if !context.has_clock_snapshot {
         result.add_error(ValidationError::PerfettoError {
             message: "No ClockSnapshot packet found in trace".to_string(),
+        });
+    }
+}
+
+/// Validate that SystemInfo with valid utsname exists.
+fn validate_system_info_exists(context: &PerfettoValidationContext, result: &mut ValidationResult) {
+    if !context.has_valid_system_info {
+        result.add_error(ValidationError::PerfettoError {
+            message: "No SystemInfo packet with valid utsname found in trace".to_string(),
         });
     }
 }
@@ -1846,6 +1900,258 @@ mod tests {
         assert!(
             !result.has_errors(),
             "Expected no errors for valid thread_name, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_system_info_valid_utsname() {
+        use perfetto_protos::system_info::{SystemInfo, Utsname};
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create a valid SystemInfo with all utsname fields
+        let mut utsname = Utsname::default();
+        utsname.set_sysname("Linux".to_string());
+        utsname.set_release("5.10.0".to_string());
+        utsname.set_version("#1 SMP".to_string());
+        utsname.set_machine("x86_64".to_string());
+
+        let system_info = SystemInfo {
+            utsname: Some(utsname).into(),
+            ..Default::default()
+        };
+
+        let mut packet = TracePacket::default();
+        packet.set_system_info(system_info);
+
+        validate_packet(&packet, &mut context, &mut result);
+
+        assert!(
+            !result.has_errors(),
+            "Expected no errors for valid SystemInfo, got: {:?}",
+            result.errors
+        );
+        assert!(
+            context.has_valid_system_info,
+            "Expected has_valid_system_info to be true"
+        );
+    }
+
+    #[test]
+    fn test_system_info_missing_utsname() {
+        use perfetto_protos::system_info::SystemInfo;
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create SystemInfo without utsname
+        let system_info = SystemInfo::default();
+
+        let mut packet = TracePacket::default();
+        packet.set_system_info(system_info);
+
+        validate_packet(&packet, &mut context, &mut result);
+
+        assert!(result.has_errors(), "Expected error for missing utsname");
+        assert!(result.errors.iter().any(|e| matches!(
+            e,
+            ValidationError::PerfettoError { message }
+                if message.contains("utsname is not set")
+        )));
+        assert!(
+            !context.has_valid_system_info,
+            "Expected has_valid_system_info to be false"
+        );
+    }
+
+    #[test]
+    fn test_system_info_utsname_missing_fields() {
+        use perfetto_protos::system_info::{SystemInfo, Utsname};
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create SystemInfo with utsname missing some fields
+        let mut utsname = Utsname::default();
+        utsname.set_sysname("Linux".to_string());
+        // Missing release, version, machine
+
+        let system_info = SystemInfo {
+            utsname: Some(utsname).into(),
+            ..Default::default()
+        };
+
+        let mut packet = TracePacket::default();
+        packet.set_system_info(system_info);
+
+        validate_packet(&packet, &mut context, &mut result);
+
+        assert!(
+            result.has_errors(),
+            "Expected error for missing utsname fields"
+        );
+        assert!(result.errors.iter().any(|e| matches!(
+            e,
+            ValidationError::PerfettoError { message }
+                if message.contains("missing required fields")
+        )));
+        assert!(
+            !context.has_valid_system_info,
+            "Expected has_valid_system_info to be false"
+        );
+    }
+
+    #[test]
+    fn test_system_info_utsname_empty_fields() {
+        use perfetto_protos::system_info::{SystemInfo, Utsname};
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create SystemInfo with utsname having empty fields
+        let mut utsname = Utsname::default();
+        utsname.set_sysname("Linux".to_string());
+        utsname.set_release("".to_string()); // Empty
+        utsname.set_version("".to_string()); // Empty
+        utsname.set_machine("x86_64".to_string());
+
+        let system_info = SystemInfo {
+            utsname: Some(utsname).into(),
+            ..Default::default()
+        };
+
+        let mut packet = TracePacket::default();
+        packet.set_system_info(system_info);
+
+        validate_packet(&packet, &mut context, &mut result);
+
+        assert!(
+            result.has_errors(),
+            "Expected error for empty utsname fields"
+        );
+        assert!(result.errors.iter().any(|e| matches!(
+            e,
+            ValidationError::PerfettoError { message }
+                if message.contains("missing required fields")
+                    && message.contains("release")
+                    && message.contains("version")
+        )));
+    }
+
+    #[test]
+    fn test_validate_system_info_exists() {
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // No SystemInfo was seen
+        validate_system_info_exists(&context, &mut result);
+
+        assert!(result.has_errors(), "Expected error for missing SystemInfo");
+        assert!(result.errors.iter().any(|e| matches!(
+            e,
+            ValidationError::PerfettoError { message }
+                if message.contains("No SystemInfo packet")
+        )));
+
+        // Now mark that we've seen valid SystemInfo
+        context.has_valid_system_info = true;
+        result = ValidationResult::default();
+
+        validate_system_info_exists(&context, &mut result);
+
+        assert!(
+            !result.has_errors(),
+            "Expected no errors when SystemInfo is present, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_system_info_utsname_all_fields_empty() {
+        use perfetto_protos::system_info::{SystemInfo, Utsname};
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create SystemInfo with utsname having ALL fields empty
+        let utsname = Utsname::default();
+
+        let system_info = SystemInfo {
+            utsname: Some(utsname).into(),
+            ..Default::default()
+        };
+
+        let mut packet = TracePacket::default();
+        packet.set_system_info(system_info);
+
+        validate_packet(&packet, &mut context, &mut result);
+
+        assert!(
+            result.has_errors(),
+            "Expected error for all empty utsname fields"
+        );
+        // Verify all four required fields are mentioned in the error
+        assert!(result.errors.iter().any(|e| matches!(
+            e,
+            ValidationError::PerfettoError { message }
+                if message.contains("missing required fields")
+                    && message.contains("sysname")
+                    && message.contains("release")
+                    && message.contains("version")
+                    && message.contains("machine")
+        )));
+    }
+
+    #[test]
+    fn test_system_info_first_valid_wins() {
+        use perfetto_protos::system_info::{SystemInfo, Utsname};
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // First, send a valid SystemInfo
+        let mut valid_utsname = Utsname::default();
+        valid_utsname.set_sysname("Linux".to_string());
+        valid_utsname.set_release("5.10.0".to_string());
+        valid_utsname.set_version("#1 SMP".to_string());
+        valid_utsname.set_machine("x86_64".to_string());
+
+        let valid_system_info = SystemInfo {
+            utsname: Some(valid_utsname).into(),
+            ..Default::default()
+        };
+
+        let mut packet1 = TracePacket::default();
+        packet1.set_system_info(valid_system_info);
+
+        validate_packet(&packet1, &mut context, &mut result);
+
+        assert!(
+            !result.has_errors(),
+            "Expected no errors for valid SystemInfo"
+        );
+        assert!(context.has_valid_system_info);
+
+        // Now send an invalid SystemInfo (missing fields)
+        let invalid_utsname = Utsname::default(); // All fields empty
+
+        let invalid_system_info = SystemInfo {
+            utsname: Some(invalid_utsname).into(),
+            ..Default::default()
+        };
+
+        let mut packet2 = TracePacket::default();
+        packet2.set_system_info(invalid_system_info);
+
+        validate_packet(&packet2, &mut context, &mut result);
+
+        // Should still have no errors - "first valid wins" means subsequent invalid
+        // SystemInfo packets are ignored
+        assert!(
+            !result.has_errors(),
+            "Expected no errors after valid SystemInfo was seen, got: {:?}",
             result.errors
         );
     }
