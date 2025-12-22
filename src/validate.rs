@@ -1058,6 +1058,7 @@ pub fn validate_perfetto_trace(path: &Path) -> ValidationResult {
     validate_clock_snapshot_exists(&context, &mut result);
     validate_system_info_exists(&context, &mut result);
     validate_network_syscalls_on_network_tracks(&context, &mut result);
+    validate_socket_tracks_have_socket_id(&context, &mut result);
 
     result
 }
@@ -1087,6 +1088,8 @@ struct PerfettoValidationContext {
     prev_state_counts: HashMap<i64, u64>,
     /// Track which CPUs we've seen first switch events for
     cpus_seen_first_switch: HashSet<u32>,
+    /// UUID of the "Network Packets" root track, if present
+    network_packets_root_uuid: Option<u64>,
 }
 
 /// Validate a single TracePacket.
@@ -1109,7 +1112,12 @@ fn validate_packet(
 
         // Store track name if present
         if desc.has_name() {
-            context.track_names.insert(uuid, desc.name().to_string());
+            let name = desc.name().to_string();
+            // Track the "Network Packets" root track UUID
+            if name == "Network Packets" {
+                context.network_packets_root_uuid = Some(uuid);
+            }
+            context.track_names.insert(uuid, name);
         }
 
         // Check parent UUID
@@ -1448,6 +1456,48 @@ fn validate_network_syscalls_on_network_tracks(
                 message: format!(
                     "Network syscall event '{event_name}' (track_uuid={track_uuid}, ts={ts}) is on track '{track_name}' \
                      which has no parent. Network tracks should be parented to thread/process tracks."
+                ),
+            });
+        }
+    }
+}
+
+/// Validate that socket tracks under "Network Packets" include the socket_id in their name.
+///
+/// Socket tracks should be named like "Socket N:..." or "Socket N" where N is the socket_id.
+/// This ensures that socket tracks can be correlated with socket_id annotations on syscall events.
+fn validate_socket_tracks_have_socket_id(
+    context: &PerfettoValidationContext,
+    result: &mut ValidationResult,
+) {
+    // If there's no "Network Packets" root track, nothing to validate
+    let Some(network_packets_uuid) = context.network_packets_root_uuid else {
+        return;
+    };
+
+    // Find all tracks that are direct children of "Network Packets"
+    for (track_uuid, parent_uuid) in &context.parent_refs {
+        if *parent_uuid != network_packets_uuid {
+            continue;
+        }
+
+        // Get the track name
+        let Some(track_name) = context.track_names.get(track_uuid) else {
+            result.add_error(ValidationError::PerfettoError {
+                message: format!(
+                    "Socket track (track_uuid={track_uuid}) under 'Network Packets' has no name"
+                ),
+            });
+            continue;
+        };
+
+        // Socket tracks should start with "Socket " followed by the socket_id
+        // Valid formats: "Socket 123:TCP:..." or "Socket 123" (fallback)
+        if !track_name.starts_with("Socket ") {
+            result.add_error(ValidationError::PerfettoError {
+                message: format!(
+                    "Socket track '{track_name}' under 'Network Packets' must start with \
+                     'Socket N:...' where N is the socket_id (track_uuid={track_uuid})"
                 ),
             });
         }
@@ -2884,6 +2934,144 @@ mod tests {
                     if message.contains("no parent")
             )),
             "Error should mention missing parent"
+        );
+    }
+
+    #[test]
+    fn test_socket_track_without_socket_id_fails() {
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create "Network Packets" root track
+        let network_packets_uuid = 100u64;
+        context.defined_tracks.insert(network_packets_uuid);
+        context
+            .track_names
+            .insert(network_packets_uuid, "Network Packets".to_string());
+        context.network_packets_root_uuid = Some(network_packets_uuid);
+
+        // Create a socket track with incorrect name (missing "Socket " prefix)
+        let socket_track_uuid = 200u64;
+        context.defined_tracks.insert(socket_track_uuid);
+        context.track_names.insert(
+            socket_track_uuid,
+            "TCP 10.0.0.1:12345 → 10.0.0.2:80".to_string(),
+        );
+        context
+            .parent_refs
+            .insert(socket_track_uuid, network_packets_uuid);
+
+        // Run validation
+        validate_socket_tracks_have_socket_id(&context, &mut result);
+
+        // Should fail - socket track doesn't start with "Socket "
+        assert!(
+            result.has_errors(),
+            "Expected error for socket track without 'Socket ' prefix"
+        );
+        assert!(
+            result.errors.iter().any(|e| matches!(
+                e,
+                ValidationError::PerfettoError { message }
+                    if message.contains("must start with")
+            )),
+            "Error should explain the naming requirement"
+        );
+    }
+
+    #[test]
+    fn test_socket_track_with_socket_id_passes() {
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create "Network Packets" root track
+        let network_packets_uuid = 100u64;
+        context.defined_tracks.insert(network_packets_uuid);
+        context
+            .track_names
+            .insert(network_packets_uuid, "Network Packets".to_string());
+        context.network_packets_root_uuid = Some(network_packets_uuid);
+
+        // Create a socket track with correct name format
+        let socket_track_uuid = 200u64;
+        context.defined_tracks.insert(socket_track_uuid);
+        context.track_names.insert(
+            socket_track_uuid,
+            "Socket 123:TCP:10.0.0.1:12345->10.0.0.2:80".to_string(),
+        );
+        context
+            .parent_refs
+            .insert(socket_track_uuid, network_packets_uuid);
+
+        // Run validation
+        validate_socket_tracks_have_socket_id(&context, &mut result);
+
+        // Should pass - socket track has correct format
+        assert!(
+            !result.has_errors(),
+            "Expected no errors for socket track with 'Socket N:...' format, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_socket_track_fallback_format_passes() {
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create "Network Packets" root track
+        let network_packets_uuid = 100u64;
+        context.defined_tracks.insert(network_packets_uuid);
+        context
+            .track_names
+            .insert(network_packets_uuid, "Network Packets".to_string());
+        context.network_packets_root_uuid = Some(network_packets_uuid);
+
+        // Create a socket track with fallback format (just socket_id)
+        let socket_track_uuid = 200u64;
+        context.defined_tracks.insert(socket_track_uuid);
+        context
+            .track_names
+            .insert(socket_track_uuid, "Socket 456".to_string());
+        context
+            .parent_refs
+            .insert(socket_track_uuid, network_packets_uuid);
+
+        // Run validation
+        validate_socket_tracks_have_socket_id(&context, &mut result);
+
+        // Should pass - socket track has fallback format
+        assert!(
+            !result.has_errors(),
+            "Expected no errors for socket track with 'Socket N' fallback format, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_socket_track_validation_skipped_without_network_packets() {
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // No "Network Packets" root track - network_packets_root_uuid is None
+
+        // Create a socket track with incorrect name format
+        // This should not cause errors since there's no "Network Packets" parent to validate
+        let socket_track_uuid = 200u64;
+        context.defined_tracks.insert(socket_track_uuid);
+        context.track_names.insert(
+            socket_track_uuid,
+            "TCP 10.0.0.1:12345 → 10.0.0.2:80".to_string(),
+        );
+
+        // Run validation
+        validate_socket_tracks_have_socket_id(&context, &mut result);
+
+        // Should pass - validation skipped when there's no Network Packets root
+        assert!(
+            !result.has_errors(),
+            "Expected no errors when 'Network Packets' root is not present, got: {:?}",
+            result.errors
         );
     }
 }

@@ -1765,8 +1765,11 @@ impl ParquetToPerfettoConverter {
     ///
     /// Creates a hierarchical track structure:
     /// - "Network Packets" (root track)
-    ///   - "TCP 10.0.0.1:12345 → 10.0.0.2:80" (per-socket tracks)
-    ///   - "UDP 10.0.0.1:5000 → 10.0.0.2:5001"
+    ///   - "Socket 1:TCP:10.0.0.1:12345->10.0.0.2:80" (per-socket tracks)
+    ///   - "Socket 2:UDP:10.0.0.1:5000->10.0.0.2:5001"
+    ///
+    /// Socket track names include the socket_id for correlation with socket_id
+    /// annotations on syscall events.
     ///
     /// Packet events are written as instants on their socket tracks.
     /// Syscall events are written as slices (with duration).
@@ -1839,8 +1842,9 @@ impl ParquetToPerfettoConverter {
                     let track_uuid = self.alloc_uuid();
                     socket_to_uuid.insert(socket_id, track_uuid);
 
-                    let track_name =
-                        format!("{protocol} {src_ip}:{src_port} → {dest_ip}:{dest_port}");
+                    let track_name = format!(
+                        "Socket {socket_id}:{protocol}:{src_ip}:{src_port}->{dest_ip}:{dest_port}"
+                    );
 
                     let mut track_desc = TrackDescriptor::default();
                     track_desc.set_uuid(track_uuid);
@@ -3209,15 +3213,16 @@ mod tests {
             "Should have 'Network Packets' root track"
         );
 
-        // Check for socket track with expected name format
+        // Check for socket track with expected name format (Socket ID:protocol:src:port->dest:port)
         let has_socket_track = track_descriptors.iter().any(|p| {
-            p.track_descriptor()
-                .name()
-                .contains("TCP 192.168.1.100:12345")
+            let name = p.track_descriptor().name();
+            name.starts_with("Socket 42:")
+                && name.contains("TCP")
+                && name.contains("192.168.1.100:12345")
         });
         assert!(
             has_socket_track,
-            "Should have socket track with TCP connection info"
+            "Should have socket track with 'Socket N:...' format including socket_id"
         );
 
         // Check for packet event
@@ -3364,11 +3369,15 @@ mod tests {
             "Should have 'Network Interfaces' track"
         );
 
-        // Verify UDP socket track exists
+        // Verify UDP socket track exists with proper format
         let has_udp_track = writer.packets.iter().any(|p| {
-            p.has_track_descriptor() && p.track_descriptor().name().starts_with("UDP 10.0.0.1")
+            let name = p.track_descriptor().name();
+            p.has_track_descriptor() && name.starts_with("Socket 1:") && name.contains("UDP")
         });
-        assert!(has_udp_track, "Should have UDP socket track");
+        assert!(
+            has_udp_track,
+            "Should have UDP socket track with 'Socket N:...' format"
+        );
 
         // Verify UDP send event exists
         let has_udp_event = writer
