@@ -43,6 +43,13 @@ pub struct NetworkTestConfig {
     pub prefix_len: u8,
 }
 
+impl NetworkTestConfig {
+    /// The network prefix used for test traffic (10.200.x.x).
+    /// This prefix identifies traffic going through the veth pair
+    /// rather than loopback.
+    pub const TEST_NETWORK_PREFIX: &'static str = "10.200.";
+}
+
 impl Default for NetworkTestConfig {
     fn default() -> Self {
         Self {
@@ -320,6 +327,130 @@ impl NetnsTestEnv {
         // Return total bytes exchanged
         Ok(message.len() + response.len())
     }
+
+    /// Generate traffic using explicit poll() syscall
+    ///
+    /// This method uses non-blocking I/O with explicit poll() calls to ensure
+    /// poll/epoll events are captured by systing's BPF probes. It connects to
+    /// the echo server, uses poll() to wait for writability, writes the message,
+    /// uses poll() to wait for readability, and reads the response.
+    ///
+    /// Returns the total bytes exchanged (sent + received).
+    pub fn generate_traffic_with_poll(&self, message: &[u8]) -> Result<usize> {
+        use std::os::unix::io::AsRawFd;
+
+        let addr = self.server_addr();
+
+        // Create a non-blocking TCP connection
+        let stream =
+            TcpStream::connect(&addr).with_context(|| format!("Failed to connect to {addr}"))?;
+        stream
+            .set_nonblocking(true)
+            .context("Failed to set non-blocking mode")?;
+
+        let fd = stream.as_raw_fd();
+
+        // Poll for write readiness (POLLOUT)
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+
+        // SAFETY: pollfd is properly initialized with a valid fd from TcpStream,
+        // nfds=1 matches the single pollfd, and timeout is a valid millisecond value.
+        let ret = unsafe { libc::poll(&mut pollfd, 1, 5000) };
+        if ret < 0 {
+            anyhow::bail!("poll() for POLLOUT failed: {}", io::Error::last_os_error());
+        }
+        if ret == 0 {
+            anyhow::bail!("poll() for POLLOUT timed out");
+        }
+        if pollfd.revents & libc::POLLOUT == 0 {
+            anyhow::bail!(
+                "poll() returned but POLLOUT not set, revents={}",
+                pollfd.revents
+            );
+        }
+
+        // Write the message (may need multiple writes for non-blocking)
+        let mut total_written = 0;
+        while total_written < message.len() {
+            match (&stream).write(&message[total_written..]) {
+                Ok(0) => anyhow::bail!("write() returned 0"),
+                Ok(n) => total_written += n,
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                    // Poll again for writability
+                    pollfd.events = libc::POLLOUT;
+                    pollfd.revents = 0;
+                    // SAFETY: pollfd is valid, nfds=1, timeout is valid.
+                    let ret = unsafe { libc::poll(&mut pollfd, 1, 5000) };
+                    if ret < 0 {
+                        anyhow::bail!(
+                            "poll() for write continuation failed: {}",
+                            io::Error::last_os_error()
+                        );
+                    }
+                    if ret == 0 {
+                        anyhow::bail!("poll() for write continuation timed out");
+                    }
+                }
+                Err(e) => return Err(e).context("write() failed"),
+            }
+        }
+
+        // Shutdown write side to signal end of message
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .context("Failed to shutdown write side")?;
+
+        // Poll for read readiness (POLLIN)
+        pollfd.events = libc::POLLIN;
+        pollfd.revents = 0;
+
+        // SAFETY: pollfd is valid, nfds=1, timeout is valid.
+        let ret = unsafe { libc::poll(&mut pollfd, 1, 5000) };
+        if ret < 0 {
+            anyhow::bail!("poll() for POLLIN failed: {}", io::Error::last_os_error());
+        }
+        if ret == 0 {
+            anyhow::bail!("poll() for POLLIN timed out");
+        }
+        if pollfd.revents & libc::POLLIN == 0 {
+            anyhow::bail!(
+                "poll() returned but POLLIN not set, revents={}",
+                pollfd.revents
+            );
+        }
+
+        // Read the echoed response
+        let mut response = Vec::new();
+        loop {
+            let mut buf = [0u8; 1024];
+            match (&stream).read(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                    // Poll again for readability
+                    pollfd.events = libc::POLLIN;
+                    pollfd.revents = 0;
+                    // SAFETY: pollfd is valid, nfds=1, timeout is valid.
+                    let ret = unsafe { libc::poll(&mut pollfd, 1, 5000) };
+                    if ret < 0 {
+                        anyhow::bail!("poll() during read failed: {}", io::Error::last_os_error());
+                    }
+                    if ret == 0 {
+                        // Timeout - no more data available, assume done
+                        break;
+                    }
+                }
+                Err(e) => return Err(e).context("read() failed"),
+            }
+        }
+
+        // Return total bytes exchanged
+        Ok(message.len() + response.len())
+    }
 }
 
 impl Drop for NetnsTestEnv {
@@ -347,6 +478,8 @@ pub struct NetworkValidationResult {
     pub syscall_count: usize,
     /// Number of packet records found
     pub packet_count: usize,
+    /// Number of poll/epoll events found
+    pub poll_count: usize,
     /// Errors encountered during validation
     pub errors: Vec<String>,
 }
@@ -396,6 +529,17 @@ pub fn validate_network_trace(output_dir: &Path) -> Result<NetworkValidationResu
             Err(e) => result
                 .errors
                 .push(format!("Failed to read network_packet.parquet: {e}")),
+        }
+    }
+
+    // Read network_poll.parquet
+    let poll_path = output_dir.join("network_poll.parquet");
+    if poll_path.exists() {
+        match count_parquet_records(&poll_path) {
+            Ok(count) => result.poll_count = count,
+            Err(e) => result
+                .errors
+                .push(format!("Failed to read network_poll.parquet: {e}")),
         }
     }
 
@@ -480,4 +624,131 @@ pub fn assert_socket_recorded(
         dest_ip,
         dest_port
     )
+}
+
+/// Count poll events for a specific socket ID
+///
+/// Searches network_poll.parquet for poll events matching the given socket_id.
+/// Returns the count of matching poll events.
+#[allow(dead_code)]
+pub fn count_poll_events_for_socket(output_dir: &Path, socket_id: i64) -> Result<usize> {
+    let poll_path = output_dir.join("network_poll.parquet");
+    if !poll_path.exists() {
+        return Ok(0);
+    }
+
+    let file = File::open(&poll_path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut count = 0;
+    for batch_result in reader {
+        let batch = batch_result?;
+
+        let socket_ids = batch
+            .column_by_name("socket_id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .context("Missing socket_id column in network_poll")?;
+
+        for i in 0..batch.num_rows() {
+            if socket_ids.value(i) == socket_id {
+                count += 1;
+            }
+        }
+    }
+
+    Ok(count)
+}
+
+/// Assert that poll events were recorded for a socket
+///
+/// Searches network_poll.parquet for poll events matching any of the
+/// sockets with dest_ip in the test network (10.200.x.x). Returns the
+/// count of poll events found, or an error if none were found.
+#[allow(dead_code)]
+pub fn assert_poll_events_recorded(output_dir: &Path, test_network_prefix: &str) -> Result<usize> {
+    // First, find all socket IDs with dest_ip matching the test network
+    let socket_path = output_dir.join("network_socket.parquet");
+    if !socket_path.exists() {
+        anyhow::bail!("network_socket.parquet not found in {:?}", output_dir);
+    }
+
+    let file = File::open(&socket_path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut test_socket_ids = std::collections::HashSet::new();
+
+    for batch_result in reader {
+        let batch = batch_result?;
+
+        let socket_ids = batch
+            .column_by_name("socket_id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .context("Missing socket_id column in network_socket")?;
+
+        let dest_ips = batch
+            .column_by_name("dest_ip")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .context("Missing dest_ip column in network_socket")?;
+
+        let src_ips = batch
+            .column_by_name("src_ip")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .context("Missing src_ip column in network_socket")?;
+
+        for i in 0..batch.num_rows() {
+            let dest_ip = dest_ips.value(i);
+            let src_ip = src_ips.value(i);
+            if dest_ip.starts_with(test_network_prefix) || src_ip.starts_with(test_network_prefix) {
+                test_socket_ids.insert(socket_ids.value(i));
+            }
+        }
+    }
+
+    if test_socket_ids.is_empty() {
+        anyhow::bail!(
+            "No sockets found with IPs matching network prefix {}",
+            test_network_prefix
+        );
+    }
+
+    // Now count poll events for these sockets
+    let poll_path = output_dir.join("network_poll.parquet");
+    if !poll_path.exists() {
+        anyhow::bail!(
+            "network_poll.parquet not found in {:?}, but expected poll events",
+            output_dir
+        );
+    }
+
+    let file = File::open(&poll_path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut poll_count = 0;
+    for batch_result in reader {
+        let batch = batch_result?;
+
+        let socket_ids = batch
+            .column_by_name("socket_id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .context("Missing socket_id column in network_poll")?;
+
+        for i in 0..batch.num_rows() {
+            if test_socket_ids.contains(&socket_ids.value(i)) {
+                poll_count += 1;
+            }
+        }
+    }
+
+    if poll_count == 0 {
+        anyhow::bail!(
+            "No poll events found for {} test sockets in network {}",
+            test_socket_ids.len(),
+            test_network_prefix
+        );
+    }
+
+    Ok(poll_count)
 }

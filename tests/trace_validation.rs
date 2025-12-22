@@ -11,7 +11,9 @@
 mod common;
 
 use arrow::array::Array;
-use common::{validate_network_trace, NetnsTestEnv, NetworkTestConfig};
+use common::{
+    assert_poll_events_recorded, validate_network_trace, NetnsTestEnv, NetworkTestConfig,
+};
 use std::path::Path;
 use systing::{
     bump_memlock_rlimit, systing, validate_parquet_dir, validate_perfetto_trace, Config,
@@ -682,6 +684,16 @@ fn test_network_recording_with_netns() {
         validation_result.packet_count
     );
 
+    // 4a. Assert poll events were captured for test traffic
+    let poll_count =
+        assert_poll_events_recorded(dir.path(), NetworkTestConfig::TEST_NETWORK_PREFIX)
+            .expect("Failed to validate poll events for test network traffic");
+    assert!(
+        poll_count > 0,
+        "No poll events recorded for test network traffic. \
+         Expected at least one poll/epoll event for the TCP connections."
+    );
+
     // 5. Assert correct IPs were captured (10.200.x.x, not 127.0.0.1)
     // This ensures we're capturing traffic through the veth interface
     // rather than loopback traffic
@@ -707,7 +719,7 @@ fn test_network_recording_with_netns() {
                 for i in 0..dest_ips.len() {
                     let ip = dest_ips.value(i);
                     // Check for traffic to/from our test namespace (10.200.x.x)
-                    if ip.starts_with("10.200.") {
+                    if ip.starts_with(NetworkTestConfig::TEST_NETWORK_PREFIX) {
                         found_netns_traffic = true;
                         break;
                     }
@@ -745,9 +757,10 @@ fn test_network_recording_with_netns() {
     );
 
     eprintln!(
-        "✓ Network namespace test passed: {} sockets, {} syscalls, {} packets",
+        "✓ Network namespace test passed: {} sockets, {} syscalls, {} packets, {} poll events",
         validation_result.socket_count,
         validation_result.syscall_count,
-        validation_result.packet_count
+        validation_result.packet_count,
+        poll_count
     );
 }
