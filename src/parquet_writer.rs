@@ -731,9 +731,27 @@ impl TraceExtractor {
                     self.data.processes.push(ProcessRecord {
                         upid,
                         pid,
-                        name: process_name,
+                        name: process_name.clone(),
                         parent_upid: None,
                     });
+
+                    // Also create a thread record for the main thread (tid == pid).
+                    // In Perfetto, main threads are represented by ProcessDescriptor rather
+                    // than ThreadDescriptor, but we need a thread record in Parquet for
+                    // perf samples that reference the main thread.
+                    if !self.tid_to_utid.contains_key(&pid) {
+                        let utid = self.next_utid;
+                        self.next_utid += 1;
+                        self.tid_to_utid.insert(pid, utid);
+                        // Map the process track UUID to the main thread for TrackEvent resolution
+                        self.track_uuid_to_utid.insert(uuid, utid);
+                        self.data.threads.push(ThreadRecord {
+                            utid,
+                            tid: pid,
+                            name: process_name,
+                            upid: Some(upid),
+                        });
+                    }
                 }
             }
 
@@ -2393,6 +2411,221 @@ mod tests {
 
         // Should be None when both are empty
         assert_eq!(extractor.data.threads.len(), 1);
+        assert_eq!(extractor.data.threads[0].name, None);
+    }
+
+    #[test]
+    fn test_process_descriptor_creates_main_thread_record() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create a TracePacket with ProcessDescriptor
+        let mut process = ProcessDescriptor::default();
+        process.set_pid(1234);
+        process.set_process_name("my_process".to_string());
+
+        let mut track_desc = TrackDescriptor::default();
+        track_desc.set_uuid(1);
+        track_desc.process = Some(process).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(track_desc);
+
+        extractor.process_packet(&packet).unwrap();
+
+        // Should create both a ProcessRecord and a ThreadRecord for the main thread
+        assert_eq!(extractor.data.processes.len(), 1);
+        assert_eq!(extractor.data.threads.len(), 1);
+
+        // Process should have the correct name
+        assert_eq!(
+            extractor.data.processes[0].name,
+            Some("my_process".to_string())
+        );
+
+        // Main thread (tid == pid) should have the same name as the process
+        assert_eq!(extractor.data.threads[0].tid, 1234);
+        assert_eq!(
+            extractor.data.threads[0].name,
+            Some("my_process".to_string())
+        );
+
+        // Thread should reference the process
+        assert_eq!(
+            extractor.data.threads[0].upid,
+            Some(extractor.data.processes[0].upid)
+        );
+    }
+
+    #[test]
+    fn test_process_descriptor_main_thread_prevents_duplicate_from_perf_sample() {
+        use perfetto_protos::profile_packet::PerfSample;
+
+        let mut extractor = TraceExtractor::new();
+
+        // First, process a ProcessDescriptor
+        let mut process = ProcessDescriptor::default();
+        process.set_pid(1234);
+        process.set_process_name("my_process".to_string());
+
+        let mut track_desc = TrackDescriptor::default();
+        track_desc.set_uuid(1);
+        track_desc.process = Some(process).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(track_desc);
+        extractor.process_packet(&packet).unwrap();
+
+        // Now process a PerfSample for the main thread (tid == pid)
+        let mut perf_sample = PerfSample::default();
+        perf_sample.set_pid(1234); // tgid
+        perf_sample.set_tid(1234); // main thread: tid == pid
+
+        let mut sample_packet = TracePacket::default();
+        sample_packet.set_timestamp(1000);
+        sample_packet.set_perf_sample(perf_sample);
+        extractor.process_packet(&sample_packet).unwrap();
+
+        // Should still have only one thread record (not duplicated)
+        assert_eq!(extractor.data.threads.len(), 1);
+
+        // The thread should retain its name from ProcessDescriptor
+        assert_eq!(
+            extractor.data.threads[0].name,
+            Some("my_process".to_string())
+        );
+    }
+
+    #[test]
+    fn test_process_descriptor_main_thread_with_empty_name() {
+        let mut extractor = TraceExtractor::new();
+
+        // Create a ProcessDescriptor with empty name
+        let mut process = ProcessDescriptor::default();
+        process.set_pid(1234);
+        // process_name not set
+
+        let mut track_desc = TrackDescriptor::default();
+        track_desc.set_uuid(1);
+        // track name also empty
+        track_desc.process = Some(process).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(track_desc);
+
+        extractor.process_packet(&packet).unwrap();
+
+        // Should create both records
+        assert_eq!(extractor.data.processes.len(), 1);
+        assert_eq!(extractor.data.threads.len(), 1);
+
+        // Both should have None name when both sources are empty
+        assert_eq!(extractor.data.processes[0].name, None);
+        assert_eq!(extractor.data.threads[0].name, None);
+        assert_eq!(extractor.data.threads[0].tid, 1234);
+    }
+
+    #[test]
+    fn test_separate_thread_not_affected_by_main_thread_fix() {
+        let mut extractor = TraceExtractor::new();
+
+        // First, process a ProcessDescriptor for process 1234
+        let mut process = ProcessDescriptor::default();
+        process.set_pid(1234);
+        process.set_process_name("my_process".to_string());
+
+        let mut track_desc = TrackDescriptor::default();
+        track_desc.set_uuid(1);
+        track_desc.process = Some(process).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(track_desc);
+        extractor.process_packet(&packet).unwrap();
+
+        // Then process a ThreadDescriptor for a different thread in the same process
+        let mut thread = ThreadDescriptor::default();
+        thread.set_tid(5678); // Different from pid
+        thread.set_pid(1234);
+        thread.set_thread_name("worker_thread".to_string());
+
+        let mut thread_track_desc = TrackDescriptor::default();
+        thread_track_desc.set_uuid(2);
+        thread_track_desc.thread = Some(thread).into();
+
+        let mut thread_packet = TracePacket::default();
+        thread_packet.set_track_descriptor(thread_track_desc);
+        extractor.process_packet(&thread_packet).unwrap();
+
+        // Should have one process and two threads
+        assert_eq!(extractor.data.processes.len(), 1);
+        assert_eq!(extractor.data.threads.len(), 2);
+
+        // Find the main thread and worker thread
+        let main_thread = extractor
+            .data
+            .threads
+            .iter()
+            .find(|t| t.tid == 1234)
+            .unwrap();
+        let worker_thread = extractor
+            .data
+            .threads
+            .iter()
+            .find(|t| t.tid == 5678)
+            .unwrap();
+
+        // Main thread should have process name
+        assert_eq!(main_thread.name, Some("my_process".to_string()));
+
+        // Worker thread should have its own name
+        assert_eq!(worker_thread.name, Some("worker_thread".to_string()));
+    }
+
+    #[test]
+    fn test_perf_sample_before_process_descriptor_creates_nameless_entries() {
+        use perfetto_protos::profile_packet::PerfSample;
+
+        let mut extractor = TraceExtractor::new();
+
+        // First, process a PerfSample for a main thread (tid == pid) BEFORE ProcessDescriptor.
+        // This is an edge case that shouldn't happen in normal operation because
+        // generate_trace() writes ProcessDescriptor packets before perf_sample packets.
+        // This test documents the current behavior for this edge case.
+        let mut perf_sample = PerfSample::default();
+        perf_sample.set_pid(1234); // tgid
+        perf_sample.set_tid(1234); // main thread: tid == pid
+
+        let mut sample_packet = TracePacket::default();
+        sample_packet.set_timestamp(1000);
+        sample_packet.set_perf_sample(perf_sample);
+        extractor.process_packet(&sample_packet).unwrap();
+
+        // perf_sample creates both process and thread with None names
+        assert_eq!(extractor.data.processes.len(), 1);
+        assert_eq!(extractor.data.threads.len(), 1);
+        assert_eq!(extractor.data.processes[0].name, None);
+        assert_eq!(extractor.data.threads[0].name, None);
+
+        // Now process the ProcessDescriptor
+        let mut process = ProcessDescriptor::default();
+        process.set_pid(1234);
+        process.set_process_name("my_process".to_string());
+
+        let mut track_desc = TrackDescriptor::default();
+        track_desc.set_uuid(1);
+        track_desc.process = Some(process).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(track_desc);
+        extractor.process_packet(&packet).unwrap();
+
+        // Neither process nor thread are duplicated
+        assert_eq!(extractor.data.processes.len(), 1);
+        assert_eq!(extractor.data.threads.len(), 1);
+
+        // Names remain None because entries were created first by perf_sample.
+        // This is acceptable because in normal operation, ProcessDescriptor always
+        // comes before perf_sample packets (see generate_trace order).
+        assert_eq!(extractor.data.processes[0].name, None);
         assert_eq!(extractor.data.threads[0].name, None);
     }
 }
