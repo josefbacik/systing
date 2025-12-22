@@ -84,6 +84,8 @@ struct ParquetToPerfettoConverter {
     utid_to_uuid: HashMap<i64, u64>,
     /// Map from upid to process track UUID
     upid_to_uuid: HashMap<i64, u64>,
+    /// Map from tid (thread ID) to thread track UUID for network events
+    tid_to_uuid: HashMap<i32, u64>,
     /// Map from upid to pid (process ID) for thread descriptors
     upid_to_pid: HashMap<i64, i32>,
     /// Sequence ID counter for trusted_packet_sequence_id
@@ -97,6 +99,7 @@ impl ParquetToPerfettoConverter {
             track_id_to_uuid: HashMap::new(),
             utid_to_uuid: HashMap::new(),
             upid_to_uuid: HashMap::new(),
+            tid_to_uuid: HashMap::new(),
             upid_to_pid: HashMap::new(),
             next_seq_id: 1,
         }
@@ -324,6 +327,8 @@ impl ParquetToPerfettoConverter {
                     let uuid = self.alloc_uuid();
                     self.upid_to_uuid.insert(upid, uuid);
                     self.upid_to_pid.insert(upid, tgid);
+                    // Map tid (which equals tgid for main threads) to the process track UUID
+                    self.tid_to_uuid.insert(tgid, uuid);
 
                     // Create TrackDescriptor with ProcessDescriptor
                     let mut desc = TrackDescriptor::default();
@@ -382,6 +387,8 @@ impl ParquetToPerfettoConverter {
 
                     let uuid = self.alloc_uuid();
                     self.utid_to_uuid.insert(utid, uuid);
+                    // Map tid to thread track UUID for network events
+                    self.tid_to_uuid.insert(tid, uuid);
 
                     // Create TrackDescriptor with ThreadDescriptor
                     // The pid field in ThreadDescriptor tells Perfetto the parent TGID
@@ -1978,25 +1985,16 @@ impl ParquetToPerfettoConverter {
                     let bytes = bytes_col.value(i);
                     let tid = tids.value(i);
 
-                    // Get track UUID for this socket
-                    let track_uuid = match socket_to_uuid.get(&socket_id) {
+                    // Get track UUID for this thread - syscall events go on thread tracks
+                    let track_uuid = match self.tid_to_uuid.get(&tid) {
                         Some(&uuid) => uuid,
                         None => {
-                            // Socket not found, create an ad-hoc track
-                            let uuid = self.alloc_uuid();
-                            socket_to_uuid.insert(socket_id, uuid);
-
-                            let track_name = format!("Socket {socket_id}");
-                            let mut track_desc = TrackDescriptor::default();
-                            track_desc.set_uuid(uuid);
-                            track_desc.set_name(track_name);
-                            track_desc.set_parent_uuid(root_uuid);
-
-                            let mut track_packet = TracePacket::default();
-                            track_packet.set_track_descriptor(track_desc);
-                            writer.write_packet(&track_packet)?;
-
-                            uuid
+                            // Thread not found in thread table, skip this event
+                            // This can happen for short-lived threads or threads not in sched trace
+                            tracing::debug!(
+                                "Skipping network syscall event: no thread track for tid={tid}"
+                            );
+                            continue;
                         }
                     };
 
@@ -2013,10 +2011,11 @@ impl ParquetToPerfettoConverter {
                     bytes_ann.set_int_value(bytes);
                     begin_event.debug_annotations.push(bytes_ann);
 
-                    let mut tid_ann = DebugAnnotation::default();
-                    tid_ann.set_name("tid".to_string());
-                    tid_ann.set_int_value(tid as i64);
-                    begin_event.debug_annotations.push(tid_ann);
+                    // Add socket_id annotation for correlation with socket tracks
+                    let mut socket_ann = DebugAnnotation::default();
+                    socket_ann.set_name("socket_id".to_string());
+                    socket_ann.set_int_value(socket_id);
+                    begin_event.debug_annotations.push(socket_ann);
 
                     let mut begin_packet = TracePacket::default();
                     begin_packet.set_timestamp(ts as u64);
@@ -2038,7 +2037,7 @@ impl ParquetToPerfettoConverter {
             }
         }
 
-        // Write poll events as instants
+        // Write poll events as instants on thread tracks
         if poll_path.exists() {
             let batches = read_parquet_file(&poll_path)?;
             let seq_id = self.alloc_seq_id();
@@ -2052,6 +2051,10 @@ impl ParquetToPerfettoConverter {
                     .column_by_name("socket_id")
                     .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
                     .context("Missing socket_id column in network_poll")?;
+                let tids = batch
+                    .column_by_name("tid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing tid column in network_poll")?;
                 let requested = batch
                     .column_by_name("requested_events")
                     .and_then(|c| c.as_any().downcast_ref::<StringArray>())
@@ -2064,14 +2067,19 @@ impl ParquetToPerfettoConverter {
                 for i in 0..batch.num_rows() {
                     let ts = timestamps.value(i);
                     let socket_id = socket_ids.value(i);
+                    let tid = tids.value(i);
                     let req_events = requested.value(i);
                     let ret_events = returned.value(i);
 
-                    // Get track UUID for this socket
-                    let track_uuid = match socket_to_uuid.get(&socket_id) {
+                    // Get track UUID for this thread - poll events go on thread tracks
+                    let track_uuid = match self.tid_to_uuid.get(&tid) {
                         Some(&uuid) => uuid,
                         None => {
-                            // Socket not found, skip this event (poll without socket metadata)
+                            // Thread not found in thread table, skip this event
+                            // This can happen for short-lived threads or threads not in sched trace
+                            tracing::debug!(
+                                "Skipping network poll event: no thread track for tid={tid}"
+                            );
                             continue;
                         }
                     };
@@ -2092,6 +2100,12 @@ impl ParquetToPerfettoConverter {
                     ret_ann.set_name("returned".to_string());
                     ret_ann.set_string_value(ret_events.to_string());
                     event.debug_annotations.push(ret_ann);
+
+                    // Add socket_id annotation for correlation with socket tracks
+                    let mut socket_ann = DebugAnnotation::default();
+                    socket_ann.set_name("socket_id".to_string());
+                    socket_ann.set_int_value(socket_id);
+                    event.debug_annotations.push(socket_ann);
 
                     let mut packet = TracePacket::default();
                     packet.set_timestamp(ts as u64);
