@@ -1057,7 +1057,7 @@ pub fn validate_perfetto_trace(path: &Path) -> ValidationResult {
     validate_parent_uuid_hierarchy(&context, &mut result);
     validate_clock_snapshot_exists(&context, &mut result);
     validate_system_info_exists(&context, &mut result);
-    validate_network_syscalls_on_thread_tracks(&context, &mut result);
+    validate_network_syscalls_on_network_tracks(&context, &mut result);
 
     result
 }
@@ -1073,6 +1073,8 @@ struct PerfettoValidationContext {
     parent_refs: HashMap<u64, u64>,
     /// Track UUIDs that have ThreadDescriptor or ProcessDescriptor (per-thread tracks)
     thread_process_tracks: HashSet<u64>,
+    /// Track names (track_uuid -> name)
+    track_names: HashMap<u64, String>,
     /// Network syscall events that need to be on per-thread tracks
     /// Maps (track_uuid, event_name) -> timestamp for deferred validation
     network_syscall_events: HashMap<(u64, String), u64>,
@@ -1104,6 +1106,11 @@ fn validate_packet(
         let uuid = desc.uuid();
 
         context.defined_tracks.insert(uuid);
+
+        // Store track name if present
+        if desc.has_name() {
+            context.track_names.insert(uuid, desc.name().to_string());
+        }
 
         // Check parent UUID
         if desc.has_parent_uuid() {
@@ -1386,22 +1393,61 @@ fn validate_system_info_exists(context: &PerfettoValidationContext, result: &mut
     }
 }
 
-/// Validate that network syscall events (poll, sendmsg, recvmsg) are on per-thread tracks.
+/// Validate that network syscall events (poll, sendmsg, recvmsg) are on dedicated "Network" tracks.
 ///
-/// Network syscall events should be placed on tracks that have a ThreadDescriptor or
-/// ProcessDescriptor, not on custom socket tracks. This ensures proper visualization
-/// in Perfetto UI where syscalls appear on thread timelines.
-fn validate_network_syscalls_on_thread_tracks(
+/// Network syscall events should be placed on tracks with names like "Network" or "Network (tid X)"
+/// that are parented to thread/process tracks. This ensures proper visualization in Perfetto UI
+/// where syscalls appear on dedicated network tracks under thread timelines.
+fn validate_network_syscalls_on_network_tracks(
     context: &PerfettoValidationContext,
     result: &mut ValidationResult,
 ) {
     for ((track_uuid, event_name), ts) in &context.network_syscall_events {
-        if !context.thread_process_tracks.contains(track_uuid) {
+        // Check that the track has a name
+        let track_name = match context.track_names.get(track_uuid) {
+            Some(name) => name,
+            None => {
+                result.add_error(ValidationError::PerfettoError {
+                    message: format!(
+                        "Network syscall event '{event_name}' (track_uuid={track_uuid}, ts={ts}) is on a track without a name. \
+                         Network syscall events should be placed on tracks named 'Network' or 'Network (tid N)'."
+                    ),
+                });
+                continue;
+            }
+        };
+
+        // Check that the track name is exactly "Network" or "Network (tid N)"
+        // Use a strict pattern to avoid matching unrelated track names like "NetworkBroken"
+        let is_valid_network_track =
+            track_name == "Network" || track_name.starts_with("Network (tid ");
+        if !is_valid_network_track {
             result.add_error(ValidationError::PerfettoError {
                 message: format!(
-                    "Network syscall event '{event_name}' (track_uuid={track_uuid}, ts={ts}) is not on a per-thread track. \
-                     Network syscall events (poll, sendmsg, recvmsg) should be placed on tracks \
-                     with ThreadDescriptor or ProcessDescriptor."
+                    "Network syscall event '{event_name}' (track_uuid={track_uuid}, ts={ts}) is on track '{track_name}'. \
+                     Network syscall events should be placed on tracks named 'Network' or 'Network (tid N)', \
+                     not directly on thread/process tracks."
+                ),
+            });
+            continue;
+        }
+
+        // Check that the track is parented to a thread/process track
+        if let Some(&parent_uuid) = context.parent_refs.get(track_uuid) {
+            if !context.thread_process_tracks.contains(&parent_uuid) {
+                result.add_error(ValidationError::PerfettoError {
+                    message: format!(
+                        "Network syscall event '{event_name}' (track_uuid={track_uuid}, ts={ts}) is on track '{track_name}' \
+                         which is not parented to a thread/process track. \
+                         Network tracks should be children of ThreadDescriptor or ProcessDescriptor tracks."
+                    ),
+                });
+            }
+        } else {
+            result.add_error(ValidationError::PerfettoError {
+                message: format!(
+                    "Network syscall event '{event_name}' (track_uuid={track_uuid}, ts={ts}) is on track '{track_name}' \
+                     which has no parent. Network tracks should be parented to thread/process tracks."
                 ),
             });
         }
@@ -2688,5 +2734,156 @@ mod tests {
             message: "Test mismatch".to_string(),
         };
         assert_eq!(format!("{error}"), "Cross-validation: Test mismatch");
+    }
+
+    #[test]
+    fn test_network_syscalls_must_be_on_network_tracks() {
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create a thread track (simulating a thread track from ThreadDescriptor)
+        let thread_track_uuid = 100u64;
+        context.defined_tracks.insert(thread_track_uuid);
+        context.thread_process_tracks.insert(thread_track_uuid);
+        // Thread track gets name from ThreadDescriptor, which doesn't start with "Network"
+        context
+            .track_names
+            .insert(thread_track_uuid, "my_thread".to_string());
+
+        // Record a network syscall event on the thread track (this is wrong - should be on Network track)
+        context
+            .network_syscall_events
+            .insert((thread_track_uuid, "sendmsg".to_string()), 1000);
+
+        // Run validation
+        validate_network_syscalls_on_network_tracks(&context, &mut result);
+
+        // Should have an error because the event is on a track named "my_thread" not "Network"
+        assert!(
+            result.has_errors(),
+            "Expected error for network syscall on non-Network track"
+        );
+        assert!(
+            result.errors.iter().any(|e| matches!(
+                e,
+                ValidationError::PerfettoError { message }
+                    if message.contains("sendmsg") && message.contains("my_thread")
+            )),
+            "Error should mention the event name and track name"
+        );
+    }
+
+    #[test]
+    fn test_network_syscalls_on_network_track_passes() {
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create a thread track
+        let thread_track_uuid = 100u64;
+        context.defined_tracks.insert(thread_track_uuid);
+        context.thread_process_tracks.insert(thread_track_uuid);
+        context
+            .track_names
+            .insert(thread_track_uuid, "my_thread".to_string());
+
+        // Create a Network track parented to the thread track
+        let network_track_uuid = 200u64;
+        context.defined_tracks.insert(network_track_uuid);
+        context
+            .track_names
+            .insert(network_track_uuid, "Network".to_string());
+        context
+            .parent_refs
+            .insert(network_track_uuid, thread_track_uuid);
+
+        // Record a network syscall event on the Network track (correct)
+        context
+            .network_syscall_events
+            .insert((network_track_uuid, "sendmsg".to_string()), 1000);
+
+        // Run validation
+        validate_network_syscalls_on_network_tracks(&context, &mut result);
+
+        // Should pass - event is on a "Network" track parented to a thread track
+        assert!(
+            !result.has_errors(),
+            "Expected no errors for network syscall on properly parented Network track, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_network_syscalls_on_network_track_with_tid_suffix_passes() {
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create a thread track
+        let thread_track_uuid = 100u64;
+        context.defined_tracks.insert(thread_track_uuid);
+        context.thread_process_tracks.insert(thread_track_uuid);
+        context
+            .track_names
+            .insert(thread_track_uuid, "my_thread".to_string());
+
+        // Create a Network track with tid suffix, parented to the thread track
+        let network_track_uuid = 200u64;
+        context.defined_tracks.insert(network_track_uuid);
+        context
+            .track_names
+            .insert(network_track_uuid, "Network (tid 1234)".to_string());
+        context
+            .parent_refs
+            .insert(network_track_uuid, thread_track_uuid);
+
+        // Record a network syscall event on the Network track (correct)
+        context
+            .network_syscall_events
+            .insert((network_track_uuid, "recvmsg".to_string()), 1000);
+
+        // Run validation
+        validate_network_syscalls_on_network_tracks(&context, &mut result);
+
+        // Should pass - event is on a "Network (tid N)" track parented to a thread track
+        assert!(
+            !result.has_errors(),
+            "Expected no errors for network syscall on 'Network (tid N)' track, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_network_syscalls_on_unparented_network_track_fails() {
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create a Network track with NO parent
+        let network_track_uuid = 200u64;
+        context.defined_tracks.insert(network_track_uuid);
+        context
+            .track_names
+            .insert(network_track_uuid, "Network".to_string());
+        // Note: no parent_ref added
+
+        // Record a network syscall event on the Network track
+        context
+            .network_syscall_events
+            .insert((network_track_uuid, "poll".to_string()), 1000);
+
+        // Run validation
+        validate_network_syscalls_on_network_tracks(&context, &mut result);
+
+        // Should fail - track has no parent
+        assert!(
+            result.has_errors(),
+            "Expected error for network syscall on unparented Network track"
+        );
+        assert!(
+            result.errors.iter().any(|e| matches!(
+                e,
+                ValidationError::PerfettoError { message }
+                    if message.contains("no parent")
+            )),
+            "Error should mention missing parent"
+        );
     }
 }
