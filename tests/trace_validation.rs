@@ -8,6 +8,10 @@
 //! sudo cargo test --test trace_validation -- --ignored
 //! ```
 
+mod common;
+
+use arrow::array::Array;
+use common::{validate_network_trace, NetnsTestEnv, NetworkTestConfig};
 use std::path::Path;
 use systing::{
     bump_memlock_rlimit, systing, validate_parquet_dir, validate_perfetto_trace, Config,
@@ -581,5 +585,169 @@ fn test_e2e_network_packets_with_traffic() {
         "Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
         perfetto_result.errors,
         perfetto_result.warnings
+    );
+}
+
+/// Tests network recording with an isolated network namespace.
+///
+/// This test creates a network namespace with a veth pair, generates
+/// traffic to an echo server in the namespace, and validates that
+/// systing captures the network activity correctly.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_network_recording_with_netns() {
+    use std::thread;
+    use std::time::Duration;
+
+    setup_bpf_environment();
+
+    // Create network namespace with default config (10.200.1.x addresses)
+    let netns_env = NetnsTestEnv::new(NetworkTestConfig::default())
+        .expect("Failed to create network namespace test environment");
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+
+    // Create config for network recording with parquet-first
+    let config = Config {
+        duration: 3,
+        parquet_first: true,
+        parquet_only: false,
+        network: true,
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path.clone(),
+        ..Config::default()
+    };
+
+    // Get the destination IP and port for validation
+    let dest_ip = netns_env.config.ns_ip.to_string();
+    let dest_port = netns_env.server_port;
+
+    // Spawn a thread to generate traffic after recording starts
+    let traffic_handle = {
+        let server_addr = netns_env.server_addr();
+        thread::spawn(move || {
+            // Wait for BPF probes to be attached - systing initialization takes time
+            // especially in virtualized environments
+            thread::sleep(Duration::from_millis(2000));
+
+            // Generate multiple rounds of traffic
+            for i in 0..5 {
+                let message = format!("Hello from netns test round {i}");
+                if let Ok(mut stream) = std::net::TcpStream::connect(&server_addr) {
+                    use std::io::{Read, Write};
+                    let _ = stream.write_all(message.as_bytes());
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    let mut response = Vec::new();
+                    let _ = stream.read_to_end(&mut response);
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        })
+    };
+
+    // Run the recording
+    systing(config).expect("systing recording failed");
+
+    // Wait for traffic thread to complete
+    traffic_handle.join().expect("Traffic thread panicked");
+
+    // Drop netns environment to clean up namespace
+    drop(netns_env);
+
+    // === STRICT ASSERTIONS ===
+
+    // 1. Assert network_socket.parquet exists
+    assert!(
+        dir.path().join("network_socket.parquet").exists(),
+        "network_socket.parquet not found - network recording failed"
+    );
+
+    // 2. Validate network trace data
+    let validation_result =
+        validate_network_trace(dir.path()).expect("Failed to validate network trace");
+
+    // 3. Assert socket_count > 0
+    assert!(
+        validation_result.socket_count > 0,
+        "No sockets recorded. Expected at least one socket for the TCP connection to {dest_ip}:{dest_port}",
+    );
+
+    // 4. Assert syscall_count > 0 OR packet_count > 0
+    assert!(
+        validation_result.syscall_count > 0 || validation_result.packet_count > 0,
+        "No network activity recorded. syscall_count={}, packet_count={}. \
+         Expected at least one syscall or packet event.",
+        validation_result.syscall_count,
+        validation_result.packet_count
+    );
+
+    // 5. Assert correct IPs were captured (10.200.x.x, not 127.0.0.1)
+    // This ensures we're capturing traffic through the veth interface
+    // rather than loopback traffic
+    let socket_path = dir.path().join("network_socket.parquet");
+    if socket_path.exists() {
+        use arrow::array::StringArray;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+
+        let file = File::open(&socket_path).expect("Failed to open network_socket.parquet");
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
+        let reader = builder.build().expect("Failed to build reader");
+
+        let mut found_netns_traffic = false;
+        for batch_result in reader {
+            let batch = batch_result.expect("Failed to read batch");
+
+            if let Some(dest_ips) = batch
+                .column_by_name("dest_ip")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            {
+                for i in 0..dest_ips.len() {
+                    let ip = dest_ips.value(i);
+                    // Check for traffic to/from our test namespace (10.200.x.x)
+                    if ip.starts_with("10.200.") {
+                        found_netns_traffic = true;
+                        break;
+                    }
+                }
+            }
+
+            if found_netns_traffic {
+                break;
+            }
+        }
+
+        assert!(
+            found_netns_traffic,
+            "No traffic to 10.200.x.x network found. \
+             Expected network namespace traffic, but only found other IPs. \
+             This suggests traffic was routed through loopback instead of the veth pair."
+        );
+    }
+
+    // 6. Run standard validations
+    let parquet_result = validate_parquet_dir(dir.path());
+    assert!(
+        parquet_result.is_valid(),
+        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        parquet_result.errors,
+        parquet_result.warnings
+    );
+
+    let perfetto_result = validate_perfetto_trace(&trace_path);
+    assert!(
+        perfetto_result.is_valid(),
+        "Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        perfetto_result.errors,
+        perfetto_result.warnings
+    );
+
+    eprintln!(
+        "✓ Network namespace test passed: {} sockets, {} syscalls, {} packets",
+        validation_result.socket_count,
+        validation_result.syscall_count,
+        validation_result.packet_count
     );
 }
