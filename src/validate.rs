@@ -1057,6 +1057,7 @@ pub fn validate_perfetto_trace(path: &Path) -> ValidationResult {
     validate_parent_uuid_hierarchy(&context, &mut result);
     validate_clock_snapshot_exists(&context, &mut result);
     validate_system_info_exists(&context, &mut result);
+    validate_network_syscalls_on_thread_tracks(&context, &mut result);
 
     result
 }
@@ -1070,6 +1071,11 @@ struct PerfettoValidationContext {
     referenced_tracks: HashMap<u64, u64>,
     /// Parent UUID references (child_uuid -> parent_uuid)
     parent_refs: HashMap<u64, u64>,
+    /// Track UUIDs that have ThreadDescriptor or ProcessDescriptor (per-thread tracks)
+    thread_process_tracks: HashSet<u64>,
+    /// Network syscall events that need to be on per-thread tracks
+    /// Maps (track_uuid, event_name) -> timestamp for deferred validation
+    network_syscall_events: HashMap<(u64, String), u64>,
     /// Whether we've seen a clock snapshot
     has_clock_snapshot: bool,
     /// Whether we've seen valid SystemInfo with utsname
@@ -1108,6 +1114,9 @@ fn validate_packet(
         // Check ThreadDescriptor: pid should not equal tid
         // When pid == tid, it's the main thread and should use ProcessDescriptor instead
         if let Some(thread) = desc.thread.as_ref() {
+            // Track this as a thread/process track for network event validation
+            context.thread_process_tracks.insert(uuid);
+
             if thread.has_pid() && thread.has_tid() && thread.pid() == thread.tid() {
                 result.add_error(ValidationError::PerfettoError {
                     message: format!(
@@ -1133,6 +1142,9 @@ fn validate_packet(
 
         // Check ProcessDescriptor: process_name should be set and not empty
         if let Some(process) = desc.process.as_ref() {
+            // Track this as a thread/process track for network event validation
+            context.thread_process_tracks.insert(uuid);
+
             if !process.has_process_name() || process.process_name().is_empty() {
                 result.add_error(ValidationError::PerfettoError {
                     message: format!(
@@ -1152,6 +1164,24 @@ fn validate_packet(
             let track_uuid = event.track_uuid();
             let ts = packet.timestamp();
             context.referenced_tracks.entry(track_uuid).or_insert(ts);
+
+            // Check if this is a network syscall or poll event
+            // These should be on per-thread/process tracks
+            // Note: Only checking for event types actually emitted by network_recorder.rs
+            let is_network_syscall = event.categories.iter().any(|c| c == "network")
+                && event.has_name()
+                && matches!(event.name(), "sendmsg" | "recvmsg" | "poll");
+
+            if is_network_syscall {
+                // Track this event for deferred validation
+                // We validate after all packets are processed since track descriptors
+                // may come after events in the trace
+                let event_name = event.name().to_string();
+                context
+                    .network_syscall_events
+                    .entry((track_uuid, event_name))
+                    .or_insert(ts);
+            }
         }
     }
 
@@ -1353,6 +1383,28 @@ fn validate_system_info_exists(context: &PerfettoValidationContext, result: &mut
         result.add_error(ValidationError::PerfettoError {
             message: "No SystemInfo packet with valid utsname found in trace".to_string(),
         });
+    }
+}
+
+/// Validate that network syscall events (poll, sendmsg, recvmsg) are on per-thread tracks.
+///
+/// Network syscall events should be placed on tracks that have a ThreadDescriptor or
+/// ProcessDescriptor, not on custom socket tracks. This ensures proper visualization
+/// in Perfetto UI where syscalls appear on thread timelines.
+fn validate_network_syscalls_on_thread_tracks(
+    context: &PerfettoValidationContext,
+    result: &mut ValidationResult,
+) {
+    for ((track_uuid, event_name), ts) in &context.network_syscall_events {
+        if !context.thread_process_tracks.contains(track_uuid) {
+            result.add_error(ValidationError::PerfettoError {
+                message: format!(
+                    "Network syscall event '{event_name}' (track_uuid={track_uuid}, ts={ts}) is not on a per-thread track. \
+                     Network syscall events (poll, sendmsg, recvmsg) should be placed on tracks \
+                     with ThreadDescriptor or ProcessDescriptor."
+                ),
+            });
+        }
     }
 }
 
