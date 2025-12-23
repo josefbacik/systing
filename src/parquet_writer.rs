@@ -739,7 +739,10 @@ impl TraceExtractor {
                     // In Perfetto, main threads are represented by ProcessDescriptor rather
                     // than ThreadDescriptor, but we need a thread record in Parquet for
                     // perf samples that reference the main thread.
-                    if !self.tid_to_utid.contains_key(&pid) {
+                    // Skip pid=0 (swapper/idle) - the idle thread should be created by sched
+                    // events to avoid utid collisions that would cause idle time to be
+                    // incorrectly attributed to other threads.
+                    if pid != 0 && !self.tid_to_utid.contains_key(&pid) {
                         let utid = self.next_utid;
                         self.next_utid += 1;
                         self.tid_to_utid.insert(pid, utid);
@@ -760,7 +763,9 @@ impl TraceExtractor {
                 let tid = thread.tid();
                 let pid = thread.pid();
 
-                if !self.tid_to_utid.contains_key(&tid) {
+                // Skip tid=0 (swapper/idle) - same rationale as ProcessDescriptor above.
+                // The idle thread should be created by sched events to avoid utid collisions.
+                if tid != 0 && !self.tid_to_utid.contains_key(&tid) {
                     let utid = self.next_utid;
                     self.next_utid += 1;
                     self.tid_to_utid.insert(tid, utid);
@@ -2522,6 +2527,50 @@ mod tests {
         assert_eq!(extractor.data.processes[0].name, None);
         assert_eq!(extractor.data.threads[0].name, None);
         assert_eq!(extractor.data.threads[0].tid, 1234);
+    }
+
+    #[test]
+    fn test_process_descriptor_skips_swapper_thread() {
+        // pid=0 (swapper/idle) should NOT get a thread record from ProcessDescriptor.
+        // The swapper thread is handled specially by sched events to ensure proper
+        // idle time tracking. Creating a thread record here would interfere with
+        // the tid_to_utid mapping.
+        let mut extractor = TraceExtractor::new();
+
+        // Create a ProcessDescriptor for pid=0 (swapper)
+        let mut process = ProcessDescriptor::default();
+        process.set_pid(0);
+        process.set_process_name("swapper".to_string());
+
+        let mut track_desc = TrackDescriptor::default();
+        track_desc.set_uuid(1);
+        track_desc.process = Some(process).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(track_desc);
+
+        extractor.process_packet(&packet).unwrap();
+
+        // Should create ProcessRecord but NOT ThreadRecord for pid=0
+        assert_eq!(extractor.data.processes.len(), 1);
+        assert_eq!(extractor.data.processes[0].pid, 0);
+        assert_eq!(
+            extractor.data.processes[0].name,
+            Some("swapper".to_string())
+        );
+
+        // No thread record should be created - swapper is handled by sched events
+        assert_eq!(
+            extractor.data.threads.len(),
+            0,
+            "ProcessDescriptor for pid=0 should not create a thread record"
+        );
+
+        // tid_to_utid should NOT have an entry for tid=0
+        assert!(
+            !extractor.tid_to_utid.contains_key(&0),
+            "tid_to_utid should not contain entry for tid=0 from ProcessDescriptor"
+        );
     }
 
     #[test]
