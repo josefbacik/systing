@@ -32,6 +32,10 @@ use std::path::Path;
 
 use crate::parquet_paths::ParquetPaths;
 
+/// Minimum number of sched events required before validating swapper/idle presence.
+/// Traces with fewer events may legitimately have no idle time if the system was busy.
+const MIN_SCHED_EVENTS_FOR_SWAPPER_VALIDATION: u64 = 1000;
+
 /// Result of validating a trace.
 #[derive(Debug, Default)]
 pub struct ValidationResult {
@@ -1059,6 +1063,7 @@ pub fn validate_perfetto_trace(path: &Path) -> ValidationResult {
     validate_system_info_exists(&context, &mut result);
     validate_network_syscalls_on_network_tracks(&context, &mut result);
     validate_socket_tracks_have_socket_id(&context, &mut result);
+    validate_swapper_thread_names(&context, &mut result);
 
     result
 }
@@ -1090,6 +1095,10 @@ struct PerfettoValidationContext {
     cpus_seen_first_switch: HashSet<u32>,
     /// UUID of the "Network Packets" root track, if present
     network_packets_root_uuid: Option<u64>,
+    /// Comm strings seen for pid=0 (swapper/idle) in sched events.
+    /// Maps comm_string -> count. Used to detect when idle events are
+    /// incorrectly attributed to other threads (e.g., migration threads).
+    pid_zero_comms: HashMap<String, u64>,
 }
 
 /// Validate a single TracePacket.
@@ -1326,6 +1335,20 @@ fn validate_compact_sched(
     for &prev_state in &compact.switch_prev_state {
         *context.prev_state_counts.entry(prev_state).or_insert(0) += 1;
     }
+
+    // Collect comm strings for pid=0 (swapper/idle) events.
+    // This helps detect when idle time is incorrectly attributed to other threads.
+    for (i, &next_pid) in compact.switch_next_pid.iter().enumerate() {
+        if next_pid == 0 {
+            let comm_idx = compact.switch_next_comm_index.get(i).copied().unwrap_or(0) as usize;
+            let comm = compact
+                .intern_table
+                .get(comm_idx)
+                .map(String::as_str)
+                .unwrap_or("");
+            *context.pid_zero_comms.entry(comm.to_string()).or_insert(0) += 1;
+        }
+    }
 }
 
 /// Validate that all referenced track UUIDs have been defined.
@@ -1501,6 +1524,91 @@ fn validate_socket_tracks_have_socket_id(
                 ),
             });
         }
+    }
+}
+
+/// Validate that pid=0 (swapper/idle) sched events exist and have appropriate comm strings.
+///
+/// In a correctly converted trace, sched events with next_pid=0 should have comm
+/// strings like "swapper", "swapper/N" (where N is the CPU number), or empty.
+/// If they have comm strings like "migration/N", it indicates that idle time
+/// is being incorrectly attributed to migration threads instead of the idle thread.
+///
+/// Additionally, if there are NO pid=0 events at all but we have sched data,
+/// it likely indicates a utid mapping collision bug where swapper events are
+/// being attributed to other threads.
+fn validate_swapper_thread_names(
+    context: &PerfettoValidationContext,
+    result: &mut ValidationResult,
+) {
+    // Calculate total sched events from prev_state_counts
+    let total_sched_events: u64 = context.prev_state_counts.values().sum();
+
+    // If we have sched events but NO pid=0 events, that's suspicious
+    if context.pid_zero_comms.is_empty() {
+        if total_sched_events > MIN_SCHED_EVENTS_FOR_SWAPPER_VALIDATION {
+            // Only report if we have a reasonable amount of sched data
+            result.add_error(ValidationError::PerfettoError {
+                message: format!(
+                    "No sched events with next_pid=0 (swapper/idle) found, but trace has \
+                     {total_sched_events} total sched events. This indicates idle time is \
+                     missing or being incorrectly attributed to other threads \
+                     (likely a utid mapping collision from ProcessDescriptor handling for pid=0)."
+                ),
+            });
+        }
+        return;
+    }
+
+    // Check for incorrect comm strings for pid=0 events
+    let mut invalid_comms: Vec<(String, u64)> = Vec::new();
+    let mut total_pid_zero_events: u64 = 0;
+
+    for (comm, count) in &context.pid_zero_comms {
+        total_pid_zero_events += count;
+
+        // Valid comm strings for pid=0 (swapper/idle):
+        // - "swapper" or "swapper/N" (CPU-specific idle threads)
+        // - Empty string (legacy format)
+        // - "<idle>" (some traces use this)
+        let is_valid = comm.is_empty()
+            || comm == "swapper"
+            || comm.starts_with("swapper/")
+            || comm == "<idle>";
+
+        if !is_valid {
+            invalid_comms.push((comm.clone(), *count));
+        }
+    }
+
+    // If we have invalid comms, report an error
+    if !invalid_comms.is_empty() {
+        // Sort by count descending to show the most common offenders first
+        invalid_comms.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let invalid_count: u64 = invalid_comms.iter().map(|(_, c)| c).sum();
+        let invalid_percent = if total_pid_zero_events > 0 {
+            (invalid_count as f64 / total_pid_zero_events as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        // Format the top offenders for the error message
+        let top_offenders: Vec<String> = invalid_comms
+            .iter()
+            .take(5)
+            .map(|(comm, count)| format!("'{comm}' ({count} events)"))
+            .collect();
+
+        result.add_error(ValidationError::PerfettoError {
+            message: format!(
+                "Idle thread (pid=0) has incorrect comm strings in {invalid_count}/{total_pid_zero_events} \
+                 sched events ({invalid_percent:.1}%). Expected 'swapper' or 'swapper/N', \
+                 but found: {}. This indicates idle time is being incorrectly attributed \
+                 to other threads (regression in ProcessDescriptor handling for pid=0).",
+                top_offenders.join(", ")
+            ),
+        });
     }
 }
 
@@ -3071,6 +3179,112 @@ mod tests {
         assert!(
             !result.has_errors(),
             "Expected no errors when 'Network Packets' root is not present, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_swapper_validation_passes_with_correct_comm() {
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Simulate sched events with pid=0 and all valid comm string variants
+        context.pid_zero_comms.insert("swapper/0".to_string(), 1000);
+        context.pid_zero_comms.insert("swapper/1".to_string(), 500);
+        context.pid_zero_comms.insert("swapper".to_string(), 100);
+        context.pid_zero_comms.insert("".to_string(), 50); // Empty string is valid (legacy)
+        context.pid_zero_comms.insert("<idle>".to_string(), 25); // Alternative idle format
+
+        // Also need some prev_state_counts to show we have sched data
+        context.prev_state_counts.insert(0, 1675);
+
+        validate_swapper_thread_names(&context, &mut result);
+
+        assert!(
+            !result.has_errors(),
+            "Expected no errors for correct swapper comm strings, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_swapper_validation_fails_with_no_pid_zero_events() {
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // No pid=0 events in pid_zero_comms (empty)
+
+        // But we have plenty of sched events (from prev_state_counts)
+        context.prev_state_counts.insert(0, 100000);
+        context.prev_state_counts.insert(1, 50000);
+
+        validate_swapper_thread_names(&context, &mut result);
+
+        assert!(
+            result.has_errors(),
+            "Expected error when no pid=0 events exist but sched data is present"
+        );
+        assert!(
+            result.errors[0]
+                .to_string()
+                .contains("No sched events with next_pid=0"),
+            "Error should mention missing pid=0 events: {}",
+            result.errors[0]
+        );
+    }
+
+    #[test]
+    fn test_swapper_validation_fails_with_wrong_comm() {
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Simulate pid=0 events with wrong comm strings (migration threads)
+        context
+            .pid_zero_comms
+            .insert("migration/133".to_string(), 50000);
+        context
+            .pid_zero_comms
+            .insert("migration/112".to_string(), 10000);
+        context.pid_zero_comms.insert("swapper".to_string(), 100); // Some correct ones
+
+        // Also need some prev_state_counts
+        context.prev_state_counts.insert(0, 60100);
+
+        validate_swapper_thread_names(&context, &mut result);
+
+        assert!(
+            result.has_errors(),
+            "Expected error for incorrect comm strings on pid=0 events"
+        );
+        assert!(
+            result.errors[0]
+                .to_string()
+                .contains("incorrect comm strings"),
+            "Error should mention incorrect comm strings: {}",
+            result.errors[0]
+        );
+        assert!(
+            result.errors[0].to_string().contains("migration/133"),
+            "Error should mention the migration thread: {}",
+            result.errors[0]
+        );
+    }
+
+    #[test]
+    fn test_swapper_validation_skipped_with_few_sched_events() {
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // No pid=0 events, but also very few total sched events
+        // (threshold is 1000)
+        context.prev_state_counts.insert(0, 500);
+
+        validate_swapper_thread_names(&context, &mut result);
+
+        // Should not report error when we have few sched events
+        assert!(
+            !result.has_errors(),
+            "Expected no error with few sched events, got: {:?}",
             result.errors
         );
     }
