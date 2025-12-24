@@ -72,6 +72,23 @@ git add src/pystacks/bindings.rs
 - Ensure both feature configurations build successfully
 - Address any clippy warnings before completion
 
+### Integration Tests (require root)
+
+Integration tests require root/BPF privileges. Use the script to avoid build artifact ownership issues:
+
+```bash
+# Run all integration tests
+./scripts/run-integration-tests.sh
+
+# Run a specific test
+./scripts/run-integration-tests.sh trace_validation test_e2e_parquet_validation
+
+# Run with pystacks feature
+CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh
+```
+
+**Important**: Do NOT use `sudo cargo test` directly, as this creates root-owned build artifacts that break subsequent user builds.
+
 ## Code Style
 
 - Use `cargo fmt` for consistent formatting

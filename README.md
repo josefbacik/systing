@@ -30,6 +30,23 @@ This will generate a `trace.pb` file which can be uploaded to a
 
 This sets up automatic `cargo fmt` checks before commits and pushes. See [CLAUDE.md](CLAUDE.md) for full development workflow details.
 
+### Running Integration Tests
+
+Integration tests require root/BPF privileges and are marked as `#[ignore]` by default. Use the provided script to run them without causing build artifact ownership issues:
+
+```bash
+# Run all integration tests
+./scripts/run-integration-tests.sh
+
+# Run a specific test
+./scripts/run-integration-tests.sh trace_validation test_e2e_parquet_validation
+
+# Run with pystacks feature
+CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh
+```
+
+The script builds as your user (preserving artifact ownership), then runs only the test binary with sudo.
+
 ## Usage
 
 Detailed options can be found [here](docs/USAGE.adoc).
