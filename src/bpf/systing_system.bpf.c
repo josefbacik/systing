@@ -485,6 +485,19 @@ struct {
 	__uint(max_entries, 1);
 } last_perf_counter_value SEC(".maps");
 
+/*
+ * Track the currently running task's PID on each CPU.
+ * Updated by sched_switch, checked by perf_event to detect
+ * when a sample is captured during a context switch.
+ * Using per-CPU array avoids cache line contention.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, u32);
+	__uint(max_entries, 1);
+} cpu_running_pid SEC(".maps");
+
 struct ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
@@ -1130,8 +1143,8 @@ static void record_task_info(struct task_info *info, struct task_struct *task)
 	}
 }
 
-static void emit_stack_event(void *ctx,struct task_struct *task,
-			     enum stack_event_type type)
+static void emit_stack_event_with_ts(void *ctx, struct task_struct *task,
+				     enum stack_event_type type, u64 ts)
 {
 	struct stack_event *event;
 	long len = 0;
@@ -1142,6 +1155,24 @@ static void emit_stack_event(void *ctx,struct task_struct *task,
 	if (!trace_task(task))
 		return;
 
+	/*
+	 * For STACK_RUNNING events, verify the task is still the expected
+	 * running task according to our sched_switch tracking.
+	 * This guards against a race where a perf event fires during the
+	 * window between sched_switch (where we update cpu_running_pid) and
+	 * the actual context switch (where 'current' is updated).
+	 *
+	 * At startup (before any sched_switch on this CPU), expected_pid is 0
+	 * and samples are dropped. The userspace validation handles this by
+	 * skipping samples that occur before the first sched_slice.
+	 */
+	if (type == STACK_RUNNING) {
+		u32 key = 0;
+		u32 *expected_pid = bpf_map_lookup_elem(&cpu_running_pid, &key);
+		if (!expected_pid || *expected_pid != task->pid)
+			return;
+	}
+
 	long flags;
 	event = reserve_stack_event(&flags);
 	if (!event) {
@@ -1149,7 +1180,7 @@ static void emit_stack_event(void *ctx,struct task_struct *task,
 		return;
 	}
 
-	event->ts = bpf_ktime_get_boot_ns();
+	event->ts = ts ? ts : bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
 
@@ -1182,6 +1213,12 @@ static void emit_stack_event(void *ctx,struct task_struct *task,
 	else
 		event->kernel_stack_length = 0;
 	bpf_ringbuf_submit(event, flags);
+}
+
+static void emit_stack_event(void *ctx, struct task_struct *task,
+			     enum stack_event_type type)
+{
+	emit_stack_event_with_ts(ctx, task, type, 0);
 }
 
 static int trace_irq_event(struct irqaction *action, int irq, int ret, bool enter)
@@ -1293,6 +1330,17 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 {
 	struct task_event *event;
 	long flags;
+
+	/*
+	 * Update cpu_running_pid FIRST, before capturing timestamp.
+	 * This allows perf event handlers to detect if they're racing
+	 * with a context switch by comparing their current task's pid
+	 * against cpu_running_pid.
+	 */
+	u32 key = 0;
+	u32 next_pid = next->pid;
+	bpf_map_update_elem(&cpu_running_pid, &key, &next_pid, BPF_ANY);
+
 	u64 ts = bpf_ktime_get_boot_ns();
 
 	if (!trace_task(prev) && !trace_task(next))
@@ -1318,13 +1366,16 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 	 * TASK_INTERRUPTIBLE and TASK_UNINTERRUPTIBLE are mutually exclusive.
 	 * sleep-stacks controls all sleep stacks; interruptible-stacks adds
 	 * additional control for interruptible sleep specifically.
+	 *
+	 * Use the same timestamp as the sched_switch event so the stack sample
+	 * timestamp matches the end of the sched_slice.
 	 */
 	if (!tool_config.no_sleep_stack_traces) {
 		if (prev->__state & TASK_UNINTERRUPTIBLE)
-			emit_stack_event(ctx, prev, STACK_SLEEP);
+			emit_stack_event_with_ts(ctx, prev, STACK_SLEEP, ts);
 		else if (!tool_config.no_interruptible_stack_traces &&
 			 prev->__state & TASK_INTERRUPTIBLE)
-			emit_stack_event(ctx, prev, STACK_SLEEP);
+			emit_stack_event_with_ts(ctx, prev, STACK_SLEEP, ts);
 	}
 	return 0;
 }
@@ -1536,9 +1587,15 @@ static void read_counters(void *ctx, struct task_struct *task)
 SEC("perf_event")
 int systing_perf_event_clock(void *ctx)
 {
+	/*
+	 * Capture timestamp at the start, then get the current task.
+	 * The cpu_running_pid check in emit_stack_event_with_ts guards against
+	 * races where the perf event fires during a context switch window.
+	 */
+	u64 ts = bpf_ktime_get_boot_ns();
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	if (!tool_config.no_cpu_stack_traces)
-		emit_stack_event(ctx, task, STACK_RUNNING);
+		emit_stack_event_with_ts(ctx, task, STACK_RUNNING, ts);
 	read_counters(ctx, task);
 	return 0;
 }
