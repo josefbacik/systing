@@ -1294,6 +1294,14 @@ fn validate_stack_timing(paths: &ParquetPaths, result: &mut ValidationResult) {
             }
         };
 
+        // Skip samples that occur before the first sched_slice for this utid.
+        // At trace startup, perf events fire before any sched_switch is recorded,
+        // so these samples cannot be correlated with scheduler data.
+        let first_slice_ts = slices.first().map(|s| s.ts).unwrap_or(i64::MAX);
+        if sample.ts < first_slice_ts {
+            continue;
+        }
+
         let closest = find_closest_slice(slices, sample.ts);
 
         let (is_valid, message) = match (sample.stack_event_type, closest) {

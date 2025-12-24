@@ -1258,7 +1258,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
                 self.pending_samples.push(StackSampleRecord {
                     ts: event.ts as i64,
                     utid: self.get_utid_for_tid(tid),
-                    cpu: None,
+                    cpu: Some(event.cpu as i32),
                     stack_id,
                     stack_event_type: convert_stack_event_type(event.stack_event_type.0),
                 });
