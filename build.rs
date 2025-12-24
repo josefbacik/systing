@@ -47,7 +47,35 @@ fn generate_bindings(out_dir: &PathBuf) {
         panic!("Missing required libraries for pystacks feature. See error message above for installation instructions.");
     }
 
-    println!("cargo:rerun-if-changed=strobelight-libs/strobelight/bpf_lib");
+    // Track strobelight-libs source files so submodule updates trigger rebuilds
+    println!("cargo:rerun-if-changed=strobelight-libs/strobelight/bpf_lib/python/Makefile");
+    println!(
+        "cargo:rerun-if-changed=strobelight-libs/strobelight/bpf_lib/python/discovery/Makefile"
+    );
+
+    let strobelight_dirs = [
+        "strobelight-libs/strobelight/bpf_lib/python/discovery",
+        "strobelight-libs/strobelight/bpf_lib/python/pystacks",
+        "strobelight-libs/strobelight/bpf_lib/python/include",
+        "strobelight-libs/strobelight/bpf_lib/python/src",
+        "strobelight-libs/strobelight/bpf_lib/util",
+        "strobelight-libs/strobelight/bpf_lib/util/pid_info",
+        "strobelight-libs/strobelight/bpf_lib/common",
+        "strobelight-libs/strobelight/bpf_lib/include",
+    ];
+
+    for dir in strobelight_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str());
+            if matches!(ext, Some("cpp" | "c" | "h")) {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+    }
     println!("cargo:rustc-link-search={}", out_dir.display());
     println!("cargo::rustc-link-lib=static=pystacks");
     println!("cargo::rustc-link-lib=static=python_discovery");
