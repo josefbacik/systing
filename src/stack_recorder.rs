@@ -45,16 +45,39 @@ pub struct Stack {
     pub py_stack: Vec<PyAddr>,
 }
 
-/// Filters out zero addresses and reverses the stack trace order
-fn filter_and_reverse_stack(stack: &[u64]) -> Vec<u64> {
-    stack.iter().rev().filter(|x| **x > 0).copied().collect()
+/// Maximum valid userspace address on x86_64 Linux.
+/// Addresses above this are either kernel space or garbage from bad frame pointer unwinding.
+/// On x86_64, the canonical address split is at bit 47, so userspace addresses are below 0x800000000000.
+#[cfg(target_arch = "x86_64")]
+const MAX_USER_ADDR: u64 = 0x00007fffffffffff;
+
+/// Maximum valid userspace address on aarch64 Linux (48-bit VA).
+#[cfg(target_arch = "aarch64")]
+const MAX_USER_ADDR: u64 = 0x0000ffffffffffff;
+
+/// Filters out zero addresses and reverses user stack trace order.
+/// Also filters out garbage addresses that are above the valid userspace range,
+/// which can occur when bpf_get_stack() follows invalid frame pointers.
+fn filter_and_reverse_user_stack(stack: &[u64]) -> Vec<u64> {
+    stack
+        .iter()
+        .copied()
+        .rev()
+        .filter(|&x| x > 0 && x <= MAX_USER_ADDR)
+        .collect()
+}
+
+/// Filters out zero addresses and reverses kernel stack trace order.
+/// Kernel addresses are valid above MAX_USER_ADDR, so we only filter zeros.
+fn filter_and_reverse_kernel_stack(stack: &[u64]) -> Vec<u64> {
+    stack.iter().copied().rev().filter(|&x| x != 0).collect()
 }
 
 impl Stack {
     pub fn new(kernel_stack: &[u64], user_stack: &[u64], py_stack: &[PyAddr]) -> Self {
         Stack {
-            kernel_stack: filter_and_reverse_stack(kernel_stack),
-            user_stack: filter_and_reverse_stack(user_stack),
+            kernel_stack: filter_and_reverse_kernel_stack(kernel_stack),
+            user_stack: filter_and_reverse_user_stack(user_stack),
             py_stack: py_stack.to_vec(),
         }
     }
@@ -1305,6 +1328,66 @@ mod tests {
     use crate::utid::UtidGenerator;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
+
+    #[test]
+    fn test_filter_and_reverse_user_stack() {
+        // Test zero filtering
+        assert_eq!(filter_and_reverse_user_stack(&[0, 0x1000, 0]), vec![0x1000]);
+
+        // Test reversal
+        assert_eq!(
+            filter_and_reverse_user_stack(&[0x1000, 0x2000]),
+            vec![0x2000, 0x1000]
+        );
+
+        // Test MAX_USER_ADDR boundary - address at boundary should be kept
+        assert_eq!(
+            filter_and_reverse_user_stack(&[0x1000, MAX_USER_ADDR]),
+            vec![MAX_USER_ADDR, 0x1000]
+        );
+
+        // Test garbage addresses above MAX_USER_ADDR are filtered
+        assert_eq!(
+            filter_and_reverse_user_stack(&[0x1000, MAX_USER_ADDR + 1]),
+            vec![0x1000]
+        );
+
+        // Test typical garbage from bad frame pointer unwinding (instruction bytes)
+        assert_eq!(
+            filter_and_reverse_user_stack(&[0x7f0000001000, 0xc48348d88948ff31]),
+            vec![0x7f0000001000]
+        );
+
+        // Empty stack
+        assert_eq!(filter_and_reverse_user_stack(&[]), Vec::<u64>::new());
+
+        // All zeros
+        assert_eq!(filter_and_reverse_user_stack(&[0, 0, 0]), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn test_filter_and_reverse_kernel_stack() {
+        // Test zero filtering
+        assert_eq!(
+            filter_and_reverse_kernel_stack(&[0, 0xffffffff81000000, 0]),
+            vec![0xffffffff81000000]
+        );
+
+        // Test reversal
+        assert_eq!(
+            filter_and_reverse_kernel_stack(&[0xffffffff81000000, 0xffffffff82000000]),
+            vec![0xffffffff82000000, 0xffffffff81000000]
+        );
+
+        // Kernel addresses above MAX_USER_ADDR should be kept
+        assert_eq!(
+            filter_and_reverse_kernel_stack(&[0xffffffff81000000]),
+            vec![0xffffffff81000000]
+        );
+
+        // Empty stack
+        assert_eq!(filter_and_reverse_kernel_stack(&[]), Vec::<u64>::new());
+    }
 
     fn create_test_recorder() -> StackRecorder {
         StackRecorder::new(false, Arc::new(UtidGenerator::new()))
