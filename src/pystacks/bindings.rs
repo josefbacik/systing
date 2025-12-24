@@ -6,6 +6,11 @@ pub type __pid_t = ::std::os::raw::c_int;
 pub type pid_t = __pid_t;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct stack_walker_discovery_opts {
+    _unused: [u8; 0],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct stack_walker_opts {
     pub pidCount: usize,
     pub pids: *mut pid_t,
@@ -47,6 +52,7 @@ unsafe extern "C" {
     pub fn pystacks_init(
         bpf_skel_obj: *mut bpf_object,
         opts: *mut stack_walker_opts,
+        discovery_opts: *mut stack_walker_discovery_opts,
     ) -> *mut stack_walker_run;
 }
 unsafe extern "C" {
