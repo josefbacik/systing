@@ -837,7 +837,7 @@ if __name__ == "__main__":
     }
 
     // Start the Python process BEFORE systing
-    let mut python_proc = Command::new("/usr/bin/python3.10")
+    let mut python_proc = Command::new("/root/.pyenv/versions/3.13.11/bin/python3.13")
         .arg(&python_script)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -964,23 +964,26 @@ if __name__ == "__main__":
         eprintln!("  {}", name);
     }
 
-    // Report what we found
-    if found_python_symbols {
-        eprintln!("✓ Found Python symbols in stack.parquet");
-        if !found_test_functions.is_empty() {
-            eprintln!(
-                "✓ Found {} of {} expected Python test functions: {:?}",
-                found_test_functions.len(),
-                expected_functions.len(),
-                found_test_functions
-            );
-        }
-    } else {
-        eprintln!(
-            "NOTE: No Python symbols found in stack.parquet. \
-             This may be due to the test process not being discovered by pystacks."
-        );
-    }
+    // Report what we found - HARD FAIL if no Python symbols
+    assert!(
+        found_python_symbols,
+        "FAILED: No Python symbols found in stack.parquet. \
+         Pystacks did not successfully symbolize the Python process."
+    );
+    eprintln!("✓ Found Python symbols in stack.parquet");
+
+    assert!(
+        !found_test_functions.is_empty(),
+        "FAILED: No expected test functions found in stack.parquet. \
+         Expected at least one of: {:?}",
+        expected_functions
+    );
+    eprintln!(
+        "✓ Found {} of {} expected Python test functions: {:?}",
+        found_test_functions.len(),
+        expected_functions.len(),
+        found_test_functions
+    );
 
     // Verify stack_sample.parquet has samples (parquet-first path uses stack_sample)
     let stack_sample_parquet = dir.path().join("stack_sample.parquet");
@@ -1054,14 +1057,13 @@ if __name__ == "__main__":
         }
     }
 
-    if found_python_interned {
-        eprintln!("✓ Found Python symbols in Perfetto interned data");
-    } else {
-        eprintln!(
-            "NOTE: No Python symbols found in Perfetto interned data. \
-             This is expected if the test process was not discovered by pystacks."
-        );
-    }
+    // HARD FAIL if no Python symbols in Perfetto output
+    assert!(
+        found_python_interned,
+        "FAILED: No Python symbols found in Perfetto interned data. \
+         Pystacks did not successfully symbolize the Python process for Perfetto output."
+    );
+    eprintln!("✓ Found Python symbols in Perfetto interned data");
 
     // 8. Run standard validations
     let parquet_result = validate_parquet_dir(dir.path());
@@ -1081,13 +1083,9 @@ if __name__ == "__main__":
     );
 
     eprintln!(
-        "✓ Pystacks integration test passed: {} perf samples, parquet valid, perfetto valid",
-        sample_count
+        "✓ Pystacks integration test passed: {} perf samples, parquet valid, perfetto valid\n\
+         ✓ Python symbols found: {} test functions",
+        sample_count,
+        found_test_functions.len()
     );
-    if found_python_symbols {
-        eprintln!(
-            "  Python symbols found: {} test functions",
-            found_test_functions.len()
-        );
-    }
 }

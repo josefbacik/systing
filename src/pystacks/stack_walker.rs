@@ -161,6 +161,7 @@ impl StackWalkerRun {
                 bindings::pystacks_init(
                     bpf_object.as_ptr() as *mut bindings::bpf_object,
                     &mut opts as *mut _,
+                    std::ptr::null_mut(),
                 )
             };
         }
