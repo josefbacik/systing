@@ -1103,3 +1103,531 @@ if __name__ == "__main__":
         found_test_functions.len()
     );
 }
+
+/// Test that Python stack traces are captured for BOTH CPU (running) and sleep (off-CPU) stacks.
+///
+/// This test reproduces an issue where Python stacks were only being captured for STACK_RUNNING
+/// events but not for STACK_SLEEP events. The root cause was that `pystacks_read_stacks()` was
+/// called with `task=NULL`, causing it to use `bpf_get_current_pid_tgid()` instead of reading
+/// from the task struct. During sched_switch for sleep stacks, the current PID doesn't match
+/// the task being put to sleep.
+#[test]
+#[ignore] // Requires root/BPF privileges
+#[cfg(feature = "pystacks")]
+fn test_pystacks_sleep_stacks() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+
+    // Create a Python script that does BOTH CPU work AND blocking sleep.
+    // This ensures we get both STACK_RUNNING and STACK_SLEEP samples.
+    let python_script = dir.path().join("test_sleep_pystacks.py");
+    let script_content = r#"
+import time
+import sys
+
+def systing_sleep_leaf_function():
+    """Leaf function that sleeps - should appear in STACK_SLEEP samples."""
+    time.sleep(0.05)  # 50ms sleep - should trigger uninterruptible sleep
+
+def systing_sleep_middle_function():
+    """Middle function that calls the sleep leaf."""
+    for _ in range(20):
+        systing_sleep_leaf_function()
+
+def systing_cpu_leaf_function():
+    """Leaf function that does CPU work - should appear in STACK_RUNNING samples."""
+    total = 0
+    for i in range(500000):
+        total += i * i
+    return total
+
+def systing_cpu_middle_function():
+    """Middle function that calls the CPU leaf."""
+    result = 0
+    for _ in range(10):
+        result += systing_cpu_leaf_function()
+    return result
+
+def main():
+    """Main entry point - alternates between CPU work and sleeping."""
+    print("Python sleep/CPU test script starting...", flush=True)
+    start_time = time.time()
+
+    # Run for at least 10 seconds alternating between CPU work and sleep
+    while time.time() - start_time < 10:
+        # Do some CPU work (generates STACK_RUNNING samples)
+        systing_cpu_middle_function()
+        # Then sleep (generates STACK_SLEEP samples)
+        systing_sleep_middle_function()
+
+    print("Python sleep/CPU test script done.", flush=True)
+
+if __name__ == "__main__":
+    main()
+"#;
+
+    {
+        let mut file = File::create(&python_script).expect("Failed to create Python script");
+        file.write_all(script_content.as_bytes())
+            .expect("Failed to write Python script");
+    }
+
+    // Start the Python process BEFORE systing
+    let mut python_proc = Command::new("/root/.pyenv/versions/3.13.11/bin/python3.13")
+        .arg(&python_script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn Python process");
+
+    let python_pid = python_proc.id();
+    eprintln!("Started Python process with PID: {}", python_pid);
+
+    // Wait for Python to fully initialize
+    thread::sleep(Duration::from_millis(1000));
+
+    // Create config with explicit PID
+    let config = Config {
+        duration: 5,
+        parquet_first: true,
+        parquet_only: false,
+        collect_pystacks: true,
+        pystacks_pids: vec![python_pid],
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path.clone(),
+        ..Config::default()
+    };
+
+    systing(config).expect("systing recording failed");
+
+    // Wait for Python process to finish
+    let python_status = python_proc
+        .wait()
+        .expect("Failed to wait for Python process");
+    eprintln!("Python process exited with status: {:?}", python_status);
+
+    // === LOAD STACK.PARQUET INTO A MAP ===
+    let stack_parquet = dir.path().join("stack.parquet");
+    assert!(
+        stack_parquet.exists(),
+        "stack.parquet not found - stack profiling may have failed"
+    );
+
+    // Build a map from stack_id -> frame_names
+    let mut stack_frames: HashMap<i64, Vec<String>> = HashMap::new();
+    {
+        let file = File::open(&stack_parquet).expect("Failed to open stack.parquet");
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
+        let reader = builder.build().expect("Failed to build reader");
+
+        for batch_result in reader {
+            let batch = batch_result.expect("Failed to read batch");
+
+            let id_col = batch
+                .column_by_name("id")
+                .expect("id column missing")
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("id should be Int64");
+
+            let frame_names_col = batch
+                .column_by_name("frame_names")
+                .expect("frame_names column missing")
+                .as_any()
+                .downcast_ref::<arrow::array::ListArray>()
+                .expect("frame_names should be ListArray");
+
+            for i in 0..batch.num_rows() {
+                let stack_id = id_col.value(i);
+                let mut frames = Vec::new();
+
+                if !frame_names_col.is_null(i) {
+                    let inner = frame_names_col.value(i);
+                    let string_array = inner
+                        .as_any()
+                        .downcast_ref::<arrow::array::StringArray>()
+                        .expect("inner should be StringArray");
+
+                    for j in 0..string_array.len() {
+                        if !string_array.is_null(j) {
+                            frames.push(string_array.value(j).to_string());
+                        }
+                    }
+                }
+
+                stack_frames.insert(stack_id, frames);
+            }
+        }
+    }
+    eprintln!(
+        "Loaded {} unique stacks from stack.parquet",
+        stack_frames.len()
+    );
+
+    // === ANALYZE STACK_SAMPLE.PARQUET ===
+    let stack_sample_parquet = dir.path().join("stack_sample.parquet");
+    assert!(
+        stack_sample_parquet.exists(),
+        "stack_sample.parquet not found"
+    );
+
+    // Track Python symbols by stack_event_type
+    // Type 0 = STACK_SLEEP (off-CPU), Type 1 = STACK_RUNNING (on-CPU)
+    let mut sleep_samples_total = 0;
+    let mut sleep_samples_with_python = 0;
+    let mut running_samples_total = 0;
+    let mut running_samples_with_python = 0;
+    let mut sleep_python_functions: Vec<String> = Vec::new();
+    let mut running_python_functions: Vec<String> = Vec::new();
+
+    {
+        let file = File::open(&stack_sample_parquet).expect("Failed to open stack_sample.parquet");
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
+        let reader = builder.build().expect("Failed to build reader");
+
+        for batch_result in reader {
+            let batch = batch_result.expect("Failed to read batch");
+
+            let stack_id_col = batch
+                .column_by_name("stack_id")
+                .expect("stack_id column missing")
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("stack_id should be Int64");
+
+            let stack_event_type_col = batch
+                .column_by_name("stack_event_type")
+                .expect("stack_event_type column missing")
+                .as_any()
+                .downcast_ref::<arrow::array::Int8Array>()
+                .expect("stack_event_type should be Int8");
+
+            for i in 0..batch.num_rows() {
+                let stack_id = stack_id_col.value(i);
+                let stack_event_type = stack_event_type_col.value(i);
+
+                let frames = stack_frames.get(&stack_id).cloned().unwrap_or_default();
+                let has_python = frames.iter().any(|f| f.contains("(python)"));
+
+                match stack_event_type {
+                    0 => {
+                        // STACK_SLEEP
+                        sleep_samples_total += 1;
+                        if has_python {
+                            sleep_samples_with_python += 1;
+                            for f in &frames {
+                                if f.contains("(python)")
+                                    && f.contains("systing_sleep")
+                                    && !sleep_python_functions.contains(f)
+                                {
+                                    sleep_python_functions.push(f.clone());
+                                }
+                            }
+                        }
+                    }
+                    1 => {
+                        // STACK_RUNNING
+                        running_samples_total += 1;
+                        if has_python {
+                            running_samples_with_python += 1;
+                            for f in &frames {
+                                if f.contains("(python)")
+                                    && f.contains("systing_cpu")
+                                    && !running_python_functions.contains(f)
+                                {
+                                    running_python_functions.push(f.clone());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // === REPORT RESULTS ===
+    eprintln!("\n=== Stack Sample Analysis ===");
+    eprintln!(
+        "STACK_RUNNING (CPU): {} total, {} with Python symbols ({:.1}%)",
+        running_samples_total,
+        running_samples_with_python,
+        if running_samples_total > 0 {
+            running_samples_with_python as f64 / running_samples_total as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
+    eprintln!("  Python functions found: {:?}", running_python_functions);
+
+    eprintln!(
+        "STACK_SLEEP (off-CPU): {} total, {} with Python symbols ({:.1}%)",
+        sleep_samples_total,
+        sleep_samples_with_python,
+        if sleep_samples_total > 0 {
+            sleep_samples_with_python as f64 / sleep_samples_total as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
+    eprintln!("  Python functions found: {:?}", sleep_python_functions);
+
+    // === ASSERTIONS ===
+
+    // We should have some samples of each type
+    assert!(
+        running_samples_total > 0,
+        "No STACK_RUNNING samples captured - test script may not have done CPU work"
+    );
+    assert!(
+        sleep_samples_total > 0,
+        "No STACK_SLEEP samples captured - test script may not have slept"
+    );
+
+    // CPU stacks should have Python symbols (this already works)
+    assert!(
+        running_samples_with_python > 0,
+        "FAILED: No Python symbols in STACK_RUNNING samples. \
+         Expected systing_cpu_* functions to appear."
+    );
+    eprintln!("✓ STACK_RUNNING samples have Python symbols");
+
+    // Sleep stacks should ALSO have Python symbols (this is the bug we're testing)
+    assert!(
+        sleep_samples_with_python > 0,
+        "FAILED: No Python symbols in STACK_SLEEP samples. \
+         Expected systing_sleep_* functions to appear. \
+         This indicates pystacks is not correctly capturing Python stacks for sleeping tasks."
+    );
+    eprintln!("✓ STACK_SLEEP samples have Python symbols");
+
+    eprintln!(
+        "\n✓ test_pystacks_sleep_stacks passed: Python symbols found in both CPU and sleep stacks"
+    );
+}
+
+/// Test that Python 3.13 stack traces don't have excessive Frame Errors.
+///
+/// Python 3.13 changed internal frame structures (f_code -> f_executable).
+/// This test validates that Frame Errors are limited to expected positions
+/// (entry frames at the bottom of the stack) and don't affect the quality
+/// of Python stack traces.
+#[test]
+#[ignore] // Requires root/BPF privileges
+#[cfg(feature = "pystacks")]
+fn test_pystacks_frame_error_rate() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+
+    // Create a simple Python script
+    let python_script = dir.path().join("test_frame_error.py");
+    let script_content = r#"
+import time
+
+def level3():
+    total = 0
+    for i in range(100000):
+        total += i * i
+    return total
+
+def level2():
+    return level3()
+
+def level1():
+    return level2()
+
+def main():
+    start = time.time()
+    while time.time() - start < 10:
+        level1()
+
+if __name__ == "__main__":
+    main()
+"#;
+
+    {
+        let mut file = File::create(&python_script).expect("Failed to create Python script");
+        file.write_all(script_content.as_bytes())
+            .expect("Failed to write Python script");
+    }
+
+    let mut python_proc = Command::new("/root/.pyenv/versions/3.13.11/bin/python3.13")
+        .arg(&python_script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn Python process");
+
+    let python_pid = python_proc.id();
+    eprintln!("Started Python 3.13 process with PID: {}", python_pid);
+    thread::sleep(Duration::from_millis(1000));
+
+    let config = Config {
+        duration: 3,
+        parquet_first: true,
+        parquet_only: false,
+        collect_pystacks: true,
+        pystacks_pids: vec![python_pid],
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path.clone(),
+        ..Config::default()
+    };
+
+    systing(config).expect("systing recording failed");
+    python_proc
+        .wait()
+        .expect("Failed to wait for Python process");
+
+    // Analyze stacks for Frame Error
+    let stack_parquet = dir.path().join("stack.parquet");
+    assert!(stack_parquet.exists(), "stack.parquet not found");
+
+    let file = File::open(&stack_parquet).expect("Failed to open stack.parquet");
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
+    let reader = builder.build().expect("Failed to build reader");
+
+    let mut total_python_stacks = 0;
+    let mut stacks_with_frame_error = 0;
+    let mut frame_error_not_at_bottom = 0;
+    let mut expected_functions_found = 0;
+
+    for batch_result in reader {
+        let batch = batch_result.expect("Failed to read batch");
+
+        let frame_names_col = batch
+            .column_by_name("frame_names")
+            .expect("frame_names column missing")
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .expect("frame_names should be ListArray");
+
+        for i in 0..batch.num_rows() {
+            if frame_names_col.is_null(i) {
+                continue;
+            }
+
+            let inner = frame_names_col.value(i);
+            let string_array = inner
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("inner should be StringArray");
+
+            let frames: Vec<String> = (0..string_array.len())
+                .filter_map(|j| {
+                    if string_array.is_null(j) {
+                        None
+                    } else {
+                        Some(string_array.value(j).to_string())
+                    }
+                })
+                .collect();
+
+            // Only analyze stacks from our test script
+            let is_our_stack = frames.iter().any(|f| f.contains("test_frame_error.py"));
+            if !is_our_stack {
+                continue;
+            }
+
+            total_python_stacks += 1;
+
+            let has_frame_error = frames.iter().any(|f| f.contains("Frame Error"));
+            if has_frame_error {
+                stacks_with_frame_error += 1;
+
+                // Check if Frame Error is at the expected position (after entry frames)
+                for (idx, frame) in frames.iter().enumerate() {
+                    if frame.contains("Frame Error") {
+                        // Frame Error should be at position 4+ (after level3, level2, level1, main, <module>)
+                        // or at least after some Python frames
+                        let python_frames_before = frames[..idx]
+                            .iter()
+                            .filter(|f| f.contains("(python)"))
+                            .count();
+                        if python_frames_before < 2 {
+                            frame_error_not_at_bottom += 1;
+                            eprintln!(
+                                "Frame Error at unexpected position {} with only {} Python frames before",
+                                idx, python_frames_before
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Check for expected function names
+            let has_level3 = frames.iter().any(|f| f.contains("level3"));
+            let has_level2 = frames.iter().any(|f| f.contains("level2"));
+            let has_level1 = frames.iter().any(|f| f.contains("level1"));
+            if has_level3 && has_level2 && has_level1 {
+                expected_functions_found += 1;
+            }
+        }
+    }
+
+    eprintln!("\n=== Python 3.13 Frame Error Analysis ===");
+    eprintln!("Total Python stacks from test: {}", total_python_stacks);
+    eprintln!(
+        "Stacks with Frame Error: {} ({:.1}%)",
+        stacks_with_frame_error,
+        if total_python_stacks > 0 {
+            100.0 * stacks_with_frame_error as f64 / total_python_stacks as f64
+        } else {
+            0.0
+        }
+    );
+    eprintln!(
+        "Frame Error at unexpected position: {}",
+        frame_error_not_at_bottom
+    );
+    eprintln!(
+        "Stacks with expected functions (level1/2/3): {}",
+        expected_functions_found
+    );
+
+    // Assertions
+    assert!(
+        total_python_stacks > 0,
+        "No Python stacks captured from test script"
+    );
+
+    // The key assertion: we should find our expected function names despite Frame Errors
+    assert!(
+        expected_functions_found > 0,
+        "FAILED: No stacks found with expected level1/level2/level3 functions. \
+         Frame Errors may be causing stack trace corruption."
+    );
+    eprintln!("✓ Expected Python functions found in stacks");
+
+    // Frame Error should only appear at the bottom of stacks (after entry frames)
+    assert!(
+        frame_error_not_at_bottom == 0,
+        "FAILED: {} stacks have Frame Error at unexpected positions. \
+         This suggests a bug in Python 3.13 frame walking.",
+        frame_error_not_at_bottom
+    );
+    eprintln!("✓ Frame Errors only at expected positions (entry frames)");
+
+    eprintln!("\n✓ test_pystacks_frame_error_rate passed");
+}
