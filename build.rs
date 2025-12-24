@@ -47,6 +47,19 @@ fn generate_bindings(out_dir: &PathBuf) {
         panic!("Missing required libraries for pystacks feature. See error message above for installation instructions.");
     }
 
+    // Check if strobelight-libs submodule is initialized
+    let submodule_makefile = Path::new("strobelight-libs/strobelight/bpf_lib/python/Makefile");
+    if !submodule_makefile.exists() {
+        eprintln!("\n===============================================");
+        eprintln!("ERROR: strobelight-libs submodule is not initialized");
+        eprintln!("===============================================\n");
+        eprintln!("The 'pystacks' feature requires the strobelight-libs submodule.");
+        eprintln!("Please initialize it by running:\n");
+        eprintln!("  git submodule update --init --recursive\n");
+        eprintln!("===============================================\n");
+        panic!("strobelight-libs submodule not initialized. See error message above.");
+    }
+
     // Track strobelight-libs source files so submodule updates trigger rebuilds
     println!("cargo:rerun-if-changed=strobelight-libs/strobelight/bpf_lib/python/Makefile");
     println!(
@@ -85,14 +98,6 @@ fn generate_bindings(out_dir: &PathBuf) {
     println!("cargo:rustc-link-lib=dylib=re2");
     println!("cargo:rustc-link-lib=dylib=elf");
     println!("cargo:rustc-link-lib=dylib=cap");
-
-    std::process::Command::new("git")
-        .arg("submodule")
-        .arg("update")
-        .arg("--init")
-        .arg("--recursive")
-        .status()
-        .expect("Failed update submodules");
 
     let vmlinux_include_arg = format!(
         "-I{}",
