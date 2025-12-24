@@ -13,8 +13,50 @@ use std::time::Instant;
 #[cfg(feature = "pystacks")]
 use {
     crate::pystacks::bindings, crate::stack_recorder::add_frame, libbpf_rs::libbpf_sys,
-    libbpf_rs::AsRawLibbpf, std::fmt, std::ptr::NonNull,
+    libbpf_rs::AsRawLibbpf, std::ffi::CStr, std::fmt, std::ptr::NonNull,
 };
+
+/// Callback function for strobelight library logging.
+/// Only logs WARN level by default. Set PYSTACKS_DEBUG=1 to enable all levels.
+#[cfg(feature = "pystacks")]
+extern "C" fn strobelight_log_callback(
+    level: bindings::strobelight_lib_print_level,
+    msg: *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Cache whether debug mode is enabled (checked once on first call)
+    static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+    if !INITIALIZED.swap(true, Ordering::Relaxed) {
+        DEBUG_ENABLED.store(std::env::var("PYSTACKS_DEBUG").is_ok(), Ordering::Relaxed);
+    }
+
+    if msg.is_null() {
+        return 0;
+    }
+
+    // By default, only log WARN. Enable DEBUG/INFO with PYSTACKS_DEBUG=1
+    let should_log = match level {
+        bindings::strobelight_lib_print_level_STROBELIGHT_LIB_WARN => true,
+        _ => DEBUG_ENABLED.load(Ordering::Relaxed),
+    };
+
+    if should_log {
+        // SAFETY: msg pointer was checked for null above, and the C library
+        // guarantees it provides a valid null-terminated string.
+        let msg_str = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
+        let level_str = match level {
+            bindings::strobelight_lib_print_level_STROBELIGHT_LIB_WARN => "WARN",
+            bindings::strobelight_lib_print_level_STROBELIGHT_LIB_INFO => "INFO",
+            bindings::strobelight_lib_print_level_STROBELIGHT_LIB_DEBUG => "DEBUG",
+            _ => "UNKNOWN",
+        };
+        eprintln!("[pystacks {level_str}] {msg_str}");
+    }
+    0
+}
 
 #[derive(Debug, Clone)]
 pub struct PyAddr {
@@ -397,6 +439,7 @@ impl StackWalkerRun {
     pub fn get_pystack_from_event(&self, event: &stack_event) -> Vec<PyAddr> {
         let stack_len =
             (event.py_msg_buffer.stack_len as usize).min(event.py_msg_buffer.buffer.len());
+
         Vec::from(&event.py_msg_buffer.buffer[..stack_len])
             .iter()
             .map(|frame| PyAddr { addr: frame.into() })
@@ -424,10 +467,12 @@ impl StackWalkerRun {
 
     pub fn init_pystacks(&mut self, pids: &[u32], bpf_object: &Object) {
         if !pids.is_empty() {
-            let mut pid_opts: Vec<i32> = Vec::new();
-            for pid in pids.iter() {
-                pid_opts.push(*pid as i32);
+            // Set up logging before initialization
+            unsafe {
+                bindings::strobelight_lib_set_print(Some(strobelight_log_callback));
             }
+
+            let mut pid_opts: Vec<i32> = pids.iter().map(|&pid| pid as i32).collect();
 
             self.init(bpf_object.as_libbpf_object(), &mut pid_opts);
         }

@@ -240,6 +240,9 @@ pub struct Config {
     /// Collect Python stack traces
     #[cfg(feature = "pystacks")]
     pub collect_pystacks: bool,
+    /// Explicit PIDs for pystacks (bypasses auto-discovery)
+    #[cfg(feature = "pystacks")]
+    pub pystacks_pids: Vec<u32>,
     /// Enable debuginfod for symbol resolution
     pub enable_debuginfod: bool,
     /// Disable scheduler tracing
@@ -285,6 +288,8 @@ impl Default for Config {
             continuous: 0,
             #[cfg(feature = "pystacks")]
             collect_pystacks: false,
+            #[cfg(feature = "pystacks")]
+            pystacks_pids: Vec::new(),
             enable_debuginfod: false,
             no_sched: false,
             syscalls: false,
@@ -967,6 +972,7 @@ fn resolve_library_path_for_pid(pid: u32, lib_name: &str) -> Option<String> {
 }
 
 /// Convenience function to discover all Python processes by checking their main executable.
+#[cfg(feature = "pystacks")]
 fn discover_python_processes() -> Vec<u32> {
     // Only discover main Python processes (TGIDs), not threads
     discover_processes_with_mapping("python", false)
@@ -2117,9 +2123,15 @@ pub fn systing(opts: Config) -> Result<()> {
                 .with_context(|| format!("Failed to add PID {pid} to BPF map"))?;
         }
 
+        #[cfg(feature = "pystacks")]
         if collect_pystacks {
             // Determine which PIDs to use for pystacks
-            let pystacks_pids = if opts.pid.is_empty() {
+            // Priority: 1) explicit pystacks_pids, 2) general pid filter, 3) auto-discovery
+            let pystacks_pids = if !opts.pystacks_pids.is_empty() {
+                // Explicit pystacks PIDs specified (bypasses discovery)
+                println!("Using explicit pystacks PIDs: {:?}", opts.pystacks_pids);
+                opts.pystacks_pids.clone()
+            } else if opts.pid.is_empty() {
                 // No PIDs specified, discover all Python processes
                 let discovered = discover_python_processes();
                 if discovered.is_empty() {
@@ -2133,7 +2145,7 @@ pub fn systing(opts: Config) -> Result<()> {
                 }
                 discovered
             } else {
-                // Use the PIDs specified by the user
+                // Use the general PIDs specified by the user
                 println!("Using specified PIDs for pystacks: {:?}", opts.pid);
                 opts.pid.clone()
             };
