@@ -65,6 +65,20 @@ pub struct StackEvent {
     pub tgidpid: u64,
     pub ts_start: u64,
     pub stack: Stack,
+    pub stack_event_type: i8,
+}
+
+/// Convert BPF stack_event_type (u32) to i8, clamping to valid range.
+/// Valid values are 0 (STACK_SLEEP) and 1 (STACK_RUNNING).
+/// Unknown values are preserved but clamped to i8::MAX to avoid truncation issues.
+#[inline]
+fn convert_stack_event_type(bpf_type: u32) -> i8 {
+    if bpf_type <= i8::MAX as u32 {
+        bpf_type as i8
+    } else {
+        // Clamp to max i8 value to indicate unknown/invalid type
+        i8::MAX
+    }
 }
 
 #[derive(Default)]
@@ -681,6 +695,7 @@ impl StackRecorder {
                         utid,
                         cpu: None,
                         stack_id,
+                        stack_event_type: event.stack_event_type,
                     })?;
                 }
             }
@@ -1245,6 +1260,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
                     utid: self.get_utid_for_tid(tid),
                     cpu: None,
                     stack_id,
+                    stack_event_type: convert_stack_event_type(event.stack_event_type.0),
                 });
             } else {
                 // Non-streaming mode: store all events for later processing
@@ -1252,6 +1268,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
                     tgidpid: event.task.tgidpid,
                     ts_start: event.ts,
                     stack,
+                    stack_event_type: convert_stack_event_type(event.stack_event_type.0),
                 };
                 let stacks = self.stacks.entry(stack_key).or_default();
                 stacks.push(stack_event);

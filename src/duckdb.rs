@@ -212,7 +212,8 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             ts BIGINT,
             utid BIGINT,
             cpu INTEGER,
-            stack_id BIGINT
+            stack_id BIGINT,
+            stack_event_type TINYINT
         );
 
         -- Network interface metadata

@@ -112,6 +112,13 @@ pub enum ValidationError {
     PerfettoError { message: String },
     /// Cross-validation error between Parquet and Perfetto.
     CrossValidationError { message: String },
+    /// Stack sample timing violation - stack captured at invalid time.
+    StackTimingViolation {
+        ts: i64,
+        utid: i64,
+        stack_event_type: i8,
+        message: String,
+    },
 }
 
 impl fmt::Display for ValidationError {
@@ -162,6 +169,22 @@ impl fmt::Display for ValidationError {
             ValidationError::CrossValidationError { message } => {
                 write!(f, "Cross-validation: {message}")
             }
+            ValidationError::StackTimingViolation {
+                ts,
+                utid,
+                stack_event_type,
+                message,
+            } => {
+                let type_str = if *stack_event_type == 0 {
+                    "STACK_SLEEP"
+                } else {
+                    "STACK_RUNNING"
+                };
+                write!(
+                    f,
+                    "Stack timing: utid={utid} ts={ts} type={type_str}: {message}"
+                )
+            }
         }
     }
 }
@@ -173,6 +196,8 @@ pub enum ValidationWarning {
     EmptyTable { table: String },
     /// An optional column is missing.
     MissingColumn { table: String, column: String },
+    /// Too many errors of the same type - only showing first N.
+    TooManyErrors { table: String, shown: usize },
 }
 
 impl fmt::Display for ValidationWarning {
@@ -183,6 +208,9 @@ impl fmt::Display for ValidationWarning {
             }
             ValidationWarning::MissingColumn { table, column } => {
                 write!(f, "{table}.{column}: optional column missing")
+            }
+            ValidationWarning::TooManyErrors { table, shown } => {
+                write!(f, "{table}: showing first {shown} errors, more exist")
             }
         }
     }
@@ -214,6 +242,9 @@ pub fn validate_parquet_dir(dir: &Path) -> ValidationResult {
     // Phase 3: Required field validation
     validate_process_names(&paths, &mut result);
     validate_thread_names(&paths, &mut result);
+
+    // Phase 4: Stack timing validation
+    validate_stack_timing(&paths, &mut result);
 
     result
 }
@@ -259,6 +290,26 @@ fn collect_end_state_counts(paths: &ParquetPaths) -> anyhow::Result<HashMap<i64,
     }
 
     Ok(counts)
+}
+
+/// Count stack samples in Parquet.
+fn count_parquet_stack_samples(paths: &ParquetPaths) -> anyhow::Result<u64> {
+    let path = &paths.stack_sample;
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut count = 0u64;
+    for batch_result in reader {
+        let batch = batch_result?;
+        count += batch.num_rows() as u64;
+    }
+
+    Ok(count)
 }
 
 /// Cross-validate Parquet and Perfetto trace files.
@@ -312,6 +363,7 @@ pub fn cross_validate_parquet_perfetto(
     let mut perfetto_counts: HashMap<i64, u64> = HashMap::new();
     let mut cpus_with_switches: HashSet<u32> = HashSet::new();
     let mut skipped_packets = 0u64;
+    let mut perfetto_perf_sample_count = 0u64;
 
     for packet_result in TracePacketIterator::new(reader) {
         let packet = match packet_result {
@@ -333,6 +385,11 @@ pub fn cross_validate_parquet_perfetto(
                     *perfetto_counts.entry(prev_state).or_insert(0) += 1;
                 }
             }
+        }
+
+        // Count PerfSample packets for stack sample cross-validation
+        if packet.has_perf_sample() {
+            perfetto_perf_sample_count += 1;
         }
     }
 
@@ -419,6 +476,29 @@ pub fn cross_validate_parquet_perfetto(
                 ),
             });
         }
+    }
+
+    // Cross-validate stack sample counts
+    let parquet_stack_sample_count = match count_parquet_stack_samples(&paths) {
+        Ok(count) => count,
+        Err(e) => {
+            result.add_warning(ValidationWarning::MissingColumn {
+                table: "stack_sample".to_string(),
+                column: format!("Failed to count: {e}"),
+            });
+            0
+        }
+    };
+
+    if (parquet_stack_sample_count > 0 || perfetto_perf_sample_count > 0)
+        && parquet_stack_sample_count != perfetto_perf_sample_count
+    {
+        result.add_error(ValidationError::CrossValidationError {
+            message: format!(
+                "Stack sample count mismatch: Parquet has {parquet_stack_sample_count} \
+                 but Perfetto has {perfetto_perf_sample_count} PerfSample packets"
+            ),
+        });
     }
 
     result
@@ -989,6 +1069,301 @@ fn validate_process_names(paths: &ParquetPaths, result: &mut ValidationResult) {
 /// Validate that all thread.name values are set (not null and not empty).
 fn validate_thread_names(paths: &ParquetPaths, result: &mut ValidationResult) {
     validate_names_not_empty(&paths.thread, "thread", "utid", "thread", result);
+}
+
+/// Sched slice info for stack timing validation.
+#[derive(Clone)]
+struct SchedSliceInfo {
+    ts: i64,
+    dur: i64,
+    end_state: Option<i32>,
+}
+
+/// Tolerance for timestamp comparisons (10 microseconds in nanoseconds).
+/// This accounts for the slight delay between sched_switch and stack capture events.
+/// Note: Under heavy system load or virtualized systems, this may need to be increased.
+const STACK_TIMING_TOLERANCE_NS: i64 = 10_000;
+
+/// Stack event type: captured when task went to sleep (blocking).
+const STACK_SLEEP: i8 = 0;
+/// Stack event type: captured while task was running (CPU sampling, probes).
+const STACK_RUNNING: i8 = 1;
+
+/// Load sched_slice data indexed by utid for efficient lookup.
+fn load_sched_slices_by_utid(path: &Path) -> anyhow::Result<HashMap<i64, Vec<SchedSliceInfo>>> {
+    let mut slices: HashMap<i64, Vec<SchedSliceInfo>> = HashMap::new();
+
+    if !path.exists() {
+        return Ok(slices);
+    }
+
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    for batch_result in reader {
+        let batch = batch_result?;
+        let schema = batch.schema();
+
+        let ts_idx = schema.index_of("ts")?;
+        let dur_idx = schema.index_of("dur")?;
+        let utid_idx = schema.index_of("utid")?;
+        let end_state_idx = schema.index_of("end_state")?;
+
+        let ts_array = batch
+            .column(ts_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .context("ts column not Int64")?;
+        let dur_array = batch
+            .column(dur_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .context("dur column not Int64")?;
+        let utid_array = batch
+            .column(utid_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .context("utid column not Int64")?;
+        let end_state_array = batch
+            .column(end_state_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .context("end_state column not Int32")?;
+
+        for i in 0..batch.num_rows() {
+            let utid = utid_array.value(i);
+            let slice = SchedSliceInfo {
+                ts: ts_array.value(i),
+                dur: dur_array.value(i),
+                end_state: if end_state_array.is_null(i) {
+                    None
+                } else {
+                    Some(end_state_array.value(i))
+                },
+            };
+            slices.entry(utid).or_default().push(slice);
+        }
+    }
+
+    // Sort slices by timestamp for binary search
+    for slices_vec in slices.values_mut() {
+        slices_vec.sort_by_key(|s| s.ts);
+    }
+
+    Ok(slices)
+}
+
+/// Stack sample info for validation.
+struct StackSampleInfo {
+    ts: i64,
+    utid: i64,
+    stack_event_type: i8,
+}
+
+/// Load stack_sample data for validation.
+fn load_stack_samples(path: &Path) -> anyhow::Result<Vec<StackSampleInfo>> {
+    let mut samples = Vec::new();
+
+    if !path.exists() {
+        return Ok(samples);
+    }
+
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    for batch_result in reader {
+        let batch = batch_result?;
+        let schema = batch.schema();
+
+        let ts_idx = schema.index_of("ts")?;
+        let utid_idx = schema.index_of("utid")?;
+        let stack_event_type_idx = match schema.index_of("stack_event_type") {
+            Ok(idx) => idx,
+            Err(_) => {
+                // Old traces without stack_event_type - skip validation
+                return Ok(Vec::new());
+            }
+        };
+
+        let ts_array = batch
+            .column(ts_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .context("ts column not Int64")?;
+        let utid_array = batch
+            .column(utid_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .context("utid column not Int64")?;
+        let stack_event_type_array = batch
+            .column(stack_event_type_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Int8Array>()
+            .context("stack_event_type column not Int8")?;
+
+        for i in 0..batch.num_rows() {
+            samples.push(StackSampleInfo {
+                ts: ts_array.value(i),
+                utid: utid_array.value(i),
+                stack_event_type: stack_event_type_array.value(i),
+            });
+        }
+    }
+
+    Ok(samples)
+}
+
+/// Find the sched slice that contains or is closest to the given timestamp.
+/// Returns (slice, is_within_slice) where is_within_slice indicates if ts is inside the slice.
+fn find_closest_slice(slices: &[SchedSliceInfo], ts: i64) -> Option<(&SchedSliceInfo, bool)> {
+    if slices.is_empty() {
+        return None;
+    }
+
+    // Binary search to find the first slice with ts > sample.ts
+    let idx = slices.partition_point(|s| s.ts <= ts);
+
+    if idx == 0 {
+        // ts is before first slice - check if it's within tolerance of first slice start
+        let slice = &slices[0];
+        let is_within = ts >= slice.ts && ts < slice.ts + slice.dur;
+        return Some((slice, is_within));
+    }
+
+    // Check the slice just before the partition point
+    let prev_slice = &slices[idx - 1];
+    let is_within = ts >= prev_slice.ts && ts < prev_slice.ts + prev_slice.dur;
+
+    Some((prev_slice, is_within))
+}
+
+/// Validate stack sample timing constraints.
+///
+/// Stack samples should only occur at valid times:
+/// - STACK_SLEEP (0): At the end of a sched_slice when task went to sleep
+/// - STACK_RUNNING (1): Within a sched_slice when task was on CPU
+///
+/// Violations indicate bugs in the BPF capture logic or data corruption.
+fn validate_stack_timing(paths: &ParquetPaths, result: &mut ValidationResult) {
+    // Load sched_slice data indexed by utid
+    let slices_by_utid = match load_sched_slices_by_utid(&paths.sched_slice) {
+        Ok(slices) => slices,
+        Err(e) => {
+            result.add_error(ValidationError::ReadError {
+                table: "sched_slice".to_string(),
+                message: format!("Failed to load sched_slice: {e}"),
+            });
+            return;
+        }
+    };
+
+    if slices_by_utid.is_empty() {
+        // No scheduling data - can't validate
+        return;
+    }
+
+    // Load stack samples
+    let samples = match load_stack_samples(&paths.stack_sample) {
+        Ok(samples) => samples,
+        Err(e) => {
+            result.add_error(ValidationError::ReadError {
+                table: "stack_sample".to_string(),
+                message: format!("Failed to load stack_sample: {e}"),
+            });
+            return;
+        }
+    };
+
+    if samples.is_empty() {
+        // No stack samples to validate
+        return;
+    }
+
+    // Validate each stack sample
+    let mut violation_count = 0;
+    const MAX_VIOLATIONS_TO_REPORT: usize = 10;
+
+    for sample in &samples {
+        let slices = match slices_by_utid.get(&sample.utid) {
+            Some(s) => s,
+            None => {
+                // No scheduling data for this utid - skip (could be kernel thread, etc.)
+                continue;
+            }
+        };
+
+        let closest = find_closest_slice(slices, sample.ts);
+
+        let (is_valid, message) = match (sample.stack_event_type, closest) {
+            // STACK_SLEEP: should be at/near the end of a sleep slice
+            (STACK_SLEEP, Some((slice, _))) => {
+                let slice_end = slice.ts + slice.dur;
+                let is_sleep_state = slice.end_state.is_some() && slice.end_state != Some(0);
+                let delta = sample.ts - slice_end;
+                let is_at_end = delta.abs() <= STACK_TIMING_TOLERANCE_NS;
+                if is_sleep_state && is_at_end {
+                    (true, String::new())
+                } else if !is_sleep_state {
+                    (
+                        false,
+                        format!(
+                            "STACK_SLEEP but slice end_state={:?} (not sleep); slice=[{}, {})",
+                            slice.end_state, slice.ts, slice_end
+                        ),
+                    )
+                } else {
+                    (
+                        false,
+                        format!(
+                            "STACK_SLEEP delta={}ns exceeds tolerance; slice=[{}, {})",
+                            delta, slice.ts, slice_end
+                        ),
+                    )
+                }
+            }
+            // STACK_RUNNING: should be within a running slice
+            (STACK_RUNNING, Some((slice, is_within))) => {
+                let slice_end = slice.ts + slice.dur;
+                if is_within && slice.dur > 0 {
+                    (true, String::new())
+                } else {
+                    (
+                        false,
+                        format!(
+                            "STACK_RUNNING not within slice; slice=[{}, {}), sample_ts={}",
+                            slice.ts, slice_end, sample.ts
+                        ),
+                    )
+                }
+            }
+            // Known types but no slice found
+            (STACK_SLEEP | STACK_RUNNING, None) => {
+                (false, "No sched_slice found for this utid".to_string())
+            }
+            // Unknown stack_event_type
+            (unknown, _) => (false, format!("Unknown stack_event_type: {unknown}")),
+        };
+
+        if !is_valid && violation_count < MAX_VIOLATIONS_TO_REPORT {
+            result.add_error(ValidationError::StackTimingViolation {
+                ts: sample.ts,
+                utid: sample.utid,
+                stack_event_type: sample.stack_event_type,
+                message,
+            });
+            violation_count += 1;
+        }
+    }
+
+    if violation_count >= MAX_VIOLATIONS_TO_REPORT {
+        // Add a warning that there are more violations
+        result.add_warning(ValidationWarning::TooManyErrors {
+            table: "stack_sample".to_string(),
+            shown: MAX_VIOLATIONS_TO_REPORT,
+        });
+    }
 }
 
 /// Collect all values from an Int64 column into a HashSet.

@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow::array::{
-    BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, ListBuilder, RecordBatch,
-    StringBuilder,
+    BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, Int8Builder, ListBuilder,
+    RecordBatch, StringBuilder,
 };
 use arrow::datatypes::Schema;
 use parquet::arrow::ArrowWriter;
@@ -1583,12 +1583,14 @@ fn build_stack_sample_batch(
     let mut utid_builder = Int64Builder::with_capacity(records.len());
     let mut cpu_builder = Int32Builder::with_capacity(records.len());
     let mut stack_id_builder = Int64Builder::with_capacity(records.len());
+    let mut stack_event_type_builder = Int8Builder::with_capacity(records.len());
 
     for record in records {
         ts_builder.append_value(record.ts);
         utid_builder.append_value(record.utid);
         cpu_builder.append_option(record.cpu);
         stack_id_builder.append_value(record.stack_id);
+        stack_event_type_builder.append_value(record.stack_event_type);
     }
 
     Ok(RecordBatch::try_new(
@@ -1598,6 +1600,7 @@ fn build_stack_sample_batch(
             Arc::new(utid_builder.finish()),
             Arc::new(cpu_builder.finish()),
             Arc::new(stack_id_builder.finish()),
+            Arc::new(stack_event_type_builder.finish()),
         ],
     )?)
 }

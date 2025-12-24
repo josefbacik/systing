@@ -252,12 +252,17 @@ pub fn stack_schema() -> Arc<Schema> {
 /// Schema for stack_sample.parquet
 ///
 /// Links perf samples to stack traces.
+///
+/// The `stack_event_type` field indicates when the stack was captured:
+/// - 0 = STACK_SLEEP: Captured when task went to sleep (blocking)
+/// - 1 = STACK_RUNNING: Captured while task was running (CPU sampling, probes)
 pub fn stack_sample_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Int64, false),
         Field::new("utid", DataType::Int64, false),
         Field::new("cpu", DataType::Int32, true),
         Field::new("stack_id", DataType::Int64, false),
+        Field::new("stack_event_type", DataType::Int8, false),
     ]))
 }
 
