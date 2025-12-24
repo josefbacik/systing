@@ -14,11 +14,26 @@ use arrow::array::Array;
 use common::{
     assert_poll_events_recorded, validate_network_trace, NetnsTestEnv, NetworkTestConfig,
 };
+use std::io::{Read, Write};
 use std::path::Path;
 use systing::{
     bump_memlock_rlimit, systing, validate_parquet_dir, validate_perfetto_trace, Config,
 };
 use tempfile::TempDir;
+
+// Timing constants for network namespace tests.
+// BPF initialization (skeleton build, probe attachment) can take 5+ seconds on some systems.
+// These values provide buffer for initialization before traffic generation begins.
+//
+// TODO: Consider adding a proper synchronization mechanism to systing (e.g., a callback
+// or channel that signals when BPF probes are attached) rather than relying on fixed delays.
+
+/// Time to wait for BPF probe initialization before generating test traffic (seconds).
+const NETNS_BPF_INIT_WAIT_SECS: u64 = 7;
+
+/// Total recording duration for netns tests (seconds). Must be longer than
+/// NETNS_BPF_INIT_WAIT_SECS plus time for traffic generation.
+const NETNS_RECORDING_DURATION_SECS: u64 = 10;
 
 /// Helper to set up the environment for BPF tests.
 fn setup_bpf_environment() {
@@ -610,9 +625,10 @@ fn test_network_recording_with_netns() {
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
-    // Create config for network recording with parquet-first
+    // Create config for network recording with parquet-first.
+    // See NETNS_RECORDING_DURATION_SECS for timing rationale.
     let config = Config {
-        duration: 3,
+        duration: NETNS_RECORDING_DURATION_SECS,
         parquet_first: true,
         parquet_only: false,
         network: true,
@@ -625,19 +641,17 @@ fn test_network_recording_with_netns() {
     let dest_ip = netns_env.config.ns_ip.to_string();
     let dest_port = netns_env.server_port;
 
-    // Spawn a thread to generate traffic after recording starts
+    // Spawn a thread to generate traffic after recording starts.
+    // See NETNS_BPF_INIT_WAIT_SECS for timing rationale.
     let traffic_handle = {
         let server_addr = netns_env.server_addr();
         thread::spawn(move || {
-            // Wait for BPF probes to be attached - systing initialization takes time
-            // especially in virtualized environments
-            thread::sleep(Duration::from_millis(2000));
+            thread::sleep(Duration::from_secs(NETNS_BPF_INIT_WAIT_SECS));
 
             // Generate multiple rounds of traffic
             for i in 0..5 {
                 let message = format!("Hello from netns test round {i}");
                 if let Ok(mut stream) = std::net::TcpStream::connect(&server_addr) {
-                    use std::io::{Read, Write};
                     let _ = stream.write_all(message.as_bytes());
                     let _ = stream.shutdown(std::net::Shutdown::Write);
                     let mut response = Vec::new();
