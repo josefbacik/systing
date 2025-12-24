@@ -85,8 +85,11 @@ fn generate_bindings(out_dir: &PathBuf) {
     assert!(status.success(), "Make command failed");
 
     let pystacks_header: PathBuf = out_dir.join("strobelight/bpf_lib/python/pystacks/pystacks.h");
+    let logging_header: PathBuf =
+        PathBuf::from("strobelight-libs/strobelight/bpf_lib/include/logging.h");
     let bindings = builder()
         .header(pystacks_header.display().to_string())
+        .header(logging_header.display().to_string())
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .clang_args([
             format!("-I{}", out_dir.display()),
@@ -96,6 +99,10 @@ fn generate_bindings(out_dir: &PathBuf) {
             "-std=c++20".to_string(),
         ])
         .allowlist_function("pystacks_.*")
+        .allowlist_function("strobelight_lib_set_print")
+        .allowlist_type("strobelight_lib_print_level")
+        .allowlist_type("strobelight_lib_print_fn_t")
+        .raw_line("#![allow(non_upper_case_globals)]")
         .generate()
         .expect("Unable to generate bindings");
 

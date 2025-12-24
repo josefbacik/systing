@@ -129,6 +129,8 @@ impl From<Command> for Config {
             continuous: cmd.continuous,
             #[cfg(feature = "pystacks")]
             collect_pystacks: cmd.collect_pystacks,
+            #[cfg(feature = "pystacks")]
+            pystacks_pids: Vec::new(), // CLI doesn't expose this yet, uses discovery
             enable_debuginfod: cmd.enable_debuginfod,
             no_sched: cmd.no_sched,
             syscalls: cmd.syscalls,
