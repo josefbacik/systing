@@ -268,17 +268,48 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             seq BIGINT,
             length INTEGER,
             tcp_flags VARCHAR,
+            -- Send buffer fields
             sndbuf_used BIGINT,
             sndbuf_limit BIGINT,
             sndbuf_fill_pct SMALLINT,
+            -- Retransmit fields
             is_retransmit BOOLEAN,
             retransmit_count SMALLINT,
             rto_ms INTEGER,
             srtt_ms INTEGER,
             rttvar_us INTEGER,
             backoff SMALLINT,
+            -- Zero window fields
             is_zero_window_probe BOOLEAN,
-            zero_window_probe_count SMALLINT
+            is_zero_window_ack BOOLEAN,
+            probe_count SMALLINT,
+            -- Window fields
+            snd_wnd INTEGER,
+            rcv_wnd INTEGER,
+            rcv_buf_used BIGINT,
+            rcv_buf_limit BIGINT,
+            window_clamp INTEGER,
+            rcv_wscale SMALLINT,
+            -- Timer fields
+            icsk_pending SMALLINT,
+            icsk_timeout BIGINT,
+            -- Drop fields
+            drop_reason INTEGER,
+            drop_reason_str VARCHAR,
+            drop_location BIGINT,
+            -- Queue fields
+            qlen INTEGER,
+            qlen_limit INTEGER,
+            -- TSQ fields
+            sk_wmem_alloc BIGINT,
+            tsq_limit BIGINT,
+            -- TX queue fields
+            txq_state INTEGER,
+            qdisc_state INTEGER,
+            qdisc_backlog BIGINT,
+            -- SKB correlation
+            skb_addr BIGINT,
+            qdisc_latency_us INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS network_socket (
