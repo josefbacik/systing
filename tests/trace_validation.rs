@@ -17,7 +17,8 @@ use common::{
 use std::io::{Read, Write};
 use std::path::Path;
 use systing::{
-    bump_memlock_rlimit, systing, validate_parquet_dir, validate_perfetto_trace, Config,
+    bump_memlock_rlimit, systing, validate_duckdb, validate_parquet_dir, validate_perfetto_trace,
+    Config,
 };
 use tempfile::TempDir;
 
@@ -1630,4 +1631,233 @@ if __name__ == "__main__":
     eprintln!("✓ Frame Errors only at expected positions (entry frames)");
 
     eprintln!("\n✓ test_pystacks_frame_error_rate passed");
+}
+
+// =============================================================================
+// DuckDB Validation Tests
+// =============================================================================
+
+/// Tests DuckDB database generation and validation.
+///
+/// This test validates that:
+/// 1. The --with-duckdb flag generates a valid DuckDB database
+/// 2. The database contains the expected tables
+/// 3. The database passes all validation checks
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_duckdb_validation() {
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let duckdb_path = dir.path().join("trace.duckdb");
+
+    // Create config with DuckDB output enabled
+    let config = Config {
+        duration: 1,
+        parquet_only: true, // Skip Perfetto to speed up test
+        with_duckdb: true,
+        duckdb_output: duckdb_path.clone(),
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+
+    // Run the recording
+    systing(config).expect("systing recording failed");
+
+    // Verify DuckDB file was created
+    assert!(
+        duckdb_path.exists(),
+        "trace.duckdb not found - DuckDB generation failed"
+    );
+
+    // Verify DuckDB file has reasonable size (not empty)
+    let metadata = std::fs::metadata(&duckdb_path).expect("Failed to get file metadata");
+    assert!(
+        metadata.len() > 1024,
+        "DuckDB file is too small ({} bytes), may be empty or corrupted",
+        metadata.len()
+    );
+
+    // Validate the DuckDB database
+    let result = validate_duckdb(&duckdb_path);
+    assert!(
+        result.is_valid(),
+        "DuckDB validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        result.errors,
+        result.warnings
+    );
+
+    eprintln!("✓ DuckDB validation passed");
+    if !result.warnings.is_empty() {
+        eprintln!("  Warnings: {:?}", result.warnings);
+    }
+}
+
+/// Tests DuckDB generation with parquet-first mode.
+///
+/// This validates that the parquet-first streaming path correctly
+/// generates DuckDB output.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_duckdb_with_parquet_first() {
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let duckdb_path = dir.path().join("trace.duckdb");
+    let trace_path = dir.path().join("trace.pb");
+
+    // Create config with parquet-first and DuckDB output
+    let config = Config {
+        duration: 1,
+        parquet_first: true,
+        parquet_only: false, // Also generate Perfetto
+        with_duckdb: true,
+        duckdb_output: duckdb_path.clone(),
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path.clone(),
+        ..Config::default()
+    };
+
+    // Run the recording
+    systing(config).expect("systing recording failed");
+
+    // Verify all outputs exist
+    assert!(
+        dir.path().join("process.parquet").exists(),
+        "process.parquet not found"
+    );
+    assert!(trace_path.exists(), "trace.pb not found");
+    assert!(duckdb_path.exists(), "trace.duckdb not found");
+
+    // Validate Parquet
+    let parquet_result = validate_parquet_dir(dir.path());
+    assert!(
+        parquet_result.is_valid(),
+        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        parquet_result.errors,
+        parquet_result.warnings
+    );
+
+    // Validate Perfetto
+    let perfetto_result = validate_perfetto_trace(&trace_path);
+    assert!(
+        perfetto_result.is_valid(),
+        "Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        perfetto_result.errors,
+        perfetto_result.warnings
+    );
+
+    // Validate DuckDB
+    let duckdb_result = validate_duckdb(&duckdb_path);
+    assert!(
+        duckdb_result.is_valid(),
+        "DuckDB validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        duckdb_result.errors,
+        duckdb_result.warnings
+    );
+
+    eprintln!("✓ All three formats (Parquet, Perfetto, DuckDB) validated successfully");
+}
+
+/// Tests DuckDB generation with network recording enabled.
+///
+/// This validates that network tables are correctly populated in DuckDB.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_duckdb_with_network_recording() {
+    use duckdb::Connection;
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let duckdb_path = dir.path().join("trace.duckdb");
+
+    // Create config with network recording and DuckDB output
+    let config = Config {
+        duration: 2, // 2 seconds to capture some network activity
+        parquet_first: true,
+        parquet_only: true,
+        network: true,
+        with_duckdb: true,
+        duckdb_output: duckdb_path.clone(),
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+
+    // Run the recording
+    systing(config).expect("systing recording failed");
+
+    // Verify DuckDB file was created
+    assert!(duckdb_path.exists(), "trace.duckdb not found");
+
+    // Validate the DuckDB database
+    let result = validate_duckdb(&duckdb_path);
+    assert!(
+        result.is_valid(),
+        "DuckDB validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        result.errors,
+        result.warnings
+    );
+
+    // Open the database and verify network tables exist
+    let conn = Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    // Check that network_interface table exists and has data
+    let interface_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM network_interface", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
+
+    assert!(
+        interface_count > 0,
+        "network_interface table is empty - expected at least one interface"
+    );
+
+    eprintln!(
+        "✓ DuckDB validation passed with network recording ({} interfaces)",
+        interface_count
+    );
+}
+
+/// Tests that DuckDB validation correctly identifies issues.
+///
+/// This is a non-privileged test that validates the error detection
+/// in validate_duckdb().
+#[test]
+fn test_validate_duckdb_nonexistent() {
+    // Test validation of a nonexistent file
+    let result = validate_duckdb(Path::new("/nonexistent/path/trace.duckdb"));
+
+    // Should have an error for failing to open
+    assert!(
+        result.has_errors(),
+        "Expected error for nonexistent DuckDB file"
+    );
+
+    // The error should mention database opening failure
+    let error_str = format!("{:?}", result.errors);
+    assert!(
+        error_str.contains("database") || error_str.contains("open"),
+        "Error should mention database opening: {error_str}"
+    );
+}
+
+/// Tests DuckDB validation with an empty/invalid database.
+#[test]
+fn test_validate_duckdb_invalid() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let bad_db = dir.path().join("bad.duckdb");
+
+    // Create an empty file that's not a valid DuckDB database
+    std::fs::write(&bad_db, b"not a duckdb file").expect("Failed to write file");
+
+    // Validation should fail
+    let result = validate_duckdb(&bad_db);
+    assert!(
+        result.has_errors(),
+        "Expected error for invalid DuckDB file, got: {result:?}"
+    );
 }
