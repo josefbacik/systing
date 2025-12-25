@@ -200,7 +200,7 @@ impl PerfCounterRecorder {
         Ok(())
     }
 
-    /// Write trace data to Perfetto format (legacy path).
+    /// Write trace data to Perfetto format (used by parquet-to-perfetto conversion).
     pub fn write_trace(
         &self,
         writer: &mut dyn TraceWriter,

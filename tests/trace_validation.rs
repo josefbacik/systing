@@ -189,13 +189,13 @@ fn test_validate_unrecognized_file() {
     );
 }
 
-/// Tests --parquet-first with --parquet-only (streaming parquet, no perfetto conversion).
+/// Tests --parquet-only mode (skips Perfetto conversion).
 ///
-/// This tests the streaming parquet writer that writes directly to parquet files
-/// during recording, which is faster for large traces.
+/// This tests recording with the --parquet-only flag, which outputs parquet files
+/// directly without converting to Perfetto format.
 #[test]
 #[ignore] // Requires root/BPF privileges
-fn test_e2e_parquet_first_parquet_only() {
+fn test_e2e_skip_perfetto_conversion() {
     setup_bpf_environment();
 
     let dir = TempDir::new().expect("Failed to create temp dir");
@@ -203,7 +203,6 @@ fn test_e2e_parquet_first_parquet_only() {
     // Create config for streaming parquet with no perfetto conversion
     let config = Config {
         duration: 1,
-        parquet_first: true,
         parquet_only: true,
         output_dir: dir.path().to_path_buf(),
         output: dir.path().join("trace.pb"),
@@ -237,19 +236,19 @@ fn test_e2e_parquet_first_parquet_only() {
     let result = validate_parquet_dir(dir.path());
     assert!(
         result.is_valid(),
-        "Parquet validation failed with parquet_first:\nErrors: {:?}\nWarnings: {:?}",
+        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
         result.errors,
         result.warnings
     );
 }
 
-/// Tests --parquet-first with perfetto conversion (streaming parquet + parquet-to-perfetto).
+/// Tests default mode with Perfetto conversion (streaming parquet + parquet-to-perfetto).
 ///
-/// This tests the full parquet-first workflow: streaming writes during recording,
+/// This tests the full workflow: streaming writes during recording,
 /// followed by conversion to Perfetto format for compatibility.
 #[test]
 #[ignore] // Requires root/BPF privileges
-fn test_e2e_parquet_first_with_perfetto() {
+fn test_e2e_with_perfetto() {
     setup_bpf_environment();
 
     let dir = TempDir::new().expect("Failed to create temp dir");
@@ -258,7 +257,6 @@ fn test_e2e_parquet_first_with_perfetto() {
     // Create config for streaming parquet with perfetto conversion
     let config = Config {
         duration: 1,
-        parquet_first: true,
         parquet_only: false, // Enable perfetto conversion
         output_dir: dir.path().to_path_buf(),
         output: trace_path.clone(),
@@ -292,7 +290,7 @@ fn test_e2e_parquet_first_with_perfetto() {
     let parquet_result = validate_parquet_dir(dir.path());
     assert!(
         parquet_result.is_valid(),
-        "Parquet validation failed with parquet_first:\nErrors: {:?}\nWarnings: {:?}",
+        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
         parquet_result.errors,
         parquet_result.warnings
     );
@@ -307,80 +305,15 @@ fn test_e2e_parquet_first_with_perfetto() {
     );
 }
 
-/// Tests that both parquet paths (legacy and parquet-first) produce valid output.
+/// Tests network recording mode.
 ///
-/// This is a sanity check that the parquet-first streaming path produces
-/// structurally equivalent output to the legacy batch path.
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_e2e_parquet_first_vs_legacy_both_valid() {
-    setup_bpf_environment();
-
-    // Test legacy path (parquet_first: false)
-    let legacy_dir = TempDir::new().expect("Failed to create temp dir");
-    let legacy_config = Config {
-        duration: 1,
-        parquet_only: true,
-        parquet_first: false,
-        output_dir: legacy_dir.path().to_path_buf(),
-        output: legacy_dir.path().join("trace.pb"),
-        ..Config::default()
-    };
-
-    systing(legacy_config).expect("systing legacy recording failed");
-
-    let legacy_result = validate_parquet_dir(legacy_dir.path());
-    assert!(
-        legacy_result.is_valid(),
-        "Legacy parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        legacy_result.errors,
-        legacy_result.warnings
-    );
-
-    // Test parquet-first path (parquet_first: true)
-    let streaming_dir = TempDir::new().expect("Failed to create temp dir");
-    let streaming_config = Config {
-        duration: 1,
-        parquet_only: true,
-        parquet_first: true,
-        output_dir: streaming_dir.path().to_path_buf(),
-        output: streaming_dir.path().join("trace.pb"),
-        ..Config::default()
-    };
-
-    systing(streaming_config).expect("systing streaming recording failed");
-
-    let streaming_result = validate_parquet_dir(streaming_dir.path());
-    assert!(
-        streaming_result.is_valid(),
-        "Parquet-first streaming validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        streaming_result.errors,
-        streaming_result.warnings
-    );
-
-    // Both paths should produce the same core files
-    let core_files = ["process.parquet", "thread.parquet", "sched_slice.parquet"];
-    for file in &core_files {
-        assert!(
-            legacy_dir.path().join(file).exists(),
-            "Legacy path missing {file}"
-        );
-        assert!(
-            streaming_dir.path().join(file).exists(),
-            "Streaming path missing {file}"
-        );
-    }
-}
-
-/// Tests --parquet-first with --add-recorder network.
-///
-/// This validates that network recording with parquet-first mode:
+/// This validates that network recording:
 /// 1. Creates network parquet files (network_socket.parquet, etc.)
 /// 2. Creates network_interface.parquet with interface metadata
 /// 3. Converts network data to Perfetto format with proper tracks
 #[test]
 #[ignore] // Requires root/BPF privileges
-fn test_e2e_parquet_first_with_network_recorder() {
+fn test_e2e_with_network_recorder() {
     use std::fs::File;
     use std::io::Read;
 
@@ -391,8 +324,7 @@ fn test_e2e_parquet_first_with_network_recorder() {
 
     // Create config for streaming parquet with network recording enabled
     let config = Config {
-        duration: 2, // 2 seconds to capture some network activity
-        parquet_first: true,
+        duration: 2,         // 2 seconds to capture some network activity
         parquet_only: false, // Enable perfetto conversion
         network: true,       // Enable network recording
         output_dir: dir.path().to_path_buf(),
@@ -502,7 +434,6 @@ fn test_e2e_network_packets_with_traffic() {
     // Create config for streaming parquet with network recording enabled
     let config = Config {
         duration: 3, // 3 seconds to capture network activity
-        parquet_first: true,
         parquet_only: false,
         network: true,
         output_dir: dir.path().to_path_buf(),
@@ -626,11 +557,10 @@ fn test_network_recording_with_netns() {
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
-    // Create config for network recording with parquet-first.
+    // Create config for network recording.
     // See NETNS_RECORDING_DURATION_SECS for timing rationale.
     let config = Config {
         duration: NETNS_RECORDING_DURATION_SECS,
-        parquet_first: true,
         parquet_only: false,
         network: true,
         output_dir: dir.path().to_path_buf(),
@@ -866,10 +796,9 @@ if __name__ == "__main__":
     thread::sleep(Duration::from_millis(1000));
 
     // Create config with explicit PID
-    // Use parquet_first for direct parquet output with stack.parquet
+    // Use direct parquet output with stack.parquet
     let config = Config {
         duration: 3,
-        parquet_first: true,
         parquet_only: false,
         collect_pystacks: true,
         pystacks_pids: vec![python_pid],
@@ -1000,7 +929,7 @@ if __name__ == "__main__":
         found_test_functions
     );
 
-    // Verify stack_sample.parquet has samples (parquet-first path uses stack_sample)
+    // Verify stack_sample.parquet has samples
     let stack_sample_parquet = dir.path().join("stack_sample.parquet");
     assert!(
         stack_sample_parquet.exists(),
@@ -1200,7 +1129,6 @@ if __name__ == "__main__":
     // Create config with explicit PID
     let config = Config {
         duration: 5,
-        parquet_first: true,
         parquet_only: false,
         collect_pystacks: true,
         pystacks_pids: vec![python_pid],
@@ -1486,7 +1414,6 @@ if __name__ == "__main__":
 
     let config = Config {
         duration: 3,
-        parquet_first: true,
         parquet_only: false,
         collect_pystacks: true,
         pystacks_pids: vec![python_pid],
@@ -1694,23 +1621,22 @@ fn test_e2e_duckdb_validation() {
     }
 }
 
-/// Tests DuckDB generation with parquet-first mode.
+/// Tests DuckDB generation.
 ///
-/// This validates that the parquet-first streaming path correctly
+/// This validates that the parquet streaming path correctly
 /// generates DuckDB output.
 #[test]
 #[ignore] // Requires root/BPF privileges
-fn test_e2e_duckdb_with_parquet_first() {
+fn test_e2e_duckdb() {
     setup_bpf_environment();
 
     let dir = TempDir::new().expect("Failed to create temp dir");
     let duckdb_path = dir.path().join("trace.duckdb");
     let trace_path = dir.path().join("trace.pb");
 
-    // Create config with parquet-first and DuckDB output
+    // Create config with DuckDB output
     let config = Config {
         duration: 1,
-        parquet_first: true,
         parquet_only: false, // Also generate Perfetto
         with_duckdb: true,
         duckdb_output: duckdb_path.clone(),
@@ -1776,7 +1702,6 @@ fn test_e2e_duckdb_with_network_recording() {
     // Create config with network recording and DuckDB output
     let config = Config {
         duration: 2, // 2 seconds to capture some network activity
-        parquet_first: true,
         parquet_only: true,
         network: true,
         with_duckdb: true,
