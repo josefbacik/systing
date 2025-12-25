@@ -636,7 +636,7 @@ impl SchedEventRecorder {
         Ok(self.streaming_collector.take())
     }
 
-    /// Write trace data to Perfetto format (legacy path).
+    /// Write trace data to Perfetto format (used by parquet-to-perfetto conversion).
     pub fn write_trace(&self, writer: &mut dyn TraceWriter) -> Result<()> {
         // Pull all the compact scheduling events
         for (cpu, compact_sched) in self.compact_sched.iter() {

@@ -14,8 +14,9 @@ use tracing_subscriber::FmtSubscriber;
 
 use systing::{get_available_recorders, systing, Config};
 
-/// Memory lock limit for BPF programs (128 MiB)
-const MEMLOCK_RLIMIT_BYTES: u64 = 128 << 20;
+/// Memory lock limit used for capability probing (128 MiB).
+/// This value should match the limit in systing_core::MEMLOCK_RLIMIT_BYTES.
+const CAPABILITY_PROBE_MEMLOCK_BYTES: u64 = 128 << 20;
 
 #[derive(Debug, Parser)]
 struct Command {
@@ -91,13 +92,6 @@ struct Command {
     #[arg(long)]
     parquet_only: bool,
 
-    /// Use Parquet-first trace generation (writes Parquet directly during recording).
-    /// This is faster for large traces as it avoids intermediate Perfetto protobuf
-    /// generation. By default, Parquet files are still converted to Perfetto format
-    /// for compatibility; use --parquet-only to skip this conversion step.
-    #[arg(long)]
-    parquet_first: bool,
-
     /// Generate a DuckDB database from the parquet files after recording.
     /// The database can be queried using standard SQL for trace analysis.
     #[arg(long)]
@@ -139,7 +133,6 @@ impl From<Command> for Config {
             output_dir: cmd.output_dir,
             output: cmd.output,
             parquet_only: cmd.parquet_only,
-            parquet_first: cmd.parquet_first,
             with_duckdb: cmd.with_duckdb,
             duckdb_output: cmd.duckdb_output,
         }
@@ -211,8 +204,8 @@ fn has_bpf_capabilities() -> bool {
 
     // Check if we can set rlimit - this is a good proxy for having needed capabilities
     let rlimit = libc::rlimit {
-        rlim_cur: MEMLOCK_RLIMIT_BYTES,
-        rlim_max: MEMLOCK_RLIMIT_BYTES,
+        rlim_cur: CAPABILITY_PROBE_MEMLOCK_BYTES,
+        rlim_max: CAPABILITY_PROBE_MEMLOCK_BYTES,
     };
 
     unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlimit) == 0 }

@@ -28,15 +28,12 @@ use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
 use perfetto_protos::clock_snapshot::ClockSnapshot;
 use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
 use perfetto_protos::counter_descriptor::CounterDescriptor;
-use perfetto_protos::debug_annotation::DebugAnnotation;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
-use perfetto_protos::process_tree::{process_tree::Process as ProtoProcess, ProcessTree};
-use perfetto_protos::system_info::{SystemInfo, Utsname};
+use perfetto_protos::process_tree::process_tree::Process as ProtoProcess;
+use perfetto_protos::system_info::Utsname;
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_descriptor::TrackDescriptor;
-use perfetto_protos::track_event::track_event::Type;
-use perfetto_protos::track_event::TrackEvent;
 use std::fs::{self, File};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -434,7 +431,7 @@ impl SysinfoRecorder {
         Ok(())
     }
 
-    /// Write trace data to Perfetto format (legacy path).
+    /// Write trace data to Perfetto format (used by parquet-to-perfetto conversion).
     pub fn write_trace(
         &self,
         writer: &mut dyn TraceWriter,
@@ -721,302 +718,7 @@ impl SessionRecorder {
         clock_snapshot.clocks.push(clock);
     }
 
-    /// Gets the minimum timestamp from all recorded events across all recorders.
-    ///
-    /// This is used to set the timestamp for metadata events (like network interface
-    /// descriptors) so they don't affect Perfetto's trace_bounds. By using the first
-    /// actual event timestamp, these metadata events will appear at the trace start
-    /// without pushing the timeline back to 0.
-    fn get_min_event_timestamp(&self) -> u64 {
-        [
-            self.event_recorder.lock().unwrap().min_timestamp(),
-            self.stack_recorder.lock().unwrap().min_timestamp(),
-            self.perf_counter_recorder.lock().unwrap().min_timestamp(),
-            self.sysinfo_recorder.lock().unwrap().min_timestamp(),
-            self.probe_recorder.lock().unwrap().min_timestamp(),
-            self.network_recorder.lock().unwrap().min_timestamp(),
-        ]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or_else(|| get_clock_value(libc::CLOCK_BOOTTIME))
-    }
-
-    /// Writes the initial trace packets including clock snapshot and root descriptor
-    fn write_initial_packets(
-        &self,
-        writer: &mut dyn TraceWriter,
-        id_counter: &Arc<AtomicUsize>,
-    ) -> Result<()> {
-        // Emit the clock snapshot
-        let mut packet = TracePacket::default();
-        packet.set_clock_snapshot(self.clock_snapshot.lock().unwrap().clone());
-        packet.set_trusted_packet_sequence_id(id_counter.fetch_add(1, Ordering::Relaxed) as u32);
-        writer.write_packet(&packet)?;
-
-        // Emit SystemInfo with UtsName in a separate packet (both are in oneof data)
-        if let Some(utsname) = get_system_utsname() {
-            let system_info = SystemInfo {
-                utsname: Some(utsname).into(),
-                ..Default::default()
-            };
-
-            let mut packet = TracePacket::default();
-            packet.set_system_info(system_info);
-            packet
-                .set_trusted_packet_sequence_id(id_counter.fetch_add(1, Ordering::Relaxed) as u32);
-            writer.write_packet(&packet)?;
-        }
-
-        // Add the root Systing track descriptor
-        let systing_desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-        let mut desc = TrackDescriptor::default();
-        desc.set_uuid(systing_desc_uuid);
-        desc.set_name("Systing".to_string());
-
-        let mut packet = TracePacket::default();
-        packet.set_track_descriptor(desc);
-        writer.write_packet(&packet)?;
-
-        Ok(())
-    }
-
-    /// Writes trace packets for all processes
-    fn write_process_packets(
-        &self,
-        writer: &mut dyn TraceWriter,
-        id_counter: &Arc<AtomicUsize>,
-        pid_uuids: &mut HashMap<i32, u64>,
-    ) -> Result<()> {
-        // Generate process track descriptors
-        for process in self.process_descriptors.read().unwrap().values() {
-            let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            pid_uuids.insert(process.pid(), uuid);
-
-            let mut desc = TrackDescriptor::default();
-            desc.set_uuid(uuid);
-            desc.process = Some(process.clone()).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            writer.write_packet(&packet)?;
-        }
-
-        // Generate process trees
-        for process in self.processes.read().unwrap().values() {
-            let process_tree = ProcessTree {
-                processes: vec![process.clone()],
-                ..ProcessTree::default()
-            };
-
-            let mut packet = TracePacket::default();
-            packet.set_process_tree(process_tree);
-            writer.write_packet(&packet)?;
-        }
-
-        Ok(())
-    }
-
-    /// Writes trace packets for all threads (excluding main threads).
-    ///
-    /// Main threads (where tid == pid) are represented by ProcessDescriptor in Perfetto,
-    /// not ThreadDescriptor. The Perfetto validation rejects ThreadDescriptor entries
-    /// where pid == tid. Main threads are already covered by `write_process_packets`.
-    fn write_thread_packets(
-        &self,
-        writer: &mut dyn TraceWriter,
-        id_counter: &Arc<AtomicUsize>,
-        thread_uuids: &mut HashMap<i32, u64>,
-    ) -> Result<()> {
-        for thread in self.threads.read().unwrap().values() {
-            // Skip main threads - they're represented by ProcessDescriptor, not ThreadDescriptor.
-            // In Perfetto, when tid == pid, the thread is the main thread and should use
-            // ProcessDescriptor instead.
-            if thread.tid() == thread.pid() {
-                continue;
-            }
-
-            let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            thread_uuids.insert(thread.tid(), uuid);
-
-            let mut desc = TrackDescriptor::default();
-            desc.set_uuid(uuid);
-            desc.thread = Some(thread.clone()).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            writer.write_packet(&packet)?;
-        }
-
-        Ok(())
-    }
-
-    /// Writes trace packets for network interface metadata.
-    ///
-    /// Creates a hierarchical "Network Interfaces" track structure that includes:
-    /// - Host network namespace interfaces
-    /// - Container/process network namespace interfaces (deduplicated by namespace inode)
-    ///
-    /// # Arguments
-    ///
-    /// * `writer` - The TraceWriter to write packets to
-    /// * `id_counter` - Atomic counter for generating unique track UUIDs
-    /// * `trace_start_ts` - BOOTTIME timestamp for when the trace began (used for metadata events)
-    ///
-    /// The hierarchy looks like:
-    /// ```text
-    /// Network Interfaces
-    /// ├── host
-    /// │   ├── eth0
-    /// │   └── docker0
-    /// ├── container:abc123 (nginx)
-    /// │   └── eth0
-    /// └── netns:4026532890 (java:1234)
-    ///     └── eth0
-    /// ```
-    fn write_network_interface_packets(
-        &self,
-        writer: &mut dyn TraceWriter,
-        id_counter: &Arc<AtomicUsize>,
-        trace_start_ts: u64,
-    ) -> Result<()> {
-        let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-
-        // Create root "Network Interfaces" track
-        let root_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-        let mut root_desc = TrackDescriptor::default();
-        root_desc.set_uuid(root_uuid);
-        root_desc.set_name(NETWORK_INTERFACES_TRACK_NAME.to_string());
-
-        let mut root_packet = TracePacket::default();
-        root_packet.set_track_descriptor(root_desc);
-        writer.write_packet(&root_packet)?;
-
-        // Get host network namespace inode for comparison
-        let host_netns_inode = get_host_netns_inode();
-
-        // Build a map of unique network namespaces from recorded processes
-        let mut netns_map: HashMap<u64, NetnsInfo> = HashMap::new();
-
-        // First, add the host namespace
-        if let Some(host_inode) = host_netns_inode {
-            netns_map.insert(
-                host_inode,
-                NetnsInfo {
-                    inode: host_inode,
-                    representative_pid: 1,
-                    container_id: None,
-                    comm: "host".to_string(),
-                    is_host: true,
-                },
-            );
-        }
-
-        // Iterate through all recorded processes to find unique network namespaces
-        for tgidpid in self.process_descriptors.read().unwrap().keys() {
-            let pid = (*tgidpid >> 32) as u32;
-
-            if let Some(inode) = get_netns_inode(pid) {
-                // Only add if we haven't seen this namespace yet
-                netns_map.entry(inode).or_insert_with(|| {
-                    let is_host = host_netns_inode == Some(inode);
-                    NetnsInfo {
-                        inode,
-                        representative_pid: pid,
-                        container_id: if is_host { None } else { get_container_id(pid) },
-                        comm: get_comm(pid),
-                        is_host,
-                    }
-                });
-            }
-        }
-
-        // Sort namespaces: host first, then by inode for consistent ordering
-        let mut namespaces: Vec<_> = netns_map.into_values().collect();
-        namespaces.sort_by(|a, b| match (a.is_host, b.is_host) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.inode.cmp(&b.inode),
-        });
-
-        // Generate tracks for each namespace
-        for netns_info in namespaces {
-            // Create namespace track name
-            let netns_name = netns_info.display_name();
-
-            // Get interfaces for this namespace
-            let interfaces = if netns_info.is_host {
-                // For host namespace, we can use get_network_interfaces directly
-                get_network_interfaces()
-            } else {
-                // For other namespaces, enter the namespace to get interfaces
-                get_interfaces_in_netns(netns_info.representative_pid)
-            };
-
-            if interfaces.is_empty() {
-                continue;
-            }
-
-            // Create namespace track (child of root)
-            let netns_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            let mut netns_desc = TrackDescriptor::default();
-            netns_desc.set_uuid(netns_uuid);
-            netns_desc.set_name(netns_name);
-            netns_desc.set_parent_uuid(root_uuid);
-
-            let mut netns_packet = TracePacket::default();
-            netns_packet.set_track_descriptor(netns_desc);
-            writer.write_packet(&netns_packet)?;
-
-            // Create child tracks for each interface in this namespace
-            for iface in interfaces {
-                let iface_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-
-                // Create track descriptor for this interface (child of namespace track)
-                let mut iface_desc = TrackDescriptor::default();
-                iface_desc.set_uuid(iface_uuid);
-                iface_desc.set_name(iface.name.clone());
-                iface_desc.set_parent_uuid(netns_uuid);
-
-                let mut iface_packet = TracePacket::default();
-                iface_packet.set_track_descriptor(iface_desc);
-                writer.write_packet(&iface_packet)?;
-
-                // Create an instant event with debug annotations for IP addresses
-                let mut track_event = TrackEvent::default();
-                track_event.set_type(Type::TYPE_INSTANT);
-                track_event.set_track_uuid(iface_uuid);
-                track_event.set_name(iface.name);
-
-                // Add IPv4 addresses as debug annotations
-                for ipv4 in iface.ipv4_addrs {
-                    let mut annotation = DebugAnnotation::default();
-                    annotation.set_name("ipv4".to_string());
-                    annotation.set_string_value(ipv4.to_string());
-                    track_event.debug_annotations.push(annotation);
-                }
-
-                // Add IPv6 addresses as debug annotations
-                for ipv6 in iface.ipv6_addrs {
-                    let mut annotation = DebugAnnotation::default();
-                    annotation.set_name("ipv6".to_string());
-                    annotation.set_string_value(ipv6.to_string());
-                    track_event.debug_annotations.push(annotation);
-                }
-
-                let mut event_packet = TracePacket::default();
-                // Use trace start timestamp so these don't affect trace_bounds
-                event_packet.set_timestamp(trace_start_ts);
-                event_packet.set_track_event(track_event);
-                event_packet.set_trusted_packet_sequence_id(sequence_id);
-                writer.write_packet(&event_packet)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Write network interface records to the RecordCollector (parquet-first path).
+    /// Write network interface records to the RecordCollector.
     ///
     /// Collects network interface metadata from all recorded processes' network namespaces
     /// and writes them as NetworkInterfaceRecord entries.
@@ -1104,87 +806,6 @@ impl SessionRecorder {
                 }
             }
         }
-
-        Ok(())
-    }
-
-    /// Writes trace packets from all event recorders directly to the writer
-    fn write_recorder_traces(
-        &self,
-        writer: &mut dyn TraceWriter,
-        pid_uuids: &HashMap<i32, u64>,
-        thread_uuids: &HashMap<i32, u64>,
-        id_counter: &Arc<AtomicUsize>,
-    ) -> Result<()> {
-        // Event recorder
-        eprintln!("Generating scheduler trace packets...");
-        self.event_recorder.lock().unwrap().write_trace(writer)?;
-
-        // Stack recorder - it has its own detailed progress bar for symbol resolution
-        eprintln!("Generating stack trace packets...");
-        self.stack_recorder
-            .lock()
-            .unwrap()
-            .write_trace(writer, id_counter)?;
-
-        // Performance counter recorder
-        eprintln!("Generating perf counter trace packets...");
-        self.perf_counter_recorder
-            .lock()
-            .unwrap()
-            .write_trace(writer, id_counter)?;
-
-        // System info recorder
-        eprintln!("Generating sysinfo trace packets...");
-        self.sysinfo_recorder
-            .lock()
-            .unwrap()
-            .write_trace(writer, id_counter)?;
-
-        eprintln!("Generating probe trace packets...");
-        self.probe_recorder.lock().unwrap().write_trace(
-            writer,
-            pid_uuids,
-            thread_uuids,
-            id_counter,
-        )?;
-
-        eprintln!("Generating syscall trace packets...");
-
-        // Network recorder
-        eprintln!("Generating network trace packets...");
-        self.network_recorder.lock().unwrap().write_trace_packets(
-            writer,
-            pid_uuids,
-            thread_uuids,
-            id_counter,
-        )?;
-
-        Ok(())
-    }
-
-    pub fn generate_trace(&self, writer: &mut dyn TraceWriter) -> Result<()> {
-        let id_counter = Arc::new(AtomicUsize::new(1));
-        let mut pid_uuids = HashMap::new();
-        let mut thread_uuids = HashMap::new();
-
-        // Step 1: Generate initial packets (clock snapshot and root descriptor)
-        self.write_initial_packets(writer, &id_counter)?;
-
-        // Get the trace start timestamp for metadata events (first actual event timestamp)
-        let trace_start_ts = self.get_min_event_timestamp();
-
-        // Step 2: Generate network interface metadata packets
-        self.write_network_interface_packets(writer, &id_counter, trace_start_ts)?;
-
-        // Step 3: Generate process-related packets
-        self.write_process_packets(writer, &id_counter, &mut pid_uuids)?;
-
-        // Step 4: Generate thread-related packets
-        self.write_thread_packets(writer, &id_counter, &mut thread_uuids)?;
-
-        // Step 5: Collect traces from all recorders
-        self.write_recorder_traces(writer, &pid_uuids, &thread_uuids, &id_counter)?;
 
         Ok(())
     }
@@ -1492,9 +1113,142 @@ impl crate::systing_core::SystingEvent for SysInfoEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::perfetto::VecTraceWriter;
+    use crate::perfetto::{TraceWriter, VecTraceWriter};
+    use perfetto_protos::process_tree::ProcessTree;
+    use perfetto_protos::system_info::SystemInfo;
     use perfetto_protos::trace_packet::TracePacket;
     use std::sync::{Mutex, RwLock};
+
+    // =========================================================================
+    // Test-only helper functions (moved from SessionRecorder impl)
+    // =========================================================================
+
+    /// Gets the minimum timestamp from all recorded events across all recorders.
+    fn get_min_event_timestamp(recorder: &SessionRecorder) -> u64 {
+        [
+            recorder.event_recorder.lock().unwrap().min_timestamp(),
+            recorder.stack_recorder.lock().unwrap().min_timestamp(),
+            recorder
+                .perf_counter_recorder
+                .lock()
+                .unwrap()
+                .min_timestamp(),
+            recorder.sysinfo_recorder.lock().unwrap().min_timestamp(),
+            recorder.probe_recorder.lock().unwrap().min_timestamp(),
+            recorder.network_recorder.lock().unwrap().min_timestamp(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or_else(|| get_clock_value(libc::CLOCK_BOOTTIME))
+    }
+
+    /// Writes the initial trace packets including clock snapshot and root descriptor
+    fn write_initial_packets(
+        recorder: &SessionRecorder,
+        writer: &mut dyn TraceWriter,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Result<()> {
+        // Emit the clock snapshot
+        let mut packet = TracePacket::default();
+        packet.set_clock_snapshot(recorder.clock_snapshot.lock().unwrap().clone());
+        packet.set_trusted_packet_sequence_id(id_counter.fetch_add(1, Ordering::Relaxed) as u32);
+        writer.write_packet(&packet)?;
+
+        // Emit SystemInfo with UtsName in a separate packet (both are in oneof data)
+        if let Some(utsname) = get_system_utsname() {
+            let system_info = SystemInfo {
+                utsname: Some(utsname).into(),
+                ..Default::default()
+            };
+
+            let mut packet = TracePacket::default();
+            packet.set_system_info(system_info);
+            packet
+                .set_trusted_packet_sequence_id(id_counter.fetch_add(1, Ordering::Relaxed) as u32);
+            writer.write_packet(&packet)?;
+        }
+
+        // Add the root Systing track descriptor
+        let systing_desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        let mut desc = TrackDescriptor::default();
+        desc.set_uuid(systing_desc_uuid);
+        desc.set_name("Systing".to_string());
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(desc);
+        writer.write_packet(&packet)?;
+
+        Ok(())
+    }
+
+    /// Writes trace packets for all processes
+    fn write_process_packets(
+        recorder: &SessionRecorder,
+        writer: &mut dyn TraceWriter,
+        id_counter: &Arc<AtomicUsize>,
+        pid_uuids: &mut HashMap<i32, u64>,
+    ) -> Result<()> {
+        // Generate process track descriptors
+        for process in recorder.process_descriptors.read().unwrap().values() {
+            let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+            pid_uuids.insert(process.pid(), uuid);
+
+            let mut desc = TrackDescriptor::default();
+            desc.set_uuid(uuid);
+            desc.process = Some(process.clone()).into();
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            writer.write_packet(&packet)?;
+        }
+
+        // Generate process trees
+        for process in recorder.processes.read().unwrap().values() {
+            let process_tree = ProcessTree {
+                processes: vec![process.clone()],
+                ..ProcessTree::default()
+            };
+
+            let mut packet = TracePacket::default();
+            packet.set_process_tree(process_tree);
+            writer.write_packet(&packet)?;
+        }
+
+        Ok(())
+    }
+
+    /// Writes trace packets for all threads (excluding main threads).
+    fn write_thread_packets(
+        recorder: &SessionRecorder,
+        writer: &mut dyn TraceWriter,
+        id_counter: &Arc<AtomicUsize>,
+        thread_uuids: &mut HashMap<i32, u64>,
+    ) -> Result<()> {
+        for thread in recorder.threads.read().unwrap().values() {
+            // Skip main threads - they're represented by ProcessDescriptor, not ThreadDescriptor.
+            if thread.tid() == thread.pid() {
+                continue;
+            }
+
+            let uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
+            thread_uuids.insert(thread.tid(), uuid);
+
+            let mut desc = TrackDescriptor::default();
+            desc.set_uuid(uuid);
+            desc.thread = Some(thread.clone()).into();
+
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            writer.write_packet(&packet)?;
+        }
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // Test helper functions that use the above
+    // =========================================================================
 
     /// Helper to collect process packets for tests
     fn generate_process_packets(
@@ -1503,9 +1257,7 @@ mod tests {
         pid_uuids: &mut HashMap<i32, u64>,
     ) -> Vec<TracePacket> {
         let mut writer = VecTraceWriter::new();
-        recorder
-            .write_process_packets(&mut writer, id_counter, pid_uuids)
-            .unwrap();
+        write_process_packets(recorder, &mut writer, id_counter, pid_uuids).unwrap();
         writer.packets
     }
 
@@ -1516,9 +1268,7 @@ mod tests {
         thread_uuids: &mut HashMap<i32, u64>,
     ) -> Vec<TracePacket> {
         let mut writer = VecTraceWriter::new();
-        recorder
-            .write_thread_packets(&mut writer, id_counter, thread_uuids)
-            .unwrap();
+        write_thread_packets(recorder, &mut writer, id_counter, thread_uuids).unwrap();
         writer.packets
     }
 
@@ -1528,9 +1278,7 @@ mod tests {
         id_counter: &Arc<AtomicUsize>,
     ) -> Vec<TracePacket> {
         let mut writer = VecTraceWriter::new();
-        recorder
-            .write_initial_packets(&mut writer, id_counter)
-            .unwrap();
+        write_initial_packets(recorder, &mut writer, id_counter).unwrap();
         writer.packets
     }
 
@@ -2091,7 +1839,7 @@ mod tests {
     fn test_get_min_event_timestamp_no_events() {
         let recorder = create_test_session_recorder();
 
-        let ts = recorder.get_min_event_timestamp();
+        let ts = get_min_event_timestamp(&recorder);
 
         // Should return a fallback non-zero value (current BOOTTIME) when no events recorded
         assert!(
@@ -2129,7 +1877,7 @@ mod tests {
             event_recorder.handle_event(event);
         }
 
-        let ts = recorder.get_min_event_timestamp();
+        let ts = get_min_event_timestamp(&recorder);
 
         // Should return the timestamp of the recorded event
         assert_eq!(ts, 1_000_000_000, "Should return min event timestamp");

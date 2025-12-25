@@ -37,7 +37,6 @@ pub mod events;
 pub mod network_recorder;
 pub mod parquet;
 pub mod parquet_to_perfetto;
-pub mod parquet_writer;
 pub mod perf;
 pub mod perf_recorder;
 pub mod perfetto;

@@ -22,7 +22,6 @@ use std::time::Duration;
 use crate::events::{EventKeyType, EventProbe, SystingProbeRecorder};
 use crate::network_recorder;
 use crate::parquet_to_perfetto;
-use crate::parquet_writer::ParquetTraceWriter;
 use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::ringbuf::RingBuffer;
@@ -259,8 +258,6 @@ pub struct Config {
     pub output: PathBuf,
     /// Skip Perfetto generation, keep only parquet
     pub parquet_only: bool,
-    /// Use Parquet-first trace generation
-    pub parquet_first: bool,
     /// Generate DuckDB database
     pub with_duckdb: bool,
     /// Path for DuckDB output
@@ -298,7 +295,6 @@ impl Default for Config {
             output_dir: PathBuf::from("./traces"),
             output: PathBuf::from("trace.pb"),
             parquet_only: false,
-            parquet_first: false,
             with_duckdb: false,
             duckdb_output: PathBuf::from("trace.duckdb"),
         }
@@ -2018,15 +2014,13 @@ pub fn systing(opts: Config) -> Result<()> {
     configure_recorder(&opts, &recorder);
     recorder.snapshot_clocks();
 
-    // If using parquet_first mode, initialize streaming parquet output BEFORE recording starts
-    if opts.parquet_first {
-        prepare_output_dir(&opts.output_dir)?;
-        recorder.init_streaming_parquet(&opts.output_dir)?;
-        eprintln!(
-            "Initialized streaming parquet output to {:?}",
-            opts.output_dir
-        );
-    }
+    // Initialize streaming parquet output BEFORE recording starts
+    prepare_output_dir(&opts.output_dir)?;
+    recorder.init_streaming_parquet(&opts.output_dir)?;
+    eprintln!(
+        "Initialized streaming parquet output to {:?}",
+        opts.output_dir
+    );
 
     {
         let mut skel_builder = SystingSystemSkelBuilder::default();
@@ -2328,34 +2322,13 @@ pub fn systing(opts: Config) -> Result<()> {
         recorder.drain_all_ringbufs();
     }
 
-    // Prepare output directory (if not already done for streaming)
-    if !opts.parquet_first {
-        prepare_output_dir(&opts.output_dir)?;
-    }
-
-    // Write trace files using either Parquet-first or legacy path
-    if opts.parquet_first {
-        // Parquet-first path: write directly to Parquet files
-        println!(
-            "Writing Parquet trace files (direct) to {}...",
-            opts.output_dir.display()
-        );
-        recorder.generate_parquet_trace(&opts.output_dir)?;
-        println!("Successfully wrote Parquet trace files");
-    } else {
-        // Legacy path: generate TracePackets, extract to Parquet
-        println!(
-            "Writing parquet trace files to {}...",
-            opts.output_dir.display()
-        );
-        let mut parquet_writer = ParquetTraceWriter::new(&opts.output_dir)?;
-        recorder.generate_trace(&mut parquet_writer)?;
-        let _paths = parquet_writer.flush()?;
-        println!(
-            "Successfully wrote {} trace packets to parquet files",
-            parquet_writer.packet_count()
-        );
-    }
+    // Write trace files directly to Parquet
+    println!(
+        "Writing Parquet trace files to {}...",
+        opts.output_dir.display()
+    );
+    recorder.generate_parquet_trace(&opts.output_dir)?;
+    println!("Successfully wrote Parquet trace files");
 
     // Convert to Perfetto (unless --parquet-only)
     if !opts.parquet_only {
