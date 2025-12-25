@@ -92,7 +92,7 @@ enum Commands {
 
     /// Validate trace data for correctness
     Validate {
-        /// Path to Parquet directory or Perfetto trace file
+        /// Path to Parquet directory, DuckDB database, or Perfetto trace file
         #[arg(required = true)]
         path: PathBuf,
 
@@ -3403,7 +3403,9 @@ fn run_interactive(conn: &Connection, format: &str) -> Result<()> {
 
 /// Run the validate command
 fn run_validate(path: PathBuf, verbose: bool, json: bool) -> Result<()> {
-    use systing::{validate_parquet_dir, validate_perfetto_trace, ValidationResult};
+    use systing::{
+        validate_duckdb, validate_parquet_dir, validate_perfetto_trace, ValidationResult,
+    };
 
     if !path.exists() {
         bail!("Path not found: {}", path.display());
@@ -3416,15 +3418,21 @@ fn run_validate(path: PathBuf, verbose: bool, json: bool) -> Result<()> {
         }
         validate_parquet_dir(&path)
     } else {
-        // Validate Perfetto trace file
+        // Validate file based on extension
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if name.ends_with(".pb") || name.ends_with(".pb.gz") {
+        if name.ends_with(".duckdb") {
+            // Validate DuckDB database
+            if verbose {
+                eprintln!("Validating DuckDB database: {}", path.display());
+            }
+            validate_duckdb(&path)
+        } else if name.ends_with(".pb") || name.ends_with(".pb.gz") {
             if verbose {
                 eprintln!("Validating Perfetto trace: {}", path.display());
             }
             validate_perfetto_trace(&path)
         } else {
-            bail!("Unrecognized file type. Use a Parquet directory or .pb/.pb.gz trace file.");
+            bail!("Unrecognized file type. Use a Parquet directory, .duckdb database, or .pb/.pb.gz trace file.");
         }
     };
 

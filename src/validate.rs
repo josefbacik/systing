@@ -1,7 +1,8 @@
 //! Trace validation module.
 //!
-//! This module provides validation for Parquet trace files and Perfetto protobuf traces.
-//! It checks for schema correctness, reference integrity, and data consistency.
+//! This module provides validation for Parquet trace files, Perfetto protobuf traces,
+//! and DuckDB databases. It checks for schema correctness, reference integrity, and
+//! data consistency.
 //!
 //! # Example
 //!
@@ -20,6 +21,7 @@
 use anyhow::{bail, Context, Result};
 use arrow::array::Array;
 use arrow::datatypes::DataType;
+use duckdb::Connection;
 use flate2::read::GzDecoder;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use perfetto_protos::trace_packet::TracePacket;
@@ -198,6 +200,10 @@ pub enum ValidationWarning {
     MissingColumn { table: String, column: String },
     /// Too many errors of the same type - only showing first N.
     TooManyErrors { table: String, shown: usize },
+    /// Some entities have empty names.
+    EmptyNames { table: String, count: i64 },
+    /// Stack timing violations detected.
+    StackTimingViolations { sample_type: String, count: i64 },
 }
 
 impl fmt::Display for ValidationWarning {
@@ -211,6 +217,15 @@ impl fmt::Display for ValidationWarning {
             }
             ValidationWarning::TooManyErrors { table, shown } => {
                 write!(f, "{table}: showing first {shown} errors, more exist")
+            }
+            ValidationWarning::EmptyNames { table, count } => {
+                write!(f, "{table}: {count} entries have empty names")
+            }
+            ValidationWarning::StackTimingViolations { sample_type, count } => {
+                write!(
+                    f,
+                    "stack_sample: {count} {sample_type} samples have timing violations"
+                )
             }
         }
     }
@@ -2110,6 +2125,412 @@ fn open_trace_reader(path: &Path) -> Result<Box<dyn BufRead + Send>> {
         Ok(Box::new(BufReader::with_capacity(256 * 1024, decoder)))
     } else {
         Ok(Box::new(reader))
+    }
+}
+
+/// Validate a DuckDB database for trace data correctness.
+///
+/// This function performs the same validation checks as `validate_parquet_dir` but
+/// operates on a DuckDB database instead of Parquet files. It checks:
+///
+/// - Schema correctness (column types)
+/// - Reference integrity (foreign key relationships)
+/// - Required field validation (non-null constraints)
+/// - Stack timing validation (stack samples occur at valid times)
+///
+/// # Arguments
+///
+/// * `db_path` - Path to the DuckDB database file
+///
+/// # Example
+///
+/// ```no_run
+/// use systing::validate::{validate_duckdb, ValidationResult};
+/// use std::path::Path;
+///
+/// let result = validate_duckdb(Path::new("./trace.duckdb"));
+/// if result.has_errors() {
+///     for error in &result.errors {
+///         eprintln!("Error: {}", error);
+///     }
+/// }
+/// ```
+pub fn validate_duckdb(db_path: &Path) -> ValidationResult {
+    let mut result = ValidationResult::default();
+
+    // Open the database
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            result.add_error(ValidationError::ReadError {
+                table: "database".to_string(),
+                message: format!("Failed to open DuckDB database: {e}"),
+            });
+            return result;
+        }
+    };
+
+    // Phase 1: Check required tables exist
+    validate_duckdb_required_tables(&conn, &mut result);
+
+    // Phase 2: Schema validation
+    validate_duckdb_sched_slice_schema(&conn, &mut result);
+    validate_duckdb_counter_track_schema(&conn, &mut result);
+
+    // Phase 3: Reference integrity
+    validate_duckdb_thread_upid_refs(&conn, &mut result);
+    validate_duckdb_sched_utid_refs(&conn, &mut result);
+
+    // Phase 4: Required field validation
+    validate_duckdb_process_names(&conn, &mut result);
+    validate_duckdb_thread_names(&conn, &mut result);
+
+    // Phase 5: Stack timing validation
+    validate_duckdb_stack_timing(&conn, &mut result);
+
+    result
+}
+
+/// Check that required tables exist in the DuckDB database.
+fn validate_duckdb_required_tables(conn: &Connection, result: &mut ValidationResult) {
+    let required_tables = ["process", "thread", "sched_slice"];
+
+    for table in required_tables {
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = ?",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if !exists {
+            result.add_error(ValidationError::MissingFile {
+                table: table.to_string(),
+                path: format!("table '{table}' not found in database"),
+            });
+        }
+    }
+}
+
+/// Check if a DuckDB type is an integer type.
+fn is_duckdb_integer_type(data_type: &str) -> bool {
+    let upper = data_type.to_uppercase();
+    // DuckDB integer types: TINYINT, SMALLINT, INTEGER, BIGINT, HUGEINT
+    // Also INT, INT2, INT4, INT8 aliases
+    upper == "INTEGER"
+        || upper == "INT"
+        || upper == "INT4"
+        || upper == "BIGINT"
+        || upper == "INT8"
+        || upper == "SMALLINT"
+        || upper == "INT2"
+        || upper == "TINYINT"
+        || upper == "HUGEINT"
+}
+
+/// Check if a DuckDB type is a string type.
+fn is_duckdb_string_type(data_type: &str) -> bool {
+    let upper = data_type.to_uppercase();
+    // DuckDB string types: VARCHAR, TEXT, STRING, CHAR(n)
+    upper == "VARCHAR" || upper == "TEXT" || upper == "STRING" || upper.starts_with("CHAR")
+}
+
+/// Validate sched_slice table schema in DuckDB.
+fn validate_duckdb_sched_slice_schema(conn: &Connection, result: &mut ValidationResult) {
+    // Check end_state column type (should be INTEGER)
+    let type_result: Result<String, _> = conn.query_row(
+        "SELECT data_type FROM information_schema.columns
+         WHERE table_name = 'sched_slice' AND column_name = 'end_state'",
+        [],
+        |row| row.get(0),
+    );
+
+    match type_result {
+        Ok(data_type) => {
+            if !is_duckdb_integer_type(&data_type) {
+                result.add_error(ValidationError::WrongColumnType {
+                    table: "sched_slice".to_string(),
+                    column: "end_state".to_string(),
+                    expected: "INTEGER".to_string(),
+                    got: data_type,
+                });
+            }
+        }
+        Err(_) => {
+            // Column doesn't exist - this is a warning, not an error
+            // (some traces may not have end_state)
+            result.add_warning(ValidationWarning::MissingColumn {
+                table: "sched_slice".to_string(),
+                column: "end_state".to_string(),
+            });
+        }
+    }
+}
+
+/// Validate counter_track table schema in DuckDB.
+fn validate_duckdb_counter_track_schema(conn: &Connection, result: &mut ValidationResult) {
+    // Check if table exists first
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = 'counter_track'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !exists {
+        // counter_track is optional
+        return;
+    }
+
+    // Check unit column type (should be VARCHAR)
+    let type_result: Result<String, _> = conn.query_row(
+        "SELECT data_type FROM information_schema.columns
+         WHERE table_name = 'counter_track' AND column_name = 'unit'",
+        [],
+        |row| row.get(0),
+    );
+
+    match type_result {
+        Ok(data_type) => {
+            if !is_duckdb_string_type(&data_type) {
+                result.add_error(ValidationError::WrongColumnType {
+                    table: "counter_track".to_string(),
+                    column: "unit".to_string(),
+                    expected: "VARCHAR".to_string(),
+                    got: data_type,
+                });
+            }
+        }
+        Err(_) => {
+            result.add_warning(ValidationWarning::MissingColumn {
+                table: "counter_track".to_string(),
+                column: "unit".to_string(),
+            });
+        }
+    }
+
+    // Validate unit values
+    let invalid_units: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT unit FROM counter_track
+             WHERE unit IS NOT NULL
+             AND unit NOT IN ('', 'count', 'time_ns', 'size_bytes', 'Hz')",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    for unit in invalid_units {
+        result.add_error(ValidationError::InvalidEnumValue {
+            table: "counter_track".to_string(),
+            column: "unit".to_string(),
+            value: unit,
+        });
+    }
+}
+
+/// Validate that all thread.upid values reference valid process.upid values.
+fn validate_duckdb_thread_upid_refs(conn: &Connection, result: &mut ValidationResult) {
+    // Find threads with invalid upid references
+    let invalid_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM thread t
+             WHERE t.upid IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM process p WHERE p.upid = t.upid)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if invalid_count > 0 {
+        // Get one example of an invalid reference
+        if let Ok(invalid_upid) = conn.query_row::<i64, _, _>(
+            "SELECT t.upid FROM thread t
+             WHERE t.upid IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM process p WHERE p.upid = t.upid)
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        ) {
+            result.add_error(ValidationError::MissingReference {
+                table: "thread".to_string(),
+                column: "upid".to_string(),
+                value: invalid_upid,
+                referenced_table: "process".to_string(),
+            });
+        }
+    }
+}
+
+/// Validate that all sched_slice.utid values reference valid thread.utid values.
+fn validate_duckdb_sched_utid_refs(conn: &Connection, result: &mut ValidationResult) {
+    // Find sched_slice entries with invalid utid references
+    let invalid_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sched_slice s
+             WHERE s.utid IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM thread t WHERE t.utid = s.utid)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if invalid_count > 0 {
+        // Get one example of an invalid reference
+        if let Ok(invalid_utid) = conn.query_row::<i64, _, _>(
+            "SELECT s.utid FROM sched_slice s
+             WHERE s.utid IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM thread t WHERE t.utid = s.utid)
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        ) {
+            result.add_error(ValidationError::MissingReference {
+                table: "sched_slice".to_string(),
+                column: "utid".to_string(),
+                value: invalid_utid,
+                referenced_table: "thread".to_string(),
+            });
+        }
+    }
+}
+
+/// Validate that process names are not empty.
+fn validate_duckdb_process_names(conn: &Connection, result: &mut ValidationResult) {
+    // Check for processes with empty names (excluding pid 0)
+    let empty_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM process
+             WHERE (name IS NULL OR name = '') AND pid != 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if empty_count > 0 {
+        result.add_warning(ValidationWarning::EmptyNames {
+            table: "process".to_string(),
+            count: empty_count,
+        });
+    }
+}
+
+/// Validate that thread names are not empty.
+fn validate_duckdb_thread_names(conn: &Connection, result: &mut ValidationResult) {
+    // Check for threads with empty names (excluding tid 0)
+    let empty_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM thread
+             WHERE (name IS NULL OR name = '') AND tid != 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if empty_count > 0 {
+        result.add_warning(ValidationWarning::EmptyNames {
+            table: "thread".to_string(),
+            count: empty_count,
+        });
+    }
+}
+
+/// Tolerance for stack timing validation in nanoseconds.
+/// Stack samples may be slightly offset from slice boundaries due to timing jitter.
+const DUCKDB_STACK_TIMING_TOLERANCE_NS: i64 = 100_000; // 100 microseconds
+
+/// Validate stack sample timing against scheduler slices.
+fn validate_duckdb_stack_timing(conn: &Connection, result: &mut ValidationResult) {
+    // Check if stack_sample table exists
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = 'stack_sample'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !exists {
+        return;
+    }
+
+    // Check if stack_event_type column exists
+    let has_event_type: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM information_schema.columns
+             WHERE table_name = 'stack_sample' AND column_name = 'stack_event_type'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !has_event_type {
+        // Old format without stack_event_type - skip timing validation
+        return;
+    }
+
+    // Validate STACK_SLEEP (type=0) samples: should be near the end of a sleep slice
+    // A sleep slice is one where end_state != 0 (not preempted)
+    let tolerance = DUCKDB_STACK_TIMING_TOLERANCE_NS;
+
+    let sleep_violations: i64 = conn
+        .query_row(
+            &format!(
+                "WITH first_sched AS (
+                    SELECT utid, MIN(ts) as first_ts FROM sched_slice GROUP BY utid
+                )
+                SELECT COUNT(*) FROM stack_sample ss
+                JOIN first_sched fs ON ss.utid = fs.utid
+                WHERE ss.stack_event_type = 0  -- STACK_SLEEP
+                AND ss.ts >= fs.first_ts  -- Only check samples after first sched event
+                AND NOT EXISTS (
+                    SELECT 1 FROM sched_slice s
+                    WHERE s.utid = ss.utid
+                    AND s.end_state IS NOT NULL AND s.end_state != 0  -- Sleep state
+                    AND ABS(ss.ts - (s.ts + s.dur)) <= {tolerance}  -- Near slice end
+                )"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if sleep_violations > 0 {
+        result.add_warning(ValidationWarning::StackTimingViolations {
+            sample_type: "STACK_SLEEP".to_string(),
+            count: sleep_violations,
+        });
+    }
+
+    // Validate STACK_RUNNING (type=1) samples: should be within a running slice
+    let running_violations: i64 = conn
+        .query_row(
+            "WITH first_sched AS (
+                SELECT utid, MIN(ts) as first_ts FROM sched_slice GROUP BY utid
+            )
+            SELECT COUNT(*) FROM stack_sample ss
+            JOIN first_sched fs ON ss.utid = fs.utid
+            WHERE ss.stack_event_type = 1  -- STACK_RUNNING
+            AND ss.ts >= fs.first_ts  -- Only check samples after first sched event
+            AND NOT EXISTS (
+                SELECT 1 FROM sched_slice s
+                WHERE s.utid = ss.utid
+                AND ss.ts >= s.ts AND ss.ts < s.ts + s.dur  -- Within slice
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if running_violations > 0 {
+        result.add_warning(ValidationWarning::StackTimingViolations {
+            sample_type: "STACK_RUNNING".to_string(),
+            count: running_violations,
+        });
     }
 }
 
