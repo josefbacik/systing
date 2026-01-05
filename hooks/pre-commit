@@ -31,13 +31,17 @@ else
     FAILED=1
 fi
 
-# Check clippy with pystacks feature
+# Check clippy with pystacks feature (only if dependencies are available)
 echo -ne "Checking clippy (pystacks)... "
-if cargo clippy --all-targets --features pystacks -- -D warnings &> /dev/null; then
-    echo -e "${GREEN}✓${NC}"
+if pkg-config --exists fmt re2 libcap 2>/dev/null; then
+    if cargo clippy --all-targets --features pystacks -- -D warnings &> /dev/null; then
+        echo -e "${GREEN}✓${NC}"
+    else
+        echo -e "${RED}✗${NC}"
+        FAILED=1
+    fi
 else
-    echo -e "${RED}✗${NC}"
-    FAILED=1
+    echo -e "${GREEN}⊘ (dependencies not installed)${NC}"
 fi
 
 # Exit with failure if any check failed
