@@ -84,22 +84,15 @@ struct Command {
     #[arg(long, default_value = "./traces")]
     output_dir: PathBuf,
 
-    /// Path for the Perfetto trace file
+    /// Output file path. Format is auto-detected from extension:
+    /// - .pb or .perfetto: Perfetto trace
+    /// - .duckdb: DuckDB database
     #[arg(long, default_value = "trace.pb")]
     output: PathBuf,
 
-    /// Skip Perfetto trace generation, keep only parquet files
+    /// Skip trace generation, keep only parquet files
     #[arg(long)]
     parquet_only: bool,
-
-    /// Generate a DuckDB database from the parquet files after recording.
-    /// The database can be queried using standard SQL for trace analysis.
-    #[arg(long)]
-    with_duckdb: bool,
-
-    /// Path for the DuckDB database output (default: trace.duckdb in output-dir)
-    #[arg(long, default_value = "trace.duckdb")]
-    duckdb_output: PathBuf,
 }
 
 impl From<Command> for Config {
@@ -133,8 +126,6 @@ impl From<Command> for Config {
             output_dir: cmd.output_dir,
             output: cmd.output,
             parquet_only: cmd.parquet_only,
-            with_duckdb: cmd.with_duckdb,
-            duckdb_output: cmd.duckdb_output,
         }
     }
 }

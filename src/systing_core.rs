@@ -254,14 +254,10 @@ pub struct Config {
     pub no_resolve_addresses: bool,
     /// Output directory for parquet files
     pub output_dir: PathBuf,
-    /// Output path for Perfetto trace
+    /// Output path (format auto-detected from extension: .pb = Perfetto, .duckdb = DuckDB)
     pub output: PathBuf,
-    /// Skip Perfetto generation, keep only parquet
+    /// Skip trace generation, keep only parquet
     pub parquet_only: bool,
-    /// Generate DuckDB database
-    pub with_duckdb: bool,
-    /// Path for DuckDB output
-    pub duckdb_output: PathBuf,
 }
 
 impl Default for Config {
@@ -295,8 +291,6 @@ impl Default for Config {
             output_dir: PathBuf::from("./traces"),
             output: PathBuf::from("trace.pb"),
             parquet_only: false,
-            with_duckdb: false,
-            duckdb_output: PathBuf::from("trace.duckdb"),
         }
     }
 }
@@ -2330,34 +2324,50 @@ pub fn systing(opts: Config) -> Result<()> {
     recorder.generate_parquet_trace(&opts.output_dir)?;
     println!("Successfully wrote Parquet trace files");
 
-    // Convert to Perfetto (unless --parquet-only)
+    // Generate output trace (unless --parquet-only)
+    // Format is auto-detected from the file extension
     if !opts.parquet_only {
-        println!(
-            "Converting to Perfetto format: {}...",
-            opts.output.display()
-        );
-        parquet_to_perfetto::convert(&opts.output_dir, &opts.output)?;
-        println!("Successfully wrote {}", opts.output.display());
-    }
+        let extension = opts
+            .output
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
 
-    // Generate DuckDB database (if --with-duckdb)
-    if opts.with_duckdb {
-        let db_path = if opts.duckdb_output.is_absolute() {
-            opts.duckdb_output.clone()
-        } else {
-            opts.output_dir.join(&opts.duckdb_output)
-        };
+        match extension.as_deref() {
+            Some("pb") | Some("perfetto") => {
+                println!(
+                    "Converting to Perfetto format: {}...",
+                    opts.output.display()
+                );
+                parquet_to_perfetto::convert(&opts.output_dir, &opts.output)?;
+                println!("Successfully wrote {}", opts.output.display());
+            }
+            Some("duckdb") => {
+                // Generate trace_id from output directory name
+                let trace_id = opts
+                    .output_dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "trace".to_string());
 
-        // Generate trace_id from output directory name
-        let trace_id = opts
-            .output_dir
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "trace".to_string());
-
-        println!("Generating DuckDB database: {}...", db_path.display());
-        systing_duckdb::parquet_to_duckdb(&opts.output_dir, &db_path, &trace_id)?;
-        println!("Successfully wrote {}", db_path.display());
+                println!("Generating DuckDB database: {}...", opts.output.display());
+                systing_duckdb::parquet_to_duckdb(&opts.output_dir, &opts.output, &trace_id)?;
+                println!("Successfully wrote {}", opts.output.display());
+            }
+            Some(ext) => {
+                bail!(
+                    "Unknown file extension '.{}' for '{}'. Use .pb for Perfetto or .duckdb for DuckDB.",
+                    ext,
+                    opts.output.display()
+                );
+            }
+            None => {
+                bail!(
+                    "Missing file extension for '{}'. Use .pb for Perfetto or .duckdb for DuckDB.",
+                    opts.output.display()
+                );
+            }
+        }
     }
 
     Ok(())

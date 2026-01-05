@@ -1578,14 +1578,11 @@ fn test_e2e_duckdb_validation() {
     let dir = TempDir::new().expect("Failed to create temp dir");
     let duckdb_path = dir.path().join("trace.duckdb");
 
-    // Create config with DuckDB output enabled
+    // Create config with DuckDB output (detected from .duckdb extension)
     let config = Config {
         duration: 1,
-        parquet_only: true, // Skip Perfetto to speed up test
-        with_duckdb: true,
-        duckdb_output: duckdb_path.clone(),
         output_dir: dir.path().to_path_buf(),
-        output: dir.path().join("trace.pb"),
+        output: duckdb_path.clone(),
         ..Config::default()
     };
 
@@ -1621,10 +1618,10 @@ fn test_e2e_duckdb_validation() {
     }
 }
 
-/// Tests DuckDB generation.
+/// Tests that both Perfetto and DuckDB can be generated from the same parquet files.
 ///
 /// This validates that the parquet streaming path correctly
-/// generates DuckDB output.
+/// generates both output formats.
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_duckdb() {
@@ -1634,27 +1631,23 @@ fn test_e2e_duckdb() {
     let duckdb_path = dir.path().join("trace.duckdb");
     let trace_path = dir.path().join("trace.pb");
 
-    // Create config with DuckDB output
+    // Create config with parquet-only output (we'll convert manually to test both formats)
     let config = Config {
         duration: 1,
-        parquet_only: false, // Also generate Perfetto
-        with_duckdb: true,
-        duckdb_output: duckdb_path.clone(),
+        parquet_only: true,
         output_dir: dir.path().to_path_buf(),
-        output: trace_path.clone(),
+        output: dir.path().join("unused.pb"), // Not used with parquet_only
         ..Config::default()
     };
 
     // Run the recording
     systing(config).expect("systing recording failed");
 
-    // Verify all outputs exist
+    // Verify parquet files exist
     assert!(
         dir.path().join("process.parquet").exists(),
         "process.parquet not found"
     );
-    assert!(trace_path.exists(), "trace.pb not found");
-    assert!(duckdb_path.exists(), "trace.duckdb not found");
 
     // Validate Parquet
     let parquet_result = validate_parquet_dir(dir.path());
@@ -1665,6 +1658,11 @@ fn test_e2e_duckdb() {
         parquet_result.warnings
     );
 
+    // Manually convert to Perfetto
+    systing::parquet_to_perfetto::convert(dir.path(), &trace_path)
+        .expect("Perfetto conversion failed");
+    assert!(trace_path.exists(), "trace.pb not found");
+
     // Validate Perfetto
     let perfetto_result = validate_perfetto_trace(&trace_path);
     assert!(
@@ -1673,6 +1671,11 @@ fn test_e2e_duckdb() {
         perfetto_result.errors,
         perfetto_result.warnings
     );
+
+    // Manually convert to DuckDB
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "test_trace")
+        .expect("DuckDB conversion failed");
+    assert!(duckdb_path.exists(), "trace.duckdb not found");
 
     // Validate DuckDB
     let duckdb_result = validate_duckdb(&duckdb_path);
@@ -1699,15 +1702,12 @@ fn test_e2e_duckdb_with_network_recording() {
     let dir = TempDir::new().expect("Failed to create temp dir");
     let duckdb_path = dir.path().join("trace.duckdb");
 
-    // Create config with network recording and DuckDB output
+    // Create config with network recording and DuckDB output (detected from .duckdb extension)
     let config = Config {
         duration: 2, // 2 seconds to capture some network activity
-        parquet_only: true,
         network: true,
-        with_duckdb: true,
-        duckdb_output: duckdb_path.clone(),
         output_dir: dir.path().to_path_buf(),
-        output: dir.path().join("trace.pb"),
+        output: duckdb_path.clone(),
         ..Config::default()
     };
 
