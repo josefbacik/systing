@@ -210,11 +210,6 @@ impl StackRecorder {
         }
     }
 
-    /// Get or create a utid for the given tid.
-    fn get_utid_for_tid(&self, tid: i32) -> i64 {
-        self.utid_generator.get_or_create_utid(tid)
-    }
-
     /// Enable streaming mode for stack recording.
     /// When enabled, stacks are deduplicated during recording and samples are
     /// buffered for later writing via finish().
@@ -589,7 +584,6 @@ impl StackRecorder {
     pub fn write_records(
         &self,
         collector: &mut dyn RecordCollector,
-        tid_to_utid: &HashMap<i32, i64>,
         stack_id_counter: &mut i64,
     ) -> Result<()> {
         // Stack deduplication cache (key: frame_names as a comparable key)
@@ -710,7 +704,7 @@ impl StackRecorder {
             // Now output stack samples with stack references
             for event in events.iter() {
                 let tid = event.tgidpid as i32;
-                let utid = tid_to_utid.get(&tid).copied().unwrap_or(tid as i64);
+                let utid = self.utid_generator.get_or_create_utid(tid);
 
                 if let Some(&stack_id) = tgid_stack_cache.get(&event.stack) {
                     collector.add_stack_sample(StackSampleRecord {
@@ -1280,7 +1274,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
                 // Buffer the sample for streaming (will be flushed in finish())
                 self.pending_samples.push(StackSampleRecord {
                     ts: event.ts as i64,
-                    utid: self.get_utid_for_tid(tid),
+                    utid: self.utid_generator.get_or_create_utid(tid),
                     cpu: Some(event.cpu as i32),
                     stack_id,
                     stack_event_type: convert_stack_event_type(event.stack_event_type.0),

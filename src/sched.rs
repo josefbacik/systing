@@ -166,7 +166,7 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                             ts: prev_state.start_ts,
                             dur,
                             cpu: event.cpu as i32,
-                            utid: self.get_utid_for_tid(prev_state.tid),
+                            utid: self.utid_generator.get_or_create_utid(prev_state.tid),
                             end_state,
                             priority: prev_state.prio,
                         });
@@ -415,11 +415,6 @@ impl SchedEventRecorder {
         }
     }
 
-    /// Get or create a utid for the given tid.
-    fn get_utid_for_tid(&self, tid: i32) -> i64 {
-        self.utid_generator.get_or_create_utid(tid)
-    }
-
     /// Set the streaming collector for real-time event emission.
     pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
         self.streaming_collector = Some(collector);
@@ -436,11 +431,7 @@ impl SchedEventRecorder {
     ///
     /// This method outputs records directly without going through Perfetto format.
     /// It converts the delta-encoded CompactSched data back to absolute timestamps.
-    pub fn write_records(
-        &self,
-        collector: &mut dyn RecordCollector,
-        tid_to_utid: &HashMap<i32, i64>,
-    ) -> Result<()> {
+    pub fn write_records(&self, collector: &mut dyn RecordCollector) -> Result<()> {
         // Process compact sched events (SCHED_SWITCH, SCHED_WAKING)
         for (cpu, local_compact) in self.compact_sched.iter() {
             let compact = &local_compact.compact_sched;
@@ -454,10 +445,7 @@ impl SchedEventRecorder {
                 let prev_state = compact.switch_prev_state.get(i).copied().unwrap_or(0);
 
                 // Get or create utid for this thread
-                let utid = tid_to_utid
-                    .get(&next_pid)
-                    .copied()
-                    .unwrap_or(next_pid as i64);
+                let utid = self.utid_generator.get_or_create_utid(next_pid);
 
                 let end_state = prev_state_to_end_state(prev_state);
 
@@ -478,7 +466,7 @@ impl SchedEventRecorder {
                 let pid = compact.waking_pid[i];
                 let target_cpu = compact.waking_target_cpu.get(i).copied().unwrap_or(0);
 
-                let utid = tid_to_utid.get(&pid).copied().unwrap_or(pid as i64);
+                let utid = self.utid_generator.get_or_create_utid(pid);
 
                 collector.add_thread_state(ThreadStateRecord {
                     ts: waking_ts,
@@ -541,10 +529,7 @@ impl SchedEventRecorder {
 
         // Emit wakeup_new events
         for wakeup in &self.wakeup_news {
-            let utid = tid_to_utid
-                .get(&wakeup.pid)
-                .copied()
-                .unwrap_or(wakeup.pid as i64);
+            let utid = self.utid_generator.get_or_create_utid(wakeup.pid);
             collector.add_wakeup_new(WakeupNewRecord {
                 ts: wakeup.ts,
                 cpu: wakeup.cpu,
@@ -555,10 +540,7 @@ impl SchedEventRecorder {
 
         // Emit process exit events
         for exit in &self.process_exits {
-            let utid = tid_to_utid
-                .get(&exit.pid)
-                .copied()
-                .unwrap_or(exit.pid as i64);
+            let utid = self.utid_generator.get_or_create_utid(exit.pid);
             collector.add_process_exit(ProcessExitRecord {
                 ts: exit.ts,
                 cpu: exit.cpu,

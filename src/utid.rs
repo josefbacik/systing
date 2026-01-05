@@ -146,3 +146,54 @@ impl Default for UtidGenerator {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_utid_generator_handles_tid_zero() {
+        // Regression test: tid=0 (swapper/idle) must get a unique utid that
+        // won't collide with other threads' utids.
+        let gen = UtidGenerator::new();
+
+        // First thread with tid=0 (swapper/idle)
+        let utid_swapper = gen.get_or_create_utid(0);
+
+        // Different thread with tid=1234
+        let utid_other = gen.get_or_create_utid(1234);
+
+        // They should have different utids
+        assert_ne!(utid_swapper, utid_other);
+
+        // utid should be positive (non-zero) to avoid confusion with tid=0
+        assert!(utid_swapper > 0);
+
+        // Looking up tid=0 again should return the same utid
+        assert_eq!(gen.get_or_create_utid(0), utid_swapper);
+    }
+
+    #[test]
+    fn test_utid_generator_sequential() {
+        let gen = UtidGenerator::new();
+
+        // First utid should be 1
+        assert_eq!(gen.get_or_create_utid(100), 1);
+        // Second utid should be 2
+        assert_eq!(gen.get_or_create_utid(200), 2);
+        // Looking up existing tid returns same utid
+        assert_eq!(gen.get_or_create_utid(100), 1);
+    }
+
+    #[test]
+    fn test_upid_generator_sequential() {
+        let gen = UtidGenerator::new();
+
+        // First upid should be 1
+        assert_eq!(gen.get_or_create_upid(1000), 1);
+        // Second upid should be 2
+        assert_eq!(gen.get_or_create_upid(2000), 2);
+        // Looking up existing pid returns same upid
+        assert_eq!(gen.get_or_create_upid(1000), 1);
+    }
+}

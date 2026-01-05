@@ -14,6 +14,7 @@ use crate::trace::{
     ArgRecord, InstantArgRecord, InstantRecord, NetworkPacketRecord, NetworkPollRecord,
     NetworkSocketRecord, NetworkSyscallRecord, SliceRecord, SocketConnectionRecord, TrackRecord,
 };
+use crate::utid::UtidGenerator;
 
 /// Unique socket identifier assigned by BPF during tracing
 pub type SocketId = u64;
@@ -514,6 +515,9 @@ pub struct NetworkRecorder {
     next_syscall_id: i64,
     next_packet_id: i64,
     next_poll_id: i64,
+
+    /// Shared utid generator for consistent thread IDs across all recorders
+    utid_generator: Arc<UtidGenerator>,
 }
 
 impl Default for NetworkRecorder {
@@ -532,14 +536,16 @@ impl Default for NetworkRecorder {
             next_syscall_id: 1,
             next_packet_id: 1,
             next_poll_id: 1,
+            utid_generator: Arc::new(UtidGenerator::new()),
         }
     }
 }
 
 impl NetworkRecorder {
-    pub fn new(resolve_addresses: bool) -> Self {
+    pub fn new(resolve_addresses: bool, utid_generator: Arc<UtidGenerator>) -> Self {
         Self {
             resolve_addresses,
+            utid_generator,
             ..Default::default()
         }
     }
@@ -2159,7 +2165,6 @@ impl NetworkRecorder {
     pub fn write_records(
         &mut self,
         collector: &mut dyn RecordCollector,
-        tid_to_utid: &HashMap<i32, i64>,
         track_id_counter: &mut i64,
         slice_id_counter: &mut i64,
         instant_id_counter: &mut i64,
@@ -2355,7 +2360,7 @@ impl NetworkRecorder {
         // Output syscall events (sendmsg/recvmsg slices) and poll_ready events
         for (pidtgid, events) in self.syscall_events.iter() {
             let tid = *pidtgid as i32;
-            let utid = tid_to_utid.get(&tid).copied();
+            let utid = Some(self.utid_generator.get_or_create_utid(tid));
 
             // Create a per-thread Network track for syscall and poll events
             let network_track_id = *track_id_counter;

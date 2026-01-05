@@ -523,8 +523,11 @@ impl SessionRecorder {
             )),
             perf_counter_recorder: Mutex::new(PerfCounterRecorder::default()),
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
-            probe_recorder: Mutex::new(SystingProbeRecorder::default()),
-            network_recorder: Mutex::new(NetworkRecorder::new(resolve_network_addresses)),
+            probe_recorder: Mutex::new(SystingProbeRecorder::new(Arc::clone(&utid_generator))),
+            network_recorder: Mutex::new(NetworkRecorder::new(
+                resolve_network_addresses,
+                Arc::clone(&utid_generator),
+            )),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
@@ -992,9 +995,6 @@ impl SessionRecorder {
             })?;
         }
 
-        // Get the tid_to_utid mapping for non-streaming recorders
-        let tid_to_utid = self.utid_generator.get_tid_to_utid_map();
-
         // Step 4: Generate network interface metadata
         eprintln!("Writing network interface metadata...");
         self.write_network_interface_records(&mut *writer)?;
@@ -1008,7 +1008,7 @@ impl SessionRecorder {
             self.event_recorder
                 .lock()
                 .unwrap()
-                .write_records(&mut *writer, &tid_to_utid)?;
+                .write_records(&mut *writer)?;
         }
 
         // Handle stack records - streaming mode uses finish(), non-streaming uses write_records()
@@ -1019,11 +1019,10 @@ impl SessionRecorder {
             writer = self.stack_recorder.lock().unwrap().finish(writer)?;
         } else {
             eprintln!("Writing stack trace records...");
-            self.stack_recorder.lock().unwrap().write_records(
-                &mut *writer,
-                &tid_to_utid,
-                &mut stack_id_counter,
-            )?;
+            self.stack_recorder
+                .lock()
+                .unwrap()
+                .write_records(&mut *writer, &mut stack_id_counter)?;
         }
 
         // Handle network records - streaming mode uses finish(), non-streaming uses write_records()
@@ -1039,7 +1038,6 @@ impl SessionRecorder {
             eprintln!("Writing network trace records...");
             self.network_recorder.lock().unwrap().write_records(
                 &mut *writer,
-                &tid_to_utid,
                 &mut track_id_counter,
                 &mut slice_id_counter,
                 &mut instant_id_counter,
@@ -1087,7 +1085,6 @@ impl SessionRecorder {
             eprintln!("Writing probe trace records...");
             self.probe_recorder.lock().unwrap().write_records(
                 &mut *writer,
-                &tid_to_utid,
                 &mut track_id_counter,
                 &mut slice_id_counter,
                 &mut instant_id_counter,
@@ -1305,7 +1302,7 @@ mod tests {
             stack_recorder: Mutex::new(StackRecorder::new(false, Arc::clone(&utid_generator))),
             perf_counter_recorder: Mutex::new(PerfCounterRecorder::default()),
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
-            probe_recorder: Mutex::new(SystingProbeRecorder::default()),
+            probe_recorder: Mutex::new(SystingProbeRecorder::new(Arc::clone(&utid_generator))),
             network_recorder: Mutex::new(NetworkRecorder::default()),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),

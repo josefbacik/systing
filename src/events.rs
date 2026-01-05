@@ -13,6 +13,7 @@ use crate::ringbuf::RingBuffer;
 use crate::systing_core::types::probe_event;
 use crate::systing_core::SystingRecordEvent;
 use crate::trace::{ArgRecord, InstantArgRecord, InstantRecord, SliceRecord, TrackRecord};
+use crate::utid::UtidGenerator;
 
 use anyhow::Result;
 use plain::Plain;
@@ -159,6 +160,9 @@ pub struct SystingProbeRecorder {
     slice_id_counter: i64,
     instant_id_counter: i64,
     track_cache: HashMap<TrackCacheKey, i64>,
+
+    // Shared utid generator for consistent thread IDs across all recorders
+    utid_generator: Arc<UtidGenerator>,
 }
 
 // usdt:<path>:<provider>:<name>
@@ -721,6 +725,14 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
 }
 
 impl SystingProbeRecorder {
+    /// Create a new SystingProbeRecorder with the given utid generator.
+    pub fn new(utid_generator: Arc<UtidGenerator>) -> Self {
+        Self {
+            utid_generator,
+            ..Default::default()
+        }
+    }
+
     /// Set the streaming collector for Parquet output during recording.
     pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
         self.streaming_collector = Some(collector);
@@ -799,8 +811,9 @@ impl SystingProbeRecorder {
                         self.slice_id_counter += 1;
                         let slice_id = self.slice_id_counter;
 
-                        // Use tid as utid for streaming (same approach as SchedEventRecorder)
-                        let utid = Some(tgidpid as i32 as i64);
+                        // Get consistent utid from shared generator
+                        let tid = tgidpid as i32;
+                        let utid = Some(self.utid_generator.get_or_create_utid(tid));
 
                         if let Err(e) = collector.add_slice(SliceRecord {
                             id: slice_id,
@@ -1047,8 +1060,9 @@ impl SystingProbeRecorder {
                 if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
                     self.instant_id_counter += 1;
                     let instant_id = self.instant_id_counter;
-                    // Use tid as utid for streaming (same approach as SchedEventRecorder)
-                    let utid = Some(event.task.tgidpid as i32 as i64);
+                    // Get consistent utid from shared generator
+                    let tid = event.task.tgidpid as i32;
+                    let utid = Some(self.utid_generator.get_or_create_utid(tid));
 
                     if let Err(e) = collector.add_instant(InstantRecord {
                         id: instant_id,
@@ -1131,8 +1145,9 @@ impl SystingProbeRecorder {
                         if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
                             self.slice_id_counter += 1;
                             let slice_id = self.slice_id_counter;
-                            // Use tid as utid for streaming (same approach as SchedEventRecorder)
-                            let utid = Some(event.task.tgidpid as i32 as i64);
+                            // Get consistent utid from shared generator
+                            let tid = event.task.tgidpid as i32;
+                            let utid = Some(self.utid_generator.get_or_create_utid(tid));
 
                             if let Err(e) = collector.add_slice(SliceRecord {
                                 id: slice_id,
@@ -1209,7 +1224,6 @@ impl SystingProbeRecorder {
     pub fn write_records(
         &self,
         collector: &mut dyn RecordCollector,
-        tid_to_utid: &HashMap<i32, i64>,
         track_id_counter: &mut i64,
         slice_id_counter: &mut i64,
         instant_id_counter: &mut i64,
@@ -1222,7 +1236,7 @@ impl SystingProbeRecorder {
         // Process thread instant events
         for (pidtgid, tracks) in self.events.iter() {
             let tid = *pidtgid as i32;
-            let utid = tid_to_utid.get(&tid).copied();
+            let utid = Some(self.utid_generator.get_or_create_utid(tid));
 
             for (track_name, track_events) in tracks.iter() {
                 let track_id = *track_id_counter;
@@ -1265,7 +1279,7 @@ impl SystingProbeRecorder {
         // Process thread range events (slices)
         for (pidtgid, tracks) in self.recorded_ranges.iter() {
             let tid = *pidtgid as i32;
-            let utid = tid_to_utid.get(&tid).copied();
+            let utid = Some(self.utid_generator.get_or_create_utid(tid));
 
             for (track_name, ranges) in tracks.iter() {
                 let track_id = *track_id_counter;
@@ -1392,7 +1406,7 @@ impl SystingProbeRecorder {
         // Process syscalls
         for (pidtgid, syscalls) in self.completed_syscalls.iter() {
             let tid = *pidtgid as i32;
-            let utid = tid_to_utid.get(&tid).copied();
+            let utid = Some(self.utid_generator.get_or_create_utid(tid));
 
             // Create track for this thread's syscalls if we have any
             if !syscalls.is_empty() {

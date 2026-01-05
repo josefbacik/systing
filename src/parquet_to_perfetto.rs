@@ -1082,9 +1082,11 @@ impl ParquetToPerfettoConverter {
 
     /// Build utid -> ThreadInfo mapping from thread table.
     ///
-    /// This also includes tid -> ThreadInfo mappings because the streaming sched
-    /// recorder uses `tid as utid` for efficiency. This allows lookups to work
-    /// whether the caller has a real utid or a tid-as-utid.
+    /// All recorders use a shared UtidGenerator during recording, ensuring consistent
+    /// utid values. Previously, this function also inserted entries keyed by tid to handle
+    /// cases where tid was used directly as utid, but this caused collisions (e.g., swapper
+    /// with tid=0 could collide with another thread's utid). With consistent UtidGenerator
+    /// usage, only utid-based lookup is needed.
     ///
     /// The upid in ThreadInfo can be used with `upid_to_pid` to get the actual process ID (tgid).
     fn build_utid_to_thread_map(&self, path: &Path) -> Result<HashMap<i64, ThreadInfo>> {
@@ -1112,10 +1114,7 @@ impl ParquetToPerfettoConverter {
                 let tid = tids.value(i);
                 let name = get_optional_string(names, i).unwrap_or_default();
                 let upid = get_optional_i64(upids, i);
-                // Insert by utid (for non-streaming cases)
-                map.insert(utid, (tid, name.clone(), upid));
-                // Also insert by tid (for streaming cases where utid = tid)
-                map.insert(tid as i64, (tid, name, upid));
+                map.insert(utid, (tid, name, upid));
             }
         }
 
@@ -2718,12 +2717,6 @@ mod tests {
         assert_eq!(*tid, 1234);
         assert_eq!(name, "test_thread");
         assert_eq!(*upid, Some(1));
-
-        // Also verify the tid-as-utid entry exists
-        let (tid2, name2, upid2) = map.get(&1234).unwrap();
-        assert_eq!(*tid2, 1234);
-        assert_eq!(name2, "test_thread");
-        assert_eq!(*upid2, Some(1));
     }
 
     #[test]
