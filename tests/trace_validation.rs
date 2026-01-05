@@ -1786,3 +1786,114 @@ fn test_validate_duckdb_invalid() {
         "Expected error for invalid DuckDB file, got: {result:?}"
     );
 }
+
+/// Tests that Perfetto → DuckDB conversion preserves sched_slice end_state.
+///
+/// This test validates that:
+/// 1. systing records a trace with Perfetto output
+/// 2. systing-analyze convert creates a valid DuckDB database
+/// 3. The DuckDB passes validation without warnings about all-NULL end_state
+///
+/// This catches regressions where switch_prev_state is not extracted from
+/// compact_sched events during Perfetto → DuckDB conversion.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_perfetto_to_duckdb_preserves_end_state() {
+    use std::process::Command;
+    use systing::validate::ValidationWarning;
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+    let duckdb_path = dir.path().join("trace.duckdb");
+
+    // Step 1: Record a trace with Perfetto output
+    let config = Config {
+        duration: 2, // 2 seconds to ensure we capture scheduler activity
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path.clone(),
+        ..Config::default()
+    };
+
+    systing(config).expect("systing recording failed");
+    assert!(trace_path.exists(), "Perfetto trace not created");
+
+    // Step 2: Convert Perfetto to DuckDB using systing-analyze
+    let output = Command::new(env!("CARGO_BIN_EXE_systing-analyze"))
+        .args([
+            "convert",
+            "-o",
+            duckdb_path.to_str().unwrap(),
+            trace_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run systing-analyze convert");
+
+    assert!(
+        output.status.success(),
+        "systing-analyze convert failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(duckdb_path.exists(), "DuckDB not created");
+
+    // Step 3: Validate the DuckDB
+    let result = validate_duckdb(&duckdb_path);
+
+    // Should pass without errors
+    assert!(
+        result.is_valid(),
+        "DuckDB validation failed: {:?}",
+        result.errors
+    );
+
+    // Check for the specific warning about all-NULL end_state
+    // This warning indicates switch_prev_state is not being extracted
+    let has_all_null_warning = result.warnings.iter().any(|w| {
+        matches!(
+            w,
+            ValidationWarning::AllNullColumn {
+                table,
+                column,
+                ..
+            } if table == "sched_slice" && column == "end_state"
+        )
+    });
+
+    assert!(
+        !has_all_null_warning,
+        "DuckDB has all-NULL end_state warning - switch_prev_state not being extracted. \
+         Warnings: {:?}",
+        result.warnings
+    );
+
+    // Additional verification: query the database to confirm end_state is populated
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    let (total, non_null): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COUNT(end_state) FROM sched_slice",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Failed to query sched_slice");
+
+    // We expect most end_states to be non-null (only the last slice per CPU should be NULL)
+    // At minimum, we should have some non-null values if there was any scheduler activity
+    assert!(total > 0, "Expected sched_slice to have rows, got 0");
+
+    // The 50% threshold is chosen because:
+    // - In theory, only the LAST slice per CPU should have NULL end_state (no subsequent switch)
+    // - With ~100+ CPUs typical on modern systems, that's only ~100 NULLs out of thousands
+    // - A 2-second trace should have many completed slices per CPU
+    // - 50% is a conservative lower bound that catches the "all NULL" bug while allowing
+    //   for edge cases like very short traces or systems with unusual scheduler behavior
+    let non_null_pct = (non_null as f64 / total as f64) * 100.0;
+    assert!(
+        non_null_pct > 50.0,
+        "Expected >50% non-null end_state values, got {:.1}% ({}/{} rows)",
+        non_null_pct,
+        non_null,
+        total
+    );
+}

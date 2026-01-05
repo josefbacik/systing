@@ -643,6 +643,10 @@ struct TraceExtractor {
     streaming_thread_state_writer: Option<StreamingWriter<ThreadStateRecord>>,
     streaming_sched_slice_writer: Option<StreamingSchedSliceWriter>,
     streaming_args_writer: Option<StreamingWriter<ArgRecord>>,
+
+    /// Pending sched slices per CPU for non-streaming mode.
+    /// Used to apply prev_state as end_state to the previous slice.
+    pending_sched_slices_per_cpu: HashMap<i32, SchedSliceRecord>,
 }
 
 impl TraceExtractor {
@@ -694,6 +698,7 @@ impl TraceExtractor {
             streaming_thread_state_writer: None,
             streaming_sched_slice_writer: None,
             streaming_args_writer: None,
+            pending_sched_slices_per_cpu: HashMap::new(),
         }
     }
 
@@ -772,12 +777,37 @@ impl TraceExtractor {
         }
     }
 
-    fn push_sched_slice(&mut self, record: SchedSliceRecord) -> Result<()> {
+    /// Push a sched_slice record with the prev_state from the current switch.
+    /// The prev_state describes why the PREVIOUS task left the CPU, so it
+    /// gets applied as end_state to the pending slice (the task being switched FROM),
+    /// not to this new slice (the task being switched TO).
+    fn push_sched_slice(
+        &mut self,
+        record: SchedSliceRecord,
+        prev_state: Option<i64>,
+    ) -> Result<()> {
         if let Some(ref mut writer) = self.streaming_sched_slice_writer {
-            writer.push(record)
+            writer.push(record, prev_state)
         } else {
-            self.data.sched_slices.push(record);
+            // Non-streaming mode: buffer per-CPU to apply prev_state to previous slice
+            let cpu = record.cpu;
+            let ts = record.ts;
+            if let Some(mut prev) = self.pending_sched_slices_per_cpu.insert(cpu, record) {
+                prev.dur = ts - prev.ts;
+                if let Some(state) = prev_state {
+                    prev.end_state = Some(state as i32);
+                }
+                self.data.sched_slices.push(prev);
+            }
             Ok(())
+        }
+    }
+
+    /// Flush any pending sched slices (for non-streaming mode).
+    /// Called at the end of extraction to write the last slice on each CPU.
+    fn flush_pending_sched_slices(&mut self) {
+        for (_, slice) in self.pending_sched_slices_per_cpu.drain() {
+            self.data.sched_slices.push(slice);
         }
     }
 
@@ -1113,15 +1143,25 @@ impl TraceExtractor {
                     self.ensure_thread_exists(next_pid, Some(switch.next_comm()));
                     self.ensure_thread_exists(prev_pid, Some(switch.prev_comm()));
 
+                    // Extract prev_state - this tells us why the PREVIOUS task left the CPU
+                    let prev_state = if switch.has_prev_state() {
+                        Some(switch.prev_state())
+                    } else {
+                        None
+                    };
+
                     if let Some(&next_utid) = self.tid_to_utid.get(&next_pid) {
-                        self.push_sched_slice(SchedSliceRecord {
-                            ts,
-                            dur: 0,
-                            cpu,
-                            utid: next_utid,
-                            end_state: None,
-                            priority: switch.next_prio(),
-                        })?;
+                        self.push_sched_slice(
+                            SchedSliceRecord {
+                                ts,
+                                dur: 0,
+                                cpu,
+                                utid: next_utid,
+                                end_state: None,
+                                priority: switch.next_prio(),
+                            },
+                            prev_state,
+                        )?;
                     }
                 }
 
@@ -1335,17 +1375,23 @@ impl TraceExtractor {
                 .unwrap_or_default() as usize;
             let comm = compact.intern_table.get(comm_idx).map(String::as_str);
 
+            // Extract prev_state - this tells us why the PREVIOUS task left the CPU
+            let prev_state = compact.switch_prev_state.get(i).copied();
+
             self.ensure_thread_exists(next_pid, comm);
 
             if let Some(&utid) = self.tid_to_utid.get(&next_pid) {
-                self.push_sched_slice(SchedSliceRecord {
-                    ts: switch_ts,
-                    dur: 0,
-                    cpu,
-                    utid,
-                    end_state: None,
-                    priority: next_prio,
-                })?;
+                self.push_sched_slice(
+                    SchedSliceRecord {
+                        ts: switch_ts,
+                        dur: 0,
+                        cpu,
+                        utid,
+                        end_state: None,
+                        priority: next_prio,
+                    },
+                    prev_state,
+                )?;
             }
         }
 
@@ -1508,6 +1554,9 @@ impl TraceExtractor {
     }
 
     fn finalize_stack_data(&mut self) {
+        // Flush any pending sched slices (non-streaming mode only)
+        self.flush_pending_sched_slices();
+
         for (iid, name) in self.interned_function_names.drain() {
             self.data.symbols.push(SymbolRecord {
                 id: iid as i64,
@@ -1935,11 +1984,18 @@ impl StreamingSchedSliceWriter {
         })
     }
 
-    fn push(&mut self, record: SchedSliceRecord) -> Result<()> {
+    /// Push a sched_slice record with the prev_state from the current switch.
+    /// The prev_state describes why the PREVIOUS task left the CPU, so it
+    /// gets applied as end_state to the pending slice, not to this new slice.
+    fn push(&mut self, record: SchedSliceRecord, prev_state: Option<i64>) -> Result<()> {
         let cpu = record.cpu;
         let ts = record.ts;
         if let Some(mut prev) = self.pending_per_cpu.insert(cpu, record) {
             prev.dur = ts - prev.ts;
+            // Apply prev_state as end_state to the previous slice
+            if let Some(state) = prev_state {
+                prev.end_state = Some(state as i32);
+            }
             self.writer.push(prev)?;
         }
         Ok(())

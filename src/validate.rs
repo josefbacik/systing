@@ -204,6 +204,12 @@ pub enum ValidationWarning {
     EmptyNames { table: String, count: i64 },
     /// Stack timing violations detected.
     StackTimingViolations { sample_type: String, count: i64 },
+    /// A column that should have data is entirely NULL.
+    AllNullColumn {
+        table: String,
+        column: String,
+        total_rows: i64,
+    },
 }
 
 impl fmt::Display for ValidationWarning {
@@ -225,6 +231,17 @@ impl fmt::Display for ValidationWarning {
                 write!(
                     f,
                     "stack_sample: {count} {sample_type} samples have timing violations"
+                )
+            }
+            ValidationWarning::AllNullColumn {
+                table,
+                column,
+                total_rows,
+            } => {
+                write!(
+                    f,
+                    "{table}.{column}: all {total_rows} rows have NULL values - \
+                     thread state transitions may not be captured correctly"
                 )
             }
         }
@@ -2177,6 +2194,9 @@ pub fn validate_duckdb(db_path: &Path) -> ValidationResult {
     validate_duckdb_sched_slice_schema(&conn, &mut result);
     validate_duckdb_counter_track_schema(&conn, &mut result);
 
+    // Phase 2b: Data quality validation
+    validate_duckdb_sched_slice_end_state(&conn, &mut result);
+
     // Phase 3: Reference integrity
     validate_duckdb_thread_upid_refs(&conn, &mut result);
     validate_duckdb_sched_utid_refs(&conn, &mut result);
@@ -2264,6 +2284,54 @@ fn validate_duckdb_sched_slice_schema(conn: &Connection, result: &mut Validation
                 table: "sched_slice".to_string(),
                 column: "end_state".to_string(),
             });
+        }
+    }
+}
+
+/// Validate that sched_slice.end_state is not entirely NULL.
+///
+/// If end_state is NULL for all rows, it indicates that thread state transitions
+/// were not captured correctly during trace import. This typically happens when
+/// switch_prev_state is not extracted from compact_sched events.
+fn validate_duckdb_sched_slice_end_state(conn: &Connection, result: &mut ValidationResult) {
+    // First check if the end_state column exists
+    let column_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM information_schema.columns
+             WHERE table_name = 'sched_slice' AND column_name = 'end_state'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !column_exists {
+        // Already handled by schema validation
+        return;
+    }
+
+    // Get total row count and non-null count
+    let counts: Result<(i64, i64), _> = conn.query_row(
+        "SELECT COUNT(*), COUNT(end_state) FROM sched_slice",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
+
+    match counts {
+        Ok((total, non_null)) => {
+            // Warn if there are rows but ALL end_states are NULL.
+            // In a healthy trace, only the last slice per CPU should have NULL end_state
+            // (because there's no subsequent switch to determine why it left).
+            // If every single row is NULL, it indicates switch_prev_state was not extracted.
+            if total > 0 && non_null == 0 {
+                result.add_warning(ValidationWarning::AllNullColumn {
+                    table: "sched_slice".to_string(),
+                    column: "end_state".to_string(),
+                    total_rows: total,
+                });
+            }
+        }
+        Err(_) => {
+            // Query failed - table might be empty, which is fine
         }
     }
 }
