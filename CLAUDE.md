@@ -92,11 +92,11 @@ git config core.hooksPath hooks
 
 ### Active Hooks
 
-- **pre-commit**: Runs `cargo fmt --check` before each commit
-- **pre-push**: Runs comprehensive checks before each push:
+- **pre-commit**: Runs comprehensive checks before each commit:
   - `cargo fmt --check`
   - `cargo clippy` (both with and without features)
   - `cargo test` (both with and without features)
+  - Integration tests (via `scripts/run-integration-tests.sh`, requires sudo)
 
 ## Temporary Files and Scratch Work
 
