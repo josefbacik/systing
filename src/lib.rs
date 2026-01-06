@@ -7,7 +7,7 @@
 //!
 //! - [`duckdb`] - DuckDB database generation from Parquet trace files
 //! - [`parquet_paths`] - Path management for Parquet trace files
-//! - [`validate`] - Trace validation for Parquet, Perfetto, and DuckDB formats
+//! - [`validation`] - Trace validation for Parquet, Perfetto, and DuckDB formats
 //! - [`systing`] - Core tracing functionality
 //!
 //! # Example
@@ -30,7 +30,7 @@
 // Core library modules
 pub mod duckdb;
 pub mod parquet_paths;
-pub mod validate;
+pub mod validation;
 
 // Tracing modules (previously in binary only)
 pub mod events;
@@ -53,7 +53,7 @@ pub mod utid;
 // Re-export for convenience
 pub use parquet_paths::ParquetPaths;
 pub use systing_core::{bump_memlock_rlimit, get_available_recorders, systing, Config};
-pub use validate::{
-    validate_duckdb, validate_parquet_dir, validate_perfetto_trace, ValidationError,
-    ValidationResult, ValidationWarning,
+pub use validation::{
+    cross_validate_parquet_perfetto, validate_duckdb, validate_parquet_dir,
+    validate_perfetto_trace, ValidationError, ValidationResult, ValidationWarning,
 };

@@ -1800,7 +1800,7 @@ fn test_validate_duckdb_invalid() {
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_perfetto_to_duckdb_preserves_end_state() {
     use std::process::Command;
-    use systing::validate::ValidationWarning;
+    use systing::validation::ValidationWarning;
 
     setup_bpf_environment();
 
