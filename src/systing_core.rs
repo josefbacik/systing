@@ -451,6 +451,11 @@ pub trait SystingEvent {
     fn prev_task_info(&self) -> Option<&task_info> {
         None
     }
+    /// Returns true if this event contains Python stack data that needs symbol loading.
+    /// Default is false; only stack_event overrides this.
+    fn has_pystack(&self) -> bool {
+        false
+    }
 }
 
 impl SystingEvent for task_event {
@@ -477,6 +482,16 @@ impl SystingEvent for stack_event {
     }
     fn next_task_info(&self) -> Option<&task_info> {
         Some(&self.task)
+    }
+    fn has_pystack(&self) -> bool {
+        #[cfg(feature = "pystacks")]
+        {
+            self.py_msg_buffer.stack_len > 0
+        }
+        #[cfg(not(feature = "pystacks"))]
+        {
+            false
+        }
     }
 }
 
@@ -576,10 +591,13 @@ fn consume_loop<T, N>(
             }
         }
 
-        // Send event to pystack symbol loading thread (with rate limiting)
+        // Send event to pystack symbol loading thread only if it has Python stack data
+        // This avoids waking up the symbol loader thread for events without Python stacks
         if let Some(ref tx) = pystack_symbol_tx {
-            tx.send(event)
-                .expect("Failed to send event to pystack symbol loader thread");
+            if event.has_pystack() {
+                tx.send(event)
+                    .expect("Failed to send event to pystack symbol loader thread");
+            }
         }
 
         let ret = recorder.lock().unwrap().record_event(event);
