@@ -949,7 +949,8 @@ impl SessionRecorder {
         eprintln!("Writing process and thread data...");
 
         // Write process records using the shared upid generator
-        for process in self.process_descriptors.read().unwrap().values() {
+        let processes = self.processes.read().unwrap();
+        for (tgidpid, process) in self.process_descriptors.read().unwrap().iter() {
             let pid = process.pid();
             let upid = self.utid_generator.get_or_create_upid(pid);
 
@@ -959,13 +960,21 @@ impl SessionRecorder {
                 None
             };
 
+            // Get cmdline from the ProtoProcess stored in self.processes
+            let cmdline = processes
+                .get(tgidpid)
+                .map(|p| p.cmdline.clone())
+                .unwrap_or_default();
+
             writer.add_process(ProcessRecord {
                 upid,
                 pid,
                 name,
                 parent_upid: None, // Could be set from parent_pid if needed
+                cmdline,
             })?;
         }
+        drop(processes);
 
         // Write thread records using the shared utid generator
         // Threads seen during streaming already have utids assigned; new threads get new utids

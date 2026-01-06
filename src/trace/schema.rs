@@ -26,6 +26,11 @@ pub fn process_schema() -> Arc<Schema> {
         Field::new("pid", DataType::Int32, false),
         Field::new("name", DataType::Utf8, true),
         Field::new("parent_upid", DataType::Int64, true),
+        Field::new(
+            "cmdline",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            false,
+        ),
     ]))
 }
 

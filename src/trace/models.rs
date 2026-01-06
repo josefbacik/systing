@@ -10,12 +10,16 @@
 /// - `pid`: OS process ID
 /// - `name`: Process name (from /proc/pid/comm or similar)
 /// - `parent_upid`: Parent process's upid (for process tree)
+/// - `cmdline`: Full command line arguments (from /proc/pid/cmdline).
+///   May be empty for short-lived processes that exit before cmdline can be read,
+///   or for kernel threads (pid 0) which have no cmdline.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ProcessRecord {
     pub upid: i64,
     pub pid: i32,
     pub name: Option<String>,
     pub parent_upid: Option<i64>,
+    pub cmdline: Vec<String>,
 }
 
 /// Thread information extracted from trace.

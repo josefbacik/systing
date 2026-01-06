@@ -274,6 +274,7 @@ pub fn validate_parquet_dir(dir: &Path) -> ValidationResult {
     // Phase 3: Required field validation
     validate_process_names(&paths, &mut result);
     validate_thread_names(&paths, &mut result);
+    validate_process_cmdline(&paths, &mut result);
 
     // Phase 4: Stack timing validation
     validate_stack_timing(&paths, &mut result);
@@ -1103,6 +1104,127 @@ fn validate_thread_names(paths: &ParquetPaths, result: &mut ValidationResult) {
     validate_names_not_empty(&paths.thread, "thread", "utid", "thread", result);
 }
 
+/// Validate that process.cmdline column exists and most processes have cmdline data.
+///
+/// Note: Short-lived processes that exit before we can read /proc/[pid]/cmdline
+/// will have empty cmdline arrays. This is expected behavior and not an error.
+/// We only error if the cmdline column is missing entirely, or warn if a significant
+/// portion of processes have no cmdline data.
+fn validate_process_cmdline(paths: &ParquetPaths, result: &mut ValidationResult) {
+    let path = &paths.process;
+    if !path.exists() {
+        return;
+    }
+
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            result.add_error(ValidationError::ReadError {
+                table: "process".to_string(),
+                message: e.to_string(),
+            });
+            return;
+        }
+    };
+
+    let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
+        Ok(b) => b,
+        Err(e) => {
+            result.add_error(ValidationError::ReadError {
+                table: "process".to_string(),
+                message: e.to_string(),
+            });
+            return;
+        }
+    };
+
+    let reader = match builder.build() {
+        Ok(r) => r,
+        Err(e) => {
+            result.add_error(ValidationError::ReadError {
+                table: "process".to_string(),
+                message: e.to_string(),
+            });
+            return;
+        }
+    };
+
+    let mut total_user_processes = 0i64;
+    let mut empty_cmdline_count = 0i64;
+
+    for batch_result in reader {
+        let batch = match batch_result {
+            Ok(b) => b,
+            Err(e) => {
+                result.add_error(ValidationError::ReadError {
+                    table: "process".to_string(),
+                    message: e.to_string(),
+                });
+                continue;
+            }
+        };
+
+        let schema = batch.schema();
+        let cmdline_idx = match schema.index_of("cmdline") {
+            Ok(idx) => idx,
+            Err(_) => {
+                result.add_error(ValidationError::InvalidValue {
+                    table: "process".to_string(),
+                    column: "cmdline".to_string(),
+                    message: "missing required column: cmdline".to_string(),
+                });
+                return;
+            }
+        };
+        let pid_idx = match schema.index_of("pid") {
+            Ok(idx) => idx,
+            Err(_) => continue,
+        };
+
+        let cmdline_array = batch.column(cmdline_idx);
+        let pid_array = batch.column(pid_idx);
+
+        if let (Some(list_array), Some(pid_int_array)) = (
+            cmdline_array
+                .as_any()
+                .downcast_ref::<arrow::array::ListArray>(),
+            pid_array
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>(),
+        ) {
+            for i in 0..list_array.len() {
+                let pid = if pid_int_array.is_null(i) {
+                    -1
+                } else {
+                    pid_int_array.value(i)
+                };
+
+                // Skip pid 0 (kernel/swapper process) which doesn't have a cmdline
+                if pid == 0 {
+                    continue;
+                }
+
+                total_user_processes += 1;
+
+                let is_empty = list_array.is_null(i) || list_array.value(i).is_empty();
+                if is_empty {
+                    empty_cmdline_count += 1;
+                }
+            }
+        }
+    }
+
+    // Warn if more than 50% of user processes have no cmdline
+    // This would indicate a problem with cmdline collection
+    if total_user_processes > 0 && empty_cmdline_count * 2 > total_user_processes {
+        result.add_warning(ValidationWarning::AllNullColumn {
+            table: "process".to_string(),
+            column: "cmdline".to_string(),
+            total_rows: empty_cmdline_count,
+        });
+    }
+}
+
 /// Sched slice info for stack timing validation.
 #[derive(Clone)]
 struct SchedSliceInfo {
@@ -1479,6 +1601,7 @@ pub fn validate_perfetto_trace(path: &Path) -> ValidationResult {
     validate_network_syscalls_on_network_tracks(&context, &mut result);
     validate_socket_tracks_have_socket_id(&context, &mut result);
     validate_swapper_thread_names(&context, &mut result);
+    validate_process_cmdline_populated(&context, &mut result);
 
     result
 }
@@ -1514,6 +1637,10 @@ struct PerfettoValidationContext {
     /// Maps comm_string -> count. Used to detect when idle events are
     /// incorrectly attributed to other threads (e.g., migration threads).
     pid_zero_comms: HashMap<String, u64>,
+    /// Count of user-space processes with empty cmdline
+    empty_cmdline_count: i64,
+    /// Count of user-space processes with non-empty cmdline
+    has_cmdline_count: i64,
 }
 
 /// Validate a single TracePacket.
@@ -1592,6 +1719,16 @@ fn validate_packet(
                         process.pid()
                     ),
                 });
+            }
+
+            // Check cmdline: should be set for user-space processes (pid != 0)
+            // Note: Short-lived processes may have empty cmdline if they exited before
+            // we could read /proc/[pid]/cmdline, so this is a warning not an error.
+            let pid = process.pid();
+            if pid != 0 && process.cmdline.is_empty() {
+                context.empty_cmdline_count += 1;
+            } else if pid != 0 {
+                context.has_cmdline_count += 1;
             }
         }
     }
@@ -2027,6 +2164,25 @@ fn validate_swapper_thread_names(
     }
 }
 
+/// Validate that ProcessDescriptor cmdline is populated for most user-space processes.
+///
+/// Note: Short-lived processes that exit before we can read /proc/[pid]/cmdline
+/// will have empty cmdline. This is expected behavior and not an error.
+/// We only warn if a significant portion (>50%) of processes have no cmdline data.
+fn validate_process_cmdline_populated(
+    context: &PerfettoValidationContext,
+    result: &mut ValidationResult,
+) {
+    let total = context.empty_cmdline_count + context.has_cmdline_count;
+    if total > 0 && context.empty_cmdline_count * 2 > total {
+        result.add_warning(ValidationWarning::AllNullColumn {
+            table: "ProcessDescriptor".to_string(),
+            column: "cmdline".to_string(),
+            total_rows: context.empty_cmdline_count,
+        });
+    }
+}
+
 // ============================================================================
 // Perfetto Trace Reader
 // ============================================================================
@@ -2204,6 +2360,7 @@ pub fn validate_duckdb(db_path: &Path) -> ValidationResult {
     // Phase 4: Required field validation
     validate_duckdb_process_names(&conn, &mut result);
     validate_duckdb_thread_names(&conn, &mut result);
+    validate_duckdb_process_cmdline(&conn, &mut result);
 
     // Phase 5: Stack timing validation
     validate_duckdb_stack_timing(&conn, &mut result);
@@ -2507,6 +2664,54 @@ fn validate_duckdb_thread_names(conn: &Connection, result: &mut ValidationResult
     }
 }
 
+/// Validate that process cmdline is populated for most user-space processes.
+///
+/// Note: Short-lived processes that exit before we can read /proc/[pid]/cmdline
+/// will have empty cmdline. This is expected behavior and not an error.
+/// We only warn if a significant portion (>50%) of processes have no cmdline data.
+fn validate_duckdb_process_cmdline(conn: &Connection, result: &mut ValidationResult) {
+    // First check if the cmdline column exists
+    let column_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM information_schema.columns
+             WHERE table_name = 'process' AND column_name = 'cmdline'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !column_exists {
+        result.add_error(ValidationError::InvalidValue {
+            table: "process".to_string(),
+            column: "cmdline".to_string(),
+            message: "missing required column: cmdline".to_string(),
+        });
+        return;
+    }
+
+    // Count user-space processes (pid != 0) with empty cmdline
+    // DuckDB stores arrays, so we check for NULL or empty array
+    let counts: Result<(i64, i64), _> = conn.query_row(
+        "SELECT
+            COUNT(*) FILTER (WHERE pid != 0),
+            COUNT(*) FILTER (WHERE pid != 0 AND (cmdline IS NULL OR len(cmdline) = 0))
+         FROM process",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
+
+    if let Ok((total, empty_count)) = counts {
+        // Warn if more than 50% of user-space processes have no cmdline
+        if total > 0 && empty_count * 2 > total {
+            result.add_warning(ValidationWarning::AllNullColumn {
+                table: "process".to_string(),
+                column: "cmdline".to_string(),
+                total_rows: empty_count,
+            });
+        }
+    }
+}
+
 /// Tolerance for stack timing validation in nanoseconds.
 /// Stack samples may be slightly offset from slice boundaries due to timing jitter.
 const DUCKDB_STACK_TIMING_TOLERANCE_NS: i64 = 100_000; // 100 microseconds
@@ -2608,8 +2813,8 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    use arrow::array::{Int32Array, Int64Array, StringBuilder};
-    use arrow::datatypes::{Field, Schema};
+    use arrow::array::{Int32Array, Int64Array, ListBuilder, StringBuilder};
+    use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
     use parquet::basic::Compression;
@@ -2630,6 +2835,42 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         Ok(())
+    }
+
+    /// Helper to create a valid process.parquet with required cmdline field
+    fn create_valid_process_parquet(dir: &Path, upid: i64, pid: i32, name: &str) {
+        let process_schema = Arc::new(Schema::new(vec![
+            Field::new("upid", DataType::Int64, false),
+            Field::new("pid", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("parent_upid", DataType::Int64, true),
+            Field::new(
+                "cmdline",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                false,
+            ),
+        ]));
+
+        let mut name_builder = StringBuilder::new();
+        name_builder.append_value(name);
+
+        let mut cmdline_builder = ListBuilder::new(StringBuilder::new());
+        cmdline_builder.values().append_value(name);
+        cmdline_builder.append(true);
+
+        let process_batch = RecordBatch::try_new(
+            process_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![upid])),
+                Arc::new(Int32Array::from(vec![pid])),
+                Arc::new(name_builder.finish()),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                Arc::new(cmdline_builder.finish()),
+            ],
+        )
+        .unwrap();
+
+        create_test_parquet(dir, "process.parquet", process_schema, process_batch).unwrap();
     }
 
     #[test]
@@ -2662,28 +2903,7 @@ mod tests {
         create_test_parquet(dir.path(), "sched_slice.parquet", schema, batch).unwrap();
 
         // Create minimal process and thread tables
-        let process_schema = Arc::new(Schema::new(vec![
-            Field::new("upid", DataType::Int64, false),
-            Field::new("pid", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("parent_upid", DataType::Int64, true),
-        ]));
-
-        let mut name_builder = StringBuilder::new();
-        name_builder.append_value("test");
-
-        let process_batch = RecordBatch::try_new(
-            process_schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![1])),
-                Arc::new(Int32Array::from(vec![1000])),
-                Arc::new(name_builder.finish()),
-                Arc::new(Int64Array::from(vec![None])),
-            ],
-        )
-        .unwrap();
-
-        create_test_parquet(dir.path(), "process.parquet", process_schema, process_batch).unwrap();
+        create_valid_process_parquet(dir.path(), 1, 1000, "test");
 
         let thread_schema = Arc::new(Schema::new(vec![
             Field::new("utid", DataType::Int64, false),
@@ -2749,28 +2969,7 @@ mod tests {
         create_test_parquet(dir.path(), "sched_slice.parquet", schema, batch).unwrap();
 
         // Create minimal process and thread tables
-        let process_schema = Arc::new(Schema::new(vec![
-            Field::new("upid", DataType::Int64, false),
-            Field::new("pid", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("parent_upid", DataType::Int64, true),
-        ]));
-
-        let mut name_builder = StringBuilder::new();
-        name_builder.append_value("test");
-
-        let process_batch = RecordBatch::try_new(
-            process_schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![1])),
-                Arc::new(Int32Array::from(vec![1000])),
-                Arc::new(name_builder.finish()),
-                Arc::new(Int64Array::from(vec![None])),
-            ],
-        )
-        .unwrap();
-
-        create_test_parquet(dir.path(), "process.parquet", process_schema, process_batch).unwrap();
+        create_valid_process_parquet(dir.path(), 1, 1000, "test");
 
         let thread_schema = Arc::new(Schema::new(vec![
             Field::new("utid", DataType::Int64, false),
@@ -2812,28 +3011,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         // Create process.parquet with upid=1
-        let process_schema = Arc::new(Schema::new(vec![
-            Field::new("upid", DataType::Int64, false),
-            Field::new("pid", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("parent_upid", DataType::Int64, true),
-        ]));
-
-        let mut name_builder = StringBuilder::new();
-        name_builder.append_value("test");
-
-        let process_batch = RecordBatch::try_new(
-            process_schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![1])),
-                Arc::new(Int32Array::from(vec![1000])),
-                Arc::new(name_builder.finish()),
-                Arc::new(Int64Array::from(vec![None])),
-            ],
-        )
-        .unwrap();
-
-        create_test_parquet(dir.path(), "process.parquet", process_schema, process_batch).unwrap();
+        create_valid_process_parquet(dir.path(), 1, 1000, "test");
 
         // Create thread.parquet with upid=999 (doesn't exist in process)
         let thread_schema = Arc::new(Schema::new(vec![
@@ -2982,10 +3160,19 @@ mod tests {
             Field::new("pid", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("parent_upid", DataType::Int64, true),
+            Field::new(
+                "cmdline",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                false,
+            ),
         ]));
 
         let mut name_builder = StringBuilder::new();
         name_builder.append_value(""); // Empty name
+
+        let mut cmdline_builder = ListBuilder::new(StringBuilder::new());
+        cmdline_builder.values().append_value("test");
+        cmdline_builder.append(true);
 
         let process_batch = RecordBatch::try_new(
             process_schema.clone(),
@@ -2993,7 +3180,8 @@ mod tests {
                 Arc::new(Int64Array::from(vec![1])),
                 Arc::new(Int32Array::from(vec![1000])),
                 Arc::new(name_builder.finish()),
-                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                Arc::new(cmdline_builder.finish()),
             ],
         )
         .unwrap();
@@ -3069,28 +3257,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         // Create process.parquet with valid name
-        let process_schema = Arc::new(Schema::new(vec![
-            Field::new("upid", DataType::Int64, false),
-            Field::new("pid", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("parent_upid", DataType::Int64, true),
-        ]));
-
-        let mut name_builder = StringBuilder::new();
-        name_builder.append_value("test");
-
-        let process_batch = RecordBatch::try_new(
-            process_schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![1])),
-                Arc::new(Int32Array::from(vec![1000])),
-                Arc::new(name_builder.finish()),
-                Arc::new(Int64Array::from(vec![None])),
-            ],
-        )
-        .unwrap();
-
-        create_test_parquet(dir.path(), "process.parquet", process_schema, process_batch).unwrap();
+        create_valid_process_parquet(dir.path(), 1, 1000, "test");
 
         // Create thread.parquet with empty name
         let thread_schema = Arc::new(Schema::new(vec![
@@ -3154,6 +3321,64 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_process_cmdline_parquet() {
+        let dir = TempDir::new().unwrap();
+
+        // Create process.parquet with empty cmdline
+        let process_schema = Arc::new(Schema::new(vec![
+            Field::new("upid", DataType::Int64, false),
+            Field::new("pid", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("parent_upid", DataType::Int64, true),
+            Field::new(
+                "cmdline",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                false,
+            ),
+        ]));
+
+        let mut name_builder = StringBuilder::new();
+        name_builder.append_value("test");
+
+        // Create an empty cmdline list
+        let mut cmdline_builder = ListBuilder::new(StringBuilder::new());
+        cmdline_builder.append(true); // Append empty list
+
+        let process_batch = RecordBatch::try_new(
+            process_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![1000])),
+                Arc::new(name_builder.finish()),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                Arc::new(cmdline_builder.finish()),
+            ],
+        )
+        .unwrap();
+
+        create_test_parquet(dir.path(), "process.parquet", process_schema, process_batch).unwrap();
+
+        // Empty cmdline is now a warning (not an error) because short-lived processes
+        // may exit before their cmdline can be read from /proc.
+        // We warn if more than 50% of processes have empty cmdline.
+        let result = validate_parquet_dir(dir.path());
+        // With only 1 process and it has empty cmdline, we expect a warning
+        assert!(
+            result.has_warnings(),
+            "Expected warnings for empty cmdline, got: {:?}",
+            result
+        );
+        assert!(result.warnings.iter().any(|w| matches!(
+            w,
+            ValidationWarning::AllNullColumn {
+                table,
+                column,
+                ..
+            } if table == "process" && column == "cmdline"
+        )));
+    }
+
+    #[test]
     fn test_process_descriptor_empty_name() {
         use perfetto_protos::process_descriptor::ProcessDescriptor;
         use perfetto_protos::track_descriptor::TrackDescriptor;
@@ -3181,6 +3406,91 @@ mod tests {
             ValidationError::PerfettoError { message }
                 if message.contains("ProcessDescriptor") && message.contains("empty")
         )));
+    }
+
+    #[test]
+    fn test_process_descriptor_empty_cmdline_perfetto() {
+        use perfetto_protos::process_descriptor::ProcessDescriptor;
+        use perfetto_protos::track_descriptor::TrackDescriptor;
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create a ProcessDescriptor with valid name but empty cmdline
+        let mut process = ProcessDescriptor::default();
+        process.set_pid(1234);
+        process.set_process_name("test".to_string());
+        // cmdline is empty by default
+
+        let mut desc = TrackDescriptor::default();
+        desc.set_uuid(1);
+        desc.process = Some(process).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(desc);
+
+        validate_packet(&packet, &mut context, &mut result);
+
+        // After processing, check that empty_cmdline_count was incremented
+        assert_eq!(context.empty_cmdline_count, 1);
+        assert_eq!(context.has_cmdline_count, 0);
+
+        // Now run the post-processing validation
+        validate_process_cmdline_populated(&context, &mut result);
+
+        // With only 1 process and it has empty cmdline (100% empty), we expect a warning
+        assert!(
+            result.has_warnings(),
+            "Expected warning for empty cmdline, got: {:?}",
+            result
+        );
+        assert!(result.warnings.iter().any(|w| matches!(
+            w,
+            ValidationWarning::AllNullColumn {
+                table,
+                column,
+                ..
+            } if table == "ProcessDescriptor" && column == "cmdline"
+        )));
+    }
+
+    #[test]
+    fn test_process_descriptor_with_cmdline_perfetto() {
+        use perfetto_protos::process_descriptor::ProcessDescriptor;
+        use perfetto_protos::track_descriptor::TrackDescriptor;
+
+        let mut context = PerfettoValidationContext::default();
+        let mut result = ValidationResult::default();
+
+        // Create a ProcessDescriptor with valid name and cmdline
+        let mut process = ProcessDescriptor::default();
+        process.set_pid(1234);
+        process.set_process_name("test".to_string());
+        process.cmdline.push("/usr/bin/test".to_string());
+        process.cmdline.push("--arg1".to_string());
+
+        let mut desc = TrackDescriptor::default();
+        desc.set_uuid(1);
+        desc.process = Some(process).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(desc);
+
+        validate_packet(&packet, &mut context, &mut result);
+
+        // After processing, check that has_cmdline_count was incremented
+        assert_eq!(context.empty_cmdline_count, 0);
+        assert_eq!(context.has_cmdline_count, 1);
+
+        // Now run the post-processing validation
+        validate_process_cmdline_populated(&context, &mut result);
+
+        // With all processes having cmdline, we expect no warning
+        assert!(
+            !result.has_warnings(),
+            "Expected no warnings, got: {:?}",
+            result.warnings
+        );
     }
 
     #[test]

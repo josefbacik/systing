@@ -318,11 +318,38 @@ impl ParquetToPerfettoConverter {
                 let names = batch
                     .column_by_name("name")
                     .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+                let cmdlines = batch
+                    .column_by_name("cmdline")
+                    .and_then(|c| c.as_any().downcast_ref::<ListArray>());
 
                 for i in 0..batch.num_rows() {
                     let upid = upids.value(i);
                     let tgid = pids.value(i); // This is the TGID (process ID)
                     let name = get_optional_string(names, i);
+
+                    // Extract cmdline list
+                    let cmdline: Vec<String> = if let Some(cmdlines) = cmdlines {
+                        if cmdlines.is_null(i) {
+                            Vec::new()
+                        } else {
+                            let inner = cmdlines.value(i);
+                            if let Some(str_array) = inner.as_any().downcast_ref::<StringArray>() {
+                                (0..str_array.len())
+                                    .filter_map(|j| {
+                                        if str_array.is_null(j) {
+                                            None
+                                        } else {
+                                            Some(str_array.value(j).to_string())
+                                        }
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
 
                     let uuid = self.alloc_uuid();
                     self.upid_to_uuid.insert(upid, uuid);
@@ -341,6 +368,15 @@ impl ParquetToPerfettoConverter {
                     process.set_pid(tgid);
                     if let Some(n) = &name {
                         process.set_process_name(n.clone());
+                    }
+                    // Use the actual cmdline from Parquet if available.
+                    // Fall back to process name for Perfetto UI compatibility - Perfetto's
+                    // process list uses cmdline[0] as the display name, so we ensure there's
+                    // always something to show even for short-lived processes where we couldn't
+                    // read /proc/[pid]/cmdline before they exited.
+                    if !cmdline.is_empty() {
+                        process.cmdline = cmdline;
+                    } else if let Some(n) = &name {
                         process.cmdline.push(n.clone());
                     }
                     desc.process = Some(process).into();
@@ -2570,6 +2606,7 @@ fn read_stack_data(input_dir: &Path) -> Result<HashMap<i64, StackData>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::ListBuilder;
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use std::sync::Arc;
@@ -2583,12 +2620,24 @@ mod tests {
             Field::new("pid", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("parent_upid", DataType::Int64, true),
+            Field::new(
+                "cmdline",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                false,
+            ),
         ]));
 
         let upids = Int64Array::from(vec![upid]);
         let pids = Int32Array::from(vec![pid]);
         let names: StringArray = vec![Some("test_process")].into_iter().collect();
         let parent_upids: Int64Array = vec![None::<i64>].into_iter().collect();
+
+        // Build cmdline list array
+        let mut cmdline_builder = ListBuilder::new(arrow::array::StringBuilder::new());
+        cmdline_builder.values().append_value("test_process");
+        cmdline_builder.values().append_value("--arg1");
+        cmdline_builder.append(true);
+        let cmdlines = cmdline_builder.finish();
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -2597,6 +2646,7 @@ mod tests {
                 Arc::new(pids),
                 Arc::new(names),
                 Arc::new(parent_upids),
+                Arc::new(cmdlines),
             ],
         )?;
 

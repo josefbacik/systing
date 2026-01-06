@@ -33,7 +33,8 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             upid BIGINT,
             pid INTEGER,
             name VARCHAR,
-            parent_upid BIGINT
+            parent_upid BIGINT,
+            cmdline VARCHAR[]
         );
 
         CREATE TABLE IF NOT EXISTS thread (

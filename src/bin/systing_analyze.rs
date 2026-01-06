@@ -5,7 +5,8 @@
 
 use anyhow::{bail, Context, Result};
 use arrow::array::{
-    BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, RecordBatch, StringBuilder,
+    BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, ListBuilder, RecordBatch,
+    StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use clap::{Parser, Subcommand};
@@ -402,6 +403,7 @@ struct ProcessRecord {
     pid: i32,
     name: Option<String>,
     parent_upid: Option<i64>,
+    cmdline: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -956,6 +958,7 @@ impl TraceExtractor {
                         pid,
                         name: proc.process_name.clone(),
                         parent_upid: None,
+                        cmdline: proc.cmdline.clone(),
                     });
                 }
                 if desc.has_uuid() {
@@ -978,6 +981,7 @@ impl TraceExtractor {
                         pid,
                         name: None,
                         parent_upid: None,
+                        cmdline: Vec::new(),
                     });
                 }
 
@@ -1083,6 +1087,7 @@ impl TraceExtractor {
                         pid,
                         name: proc.cmdline.first().cloned(),
                         parent_upid: self.pid_to_upid.get(&proc.ppid()).copied(),
+                        cmdline: proc.cmdline.clone(),
                     });
                 }
             }
@@ -1105,6 +1110,7 @@ impl TraceExtractor {
                             pid: tgid,
                             name: None,
                             parent_upid: None,
+                            cmdline: Vec::new(),
                         });
                     }
 
@@ -1443,6 +1449,7 @@ impl TraceExtractor {
                     pid: tid,
                     name: name.map(str::to_string),
                     parent_upid: None,
+                    cmdline: Vec::new(),
                 });
                 upid
             };
@@ -1490,6 +1497,7 @@ impl TraceExtractor {
                     pid: tgid,
                     name: None,
                     parent_upid: None,
+                    cmdline: Vec::new(),
                 });
             }
 
@@ -2022,6 +2030,11 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
             Field::new("pid", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("parent_upid", DataType::Int64, true),
+            Field::new(
+                "cmdline",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                false,
+            ),
         ]));
 
         let mut trace_id_builder = StringBuilder::new();
@@ -2029,6 +2042,7 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
         let mut pid_builder = Int32Builder::new();
         let mut name_builder = StringBuilder::new();
         let mut parent_upid_builder = Int64Builder::new();
+        let mut cmdline_builder = ListBuilder::new(StringBuilder::new());
 
         for proc in &data.processes {
             trace_id_builder.append_value(trace_id);
@@ -2036,6 +2050,11 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
             pid_builder.append_value(proc.pid);
             name_builder.append_option(proc.name.as_deref());
             parent_upid_builder.append_option(proc.parent_upid);
+            // Build cmdline list
+            for arg in &proc.cmdline {
+                cmdline_builder.values().append_value(arg);
+            }
+            cmdline_builder.append(true);
         }
 
         let batch = RecordBatch::try_new(
@@ -2046,6 +2065,7 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
                 Arc::new(pid_builder.finish()),
                 Arc::new(name_builder.finish()),
                 Arc::new(parent_upid_builder.finish()),
+                Arc::new(cmdline_builder.finish()),
             ],
         )?;
 

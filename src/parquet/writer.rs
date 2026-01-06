@@ -1138,12 +1138,19 @@ fn build_process_batch(records: &[ProcessRecord], schema: &Arc<Schema>) -> Resul
     let mut pid_builder = Int32Builder::with_capacity(records.len());
     let mut name_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
     let mut parent_upid_builder = Int64Builder::with_capacity(records.len());
+    let mut cmdline_builder = ListBuilder::new(StringBuilder::new());
 
     for record in records {
         upid_builder.append_value(record.upid);
         pid_builder.append_value(record.pid);
         name_builder.append_option(record.name.as_deref());
         parent_upid_builder.append_option(record.parent_upid);
+
+        // Build cmdline list
+        for arg in &record.cmdline {
+            cmdline_builder.values().append_value(arg);
+        }
+        cmdline_builder.append(true);
     }
 
     Ok(RecordBatch::try_new(
@@ -1153,6 +1160,7 @@ fn build_process_batch(records: &[ProcessRecord], schema: &Arc<Schema>) -> Resul
             Arc::new(pid_builder.finish()),
             Arc::new(name_builder.finish()),
             Arc::new(parent_upid_builder.finish()),
+            Arc::new(cmdline_builder.finish()),
         ],
     )?)
 }
