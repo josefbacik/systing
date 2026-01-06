@@ -242,6 +242,9 @@ pub struct Config {
     /// Explicit PIDs for pystacks (bypasses auto-discovery)
     #[cfg(feature = "pystacks")]
     pub pystacks_pids: Vec<u32>,
+    /// Enable debug output for pystacks
+    #[cfg(feature = "pystacks")]
+    pub pystacks_debug: bool,
     /// Enable debuginfod for symbol resolution
     pub enable_debuginfod: bool,
     /// Disable scheduler tracing
@@ -283,6 +286,8 @@ impl Default for Config {
             collect_pystacks: false,
             #[cfg(feature = "pystacks")]
             pystacks_pids: Vec::new(),
+            #[cfg(feature = "pystacks")]
+            pystacks_debug: false,
             enable_debuginfod: false,
             no_sched: false,
             syscalls: false,
@@ -981,11 +986,105 @@ fn resolve_library_path_for_pid(pid: u32, lib_name: &str) -> Option<String> {
 
 /// Convenience function to discover all Python processes by checking their main executable.
 #[cfg(feature = "pystacks")]
-fn discover_python_processes() -> Vec<u32> {
-    // Only discover main Python processes (TGIDs), not threads
-    discover_processes_with_mapping("python", false)
-        .map(|map| map.keys().cloned().collect())
-        .unwrap_or_else(|_| Vec::new())
+fn discover_python_processes(debug: bool) -> Vec<u32> {
+    use std::io::{BufRead, BufReader};
+
+    if debug {
+        eprintln!("[pystacks debug] Starting Python process discovery...");
+    }
+
+    let proc_dir = match std::fs::read_dir("/proc") {
+        Ok(dir) => dir,
+        Err(e) => {
+            if debug {
+                eprintln!("[pystacks debug] Failed to read /proc: {e}");
+            }
+            return Vec::new();
+        }
+    };
+
+    let mut discovered = Vec::new();
+
+    for entry in proc_dir.filter_map(Result::ok) {
+        let pid_u32: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
+            Some(pid) if pid > 2 => pid,
+            _ => continue,
+        };
+
+        let proc_path = entry.path();
+
+        // Skip threads - only process thread group leaders
+        if let Ok(status) = std::fs::read_to_string(proc_path.join("status")) {
+            let mut is_thread = false;
+            for line in status.lines() {
+                if let Some(tgid_str) = line.strip_prefix("Tgid:\t") {
+                    if let Ok(tgid) = tgid_str.trim().parse::<u32>() {
+                        if tgid != pid_u32 {
+                            is_thread = true;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            if is_thread {
+                continue;
+            }
+        }
+
+        // Check /proc/PID/exe for python
+        if let Ok(exe) = std::fs::read_link(proc_path.join("exe")) {
+            let exe_str = exe.to_string_lossy();
+            if exe_str.contains("python") {
+                if debug {
+                    // Get comm for additional info
+                    let comm = std::fs::read_to_string(proc_path.join("comm"))
+                        .unwrap_or_else(|_| "unknown".to_string())
+                        .trim()
+                        .to_string();
+                    eprintln!(
+                        "[pystacks debug] Found Python process: PID={pid_u32} exe={exe_str} comm={comm}"
+                    );
+                }
+                discovered.push(pid_u32);
+                continue;
+            }
+        }
+
+        // Also check /proc/PID/maps for libpython (embedded Python)
+        let maps_path = proc_path.join("maps");
+        if let Ok(file) = std::fs::File::open(&maps_path) {
+            let reader = BufReader::new(file);
+            for line in reader.lines().map_while(Result::ok) {
+                if line.contains("libpython") {
+                    if debug {
+                        let comm = std::fs::read_to_string(proc_path.join("comm"))
+                            .unwrap_or_else(|_| "unknown".to_string())
+                            .trim()
+                            .to_string();
+                        let exe = std::fs::read_link(proc_path.join("exe"))
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| "unknown".to_string());
+                        eprintln!(
+                            "[pystacks debug] Found embedded Python: PID={pid_u32} exe={exe} comm={comm} (has libpython)"
+                        );
+                    }
+                    discovered.push(pid_u32);
+                    break;
+                }
+            }
+        }
+    }
+
+    if debug {
+        eprintln!(
+            "[pystacks debug] Discovery complete: found {} Python process(es): {:?}",
+            discovered.len(),
+            discovered
+        );
+    }
+
+    discovered
 }
 
 /// Discovers processes with a specific binary or library mapped.
@@ -2131,17 +2230,32 @@ pub fn systing(opts: Config) -> Result<()> {
 
         #[cfg(feature = "pystacks")]
         if collect_pystacks {
+            let pystacks_debug = opts.pystacks_debug;
+
+            if pystacks_debug {
+                eprintln!("[pystacks debug] Pystacks collection enabled");
+            }
+
             // Determine which PIDs to use for pystacks
             // Priority: 1) explicit pystacks_pids, 2) general pid filter, 3) auto-discovery
             let pystacks_pids = if !opts.pystacks_pids.is_empty() {
                 // Explicit pystacks PIDs specified (bypasses discovery)
                 println!("Using explicit pystacks PIDs: {:?}", opts.pystacks_pids);
+                if pystacks_debug {
+                    eprintln!(
+                        "[pystacks debug] Using {} explicit PIDs (bypassing discovery)",
+                        opts.pystacks_pids.len()
+                    );
+                }
                 opts.pystacks_pids.clone()
             } else if opts.pid.is_empty() {
                 // No PIDs specified, discover all Python processes
-                let discovered = discover_python_processes();
+                let discovered = discover_python_processes(pystacks_debug);
                 if discovered.is_empty() {
                     println!("Warning: No Python processes found on the system");
+                    if pystacks_debug {
+                        eprintln!("[pystacks debug] WARNING: No Python processes discovered - pystacks will have no targets");
+                    }
                 } else {
                     println!(
                         "Discovered {} Python process(es) for pystacks: {:?}",
@@ -2153,14 +2267,28 @@ pub fn systing(opts: Config) -> Result<()> {
             } else {
                 // Use the general PIDs specified by the user
                 println!("Using specified PIDs for pystacks: {:?}", opts.pid);
+                if pystacks_debug {
+                    eprintln!(
+                        "[pystacks debug] Using {} user-specified PIDs for pystacks",
+                        opts.pid.len()
+                    );
+                }
                 opts.pid.clone()
             };
 
-            recorder
-                .stack_recorder
-                .lock()
-                .unwrap()
-                .init_pystacks(&pystacks_pids, skel.object());
+            if pystacks_debug {
+                eprintln!(
+                    "[pystacks debug] Initializing pystacks library with {} PIDs: {:?}",
+                    pystacks_pids.len(),
+                    pystacks_pids
+                );
+            }
+
+            recorder.stack_recorder.lock().unwrap().init_pystacks(
+                &pystacks_pids,
+                skel.object(),
+                pystacks_debug,
+            );
         }
 
         let (rings, channels) = setup_ringbuffers(&skel, &opts, &perf_counter_names)?;

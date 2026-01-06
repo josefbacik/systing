@@ -56,6 +56,10 @@ struct Command {
     #[cfg(feature = "pystacks")]
     #[arg(long)]
     collect_pystacks: bool,
+    /// Enable debug output for pystacks (Python stack tracing)
+    #[cfg(feature = "pystacks")]
+    #[arg(long)]
+    pystacks_debug: bool,
     /// Enable debuginfod for enhanced symbol resolution (requires DEBUGINFOD_URLS environment variable)
     #[arg(long)]
     enable_debuginfod: bool,
@@ -118,6 +122,8 @@ impl From<Command> for Config {
             collect_pystacks: cmd.collect_pystacks,
             #[cfg(feature = "pystacks")]
             pystacks_pids: Vec::new(), // CLI doesn't expose this yet, uses discovery
+            #[cfg(feature = "pystacks")]
+            pystacks_debug: cmd.pystacks_debug,
             enable_debuginfod: cmd.enable_debuginfod,
             no_sched: cmd.no_sched,
             syscalls: cmd.syscalls,

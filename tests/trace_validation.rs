@@ -1401,7 +1401,7 @@ if __name__ == "__main__":
             .expect("Failed to write Python script");
     }
 
-    let mut python_proc = Command::new("/root/.pyenv/versions/3.13.11/bin/python3.13")
+    let mut python_proc = Command::new("/root/.pyenv/versions/3.11.14/bin/python3.11")
         .arg(&python_script)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
