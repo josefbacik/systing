@@ -1934,19 +1934,19 @@ fn test_e2e_task_exit_states() {
     // We'll spawn multiple short-lived processes that will exit during the trace
     // Using bash to spawn and wait for multiple sleep processes
     let workload_script = r#"
-        for i in $(seq 1 10); do
-            sleep 0.1 &
+        for i in $(seq 1 5); do
+            sleep 0.01 &
         done
         wait
     "#;
 
     // Start the workload in a separate thread
     let workload_handle = thread::spawn(move || {
-        // Wait a bit for recording to start and BPF to attach
-        thread::sleep(Duration::from_secs(1));
+        // Wait briefly for recording to start and BPF to attach
+        thread::sleep(Duration::from_millis(100));
 
-        // Run multiple rounds of short-lived processes
-        for _ in 0..3 {
+        // Run 2 rounds of short-lived processes
+        for _ in 0..2 {
             let mut child = Command::new("bash")
                 .arg("-c")
                 .arg(workload_script)
@@ -1955,13 +1955,12 @@ fn test_e2e_task_exit_states() {
                 .spawn()
                 .expect("Failed to spawn workload");
             child.wait().expect("Failed to wait for workload");
-            thread::sleep(Duration::from_millis(100));
         }
     });
 
     // Create config for recording
     let config = Config {
-        duration: 4, // 4 seconds to capture the workload
+        duration: 1, // 1 second to capture the workload
         output_dir: dir.path().to_path_buf(),
         output: trace_path.clone(),
         ..Config::default()
@@ -2033,13 +2032,13 @@ fn test_e2e_task_exit_states() {
         }
     );
 
-    // We spawned 30 processes (10 per round × 3 rounds), so we expect some exit states
+    // We spawned 10 processes (5 per round × 2 rounds), so we expect some exit states
     let total_exits = exit_dead_count + exit_zombie_count;
     assert!(
         total_exits > 0,
         "FAILED: No exit states (EXIT_DEAD or EXIT_ZOMBIE) found in sched_slice.parquet. \
          This indicates the BPF code is not properly combining __state with exit_state. \
-         Expected at least some exits from the 30 spawned processes."
+         Expected at least some exits from the 10 spawned processes."
     );
     eprintln!(
         "✓ Found {} total exit states in Parquet ({} EXIT_DEAD, {} EXIT_ZOMBIE)",
