@@ -1897,3 +1897,304 @@ fn test_e2e_perfetto_to_duckdb_preserves_end_state() {
         total
     );
 }
+
+/// Tests that task/thread exit states are properly recorded.
+///
+/// This test validates that:
+/// 1. Threads that exit during recording have their exit states captured
+/// 2. The Parquet sched_slice.parquet contains EXIT_DEAD (16) or EXIT_ZOMBIE (32) end_states
+/// 3. The Perfetto trace contains the exit states in compact_sched events
+/// 4. The DuckDB database also has the exit states populated
+///
+/// This catches regressions where exit_state is not combined with __state in BPF code.
+/// See: kernel's __task_state_index() which ORs tsk->__state with tsk->exit_state.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_task_exit_states() {
+    use arrow::array::{Array, Int32Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use perfetto_protos::trace::Trace;
+    use protobuf::Message;
+    use std::fs::File;
+    use std::io::Read as IoRead;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
+
+    // Exit state constants from kernel (stored in task_struct->exit_state)
+    const EXIT_DEAD: i32 = 16; // 0x10 - 'X' in ftrace format
+    const EXIT_ZOMBIE: i32 = 32; // 0x20 - 'Z' in ftrace format
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+    let duckdb_path = dir.path().join("trace.duckdb");
+
+    // We'll spawn multiple short-lived processes that will exit during the trace
+    // Using bash to spawn and wait for multiple sleep processes
+    let workload_script = r#"
+        for i in $(seq 1 10); do
+            sleep 0.1 &
+        done
+        wait
+    "#;
+
+    // Start the workload in a separate thread
+    let workload_handle = thread::spawn(move || {
+        // Wait a bit for recording to start and BPF to attach
+        thread::sleep(Duration::from_secs(1));
+
+        // Run multiple rounds of short-lived processes
+        for _ in 0..3 {
+            let mut child = Command::new("bash")
+                .arg("-c")
+                .arg(workload_script)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("Failed to spawn workload");
+            child.wait().expect("Failed to wait for workload");
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    // Create config for recording
+    let config = Config {
+        duration: 4, // 4 seconds to capture the workload
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path.clone(),
+        ..Config::default()
+    };
+
+    // Run the recording
+    systing(config).expect("systing recording failed");
+
+    // Wait for workload to complete
+    workload_handle.join().expect("Workload thread panicked");
+
+    // === VALIDATE PARQUET OUTPUT ===
+
+    let sched_slice_path = dir.path().join("sched_slice.parquet");
+    assert!(
+        sched_slice_path.exists(),
+        "sched_slice.parquet not found - scheduler recording may have failed"
+    );
+
+    // Read sched_slice.parquet and count exit states
+    let file = File::open(&sched_slice_path).expect("Failed to open sched_slice.parquet");
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
+    let reader = builder.build().expect("Failed to build reader");
+
+    let mut total_slices = 0;
+    let mut exit_dead_count = 0; // end_state = 16 (EXIT_DEAD 'X')
+    let mut exit_zombie_count = 0; // end_state = 32 (EXIT_ZOMBIE 'Z')
+
+    for batch_result in reader {
+        let batch = batch_result.expect("Failed to read batch");
+        total_slices += batch.num_rows();
+
+        if let Some(end_state_col) = batch.column_by_name("end_state") {
+            let end_state_array = end_state_col
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("end_state should be Int32");
+
+            for i in 0..end_state_array.len() {
+                if !end_state_array.is_null(i) {
+                    match end_state_array.value(i) {
+                        EXIT_DEAD => exit_dead_count += 1,
+                        EXIT_ZOMBIE => exit_zombie_count += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    eprintln!("\n=== Parquet Task Exit State Analysis ===");
+    eprintln!("Total sched_slice rows: {}", total_slices);
+    eprintln!(
+        "EXIT_DEAD (16/'X') slices: {} ({:.2}%)",
+        exit_dead_count,
+        if total_slices > 0 {
+            100.0 * exit_dead_count as f64 / total_slices as f64
+        } else {
+            0.0
+        }
+    );
+    eprintln!(
+        "EXIT_ZOMBIE (32/'Z') slices: {} ({:.2}%)",
+        exit_zombie_count,
+        if total_slices > 0 {
+            100.0 * exit_zombie_count as f64 / total_slices as f64
+        } else {
+            0.0
+        }
+    );
+
+    // We spawned 30 processes (10 per round × 3 rounds), so we expect some exit states
+    let total_exits = exit_dead_count + exit_zombie_count;
+    assert!(
+        total_exits > 0,
+        "FAILED: No exit states (EXIT_DEAD or EXIT_ZOMBIE) found in sched_slice.parquet. \
+         This indicates the BPF code is not properly combining __state with exit_state. \
+         Expected at least some exits from the 30 spawned processes."
+    );
+    eprintln!(
+        "✓ Found {} total exit states in Parquet ({} EXIT_DEAD, {} EXIT_ZOMBIE)",
+        total_exits, exit_dead_count, exit_zombie_count
+    );
+
+    // Verify process_exit.parquet also exists and has entries
+    let process_exit_path = dir.path().join("process_exit.parquet");
+    assert!(
+        process_exit_path.exists(),
+        "process_exit.parquet not found - process exit events not recorded"
+    );
+
+    let file = File::open(&process_exit_path).expect("Failed to open process_exit.parquet");
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
+    let reader = builder.build().expect("Failed to build reader");
+
+    let mut process_exit_count = 0;
+    for batch_result in reader {
+        let batch = batch_result.expect("Failed to read batch");
+        process_exit_count += batch.num_rows();
+    }
+
+    assert!(
+        process_exit_count > 0,
+        "FAILED: No entries in process_exit.parquet. Expected process exit events."
+    );
+    eprintln!(
+        "✓ Found {} process exit events in process_exit.parquet",
+        process_exit_count
+    );
+
+    // === VALIDATE PERFETTO OUTPUT ===
+
+    assert!(
+        trace_path.exists(),
+        "Perfetto trace not found at {:?}",
+        trace_path
+    );
+
+    let mut trace_data = Vec::new();
+    File::open(&trace_path)
+        .expect("Failed to open trace.pb")
+        .read_to_end(&mut trace_data)
+        .expect("Failed to read trace.pb");
+
+    let trace = Trace::parse_from_bytes(&trace_data).expect("Failed to parse Perfetto trace");
+
+    // Look for compact_sched events with exit states in switch_prev_state
+    let mut perfetto_exit_dead = 0;
+    let mut perfetto_exit_zombie = 0;
+
+    for packet in trace.packet.iter() {
+        if packet.has_ftrace_events() {
+            let ftrace_events = packet.ftrace_events();
+            if let Some(compact_sched) = ftrace_events.compact_sched.as_ref() {
+                for &prev_state in compact_sched.switch_prev_state.iter() {
+                    match prev_state as i32 {
+                        EXIT_DEAD => perfetto_exit_dead += 1,
+                        EXIT_ZOMBIE => perfetto_exit_zombie += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    eprintln!("\n=== Perfetto Task Exit State Analysis ===");
+    eprintln!(
+        "EXIT_DEAD (16/'X') in compact_sched: {}",
+        perfetto_exit_dead
+    );
+    eprintln!(
+        "EXIT_ZOMBIE (32/'Z') in compact_sched: {}",
+        perfetto_exit_zombie
+    );
+
+    let perfetto_total_exits = perfetto_exit_dead + perfetto_exit_zombie;
+    assert!(
+        perfetto_total_exits > 0,
+        "FAILED: No exit states found in Perfetto compact_sched events. \
+         This indicates the Parquet-to-Perfetto conversion is not preserving exit states."
+    );
+    eprintln!(
+        "✓ Found {} total exit states in Perfetto ({} EXIT_DEAD, {} EXIT_ZOMBIE)",
+        perfetto_total_exits, perfetto_exit_dead, perfetto_exit_zombie
+    );
+
+    // Also validate the trace passes standard validation
+    let perfetto_result = validate_perfetto_trace(&trace_path);
+    assert!(
+        perfetto_result.is_valid(),
+        "Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        perfetto_result.errors,
+        perfetto_result.warnings
+    );
+    eprintln!("✓ Perfetto trace passes standard validation");
+
+    // === VALIDATE DUCKDB OUTPUT ===
+
+    // Convert Parquet to DuckDB
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "exit_test")
+        .expect("DuckDB conversion failed");
+
+    assert!(duckdb_path.exists(), "DuckDB file not created");
+
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    // Query for exit states in sched_slice
+    let (duckdb_exit_dead, duckdb_exit_zombie): (i64, i64) = conn
+        .query_row(
+            "SELECT
+                COUNT(*) FILTER (WHERE end_state = 16),
+                COUNT(*) FILTER (WHERE end_state = 32)
+             FROM sched_slice",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Failed to query sched_slice");
+
+    eprintln!("\n=== DuckDB Task Exit State Analysis ===");
+    eprintln!("EXIT_DEAD (16/'X') in sched_slice: {}", duckdb_exit_dead);
+    eprintln!(
+        "EXIT_ZOMBIE (32/'Z') in sched_slice: {}",
+        duckdb_exit_zombie
+    );
+
+    let duckdb_total_exits = duckdb_exit_dead + duckdb_exit_zombie;
+    assert!(
+        duckdb_total_exits > 0,
+        "FAILED: No exit states found in DuckDB sched_slice table. \
+         This indicates the Parquet-to-DuckDB conversion is not preserving exit states."
+    );
+    eprintln!(
+        "✓ Found {} total exit states in DuckDB ({} EXIT_DEAD, {} EXIT_ZOMBIE)",
+        duckdb_total_exits, duckdb_exit_dead, duckdb_exit_zombie
+    );
+
+    // Validate DuckDB
+    let duckdb_result = validate_duckdb(&duckdb_path);
+    assert!(
+        duckdb_result.is_valid(),
+        "DuckDB validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        duckdb_result.errors,
+        duckdb_result.warnings
+    );
+    eprintln!("✓ DuckDB passes standard validation");
+
+    // === FINAL SUMMARY ===
+    eprintln!(
+        "\n✓ test_e2e_task_exit_states passed:\n  \
+         - Parquet: {} exit states\n  \
+         - Perfetto: {} exit states\n  \
+         - DuckDB: {} exit states\n  \
+         - {} process exit events recorded",
+        total_exits, perfetto_total_exits, duckdb_total_exits, process_exit_count
+    );
+}

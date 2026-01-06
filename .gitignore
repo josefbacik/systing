@@ -16,3 +16,4 @@
 scratch/
 
 .claude/settings.local.json
+traces/

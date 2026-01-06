@@ -8,10 +8,19 @@
 #include "strobelight/bpf_lib/python/pystacks/pystacks.bpf.h"
 #endif
 
-/* Task state definitions */
+/* Task state definitions (from task_struct->__state) */
 #define TASK_RUNNING		0x00000000
 #define TASK_INTERRUPTIBLE	0x00000001
 #define TASK_UNINTERRUPTIBLE	0x00000002
+
+/*
+ * Exit state definitions (from task_struct->exit_state, not __state).
+ * The kernel stores exit states in a separate field to avoid interference
+ * with the running/sleeping states. When recording task state for tracing,
+ * both fields must be ORed together (see __task_state_index in kernel).
+ */
+#define EXIT_DEAD		0x00000010  /* 'X' in ftrace format */
+#define EXIT_ZOMBIE		0x00000020  /* 'Z' in ftrace format */
 
 /* TASK_REPORT mask - valid task states for ftrace format (bits 0-6) */
 #define TASK_REPORT		0x0000007f
@@ -1355,8 +1364,13 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->next, next);
 	record_task_info(&event->prev, prev);
-	/* Convert raw task state to ftrace format (mask to TASK_REPORT bits + preemption) */
-	event->prev_state = preempt ? TASK_REPORT_MAX : (prev->__state & TASK_REPORT);
+	/*
+	 * Convert raw task state to ftrace format (mask to TASK_REPORT bits + preemption).
+	 * The kernel stores exit states (EXIT_ZOMBIE, EXIT_DEAD) in a separate exit_state
+	 * field, so we must OR it with __state to get the complete task state.
+	 * See kernel's __task_state_index() in include/linux/sched.h.
+	 */
+	event->prev_state = preempt ? TASK_REPORT_MAX : ((prev->__state | prev->exit_state) & TASK_REPORT);
 	event->next_prio = next->prio;
 	event->prev_prio = prev->prio;
 	bpf_ringbuf_submit(event, flags);
@@ -1369,6 +1383,10 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 	 *
 	 * Use the same timestamp as the sched_switch event so the stack sample
 	 * timestamp matches the end of the sched_slice.
+	 *
+	 * Note: Only check __state here, not exit_state. Exit states (EXIT_DEAD,
+	 * EXIT_ZOMBIE) should not trigger sleep stack recording - we only want
+	 * stacks for tasks that are blocked waiting for something.
 	 */
 	if (!tool_config.no_sleep_stack_traces) {
 		if (prev->__state & TASK_UNINTERRUPTIBLE)
