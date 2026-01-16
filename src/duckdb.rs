@@ -60,7 +60,7 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             ts BIGINT,
             dur BIGINT,
             utid BIGINT,
-            state VARCHAR,
+            state INTEGER,
             cpu INTEGER
         );
 
@@ -344,6 +344,14 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             timestamp_ns BIGINT,
             is_primary BOOLEAN
         );
+
+        CREATE TABLE IF NOT EXISTS sysinfo (
+            trace_id VARCHAR,
+            sysname VARCHAR,
+            release VARCHAR,
+            version VARCHAR,
+            machine VARCHAR
+        );
         ",
     )?;
 
@@ -476,6 +484,173 @@ fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Res
     // Clock snapshot
     import_table("clock_snapshot", &paths.clock_snapshot)?;
 
+    // System info
+    import_table("sysinfo", &paths.sysinfo)?;
+
+    Ok(())
+}
+
+/// Get list of trace IDs in a DuckDB database.
+///
+/// Returns a vector of trace IDs found in the _traces table.
+///
+/// # Arguments
+///
+/// * `db_path` - Path to the DuckDB database file
+///
+/// # Example
+///
+/// ```no_run
+/// use systing::duckdb::get_trace_ids;
+/// use std::path::Path;
+///
+/// let trace_ids = get_trace_ids(Path::new("./trace.duckdb")).unwrap();
+/// for id in trace_ids {
+///     println!("Found trace: {}", id);
+/// }
+/// ```
+pub fn get_trace_ids(db_path: &Path) -> Result<Vec<String>> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("Failed to open DuckDB database: {}", db_path.display()))?;
+
+    let mut stmt = conn
+        .prepare("SELECT trace_id FROM _traces ORDER BY trace_id")
+        .with_context(|| "Failed to query _traces table - database may not be a systing trace")?;
+
+    let trace_ids: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .with_context(|| "Failed to execute query on _traces table")?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(trace_ids)
+}
+
+/// Export DuckDB tables to Parquet files.
+///
+/// This function exports all trace tables from a DuckDB database to Parquet files
+/// in the specified output directory. The trace_id column is excluded from the
+/// output since Parquet files don't use it.
+///
+/// # Arguments
+///
+/// * `db_path` - Path to the source DuckDB database
+/// * `output_dir` - Directory where Parquet files will be written
+/// * `trace_id` - The trace ID to export (must exist in the database)
+///
+/// # Example
+///
+/// ```no_run
+/// use systing::duckdb::duckdb_to_parquet;
+/// use std::path::Path;
+///
+/// duckdb_to_parquet(
+///     Path::new("./trace.duckdb"),
+///     Path::new("./parquet_output"),
+///     "my_trace",
+/// ).unwrap();
+/// ```
+pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> Result<()> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("Failed to open DuckDB database: {}", db_path.display()))?;
+
+    // Create output directory if it doesn't exist
+    std::fs::create_dir_all(output_dir).with_context(|| {
+        format!(
+            "Failed to create output directory: {}",
+            output_dir.display()
+        )
+    })?;
+
+    // Configure DuckDB for parallel export
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    conn.execute_batch(&format!("SET threads TO {num_cpus};"))?;
+
+    let paths = ParquetPaths::new(output_dir);
+    let escaped_trace_id = trace_id.replace('\'', "''");
+
+    // Helper to export a single table to Parquet
+    // Uses EXCLUDE to omit the trace_id column (Parquet files don't have it)
+    let export_table = |table_name: &str, output_path: &Path| -> Result<()> {
+        // First check if the table has any rows for this trace_id
+        let count_query =
+            format!("SELECT COUNT(*) FROM {table_name} WHERE trace_id = '{escaped_trace_id}'");
+        let count: i64 = conn
+            .query_row(&count_query, [], |row| row.get(0))
+            .unwrap_or(0);
+
+        if count == 0 {
+            // Skip empty tables
+            return Ok(());
+        }
+
+        let escaped_path = output_path.to_string_lossy().replace('\'', "''");
+        let query = format!(
+            "COPY (SELECT * EXCLUDE (trace_id) FROM {table_name} WHERE trace_id = '{escaped_trace_id}') \
+             TO '{escaped_path}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+        );
+
+        conn.execute_batch(&query).with_context(|| {
+            format!(
+                "Failed to export table '{}' to '{}'",
+                table_name,
+                output_path.display()
+            )
+        })?;
+
+        Ok(())
+    };
+
+    // Export all tables
+    export_table("process", &paths.process)?;
+    export_table("thread", &paths.thread)?;
+    export_table("sched_slice", &paths.sched_slice)?;
+    export_table("thread_state", &paths.thread_state)?;
+
+    // IRQ/softirq tables
+    export_table("irq_slice", &paths.irq_slice)?;
+    export_table("softirq_slice", &paths.softirq_slice)?;
+    export_table("wakeup_new", &paths.wakeup_new)?;
+    export_table("process_exit", &paths.process_exit)?;
+
+    // Counter tables
+    export_table("counter_track", &paths.counter_track)?;
+    export_table("counter", &paths.counter)?;
+
+    // Event tables
+    export_table("slice", &paths.slice)?;
+    export_table("track", &paths.track)?;
+    export_table("args", &paths.args)?;
+    export_table("instant", &paths.instant)?;
+    export_table("instant_args", &paths.instant_args)?;
+
+    // Stack tables (query-friendly format)
+    export_table("stack", &paths.stack)?;
+    export_table("stack_sample", &paths.stack_sample)?;
+
+    // Legacy stack profile tables (for Perfetto .pb extraction compatibility)
+    export_table("stack_profile_symbol", &paths.symbol)?;
+    export_table("stack_profile_mapping", &paths.stack_mapping)?;
+    export_table("stack_profile_frame", &paths.frame)?;
+    export_table("stack_profile_callsite", &paths.callsite)?;
+    export_table("perf_sample", &paths.perf_sample)?;
+
+    // Network tables
+    export_table("network_interface", &paths.network_interface)?;
+    export_table("socket_connection", &paths.socket_connection)?;
+    export_table("network_syscall", &paths.network_syscall)?;
+    export_table("network_packet", &paths.network_packet)?;
+    export_table("network_socket", &paths.network_socket)?;
+    export_table("network_poll", &paths.network_poll)?;
+
+    // Clock snapshot
+    export_table("clock_snapshot", &paths.clock_snapshot)?;
+
+    // System info
+    export_table("sysinfo", &paths.sysinfo)?;
+
     Ok(())
 }
 
@@ -528,5 +703,100 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM _traces", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_get_trace_ids() {
+        let temp_dir = TempDir::new().unwrap();
+        let parquet_dir = temp_dir.path().join("traces");
+        fs::create_dir(&parquet_dir).unwrap();
+
+        let db_path = temp_dir.path().join("test.duckdb");
+
+        // Create a database with a trace
+        parquet_to_duckdb(&parquet_dir, &db_path, "my_trace_id").unwrap();
+
+        // Get trace IDs
+        let trace_ids = get_trace_ids(&db_path).unwrap();
+
+        assert_eq!(trace_ids.len(), 1);
+        assert_eq!(trace_ids[0], "my_trace_id");
+    }
+
+    #[test]
+    fn test_get_trace_ids_multiple() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.duckdb");
+
+        // Create database and add multiple traces manually
+        let conn = Connection::open(&db_path).unwrap();
+        create_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
+            ["trace_a", "/path/a"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
+            ["trace_b", "/path/b"],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Get trace IDs
+        let trace_ids = get_trace_ids(&db_path).unwrap();
+
+        assert_eq!(trace_ids.len(), 2);
+        assert!(trace_ids.contains(&"trace_a".to_string()));
+        assert!(trace_ids.contains(&"trace_b".to_string()));
+    }
+
+    #[test]
+    fn test_duckdb_to_parquet_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.duckdb");
+        let output_dir = temp_dir.path().join("output");
+
+        // Create a database with some test data
+        let conn = Connection::open(&db_path).unwrap();
+        create_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
+            ["test_trace", "/test/path"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO process (trace_id, upid, pid, name) VALUES (?, ?, ?, ?)",
+            duckdb::params!["test_trace", 1i64, 1234i32, "test_process"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO thread (trace_id, utid, tid, name, upid) VALUES (?, ?, ?, ?, ?)",
+            duckdb::params!["test_trace", 1i64, 1234i32, "main", 1i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Export to Parquet
+        duckdb_to_parquet(&db_path, &output_dir, "test_trace").unwrap();
+
+        // Verify Parquet files were created
+        assert!(output_dir.join("process.parquet").exists());
+        assert!(output_dir.join("thread.parquet").exists());
+
+        // Verify the Parquet files can be read back
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+
+        let file = File::open(output_dir.join("process.parquet")).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let reader = builder.build().unwrap();
+
+        let mut total_rows = 0;
+        for batch in reader {
+            let batch = batch.unwrap();
+            total_rows += batch.num_rows();
+        }
+        assert_eq!(total_rows, 1, "Expected 1 process row");
     }
 }

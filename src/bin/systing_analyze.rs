@@ -57,15 +57,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Convert Perfetto trace files to DuckDB database
+    /// Convert trace files between formats (Perfetto/Parquet/DuckDB)
     Convert {
         /// Input trace files or directories
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
 
-        /// Output DuckDB database path
+        /// Output path (DuckDB .duckdb or Perfetto .pb/.pftrace/.perfetto-trace)
         #[arg(short, long)]
         output: PathBuf,
+
+        /// Trace ID to export (required when DuckDB has multiple traces)
+        #[arg(long)]
+        trace_id: Option<String>,
 
         /// Recursively search directories for trace files
         #[arg(short, long)]
@@ -178,19 +182,39 @@ fn is_parquet_dir(path: &Path) -> bool {
         && path.join("sched_slice.parquet").exists()
 }
 
-/// Input type for trace conversion - either a Perfetto .pb file or a Parquet directory.
+/// Check if a path is a DuckDB database file.
+fn is_duckdb_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("duckdb"))
+}
+
+/// Check if a path is a Perfetto trace file (output format).
+fn is_perfetto_output(path: &Path) -> bool {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    name.ends_with(".pb")
+        || name.ends_with(".perfetto-trace")
+        || name.ends_with(".perfetto")
+        || name.ends_with(".pftrace")
+}
+
+/// Input type for trace conversion - Perfetto .pb file, Parquet directory, or DuckDB file.
 #[derive(Clone, Debug)]
 enum TraceInput {
     /// Perfetto protobuf trace file (.pb, .pb.gz, .perfetto-trace, .pftrace)
     PbFile(PathBuf),
     /// Directory containing Parquet trace files (from `systing --parquet`)
     ParquetDir(PathBuf),
+    /// DuckDB database file (.duckdb)
+    DuckDbFile(PathBuf),
 }
 
 impl TraceInput {
+    #[allow(dead_code)]
     fn path(&self) -> &Path {
         match self {
-            TraceInput::PbFile(p) | TraceInput::ParquetDir(p) => p,
+            TraceInput::PbFile(p) | TraceInput::ParquetDir(p) | TraceInput::DuckDbFile(p) => p,
         }
     }
 }
@@ -207,18 +231,20 @@ fn make_unique_trace_id(base_id: String, id_counts: &mut HashMap<String, usize>)
     result
 }
 
-/// Find all trace inputs (both .pb files and Parquet directories) in the given inputs
+/// Find all trace inputs (Perfetto .pb files, Parquet directories, or DuckDB files) in the given inputs
 fn find_trace_inputs(inputs: &[PathBuf], recursive: bool) -> Result<Vec<TraceInput>> {
     let mut traces = Vec::new();
 
     for input in inputs {
         if input.is_file() {
-            if is_trace_file(input) {
+            if is_duckdb_file(input) {
+                traces.push(TraceInput::DuckDbFile(input.clone()));
+            } else if is_trace_file(input) {
                 traces.push(TraceInput::PbFile(input.clone()));
             } else {
                 // Warn about explicitly-provided files that aren't recognized trace formats
                 eprintln!(
-                    "Warning: {} is not a recognized trace format (expected .pb, .pb.gz, .perfetto-trace, or .pftrace)",
+                    "Warning: {} is not a recognized trace format (expected .pb, .pb.gz, .perfetto-trace, .pftrace, or .duckdb)",
                     input.display()
                 );
             }
@@ -227,10 +253,14 @@ fn find_trace_inputs(inputs: &[PathBuf], recursive: bool) -> Result<Vec<TraceInp
             if is_parquet_dir(input) {
                 traces.push(TraceInput::ParquetDir(input.clone()));
             } else if recursive {
-                // Recursively search for .pb files and Parquet directories
+                // Recursively search for .pb files, Parquet directories, and DuckDB files
                 for entry in walkdir(input)? {
-                    if entry.is_file() && is_trace_file(&entry) {
-                        traces.push(TraceInput::PbFile(entry));
+                    if entry.is_file() {
+                        if is_duckdb_file(&entry) {
+                            traces.push(TraceInput::DuckDbFile(entry));
+                        } else if is_trace_file(&entry) {
+                            traces.push(TraceInput::PbFile(entry));
+                        }
                     } else if entry.is_dir() && is_parquet_dir(&entry) {
                         traces.push(TraceInput::ParquetDir(entry));
                     }
@@ -240,8 +270,12 @@ fn find_trace_inputs(inputs: &[PathBuf], recursive: bool) -> Result<Vec<TraceInp
                 for entry in fs::read_dir(input)? {
                     let entry = entry?;
                     let path = entry.path();
-                    if path.is_file() && is_trace_file(&path) {
-                        traces.push(TraceInput::PbFile(path));
+                    if path.is_file() {
+                        if is_duckdb_file(&path) {
+                            traces.push(TraceInput::DuckDbFile(path));
+                        } else if is_trace_file(&path) {
+                            traces.push(TraceInput::PbFile(path));
+                        }
                     } else if path.is_dir() && is_parquet_dir(&path) {
                         traces.push(TraceInput::ParquetDir(path));
                     }
@@ -2894,26 +2928,159 @@ struct TraceProcessingResult {
     needs_trace_id_injection: bool,
 }
 
+/// Run DuckDB → Perfetto conversion.
+/// This is a separate path from the main multi-trace → DuckDB conversion.
+fn run_duckdb_to_perfetto_convert(
+    duckdb_path: &Path,
+    output: &Path,
+    trace_id: Option<String>,
+    verbose: bool,
+) -> Result<()> {
+    use systing::duckdb::{duckdb_to_parquet, get_trace_ids};
+
+    let start_time = Instant::now();
+
+    // Get available trace IDs
+    let trace_ids = get_trace_ids(duckdb_path)?;
+
+    if trace_ids.is_empty() {
+        bail!(
+            "No traces found in DuckDB database: {}",
+            duckdb_path.display()
+        );
+    }
+
+    // Determine which trace to export
+    let selected_trace_id = match trace_id {
+        Some(id) => {
+            if !trace_ids.contains(&id) {
+                bail!(
+                    "Trace ID '{}' not found in database. Available traces: {:?}",
+                    id,
+                    trace_ids
+                );
+            }
+            id
+        }
+        None => {
+            if trace_ids.len() > 1 {
+                bail!(
+                    "Database contains multiple traces: {:?}\n\
+                     Use --trace-id to specify which trace to export.",
+                    trace_ids
+                );
+            }
+            trace_ids.into_iter().next().unwrap()
+        }
+    };
+
+    eprintln!(
+        "Converting DuckDB trace '{}' to Perfetto...",
+        selected_trace_id
+    );
+
+    // Create temp directory for intermediate Parquet files
+    let temp_dir = tempfile::tempdir()?;
+    let temp_path = temp_dir.path();
+
+    if verbose {
+        eprintln!("Using temp directory: {}", temp_path.display());
+    }
+
+    // Step 1: Export DuckDB to Parquet
+    let export_start = Instant::now();
+    duckdb_to_parquet(duckdb_path, temp_path, &selected_trace_id)?;
+    let export_time = export_start.elapsed();
+
+    if verbose {
+        eprintln!(
+            "DuckDB → Parquet export time: {:.2}s",
+            export_time.as_secs_f64()
+        );
+    }
+
+    // Step 2: Convert Parquet to Perfetto
+    let convert_start = Instant::now();
+    systing::parquet_to_perfetto::convert(temp_path, output)?;
+    let convert_time = convert_start.elapsed();
+
+    if verbose {
+        eprintln!(
+            "Parquet → Perfetto conversion time: {:.2}s",
+            convert_time.as_secs_f64()
+        );
+    }
+
+    let total_time = start_time.elapsed();
+    eprintln!(
+        "Converted '{}' → {} in {:.2}s",
+        selected_trace_id,
+        output.display(),
+        total_time.as_secs_f64()
+    );
+
+    Ok(())
+}
+
 /// Run the convert command
 fn run_convert(
     inputs: Vec<PathBuf>,
     output: PathBuf,
+    trace_id: Option<String>,
     recursive: bool,
     verbose: bool,
 ) -> Result<()> {
     let start_time = Instant::now();
 
-    // Find all trace inputs (both .pb files and Parquet directories)
+    // Find all trace inputs (Perfetto .pb files, Parquet directories, or DuckDB files)
     let trace_inputs = find_trace_inputs(&inputs, recursive)?;
     if trace_inputs.is_empty() {
-        bail!("No trace files or Parquet directories found in the specified inputs");
+        bail!("No trace files, Parquet directories, or DuckDB files found in the specified inputs");
     }
 
     // Separate inputs by type
-    let (pb_files, parquet_dirs): (Vec<_>, Vec<_>) = trace_inputs
-        .into_iter()
-        .partition(|t| matches!(t, TraceInput::PbFile(_)));
+    let mut pb_files = Vec::new();
+    let mut parquet_dirs = Vec::new();
+    let mut duckdb_files = Vec::new();
 
+    for input in trace_inputs {
+        match input {
+            TraceInput::PbFile(p) => pb_files.push(p),
+            TraceInput::ParquetDir(p) => parquet_dirs.push(p),
+            TraceInput::DuckDbFile(p) => duckdb_files.push(p),
+        }
+    }
+
+    // Check for DuckDB → Perfetto conversion path
+    if !duckdb_files.is_empty() && is_perfetto_output(&output) {
+        // DuckDB → Perfetto conversion
+        if duckdb_files.len() > 1 {
+            bail!(
+                "DuckDB → Perfetto conversion only supports a single DuckDB file. \
+                 Found {} DuckDB files.",
+                duckdb_files.len()
+            );
+        }
+        if !pb_files.is_empty() || !parquet_dirs.is_empty() {
+            bail!(
+                "DuckDB → Perfetto conversion cannot be mixed with other input types. \
+                 Found {} Perfetto files and {} Parquet directories.",
+                pb_files.len(),
+                parquet_dirs.len()
+            );
+        }
+        return run_duckdb_to_perfetto_convert(&duckdb_files[0], &output, trace_id, verbose);
+    }
+
+    // If we have DuckDB files but Perfetto output wasn't detected, error out
+    if !duckdb_files.is_empty() && !is_perfetto_output(&output) {
+        bail!(
+            "DuckDB input detected but output is not a Perfetto file. \
+             To convert DuckDB → Perfetto, use an output with extension .pb, .pftrace, or .perfetto-trace"
+        );
+    }
+
+    // Standard path: convert to DuckDB database
     eprintln!(
         "Found {} Perfetto trace files and {} Parquet directories",
         pb_files.len(),
@@ -2924,8 +3091,8 @@ fn run_convert(
     let pb_traces: Vec<TraceInfo> = pb_files
         .iter()
         .map(|input| TraceInfo {
-            trace_id: generate_trace_id(input.path()),
-            source_path: input.path().to_path_buf(),
+            trace_id: generate_trace_id(input),
+            source_path: input.clone(),
         })
         .collect();
 
@@ -2943,11 +3110,11 @@ fn run_convert(
     let parquet_traces: Vec<TraceInfo> = parquet_dirs
         .iter()
         .map(|input| {
-            let base_id = generate_trace_id(input.path());
+            let base_id = generate_trace_id(input);
             let trace_id = make_unique_trace_id(base_id, &mut id_counts);
             TraceInfo {
                 trace_id,
-                source_path: input.path().to_path_buf(),
+                source_path: input.clone(),
             }
         })
         .collect();
@@ -3559,9 +3726,10 @@ fn main() -> Result<()> {
         Commands::Convert {
             inputs,
             output,
+            trace_id,
             recursive,
             verbose,
-        } => run_convert(inputs, output, recursive, verbose),
+        } => run_convert(inputs, output, trace_id, recursive, verbose),
         Commands::Query {
             database,
             sql,

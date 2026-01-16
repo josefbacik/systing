@@ -2197,3 +2197,128 @@ fn test_e2e_task_exit_states() {
         total_exits, perfetto_total_exits, duckdb_total_exits, process_exit_count
     );
 }
+
+// =============================================================================
+// DuckDB → Perfetto Conversion Tests
+// =============================================================================
+
+/// Tests DuckDB → Perfetto conversion using systing-analyze convert.
+///
+/// This test validates that:
+/// 1. A DuckDB database can be converted to Perfetto format
+/// 2. The resulting Perfetto trace passes validation
+/// 3. The trace contains expected data (processes, threads, scheduler events)
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_duckdb_to_perfetto() {
+    use perfetto_protos::trace::Trace;
+    use protobuf::Message;
+    use std::fs::File;
+    use std::io::Read as IoRead;
+    use std::process::Command;
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let duckdb_path = dir.path().join("trace.duckdb");
+    let perfetto_path = dir.path().join("converted.pb");
+
+    // Step 1: Record a trace with DuckDB output
+    let config = Config {
+        duration: 2, // 2 seconds to ensure we capture some activity
+        output_dir: dir.path().to_path_buf(),
+        output: duckdb_path.clone(),
+        ..Config::default()
+    };
+
+    systing(config).expect("systing recording failed");
+
+    // Verify DuckDB file was created
+    assert!(
+        duckdb_path.exists(),
+        "DuckDB trace not created at {:?}",
+        duckdb_path
+    );
+
+    // Step 2: Convert DuckDB → Perfetto using systing-analyze convert
+    let output = Command::new(env!("CARGO_BIN_EXE_systing-analyze"))
+        .args([
+            "convert",
+            "-o",
+            perfetto_path.to_str().unwrap(),
+            duckdb_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run systing-analyze convert");
+
+    assert!(
+        output.status.success(),
+        "systing-analyze convert failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify Perfetto file was created
+    assert!(
+        perfetto_path.exists(),
+        "Perfetto trace not created at {:?}",
+        perfetto_path
+    );
+
+    // Step 3: Validate the Perfetto output
+    let perfetto_result = validate_perfetto_trace(&perfetto_path);
+    assert!(
+        perfetto_result.is_valid(),
+        "Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        perfetto_result.errors,
+        perfetto_result.warnings
+    );
+
+    // Step 4: Verify the trace contains expected content
+    let mut trace_data = Vec::new();
+    File::open(&perfetto_path)
+        .expect("Failed to open perfetto trace")
+        .read_to_end(&mut trace_data)
+        .expect("Failed to read perfetto trace");
+
+    let trace = Trace::parse_from_bytes(&trace_data).expect("Failed to parse Perfetto trace");
+
+    // Count key packet types
+    let mut has_process_descriptor = false;
+    let mut has_thread_descriptor = false;
+    let mut has_ftrace_events = false;
+
+    for packet in trace.packet.iter() {
+        if packet.has_track_descriptor() {
+            let td = packet.track_descriptor();
+            if td.process.is_some() {
+                has_process_descriptor = true;
+            }
+            if td.thread.is_some() {
+                has_thread_descriptor = true;
+            }
+        }
+        if packet.has_ftrace_events() {
+            has_ftrace_events = true;
+        }
+    }
+
+    assert!(
+        has_process_descriptor,
+        "Perfetto trace missing process descriptors"
+    );
+    assert!(
+        has_thread_descriptor,
+        "Perfetto trace missing thread descriptors"
+    );
+    assert!(
+        has_ftrace_events,
+        "Perfetto trace missing ftrace events (scheduler data)"
+    );
+
+    eprintln!(
+        "✓ test_e2e_duckdb_to_perfetto passed:\n  \
+         - DuckDB → Perfetto conversion successful\n  \
+         - Perfetto trace valid with process, thread, and scheduler data"
+    );
+}
