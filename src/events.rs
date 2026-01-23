@@ -430,8 +430,7 @@ impl UProbeEvent {
                 let symbol = parts[2].to_string();
                 let mut symbol_parts = symbol.split('+');
                 let symbol = symbol_parts.next().unwrap();
-                let offset = symbol_parts.next();
-                if let Some(offset) = offset {
+                if let Some(offset) = symbol_parts.next() {
                     probe.offset = offset.parse::<u64>()?;
                 } else {
                     probe.offset = 0;
@@ -488,8 +487,7 @@ impl KProbeEvent {
                 let symbol = parts[1].to_string();
                 let mut symbol_parts = symbol.split('+');
                 let symbol = symbol_parts.next().unwrap();
-                let offset = symbol_parts.next();
-                if let Some(offset) = offset {
+                if let Some(offset) = symbol_parts.next() {
                     probe.offset = offset.parse::<u64>()?;
                 } else {
                     probe.offset = 0;

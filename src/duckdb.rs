@@ -5,9 +5,54 @@
 
 use anyhow::{Context, Result};
 use duckdb::Connection;
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::parquet_paths::ParquetPaths;
+
+/// Mapping for a single trace when importing from one DuckDB database to another.
+pub struct TraceImportMapping {
+    /// The trace ID in the source database
+    pub old_id: String,
+    /// The trace ID to use in the destination database
+    pub new_id: String,
+    /// The original source path for provenance tracking in `_traces`
+    pub source_path: String,
+}
+
+/// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
+pub const DATA_TABLES: &[&str] = &[
+    "process",
+    "thread",
+    "sched_slice",
+    "thread_state",
+    "irq_slice",
+    "softirq_slice",
+    "wakeup_new",
+    "process_exit",
+    "counter_track",
+    "counter",
+    "slice",
+    "track",
+    "args",
+    "instant",
+    "instant_args",
+    "stack_profile_symbol",
+    "stack_profile_mapping",
+    "stack_profile_frame",
+    "stack_profile_callsite",
+    "perf_sample",
+    "stack",
+    "stack_sample",
+    "network_interface",
+    "socket_connection",
+    "network_syscall",
+    "network_packet",
+    "network_socket",
+    "network_poll",
+    "clock_snapshot",
+    "sysinfo",
+];
 
 /// Create DuckDB schema with all tables.
 ///
@@ -526,6 +571,194 @@ pub fn get_trace_ids(db_path: &Path) -> Result<Vec<String>> {
     Ok(trace_ids)
 }
 
+/// Get trace IDs and their source paths from a DuckDB database.
+///
+/// Returns a vector of (trace_id, source_path) pairs found in the _traces table.
+pub fn get_trace_info(db_path: &Path) -> Result<Vec<(String, String)>> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("Failed to open DuckDB database: {}", db_path.display()))?;
+
+    let mut stmt = conn
+        .prepare("SELECT trace_id, COALESCE(source_path, '') FROM _traces ORDER BY trace_id")
+        .with_context(|| {
+            format!(
+                "Failed to query _traces table in '{}' - file may not be a valid systing trace database",
+                db_path.display()
+            )
+        })?;
+
+    let traces: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .with_context(|| "Failed to execute query on _traces table")?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(traces)
+}
+
+/// Import traces from one DuckDB database into another via ATTACH.
+///
+/// This function attaches the input database read-only, then copies data for the
+/// specified trace IDs into the output database with remapped trace IDs.
+/// Handles schema version mismatches by dynamically querying column lists and
+/// using NULL defaults for columns missing in the source.
+///
+/// # Arguments
+///
+/// * `conn` - Connection to the output DuckDB database (must already have schema created)
+/// * `input_path` - Path to the input DuckDB database file
+/// * `mappings` - Trace ID mappings (old_id -> new_id + source_path) for each trace to import
+pub fn import_duckdb_traces(
+    conn: &Connection,
+    input_path: &Path,
+    mappings: &[TraceImportMapping],
+) -> Result<()> {
+    if mappings.is_empty() {
+        return Ok(());
+    }
+
+    let escaped_input_path = input_path.to_string_lossy().replace('\'', "''");
+
+    // Defensive cleanup of any leftover ATTACH from a previous failed call
+    conn.execute_batch("DETACH IF EXISTS input_db").ok();
+
+    // Attach the input database read-only
+    conn.execute_batch(&format!(
+        "ATTACH '{escaped_input_path}' AS input_db (READ_ONLY)"
+    ))
+    .with_context(|| {
+        format!(
+            "Failed to attach DuckDB file '{}' - it may have been created with an incompatible DuckDB version",
+            input_path.display()
+        )
+    })?;
+
+    // Do the actual import work, then always DETACH
+    let result = import_duckdb_traces_inner(conn, mappings);
+    conn.execute_batch("DETACH input_db").ok();
+    result
+}
+
+/// Inner implementation of DuckDB trace import (called after ATTACH).
+fn import_duckdb_traces_inner(conn: &Connection, mappings: &[TraceImportMapping]) -> Result<()> {
+    // Insert _traces metadata for each mapped trace
+    for mapping in mappings {
+        conn.execute(
+            "INSERT INTO main._traces (trace_id, source_path) VALUES (?, ?)",
+            duckdb::params![mapping.new_id, mapping.source_path],
+        )
+        .with_context(|| format!("Failed to insert trace metadata for '{}'", mapping.new_id))?;
+    }
+
+    // Get the set of tables that exist in the input database
+    // Note: information_schema is not accessible on attached databases, so use duckdb_tables()
+    let input_tables: HashSet<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT table_name FROM duckdb_tables() \
+             WHERE database_name = 'input_db' AND schema_name = 'main' AND table_name != '_traces'",
+        )?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<_, _>>()
+            .context("Failed to query tables in attached database")?
+    };
+
+    // Build the CASE expression for trace ID remapping.
+    // ELSE trace_id is a defensive fallback — the WHERE clause should ensure only
+    // mapped trace IDs are selected, but this prevents NULL trace_ids if they ever drift.
+    let case_expr = {
+        let mut parts = String::from("CASE trace_id ");
+        for mapping in mappings {
+            let escaped_old = mapping.old_id.replace('\'', "''");
+            let escaped_new = mapping.new_id.replace('\'', "''");
+            parts.push_str(&format!("WHEN '{escaped_old}' THEN '{escaped_new}' "));
+        }
+        parts.push_str("ELSE trace_id END");
+        parts
+    };
+
+    // Build the WHERE clause for filtering trace IDs
+    let where_clause = {
+        let ids: Vec<String> = mappings
+            .iter()
+            .map(|m| format!("'{}'", m.old_id.replace('\'', "''")))
+            .collect();
+        format!("WHERE trace_id IN ({})", ids.join(", "))
+    };
+
+    // Import each table
+    for table_name in DATA_TABLES {
+        if !input_tables.contains(*table_name) {
+            continue;
+        }
+
+        let escaped_table_name = table_name.replace('\'', "''");
+
+        // Get columns in the target (output) table, excluding trace_id
+        let target_columns: Vec<String> = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT column_name FROM duckdb_columns() \
+                 WHERE database_name = current_database() AND schema_name = 'main' \
+                 AND table_name = '{escaped_table_name}' AND column_name != 'trace_id' \
+                 ORDER BY column_index",
+            ))?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<_, _>>()
+                .with_context(|| {
+                    format!("Failed to query columns for target table '{table_name}'")
+                })?
+        };
+
+        // Get columns in the source (input) table, excluding trace_id
+        let source_columns: HashSet<String> = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT column_name FROM duckdb_columns() \
+                 WHERE database_name = 'input_db' AND schema_name = 'main' \
+                 AND table_name = '{escaped_table_name}' AND column_name != 'trace_id'",
+            ))?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<_, _>>()
+                .with_context(|| {
+                    format!("Failed to query columns for source table '{table_name}'")
+                })?
+        };
+
+        if target_columns.is_empty() {
+            continue;
+        }
+
+        // Build SELECT expressions: use source column if present, NULL otherwise
+        let select_exprs: Vec<String> = target_columns
+            .iter()
+            .map(|col| {
+                if source_columns.contains(col) {
+                    format!("\"{col}\"")
+                } else {
+                    format!("NULL AS \"{col}\"")
+                }
+            })
+            .collect();
+
+        let target_col_list: String = target_columns
+            .iter()
+            .map(|col| format!("\"{col}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "INSERT INTO main.\"{table_name}\" (trace_id, {target_col_list}) \
+             SELECT {case_expr} AS trace_id, {} \
+             FROM input_db.\"{table_name}\" {where_clause}",
+            select_exprs.join(", ")
+        );
+
+        conn.execute_batch(&sql).with_context(|| {
+            format!("Failed to import table '{table_name}' from attached DuckDB database")
+        })?;
+    }
+
+    Ok(())
+}
+
 /// Export DuckDB tables to Parquet files.
 ///
 /// This function exports all trace tables from a DuckDB database to Parquet files
@@ -798,5 +1031,541 @@ mod tests {
             total_rows += batch.num_rows();
         }
         assert_eq!(total_rows, 1, "Expected 1 process row");
+    }
+
+    /// Helper to create a test DuckDB with process and thread data for a given trace.
+    fn create_test_db(db_path: &Path, trace_id: &str, pid: i32, process_name: &str) {
+        let conn = Connection::open(db_path).unwrap();
+        create_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
+            duckdb::params![trace_id, format!("/test/{trace_id}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO process (trace_id, upid, pid, name) VALUES (?, ?, ?, ?)",
+            duckdb::params![trace_id, 1i64, pid, process_name],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO thread (trace_id, utid, tid, name, upid) VALUES (?, ?, ?, ?, ?)",
+            duckdb::params![trace_id, 1i64, pid, "main", 1i64],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_get_trace_info() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.duckdb");
+
+        let conn = Connection::open(&db_path).unwrap();
+        create_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
+            ["trace_a", "/path/to/a"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
+            ["trace_b", "/path/to/b"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let info = get_trace_info(&db_path).unwrap();
+        assert_eq!(info.len(), 2);
+        assert_eq!(info[0], ("trace_a".to_string(), "/path/to/a".to_string()));
+        assert_eq!(info[1], ("trace_b".to_string(), "/path/to/b".to_string()));
+    }
+
+    #[test]
+    fn test_import_duckdb_traces_basic() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create two input databases
+        let input1_path = temp_dir.path().join("input1.duckdb");
+        create_test_db(&input1_path, "trace_a", 100, "proc_a");
+
+        let input2_path = temp_dir.path().join("input2.duckdb");
+        create_test_db(&input2_path, "trace_b", 200, "proc_b");
+
+        // Create output database
+        let output_path = temp_dir.path().join("output.duckdb");
+        let conn = Connection::open(&output_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        // Import from first input
+        import_duckdb_traces(
+            &conn,
+            &input1_path,
+            &[TraceImportMapping {
+                old_id: "trace_a".into(),
+                new_id: "node1".into(),
+                source_path: "/test/trace_a".into(),
+            }],
+        )
+        .unwrap();
+
+        // Import from second input
+        import_duckdb_traces(
+            &conn,
+            &input2_path,
+            &[TraceImportMapping {
+                old_id: "trace_b".into(),
+                new_id: "node2".into(),
+                source_path: "/test/trace_b".into(),
+            }],
+        )
+        .unwrap();
+
+        // Verify _traces table
+        let trace_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _traces", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(trace_count, 2);
+
+        // Verify process data with remapped trace IDs
+        let proc_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM process", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(proc_count, 2);
+
+        // Check trace IDs were remapped correctly
+        let node1_procs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM process WHERE trace_id = 'node1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(node1_procs, 1);
+
+        let node2_procs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM process WHERE trace_id = 'node2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(node2_procs, 1);
+
+        // Verify thread data was also imported
+        let thread_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM thread", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(thread_count, 2);
+    }
+
+    #[test]
+    fn test_import_duckdb_traces_multi_trace_input() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create input with multiple traces
+        let input_path = temp_dir.path().join("multi.duckdb");
+        {
+            let conn = Connection::open(&input_path).unwrap();
+            create_schema(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
+                ["trace_x", "/path/x"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
+                ["trace_y", "/path/y"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO process (trace_id, upid, pid, name) VALUES (?, ?, ?, ?)",
+                duckdb::params!["trace_x", 1i64, 100i32, "proc_x"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO process (trace_id, upid, pid, name) VALUES (?, ?, ?, ?)",
+                duckdb::params!["trace_y", 2i64, 200i32, "proc_y"],
+            )
+            .unwrap();
+        }
+
+        // Create output database
+        let output_path = temp_dir.path().join("output.duckdb");
+        let conn = Connection::open(&output_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        // Import both traces with remapped IDs
+        import_duckdb_traces(
+            &conn,
+            &input_path,
+            &[
+                TraceImportMapping {
+                    old_id: "trace_x".into(),
+                    new_id: "remapped_x".into(),
+                    source_path: "/path/x".into(),
+                },
+                TraceImportMapping {
+                    old_id: "trace_y".into(),
+                    new_id: "remapped_y".into(),
+                    source_path: "/path/y".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        // Verify all 3 traces in output _traces table (both remapped)
+        let trace_ids = get_trace_ids(&output_path).unwrap();
+        assert_eq!(trace_ids.len(), 2);
+        assert!(trace_ids.contains(&"remapped_x".to_string()));
+        assert!(trace_ids.contains(&"remapped_y".to_string()));
+
+        // Verify process rows are correctly remapped
+        let x_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM process WHERE trace_id = 'remapped_x'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(x_count, 1);
+
+        let y_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM process WHERE trace_id = 'remapped_y'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(y_count, 1);
+    }
+
+    #[test]
+    fn test_import_duckdb_traces_empty_map() {
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.duckdb");
+        create_test_db(&input_path, "trace_a", 100, "proc_a");
+
+        let output_path = temp_dir.path().join("output.duckdb");
+        let conn = Connection::open(&output_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        // Import with empty mappings should be a no-op
+        import_duckdb_traces(&conn, &input_path, &[]).unwrap();
+
+        let trace_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _traces", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(trace_count, 0);
+    }
+
+    #[test]
+    fn test_import_duckdb_traces_missing_table_in_source() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a minimal input database with only _traces and process tables
+        let input_path = temp_dir.path().join("minimal.duckdb");
+        {
+            let conn = Connection::open(&input_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _traces (trace_id VARCHAR PRIMARY KEY, source_path VARCHAR, import_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+                 CREATE TABLE process (trace_id VARCHAR, upid BIGINT, pid INTEGER, name VARCHAR);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
+                ["trace_a", "/path/a"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO process (trace_id, upid, pid, name) VALUES (?, ?, ?, ?)",
+                duckdb::params!["trace_a", 1i64, 100i32, "proc_a"],
+            )
+            .unwrap();
+        }
+
+        // Create full-schema output database
+        let output_path = temp_dir.path().join("output.duckdb");
+        let conn = Connection::open(&output_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        // Import should succeed, skipping missing tables
+        import_duckdb_traces(
+            &conn,
+            &input_path,
+            &[TraceImportMapping {
+                old_id: "trace_a".into(),
+                new_id: "imported".into(),
+                source_path: "/path/a".into(),
+            }],
+        )
+        .unwrap();
+
+        // Verify process was imported
+        let proc_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM process WHERE trace_id = 'imported'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(proc_count, 1);
+
+        // Other tables should be empty
+        let thread_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM thread", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(thread_count, 0);
+    }
+
+    #[test]
+    fn test_import_duckdb_traces_missing_column_in_source() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create input with an older schema that lacks the cmdline column in process
+        let input_path = temp_dir.path().join("old_schema.duckdb");
+        {
+            let conn = Connection::open(&input_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _traces (trace_id VARCHAR PRIMARY KEY, source_path VARCHAR, import_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+                 CREATE TABLE process (trace_id VARCHAR, upid BIGINT, pid INTEGER, name VARCHAR);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
+                ["trace_a", "/path/a"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO process (trace_id, upid, pid, name) VALUES (?, ?, ?, ?)",
+                duckdb::params!["trace_a", 1i64, 100i32, "proc_a"],
+            )
+            .unwrap();
+        }
+
+        // Create output with current schema (process has cmdline column)
+        let output_path = temp_dir.path().join("output.duckdb");
+        let conn = Connection::open(&output_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        // Import should succeed, with NULL for missing cmdline column
+        import_duckdb_traces(
+            &conn,
+            &input_path,
+            &[TraceImportMapping {
+                old_id: "trace_a".into(),
+                new_id: "imported".into(),
+                source_path: "/path/a".into(),
+            }],
+        )
+        .unwrap();
+
+        // Verify process was imported with correct values
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM process WHERE trace_id = 'imported'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "proc_a");
+
+        // Verify cmdline is NULL for the imported row
+        let cmdline_is_null: bool = conn
+            .query_row(
+                "SELECT cmdline IS NULL FROM process WHERE trace_id = 'imported'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cmdline_is_null);
+    }
+
+    #[test]
+    fn test_import_duckdb_traces_preserves_source_path() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let input_path = temp_dir.path().join("input.duckdb");
+        create_test_db(&input_path, "trace_a", 100, "proc_a");
+
+        let output_path = temp_dir.path().join("output.duckdb");
+        let conn = Connection::open(&output_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        // Import with the original source path preserved
+        import_duckdb_traces(
+            &conn,
+            &input_path,
+            &[TraceImportMapping {
+                old_id: "trace_a".into(),
+                new_id: "remapped".into(),
+                source_path: "/original/source/path".into(),
+            }],
+        )
+        .unwrap();
+
+        // Verify source_path in _traces uses the original source path, not the DuckDB file path
+        let source_path: String = conn
+            .query_row(
+                "SELECT source_path FROM _traces WHERE trace_id = 'remapped'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_path, "/original/source/path");
+    }
+
+    #[test]
+    fn test_import_duckdb_traces_detach_on_error() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let input_path = temp_dir.path().join("input.duckdb");
+        create_test_db(&input_path, "trace_a", 100, "proc_a");
+
+        let output_path = temp_dir.path().join("output.duckdb");
+        let conn = Connection::open(&output_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        // First import succeeds
+        import_duckdb_traces(
+            &conn,
+            &input_path,
+            &[TraceImportMapping {
+                old_id: "trace_a".into(),
+                new_id: "first".into(),
+                source_path: "/test/a".into(),
+            }],
+        )
+        .unwrap();
+
+        // Second import with a conflicting trace_id should fail (PRIMARY KEY violation in _traces)
+        let result = import_duckdb_traces(
+            &conn,
+            &input_path,
+            &[TraceImportMapping {
+                old_id: "trace_a".into(),
+                new_id: "first".into(), // duplicate!
+                source_path: "/test/a".into(),
+            }],
+        );
+        assert!(result.is_err());
+
+        // After error, we should still be able to import again (DETACH was called)
+        import_duckdb_traces(
+            &conn,
+            &input_path,
+            &[TraceImportMapping {
+                old_id: "trace_a".into(),
+                new_id: "second".into(),
+                source_path: "/test/a".into(),
+            }],
+        )
+        .unwrap();
+
+        // Verify both successful imports are present
+        let trace_ids = get_trace_ids(&output_path).unwrap();
+        assert!(trace_ids.contains(&"first".to_string()));
+        assert!(trace_ids.contains(&"second".to_string()));
+    }
+
+    #[test]
+    fn test_import_duckdb_traces_extra_columns_in_source() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create input with a newer schema that has an extra column in process
+        let input_path = temp_dir.path().join("new_schema.duckdb");
+        {
+            let conn = Connection::open(&input_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _traces (trace_id VARCHAR PRIMARY KEY, source_path VARCHAR, import_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+                 CREATE TABLE process (trace_id VARCHAR, upid BIGINT, pid INTEGER, name VARCHAR, cmdline VARCHAR[], extra_future_col VARCHAR);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
+                ["trace_a", "/path/a"],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO process VALUES ('trace_a', 1, 100, 'proc_a', NULL, 'future_value')",
+            )
+            .unwrap();
+        }
+
+        // Create output with current schema (process does NOT have extra_future_col)
+        let output_path = temp_dir.path().join("output.duckdb");
+        let conn = Connection::open(&output_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        // Import should succeed, silently dropping the extra column
+        import_duckdb_traces(
+            &conn,
+            &input_path,
+            &[TraceImportMapping {
+                old_id: "trace_a".into(),
+                new_id: "imported".into(),
+                source_path: "/path/a".into(),
+            }],
+        )
+        .unwrap();
+
+        // Verify process was imported with known columns preserved
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM process WHERE trace_id = 'imported'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "proc_a");
+
+        // Verify the row count is correct (extra column was silently dropped)
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM process WHERE trace_id = 'imported'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_data_tables_matches_schema() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.duckdb");
+
+        let conn = Connection::open(&db_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        // Get all tables from schema
+        let schema_tables: HashSet<String> = conn
+            .prepare(
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE table_schema = 'main' AND table_name != '_traces'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Verify DATA_TABLES contains all schema tables
+        let data_tables_set: HashSet<&str> = DATA_TABLES.iter().copied().collect();
+
+        for table in &schema_tables {
+            assert!(
+                data_tables_set.contains(table.as_str()),
+                "Schema table '{}' is missing from DATA_TABLES",
+                table
+            );
+        }
+
+        // Verify DATA_TABLES doesn't have extra entries
+        for table in DATA_TABLES {
+            assert!(
+                schema_tables.contains(*table),
+                "DATA_TABLES entry '{}' is not in the schema",
+                table
+            );
+        }
     }
 }

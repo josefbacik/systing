@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::thread;
 use std::time::Instant;
-use systing::duckdb::create_schema;
+use systing::duckdb::{create_schema, get_trace_info, import_duckdb_traces, TraceImportMapping};
 use systing::ParquetPaths;
 
 /// Track name for network interface metadata in Perfetto traces.
@@ -3072,20 +3072,52 @@ fn run_convert(
         return run_duckdb_to_perfetto_convert(&duckdb_files[0], &output, trace_id, verbose);
     }
 
-    // If we have DuckDB files but Perfetto output wasn't detected, error out
-    if !duckdb_files.is_empty() && !is_perfetto_output(&output) {
-        bail!(
-            "DuckDB input detected but output is not a Perfetto file. \
-             To convert DuckDB → Perfetto, use an output with extension .pb, .pftrace, or .perfetto-trace"
-        );
+    // Self-reference check: ensure no DuckDB input resolves to the same path as the output
+    if !duckdb_files.is_empty() {
+        let parent = output
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if let Ok(canon_parent) = parent.canonicalize() {
+            let output_canon = canon_parent.join(output.file_name().unwrap_or_default());
+            for db_file in &duckdb_files {
+                if let Ok(input_canon) = db_file.canonicalize() {
+                    if input_canon == output_canon {
+                        bail!(
+                            "Input DuckDB file '{}' is the same as the output path. \
+                             Cannot use the output file as an input.",
+                            db_file.display()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // Standard path: convert to DuckDB database
-    eprintln!(
-        "Found {} Perfetto trace files and {} Parquet directories",
-        pb_files.len(),
-        parquet_dirs.len()
-    );
+    let mut source_counts = Vec::new();
+    if !pb_files.is_empty() {
+        source_counts.push(format!(
+            "{} Perfetto trace file{}",
+            pb_files.len(),
+            if pb_files.len() == 1 { "" } else { "s" }
+        ));
+    }
+    if !parquet_dirs.is_empty() {
+        source_counts.push(format!(
+            "{} Parquet director{}",
+            parquet_dirs.len(),
+            if parquet_dirs.len() == 1 { "y" } else { "ies" }
+        ));
+    }
+    if !duckdb_files.is_empty() {
+        source_counts.push(format!(
+            "{} DuckDB file{}",
+            duckdb_files.len(),
+            if duckdb_files.len() == 1 { "" } else { "s" }
+        ));
+    }
+    eprintln!("Found {}", source_counts.join(", "));
 
     // Prepare trace info for .pb files
     let pb_traces: Vec<TraceInfo> = pb_files
@@ -3119,7 +3151,50 @@ fn run_convert(
         })
         .collect();
 
-    let total_traces = pb_traces.len() + parquet_traces.len();
+    // Phase 1c: Pre-scan DuckDB input files for their trace IDs
+    struct DuckDbInput {
+        path: PathBuf,
+        mappings: Vec<TraceImportMapping>,
+    }
+    let mut duckdb_inputs: Vec<DuckDbInput> = Vec::new();
+    let mut duckdb_trace_count = 0usize;
+
+    for db_file in &duckdb_files {
+        let trace_info = get_trace_info(db_file)
+            .with_context(|| format!("Failed to read traces from '{}'", db_file.display()))?;
+        if trace_info.is_empty() {
+            eprintln!(
+                "Warning: DuckDB file '{}' contains no traces, skipping",
+                db_file.display()
+            );
+            continue;
+        }
+
+        let mut mappings = Vec::new();
+        for (old_id, source_path) in &trace_info {
+            let base_id = generate_trace_id(db_file);
+            // If the DuckDB has multiple traces, incorporate the original trace ID into the base
+            let base_id = if trace_info.len() > 1 {
+                format!("{base_id}_{old_id}")
+            } else {
+                base_id
+            };
+            let new_id = make_unique_trace_id(base_id, &mut id_counts);
+            mappings.push(TraceImportMapping {
+                old_id: old_id.clone(),
+                new_id,
+                source_path: source_path.clone(),
+            });
+        }
+
+        duckdb_trace_count += trace_info.len();
+        duckdb_inputs.push(DuckDbInput {
+            path: db_file.clone(),
+            mappings,
+        });
+    }
+
+    let total_traces = pb_traces.len() + parquet_traces.len() + duckdb_trace_count;
 
     // Remove existing output database
     if output.exists() {
@@ -3238,16 +3313,14 @@ fn run_convert(
         })
         .collect();
 
-    if successful_results.is_empty() {
+    if successful_results.is_empty() && duckdb_inputs.is_empty() {
         bail!("All traces failed to process");
     }
 
-    // Phase 2: Create DuckDB database and bulk import Parquet files
+    // Phase 2: Create DuckDB database and bulk import
+    let total_import_count = successful_results.len() + duckdb_trace_count;
     if verbose {
-        eprintln!(
-            "Importing {} traces into DuckDB...",
-            successful_results.len()
-        );
+        eprintln!("Importing {} traces into DuckDB...", total_import_count);
     }
     let import_start = Instant::now();
 
@@ -3255,7 +3328,10 @@ fn run_convert(
     conn.execute_batch(&format!("SET threads TO {num_cpus};"))?;
     create_schema(&conn)?;
 
-    // Import _traces table
+    // Wrap all imports in a single transaction for performance
+    conn.execute_batch("BEGIN TRANSACTION")?;
+
+    // Import _traces table for Parquet/.pb results
     for result in &successful_results {
         conn.execute(
             "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
@@ -3354,6 +3430,39 @@ fn run_convert(
     import_table("network_poll", |p| &p.network_poll)?;
     // Clock snapshot data
     import_table("clock_snapshot", |p| &p.clock_snapshot)?;
+    // System info
+    import_table("sysinfo", |p| &p.sysinfo)?;
+
+    // Phase 2b: Import DuckDB traces via ATTACH.
+    // Note: any failure here will propagate before COMMIT, so the entire transaction
+    // (including earlier Parquet imports) will be rolled back when conn is dropped.
+    for duckdb_input in &duckdb_inputs {
+        if verbose {
+            eprintln!(
+                "  Importing {} traces from DuckDB file '{}'...",
+                duckdb_input.mappings.len(),
+                duckdb_input.path.display()
+            );
+        }
+        let db_start = Instant::now();
+        import_duckdb_traces(&conn, &duckdb_input.path, &duckdb_input.mappings).with_context(
+            || {
+                format!(
+                    "Failed to import traces from DuckDB file '{}'",
+                    duckdb_input.path.display()
+                )
+            },
+        )?;
+        if verbose {
+            eprintln!(
+                "  DuckDB import from '{}': {:.2}s",
+                duckdb_input.path.display(),
+                db_start.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    conn.execute_batch("COMMIT")?;
 
     let import_time = import_start.elapsed();
     if verbose {
@@ -3379,16 +3488,33 @@ fn run_convert(
         elapsed.as_secs_f64()
     );
 
-    // Event counts are unknown for Parquet directory imports
+    // Build summary of import sources
     let parquet_dir_count = successful_results
         .iter()
         .filter(|r| r.needs_trace_id_injection)
         .count();
     let pb_file_count = successful_results.len() - parquet_dir_count;
+    let total_imported = pb_file_count + parquet_dir_count + duckdb_trace_count;
 
-    match (parquet_dir_count, pb_file_count, total_events) {
-        (_, 0, _) => {
-            // All traces were from Parquet directories
+    let mut parts = Vec::new();
+    if pb_file_count > 0 {
+        parts.push(format!(
+            "{pb_file_count} from .pb with {total_events} events"
+        ));
+    }
+    if parquet_dir_count > 0 {
+        parts.push(format!("{parquet_dir_count} from Parquet"));
+    }
+    if duckdb_trace_count > 0 {
+        parts.push(format!("{duckdb_trace_count} from DuckDB"));
+    }
+
+    if parts.len() <= 1 {
+        // Single source type
+        if pb_file_count > 0 {
+            let s = if pb_file_count == 1 { "" } else { "s" };
+            eprintln!("  {pb_file_count} trace{s} imported, {total_events} total events");
+        } else if parquet_dir_count > 0 {
             let s = if parquet_dir_count == 1 { "" } else { "s" };
             eprintln!(
                 "  {} trace{} imported from Parquet director{}",
@@ -3396,22 +3522,17 @@ fn run_convert(
                 s,
                 if parquet_dir_count == 1 { "y" } else { "ies" }
             );
+        } else if duckdb_trace_count > 0 {
+            let s = if duckdb_trace_count == 1 { "" } else { "s" };
+            eprintln!("  {} trace{} imported from DuckDB", duckdb_trace_count, s);
         }
-        (0, _, events) => {
-            // All traces were from .pb files
-            let s = if pb_file_count == 1 { "" } else { "s" };
-            eprintln!("  {pb_file_count} trace{s} imported, {events} total events");
-        }
-        (parquet, pb, events) => {
-            // Mixed sources
-            eprintln!(
-                "  {} traces imported ({} from Parquet, {} from .pb with {} events)",
-                successful_results.len(),
-                parquet,
-                pb,
-                events
-            );
-        }
+    } else {
+        // Mixed sources
+        eprintln!(
+            "  {} traces imported ({})",
+            total_imported,
+            parts.join(", ")
+        );
     }
 
     Ok(())
