@@ -16,7 +16,7 @@ use crate::parquet_paths::ParquetPaths;
 use super::config::ValidationConfig;
 use super::queries::{
     CmdlineStats, FieldCheck, OrphanCheck, SchemaResult, StackViolation, ValidationQueries,
-    STACK_RUNNING, STACK_SLEEP,
+    STACK_RUNNING, STACK_SLEEP_INTERRUPTIBLE, STACK_SLEEP_UNINTERRUPTIBLE,
 };
 use super::result::{ValidationError, ValidationResult};
 use super::runner::run_common_validations;
@@ -381,8 +381,8 @@ impl ValidationQueries for ParquetQueries {
             let closest = find_closest_slice(slices, sample.ts);
 
             let violation = match (sample.stack_event_type, closest) {
-                // STACK_SLEEP: should be at/near the end of a sleep slice
-                (STACK_SLEEP, Some((slice, _))) => {
+                // STACK_SLEEP_UNINTERRUPTIBLE/STACK_SLEEP_INTERRUPTIBLE: should be at/near the end of a sleep slice
+                (STACK_SLEEP_UNINTERRUPTIBLE | STACK_SLEEP_INTERRUPTIBLE, Some((slice, _))) => {
                     let slice_end = slice.ts + slice.dur;
                     let is_sleep_state = slice.end_state.is_some() && slice.end_state != Some(0);
                     let delta = sample.ts - slice_end;
@@ -430,12 +430,14 @@ impl ValidationQueries for ParquetQueries {
                     }
                 }
                 // Known types but no slice found
-                (STACK_SLEEP | STACK_RUNNING, None) => Some(StackViolation {
-                    ts: sample.ts,
-                    utid: sample.utid,
-                    event_type: sample.stack_event_type,
-                    message: "No sched_slice found for this utid".to_string(),
-                }),
+                (STACK_SLEEP_UNINTERRUPTIBLE | STACK_SLEEP_INTERRUPTIBLE | STACK_RUNNING, None) => {
+                    Some(StackViolation {
+                        ts: sample.ts,
+                        utid: sample.utid,
+                        event_type: sample.stack_event_type,
+                        message: "No sched_slice found for this utid".to_string(),
+                    })
+                }
                 // Unknown stack_event_type
                 (unknown, _) => Some(StackViolation {
                     ts: sample.ts,

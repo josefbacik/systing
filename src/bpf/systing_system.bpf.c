@@ -84,8 +84,9 @@ enum event_type {
 };
 
 enum stack_event_type {
-	STACK_SLEEP,
+	STACK_SLEEP_UNINTERRUPTIBLE,
 	STACK_RUNNING,
+	STACK_SLEEP_INTERRUPTIBLE,
 };
 
 struct task_info {
@@ -299,7 +300,7 @@ struct probe_event _uprobe_event = {0};
 struct arg_desc _arg_desc = {0};
 enum event_type _type = SCHED_SWITCH;
 enum arg_type _arg_type = ARG_NONE;
-enum stack_event_type _stack_type = STACK_SLEEP;
+enum stack_event_type _stack_type = STACK_SLEEP_UNINTERRUPTIBLE;
 enum network_protocol _network_proto = NETWORK_TCP;
 enum network_operation _network_op = NETWORK_SEND;
 enum network_address_family _network_af = NETWORK_AF_INET;
@@ -1390,10 +1391,10 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 	 */
 	if (!tool_config.no_sleep_stack_traces) {
 		if (prev->__state & TASK_UNINTERRUPTIBLE)
-			emit_stack_event_with_ts(ctx, prev, STACK_SLEEP, ts);
+			emit_stack_event_with_ts(ctx, prev, STACK_SLEEP_UNINTERRUPTIBLE, ts);
 		else if (!tool_config.no_interruptible_stack_traces &&
 			 prev->__state & TASK_INTERRUPTIBLE)
-			emit_stack_event_with_ts(ctx, prev, STACK_SLEEP, ts);
+			emit_stack_event_with_ts(ctx, prev, STACK_SLEEP_INTERRUPTIBLE, ts);
 	}
 	return 0;
 }

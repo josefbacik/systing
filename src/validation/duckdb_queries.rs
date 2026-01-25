@@ -302,7 +302,7 @@ impl ValidationQueries for DuckDbQueries {
 
         let mut violations = Vec::new();
 
-        // Find STACK_SLEEP violations (type=0)
+        // Find STACK_SLEEP violations (type=0 uninterruptible, type=2 interruptible)
         // Should be near the end of a sleep slice (end_state != 0)
         let mut stmt = self.conn.prepare(&format!(
             "WITH first_sched AS (
@@ -312,7 +312,7 @@ impl ValidationQueries for DuckDbQueries {
                    'STACK_SLEEP not near sleep slice end' as message
             FROM stack_sample ss
             JOIN first_sched fs ON ss.utid = fs.utid
-            WHERE ss.stack_event_type = 0  -- STACK_SLEEP
+            WHERE ss.stack_event_type IN (0, 2)  -- STACK_SLEEP_UNINTERRUPTIBLE or STACK_SLEEP_INTERRUPTIBLE
             AND ss.ts >= fs.first_ts  -- Only check samples after first sched event
             AND NOT EXISTS (
                 SELECT 1 FROM sched_slice s

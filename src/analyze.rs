@@ -324,17 +324,6 @@ impl AnalyzeDb {
             );
         }
 
-        if matches!(
-            params.stack_type,
-            StackTypeFilter::InterruptibleSleep | StackTypeFilter::UninterruptibleSleep
-        ) && !self.table_has_rows("sched_slice")?
-        {
-            bail!(
-                "No sched_slice data available, required for {} filtering",
-                params.stack_type.as_str()
-            );
-        }
-
         let (min_ts, max_ts, total_samples) = self.get_trace_time_range(&params.trace_id)?;
 
         let abs_start = params.start_time.map(|t| min_ts + (t * 1e9) as i64);
@@ -647,23 +636,13 @@ pub fn build_flamegraph_query(
             conditions.push("ss.stack_event_type = 1".to_string());
         }
         StackTypeFilter::InterruptibleSleep => {
-            conditions.push("ss.stack_event_type = 0".to_string());
-            conditions.push("sl.end_state = 1".to_string());
-            joins.push_str(
-                " JOIN sched_slice sl ON ss.utid = sl.utid AND ss.trace_id = sl.trace_id \
-                 AND ABS(ss.ts - (sl.ts + sl.dur)) <= 10000000",
-            );
+            conditions.push("ss.stack_event_type = 2".to_string());
         }
         StackTypeFilter::UninterruptibleSleep => {
             conditions.push("ss.stack_event_type = 0".to_string());
-            conditions.push("sl.end_state = 2".to_string());
-            joins.push_str(
-                " JOIN sched_slice sl ON ss.utid = sl.utid AND ss.trace_id = sl.trace_id \
-                 AND ABS(ss.ts - (sl.ts + sl.dur)) <= 10000000",
-            );
         }
         StackTypeFilter::AllSleep => {
-            conditions.push("ss.stack_event_type = 0".to_string());
+            conditions.push("ss.stack_event_type IN (0, 2)".to_string());
         }
         StackTypeFilter::All => {}
     }
@@ -850,9 +829,41 @@ mod tests {
             &None,
             1,
         );
+        assert!(sql.contains("stack_event_type = 2"));
+        assert!(!sql.contains("sched_slice"));
+        assert!(!sql.contains("end_state"));
+    }
+
+    #[test]
+    fn test_build_flamegraph_query_uninterruptible_sleep() {
+        let sql = build_flamegraph_query(
+            &StackTypeFilter::UninterruptibleSleep,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            1,
+        );
         assert!(sql.contains("stack_event_type = 0"));
-        assert!(sql.contains("sched_slice"));
-        assert!(sql.contains("end_state = 1"));
+        assert!(!sql.contains("sched_slice"));
+        assert!(!sql.contains("end_state"));
+    }
+
+    #[test]
+    fn test_build_flamegraph_query_all_sleep() {
+        let sql = build_flamegraph_query(
+            &StackTypeFilter::AllSleep,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            1,
+        );
+        assert!(sql.contains("stack_event_type IN (0, 2)"));
+        assert!(!sql.contains("sched_slice"));
+        assert!(!sql.contains("end_state"));
     }
 
     #[test]

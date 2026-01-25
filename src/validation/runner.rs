@@ -5,7 +5,9 @@
 //! `ValidationQueries` trait.
 
 use super::config::ValidationConfig;
-use super::queries::{ValidationQueries, STACK_RUNNING, STACK_SLEEP};
+use super::queries::{
+    ValidationQueries, STACK_RUNNING, STACK_SLEEP_INTERRUPTIBLE, STACK_SLEEP_UNINTERRUPTIBLE,
+};
 use super::result::{ValidationError, ValidationResult, ValidationWarning};
 
 /// Valid counter unit values (from perfetto_protos CounterDescriptor::Unit and custom units).
@@ -218,7 +220,10 @@ fn validate_stack_timing<Q: ValidationQueries>(
         Ok(violations) => {
             let sleep_count = violations
                 .iter()
-                .filter(|v| v.event_type == STACK_SLEEP)
+                .filter(|v| {
+                    v.event_type == STACK_SLEEP_UNINTERRUPTIBLE
+                        || v.event_type == STACK_SLEEP_INTERRUPTIBLE
+                })
                 .count();
             let running_count = violations
                 .iter()
@@ -253,7 +258,7 @@ fn validate_stack_timing<Q: ValidationQueries>(
             // Add summary warnings if there are violations
             if sleep_count > 0 {
                 result.add_warning(ValidationWarning::StackTimingViolations {
-                    sample_type: "STACK_SLEEP".into(),
+                    sample_type: "STACK_SLEEP (uninterruptible + interruptible)".into(),
                     count: sleep_count as i64,
                 });
             }

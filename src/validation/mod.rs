@@ -43,7 +43,7 @@ pub use result::{ValidationError, ValidationResult, ValidationWarning};
 // Re-export query trait and result types
 pub use queries::{
     CmdlineStats, FieldCheck, OrphanCheck, SchemaResult, StackViolation, ValidationQueries,
-    STACK_RUNNING, STACK_SLEEP,
+    STACK_RUNNING, STACK_SLEEP_INTERRUPTIBLE, STACK_SLEEP_UNINTERRUPTIBLE,
 };
 
 // Re-export query implementations

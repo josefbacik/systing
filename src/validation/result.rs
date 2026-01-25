@@ -146,10 +146,11 @@ impl fmt::Display for ValidationError {
                 stack_event_type,
                 message,
             } => {
-                let type_str = if *stack_event_type == 0 {
-                    "STACK_SLEEP"
-                } else {
-                    "STACK_RUNNING"
+                let type_str = match *stack_event_type {
+                    0 => "STACK_SLEEP_UNINTERRUPTIBLE",
+                    1 => "STACK_RUNNING",
+                    2 => "STACK_SLEEP_INTERRUPTIBLE",
+                    _ => "UNKNOWN",
                 };
                 write!(
                     f,
@@ -248,12 +249,26 @@ mod tests {
         let error = ValidationError::StackTimingViolation {
             ts: 1000,
             utid: 42,
-            stack_event_type: 0, // STACK_SLEEP
+            stack_event_type: 0, // STACK_SLEEP_UNINTERRUPTIBLE
             message: "not at slice end".to_string(),
         };
         assert_eq!(
             format!("{error}"),
-            "Stack timing: utid=42 ts=1000 type=STACK_SLEEP: not at slice end"
+            "Stack timing: utid=42 ts=1000 type=STACK_SLEEP_UNINTERRUPTIBLE: not at slice end"
+        );
+    }
+
+    #[test]
+    fn test_stack_timing_violation_interruptible_sleep_display() {
+        let error = ValidationError::StackTimingViolation {
+            ts: 3000,
+            utid: 55,
+            stack_event_type: 2, // STACK_SLEEP_INTERRUPTIBLE
+            message: "not at slice end".to_string(),
+        };
+        assert_eq!(
+            format!("{error}"),
+            "Stack timing: utid=55 ts=3000 type=STACK_SLEEP_INTERRUPTIBLE: not at slice end"
         );
     }
 

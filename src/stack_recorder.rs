@@ -92,7 +92,7 @@ pub struct StackEvent {
 }
 
 /// Convert BPF stack_event_type (u32) to i8, clamping to valid range.
-/// Valid values are 0 (STACK_SLEEP) and 1 (STACK_RUNNING).
+/// Valid values are 0 (STACK_SLEEP_UNINTERRUPTIBLE), 1 (STACK_RUNNING), 2 (STACK_SLEEP_INTERRUPTIBLE).
 /// Unknown values are preserved but clamped to i8::MAX to avoid truncation issues.
 #[inline]
 fn convert_stack_event_type(bpf_type: u32) -> i8 {

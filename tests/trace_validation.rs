@@ -1245,7 +1245,7 @@ if __name__ == "__main__":
     );
 
     // Track Python symbols by stack_event_type
-    // Type 0 = STACK_SLEEP (off-CPU), Type 1 = STACK_RUNNING (on-CPU)
+    // Type 0 = STACK_SLEEP_UNINTERRUPTIBLE, Type 1 = STACK_RUNNING, Type 2 = STACK_SLEEP_INTERRUPTIBLE
     let mut sleep_samples_total = 0;
     let mut sleep_samples_with_python = 0;
     let mut running_samples_total = 0;
@@ -1284,8 +1284,8 @@ if __name__ == "__main__":
                 let has_python = frames.iter().any(|f| f.contains("(python)"));
 
                 match stack_event_type {
-                    0 => {
-                        // STACK_SLEEP
+                    0 | 2 => {
+                        // STACK_SLEEP_UNINTERRUPTIBLE or STACK_SLEEP_INTERRUPTIBLE
                         sleep_samples_total += 1;
                         if has_python {
                             sleep_samples_with_python += 1;

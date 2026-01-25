@@ -246,7 +246,7 @@ pub struct StackRecord {
 /// - `utid`: Unique thread ID (references ThreadRecord.utid)
 /// - `cpu`: CPU core number (optional)
 /// - `stack_id`: Reference to StackRecord.id
-/// - `stack_event_type`: Type of stack capture (0=STACK_SLEEP, 1=STACK_RUNNING)
+/// - `stack_event_type`: Type of stack capture (0=STACK_SLEEP_UNINTERRUPTIBLE, 1=STACK_RUNNING, 2=STACK_SLEEP_INTERRUPTIBLE)
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StackSampleRecord {
     pub ts: i64,

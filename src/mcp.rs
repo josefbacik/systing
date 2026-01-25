@@ -312,7 +312,7 @@ network activity, and performance counters. Traces are stored in DuckDB database
 
 # Key tables and their contents
 - stack_sample: Stack trace samples with timestamps (ts in nanoseconds). \
-  stack_event_type: 0=sleep, 1=cpu.
+  stack_event_type: 0=uninterruptible-sleep, 1=cpu, 2=interruptible-sleep.
 - stack: Flattened stack frames (frame_names array, leaf-to-root order).
 - thread: Thread metadata (utid=internal unique ID, tid=Linux TID).
 - process: Process metadata (upid=internal unique ID, pid=Linux PID, name).
@@ -327,7 +327,7 @@ network activity, and performance counters. Traces are stored in DuckDB database
 - All timestamps (ts) are in nanoseconds since an arbitrary epoch.
 - utid/upid are internal unique thread/process IDs (not Linux TID/PID). \
   Use thread.tid / process.pid for the Linux IDs.
-- stack_sample.stack_event_type: 0 = sleep/off-cpu sample, 1 = CPU sample.
+- stack_sample.stack_event_type: 0 = uninterruptible-sleep, 1 = CPU sample, 2 = interruptible-sleep.
 - sched_slice.end_state: 1 = interruptible sleep (S), 2 = uninterruptible sleep (D).
 - Tables are linked by trace_id (for multi-trace databases).
 

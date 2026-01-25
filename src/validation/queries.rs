@@ -6,11 +6,14 @@
 
 use anyhow::Result;
 
-/// Stack event type: captured when task went to sleep (blocking).
-pub const STACK_SLEEP: i8 = 0;
+/// Stack event type: captured when task went to uninterruptible sleep.
+pub const STACK_SLEEP_UNINTERRUPTIBLE: i8 = 0;
 
 /// Stack event type: captured while task was running (CPU sampling, probes).
 pub const STACK_RUNNING: i8 = 1;
+
+/// Stack event type: captured when task went to interruptible sleep.
+pub const STACK_SLEEP_INTERRUPTIBLE: i8 = 2;
 
 /// Trait for validation queries - each format implements using its native mechanism.
 ///
@@ -66,8 +69,9 @@ pub trait ValidationQueries {
     // === Stack Timing Queries ===
 
     /// Find stack samples that occur outside valid sched slices.
-    /// - STACK_SLEEP (0): Should be at/near end of a sleep slice
+    /// - STACK_SLEEP_UNINTERRUPTIBLE (0): Should be at/near end of a sleep slice
     /// - STACK_RUNNING (1): Should be within a running slice
+    /// - STACK_SLEEP_INTERRUPTIBLE (2): Should be at/near end of a sleep slice
     fn find_stack_timing_violations(&mut self, tolerance_ns: i64) -> Result<Vec<StackViolation>>;
 }
 
@@ -209,7 +213,7 @@ pub struct StackViolation {
     pub ts: i64,
     /// Unique thread ID.
     pub utid: i64,
-    /// Event type: 0=STACK_SLEEP, 1=STACK_RUNNING.
+    /// Event type: 0=STACK_SLEEP_UNINTERRUPTIBLE, 1=STACK_RUNNING, 2=STACK_SLEEP_INTERRUPTIBLE.
     pub event_type: i8,
     /// Description of the violation.
     pub message: String,
