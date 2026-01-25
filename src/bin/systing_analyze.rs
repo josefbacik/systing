@@ -3433,9 +3433,11 @@ fn run_convert(
     // System info
     import_table("sysinfo", |p| &p.sysinfo)?;
 
+    conn.execute_batch("COMMIT")?;
+
     // Phase 2b: Import DuckDB traces via ATTACH.
-    // Note: any failure here will propagate before COMMIT, so the entire transaction
-    // (including earlier Parquet imports) will be rolled back when conn is dropped.
+    // This must happen outside the Parquet transaction because DuckDB does not allow
+    // reusing an ATTACHed database name within a single meta-transaction, even after DETACH.
     for duckdb_input in &duckdb_inputs {
         if verbose {
             eprintln!(
@@ -3461,8 +3463,6 @@ fn run_convert(
             );
         }
     }
-
-    conn.execute_batch("COMMIT")?;
 
     let import_time = import_start.elapsed();
     if verbose {
