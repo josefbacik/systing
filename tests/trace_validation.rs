@@ -16,6 +16,8 @@ use common::{
 };
 use std::io::{Read, Write};
 use std::path::Path;
+#[cfg(feature = "pystacks")]
+use std::path::PathBuf;
 use systing::{
     bump_memlock_rlimit, systing, validate_duckdb, validate_parquet_dir, validate_perfetto_trace,
     Config,
@@ -39,6 +41,37 @@ const NETNS_RECORDING_DURATION_SECS: u64 = 10;
 /// Helper to set up the environment for BPF tests.
 fn setup_bpf_environment() {
     bump_memlock_rlimit().expect("Failed to bump memlock rlimit");
+}
+
+/// Python versions used by pystacks integration tests.
+/// Install these via: ./scripts/setup-pystacks.sh
+#[cfg(feature = "pystacks")]
+const PYTHON_313_VERSION: &str = "3.13.11";
+#[cfg(feature = "pystacks")]
+const PYTHON_311_VERSION: &str = "3.11.14";
+
+/// Get the path to a pyenv-installed Python binary.
+///
+/// Resolves `$HOME/.pyenv/versions/<version>/bin/python<major.minor>`.
+/// Panics with a helpful message if the binary is not found.
+#[cfg(feature = "pystacks")]
+fn pyenv_python(version: &str) -> PathBuf {
+    let home = std::env::var("HOME").expect("HOME environment variable not set");
+    let parts: Vec<&str> = version.split('.').collect();
+    assert!(
+        parts.len() == 3,
+        "expected version in X.Y.Z format, got: {version}"
+    );
+    let short = format!("{}.{}", parts[0], parts[1]);
+    let path = PathBuf::from(format!(
+        "{home}/.pyenv/versions/{version}/bin/python{short}"
+    ));
+    assert!(
+        path.exists(),
+        "Python {version} not found at {}. Install it with: ./scripts/setup-pystacks.sh",
+        path.display()
+    );
+    path
 }
 
 #[test]
@@ -782,7 +815,7 @@ if __name__ == "__main__":
     }
 
     // Start the Python process BEFORE systing
-    let mut python_proc = Command::new("/root/.pyenv/versions/3.13.11/bin/python3.13")
+    let mut python_proc = Command::new(pyenv_python(PYTHON_313_VERSION))
         .arg(&python_script)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1113,7 +1146,7 @@ if __name__ == "__main__":
     }
 
     // Start the Python process BEFORE systing
-    let mut python_proc = Command::new("/root/.pyenv/versions/3.13.11/bin/python3.13")
+    let mut python_proc = Command::new(pyenv_python(PYTHON_313_VERSION))
         .arg(&python_script)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1401,7 +1434,7 @@ if __name__ == "__main__":
             .expect("Failed to write Python script");
     }
 
-    let mut python_proc = Command::new("/root/.pyenv/versions/3.11.14/bin/python3.11")
+    let mut python_proc = Command::new(pyenv_python(PYTHON_311_VERSION))
         .arg(&python_script)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1409,7 +1442,7 @@ if __name__ == "__main__":
         .expect("Failed to spawn Python process");
 
     let python_pid = python_proc.id();
-    eprintln!("Started Python 3.13 process with PID: {}", python_pid);
+    eprintln!("Started Python 3.11 process with PID: {}", python_pid);
     thread::sleep(Duration::from_millis(1000));
 
     let config = Config {
