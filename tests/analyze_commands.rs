@@ -140,10 +140,14 @@ fn test_query_json_format(db: &Path) {
     );
     let arr = parsed.as_array().unwrap();
     assert_eq!(arr.len(), 1, "expected 1 row");
-    let cnt = arr[0]["cnt"]
-        .as_str()
-        .expect("cnt should be a string in json output");
-    let count: u64 = cnt.parse().expect("cnt should be numeric");
+    let cnt_val = &arr[0]["cnt"];
+    let count: u64 = if let Some(n) = cnt_val.as_u64() {
+        n
+    } else if let Some(s) = cnt_val.as_str() {
+        s.parse().expect("cnt should be numeric")
+    } else {
+        panic!("cnt is neither a number nor string: {cnt_val}");
+    };
     assert!(count > 0, "expected at least 1 stack sample, got 0");
 }
 
@@ -383,6 +387,280 @@ fn test_flamegraph_nonexistent_db(db: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// sched stats subcommand tests
+// ---------------------------------------------------------------------------
+
+/// Get a valid PID from the trace database for testing.
+fn get_first_pid(db: &Path) -> u32 {
+    let output = run_analyze(&[
+        "query",
+        "-d",
+        db.to_str().unwrap(),
+        "-f",
+        "csv",
+        "-s",
+        "SELECT DISTINCT p.pid FROM sched_slice ss \
+         JOIN thread t ON ss.utid = t.utid AND ss.trace_id = t.trace_id \
+         JOIN process p ON t.upid = p.upid AND t.trace_id = p.trace_id \
+         WHERE ss.dur > 0 LIMIT 1",
+    ]);
+    assert!(
+        output.status.success(),
+        "get_first_pid query failed: {}",
+        lossy(&output.stderr)
+    );
+    let stdout = lossy(&output.stdout);
+    let pid_str = stdout.lines().nth(1).expect("no PID found in trace").trim();
+    pid_str.parse().expect("PID not a valid number")
+}
+
+/// Get a valid TID from the trace database for testing.
+fn get_first_tid(db: &Path) -> u32 {
+    let output = run_analyze(&[
+        "query",
+        "-d",
+        db.to_str().unwrap(),
+        "-f",
+        "csv",
+        "-s",
+        "SELECT DISTINCT t.tid FROM sched_slice ss \
+         JOIN thread t ON ss.utid = t.utid AND ss.trace_id = t.trace_id \
+         WHERE ss.dur > 0 LIMIT 1",
+    ]);
+    assert!(
+        output.status.success(),
+        "get_first_tid query failed: {}",
+        lossy(&output.stderr)
+    );
+    let stdout = lossy(&output.stdout);
+    let tid_str = stdout.lines().nth(1).expect("no TID found in trace").trim();
+    tid_str.parse().expect("TID not a valid number")
+}
+
+fn test_sched_stats_whole_trace(db: &Path) {
+    let output = run_analyze(&["sched", "stats", "-d", db.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "sched stats (whole trace) failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stderr = lossy(&output.stderr);
+    let stdout = lossy(&output.stdout);
+
+    // Metadata headers on stderr
+    assert!(
+        stderr.contains("# Sched Stats:"),
+        "missing Sched Stats header: {stderr}"
+    );
+    assert!(
+        stderr.contains("# Total sched events:"),
+        "missing total events: {stderr}"
+    );
+    assert!(
+        stderr.contains("# Total CPU time:"),
+        "missing total CPU time: {stderr}"
+    );
+    assert!(
+        stderr.contains("# Trace duration:"),
+        "missing trace duration: {stderr}"
+    );
+
+    // Table output on stdout should have PID column
+    assert!(
+        stdout.contains("PID"),
+        "missing PID column in table output: {stdout}"
+    );
+    assert!(
+        stdout.contains("Name"),
+        "missing Name column in table output: {stdout}"
+    );
+}
+
+fn test_sched_stats_json(db: &Path) {
+    let output = run_analyze(&["sched", "stats", "-d", db.to_str().unwrap(), "-f", "json"]);
+    assert!(
+        output.status.success(),
+        "sched stats (json) failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("sched stats JSON should be valid");
+    assert!(
+        parsed.get("summary").is_some(),
+        "JSON missing summary key: {stdout}"
+    );
+    let total_events = parsed["summary"]["total_events"]
+        .as_u64()
+        .expect("total_events should be a number");
+    assert!(total_events > 0, "expected total_events > 0");
+}
+
+fn test_sched_stats_per_process(db: &Path) {
+    let pid = get_first_pid(db);
+    let pid_str = pid.to_string();
+    let output = run_analyze(&["sched", "stats", "-d", db.to_str().unwrap(), "-p", &pid_str]);
+    assert!(
+        output.status.success(),
+        "sched stats (per-process) failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stderr = lossy(&output.stderr);
+    let stdout = lossy(&output.stdout);
+
+    assert!(
+        stderr.contains("# Sched Stats:"),
+        "missing header: {stderr}"
+    );
+    assert!(
+        stderr.contains("# Thread count:"),
+        "missing thread count: {stderr}"
+    );
+
+    // Per-thread table should have TID column
+    assert!(
+        stdout.contains("TID"),
+        "missing TID column in per-process output: {stdout}"
+    );
+}
+
+fn test_sched_stats_per_process_json(db: &Path) {
+    let pid = get_first_pid(db);
+    let pid_str = pid.to_string();
+    let output = run_analyze(&[
+        "sched",
+        "stats",
+        "-d",
+        db.to_str().unwrap(),
+        "-p",
+        &pid_str,
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "sched stats (per-process json) failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("per-process JSON should be valid");
+    assert!(
+        parsed.get("threads").is_some(),
+        "JSON missing threads key: {stdout}"
+    );
+    let threads = parsed["threads"]
+        .as_array()
+        .expect("threads should be array");
+    assert!(!threads.is_empty(), "threads array should not be empty");
+}
+
+fn test_sched_stats_per_thread(db: &Path) {
+    let tid = get_first_tid(db);
+    let tid_str = tid.to_string();
+    let output = run_analyze(&[
+        "sched",
+        "stats",
+        "-d",
+        db.to_str().unwrap(),
+        "--tid",
+        &tid_str,
+    ]);
+    assert!(
+        output.status.success(),
+        "sched stats (per-thread) failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stderr = lossy(&output.stderr);
+    assert!(
+        stderr.contains("# Thread:"),
+        "missing thread header: {stderr}"
+    );
+    assert!(
+        stderr.contains("# CPU migrations:"),
+        "missing CPU migrations: {stderr}"
+    );
+    assert!(
+        stderr.contains("# End states:"),
+        "missing end states: {stderr}"
+    );
+}
+
+fn test_sched_stats_per_thread_json(db: &Path) {
+    let tid = get_first_tid(db);
+    let tid_str = tid.to_string();
+    let output = run_analyze(&[
+        "sched",
+        "stats",
+        "-d",
+        db.to_str().unwrap(),
+        "--tid",
+        &tid_str,
+        "--format",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "sched stats (per-thread json) failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("per-thread json output should be valid JSON");
+    assert!(
+        json.get("thread_detail").is_some(),
+        "per-thread json should have thread_detail key"
+    );
+    let detail = &json["thread_detail"];
+    assert!(
+        detail.get("end_states").is_some(),
+        "thread_detail should have end_states"
+    );
+    let end_states = detail["end_states"]
+        .as_array()
+        .expect("end_states should be an array");
+    assert!(
+        !end_states.is_empty(),
+        "end_states should not be empty for a valid thread"
+    );
+}
+
+fn test_sched_stats_nonexistent_pid(db: &Path) {
+    let output = run_analyze(&["sched", "stats", "-d", db.to_str().unwrap(), "-p", "999999"]);
+    // Command should succeed even for a nonexistent PID
+    assert!(
+        output.status.success(),
+        "sched stats (nonexistent pid) should succeed: {}",
+        lossy(&output.stderr)
+    );
+    // Should warn about no events found
+    let stderr = lossy(&output.stderr);
+    assert!(
+        stderr.contains("No scheduling events found"),
+        "should warn about no events for nonexistent PID: {stderr}"
+    );
+}
+
+fn test_sched_stats_nonexistent_db(_db: &Path) {
+    let output = run_analyze(&[
+        "sched",
+        "stats",
+        "-d",
+        "/tmp/does_not_exist_systing_sched_test.duckdb",
+    ]);
+    assert!(
+        !output.status.success(),
+        "sched stats should fail for nonexistent database"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Main integration test: record once, then exercise all commands
 // ---------------------------------------------------------------------------
 
@@ -432,6 +710,33 @@ fn test_analyze_commands() {
 
     eprintln!("  nonexistent database...");
     test_flamegraph_nonexistent_db(&duckdb_path);
+
+    // Phase 4: Test sched stats subcommand
+    eprintln!("\n--- sched stats subcommand ---");
+
+    eprintln!("  whole trace...");
+    test_sched_stats_whole_trace(&duckdb_path);
+
+    eprintln!("  json format...");
+    test_sched_stats_json(&duckdb_path);
+
+    eprintln!("  per-process...");
+    test_sched_stats_per_process(&duckdb_path);
+
+    eprintln!("  per-process json...");
+    test_sched_stats_per_process_json(&duckdb_path);
+
+    eprintln!("  per-thread...");
+    test_sched_stats_per_thread(&duckdb_path);
+
+    eprintln!("  per-thread json...");
+    test_sched_stats_per_thread_json(&duckdb_path);
+
+    eprintln!("  nonexistent pid...");
+    test_sched_stats_nonexistent_pid(&duckdb_path);
+
+    eprintln!("  nonexistent database...");
+    test_sched_stats_nonexistent_db(&duckdb_path);
 
     eprintln!("\n✓ All systing-analyze commands passed");
 }

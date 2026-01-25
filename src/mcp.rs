@@ -3,7 +3,7 @@
 //! Provides an MCP server that exposes trace database analysis tools to AI
 //! assistants. Uses a dedicated DB thread to handle DuckDB's non-Send connection.
 
-use crate::analyze::{AnalyzeDb, FlamegraphParams, StackTypeFilter};
+use crate::analyze::{AnalyzeDb, FlamegraphParams, SchedStatsParams, StackTypeFilter};
 use anyhow::Result;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -25,6 +25,7 @@ enum DbRequest {
     ListTables,
     DescribeTable(String),
     Flamegraph(FlamegraphParams),
+    SchedStats(SchedStatsParams),
     TraceInfo,
 }
 
@@ -113,6 +114,10 @@ fn handle_db_request(db: &mut Option<AnalyzeDb>, request: DbRequest) -> DbRespon
                     .flamegraph(&params)
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .map_err(|e| format!("Flamegraph error: {e}")),
+                DbRequest::SchedStats(params) => db
+                    .sched_stats(&params)
+                    .map(|r| serde_json::to_value(r).unwrap_or_default())
+                    .map_err(|e| format!("Sched stats error: {e}")),
                 DbRequest::TraceInfo => db
                     .trace_info()
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
@@ -168,6 +173,21 @@ struct FlamegraphToolParams {
     min_count: Option<u64>,
 
     /// Limit to top N stacks by sample count. Default: 500.
+    top_n: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SchedStatsToolParams {
+    /// Filter to a specific process ID.
+    pid: Option<u32>,
+
+    /// Filter to a specific thread ID (mutually exclusive with pid).
+    tid: Option<u32>,
+
+    /// Filter to a specific trace ID (for multi-trace databases).
+    trace_id: Option<String>,
+
+    /// Max processes/threads to return. Default: 20.
     top_n: Option<usize>,
 }
 
@@ -301,6 +321,33 @@ impl SystingMcpServer {
             Err(e) => Ok(make_error_result(&e)),
         }
     }
+
+    #[tool(
+        name = "sched_stats",
+        description = "Scheduling timing statistics. Shows CPU time, event counts, slice durations, preemption rates, and CPU migrations. d_sleep_seconds is approximate: it includes both actual uninterruptible sleep and subsequent runqueue latency. Three modes: no filter = whole-trace with per-process ranking, pid = process detail with per-thread breakdown, tid = single thread detail with end-state distribution."
+    )]
+    async fn sched_stats(
+        &self,
+        Parameters(params): Parameters<SchedStatsToolParams>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        if params.pid.is_some() && params.tid.is_some() {
+            return Ok(make_error_result(
+                "pid and tid are mutually exclusive. Provide one or neither.",
+            ));
+        }
+
+        let sched_params = SchedStatsParams {
+            pid: params.pid,
+            tid: params.tid,
+            trace_id: params.trace_id,
+            top_n: params.top_n.unwrap_or(20),
+        };
+
+        match self.db.request(DbRequest::SchedStats(sched_params)).await {
+            Ok(value) => Ok(make_tool_result(value)),
+            Err(e) => Ok(make_error_result(&e)),
+        }
+    }
 }
 
 const SERVER_INSTRUCTIONS: &str = "\
@@ -339,6 +386,11 @@ network activity, and performance counters. Traces are stored in DuckDB database
 5. query — Run SQL queries. Results are capped at 10,000 rows; \
    use SQL LIMIT/OFFSET for larger result sets.
 6. flamegraph — Structured stack trace analysis with filtering.
+7. sched_stats — Scheduling timing statistics. Shows CPU time, event counts, \
+   slice durations, preemption rates, and CPU migrations. Three modes: \
+   no filter = whole-trace with per-process ranking, \
+   pid = process detail with per-thread breakdown, \
+   tid = single thread detail with end-state distribution.
 
 # Query result limits
 Queries return at most 10,000 rows. If results are truncated, the response \

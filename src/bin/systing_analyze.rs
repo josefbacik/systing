@@ -36,6 +36,8 @@ enum Commands {
     },
     /// Stack trace analysis commands
     Stacktrace(StacktraceArgs),
+    /// Scheduling analysis commands
+    Sched(SchedArgs),
     /// Start MCP (Model Context Protocol) server for AI assistant integration
     Mcp {
         /// Path to DuckDB database to open on startup (optional)
@@ -110,6 +112,45 @@ impl From<CliStackType> for analyze::StackTypeFilter {
             CliStackType::All => Self::All,
         }
     }
+}
+
+#[derive(Args)]
+struct SchedArgs {
+    #[command(subcommand)]
+    command: SchedCommands,
+}
+
+#[derive(Subcommand)]
+enum SchedCommands {
+    /// Show scheduling timing statistics
+    Stats(SchedStatsArgs),
+}
+
+#[derive(Args)]
+struct SchedStatsArgs {
+    /// Path to DuckDB database
+    #[arg(short, long)]
+    database: PathBuf,
+
+    /// Filter to a specific process (all its threads)
+    #[arg(short, long, conflicts_with = "tid")]
+    pid: Option<u32>,
+
+    /// Filter to a specific thread
+    #[arg(long, conflicts_with = "pid")]
+    tid: Option<u32>,
+
+    /// Output format: table or json
+    #[arg(short, long, default_value = "table")]
+    format: String,
+
+    /// Filter to a specific trace (for multi-trace DBs)
+    #[arg(long)]
+    trace_id: Option<String>,
+
+    /// Max processes/threads to show (minimum 1)
+    #[arg(long, default_value = "20", value_parser = clap::value_parser!(u64).range(1..))]
+    top: u64,
 }
 
 /// Run the query command
@@ -207,7 +248,8 @@ fn print_table(headers: &[String], rows: &[Vec<String>]) {
             .map(|(i, v)| {
                 let width = widths.get(i).copied().unwrap_or(10);
                 let truncated = if v.len() > width && width > 3 {
-                    format!("{}...", &v[..width.saturating_sub(3)])
+                    let trunc_chars: String = v.chars().take(width.saturating_sub(3)).collect();
+                    format!("{trunc_chars}...")
                 } else {
                     v.clone()
                 };
@@ -335,6 +377,177 @@ fn run_flamegraph(args: FlamegraphArgs) -> Result<()> {
     Ok(())
 }
 
+/// Format a duration in seconds for display.
+fn format_duration(seconds: f64) -> String {
+    if seconds < 0.0 {
+        format!("-{}", format_duration(-seconds))
+    } else if seconds >= 1.0 {
+        format!("{:.3}s", seconds)
+    } else if seconds >= 0.001 {
+        format!("{:.3}ms", seconds * 1e3)
+    } else {
+        format!("{:.3}us", seconds * 1e6)
+    }
+}
+
+/// Format a value in microseconds for display.
+fn format_us(us: f64) -> String {
+    if us >= 1e6 {
+        format!("{:.3}s", us / 1e6)
+    } else if us >= 1e3 {
+        format!("{:.3}ms", us / 1e3)
+    } else {
+        format!("{:.3}us", us)
+    }
+}
+
+/// Run the sched stats subcommand
+fn run_sched_stats(args: SchedStatsArgs) -> Result<()> {
+    let db = AnalyzeDb::open(&args.database, true)?;
+
+    let params = analyze::SchedStatsParams {
+        pid: args.pid,
+        tid: args.tid,
+        trace_id: args.trace_id,
+        top_n: args.top as usize,
+    };
+
+    let result = db.sched_stats(&params)?;
+
+    if args.format == "json" {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    // Warn if no scheduling data matched the filter
+    if result.summary.total_events == 0 {
+        eprintln!("# Sched Stats: {}", args.database.display());
+        eprintln!("# No scheduling events found for the specified filter.");
+        return Ok(());
+    }
+
+    // Table output: metadata to stderr, data to stdout
+    if let Some(ref detail) = result.thread_detail {
+        // Per-thread view
+        eprintln!("# Sched Stats: {}", args.database.display());
+        eprintln!(
+            "# Thread: {} (TID {}, PID {}, Process: {})",
+            detail.thread_name, detail.tid, detail.pid, detail.process_name
+        );
+        eprintln!("# CPU time: {}", format_duration(detail.cpu_time_seconds));
+        eprintln!(
+            "# Uninterruptible sleep (D): {}",
+            format_duration(detail.d_sleep_seconds)
+        );
+        eprintln!("# Events: {}", detail.event_count);
+        eprintln!("# Avg slice: {}", format_us(detail.avg_slice_us));
+        eprintln!("# Min slice: {}", format_us(detail.min_slice_us));
+        eprintln!("# Max slice: {}", format_us(detail.max_slice_us));
+        eprintln!("# CPU migrations: {}", detail.cpu_migrations);
+        eprintln!("# End states:");
+        for es in &detail.end_states {
+            eprintln!("#   {}: {} ({:.1}%)", es.state, es.count, es.percent);
+        }
+    } else if let Some(ref threads) = result.threads {
+        // Per-process view
+        eprintln!("# Sched Stats: {}", args.database.display());
+        if let Some(ref name) = result.summary.process_name {
+            eprintln!("# Process: {} (PID {})", name, args.pid.unwrap_or(0));
+        } else {
+            eprintln!("# Process: (PID {})", args.pid.unwrap_or(0));
+        }
+        eprintln!(
+            "# Total CPU time: {}",
+            format_duration(result.summary.total_cpu_time_seconds)
+        );
+        eprintln!(
+            "# Uninterruptible sleep (D): {}",
+            format_duration(result.summary.d_sleep_seconds)
+        );
+        eprintln!("# Total events: {}", result.summary.total_events);
+        eprintln!("# Thread count: {}", result.summary.thread_count);
+
+        // Table header
+        println!(
+            "{:<8} {:<20} {:>12} {:>12} {:>8} {:>12} {:>12} {:>12} {:>8}",
+            "TID",
+            "Name",
+            "CPU Time",
+            "D Sleep",
+            "Events",
+            "Avg Slice",
+            "Min Slice",
+            "Max Slice",
+            "Preempt%"
+        );
+        for t in threads {
+            println!(
+                "{:<8} {:<20} {:>12} {:>12} {:>8} {:>12} {:>12} {:>12} {:>7.1}%",
+                t.tid,
+                truncate_name(&t.name, 20),
+                format_duration(t.cpu_time_seconds),
+                format_duration(t.d_sleep_seconds),
+                t.event_count,
+                format_us(t.avg_slice_us),
+                format_us(t.min_slice_us),
+                format_us(t.max_slice_us),
+                t.preempt_pct,
+            );
+        }
+    } else if let Some(ref processes) = result.processes {
+        // Whole-trace view
+        eprintln!("# Sched Stats: {}", args.database.display());
+        eprintln!(
+            "# Trace duration: {}",
+            format_duration(result.summary.trace_duration_seconds)
+        );
+        eprintln!("# Total sched events: {}", result.summary.total_events);
+        eprintln!(
+            "# Total CPU time: {}",
+            format_duration(result.summary.total_cpu_time_seconds)
+        );
+        eprintln!(
+            "# Uninterruptible sleep (D): {}",
+            format_duration(result.summary.d_sleep_seconds)
+        );
+        eprintln!("# CPUs observed: {}", result.summary.cpus_observed);
+        eprintln!("# Processes: {}", result.summary.process_count);
+        eprintln!("# Threads: {}", result.summary.thread_count);
+
+        // Table header
+        println!(
+            "{:<8} {:<20} {:>8} {:>12} {:>12} {:>8} {:>12} {:>8}",
+            "PID", "Name", "Threads", "CPU Time", "D Sleep", "Events", "Avg Slice", "Preempt%"
+        );
+        for p in processes {
+            println!(
+                "{:<8} {:<20} {:>8} {:>12} {:>12} {:>8} {:>12} {:>7.1}%",
+                p.pid,
+                truncate_name(&p.name, 20),
+                p.thread_count,
+                format_duration(p.cpu_time_seconds),
+                format_duration(p.d_sleep_seconds),
+                p.event_count,
+                format_us(p.avg_slice_us),
+                p.preempt_pct,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Truncate a name to fit within a column width (UTF-8 safe).
+fn truncate_name(name: &str, max: usize) -> String {
+    if name.len() <= max {
+        name.to_string()
+    } else {
+        let trunc_len = max.saturating_sub(3);
+        let truncated: String = name.chars().take(trunc_len).collect();
+        format!("{truncated}...")
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -346,6 +559,9 @@ fn main() -> Result<()> {
         } => run_query(database, sql, format),
         Commands::Stacktrace(args) => match args.command {
             StacktraceCommands::Flamegraph(flamegraph_args) => run_flamegraph(flamegraph_args),
+        },
+        Commands::Sched(args) => match args.command {
+            SchedCommands::Stats(stats_args) => run_sched_stats(stats_args),
         },
         Commands::Mcp { database } => {
             let rt = tokio::runtime::Runtime::new()?;
