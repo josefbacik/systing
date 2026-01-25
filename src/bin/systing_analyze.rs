@@ -1,12 +1,13 @@
 //! systing-analyze: Query and analyze trace databases
 //!
 //! This tool runs SQL queries against DuckDB trace databases, supporting both
-//! one-shot queries, interactive mode, and specialized analysis commands.
+//! one-shot queries, interactive mode, specialized analysis commands, and an
+//! MCP server mode for AI assistant integration.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use duckdb::Connection;
 use std::path::PathBuf;
+use systing::analyze::{self, AnalyzeDb};
 
 #[derive(Parser)]
 #[command(name = "systing-analyze")]
@@ -35,6 +36,12 @@ enum Commands {
     },
     /// Stack trace analysis commands
     Stacktrace(StacktraceArgs),
+    /// Start MCP (Model Context Protocol) server for AI assistant integration
+    Mcp {
+        /// Path to DuckDB database to open on startup (optional)
+        #[arg(short, long)]
+        database: Option<PathBuf>,
+    },
 }
 
 #[derive(Args)]
@@ -57,7 +64,7 @@ struct FlamegraphArgs {
 
     /// Stack type filter
     #[arg(short = 't', long, default_value = "cpu")]
-    stack_type: StackTypeFilter,
+    stack_type: CliStackType,
 
     /// Filter to a specific process (all its threads)
     #[arg(short, long)]
@@ -85,7 +92,7 @@ struct FlamegraphArgs {
 }
 
 #[derive(Clone, clap::ValueEnum)]
-enum StackTypeFilter {
+enum CliStackType {
     Cpu,
     InterruptibleSleep,
     UninterruptibleSleep,
@@ -93,21 +100,28 @@ enum StackTypeFilter {
     All,
 }
 
+impl From<CliStackType> for analyze::StackTypeFilter {
+    fn from(s: CliStackType) -> Self {
+        match s {
+            CliStackType::Cpu => Self::Cpu,
+            CliStackType::InterruptibleSleep => Self::InterruptibleSleep,
+            CliStackType::UninterruptibleSleep => Self::UninterruptibleSleep,
+            CliStackType::AllSleep => Self::AllSleep,
+            CliStackType::All => Self::All,
+        }
+    }
+}
+
 /// Run the query command
 fn run_query(database: PathBuf, sql: Option<String>, format: String) -> Result<()> {
-    if !database.exists() {
-        bail!("Database not found: {}", database.display());
-    }
-
-    let conn = Connection::open(&database)?;
+    let db = AnalyzeDb::open(&database, false)?;
 
     match sql {
         Some(query) => {
-            execute_query(&conn, &query, &format)?;
+            execute_query(&db, &query, &format)?;
         }
         None => {
-            // Interactive mode
-            run_interactive(&conn, &format)?;
+            run_interactive(&db, &format)?;
         }
     }
 
@@ -115,80 +129,43 @@ fn run_query(database: PathBuf, sql: Option<String>, format: String) -> Result<(
 }
 
 /// Execute a single query and display results
-fn execute_query(conn: &Connection, sql: &str, format: &str) -> Result<()> {
-    let mut stmt = conn.prepare(sql)?;
-    let mut rows = stmt.query([])?;
-
-    // Get column info from the first row or statement
-    let column_count = rows.as_ref().map_or(0, |r| r.column_count());
-    let column_names: Vec<String> = if let Some(row_ref) = rows.as_ref() {
-        (0..column_count)
-            .map(|i| {
-                row_ref
-                    .column_name(i)
-                    .map_or("?".to_string(), |s| s.to_string())
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut rows_data: Vec<Vec<String>> = Vec::new();
-
-    while let Some(row) = rows.next()? {
-        let mut row_values = Vec::new();
-        for i in 0..column_count {
-            let value: duckdb::types::Value = row.get(i)?;
-            let str_value = match value {
-                duckdb::types::Value::Null => "NULL".to_string(),
-                duckdb::types::Value::Boolean(b) => b.to_string(),
-                duckdb::types::Value::TinyInt(n) => n.to_string(),
-                duckdb::types::Value::SmallInt(n) => n.to_string(),
-                duckdb::types::Value::Int(n) => n.to_string(),
-                duckdb::types::Value::BigInt(n) => n.to_string(),
-                duckdb::types::Value::HugeInt(n) => n.to_string(),
-                duckdb::types::Value::UTinyInt(n) => n.to_string(),
-                duckdb::types::Value::USmallInt(n) => n.to_string(),
-                duckdb::types::Value::UInt(n) => n.to_string(),
-                duckdb::types::Value::UBigInt(n) => n.to_string(),
-                duckdb::types::Value::Float(n) => n.to_string(),
-                duckdb::types::Value::Double(n) => n.to_string(),
-                duckdb::types::Value::Text(s) => s,
-                _ => format!("{value:?}"),
-            };
-            row_values.push(str_value);
-        }
-        rows_data.push(row_values);
-    }
-
+fn execute_query(db: &AnalyzeDb, sql: &str, format: &str) -> Result<()> {
     match format {
-        "csv" => {
-            println!("{}", column_names.join(","));
-            for row in &rows_data {
-                println!("{}", row.join(","));
-            }
-        }
         "json" => {
-            let json_rows: Vec<serde_json::Value> = rows_data
+            let result = db.query(sql)?;
+            let json_rows: Vec<serde_json::Value> = result
+                .rows
                 .iter()
                 .map(|row| {
-                    let obj: serde_json::Map<String, serde_json::Value> = column_names
+                    let obj: serde_json::Map<String, serde_json::Value> = result
+                        .columns
                         .iter()
                         .zip(row.iter())
-                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                        .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
                     serde_json::Value::Object(obj)
                 })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&json_rows)?);
+            eprintln!("\n{} rows returned", result.row_count);
         }
         _ => {
-            // Table format
-            print_table(&column_names, &rows_data);
+            // Table/CSV: use string-based query for display
+            let (column_names, rows_data) = db.query_strings(sql)?;
+            match format {
+                "csv" => {
+                    println!("{}", column_names.join(","));
+                    for row in &rows_data {
+                        println!("{}", row.join(","));
+                    }
+                }
+                _ => {
+                    print_table(&column_names, &rows_data);
+                }
+            }
+            eprintln!("\n{} rows returned", rows_data.len());
         }
     }
-
-    eprintln!("\n{} rows returned", rows_data.len());
     Ok(())
 }
 
@@ -241,21 +218,20 @@ fn print_table(headers: &[String], rows: &[Vec<String>]) {
     }
 }
 
-fn run_interactive(conn: &Connection, format: &str) -> Result<()> {
+fn run_interactive(db: &AnalyzeDb, format: &str) -> Result<()> {
     use std::io::{self, BufRead, Write};
 
     eprintln!("systing-analyze interactive mode");
     eprintln!("Enter SQL queries (end with ';'), or 'quit' to exit.\n");
 
     eprintln!("Available tables:");
-    let mut stmt = conn.prepare(
-        "SELECT table_name FROM information_schema.tables
-         WHERE table_schema = 'main' ORDER BY table_name",
-    )?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(0)?;
-        eprintln!("  {name}");
+    match db.list_tables() {
+        Ok(tables) => {
+            for table in &tables {
+                eprintln!("  {}", table.name);
+            }
+        }
+        Err(e) => eprintln!("  Error listing tables: {e}"),
     }
     eprintln!();
 
@@ -288,7 +264,7 @@ fn run_interactive(conn: &Connection, format: &str) -> Result<()> {
             query_buffer.clear();
 
             if !query.is_empty() {
-                if let Err(e) = execute_query(conn, &query, format) {
+                if let Err(e) = execute_query(db, &query, format) {
                     eprintln!("Error: {e}");
                 }
             }
@@ -299,80 +275,36 @@ fn run_interactive(conn: &Connection, format: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run the flamegraph subcommand: query stack traces and output folded-stack format.
+/// Run the flamegraph subcommand
 fn run_flamegraph(args: FlamegraphArgs) -> Result<()> {
-    if !args.database.exists() {
-        bail!("Database not found: {}", args.database.display());
-    }
+    let db = AnalyzeDb::open(&args.database, true)?;
 
-    let conn = Connection::open(&args.database)?;
+    let params = analyze::FlamegraphParams {
+        stack_type: args.stack_type.into(),
+        pid: args.pid,
+        tid: args.tid,
+        start_time: args.start_time,
+        end_time: args.end_time,
+        trace_id: args.trace_id.clone(),
+        min_count: args.min_count,
+        top_n: usize::MAX, // No limit for CLI output
+    };
 
-    // Check that required tables exist
-    if !table_exists(&conn, "stack_sample")? || !table_exists(&conn, "stack")? {
-        bail!(
-            "Database missing required tables (stack_sample, stack). \
-             Is this a systing trace database?"
-        );
-    }
-
-    // For sleep types requiring sched_slice correlation, verify the table exists
-    if matches!(
-        args.stack_type,
-        StackTypeFilter::InterruptibleSleep | StackTypeFilter::UninterruptibleSleep
-    ) && !table_has_rows(&conn, "sched_slice")?
-    {
-        bail!(
-            "No sched_slice data available, required for {} filtering",
-            stack_type_str(&args.stack_type)
-        );
-    }
-
-    // Get time range for offset calculations
-    let (min_ts, max_ts, total_samples) = get_trace_time_range(&conn, &args.trace_id)?;
-
-    // Convert time offsets to absolute nanosecond timestamps
-    let abs_start = args.start_time.map(|t| min_ts + (t * 1e9) as i64);
-    let abs_end = args.end_time.map(|t| min_ts + (t * 1e9) as i64);
-
-    // Build and execute the query
-    let sql = build_flamegraph_query(
-        &args.stack_type,
-        &args.pid,
-        &args.tid,
-        &abs_start,
-        &abs_end,
-        &args.trace_id,
-        args.min_count,
-    );
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([])?;
-
-    let mut total_output_samples: u64 = 0;
-    let mut unique_stacks: u64 = 0;
-    let mut output_lines: Vec<(String, u64)> = Vec::new();
-
-    while let Some(row) = rows.next()? {
-        let frames_str: String = row.get(0)?;
-        let count: i64 = row.get(1)?;
-        let count = count as u64;
-
-        let folded = format_folded_stack(&frames_str);
-        if !folded.is_empty() {
-            output_lines.push((folded, count));
-            total_output_samples += count;
-            unique_stacks += 1;
-        }
-    }
+    let result = db.flamegraph(&params)?;
 
     // Print metadata to stderr
-    let duration_secs = (max_ts - min_ts) as f64 / 1e9;
     eprintln!("# Flamegraph: {}", args.database.display());
-    eprintln!("# Stack type: {}", stack_type_str(&args.stack_type));
-    eprintln!("# Total trace samples: {}", total_samples);
-    eprintln!("# Output samples: {}", total_output_samples);
-    eprintln!("# Unique stacks: {}", unique_stacks);
-    eprintln!("# Time range: 0.000s - {:.3}s", duration_secs);
+    eprintln!("# Stack type: {}", result.metadata.stack_type);
+    eprintln!("# Total trace samples: {}", result.metadata.total_samples);
+    eprintln!(
+        "# Output samples: {}",
+        result.stacks.iter().map(|s| s.count).sum::<u64>()
+    );
+    eprintln!("# Unique stacks: {}", result.metadata.unique_stacks);
+    eprintln!(
+        "# Time range: {:.3}s - {:.3}s",
+        result.metadata.time_range_seconds.0, result.metadata.time_range_seconds.1
+    );
 
     let mut filters = Vec::new();
     if let Some(p) = &args.pid {
@@ -395,220 +327,12 @@ fn run_flamegraph(args: FlamegraphArgs) -> Result<()> {
     }
 
     // Print folded stacks to stdout
-    for (folded, count) in &output_lines {
-        println!("{folded} {count}");
+    for stack in &result.stacks {
+        let folded = stack.frames.join(";");
+        println!("{folded} {}", stack.count);
     }
 
     Ok(())
-}
-
-fn stack_type_str(stack_type: &StackTypeFilter) -> &'static str {
-    match stack_type {
-        StackTypeFilter::Cpu => "cpu",
-        StackTypeFilter::InterruptibleSleep => "interruptible-sleep",
-        StackTypeFilter::UninterruptibleSleep => "uninterruptible-sleep",
-        StackTypeFilter::AllSleep => "all-sleep",
-        StackTypeFilter::All => "all",
-    }
-}
-
-fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(
-        "SELECT COUNT(*) FROM information_schema.tables \
-         WHERE table_schema = 'main' AND table_name = ?",
-    )?;
-    let mut rows = stmt.query([table_name])?;
-    if let Some(row) = rows.next()? {
-        let count: i64 = row.get(0)?;
-        Ok(count > 0)
-    } else {
-        Ok(false)
-    }
-}
-
-fn table_has_rows(conn: &Connection, table_name: &str) -> Result<bool> {
-    if !table_exists(conn, table_name)? {
-        return Ok(false);
-    }
-    // Use the table name directly - it's a known internal constant, not user input
-    let sql = format!("SELECT 1 FROM {table_name} LIMIT 1");
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([])?;
-    Ok(rows.next()?.is_some())
-}
-
-fn get_trace_time_range(conn: &Connection, trace_id: &Option<String>) -> Result<(i64, i64, u64)> {
-    let sql = if let Some(tid) = trace_id {
-        let escaped = tid.replace('\'', "''");
-        format!("SELECT MIN(ts), MAX(ts), COUNT(*) FROM stack_sample WHERE trace_id = '{escaped}'")
-    } else {
-        "SELECT MIN(ts), MAX(ts), COUNT(*) FROM stack_sample".to_string()
-    };
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([])?;
-    if let Some(row) = rows.next()? {
-        let count: i64 = row.get(2)?;
-        if count == 0 {
-            bail!("No stack samples found in database");
-        }
-        let min_ts: i64 = row.get(0)?;
-        let max_ts: i64 = row.get(1)?;
-        Ok((min_ts, max_ts, count as u64))
-    } else {
-        bail!("No data in stack_sample table");
-    }
-}
-
-fn build_flamegraph_query(
-    stack_type: &StackTypeFilter,
-    pid: &Option<u32>,
-    tid: &Option<u32>,
-    abs_start: &Option<i64>,
-    abs_end: &Option<i64>,
-    trace_id: &Option<String>,
-    min_count: u64,
-) -> String {
-    let mut joins = String::new();
-    let mut conditions = Vec::new();
-
-    // Stack type filter and potential sched_slice join
-    match stack_type {
-        StackTypeFilter::Cpu => {
-            conditions.push("ss.stack_event_type = 1".to_string());
-        }
-        StackTypeFilter::InterruptibleSleep => {
-            conditions.push("ss.stack_event_type = 0".to_string());
-            conditions.push("sl.end_state = 1".to_string());
-            joins.push_str(
-                " JOIN sched_slice sl ON ss.utid = sl.utid AND ss.trace_id = sl.trace_id \
-                 AND ABS(ss.ts - (sl.ts + sl.dur)) <= 10000000",
-            );
-        }
-        StackTypeFilter::UninterruptibleSleep => {
-            conditions.push("ss.stack_event_type = 0".to_string());
-            conditions.push("sl.end_state = 2".to_string());
-            joins.push_str(
-                " JOIN sched_slice sl ON ss.utid = sl.utid AND ss.trace_id = sl.trace_id \
-                 AND ABS(ss.ts - (sl.ts + sl.dur)) <= 10000000",
-            );
-        }
-        StackTypeFilter::AllSleep => {
-            conditions.push("ss.stack_event_type = 0".to_string());
-        }
-        StackTypeFilter::All => {}
-    }
-
-    // PID/TID filters require thread/process joins
-    if pid.is_some() || tid.is_some() {
-        joins.push_str(" JOIN thread t ON ss.utid = t.utid AND ss.trace_id = t.trace_id");
-    }
-    if pid.is_some() {
-        joins.push_str(" JOIN process p ON t.upid = p.upid AND t.trace_id = p.trace_id");
-    }
-
-    if let Some(pid_val) = pid {
-        conditions.push(format!("p.pid = {pid_val}"));
-    }
-    if let Some(tid_val) = tid {
-        conditions.push(format!("t.tid = {tid_val}"));
-    }
-
-    // Time range
-    if let Some(start) = abs_start {
-        conditions.push(format!("ss.ts >= {start}"));
-    }
-    if let Some(end) = abs_end {
-        conditions.push(format!("ss.ts <= {end}"));
-    }
-
-    // Trace ID
-    if let Some(tid) = trace_id {
-        let escaped = tid.replace('\'', "''");
-        conditions.push(format!("ss.trace_id = '{escaped}'"));
-    }
-
-    // Filter out NULL/empty frame_names
-    conditions.push("s.frame_names IS NOT NULL".to_string());
-    conditions.push("len(s.frame_names) > 0".to_string());
-
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", conditions.join(" AND "))
-    };
-
-    let having_clause = if min_count > 1 {
-        format!(" HAVING COUNT(*) >= {min_count}")
-    } else {
-        String::new()
-    };
-
-    format!(
-        "SELECT array_to_string(s.frame_names, chr(31)) as frames, \
-         COUNT(*) as count \
-         FROM stack_sample ss \
-         JOIN stack s ON ss.stack_id = s.id AND ss.trace_id = s.trace_id\
-         {joins}{where_clause} \
-         GROUP BY s.frame_names{having_clause} \
-         ORDER BY count DESC"
-    )
-}
-
-/// Format a DuckDB frame_names array (as chr(31)-separated string) into folded stack format.
-///
-/// Frame names are stored leaf-to-root in the database, so they are reversed
-/// to root-to-leaf order for flamegraph convention (root;child;...;leaf).
-fn format_folded_stack(frames_str: &str) -> String {
-    if frames_str.is_empty() {
-        return String::new();
-    }
-
-    let frames: Vec<&str> = frames_str.split('\x1F').collect();
-
-    // Reverse from leaf-to-root (storage order) to root-to-leaf (flamegraph convention)
-    let formatted: Vec<String> = frames.iter().rev().map(|f| format_frame(f)).collect();
-
-    formatted.join(";")
-}
-
-/// Simplify a frame name for folded output.
-///
-/// Input format: `function_name (module_name [file:line]) <0xaddr>`
-/// Output format: `function_name [module_name]`
-///
-/// Unsymbolized frames (bare hex addresses like `0x5dbfa1`) become `0x5dbfa1 [unknown]`.
-fn format_frame(frame: &str) -> String {
-    let frame = frame.trim();
-    if frame.is_empty() {
-        return "[unknown]".to_string();
-    }
-
-    // Try to parse: "function_name (module_name [file:line]) <0xaddr>"
-    // or: "function_name (module_name) <0xaddr>"
-    if let Some(paren_pos) = frame.find(" (") {
-        let func_name = &frame[..paren_pos];
-        let rest = &frame[paren_pos + 2..];
-
-        // Extract module name (up to ' [' for source location or ')' for end)
-        let module_end = rest
-            .find(" [")
-            .or_else(|| rest.find(')'))
-            .unwrap_or(rest.len());
-        let module_name = &rest[..module_end];
-
-        if module_name.is_empty() {
-            func_name.to_string()
-        } else {
-            format!("{func_name} [{module_name}]")
-        }
-    } else if frame.starts_with("0x") {
-        // Bare hex address (unsymbolized)
-        format!("{frame} [unknown]")
-    } else {
-        // Unknown format, return as-is
-        frame.to_string()
-    }
 }
 
 fn main() -> Result<()> {
@@ -623,115 +347,9 @@ fn main() -> Result<()> {
         Commands::Stacktrace(args) => match args.command {
             StacktraceCommands::Flamegraph(flamegraph_args) => run_flamegraph(flamegraph_args),
         },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_frame_symbolized() {
-        assert_eq!(
-            format_frame("tcp_sendmsg (vmlinux [net/ipv4/tcp.c:1234]) <0xffffffff8ec7559e>"),
-            "tcp_sendmsg [vmlinux]"
-        );
-    }
-
-    #[test]
-    fn test_format_frame_with_module_only() {
-        assert_eq!(format_frame("main (myapp) <0x401234>"), "main [myapp]");
-    }
-
-    #[test]
-    fn test_format_frame_kernel_unknown() {
-        assert_eq!(
-            format_frame("unknown ([kernel]) <0xffffffff8e000000>"),
-            "unknown [[kernel]]"
-        );
-    }
-
-    #[test]
-    fn test_format_frame_bare_hex() {
-        assert_eq!(format_frame("0x5dbfa1"), "0x5dbfa1 [unknown]");
-    }
-
-    #[test]
-    fn test_format_frame_empty() {
-        assert_eq!(format_frame(""), "[unknown]");
-    }
-
-    #[test]
-    fn test_format_folded_stack_reversal() {
-        // frame_names stored leaf-to-root: "leaf\x1Fmid\x1Froot"
-        // Should output root-to-leaf: "root;mid;leaf"
-        let input = "leaf (app) <0x1>\x1Fmid (app) <0x2>\x1Froot (app) <0x3>";
-        let result = format_folded_stack(input);
-        assert_eq!(result, "root [app];mid [app];leaf [app]");
-    }
-
-    #[test]
-    fn test_format_folded_stack_empty() {
-        assert_eq!(format_folded_stack(""), "");
-    }
-
-    #[test]
-    fn test_format_folded_stack_single_frame() {
-        let input = "main (myapp) <0x401234>";
-        assert_eq!(format_folded_stack(input), "main [myapp]");
-    }
-
-    #[test]
-    fn test_build_flamegraph_query_cpu() {
-        let sql =
-            build_flamegraph_query(&StackTypeFilter::Cpu, &None, &None, &None, &None, &None, 1);
-        assert!(sql.contains("stack_event_type = 1"));
-        assert!(!sql.contains("sched_slice"));
-    }
-
-    #[test]
-    fn test_build_flamegraph_query_interruptible_sleep() {
-        let sql = build_flamegraph_query(
-            &StackTypeFilter::InterruptibleSleep,
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-            1,
-        );
-        assert!(sql.contains("stack_event_type = 0"));
-        assert!(sql.contains("sched_slice"));
-        assert!(sql.contains("end_state = 1"));
-    }
-
-    #[test]
-    fn test_build_flamegraph_query_with_pid() {
-        let sql = build_flamegraph_query(
-            &StackTypeFilter::Cpu,
-            &Some(1234),
-            &None,
-            &None,
-            &None,
-            &None,
-            1,
-        );
-        assert!(sql.contains("JOIN thread t"));
-        assert!(sql.contains("JOIN process p"));
-        assert!(sql.contains("p.pid = 1234"));
-    }
-
-    #[test]
-    fn test_build_flamegraph_query_with_min_count() {
-        let sql =
-            build_flamegraph_query(&StackTypeFilter::All, &None, &None, &None, &None, &None, 10);
-        assert!(sql.contains("HAVING COUNT(*) >= 10"));
-    }
-
-    #[test]
-    fn test_build_flamegraph_query_no_having_for_min_count_1() {
-        let sql =
-            build_flamegraph_query(&StackTypeFilter::All, &None, &None, &None, &None, &None, 1);
-        assert!(!sql.contains("HAVING"));
+        Commands::Mcp { database } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(systing::mcp::run_mcp_server(database))
+        }
     }
 }

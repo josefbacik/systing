@@ -27,6 +27,10 @@
 //! ).expect("Failed to create DuckDB database");
 //! ```
 
+// Analysis modules
+pub mod analyze;
+pub mod mcp;
+
 // Core library modules
 pub mod duckdb;
 pub mod parquet_paths;
