@@ -1791,7 +1791,7 @@ fn test_validate_duckdb_invalid() {
 ///
 /// This test validates that:
 /// 1. systing records a trace with Perfetto output
-/// 2. systing-analyze convert creates a valid DuckDB database
+/// 2. systing-util convert creates a valid DuckDB database
 /// 3. The DuckDB passes validation without warnings about all-NULL end_state
 ///
 /// This catches regressions where switch_prev_state is not extracted from
@@ -1820,7 +1820,7 @@ fn test_e2e_perfetto_to_duckdb_preserves_end_state() {
     assert!(trace_path.exists(), "Perfetto trace not created");
 
     // Step 2: Convert Perfetto to DuckDB using systing-analyze
-    let output = Command::new(env!("CARGO_BIN_EXE_systing-analyze"))
+    let output = Command::new(env!("CARGO_BIN_EXE_systing-util"))
         .args([
             "convert",
             "-o",
@@ -1828,11 +1828,11 @@ fn test_e2e_perfetto_to_duckdb_preserves_end_state() {
             trace_path.to_str().unwrap(),
         ])
         .output()
-        .expect("Failed to run systing-analyze convert");
+        .expect("Failed to run systing-util convert");
 
     assert!(
         output.status.success(),
-        "systing-analyze convert failed: {}",
+        "systing-util convert failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(duckdb_path.exists(), "DuckDB not created");
@@ -2202,7 +2202,7 @@ fn test_e2e_task_exit_states() {
 // DuckDB → Perfetto Conversion Tests
 // =============================================================================
 
-/// Tests DuckDB → Perfetto conversion using systing-analyze convert.
+/// Tests DuckDB → Perfetto conversion using systing-util convert.
 ///
 /// This test validates that:
 /// 1. A DuckDB database can be converted to Perfetto format
@@ -2240,8 +2240,8 @@ fn test_e2e_duckdb_to_perfetto() {
         duckdb_path
     );
 
-    // Step 2: Convert DuckDB → Perfetto using systing-analyze convert
-    let output = Command::new(env!("CARGO_BIN_EXE_systing-analyze"))
+    // Step 2: Convert DuckDB → Perfetto using systing-util convert
+    let output = Command::new(env!("CARGO_BIN_EXE_systing-util"))
         .args([
             "convert",
             "-o",
@@ -2249,11 +2249,11 @@ fn test_e2e_duckdb_to_perfetto() {
             duckdb_path.to_str().unwrap(),
         ])
         .output()
-        .expect("Failed to run systing-analyze convert");
+        .expect("Failed to run systing-util convert");
 
     assert!(
         output.status.success(),
-        "systing-analyze convert failed:\nstdout: {}\nstderr: {}",
+        "systing-util convert failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

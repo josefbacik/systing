@@ -55,5 +55,9 @@ path = "src/lib.rs"
 name = "systing-analyze"
 path = "src/bin/systing_analyze.rs"
 
+[[bin]]
+name = "systing-util"
+path = "src/bin/systing_util.rs"
+
 [profile.release]
 lto = "thin"
