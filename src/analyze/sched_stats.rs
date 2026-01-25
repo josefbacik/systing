@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use serde::Serialize;
 
-use super::AnalyzeDb;
+use super::{trace_id_filter, AnalyzeDb};
 
 /// Parameters for sched stats analysis.
 #[derive(Debug, Clone)]
@@ -374,18 +374,6 @@ fn build_sched_next_cte(filter: &str) -> String {
          FROM sched_slice \
          WHERE dur > 0{filter})"
     )
-}
-
-/// Build a trace_id SQL filter clause (e.g., ` AND ss.trace_id = '...'`).
-/// trace_id values are escaped via single-quote doubling for safe SQL interpolation.
-fn trace_id_filter(trace_id: Option<&str>, table_alias: &str) -> String {
-    match trace_id {
-        Some(tid) => {
-            let escaped = tid.replace('\'', "''");
-            format!(" AND {table_alias}trace_id = '{escaped}'")
-        }
-        None => String::new(),
-    }
 }
 
 fn build_sched_summary_query(trace_id: Option<&str>) -> String {

@@ -3,7 +3,9 @@
 //! Provides an MCP server that exposes trace database analysis tools to AI
 //! assistants. Uses a dedicated DB thread to handle DuckDB's non-Send connection.
 
-use crate::analyze::{AnalyzeDb, FlamegraphParams, SchedStatsParams, StackTypeFilter};
+use crate::analyze::{
+    AnalyzeDb, CpuStatsParams, FlamegraphParams, SchedStatsParams, StackTypeFilter,
+};
 use anyhow::Result;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -26,6 +28,7 @@ enum DbRequest {
     DescribeTable(String),
     Flamegraph(FlamegraphParams),
     SchedStats(SchedStatsParams),
+    CpuStats(CpuStatsParams),
     TraceInfo,
 }
 
@@ -118,6 +121,10 @@ fn handle_db_request(db: &mut Option<AnalyzeDb>, request: DbRequest) -> DbRespon
                     .sched_stats(&params)
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .map_err(|e| format!("Sched stats error: {e}")),
+                DbRequest::CpuStats(params) => db
+                    .cpu_stats(&params)
+                    .map(|r| serde_json::to_value(r).unwrap_or_default())
+                    .map_err(|e| format!("CPU stats error: {e}")),
                 DbRequest::TraceInfo => db
                     .trace_info()
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
@@ -189,6 +196,12 @@ struct SchedStatsToolParams {
 
     /// Max processes/threads to return. Default: 20.
     top_n: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CpuStatsToolParams {
+    /// Filter to a specific trace ID (for multi-trace databases).
+    trace_id: Option<String>,
 }
 
 // -- Helper functions --
@@ -348,6 +361,24 @@ impl SystingMcpServer {
             Err(e) => Ok(make_error_result(&e)),
         }
     }
+
+    #[tool(
+        name = "cpu_stats",
+        description = "Per-CPU scheduling statistics. Shows utilization, idle%, thread count, IRQ/softIRQ time, and runqueue depth percentiles (p50/p90/p99) for each CPU. IRQ/softIRQ times are zero if the corresponding tables are absent. Runqueue percentiles are null if thread_state table is absent. Runqueue estimates are approximate: they model sleep-to-wake-to-run cycles only (preempted threads excluded), target_cpu is the CPU at wakeup time (migration not tracked), and percentiles are event-weighted not time-weighted."
+    )]
+    async fn cpu_stats(
+        &self,
+        Parameters(params): Parameters<CpuStatsToolParams>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let cpu_params = CpuStatsParams {
+            trace_id: params.trace_id,
+        };
+
+        match self.db.request(DbRequest::CpuStats(cpu_params)).await {
+            Ok(value) => Ok(make_tool_result(value)),
+            Err(e) => Ok(make_error_result(&e)),
+        }
+    }
 }
 
 const SERVER_INSTRUCTIONS: &str = "\
@@ -391,6 +422,8 @@ network activity, and performance counters. Traces are stored in DuckDB database
    no filter = whole-trace with per-process ranking, \
    pid = process detail with per-thread breakdown, \
    tid = single thread detail with end-state distribution.
+8. cpu_stats — Per-CPU scheduling statistics. Shows utilization, idle%, \
+   thread count, IRQ/softIRQ time, and runqueue depth percentiles per CPU.
 
 # Query result limits
 Queries return at most 10,000 rows. If results are truncated, the response \

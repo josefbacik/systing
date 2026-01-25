@@ -4,10 +4,12 @@
 //! and MCP server interfaces. All methods are synchronous and work directly
 //! with DuckDB connections.
 
+mod cpu_stats;
 mod flamegraph;
 mod query;
 mod sched_stats;
 
+pub use cpu_stats::{CpuStatsParams, CpuStatsResult, CpuStatsSummary, PerCpuStats};
 pub use flamegraph::{
     FlamegraphMetadata, FlamegraphParams, FlamegraphResult, StackEntry, StackTypeFilter,
 };
@@ -383,6 +385,18 @@ fn table_has_rows(conn: &Connection, table_name: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
     Ok(rows.next()?.is_some())
+}
+
+/// Build a trace_id SQL filter clause (e.g., ` AND ss.trace_id = '...'`).
+/// trace_id values are escaped via single-quote doubling for safe SQL interpolation.
+pub(crate) fn trace_id_filter(trace_id: Option<&str>, table_alias: &str) -> String {
+    match trace_id {
+        Some(tid) => {
+            let escaped = tid.replace('\'', "''");
+            format!(" AND {table_alias}trace_id = '{escaped}'")
+        }
+        None => String::new(),
+    }
 }
 
 fn get_trace_time_range(conn: &Connection, trace_id: Option<&str>) -> Result<(i64, i64, u64)> {

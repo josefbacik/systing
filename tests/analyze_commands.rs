@@ -661,6 +661,145 @@ fn test_sched_stats_nonexistent_db(_db: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// sched cpu-stats subcommand tests
+// ---------------------------------------------------------------------------
+
+fn test_sched_cpu_stats_table(db: &Path) {
+    let output = run_analyze(&["sched", "cpu-stats", "-d", db.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "sched cpu-stats (table) failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stderr = lossy(&output.stderr);
+    let stdout = lossy(&output.stdout);
+
+    // Metadata headers on stderr
+    assert!(
+        stderr.contains("# CPU Stats:"),
+        "missing CPU Stats header: {stderr}"
+    );
+    assert!(
+        stderr.contains("# Trace duration:"),
+        "missing trace duration: {stderr}"
+    );
+    assert!(stderr.contains("# CPUs:"), "missing CPUs count: {stderr}");
+    assert!(
+        stderr.contains("# Total sched events:"),
+        "missing total sched events: {stderr}"
+    );
+
+    // Table output on stdout should have CPU column
+    assert!(
+        stdout.contains("CPU"),
+        "missing CPU column in table output: {stdout}"
+    );
+    assert!(
+        stdout.contains("Util%"),
+        "missing Util% column in table output: {stdout}"
+    );
+    assert!(
+        stdout.contains("Idle%"),
+        "missing Idle% column in table output: {stdout}"
+    );
+}
+
+fn test_sched_cpu_stats_json(db: &Path) {
+    let output = run_analyze(&[
+        "sched",
+        "cpu-stats",
+        "-d",
+        db.to_str().unwrap(),
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "sched cpu-stats (json) failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("cpu-stats JSON should be valid");
+    assert!(
+        parsed.get("summary").is_some(),
+        "JSON missing summary key: {stdout}"
+    );
+    assert!(
+        parsed.get("cpus").is_some(),
+        "JSON missing cpus key: {stdout}"
+    );
+    let cpus = parsed["cpus"].as_array().expect("cpus should be an array");
+    assert!(!cpus.is_empty(), "cpus array should not be empty");
+
+    let cpu_count = parsed["summary"]["cpu_count"]
+        .as_u64()
+        .expect("cpu_count should be a number");
+    assert!(cpu_count > 0, "expected cpu_count > 0");
+    assert_eq!(
+        cpus.len() as u64,
+        cpu_count,
+        "cpus array length should match cpu_count"
+    );
+
+    // Each CPU entry should have expected fields
+    let first_cpu = &cpus[0];
+    assert!(
+        first_cpu.get("cpu").is_some(),
+        "CPU entry missing 'cpu' field"
+    );
+    assert!(
+        first_cpu.get("utilization_pct").is_some(),
+        "CPU entry missing 'utilization_pct' field"
+    );
+    assert!(
+        first_cpu.get("idle_pct").is_some(),
+        "CPU entry missing 'idle_pct' field"
+    );
+    assert!(
+        first_cpu.get("irq_time_seconds").is_some(),
+        "CPU entry missing 'irq_time_seconds' field"
+    );
+    assert!(
+        first_cpu.get("softirq_time_seconds").is_some(),
+        "CPU entry missing 'softirq_time_seconds' field"
+    );
+
+    // Verify utilization/idle percentages are within valid bounds
+    for cpu_entry in cpus {
+        let util = cpu_entry["utilization_pct"]
+            .as_f64()
+            .expect("utilization_pct should be a number");
+        let idle = cpu_entry["idle_pct"]
+            .as_f64()
+            .expect("idle_pct should be a number");
+        assert!(
+            (0.0..=100.0).contains(&util),
+            "utilization_pct out of range [0,100]: {util}"
+        );
+        assert!(
+            (0.0..=100.0).contains(&idle),
+            "idle_pct out of range [0,100]: {idle}"
+        );
+    }
+}
+
+fn test_sched_cpu_stats_nonexistent_db(_db: &Path) {
+    let output = run_analyze(&[
+        "sched",
+        "cpu-stats",
+        "-d",
+        "/tmp/does_not_exist_systing_cpu_stats_test.duckdb",
+    ]);
+    assert!(
+        !output.status.success(),
+        "sched cpu-stats should fail for nonexistent database"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Main integration test: record once, then exercise all commands
 // ---------------------------------------------------------------------------
 
@@ -737,6 +876,18 @@ fn test_analyze_commands() {
 
     eprintln!("  nonexistent database...");
     test_sched_stats_nonexistent_db(&duckdb_path);
+
+    // Phase 5: Test sched cpu-stats subcommand
+    eprintln!("\n--- sched cpu-stats subcommand ---");
+
+    eprintln!("  table format...");
+    test_sched_cpu_stats_table(&duckdb_path);
+
+    eprintln!("  json format...");
+    test_sched_cpu_stats_json(&duckdb_path);
+
+    eprintln!("  nonexistent database...");
+    test_sched_cpu_stats_nonexistent_db(&duckdb_path);
 
     eprintln!("\n✓ All systing-analyze commands passed");
 }

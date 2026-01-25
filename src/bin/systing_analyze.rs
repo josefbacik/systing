@@ -124,6 +124,8 @@ struct SchedArgs {
 enum SchedCommands {
     /// Show scheduling timing statistics
     Stats(SchedStatsArgs),
+    /// Show per-CPU scheduling statistics
+    CpuStats(SchedCpuStatsArgs),
 }
 
 #[derive(Args)]
@@ -151,6 +153,21 @@ struct SchedStatsArgs {
     /// Max processes/threads to show (minimum 1)
     #[arg(long, default_value = "20", value_parser = clap::value_parser!(u64).range(1..))]
     top: u64,
+}
+
+#[derive(Args)]
+struct SchedCpuStatsArgs {
+    /// Path to DuckDB database
+    #[arg(short, long)]
+    database: PathBuf,
+
+    /// Output format: table or json
+    #[arg(short, long, default_value = "table")]
+    format: String,
+
+    /// Filter to a specific trace (for multi-trace DBs)
+    #[arg(long)]
+    trace_id: Option<String>,
 }
 
 /// Run the query command
@@ -537,6 +554,98 @@ fn run_sched_stats(args: SchedStatsArgs) -> Result<()> {
     Ok(())
 }
 
+/// Run the sched cpu-stats subcommand
+fn run_sched_cpu_stats(args: SchedCpuStatsArgs) -> Result<()> {
+    let db = AnalyzeDb::open(&args.database, true)?;
+
+    let params = analyze::CpuStatsParams {
+        trace_id: args.trace_id,
+    };
+
+    let result = db.cpu_stats(&params)?;
+
+    if args.format == "json" {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    // Table output: metadata to stderr, data to stdout
+    eprintln!("# CPU Stats: {}", args.database.display());
+    eprintln!(
+        "# Trace duration: {}",
+        format_duration(result.summary.trace_duration_seconds)
+    );
+    eprintln!("# CPUs: {}", result.summary.cpu_count);
+    eprintln!(
+        "# Total sched events: {}",
+        result.summary.total_sched_events
+    );
+    eprintln!("# Note: IRQ/SoftIRQ time is stolen from scheduled tasks and included in Util%.");
+    eprintln!("# Note: RQ estimates are approximate (see --format json for details).");
+
+    // Check if any CPU has runqueue data
+    let has_rq = result.cpus.iter().any(|c| c.rq_p50.is_some());
+
+    // Table header
+    if has_rq {
+        println!(
+            "{:>3}  {:>6}  {:>6}  {:>7}  {:>8}  {:>10}  {:>10}  {:>6}  {:>6}  {:>6}",
+            "CPU",
+            "Util%",
+            "Idle%",
+            "Threads",
+            "Events",
+            "IRQ Time",
+            "SoftIRQ",
+            "RQ p50",
+            "RQ p90",
+            "RQ p99"
+        );
+    } else {
+        println!(
+            "{:>3}  {:>6}  {:>6}  {:>7}  {:>8}  {:>10}  {:>10}",
+            "CPU", "Util%", "Idle%", "Threads", "Events", "IRQ Time", "SoftIRQ"
+        );
+    }
+
+    let fmt_rq = |v: Option<f64>| v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "-".into());
+
+    for c in &result.cpus {
+        let rq_p50 = fmt_rq(c.rq_p50);
+        let rq_p90 = fmt_rq(c.rq_p90);
+        let rq_p99 = fmt_rq(c.rq_p99);
+
+        if has_rq {
+            println!(
+                "{:>3}  {:>5.1}%  {:>5.1}%  {:>7}  {:>8}  {:>10}  {:>10}  {:>6}  {:>6}  {:>6}",
+                c.cpu,
+                c.utilization_pct,
+                c.idle_pct,
+                c.thread_count,
+                c.sched_events,
+                format_duration(c.irq_time_seconds),
+                format_duration(c.softirq_time_seconds),
+                rq_p50,
+                rq_p90,
+                rq_p99,
+            );
+        } else {
+            println!(
+                "{:>3}  {:>5.1}%  {:>5.1}%  {:>7}  {:>8}  {:>10}  {:>10}",
+                c.cpu,
+                c.utilization_pct,
+                c.idle_pct,
+                c.thread_count,
+                c.sched_events,
+                format_duration(c.irq_time_seconds),
+                format_duration(c.softirq_time_seconds),
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Truncate a name to fit within a column width (UTF-8 safe).
 fn truncate_name(name: &str, max: usize) -> String {
     if name.len() <= max {
@@ -562,6 +671,7 @@ fn main() -> Result<()> {
         },
         Commands::Sched(args) => match args.command {
             SchedCommands::Stats(stats_args) => run_sched_stats(stats_args),
+            SchedCommands::CpuStats(cpu_stats_args) => run_sched_cpu_stats(cpu_stats_args),
         },
         Commands::Mcp { database } => {
             let rt = tokio::runtime::Runtime::new()?;
