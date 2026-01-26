@@ -8,6 +8,7 @@ mod cpu_stats;
 mod flamegraph;
 mod network_connections;
 mod network_interfaces;
+mod network_socket_pairs;
 mod query;
 mod sched_stats;
 
@@ -21,6 +22,9 @@ pub use network_connections::{
 pub use network_interfaces::{
     InterfaceStats, NetworkInterfacesParams, NetworkInterfacesResult, TraceNetworkStats,
     TrafficStats,
+};
+pub use network_socket_pairs::{
+    NetworkSocketPairsParams, NetworkSocketPairsResult, SocketPair, SocketSide,
 };
 pub use sched_stats::{
     EndStateCount, ProcessSchedStats, SchedStatsParams, SchedStatsResult, SchedSummary,

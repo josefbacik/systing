@@ -128,6 +128,8 @@ enum NetworkCommands {
     Connections(NetworkConnectionsArgs),
     /// Show per-interface network traffic summary
     Interfaces(NetworkInterfacesArgs),
+    /// Find matched socket pairs (both sides of a connection)
+    SocketPairs(NetworkSocketPairsArgs),
 }
 
 #[derive(Args)]
@@ -159,6 +161,41 @@ struct NetworkConnectionsArgs {
     /// Show all connections (no top-N limit)
     #[arg(long, conflicts_with = "top")]
     all: bool,
+}
+
+#[derive(Args)]
+struct NetworkSocketPairsArgs {
+    /// Path to DuckDB database
+    #[arg(short, long)]
+    database: PathBuf,
+
+    /// Output format: table or json
+    #[arg(short, long, default_value = "table")]
+    format: String,
+
+    /// Filter: at least one side must be in this trace
+    #[arg(long)]
+    trace_id: Option<String>,
+
+    /// Filter: connections involving this service port
+    #[arg(long)]
+    dest_port: Option<i32>,
+
+    /// Filter: connections involving this IP address (matches src or dest)
+    #[arg(long)]
+    ip: Option<String>,
+
+    /// Max pairs to show (default: 50)
+    #[arg(long, default_value = "50", value_parser = clap::value_parser!(u64).range(1..), conflicts_with = "all")]
+    top: u64,
+
+    /// Show all pairs (no top-N limit)
+    #[arg(long, conflicts_with = "top")]
+    all: bool,
+
+    /// Exclude loopback pairs (127.x, ::1, ::ffff:127.x)
+    #[arg(long)]
+    exclude_loopback: bool,
 }
 
 #[derive(Args)]
@@ -897,6 +934,89 @@ fn run_network_interfaces(args: NetworkInterfacesArgs) -> Result<()> {
     Ok(())
 }
 
+/// Run the network socket-pairs subcommand
+fn run_network_socket_pairs(args: NetworkSocketPairsArgs) -> Result<()> {
+    let db = AnalyzeDb::open(&args.database, true)?;
+
+    let top_n = if args.all {
+        None
+    } else {
+        Some(args.top as usize)
+    };
+
+    let params = analyze::NetworkSocketPairsParams {
+        trace_id: args.trace_id,
+        dest_port: args.dest_port,
+        ip: args.ip,
+        top_n,
+        exclude_loopback: args.exclude_loopback,
+    };
+
+    let result = db.network_socket_pairs(&params)?;
+
+    if args.format == "json" {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    // Table output: metadata to stderr, data to stdout
+    eprintln!("# Network Socket Pairs: {}", args.database.display());
+    eprintln!("# Matched pairs: {}", result.pairs.len());
+
+    if let Some(n) = top_n {
+        if result.pairs.len() >= n {
+            eprintln!(
+                "# Showing top {} pairs by total bytes (use --all to show all)",
+                n
+            );
+        }
+    }
+
+    if result.pairs.is_empty() {
+        println!("(no socket pairs found)");
+        return Ok(());
+    }
+
+    // Table header
+    println!(
+        "{:<5}  {:<40}  {:<40}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "Proto", "Side A", "Side B", "A->B", "B->A", "A Retrans%", "B Retrans%"
+    );
+
+    for pair in &result.pairs {
+        // Build side labels: trace_id:socket_id IP:port
+        let side_a_str = format!(
+            "{}:{} {}:{}",
+            pair.side_a.trace_id, pair.side_a.socket_id, pair.side_a.src_ip, pair.side_a.src_port,
+        );
+        let side_b_str = format!(
+            "{}:{} {}:{}",
+            pair.side_b.trace_id, pair.side_b.socket_id, pair.side_b.src_ip, pair.side_b.src_port,
+        );
+
+        // A->B = bytes A sent (side_a.send_bytes)
+        // B->A = bytes B sent (side_b.send_bytes)
+        let a_to_b = format_bytes(pair.side_a.send_bytes);
+        let b_to_a = format_bytes(pair.side_b.send_bytes);
+
+        let a_retrans = match pair.side_a.retransmit_pct {
+            Some(pct) => format!("{:.2}%", pct),
+            None => "-".to_string(),
+        };
+        let b_retrans = match pair.side_b.retransmit_pct {
+            Some(pct) => format!("{:.2}%", pct),
+            None => "-".to_string(),
+        };
+
+        println!(
+            "{:<5}  {:<40}  {:<40}  {:>10}  {:>10}  {:>10}  {:>10}",
+            pair.protocol, side_a_str, side_b_str, a_to_b, b_to_a, a_retrans, b_retrans,
+        );
+    }
+
+    Ok(())
+}
+
 /// Truncate a name to fit within a column width (UTF-8 safe).
 fn truncate_name(name: &str, max: usize) -> String {
     if name.len() <= max {
@@ -927,6 +1047,7 @@ fn main() -> Result<()> {
         Commands::Network(args) => match args.command {
             NetworkCommands::Connections(conn_args) => run_network_connections(conn_args),
             NetworkCommands::Interfaces(iface_args) => run_network_interfaces(iface_args),
+            NetworkCommands::SocketPairs(pairs_args) => run_network_socket_pairs(pairs_args),
         },
         Commands::Mcp { database } => {
             let rt = tokio::runtime::Runtime::new()?;

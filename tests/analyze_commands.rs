@@ -1272,6 +1272,423 @@ fn test_network_connections_pid_tid_conflict(_db: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// network socket-pairs subcommand tests
+// ---------------------------------------------------------------------------
+
+fn test_network_socket_pairs_table_format(db: &Path) {
+    let output = run_analyze(&["network", "socket-pairs", "-d", db.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "network socket-pairs (table) failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stderr = lossy(&output.stderr);
+    let stdout = lossy(&output.stdout);
+
+    // Metadata headers on stderr
+    assert!(
+        stderr.contains("# Network Socket Pairs:"),
+        "missing Network Socket Pairs header: {stderr}"
+    );
+    assert!(
+        stderr.contains("# Matched pairs:"),
+        "missing Matched pairs count: {stderr}"
+    );
+
+    // Table output should have expected columns
+    assert!(stdout.contains("Proto"), "missing Proto column: {stdout}");
+    assert!(stdout.contains("Side A"), "missing Side A column: {stdout}");
+    assert!(stdout.contains("Side B"), "missing Side B column: {stdout}");
+    assert!(stdout.contains("A->B"), "missing A->B column: {stdout}");
+    assert!(stdout.contains("B->A"), "missing B->A column: {stdout}");
+    assert!(
+        stdout.contains("A Retrans%"),
+        "missing A Retrans% column: {stdout}"
+    );
+    assert!(
+        stdout.contains("B Retrans%"),
+        "missing B Retrans% column: {stdout}"
+    );
+}
+
+fn test_network_socket_pairs_json(db: &Path) {
+    let output = run_analyze(&[
+        "network",
+        "socket-pairs",
+        "-d",
+        db.to_str().unwrap(),
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "network socket-pairs (json) failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("network socket-pairs JSON should be valid");
+    assert!(
+        parsed.get("pairs").is_some(),
+        "JSON missing pairs key: {stdout}"
+    );
+    let pairs = parsed["pairs"]
+        .as_array()
+        .expect("pairs should be an array");
+
+    // We generated TCP loopback traffic (client + server in same trace),
+    // so there should be at least one matched pair
+    assert!(
+        !pairs.is_empty(),
+        "pairs should not be empty (we generated TCP traffic on localhost during recording)"
+    );
+
+    // Validate structure of the first pair
+    let first = &pairs[0];
+    assert!(first.get("protocol").is_some(), "missing protocol field");
+    assert!(
+        first.get("address_family").is_some(),
+        "missing address_family field"
+    );
+    assert!(
+        first.get("total_bytes").is_some(),
+        "missing total_bytes field"
+    );
+    assert!(
+        first.get("cross_trace").is_some(),
+        "missing cross_trace field"
+    );
+    // Single trace recording — all pairs should be within the same trace
+    assert_eq!(
+        first["cross_trace"].as_bool(),
+        Some(false),
+        "expected cross_trace=false for single-trace recording"
+    );
+
+    // Validate side_a structure
+    let side_a = first.get("side_a").expect("missing side_a");
+    assert!(side_a.get("trace_id").is_some(), "side_a missing trace_id");
+    assert!(
+        side_a.get("socket_id").is_some(),
+        "side_a missing socket_id"
+    );
+    assert!(side_a.get("src_ip").is_some(), "side_a missing src_ip");
+    assert!(side_a.get("src_port").is_some(), "side_a missing src_port");
+    assert!(side_a.get("dest_ip").is_some(), "side_a missing dest_ip");
+    assert!(
+        side_a.get("dest_port").is_some(),
+        "side_a missing dest_port"
+    );
+    assert!(
+        side_a.get("send_bytes").is_some(),
+        "side_a missing send_bytes"
+    );
+    assert!(
+        side_a.get("recv_bytes").is_some(),
+        "side_a missing recv_bytes"
+    );
+
+    // Validate side_b structure
+    let side_b = first.get("side_b").expect("missing side_b");
+    assert!(side_b.get("trace_id").is_some(), "side_b missing trace_id");
+    assert!(
+        side_b.get("socket_id").is_some(),
+        "side_b missing socket_id"
+    );
+    assert!(side_b.get("src_ip").is_some(), "side_b missing src_ip");
+    assert!(side_b.get("src_port").is_some(), "side_b missing src_port");
+}
+
+fn test_network_socket_pairs_with_top(db: &Path) {
+    let output = run_analyze(&[
+        "network",
+        "socket-pairs",
+        "-d",
+        db.to_str().unwrap(),
+        "--top",
+        "2",
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "network socket-pairs with --top failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("JSON should be valid");
+    let pairs = parsed["pairs"].as_array().unwrap();
+    assert!(
+        pairs.len() <= 2,
+        "expected at most 2 pairs with --top 2, got {}",
+        pairs.len()
+    );
+}
+
+fn test_network_socket_pairs_with_all(db: &Path) {
+    let output = run_analyze(&[
+        "network",
+        "socket-pairs",
+        "-d",
+        db.to_str().unwrap(),
+        "--all",
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "network socket-pairs with --all failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stderr = lossy(&output.stderr);
+    // --all should NOT show the "Showing top N" message
+    assert!(
+        !stderr.contains("Showing top"),
+        "stderr should not mention top N with --all: {stderr}"
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("JSON should be valid");
+    assert!(
+        parsed.get("pairs").is_some(),
+        "JSON missing pairs key with --all"
+    );
+}
+
+fn test_network_socket_pairs_exclude_loopback(db: &Path) {
+    // Get unfiltered count first
+    let output_all = run_analyze(&[
+        "network",
+        "socket-pairs",
+        "-d",
+        db.to_str().unwrap(),
+        "--all",
+        "-f",
+        "json",
+    ]);
+    assert!(output_all.status.success());
+    let parsed_all: serde_json::Value =
+        serde_json::from_str(&lossy(&output_all.stdout)).expect("JSON should be valid");
+    let all_count = parsed_all["pairs"].as_array().unwrap().len();
+
+    // Now with --exclude-loopback
+    let output = run_analyze(&[
+        "network",
+        "socket-pairs",
+        "-d",
+        db.to_str().unwrap(),
+        "--exclude-loopback",
+        "--all",
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "network socket-pairs with --exclude-loopback failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("JSON should be valid");
+    let filtered_count = parsed["pairs"].as_array().unwrap().len();
+
+    // Our test traffic is on 127.0.0.1, so --exclude-loopback should remove at least those pairs.
+    // We can't assert exactly 0 because there may be non-loopback paired connections
+    // on the system, but the filtered count should be strictly less than unfiltered.
+    assert!(
+        filtered_count < all_count,
+        "expected --exclude-loopback to reduce pair count, but got {} filtered vs {} unfiltered",
+        filtered_count,
+        all_count
+    );
+}
+
+fn test_network_socket_pairs_with_ip(db: &Path) {
+    // Our test traffic is on 127.0.0.1, so filtering by that IP should return pairs
+    let output = run_analyze(&[
+        "network",
+        "socket-pairs",
+        "-d",
+        db.to_str().unwrap(),
+        "--ip",
+        "127.0.0.1",
+        "--all",
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "network socket-pairs with --ip failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("JSON should be valid");
+    let pairs = parsed["pairs"].as_array().unwrap();
+    assert!(
+        !pairs.is_empty(),
+        "expected pairs with --ip 127.0.0.1 (we generated loopback traffic)"
+    );
+}
+
+fn test_network_socket_pairs_with_dest_port(db: &Path) {
+    // Get a dest_port from a known socket pair (query the DB for a matched pair's dest_port)
+    let output = run_analyze(&[
+        "network",
+        "socket-pairs",
+        "-d",
+        db.to_str().unwrap(),
+        "--all",
+        "-f",
+        "json",
+    ]);
+    assert!(output.status.success());
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("JSON should be valid");
+    let pairs = parsed["pairs"].as_array().unwrap();
+    if pairs.is_empty() {
+        return; // Nothing to filter on
+    }
+
+    // Get the server-side dest_port (side_b.dest_port is the client's ephemeral port,
+    // side_a.dest_port is the service port since side_a is client connecting to service)
+    let dest_port = pairs[0]["side_a"]["dest_port"].as_i64().unwrap();
+
+    let output = run_analyze(&[
+        "network",
+        "socket-pairs",
+        "-d",
+        db.to_str().unwrap(),
+        "--dest-port",
+        &dest_port.to_string(),
+        "--all",
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "network socket-pairs with --dest-port failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("JSON should be valid");
+    let filtered_pairs = parsed["pairs"].as_array().unwrap();
+    assert!(
+        !filtered_pairs.is_empty(),
+        "expected pairs with --dest-port {} (port exists in unfiltered results)",
+        dest_port
+    );
+
+    // Every returned pair should involve this dest_port on at least one side
+    for pair in filtered_pairs {
+        let a_dest = pair["side_a"]["dest_port"].as_i64().unwrap();
+        let b_dest = pair["side_b"]["dest_port"].as_i64().unwrap();
+        assert!(
+            a_dest == dest_port || b_dest == dest_port,
+            "pair does not involve dest_port {}: side_a.dest_port={}, side_b.dest_port={}",
+            dest_port,
+            a_dest,
+            b_dest
+        );
+    }
+}
+
+fn test_network_socket_pairs_with_trace_id(db: &Path) {
+    // Get the trace_id from the recording
+    let output = run_analyze(&[
+        "query",
+        "-d",
+        db.to_str().unwrap(),
+        "-f",
+        "csv",
+        "-s",
+        "SELECT DISTINCT trace_id FROM network_socket LIMIT 1",
+    ]);
+    assert!(output.status.success());
+    let stdout = lossy(&output.stdout);
+    let trace_id = stdout.lines().nth(1).expect("no trace_id found").trim();
+
+    let output = run_analyze(&[
+        "network",
+        "socket-pairs",
+        "-d",
+        db.to_str().unwrap(),
+        "--trace-id",
+        trace_id,
+        "--all",
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "network socket-pairs with --trace-id failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("JSON should be valid");
+    let pairs = parsed["pairs"].as_array().unwrap();
+    // With a valid trace_id from the recording, we should get results
+    assert!(
+        !pairs.is_empty(),
+        "expected pairs with --trace-id {trace_id}"
+    );
+
+    // Every pair should have at least one side in this trace
+    for pair in pairs {
+        let a_trace = pair["side_a"]["trace_id"].as_str().unwrap();
+        let b_trace = pair["side_b"]["trace_id"].as_str().unwrap();
+        assert!(
+            a_trace == trace_id || b_trace == trace_id,
+            "pair does not involve trace {}: side_a.trace_id={}, side_b.trace_id={}",
+            trace_id,
+            a_trace,
+            b_trace
+        );
+    }
+}
+
+fn test_network_socket_pairs_nonexistent_db(_db: &Path) {
+    let output = run_analyze(&[
+        "network",
+        "socket-pairs",
+        "-d",
+        "/tmp/does_not_exist_systing_pairs_test.duckdb",
+    ]);
+    assert!(
+        !output.status.success(),
+        "network socket-pairs should fail for nonexistent database"
+    );
+}
+
+fn test_network_socket_pairs_top_all_conflict(_db: &Path) {
+    let output = run_analyze(&[
+        "network",
+        "socket-pairs",
+        "-d",
+        "/tmp/dummy.duckdb",
+        "--top",
+        "5",
+        "--all",
+    ]);
+    assert!(
+        !output.status.success(),
+        "network socket-pairs should fail when both --top and --all are given"
+    );
+    let stderr = lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "error should mention conflict: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Main integration test: record once, then exercise all commands
 // ---------------------------------------------------------------------------
 
@@ -1401,6 +1818,39 @@ fn test_analyze_commands() {
 
     eprintln!("  pid/tid conflict...");
     test_network_connections_pid_tid_conflict(&duckdb_path);
+
+    // Phase 8: Test network socket-pairs subcommand
+    eprintln!("\n--- network socket-pairs subcommand ---");
+
+    eprintln!("  table format...");
+    test_network_socket_pairs_table_format(&duckdb_path);
+
+    eprintln!("  json format...");
+    test_network_socket_pairs_json(&duckdb_path);
+
+    eprintln!("  with --top...");
+    test_network_socket_pairs_with_top(&duckdb_path);
+
+    eprintln!("  with --all...");
+    test_network_socket_pairs_with_all(&duckdb_path);
+
+    eprintln!("  with --exclude-loopback...");
+    test_network_socket_pairs_exclude_loopback(&duckdb_path);
+
+    eprintln!("  with --ip...");
+    test_network_socket_pairs_with_ip(&duckdb_path);
+
+    eprintln!("  with --dest-port...");
+    test_network_socket_pairs_with_dest_port(&duckdb_path);
+
+    eprintln!("  with --trace-id...");
+    test_network_socket_pairs_with_trace_id(&duckdb_path);
+
+    eprintln!("  nonexistent database...");
+    test_network_socket_pairs_nonexistent_db(&duckdb_path);
+
+    eprintln!("  top/all conflict...");
+    test_network_socket_pairs_top_all_conflict(&duckdb_path);
 
     eprintln!("\n✓ All systing-analyze commands passed");
 }
