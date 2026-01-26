@@ -800,6 +800,130 @@ fn test_sched_cpu_stats_nonexistent_db(_db: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// network interfaces subcommand tests
+// ---------------------------------------------------------------------------
+
+fn test_network_interfaces_table_format(db: &Path) {
+    let output = run_analyze(&["network", "interfaces", "-d", db.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "network interfaces (table) failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stderr = lossy(&output.stderr);
+    let stdout = lossy(&output.stdout);
+
+    // Metadata headers on stderr
+    assert!(
+        stderr.contains("# Network Interfaces:"),
+        "missing Network Interfaces header: {stderr}"
+    );
+    assert!(
+        stderr.contains("# Traces:"),
+        "missing Traces count: {stderr}"
+    );
+
+    // Table output should have expected columns
+    assert!(
+        stdout.contains("Namespace"),
+        "missing Namespace column: {stdout}"
+    );
+    assert!(
+        stdout.contains("Interface"),
+        "missing Interface column: {stdout}"
+    );
+    assert!(stdout.contains("Proto"), "missing Proto column: {stdout}");
+    assert!(
+        stdout.contains("Retrans%"),
+        "missing Retrans% column: {stdout}"
+    );
+}
+
+fn test_network_interfaces_json(db: &Path) {
+    let output = run_analyze(&[
+        "network",
+        "interfaces",
+        "-d",
+        db.to_str().unwrap(),
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "network interfaces (json) failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("network interfaces JSON should be valid");
+    assert!(
+        parsed.get("traces").is_some(),
+        "JSON missing traces key: {stdout}"
+    );
+    let traces = parsed["traces"]
+        .as_array()
+        .expect("traces should be an array");
+    assert!(!traces.is_empty(), "traces array should not be empty");
+
+    // Each trace should have expected structure
+    let first_trace = &traces[0];
+    assert!(
+        first_trace.get("trace_id").is_some(),
+        "trace missing trace_id"
+    );
+    assert!(
+        first_trace.get("interfaces").is_some(),
+        "trace missing interfaces"
+    );
+    let interfaces = first_trace["interfaces"]
+        .as_array()
+        .expect("interfaces should be an array");
+    assert!(
+        !interfaces.is_empty(),
+        "interfaces should not be empty (host always has at least lo)"
+    );
+
+    // Each interface should have expected fields
+    let first_iface = &interfaces[0];
+    assert!(first_iface.get("namespace").is_some(), "missing namespace");
+    assert!(
+        first_iface.get("interface_name").is_some(),
+        "missing interface_name"
+    );
+    assert!(
+        first_iface.get("ip_addresses").is_some(),
+        "missing ip_addresses"
+    );
+    let ips = first_iface["ip_addresses"]
+        .as_array()
+        .expect("ip_addresses should be an array");
+    assert!(!ips.is_empty(), "ip_addresses should not be empty");
+    assert!(
+        first_iface.get("total_send_bytes").is_some(),
+        "missing total_send_bytes"
+    );
+    assert!(
+        first_iface.get("total_recv_bytes").is_some(),
+        "missing total_recv_bytes"
+    );
+}
+
+fn test_network_interfaces_nonexistent_db(_db: &Path) {
+    let output = run_analyze(&[
+        "network",
+        "interfaces",
+        "-d",
+        "/tmp/does_not_exist_systing_network_test.duckdb",
+    ]);
+    assert!(
+        !output.status.success(),
+        "network interfaces should fail for nonexistent database"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Main integration test: record once, then exercise all commands
 // ---------------------------------------------------------------------------
 
@@ -888,6 +1012,20 @@ fn test_analyze_commands() {
 
     eprintln!("  nonexistent database...");
     test_sched_cpu_stats_nonexistent_db(&duckdb_path);
+
+    // Phase 6: Test network interfaces subcommand
+    // network_interface table is always populated (interface metadata is recorded
+    // regardless of the --network flag), so we can test against the existing trace.
+    eprintln!("\n--- network interfaces subcommand ---");
+
+    eprintln!("  table format...");
+    test_network_interfaces_table_format(&duckdb_path);
+
+    eprintln!("  json format...");
+    test_network_interfaces_json(&duckdb_path);
+
+    eprintln!("  nonexistent database...");
+    test_network_interfaces_nonexistent_db(&duckdb_path);
 
     eprintln!("\n✓ All systing-analyze commands passed");
 }

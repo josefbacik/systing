@@ -6,12 +6,17 @@
 
 mod cpu_stats;
 mod flamegraph;
+mod network_interfaces;
 mod query;
 mod sched_stats;
 
 pub use cpu_stats::{CpuStatsParams, CpuStatsResult, CpuStatsSummary, PerCpuStats};
 pub use flamegraph::{
     FlamegraphMetadata, FlamegraphParams, FlamegraphResult, StackEntry, StackTypeFilter,
+};
+pub use network_interfaces::{
+    InterfaceStats, NetworkInterfacesParams, NetworkInterfacesResult, TraceNetworkStats,
+    TrafficStats,
 };
 pub use sched_stats::{
     EndStateCount, ProcessSchedStats, SchedStatsParams, SchedStatsResult, SchedSummary,

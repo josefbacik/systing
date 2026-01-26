@@ -38,6 +38,8 @@ enum Commands {
     Stacktrace(StacktraceArgs),
     /// Scheduling analysis commands
     Sched(SchedArgs),
+    /// Network analysis commands
+    Network(NetworkArgs),
     /// Start MCP (Model Context Protocol) server for AI assistant integration
     Mcp {
         /// Path to DuckDB database to open on startup (optional)
@@ -112,6 +114,33 @@ impl From<CliStackType> for analyze::StackTypeFilter {
             CliStackType::All => Self::All,
         }
     }
+}
+
+#[derive(Args)]
+struct NetworkArgs {
+    #[command(subcommand)]
+    command: NetworkCommands,
+}
+
+#[derive(Subcommand)]
+enum NetworkCommands {
+    /// Show per-interface network traffic summary
+    Interfaces(NetworkInterfacesArgs),
+}
+
+#[derive(Args)]
+struct NetworkInterfacesArgs {
+    /// Path to DuckDB database
+    #[arg(short, long)]
+    database: PathBuf,
+
+    /// Output format: table or json
+    #[arg(short, long, default_value = "table")]
+    format: String,
+
+    /// Filter to a specific trace (for multi-trace DBs)
+    #[arg(long)]
+    trace_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -646,6 +675,103 @@ fn run_sched_cpu_stats(args: SchedCpuStatsArgs) -> Result<()> {
     Ok(())
 }
 
+const KB: u64 = 1 << 10;
+const MB: u64 = 1 << 20;
+const GB: u64 = 1 << 30;
+
+/// Format a byte count for display (human-readable).
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Run the network interfaces subcommand
+fn run_network_interfaces(args: NetworkInterfacesArgs) -> Result<()> {
+    let db = AnalyzeDb::open(&args.database, true)?;
+
+    let params = analyze::NetworkInterfacesParams {
+        trace_id: args.trace_id,
+    };
+
+    let result = db.network_interfaces(&params)?;
+
+    if args.format == "json" {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    // Table output: metadata to stderr, data to stdout
+    eprintln!("# Network Interfaces: {}", args.database.display());
+    eprintln!("# Traces: {}", result.traces.len());
+
+    let multi_trace = result.traces.len() > 1;
+
+    for trace in &result.traces {
+        if multi_trace {
+            println!();
+            println!("=== Trace: {} ===", trace.trace_id);
+            println!();
+        }
+
+        // Table header
+        println!(
+            "{:<40}  {:<12}  {:<5}  {:<4}  {:>10}  {:>10}  {:>7}  {:>8}",
+            "Namespace", "Interface", "Proto", "AF", "Send", "Recv", "Sockets", "Retrans%"
+        );
+
+        if trace.interfaces.is_empty() {
+            println!("(no interfaces found)");
+            continue;
+        }
+
+        for iface in &trace.interfaces {
+            if iface.traffic.is_empty() {
+                // Interface exists but has no traffic
+                println!(
+                    "{:<40}  {:<12}  {:<5}  {:<4}  {:>10}  {:>10}  {:>7}  {:>8}",
+                    truncate_name(&iface.namespace, 40),
+                    truncate_name(&iface.interface_name, 12),
+                    "-",
+                    "-",
+                    "0 B",
+                    "0 B",
+                    0,
+                    "-"
+                );
+            } else {
+                for ts in &iface.traffic {
+                    let retrans = if let Some(pct) = ts.retransmit_pct {
+                        format!("{:.2}%", pct)
+                    } else {
+                        "-".to_string()
+                    };
+
+                    println!(
+                        "{:<40}  {:<12}  {:<5}  {:<4}  {:>10}  {:>10}  {:>7}  {:>8}",
+                        truncate_name(&iface.namespace, 40),
+                        truncate_name(&iface.interface_name, 12),
+                        ts.protocol,
+                        ts.address_family,
+                        format_bytes(ts.send_bytes),
+                        format_bytes(ts.recv_bytes),
+                        ts.socket_count,
+                        retrans,
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Truncate a name to fit within a column width (UTF-8 safe).
 fn truncate_name(name: &str, max: usize) -> String {
     if name.len() <= max {
@@ -672,6 +798,9 @@ fn main() -> Result<()> {
         Commands::Sched(args) => match args.command {
             SchedCommands::Stats(stats_args) => run_sched_stats(stats_args),
             SchedCommands::CpuStats(cpu_stats_args) => run_sched_cpu_stats(cpu_stats_args),
+        },
+        Commands::Network(args) => match args.command {
+            NetworkCommands::Interfaces(iface_args) => run_network_interfaces(iface_args),
         },
         Commands::Mcp { database } => {
             let rt = tokio::runtime::Runtime::new()?;

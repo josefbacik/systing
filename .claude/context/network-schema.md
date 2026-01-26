@@ -131,6 +131,7 @@ Local network interface metadata for cross-trace correlation.
 
 | Column | Type | Description |
 |--------|------|-------------|
+| trace_id | VARCHAR | Trace identifier (added during DuckDB import) |
 | namespace | VARCHAR | Network namespace name |
 | interface_name | VARCHAR | Interface name (e.g., "eth0", "lo") |
 | ip_address | VARCHAR | IP address assigned to interface |
