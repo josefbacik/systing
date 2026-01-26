@@ -9,8 +9,11 @@
 //! ./scripts/run-integration-tests.sh analyze_commands
 //! ```
 
+use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::thread;
+use std::time::Duration;
 use systing::{bump_memlock_rlimit, systing, validate_duckdb, Config};
 use tempfile::TempDir;
 
@@ -35,13 +38,33 @@ fn record_trace() -> (TempDir, std::path::PathBuf) {
     let duckdb_path = dir.path().join("trace.duckdb");
 
     let config = Config {
-        duration: 2,
+        duration: 3,
+        network: true,
         output_dir: dir.path().to_path_buf(),
         output: duckdb_path.clone(),
         ..Config::default()
     };
 
+    // Generate TCP traffic in background so network_socket table has data
+    let traffic_thread = thread::spawn(|| {
+        thread::sleep(Duration::from_millis(500));
+
+        // Start a local TCP listener and connect to it to guarantee socket data
+        if let Ok(listener) = TcpListener::bind("127.0.0.1:0") {
+            let addr = listener.local_addr().unwrap();
+            for _ in 0..3 {
+                if let Ok(_stream) =
+                    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100))
+                {
+                    let _ = listener.accept();
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+    });
+
     systing(config).expect("systing recording failed");
+    traffic_thread.join().expect("Traffic thread panicked");
 
     assert!(
         duckdb_path.exists(),
@@ -924,6 +947,331 @@ fn test_network_interfaces_nonexistent_db(_db: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// network connections subcommand tests
+// ---------------------------------------------------------------------------
+
+fn test_network_connections_table_format(db: &Path) {
+    let output = run_analyze(&["network", "connections", "-d", db.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "network connections (table) failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stderr = lossy(&output.stderr);
+    let stdout = lossy(&output.stdout);
+
+    // Metadata headers on stderr
+    assert!(
+        stderr.contains("# Network Connections:"),
+        "missing Network Connections header: {stderr}"
+    );
+    assert!(
+        stderr.contains("# Traces:"),
+        "missing Traces count: {stderr}"
+    );
+    assert!(
+        stderr.contains("# Connections:"),
+        "missing Connections count: {stderr}"
+    );
+
+    // Table output should have expected columns
+    assert!(stdout.contains("Proto"), "missing Proto column: {stdout}");
+    assert!(stdout.contains("AF"), "missing AF column: {stdout}");
+    assert!(stdout.contains("Source"), "missing Source column: {stdout}");
+    assert!(
+        stdout.contains("Destination"),
+        "missing Destination column: {stdout}"
+    );
+    assert!(
+        stdout.contains("Interface"),
+        "missing Interface column: {stdout}"
+    );
+    assert!(stdout.contains("Send"), "missing Send column: {stdout}");
+    assert!(stdout.contains("Recv"), "missing Recv column: {stdout}");
+    assert!(
+        stdout.contains("Retrans%"),
+        "missing Retrans% column: {stdout}"
+    );
+}
+
+fn test_network_connections_json(db: &Path) {
+    let output = run_analyze(&[
+        "network",
+        "connections",
+        "-d",
+        db.to_str().unwrap(),
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "network connections (json) failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("network connections JSON should be valid");
+    assert!(
+        parsed.get("traces").is_some(),
+        "JSON missing traces key: {stdout}"
+    );
+    let traces = parsed["traces"]
+        .as_array()
+        .expect("traces should be an array");
+    assert!(!traces.is_empty(), "traces array should not be empty");
+
+    // Each trace should have expected structure
+    let first_trace = &traces[0];
+    assert!(
+        first_trace.get("trace_id").is_some(),
+        "trace missing trace_id"
+    );
+    assert!(
+        first_trace.get("connections").is_some(),
+        "trace missing connections"
+    );
+    let connections = first_trace["connections"]
+        .as_array()
+        .expect("connections should be an array");
+
+    // We generated TCP traffic, so there should be at least one connection
+    assert!(
+        !connections.is_empty(),
+        "connections should not be empty (we generated TCP traffic during recording)"
+    );
+
+    // Each connection should have expected fields
+    let first_conn = &connections[0];
+    assert!(
+        first_conn.get("protocol").is_some(),
+        "missing protocol field"
+    );
+    assert!(
+        first_conn.get("address_family").is_some(),
+        "missing address_family field"
+    );
+    assert!(first_conn.get("src_ip").is_some(), "missing src_ip field");
+    assert!(
+        first_conn.get("src_port").is_some(),
+        "missing src_port field"
+    );
+    assert!(first_conn.get("dest_ip").is_some(), "missing dest_ip field");
+    assert!(
+        first_conn.get("dest_port").is_some(),
+        "missing dest_port field"
+    );
+    assert!(
+        first_conn.get("interface_name").is_some(),
+        "missing interface_name field"
+    );
+    assert!(
+        first_conn.get("send_bytes").is_some(),
+        "missing send_bytes field"
+    );
+    assert!(
+        first_conn.get("recv_bytes").is_some(),
+        "missing recv_bytes field"
+    );
+    assert!(
+        first_conn.get("total_bytes").is_some(),
+        "missing total_bytes field"
+    );
+}
+
+fn test_network_connections_with_pid(db: &Path) {
+    // Get a PID that had network syscalls
+    let output = run_analyze(&[
+        "query",
+        "-d",
+        db.to_str().unwrap(),
+        "-f",
+        "csv",
+        "-s",
+        "SELECT DISTINCT pid FROM network_syscall LIMIT 1",
+    ]);
+    assert!(
+        output.status.success(),
+        "pid query failed: {}",
+        lossy(&output.stderr)
+    );
+    let stdout = lossy(&output.stdout);
+    let pid_str = stdout
+        .lines()
+        .nth(1)
+        .expect("no PID found in network_syscall")
+        .trim();
+    let pid: u32 = pid_str.parse().expect("PID not a valid number");
+
+    let output = run_analyze(&[
+        "network",
+        "connections",
+        "-d",
+        db.to_str().unwrap(),
+        "-p",
+        &pid.to_string(),
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "network connections with --pid failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("JSON should be valid");
+    assert!(
+        parsed.get("traces").is_some(),
+        "JSON missing traces key with --pid filter"
+    );
+}
+
+fn test_network_connections_with_tid(db: &Path) {
+    // Get a TID that had network syscalls
+    let output = run_analyze(&[
+        "query",
+        "-d",
+        db.to_str().unwrap(),
+        "-f",
+        "csv",
+        "-s",
+        "SELECT DISTINCT tid FROM network_syscall LIMIT 1",
+    ]);
+    assert!(
+        output.status.success(),
+        "tid query failed: {}",
+        lossy(&output.stderr)
+    );
+    let stdout = lossy(&output.stdout);
+    let tid_str = stdout
+        .lines()
+        .nth(1)
+        .expect("no TID found in network_syscall")
+        .trim();
+    let tid: u32 = tid_str.parse().expect("TID not a valid number");
+
+    let output = run_analyze(&[
+        "network",
+        "connections",
+        "-d",
+        db.to_str().unwrap(),
+        "--tid",
+        &tid.to_string(),
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "network connections with --tid failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("JSON should be valid");
+    assert!(
+        parsed.get("traces").is_some(),
+        "JSON missing traces key with --tid filter"
+    );
+}
+
+fn test_network_connections_with_top(db: &Path) {
+    let output = run_analyze(&[
+        "network",
+        "connections",
+        "-d",
+        db.to_str().unwrap(),
+        "--top",
+        "5",
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "network connections with --top failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("JSON should be valid");
+    // --top limits per-trace, so each trace should have at most 5 connections
+    for trace in parsed["traces"].as_array().unwrap() {
+        let count = trace["connections"].as_array().unwrap().len();
+        assert!(
+            count <= 5,
+            "expected at most 5 connections per trace with --top 5, got {count}"
+        );
+    }
+}
+
+fn test_network_connections_with_all(db: &Path) {
+    let output = run_analyze(&[
+        "network",
+        "connections",
+        "-d",
+        db.to_str().unwrap(),
+        "--all",
+        "-f",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "network connections with --all failed: {}",
+        lossy(&output.stderr)
+    );
+
+    let stderr = lossy(&output.stderr);
+    // --all should NOT show the "Showing top N" message
+    assert!(
+        !stderr.contains("Showing top"),
+        "stderr should not mention top N with --all: {stderr}"
+    );
+
+    let stdout = lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("JSON should be valid");
+    assert!(
+        parsed.get("traces").is_some(),
+        "JSON missing traces key with --all"
+    );
+}
+
+fn test_network_connections_nonexistent_db(_db: &Path) {
+    let output = run_analyze(&[
+        "network",
+        "connections",
+        "-d",
+        "/tmp/does_not_exist_systing_conn_test.duckdb",
+    ]);
+    assert!(
+        !output.status.success(),
+        "network connections should fail for nonexistent database"
+    );
+}
+
+fn test_network_connections_pid_tid_conflict(_db: &Path) {
+    let output = run_analyze(&[
+        "network",
+        "connections",
+        "-d",
+        "/tmp/dummy.duckdb",
+        "-p",
+        "1",
+        "--tid",
+        "2",
+    ]);
+    assert!(
+        !output.status.success(),
+        "network connections should fail when both --pid and --tid are given"
+    );
+    let stderr = lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "error should mention conflict: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Main integration test: record once, then exercise all commands
 // ---------------------------------------------------------------------------
 
@@ -1026,6 +1374,33 @@ fn test_analyze_commands() {
 
     eprintln!("  nonexistent database...");
     test_network_interfaces_nonexistent_db(&duckdb_path);
+
+    // Phase 7: Test network connections subcommand
+    eprintln!("\n--- network connections subcommand ---");
+
+    eprintln!("  table format...");
+    test_network_connections_table_format(&duckdb_path);
+
+    eprintln!("  json format...");
+    test_network_connections_json(&duckdb_path);
+
+    eprintln!("  with --pid...");
+    test_network_connections_with_pid(&duckdb_path);
+
+    eprintln!("  with --tid...");
+    test_network_connections_with_tid(&duckdb_path);
+
+    eprintln!("  with --top...");
+    test_network_connections_with_top(&duckdb_path);
+
+    eprintln!("  with --all...");
+    test_network_connections_with_all(&duckdb_path);
+
+    eprintln!("  nonexistent database...");
+    test_network_connections_nonexistent_db(&duckdb_path);
+
+    eprintln!("  pid/tid conflict...");
+    test_network_connections_pid_tid_conflict(&duckdb_path);
 
     eprintln!("\n✓ All systing-analyze commands passed");
 }

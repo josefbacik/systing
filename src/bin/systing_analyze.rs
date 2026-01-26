@@ -124,8 +124,41 @@ struct NetworkArgs {
 
 #[derive(Subcommand)]
 enum NetworkCommands {
+    /// Show per-connection network traffic summary
+    Connections(NetworkConnectionsArgs),
     /// Show per-interface network traffic summary
     Interfaces(NetworkInterfacesArgs),
+}
+
+#[derive(Args)]
+struct NetworkConnectionsArgs {
+    /// Path to DuckDB database
+    #[arg(short, long)]
+    database: PathBuf,
+
+    /// Output format: table or json
+    #[arg(short, long, default_value = "table")]
+    format: String,
+
+    /// Filter to a specific trace (for multi-trace DBs)
+    #[arg(long)]
+    trace_id: Option<String>,
+
+    /// Filter to a specific process (all its threads)
+    #[arg(short, long, conflicts_with = "tid")]
+    pid: Option<u32>,
+
+    /// Filter to a specific thread
+    #[arg(long, conflicts_with = "pid")]
+    tid: Option<u32>,
+
+    /// Max connections per trace to show (minimum 1)
+    #[arg(long, default_value = "50", value_parser = clap::value_parser!(u64).range(1..), conflicts_with = "all")]
+    top: u64,
+
+    /// Show all connections (no top-N limit)
+    #[arg(long, conflicts_with = "top")]
+    all: bool,
 }
 
 #[derive(Args)]
@@ -692,6 +725,98 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Run the network connections subcommand
+fn run_network_connections(args: NetworkConnectionsArgs) -> Result<()> {
+    let db = AnalyzeDb::open(&args.database, true)?;
+
+    let top_n = if args.all {
+        None
+    } else {
+        Some(args.top as usize)
+    };
+
+    let params = analyze::NetworkConnectionsParams {
+        trace_id: args.trace_id,
+        pid: args.pid,
+        tid: args.tid,
+        top_n,
+    };
+
+    let result = db.network_connections(&params)?;
+
+    if args.format == "json" {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    // Table output: metadata to stderr, data to stdout
+    eprintln!("# Network Connections: {}", args.database.display());
+    eprintln!("# Traces: {}", result.traces.len());
+
+    let total_conns: usize = result.traces.iter().map(|t| t.connections.len()).sum();
+    eprintln!("# Connections: {}", total_conns);
+
+    if let Some(n) = top_n {
+        eprintln!(
+            "# Showing top {} connections per trace by total bytes (use --all to show all)",
+            n
+        );
+    }
+
+    if let Some(pid) = params.pid {
+        eprintln!("# Filter: pid={}", pid);
+    }
+    if let Some(tid) = params.tid {
+        eprintln!("# Filter: tid={}", tid);
+    }
+
+    let multi_trace = result.traces.len() > 1;
+
+    for trace in &result.traces {
+        if multi_trace {
+            println!();
+            println!("=== Trace: {} ===", trace.trace_id);
+            println!();
+        }
+
+        // Table header
+        println!(
+            "{:<5}  {:<4}  {:<25}  {:<25}  {:<12}  {:>10}  {:>10}  {:>8}",
+            "Proto", "AF", "Source", "Destination", "Interface", "Send", "Recv", "Retrans%"
+        );
+
+        if trace.connections.is_empty() {
+            println!("(no connections found)");
+            continue;
+        }
+
+        for conn in &trace.connections {
+            let source = format!("{}:{}", conn.src_ip, conn.src_port);
+            let dest = format!("{}:{}", conn.dest_ip, conn.dest_port);
+
+            let retrans = if let Some(pct) = conn.retransmit_pct {
+                format!("{:.2}%", pct)
+            } else {
+                "-".to_string()
+            };
+
+            println!(
+                "{:<5}  {:<4}  {:<25}  {:<25}  {:<12}  {:>10}  {:>10}  {:>8}",
+                conn.protocol,
+                conn.address_family,
+                truncate_name(&source, 25),
+                truncate_name(&dest, 25),
+                truncate_name(&conn.interface_name, 12),
+                format_bytes(conn.send_bytes),
+                format_bytes(conn.recv_bytes),
+                retrans,
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Run the network interfaces subcommand
 fn run_network_interfaces(args: NetworkInterfacesArgs) -> Result<()> {
     let db = AnalyzeDb::open(&args.database, true)?;
@@ -800,6 +925,7 @@ fn main() -> Result<()> {
             SchedCommands::CpuStats(cpu_stats_args) => run_sched_cpu_stats(cpu_stats_args),
         },
         Commands::Network(args) => match args.command {
+            NetworkCommands::Connections(conn_args) => run_network_connections(conn_args),
             NetworkCommands::Interfaces(iface_args) => run_network_interfaces(iface_args),
         },
         Commands::Mcp { database } => {

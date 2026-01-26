@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{bail, Result};
 use serde::Serialize;
 
-use super::{trace_id_filter, AnalyzeDb};
+use super::{to_u64, trace_id_filter, AnalyzeDb};
 
 /// Parameters for network interfaces analysis.
 #[derive(Debug, Clone, Default)]
@@ -66,11 +66,6 @@ struct TrafficEntry {
     socket_count: u64,
     send_bytes: u64,
     recv_bytes: u64,
-}
-
-/// Convert an i64 from DuckDB to u64, clamping negatives to 0.
-fn to_u64(val: i64) -> u64 {
-    u64::try_from(val).unwrap_or(0)
 }
 
 impl AnalyzeDb {
@@ -373,18 +368,5 @@ mod tests {
     fn test_network_interfaces_params_default() {
         let params = NetworkInterfacesParams::default();
         assert!(params.trace_id.is_none());
-    }
-
-    #[test]
-    fn test_to_u64_positive() {
-        assert_eq!(to_u64(42), 42);
-        assert_eq!(to_u64(0), 0);
-        assert_eq!(to_u64(i64::MAX), i64::MAX as u64);
-    }
-
-    #[test]
-    fn test_to_u64_negative() {
-        assert_eq!(to_u64(-1), 0);
-        assert_eq!(to_u64(i64::MIN), 0);
     }
 }

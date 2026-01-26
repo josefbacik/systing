@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# claude-code-attribution-hook
+# Injected by Claude Code for commit attribution trailers
+COMMIT_MSG_FILE="$1"
+COMMIT_SOURCE="$2"
+
+# Chain to original hook if it exists
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$HOOK_DIR/prepare-commit-msg.claude-original" ]; then
+  "$HOOK_DIR/prepare-commit-msg.claude-original" "$@" || exit $?
+fi
+
+# Skip for merge/squash commits
+if [ "$COMMIT_SOURCE" = "merge" ] || [ "$COMMIT_SOURCE" = "squash" ]; then
+  exit 0
+fi
+
+TRAILER_FILE="$(git rev-parse --git-dir)/claude-trailers"
+if [ -f "$TRAILER_FILE" ]; then
+  # Strip any existing Claude attribution trailers (handles amend case)
+  sed -i.bak -E '/^Claude-(Generated-By|Steers|Permission-Prompts|Escapes|Session):/d' "$COMMIT_MSG_FILE"
+  rm -f "$COMMIT_MSG_FILE.bak"
+
+  # Add trailers using git interpret-trailers
+  while IFS= read -r trailer; do
+    [ -n "$trailer" ] && git interpret-trailers --in-place --trailer "$trailer" "$COMMIT_MSG_FILE"
+  done < "$TRAILER_FILE"
+
+  # Clean up trailer file
+  rm -f "$TRAILER_FILE"
+fi

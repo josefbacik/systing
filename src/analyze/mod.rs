@@ -6,6 +6,7 @@
 
 mod cpu_stats;
 mod flamegraph;
+mod network_connections;
 mod network_interfaces;
 mod query;
 mod sched_stats;
@@ -13,6 +14,9 @@ mod sched_stats;
 pub use cpu_stats::{CpuStatsParams, CpuStatsResult, CpuStatsSummary, PerCpuStats};
 pub use flamegraph::{
     FlamegraphMetadata, FlamegraphParams, FlamegraphResult, StackEntry, StackTypeFilter,
+};
+pub use network_connections::{
+    ConnectionStats, NetworkConnectionsParams, NetworkConnectionsResult, TraceConnectionStats,
 };
 pub use network_interfaces::{
     InterfaceStats, NetworkInterfacesParams, NetworkInterfacesResult, TraceNetworkStats,
@@ -392,6 +396,11 @@ fn table_has_rows(conn: &Connection, table_name: &str) -> Result<bool> {
     Ok(rows.next()?.is_some())
 }
 
+/// Convert an i64 from DuckDB to u64, clamping negatives to 0.
+pub(crate) fn to_u64(val: i64) -> u64 {
+    u64::try_from(val).unwrap_or(0)
+}
+
 /// Build a trace_id SQL filter clause (e.g., ` AND ss.trace_id = '...'`).
 /// trace_id values are escaped via single-quote doubling for safe SQL interpolation.
 pub(crate) fn trace_id_filter(trace_id: Option<&str>, table_alias: &str) -> String {
@@ -425,5 +434,23 @@ fn get_trace_time_range(conn: &Connection, trace_id: Option<&str>) -> Result<(i6
         Ok((min_ts, max_ts, count as u64))
     } else {
         bail!("No data in stack_sample table");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_u64_positive() {
+        assert_eq!(to_u64(42), 42);
+        assert_eq!(to_u64(0), 0);
+        assert_eq!(to_u64(i64::MAX), i64::MAX as u64);
+    }
+
+    #[test]
+    fn test_to_u64_negative() {
+        assert_eq!(to_u64(-1), 0);
+        assert_eq!(to_u64(i64::MIN), 0);
     }
 }
