@@ -4,7 +4,8 @@
 //! assistants. Uses a dedicated DB thread to handle DuckDB's non-Send connection.
 
 use crate::analyze::{
-    AnalyzeDb, CpuStatsParams, FlamegraphParams, SchedStatsParams, StackTypeFilter,
+    AnalyzeDb, CpuStatsParams, FlamegraphParams, NetworkConnectionsParams, NetworkInterfacesParams,
+    NetworkSocketPairsParams, SchedStatsParams, StackTypeFilter,
 };
 use anyhow::Result;
 use rmcp::{
@@ -30,6 +31,9 @@ enum DbRequest {
     SchedStats(SchedStatsParams),
     CpuStats(CpuStatsParams),
     TraceInfo,
+    NetworkConnections(NetworkConnectionsParams),
+    NetworkInterfaces(NetworkInterfacesParams),
+    NetworkSocketPairs(NetworkSocketPairsParams),
 }
 
 type DbResponse = std::result::Result<serde_json::Value, String>;
@@ -129,6 +133,18 @@ fn handle_db_request(db: &mut Option<AnalyzeDb>, request: DbRequest) -> DbRespon
                     .trace_info()
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .map_err(|e| format!("Error getting trace info: {e}")),
+                DbRequest::NetworkConnections(params) => db
+                    .network_connections(&params)
+                    .map(|r| serde_json::to_value(r).unwrap_or_default())
+                    .map_err(|e| format!("Network connections error: {e}")),
+                DbRequest::NetworkInterfaces(params) => db
+                    .network_interfaces(&params)
+                    .map(|r| serde_json::to_value(r).unwrap_or_default())
+                    .map_err(|e| format!("Network interfaces error: {e}")),
+                DbRequest::NetworkSocketPairs(params) => db
+                    .network_socket_pairs(&params)
+                    .map(|r| serde_json::to_value(r).unwrap_or_default())
+                    .map_err(|e| format!("Network socket pairs error: {e}")),
                 DbRequest::OpenDatabase(_) => unreachable!(),
             }
         }
@@ -202,6 +218,45 @@ struct SchedStatsToolParams {
 struct CpuStatsToolParams {
     /// Filter to a specific trace ID (for multi-trace databases).
     trace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct NetworkConnectionsToolParams {
+    /// Filter to a specific trace ID (for multi-trace databases).
+    trace_id: Option<String>,
+
+    /// Filter to a specific process ID.
+    pid: Option<u32>,
+
+    /// Filter to a specific thread ID (mutually exclusive with pid).
+    tid: Option<u32>,
+
+    /// Max connections per trace to return. Default: 50. Null for no limit.
+    top_n: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct NetworkInterfacesToolParams {
+    /// Filter to a specific trace ID (for multi-trace databases).
+    trace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct NetworkSocketPairsToolParams {
+    /// Filter to a specific trace ID. Shows pairs where at least one side is in this trace.
+    trace_id: Option<String>,
+
+    /// Filter to connections involving this service port (either side's dest_port).
+    dest_port: Option<i32>,
+
+    /// Filter to connections involving this IP address (matches src or dest on either side).
+    ip: Option<String>,
+
+    /// Max pairs to return. Default: 50. Null for no limit.
+    top_n: Option<usize>,
+
+    /// Exclude loopback pairs (127.x, ::1, ::ffff:127.x). Default: false.
+    exclude_loopback: Option<bool>,
 }
 
 // -- Helper functions --
@@ -379,6 +434,85 @@ impl SystingMcpServer {
             Err(e) => Ok(make_error_result(&e)),
         }
     }
+
+    #[tool(
+        name = "network_connections",
+        description = "Per-connection network traffic summary. Shows protocol, address family, source/destination IP:port, interface, namespace, send/recv bytes, and TCP retransmit percentage for each socket. Results are grouped by trace and sorted by total bytes descending within each trace."
+    )]
+    async fn network_connections(
+        &self,
+        Parameters(params): Parameters<NetworkConnectionsToolParams>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        if params.pid.is_some() && params.tid.is_some() {
+            return Ok(make_error_result(
+                "pid and tid are mutually exclusive. Provide one or neither.",
+            ));
+        }
+
+        let nc_params = NetworkConnectionsParams {
+            trace_id: params.trace_id,
+            pid: params.pid,
+            tid: params.tid,
+            top_n: params.top_n.or(Some(50)),
+        };
+
+        match self
+            .db
+            .request(DbRequest::NetworkConnections(nc_params))
+            .await
+        {
+            Ok(value) => Ok(make_tool_result(value)),
+            Err(e) => Ok(make_error_result(&e)),
+        }
+    }
+
+    #[tool(
+        name = "network_interfaces",
+        description = "Per-interface network traffic summary. Shows namespace, interface name, IP addresses, and per-protocol traffic breakdown (send/recv bytes, socket count, TCP retransmit percentage). Results are grouped by trace."
+    )]
+    async fn network_interfaces(
+        &self,
+        Parameters(params): Parameters<NetworkInterfacesToolParams>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let ni_params = NetworkInterfacesParams {
+            trace_id: params.trace_id,
+        };
+
+        match self
+            .db
+            .request(DbRequest::NetworkInterfaces(ni_params))
+            .await
+        {
+            Ok(value) => Ok(make_tool_result(value)),
+            Err(e) => Ok(make_error_result(&e)),
+        }
+    }
+
+    #[tool(
+        name = "network_socket_pairs",
+        description = "Find matched socket pairs — connections where both the sender and receiver side are captured in the database. Matches by 4-tuple (src_ip, src_port, dest_ip, dest_port) reversal with same protocol and address family. Shows traffic stats and retransmit info for both sides. Pairs can be within the same trace or across different traces (cross_trace=true). Side A is the client (higher ephemeral src_port), Side B is the server."
+    )]
+    async fn network_socket_pairs(
+        &self,
+        Parameters(params): Parameters<NetworkSocketPairsToolParams>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let nsp_params = NetworkSocketPairsParams {
+            trace_id: params.trace_id,
+            dest_port: params.dest_port,
+            ip: params.ip,
+            top_n: params.top_n.or(Some(50)),
+            exclude_loopback: params.exclude_loopback.unwrap_or(false),
+        };
+
+        match self
+            .db
+            .request(DbRequest::NetworkSocketPairs(nsp_params))
+            .await
+        {
+            Ok(value) => Ok(make_tool_result(value)),
+            Err(e) => Ok(make_error_result(&e)),
+        }
+    }
 }
 
 const SERVER_INSTRUCTIONS: &str = "\
@@ -424,6 +558,13 @@ network activity, and performance counters. Traces are stored in DuckDB database
    tid = single thread detail with end-state distribution.
 8. cpu_stats — Per-CPU scheduling statistics. Shows utilization, idle%, \
    thread count, IRQ/softIRQ time, and runqueue depth percentiles per CPU.
+9. network_connections — Per-connection traffic summary. Shows protocol, \
+   source/dest IP:port, interface, send/recv bytes, and TCP retransmit rate.
+10. network_interfaces — Per-interface traffic summary. Shows namespace, \
+   interface, IP addresses, and per-protocol traffic breakdown.
+11. network_socket_pairs — Find matched socket pairs (both sides of a \
+   connection captured). Shows traffic stats for both sides, useful for \
+   analyzing cross-node or same-node connection pairs in multi-trace databases.
 
 # Query result limits
 Queries return at most 10,000 rows. If results are truncated, the response \
@@ -450,4 +591,61 @@ pub async fn run_mcp_server(database: Option<PathBuf>) -> Result<()> {
     service.waiting().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Verify that the MCP tool router contains exactly the expected set of tools.
+    ///
+    /// When adding a new analysis subcommand to systing-analyze, you must also add
+    /// a corresponding MCP tool in this file and update the expected list below.
+    /// This test will fail if tools are added to the router without updating the
+    /// list, or if expected tools are missing from the router.
+    #[test]
+    fn test_mcp_tools_match_expected_set() {
+        let router = SystingMcpServer::tool_router();
+        let registered: BTreeSet<String> = router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+
+        // Every AnalyzeDb analysis method that has a CLI subcommand should have
+        // a corresponding MCP tool listed here. Update this list when adding
+        // new analysis tools.
+        let expected: BTreeSet<String> = [
+            // Core utilities
+            "open_database",
+            "query",
+            "list_tables",
+            "describe_table",
+            "trace_info",
+            // Analysis tools (each corresponds to an AnalyzeDb method + CLI subcommand)
+            "flamegraph",
+            "sched_stats",
+            "cpu_stats",
+            "network_connections",
+            "network_interfaces",
+            "network_socket_pairs",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let missing: BTreeSet<_> = expected.difference(&registered).collect();
+        let extra: BTreeSet<_> = registered.difference(&expected).collect();
+
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "MCP tool registration mismatch!\n\
+             Missing from router (need #[tool] impl): {missing:?}\n\
+             In router but not in expected list (update test_mcp_tools_match_expected_set): {extra:?}\n\
+             \n\
+             If you added a new analysis subcommand, add a corresponding MCP tool \
+             in src/mcp.rs and add its name to the expected list in this test."
+        );
+    }
 }
