@@ -151,6 +151,97 @@ fn handle_db_request(db: &mut Option<AnalyzeDb>, request: DbRequest) -> DbRespon
     }
 }
 
+// -- Serde helpers: accept both JSON numbers and stringified numbers --
+// MCP clients (including Claude Code) often send numeric parameters as strings.
+
+mod string_or_number {
+    use serde::{self, Deserialize, Deserializer};
+    use std::fmt;
+    use std::marker::PhantomData;
+    use std::str::FromStr;
+
+    struct StringOrNumberVisitor<T>(PhantomData<T>);
+
+    impl<'de, T> serde::de::Visitor<'de> for StringOrNumberVisitor<T>
+    where
+        T: FromStr + Deserialize<'de>,
+        T::Err: fmt::Display,
+    {
+        type Value = T;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a number or a string containing a number")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<T, E> {
+            v.parse::<T>().map_err(serde::de::Error::custom)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<T, E> {
+            T::deserialize(serde::de::value::U64Deserializer::new(v))
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<T, E> {
+            T::deserialize(serde::de::value::I64Deserializer::new(v))
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<T, E> {
+            T::deserialize(serde::de::value::F64Deserializer::new(v))
+        }
+    }
+
+    fn deserialize<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+    where
+        T: FromStr + Deserialize<'de>,
+        T::Err: fmt::Display,
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StringOrNumberVisitor(PhantomData))
+    }
+
+    pub mod option {
+        use super::*;
+
+        pub fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+        where
+            T: FromStr + Deserialize<'de>,
+            T::Err: fmt::Display,
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_option(OptionVisitor(PhantomData))
+        }
+
+        struct OptionVisitor<T>(PhantomData<T>);
+
+        impl<'de, T> serde::de::Visitor<'de> for OptionVisitor<T>
+        where
+            T: FromStr + Deserialize<'de>,
+            T::Err: fmt::Display,
+        {
+            type Value = Option<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("null, a number, or a string containing a number")
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Option<T>, E> {
+                Ok(None)
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Option<T>, E> {
+                Ok(None)
+            }
+
+            fn visit_some<D2: Deserializer<'de>>(
+                self,
+                deserializer: D2,
+            ) -> Result<Option<T>, D2::Error> {
+                super::deserialize(deserializer).map(Some)
+            }
+        }
+    }
+}
+
 // -- Tool parameter types --
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -178,39 +269,50 @@ struct FlamegraphToolParams {
     stack_type: Option<String>,
 
     /// Filter to a specific process ID.
+    // `default` handles missing fields (=> None); `deserialize_with` handles
+    // present fields that may be strings or numbers.
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     pid: Option<u32>,
 
     /// Filter to a specific thread ID.
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     tid: Option<u32>,
 
     /// Start time offset in seconds from trace start.
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     start_time: Option<f64>,
 
     /// End time offset in seconds from trace start.
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     end_time: Option<f64>,
 
     /// Filter to a specific trace ID (for multi-trace databases).
     trace_id: Option<String>,
 
     /// Minimum sample count to include a stack. Default: 1.
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     min_count: Option<u64>,
 
     /// Limit to top N stacks by sample count. Default: 500.
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     top_n: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SchedStatsToolParams {
     /// Filter to a specific process ID.
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     pid: Option<u32>,
 
     /// Filter to a specific thread ID (mutually exclusive with pid).
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     tid: Option<u32>,
 
     /// Filter to a specific trace ID (for multi-trace databases).
     trace_id: Option<String>,
 
     /// Max processes/threads to return. Default: 20.
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     top_n: Option<usize>,
 }
 
@@ -226,12 +328,15 @@ struct NetworkConnectionsToolParams {
     trace_id: Option<String>,
 
     /// Filter to a specific process ID.
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     pid: Option<u32>,
 
     /// Filter to a specific thread ID (mutually exclusive with pid).
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     tid: Option<u32>,
 
     /// Max connections per trace to return. Default: 50. Null for no limit.
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     top_n: Option<usize>,
 }
 
@@ -247,12 +352,14 @@ struct NetworkSocketPairsToolParams {
     trace_id: Option<String>,
 
     /// Filter to connections involving this service port (either side's dest_port).
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     dest_port: Option<i32>,
 
     /// Filter to connections involving this IP address (matches src or dest on either side).
     ip: Option<String>,
 
     /// Max pairs to return. Default: 50. Null for no limit.
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     top_n: Option<usize>,
 
     /// Exclude loopback pairs (127.x, ::1, ::ffff:127.x). Default: false.
@@ -647,5 +754,85 @@ mod tests {
              If you added a new analysis subcommand, add a corresponding MCP tool \
              in src/mcp.rs and add its name to the expected list in this test."
         );
+    }
+
+    // -- string_or_number deserialization tests --
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TestU32Params {
+        #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
+        value: Option<u32>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TestF64Params {
+        #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
+        value: Option<f64>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TestI32Params {
+        #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
+        value: Option<i32>,
+    }
+
+    #[test]
+    fn test_string_or_number_u32_from_number() {
+        let p: TestU32Params = serde_json::from_str(r#"{"value": 42}"#).unwrap();
+        assert_eq!(p.value, Some(42));
+    }
+
+    #[test]
+    fn test_string_or_number_u32_from_string() {
+        let p: TestU32Params = serde_json::from_str(r#"{"value": "42"}"#).unwrap();
+        assert_eq!(p.value, Some(42));
+    }
+
+    #[test]
+    fn test_string_or_number_null() {
+        let p: TestU32Params = serde_json::from_str(r#"{"value": null}"#).unwrap();
+        assert_eq!(p.value, None);
+    }
+
+    #[test]
+    fn test_string_or_number_missing_field() {
+        let p: TestU32Params = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(p.value, None);
+    }
+
+    #[test]
+    fn test_string_or_number_invalid_string() {
+        let result = serde_json::from_str::<TestU32Params>(r#"{"value": "not_a_number"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_string_or_number_f64_from_string() {
+        let p: TestF64Params = serde_json::from_str(r#"{"value": "1.25"}"#).unwrap();
+        assert!((p.value.unwrap() - 1.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_string_or_number_f64_from_number() {
+        let p: TestF64Params = serde_json::from_str(r#"{"value": 1.25}"#).unwrap();
+        assert!((p.value.unwrap() - 1.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_string_or_number_i32_from_negative_string() {
+        let p: TestI32Params = serde_json::from_str(r#"{"value": "-80"}"#).unwrap();
+        assert_eq!(p.value, Some(-80));
+    }
+
+    #[test]
+    fn test_string_or_number_i32_from_negative_number() {
+        let p: TestI32Params = serde_json::from_str(r#"{"value": -80}"#).unwrap();
+        assert_eq!(p.value, Some(-80));
+    }
+
+    #[test]
+    fn test_string_or_number_rejects_boolean() {
+        let result = serde_json::from_str::<TestU32Params>(r#"{"value": true}"#);
+        assert!(result.is_err());
     }
 }
