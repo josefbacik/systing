@@ -41,6 +41,9 @@ use query::{duckdb_value_to_json, duckdb_value_to_string};
 /// Maximum number of rows returned by a query.
 pub const MAX_QUERY_ROWS: usize = 10_000;
 
+/// Maximum number of processes returned in trace info summaries.
+const MAX_TRACE_INFO_PROCESSES: usize = 25;
+
 /// Result of a SQL query.
 #[derive(Debug, Serialize)]
 pub struct QueryResult {
@@ -96,6 +99,7 @@ pub struct TraceInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_range: Option<TimeRange>,
     pub tables: Vec<TableInfo>,
+    pub total_process_count: u64,
     pub processes: Vec<ProcessInfo>,
 }
 
@@ -267,13 +271,15 @@ impl AnalyzeDb {
                 None
             };
 
-        let processes = self.get_processes()?;
+        let total_process_count = self.get_process_count()?;
+        let processes = self.get_processes(MAX_TRACE_INFO_PROCESSES)?;
 
         Ok(TraceInfo {
             database_path: self.path.display().to_string(),
             traces,
             time_range,
             tables,
+            total_process_count,
             processes,
         })
     }
@@ -338,7 +344,26 @@ impl AnalyzeDb {
         Ok(Vec::new())
     }
 
-    fn get_processes(&self) -> Result<Vec<ProcessInfo>> {
+    fn get_process_count(&self) -> Result<u64> {
+        if !self.table_exists("process")? {
+            return Ok(0);
+        }
+        // Use the same grouping as get_processes (pid, name) so the count
+        // matches the number of rows that query would return without a LIMIT.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM (SELECT DISTINCT pid, name FROM process)")?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => {
+                let count: i64 = row.get(0)?;
+                Ok(count as u64)
+            }
+            None => Ok(0),
+        }
+    }
+
+    fn get_processes(&self, limit: usize) -> Result<Vec<ProcessInfo>> {
         if !self.table_exists("process")? {
             return Ok(Vec::new());
         }
@@ -346,16 +371,19 @@ impl AnalyzeDb {
         let has_thread = self.table_exists("thread")?;
 
         let sql = if has_thread {
-            "SELECT p.pid, COALESCE(p.name, ''), COUNT(DISTINCT t.tid) as thread_count \
-             FROM process p \
-             LEFT JOIN thread t ON p.upid = t.upid AND p.trace_id = t.trace_id \
-             GROUP BY p.pid, p.name \
-             ORDER BY p.pid"
+            format!(
+                "SELECT p.pid, COALESCE(p.name, ''), COUNT(DISTINCT t.tid) as thread_count \
+                 FROM process p \
+                 LEFT JOIN thread t ON p.upid = t.upid AND p.trace_id = t.trace_id \
+                 GROUP BY p.pid, p.name \
+                 ORDER BY thread_count DESC, p.pid \
+                 LIMIT {limit}"
+            )
         } else {
-            "SELECT pid, COALESCE(name, ''), 0 FROM process ORDER BY pid"
+            format!("SELECT pid, COALESCE(name, ''), 0 FROM process ORDER BY pid LIMIT {limit}")
         };
 
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         let mut processes = Vec::new();
 

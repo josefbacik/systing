@@ -292,7 +292,7 @@ impl SystingMcpServer {
 
     #[tool(
         name = "open_database",
-        description = "Open a DuckDB trace database for analysis. Replaces any previously opened database. The database is opened read-only. Returns basic info about the database contents including table counts, trace IDs, and processes."
+        description = "Open a DuckDB trace database for analysis. Replaces any previously opened database. The database is opened read-only. Returns basic info about the database contents including table counts, trace IDs, total process count, and the top 25 processes by thread count. Use the query tool to explore the full process list if needed."
     )]
     async fn open_database(
         &self,
@@ -381,7 +381,7 @@ impl SystingMcpServer {
 
     #[tool(
         name = "trace_info",
-        description = "Get metadata about the open trace database: database path, trace IDs, time range (in nanoseconds and seconds), non-empty tables with row counts, and a list of processes with PID, name, and thread count."
+        description = "Get metadata about the open trace database: database path, trace IDs, time range (in nanoseconds and seconds), non-empty tables with row counts, total process count, and the top 25 processes by thread count. Use the query tool to explore the full process list if needed."
     )]
     async fn trace_info(&self) -> std::result::Result<CallToolResult, McpError> {
         match self.db.request(DbRequest::TraceInfo).await {
