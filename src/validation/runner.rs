@@ -230,32 +230,10 @@ fn validate_stack_timing<Q: ValidationQueries>(
                 .filter(|v| v.event_type == STACK_RUNNING)
                 .count();
 
-            // Report individual violations up to the limit
-            for (i, violation) in violations
-                .iter()
-                .take(config.max_errors_per_category)
-                .enumerate()
-            {
-                result.add_error(ValidationError::StackTimingViolation {
-                    ts: violation.ts,
-                    utid: violation.utid,
-                    stack_event_type: violation.event_type,
-                    message: violation.message.clone(),
-                });
-
-                // Report "too many errors" warning after first few
-                if i >= config.max_errors_per_category - 1
-                    && violations.len() > config.max_errors_per_category
-                {
-                    result.add_warning(ValidationWarning::TooManyErrors {
-                        table: "stack_sample".into(),
-                        shown: config.max_errors_per_category,
-                    });
-                    break;
-                }
-            }
-
-            // Add summary warnings if there are violations
+            // Stack timing violations are reported as warnings, not errors.
+            // BPF event loss (missed sched/IRQ events) creates gaps in sched_slice data,
+            // causing valid stack samples to appear outside any slice. Under load,
+            // especially with network recording, significant event loss is expected.
             if sleep_count > 0 {
                 result.add_warning(ValidationWarning::StackTimingViolations {
                     sample_type: "STACK_SLEEP (uninterruptible + interruptible)".into(),
@@ -267,6 +245,20 @@ fn validate_stack_timing<Q: ValidationQueries>(
                     sample_type: "STACK_RUNNING".into(),
                     count: running_count as i64,
                 });
+            }
+
+            // Log first few individual violations for diagnostics
+            for v in violations.iter().take(5) {
+                let type_name = match v.event_type {
+                    STACK_SLEEP_UNINTERRUPTIBLE => "SLEEP_UNINTERRUPTIBLE",
+                    STACK_RUNNING => "RUNNING",
+                    STACK_SLEEP_INTERRUPTIBLE => "SLEEP_INTERRUPTIBLE",
+                    _ => "UNKNOWN",
+                };
+                eprintln!(
+                    "  stack timing: utid={} ts={} type={type_name}: {}",
+                    v.utid, v.ts, v.message
+                );
             }
         }
         Err(_) => {

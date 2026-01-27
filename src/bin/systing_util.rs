@@ -980,6 +980,21 @@ impl TraceExtractor {
                         cmdline: proc.cmdline.clone(),
                     });
                 }
+                // Also create a thread entry for the main thread (tid == pid).
+                // In Perfetto, main threads are represented by ProcessDescriptor
+                // (not ThreadDescriptor), but the DuckDB schema requires a thread
+                // entry for every tid that appears in sched or perf_sample events.
+                if let std::collections::hash_map::Entry::Vacant(e) = self.tid_to_utid.entry(pid) {
+                    let utid = self.next_utid;
+                    self.next_utid += 1;
+                    e.insert(utid);
+                    self.data.threads.push(ThreadRecord {
+                        utid,
+                        tid: pid,
+                        name: proc.process_name.clone(),
+                        upid: self.pid_to_upid.get(&pid).copied(),
+                    });
+                }
                 if desc.has_uuid() {
                     if let Some(&upid) = self.pid_to_upid.get(&pid) {
                         self.track_uuid_to_id.insert(desc.uuid(), upid);
@@ -3642,6 +3657,8 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use perfetto_protos::interned_data::InternedData;
+    use perfetto_protos::process_descriptor::ProcessDescriptor;
+    use perfetto_protos::profile_packet::PerfSample;
     use perfetto_protos::track_event::track_event::Type;
     use perfetto_protos::track_event::{EventName, TrackEvent};
 
@@ -4335,5 +4352,181 @@ mod tests {
             let expected_dur = 1000 + ((4 - i) * 100) - (i * 100);
             assert_eq!(extractor.data.slices[i].dur, expected_dur as i64);
         }
+    }
+
+    /// Helper: create a TracePacket with a ProcessDescriptor TrackDescriptor.
+    fn make_process_descriptor_packet(pid: i32, name: &str, uuid: u64) -> TracePacket {
+        let mut proc = ProcessDescriptor::default();
+        proc.set_pid(pid);
+        proc.set_process_name(name.to_string());
+
+        let mut desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+        desc.set_uuid(uuid);
+        desc.process = Some(proc).into();
+
+        let mut packet = TracePacket::default();
+        packet.set_track_descriptor(desc);
+        packet
+    }
+
+    /// Helper: create a TracePacket with a PerfSample.
+    fn make_perf_sample_packet(tid: u32, pid: u32, ts: u64) -> TracePacket {
+        let mut sample = PerfSample::default();
+        sample.set_tid(tid);
+        sample.set_pid(pid);
+
+        let mut packet = TracePacket::default();
+        packet.set_timestamp(ts);
+        packet.set_perf_sample(sample);
+        packet
+    }
+
+    #[test]
+    fn test_process_descriptor_creates_main_thread() {
+        let mut extractor = TraceExtractor::new();
+
+        let packet = make_process_descriptor_packet(1234, "myprocess", 100);
+        extractor.process_packet(&packet).unwrap();
+
+        // Should create both a process and a thread entry
+        assert_eq!(extractor.data.processes.len(), 1);
+        assert_eq!(extractor.data.processes[0].pid, 1234);
+        assert_eq!(
+            extractor.data.processes[0].name,
+            Some("myprocess".to_string())
+        );
+
+        assert_eq!(extractor.data.threads.len(), 1);
+        assert_eq!(extractor.data.threads[0].tid, 1234);
+        assert_eq!(
+            extractor.data.threads[0].name,
+            Some("myprocess".to_string())
+        );
+        assert_eq!(
+            extractor.data.threads[0].upid,
+            Some(extractor.data.processes[0].upid)
+        );
+    }
+
+    #[test]
+    fn test_perf_sample_after_process_descriptor_preserves_name() {
+        // Regression test: a main thread (tid == tgid) that only appears in
+        // PerfSample events should still have a name, because the
+        // ProcessDescriptor already created the thread entry with a name.
+        let mut extractor = TraceExtractor::new();
+
+        // Step 1: Process a ProcessDescriptor (comes first in Perfetto traces)
+        let desc_packet = make_process_descriptor_packet(5678, "kworker", 200);
+        extractor.process_packet(&desc_packet).unwrap();
+
+        // Step 2: Process a PerfSample for the same tid (comes later)
+        let sample_packet = make_perf_sample_packet(5678, 5678, 1000);
+        extractor.process_packet(&sample_packet).unwrap();
+
+        // The thread should keep its name from the ProcessDescriptor
+        let thread = extractor
+            .data
+            .threads
+            .iter()
+            .find(|t| t.tid == 5678)
+            .expect("Thread with tid 5678 should exist");
+        assert_eq!(thread.name, Some("kworker".to_string()));
+    }
+
+    #[test]
+    fn test_perf_sample_without_descriptor_creates_nameless_thread() {
+        // When a PerfSample arrives for a completely unknown thread (no
+        // ProcessDescriptor, no ThreadDescriptor, no sched events), the
+        // thread is created without a name. This is expected behavior for
+        // threads from external Perfetto traces where we have no metadata.
+        let mut extractor = TraceExtractor::new();
+
+        let sample_packet = make_perf_sample_packet(9999, 9999, 1000);
+        extractor.process_packet(&sample_packet).unwrap();
+
+        let thread = extractor
+            .data
+            .threads
+            .iter()
+            .find(|t| t.tid == 9999)
+            .expect("Thread with tid 9999 should exist");
+        assert_eq!(thread.name, None);
+    }
+
+    #[test]
+    fn test_process_descriptor_does_not_duplicate_thread() {
+        let mut extractor = TraceExtractor::new();
+
+        // Process the same ProcessDescriptor twice
+        let packet = make_process_descriptor_packet(1234, "myprocess", 100);
+        extractor.process_packet(&packet).unwrap();
+        extractor.process_packet(&packet).unwrap();
+
+        // Should only create one thread entry (Vacant check)
+        assert_eq!(extractor.data.threads.len(), 1);
+        assert_eq!(extractor.data.threads[0].tid, 1234);
+    }
+
+    #[test]
+    fn test_process_descriptor_does_not_create_child_threads() {
+        // ProcessDescriptor should only create a thread entry for the main thread
+        // (tid == pid), not for any other threads in the process.
+        let mut extractor = TraceExtractor::new();
+
+        let packet = make_process_descriptor_packet(1000, "myproc", 100);
+        extractor.process_packet(&packet).unwrap();
+
+        // Should create exactly one thread (tid=1000, the main thread)
+        assert_eq!(extractor.data.threads.len(), 1);
+        assert_eq!(extractor.data.threads[0].tid, 1000);
+
+        // A child thread (tid=1001) should NOT exist yet
+        assert!(
+            !extractor.data.threads.iter().any(|t| t.tid == 1001),
+            "ProcessDescriptor should not create entries for child threads"
+        );
+    }
+
+    #[test]
+    fn test_thread_descriptor_not_overwritten_by_process_descriptor() {
+        // If a ThreadDescriptor arrives first (unusual but possible), the
+        // later ProcessDescriptor should not create a duplicate.
+        let mut extractor = TraceExtractor::new();
+
+        // Create a ThreadDescriptor for tid=1234 with pid=1234 (main thread)
+        let mut thread = perfetto_protos::thread_descriptor::ThreadDescriptor::default();
+        thread.set_tid(1234);
+        thread.set_pid(1234);
+        thread.set_thread_name("from_thread_desc".to_string());
+
+        let mut desc = perfetto_protos::track_descriptor::TrackDescriptor::default();
+        desc.set_uuid(300);
+        desc.thread = Some(thread).into();
+
+        let mut thread_packet = TracePacket::default();
+        thread_packet.set_track_descriptor(desc);
+        extractor.process_packet(&thread_packet).unwrap();
+
+        // Now process a ProcessDescriptor for the same pid
+        let proc_packet = make_process_descriptor_packet(1234, "from_proc_desc", 301);
+        extractor.process_packet(&proc_packet).unwrap();
+
+        // Thread should keep the name from ThreadDescriptor (first one wins)
+        let thread = extractor
+            .data
+            .threads
+            .iter()
+            .find(|t| t.tid == 1234)
+            .expect("Thread with tid 1234 should exist");
+        assert_eq!(thread.name, Some("from_thread_desc".to_string()));
+
+        // Should still be just one thread entry
+        let count = extractor
+            .data
+            .threads
+            .iter()
+            .filter(|t| t.tid == 1234)
+            .count();
+        assert_eq!(count, 1);
     }
 }

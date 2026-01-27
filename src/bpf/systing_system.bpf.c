@@ -878,10 +878,10 @@ static __always_inline long get_ringbuf_flags(void *rb)
 
 static struct task_event *reserve_task_event(long *flags)
 {
-	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
 	void *rb;
 
-	rb = bpf_map_lookup_elem(&ringbufs, &node);
+	rb = bpf_map_lookup_elem(&ringbufs, &rb_idx);
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
@@ -893,10 +893,10 @@ static struct task_event *reserve_task_event(long *flags)
 
 static struct stack_event *reserve_stack_event(long *flags)
 {
-	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
 	void *rb;
 
-	rb = bpf_map_lookup_elem(&stack_ringbufs, &node);
+	rb = bpf_map_lookup_elem(&stack_ringbufs, &rb_idx);
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
@@ -920,10 +920,10 @@ static struct stack_event *reserve_stack_event(long *flags)
 
 static struct perf_counter_event *reserve_perf_counter_event(long *flags)
 {
-	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
 	void *rb;
 
-	rb = bpf_map_lookup_elem(&perf_counter_ringbufs, &node);
+	rb = bpf_map_lookup_elem(&perf_counter_ringbufs, &rb_idx);
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
@@ -935,10 +935,10 @@ static struct perf_counter_event *reserve_perf_counter_event(long *flags)
 
 static struct probe_event *reserve_probe_event(long *flags)
 {
-	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
 	void *rb;
 
-	rb = bpf_map_lookup_elem(&probe_ringbufs, &node);
+	rb = bpf_map_lookup_elem(&probe_ringbufs, &rb_idx);
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
@@ -950,10 +950,10 @@ static struct probe_event *reserve_probe_event(long *flags)
 
 static struct network_event *reserve_network_event(long *flags)
 {
-	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
 	void *rb;
 
-	rb = bpf_map_lookup_elem(&network_ringbufs, &node);
+	rb = bpf_map_lookup_elem(&network_ringbufs, &rb_idx);
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
@@ -965,10 +965,10 @@ static struct network_event *reserve_network_event(long *flags)
 
 static struct packet_event *reserve_packet_event(long *flags)
 {
-	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
 	void *rb;
 
-	rb = bpf_map_lookup_elem(&packet_ringbufs, &node);
+	rb = bpf_map_lookup_elem(&packet_ringbufs, &rb_idx);
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
@@ -980,10 +980,10 @@ static struct packet_event *reserve_packet_event(long *flags)
 
 static struct epoll_event_bpf *reserve_epoll_event(long *flags)
 {
-	u32 node = (u32)bpf_get_numa_node_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
 	void *rb;
 
-	rb = bpf_map_lookup_elem(&epoll_ringbufs, &node);
+	rb = bpf_map_lookup_elem(&epoll_ringbufs, &rb_idx);
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
