@@ -555,7 +555,15 @@ impl SessionRecorder {
         let exe_path = Path::new("/proc").join(pid.to_string()).join("exe");
         if let Ok(exe) = fs::read_link(&exe_path) {
             if let Some(name) = exe.file_name() {
-                return name.to_string_lossy().to_string();
+                let name_str = name.to_string_lossy();
+                // Strip " (deleted)" suffix that Linux appends when a binary has
+                // been replaced on disk (e.g., during upgrades). Note: this would
+                // incorrectly strip the suffix from a binary literally named
+                // "foo (deleted)", but that is not a realistic concern.
+                return name_str
+                    .strip_suffix(" (deleted)")
+                    .unwrap_or(&name_str)
+                    .to_string();
             }
         }
         String::new()
@@ -578,16 +586,20 @@ impl SessionRecorder {
         let comm = Self::extract_comm(info);
         let pid = (info.tgidpid >> 32) as u32;
 
-        let process_name = if !comm.is_empty() {
+        // Prefer /proc/PID/exe over BPF comm for process names: exe is stable
+        // and consistent regardless of which thread is observed first, while comm
+        // is limited to 15 chars and non-deterministic (child thread names can
+        // leak to the process when the child is seen before the main thread).
+        // Note: record_new_thread() uses the opposite priority (comm first)
+        // because thread names set via pthread_setname_np (e.g., "gc-worker-3")
+        // are more informative than the binary filename.
+        let name_from_proc = Self::fetch_name_from_proc(pid);
+        let process_name = if !name_from_proc.is_empty() {
+            name_from_proc
+        } else if !comm.is_empty() {
             comm
         } else {
-            let name_from_proc = Self::fetch_name_from_proc(pid);
-            if !name_from_proc.is_empty() {
-                name_from_proc
-            } else {
-                // Fallback to pid as name when both comm and /proc lookup fail
-                format!("<pid:{pid}>")
-            }
+            format!("<pid:{pid}>")
         };
 
         let cmdline = Self::fetch_cmdline_from_proc(pid);
@@ -1125,6 +1137,15 @@ mod tests {
     use perfetto_protos::trace_packet::TracePacket;
     use std::sync::{Mutex, RwLock};
 
+    // PIDs above Linux's pid_max (4194304) to ensure /proc lookups never
+    // resolve to real processes, keeping test assertions deterministic.
+    const TEST_PID_A: u32 = 5_000_001;
+    const TEST_PID_B: u32 = 5_000_002;
+    const TEST_TID_A: u32 = 5_000_011;
+    const TEST_TID_B: u32 = 5_000_012;
+    const TEST_TID_C: u32 = 5_000_013;
+    const TEST_TID_D: u32 = 5_000_014;
+
     // =========================================================================
     // Test-only helper functions (moved from SessionRecorder impl)
     // =========================================================================
@@ -1321,9 +1342,24 @@ mod tests {
     }
 
     #[test]
+    fn test_fetch_name_from_proc_current_process() {
+        // The test process itself should have a valid /proc/PID/exe
+        let pid = std::process::id();
+        let name = SessionRecorder::fetch_name_from_proc(pid);
+        assert!(!name.is_empty(), "should resolve current process exe");
+    }
+
+    #[test]
+    fn test_fetch_name_from_proc_nonexistent_pid() {
+        // A PID above pid_max should not exist
+        let name = SessionRecorder::fetch_name_from_proc(u32::MAX);
+        assert!(name.is_empty(), "should return empty for nonexistent PID");
+    }
+
+    #[test]
     fn test_maybe_record_task_new_process() {
         let recorder = create_test_session_recorder();
-        let task = create_test_task_info(1234, 1234, "test_process");
+        let task = create_test_task_info(TEST_PID_A, TEST_PID_A, "test_process");
 
         // Initially, no processes should be recorded
         assert!(recorder.process_descriptors.read().unwrap().is_empty());
@@ -1338,7 +1374,7 @@ mod tests {
         assert!(process_descriptors.contains_key(&task.tgidpid));
 
         let process_desc = process_descriptors.get(&task.tgidpid).unwrap();
-        assert_eq!(process_desc.pid(), 1234);
+        assert_eq!(process_desc.pid(), TEST_PID_A as i32);
         assert_eq!(process_desc.process_name(), "test_process");
 
         // Check that the process tree entry was also created
@@ -1353,7 +1389,7 @@ mod tests {
     #[test]
     fn test_maybe_record_task_new_thread() {
         let recorder = create_test_session_recorder();
-        let task = create_test_task_info(1234, 5678, "test_thread");
+        let task = create_test_task_info(TEST_PID_A, TEST_TID_A, "test_thread");
 
         // Initially, no threads should be recorded
         assert!(recorder.threads.read().unwrap().is_empty());
@@ -1367,21 +1403,21 @@ mod tests {
         assert!(threads.contains_key(&task.tgidpid));
 
         let thread_desc = threads.get(&task.tgidpid).unwrap();
-        assert_eq!(thread_desc.tid(), 5678);
-        assert_eq!(thread_desc.pid(), 1234);
+        assert_eq!(thread_desc.tid(), TEST_TID_A as i32);
+        assert_eq!(thread_desc.pid(), TEST_PID_A as i32);
         assert_eq!(thread_desc.thread_name(), "test_thread");
 
         // Parent process should also be recorded when recording a thread
         let process_descriptors = recorder.process_descriptors.read().unwrap();
         assert_eq!(process_descriptors.len(), 1);
-        let parent_tgidpid = (1234u64 << 32) | 1234u64;
+        let parent_tgidpid = (TEST_PID_A as u64) << 32 | TEST_PID_A as u64;
         assert!(process_descriptors.contains_key(&parent_tgidpid));
     }
 
     #[test]
     fn test_maybe_record_task_duplicate_process() {
         let recorder = create_test_session_recorder();
-        let task = create_test_task_info(1234, 1234, "test_process");
+        let task = create_test_task_info(TEST_PID_A, TEST_PID_A, "test_process");
 
         // Record the task twice
         recorder.maybe_record_task(&task);
@@ -1398,7 +1434,7 @@ mod tests {
     #[test]
     fn test_maybe_record_task_duplicate_thread() {
         let recorder = create_test_session_recorder();
-        let task = create_test_task_info(1234, 5678, "test_thread");
+        let task = create_test_task_info(TEST_PID_A, TEST_TID_A, "test_thread");
 
         // Record the task twice
         recorder.maybe_record_task(&task);
@@ -1412,8 +1448,8 @@ mod tests {
     #[test]
     fn test_maybe_record_task_multiple_processes() {
         let recorder = create_test_session_recorder();
-        let task1 = create_test_task_info(1234, 1234, "process1");
-        let task2 = create_test_task_info(5678, 5678, "process2");
+        let task1 = create_test_task_info(TEST_PID_A, TEST_PID_A, "process1");
+        let task2 = create_test_task_info(TEST_PID_B, TEST_PID_B, "process2");
 
         // Record both tasks
         recorder.maybe_record_task(&task1);
@@ -1432,8 +1468,8 @@ mod tests {
     #[test]
     fn test_maybe_record_task_multiple_threads() {
         let recorder = create_test_session_recorder();
-        let task1 = create_test_task_info(1234, 5678, "thread1");
-        let task2 = create_test_task_info(1234, 9012, "thread2");
+        let task1 = create_test_task_info(TEST_PID_A, TEST_TID_A, "thread1");
+        let task2 = create_test_task_info(TEST_PID_A, TEST_TID_B, "thread2");
 
         // Record both tasks
         recorder.maybe_record_task(&task1);
@@ -1447,20 +1483,20 @@ mod tests {
 
         // Verify thread details
         let thread1 = threads.get(&task1.tgidpid).unwrap();
-        assert_eq!(thread1.tid(), 5678);
-        assert_eq!(thread1.pid(), 1234);
+        assert_eq!(thread1.tid(), TEST_TID_A as i32);
+        assert_eq!(thread1.pid(), TEST_PID_A as i32);
 
         let thread2 = threads.get(&task2.tgidpid).unwrap();
-        assert_eq!(thread2.tid(), 9012);
-        assert_eq!(thread2.pid(), 1234);
+        assert_eq!(thread2.tid(), TEST_TID_B as i32);
+        assert_eq!(thread2.pid(), TEST_PID_A as i32);
     }
 
     #[test]
     fn test_maybe_record_task_process_and_threads() {
         let recorder = create_test_session_recorder();
-        let process_task = create_test_task_info(1234, 1234, "main_process");
-        let thread_task1 = create_test_task_info(1234, 5678, "thread1");
-        let thread_task2 = create_test_task_info(1234, 9012, "thread2");
+        let process_task = create_test_task_info(TEST_PID_A, TEST_PID_A, "main_process");
+        let thread_task1 = create_test_task_info(TEST_PID_A, TEST_TID_A, "thread1");
+        let thread_task2 = create_test_task_info(TEST_PID_A, TEST_TID_B, "thread2");
 
         // Record process and threads
         recorder.maybe_record_task(&process_task);
@@ -1481,14 +1517,14 @@ mod tests {
 
         // Verify all threads belong to the same process
         for thread in threads.values() {
-            assert_eq!(thread.pid(), 1234);
+            assert_eq!(thread.pid(), TEST_PID_A as i32);
         }
     }
 
     #[test]
     fn test_maybe_record_task_comm_with_null_terminator() {
         let recorder = create_test_session_recorder();
-        let task = create_test_task_info(1234, 1234, "short");
+        let task = create_test_task_info(TEST_PID_A, TEST_PID_A, "short");
 
         recorder.maybe_record_task(&task);
 
@@ -1502,7 +1538,7 @@ mod tests {
         let recorder = create_test_session_recorder();
         // Create a long comm name that would exceed the buffer
         let long_name = "this_is_a_very_long_process_name_that_exceeds_the_buffer_size";
-        let task = create_test_task_info(1234, 1234, long_name);
+        let task = create_test_task_info(TEST_PID_A, TEST_PID_A, long_name);
 
         recorder.maybe_record_task(&task);
 
@@ -1517,14 +1553,14 @@ mod tests {
     #[test]
     fn test_maybe_record_task_empty_comm() {
         let recorder = create_test_session_recorder();
-        let task = create_test_task_info(1234, 1234, "");
+        let task = create_test_task_info(TEST_PID_A, TEST_PID_A, "");
 
         recorder.maybe_record_task(&task);
 
         let process_descriptors = recorder.process_descriptors.read().unwrap();
         let process_desc = process_descriptors.get(&task.tgidpid).unwrap();
         // When comm is empty and /proc lookup fails, fall back to pid-based name
-        assert_eq!(process_desc.process_name(), "<pid:1234>");
+        assert_eq!(process_desc.process_name(), format!("<pid:{TEST_PID_A}>"));
     }
 
     #[test]
@@ -1650,7 +1686,7 @@ mod tests {
         let mut pid_uuids = HashMap::new();
 
         // Add a process
-        let task = create_test_task_info(1234, 1234, "test_process");
+        let task = create_test_task_info(TEST_PID_A, TEST_PID_A, "test_process");
         recorder.maybe_record_task(&task);
 
         let packets = generate_process_packets(&recorder, &id_counter, &mut pid_uuids);
@@ -1662,7 +1698,7 @@ mod tests {
         let track_desc = packets[0].track_descriptor();
         assert_eq!(track_desc.uuid(), 100);
         let process_desc = &track_desc.process;
-        assert_eq!(process_desc.pid(), 1234);
+        assert_eq!(process_desc.pid(), TEST_PID_A as i32);
         assert_eq!(process_desc.process_name(), "test_process");
 
         // Second packet should be the process tree
@@ -1672,7 +1708,7 @@ mod tests {
 
         // pid_uuids should be updated
         assert_eq!(pid_uuids.len(), 1);
-        assert_eq!(pid_uuids.get(&1234), Some(&100));
+        assert_eq!(pid_uuids.get(&(TEST_PID_A as i32)), Some(&100));
 
         // id_counter should be incremented
         assert_eq!(id_counter.load(std::sync::atomic::Ordering::Relaxed), 101);
@@ -1685,8 +1721,8 @@ mod tests {
         let mut pid_uuids = HashMap::new();
 
         // Add multiple processes
-        let task1 = create_test_task_info(1234, 1234, "process1");
-        let task2 = create_test_task_info(5678, 5678, "process2");
+        let task1 = create_test_task_info(TEST_PID_A, TEST_PID_A, "process1");
+        let task2 = create_test_task_info(TEST_PID_B, TEST_PID_B, "process2");
         recorder.maybe_record_task(&task1);
         recorder.maybe_record_task(&task2);
 
@@ -1712,12 +1748,12 @@ mod tests {
 
         // pid_uuids should contain both processes
         assert_eq!(pid_uuids.len(), 2);
-        assert!(pid_uuids.contains_key(&1234));
-        assert!(pid_uuids.contains_key(&5678));
+        assert!(pid_uuids.contains_key(&(TEST_PID_A as i32)));
+        assert!(pid_uuids.contains_key(&(TEST_PID_B as i32)));
 
         // UUIDs should be unique
-        let uuid1 = pid_uuids.get(&1234).unwrap();
-        let uuid2 = pid_uuids.get(&5678).unwrap();
+        let uuid1 = pid_uuids.get(&(TEST_PID_A as i32)).unwrap();
+        let uuid2 = pid_uuids.get(&(TEST_PID_B as i32)).unwrap();
         assert_ne!(uuid1, uuid2);
 
         // id_counter should be incremented appropriately
@@ -1747,7 +1783,7 @@ mod tests {
         let mut thread_uuids = HashMap::new();
 
         // Add a thread
-        let task = create_test_task_info(1234, 5678, "test_thread");
+        let task = create_test_task_info(TEST_PID_A, TEST_TID_A, "test_thread");
         recorder.maybe_record_task(&task);
 
         let packets = generate_thread_packets(&recorder, &id_counter, &mut thread_uuids);
@@ -1759,13 +1795,13 @@ mod tests {
         let track_desc = packets[0].track_descriptor();
         assert_eq!(track_desc.uuid(), 150);
         let thread_desc = &track_desc.thread;
-        assert_eq!(thread_desc.tid(), 5678);
-        assert_eq!(thread_desc.pid(), 1234);
+        assert_eq!(thread_desc.tid(), TEST_TID_A as i32);
+        assert_eq!(thread_desc.pid(), TEST_PID_A as i32);
         assert_eq!(thread_desc.thread_name(), "test_thread");
 
         // thread_uuids should be updated
         assert_eq!(thread_uuids.len(), 1);
-        assert_eq!(thread_uuids.get(&5678), Some(&150));
+        assert_eq!(thread_uuids.get(&(TEST_TID_A as i32)), Some(&150));
 
         // id_counter should be incremented
         assert_eq!(id_counter.load(std::sync::atomic::Ordering::Relaxed), 151);
@@ -1778,9 +1814,9 @@ mod tests {
         let mut thread_uuids = HashMap::new();
 
         // Add multiple threads
-        let task1 = create_test_task_info(1234, 5678, "thread1");
-        let task2 = create_test_task_info(1234, 9012, "thread2");
-        let task3 = create_test_task_info(5678, 1111, "thread3");
+        let task1 = create_test_task_info(TEST_PID_A, TEST_TID_A, "thread1");
+        let task2 = create_test_task_info(TEST_PID_A, TEST_TID_B, "thread2");
+        let task3 = create_test_task_info(TEST_PID_B, TEST_TID_C, "thread3");
         recorder.maybe_record_task(&task1);
         recorder.maybe_record_task(&task2);
         recorder.maybe_record_task(&task3);
@@ -1798,14 +1834,14 @@ mod tests {
 
         // thread_uuids should contain all threads
         assert_eq!(thread_uuids.len(), 3);
-        assert!(thread_uuids.contains_key(&5678)); // TID from task1
-        assert!(thread_uuids.contains_key(&9012)); // TID from task2
-        assert!(thread_uuids.contains_key(&1111)); // TID from task3
+        assert!(thread_uuids.contains_key(&(TEST_TID_A as i32))); // TID from task1
+        assert!(thread_uuids.contains_key(&(TEST_TID_B as i32))); // TID from task2
+        assert!(thread_uuids.contains_key(&(TEST_TID_C as i32))); // TID from task3
 
         // UUIDs should be unique
-        let uuid1 = thread_uuids.get(&5678).unwrap();
-        let uuid2 = thread_uuids.get(&9012).unwrap();
-        let uuid3 = thread_uuids.get(&1111).unwrap();
+        let uuid1 = thread_uuids.get(&(TEST_TID_A as i32)).unwrap();
+        let uuid2 = thread_uuids.get(&(TEST_TID_B as i32)).unwrap();
+        let uuid3 = thread_uuids.get(&(TEST_TID_C as i32)).unwrap();
         assert_ne!(uuid1, uuid2);
         assert_ne!(uuid1, uuid3);
         assert_ne!(uuid2, uuid3);
@@ -1821,7 +1857,7 @@ mod tests {
         let mut thread_uuids = HashMap::new();
 
         // Add a thread with specific details to verify
-        let task = create_test_task_info(9999, 8888, "special_thread");
+        let task = create_test_task_info(TEST_PID_B, TEST_TID_D, "special_thread");
         recorder.maybe_record_task(&task);
 
         let packets = generate_thread_packets(&recorder, &id_counter, &mut thread_uuids);
@@ -1832,12 +1868,12 @@ mod tests {
         let thread_desc = &track_desc.thread;
 
         // Verify all thread details are correct
-        assert_eq!(thread_desc.tid(), 8888);
-        assert_eq!(thread_desc.pid(), 9999);
+        assert_eq!(thread_desc.tid(), TEST_TID_D as i32);
+        assert_eq!(thread_desc.pid(), TEST_PID_B as i32);
         assert_eq!(thread_desc.thread_name(), "special_thread");
 
         // Verify UUID mapping
-        assert_eq!(thread_uuids.get(&8888), Some(&400));
+        assert_eq!(thread_uuids.get(&(TEST_TID_D as i32)), Some(&400));
         assert_eq!(track_desc.uuid(), 400);
     }
 
