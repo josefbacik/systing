@@ -52,6 +52,7 @@ pub mod session_recorder;
 pub mod stack_recorder;
 pub mod systing_core;
 pub mod trace;
+pub mod traced_command;
 pub mod utid;
 
 // Re-export for convenience

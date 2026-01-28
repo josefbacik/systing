@@ -261,6 +261,8 @@ pub struct Config {
     pub output: PathBuf,
     /// Skip trace generation, keep only parquet
     pub parquet_only: bool,
+    /// Command to run and trace (everything after --)
+    pub run_command: Option<Vec<String>>,
 }
 
 impl Default for Config {
@@ -296,6 +298,7 @@ impl Default for Config {
             output_dir: PathBuf::from("./traces"),
             output: PathBuf::from("trace.pb"),
             parquet_only: false,
+            run_command: None,
         }
     }
 }
@@ -608,7 +611,7 @@ fn consume_loop<T, N>(
         let ret = recorder.lock().unwrap().record_event(event);
 
         if ret {
-            stop_tx.send(()).expect("Failed to send stop signal");
+            let _ = stop_tx.send(());
             break;
         }
     }
@@ -2035,6 +2038,7 @@ struct ThreadHandles {
     pystack_symbol_tx: Sender<stack_event>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tracing_loop(
     handles: ThreadHandles,
     opts: &Config,
@@ -2043,15 +2047,74 @@ fn run_tracing_loop(
     ringbuf_shutdown: Arc<ShutdownSignal>,
     shutdown_signal: Arc<AtomicBool>,
     skel: &mut SystingSystemSkel,
+    traced_child: &Option<crate::traced_command::TracedChild>,
 ) -> Result<()> {
     sd_notify()?;
 
-    if opts.duration > 0 {
+    if let Some(child) = traced_child.as_ref() {
+        // Command mode: trace until child exits, duration expires, or Ctrl-C
+        let stop_for_child = stop_tx.clone();
+        let child_pid = child.pid as i32;
+        let child_waited = child.waited.clone();
+        let child_exit_status = child.exit_status.clone();
+
+        // Background thread to wait for child exit
+        thread::spawn(move || {
+            let mut status: i32 = 0;
+            let ret = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+            if ret > 0 {
+                let exit_code = if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else if libc::WIFSIGNALED(status) {
+                    128 + libc::WTERMSIG(status)
+                } else {
+                    1
+                };
+                *child_exit_status.lock().unwrap() = Some(exit_code);
+                // Set waited AFTER exit_status so Acquire readers see both
+                child_waited.store(true, Ordering::Release);
+            }
+            // Small delay to drain remaining BPF events from the child's final moments
+            thread::sleep(Duration::from_millis(100));
+            let _ = stop_for_child.send(());
+        });
+
+        // Duration timeout thread (if --duration is set)
+        let duration = opts.duration;
+        if duration > 0 {
+            let stop_for_duration = stop_tx.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_secs(duration));
+                let _ = stop_for_duration.send(());
+            });
+            eprintln!(
+                "Tracing command (PID {}) for up to {} seconds...",
+                child.pid, opts.duration
+            );
+        } else {
+            eprintln!("Tracing command (PID {})...", child.pid);
+        }
+
+        // Forward SIGINT to the child so it gets graceful cleanup.
+        // Ignore MultipleHandlers error (e.g., in test harnesses).
+        let _ = ctrlc::set_handler(move || {
+            unsafe {
+                libc::kill(child_pid, libc::SIGINT);
+            }
+            let _ = stop_tx.send(());
+        });
+
+        eprintln!("Press Ctrl-C to stop early");
+        let _ = stop_rx.recv();
+    } else if opts.duration > 0 {
+        // Duration mode (no command): trace for a fixed time
         println!("Tracing for {} seconds", opts.duration);
         thread::sleep(Duration::from_secs(opts.duration));
     } else {
-        ctrlc::set_handler(move || stop_tx.send(()).expect("Could not send signal on channel."))
-            .expect("Error setting Ctrl-C handler");
+        // Indefinite mode: trace until Ctrl-C
+        let _ = ctrlc::set_handler(move || {
+            let _ = stop_tx.send(());
+        });
         if opts.continuous > 0 {
             println!("Tracing in a continues loop of {} seconds", opts.continuous);
             println!("Will stop if a trigger is specified, otherwise Ctrl-C to stop");
@@ -2059,9 +2122,7 @@ fn run_tracing_loop(
             println!("Tracing indefinitely...");
             println!("Press Ctrl-C to stop");
         }
-        stop_rx
-            .recv()
-            .expect("Could not receive signal on channel.");
+        let _ = stop_rx.recv();
     }
 
     if opts.continuous > 0 {
@@ -2107,8 +2168,20 @@ fn run_tracing_loop(
 }
 
 /// Main tracing function that sets up and runs the BPF-based system tracer.
-pub fn systing(opts: Config) -> Result<()> {
+///
+/// If `traced_child` is provided, the child's PID is added to the PID filter,
+/// the child is signaled to exec after BPF is attached, and tracing stops when
+/// the child exits. Returns the child's exit code (or 0 if no child).
+pub fn systing(
+    mut opts: Config,
+    mut traced_child: Option<crate::traced_command::TracedChild>,
+) -> Result<i32> {
     bump_memlock_rlimit()?;
+
+    // Add the traced child's PID to the PID filter list
+    if let Some(ref child) = traced_child {
+        opts.pid.push(child.pid);
+    }
 
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let mut perf_counter_names = Vec::new();
@@ -2228,8 +2301,11 @@ pub fn systing(opts: Config) -> Result<()> {
                 .with_context(|| format!("Failed to add PID {pid} to BPF map"))?;
         }
 
+        // Initialize pystacks for the non-run-command case (normal path).
+        // When tracing a run command, pystacks init is deferred until after the
+        // child has exec'd (so /proc/PID/exe points to the real Python binary).
         #[cfg(feature = "pystacks")]
-        if collect_pystacks {
+        if collect_pystacks && traced_child.is_none() {
             let pystacks_debug = opts.pystacks_debug;
 
             if pystacks_debug {
@@ -2350,6 +2426,40 @@ pub fn systing(opts: Config) -> Result<()> {
         // Attach any usdt's that we may have
         let _probe_links = attach_probes(&mut skel, &recorder, &opts, old_kernel)?;
 
+        // Signal the traced child to exec now that BPF is fully attached.
+        // All tracing is active, so we capture everything from exec onwards.
+        if let Some(ref mut child) = traced_child {
+            child.signal_exec()?;
+            child.wait_for_exec()?;
+            eprintln!("Traced command started (PID {})", child.pid);
+        }
+
+        // Deferred pystacks init for run-command case.
+        // Now the child has exec'd and /proc/PID/exe points to the real executable.
+        #[cfg(feature = "pystacks")]
+        if collect_pystacks && traced_child.is_some() {
+            let pystacks_debug = opts.pystacks_debug;
+            // Use all PIDs in the filter (includes child PID + any --pid args)
+            let pystacks_pids = if !opts.pystacks_pids.is_empty() {
+                opts.pystacks_pids.clone()
+            } else {
+                opts.pid.clone()
+            };
+
+            if pystacks_debug {
+                eprintln!(
+                    "[pystacks debug] Deferred pystacks init (after exec) with PIDs: {:?}",
+                    pystacks_pids
+                );
+            }
+
+            recorder.stack_recorder.lock().unwrap().init_pystacks(
+                &pystacks_pids,
+                skel.object(),
+                pystacks_debug,
+            );
+        }
+
         let mut ringbuf_threads = Vec::new();
         let ringbuf_shutdown = Arc::new(ShutdownSignal::new()?);
         for (name, ring) in rings {
@@ -2444,6 +2554,7 @@ pub fn systing(opts: Config) -> Result<()> {
             ringbuf_shutdown,
             shutdown_signal,
             &mut skel,
+            &traced_child,
         )?;
 
         // Load socket metadata from BPF map after tracing completes
@@ -2516,5 +2627,46 @@ pub fn systing(opts: Config) -> Result<()> {
         }
     }
 
-    Ok(())
+    // Clean up the traced child if it's still alive (e.g., --duration expired before child exited)
+    let exit_code = if let Some(ref child) = traced_child {
+        if !child.waited.load(Ordering::Acquire) {
+            // Try non-blocking waitpid first to see if child already exited
+            let mut status: i32 = 0;
+            let ret = unsafe { libc::waitpid(child.pid as i32, &mut status, libc::WNOHANG) };
+            if ret > 0 {
+                // Child already exited
+                child.waited.store(true, Ordering::Release);
+                let code = if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else if libc::WIFSIGNALED(status) {
+                    128 + libc::WTERMSIG(status)
+                } else {
+                    1
+                };
+                *child.exit_status.lock().unwrap() = Some(code);
+            } else {
+                // Child still running - send SIGINT for graceful cleanup
+                unsafe {
+                    libc::kill(child.pid as i32, libc::SIGINT);
+                }
+                eprintln!("Sent SIGINT to traced command (PID {})", child.pid);
+                // Wait for the background waitpid thread to reap it.
+                // exit_status is set before waited (Release ordering), so
+                // Acquire load of waited==true guarantees exit_status is visible.
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !child.waited.load(Ordering::Acquire) {
+                    if std::time::Instant::now() > deadline {
+                        // Timeout - Drop will SIGKILL and reap
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        child.exit_code().unwrap_or(0)
+    } else {
+        0
+    };
+
+    Ok(exit_code)
 }

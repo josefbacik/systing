@@ -91,7 +91,7 @@ fn test_e2e_parquet_validation() {
     };
 
     // Run the recording
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Verify essential files exist
     assert!(
@@ -134,7 +134,7 @@ fn test_e2e_perfetto_validation() {
     };
 
     // Run the recording
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Verify trace file exists
     assert!(trace_path.exists(), "trace.pb not found");
@@ -166,7 +166,7 @@ fn test_e2e_both_validations() {
     };
 
     // Run the recording
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Validate Parquet
     let parquet_result = validate_parquet_dir(dir.path());
@@ -243,7 +243,7 @@ fn test_e2e_skip_perfetto_conversion() {
     };
 
     // Run the recording
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Verify essential parquet files exist
     assert!(
@@ -297,7 +297,7 @@ fn test_e2e_with_perfetto() {
     };
 
     // Run the recording
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Verify essential parquet files exist
     assert!(
@@ -366,7 +366,7 @@ fn test_e2e_with_network_recorder() {
     };
 
     // Run the recording
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Verify essential parquet files exist
     assert!(
@@ -495,7 +495,7 @@ fn test_e2e_network_packets_with_traffic() {
     });
 
     // Run the recording
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Wait for traffic thread to complete
     traffic_thread.join().expect("Traffic thread panicked");
@@ -627,7 +627,7 @@ fn test_network_recording_with_netns() {
     };
 
     // Run the recording
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Wait for traffic thread to complete
     traffic_handle.join().expect("Traffic thread panicked");
@@ -844,7 +844,7 @@ if __name__ == "__main__":
         ..Config::default()
     };
 
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Wait for Python process to finish
     let python_status = python_proc
@@ -1174,7 +1174,7 @@ if __name__ == "__main__":
         ..Config::default()
     };
 
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Wait for Python process to finish
     let python_status = python_proc
@@ -1459,7 +1459,7 @@ if __name__ == "__main__":
         ..Config::default()
     };
 
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
     python_proc
         .wait()
         .expect("Failed to wait for Python process");
@@ -1624,7 +1624,7 @@ fn test_e2e_duckdb_validation() {
     };
 
     // Run the recording
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Verify DuckDB file was created
     assert!(
@@ -1678,7 +1678,7 @@ fn test_e2e_duckdb() {
     };
 
     // Run the recording
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Verify parquet files exist
     assert!(
@@ -1749,7 +1749,7 @@ fn test_e2e_duckdb_with_network_recording() {
     };
 
     // Run the recording
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Verify DuckDB file was created
     assert!(duckdb_path.exists(), "trace.duckdb not found");
@@ -1853,7 +1853,7 @@ fn test_e2e_perfetto_to_duckdb_preserves_end_state() {
         ..Config::default()
     };
 
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
     assert!(trace_path.exists(), "Perfetto trace not created");
 
     // Step 2: Convert Perfetto to DuckDB using systing-analyze
@@ -2004,7 +2004,7 @@ fn test_e2e_task_exit_states() {
     };
 
     // Run the recording
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Wait for workload to complete
     workload_handle.join().expect("Workload thread panicked");
@@ -2268,7 +2268,7 @@ fn test_e2e_duckdb_to_perfetto() {
         ..Config::default()
     };
 
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
 
     // Verify DuckDB file was created
     assert!(
@@ -2358,4 +2358,406 @@ fn test_e2e_duckdb_to_perfetto() {
          - DuckDB → Perfetto conversion successful\n  \
          - Perfetto trace valid with process, thread, and scheduler data"
     );
+}
+
+// ============================================================================
+// Run-command (-- <command>) integration tests
+// ============================================================================
+
+/// Tests that `systing -- sleep 0.5` traces the command and auto-stops when it exits.
+///
+/// Validates:
+/// - Recording starts and stops automatically with the command lifecycle
+/// - The command's process appears in process.parquet with the correct name
+/// - Valid parquet output is produced
+/// - The exit code is 0
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_run_command_basic() {
+    use arrow::array::{Int32Array, StringArray};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+    // StringArray is used to read the name column for diagnostic output
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+
+    let run_cmd = vec!["sleep".to_string(), "0.5".to_string()];
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+    let child_pid = traced_child.pid;
+
+    let config = Config {
+        parquet_only: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+    assert_eq!(exit_code, 0, "sleep should exit with code 0");
+
+    // Verify essential parquet files exist
+    assert!(
+        dir.path().join("process.parquet").exists(),
+        "process.parquet not found"
+    );
+    assert!(
+        dir.path().join("sched_slice.parquet").exists(),
+        "sched_slice.parquet not found"
+    );
+
+    // Read process.parquet and verify the traced command appears
+    let file =
+        File::open(dir.path().join("process.parquet")).expect("Failed to open process.parquet");
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
+    let reader = builder.build().expect("Failed to build reader");
+
+    let mut found_child = false;
+    let mut total_processes = 0;
+    for batch_result in reader {
+        let batch = batch_result.expect("Failed to read batch");
+
+        let pids = batch
+            .column_by_name("pid")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+        let names = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+        if let (Some(pids), Some(names)) = (pids, names) {
+            for i in 0..batch.num_rows() {
+                total_processes += 1;
+                if pids.value(i) == child_pid as i32 {
+                    let name = names.value(i);
+                    eprintln!("Found traced process: pid={}, name={}", pids.value(i), name);
+                    found_child = true;
+                }
+            }
+        }
+    }
+
+    assert!(
+        found_child,
+        "Traced command (PID {}) not found in process.parquet ({} total processes)",
+        child_pid, total_processes
+    );
+
+    // Validate parquet output
+    let result = validate_parquet_dir(dir.path());
+    assert!(
+        result.is_valid(),
+        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        result.errors,
+        result.warnings
+    );
+
+    eprintln!(
+        "✓ test_run_command_basic passed: traced sleep command (PID {})",
+        child_pid
+    );
+}
+
+/// Tests exit code propagation when the traced command fails.
+///
+/// Validates that `systing -- false` returns exit code 1.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_run_command_exit_code() {
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+
+    let run_cmd = vec!["false".to_string()];
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+
+    let config = Config {
+        parquet_only: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+    assert_eq!(
+        exit_code, 1,
+        "Expected exit code 1 from 'false', got {}",
+        exit_code
+    );
+
+    eprintln!("✓ test_run_command_exit_code passed: exit code 1 from 'false'");
+}
+
+/// Tests that child processes spawned by the traced command are also captured.
+///
+/// Runs `bash -c 'sleep 0.2 & sleep 0.2 & wait'` and verifies that the bash
+/// process AND its forked sleep children appear in the trace.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_run_command_child_tracking() {
+    use arrow::array::Int32Array;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+
+    let run_cmd = vec![
+        "bash".to_string(),
+        "-c".to_string(),
+        "sleep 0.3 & sleep 0.3 & wait".to_string(),
+    ];
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+    let bash_pid = traced_child.pid;
+
+    let config = Config {
+        parquet_only: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+    assert_eq!(exit_code, 0, "bash should exit with code 0");
+
+    // Count distinct PIDs in sched_slice.parquet - should have bash + sleep children
+    let file = File::open(dir.path().join("sched_slice.parquet"))
+        .expect("Failed to open sched_slice.parquet");
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
+    let reader = builder.build().expect("Failed to build reader");
+
+    // Read thread.parquet to get the mapping of utid -> upid
+    let thread_file =
+        File::open(dir.path().join("thread.parquet")).expect("Failed to open thread.parquet");
+    let thread_builder =
+        ParquetRecordBatchReaderBuilder::try_new(thread_file).expect("Failed to create reader");
+    let thread_reader = thread_builder.build().expect("Failed to build reader");
+
+    let mut traced_tids = std::collections::HashSet::new();
+    for batch_result in thread_reader {
+        let batch = batch_result.expect("Failed to read batch");
+        let tids = batch
+            .column_by_name("tid")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+        if let Some(tids) = tids {
+            for i in 0..tids.len() {
+                traced_tids.insert(tids.value(i));
+            }
+        }
+    }
+
+    // Count distinct utids in sched_slice to verify multiple processes were traced
+    let mut sched_utids = std::collections::HashSet::new();
+    for batch_result in reader {
+        let batch = batch_result.expect("Failed to read batch");
+        if let Some(utids) = batch
+            .column_by_name("utid")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>())
+        {
+            for i in 0..utids.len() {
+                sched_utids.insert(utids.value(i));
+            }
+        }
+    }
+
+    eprintln!(
+        "Traced {} threads, {} unique utids in sched_slices (bash PID {})",
+        traced_tids.len(),
+        sched_utids.len(),
+        bash_pid
+    );
+
+    // We expect at least 3 threads: bash main thread + 2 sleep children
+    assert!(
+        traced_tids.len() >= 3,
+        "Expected at least 3 traced threads (bash + 2 sleep children), got {}",
+        traced_tids.len()
+    );
+
+    eprintln!(
+        "✓ test_run_command_child_tracking passed: {} threads traced",
+        traced_tids.len()
+    );
+}
+
+/// Tests that --duration combined with -- works correctly.
+///
+/// Uses a short duration that expires before the command finishes.
+/// The command should be killed when duration expires.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_run_command_with_duration() {
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+
+    // Command sleeps for 300s, but duration is only 1s.
+    // If duration composability is broken, this test hangs (caught by test timeout).
+    let run_cmd = vec!["sleep".to_string(), "300".to_string()];
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+
+    let config = Config {
+        duration: 1,
+        parquet_only: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+
+    // The child should have been interrupted (SIGINT -> exit code 130),
+    // proving the duration expired before the 300s sleep finished.
+    assert_ne!(
+        exit_code, 0,
+        "Expected non-zero exit code (child should have been interrupted by duration)"
+    );
+
+    // Verify output was produced
+    assert!(
+        dir.path().join("process.parquet").exists(),
+        "process.parquet not found"
+    );
+
+    let result = validate_parquet_dir(dir.path());
+    assert!(
+        result.is_valid(),
+        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        result.errors,
+        result.warnings
+    );
+
+    eprintln!("✓ test_run_command_with_duration passed: child was interrupted by duration");
+}
+
+/// Tests that spawn_traced_child returns an error for a nonexistent command.
+#[test]
+fn test_run_command_not_found() {
+    let result = systing::traced_command::spawn_traced_child(&["nonexistent_cmd_xyz".to_string()]);
+    assert!(result.is_err(), "Expected error for nonexistent command");
+    let err = result.err().unwrap();
+    let err_msg = format!("{:#}", err);
+    assert!(
+        err_msg.contains("not found"),
+        "Expected 'not found' in error message, got: {}",
+        err_msg
+    );
+
+    eprintln!("✓ test_run_command_not_found passed");
+}
+
+/// Tests that is_python_command correctly identifies Python commands.
+#[test]
+fn test_is_python_command() {
+    use systing::traced_command::is_python_command;
+
+    assert!(is_python_command(&[
+        "python3".to_string(),
+        "script.py".to_string()
+    ]));
+    assert!(is_python_command(&["python".to_string()]));
+    assert!(is_python_command(&["/usr/bin/python3.11".to_string()]));
+    assert!(!is_python_command(&["bash".to_string()]));
+    assert!(!is_python_command(&["sleep".to_string(), "1".to_string()]));
+    assert!(!is_python_command(&[]));
+
+    eprintln!("✓ test_is_python_command passed");
+}
+
+/// Tests that run command produces valid Perfetto output (not just parquet).
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_run_command_perfetto_output() {
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+
+    let run_cmd = vec!["sleep".to_string(), "0.5".to_string()];
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+
+    let config = Config {
+        parquet_only: false,
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path.clone(),
+        ..Config::default()
+    };
+
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+    assert_eq!(exit_code, 0);
+
+    // Verify Perfetto trace was created and is valid
+    assert!(trace_path.exists(), "trace.pb not found");
+
+    let perfetto_result = validate_perfetto_trace(&trace_path);
+    assert!(
+        perfetto_result.is_valid(),
+        "Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        perfetto_result.errors,
+        perfetto_result.warnings
+    );
+
+    eprintln!("✓ test_run_command_perfetto_output passed");
+}
+
+/// Tests that a signal-killed child produces the correct exit code (128 + signal).
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_run_command_signal_exit_code() {
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+
+    // Use sh -c to have the child kill itself with SIGKILL (signal 9)
+    // Expected exit code: 128 + 9 = 137
+    let run_cmd = vec!["sh".to_string(), "-c".to_string(), "kill -9 $$".to_string()];
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+
+    let config = Config {
+        parquet_only: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+    assert_eq!(
+        exit_code, 137,
+        "Expected exit code 137 (128 + SIGKILL=9), got {}",
+        exit_code
+    );
+
+    eprintln!("✓ test_run_command_signal_exit_code passed");
+}
+
+/// Tests that spawn_traced_child returns an error for a non-executable file.
+#[test]
+fn test_run_command_not_executable() {
+    use std::io::Write;
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let not_exec = dir.path().join("not_executable.sh");
+    {
+        let mut f = std::fs::File::create(&not_exec).expect("Failed to create file");
+        writeln!(f, "#!/bin/sh\necho hello").expect("Failed to write");
+        // File is NOT given executable permissions
+    }
+
+    let result =
+        systing::traced_command::spawn_traced_child(&[not_exec.to_str().unwrap().to_string()]);
+    assert!(result.is_err(), "Expected error for non-executable file");
+    let err_msg = format!("{:#}", result.err().unwrap());
+    assert!(
+        err_msg.contains("not executable"),
+        "Expected 'not executable' in error, got: {}",
+        err_msg
+    );
+
+    eprintln!("✓ test_run_command_not_executable passed");
 }

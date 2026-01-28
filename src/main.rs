@@ -12,6 +12,7 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::time::SystemTime;
 use tracing_subscriber::FmtSubscriber;
 
+use systing::traced_command;
 use systing::{get_available_recorders, systing, Config};
 
 /// Memory lock limit used for capability probing (128 MiB).
@@ -97,6 +98,12 @@ struct Command {
     /// Skip trace generation, keep only parquet files
     #[arg(long)]
     parquet_only: bool,
+
+    /// Command to run and trace. Everything after -- is treated as the command.
+    /// Only the command and its children/threads will be traced.
+    /// Example: systing -- python3 myscript.py
+    #[arg(last = true)]
+    run_command: Vec<String>,
 }
 
 impl From<Command> for Config {
@@ -132,6 +139,11 @@ impl From<Command> for Config {
             output_dir: cmd.output_dir,
             output: cmd.output,
             parquet_only: cmd.parquet_only,
+            run_command: if cmd.run_command.is_empty() {
+                None
+            } else {
+                Some(cmd.run_command)
+            },
         }
     }
 }
@@ -289,6 +301,21 @@ fn main() -> Result<()> {
 
     process_recorder_options(&mut opts)?;
 
+    // Validate incompatible options
+    if !opts.run_command.is_empty() && opts.continuous > 0 {
+        anyhow::bail!("--continuous cannot be used with a run command (-- <command>)");
+    }
+
+    // Auto-enable pystacks for Python commands
+    #[cfg(feature = "pystacks")]
+    if !opts.run_command.is_empty()
+        && !opts.collect_pystacks
+        && traced_command::is_python_command(&opts.run_command)
+    {
+        eprintln!("Detected Python command, auto-enabling --collect-pystacks");
+        opts.collect_pystacks = true;
+    }
+
     // Set up tracing subscriber with level based on verbosity
     let level = match opts.verbosity {
         0 => LevelFilter::WARN,
@@ -305,5 +332,18 @@ fn main() -> Result<()> {
     set_global_subscriber(subscriber).expect("Failed to set tracing subscriber");
 
     let config = Config::from(opts);
-    systing(config)
+
+    // Fork the traced child BEFORE systing() to ensure single-threaded context.
+    // The child blocks on a pipe until BPF is ready, then exec's the command.
+    let traced_child = if let Some(ref cmd) = config.run_command {
+        Some(traced_command::spawn_traced_child(cmd)?)
+    } else {
+        None
+    };
+
+    let exit_code = systing(config, traced_child)?;
+    if exit_code != 0 {
+        process::exit(exit_code);
+    }
+    Ok(())
 }

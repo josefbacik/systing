@@ -63,7 +63,7 @@ fn record_trace() -> (TempDir, std::path::PathBuf) {
         }
     });
 
-    systing(config).expect("systing recording failed");
+    systing(config, None).expect("systing recording failed");
     traffic_thread.join().expect("Traffic thread panicked");
 
     assert!(

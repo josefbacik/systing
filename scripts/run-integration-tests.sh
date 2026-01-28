@@ -68,5 +68,7 @@ fi
 echo "Found test binary: $TEST_BINARY"
 echo "Running: sudo -E $TEST_BINARY --ignored $*"
 
+# Run tests serially: systing attaches system-wide BPF tracepoints, so only
+# one instance can run at a time without ring buffer contention and event drops.
 # Use sudo -E to preserve environment (DEBUGINFOD_URLS, PATH, etc.)
-sudo -E "$TEST_BINARY" --ignored "$@"
+sudo -E "$TEST_BINARY" --ignored --test-threads=1 "$@"
