@@ -1901,3 +1901,142 @@ fn test_run_command_suite() {
 
     eprintln!("\n  All run command checks passed");
 }
+
+// =============================================================================
+// Pystacks + run-and-trace mode (regression test for Arc::get_mut failure)
+// =============================================================================
+
+#[test]
+#[ignore] // Requires root/BPF privileges and pystacks feature
+#[cfg(feature = "pystacks")]
+fn test_pystacks_run_and_trace() {
+    use arrow::array::ListArray;
+    use arrow::array::StringArray;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+    use std::io::Write;
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+
+    let python_script = dir.path().join("test_pystacks_run_trace.py");
+    let script_content = r#"
+import time
+
+def systing_run_trace_function():
+    """Function that does busy work to show up in profiling."""
+    total = 0
+    for i in range(1000000):
+        total += i * i
+    return total
+
+def main():
+    start_time = time.time()
+    while time.time() - start_time < 5:
+        systing_run_trace_function()
+
+if __name__ == "__main__":
+    main()
+"#;
+
+    {
+        let mut file = File::create(&python_script).expect("Failed to create Python script");
+        file.write_all(script_content.as_bytes())
+            .expect("Failed to write Python script");
+    }
+
+    let python_bin = pyenv_python(PYTHON_313_VERSION);
+    let run_cmd = vec![
+        python_bin.to_str().unwrap().to_string(),
+        python_script.to_str().unwrap().to_string(),
+    ];
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+
+    let config = Config {
+        parquet_only: false,
+        collect_pystacks: true,
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path.clone(),
+        ..Config::default()
+    };
+
+    // This previously failed with "Unable to initialize pystacks - Arc is already shared"
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+    assert_eq!(
+        exit_code, 0,
+        "[pystacks run-trace] Python script should exit with code 0"
+    );
+
+    // Verify Python symbols appear in stack.parquet
+    let stack_parquet = dir.path().join("stack.parquet");
+    assert!(
+        stack_parquet.exists(),
+        "[pystacks run-trace] stack.parquet not found"
+    );
+
+    let file = File::open(&stack_parquet).expect("Failed to open stack.parquet");
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
+    let reader = builder.build().expect("Failed to build reader");
+
+    let mut found_python_symbols = false;
+    let mut found_test_function = false;
+
+    for batch_result in reader {
+        let batch = batch_result.expect("Failed to read batch");
+
+        if let Some(frame_names_col) = batch.column_by_name("frame_names") {
+            let list_array = frame_names_col
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("frame_names should be a ListArray");
+
+            for i in 0..list_array.len() {
+                if list_array.is_null(i) {
+                    continue;
+                }
+
+                let inner = list_array.value(i);
+                let string_array = inner
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("frame_names inner should be StringArray");
+
+                for j in 0..string_array.len() {
+                    if string_array.is_null(j) {
+                        continue;
+                    }
+                    let func_name = string_array.value(j);
+                    if func_name.contains("(python)") {
+                        found_python_symbols = true;
+                    }
+                    if func_name.contains("systing_run_trace_function") {
+                        found_test_function = true;
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        found_python_symbols,
+        "[pystacks run-trace] No Python symbols found in stack.parquet"
+    );
+
+    assert!(
+        found_test_function,
+        "[pystacks run-trace] Expected function 'systing_run_trace_function' not found"
+    );
+
+    let parquet_result = validate_parquet_dir(dir.path());
+    assert!(
+        parquet_result.is_valid(),
+        "[pystacks run-trace] Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        parquet_result.errors,
+        parquet_result.warnings
+    );
+
+    eprintln!("  Pystacks run-and-trace mode passed");
+}

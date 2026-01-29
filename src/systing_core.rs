@@ -2389,18 +2389,6 @@ pub fn systing(
         // Create channel for Python symbol loading
         let (pystack_symbol_tx, pystack_symbol_rx) = channel();
 
-        // Spawn dedicated Python symbol loading thread
-        // Clone the Arc<StackWalkerRun> directly to avoid locking the entire StackRecorder
-        let psr = recorder.stack_recorder.lock().unwrap().psr.clone();
-        let symbol_thread = thread::Builder::new()
-            .name("pystack_symbol_loader".to_string())
-            .spawn(move || {
-                while let Ok(event) = pystack_symbol_rx.recv() {
-                    psr.load_pystack_symbols(&event);
-                }
-                0
-            })?;
-
         // Spawn all recorder threads
         let recv_threads = spawn_recorder_threads(
             &recorder,
@@ -2459,6 +2447,20 @@ pub fn systing(
                 pystacks_debug,
             );
         }
+
+        // Spawn the symbol loader thread AFTER pystacks initialization (both normal
+        // and deferred paths) because init_pystacks requires Arc::get_mut (exclusive
+        // access), which fails if the Arc has been cloned. Events queue in the
+        // unbounded mpsc channel until this thread starts draining them.
+        let psr = recorder.stack_recorder.lock().unwrap().psr.clone();
+        let symbol_thread = thread::Builder::new()
+            .name("pystack_symbol_loader".to_string())
+            .spawn(move || {
+                while let Ok(event) = pystack_symbol_rx.recv() {
+                    psr.load_pystack_symbols(&event);
+                }
+                0
+            })?;
 
         let mut ringbuf_threads = Vec::new();
         let ringbuf_shutdown = Arc::new(ShutdownSignal::new()?);

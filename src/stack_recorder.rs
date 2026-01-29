@@ -419,13 +419,11 @@ impl StackRecorder {
     }
 
     pub fn init_pystacks(&mut self, pids: &[u32], bpf_object: &libbpf_rs::Object, debug: bool) {
-        if let Some(psr) = Arc::get_mut(&mut self.psr) {
-            psr.init_pystacks(pids, bpf_object, debug);
-        } else {
-            // If we can't get exclusive access, it means the Arc is already shared
-            // This shouldn't happen during initialization, but we handle it gracefully
-            eprintln!("Warning: Unable to initialize pystacks - Arc is already shared");
-        }
+        let psr = Arc::get_mut(&mut self.psr).expect(
+            "Unable to initialize pystacks: Arc is already shared. \
+             The symbol loader thread must not be spawned before init_pystacks.",
+        );
+        psr.init_pystacks(pids, bpf_object, debug);
     }
 
     /// Symbolizes all stacks (user, kernel, and Python) and returns the resolved information
