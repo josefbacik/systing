@@ -3,9 +3,12 @@
 //! These tests run the full systing recording pipeline and validate the output.
 //! They require root/BPF privileges and are marked as `#[ignore]` by default.
 //!
+//! Tests are consolidated so that each systing recording is reused by multiple
+//! checks, minimizing BPF setup/teardown overhead.
+//!
 //! To run these tests:
 //! ```
-//! sudo cargo test --test trace_validation -- --ignored
+//! ./scripts/run-integration-tests.sh trace_validation
 //! ```
 
 mod common;
@@ -37,6 +40,15 @@ const NETNS_BPF_INIT_WAIT_SECS: u64 = 7;
 /// Total recording duration for netns tests (seconds). Must be longer than
 /// NETNS_BPF_INIT_WAIT_SECS plus time for traffic generation.
 const NETNS_RECORDING_DURATION_SECS: u64 = 10;
+
+/// Recording duration for the basic validation suite (seconds).
+/// Set to 2s (instead of 1s) to give the exit workload time to generate
+/// EXIT_DEAD/EXIT_ZOMBIE states during the trace.
+const VALIDATION_SUITE_DURATION_SECS: u64 = 2;
+
+/// Recording duration for the network suite (seconds).
+/// Set to 3s to allow time for traffic generation after BPF init (~500ms).
+const NETWORK_SUITE_DURATION_SECS: u64 = 3;
 
 /// Helper to set up the environment for BPF tests.
 fn setup_bpf_environment() {
@@ -74,134 +86,18 @@ fn pyenv_python(version: &str) -> PathBuf {
     path
 }
 
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_e2e_parquet_validation() {
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-
-    // Create config for a 1-second trace with Parquet output only
-    let config = Config {
-        duration: 1,
-        parquet_only: true,
-        output_dir: dir.path().to_path_buf(),
-        output: dir.path().join("trace.pb"),
-        ..Config::default()
-    };
-
-    // Run the recording
-    systing(config, None).expect("systing recording failed");
-
-    // Verify essential files exist
-    assert!(
-        dir.path().join("process.parquet").exists(),
-        "process.parquet not found"
-    );
-    assert!(
-        dir.path().join("thread.parquet").exists(),
-        "thread.parquet not found"
-    );
-    assert!(
-        dir.path().join("sched_slice.parquet").exists(),
-        "sched_slice.parquet not found"
-    );
-
-    // Validate the Parquet output using the library
-    let result = validate_parquet_dir(dir.path());
-    assert!(
-        result.is_valid(),
-        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        result.errors,
-        result.warnings
-    );
-}
-
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_e2e_perfetto_validation() {
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-    let trace_path = dir.path().join("trace.pb");
-
-    // Create config for a 1-second trace with Perfetto output
-    let config = Config {
-        duration: 1,
-        output_dir: dir.path().to_path_buf(),
-        output: trace_path.clone(),
-        ..Config::default()
-    };
-
-    // Run the recording
-    systing(config, None).expect("systing recording failed");
-
-    // Verify trace file exists
-    assert!(trace_path.exists(), "trace.pb not found");
-
-    // Validate the Perfetto output using the library
-    let result = validate_perfetto_trace(&trace_path);
-    assert!(
-        result.is_valid(),
-        "Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        result.errors,
-        result.warnings
-    );
-}
-
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_e2e_both_validations() {
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-    let trace_path = dir.path().join("trace.pb");
-
-    // Create config for a 1-second trace
-    let config = Config {
-        duration: 1,
-        output_dir: dir.path().to_path_buf(),
-        output: trace_path.clone(),
-        ..Config::default()
-    };
-
-    // Run the recording
-    systing(config, None).expect("systing recording failed");
-
-    // Validate Parquet
-    let parquet_result = validate_parquet_dir(dir.path());
-    assert!(
-        parquet_result.is_valid(),
-        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        parquet_result.errors,
-        parquet_result.warnings
-    );
-
-    // Validate Perfetto
-    let perfetto_result = validate_perfetto_trace(&trace_path);
-    assert!(
-        perfetto_result.is_valid(),
-        "Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        perfetto_result.errors,
-        perfetto_result.warnings
-    );
-}
+// =============================================================================
+// Non-privileged tests (no systing recording needed)
+// =============================================================================
 
 #[test]
 fn test_validate_nonexistent_path() {
-    // This test doesn't require privileges - validates the library handles nonexistent paths
     let result = validate_parquet_dir(Path::new("/nonexistent/path"));
-
-    // The validation should either return errors or handle gracefully
-    // Since parquet_dir validation creates a ParquetPaths which just stores the path,
-    // the actual errors would show up during validation checks
-    // For now, we just verify it doesn't panic
     let _ = result;
 }
 
 #[test]
 fn test_validate_unrecognized_file() {
-    // This test doesn't require privileges - validates error handling for wrong file type
     use std::io::Write;
 
     let dir = TempDir::new().expect("Failed to create temp dir");
@@ -212,247 +108,544 @@ fn test_validate_unrecognized_file() {
         .write_all(b"not a trace file")
         .unwrap();
 
-    // Validate as Perfetto trace - should not panic, may return errors
     let result = validate_perfetto_trace(&bad_file);
-
-    // The validation should fail for an invalid file
     assert!(
         result.has_errors(),
         "Expected validation errors for invalid file, got: {result:?}"
     );
 }
 
-/// Tests --parquet-only mode (skips Perfetto conversion).
-///
-/// This tests recording with the --parquet-only flag, which outputs parquet files
-/// directly without converting to Perfetto format.
 #[test]
-#[ignore] // Requires root/BPF privileges
-fn test_e2e_skip_perfetto_conversion() {
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-
-    // Create config for streaming parquet with no perfetto conversion
-    let config = Config {
-        duration: 1,
-        parquet_only: true,
-        output_dir: dir.path().to_path_buf(),
-        output: dir.path().join("trace.pb"),
-        ..Config::default()
-    };
-
-    // Run the recording
-    systing(config, None).expect("systing recording failed");
-
-    // Verify essential parquet files exist
+fn test_validate_duckdb_nonexistent() {
+    let result = validate_duckdb(Path::new("/nonexistent/path/trace.duckdb"));
     assert!(
-        dir.path().join("process.parquet").exists(),
-        "process.parquet not found"
+        result.has_errors(),
+        "Expected error for nonexistent DuckDB file"
     );
+    let error_str = format!("{:?}", result.errors);
     assert!(
-        dir.path().join("thread.parquet").exists(),
-        "thread.parquet not found"
-    );
-    assert!(
-        dir.path().join("sched_slice.parquet").exists(),
-        "sched_slice.parquet not found"
-    );
-
-    // Verify perfetto trace was NOT created (parquet_only mode)
-    assert!(
-        !dir.path().join("trace.pb").exists(),
-        "trace.pb should not exist in parquet_only mode"
-    );
-
-    // Validate the Parquet output
-    let result = validate_parquet_dir(dir.path());
-    assert!(
-        result.is_valid(),
-        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        result.errors,
-        result.warnings
+        error_str.contains("database") || error_str.contains("open"),
+        "Error should mention database opening: {error_str}"
     );
 }
 
-/// Tests default mode with Perfetto conversion (streaming parquet + parquet-to-perfetto).
-///
-/// This tests the full workflow: streaming writes during recording,
-/// followed by conversion to Perfetto format for compatibility.
 #[test]
-#[ignore] // Requires root/BPF privileges
-fn test_e2e_with_perfetto() {
-    setup_bpf_environment();
-
+fn test_validate_duckdb_invalid() {
     let dir = TempDir::new().expect("Failed to create temp dir");
-    let trace_path = dir.path().join("trace.pb");
+    let bad_db = dir.path().join("bad.duckdb");
+    std::fs::write(&bad_db, b"not a duckdb file").expect("Failed to write file");
 
-    // Create config for streaming parquet with perfetto conversion
-    let config = Config {
-        duration: 1,
-        parquet_only: false, // Enable perfetto conversion
-        output_dir: dir.path().to_path_buf(),
-        output: trace_path.clone(),
-        ..Config::default()
-    };
-
-    // Run the recording
-    systing(config, None).expect("systing recording failed");
-
-    // Verify essential parquet files exist
+    let result = validate_duckdb(&bad_db);
     assert!(
-        dir.path().join("process.parquet").exists(),
-        "process.parquet not found"
-    );
-    assert!(
-        dir.path().join("thread.parquet").exists(),
-        "thread.parquet not found"
-    );
-    assert!(
-        dir.path().join("sched_slice.parquet").exists(),
-        "sched_slice.parquet not found"
-    );
-
-    // Verify perfetto trace was created
-    assert!(
-        trace_path.exists(),
-        "trace.pb not found after parquet-to-perfetto conversion"
-    );
-
-    // Validate the Parquet output
-    let parquet_result = validate_parquet_dir(dir.path());
-    assert!(
-        parquet_result.is_valid(),
-        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        parquet_result.errors,
-        parquet_result.warnings
-    );
-
-    // Validate the Perfetto output
-    let perfetto_result = validate_perfetto_trace(&trace_path);
-    assert!(
-        perfetto_result.is_valid(),
-        "Perfetto validation failed after parquet-to-perfetto conversion:\nErrors: {:?}\nWarnings: {:?}",
-        perfetto_result.errors,
-        perfetto_result.warnings
+        result.has_errors(),
+        "Expected error for invalid DuckDB file, got: {result:?}"
     );
 }
 
-/// Tests network recording mode.
-///
-/// This validates that network recording:
-/// 1. Creates network parquet files (network_socket.parquet, etc.)
-/// 2. Creates network_interface.parquet with interface metadata
-/// 3. Converts network data to Perfetto format with proper tracks
+#[test]
+fn test_run_command_not_found() {
+    let result = systing::traced_command::spawn_traced_child(&["nonexistent_cmd_xyz".to_string()]);
+    assert!(result.is_err(), "Expected error for nonexistent command");
+    let err = result.err().unwrap();
+    let err_msg = format!("{:#}", err);
+    assert!(
+        err_msg.contains("not found"),
+        "Expected 'not found' in error message, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_is_python_command() {
+    use systing::traced_command::is_python_command;
+
+    assert!(is_python_command(&[
+        "python3".to_string(),
+        "script.py".to_string()
+    ]));
+    assert!(is_python_command(&["python".to_string()]));
+    assert!(is_python_command(&["/usr/bin/python3.11".to_string()]));
+    assert!(!is_python_command(&["bash".to_string()]));
+    assert!(!is_python_command(&["sleep".to_string(), "1".to_string()]));
+    assert!(!is_python_command(&[]));
+}
+
+#[test]
+fn test_run_command_not_executable() {
+    use std::io::Write;
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let not_exec = dir.path().join("not_executable.sh");
+    {
+        let mut f = std::fs::File::create(&not_exec).expect("Failed to create file");
+        writeln!(f, "#!/bin/sh\necho hello").expect("Failed to write");
+    }
+
+    let result =
+        systing::traced_command::spawn_traced_child(&[not_exec.to_str().unwrap().to_string()]);
+    assert!(result.is_err(), "Expected error for non-executable file");
+    let err_msg = format!("{:#}", result.err().unwrap());
+    assert!(
+        err_msg.contains("not executable"),
+        "Expected 'not executable' in error, got: {}",
+        err_msg
+    );
+}
+
+// =============================================================================
+// Consolidated validation suite
+//
+// Records ONE trace (2s, parquet+perfetto, with exit workload) and runs all
+// basic validation checks against it. This replaces 9 separate tests that
+// each recorded their own trace.
+// =============================================================================
+
 #[test]
 #[ignore] // Requires root/BPF privileges
-fn test_e2e_with_network_recorder() {
-    use std::fs::File;
-    use std::io::Read;
-
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-    let trace_path = dir.path().join("trace.pb");
-
-    // Create config for streaming parquet with network recording enabled
-    let config = Config {
-        duration: 2,         // 2 seconds to capture some network activity
-        parquet_only: false, // Enable perfetto conversion
-        network: true,       // Enable network recording
-        output_dir: dir.path().to_path_buf(),
-        output: trace_path.clone(),
-        ..Config::default()
-    };
-
-    // Run the recording
-    systing(config, None).expect("systing recording failed");
-
-    // Verify essential parquet files exist
-    assert!(
-        dir.path().join("process.parquet").exists(),
-        "process.parquet not found"
-    );
-    assert!(
-        dir.path().join("thread.parquet").exists(),
-        "thread.parquet not found"
-    );
-
-    // Verify network interface metadata parquet file exists
-    assert!(
-        dir.path().join("network_interface.parquet").exists(),
-        "network_interface.parquet not found - network interface metadata not written"
-    );
-
-    // Verify perfetto trace was created
-    assert!(
-        trace_path.exists(),
-        "trace.pb not found after parquet-to-perfetto conversion"
-    );
-
-    // Read and parse the Perfetto trace to verify network tracks exist
-    let mut trace_data = Vec::new();
-    File::open(&trace_path)
-        .expect("Failed to open trace.pb")
-        .read_to_end(&mut trace_data)
-        .expect("Failed to read trace.pb");
-
-    // Parse the trace and look for network-related tracks
+fn test_e2e_validation_suite() {
+    use arrow::array::Int32Array;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use perfetto_protos::trace::Trace;
     use protobuf::Message;
+    use std::fs::File;
+    use std::io::Read as IoRead;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
+    use systing::validation::ValidationWarning;
 
-    let trace = Trace::parse_from_bytes(&trace_data).expect("Failed to parse Perfetto trace");
+    const EXIT_DEAD: i32 = 16;
+    const EXIT_ZOMBIE: i32 = 32;
 
-    // Collect all track descriptors
-    let track_names: Vec<String> = trace
-        .packet
-        .iter()
-        .filter(|p| p.has_track_descriptor())
-        .map(|p| p.track_descriptor().name().to_string())
-        .collect();
+    setup_bpf_environment();
 
-    // Verify "Network Interfaces" root track exists
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+
+    // Spawn exit workload to generate EXIT_DEAD/EXIT_ZOMBIE states
+    let workload_handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(100));
+        for _ in 0..2 {
+            let mut child = Command::new("bash")
+                .arg("-c")
+                .arg("for i in $(seq 1 5); do sleep 0.01 & done; wait")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("Failed to spawn workload");
+            child.wait().expect("Failed to wait for workload");
+        }
+    });
+
+    // Record a trace with both parquet and perfetto output
+    eprintln!(
+        "Recording trace ({}s, with exit workload)...",
+        VALIDATION_SUITE_DURATION_SECS
+    );
+    let config = Config {
+        duration: VALIDATION_SUITE_DURATION_SECS,
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path.clone(),
+        ..Config::default()
+    };
+
+    systing(config, None).expect("systing recording failed");
+    workload_handle.join().expect("Workload thread panicked");
+    eprintln!("Recording complete.\n");
+
+    // --- Check: parquet files exist (test_e2e_parquet_validation, test_e2e_with_perfetto) ---
+    eprintln!("  parquet files exist...");
     assert!(
-        track_names.iter().any(|n| n == "Network Interfaces"),
-        "Missing 'Network Interfaces' root track in Perfetto trace. Found tracks: {track_names:?}"
+        dir.path().join("process.parquet").exists(),
+        "[parquet files] process.parquet not found"
+    );
+    assert!(
+        dir.path().join("thread.parquet").exists(),
+        "[parquet files] thread.parquet not found"
+    );
+    assert!(
+        dir.path().join("sched_slice.parquet").exists(),
+        "[parquet files] sched_slice.parquet not found"
     );
 
-    // Verify at least one namespace track exists (e.g., "host")
+    // --- Check: perfetto file exists (test_e2e_perfetto_validation, test_e2e_with_perfetto) ---
+    eprintln!("  perfetto file exists...");
     assert!(
-        track_names
-            .iter()
-            .any(|n| n == "host" || n.starts_with("netns:") || n.starts_with("container:")),
-        "Missing network namespace track in Perfetto trace. Found tracks: {track_names:?}"
+        trace_path.exists(),
+        "[perfetto file] trace.pb not found after parquet-to-perfetto conversion"
     );
 
-    // Validate the Parquet output
+    // --- Check: parquet validation (test_e2e_parquet_validation) ---
+    eprintln!("  parquet validation...");
     let parquet_result = validate_parquet_dir(dir.path());
     assert!(
         parquet_result.is_valid(),
-        "Parquet validation failed with network recording:\nErrors: {:?}\nWarnings: {:?}",
+        "[parquet validation] failed:\nErrors: {:?}\nWarnings: {:?}",
         parquet_result.errors,
         parquet_result.warnings
     );
 
-    // Validate the Perfetto output
+    // --- Check: standalone parquet_to_perfetto::convert() (test_e2e_duckdb) ---
+    // Tests the standalone conversion function directly, separate from the integrated recording path.
+    eprintln!("  parquet -> perfetto (standalone convert)...");
+    let manual_perfetto_path = dir.path().join("manual_convert.pb");
+    systing::parquet_to_perfetto::convert(dir.path(), &manual_perfetto_path)
+        .expect("Standalone parquet_to_perfetto::convert() failed");
+    assert!(
+        manual_perfetto_path.exists(),
+        "[parquet->perfetto convert] manual_convert.pb not created by standalone convert()"
+    );
+    let manual_perfetto_result = validate_perfetto_trace(&manual_perfetto_path);
+    assert!(
+        manual_perfetto_result.is_valid(),
+        "[parquet->perfetto convert] validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        manual_perfetto_result.errors,
+        manual_perfetto_result.warnings
+    );
+
+    // --- Check: perfetto validation (test_e2e_perfetto_validation) ---
+    eprintln!("  perfetto validation...");
     let perfetto_result = validate_perfetto_trace(&trace_path);
     assert!(
         perfetto_result.is_valid(),
-        "Perfetto validation failed with network recording:\nErrors: {:?}\nWarnings: {:?}",
+        "[perfetto validation] failed:\nErrors: {:?}\nWarnings: {:?}",
         perfetto_result.errors,
         perfetto_result.warnings
     );
+
+    // --- Check: exit states in parquet (test_e2e_task_exit_states) ---
+    eprintln!("  exit states (parquet)...");
+    {
+        let sched_slice_path = dir.path().join("sched_slice.parquet");
+        assert!(
+            sched_slice_path.exists(),
+            "[exit states parquet] sched_slice.parquet not found"
+        );
+
+        let file = File::open(&sched_slice_path).expect("Failed to open sched_slice.parquet");
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
+        let reader = builder.build().expect("Failed to build reader");
+
+        let mut total_slices = 0;
+        let mut exit_dead_count = 0;
+        let mut exit_zombie_count = 0;
+
+        for batch_result in reader {
+            let batch = batch_result.expect("Failed to read batch");
+            total_slices += batch.num_rows();
+
+            if let Some(end_state_col) = batch.column_by_name("end_state") {
+                let end_state_array = end_state_col
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("end_state should be Int32");
+
+                for i in 0..end_state_array.len() {
+                    if !end_state_array.is_null(i) {
+                        match end_state_array.value(i) {
+                            EXIT_DEAD => exit_dead_count += 1,
+                            EXIT_ZOMBIE => exit_zombie_count += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        let total_exits = exit_dead_count + exit_zombie_count;
+        assert!(
+            total_exits > 0,
+            "[exit states parquet] No exit states (EXIT_DEAD or EXIT_ZOMBIE) found in sched_slice.parquet ({total_slices} total slices)"
+        );
+        eprintln!(
+            "    found {} exit states ({} EXIT_DEAD, {} EXIT_ZOMBIE)",
+            total_exits, exit_dead_count, exit_zombie_count
+        );
+    }
+
+    // --- Check: process_exit.parquet exists and has entries ---
+    eprintln!("  process exit events...");
+    {
+        let process_exit_path = dir.path().join("process_exit.parquet");
+        assert!(
+            process_exit_path.exists(),
+            "[process exit] process_exit.parquet not found"
+        );
+
+        let file = File::open(&process_exit_path).expect("Failed to open process_exit.parquet");
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
+        let reader = builder.build().expect("Failed to build reader");
+
+        let mut process_exit_count = 0;
+        for batch_result in reader {
+            let batch = batch_result.expect("Failed to read batch");
+            process_exit_count += batch.num_rows();
+        }
+
+        assert!(
+            process_exit_count > 0,
+            "[process exit] No entries in process_exit.parquet"
+        );
+        eprintln!("    found {} process exit events", process_exit_count);
+    }
+
+    // --- Check: exit states in perfetto (test_e2e_task_exit_states) ---
+    eprintln!("  exit states (perfetto)...");
+    {
+        let mut trace_data = Vec::new();
+        File::open(&trace_path)
+            .expect("Failed to open trace.pb")
+            .read_to_end(&mut trace_data)
+            .expect("Failed to read trace.pb");
+
+        let trace = Trace::parse_from_bytes(&trace_data).expect("Failed to parse Perfetto trace");
+
+        let mut perfetto_exit_dead = 0;
+        let mut perfetto_exit_zombie = 0;
+
+        for packet in trace.packet.iter() {
+            if packet.has_ftrace_events() {
+                let ftrace_events = packet.ftrace_events();
+                if let Some(compact_sched) = ftrace_events.compact_sched.as_ref() {
+                    for &prev_state in compact_sched.switch_prev_state.iter() {
+                        match prev_state as i32 {
+                            EXIT_DEAD => perfetto_exit_dead += 1,
+                            EXIT_ZOMBIE => perfetto_exit_zombie += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        let perfetto_total_exits = perfetto_exit_dead + perfetto_exit_zombie;
+        assert!(
+            perfetto_total_exits > 0,
+            "[exit states perfetto] No exit states found in Perfetto compact_sched events"
+        );
+        eprintln!(
+            "    found {} exit states ({} EXIT_DEAD, {} EXIT_ZOMBIE)",
+            perfetto_total_exits, perfetto_exit_dead, perfetto_exit_zombie
+        );
+    }
+
+    // --- Check: DuckDB validation via parquet->duckdb (test_e2e_duckdb_validation, test_e2e_duckdb) ---
+    eprintln!("  duckdb from parquet...");
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "test_trace")
+        .expect("DuckDB conversion failed");
+    assert!(
+        duckdb_path.exists(),
+        "[duckdb from parquet] trace.duckdb not found"
+    );
+
+    let metadata = std::fs::metadata(&duckdb_path).expect("Failed to get file metadata");
+    assert!(
+        metadata.len() > 1024,
+        "[duckdb from parquet] DuckDB file is too small ({} bytes)",
+        metadata.len()
+    );
+
+    let duckdb_result = validate_duckdb(&duckdb_path);
+    assert!(
+        duckdb_result.is_valid(),
+        "[duckdb from parquet] validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        duckdb_result.errors,
+        duckdb_result.warnings
+    );
+
+    // --- Check: exit states in duckdb (test_e2e_task_exit_states) ---
+    eprintln!("  exit states (duckdb)...");
+    {
+        let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+        let (duckdb_exit_dead, duckdb_exit_zombie): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    COUNT(*) FILTER (WHERE end_state = 16),
+                    COUNT(*) FILTER (WHERE end_state = 32)
+                 FROM sched_slice",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("Failed to query sched_slice");
+
+        let duckdb_total_exits = duckdb_exit_dead + duckdb_exit_zombie;
+        assert!(
+            duckdb_total_exits > 0,
+            "[exit states duckdb] No exit states found in DuckDB sched_slice table"
+        );
+        eprintln!(
+            "    found {} exit states ({} EXIT_DEAD, {} EXIT_ZOMBIE)",
+            duckdb_total_exits, duckdb_exit_dead, duckdb_exit_zombie
+        );
+    }
+
+    // --- Check: perfetto->duckdb preserves end_state (test_e2e_perfetto_to_duckdb_preserves_end_state) ---
+    eprintln!("  perfetto -> duckdb end_state...");
+    {
+        let duckdb_from_perfetto = dir.path().join("from_perfetto.duckdb");
+        let output = Command::new(env!("CARGO_BIN_EXE_systing-util"))
+            .args([
+                "convert",
+                "-o",
+                duckdb_from_perfetto.to_str().unwrap(),
+                trace_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("Failed to run systing-util convert");
+
+        assert!(
+            output.status.success(),
+            "[perfetto->duckdb] systing-util convert failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            duckdb_from_perfetto.exists(),
+            "[perfetto->duckdb] DuckDB not created from perfetto"
+        );
+
+        let result = validate_duckdb(&duckdb_from_perfetto);
+        assert!(
+            result.is_valid(),
+            "[perfetto->duckdb] validation failed: {:?}",
+            result.errors
+        );
+
+        // Check for the specific warning about all-NULL end_state
+        let has_all_null_warning = result.warnings.iter().any(|w| {
+            matches!(
+                w,
+                ValidationWarning::AllNullColumn {
+                    table,
+                    column,
+                    ..
+                } if table == "sched_slice" && column == "end_state"
+            )
+        });
+
+        assert!(
+            !has_all_null_warning,
+            "[perfetto->duckdb] DuckDB has all-NULL end_state warning. Warnings: {:?}",
+            result.warnings
+        );
+
+        // Verify end_state is populated
+        let conn = duckdb::Connection::open(&duckdb_from_perfetto).expect("Failed to open DuckDB");
+
+        let (total, non_null): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(end_state) FROM sched_slice",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("Failed to query sched_slice");
+
+        assert!(
+            total > 0,
+            "[perfetto->duckdb] Expected sched_slice to have rows"
+        );
+
+        let non_null_pct = (non_null as f64 / total as f64) * 100.0;
+        assert!(
+            non_null_pct > 50.0,
+            "[perfetto->duckdb] Expected >50% non-null end_state values, got {:.1}% ({}/{})",
+            non_null_pct,
+            non_null,
+            total
+        );
+    }
+
+    // --- Check: duckdb->perfetto conversion (test_e2e_duckdb_to_perfetto) ---
+    eprintln!("  duckdb -> perfetto...");
+    {
+        let perfetto_from_duckdb = dir.path().join("from_duckdb.pb");
+        let output = Command::new(env!("CARGO_BIN_EXE_systing-util"))
+            .args([
+                "convert",
+                "-o",
+                perfetto_from_duckdb.to_str().unwrap(),
+                duckdb_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("Failed to run systing-util convert");
+
+        assert!(
+            output.status.success(),
+            "[duckdb->perfetto] systing-util convert failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            perfetto_from_duckdb.exists(),
+            "[duckdb->perfetto] Perfetto trace not created from DuckDB"
+        );
+
+        let perfetto_result = validate_perfetto_trace(&perfetto_from_duckdb);
+        assert!(
+            perfetto_result.is_valid(),
+            "[duckdb->perfetto] validation failed:\nErrors: {:?}\nWarnings: {:?}",
+            perfetto_result.errors,
+            perfetto_result.warnings
+        );
+
+        // Verify expected content
+        let mut trace_data = Vec::new();
+        File::open(&perfetto_from_duckdb)
+            .expect("Failed to open perfetto trace")
+            .read_to_end(&mut trace_data)
+            .expect("Failed to read perfetto trace");
+
+        let trace = Trace::parse_from_bytes(&trace_data).expect("Failed to parse Perfetto trace");
+
+        let mut has_process_descriptor = false;
+        let mut has_thread_descriptor = false;
+        let mut has_ftrace_events = false;
+
+        for packet in trace.packet.iter() {
+            if packet.has_track_descriptor() {
+                let td = packet.track_descriptor();
+                if td.process.is_some() {
+                    has_process_descriptor = true;
+                }
+                if td.thread.is_some() {
+                    has_thread_descriptor = true;
+                }
+            }
+            if packet.has_ftrace_events() {
+                has_ftrace_events = true;
+            }
+        }
+
+        assert!(
+            has_process_descriptor,
+            "[duckdb->perfetto] Missing process descriptors"
+        );
+        assert!(
+            has_thread_descriptor,
+            "[duckdb->perfetto] Missing thread descriptors"
+        );
+        assert!(
+            has_ftrace_events,
+            "[duckdb->perfetto] Missing ftrace events"
+        );
+    }
+
+    eprintln!("\n  All validation suite checks passed");
 }
 
-/// Tests that network packet tracks are created when there is actual network traffic.
-///
-/// This test generates some network activity and verifies that:
-/// 1. Network socket parquet files are created with data
-/// 2. The Perfetto trace includes "Network Packets" track
-/// 3. Socket-specific tracks are created for observed connections
+// =============================================================================
+// Consolidated network suite
+//
+// Records ONE trace (3s, network=true, with traffic) and runs all network
+// validation checks. Replaces 3 separate tests.
+// =============================================================================
+
 #[test]
 #[ignore] // Requires root/BPF privileges
-fn test_e2e_network_packets_with_traffic() {
+fn test_e2e_network_suite() {
     use std::fs::File;
     use std::io::Read;
     use std::net::TcpStream;
@@ -464,9 +657,9 @@ fn test_e2e_network_packets_with_traffic() {
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
-    // Create config for streaming parquet with network recording enabled
+    // Record a trace with network enabled and traffic generation
     let config = Config {
-        duration: 3, // 3 seconds to capture network activity
+        duration: NETWORK_SUITE_DURATION_SECS,
         parquet_only: false,
         network: true,
         output_dir: dir.path().to_path_buf(),
@@ -474,13 +667,22 @@ fn test_e2e_network_packets_with_traffic() {
         ..Config::default()
     };
 
-    // Spawn a thread to generate network traffic while recording
+    // Spawn traffic generation thread
     let traffic_thread = thread::spawn(|| {
-        // Wait a bit for recording to start
         thread::sleep(Duration::from_millis(500));
 
-        // Try to connect to a few common addresses to generate TCP traffic
-        // These may fail but will still generate network events
+        // Start a local TCP listener and connect to it to guarantee socket data
+        if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") {
+            let addr = listener.local_addr().unwrap();
+            for _ in 0..3 {
+                if let Ok(_stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+                    let _ = listener.accept();
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+
+        // Also try connecting to common ports for additional network events
         for _ in 0..3 {
             let _ = TcpStream::connect_timeout(
                 &"127.0.0.1:22".parse().unwrap(),
@@ -494,87 +696,143 @@ fn test_e2e_network_packets_with_traffic() {
         }
     });
 
-    // Run the recording
+    eprintln!("Recording trace (3s, network=true, with traffic)...");
     systing(config, None).expect("systing recording failed");
-
-    // Wait for traffic thread to complete
     traffic_thread.join().expect("Traffic thread panicked");
+    eprintln!("Recording complete.\n");
 
-    // Verify perfetto trace was created
+    // --- Check: basic parquet files exist ---
+    eprintln!("  basic parquet files exist...");
     assert!(
-        trace_path.exists(),
-        "trace.pb not found after parquet-to-perfetto conversion"
+        dir.path().join("process.parquet").exists(),
+        "[network parquet] process.parquet not found"
+    );
+    assert!(
+        dir.path().join("thread.parquet").exists(),
+        "[network parquet] thread.parquet not found"
     );
 
-    // Read and parse the Perfetto trace
-    let mut trace_data = Vec::new();
-    File::open(&trace_path)
-        .expect("Failed to open trace.pb")
-        .read_to_end(&mut trace_data)
-        .expect("Failed to read trace.pb");
-
-    use perfetto_protos::trace::Trace;
-    use protobuf::Message;
-
-    let trace = Trace::parse_from_bytes(&trace_data).expect("Failed to parse Perfetto trace");
-
-    // Collect all track descriptors
-    let track_names: Vec<String> = trace
-        .packet
-        .iter()
-        .filter(|p| p.has_track_descriptor())
-        .map(|p| p.track_descriptor().name().to_string())
-        .collect();
-
-    // Network Interfaces should always exist (from interface enumeration)
+    // --- Check: network parquet files exist (test_e2e_with_network_recorder) ---
+    eprintln!("  network parquet files exist...");
     assert!(
-        track_names.iter().any(|n| n == "Network Interfaces"),
-        "Missing 'Network Interfaces' track. Found tracks: {track_names:?}"
+        dir.path().join("network_interface.parquet").exists(),
+        "[network] network_interface.parquet not found"
+    );
+    assert!(
+        dir.path().join("network_socket.parquet").exists(),
+        "[network] network_socket.parquet not found"
     );
 
-    // Note: "Network Packets" track only appears if there were actual socket events captured.
-    // The traffic generation may not always succeed in creating observable socket events
-    // (depends on whether the kernel probes fire for localhost connections).
-    // So we check for it but don't fail if it's missing - the interface test above is sufficient.
-    if track_names.iter().any(|n| n == "Network Packets") {
-        eprintln!("✓ Found 'Network Packets' track with socket data");
+    // --- Check: perfetto trace has network tracks (test_e2e_with_network_recorder) ---
+    eprintln!("  perfetto network tracks...");
+    assert!(trace_path.exists(), "[network perfetto] trace.pb not found");
+    {
+        let mut trace_data = Vec::new();
+        File::open(&trace_path)
+            .expect("Failed to open trace.pb")
+            .read_to_end(&mut trace_data)
+            .expect("Failed to read trace.pb");
 
-        // Check if any socket tracks were created (format: "TCP x.x.x.x:port → y.y.y.y:port")
-        let socket_tracks: Vec<_> = track_names
+        use perfetto_protos::trace::Trace;
+        use protobuf::Message;
+
+        let trace = Trace::parse_from_bytes(&trace_data).expect("Failed to parse Perfetto trace");
+
+        let track_names: Vec<String> = trace
+            .packet
             .iter()
-            .filter(|n| n.starts_with("TCP ") || n.starts_with("UDP ") || n.starts_with("Socket "))
+            .filter(|p| p.has_track_descriptor())
+            .map(|p| p.track_descriptor().name().to_string())
             .collect();
-        if !socket_tracks.is_empty() {
-            let count = socket_tracks.len();
-            eprintln!("✓ Found {count} socket tracks: {socket_tracks:?}");
+
+        // Verify "Network Interfaces" root track exists
+        assert!(
+            track_names.iter().any(|n| n == "Network Interfaces"),
+            "[network perfetto] Missing 'Network Interfaces' root track. Found tracks: {track_names:?}"
+        );
+
+        // Verify at least one namespace track exists
+        assert!(
+            track_names
+                .iter()
+                .any(|n| n == "host" || n.starts_with("netns:") || n.starts_with("container:")),
+            "[network perfetto] Missing network namespace track. Found tracks: {track_names:?}"
+        );
+
+        // Check for optional network packet tracks (test_e2e_network_packets_with_traffic)
+        if track_names.iter().any(|n| n == "Network Packets") {
+            eprintln!("    found 'Network Packets' track with socket data");
+
+            let socket_tracks: Vec<_> = track_names
+                .iter()
+                .filter(|n| {
+                    n.starts_with("TCP ") || n.starts_with("UDP ") || n.starts_with("Socket ")
+                })
+                .collect();
+            if !socket_tracks.is_empty() {
+                eprintln!("    found {} socket tracks", socket_tracks.len());
+            }
+        } else {
+            eprintln!("    note: 'Network Packets' track not present (no socket events captured)");
         }
-    } else {
-        eprintln!("Note: 'Network Packets' track not present (no socket events captured)");
     }
 
-    // Validate both outputs
+    // --- Check: parquet and perfetto validation ---
+    eprintln!("  parquet validation...");
     let parquet_result = validate_parquet_dir(dir.path());
     assert!(
         parquet_result.is_valid(),
-        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        "[network parquet validation] failed:\nErrors: {:?}\nWarnings: {:?}",
         parquet_result.errors,
         parquet_result.warnings
     );
 
+    eprintln!("  perfetto validation...");
     let perfetto_result = validate_perfetto_trace(&trace_path);
     assert!(
         perfetto_result.is_valid(),
-        "Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        "[network perfetto validation] failed:\nErrors: {:?}\nWarnings: {:?}",
         perfetto_result.errors,
         perfetto_result.warnings
     );
+
+    // --- Check: DuckDB with network recording (test_e2e_duckdb_with_network_recording) ---
+    eprintln!("  duckdb with network recording...");
+    {
+        let duckdb_path = dir.path().join("trace.duckdb");
+        systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "network_test")
+            .expect("DuckDB conversion failed");
+
+        let result = validate_duckdb(&duckdb_path);
+        assert!(
+            result.is_valid(),
+            "[network duckdb] validation failed:\nErrors: {:?}\nWarnings: {:?}",
+            result.errors,
+            result.warnings
+        );
+
+        let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+        let interface_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM network_interface", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+
+        assert!(
+            interface_count > 0,
+            "[network duckdb] network_interface table is empty"
+        );
+        eprintln!("    {} interfaces in DuckDB", interface_count);
+    }
+
+    eprintln!("\n  All network suite checks passed");
 }
 
-/// Tests network recording with an isolated network namespace.
-///
-/// This test creates a network namespace with a veth pair, generates
-/// traffic to an echo server in the namespace, and validates that
-/// systing captures the network activity correctly.
+// =============================================================================
+// Network namespace test (unchanged, needs its own recording)
+// =============================================================================
+
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_network_recording_with_netns() {
@@ -583,15 +841,12 @@ fn test_network_recording_with_netns() {
 
     setup_bpf_environment();
 
-    // Create network namespace with default config (10.200.1.x addresses)
     let netns_env = NetnsTestEnv::new(NetworkTestConfig::default())
         .expect("Failed to create network namespace test environment");
 
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
-    // Create config for network recording.
-    // See NETNS_RECORDING_DURATION_SECS for timing rationale.
     let config = Config {
         duration: NETNS_RECORDING_DURATION_SECS,
         parquet_only: false,
@@ -601,18 +856,14 @@ fn test_network_recording_with_netns() {
         ..Config::default()
     };
 
-    // Get the destination IP and port for validation
     let dest_ip = netns_env.config.ns_ip.to_string();
     let dest_port = netns_env.server_port;
 
-    // Spawn a thread to generate traffic after recording starts.
-    // See NETNS_BPF_INIT_WAIT_SECS for timing rationale.
     let traffic_handle = {
         let server_addr = netns_env.server_addr();
         thread::spawn(move || {
             thread::sleep(Duration::from_secs(NETNS_BPF_INIT_WAIT_SECS));
 
-            // Generate multiple rounds of traffic
             for i in 0..5 {
                 let message = format!("Hello from netns test round {i}");
                 if let Ok(mut stream) = std::net::TcpStream::connect(&server_addr) {
@@ -626,59 +877,45 @@ fn test_network_recording_with_netns() {
         })
     };
 
-    // Run the recording
     systing(config, None).expect("systing recording failed");
-
-    // Wait for traffic thread to complete
     traffic_handle.join().expect("Traffic thread panicked");
-
-    // Drop netns environment to clean up namespace
     drop(netns_env);
 
     // === STRICT ASSERTIONS ===
 
-    // 1. Assert network_socket.parquet exists
     assert!(
         dir.path().join("network_socket.parquet").exists(),
-        "network_socket.parquet not found - network recording failed"
+        "network_socket.parquet not found"
     );
 
-    // 2. Validate network trace data
     let validation_result =
         validate_network_trace(dir.path()).expect("Failed to validate network trace");
 
-    // 3. Assert socket_count > 0
     assert!(
         validation_result.socket_count > 0,
-        "No sockets recorded. Expected at least one socket for the TCP connection to {dest_ip}:{dest_port}",
+        "No sockets recorded. Expected at least one socket for {dest_ip}:{dest_port}",
     );
 
-    // 4. Assert syscall_count > 0 OR packet_count > 0
     assert!(
         validation_result.syscall_count > 0 || validation_result.packet_count > 0,
-        "No network activity recorded. syscall_count={}, packet_count={}. \
-         Expected at least one syscall or packet event.",
+        "No network activity recorded. syscall_count={}, packet_count={}",
         validation_result.syscall_count,
         validation_result.packet_count
     );
 
-    // 4a. Check poll events if captured (may not fire in all environments
-    // due to BPF probe attachment timing or kernel configuration)
     let poll_count =
         match assert_poll_events_recorded(dir.path(), NetworkTestConfig::TEST_NETWORK_PREFIX) {
             Ok(count) => {
-                eprintln!("✓ Found {count} poll events for test network traffic");
+                eprintln!("  Found {count} poll events for test network traffic");
                 count
             }
             Err(e) => {
-                eprintln!("Note: poll event validation skipped (environment-dependent): {e}");
+                eprintln!("  Note: poll event validation skipped: {e}");
                 0
             }
         };
 
-    // 5. Assert correct IPs were captured (10.200.x.x, not 127.0.0.1)
-    // This ensures we're capturing traffic through the veth interface
-    // rather than loopback traffic
+    // Check traffic through veth (not loopback)
     let socket_path = dir.path().join("network_socket.parquet");
     if socket_path.exists() {
         use arrow::array::StringArray;
@@ -700,7 +937,6 @@ fn test_network_recording_with_netns() {
             {
                 for i in 0..dest_ips.len() {
                     let ip = dest_ips.value(i);
-                    // Check for traffic to/from our test namespace (10.200.x.x)
                     if ip.starts_with(NetworkTestConfig::TEST_NETWORK_PREFIX) {
                         found_netns_traffic = true;
                         break;
@@ -715,13 +951,10 @@ fn test_network_recording_with_netns() {
 
         assert!(
             found_netns_traffic,
-            "No traffic to 10.200.x.x network found. \
-             Expected network namespace traffic, but only found other IPs. \
-             This suggests traffic was routed through loopback instead of the veth pair."
+            "No traffic to 10.200.x.x network found"
         );
     }
 
-    // 6. Run standard validations
     let parquet_result = validate_parquet_dir(dir.path());
     assert!(
         parquet_result.is_valid(),
@@ -739,7 +972,7 @@ fn test_network_recording_with_netns() {
     );
 
     eprintln!(
-        "✓ Network namespace test passed: {} sockets, {} syscalls, {} packets, {} poll events",
+        "  Network namespace test passed: {} sockets, {} syscalls, {} packets, {} poll events",
         validation_result.socket_count,
         validation_result.syscall_count,
         validation_result.packet_count,
@@ -747,18 +980,10 @@ fn test_network_recording_with_netns() {
     );
 }
 
-/// Tests pystacks recording with Python stack trace symbolization.
-///
-/// This test:
-/// 1. Creates a Python script with known function names
-/// 2. Runs systing recording with pystacks enabled while the script runs
-/// 3. Validates that Python symbols appear in the output
-/// 4. Validates both parquet and perfetto outputs are valid
-///
-/// NOTE: There is a known issue where discover_python_processes() may not find
-/// newly spawned Python processes even when they have "python" in their exe path.
-/// This test validates the pystacks infrastructure works correctly when processes
-/// ARE discovered.
+// =============================================================================
+// Pystacks tests (feature-gated, each needs its own Python process)
+// =============================================================================
+
 #[test]
 #[ignore] // Requires root/BPF privileges and pystacks feature
 #[cfg(feature = "pystacks")]
@@ -775,7 +1000,6 @@ fn test_pystacks_symbol_resolution() {
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
-    // Create a Python script with known, unique function names
     let python_script = dir.path().join("test_pystacks.py");
     let script_content = r#"
 import time
@@ -803,7 +1027,6 @@ def main():
     """Main entry point."""
     print("Python test script starting...", flush=True)
     start_time = time.time()
-    # Run for at least 10 seconds to ensure we capture samples
     while time.time() - start_time < 10:
         systing_test_outer_function()
     print("Python test script done.", flush=True)
@@ -818,7 +1041,6 @@ if __name__ == "__main__":
             .expect("Failed to write Python script");
     }
 
-    // Start the Python process BEFORE systing
     let mut python_proc = Command::new(pyenv_python(PYTHON_313_VERSION))
         .arg(&python_script)
         .stdout(Stdio::piped())
@@ -829,11 +1051,8 @@ if __name__ == "__main__":
     let python_pid = python_proc.id();
     eprintln!("Started Python process with PID: {}", python_pid);
 
-    // Wait for Python to fully initialize
     thread::sleep(Duration::from_millis(1000));
 
-    // Create config with explicit PID
-    // Use direct parquet output with stack.parquet
     let config = Config {
         duration: 3,
         parquet_only: false,
@@ -846,7 +1065,6 @@ if __name__ == "__main__":
 
     systing(config, None).expect("systing recording failed");
 
-    // Wait for Python process to finish
     let python_status = python_proc
         .wait()
         .expect("Failed to wait for Python process");
@@ -854,30 +1072,28 @@ if __name__ == "__main__":
 
     // === VALIDATE PARQUET OUTPUT ===
 
-    // Debug: List files in output directory
-    eprintln!("Files in output directory {:?}:", dir.path());
-    for entry in std::fs::read_dir(dir.path())
-        .expect("Failed to read output dir")
-        .flatten()
-    {
-        eprintln!("  {:?}", entry.path());
+    // List output files for diagnostic purposes
+    eprintln!("  Output files:");
+    if let Ok(entries) = std::fs::read_dir(dir.path()) {
+        for entry in entries.flatten() {
+            eprintln!("    {}", entry.file_name().to_string_lossy());
+        }
     }
 
-    // Parquet-first path uses stack.parquet with frame_names column (list of strings)
     let stack_parquet = dir.path().join("stack.parquet");
     assert!(
         stack_parquet.exists(),
-        "stack.parquet not found - stack profiling may have failed"
+        "[pystacks symbol] stack.parquet not found"
     );
 
-    // Read stack.parquet and look for Python symbols in frame_names
     let file = File::open(&stack_parquet).expect("Failed to open stack.parquet");
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
     let reader = builder.build().expect("Failed to build reader");
 
     let mut found_python_symbols = false;
     let mut found_test_functions: Vec<String> = Vec::new();
-    let mut all_function_names: Vec<String> = Vec::new();
+    let mut all_function_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let expected_functions = [
         "systing_test_leaf_function",
         "systing_test_middle_function",
@@ -887,7 +1103,6 @@ if __name__ == "__main__":
     for batch_result in reader {
         let batch = batch_result.expect("Failed to read batch");
 
-        // Get frame_names column from stack.parquet (it's a List of strings)
         if let Some(frame_names_col) = batch.column_by_name("frame_names") {
             use arrow::array::{ListArray, StringArray};
 
@@ -913,24 +1128,15 @@ if __name__ == "__main__":
                     }
                     let func_name = string_array.value(j);
 
-                    // Collect sample names for debugging
-                    if all_function_names.len() < 20
-                        && !all_function_names.contains(&func_name.to_string())
-                    {
-                        all_function_names.push(func_name.to_string());
-                    }
-
-                    // Check if this is a Python frame (contains "(python)")
                     if func_name.contains("(python)") {
                         found_python_symbols = true;
+                        all_function_names.insert(func_name.to_string());
 
-                        // Check for our test functions
                         for expected in &expected_functions {
                             if func_name.contains(expected)
                                 && !found_test_functions.contains(&expected.to_string())
                             {
                                 found_test_functions.push(expected.to_string());
-                                eprintln!("✓ Found expected Python symbol: {}", func_name);
                             }
                         }
                     }
@@ -939,38 +1145,30 @@ if __name__ == "__main__":
         }
     }
 
-    // Debug: show sample function names
-    eprintln!("Sample function names from stack.parquet:");
-    for name in &all_function_names {
-        eprintln!("  {}", name);
-    }
+    // Log discovered function names for CI debugging
+    let sample_names: Vec<_> = all_function_names.iter().take(20).collect();
+    eprintln!(
+        "  Found {} unique Python function names (first 20): {:?}",
+        all_function_names.len(),
+        sample_names
+    );
 
-    // Report what we found - HARD FAIL if no Python symbols
     assert!(
         found_python_symbols,
-        "FAILED: No Python symbols found in stack.parquet. \
-         Pystacks did not successfully symbolize the Python process."
+        "[pystacks symbol] No Python symbols found in stack.parquet"
     );
-    eprintln!("✓ Found Python symbols in stack.parquet");
 
     assert!(
         !found_test_functions.is_empty(),
-        "FAILED: No expected test functions found in stack.parquet. \
-         Expected at least one of: {:?}",
+        "[pystacks symbol] No expected test functions found. Expected at least one of: {:?}",
         expected_functions
-    );
-    eprintln!(
-        "✓ Found {} of {} expected Python test functions: {:?}",
-        found_test_functions.len(),
-        expected_functions.len(),
-        found_test_functions
     );
 
     // Verify stack_sample.parquet has samples
     let stack_sample_parquet = dir.path().join("stack_sample.parquet");
     assert!(
         stack_sample_parquet.exists(),
-        "stack_sample.parquet not found"
+        "[pystacks symbol] stack_sample.parquet not found"
     );
 
     let file = File::open(&stack_sample_parquet).expect("Failed to open stack_sample.parquet");
@@ -983,21 +1181,12 @@ if __name__ == "__main__":
         sample_count += batch.num_rows();
     }
 
-    assert!(
-        sample_count > 0,
-        "No stack samples found in stack_sample.parquet"
-    );
-    eprintln!("✓ Found {} perf samples", sample_count);
+    assert!(sample_count > 0, "[pystacks symbol] No stack samples found");
 
     // === VALIDATE PERFETTO OUTPUT ===
 
-    // 6. Verify perfetto trace was created
-    assert!(
-        trace_path.exists(),
-        "trace.pb not found after parquet-to-perfetto conversion"
-    );
+    assert!(trace_path.exists(), "trace.pb not found");
 
-    // 7. Parse Perfetto trace and verify it contains PerfSample packets
     use perfetto_protos::trace::Trace;
     use protobuf::Message;
     use std::io::Read;
@@ -1010,15 +1199,6 @@ if __name__ == "__main__":
 
     let trace = Trace::parse_from_bytes(&trace_data).expect("Failed to parse Perfetto trace");
 
-    // Count PerfSample packets
-    let perf_sample_count = trace.packet.iter().filter(|p| p.has_perf_sample()).count();
-
-    eprintln!(
-        "✓ Perfetto trace contains {} PerfSample packets",
-        perf_sample_count
-    );
-
-    // Check for interned data with function names (Python symbols)
     let mut found_python_interned = false;
     for packet in trace.packet.iter() {
         if let Some(interned) = packet.interned_data.as_ref() {
@@ -1038,19 +1218,15 @@ if __name__ == "__main__":
         }
     }
 
-    // HARD FAIL if no Python symbols in Perfetto output
     assert!(
         found_python_interned,
-        "FAILED: No Python symbols found in Perfetto interned data. \
-         Pystacks did not successfully symbolize the Python process for Perfetto output."
+        "[pystacks symbol] No Python symbols found in Perfetto interned data"
     );
-    eprintln!("✓ Found Python symbols in Perfetto interned data");
 
-    // 8. Run standard validations
     let parquet_result = validate_parquet_dir(dir.path());
     assert!(
         parquet_result.is_valid(),
-        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        "[pystacks symbol] Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
         parquet_result.errors,
         parquet_result.warnings
     );
@@ -1058,26 +1234,18 @@ if __name__ == "__main__":
     let perfetto_result = validate_perfetto_trace(&trace_path);
     assert!(
         perfetto_result.is_valid(),
-        "Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        "[pystacks symbol] Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
         perfetto_result.errors,
         perfetto_result.warnings
     );
 
     eprintln!(
-        "✓ Pystacks integration test passed: {} perf samples, parquet valid, perfetto valid\n\
-         ✓ Python symbols found: {} test functions",
+        "  Pystacks symbol resolution passed: {} samples, {} test functions",
         sample_count,
         found_test_functions.len()
     );
 }
 
-/// Test that Python stack traces are captured for BOTH CPU (running) and sleep (off-CPU) stacks.
-///
-/// This test reproduces an issue where Python stacks were only being captured for STACK_RUNNING
-/// events but not for STACK_SLEEP events. The root cause was that `pystacks_read_stacks()` was
-/// called with `task=NULL`, causing it to use `bpf_get_current_pid_tgid()` instead of reading
-/// from the task struct. During sched_switch for sleep stacks, the current PID doesn't match
-/// the task being put to sleep.
 #[test]
 #[ignore] // Requires root/BPF privileges
 #[cfg(feature = "pystacks")]
@@ -1095,8 +1263,6 @@ fn test_pystacks_sleep_stacks() {
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
-    // Create a Python script that does BOTH CPU work AND blocking sleep.
-    // This ensures we get both STACK_RUNNING and STACK_SLEEP samples.
     let python_script = dir.path().join("test_sleep_pystacks.py");
     let script_content = r#"
 import time
@@ -1104,7 +1270,7 @@ import sys
 
 def systing_sleep_leaf_function():
     """Leaf function that sleeps - should appear in STACK_SLEEP samples."""
-    time.sleep(0.05)  # 50ms sleep - should trigger uninterruptible sleep
+    time.sleep(0.05)
 
 def systing_sleep_middle_function():
     """Middle function that calls the sleep leaf."""
@@ -1129,14 +1295,9 @@ def main():
     """Main entry point - alternates between CPU work and sleeping."""
     print("Python sleep/CPU test script starting...", flush=True)
     start_time = time.time()
-
-    # Run for at least 10 seconds alternating between CPU work and sleep
     while time.time() - start_time < 10:
-        # Do some CPU work (generates STACK_RUNNING samples)
         systing_cpu_middle_function()
-        # Then sleep (generates STACK_SLEEP samples)
         systing_sleep_middle_function()
-
     print("Python sleep/CPU test script done.", flush=True)
 
 if __name__ == "__main__":
@@ -1149,7 +1310,6 @@ if __name__ == "__main__":
             .expect("Failed to write Python script");
     }
 
-    // Start the Python process BEFORE systing
     let mut python_proc = Command::new(pyenv_python(PYTHON_313_VERSION))
         .arg(&python_script)
         .stdout(Stdio::piped())
@@ -1160,10 +1320,8 @@ if __name__ == "__main__":
     let python_pid = python_proc.id();
     eprintln!("Started Python process with PID: {}", python_pid);
 
-    // Wait for Python to fully initialize
     thread::sleep(Duration::from_millis(1000));
 
-    // Create config with explicit PID
     let config = Config {
         duration: 5,
         parquet_only: false,
@@ -1176,7 +1334,6 @@ if __name__ == "__main__":
 
     systing(config, None).expect("systing recording failed");
 
-    // Wait for Python process to finish
     let python_status = python_proc
         .wait()
         .expect("Failed to wait for Python process");
@@ -1184,12 +1341,8 @@ if __name__ == "__main__":
 
     // === LOAD STACK.PARQUET INTO A MAP ===
     let stack_parquet = dir.path().join("stack.parquet");
-    assert!(
-        stack_parquet.exists(),
-        "stack.parquet not found - stack profiling may have failed"
-    );
+    assert!(stack_parquet.exists(), "stack.parquet not found");
 
-    // Build a map from stack_id -> frame_names
     let mut stack_frames: HashMap<i64, Vec<String>> = HashMap::new();
     {
         let file = File::open(&stack_parquet).expect("Failed to open stack.parquet");
@@ -1236,10 +1389,6 @@ if __name__ == "__main__":
             }
         }
     }
-    eprintln!(
-        "Loaded {} unique stacks from stack.parquet",
-        stack_frames.len()
-    );
 
     // === ANALYZE STACK_SAMPLE.PARQUET ===
     let stack_sample_parquet = dir.path().join("stack_sample.parquet");
@@ -1248,14 +1397,10 @@ if __name__ == "__main__":
         "stack_sample.parquet not found"
     );
 
-    // Track Python symbols by stack_event_type
-    // Type 0 = STACK_SLEEP_UNINTERRUPTIBLE, Type 1 = STACK_RUNNING, Type 2 = STACK_SLEEP_INTERRUPTIBLE
     let mut sleep_samples_total = 0;
     let mut sleep_samples_with_python = 0;
     let mut running_samples_total = 0;
     let mut running_samples_with_python = 0;
-    let mut sleep_python_functions: Vec<String> = Vec::new();
-    let mut running_python_functions: Vec<String> = Vec::new();
 
     {
         let file = File::open(&stack_sample_parquet).expect("Failed to open stack_sample.parquet");
@@ -1289,33 +1434,15 @@ if __name__ == "__main__":
 
                 match stack_event_type {
                     0 | 2 => {
-                        // STACK_SLEEP_UNINTERRUPTIBLE or STACK_SLEEP_INTERRUPTIBLE
                         sleep_samples_total += 1;
                         if has_python {
                             sleep_samples_with_python += 1;
-                            for f in &frames {
-                                if f.contains("(python)")
-                                    && f.contains("systing_sleep")
-                                    && !sleep_python_functions.contains(f)
-                                {
-                                    sleep_python_functions.push(f.clone());
-                                }
-                            }
                         }
                     }
                     1 => {
-                        // STACK_RUNNING
                         running_samples_total += 1;
                         if has_python {
                             running_samples_with_python += 1;
-                            for f in &frames {
-                                if f.contains("(python)")
-                                    && f.contains("systing_cpu")
-                                    && !running_python_functions.contains(f)
-                                {
-                                    running_python_functions.push(f.clone());
-                                }
-                            }
                         }
                     }
                     _ => {}
@@ -1324,72 +1451,31 @@ if __name__ == "__main__":
         }
     }
 
-    // === REPORT RESULTS ===
-    eprintln!("\n=== Stack Sample Analysis ===");
-    eprintln!(
-        "STACK_RUNNING (CPU): {} total, {} with Python symbols ({:.1}%)",
-        running_samples_total,
-        running_samples_with_python,
-        if running_samples_total > 0 {
-            running_samples_with_python as f64 / running_samples_total as f64 * 100.0
-        } else {
-            0.0
-        }
-    );
-    eprintln!("  Python functions found: {:?}", running_python_functions);
-
-    eprintln!(
-        "STACK_SLEEP (off-CPU): {} total, {} with Python symbols ({:.1}%)",
-        sleep_samples_total,
-        sleep_samples_with_python,
-        if sleep_samples_total > 0 {
-            sleep_samples_with_python as f64 / sleep_samples_total as f64 * 100.0
-        } else {
-            0.0
-        }
-    );
-    eprintln!("  Python functions found: {:?}", sleep_python_functions);
-
-    // === ASSERTIONS ===
-
-    // We should have some samples of each type
     assert!(
         running_samples_total > 0,
-        "No STACK_RUNNING samples captured - test script may not have done CPU work"
+        "No STACK_RUNNING samples captured"
     );
-    assert!(
-        sleep_samples_total > 0,
-        "No STACK_SLEEP samples captured - test script may not have slept"
-    );
+    assert!(sleep_samples_total > 0, "No STACK_SLEEP samples captured");
 
-    // CPU stacks should have Python symbols (this already works)
     assert!(
         running_samples_with_python > 0,
-        "FAILED: No Python symbols in STACK_RUNNING samples. \
-         Expected systing_cpu_* functions to appear."
+        "No Python symbols in STACK_RUNNING samples"
     );
-    eprintln!("✓ STACK_RUNNING samples have Python symbols");
 
-    // Sleep stacks should ALSO have Python symbols (this is the bug we're testing)
     assert!(
         sleep_samples_with_python > 0,
-        "FAILED: No Python symbols in STACK_SLEEP samples. \
-         Expected systing_sleep_* functions to appear. \
-         This indicates pystacks is not correctly capturing Python stacks for sleeping tasks."
+        "No Python symbols in STACK_SLEEP samples"
     );
-    eprintln!("✓ STACK_SLEEP samples have Python symbols");
 
     eprintln!(
-        "\n✓ test_pystacks_sleep_stacks passed: Python symbols found in both CPU and sleep stacks"
+        "  Pystacks sleep stacks passed: running={}/{}, sleep={}/{}",
+        running_samples_with_python,
+        running_samples_total,
+        sleep_samples_with_python,
+        sleep_samples_total
     );
 }
 
-/// Test that Python 3.13 stack traces don't have excessive Frame Errors.
-///
-/// Python 3.13 changed internal frame structures (f_code -> f_executable).
-/// This test validates that Frame Errors are limited to expected positions
-/// (entry frames at the bottom of the stack) and don't affect the quality
-/// of Python stack traces.
 #[test]
 #[ignore] // Requires root/BPF privileges
 #[cfg(feature = "pystacks")]
@@ -1406,7 +1492,6 @@ fn test_pystacks_frame_error_rate() {
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
-    // Create a simple Python script
     let python_script = dir.path().join("test_frame_error.py");
     let script_content = r#"
 import time
@@ -1446,7 +1531,6 @@ if __name__ == "__main__":
         .expect("Failed to spawn Python process");
 
     let python_pid = python_proc.id();
-    eprintln!("Started Python 3.11 process with PID: {}", python_pid);
     thread::sleep(Duration::from_millis(1000));
 
     let config = Config {
@@ -1464,7 +1548,6 @@ if __name__ == "__main__":
         .wait()
         .expect("Failed to wait for Python process");
 
-    // Analyze stacks for Frame Error
     let stack_parquet = dir.path().join("stack.parquet");
     assert!(stack_parquet.exists(), "stack.parquet not found");
 
@@ -1473,7 +1556,6 @@ if __name__ == "__main__":
     let reader = builder.build().expect("Failed to build reader");
 
     let mut total_python_stacks = 0;
-    let mut stacks_with_frame_error = 0;
     let mut frame_error_not_at_bottom = 0;
     let mut expected_functions_found = 0;
 
@@ -1508,7 +1590,6 @@ if __name__ == "__main__":
                 })
                 .collect();
 
-            // Only analyze stacks from our test script
             let is_our_stack = frames.iter().any(|f| f.contains("test_frame_error.py"));
             if !is_our_stack {
                 continue;
@@ -1518,30 +1599,20 @@ if __name__ == "__main__":
 
             let has_frame_error = frames.iter().any(|f| f.contains("Frame Error"));
             if has_frame_error {
-                stacks_with_frame_error += 1;
-
-                // Check if Frame Error is at the expected position (after entry frames)
                 for (idx, frame) in frames.iter().enumerate() {
                     if frame.contains("Frame Error") {
-                        // Frame Error should be at position 4+ (after level3, level2, level1, main, <module>)
-                        // or at least after some Python frames
                         let python_frames_before = frames[..idx]
                             .iter()
                             .filter(|f| f.contains("(python)"))
                             .count();
                         if python_frames_before < 2 {
                             frame_error_not_at_bottom += 1;
-                            eprintln!(
-                                "Frame Error at unexpected position {} with only {} Python frames before",
-                                idx, python_frames_before
-                            );
                         }
                         break;
                     }
                 }
             }
 
-            // Check for expected function names
             let has_level3 = frames.iter().any(|f| f.contains("level3"));
             let has_level2 = frames.iter().any(|f| f.contains("level2"));
             let has_level1 = frames.iter().any(|f| f.contains("level1"));
@@ -1551,1213 +1622,282 @@ if __name__ == "__main__":
         }
     }
 
-    eprintln!("\n=== Python 3.13 Frame Error Analysis ===");
-    eprintln!("Total Python stacks from test: {}", total_python_stacks);
-    eprintln!(
-        "Stacks with Frame Error: {} ({:.1}%)",
-        stacks_with_frame_error,
-        if total_python_stacks > 0 {
-            100.0 * stacks_with_frame_error as f64 / total_python_stacks as f64
-        } else {
-            0.0
-        }
-    );
-    eprintln!(
-        "Frame Error at unexpected position: {}",
-        frame_error_not_at_bottom
-    );
-    eprintln!(
-        "Stacks with expected functions (level1/2/3): {}",
-        expected_functions_found
-    );
+    assert!(total_python_stacks > 0, "No Python stacks captured");
 
-    // Assertions
-    assert!(
-        total_python_stacks > 0,
-        "No Python stacks captured from test script"
-    );
-
-    // The key assertion: we should find our expected function names despite Frame Errors
     assert!(
         expected_functions_found > 0,
-        "FAILED: No stacks found with expected level1/level2/level3 functions. \
-         Frame Errors may be causing stack trace corruption."
+        "No stacks with expected level1/level2/level3 functions"
     );
-    eprintln!("✓ Expected Python functions found in stacks");
 
-    // Frame Error should only appear at the bottom of stacks (after entry frames)
     assert!(
         frame_error_not_at_bottom == 0,
-        "FAILED: {} stacks have Frame Error at unexpected positions. \
-         This suggests a bug in Python 3.13 frame walking.",
+        "{} stacks have Frame Error at unexpected positions",
         frame_error_not_at_bottom
     );
-    eprintln!("✓ Frame Errors only at expected positions (entry frames)");
-
-    eprintln!("\n✓ test_pystacks_frame_error_rate passed");
 }
 
 // =============================================================================
-// DuckDB Validation Tests
+// Consolidated run command suite
+//
+// Tests the `systing -- <command>` mode. Each sub-test needs its own systing
+// invocation (different commands), but they're consolidated into one test
+// function to reduce overhead. Also includes the parquet_only mode check.
 // =============================================================================
 
-/// Tests DuckDB database generation and validation.
-///
-/// This test validates that:
-/// 1. The --with-duckdb flag generates a valid DuckDB database
-/// 2. The database contains the expected tables
-/// 3. The database passes all validation checks
 #[test]
 #[ignore] // Requires root/BPF privileges
-fn test_e2e_duckdb_validation() {
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-    let duckdb_path = dir.path().join("trace.duckdb");
-
-    // Create config with DuckDB output (detected from .duckdb extension)
-    let config = Config {
-        duration: 1,
-        output_dir: dir.path().to_path_buf(),
-        output: duckdb_path.clone(),
-        ..Config::default()
-    };
-
-    // Run the recording
-    systing(config, None).expect("systing recording failed");
-
-    // Verify DuckDB file was created
-    assert!(
-        duckdb_path.exists(),
-        "trace.duckdb not found - DuckDB generation failed"
-    );
-
-    // Verify DuckDB file has reasonable size (not empty)
-    let metadata = std::fs::metadata(&duckdb_path).expect("Failed to get file metadata");
-    assert!(
-        metadata.len() > 1024,
-        "DuckDB file is too small ({} bytes), may be empty or corrupted",
-        metadata.len()
-    );
-
-    // Validate the DuckDB database
-    let result = validate_duckdb(&duckdb_path);
-    assert!(
-        result.is_valid(),
-        "DuckDB validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        result.errors,
-        result.warnings
-    );
-
-    eprintln!("✓ DuckDB validation passed");
-    if !result.warnings.is_empty() {
-        eprintln!("  Warnings: {:?}", result.warnings);
-    }
-}
-
-/// Tests that both Perfetto and DuckDB can be generated from the same parquet files.
-///
-/// This validates that the parquet streaming path correctly
-/// generates both output formats.
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_e2e_duckdb() {
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-    let duckdb_path = dir.path().join("trace.duckdb");
-    let trace_path = dir.path().join("trace.pb");
-
-    // Create config with parquet-only output (we'll convert manually to test both formats)
-    let config = Config {
-        duration: 1,
-        parquet_only: true,
-        output_dir: dir.path().to_path_buf(),
-        output: dir.path().join("unused.pb"), // Not used with parquet_only
-        ..Config::default()
-    };
-
-    // Run the recording
-    systing(config, None).expect("systing recording failed");
-
-    // Verify parquet files exist
-    assert!(
-        dir.path().join("process.parquet").exists(),
-        "process.parquet not found"
-    );
-
-    // Validate Parquet
-    let parquet_result = validate_parquet_dir(dir.path());
-    assert!(
-        parquet_result.is_valid(),
-        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        parquet_result.errors,
-        parquet_result.warnings
-    );
-
-    // Manually convert to Perfetto
-    systing::parquet_to_perfetto::convert(dir.path(), &trace_path)
-        .expect("Perfetto conversion failed");
-    assert!(trace_path.exists(), "trace.pb not found");
-
-    // Validate Perfetto
-    let perfetto_result = validate_perfetto_trace(&trace_path);
-    assert!(
-        perfetto_result.is_valid(),
-        "Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        perfetto_result.errors,
-        perfetto_result.warnings
-    );
-
-    // Manually convert to DuckDB
-    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "test_trace")
-        .expect("DuckDB conversion failed");
-    assert!(duckdb_path.exists(), "trace.duckdb not found");
-
-    // Validate DuckDB
-    let duckdb_result = validate_duckdb(&duckdb_path);
-    assert!(
-        duckdb_result.is_valid(),
-        "DuckDB validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        duckdb_result.errors,
-        duckdb_result.warnings
-    );
-
-    eprintln!("✓ All three formats (Parquet, Perfetto, DuckDB) validated successfully");
-}
-
-/// Tests DuckDB generation with network recording enabled.
-///
-/// This validates that network tables are correctly populated in DuckDB.
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_e2e_duckdb_with_network_recording() {
-    use duckdb::Connection;
-
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-    let duckdb_path = dir.path().join("trace.duckdb");
-
-    // Create config with network recording and DuckDB output (detected from .duckdb extension)
-    let config = Config {
-        duration: 2, // 2 seconds to capture some network activity
-        network: true,
-        output_dir: dir.path().to_path_buf(),
-        output: duckdb_path.clone(),
-        ..Config::default()
-    };
-
-    // Run the recording
-    systing(config, None).expect("systing recording failed");
-
-    // Verify DuckDB file was created
-    assert!(duckdb_path.exists(), "trace.duckdb not found");
-
-    // Validate the DuckDB database
-    let result = validate_duckdb(&duckdb_path);
-    assert!(
-        result.is_valid(),
-        "DuckDB validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        result.errors,
-        result.warnings
-    );
-
-    // Open the database and verify network tables exist
-    let conn = Connection::open(&duckdb_path).expect("Failed to open DuckDB");
-
-    // Check that network_interface table exists and has data
-    let interface_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM network_interface", [], |row| {
-            row.get(0)
-        })
-        .unwrap_or(0);
-
-    assert!(
-        interface_count > 0,
-        "network_interface table is empty - expected at least one interface"
-    );
-
-    eprintln!(
-        "✓ DuckDB validation passed with network recording ({} interfaces)",
-        interface_count
-    );
-}
-
-/// Tests that DuckDB validation correctly identifies issues.
-///
-/// This is a non-privileged test that validates the error detection
-/// in validate_duckdb().
-#[test]
-fn test_validate_duckdb_nonexistent() {
-    // Test validation of a nonexistent file
-    let result = validate_duckdb(Path::new("/nonexistent/path/trace.duckdb"));
-
-    // Should have an error for failing to open
-    assert!(
-        result.has_errors(),
-        "Expected error for nonexistent DuckDB file"
-    );
-
-    // The error should mention database opening failure
-    let error_str = format!("{:?}", result.errors);
-    assert!(
-        error_str.contains("database") || error_str.contains("open"),
-        "Error should mention database opening: {error_str}"
-    );
-}
-
-/// Tests DuckDB validation with an empty/invalid database.
-#[test]
-fn test_validate_duckdb_invalid() {
-    let dir = TempDir::new().expect("Failed to create temp dir");
-    let bad_db = dir.path().join("bad.duckdb");
-
-    // Create an empty file that's not a valid DuckDB database
-    std::fs::write(&bad_db, b"not a duckdb file").expect("Failed to write file");
-
-    // Validation should fail
-    let result = validate_duckdb(&bad_db);
-    assert!(
-        result.has_errors(),
-        "Expected error for invalid DuckDB file, got: {result:?}"
-    );
-}
-
-/// Tests that Perfetto → DuckDB conversion preserves sched_slice end_state.
-///
-/// This test validates that:
-/// 1. systing records a trace with Perfetto output
-/// 2. systing-util convert creates a valid DuckDB database
-/// 3. The DuckDB passes validation without warnings about all-NULL end_state
-///
-/// This catches regressions where switch_prev_state is not extracted from
-/// compact_sched events during Perfetto → DuckDB conversion.
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_e2e_perfetto_to_duckdb_preserves_end_state() {
-    use std::process::Command;
-    use systing::validation::ValidationWarning;
-
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-    let trace_path = dir.path().join("trace.pb");
-    let duckdb_path = dir.path().join("trace.duckdb");
-
-    // Step 1: Record a trace with Perfetto output
-    let config = Config {
-        duration: 2, // 2 seconds to ensure we capture scheduler activity
-        output_dir: dir.path().to_path_buf(),
-        output: trace_path.clone(),
-        ..Config::default()
-    };
-
-    systing(config, None).expect("systing recording failed");
-    assert!(trace_path.exists(), "Perfetto trace not created");
-
-    // Step 2: Convert Perfetto to DuckDB using systing-analyze
-    let output = Command::new(env!("CARGO_BIN_EXE_systing-util"))
-        .args([
-            "convert",
-            "-o",
-            duckdb_path.to_str().unwrap(),
-            trace_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to run systing-util convert");
-
-    assert!(
-        output.status.success(),
-        "systing-util convert failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(duckdb_path.exists(), "DuckDB not created");
-
-    // Step 3: Validate the DuckDB
-    let result = validate_duckdb(&duckdb_path);
-
-    // Should pass without errors
-    assert!(
-        result.is_valid(),
-        "DuckDB validation failed: {:?}",
-        result.errors
-    );
-
-    // Check for the specific warning about all-NULL end_state
-    // This warning indicates switch_prev_state is not being extracted
-    let has_all_null_warning = result.warnings.iter().any(|w| {
-        matches!(
-            w,
-            ValidationWarning::AllNullColumn {
-                table,
-                column,
-                ..
-            } if table == "sched_slice" && column == "end_state"
-        )
-    });
-
-    assert!(
-        !has_all_null_warning,
-        "DuckDB has all-NULL end_state warning - switch_prev_state not being extracted. \
-         Warnings: {:?}",
-        result.warnings
-    );
-
-    // Additional verification: query the database to confirm end_state is populated
-    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
-
-    let (total, non_null): (i64, i64) = conn
-        .query_row(
-            "SELECT COUNT(*), COUNT(end_state) FROM sched_slice",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("Failed to query sched_slice");
-
-    // We expect most end_states to be non-null (only the last slice per CPU should be NULL)
-    // At minimum, we should have some non-null values if there was any scheduler activity
-    assert!(total > 0, "Expected sched_slice to have rows, got 0");
-
-    // The 50% threshold is chosen because:
-    // - In theory, only the LAST slice per CPU should have NULL end_state (no subsequent switch)
-    // - With ~100+ CPUs typical on modern systems, that's only ~100 NULLs out of thousands
-    // - A 2-second trace should have many completed slices per CPU
-    // - 50% is a conservative lower bound that catches the "all NULL" bug while allowing
-    //   for edge cases like very short traces or systems with unusual scheduler behavior
-    let non_null_pct = (non_null as f64 / total as f64) * 100.0;
-    assert!(
-        non_null_pct > 50.0,
-        "Expected >50% non-null end_state values, got {:.1}% ({}/{} rows)",
-        non_null_pct,
-        non_null,
-        total
-    );
-}
-
-/// Tests that task/thread exit states are properly recorded.
-///
-/// This test validates that:
-/// 1. Threads that exit during recording have their exit states captured
-/// 2. The Parquet sched_slice.parquet contains EXIT_DEAD (16) or EXIT_ZOMBIE (32) end_states
-/// 3. The Perfetto trace contains the exit states in compact_sched events
-/// 4. The DuckDB database also has the exit states populated
-///
-/// This catches regressions where exit_state is not combined with __state in BPF code.
-/// See: kernel's __task_state_index() which ORs tsk->__state with tsk->exit_state.
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_e2e_task_exit_states() {
-    use arrow::array::{Array, Int32Array};
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use perfetto_protos::trace::Trace;
-    use protobuf::Message;
-    use std::fs::File;
-    use std::io::Read as IoRead;
-    use std::process::{Command, Stdio};
-    use std::thread;
-    use std::time::Duration;
-
-    // Exit state constants from kernel (stored in task_struct->exit_state)
-    const EXIT_DEAD: i32 = 16; // 0x10 - 'X' in ftrace format
-    const EXIT_ZOMBIE: i32 = 32; // 0x20 - 'Z' in ftrace format
-
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-    let trace_path = dir.path().join("trace.pb");
-    let duckdb_path = dir.path().join("trace.duckdb");
-
-    // We'll spawn multiple short-lived processes that will exit during the trace
-    // Using bash to spawn and wait for multiple sleep processes
-    let workload_script = r#"
-        for i in $(seq 1 5); do
-            sleep 0.01 &
-        done
-        wait
-    "#;
-
-    // Start the workload in a separate thread
-    let workload_handle = thread::spawn(move || {
-        // Wait briefly for recording to start and BPF to attach
-        thread::sleep(Duration::from_millis(100));
-
-        // Run 2 rounds of short-lived processes
-        for _ in 0..2 {
-            let mut child = Command::new("bash")
-                .arg("-c")
-                .arg(workload_script)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("Failed to spawn workload");
-            child.wait().expect("Failed to wait for workload");
-        }
-    });
-
-    // Create config for recording
-    let config = Config {
-        duration: 1, // 1 second to capture the workload
-        output_dir: dir.path().to_path_buf(),
-        output: trace_path.clone(),
-        ..Config::default()
-    };
-
-    // Run the recording
-    systing(config, None).expect("systing recording failed");
-
-    // Wait for workload to complete
-    workload_handle.join().expect("Workload thread panicked");
-
-    // === VALIDATE PARQUET OUTPUT ===
-
-    let sched_slice_path = dir.path().join("sched_slice.parquet");
-    assert!(
-        sched_slice_path.exists(),
-        "sched_slice.parquet not found - scheduler recording may have failed"
-    );
-
-    // Read sched_slice.parquet and count exit states
-    let file = File::open(&sched_slice_path).expect("Failed to open sched_slice.parquet");
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
-    let reader = builder.build().expect("Failed to build reader");
-
-    let mut total_slices = 0;
-    let mut exit_dead_count = 0; // end_state = 16 (EXIT_DEAD 'X')
-    let mut exit_zombie_count = 0; // end_state = 32 (EXIT_ZOMBIE 'Z')
-
-    for batch_result in reader {
-        let batch = batch_result.expect("Failed to read batch");
-        total_slices += batch.num_rows();
-
-        if let Some(end_state_col) = batch.column_by_name("end_state") {
-            let end_state_array = end_state_col
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("end_state should be Int32");
-
-            for i in 0..end_state_array.len() {
-                if !end_state_array.is_null(i) {
-                    match end_state_array.value(i) {
-                        EXIT_DEAD => exit_dead_count += 1,
-                        EXIT_ZOMBIE => exit_zombie_count += 1,
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    eprintln!("\n=== Parquet Task Exit State Analysis ===");
-    eprintln!("Total sched_slice rows: {}", total_slices);
-    eprintln!(
-        "EXIT_DEAD (16/'X') slices: {} ({:.2}%)",
-        exit_dead_count,
-        if total_slices > 0 {
-            100.0 * exit_dead_count as f64 / total_slices as f64
-        } else {
-            0.0
-        }
-    );
-    eprintln!(
-        "EXIT_ZOMBIE (32/'Z') slices: {} ({:.2}%)",
-        exit_zombie_count,
-        if total_slices > 0 {
-            100.0 * exit_zombie_count as f64 / total_slices as f64
-        } else {
-            0.0
-        }
-    );
-
-    // We spawned 10 processes (5 per round × 2 rounds), so we expect some exit states
-    let total_exits = exit_dead_count + exit_zombie_count;
-    assert!(
-        total_exits > 0,
-        "FAILED: No exit states (EXIT_DEAD or EXIT_ZOMBIE) found in sched_slice.parquet. \
-         This indicates the BPF code is not properly combining __state with exit_state. \
-         Expected at least some exits from the 10 spawned processes."
-    );
-    eprintln!(
-        "✓ Found {} total exit states in Parquet ({} EXIT_DEAD, {} EXIT_ZOMBIE)",
-        total_exits, exit_dead_count, exit_zombie_count
-    );
-
-    // Verify process_exit.parquet also exists and has entries
-    let process_exit_path = dir.path().join("process_exit.parquet");
-    assert!(
-        process_exit_path.exists(),
-        "process_exit.parquet not found - process exit events not recorded"
-    );
-
-    let file = File::open(&process_exit_path).expect("Failed to open process_exit.parquet");
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
-    let reader = builder.build().expect("Failed to build reader");
-
-    let mut process_exit_count = 0;
-    for batch_result in reader {
-        let batch = batch_result.expect("Failed to read batch");
-        process_exit_count += batch.num_rows();
-    }
-
-    assert!(
-        process_exit_count > 0,
-        "FAILED: No entries in process_exit.parquet. Expected process exit events."
-    );
-    eprintln!(
-        "✓ Found {} process exit events in process_exit.parquet",
-        process_exit_count
-    );
-
-    // === VALIDATE PERFETTO OUTPUT ===
-
-    assert!(
-        trace_path.exists(),
-        "Perfetto trace not found at {:?}",
-        trace_path
-    );
-
-    let mut trace_data = Vec::new();
-    File::open(&trace_path)
-        .expect("Failed to open trace.pb")
-        .read_to_end(&mut trace_data)
-        .expect("Failed to read trace.pb");
-
-    let trace = Trace::parse_from_bytes(&trace_data).expect("Failed to parse Perfetto trace");
-
-    // Look for compact_sched events with exit states in switch_prev_state
-    let mut perfetto_exit_dead = 0;
-    let mut perfetto_exit_zombie = 0;
-
-    for packet in trace.packet.iter() {
-        if packet.has_ftrace_events() {
-            let ftrace_events = packet.ftrace_events();
-            if let Some(compact_sched) = ftrace_events.compact_sched.as_ref() {
-                for &prev_state in compact_sched.switch_prev_state.iter() {
-                    match prev_state as i32 {
-                        EXIT_DEAD => perfetto_exit_dead += 1,
-                        EXIT_ZOMBIE => perfetto_exit_zombie += 1,
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    eprintln!("\n=== Perfetto Task Exit State Analysis ===");
-    eprintln!(
-        "EXIT_DEAD (16/'X') in compact_sched: {}",
-        perfetto_exit_dead
-    );
-    eprintln!(
-        "EXIT_ZOMBIE (32/'Z') in compact_sched: {}",
-        perfetto_exit_zombie
-    );
-
-    let perfetto_total_exits = perfetto_exit_dead + perfetto_exit_zombie;
-    assert!(
-        perfetto_total_exits > 0,
-        "FAILED: No exit states found in Perfetto compact_sched events. \
-         This indicates the Parquet-to-Perfetto conversion is not preserving exit states."
-    );
-    eprintln!(
-        "✓ Found {} total exit states in Perfetto ({} EXIT_DEAD, {} EXIT_ZOMBIE)",
-        perfetto_total_exits, perfetto_exit_dead, perfetto_exit_zombie
-    );
-
-    // Also validate the trace passes standard validation
-    let perfetto_result = validate_perfetto_trace(&trace_path);
-    assert!(
-        perfetto_result.is_valid(),
-        "Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        perfetto_result.errors,
-        perfetto_result.warnings
-    );
-    eprintln!("✓ Perfetto trace passes standard validation");
-
-    // === VALIDATE DUCKDB OUTPUT ===
-
-    // Convert Parquet to DuckDB
-    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "exit_test")
-        .expect("DuckDB conversion failed");
-
-    assert!(duckdb_path.exists(), "DuckDB file not created");
-
-    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
-
-    // Query for exit states in sched_slice
-    let (duckdb_exit_dead, duckdb_exit_zombie): (i64, i64) = conn
-        .query_row(
-            "SELECT
-                COUNT(*) FILTER (WHERE end_state = 16),
-                COUNT(*) FILTER (WHERE end_state = 32)
-             FROM sched_slice",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("Failed to query sched_slice");
-
-    eprintln!("\n=== DuckDB Task Exit State Analysis ===");
-    eprintln!("EXIT_DEAD (16/'X') in sched_slice: {}", duckdb_exit_dead);
-    eprintln!(
-        "EXIT_ZOMBIE (32/'Z') in sched_slice: {}",
-        duckdb_exit_zombie
-    );
-
-    let duckdb_total_exits = duckdb_exit_dead + duckdb_exit_zombie;
-    assert!(
-        duckdb_total_exits > 0,
-        "FAILED: No exit states found in DuckDB sched_slice table. \
-         This indicates the Parquet-to-DuckDB conversion is not preserving exit states."
-    );
-    eprintln!(
-        "✓ Found {} total exit states in DuckDB ({} EXIT_DEAD, {} EXIT_ZOMBIE)",
-        duckdb_total_exits, duckdb_exit_dead, duckdb_exit_zombie
-    );
-
-    // Validate DuckDB
-    let duckdb_result = validate_duckdb(&duckdb_path);
-    assert!(
-        duckdb_result.is_valid(),
-        "DuckDB validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        duckdb_result.errors,
-        duckdb_result.warnings
-    );
-    eprintln!("✓ DuckDB passes standard validation");
-
-    // === FINAL SUMMARY ===
-    eprintln!(
-        "\n✓ test_e2e_task_exit_states passed:\n  \
-         - Parquet: {} exit states\n  \
-         - Perfetto: {} exit states\n  \
-         - DuckDB: {} exit states\n  \
-         - {} process exit events recorded",
-        total_exits, perfetto_total_exits, duckdb_total_exits, process_exit_count
-    );
-}
-
-// =============================================================================
-// DuckDB → Perfetto Conversion Tests
-// =============================================================================
-
-/// Tests DuckDB → Perfetto conversion using systing-util convert.
-///
-/// This test validates that:
-/// 1. A DuckDB database can be converted to Perfetto format
-/// 2. The resulting Perfetto trace passes validation
-/// 3. The trace contains expected data (processes, threads, scheduler events)
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_e2e_duckdb_to_perfetto() {
-    use perfetto_protos::trace::Trace;
-    use protobuf::Message;
-    use std::fs::File;
-    use std::io::Read as IoRead;
-    use std::process::Command;
-
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-    let duckdb_path = dir.path().join("trace.duckdb");
-    let perfetto_path = dir.path().join("converted.pb");
-
-    // Step 1: Record a trace with DuckDB output
-    let config = Config {
-        duration: 2, // 2 seconds to ensure we capture some activity
-        output_dir: dir.path().to_path_buf(),
-        output: duckdb_path.clone(),
-        ..Config::default()
-    };
-
-    systing(config, None).expect("systing recording failed");
-
-    // Verify DuckDB file was created
-    assert!(
-        duckdb_path.exists(),
-        "DuckDB trace not created at {:?}",
-        duckdb_path
-    );
-
-    // Step 2: Convert DuckDB → Perfetto using systing-util convert
-    let output = Command::new(env!("CARGO_BIN_EXE_systing-util"))
-        .args([
-            "convert",
-            "-o",
-            perfetto_path.to_str().unwrap(),
-            duckdb_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to run systing-util convert");
-
-    assert!(
-        output.status.success(),
-        "systing-util convert failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // Verify Perfetto file was created
-    assert!(
-        perfetto_path.exists(),
-        "Perfetto trace not created at {:?}",
-        perfetto_path
-    );
-
-    // Step 3: Validate the Perfetto output
-    let perfetto_result = validate_perfetto_trace(&perfetto_path);
-    assert!(
-        perfetto_result.is_valid(),
-        "Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        perfetto_result.errors,
-        perfetto_result.warnings
-    );
-
-    // Step 4: Verify the trace contains expected content
-    let mut trace_data = Vec::new();
-    File::open(&perfetto_path)
-        .expect("Failed to open perfetto trace")
-        .read_to_end(&mut trace_data)
-        .expect("Failed to read perfetto trace");
-
-    let trace = Trace::parse_from_bytes(&trace_data).expect("Failed to parse Perfetto trace");
-
-    // Count key packet types
-    let mut has_process_descriptor = false;
-    let mut has_thread_descriptor = false;
-    let mut has_ftrace_events = false;
-
-    for packet in trace.packet.iter() {
-        if packet.has_track_descriptor() {
-            let td = packet.track_descriptor();
-            if td.process.is_some() {
-                has_process_descriptor = true;
-            }
-            if td.thread.is_some() {
-                has_thread_descriptor = true;
-            }
-        }
-        if packet.has_ftrace_events() {
-            has_ftrace_events = true;
-        }
-    }
-
-    assert!(
-        has_process_descriptor,
-        "Perfetto trace missing process descriptors"
-    );
-    assert!(
-        has_thread_descriptor,
-        "Perfetto trace missing thread descriptors"
-    );
-    assert!(
-        has_ftrace_events,
-        "Perfetto trace missing ftrace events (scheduler data)"
-    );
-
-    eprintln!(
-        "✓ test_e2e_duckdb_to_perfetto passed:\n  \
-         - DuckDB → Perfetto conversion successful\n  \
-         - Perfetto trace valid with process, thread, and scheduler data"
-    );
-}
-
-// ============================================================================
-// Run-command (-- <command>) integration tests
-// ============================================================================
-
-/// Tests that `systing -- sleep 0.5` traces the command and auto-stops when it exits.
-///
-/// Validates:
-/// - Recording starts and stops automatically with the command lifecycle
-/// - The command's process appears in process.parquet with the correct name
-/// - Valid parquet output is produced
-/// - The exit code is 0
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_run_command_basic() {
+fn test_run_command_suite() {
     use arrow::array::{Int32Array, StringArray};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File;
-    // StringArray is used to read the name column for diagnostic output
 
     setup_bpf_environment();
 
-    let dir = TempDir::new().expect("Failed to create temp dir");
+    // --- Sub-test: basic command with perfetto output (combines basic + perfetto_output) ---
+    eprintln!("\n  run command: basic (sleep 0.5, with perfetto)...");
+    {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+        let trace_path = dir.path().join("trace.pb");
 
-    let run_cmd = vec!["sleep".to_string(), "0.5".to_string()];
-    let traced_child =
-        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
-    let child_pid = traced_child.pid;
+        let run_cmd = vec!["sleep".to_string(), "0.5".to_string()];
+        let traced_child =
+            systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+        let child_pid = traced_child.pid;
 
-    let config = Config {
-        parquet_only: true,
-        output_dir: dir.path().to_path_buf(),
-        output: dir.path().join("trace.pb"),
-        ..Config::default()
-    };
+        let config = Config {
+            parquet_only: false,
+            output_dir: dir.path().to_path_buf(),
+            output: trace_path.clone(),
+            ..Config::default()
+        };
 
-    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
-    assert_eq!(exit_code, 0, "sleep should exit with code 0");
+        let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+        assert_eq!(
+            exit_code, 0,
+            "[run cmd basic] sleep should exit with code 0"
+        );
 
-    // Verify essential parquet files exist
-    assert!(
-        dir.path().join("process.parquet").exists(),
-        "process.parquet not found"
-    );
-    assert!(
-        dir.path().join("sched_slice.parquet").exists(),
-        "sched_slice.parquet not found"
-    );
+        // Check parquet output
+        assert!(
+            dir.path().join("process.parquet").exists(),
+            "[run cmd basic] process.parquet not found"
+        );
+        assert!(
+            dir.path().join("sched_slice.parquet").exists(),
+            "[run cmd basic] sched_slice.parquet not found"
+        );
 
-    // Read process.parquet and verify the traced command appears
-    let file =
-        File::open(dir.path().join("process.parquet")).expect("Failed to open process.parquet");
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
-    let reader = builder.build().expect("Failed to build reader");
+        // Verify traced command appears in process.parquet
+        let file =
+            File::open(dir.path().join("process.parquet")).expect("Failed to open process.parquet");
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
+        let reader = builder.build().expect("Failed to build reader");
 
-    let mut found_child = false;
-    let mut total_processes = 0;
-    for batch_result in reader {
-        let batch = batch_result.expect("Failed to read batch");
+        let mut found_child = false;
+        for batch_result in reader {
+            let batch = batch_result.expect("Failed to read batch");
 
-        let pids = batch
-            .column_by_name("pid")
-            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
-        let names = batch
-            .column_by_name("name")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let pids = batch
+                .column_by_name("pid")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+            let names = batch
+                .column_by_name("name")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
-        if let (Some(pids), Some(names)) = (pids, names) {
-            for i in 0..batch.num_rows() {
-                total_processes += 1;
-                if pids.value(i) == child_pid as i32 {
-                    let name = names.value(i);
-                    eprintln!("Found traced process: pid={}, name={}", pids.value(i), name);
-                    found_child = true;
+            if let (Some(pids), Some(_names)) = (pids, names) {
+                for i in 0..batch.num_rows() {
+                    if pids.value(i) == child_pid as i32 {
+                        found_child = true;
+                    }
                 }
             }
         }
+
+        assert!(
+            found_child,
+            "[run cmd basic] Traced command (PID {}) not found in process.parquet",
+            child_pid
+        );
+
+        // Validate parquet
+        let result = validate_parquet_dir(dir.path());
+        assert!(
+            result.is_valid(),
+            "[run cmd basic] Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
+            result.errors,
+            result.warnings
+        );
+
+        // Validate perfetto
+        assert!(trace_path.exists(), "[run cmd basic] trace.pb not found");
+        let perfetto_result = validate_perfetto_trace(&trace_path);
+        assert!(
+            perfetto_result.is_valid(),
+            "[run cmd basic] Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
+            perfetto_result.errors,
+            perfetto_result.warnings
+        );
     }
 
-    assert!(
-        found_child,
-        "Traced command (PID {}) not found in process.parquet ({} total processes)",
-        child_pid, total_processes
-    );
-
-    // Validate parquet output
-    let result = validate_parquet_dir(dir.path());
-    assert!(
-        result.is_valid(),
-        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        result.errors,
-        result.warnings
-    );
-
-    eprintln!(
-        "✓ test_run_command_basic passed: traced sleep command (PID {})",
-        child_pid
-    );
-}
-
-/// Tests exit code propagation when the traced command fails.
-///
-/// Validates that `systing -- false` returns exit code 1.
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_run_command_exit_code() {
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-
-    let run_cmd = vec!["false".to_string()];
-    let traced_child =
-        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
-
-    let config = Config {
-        parquet_only: true,
-        output_dir: dir.path().to_path_buf(),
-        output: dir.path().join("trace.pb"),
-        ..Config::default()
-    };
-
-    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
-    assert_eq!(
-        exit_code, 1,
-        "Expected exit code 1 from 'false', got {}",
-        exit_code
-    );
-
-    eprintln!("✓ test_run_command_exit_code passed: exit code 1 from 'false'");
-}
-
-/// Tests that child processes spawned by the traced command are also captured.
-///
-/// Runs `bash -c 'sleep 0.2 & sleep 0.2 & wait'` and verifies that the bash
-/// process AND its forked sleep children appear in the trace.
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_run_command_child_tracking() {
-    use arrow::array::Int32Array;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use std::fs::File;
-
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-
-    let run_cmd = vec![
-        "bash".to_string(),
-        "-c".to_string(),
-        "sleep 0.3 & sleep 0.3 & wait".to_string(),
-    ];
-    let traced_child =
-        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
-    let bash_pid = traced_child.pid;
-
-    let config = Config {
-        parquet_only: true,
-        output_dir: dir.path().to_path_buf(),
-        output: dir.path().join("trace.pb"),
-        ..Config::default()
-    };
-
-    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
-    assert_eq!(exit_code, 0, "bash should exit with code 0");
-
-    // Count distinct PIDs in sched_slice.parquet - should have bash + sleep children
-    let file = File::open(dir.path().join("sched_slice.parquet"))
-        .expect("Failed to open sched_slice.parquet");
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
-    let reader = builder.build().expect("Failed to build reader");
-
-    // Read thread.parquet to get the mapping of utid -> upid
-    let thread_file =
-        File::open(dir.path().join("thread.parquet")).expect("Failed to open thread.parquet");
-    let thread_builder =
-        ParquetRecordBatchReaderBuilder::try_new(thread_file).expect("Failed to create reader");
-    let thread_reader = thread_builder.build().expect("Failed to build reader");
-
-    let mut traced_tids = std::collections::HashSet::new();
-    for batch_result in thread_reader {
-        let batch = batch_result.expect("Failed to read batch");
-        let tids = batch
-            .column_by_name("tid")
-            .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
-        if let Some(tids) = tids {
-            for i in 0..tids.len() {
-                traced_tids.insert(tids.value(i));
-            }
-        }
-    }
-
-    // Count distinct utids in sched_slice to verify multiple processes were traced
-    let mut sched_utids = std::collections::HashSet::new();
-    for batch_result in reader {
-        let batch = batch_result.expect("Failed to read batch");
-        if let Some(utids) = batch
-            .column_by_name("utid")
-            .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>())
-        {
-            for i in 0..utids.len() {
-                sched_utids.insert(utids.value(i));
-            }
-        }
-    }
-
-    eprintln!(
-        "Traced {} threads, {} unique utids in sched_slices (bash PID {})",
-        traced_tids.len(),
-        sched_utids.len(),
-        bash_pid
-    );
-
-    // We expect at least 3 threads: bash main thread + 2 sleep children
-    assert!(
-        traced_tids.len() >= 3,
-        "Expected at least 3 traced threads (bash + 2 sleep children), got {}",
-        traced_tids.len()
-    );
-
-    eprintln!(
-        "✓ test_run_command_child_tracking passed: {} threads traced",
-        traced_tids.len()
-    );
-}
-
-/// Tests that --duration combined with -- works correctly.
-///
-/// Uses a short duration that expires before the command finishes.
-/// The command should be killed when duration expires.
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_run_command_with_duration() {
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-
-    // Command sleeps for 300s, but duration is only 1s.
-    // If duration composability is broken, this test hangs (caught by test timeout).
-    let run_cmd = vec!["sleep".to_string(), "300".to_string()];
-    let traced_child =
-        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
-
-    let config = Config {
-        duration: 1,
-        parquet_only: true,
-        output_dir: dir.path().to_path_buf(),
-        output: dir.path().join("trace.pb"),
-        ..Config::default()
-    };
-
-    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
-
-    // The child should have been interrupted (SIGINT -> exit code 130),
-    // proving the duration expired before the 300s sleep finished.
-    assert_ne!(
-        exit_code, 0,
-        "Expected non-zero exit code (child should have been interrupted by duration)"
-    );
-
-    // Verify output was produced
-    assert!(
-        dir.path().join("process.parquet").exists(),
-        "process.parquet not found"
-    );
-
-    let result = validate_parquet_dir(dir.path());
-    assert!(
-        result.is_valid(),
-        "Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        result.errors,
-        result.warnings
-    );
-
-    eprintln!("✓ test_run_command_with_duration passed: child was interrupted by duration");
-}
-
-/// Tests that spawn_traced_child returns an error for a nonexistent command.
-#[test]
-fn test_run_command_not_found() {
-    let result = systing::traced_command::spawn_traced_child(&["nonexistent_cmd_xyz".to_string()]);
-    assert!(result.is_err(), "Expected error for nonexistent command");
-    let err = result.err().unwrap();
-    let err_msg = format!("{:#}", err);
-    assert!(
-        err_msg.contains("not found"),
-        "Expected 'not found' in error message, got: {}",
-        err_msg
-    );
-
-    eprintln!("✓ test_run_command_not_found passed");
-}
-
-/// Tests that is_python_command correctly identifies Python commands.
-#[test]
-fn test_is_python_command() {
-    use systing::traced_command::is_python_command;
-
-    assert!(is_python_command(&[
-        "python3".to_string(),
-        "script.py".to_string()
-    ]));
-    assert!(is_python_command(&["python".to_string()]));
-    assert!(is_python_command(&["/usr/bin/python3.11".to_string()]));
-    assert!(!is_python_command(&["bash".to_string()]));
-    assert!(!is_python_command(&["sleep".to_string(), "1".to_string()]));
-    assert!(!is_python_command(&[]));
-
-    eprintln!("✓ test_is_python_command passed");
-}
-
-/// Tests that run command produces valid Perfetto output (not just parquet).
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_run_command_perfetto_output() {
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-    let trace_path = dir.path().join("trace.pb");
-
-    let run_cmd = vec!["sleep".to_string(), "0.5".to_string()];
-    let traced_child =
-        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
-
-    let config = Config {
-        parquet_only: false,
-        output_dir: dir.path().to_path_buf(),
-        output: trace_path.clone(),
-        ..Config::default()
-    };
-
-    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
-    assert_eq!(exit_code, 0);
-
-    // Verify Perfetto trace was created and is valid
-    assert!(trace_path.exists(), "trace.pb not found");
-
-    let perfetto_result = validate_perfetto_trace(&trace_path);
-    assert!(
-        perfetto_result.is_valid(),
-        "Perfetto validation failed:\nErrors: {:?}\nWarnings: {:?}",
-        perfetto_result.errors,
-        perfetto_result.warnings
-    );
-
-    eprintln!("✓ test_run_command_perfetto_output passed");
-}
-
-/// Tests that a signal-killed child produces the correct exit code (128 + signal).
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_run_command_signal_exit_code() {
-    setup_bpf_environment();
-
-    let dir = TempDir::new().expect("Failed to create temp dir");
-
-    // Use sh -c to have the child kill itself with SIGKILL (signal 9)
-    // Expected exit code: 128 + 9 = 137
-    let run_cmd = vec!["sh".to_string(), "-c".to_string(), "kill -9 $$".to_string()];
-    let traced_child =
-        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
-
-    let config = Config {
-        parquet_only: true,
-        output_dir: dir.path().to_path_buf(),
-        output: dir.path().join("trace.pb"),
-        ..Config::default()
-    };
-
-    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
-    assert_eq!(
-        exit_code, 137,
-        "Expected exit code 137 (128 + SIGKILL=9), got {}",
-        exit_code
-    );
-
-    eprintln!("✓ test_run_command_signal_exit_code passed");
-}
-
-/// Tests that spawn_traced_child returns an error for a non-executable file.
-#[test]
-fn test_run_command_not_executable() {
-    use std::io::Write;
-    let dir = TempDir::new().expect("Failed to create temp dir");
-    let not_exec = dir.path().join("not_executable.sh");
+    // --- Sub-test: exit code propagation + parquet_only mode check ---
+    eprintln!("  run command: exit code (false, parquet_only)...");
     {
-        let mut f = std::fs::File::create(&not_exec).expect("Failed to create file");
-        writeln!(f, "#!/bin/sh\necho hello").expect("Failed to write");
-        // File is NOT given executable permissions
+        let dir = TempDir::new().expect("Failed to create temp dir");
+
+        let run_cmd = vec!["false".to_string()];
+        let traced_child =
+            systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+
+        let config = Config {
+            parquet_only: true,
+            output_dir: dir.path().to_path_buf(),
+            output: dir.path().join("trace.pb"),
+            ..Config::default()
+        };
+
+        let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+        assert_eq!(
+            exit_code, 1,
+            "Expected exit code 1 from 'false', got {}",
+            exit_code
+        );
+
+        // Also verify parquet_only mode: trace.pb should NOT exist
+        assert!(
+            !dir.path().join("trace.pb").exists(),
+            "[parquet_only] trace.pb should not exist in parquet_only mode"
+        );
+
+        // All core parquet files should exist in parquet_only mode
+        assert!(
+            dir.path().join("process.parquet").exists(),
+            "[parquet_only] process.parquet not found"
+        );
+        assert!(
+            dir.path().join("thread.parquet").exists(),
+            "[parquet_only] thread.parquet not found"
+        );
+        assert!(
+            dir.path().join("sched_slice.parquet").exists(),
+            "[parquet_only] sched_slice.parquet not found"
+        );
     }
 
-    let result =
-        systing::traced_command::spawn_traced_child(&[not_exec.to_str().unwrap().to_string()]);
-    assert!(result.is_err(), "Expected error for non-executable file");
-    let err_msg = format!("{:#}", result.err().unwrap());
-    assert!(
-        err_msg.contains("not executable"),
-        "Expected 'not executable' in error, got: {}",
-        err_msg
-    );
+    // --- Sub-test: child process tracking ---
+    eprintln!("  run command: child tracking...");
+    {
+        let dir = TempDir::new().expect("Failed to create temp dir");
 
-    eprintln!("✓ test_run_command_not_executable passed");
+        let run_cmd = vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            "sleep 0.3 & sleep 0.3 & wait".to_string(),
+        ];
+        let traced_child =
+            systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+
+        let config = Config {
+            parquet_only: true,
+            output_dir: dir.path().to_path_buf(),
+            output: dir.path().join("trace.pb"),
+            ..Config::default()
+        };
+
+        let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+        assert_eq!(
+            exit_code, 0,
+            "[run cmd child tracking] bash should exit with code 0"
+        );
+
+        // Count distinct TIDs in thread.parquet
+        let thread_file =
+            File::open(dir.path().join("thread.parquet")).expect("Failed to open thread.parquet");
+        let thread_builder =
+            ParquetRecordBatchReaderBuilder::try_new(thread_file).expect("Failed to create reader");
+        let thread_reader = thread_builder.build().expect("Failed to build reader");
+
+        let mut traced_tids = std::collections::HashSet::new();
+        for batch_result in thread_reader {
+            let batch = batch_result.expect("Failed to read batch");
+            let tids = batch
+                .column_by_name("tid")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+            if let Some(tids) = tids {
+                for i in 0..tids.len() {
+                    traced_tids.insert(tids.value(i));
+                }
+            }
+        }
+
+        assert!(
+            traced_tids.len() >= 3,
+            "[run cmd child tracking] Expected at least 3 traced threads (bash + 2 sleep children), got {}",
+            traced_tids.len()
+        );
+    }
+
+    // --- Sub-test: duration override ---
+    eprintln!("  run command: duration override...");
+    {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+
+        let run_cmd = vec!["sleep".to_string(), "300".to_string()];
+        let traced_child =
+            systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+
+        let config = Config {
+            duration: 1,
+            parquet_only: true,
+            output_dir: dir.path().to_path_buf(),
+            output: dir.path().join("trace.pb"),
+            ..Config::default()
+        };
+
+        let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+
+        assert_ne!(
+            exit_code, 0,
+            "[run cmd duration] Expected non-zero exit code (child should have been interrupted by duration)"
+        );
+
+        assert!(
+            dir.path().join("process.parquet").exists(),
+            "[run cmd duration] process.parquet not found"
+        );
+
+        let result = validate_parquet_dir(dir.path());
+        assert!(
+            result.is_valid(),
+            "[run cmd duration] Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
+            result.errors,
+            result.warnings
+        );
+    }
+
+    // --- Sub-test: signal exit code ---
+    eprintln!("  run command: signal exit code...");
+    {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+
+        let run_cmd = vec!["sh".to_string(), "-c".to_string(), "kill -9 $$".to_string()];
+        let traced_child =
+            systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+
+        let config = Config {
+            parquet_only: true,
+            output_dir: dir.path().to_path_buf(),
+            output: dir.path().join("trace.pb"),
+            ..Config::default()
+        };
+
+        let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+        assert_eq!(
+            exit_code, 137,
+            "[run cmd signal] Expected exit code 137 (128 + SIGKILL=9), got {}",
+            exit_code
+        );
+    }
+
+    eprintln!("\n  All run command checks passed");
 }
