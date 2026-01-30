@@ -66,31 +66,6 @@ else
     echo -e "${GREEN}⊘ (dependencies not installed)${NC}"
 fi
 
-# Get repo root for integration test script
-REPO_ROOT=$(git rev-parse --show-toplevel)
-
-# Run integration tests (requires sudo)
-echo -ne "Running integration tests... "
-if "$REPO_ROOT/scripts/run-integration-tests.sh" &> /dev/null; then
-    echo -e "${GREEN}✓${NC}"
-else
-    echo -e "${RED}✗${NC}"
-    FAILED=1
-fi
-
-# Run integration tests with pystacks feature (only if dependencies are available)
-echo -ne "Running integration tests (pystacks)... "
-if pkg-config --exists fmt re2 libcap 2>/dev/null; then
-    if CARGO_FEATURES=pystacks "$REPO_ROOT/scripts/run-integration-tests.sh" &> /dev/null; then
-        echo -e "${GREEN}✓${NC}"
-    else
-        echo -e "${RED}✗${NC}"
-        FAILED=1
-    fi
-else
-    echo -e "${GREEN}⊘ (dependencies not installed)${NC}"
-fi
-
 # Exit with failure if any check failed
 if [ $FAILED -eq 1 ]; then
     echo -e "\n${RED}Pre-commit checks failed. Please fix the issues above.${NC}"

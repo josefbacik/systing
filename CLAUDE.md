@@ -96,7 +96,7 @@ git config core.hooksPath hooks
   - `cargo fmt --check`
   - `cargo clippy` (both with and without features)
   - `cargo test` (both with and without features)
-  - Integration tests (via `scripts/run-integration-tests.sh`, requires sudo)
+  - Note: Integration tests run in CI only (GitHub Actions), not in the pre-commit hook
 
 ## Temporary Files and Scratch Work
 

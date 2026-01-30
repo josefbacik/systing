@@ -63,3 +63,23 @@ jobs:
 
       - name: Test (pystacks)
         run: cargo test --features pystacks
+
+  integration_test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Deps.
+        run: ./.github/workflows/install_deps.sh
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Integration tests (no features)
+        run: |
+          ./scripts/run-integration-tests.sh trace_validation
+          ./scripts/run-integration-tests.sh analyze_commands
+
+      - name: Integration tests (pystacks)
+        run: |
+          CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh trace_validation
+          CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh analyze_commands
