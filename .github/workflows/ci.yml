@@ -21,7 +21,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
-  clippy_check:
+  check_build_test:
     runs-on: ubuntu-latest
     steps:
       - name: Set Swap Space
@@ -36,46 +36,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Clippy Check
-        run: |
-          cargo clippy --all-targets --no-default-features -- -D warnings
-          cargo clippy --all-targets --features pystacks -- -D warnings
+      - name: Clippy (no features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
 
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Set Swap Space
-        uses: pierotofy/set-swap-space@master
-        with:
-          swap-size-gb: 10
+      - name: Clippy (pystacks)
+        run: cargo clippy --all-targets --features pystacks -- -D warnings
 
-      - uses: actions/checkout@v4
-
-      - name: Install Deps.
-        run: ./.github/workflows/install_deps.sh
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build (no features)
+      - name: Build release (no features)
         run: cargo build --no-default-features --release
 
-      - name: Build (pystacks)
+      - name: Build release (pystacks)
         run: cargo build --features pystacks --release
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Set Swap Space
-        uses: pierotofy/set-swap-space@master
-        with:
-          swap-size-gb: 10
-
-      - uses: actions/checkout@v4
-
-      - name: Install Deps.
-        run: ./.github/workflows/install_deps.sh
-
-      - uses: Swatinem/rust-cache@v2
 
       - name: Unit tests (no features)
         run: cargo test --no-default-features
@@ -83,39 +54,34 @@ jobs:
       - name: Unit tests (pystacks)
         run: cargo test --features pystacks
 
-  integration_test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Set Swap Space
-        uses: pierotofy/set-swap-space@master
-        with:
-          swap-size-gb: 10
-
-      - uses: actions/checkout@v4
-
-      - name: Install Deps.
-        run: ./.github/workflows/install_deps.sh
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build integration test binaries (no features)
+      - name: Build integration tests (no features)
+        id: build-no-features
         run: |
-          cargo test --test trace_validation --no-default-features --no-run
-          cargo test --test analyze_commands --no-default-features --no-run
+          TV=$(cargo test --test trace_validation --no-default-features --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "trace_validation") | .executable' | tail -1)
+          AC=$(cargo test --test analyze_commands --no-default-features --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "analyze_commands") | .executable' | tail -1)
+          echo "TV_BIN=/mnt/vmtest${TV#$GITHUB_WORKSPACE}" >> "$GITHUB_OUTPUT"
+          echo "AC_BIN=/mnt/vmtest${AC#$GITHUB_WORKSPACE}" >> "$GITHUB_OUTPUT"
 
-      - name: Build integration test binaries (pystacks)
+      - name: Build integration tests (pystacks)
+        id: build-pystacks
         run: |
-          cargo test --test trace_validation --features pystacks --no-run
-          cargo test --test analyze_commands --features pystacks --no-run
+          TV=$(cargo test --test trace_validation --features pystacks --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "trace_validation") | .executable' | tail -1)
+          AC=$(cargo test --test analyze_commands --features pystacks --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "analyze_commands") | .executable' | tail -1)
+          echo "TV_BIN=/mnt/vmtest${TV#$GITHUB_WORKSPACE}" >> "$GITHUB_OUTPUT"
+          echo "AC_BIN=/mnt/vmtest${AC#$GITHUB_WORKSPACE}" >> "$GITHUB_OUTPUT"
 
       - name: Integration tests (no features)
         uses: danobi/vmtest-action@master
         with:
           kernel_url: 'https://github.com/danobi/vmtest/releases/download/test_assets/bzImage-v6.6-fedora38'
-          command: '/bin/bash -c "set -euo pipefail && cd /mnt/vmtest && ./scripts/run-integration-tests.sh trace_validation && ./scripts/run-integration-tests.sh analyze_commands"'
+          command: '/bin/bash -c "set -euo pipefail && cd /mnt/vmtest && TEST_BINARY=${{ steps.build-no-features.outputs.TV_BIN }} ./scripts/run-integration-tests.sh && TEST_BINARY=${{ steps.build-no-features.outputs.AC_BIN }} ./scripts/run-integration-tests.sh"'
 
       - name: Integration tests (pystacks)
         uses: danobi/vmtest-action@master
         with:
           kernel_url: 'https://github.com/danobi/vmtest/releases/download/test_assets/bzImage-v6.6-fedora38'
-          command: '/bin/bash -c "set -euo pipefail && cd /mnt/vmtest && CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh trace_validation && CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh analyze_commands"'
+          command: '/bin/bash -c "set -euo pipefail && cd /mnt/vmtest && TEST_BINARY=${{ steps.build-pystacks.outputs.TV_BIN }} ./scripts/run-integration-tests.sh && TEST_BINARY=${{ steps.build-pystacks.outputs.AC_BIN }} ./scripts/run-integration-tests.sh"'

@@ -24,6 +24,17 @@ TEST_NAME="${1:-trace_validation}"
 shift || true  # Allow $@ to be empty if no additional args provided
 CARGO_FEATURES="${CARGO_FEATURES:-}"
 
+# If TEST_BINARY is set, skip build/discovery and run directly
+if [[ -n "${TEST_BINARY:-}" ]]; then
+    if [[ ! -x "$TEST_BINARY" ]]; then
+        echo "ERROR: TEST_BINARY is set but not executable: $TEST_BINARY"
+        exit 1
+    fi
+    echo "Using pre-built test binary: $TEST_BINARY"
+    sudo -E "$TEST_BINARY" --ignored --test-threads=1 "$@"
+    exit $?
+fi
+
 # Build arguments
 BUILD_ARGS=(--test "$TEST_NAME" --no-run --message-format=json)
 [[ -n "$CARGO_FEATURES" ]] && BUILD_ARGS+=(--features "$CARGO_FEATURES")
