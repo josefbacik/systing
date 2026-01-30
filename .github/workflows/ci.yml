@@ -80,15 +80,42 @@ jobs:
       - name: Unit tests (no features)
         run: cargo test --no-default-features
 
-      - name: Integration tests (no features)
-        run: |
-          ./scripts/run-integration-tests.sh trace_validation
-          ./scripts/run-integration-tests.sh analyze_commands
-
       - name: Unit tests (pystacks)
         run: cargo test --features pystacks
 
-      - name: Integration tests (pystacks)
+  integration_test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
+      - uses: actions/checkout@v4
+
+      - name: Install Deps.
+        run: ./.github/workflows/install_deps.sh
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build integration test binaries (no features)
         run: |
-          CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh trace_validation
-          CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh analyze_commands
+          cargo test --test trace_validation --no-default-features --no-run
+          cargo test --test analyze_commands --no-default-features --no-run
+
+      - name: Build integration test binaries (pystacks)
+        run: |
+          cargo test --test trace_validation --features pystacks --no-run
+          cargo test --test analyze_commands --features pystacks --no-run
+
+      - name: Integration tests (no features)
+        uses: danobi/vmtest-action@master
+        with:
+          kernel_url: 'https://github.com/danobi/vmtest/releases/download/test_assets/bzImage-v6.6-fedora38'
+          command: '/bin/bash -c "set -euo pipefail && cd /mnt/vmtest && ./scripts/run-integration-tests.sh trace_validation && ./scripts/run-integration-tests.sh analyze_commands"'
+
+      - name: Integration tests (pystacks)
+        uses: danobi/vmtest-action@master
+        with:
+          kernel_url: 'https://github.com/danobi/vmtest/releases/download/test_assets/bzImage-v6.6-fedora38'
+          command: '/bin/bash -c "set -euo pipefail && cd /mnt/vmtest && CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh trace_validation && CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh analyze_commands"'
