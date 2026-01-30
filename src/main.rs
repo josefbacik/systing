@@ -114,8 +114,18 @@ impl ThreadLocalBloomFilter {
         }
     }
 
-    fn hash(&self, key: u64, seed: usize) -> usize {
-        let mut h = key.wrapping_add(seed as u64);
+    // Large prime seeds for better hash distribution
+    const SEEDS: [u64; 3] = [
+        0x9E3779B97F4A7C15, // Golden ratio based
+        0xBF58476D1CE4E5B9, // Splitmix64 constant
+        0x94D049BB133111EB, // Another prime
+    ];
+
+    fn hash(&self, key: u64, seed_idx: usize) -> usize {
+        // XOR with a large prime seed for better differentiation
+        let seed = Self::SEEDS[seed_idx];
+        let mut h = key ^ seed;
+        // Murmur3-style finalization
         h ^= h >> 33;
         h = h.wrapping_mul(0xff51afd7ed558ccd);
         h ^= h >> 33;
