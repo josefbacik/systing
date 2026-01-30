@@ -1,0 +1,31 @@
+name: build-kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build kernel
+        run: |
+          chmod +x kernel/build.sh
+          cd kernel && ./build.sh
+
+      - name: Create or update release and upload kernel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="vmtest-kernels"
+          ASSET="kernel/bzImage-v6.12-bpf"
+
+          # Create the release if it doesn't exist
+          if ! gh release view "$TAG" &>/dev/null; then
+            gh release create "$TAG" --title "vmtest kernels" --notes "Custom kernels for vmtest CI"
+          fi
+
+          # Delete existing asset if present, then upload
+          gh release delete-asset "$TAG" "bzImage-v6.12-bpf" --yes 2>/dev/null || true
+          gh release upload "$TAG" "$ASSET"
