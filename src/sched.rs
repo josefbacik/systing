@@ -202,13 +202,15 @@ impl SchedEventRecorder {
             counter_desc.set_unit(Unit::UNIT_TIME_NS);
             counter_desc.set_is_incremental(false);
 
-            let mut desc = crate::perfetto::generate_pidtgid_track_descriptor(
+            let Some(mut desc) = crate::perfetto::generate_pidtgid_track_descriptor(
                 pid_uuids,
                 thread_uuids,
                 pidtgid,
                 "Wake latency".to_string(),
                 desc_uuid,
-            );
+            ) else {
+                continue;
+            };
             desc.counter = Some(counter_desc).into();
 
             let mut packet = TracePacket::default();

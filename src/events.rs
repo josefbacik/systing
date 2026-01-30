@@ -821,13 +821,15 @@ impl SystingProbeRecorder {
         for (pidtgid, events) in self.events.iter() {
             for (track_name, track_events) in events.iter() {
                 let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-                let desc = crate::perfetto::generate_pidtgid_track_descriptor(
+                let Some(desc) = crate::perfetto::generate_pidtgid_track_descriptor(
                     pid_uuids,
                     thread_uuids,
                     pidtgid,
                     track_name.clone(),
                     desc_uuid,
-                );
+                ) else {
+                    continue;
+                };
                 let mut packet = TracePacket::default();
                 packet.set_track_descriptor(desc);
                 packets.push(packet);
@@ -853,13 +855,15 @@ impl SystingProbeRecorder {
         for (tgidpid, tracks) in self.recorded_ranges.iter() {
             for (track_name, ranges) in tracks.iter() {
                 let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-                let desc = crate::perfetto::generate_pidtgid_track_descriptor(
+                let Some(desc) = crate::perfetto::generate_pidtgid_track_descriptor(
                     pid_uuids,
                     thread_uuids,
                     tgidpid,
                     track_name.clone(),
                     desc_uuid,
-                );
+                ) else {
+                    continue;
+                };
                 let mut packet = TracePacket::default();
                 packet.set_track_descriptor(desc);
                 packets.push(packet);
@@ -1032,13 +1036,15 @@ impl SystingProbeRecorder {
             }
 
             let track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            let desc = crate::perfetto::generate_pidtgid_track_descriptor(
+            let Some(desc) = crate::perfetto::generate_pidtgid_track_descriptor(
                 pid_uuids,
                 thread_uuids,
                 tgidpid,
                 "Syscalls".to_string(),
                 track_uuid,
-            );
+            ) else {
+                continue;
+            };
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);

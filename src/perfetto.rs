@@ -18,14 +18,14 @@ pub fn generate_pidtgid_track_descriptor(
     tgidpid: &u64,
     name: String,
     desc_uuid: u64,
-) -> TrackDescriptor {
+) -> Option<TrackDescriptor> {
     let pid = *tgidpid as i32;
     let tgid = (*tgidpid >> 32) as i32;
 
     let uuid = if pid == tgid {
-        *pid_uuids.get(&tgid).unwrap()
+        *pid_uuids.get(&tgid)?
     } else {
-        *thread_uuids.get(&pid).unwrap()
+        *thread_uuids.get(&pid)?
     };
 
     let mut desc = TrackDescriptor::default();
@@ -33,7 +33,7 @@ pub fn generate_pidtgid_track_descriptor(
     desc.set_uuid(desc_uuid);
     desc.set_parent_uuid(uuid);
 
-    desc
+    Some(desc)
 }
 
 pub fn generate_cpu_track_descriptors(

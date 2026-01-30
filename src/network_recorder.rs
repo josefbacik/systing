@@ -543,13 +543,15 @@ impl NetworkRecorder {
             // Create a "Network Connections" track group for this thread
             let thread_group_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
-            let thread_group_desc = crate::perfetto::generate_pidtgid_track_descriptor(
+            let Some(thread_group_desc) = crate::perfetto::generate_pidtgid_track_descriptor(
                 pid_uuids,
                 thread_uuids,
                 tgidpid,
                 "Network Connections".to_string(),
                 thread_group_uuid,
-            );
+            ) else {
+                continue;
+            };
 
             let mut thread_group_packet = TracePacket::default();
             thread_group_packet.set_track_descriptor(thread_group_desc);
