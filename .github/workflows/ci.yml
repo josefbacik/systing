@@ -35,18 +35,20 @@ jobs:
         run: ./.github/workflows/install_deps.sh
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Clippy (no features)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
-
-      - name: Clippy (pystacks)
-        run: cargo clippy --all-targets --features pystacks -- -D warnings
+        with:
+          cache-on-failure: true
 
       - name: Unit tests (no features)
         run: cargo test --no-default-features
 
       - name: Unit tests (pystacks)
         run: cargo test --features pystacks
+
+      - name: Clippy (no features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: Clippy (pystacks)
+        run: cargo clippy --all-targets --features pystacks -- -D warnings
 
       - name: Build integration tests (no features)
         id: build-no-features
@@ -71,11 +73,11 @@ jobs:
       - name: Integration tests (no features)
         uses: danobi/vmtest-action@master
         with:
-          kernel_url: 'https://github.com/danobi/vmtest/releases/download/test_assets/bzImage-v6.6-fedora38'
+          kernel_url: 'https://github.com/josefbacik/systing/releases/download/vmtest-kernels/bzImage-v6.12-bpf'
           command: '/bin/bash -c "set -euo pipefail && cd /mnt/vmtest && TEST_BINARY=${{ steps.build-no-features.outputs.TV_BIN }} ./scripts/run-integration-tests.sh --no-sudo && TEST_BINARY=${{ steps.build-no-features.outputs.AC_BIN }} ./scripts/run-integration-tests.sh --no-sudo"'
 
       - name: Integration tests (pystacks)
         uses: danobi/vmtest-action@master
         with:
-          kernel_url: 'https://github.com/danobi/vmtest/releases/download/test_assets/bzImage-v6.6-fedora38'
+          kernel_url: 'https://github.com/josefbacik/systing/releases/download/vmtest-kernels/bzImage-v6.12-bpf'
           command: '/bin/bash -c "set -euo pipefail && cd /mnt/vmtest && TEST_BINARY=${{ steps.build-pystacks.outputs.TV_BIN }} ./scripts/run-integration-tests.sh --no-sudo && TEST_BINARY=${{ steps.build-pystacks.outputs.AC_BIN }} ./scripts/run-integration-tests.sh --no-sudo"'
