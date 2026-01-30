@@ -8,6 +8,10 @@ on:
       branches:
         - main
 
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_INCREMENTAL: 0
+
 jobs:
   format_check:
     runs-on: ubuntu-latest
@@ -20,6 +24,11 @@ jobs:
   clippy_check:
     runs-on: ubuntu-latest
     steps:
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
       - uses: actions/checkout@v4
 
       - name: Install Deps.
@@ -35,8 +44,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
       - uses: actions/checkout@v4
-      
+
       - name: Install Deps.
         run: ./.github/workflows/install_deps.sh
 
@@ -51,6 +65,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
       - uses: actions/checkout@v4
 
       - name: Install Deps.
