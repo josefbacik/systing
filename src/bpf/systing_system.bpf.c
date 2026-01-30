@@ -289,6 +289,12 @@ struct epoll_event_bpf {
  * Dummy instance to get skeleton to generate definition for
  * `struct task_event`
  */
+#ifdef SYSTING_PYSTACKS
+struct exec_event {
+	u32 pid;
+};
+#endif
+
 struct task_event _event = {0};
 struct stack_event _stack_event = {0};
 struct perf_counter_event _perf_counter_event = {0};
@@ -297,6 +303,9 @@ struct packet_event _packet_event = {0};
 struct epoll_event_bpf _epoll_event = {0};
 struct task_info _task_info = {0};
 struct probe_event _uprobe_event = {0};
+#ifdef SYSTING_PYSTACKS
+struct exec_event _exec_event = {0};
+#endif
 struct arg_desc _arg_desc = {0};
 enum event_type _type = SCHED_SWITCH;
 enum arg_type _arg_type = ARG_NONE;
@@ -579,6 +588,13 @@ struct epoll_ringbuf_map {
 	ringbuf_epoll_events_node5 SEC(".maps"),
 	ringbuf_epoll_events_node6 SEC(".maps"),
 	ringbuf_epoll_events_node7 SEC(".maps");
+
+#ifdef SYSTING_PYSTACKS
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 4096 /* 4KB - exec events are tiny and rare */);
+} ringbuf_exec_events SEC(".maps");
+#endif
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
@@ -1469,6 +1485,26 @@ int BPF_PROG(systing_sched_process_fork, struct task_struct *parent,
 {
 	return handle_sched_process_fork(parent, child);
 }
+
+#ifdef SYSTING_PYSTACKS
+SEC("tp_btf/sched_process_exec")
+int BPF_PROG(systing_sched_process_exec, struct task_struct *task,
+	     pid_t old_pid, struct linux_binprm *bprm)
+{
+	if (!tool_config.collect_pystacks)
+		return 0;
+	if (!trace_task(task))
+		return 0;
+
+	struct exec_event *event =
+		bpf_ringbuf_reserve(&ringbuf_exec_events, sizeof(*event), 0);
+	if (!event)
+		return 0;
+	event->pid = task->tgid;
+	bpf_ringbuf_submit(event, 0);
+	return 0;
+}
+#endif
 
 SEC("tp_btf/irq_handler_entry")
 int BPF_PROG(systing_irq_handler_entry, int irq, struct irqaction *action)

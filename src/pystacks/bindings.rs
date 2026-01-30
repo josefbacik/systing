@@ -78,6 +78,9 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn pystacks_load_symbols(run: *mut stack_walker_run);
 }
+unsafe extern "C" {
+    pub fn pystacks_add_pid(run: *mut stack_walker_run, pid: pid_t);
+}
 pub const strobelight_lib_print_level_STROBELIGHT_LIB_WARN: strobelight_lib_print_level = 0;
 pub const strobelight_lib_print_level_STROBELIGHT_LIB_INFO: strobelight_lib_print_level = 1;
 pub const strobelight_lib_print_level_STROBELIGHT_LIB_DEBUG: strobelight_lib_print_level = 2;

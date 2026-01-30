@@ -326,6 +326,15 @@ impl StackWalkerRun {
         }
     }
 
+    pub fn add_pid(&self, pid: i32) {
+        if self.initialized() {
+            if self.is_debug() {
+                eprintln!("[pystacks debug] Dynamically adding PID {}", pid);
+            }
+            unsafe { bindings::pystacks_add_pid(self.ptr, pid) };
+        }
+    }
+
     pub fn pystacks_to_frames_mapping(
         &self,
         frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
@@ -747,6 +756,10 @@ impl StackWalkerRun {
     }
 
     pub fn init_pystacks(&mut self, _pids: &[u32], _bpf_object: &Object, _debug: bool) {
+        // Stub implementation when pystacks feature is disabled
+    }
+
+    pub fn add_pid(&self, _pid: i32) {
         // Stub implementation when pystacks feature is disabled
     }
 

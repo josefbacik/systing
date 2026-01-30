@@ -86,6 +86,63 @@ fn pyenv_python(version: &str) -> PathBuf {
     path
 }
 
+/// Scan a stack.parquet file for Python symbols and a specific target function name.
+/// Returns `(found_python_symbols, found_target_function)`.
+#[cfg(feature = "pystacks")]
+fn find_python_symbols_in_parquet(
+    parquet_path: &std::path::Path,
+    target_function: &str,
+) -> (bool, bool) {
+    use arrow::array::ListArray;
+    use arrow::array::StringArray;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = std::fs::File::open(parquet_path).expect("Failed to open stack.parquet");
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
+    let reader = builder.build().expect("Failed to build reader");
+
+    let mut found_python_symbols = false;
+    let mut found_target_function = false;
+
+    for batch_result in reader {
+        let batch = batch_result.expect("Failed to read batch");
+
+        if let Some(frame_names_col) = batch.column_by_name("frame_names") {
+            let list_array = frame_names_col
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("frame_names should be a ListArray");
+
+            for i in 0..list_array.len() {
+                if list_array.is_null(i) {
+                    continue;
+                }
+
+                let inner = list_array.value(i);
+                let string_array = inner
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("frame_names inner should be StringArray");
+
+                for j in 0..string_array.len() {
+                    if string_array.is_null(j) {
+                        continue;
+                    }
+                    let func_name = string_array.value(j);
+                    if func_name.contains("(python)") {
+                        found_python_symbols = true;
+                    }
+                    if func_name.contains(target_function) {
+                        found_target_function = true;
+                    }
+                }
+            }
+        }
+    }
+
+    (found_python_symbols, found_target_function)
+}
+
 // =============================================================================
 // Non-privileged tests (no systing recording needed)
 // =============================================================================
@@ -1910,9 +1967,6 @@ fn test_run_command_suite() {
 #[ignore] // Requires root/BPF privileges and pystacks feature
 #[cfg(feature = "pystacks")]
 fn test_pystacks_run_and_trace() {
-    use arrow::array::ListArray;
-    use arrow::array::StringArray;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File;
     use std::io::Write;
 
@@ -1977,48 +2031,8 @@ if __name__ == "__main__":
         "[pystacks run-trace] stack.parquet not found"
     );
 
-    let file = File::open(&stack_parquet).expect("Failed to open stack.parquet");
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
-    let reader = builder.build().expect("Failed to build reader");
-
-    let mut found_python_symbols = false;
-    let mut found_test_function = false;
-
-    for batch_result in reader {
-        let batch = batch_result.expect("Failed to read batch");
-
-        if let Some(frame_names_col) = batch.column_by_name("frame_names") {
-            let list_array = frame_names_col
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .expect("frame_names should be a ListArray");
-
-            for i in 0..list_array.len() {
-                if list_array.is_null(i) {
-                    continue;
-                }
-
-                let inner = list_array.value(i);
-                let string_array = inner
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("frame_names inner should be StringArray");
-
-                for j in 0..string_array.len() {
-                    if string_array.is_null(j) {
-                        continue;
-                    }
-                    let func_name = string_array.value(j);
-                    if func_name.contains("(python)") {
-                        found_python_symbols = true;
-                    }
-                    if func_name.contains("systing_run_trace_function") {
-                        found_test_function = true;
-                    }
-                }
-            }
-        }
-    }
+    let (found_python_symbols, found_test_function) =
+        find_python_symbols_in_parquet(&stack_parquet, "systing_run_trace_function");
 
     assert!(
         found_python_symbols,
@@ -2039,4 +2053,132 @@ if __name__ == "__main__":
     );
 
     eprintln!("  Pystacks run-and-trace mode passed");
+}
+
+// =============================================================================
+// Pystacks exec event dynamic discovery (wrapper script → Python)
+// =============================================================================
+
+/// Tests that the BPF sched_process_exec handler dynamically discovers Python
+/// when the traced command is a shell wrapper that forks a child which execs
+/// into Python. This exercises the exec event ringbuf → handle_exec_events()
+/// → add_pid() path.
+///
+/// The wrapper script backgrounds Python (`python script.py &`), creating a
+/// new child PID that execs into Python. This new PID was not seen during
+/// pystacks init, so it must be dynamically discovered via the exec event
+/// handler.
+#[test]
+#[ignore] // Requires root/BPF privileges and pystacks feature
+#[cfg(feature = "pystacks")]
+fn test_pystacks_exec_discovery() {
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+
+    // Create a Python script with a distinctive function name
+    let python_script = dir.path().join("test_exec_discovery.py");
+    let script_content = r#"
+import time
+
+def exec_discovery_target_function():
+    """Function that does busy work to show up in profiling."""
+    total = 0
+    for i in range(1000000):
+        total += i * i
+    return total
+
+def main():
+    start_time = time.time()
+    while time.time() - start_time < 5:
+        exec_discovery_target_function()
+
+if __name__ == "__main__":
+    main()
+"#;
+    {
+        let mut file = File::create(&python_script).expect("Failed to create Python script");
+        file.write_all(script_content.as_bytes())
+            .expect("Failed to write Python script");
+    }
+
+    // Create a wrapper that forks a child which execs into Python.
+    // The traced PID is the wrapper (sh), but the Python work happens in
+    // a forked child — a NEW PID that was not seen during pystacks init.
+    // The exec handler must detect this child's exec into Python and call
+    // add_pid() for the child PID.
+    let wrapper_script = dir.path().join("wrapper.sh");
+    let python_bin = pyenv_python(PYTHON_313_VERSION);
+    let wrapper_content = format!(
+        "#!/bin/sh\n{} {} &\nPYPID=$!\nwait $PYPID\n",
+        python_bin.display(),
+        python_script.display()
+    );
+    {
+        let mut file = File::create(&wrapper_script).expect("Failed to create wrapper script");
+        file.write_all(wrapper_content.as_bytes())
+            .expect("Failed to write wrapper script");
+        let mut perms = file.metadata().unwrap().permissions();
+        perms.set_mode(0o755);
+        file.set_permissions(perms).unwrap();
+    }
+
+    // Trace the wrapper script, NOT Python directly
+    let run_cmd = vec![wrapper_script.to_str().unwrap().to_string()];
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+
+    let config = Config {
+        parquet_only: false,
+        collect_pystacks: true,
+        // pystacks_pids is intentionally empty — discovery must happen
+        // via the BPF exec event handler detecting the child's exec into Python
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path.clone(),
+        ..Config::default()
+    };
+
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+    assert_eq!(
+        exit_code, 0,
+        "[pystacks exec-discovery] Wrapper script should exit with code 0"
+    );
+
+    // Verify Python symbols appear in stack.parquet — this proves the exec
+    // handler dynamically discovered the child Python PID
+    let stack_parquet = dir.path().join("stack.parquet");
+    assert!(
+        stack_parquet.exists(),
+        "[pystacks exec-discovery] stack.parquet not found"
+    );
+
+    let (found_python_symbols, found_test_function) =
+        find_python_symbols_in_parquet(&stack_parquet, "exec_discovery_target_function");
+
+    assert!(
+        found_python_symbols,
+        "[pystacks exec-discovery] No Python symbols found in stack.parquet. \
+         The exec event handler should have detected the child's exec into Python."
+    );
+
+    assert!(
+        found_test_function,
+        "[pystacks exec-discovery] Expected function 'exec_discovery_target_function' not found. \
+         The exec event handler should have added the child Python PID for stack walking."
+    );
+
+    let parquet_result = validate_parquet_dir(dir.path());
+    assert!(
+        parquet_result.is_valid(),
+        "[pystacks exec-discovery] Parquet validation failed:\nErrors: {:?}\nWarnings: {:?}",
+        parquet_result.errors,
+        parquet_result.warnings
+    );
+
+    eprintln!("  Pystacks exec event discovery passed");
 }
