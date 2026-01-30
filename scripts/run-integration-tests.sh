@@ -19,10 +19,29 @@ if ! command -v jq &>/dev/null; then
     exit 1
 fi
 
+# Parse flags
+USE_SUDO=true
+POSITIONAL=()
+for arg in "$@"; do
+    case "$arg" in
+        --no-sudo) USE_SUDO=false ;;
+        *) POSITIONAL+=("$arg") ;;
+    esac
+done
+set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+
 # Configuration with defaults
 TEST_NAME="${1:-trace_validation}"
 shift || true  # Allow $@ to be empty if no additional args provided
 CARGO_FEATURES="${CARGO_FEATURES:-}"
+
+run_test() {
+    if [[ "$USE_SUDO" == true ]]; then
+        sudo -E "$@"
+    else
+        "$@"
+    fi
+}
 
 # If TEST_BINARY is set, skip build/discovery and run directly
 if [[ -n "${TEST_BINARY:-}" ]]; then
@@ -31,7 +50,7 @@ if [[ -n "${TEST_BINARY:-}" ]]; then
         exit 1
     fi
     echo "Using pre-built test binary: $TEST_BINARY"
-    sudo -E "$TEST_BINARY" --ignored --test-threads=1 "$@"
+    run_test "$TEST_BINARY" --ignored --test-threads=1 "$@"
     exit $?
 fi
 
@@ -77,9 +96,9 @@ if [[ -z "$TEST_BINARY" || ! -x "$TEST_BINARY" ]]; then
 fi
 
 echo "Found test binary: $TEST_BINARY"
-echo "Running: sudo -E $TEST_BINARY --ignored $*"
+echo "Running: $TEST_BINARY --ignored $*"
 
 # Run tests serially: systing attaches system-wide BPF tracepoints, so only
 # one instance can run at a time without ring buffer contention and event drops.
 # Use sudo -E to preserve environment (DEBUGINFOD_URLS, PATH, etc.)
-sudo -E "$TEST_BINARY" --ignored --test-threads=1 "$@"
+run_test "$TEST_BINARY" --ignored --test-threads=1 "$@"

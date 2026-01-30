@@ -42,12 +42,6 @@ jobs:
       - name: Clippy (pystacks)
         run: cargo clippy --all-targets --features pystacks -- -D warnings
 
-      - name: Build release (no features)
-        run: cargo build --no-default-features --release
-
-      - name: Build release (pystacks)
-        run: cargo build --features pystacks --release
-
       - name: Unit tests (no features)
         run: cargo test --no-default-features
 
@@ -78,10 +72,10 @@ jobs:
         uses: danobi/vmtest-action@master
         with:
           kernel_url: 'https://github.com/danobi/vmtest/releases/download/test_assets/bzImage-v6.6-fedora38'
-          command: '/bin/bash -c "set -euo pipefail && cd /mnt/vmtest && TEST_BINARY=${{ steps.build-no-features.outputs.TV_BIN }} ./scripts/run-integration-tests.sh && TEST_BINARY=${{ steps.build-no-features.outputs.AC_BIN }} ./scripts/run-integration-tests.sh"'
+          command: '/bin/bash -c "set -euo pipefail && cd /mnt/vmtest && TEST_BINARY=${{ steps.build-no-features.outputs.TV_BIN }} ./scripts/run-integration-tests.sh --no-sudo && TEST_BINARY=${{ steps.build-no-features.outputs.AC_BIN }} ./scripts/run-integration-tests.sh --no-sudo"'
 
       - name: Integration tests (pystacks)
         uses: danobi/vmtest-action@master
         with:
           kernel_url: 'https://github.com/danobi/vmtest/releases/download/test_assets/bzImage-v6.6-fedora38'
-          command: '/bin/bash -c "set -euo pipefail && cd /mnt/vmtest && TEST_BINARY=${{ steps.build-pystacks.outputs.TV_BIN }} ./scripts/run-integration-tests.sh && TEST_BINARY=${{ steps.build-pystacks.outputs.AC_BIN }} ./scripts/run-integration-tests.sh"'
+          command: '/bin/bash -c "set -euo pipefail && cd /mnt/vmtest && TEST_BINARY=${{ steps.build-pystacks.outputs.TV_BIN }} ./scripts/run-integration-tests.sh --no-sudo && TEST_BINARY=${{ steps.build-pystacks.outputs.AC_BIN }} ./scripts/run-integration-tests.sh --no-sudo"'
