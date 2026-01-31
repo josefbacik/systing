@@ -1,5 +1,5 @@
 use crate::stack_recorder::{LocalFrame, Stack};
-use crate::systing::types::stack_event;
+use crate::systing_core::types::stack_event;
 use libbpf_rs::Object;
 use std::collections::HashMap;
 #[cfg(feature = "pystacks")]
@@ -13,8 +13,50 @@ use std::time::Instant;
 #[cfg(feature = "pystacks")]
 use {
     crate::pystacks::bindings, crate::stack_recorder::add_frame, libbpf_rs::libbpf_sys,
-    libbpf_rs::AsRawLibbpf, std::fmt, std::ptr::NonNull,
+    libbpf_rs::AsRawLibbpf, std::ffi::CStr, std::fmt, std::ptr::NonNull,
 };
+
+/// Callback function for strobelight library logging.
+/// Only logs WARN level by default. Set PYSTACKS_DEBUG=1 to enable all levels.
+#[cfg(feature = "pystacks")]
+extern "C" fn strobelight_log_callback(
+    level: bindings::strobelight_lib_print_level,
+    msg: *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Cache whether debug mode is enabled (checked once on first call)
+    static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+    if !INITIALIZED.swap(true, Ordering::Relaxed) {
+        DEBUG_ENABLED.store(std::env::var("PYSTACKS_DEBUG").is_ok(), Ordering::Relaxed);
+    }
+
+    if msg.is_null() {
+        return 0;
+    }
+
+    // By default, only log WARN. Enable DEBUG/INFO with PYSTACKS_DEBUG=1
+    let should_log = match level {
+        bindings::strobelight_lib_print_level_STROBELIGHT_LIB_WARN => true,
+        _ => DEBUG_ENABLED.load(Ordering::Relaxed),
+    };
+
+    if should_log {
+        // SAFETY: msg pointer was checked for null above, and the C library
+        // guarantees it provides a valid null-terminated string.
+        let msg_str = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
+        let level_str = match level {
+            bindings::strobelight_lib_print_level_STROBELIGHT_LIB_WARN => "WARN",
+            bindings::strobelight_lib_print_level_STROBELIGHT_LIB_INFO => "INFO",
+            bindings::strobelight_lib_print_level_STROBELIGHT_LIB_DEBUG => "DEBUG",
+            _ => "UNKNOWN",
+        };
+        eprintln!("[pystacks {level_str}] {msg_str}");
+    }
+    0
+}
 
 #[derive(Debug, Clone)]
 pub struct PyAddr {
@@ -51,8 +93,8 @@ impl Hash for PyAddr {
 }
 
 #[cfg(feature = "pystacks")]
-impl From<&crate::systing::types::stack_walker_frame> for bindings::stack_walker_frame {
-    fn from(frame: &crate::systing::types::stack_walker_frame) -> Self {
+impl From<&crate::systing_core::types::stack_walker_frame> for bindings::stack_walker_frame {
+    fn from(frame: &crate::systing_core::types::stack_walker_frame) -> Self {
         bindings::stack_walker_frame {
             symbol_id: frame.symbol_id,
             inst_idx: frame.inst_idx,
@@ -61,7 +103,7 @@ impl From<&crate::systing::types::stack_walker_frame> for bindings::stack_walker
 }
 
 #[cfg(feature = "pystacks")]
-impl fmt::Display for crate::systing::types::stack_walker_frame {
+impl fmt::Display for crate::systing_core::types::stack_walker_frame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Customize the formatting as needed
         write!(
@@ -87,27 +129,64 @@ impl fmt::Display for bindings::stack_walker_frame {
 //
 // Implementation when pystacks feature is ENABLED
 //
+/// Maximum number of sample events/frames to log in debug mode.
+#[cfg(feature = "pystacks")]
+const DEBUG_SAMPLE_LOG_LIMIT: u64 = 10;
+
 #[cfg(feature = "pystacks")]
 pub struct StackWalkerRun {
     ptr: *mut bindings::stack_walker_run,
     // Symbol loading rate limiting
     last_symbol_load: std::cell::Cell<Option<Instant>>,
     symbol_load_interval: std::time::Duration,
+    // Debug mode flag (atomic for thread safety with Sync impl)
+    debug: std::sync::atomic::AtomicBool,
+    // Counters for debug statistics (atomic for thread safety with Sync impl)
+    events_with_pystack: std::sync::atomic::AtomicU64,
+    events_without_pystack: std::sync::atomic::AtomicU64,
+    symbols_loaded_count: std::sync::atomic::AtomicU64,
+    frames_symbolized: std::sync::atomic::AtomicU64,
+    frames_unknown: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "pystacks")]
 impl StackWalkerRun {
     fn new() -> Self {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicU64;
+
         StackWalkerRun {
             ptr: std::ptr::null_mut(),
             last_symbol_load: std::cell::Cell::new(None),
             // Load symbols at most once per 500ms (2 Hz) to catch dying processes
             // while minimizing overhead on long traces
             symbol_load_interval: std::time::Duration::from_millis(500),
+            debug: AtomicBool::new(false),
+            events_with_pystack: AtomicU64::new(0),
+            events_without_pystack: AtomicU64::new(0),
+            symbols_loaded_count: AtomicU64::new(0),
+            frames_symbolized: AtomicU64::new(0),
+            frames_unknown: AtomicU64::new(0),
         }
     }
 
-    fn init(&mut self, bpf_object: NonNull<libbpf_sys::bpf_object>, pid_opts: &mut [i32]) {
+    fn init(
+        &mut self,
+        bpf_object: NonNull<libbpf_sys::bpf_object>,
+        pid_opts: &mut [i32],
+        debug: bool,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        self.debug.store(debug, Ordering::Relaxed);
+
+        if debug {
+            eprintln!(
+                "[pystacks debug] StackWalkerRun::init called with {} PIDs",
+                pid_opts.len()
+            );
+        }
+
         if !self.initialized() {
             let mut opts = bindings::stack_walker_opts {
                 pids: pid_opts.as_mut_ptr(),
@@ -115,17 +194,59 @@ impl StackWalkerRun {
                 manualSymbolRefresh: true,
             };
 
+            if debug {
+                eprintln!("[pystacks debug] Calling pystacks_init...");
+            }
+
             self.ptr = unsafe {
                 bindings::pystacks_init(
                     bpf_object.as_ptr() as *mut bindings::bpf_object,
                     &mut opts as *mut _,
+                    std::ptr::null_mut(),
                 )
             };
+
+            if debug {
+                if self.ptr.is_null() {
+                    eprintln!("[pystacks debug] pystacks_init FAILED - returned null pointer");
+                } else {
+                    eprintln!("[pystacks debug] pystacks_init SUCCESS - library initialized");
+                }
+            }
+        } else if debug {
+            eprintln!("[pystacks debug] StackWalkerRun already initialized, skipping");
         }
     }
 
     fn initialized(&self) -> bool {
         !self.ptr.is_null()
+    }
+
+    /// Returns true if debug mode is enabled.
+    fn is_debug(&self) -> bool {
+        self.debug.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Prints debug statistics summarizing pystacks activity.
+    ///
+    /// This is automatically called when the StackWalkerRun is dropped,
+    /// but can also be called manually to get intermediate statistics.
+    /// Only produces output if debug mode was enabled during initialization.
+    pub fn print_debug_stats(&self) {
+        use std::sync::atomic::Ordering;
+
+        if self.is_debug() {
+            eprintln!(
+                "[pystacks debug] stats: with_pystack={} without_pystack={} \
+                 symbol_loads={} symbolized={} unknown={} initialized={}",
+                self.events_with_pystack.load(Ordering::Relaxed),
+                self.events_without_pystack.load(Ordering::Relaxed),
+                self.symbols_loaded_count.load(Ordering::Relaxed),
+                self.frames_symbolized.load(Ordering::Relaxed),
+                self.frames_unknown.load(Ordering::Relaxed),
+                self.initialized()
+            );
+        }
     }
 
     fn symbolize_function(&self, frame: &PyAddr) -> String {
@@ -202,6 +323,15 @@ impl StackWalkerRun {
     fn load_symbols(&self) {
         if self.initialized() {
             unsafe { bindings::pystacks_load_symbols(self.ptr) };
+        }
+    }
+
+    pub fn add_pid(&self, pid: i32) {
+        if self.initialized() {
+            if self.is_debug() {
+                eprintln!("[pystacks debug] Dynamically adding PID {}", pid);
+            }
+            unsafe { bindings::pystacks_add_pid(self.ptr, pid) };
         }
     }
 
@@ -395,8 +525,29 @@ impl StackWalkerRun {
     }
 
     pub fn get_pystack_from_event(&self, event: &stack_event) -> Vec<PyAddr> {
+        use std::sync::atomic::Ordering;
+
         let stack_len =
             (event.py_msg_buffer.stack_len as usize).min(event.py_msg_buffer.buffer.len());
+
+        // Track statistics only in debug mode to avoid overhead in hot path
+        if self.is_debug() {
+            if stack_len > 0 {
+                let count = self.events_with_pystack.fetch_add(1, Ordering::Relaxed) + 1;
+
+                // Log first few events with Python stacks
+                if count <= DEBUG_SAMPLE_LOG_LIMIT {
+                    let pid = event.task.tgidpid >> 32;
+                    eprintln!(
+                        "[pystacks debug] Event #{} with Python stack: PID={} stack_len={}",
+                        count, pid, stack_len
+                    );
+                }
+            } else {
+                self.events_without_pystack.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         Vec::from(&event.py_msg_buffer.buffer[..stack_len])
             .iter()
             .map(|frame| PyAddr { addr: frame.into() })
@@ -404,7 +555,16 @@ impl StackWalkerRun {
     }
 
     pub fn load_pystack_symbols(&self, event: &stack_event) {
-        if !self.initialized() || event.py_msg_buffer.stack_len == 0 {
+        use std::sync::atomic::Ordering;
+
+        if !self.initialized() {
+            if self.is_debug() && self.events_with_pystack.load(Ordering::Relaxed) == 1 {
+                eprintln!("[pystacks debug] load_pystack_symbols: library not initialized!");
+            }
+            return;
+        }
+
+        if event.py_msg_buffer.stack_len == 0 {
             return;
         }
 
@@ -417,20 +577,105 @@ impl StackWalkerRun {
         };
 
         if should_load {
+            if self.is_debug() {
+                let count = self.symbols_loaded_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if count <= DEBUG_SAMPLE_LOG_LIMIT {
+                    eprintln!("[pystacks debug] Loading symbols (load #{})", count);
+                }
+            }
+
             self.load_symbols();
             self.last_symbol_load.set(Some(now));
         }
     }
 
-    pub fn init_pystacks(&mut self, pids: &[u32], bpf_object: &Object) {
+    pub fn init_pystacks(&mut self, pids: &[u32], bpf_object: &Object, debug: bool) {
+        if debug {
+            eprintln!(
+                "[pystacks debug] init_pystacks called with {} PIDs",
+                pids.len()
+            );
+        }
+
         if !pids.is_empty() {
-            let mut pid_opts: Vec<i32> = Vec::new();
-            for pid in pids.iter() {
-                pid_opts.push(*pid as i32);
+            // Set up logging before initialization
+            // Note: The strobelight_log_callback checks PYSTACKS_DEBUG env var internally
+            // for enabling verbose C++ library output. Set this env var before running
+            // systing if you need C++ library debug output.
+            unsafe {
+                bindings::strobelight_lib_set_print(Some(strobelight_log_callback));
             }
 
-            self.init(bpf_object.as_libbpf_object(), &mut pid_opts);
+            let mut pid_opts: Vec<i32> = pids.iter().map(|&pid| pid as i32).collect();
+
+            self.init(bpf_object.as_libbpf_object(), &mut pid_opts, debug);
+        } else if debug {
+            eprintln!("[pystacks debug] No PIDs provided, skipping pystacks initialization");
         }
+    }
+
+    /// Get Python frame names as formatted strings for streaming mode.
+    /// Returns a vector of frame name strings in the format:
+    /// "function_name (python) [filename:line]"
+    pub fn get_python_frame_names(&self, py_stack: &[PyAddr]) -> Vec<String> {
+        use std::sync::atomic::Ordering;
+
+        if !self.initialized() {
+            if self.is_debug() && !py_stack.is_empty() {
+                eprintln!(
+                    "[pystacks debug] get_python_frame_names: library not initialized, returning empty for {} frames",
+                    py_stack.len()
+                );
+            }
+            return Vec::new();
+        }
+
+        if py_stack.is_empty() {
+            return Vec::new();
+        }
+
+        let debug = self.is_debug();
+
+        py_stack
+            .iter()
+            .map(|frame| {
+                let func_name = self.symbolize_function(frame);
+                let (filename, line_number) = self.symbolize_filename_line(frame);
+
+                // Track statistics only in debug mode
+                if debug {
+                    if func_name == "<unknown python>" {
+                        self.frames_unknown.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        let count = self.frames_symbolized.fetch_add(1, Ordering::Relaxed) + 1;
+
+                        // Log sample frames
+                        if count <= DEBUG_SAMPLE_LOG_LIMIT {
+                            // Extract just the base filename for logging
+                            let base_filename = std::path::Path::new(&filename)
+                                .file_name()
+                                .and_then(|f| f.to_str())
+                                .unwrap_or(&filename);
+                            eprintln!(
+                                "[pystacks debug] Symbolized frame #{}: symbol_id={} -> {} [{}]",
+                                count, frame.addr.symbol_id, func_name, base_filename
+                            );
+                        }
+                    }
+                }
+
+                // Extract just the base filename
+                let base_filename = std::path::Path::new(&filename)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(&filename);
+
+                match line_number {
+                    Some(line) => format!("{func_name} (python) [{base_filename}:{line}]"),
+                    None => format!("{func_name} (python) [{base_filename}]"),
+                }
+            })
+            .collect()
     }
 }
 
@@ -444,6 +689,9 @@ impl Default for StackWalkerRun {
 #[cfg(feature = "pystacks")]
 impl Drop for StackWalkerRun {
     fn drop(&mut self) {
+        // Print debug stats before cleanup
+        self.print_debug_stats();
+
         if !self.ptr.is_null() {
             unsafe { bindings::pystacks_free(self.ptr) };
             self.ptr = std::ptr::null_mut();
@@ -507,8 +755,21 @@ impl StackWalkerRun {
         // Stub implementation when pystacks feature is disabled
     }
 
-    pub fn init_pystacks(&mut self, _pids: &[u32], _bpf_object: &Object) {
+    pub fn init_pystacks(&mut self, _pids: &[u32], _bpf_object: &Object, _debug: bool) {
         // Stub implementation when pystacks feature is disabled
+    }
+
+    pub fn add_pid(&self, _pid: i32) {
+        // Stub implementation when pystacks feature is disabled
+    }
+
+    pub fn print_debug_stats(&self) {
+        // Stub implementation when pystacks feature is disabled
+    }
+
+    pub fn get_python_frame_names(&self, _py_stack: &[PyAddr]) -> Vec<String> {
+        // Stub implementation when pystacks feature is disabled
+        Vec::new()
     }
 }
 

@@ -1,9 +1,9 @@
 #!/bin/bash
 #
-# Pre-commit hook to enforce cargo fmt and clippy
+# Pre-commit hook to enforce cargo fmt, clippy, and tests
 #
-# This hook checks if the code is properly formatted and passes clippy
-# before allowing a commit.
+# This hook checks if the code is properly formatted, passes clippy,
+# and all tests pass before allowing a commit.
 
 # Colors
 GREEN='\033[0;32m'
@@ -31,13 +31,39 @@ else
     FAILED=1
 fi
 
-# Check clippy with pystacks feature
+# Check clippy with pystacks feature (only if dependencies are available)
 echo -ne "Checking clippy (pystacks)... "
-if cargo clippy --all-targets --features pystacks -- -D warnings &> /dev/null; then
+if pkg-config --exists fmt re2 libcap 2>/dev/null; then
+    if cargo clippy --all-targets --features pystacks -- -D warnings &> /dev/null; then
+        echo -e "${GREEN}✓${NC}"
+    else
+        echo -e "${RED}✗${NC}"
+        FAILED=1
+    fi
+else
+    echo -e "${GREEN}⊘ (dependencies not installed)${NC}"
+fi
+
+# Run tests with no-default-features
+echo -ne "Running tests (no-default-features)... "
+if cargo test --no-default-features &> /dev/null; then
     echo -e "${GREEN}✓${NC}"
 else
     echo -e "${RED}✗${NC}"
     FAILED=1
+fi
+
+# Run tests with pystacks feature (only if dependencies are available)
+echo -ne "Running tests (pystacks)... "
+if pkg-config --exists fmt re2 libcap 2>/dev/null; then
+    if cargo test --features pystacks &> /dev/null; then
+        echo -e "${GREEN}✓${NC}"
+    else
+        echo -e "${RED}✗${NC}"
+        FAILED=1
+    fi
+else
+    echo -e "${GREEN}⊘ (dependencies not installed)${NC}"
 fi
 
 # Exit with failure if any check failed
