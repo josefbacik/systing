@@ -7,9 +7,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::perfetto::TraceWriter;
+use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
-use crate::systing::types::probe_event;
-use crate::SystingRecordEvent;
+use crate::systing_core::types::probe_event;
+use crate::systing_core::SystingRecordEvent;
+use crate::trace::{ArgRecord, InstantArgRecord, InstantRecord, SliceRecord, TrackRecord};
+use crate::utid::UtidGenerator;
 
 use anyhow::Result;
 use plain::Plain;
@@ -23,10 +27,27 @@ use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::{EventName, TrackEvent};
 
 const SYS_ENTER_COOKIE: u64 = 0xFFFFFFFFFFFFFFFE;
+const SYSCALLS_TRACK_NAME: &str = "syscalls";
 
 enum ArgValue {
     String(String),
     Long(u64),
+}
+
+/// Convert ArgValue to record fields (key, int_value, string_value).
+fn convert_arg(arg: &(String, ArgValue)) -> (String, Option<i64>, Option<String>) {
+    match &arg.1 {
+        ArgValue::String(s) => (arg.0.clone(), None, Some(s.clone())),
+        ArgValue::Long(v) => (arg.0.clone(), Some(*v as i64), None),
+    }
+}
+
+/// Get the name for a syscall number.
+fn syscall_name(nr: u64) -> String {
+    use syscalls::Sysno;
+    Sysno::new(nr as usize)
+        .map(|sysno| sysno.name().to_string())
+        .unwrap_or_else(|| format!("syscall_{nr}"))
 }
 
 struct TrackInstant {
@@ -45,6 +66,13 @@ struct TrackRange {
 struct ThresholdStopTrigger {
     start_cookie: u64,
     duration_us: u64,
+}
+
+/// Key for track ID caching during streaming.
+#[derive(Hash, Eq, PartialEq, Clone)]
+enum TrackCacheKey {
+    Thread { tgidpid: u64, track_name: String },
+    Cpu { cpu: u32, track_name: String },
 }
 
 // This is the main recorder struct, we keep track of the configuration for the events, as well as
@@ -124,6 +152,17 @@ pub struct SystingProbeRecorder {
     completed_syscalls: HashMap<u64, Vec<(u64, u64, u64)>>,
     syscall_iids: HashMap<u64, u64>,
     syscall_name_ids: HashMap<String, u64>,
+
+    // Streaming mode support
+    streaming_collector: Option<Box<dyn RecordCollector + Send>>,
+    streaming_enabled: bool, // Track if streaming was ever enabled (survives finish())
+    track_id_counter: i64,
+    slice_id_counter: i64,
+    instant_id_counter: i64,
+    track_cache: HashMap<TrackCacheKey, i64>,
+
+    // Shared utid generator for consistent thread IDs across all recorders
+    utid_generator: Arc<UtidGenerator>,
 }
 
 // usdt:<path>:<provider>:<name>
@@ -171,12 +210,20 @@ pub struct TracepointEvent {
     pub name: String,
 }
 
+// Format is
+// marker:<match_string>
+#[derive(Clone, Default)]
+pub struct MarkerEvent {
+    pub match_string: String,
+}
+
 #[derive(Clone, Default)]
 pub enum EventProbe {
     UProbe(UProbeEvent),
     Usdt(UsdtProbeEvent),
     KProbe(KProbeEvent),
     Tracepoint(TracepointEvent),
+    Marker(MarkerEvent),
     #[default]
     Undefined,
 }
@@ -238,6 +285,21 @@ pub struct SystingEvent {
 //
 //   The "stack" field is optional (defaults to false). When set to true, systing will
 //   capture and emit a stack trace whenever this event fires.
+//
+//   Supported event formats:
+//     - "usdt:<path>:<provider>:<name>" - User Statically Defined Tracepoint
+//     - "uprobe:<path>:<symbol>" or "uprobe:<path>:<symbol>+<offset>" - User probe
+//     - "uretprobe:<path>:<symbol>" - User return probe
+//     - "kprobe:<symbol>" or "kprobe:<symbol>+<offset>" - Kernel probe
+//     - "kretprobe:<symbol>" - Kernel return probe
+//     - "tracepoint:<category>:<name>" - Kernel tracepoint
+//     - "marker:<match_string>" - Userspace marker via faccessat2 syscall
+//
+//   Marker events allow userspace code to emit trace events by calling:
+//     faccessat2(fd, "<match_string>", F_OK, 0)
+//   The fd argument and other syscall args can be captured using the "args" field.
+//   For markers, arg_index refers to the faccessat2 syscall arguments:
+//     0 = dfd, 1 = filename (the match string), 2 = mode, 3 = flags
 //
 //   "tracks": [
 //     {
@@ -368,8 +430,7 @@ impl UProbeEvent {
                 let symbol = parts[2].to_string();
                 let mut symbol_parts = symbol.split('+');
                 let symbol = symbol_parts.next().unwrap();
-                let offset = symbol_parts.next();
-                if let Some(offset) = offset {
+                if let Some(offset) = symbol_parts.next() {
                     probe.offset = offset.parse::<u64>()?;
                 } else {
                     probe.offset = 0;
@@ -426,8 +487,7 @@ impl KProbeEvent {
                 let symbol = parts[1].to_string();
                 let mut symbol_parts = symbol.split('+');
                 let symbol = symbol_parts.next().unwrap();
-                let offset = symbol_parts.next();
-                if let Some(offset) = offset {
+                if let Some(offset) = symbol_parts.next() {
                     probe.offset = offset.parse::<u64>()?;
                 } else {
                     probe.offset = 0;
@@ -471,9 +531,28 @@ impl TracepointEvent {
     }
 }
 
+impl MarkerEvent {
+    fn from_parts(parts: Vec<&str>) -> Result<Self, anyhow::Error> {
+        if parts.len() < 2 {
+            return Err(anyhow::anyhow!(
+                "Invalid marker format, expected marker:<match_string>"
+            ));
+        }
+        // Join with colons since match_string can contain colons
+        let match_string = parts[1..].join(":");
+        Ok(MarkerEvent { match_string })
+    }
+}
+
 impl fmt::Display for TracepointEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "tracepoint:{}:{}", self.category, self.name)
+    }
+}
+
+impl fmt::Display for MarkerEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "marker:{}", self.match_string)
     }
 }
 
@@ -506,6 +585,7 @@ impl fmt::Display for SystingEvent {
             EventProbe::Usdt(usdt) => write!(f, "{usdt}"),
             EventProbe::KProbe(kprobe) => write!(f, "{kprobe}"),
             EventProbe::Tracepoint(tracepoint) => write!(f, "{tracepoint}"),
+            EventProbe::Marker(marker) => write!(f, "{marker}"),
             _ => write!(f, "Invalid event"),
         }
     }
@@ -531,29 +611,46 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
         };
         let mut arg_data: Vec<(String, ArgValue)> = Vec::new();
 
+        // For marker events, args[0] is always socket_id (injected by BPF),
+        // and user-configured args start at args[1]
+        let is_marker = matches!(systing_event.event, EventProbe::Marker(_));
+        let arg_offset: usize = if is_marker { 1 } else { 0 };
+
+        // For marker events, extract socket_id from args[0]
+        if is_marker && event.num_args > 0 {
+            let bpf_arg = &event.args[0];
+            if bpf_arg.r#type == crate::systing_core::types::arg_type::ARG_LONG {
+                let mut bytes: [u8; 8] = [0; 8];
+                let _ = bytes.copy_from_bytes(&bpf_arg.value[..8]);
+                let val = u64::from_ne_bytes(bytes);
+                arg_data.push(("socket_id".to_string(), ArgValue::Long(val)));
+            }
+        }
+
         let num_args = event.num_args.min(event.args.len() as u8);
-        for i in 0..num_args as usize {
-            if i >= systing_event.args.len() {
+        for i in arg_offset..num_args as usize {
+            let config_idx = i - arg_offset;
+            if config_idx >= systing_event.args.len() {
                 break;
             }
 
             let bpf_arg = &event.args[i];
-            let event_key = &systing_event.args[i];
+            let event_key = &systing_event.args[config_idx];
 
             match bpf_arg.r#type {
-                crate::systing::types::arg_type::ARG_LONG => {
+                crate::systing_core::types::arg_type::ARG_LONG => {
                     let mut bytes: [u8; 8] = [0; 8];
                     let _ = bytes.copy_from_bytes(&bpf_arg.value[..8]);
                     let val = u64::from_ne_bytes(bytes);
                     arg_data.push((event_key.arg_name.clone(), ArgValue::Long(val)));
                 }
-                crate::systing::types::arg_type::ARG_RETVAL => {
+                crate::systing_core::types::arg_type::ARG_RETVAL => {
                     let mut bytes: [u8; 8] = [0; 8];
                     let _ = bytes.copy_from_bytes(&bpf_arg.value[..8]);
                     let val = u64::from_ne_bytes(bytes);
                     arg_data.push((event_key.arg_name.clone(), ArgValue::Long(val)));
                 }
-                crate::systing::types::arg_type::ARG_STRING => {
+                crate::systing_core::types::arg_type::ARG_STRING => {
                     let arg_str = CStr::from_bytes_until_nul(&bpf_arg.value);
                     if let Ok(arg_str) = arg_str {
                         let bytes = arg_str.to_bytes();
@@ -571,7 +668,7 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
         if systing_event.percpu {
             self.handle_cpu_event(event, arg_data);
         } else {
-            self.handle_process_event(event, arg_data);
+            self.handle_process_event(event, arg_data, is_marker);
         }
     }
 
@@ -626,6 +723,65 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
 }
 
 impl SystingProbeRecorder {
+    /// Create a new SystingProbeRecorder with the given utid generator.
+    pub fn new(utid_generator: Arc<UtidGenerator>) -> Self {
+        Self {
+            utid_generator,
+            ..Default::default()
+        }
+    }
+
+    /// Set the streaming collector for Parquet output during recording.
+    pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
+        self.streaming_collector = Some(collector);
+        self.streaming_enabled = true;
+    }
+
+    /// Check if streaming mode is currently active (collector present).
+    pub fn is_streaming(&self) -> bool {
+        self.streaming_collector.is_some()
+    }
+
+    /// Get or create a track ID, caching to avoid duplicates.
+    fn get_or_create_track(
+        &mut self,
+        key: TrackCacheKey,
+        collector: &mut dyn RecordCollector,
+    ) -> Result<i64> {
+        if let Some(&id) = self.track_cache.get(&key) {
+            return Ok(id);
+        }
+
+        self.track_id_counter += 1;
+        let track_id = self.track_id_counter;
+
+        let name = match &key {
+            TrackCacheKey::Thread { track_name, .. } => track_name.clone(),
+            TrackCacheKey::Cpu { cpu, track_name } => format!("{track_name} CPU {cpu}"),
+        };
+
+        collector.add_track(TrackRecord {
+            id: track_id,
+            name,
+            parent_id: None,
+        })?;
+
+        self.track_cache.insert(key, track_id);
+        Ok(track_id)
+    }
+
+    /// Finish streaming and return the collector.
+    /// Incomplete events (outstanding_ranges, pending_syscalls) are discarded,
+    /// matching current write_records() behavior.
+    pub fn finish(&mut self) -> Result<Option<Box<dyn RecordCollector + Send>>> {
+        if let Some(mut collector) = self.streaming_collector.take() {
+            collector.flush()?;
+            Ok(Some(collector))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn handle_syscall_event(&mut self, event: probe_event) {
         if event.num_args == 0 {
             return;
@@ -643,10 +799,51 @@ impl SystingProbeRecorder {
                 .insert(syscall_nr, event.ts);
         } else if let Some(pid_pending) = self.pending_syscalls.get_mut(&tgidpid) {
             if let Some(enter_ts) = pid_pending.remove(&syscall_nr) {
-                self.completed_syscalls
-                    .entry(tgidpid)
-                    .or_default()
-                    .push((enter_ts, event.ts, syscall_nr));
+                // Stream the completed syscall if streaming is enabled
+                if let Some(mut collector) = self.streaming_collector.take() {
+                    let key = TrackCacheKey::Thread {
+                        tgidpid,
+                        track_name: SYSCALLS_TRACK_NAME.to_string(),
+                    };
+                    if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
+                        self.slice_id_counter += 1;
+                        let slice_id = self.slice_id_counter;
+
+                        // Get consistent utid from shared generator
+                        let tid = tgidpid as i32;
+                        let utid = Some(self.utid_generator.get_or_create_utid(tid));
+
+                        if let Err(e) = collector.add_slice(SliceRecord {
+                            id: slice_id,
+                            ts: enter_ts as i64,
+                            dur: (event.ts - enter_ts) as i64,
+                            track_id,
+                            utid,
+                            name: syscall_name(syscall_nr),
+                            category: Some("syscall".to_string()),
+                            depth: 0,
+                        }) {
+                            eprintln!("Warning: Failed to stream syscall slice: {e}");
+                        }
+
+                        if let Err(e) = collector.add_arg(ArgRecord {
+                            slice_id,
+                            key: "nr".to_string(),
+                            int_value: Some(syscall_nr as i64),
+                            string_value: None,
+                            real_value: None,
+                        }) {
+                            eprintln!("Warning: Failed to stream syscall arg: {e}");
+                        }
+                    }
+                    self.streaming_collector = Some(collector);
+                } else {
+                    // Non-streaming path: store for batch write
+                    self.completed_syscalls
+                        .entry(tgidpid)
+                        .or_default()
+                        .push((enter_ts, event.ts, syscall_nr));
+                }
             }
         }
     }
@@ -656,22 +853,17 @@ impl SystingProbeRecorder {
         syscall_nr: u64,
         id_counter: &Arc<AtomicUsize>,
     ) -> u64 {
-        use syscalls::Sysno;
-
         if let Some(&iid) = self.syscall_iids.get(&syscall_nr) {
             return iid;
         }
 
-        let syscall_name = match Sysno::new(syscall_nr as usize) {
-            Some(sysno) => sysno.name().to_string(),
-            None => format!("syscall_{syscall_nr}"),
-        };
+        let name = syscall_name(syscall_nr);
 
-        let iid = if let Some(&existing_iid) = self.syscall_name_ids.get(&syscall_name) {
+        let iid = if let Some(&existing_iid) = self.syscall_name_ids.get(&name) {
             existing_iid
         } else {
             let new_iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-            self.syscall_name_ids.insert(syscall_name, new_iid);
+            self.syscall_name_ids.insert(name, new_iid);
             new_iid
         };
 
@@ -692,37 +884,125 @@ impl SystingProbeRecorder {
     }
 
     fn handle_cpu_event(&mut self, event: probe_event, arg_data: Vec<(String, ArgValue)>) {
+        // Clone data we need from systing_event early to avoid borrow conflicts
         let systing_event = self.cookies.get(&event.cookie).unwrap();
+        let systing_event_name = systing_event.name.clone();
+        let event_display_name = format!("{systing_event}");
 
         // If this is an instant event just add it to the list of events
-        if self.instant_events.contains_key(&systing_event.name) {
-            let instant_track = self.instant_events.get(&systing_event.name).unwrap();
-            let entry = self.cpu_events.entry(event.cpu).or_default();
-            let entry = entry.entry(instant_track.clone()).or_default();
-            entry.push(TrackInstant {
-                ts: event.ts,
-                name: format!("{systing_event}"),
-                args: arg_data,
-            });
+        if self.instant_events.contains_key(&systing_event_name) {
+            let instant_track = self
+                .instant_events
+                .get(&systing_event_name)
+                .unwrap()
+                .clone();
+
+            // Stream if enabled
+            if let Some(mut collector) = self.streaming_collector.take() {
+                let key = TrackCacheKey::Cpu {
+                    cpu: event.cpu,
+                    track_name: instant_track,
+                };
+                if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
+                    self.instant_id_counter += 1;
+                    let instant_id = self.instant_id_counter;
+
+                    if let Err(e) = collector.add_instant(InstantRecord {
+                        id: instant_id,
+                        ts: event.ts as i64,
+                        track_id,
+                        utid: None,
+                        name: event_display_name,
+                        category: None,
+                    }) {
+                        eprintln!("Warning: Failed to stream CPU instant: {e}");
+                    }
+
+                    for arg in &arg_data {
+                        let (key, int_value, string_value) = convert_arg(arg);
+                        if let Err(e) = collector.add_instant_arg(InstantArgRecord {
+                            instant_id,
+                            key,
+                            int_value,
+                            string_value,
+                            real_value: None,
+                        }) {
+                            eprintln!("Warning: Failed to stream CPU instant arg: {e}");
+                        }
+                    }
+                }
+                self.streaming_collector = Some(collector);
+            } else {
+                // Non-streaming path
+                let entry = self.cpu_events.entry(event.cpu).or_default();
+                let instant_track = self.instant_events.get(&systing_event_name).unwrap();
+                let entry = entry.entry(instant_track.clone()).or_default();
+                entry.push(TrackInstant {
+                    ts: event.ts,
+                    name: event_display_name,
+                    args: arg_data,
+                });
+            }
             return;
         }
 
         // First check to see if this is an end event, since we can have the same event for a start
         // event and an end event
-        if let Some(range_name) = self.stop_events.get(&systing_event.name) {
+        if let Some(range_name) = self.stop_events.get(&systing_event_name) {
             if let Some(ranges) = self.outstanding_cpu_ranges.get_mut(&event.cpu) {
                 if let Some(mut range) = ranges.remove(range_name) {
                     let track_name = self.ranges.get(range_name).unwrap().clone();
                     range.end = event.ts;
-                    let track_hash = self.cpu_ranges.entry(event.cpu).or_default();
-                    let entry = track_hash.entry(track_name).or_default();
-                    entry.push(range);
+
+                    // Stream if enabled
+                    if let Some(mut collector) = self.streaming_collector.take() {
+                        let key = TrackCacheKey::Cpu {
+                            cpu: event.cpu,
+                            track_name: track_name.clone(),
+                        };
+                        if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
+                            self.slice_id_counter += 1;
+                            let slice_id = self.slice_id_counter;
+
+                            if let Err(e) = collector.add_slice(SliceRecord {
+                                id: slice_id,
+                                ts: range.start as i64,
+                                dur: (range.end - range.start) as i64,
+                                track_id,
+                                utid: None,
+                                name: range.range_name.clone(),
+                                category: None,
+                                depth: 0,
+                            }) {
+                                eprintln!("Warning: Failed to stream CPU range slice: {e}");
+                            }
+
+                            for arg in &range.args {
+                                let (key, int_value, string_value) = convert_arg(arg);
+                                if let Err(e) = collector.add_arg(ArgRecord {
+                                    slice_id,
+                                    key,
+                                    int_value,
+                                    string_value,
+                                    real_value: None,
+                                }) {
+                                    eprintln!("Warning: Failed to stream CPU range arg: {e}");
+                                }
+                            }
+                        }
+                        self.streaming_collector = Some(collector);
+                    } else {
+                        // Non-streaming path
+                        let track_hash = self.cpu_ranges.entry(event.cpu).or_default();
+                        let entry = track_hash.entry(track_name).or_default();
+                        entry.push(range);
+                    }
                 }
             }
         }
 
         // Now handle the start event case
-        if let Some(range_name) = self.start_events.get(&systing_event.name) {
+        if let Some(range_name) = self.start_events.get(&systing_event_name) {
             if let Some(ranges) = self.outstanding_cpu_ranges.get_mut(&event.cpu) {
                 if let Some(range) = ranges.get_mut(range_name) {
                     range.start = event.ts;
@@ -750,40 +1030,166 @@ impl SystingProbeRecorder {
         }
     }
 
-    fn handle_process_event(&mut self, event: probe_event, arg_data: Vec<(String, ArgValue)>) {
+    fn handle_process_event(
+        &mut self,
+        event: probe_event,
+        arg_data: Vec<(String, ArgValue)>,
+        is_marker: bool,
+    ) {
+        // Clone data we need from systing_event early to avoid borrow conflicts
         let systing_event = self.cookies.get(&event.cookie).unwrap();
+        let systing_event_name = systing_event.name.clone();
+        let event_display_name = format!("{systing_event}");
 
         // If this is an instant event just add it to the list of events
-        if self.instant_events.contains_key(&systing_event.name) {
-            let instant_track = self.instant_events.get(&systing_event.name).unwrap();
-            let entry = self.events.entry(event.task.tgidpid).or_default();
-            let entry = entry.entry(instant_track.clone()).or_default();
-            entry.push(TrackInstant {
-                ts: event.ts,
-                name: format!("{systing_event}"),
-                args: arg_data,
-            });
+        if self.instant_events.contains_key(&systing_event_name) {
+            let instant_track = self
+                .instant_events
+                .get(&systing_event_name)
+                .unwrap()
+                .clone();
+
+            // Stream if enabled
+            if let Some(mut collector) = self.streaming_collector.take() {
+                let key = TrackCacheKey::Thread {
+                    tgidpid: event.task.tgidpid,
+                    track_name: instant_track,
+                };
+                if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
+                    self.instant_id_counter += 1;
+                    let instant_id = self.instant_id_counter;
+                    // Get consistent utid from shared generator
+                    let tid = event.task.tgidpid as i32;
+                    let utid = Some(self.utid_generator.get_or_create_utid(tid));
+
+                    if let Err(e) = collector.add_instant(InstantRecord {
+                        id: instant_id,
+                        ts: event.ts as i64,
+                        track_id,
+                        utid,
+                        name: event_display_name,
+                        category: None,
+                    }) {
+                        eprintln!("Warning: Failed to stream instant: {e}");
+                    }
+
+                    for arg in &arg_data {
+                        let (key, int_value, string_value) = convert_arg(arg);
+                        if let Err(e) = collector.add_instant_arg(InstantArgRecord {
+                            instant_id,
+                            key,
+                            int_value,
+                            string_value,
+                            real_value: None,
+                        }) {
+                            eprintln!("Warning: Failed to stream instant arg: {e}");
+                        }
+                    }
+                }
+                self.streaming_collector = Some(collector);
+            } else {
+                // Non-streaming path
+                let entry = self.events.entry(event.task.tgidpid).or_default();
+                let instant_track = self.instant_events.get(&systing_event_name).unwrap();
+                let entry = entry.entry(instant_track.clone()).or_default();
+                entry.push(TrackInstant {
+                    ts: event.ts,
+                    name: event_display_name,
+                    args: arg_data,
+                });
+            }
             return;
         }
 
+        // For marker events, use TGID (process ID) instead of TGIDPID (thread ID) as the key.
+        // This allows matching start/end markers when async tasks migrate between threads.
+        // We also include socket_id in the range key to distinguish concurrent operations
+        // on different sockets within the same process.
+        let range_key = if is_marker {
+            event.task.tgidpid >> 32 // Use TGID only
+        } else {
+            event.task.tgidpid // Use full TGIDPID for non-marker events
+        };
+
+        // For marker events, include socket_id in the range name to handle concurrent
+        // operations on different sockets within the same process
+        let get_range_lookup_key = |range_name: &str, args: &[(String, ArgValue)]| -> String {
+            if is_marker {
+                // Extract socket_id from args if present
+                if let Some((_, ArgValue::Long(socket_id))) =
+                    args.iter().find(|(k, _)| k == "socket_id")
+                {
+                    return format!("{range_name}:{socket_id}");
+                }
+            }
+            range_name.to_string()
+        };
+
         // First check to see if this is an end event, since we can have the same event for a start
         // event and an end event
-        if let Some(range_name) = self.stop_events.get(&systing_event.name) {
-            if let Some(ranges) = self.outstanding_ranges.get_mut(&event.task.tgidpid) {
-                if let Some(mut range) = ranges.remove(range_name) {
+        if let Some(range_name) = self.stop_events.get(&systing_event_name) {
+            let lookup_key = get_range_lookup_key(range_name, &arg_data);
+            if let Some(ranges) = self.outstanding_ranges.get_mut(&range_key) {
+                if let Some(mut range) = ranges.remove(&lookup_key) {
                     let track_name = self.ranges.get(range_name).unwrap().clone();
                     range.end = event.ts;
-                    let track_hash = self.recorded_ranges.entry(event.task.tgidpid).or_default();
-                    let entry = track_hash.entry(track_name).or_default();
-                    entry.push(range);
+
+                    // Stream if enabled (thread that receives END owns the track)
+                    if let Some(mut collector) = self.streaming_collector.take() {
+                        let key = TrackCacheKey::Thread {
+                            tgidpid: event.task.tgidpid,
+                            track_name: track_name.clone(),
+                        };
+                        if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
+                            self.slice_id_counter += 1;
+                            let slice_id = self.slice_id_counter;
+                            // Get consistent utid from shared generator
+                            let tid = event.task.tgidpid as i32;
+                            let utid = Some(self.utid_generator.get_or_create_utid(tid));
+
+                            if let Err(e) = collector.add_slice(SliceRecord {
+                                id: slice_id,
+                                ts: range.start as i64,
+                                dur: (range.end - range.start) as i64,
+                                track_id,
+                                utid,
+                                name: range.range_name.clone(),
+                                category: None,
+                                depth: 0,
+                            }) {
+                                eprintln!("Warning: Failed to stream range slice: {e}");
+                            }
+
+                            for arg in &range.args {
+                                let (key, int_value, string_value) = convert_arg(arg);
+                                if let Err(e) = collector.add_arg(ArgRecord {
+                                    slice_id,
+                                    key,
+                                    int_value,
+                                    string_value,
+                                    real_value: None,
+                                }) {
+                                    eprintln!("Warning: Failed to stream range arg: {e}");
+                                }
+                            }
+                        }
+                        self.streaming_collector = Some(collector);
+                    } else {
+                        // Non-streaming path
+                        let track_hash =
+                            self.recorded_ranges.entry(event.task.tgidpid).or_default();
+                        let entry = track_hash.entry(track_name).or_default();
+                        entry.push(range);
+                    }
                 }
             }
         }
 
         // Now handle the start event case
-        if let Some(range_name) = self.start_events.get(&systing_event.name) {
-            if let Some(ranges) = self.outstanding_ranges.get_mut(&event.task.tgidpid) {
-                if let Some(range) = ranges.get_mut(range_name) {
+        if let Some(range_name) = self.start_events.get(&systing_event_name) {
+            let lookup_key = get_range_lookup_key(range_name, &arg_data);
+            if let Some(ranges) = self.outstanding_ranges.get_mut(&range_key) {
+                if let Some(range) = ranges.get_mut(&lookup_key) {
                     range.start = event.ts;
                     range.args = arg_data;
                 } else {
@@ -793,7 +1199,7 @@ impl SystingProbeRecorder {
                         end: 0,
                         args: arg_data,
                     };
-                    ranges.insert(range_name.clone(), range);
+                    ranges.insert(lookup_key, range);
                 }
             } else {
                 let mut ranges = HashMap::new();
@@ -803,20 +1209,252 @@ impl SystingProbeRecorder {
                     end: 0,
                     args: arg_data,
                 };
-                ranges.insert(range_name.clone(), range);
-                self.outstanding_ranges.insert(event.task.tgidpid, ranges);
+                ranges.insert(lookup_key, range);
+                self.outstanding_ranges.insert(range_key, ranges);
             }
         }
     }
 
-    pub fn generate_trace(
+    /// Write trace data directly to a RecordCollector (Parquet-first path).
+    ///
+    /// This method outputs probe events as native records without going through Perfetto format.
+    /// If streaming mode was enabled, all data was already streamed and this returns early.
+    pub fn write_records(
+        &self,
+        collector: &mut dyn RecordCollector,
+        track_id_counter: &mut i64,
+        slice_id_counter: &mut i64,
+        instant_id_counter: &mut i64,
+    ) -> Result<()> {
+        // If streaming was enabled, all data was already streamed
+        if self.streaming_enabled {
+            return Ok(());
+        }
+
+        // Process thread instant events
+        for (pidtgid, tracks) in self.events.iter() {
+            let tid = *pidtgid as i32;
+            let utid = Some(self.utid_generator.get_or_create_utid(tid));
+
+            for (track_name, track_events) in tracks.iter() {
+                let track_id = *track_id_counter;
+                *track_id_counter += 1;
+
+                collector.add_track(TrackRecord {
+                    id: track_id,
+                    name: track_name.clone(),
+                    parent_id: None,
+                })?;
+
+                for event in track_events.iter() {
+                    let instant_id = *instant_id_counter;
+                    *instant_id_counter += 1;
+
+                    collector.add_instant(InstantRecord {
+                        id: instant_id,
+                        ts: event.ts as i64,
+                        track_id,
+                        utid,
+                        name: event.name.clone(),
+                        category: None,
+                    })?;
+
+                    // Output args
+                    for arg in &event.args {
+                        let (key, int_value, string_value) = convert_arg(arg);
+                        collector.add_instant_arg(InstantArgRecord {
+                            instant_id,
+                            key,
+                            int_value,
+                            string_value,
+                            real_value: None,
+                        })?;
+                    }
+                }
+            }
+        }
+
+        // Process thread range events (slices)
+        for (pidtgid, tracks) in self.recorded_ranges.iter() {
+            let tid = *pidtgid as i32;
+            let utid = Some(self.utid_generator.get_or_create_utid(tid));
+
+            for (track_name, ranges) in tracks.iter() {
+                let track_id = *track_id_counter;
+                *track_id_counter += 1;
+
+                collector.add_track(TrackRecord {
+                    id: track_id,
+                    name: track_name.clone(),
+                    parent_id: None,
+                })?;
+
+                for range in ranges.iter() {
+                    let slice_id = *slice_id_counter;
+                    *slice_id_counter += 1;
+
+                    collector.add_slice(SliceRecord {
+                        id: slice_id,
+                        ts: range.start as i64,
+                        dur: (range.end - range.start) as i64,
+                        track_id,
+                        utid,
+                        name: range.range_name.clone(),
+                        category: None,
+                        depth: 0,
+                    })?;
+
+                    // Output args
+                    for arg in &range.args {
+                        let (key, int_value, string_value) = convert_arg(arg);
+                        collector.add_arg(ArgRecord {
+                            slice_id,
+                            key,
+                            int_value,
+                            string_value,
+                            real_value: None,
+                        })?;
+                    }
+                }
+            }
+        }
+
+        // Process CPU range events
+        for (cpu, tracks) in self.cpu_ranges.iter() {
+            for (track_name, ranges) in tracks.iter() {
+                let track_id = *track_id_counter;
+                *track_id_counter += 1;
+
+                collector.add_track(TrackRecord {
+                    id: track_id,
+                    name: format!("{track_name} CPU {cpu}"),
+                    parent_id: None,
+                })?;
+
+                for range in ranges.iter() {
+                    let slice_id = *slice_id_counter;
+                    *slice_id_counter += 1;
+
+                    collector.add_slice(SliceRecord {
+                        id: slice_id,
+                        ts: range.start as i64,
+                        dur: (range.end - range.start) as i64,
+                        track_id,
+                        utid: None,
+                        name: range.range_name.clone(),
+                        category: None,
+                        depth: 0,
+                    })?;
+
+                    // Output args
+                    for arg in &range.args {
+                        let (key, int_value, string_value) = convert_arg(arg);
+                        collector.add_arg(ArgRecord {
+                            slice_id,
+                            key,
+                            int_value,
+                            string_value,
+                            real_value: None,
+                        })?;
+                    }
+                }
+            }
+        }
+
+        // Process CPU instant events
+        for (cpu, tracks) in self.cpu_events.iter() {
+            for (track_name, track_events) in tracks.iter() {
+                let track_id = *track_id_counter;
+                *track_id_counter += 1;
+
+                collector.add_track(TrackRecord {
+                    id: track_id,
+                    name: format!("{track_name} CPU {cpu}"),
+                    parent_id: None,
+                })?;
+
+                for event in track_events.iter() {
+                    let instant_id = *instant_id_counter;
+                    *instant_id_counter += 1;
+
+                    collector.add_instant(InstantRecord {
+                        id: instant_id,
+                        ts: event.ts as i64,
+                        track_id,
+                        utid: None,
+                        name: event.name.clone(),
+                        category: None,
+                    })?;
+
+                    // Output args
+                    for arg in &event.args {
+                        let (key, int_value, string_value) = convert_arg(arg);
+                        collector.add_instant_arg(InstantArgRecord {
+                            instant_id,
+                            key,
+                            int_value,
+                            string_value,
+                            real_value: None,
+                        })?;
+                    }
+                }
+            }
+        }
+
+        // Process syscalls
+        for (pidtgid, syscalls) in self.completed_syscalls.iter() {
+            let tid = *pidtgid as i32;
+            let utid = Some(self.utid_generator.get_or_create_utid(tid));
+
+            // Create track for this thread's syscalls if we have any
+            if !syscalls.is_empty() {
+                let track_id = *track_id_counter;
+                *track_id_counter += 1;
+
+                collector.add_track(TrackRecord {
+                    id: track_id,
+                    name: SYSCALLS_TRACK_NAME.to_string(),
+                    parent_id: None,
+                })?;
+
+                for (start_ts, end_ts, syscall_nr) in syscalls.iter() {
+                    let slice_id = *slice_id_counter;
+                    *slice_id_counter += 1;
+
+                    collector.add_slice(SliceRecord {
+                        id: slice_id,
+                        ts: *start_ts as i64,
+                        dur: (*end_ts - *start_ts) as i64,
+                        track_id,
+                        utid,
+                        name: syscall_name(*syscall_nr),
+                        category: Some("syscall".to_string()),
+                        depth: 0,
+                    })?;
+
+                    // Add syscall number as arg
+                    collector.add_arg(ArgRecord {
+                        slice_id,
+                        key: "nr".to_string(),
+                        int_value: Some(*syscall_nr as i64),
+                        string_value: None,
+                        real_value: None,
+                    })?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write trace data to Perfetto format (used by parquet-to-perfetto conversion).
+    pub fn write_trace(
         &mut self,
+        writer: &mut dyn TraceWriter,
         pid_uuids: &HashMap<i32, u64>,
         thread_uuids: &HashMap<i32, u64>,
         id_counter: &Arc<AtomicUsize>,
-    ) -> Vec<TracePacket> {
-        let mut packets = Vec::new();
-
+    ) -> Result<()> {
         // Populate the instant events
         for (pidtgid, events) in self.events.iter() {
             for (track_name, track_events) in events.iter() {
@@ -830,7 +1468,7 @@ impl SystingProbeRecorder {
                 );
                 let mut packet = TracePacket::default();
                 packet.set_track_descriptor(desc);
-                packets.push(packet);
+                writer.write_packet(&packet)?;
 
                 let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
                 for event in track_events.iter() {
@@ -844,7 +1482,7 @@ impl SystingProbeRecorder {
                     packet.set_timestamp(event.ts);
                     packet.set_track_event(tevent);
                     packet.set_trusted_packet_sequence_id(seq);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
                 }
             }
         }
@@ -862,7 +1500,7 @@ impl SystingProbeRecorder {
                 );
                 let mut packet = TracePacket::default();
                 packet.set_track_descriptor(desc);
-                packets.push(packet);
+                writer.write_packet(&packet)?;
 
                 let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
                 for range in ranges.iter() {
@@ -876,7 +1514,7 @@ impl SystingProbeRecorder {
                     packet.set_timestamp(range.start);
                     packet.set_track_event(tevent);
                     packet.set_trusted_packet_sequence_id(seq);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
 
                     let mut tevent = TrackEvent::default();
                     tevent.set_type(Type::TYPE_SLICE_END);
@@ -887,7 +1525,7 @@ impl SystingProbeRecorder {
                     packet.set_timestamp(range.end);
                     packet.set_track_event(tevent);
                     packet.set_trusted_packet_sequence_id(seq);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
                 }
             }
         }
@@ -909,12 +1547,12 @@ impl SystingProbeRecorder {
                 if let Some(new_desc) = descs.pop() {
                     let mut packet = TracePacket::default();
                     packet.set_track_descriptor(new_desc);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
                 }
 
                 let mut packet = TracePacket::default();
                 packet.set_track_descriptor(desc);
-                packets.push(packet);
+                writer.write_packet(&packet)?;
 
                 let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
                 for range in ranges.iter() {
@@ -928,7 +1566,7 @@ impl SystingProbeRecorder {
                     packet.set_timestamp(range.start);
                     packet.set_track_event(tevent);
                     packet.set_trusted_packet_sequence_id(seq);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
 
                     let mut tevent = TrackEvent::default();
                     tevent.set_type(Type::TYPE_SLICE_END);
@@ -939,7 +1577,7 @@ impl SystingProbeRecorder {
                     packet.set_timestamp(range.end);
                     packet.set_track_event(tevent);
                     packet.set_trusted_packet_sequence_id(seq);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
                 }
             }
         }
@@ -960,12 +1598,12 @@ impl SystingProbeRecorder {
                 if let Some(new_desc) = descs.pop() {
                     let mut packet = TracePacket::default();
                     packet.set_track_descriptor(new_desc);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
                 }
 
                 let mut packet = TracePacket::default();
                 packet.set_track_descriptor(desc);
-                packets.push(packet);
+                writer.write_packet(&packet)?;
 
                 let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
                 for event in track_events.iter() {
@@ -979,7 +1617,7 @@ impl SystingProbeRecorder {
                     packet.set_timestamp(event.ts);
                     packet.set_track_event(tevent);
                     packet.set_trusted_packet_sequence_id(seq);
-                    packets.push(packet);
+                    writer.write_packet(&packet)?;
                 }
             }
         }
@@ -1022,7 +1660,7 @@ impl SystingProbeRecorder {
                 SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
                     | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
             );
-            packets.push(interned_packet);
+            writer.write_packet(&interned_packet)?;
         }
 
         // Generate per-thread syscall tracks and events
@@ -1042,7 +1680,7 @@ impl SystingProbeRecorder {
 
             let mut packet = TracePacket::default();
             packet.set_track_descriptor(desc);
-            packets.push(packet);
+            writer.write_packet(&packet)?;
 
             for (start_ts, end_ts, syscall_nr) in syscalls {
                 let name_iid = *self.syscall_iids.get(syscall_nr).unwrap();
@@ -1056,7 +1694,7 @@ impl SystingProbeRecorder {
                 begin_packet.set_timestamp(*start_ts);
                 begin_packet.set_track_event(begin_event);
                 begin_packet.set_trusted_packet_sequence_id(sequence_id);
-                packets.push(begin_packet);
+                writer.write_packet(&begin_packet)?;
 
                 let mut end_event = TrackEvent::default();
                 end_event.set_type(Type::TYPE_SLICE_END);
@@ -1066,7 +1704,7 @@ impl SystingProbeRecorder {
                 end_packet.set_timestamp(*end_ts);
                 end_packet.set_track_event(end_event);
                 end_packet.set_trusted_packet_sequence_id(sequence_id);
-                packets.push(end_packet);
+                writer.write_packet(&end_packet)?;
             }
         }
 
@@ -1076,7 +1714,7 @@ impl SystingProbeRecorder {
         self.syscall_iids.clear();
         self.syscall_name_ids.clear();
 
-        packets
+        Ok(())
     }
 
     pub fn add_event_from_str(&mut self, event: &str, rng: &mut dyn rand::RngCore) -> Result<()> {
@@ -1167,6 +1805,7 @@ impl SystingProbeRecorder {
             "uprobe" | "uretprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
             "kprobe" | "kretprobe" => EventProbe::KProbe(KProbeEvent::from_parts(parts)?),
             "tracepoint" => EventProbe::Tracepoint(TracepointEvent::from_parts(parts)?),
+            "marker" => EventProbe::Marker(MarkerEvent::from_parts(parts)?),
             _ => return Err(anyhow::anyhow!("Invalid event type")),
         };
 
@@ -1197,6 +1836,12 @@ impl SystingProbeRecorder {
                     EventProbe::Tracepoint(_) => {
                         return Err(anyhow::anyhow!(
                             "retval arg type is not supported for tracepoint events: {}",
+                            event.name
+                        ));
+                    }
+                    EventProbe::Marker(_) => {
+                        return Err(anyhow::anyhow!(
+                            "retval arg type is not supported for marker events: {}",
                             event.name
                         ));
                     }
@@ -1374,13 +2019,69 @@ impl SystingProbeRecorder {
 
         self.load_config_from_json(&buf, rng)
     }
+
+    /// Returns the minimum timestamp from all events, or None if no events recorded.
+    pub fn min_timestamp(&self) -> Option<u64> {
+        let instant_min = self
+            .events
+            .values()
+            .flat_map(|track| track.values())
+            .filter_map(|events| events.first())
+            .map(|e| e.ts)
+            .min();
+
+        let cpu_instant_min = self
+            .cpu_events
+            .values()
+            .flat_map(|track| track.values())
+            .filter_map(|events| events.first())
+            .map(|e| e.ts)
+            .min();
+
+        let range_min = self
+            .recorded_ranges
+            .values()
+            .flat_map(|track| track.values())
+            .filter_map(|ranges| ranges.first())
+            .map(|r| r.start)
+            .min();
+
+        let cpu_range_min = self
+            .cpu_ranges
+            .values()
+            .flat_map(|track| track.values())
+            .filter_map(|ranges| ranges.first())
+            .map(|r| r.start)
+            .min();
+
+        [instant_min, cpu_instant_min, range_min, cpu_range_min]
+            .into_iter()
+            .flatten()
+            .min()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::systing::types::task_info;
+    use crate::perfetto::VecTraceWriter;
+    use crate::systing_core::types::task_info;
+    use perfetto_protos::trace_packet::TracePacket;
     use rand::rngs::mock::StepRng;
+
+    /// Helper to collect packets from SystingProbeRecorder for tests
+    fn generate_trace(
+        recorder: &mut SystingProbeRecorder,
+        pid_uuids: &HashMap<i32, u64>,
+        thread_uuids: &HashMap<i32, u64>,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Vec<TracePacket> {
+        let mut writer = VecTraceWriter::new();
+        recorder
+            .write_trace(&mut writer, pid_uuids, thread_uuids, id_counter)
+            .unwrap();
+        writer.packets
+    }
 
     #[test]
     fn test_add_event() {
@@ -1823,7 +2524,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -1882,7 +2584,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -1948,7 +2651,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2000,7 +2704,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2066,7 +2771,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2174,7 +2880,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2284,7 +2991,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2331,7 +3039,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2730,7 +3439,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2777,7 +3487,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -2824,7 +3535,8 @@ mod tests {
         recorder.handle_event(event);
         let mut thread_uuids = HashMap::new();
         thread_uuids.insert(1234, 1);
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &thread_uuids,
             &Arc::new(AtomicUsize::new(0)),
@@ -3291,7 +4003,8 @@ mod tests {
         };
         recorder.handle_event(event);
         assert!(recorder.cpu_events.contains_key(&1));
-        let packets = recorder.generate_trace(
+        let packets = generate_trace(
+            &mut recorder,
             &HashMap::new(),
             &HashMap::new(),
             &Arc::new(AtomicUsize::new(0)),
@@ -3436,7 +4149,7 @@ mod tests {
             num_args: 1,
             ..Default::default()
         };
-        event.args[0].r#type = crate::systing::types::arg_type::ARG_LONG;
+        event.args[0].r#type = crate::systing_core::types::arg_type::ARG_LONG;
         event.args[0].size = 8;
         let bytes = syscall_nr.to_ne_bytes();
         event.args[0].value[..8].copy_from_slice(&bytes);
@@ -3457,11 +4170,11 @@ mod tests {
             num_args: 2,
             ..Default::default()
         };
-        event.args[0].r#type = crate::systing::types::arg_type::ARG_LONG;
+        event.args[0].r#type = crate::systing_core::types::arg_type::ARG_LONG;
         event.args[0].size = 8;
         let bytes = syscall_nr.to_ne_bytes();
         event.args[0].value[..8].copy_from_slice(&bytes);
-        event.args[1].r#type = crate::systing::types::arg_type::ARG_LONG;
+        event.args[1].r#type = crate::systing_core::types::arg_type::ARG_LONG;
         event.args[1].size = 8;
         let ret_bytes = ret.to_ne_bytes();
         event.args[1].value[..8].copy_from_slice(&ret_bytes);
@@ -3548,7 +4261,7 @@ mod tests {
         recorder.handle_event(enter);
         recorder.handle_event(exit);
 
-        let packets = recorder.generate_trace(&pid_uuids, &thread_uuids, &id_counter);
+        let packets = generate_trace(&mut recorder, &pid_uuids, &thread_uuids, &id_counter);
 
         let syscall_packets: Vec<_> = packets
             .iter()
@@ -3581,5 +4294,328 @@ mod tests {
         assert_eq!(iid1, iid2);
         assert_ne!(iid1, iid3);
         assert_eq!(recorder.syscall_iids.len(), 2);
+    }
+
+    #[test]
+    fn test_marker_event_basic() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "my_marker",
+                    "event": "marker:myapp:start"
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "markers",
+                    "instants": [
+                      {
+                        "event": "my_marker"
+                      }
+                    ]
+                }
+            ]
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        assert_eq!(recorder.config_events.len(), 1);
+
+        let event = recorder.config_events.get("my_marker").unwrap();
+        match &event.event {
+            EventProbe::Marker(marker) => {
+                assert_eq!(marker.match_string, "myapp:start");
+            }
+            _ => panic!("Expected Marker event"),
+        }
+    }
+
+    #[test]
+    fn test_marker_event_with_colons_in_match_string() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "complex_marker",
+                    "event": "marker:myapp:api:v2:request:start"
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        let event = recorder.config_events.get("complex_marker").unwrap();
+        match &event.event {
+            EventProbe::Marker(marker) => {
+                assert_eq!(marker.match_string, "myapp:api:v2:request:start");
+            }
+            _ => panic!("Expected Marker event"),
+        }
+    }
+
+    #[test]
+    fn test_marker_event_with_args() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "marker_with_args",
+                    "event": "marker:myapp:request",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "long",
+                        "arg_name": "request_id"
+                      },
+                      {
+                        "arg_index": 3,
+                        "arg_type": "long",
+                        "arg_name": "flags"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        let event = recorder.config_events.get("marker_with_args").unwrap();
+        assert_eq!(event.args.len(), 2);
+        assert_eq!(event.args[0].arg_index, 0);
+        assert_eq!(event.args[0].arg_name, "request_id");
+        assert_eq!(event.args[1].arg_index, 3);
+        assert_eq!(event.args[1].arg_name, "flags");
+    }
+
+    #[test]
+    fn test_marker_event_retval_not_supported() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "marker_with_retval",
+                    "event": "marker:myapp:request",
+                    "args": [
+                      {
+                        "arg_index": 0,
+                        "arg_type": "retval",
+                        "arg_name": "return_value"
+                      }
+                    ]
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "retval arg type is not supported for marker events: marker_with_retval"
+        );
+    }
+
+    #[test]
+    fn test_marker_event_invalid_format_missing_match_string() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "invalid_marker",
+                    "event": "marker"
+                }
+            ],
+            "tracks": []
+        }
+        "#;
+
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid marker format"));
+    }
+
+    #[test]
+    fn test_marker_event_as_range_start_end() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "request_start",
+                    "event": "marker:myapp:request:start"
+                },
+                {
+                    "name": "request_end",
+                    "event": "marker:myapp:request:end"
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "requests",
+                    "ranges": [
+                        {
+                            "name": "request",
+                            "start": "request_start",
+                            "end": "request_end"
+                        }
+                    ]
+                }
+            ]
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        assert_eq!(recorder.config_events.len(), 2);
+        assert!(recorder.start_events.contains_key("request_start"));
+        assert!(recorder.stop_events.contains_key("request_end"));
+        assert_eq!(
+            recorder.ranges.get("request"),
+            Some(&"requests".to_string())
+        );
+    }
+
+    #[test]
+    fn test_marker_event_generates_instant_packet() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "checkpoint",
+                    "event": "marker:myapp:checkpoint"
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "checkpoints",
+                    "instants": [
+                      {
+                        "event": "checkpoint"
+                      }
+                    ]
+                }
+            ]
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+
+        let cookie = recorder.config_events.get("checkpoint").unwrap().cookie;
+        let event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
+            ts: 5000,
+            cookie,
+            ..Default::default()
+        };
+        recorder.handle_event(event);
+
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        let packets = generate_trace(
+            &mut recorder,
+            &HashMap::new(),
+            &thread_uuids,
+            &Arc::new(AtomicUsize::new(0)),
+        );
+
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].track_descriptor().name(), "checkpoints");
+        assert_eq!(packets[1].track_event().name(), "marker:myapp:checkpoint");
+    }
+
+    #[test]
+    fn test_marker_event_generates_range_packets() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                {
+                    "name": "span_start",
+                    "event": "marker:myapp:span:begin"
+                },
+                {
+                    "name": "span_end",
+                    "event": "marker:myapp:span:end"
+                }
+            ],
+            "tracks": [
+                {
+                    "track_name": "spans",
+                    "ranges": [
+                        {
+                            "name": "my_span",
+                            "start": "span_start",
+                            "end": "span_end"
+                        }
+                    ]
+                }
+            ]
+        }
+        "#;
+
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+
+        let start_cookie = recorder.config_events.get("span_start").unwrap().cookie;
+        let end_cookie = recorder.config_events.get("span_end").unwrap().cookie;
+
+        let start_event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
+            ts: 1000,
+            cookie: start_cookie,
+            ..Default::default()
+        };
+        recorder.handle_event(start_event);
+
+        let end_event = probe_event {
+            task: task_info {
+                tgidpid: 1234,
+                ..Default::default()
+            },
+            ts: 2000,
+            cookie: end_cookie,
+            ..Default::default()
+        };
+        recorder.handle_event(end_event);
+
+        let mut thread_uuids = HashMap::new();
+        thread_uuids.insert(1234, 1);
+        let packets = generate_trace(
+            &mut recorder,
+            &HashMap::new(),
+            &thread_uuids,
+            &Arc::new(AtomicUsize::new(0)),
+        );
+
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0].track_descriptor().name(), "spans");
+        assert_eq!(packets[1].track_event().type_(), Type::TYPE_SLICE_BEGIN);
+        assert_eq!(packets[1].track_event().name(), "my_span");
+        assert_eq!(packets[2].track_event().type_(), Type::TYPE_SLICE_END);
     }
 }

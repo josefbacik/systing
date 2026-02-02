@@ -1,0 +1,109 @@
+{
+  "events": [
+    {
+      "name": "tcp_sendmsg_entry",
+      "event": "kprobe:tcp_sendmsg",
+      "stack": true,
+      "args": [
+        { "arg_index": 2, "arg_type": "long", "arg_name": "size" }
+      ]
+    },
+    {
+      "name": "tcp_sendmsg_exit",
+      "event": "kretprobe:tcp_sendmsg",
+      "args": [
+        { "arg_type": "retval", "arg_name": "bytes_sent" }
+      ]
+    },
+    {
+      "name": "tcp_sendmsg_locked_entry",
+      "event": "kprobe:tcp_sendmsg_locked"
+    },
+    {
+      "name": "tcp_sendmsg_locked_exit",
+      "event": "kretprobe:tcp_sendmsg_locked"
+    },
+    {
+      "name": "wait_memory_entry",
+      "event": "kprobe:sk_stream_wait_memory"
+    },
+    {
+      "name": "wait_memory_exit",
+      "event": "kretprobe:sk_stream_wait_memory"
+    },
+    {
+      "name": "lock_sock_entry",
+      "event": "kprobe:lock_sock_nested"
+    },
+    {
+      "name": "lock_sock_exit",
+      "event": "kretprobe:lock_sock_nested"
+    }
+  ],
+  "tracks": [
+    {
+      "track_name": "TCP Send (total)",
+      "ranges": [
+        {
+          "name": "tcp_sendmsg",
+          "start": "tcp_sendmsg_entry",
+          "end": "tcp_sendmsg_exit"
+        }
+      ]
+    },
+    {
+      "track_name": "TCP Send (locked)",
+      "ranges": [
+        {
+          "name": "tcp_sendmsg_locked",
+          "start": "tcp_sendmsg_locked_entry",
+          "end": "tcp_sendmsg_locked_exit"
+        }
+      ]
+    },
+    {
+      "track_name": "Waiting for Buffer Space",
+      "ranges": [
+        {
+          "name": "sk_stream_wait_memory",
+          "start": "wait_memory_entry",
+          "end": "wait_memory_exit"
+        }
+      ]
+    },
+    {
+      "track_name": "Socket Lock",
+      "ranges": [
+        {
+          "name": "lock_sock",
+          "start": "lock_sock_entry",
+          "end": "lock_sock_exit"
+        }
+      ]
+    }
+  ],
+  "stop_triggers": {
+    "thresholds": [
+      {
+        "start": "tcp_sendmsg_entry",
+        "end": "tcp_sendmsg_exit",
+        "duration_us": 100000
+      },
+      {
+        "start": "tcp_sendmsg_locked_entry",
+        "end": "tcp_sendmsg_locked_exit",
+        "duration_us": 100000
+      },
+      {
+        "start": "wait_memory_entry",
+        "end": "wait_memory_exit",
+        "duration_us": 50000
+      },
+      {
+        "start": "lock_sock_entry",
+        "end": "lock_sock_exit",
+        "duration_us": 50000
+      }
+    ]
+  }
+}

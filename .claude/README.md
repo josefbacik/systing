@@ -4,14 +4,17 @@ This directory contains Claude Code configuration and context files for the Syst
 
 ## Structure
 
-- **`instructions.md`** - Main project instructions for Claude Code (formerly `CLAUDE.md`)
 - **`commands/`** - Custom slash commands for Claude Code
 - **`prompts/`** - Reusable prompts and templates
 - **`context/`** - Additional context files and documentation
+  - `stack-trace-schema.md` - Stack trace storage schema in DuckDB (tables, queries, design notes)
+  - `network-schema.md` - Network event schema in DuckDB (track metadata, debug annotations, query examples)
+  - `perfetto-reference.md` - Perfetto format reference
+  - `perfetto-messages.md` - Perfetto message definitions
 
 ## Usage
 
-Claude Code automatically reads `instructions.md` when working on this project. Additional context files can be placed in the `context/` directory and referenced as needed.
+Project instructions for Claude are in `CLAUDE.md` at the project root. Additional context files can be placed in the `context/` directory and referenced as needed.
 
 ## Adding Custom Commands
 

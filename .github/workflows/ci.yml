@@ -8,6 +8,10 @@ on:
       branches:
         - main
 
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_INCREMENTAL: 0
+
 jobs:
   format_check:
     runs-on: ubuntu-latest
@@ -17,49 +21,31 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
-  clippy_check:
+  check_build_test:
     runs-on: ubuntu-latest
     steps:
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
       - uses: actions/checkout@v4
 
       - name: Install Deps.
         run: ./.github/workflows/install_deps.sh
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
-      - name: Clippy Check
-        run: |
-          cargo clippy --all-targets --no-default-features -- -D warnings
-          cargo clippy --all-targets --features pystacks -- -D warnings
-
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Deps.
-        run: ./.github/workflows/install_deps.sh
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build (no features)
-        run: cargo build --no-default-features --release
-
-      - name: Build (pystacks)
-        run: cargo build --features pystacks --release
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Deps.
-        run: ./.github/workflows/install_deps.sh
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Test (no features)
+      - name: Unit tests (no features)
         run: cargo test --no-default-features
 
-      - name: Test (pystacks)
+      - name: Unit tests (pystacks)
         run: cargo test --features pystacks
+
+      - name: Clippy (no features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: Clippy (pystacks)
+        run: cargo clippy --all-targets --features pystacks -- -D warnings

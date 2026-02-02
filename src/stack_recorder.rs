@@ -2,10 +2,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
+use anyhow::Result;
+
+use crate::perfetto::TraceWriter;
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
+use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
-use crate::systing::types::stack_event;
-use crate::SystingRecordEvent;
+use crate::systing_core::types::stack_event;
+use crate::systing_core::SystingRecordEvent;
+use crate::trace::{StackRecord, StackSampleRecord};
+use crate::utid::UtidGenerator;
 
 use blazesym::helper::{read_elf_build_id, ElfResolver};
 use blazesym::symbolize::source::{Kernel, Process, Source};
@@ -39,16 +45,39 @@ pub struct Stack {
     pub py_stack: Vec<PyAddr>,
 }
 
-/// Filters out zero addresses and reverses the stack trace order
-fn filter_and_reverse_stack(stack: &[u64]) -> Vec<u64> {
-    stack.iter().rev().filter(|x| **x > 0).copied().collect()
+/// Maximum valid userspace address on x86_64 Linux.
+/// Addresses above this are either kernel space or garbage from bad frame pointer unwinding.
+/// On x86_64, the canonical address split is at bit 47, so userspace addresses are below 0x800000000000.
+#[cfg(target_arch = "x86_64")]
+const MAX_USER_ADDR: u64 = 0x00007fffffffffff;
+
+/// Maximum valid userspace address on aarch64 Linux (48-bit VA).
+#[cfg(target_arch = "aarch64")]
+const MAX_USER_ADDR: u64 = 0x0000ffffffffffff;
+
+/// Filters out zero addresses and reverses user stack trace order.
+/// Also filters out garbage addresses that are above the valid userspace range,
+/// which can occur when bpf_get_stack() follows invalid frame pointers.
+fn filter_and_reverse_user_stack(stack: &[u64]) -> Vec<u64> {
+    stack
+        .iter()
+        .copied()
+        .rev()
+        .filter(|&x| x > 0 && x <= MAX_USER_ADDR)
+        .collect()
+}
+
+/// Filters out zero addresses and reverses kernel stack trace order.
+/// Kernel addresses are valid above MAX_USER_ADDR, so we only filter zeros.
+fn filter_and_reverse_kernel_stack(stack: &[u64]) -> Vec<u64> {
+    stack.iter().copied().rev().filter(|&x| x != 0).collect()
 }
 
 impl Stack {
     pub fn new(kernel_stack: &[u64], user_stack: &[u64], py_stack: &[PyAddr]) -> Self {
         Stack {
-            kernel_stack: filter_and_reverse_stack(kernel_stack),
-            user_stack: filter_and_reverse_stack(user_stack),
+            kernel_stack: filter_and_reverse_kernel_stack(kernel_stack),
+            user_stack: filter_and_reverse_user_stack(user_stack),
             py_stack: py_stack.to_vec(),
         }
     }
@@ -59,6 +88,20 @@ pub struct StackEvent {
     pub tgidpid: u64,
     pub ts_start: u64,
     pub stack: Stack,
+    pub stack_event_type: i8,
+}
+
+/// Convert BPF stack_event_type (u32) to i8, clamping to valid range.
+/// Valid values are 0 (STACK_SLEEP_UNINTERRUPTIBLE), 1 (STACK_RUNNING), 2 (STACK_SLEEP_INTERRUPTIBLE).
+/// Unknown values are preserved but clamped to i8::MAX to avoid truncation issues.
+#[inline]
+fn convert_stack_event_type(bpf_type: u32) -> i8 {
+    if bpf_type <= i8::MAX as u32 {
+        bpf_type as i8
+    } else {
+        // Clamp to max i8 value to indicate unknown/invalid type
+        i8::MAX
+    }
 }
 
 #[derive(Default)]
@@ -128,23 +171,24 @@ pub struct StackRecorder {
     pub psr: Arc<StackWalkerRun>,
     pub process_dispatcher: Option<Arc<ProcessDispatcher>>,
     pub global_func_manager: Arc<GlobalFunctionManager>,
-}
-
-impl Default for StackRecorder {
-    fn default() -> Self {
-        let id_counter = Arc::new(AtomicUsize::new(1));
-        Self {
-            ringbuf: RingBuffer::default(),
-            stacks: HashMap::new(),
-            psr: Arc::new(StackWalkerRun::default()),
-            process_dispatcher: None,
-            global_func_manager: Arc::new(GlobalFunctionManager::new(id_counter)),
-        }
-    }
+    // Streaming support
+    /// Whether streaming mode is enabled. When true, stacks are deduplicated during
+    /// recording and samples are buffered for later writing via finish().
+    streaming_enabled: bool,
+    /// Maps (Stack, tgid) to stack_id for deduplication during streaming.
+    /// The tgid is included in the key because the same addresses in different processes
+    /// may resolve to different symbols (e.g., shared libraries at fixed addresses).
+    unique_stacks: HashMap<(Stack, i32), i64>,
+    /// Next stack_id to assign for new unique stacks.
+    next_stack_id: i64,
+    /// Pending samples buffer for streaming.
+    pending_samples: Vec<StackSampleRecord>,
+    /// Shared utid generator for consistent thread IDs across all recorders.
+    utid_generator: Arc<UtidGenerator>,
 }
 
 impl StackRecorder {
-    pub fn new(enable_debuginfod: bool) -> Self {
+    pub fn new(enable_debuginfod: bool, utid_generator: Arc<UtidGenerator>) -> Self {
         let process_dispatcher = if enable_debuginfod {
             create_debuginfod_dispatcher()
         } else {
@@ -158,17 +202,228 @@ impl StackRecorder {
             psr: Arc::new(StackWalkerRun::default()),
             process_dispatcher,
             global_func_manager: Arc::new(GlobalFunctionManager::new(id_counter)),
+            streaming_enabled: false,
+            unique_stacks: HashMap::new(),
+            next_stack_id: 1,
+            pending_samples: Vec::new(),
+            utid_generator,
         }
     }
 
-    pub fn init_pystacks(&mut self, pids: &[u32], bpf_object: &libbpf_rs::Object) {
-        if let Some(psr) = Arc::get_mut(&mut self.psr) {
-            psr.init_pystacks(pids, bpf_object);
+    /// Enable streaming mode for stack recording.
+    /// When enabled, stacks are deduplicated during recording and samples are
+    /// buffered for later writing via finish().
+    pub fn enable_streaming(&mut self) {
+        self.streaming_enabled = true;
+    }
+
+    /// Create a symbolizer with the configured process dispatcher.
+    fn create_symbolizer(&self) -> Symbolizer {
+        if let Some(dispatcher) = &self.process_dispatcher {
+            let dispatcher = dispatcher.clone();
+            Symbolizer::builder()
+                .enable_code_info(true)
+                .enable_inlined_fns(true)
+                .set_process_dispatcher(move |info| dispatcher(info))
+                .build()
         } else {
-            // If we can't get exclusive access, it means the Arc is already shared
-            // This shouldn't happen during initialization, but we handle it gracefully
-            eprintln!("Warning: Unable to initialize pystacks - Arc is already shared");
+            Symbolizer::builder()
+                .enable_code_info(true)
+                .enable_inlined_fns(true)
+                .build()
         }
+    }
+
+    /// Finish streaming and symbolize all unique stacks.
+    ///
+    /// This method should be called at the end of recording to:
+    /// 1. Flush any remaining pending samples to the collector
+    /// 2. Symbolize all unique stacks collected during recording
+    /// 3. Stream StackRecords for each unique stack
+    ///
+    /// # Arguments
+    /// * `collector` - The collector to write samples and stacks to. This is typically
+    ///   the collector returned by sched recorder's finish().
+    ///
+    /// Returns the collector so it can be passed to other recorders or finished.
+    pub fn finish(
+        &mut self,
+        mut collector: Box<dyn RecordCollector + Send>,
+    ) -> Result<Box<dyn RecordCollector + Send>> {
+        // Check if streaming was enabled (we have pending samples/unique stacks)
+        if self.unique_stacks.is_empty() {
+            return Ok(collector);
+        }
+
+        // Flush pending samples to the collector
+        eprintln!(
+            "Flushing {} pending stack samples...",
+            self.pending_samples.len()
+        );
+        for sample in self.pending_samples.drain(..) {
+            collector.add_stack_sample(sample)?;
+        }
+
+        // Now symbolize all unique stacks and stream StackRecords
+        let total_stacks = self.unique_stacks.len();
+        let progress_bar = if total_stacks > 0 {
+            let pb = ProgressBar::new(total_stacks as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(
+                        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} stacks ({per_sec}, {eta})"
+                    )
+                    .expect("Failed to set progress bar template")
+                    .progress_chars("#>-"),
+            );
+            pb.set_message("Symbolizing stacks");
+            Some(pb)
+        } else {
+            None
+        };
+
+        let mut symbolizer = self.create_symbolizer();
+
+        // Create kernel source once - it's shared across all processes
+        let kernel_src = Source::Kernel(Kernel::default());
+
+        // Address cache: blazesym caches metadata (KASLR, ELF parsing) but not individual
+        // symbolization results. We cache (addr, tgid) -> frame_name to avoid re-symbolizing
+        // the same address across different stacks.
+        let mut addr_cache: HashMap<(u64, i32), String> = HashMap::new();
+
+        // Group stacks by tgid to reuse process sources efficiently
+        let mut stacks_by_tgid: HashMap<i32, Vec<(&Stack, i64)>> = HashMap::new();
+        for ((stack, tgid), stack_id) in self.unique_stacks.iter() {
+            stacks_by_tgid
+                .entry(*tgid)
+                .or_default()
+                .push((stack, *stack_id));
+        }
+
+        // Process each tgid group with a single Source per process
+        for (tgid, stacks) in stacks_by_tgid.iter() {
+            // Create process source once per tgid
+            let proc_src = Source::Process(Process::new(Pid::from(*tgid as u32)));
+
+            // Pre-cache process metadata for this tgid (best-effort optimization;
+            // result is ignored as caching failure doesn't affect correctness)
+            let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(
+                (*tgid as u32).into(),
+            )));
+
+            for (stack, stack_id) in stacks {
+                // Symbolize this stack using the shared sources and address cache
+                let frame_names = self.symbolize_stack_with_sources_cached(
+                    &mut symbolizer,
+                    stack,
+                    &proc_src,
+                    &kernel_src,
+                    *tgid,
+                    &mut addr_cache,
+                );
+
+                // Update progress bar
+                if let Some(ref pb) = progress_bar {
+                    pb.inc(1);
+                }
+
+                // Skip empty stacks
+                if frame_names.is_empty() {
+                    continue;
+                }
+
+                let leaf_name = frame_names.first().cloned().unwrap_or_default();
+                let depth = frame_names.len().min(i32::MAX as usize) as i32;
+
+                collector.add_stack(StackRecord {
+                    id: *stack_id,
+                    frame_names,
+                    depth,
+                    leaf_name,
+                })?;
+            }
+        }
+
+        // Finish the progress bar
+        if let Some(pb) = progress_bar {
+            pb.finish_with_message("Stack symbolization complete");
+        }
+
+        // Flush and return the collector
+        collector.flush()?;
+        Ok(collector)
+    }
+
+    /// Check if streaming mode is enabled.
+    pub fn is_streaming(&self) -> bool {
+        self.streaming_enabled
+    }
+
+    /// Symbolize a single stack and return frame names.
+    /// Takes pre-created Source objects and an address cache for efficiency.
+    /// Blazesym caches metadata (KASLR, ELF parsing) but not symbolization results,
+    /// so we maintain our own cache for individual addresses.
+    fn symbolize_stack_with_sources_cached(
+        &self,
+        symbolizer: &mut Symbolizer,
+        stack: &Stack,
+        proc_src: &Source<'_>,
+        kernel_src: &Source<'_>,
+        tgid: i32,
+        addr_cache: &mut HashMap<(u64, i32), String>,
+    ) -> Vec<String> {
+        let mut frame_names = Vec::with_capacity(
+            stack.user_stack.len() + stack.kernel_stack.len() + stack.py_stack.len(),
+        );
+
+        // Symbolize Python stack first (if present)
+        let python_frames = self.psr.get_python_frame_names(&stack.py_stack);
+        frame_names.extend(python_frames);
+
+        // Symbolize user addresses (leaf) - use tgid for cache key
+        for &addr in &stack.user_stack {
+            let frame_name = addr_cache
+                .entry((addr, tgid))
+                .or_insert_with(|| {
+                    symbolizer
+                        .symbolize_single(proc_src, Input::AbsAddr(addr))
+                        .ok()
+                        .and_then(|s| s.into_sym())
+                        .map(|s| format_symbolized_frame(&s, addr, "unknown"))
+                        .unwrap_or_else(|| format!("0x{addr:x}"))
+                })
+                .clone();
+            frame_names.push(frame_name);
+        }
+
+        // Symbolize kernel addresses (root).
+        // Use tgid=0 since KASLR offset is system-wide; the same kernel address
+        // resolves identically for all processes.
+        for &addr in &stack.kernel_stack {
+            let frame_name = addr_cache
+                .entry((addr, 0))
+                .or_insert_with(|| {
+                    symbolizer
+                        .symbolize_single(kernel_src, Input::AbsAddr(addr))
+                        .ok()
+                        .and_then(|s| s.into_sym())
+                        .map(|s| format_symbolized_frame(&s, addr, "[kernel]"))
+                        .unwrap_or_else(|| format!("unknown ([kernel]) <{addr:#x}>"))
+                })
+                .clone();
+            frame_names.push(frame_name);
+        }
+
+        frame_names
+    }
+
+    pub fn init_pystacks(&mut self, pids: &[u32], bpf_object: &libbpf_rs::Object, debug: bool) {
+        let psr = Arc::get_mut(&mut self.psr).expect(
+            "Unable to initialize pystacks: Arc is already shared. \
+             The symbol loader thread must not be spawned before init_pystacks.",
+        );
+        psr.init_pystacks(pids, bpf_object, debug);
     }
 
     /// Symbolizes all stacks (user, kernel, and Python) and returns the resolved information
@@ -241,7 +496,9 @@ impl StackRecorder {
         }
     }
 
-    /// Process stacks for a single process and collect the interned data
+    /// Process stacks for a single process and collect the interned data.
+    /// Returns interned data and a closure that can write sample packets later
+    /// (samples must be written after the interned data packet).
     fn process_tgid_stacks(
         &self,
         symbolizer: &mut Symbolizer,
@@ -249,7 +506,12 @@ impl StackRecorder {
         stacks: &[StackEvent],
         global_kernel_frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
         ctx: &TraceContext,
-    ) -> (Vec<Callstack>, Vec<Frame>, Vec<Mapping>, Vec<TracePacket>) {
+    ) -> (
+        Vec<Callstack>,
+        Vec<Frame>,
+        Vec<Mapping>,
+        HashMap<Stack, Callstack>,
+    ) {
         // Step 1: Symbolize all stacks
         let resolved_info = self.symbolize_stacks(
             symbolizer,
@@ -269,11 +531,13 @@ impl StackRecorder {
         let user_frames = collect_frames(&resolved_info.user_frame_map);
         let user_mappings = collect_mappings(&resolved_info.user_frame_map);
 
-        // Step 3: Generate sample packets for this process
-        let sample_packets =
-            generate_sample_packets(stacks, &deduplicated_data.callstacks, ctx.sequence_id);
-
-        (callstacks, user_frames, user_mappings, sample_packets)
+        // Return the callstack map so samples can be written later (after interned data)
+        (
+            callstacks,
+            user_frames,
+            user_mappings,
+            deduplicated_data.callstacks,
+        )
     }
 
     /// Create the interned data packet with all collected data
@@ -306,7 +570,161 @@ impl StackRecorder {
         Some(interned_packet)
     }
 
-    pub fn generate_trace(&self, id_counter: &Arc<AtomicUsize>) -> Vec<TracePacket> {
+    /// Write trace data directly to a RecordCollector (Parquet-first path).
+    ///
+    /// This method outputs stack profiling data as native records. It performs
+    /// symbolization and outputs the results directly without Perfetto format.
+    ///
+    /// Uses a simplified schema where StackRecord contains only frame_names
+    /// (with embedded module and location info) - no separate frame/symbol tables.
+    ///
+    /// Frame names are formatted as: `function_name (module_name [file:line]) <0xaddr>`
+    pub fn write_records(
+        &self,
+        collector: &mut dyn RecordCollector,
+        stack_id_counter: &mut i64,
+    ) -> Result<()> {
+        // Stack deduplication cache (key: frame_names as a comparable key)
+        let mut stack_cache: HashMap<Vec<String>, i64> = HashMap::new();
+
+        // Process each unique stack
+        for (tgid, events) in self.stacks.iter() {
+            let symbolizer = self.create_symbolizer();
+
+            // Process each unique stack for this tgid
+            let unique_stacks: HashSet<_> = events.iter().map(|e| &e.stack).collect();
+
+            // Stack ID cache for this tgid (maps Stack -> stack_id)
+            let mut tgid_stack_cache: HashMap<&Stack, i64> = HashMap::new();
+
+            for stack in unique_stacks.iter() {
+                // Collect addresses for symbolization (user first, then kernel)
+                // This gives us leaf-to-root order in the arrays
+                let addr_count = stack.user_stack.len() + stack.kernel_stack.len();
+                let mut all_addrs = Vec::with_capacity(addr_count);
+
+                // Add user addresses first (leaf)
+                for &addr in &stack.user_stack {
+                    all_addrs.push((addr, false)); // is_kernel=false
+                }
+
+                // Add kernel addresses (root)
+                for &addr in &stack.kernel_stack {
+                    all_addrs.push((addr, true)); // is_kernel=true
+                }
+
+                // Build frame_names array with embedded module/location info
+                let mut frame_names: Vec<String> = Vec::with_capacity(addr_count);
+
+                for (addr, is_kernel) in all_addrs.iter() {
+                    // Symbolize and format frame name with embedded info
+                    let frame_name = if *is_kernel {
+                        let kernel_src = Source::Kernel(Kernel::default());
+                        let sym_result =
+                            symbolizer.symbolize_single(&kernel_src, Input::AbsAddr(*addr));
+                        sym_result
+                            .ok()
+                            .and_then(|s| s.into_sym())
+                            .map(|s| {
+                                let module_name = s
+                                    .module
+                                    .as_ref()
+                                    .and_then(|m| m.to_str())
+                                    .and_then(|m| std::path::Path::new(m).file_name())
+                                    .and_then(|f| f.to_str())
+                                    .unwrap_or("[kernel]");
+                                let location_info = format_location_info(&s.code_info);
+                                format!(
+                                    "{} ({}{}) <{:#x}>",
+                                    s.name, module_name, location_info, *addr
+                                )
+                            })
+                            .unwrap_or_else(|| format!("unknown ([kernel]) <{:#x}>", *addr))
+                    } else {
+                        let proc_src = Source::Process(Process::new(Pid::from(*tgid as u32)));
+                        let sym_result =
+                            symbolizer.symbolize_single(&proc_src, Input::AbsAddr(*addr));
+                        sym_result
+                            .ok()
+                            .and_then(|s| s.into_sym())
+                            .map(|s| {
+                                let module_name = s
+                                    .module
+                                    .as_ref()
+                                    .and_then(|m| m.to_str())
+                                    .and_then(|m| std::path::Path::new(m).file_name())
+                                    .and_then(|f| f.to_str())
+                                    .unwrap_or("unknown");
+                                let location_info = format_location_info(&s.code_info);
+                                format!(
+                                    "{} ({}{}) <{:#x}>",
+                                    s.name, module_name, location_info, *addr
+                                )
+                            })
+                            .unwrap_or_else(|| format!("0x{:x}", *addr))
+                    };
+
+                    frame_names.push(frame_name);
+                }
+
+                // Skip empty stacks
+                if frame_names.is_empty() {
+                    continue;
+                }
+
+                // Check if this exact stack already exists (global deduplication by frame_names)
+                let stack_id = if let Some(&id) = stack_cache.get(&frame_names) {
+                    id
+                } else {
+                    let id = *stack_id_counter;
+                    *stack_id_counter += 1;
+
+                    let leaf_name = frame_names.first().cloned().unwrap_or_default();
+                    let depth = frame_names.len().min(i32::MAX as usize) as i32;
+
+                    // Clone frame_names for the cache key before moving into StackRecord
+                    let cache_key = frame_names.clone();
+
+                    collector.add_stack(StackRecord {
+                        id,
+                        frame_names,
+                        depth,
+                        leaf_name,
+                    })?;
+
+                    stack_cache.insert(cache_key, id);
+                    id
+                };
+
+                tgid_stack_cache.insert(stack, stack_id);
+            }
+
+            // Now output stack samples with stack references
+            for event in events.iter() {
+                let tid = event.tgidpid as i32;
+                let utid = self.utid_generator.get_or_create_utid(tid);
+
+                if let Some(&stack_id) = tgid_stack_cache.get(&event.stack) {
+                    collector.add_stack_sample(StackSampleRecord {
+                        ts: event.ts_start as i64,
+                        utid,
+                        cpu: None,
+                        stack_id,
+                        stack_event_type: event.stack_event_type,
+                    })?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write trace data to Perfetto format (used by parquet-to-perfetto conversion).
+    pub fn write_trace(
+        &self,
+        writer: &mut dyn TraceWriter,
+        id_counter: &Arc<AtomicUsize>,
+    ) -> Result<()> {
         // Get a unique sequence ID for this trace
         let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
 
@@ -315,19 +733,7 @@ impl StackRecorder {
 
         // Create a single symbolizer to reuse across all processes
         // This avoids the ~60ms initialization overhead per process
-        let mut symbolizer = if let Some(dispatcher) = &self.process_dispatcher {
-            let dispatcher = dispatcher.clone();
-            Symbolizer::builder()
-                .enable_code_info(true)
-                .enable_inlined_fns(true)
-                .set_process_dispatcher(move |info| dispatcher(info))
-                .build()
-        } else {
-            Symbolizer::builder()
-                .enable_code_info(true)
-                .enable_inlined_fns(true)
-                .build()
-        };
+        let mut symbolizer = self.create_symbolizer();
 
         // Create a progress bar if we have addresses to process
         let progress_bar = if total_addresses > 0 {
@@ -346,14 +752,14 @@ impl StackRecorder {
             None
         };
 
-        // Process all stacks synchronously to avoid the interleaving issue
-        let mut all_packets = Vec::new();
-        let mut all_sample_packets = Vec::new();
-
         // Collect all interned data from all processes
+        // We still need to collect these in memory as they go into a single packet
         let mut all_callstacks = Vec::new();
         let mut all_user_frames = Vec::new();
         let mut all_user_mappings = Vec::new();
+
+        // Store callstack maps per-tgid so we can write samples after interned data
+        let mut tgid_callstack_maps: Vec<(i32, HashMap<Stack, Callstack>)> = Vec::new();
 
         // Global kernel frame map shared across all processes
         let mut global_kernel_frame_map = HashMap::new();
@@ -361,27 +767,26 @@ impl StackRecorder {
         // Create trace context to pass common parameters
         let ctx = TraceContext {
             id_counter,
-            sequence_id,
             progress_bar: &progress_bar,
         };
 
-        // Process each tgid's stacks
+        // Phase 1: Process each tgid's stacks and collect interned data
+        // (sample packets will be written after interned data)
         for (tgid, stacks) in self.stacks.iter() {
-            let tgid = *tgid as u32;
+            let tgid_u32 = *tgid as u32;
 
-            let (callstacks, user_frames, user_mappings, sample_packets) = self
-                .process_tgid_stacks(
-                    &mut symbolizer,
-                    tgid,
-                    stacks,
-                    &mut global_kernel_frame_map,
-                    &ctx,
-                );
+            let (callstacks, user_frames, user_mappings, callstack_map) = self.process_tgid_stacks(
+                &mut symbolizer,
+                tgid_u32,
+                stacks,
+                &mut global_kernel_frame_map,
+                &ctx,
+            );
 
             all_callstacks.extend(callstacks);
             all_user_frames.extend(user_frames);
             all_user_mappings.extend(user_mappings);
-            all_sample_packets.extend(sample_packets);
+            tgid_callstack_maps.push((*tgid, callstack_map));
         }
 
         // Extract kernel frames and mappings from the global kernel frame map
@@ -397,22 +802,37 @@ impl StackRecorder {
         all_mappings.extend(kernel_mappings);
         all_mappings.extend(all_user_mappings);
 
-        // Create a single interned data packet with everything
+        // Phase 2: Write the interned data packet FIRST (before sample packets)
         if let Some(interned_packet) =
             self.create_interned_packet(all_callstacks, all_frames, all_mappings, sequence_id)
         {
-            all_packets.push(interned_packet);
+            writer.write_packet(&interned_packet)?;
         }
 
-        // Then add all the sample packets
-        all_packets.extend(all_sample_packets);
+        // Phase 3: Now write sample packets (they reference IIDs from interned data)
+        for (tgid, callstack_map) in tgid_callstack_maps {
+            let stacks = self
+                .stacks
+                .get(&tgid)
+                .expect("tgid must exist since we just collected from self.stacks");
+            write_sample_packets(writer, stacks, &callstack_map, sequence_id)?;
+        }
 
         // Finish the progress bar
         if let Some(pb) = progress_bar {
             pb.finish_with_message("Stack symbol resolution complete");
         }
 
-        all_packets
+        Ok(())
+    }
+
+    /// Returns the minimum timestamp from all stacks, or None if no stacks recorded.
+    pub fn min_timestamp(&self) -> Option<u64> {
+        self.stacks
+            .values()
+            .flatten()
+            .map(|stack| stack.ts_start)
+            .min()
     }
 }
 
@@ -462,6 +882,23 @@ fn format_location_info(code_info: &Option<blazesym::symbolize::CodeInfo>) -> St
             format!(" [{file_name}]")
         }
     })
+}
+
+/// Formats a symbolized frame as a string with module and location info.
+/// Format: "function_name (module_name [file:line]) <0xaddr>"
+fn format_symbolized_frame(sym: &Sym, addr: u64, default_module: &str) -> String {
+    let module_name = sym
+        .module
+        .as_ref()
+        .and_then(|m| m.to_str())
+        .and_then(|m| std::path::Path::new(m).file_name())
+        .and_then(|f| f.to_str())
+        .unwrap_or(default_module);
+    let location_info = format_location_info(&sym.code_info);
+    format!(
+        "{} ({}{}) <{:#x}>",
+        sym.name, module_name, location_info, addr
+    )
 }
 
 pub fn stack_to_frames_mapping<'a, I>(
@@ -638,7 +1075,6 @@ fn dispatch_process_with_client(
 /// Context for trace generation shared across symbolization calls
 struct TraceContext<'a> {
     id_counter: &'a Arc<AtomicUsize>,
-    sequence_id: u32,
     progress_bar: &'a Option<ProgressBar>,
 }
 
@@ -763,14 +1199,13 @@ fn deduplicate_stacks(
 
 /// Generates PerfSample packets from the deduplicated stacks
 /// Skips stacks that don't have a callstack (e.g., filtered out due to empty frames)
-fn generate_sample_packets(
+fn write_sample_packets(
+    writer: &mut dyn TraceWriter,
     stacks: &[StackEvent],
     callstack_map: &HashMap<Stack, Callstack>,
     sequence_id: u32,
-) -> Vec<TracePacket> {
-    let mut packets = Vec::new();
-
-    // Generate sample packets for each stack
+) -> Result<()> {
+    // Generate and write sample packets for each stack
     for stack in stacks.iter() {
         // Skip stacks that were filtered out during deduplication (empty callstacks)
         let callstack = match callstack_map.get(&stack.stack) {
@@ -789,9 +1224,9 @@ fn generate_sample_packets(
         sample.set_tid(pid);
         packet.set_perf_sample(sample);
         packet.set_trusted_packet_sequence_id(sequence_id);
-        packets.push(packet);
+        writer.write_packet(&packet)?;
     }
-    packets
+    Ok(())
 }
 
 impl SystingRecordEvent<stack_event> for StackRecorder {
@@ -816,16 +1251,44 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
             let stack_key = (event.task.tgidpid >> 32) as i32;
             let py_stack = self.psr.get_pystack_from_event(&event);
 
-            let stack = StackEvent {
-                tgidpid: event.task.tgidpid,
-                ts_start: event.ts,
-                stack: Stack::new(&kstack_vec, &ustack_vec, &py_stack),
-            };
-            let stacks = self.stacks.entry(stack_key).or_default();
-            stacks.push(stack);
-        }
+            let stack = Stack::new(&kstack_vec, &ustack_vec, &py_stack);
+            let tid = event.task.tgidpid as i32;
+            let tgid = stack_key; // tgid for process-specific symbolization
 
-        // Symbol loading will be handled by dedicated thread via channel
+            // Streaming mode: dedupe stacks and buffer samples for streaming
+            if self.streaming_enabled {
+                // Get or assign stack_id for this (stack, tgid) pair
+                // Include tgid in key since same addresses may resolve differently per-process
+                let key = (stack, tgid);
+                let stack_id = if let Some(&id) = self.unique_stacks.get(&key) {
+                    id
+                } else {
+                    let id = self.next_stack_id;
+                    self.next_stack_id += 1;
+                    self.unique_stacks.insert(key, id);
+                    id
+                };
+
+                // Buffer the sample for streaming (will be flushed in finish())
+                self.pending_samples.push(StackSampleRecord {
+                    ts: event.ts as i64,
+                    utid: self.utid_generator.get_or_create_utid(tid),
+                    cpu: Some(event.cpu as i32),
+                    stack_id,
+                    stack_event_type: convert_stack_event_type(event.stack_event_type.0),
+                });
+            } else {
+                // Non-streaming mode: store all events for later processing
+                let stack_event = StackEvent {
+                    tgidpid: event.task.tgidpid,
+                    ts_start: event.ts,
+                    stack,
+                    stack_event_type: convert_stack_event_type(event.stack_event_type.0),
+                };
+                let stacks = self.stacks.entry(stack_key).or_default();
+                stacks.push(stack_event);
+            }
+        }
     }
 }
 
@@ -853,8 +1316,74 @@ mod tests {
     //! generation pipeline works end-to-end despite fake data.
 
     use super::*;
+    use crate::perfetto::VecTraceWriter;
+    use crate::utid::UtidGenerator;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
+
+    #[test]
+    fn test_filter_and_reverse_user_stack() {
+        // Test zero filtering
+        assert_eq!(filter_and_reverse_user_stack(&[0, 0x1000, 0]), vec![0x1000]);
+
+        // Test reversal
+        assert_eq!(
+            filter_and_reverse_user_stack(&[0x1000, 0x2000]),
+            vec![0x2000, 0x1000]
+        );
+
+        // Test MAX_USER_ADDR boundary - address at boundary should be kept
+        assert_eq!(
+            filter_and_reverse_user_stack(&[0x1000, MAX_USER_ADDR]),
+            vec![MAX_USER_ADDR, 0x1000]
+        );
+
+        // Test garbage addresses above MAX_USER_ADDR are filtered
+        assert_eq!(
+            filter_and_reverse_user_stack(&[0x1000, MAX_USER_ADDR + 1]),
+            vec![0x1000]
+        );
+
+        // Test typical garbage from bad frame pointer unwinding (instruction bytes)
+        assert_eq!(
+            filter_and_reverse_user_stack(&[0x7f0000001000, 0xc48348d88948ff31]),
+            vec![0x7f0000001000]
+        );
+
+        // Empty stack
+        assert_eq!(filter_and_reverse_user_stack(&[]), Vec::<u64>::new());
+
+        // All zeros
+        assert_eq!(filter_and_reverse_user_stack(&[0, 0, 0]), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn test_filter_and_reverse_kernel_stack() {
+        // Test zero filtering
+        assert_eq!(
+            filter_and_reverse_kernel_stack(&[0, 0xffffffff81000000, 0]),
+            vec![0xffffffff81000000]
+        );
+
+        // Test reversal
+        assert_eq!(
+            filter_and_reverse_kernel_stack(&[0xffffffff81000000, 0xffffffff82000000]),
+            vec![0xffffffff82000000, 0xffffffff81000000]
+        );
+
+        // Kernel addresses above MAX_USER_ADDR should be kept
+        assert_eq!(
+            filter_and_reverse_kernel_stack(&[0xffffffff81000000]),
+            vec![0xffffffff81000000]
+        );
+
+        // Empty stack
+        assert_eq!(filter_and_reverse_kernel_stack(&[]), Vec::<u64>::new());
+    }
+
+    fn create_test_recorder() -> StackRecorder {
+        StackRecorder::new(false, Arc::new(UtidGenerator::new()))
+    }
 
     fn create_test_stack_event_raw(
         tgidpid: u64,
@@ -1067,7 +1596,7 @@ mod tests {
 
     #[test]
     fn test_deduplicate_stacks_single_stack() {
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create a single test event
         let event = create_test_stack_event_raw(
@@ -1079,15 +1608,20 @@ mod tests {
         recorder.handle_event(event);
 
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
     #[test]
     fn test_deduplicate_stacks_duplicate_stacks() {
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create two events with identical stacks but different threads
         let event1 = create_test_stack_event_raw(
@@ -1107,15 +1641,20 @@ mod tests {
         recorder.handle_event(event2);
 
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
     #[test]
     fn test_deduplicate_stacks_different_stacks() {
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create two events with different stacks
         let event1 =
@@ -1127,27 +1666,33 @@ mod tests {
         recorder.handle_event(event2);
 
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
     #[test]
-    fn test_generate_sample_packets_empty() {
+    fn test_write_sample_packets_empty() {
         // Test packet generation with no stacks
         let stacks = vec![];
         let callstack_map = HashMap::new();
 
-        let packets = generate_sample_packets(&stacks, &callstack_map, 1);
+        let mut writer = VecTraceWriter::new();
+        write_sample_packets(&mut writer, &stacks, &callstack_map, 1).unwrap();
 
         // Should have no packets since there are no stacks
-        assert!(packets.is_empty());
+        assert!(writer.packets.is_empty());
     }
 
     #[test]
     fn test_generate_trace_packets_single_stack() {
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create a single test event
         let event = create_test_stack_event_raw(
@@ -1159,15 +1704,20 @@ mod tests {
         recorder.handle_event(event);
 
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
     #[test]
     fn test_generate_trace_packets_multiple_stacks() {
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create two test events with different processes
         let event1 =
@@ -1179,16 +1729,21 @@ mod tests {
         recorder.handle_event(event2);
 
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
     #[test]
     fn test_symbolize_stacks_with_mock_resolver() {
         // Test symbolization pipeline with generate_trace
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create and handle a test event with addresses that MockResolver knows
         let event = create_test_stack_event_raw(
@@ -1201,16 +1756,21 @@ mod tests {
 
         // Generate trace using the mock resolver
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
     #[test]
     fn test_stack_recorder_with_custom_dispatcher() {
         // Test multiple stack events through the pipeline
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create and handle multiple test events with different known addresses
         let event1 =
@@ -1223,16 +1783,21 @@ mod tests {
 
         // Generate trace with mock resolver
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
     #[test]
     fn test_deduplicate_stacks_with_mock_resolver() {
         // Test that duplicate stacks are properly deduplicated
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create and handle identical stacks from different threads - should be deduplicated
         let event1 = create_test_stack_event_raw(
@@ -1253,15 +1818,20 @@ mod tests {
 
         // Generate trace
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 
     #[test]
     fn test_generate_trace_packets_timestamps() {
-        let mut recorder = StackRecorder::default();
+        let mut recorder = create_test_recorder();
 
         // Create two test events with same stack but different timestamps
         let event1 =
@@ -1273,9 +1843,14 @@ mod tests {
         recorder.handle_event(event2);
 
         let id_counter = Arc::new(AtomicUsize::new(100));
-        let packets = recorder.generate_trace(&id_counter);
+        let mut writer = VecTraceWriter::new();
+        recorder.write_trace(&mut writer, &id_counter).unwrap();
 
-        let sample_packets: Vec<_> = packets.iter().filter(|p| p.has_perf_sample()).collect();
+        let sample_packets: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_perf_sample())
+            .collect();
         assert_eq!(sample_packets.len(), 0);
     }
 }

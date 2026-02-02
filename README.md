@@ -30,6 +30,23 @@ This will generate a `trace.pb` file which can be uploaded to a
 
 This sets up automatic `cargo fmt` checks before commits and pushes. See [CLAUDE.md](CLAUDE.md) for full development workflow details.
 
+### Running Integration Tests
+
+Integration tests require root/BPF privileges and are marked as `#[ignore]` by default. Use the provided script to run them without causing build artifact ownership issues:
+
+```bash
+# Run all integration tests
+./scripts/run-integration-tests.sh
+
+# Run a specific test
+./scripts/run-integration-tests.sh trace_validation test_e2e_parquet_validation
+
+# Run with pystacks feature
+CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh
+```
+
+The script builds as your user (preserving artifact ownership), then runs only the test binary with sudo.
+
 ## Usage
 
 Detailed options can be found [here](docs/USAGE.adoc).
@@ -58,10 +75,16 @@ sudo ./target/debug/systing --list-recorders
 This will display all available recorders and their default states:
 - `sched` - Scheduler event tracing (on by default)
 - `syscalls` - Syscall tracing
-- `sleep-stacks` - Sleep stack traces (on by default)
+- `sleep-stacks` - Sleep stack traces for all sleep states (on by default)
+- `interruptible-stacks` - Interruptible sleep stack traces (on by default, requires sleep-stacks)
 - `cpu-stacks` - CPU perf stack traces (on by default)
 - `network` - Network traffic recording (TCP/UDP send/receive and packet-level latency)
 - `pystacks` - Python stack tracing (requires pystacks feature)
+
+Note: `sleep-stacks` acts as a master switch for all sleep stack collection. When enabled,
+both uninterruptible (D state) and interruptible (S state) sleep stacks are collected by
+default. Use `--no-interruptible-stack-traces` or disable the `interruptible-stacks`
+recorder to collect only uninterruptible sleep stacks.
 
 #### Add Specific Recorders
 

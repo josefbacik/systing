@@ -1,0 +1,38 @@
+{
+  "events": [
+    {
+      "name": "send_chunk_start",
+      "event": "marker:start",
+      "args": [
+        {
+          "arg_index": 0,
+          "arg_type": "long",
+          "arg_name": "socket_fd"
+        }
+      ]
+    },
+    {
+      "name": "send_chunk_end",
+      "event": "marker:end",
+      "args": [
+        {
+          "arg_index": 0,
+          "arg_type": "long",
+          "arg_name": "socket_fd"
+        }
+      ]
+    }
+  ],
+  "tracks": [
+    {
+      "track_name": "Send Chunks",
+      "ranges": [
+        {
+          "name": "send_chunk",
+          "start": "send_chunk_start",
+          "end": "send_chunk_end"
+        }
+      ]
+    }
+  ]
+}
