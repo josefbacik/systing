@@ -237,32 +237,20 @@ fn main() {
         println!("cargo:rerun-if-changed={src}");
     }
 
+    // Link individual BPF objects into a single object file for skeleton generation.
     let obj_path = out_dir.join("systing_system.bpf.o");
 
-    // allow mut for feature pystacks
-    #[allow(unused_mut)]
-    let mut bpftool_args: Vec<_> = vec![
-        "gen".to_string(),
-        "object".to_string(),
-        obj_path.display().to_string(),
-        out_dir
-            .join("systing_system_tmp.bpf.o")
-            .display()
-            .to_string(),
-    ];
+    let mut linker = libbpf_rs::Linker::new(&obj_path).expect("Failed to create BPF linker");
+    linker
+        .add_file(out_dir.join("systing_system_tmp.bpf.o"))
+        .expect("Failed to add systing_system BPF object");
 
     #[cfg(feature = "pystacks")]
-    bpftool_args.push(out_dir.join("pystacks.bpf.o").display().to_string());
+    linker
+        .add_file(out_dir.join("pystacks.bpf.o"))
+        .expect("Failed to add pystacks BPF object");
 
-    let bpftool_output = std::process::Command::new("bpftool")
-        .args(bpftool_args)
-        .output()
-        .expect("Failed to link bpf objexts via bpftool");
-
-    let bpft_stdout = String::from_utf8(bpftool_output.stdout).unwrap();
-    let bpft_stderr = String::from_utf8(bpftool_output.stderr).unwrap();
-    println!("{bpft_stdout}");
-    println!("{bpft_stderr}");
+    linker.link().expect("Failed to link BPF objects");
 
     let skel_path = out_dir.join("systing_system.skel.rs");
     SkeletonBuilder::new()
