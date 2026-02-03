@@ -6,16 +6,22 @@ use libbpf_cargo::SkeletonBuilder;
 
 const SRC: [&str; 1] = ["src/bpf/systing_system.bpf.c"];
 
+#[cfg(any(feature = "pystacks", feature = "generate-pystacks-bindings"))]
+fn vmlinux_include_arg() -> String {
+    format!(
+        "-I{}",
+        Path::new("src/bpf")
+            .canonicalize()
+            .expect("src directory exists")
+            .display()
+    )
+}
+
 #[cfg(not(feature = "pystacks"))]
-fn generate_bindings(_: &PathBuf) {}
+fn build_pystacks_libs(_: &Path) {}
 
 #[cfg(feature = "pystacks")]
-fn generate_bindings(out_dir: &PathBuf) {
-    use std::path::PathBuf;
-
-    use bindgen::builder;
-    use pkg_config;
-
+fn build_pystacks_libs(out_dir: &Path) {
     // Check for required libraries and collect missing ones
     let mut missing_libs = Vec::new();
 
@@ -99,16 +105,9 @@ fn generate_bindings(out_dir: &PathBuf) {
     println!("cargo:rustc-link-lib=dylib=elf");
     println!("cargo:rustc-link-lib=dylib=cap");
 
-    let vmlinux_include_arg = format!(
-        "-I{}",
-        Path::new("src/bpf")
-            .canonicalize()
-            .expect("src directory exists")
-            .display()
-    );
     let status = std::process::Command::new("make")
         .env("INSTALL_DIR", out_dir)
-        .env("VMLINUX_INCLUDE", &vmlinux_include_arg)
+        .env("VMLINUX_INCLUDE", vmlinux_include_arg())
         .arg("-C")
         .arg("strobelight-libs/strobelight/bpf_lib/python")
         .arg("install")
@@ -116,8 +115,16 @@ fn generate_bindings(out_dir: &PathBuf) {
         .expect("Failed to run make");
 
     assert!(status.success(), "Make command failed");
+}
 
-    let pystacks_header: PathBuf = out_dir.join("strobelight/bpf_lib/python/pystacks/pystacks.h");
+#[cfg(not(feature = "generate-pystacks-bindings"))]
+fn generate_pystacks_bindings(_: &Path) {}
+
+#[cfg(feature = "generate-pystacks-bindings")]
+fn generate_pystacks_bindings(out_dir: &Path) {
+    use bindgen::builder;
+
+    let pystacks_header = out_dir.join("strobelight/bpf_lib/python/pystacks/pystacks.h");
     let logging_header: PathBuf =
         PathBuf::from("strobelight-libs/strobelight/bpf_lib/include/logging.h");
     let bindings = builder()
@@ -126,7 +133,7 @@ fn generate_bindings(out_dir: &PathBuf) {
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .clang_args([
             format!("-I{}", out_dir.display()),
-            vmlinux_include_arg.to_string(),
+            vmlinux_include_arg(),
             "-x".to_string(),
             "c++".to_string(),
             "-std=c++20".to_string(),
@@ -172,7 +179,8 @@ fn main() {
 
     generate_vmlinux_header();
 
-    generate_bindings(&out_dir);
+    build_pystacks_libs(&out_dir);
+    generate_pystacks_bindings(&out_dir);
 
     let include_arg = format!("-I{}", out_dir.display());
     let bpf_include_arg = format!(

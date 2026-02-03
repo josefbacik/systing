@@ -50,6 +50,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "time"] }
 [features]
 generate-vmlinux-header = []
 pystacks = []
+generate-pystacks-bindings = ["pystacks"]
 
 [lib]
 name = "systing"

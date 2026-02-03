@@ -59,7 +59,7 @@ CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh
 
 ## Generated Files
 
-The `src/pystacks/bindings.rs` file is **generated from C++ headers** using bindgen and is **committed to the repository**. This avoids requiring all developers to have the C++ build dependencies (libfmt-dev, libre2-dev, libcap-dev) installed.
+The `src/pystacks/bindings.rs` file is **generated from C++ headers** using bindgen and is **committed to the repository**. Normal builds with the `pystacks` feature use the pre-committed bindings, avoiding the need for bindgen during regular builds.
 
 **When to regenerate:**
 - After updating the `strobelight-libs` submodule
@@ -68,9 +68,11 @@ The `src/pystacks/bindings.rs` file is **generated from C++ headers** using bind
 **How to regenerate:**
 ```bash
 cargo clean
-cargo check --features pystacks
+cargo check --features generate-pystacks-bindings
 git add src/pystacks/bindings.rs
 ```
+
+Note: The `generate-pystacks-bindings` feature implies `pystacks`, so you don't need to specify both.
 
 ## Git Hooks
 
