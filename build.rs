@@ -6,8 +6,48 @@ use libbpf_cargo::SkeletonBuilder;
 
 const SRC: [&str; 1] = ["src/bpf/systing_system.bpf.c"];
 
+/// Detect the multiarch include path for Ubuntu/Debian systems.
+///
+/// On these distros, headers like `asm/errno.h` and `bits/wordsize.h` live
+/// under `/usr/include/<triplet>/` (e.g. `/usr/include/x86_64-linux-gnu/`).
+/// On Fedora/RHEL they're directly in `/usr/include/asm/`.
+///
+/// Returns a `-I/usr/include/<triplet>` string if needed, or None.
+fn detect_multiarch_include() -> Option<String> {
+    if Path::new("/usr/include/asm").exists() {
+        return None;
+    }
+
+    // Try multiple methods to detect the multiarch triplet, in order of
+    // reliability and availability across different environments.
+    let triplet = None
+        // 1. dpkg-architecture (Debian/Ubuntu with dpkg-dev installed)
+        .or_else(|| {
+            std::process::Command::new("dpkg-architecture")
+                .arg("-qDEB_HOST_MULTIARCH")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+        })
+        // 2. cc -dumpmachine (works on any system with a C compiler)
+        .or_else(|| {
+            std::process::Command::new("cc")
+                .arg("-dumpmachine")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+        });
+
+    triplet
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty() && Path::new(&format!("/usr/include/{t}")).exists())
+        .map(|t| format!("-I/usr/include/{t}"))
+}
+
 #[cfg(feature = "pystacks")]
-fn build_pystacks_bpf(out_dir: &Path) {
+fn build_pystacks_bpf(out_dir: &Path, multiarch_include: &Option<String>) {
     let bpf_include_arg = format!(
         "-I{}",
         Path::new("src/bpf")
@@ -41,24 +81,6 @@ fn build_pystacks_bpf(out_dir: &Path) {
         OsStr::new("-D__x86_64__"),
     ];
 
-    // Handle multiarch include paths for Ubuntu/Debian
-    let multiarch_include = if !Path::new("/usr/include/asm").exists() {
-        std::process::Command::new("dpkg-architecture")
-            .arg("-qDEB_HOST_MULTIARCH")
-            .output()
-            .ok()
-            .and_then(|output| {
-                if output.status.success() {
-                    String::from_utf8(output.stdout).ok()
-                } else {
-                    None
-                }
-            })
-            .map(|triplet| format!("-I/usr/include/{}", triplet.trim()))
-    } else {
-        None
-    };
-
     if let Some(ref include_path) = multiarch_include {
         clang_args.push(OsStr::new(include_path));
     }
@@ -71,7 +93,6 @@ fn build_pystacks_bpf(out_dir: &Path) {
         .expect("Failed to build pystacks BPF object");
 
     // Generate pystacks skeleton for typed access to BSS variables and maps.
-    // This skeleton is used as a subskeleton opened against the main BPF object.
     let pystacks_skel_path = out_dir.join("pystacks.skel.rs");
     SkeletonBuilder::new()
         .obj(&obj_path)
@@ -95,7 +116,7 @@ fn build_pystacks_bpf(out_dir: &Path) {
 }
 
 #[cfg(not(feature = "pystacks"))]
-fn build_pystacks_bpf(_: &Path) {}
+fn build_pystacks_bpf(_: &Path, _: &Option<String>) {}
 
 #[cfg(not(feature = "generate-vmlinux-header"))]
 fn generate_vmlinux_header() {}
@@ -124,8 +145,11 @@ fn main() {
 
     generate_vmlinux_header();
 
+    // Detect multiarch include path once for all BPF compilations
+    let multiarch_include = detect_multiarch_include();
+
     // Build pystacks BPF object (when feature enabled)
-    build_pystacks_bpf(&out_dir);
+    build_pystacks_bpf(&out_dir, &multiarch_include);
 
     let include_arg = format!("-I{}", out_dir.display());
     let bpf_include_arg = format!(
@@ -151,27 +175,6 @@ fn main() {
             OsStr::new(&include_arg),
             OsStr::new("-D__x86_64__"),
         ];
-
-        // Handle multiarch include paths for Ubuntu/Debian
-        // On these distros, asm/errno.h is in /usr/include/<triplet>/asm/
-        // On Fedora/RHEL, it's directly in /usr/include/asm/
-        let multiarch_include = if !Path::new("/usr/include/asm").exists() {
-            // Try to detect multiarch triplet using dpkg-architecture
-            std::process::Command::new("dpkg-architecture")
-                .arg("-qDEB_HOST_MULTIARCH")
-                .output()
-                .ok()
-                .and_then(|output| {
-                    if output.status.success() {
-                        String::from_utf8(output.stdout).ok()
-                    } else {
-                        None
-                    }
-                })
-                .map(|triplet| format!("-I/usr/include/{}", triplet.trim()))
-        } else {
-            None
-        };
 
         if let Some(ref include_path) = multiarch_include {
             clang_args.push(OsStr::new(include_path));
