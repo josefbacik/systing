@@ -14,7 +14,10 @@ const SRC: [&str; 1] = ["src/bpf/systing_system.bpf.c"];
 ///
 /// Returns a `-I/usr/include/<triplet>` string if needed, or None.
 fn detect_multiarch_include() -> Option<String> {
-    if Path::new("/usr/include/asm").exists() {
+    // Check that both asm/ and bits/ headers are available directly.
+    // On some CI environments (GitHub Actions), /usr/include/asm is symlinked
+    // to asm-generic but bits/wordsize.h still lives under the multiarch path.
+    if Path::new("/usr/include/asm").exists() && Path::new("/usr/include/bits").exists() {
         return None;
     }
 
