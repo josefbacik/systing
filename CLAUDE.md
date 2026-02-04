@@ -8,7 +8,7 @@ This document contains information for Claude (AI assistant) when working on the
 - **Build Tool**: Cargo
 - **Main Binary**: systing
 - **Features**:
-  - `pystacks` - Optional Python stack tracing support
+  - `pystacks` - Optional Python stack tracing support (pure Rust implementation)
   - `generate-vmlinux-header` - Optional VMLinux header generation
 
 ## Running Tests
@@ -57,22 +57,23 @@ CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh
 - `cargo test --test '*'` - This only runs non-ignored tests
 - `sudo cargo test` - This creates root-owned build artifacts
 
-## Generated Files
+## Pystacks Architecture
 
-The `src/pystacks/bindings.rs` file is **generated from C++ headers** using bindgen and is **committed to the repository**. Normal builds with the `pystacks` feature use the pre-committed bindings, avoiding the need for bindgen during regular builds.
+The `pystacks` feature provides Python stack tracing via BPF. The implementation is split into:
 
-**When to regenerate:**
-- After updating the `strobelight-libs` submodule
-- After modifying C++ headers that affect the bindings
+- **BPF kernel code** (`src/pystacks/bpf/`) - C code compiled by clang for BPF, walks Python frames in-kernel
+- **Rust userspace code** (`src/pystacks/`) - Process discovery, symbol resolution, line table parsing
 
-**How to regenerate:**
-```bash
-cargo clean
-cargo check --features generate-pystacks-bindings
-git add src/pystacks/bindings.rs
-```
+Key modules:
+- `types.rs` - `#[repr(C)]` structs matching BPF map key/value layouts
+- `offsets.rs` - Python version-specific struct offset configurations (3.8-3.13)
+- `discovery.rs` - Detects Python processes, parses ELF binaries for version and runtime info
+- `symbols.rs` - Resolves BPF symbol IDs to function names and source locations
+- `linetable.rs` - Parses Python line number tables (3.10 lnotab and 3.11+ location table formats)
+- `process.rs` - Reads process memory via `/proc/pid/mem`
+- `stack_walker.rs` - High-level API integrating all components
 
-Note: The `generate-pystacks-bindings` feature implies `pystacks`, so you don't need to specify both.
+No C++ dependencies or external submodules required.
 
 ## Git Hooks
 

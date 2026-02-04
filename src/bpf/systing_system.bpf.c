@@ -4,8 +4,8 @@
 #include <bpf/usdt.bpf.h>
 
 #ifdef SYSTING_PYSTACKS
-#include "strobelight/bpf_lib/common/common.h"
-#include "strobelight/bpf_lib/python/pystacks/pystacks.bpf.h"
+#include "common.h"
+#include "pystacks.bpf.h"
 #endif
 
 /* Task state definitions (from task_struct->__state) */

@@ -6,151 +6,120 @@ use libbpf_cargo::SkeletonBuilder;
 
 const SRC: [&str; 1] = ["src/bpf/systing_system.bpf.c"];
 
-#[cfg(any(feature = "pystacks", feature = "generate-pystacks-bindings"))]
-fn vmlinux_include_arg() -> String {
-    format!(
+/// Detect the multiarch include path for Ubuntu/Debian systems.
+///
+/// On these distros, headers like `asm/errno.h` and `bits/wordsize.h` live
+/// under `/usr/include/<triplet>/` (e.g. `/usr/include/x86_64-linux-gnu/`).
+/// On Fedora/RHEL they're directly in `/usr/include/asm/`.
+///
+/// Returns a `-I/usr/include/<triplet>` string if needed, or None.
+fn detect_multiarch_include() -> Option<String> {
+    // Check that both asm/ and bits/ headers are available directly.
+    // On some CI environments (GitHub Actions), /usr/include/asm is symlinked
+    // to asm-generic but bits/wordsize.h still lives under the multiarch path.
+    if Path::new("/usr/include/asm").exists() && Path::new("/usr/include/bits").exists() {
+        return None;
+    }
+
+    // Try multiple methods to detect the multiarch triplet, in order of
+    // reliability and availability across different environments.
+    let triplet = None
+        // 1. dpkg-architecture (Debian/Ubuntu with dpkg-dev installed)
+        .or_else(|| {
+            std::process::Command::new("dpkg-architecture")
+                .arg("-qDEB_HOST_MULTIARCH")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+        })
+        // 2. cc -dumpmachine (works on any system with a C compiler)
+        .or_else(|| {
+            std::process::Command::new("cc")
+                .arg("-dumpmachine")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+        });
+
+    triplet
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty() && Path::new(&format!("/usr/include/{t}")).exists())
+        .map(|t| format!("-I/usr/include/{t}"))
+}
+
+#[cfg(feature = "pystacks")]
+fn build_pystacks_bpf(out_dir: &Path, multiarch_include: &Option<String>) {
+    let bpf_include_arg = format!(
         "-I{}",
         Path::new("src/bpf")
             .canonicalize()
             .expect("src directory exists")
             .display()
-    )
+    );
+
+    let pystacks_include_arg = format!(
+        "-I{}",
+        Path::new("src/pystacks/bpf/include")
+            .canonicalize()
+            .expect("src/pystacks/bpf/include directory exists")
+            .display()
+    );
+
+    let pystacks_bpf_arg = format!(
+        "-I{}",
+        Path::new("src/pystacks/bpf")
+            .canonicalize()
+            .expect("src/pystacks/bpf directory exists")
+            .display()
+    );
+
+    let obj_path = out_dir.join("pystacks.bpf.o");
+
+    let mut clang_args = vec![
+        OsStr::new(&bpf_include_arg),
+        OsStr::new(&pystacks_include_arg),
+        OsStr::new(&pystacks_bpf_arg),
+        OsStr::new("-D__x86_64__"),
+    ];
+
+    if let Some(ref include_path) = multiarch_include {
+        clang_args.push(OsStr::new(include_path));
+    }
+
+    SkeletonBuilder::new()
+        .source("src/pystacks/bpf/pystacks.bpf.c")
+        .clang_args(clang_args)
+        .obj(obj_path.to_str().unwrap())
+        .build()
+        .expect("Failed to build pystacks BPF object");
+
+    // Generate pystacks skeleton for typed access to BSS variables and maps.
+    let pystacks_skel_path = out_dir.join("pystacks.skel.rs");
+    SkeletonBuilder::new()
+        .obj(&obj_path)
+        .generate(&pystacks_skel_path)
+        .expect("Failed to generate pystacks skeleton");
+
+    // Track pystacks BPF source files for rebuilds
+    println!("cargo:rerun-if-changed=src/pystacks/bpf/pystacks.bpf.c");
+    println!("cargo:rerun-if-changed=src/pystacks/bpf/pystacks.bpf.h");
+    for entry in std::fs::read_dir("src/pystacks/bpf/include")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str());
+        if matches!(ext, Some("c" | "h")) {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 }
 
 #[cfg(not(feature = "pystacks"))]
-fn build_pystacks_libs(_: &Path) {}
-
-#[cfg(feature = "pystacks")]
-fn build_pystacks_libs(out_dir: &Path) {
-    // Check for required libraries and collect missing ones
-    let mut missing_libs = Vec::new();
-
-    if pkg_config::probe_library("fmt").is_err() {
-        missing_libs.push("libfmt-dev");
-    }
-    if pkg_config::probe_library("re2").is_err() {
-        missing_libs.push("libre2-dev");
-    }
-    if pkg_config::probe_library("libcap").is_err() {
-        missing_libs.push("libcap-dev");
-    }
-
-    if !missing_libs.is_empty() {
-        eprintln!("\n===============================================");
-        eprintln!("ERROR: Missing required libraries for 'pystacks' feature");
-        eprintln!("===============================================\n");
-        eprintln!("The following development libraries are required but not found:");
-        for lib in &missing_libs {
-            eprintln!("  - {lib}");
-        }
-        eprintln!("\nTo install these libraries on Ubuntu/Debian, run:");
-        eprintln!("  sudo apt-get install {}\n", missing_libs.join(" "));
-        eprintln!("On Fedora/RHEL, run:");
-        eprintln!("  sudo dnf install fmt-devel re2-devel libcap-devel\n");
-        eprintln!("On Arch Linux, run:");
-        eprintln!("  sudo pacman -S fmt re2 libcap\n");
-        eprintln!("===============================================\n");
-        panic!("Missing required libraries for pystacks feature. See error message above for installation instructions.");
-    }
-
-    // Check if strobelight-libs submodule is initialized
-    let submodule_makefile = Path::new("strobelight-libs/strobelight/bpf_lib/python/Makefile");
-    if !submodule_makefile.exists() {
-        eprintln!("\n===============================================");
-        eprintln!("ERROR: strobelight-libs submodule is not initialized");
-        eprintln!("===============================================\n");
-        eprintln!("The 'pystacks' feature requires the strobelight-libs submodule.");
-        eprintln!("Please initialize it by running:\n");
-        eprintln!("  git submodule update --init --recursive\n");
-        eprintln!("===============================================\n");
-        panic!("strobelight-libs submodule not initialized. See error message above.");
-    }
-
-    // Track strobelight-libs source files so submodule updates trigger rebuilds
-    println!("cargo:rerun-if-changed=strobelight-libs/strobelight/bpf_lib/python/Makefile");
-    println!(
-        "cargo:rerun-if-changed=strobelight-libs/strobelight/bpf_lib/python/discovery/Makefile"
-    );
-
-    let strobelight_dirs = [
-        "strobelight-libs/strobelight/bpf_lib/python/discovery",
-        "strobelight-libs/strobelight/bpf_lib/python/pystacks",
-        "strobelight-libs/strobelight/bpf_lib/python/include",
-        "strobelight-libs/strobelight/bpf_lib/python/src",
-        "strobelight-libs/strobelight/bpf_lib/util",
-        "strobelight-libs/strobelight/bpf_lib/util/pid_info",
-        "strobelight-libs/strobelight/bpf_lib/common",
-        "strobelight-libs/strobelight/bpf_lib/include",
-    ];
-
-    for dir in strobelight_dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let ext = path.extension().and_then(|e| e.to_str());
-            if matches!(ext, Some("cpp" | "c" | "h")) {
-                println!("cargo:rerun-if-changed={}", path.display());
-            }
-        }
-    }
-    println!("cargo:rustc-link-search={}", out_dir.display());
-    println!("cargo::rustc-link-lib=static=pystacks");
-    println!("cargo::rustc-link-lib=static=python_discovery");
-    println!("cargo::rustc-link-lib=static=strobelight_util");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
-    println!("cargo:rustc-link-lib=dylib=fmt");
-    println!("cargo:rustc-link-lib=dylib=re2");
-    println!("cargo:rustc-link-lib=dylib=elf");
-    println!("cargo:rustc-link-lib=dylib=cap");
-
-    let status = std::process::Command::new("make")
-        .env("INSTALL_DIR", out_dir)
-        .env("VMLINUX_INCLUDE", vmlinux_include_arg())
-        .arg("-C")
-        .arg("strobelight-libs/strobelight/bpf_lib/python")
-        .arg("install")
-        .status()
-        .expect("Failed to run make");
-
-    assert!(status.success(), "Make command failed");
-}
-
-#[cfg(not(feature = "generate-pystacks-bindings"))]
-fn generate_pystacks_bindings(_: &Path) {}
-
-#[cfg(feature = "generate-pystacks-bindings")]
-fn generate_pystacks_bindings(out_dir: &Path) {
-    use bindgen::builder;
-
-    let pystacks_header = out_dir.join("strobelight/bpf_lib/python/pystacks/pystacks.h");
-    let logging_header: PathBuf =
-        PathBuf::from("strobelight-libs/strobelight/bpf_lib/include/logging.h");
-    let bindings = builder()
-        .header(pystacks_header.display().to_string())
-        .header(logging_header.display().to_string())
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .clang_args([
-            format!("-I{}", out_dir.display()),
-            vmlinux_include_arg(),
-            "-x".to_string(),
-            "c++".to_string(),
-            "-std=c++20".to_string(),
-        ])
-        .allowlist_function("pystacks_.*")
-        .allowlist_function("strobelight_lib_set_print")
-        .allowlist_type("strobelight_lib_print_level")
-        .allowlist_type("strobelight_lib_print_fn_t")
-        .raw_line("#![allow(non_upper_case_globals)]")
-        .generate()
-        .expect("Unable to generate bindings");
-
-    let bindings_path = PathBuf::from("src/pystacks/bindings.rs");
-    bindings
-        .write_to_file(bindings_path)
-        .expect("Couldn't write bindings!");
-}
+fn build_pystacks_bpf(_: &Path, _: &Option<String>) {}
 
 #[cfg(not(feature = "generate-vmlinux-header"))]
 fn generate_vmlinux_header() {}
@@ -179,8 +148,11 @@ fn main() {
 
     generate_vmlinux_header();
 
-    build_pystacks_libs(&out_dir);
-    generate_pystacks_bindings(&out_dir);
+    // Detect multiarch include path once for all BPF compilations
+    let multiarch_include = detect_multiarch_include();
+
+    // Build pystacks BPF object (when feature enabled)
+    build_pystacks_bpf(&out_dir, &multiarch_include);
 
     let include_arg = format!("-I{}", out_dir.display());
     let bpf_include_arg = format!(
@@ -207,33 +179,35 @@ fn main() {
             OsStr::new("-D__x86_64__"),
         ];
 
-        // Handle multiarch include paths for Ubuntu/Debian
-        // On these distros, asm/errno.h is in /usr/include/<triplet>/asm/
-        // On Fedora/RHEL, it's directly in /usr/include/asm/
-        let multiarch_include = if !Path::new("/usr/include/asm").exists() {
-            // Try to detect multiarch triplet using dpkg-architecture
-            std::process::Command::new("dpkg-architecture")
-                .arg("-qDEB_HOST_MULTIARCH")
-                .output()
-                .ok()
-                .and_then(|output| {
-                    if output.status.success() {
-                        String::from_utf8(output.stdout).ok()
-                    } else {
-                        None
-                    }
-                })
-                .map(|triplet| format!("-I/usr/include/{}", triplet.trim()))
-        } else {
-            None
-        };
-
         if let Some(ref include_path) = multiarch_include {
             clang_args.push(OsStr::new(include_path));
         }
 
         #[cfg(feature = "pystacks")]
-        clang_args.push(OsStr::new("-DSYSTING_PYSTACKS"));
+        {
+            clang_args.push(OsStr::new("-DSYSTING_PYSTACKS"));
+
+            let pystacks_inc = format!(
+                "-I{}",
+                Path::new("src/pystacks/bpf/include")
+                    .canonicalize()
+                    .expect("pystacks bpf include dir exists")
+                    .display()
+            );
+            // Leak the string so OsStr can reference it for the clang_args lifetime
+            let pystacks_inc: &'static str = Box::leak(pystacks_inc.into_boxed_str());
+            clang_args.push(OsStr::new(pystacks_inc));
+
+            let pystacks_bpf = format!(
+                "-I{}",
+                Path::new("src/pystacks/bpf")
+                    .canonicalize()
+                    .expect("pystacks bpf dir exists")
+                    .display()
+            );
+            let pystacks_bpf: &'static str = Box::leak(pystacks_bpf.into_boxed_str());
+            clang_args.push(OsStr::new(pystacks_bpf));
+        }
 
         SkeletonBuilder::new()
             .source(src)
