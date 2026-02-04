@@ -65,25 +65,27 @@ const PYTHON_311_VERSION: &str = "3.11.14";
 /// Get the path to a pyenv-installed Python binary.
 ///
 /// Resolves `$HOME/.pyenv/versions/<version>/bin/python<major.minor>`.
-/// Panics with a helpful message if the binary is not found.
+/// Returns `None` if the binary is not found (caller decides whether to skip or panic).
 #[cfg(feature = "pystacks")]
-fn pyenv_python(version: &str) -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME environment variable not set");
+fn try_pyenv_python(version: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
     let parts: Vec<&str> = version.split('.').collect();
-    assert!(
-        parts.len() == 3,
-        "expected version in X.Y.Z format, got: {version}"
-    );
+    if parts.len() != 3 {
+        return None;
+    }
     let short = format!("{}.{}", parts[0], parts[1]);
     let path = PathBuf::from(format!(
         "{home}/.pyenv/versions/{version}/bin/python{short}"
     ));
-    assert!(
-        path.exists(),
-        "Python {version} not found at {}. Install it with: ./scripts/setup-pystacks.sh",
-        path.display()
-    );
-    path
+    path.exists().then_some(path)
+}
+
+/// Get the path to a pyenv-installed Python binary, panicking if not found.
+#[cfg(feature = "pystacks")]
+fn pyenv_python(version: &str) -> PathBuf {
+    try_pyenv_python(version).unwrap_or_else(|| {
+        panic!("Python {version} not found. Install it with: ./scripts/setup-pystacks.sh")
+    })
 }
 
 /// Scan a stack.parquet file for Python symbols and a specific target function name.
@@ -1544,6 +1546,17 @@ fn test_pystacks_frame_error_rate() {
     use std::thread;
     use std::time::Duration;
 
+    let python_bin = match try_pyenv_python(PYTHON_311_VERSION) {
+        Some(p) => p,
+        None => {
+            println!(
+                "SKIPPED: Python {} not installed. Install with: ./scripts/setup-pystacks.sh",
+                PYTHON_311_VERSION
+            );
+            return;
+        }
+    };
+
     setup_bpf_environment();
 
     let dir = TempDir::new().expect("Failed to create temp dir");
@@ -1580,7 +1593,7 @@ if __name__ == "__main__":
             .expect("Failed to write Python script");
     }
 
-    let mut python_proc = Command::new(pyenv_python(PYTHON_311_VERSION))
+    let mut python_proc = Command::new(&python_bin)
         .arg(&python_script)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

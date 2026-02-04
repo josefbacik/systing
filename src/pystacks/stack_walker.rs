@@ -12,59 +12,16 @@ use std::time::Instant;
 
 #[cfg(feature = "pystacks")]
 use {
-    crate::pystacks::bindings, crate::stack_recorder::add_frame, libbpf_rs::libbpf_sys,
-    libbpf_rs::AsRawLibbpf, std::ffi::CStr, std::fmt, std::ptr::NonNull,
+    crate::pystacks::bpf_maps::PystacksMaps, crate::pystacks::discovery,
+    crate::pystacks::symbols::SymbolResolver, crate::pystacks::types::StackWalkerFrame,
+    crate::stack_recorder::add_frame, std::fmt,
 };
-
-/// Callback function for strobelight library logging.
-/// Only logs WARN level by default. Set PYSTACKS_DEBUG=1 to enable all levels.
-#[cfg(feature = "pystacks")]
-extern "C" fn strobelight_log_callback(
-    level: bindings::strobelight_lib_print_level,
-    msg: *const std::os::raw::c_char,
-) -> std::os::raw::c_int {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    // Cache whether debug mode is enabled (checked once on first call)
-    static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
-    static INITIALIZED: AtomicBool = AtomicBool::new(false);
-
-    if !INITIALIZED.swap(true, Ordering::Relaxed) {
-        DEBUG_ENABLED.store(std::env::var("PYSTACKS_DEBUG").is_ok(), Ordering::Relaxed);
-    }
-
-    if msg.is_null() {
-        return 0;
-    }
-
-    // By default, only log WARN. Enable DEBUG/INFO with PYSTACKS_DEBUG=1
-    let should_log = match level {
-        bindings::strobelight_lib_print_level_STROBELIGHT_LIB_WARN => true,
-        _ => DEBUG_ENABLED.load(Ordering::Relaxed),
-    };
-
-    if should_log {
-        // SAFETY: msg pointer was checked for null above, and the C library
-        // guarantees it provides a valid null-terminated string.
-        let msg_str = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
-        let level_str = match level {
-            bindings::strobelight_lib_print_level_STROBELIGHT_LIB_WARN => "WARN",
-            bindings::strobelight_lib_print_level_STROBELIGHT_LIB_INFO => "INFO",
-            bindings::strobelight_lib_print_level_STROBELIGHT_LIB_DEBUG => "DEBUG",
-            _ => "UNKNOWN",
-        };
-        eprintln!("[pystacks {level_str}] {msg_str}");
-    }
-    0
-}
 
 #[derive(Debug, Clone)]
 pub struct PyAddr {
     #[cfg(feature = "pystacks")]
-    pub addr: bindings::stack_walker_frame,
+    pub addr: StackWalkerFrame,
 }
-unsafe impl Send for PyAddr {}
-unsafe impl Sync for PyAddr {}
 
 impl PartialEq for PyAddr {
     #[cfg(not(feature = "pystacks"))]
@@ -74,7 +31,6 @@ impl PartialEq for PyAddr {
 
     #[cfg(feature = "pystacks")]
     fn eq(&self, other: &Self) -> bool {
-        // Define equality based on both fields
         self.addr.symbol_id == other.addr.symbol_id && self.addr.inst_idx == other.addr.inst_idx
     }
 }
@@ -86,16 +42,15 @@ impl Hash for PyAddr {
 
     #[cfg(feature = "pystacks")]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Hash each field
         self.addr.symbol_id.hash(state);
         self.addr.inst_idx.hash(state);
     }
 }
 
 #[cfg(feature = "pystacks")]
-impl From<&crate::systing_core::types::stack_walker_frame> for bindings::stack_walker_frame {
+impl From<&crate::systing_core::types::stack_walker_frame> for StackWalkerFrame {
     fn from(frame: &crate::systing_core::types::stack_walker_frame) -> Self {
-        bindings::stack_walker_frame {
+        StackWalkerFrame {
             symbol_id: frame.symbol_id,
             inst_idx: frame.inst_idx,
         }
@@ -105,7 +60,6 @@ impl From<&crate::systing_core::types::stack_walker_frame> for bindings::stack_w
 #[cfg(feature = "pystacks")]
 impl fmt::Display for crate::systing_core::types::stack_walker_frame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Customize the formatting as needed
         write!(
             f,
             "StackWalkerFrame {{ symbol_id: {} inst_idx: {} }}",
@@ -115,9 +69,8 @@ impl fmt::Display for crate::systing_core::types::stack_walker_frame {
 }
 
 #[cfg(feature = "pystacks")]
-impl fmt::Display for bindings::stack_walker_frame {
+impl fmt::Display for StackWalkerFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Customize the formatting as needed
         write!(
             f,
             "StackWalkerFrame {{ symbol_id: {} inst_idx: {} }}",
@@ -135,7 +88,8 @@ const DEBUG_SAMPLE_LOG_LIMIT: u64 = 10;
 
 #[cfg(feature = "pystacks")]
 pub struct StackWalkerRun {
-    ptr: *mut bindings::stack_walker_run,
+    resolver: Option<SymbolResolver>,
+    maps: Option<PystacksMaps>,
     // Symbol loading rate limiting
     last_symbol_load: std::cell::Cell<Option<Instant>>,
     symbol_load_interval: std::time::Duration,
@@ -156,7 +110,8 @@ impl StackWalkerRun {
         use std::sync::atomic::AtomicU64;
 
         StackWalkerRun {
-            ptr: std::ptr::null_mut(),
+            resolver: None,
+            maps: None,
             last_symbol_load: std::cell::Cell::new(None),
             // Load symbols at most once per 500ms (2 Hz) to catch dying processes
             // while minimizing overhead on long traces
@@ -170,12 +125,7 @@ impl StackWalkerRun {
         }
     }
 
-    fn init(
-        &mut self,
-        bpf_object: NonNull<libbpf_sys::bpf_object>,
-        pid_opts: &mut [i32],
-        debug: bool,
-    ) {
+    fn init(&mut self, bpf_object: &Object, pid_opts: &[i32], debug: bool) {
         use std::sync::atomic::Ordering;
 
         self.debug.store(debug, Ordering::Relaxed);
@@ -187,39 +137,66 @@ impl StackWalkerRun {
             );
         }
 
-        if !self.initialized() {
-            let mut opts = bindings::stack_walker_opts {
-                pids: pid_opts.as_mut_ptr(),
-                pidCount: pid_opts.len(),
-                manualSymbolRefresh: true,
-            };
-
+        if self.initialized() {
             if debug {
-                eprintln!("[pystacks debug] Calling pystacks_init...");
+                eprintln!("[pystacks debug] StackWalkerRun already initialized, skipping");
             }
+            return;
+        }
 
-            self.ptr = unsafe {
-                bindings::pystacks_init(
-                    bpf_object.as_ptr() as *mut bindings::bpf_object,
-                    &mut opts as *mut _,
-                    std::ptr::null_mut(),
-                )
-            };
-
-            if debug {
-                if self.ptr.is_null() {
-                    eprintln!("[pystacks debug] pystacks_init FAILED - returned null pointer");
-                } else {
-                    eprintln!("[pystacks debug] pystacks_init SUCCESS - library initialized");
-                }
+        // Get BPF map FDs (do this first so add_pid works even with no initial PIDs)
+        let maps = match PystacksMaps::new(bpf_object) {
+            Some(m) => m,
+            None => {
+                eprintln!("[pystacks] Failed to get BPF map FDs");
+                return;
             }
-        } else if debug {
-            eprintln!("[pystacks debug] StackWalkerRun already initialized, skipping");
+        };
+
+        // Set BSS configuration (has_targeted_pids, enable_py_src_lines, etc.)
+        maps.configure_bss();
+
+        // Discover Python processes
+        let process_info = discovery::discover_python_processes(pid_opts);
+
+        if process_info.is_empty() && debug {
+            eprintln!(
+                "[pystacks debug] No Python processes found initially (will discover via exec)"
+            );
+        }
+
+        // Populate BPF maps
+        let mut attached_count = 0;
+        for (pid, info) in &process_info {
+            if maps.add_targeted_pid(*pid) {
+                attached_count += 1;
+            }
+            maps.update_pid_config(*pid, &info.pid_data);
+        }
+
+        if debug {
+            eprintln!(
+                "[pystacks debug] Attached {} Python processes to BPF maps",
+                attached_count
+            );
+        }
+
+        // Create symbol resolver
+        self.resolver = Some(SymbolResolver::new(
+            maps.symbols_fd,
+            maps.linetables_fd,
+            &process_info,
+        ));
+
+        self.maps = Some(maps);
+
+        if debug {
+            eprintln!("[pystacks debug] pystacks init SUCCESS - Rust implementation initialized");
         }
     }
 
     fn initialized(&self) -> bool {
-        !self.ptr.is_null()
+        self.resolver.is_some()
     }
 
     /// Returns true if debug mode is enabled.
@@ -227,11 +204,6 @@ impl StackWalkerRun {
         self.debug.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Prints debug statistics summarizing pystacks activity.
-    ///
-    /// This is automatically called when the StackWalkerRun is dropped,
-    /// but can also be called manually to get intermediate statistics.
-    /// Only produces output if debug mode was enabled during initialization.
     pub fn print_debug_stats(&self) {
         use std::sync::atomic::Ordering;
 
@@ -250,88 +222,47 @@ impl StackWalkerRun {
     }
 
     fn symbolize_function(&self, frame: &PyAddr) -> String {
-        let mut buff = vec![0; 256];
-        let mut len = 0;
-
-        if self.initialized() {
-            len = unsafe {
-                bindings::pystacks_symbolize_function(
-                    self.ptr,
-                    &raw const frame.addr,
-                    buff.as_mut_ptr() as *mut i8,
-                    buff.len(),
-                )
-            };
-        }
-
-        if len > 0 {
-            core::str::from_utf8(&buff[..len as usize])
-                .unwrap_or("<unknown python>")
-                .to_string()
-        } else {
-            "<unknown python>".to_string()
+        match &self.resolver {
+            Some(resolver) => resolver.symbolize_function(&frame.addr),
+            None => "<unknown python>".to_string(),
         }
     }
 
-    /// Symbolizes a Python frame to extract the source filename and line number.
-    ///
-    /// Returns a tuple of (filename, line_number) where:
-    /// - `filename` is the source file path, or "unknown" if unavailable
-    /// - `line_number` is `Some(line)` if available, or `None` if unavailable
-    ///
-    /// The C++ pystacks library uses `u32::MAX` as a sentinel value to indicate
-    /// no line information is available.
     fn symbolize_filename_line(&self, frame: &PyAddr) -> (String, Option<usize>) {
-        const FILENAME_BUFFER_SIZE: usize = 512;
-        const NO_LINE_INFO: usize = u32::MAX as usize;
-        const UNKNOWN_FILENAME: &str = "unknown";
-
-        let mut buff = vec![0; FILENAME_BUFFER_SIZE];
-        let mut line_number: usize = 0;
-
-        let len = if self.initialized() {
-            unsafe {
-                bindings::pystacks_symbolize_filename_line(
-                    self.ptr,
-                    &raw const frame.addr,
-                    buff.as_mut_ptr() as *mut i8,
-                    buff.len(),
-                    &mut line_number as *mut usize,
-                )
-            }
-        } else {
-            0
-        };
-
-        let filename = if len > 0 {
-            core::str::from_utf8(&buff[..len as usize])
-                .unwrap_or(UNKNOWN_FILENAME)
-                .to_string()
-        } else {
-            UNKNOWN_FILENAME.to_string()
-        };
-
-        let line = if line_number == NO_LINE_INFO {
-            None
-        } else {
-            Some(line_number)
-        };
-
-        (filename, line)
+        match &self.resolver {
+            Some(resolver) => resolver.symbolize_filename_line(&frame.addr),
+            None => ("unknown".to_string(), None),
+        }
     }
 
     fn load_symbols(&self) {
-        if self.initialized() {
-            unsafe { bindings::pystacks_load_symbols(self.ptr) };
+        if let Some(resolver) = &self.resolver {
+            resolver.load_symbols();
         }
     }
 
     pub fn add_pid(&self, pid: i32) {
-        if self.initialized() {
+        if !self.initialized() {
+            return;
+        }
+
+        if self.is_debug() {
+            eprintln!("[pystacks debug] Dynamically adding PID {}", pid);
+        }
+
+        // Check if this is a Python process
+        if let Some(info) = discovery::check_python_process(pid) {
             if self.is_debug() {
-                eprintln!("[pystacks debug] Dynamically adding PID {}", pid);
+                eprintln!(
+                    "[pystacks debug] Found Python {}.{} in PID {}",
+                    info.version_major, info.version_minor, pid
+                );
             }
-            unsafe { bindings::pystacks_add_pid(self.ptr, pid) };
+
+            if let Some(maps) = &self.maps {
+                maps.add_targeted_pid(pid);
+                maps.update_pid_config(pid, &info.pid_data);
+            }
         }
     }
 
@@ -355,13 +286,11 @@ impl StackWalkerRun {
             let func_name = self.symbolize_function(frame);
             let (filename, line_number) = self.symbolize_filename_line(frame);
 
-            // Extract just the base filename (similar to how blazesym extracts module name)
             let base_filename = std::path::Path::new(&filename)
                 .file_name()
                 .and_then(|f| f.to_str())
                 .unwrap_or(&filename);
 
-            // Format matches blazesym: "function_name (python) [filename:line]"
             let formatted_name = match line_number {
                 Some(line) => format!("{func_name} (python) [{base_filename}:{line}]"),
                 None => format!("{func_name} (python) [{base_filename}]"),
@@ -383,7 +312,7 @@ impl StackWalkerRun {
         }
     }
 
-    #[allow(clippy::ptr_arg)] // allow Vec needed for push below
+    #[allow(clippy::ptr_arg)]
     pub fn user_stack_to_python_calls(
         &self,
         frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
@@ -435,8 +364,7 @@ impl StackWalkerRun {
                 .count()
         };
 
-        // Fallback for Python binaries without frame pointers: C stack unwinding fails,
-        // so use Python frames directly when no _PyEval_EvalFrame marker is found.
+        // Fallback for Python binaries without frame pointers
         if !stack.py_stack.is_empty() && py_call_count == 0 {
             merged_addrs.extend(
                 stack
@@ -449,11 +377,6 @@ impl StackWalkerRun {
             return merged_addrs;
         }
 
-        // if we have more python calls in the system stack than python frames
-        // skip the first N python calls, as the python frames are leafs
-        // If it is only off by 1, it is more likely that we have entered a
-        // PyEval_EvalFrameDefault but not yet setup the leaf frame, so ignore these
-        // instances
         let mut skip_py_calls =
             if py_call_count > py_marker_count && py_call_count - py_marker_count > 1 {
                 py_call_count - py_marker_count
@@ -461,16 +384,10 @@ impl StackWalkerRun {
                 0
             };
 
-        // if we have more python frames than python calls in the system stack
-        // drop the first N python frames. This could happen if the system stack overflows
-        // the buffer used to collect it, in which case the base of the stack would be
-        // missing.
         let frame_mismatch = py_marker_count.saturating_sub(py_call_count);
         let mut skip_py_frame = if python_stack_markers.is_empty() {
-            // No markers - we'll add all frames when we hit PyEval, so don't skip any
             0
         } else if frame_mismatch > Self::FRAME_MISMATCH_THRESHOLD {
-            // With markers but significant mismatch - likely truncation
             frame_mismatch
         } else {
             0
@@ -491,9 +408,6 @@ impl StackWalkerRun {
         while user_stack_idx < stack.user_stack.len() {
             let user_addr = stack.user_stack[user_stack_idx];
             if skip_py_calls == 0 && pystack_idx > 0 && python_calls.contains(&user_addr) {
-                // decrement either way. In the if case below, we added the address. In
-                // the else case below, we are incrementing past the stack marker that
-                // ended the previous loop
                 if python_stack_markers.is_empty() {
                     while pystack_idx > 0 {
                         pystack_idx -= 1;
@@ -516,8 +430,6 @@ impl StackWalkerRun {
 
                 merged_addrs.push(user_addr);
             }
-            // increment either way. In the if case, we are incremented past the
-            // python_call address, in the else case, we added the address
             user_stack_idx += 1;
         }
 
@@ -530,12 +442,9 @@ impl StackWalkerRun {
         let stack_len =
             (event.py_msg_buffer.stack_len as usize).min(event.py_msg_buffer.buffer.len());
 
-        // Track statistics only in debug mode to avoid overhead in hot path
         if self.is_debug() {
             if stack_len > 0 {
                 let count = self.events_with_pystack.fetch_add(1, Ordering::Relaxed) + 1;
-
-                // Log first few events with Python stacks
                 if count <= DEBUG_SAMPLE_LOG_LIMIT {
                     let pid = event.task.tgidpid >> 32;
                     eprintln!(
@@ -559,7 +468,7 @@ impl StackWalkerRun {
 
         if !self.initialized() {
             if self.is_debug() && self.events_with_pystack.load(Ordering::Relaxed) == 1 {
-                eprintln!("[pystacks debug] load_pystack_symbols: library not initialized!");
+                eprintln!("[pystacks debug] load_pystack_symbols: not initialized!");
             }
             return;
         }
@@ -568,11 +477,9 @@ impl StackWalkerRun {
             return;
         }
 
-        // Rate limit symbol loading - only reload if enough time has passed
-        // This catches dying processes while avoiding excessive BPF map scanning
         let now = Instant::now();
         let should_load = match self.last_symbol_load.get() {
-            None => true, // First time, always load
+            None => true,
             Some(last_load) => now.duration_since(last_load) >= self.symbol_load_interval,
         };
 
@@ -598,32 +505,20 @@ impl StackWalkerRun {
         }
 
         if !pids.is_empty() {
-            // Set up logging before initialization
-            // Note: The strobelight_log_callback checks PYSTACKS_DEBUG env var internally
-            // for enabling verbose C++ library output. Set this env var before running
-            // systing if you need C++ library debug output.
-            unsafe {
-                bindings::strobelight_lib_set_print(Some(strobelight_log_callback));
-            }
-
-            let mut pid_opts: Vec<i32> = pids.iter().map(|&pid| pid as i32).collect();
-
-            self.init(bpf_object.as_libbpf_object(), &mut pid_opts, debug);
+            let pid_opts: Vec<i32> = pids.iter().map(|&pid| pid as i32).collect();
+            self.init(bpf_object, &pid_opts, debug);
         } else if debug {
             eprintln!("[pystacks debug] No PIDs provided, skipping pystacks initialization");
         }
     }
 
-    /// Get Python frame names as formatted strings for streaming mode.
-    /// Returns a vector of frame name strings in the format:
-    /// "function_name (python) [filename:line]"
     pub fn get_python_frame_names(&self, py_stack: &[PyAddr]) -> Vec<String> {
         use std::sync::atomic::Ordering;
 
         if !self.initialized() {
             if self.is_debug() && !py_stack.is_empty() {
                 eprintln!(
-                    "[pystacks debug] get_python_frame_names: library not initialized, returning empty for {} frames",
+                    "[pystacks debug] get_python_frame_names: not initialized, returning empty for {} frames",
                     py_stack.len()
                 );
             }
@@ -642,16 +537,12 @@ impl StackWalkerRun {
                 let func_name = self.symbolize_function(frame);
                 let (filename, line_number) = self.symbolize_filename_line(frame);
 
-                // Track statistics only in debug mode
                 if debug {
                     if func_name == "<unknown python>" {
                         self.frames_unknown.fetch_add(1, Ordering::Relaxed);
                     } else {
                         let count = self.frames_symbolized.fetch_add(1, Ordering::Relaxed) + 1;
-
-                        // Log sample frames
                         if count <= DEBUG_SAMPLE_LOG_LIMIT {
-                            // Extract just the base filename for logging
                             let base_filename = std::path::Path::new(&filename)
                                 .file_name()
                                 .and_then(|f| f.to_str())
@@ -664,7 +555,6 @@ impl StackWalkerRun {
                     }
                 }
 
-                // Extract just the base filename
                 let base_filename = std::path::Path::new(&filename)
                     .file_name()
                     .and_then(|f| f.to_str())
@@ -689,13 +579,7 @@ impl Default for StackWalkerRun {
 #[cfg(feature = "pystacks")]
 impl Drop for StackWalkerRun {
     fn drop(&mut self) {
-        // Print debug stats before cleanup
         self.print_debug_stats();
-
-        if !self.ptr.is_null() {
-            unsafe { bindings::pystacks_free(self.ptr) };
-            self.ptr = std::ptr::null_mut();
-        }
     }
 }
 
@@ -716,7 +600,7 @@ impl StackWalkerRun {
         StackWalkerRun {}
     }
 
-    #[allow(clippy::ptr_arg)] // allow Vec needed for consistency with pystacks version
+    #[allow(clippy::ptr_arg)]
     pub fn pystacks_to_frames_mapping(
         &self,
         _frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
@@ -725,17 +609,15 @@ impl StackWalkerRun {
         _python_stack_markers: &mut Vec<u64>,
         _stack: &[PyAddr],
     ) {
-        // Stub implementation when pystacks feature is disabled
     }
 
-    #[allow(clippy::ptr_arg)] // allow Vec needed for consistency with pystacks version
+    #[allow(clippy::ptr_arg)]
     pub fn user_stack_to_python_calls(
         &self,
         _frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
         _global_func_manager: &Arc<crate::stack_recorder::GlobalFunctionManager>,
         _python_calls: &mut Vec<u64>,
     ) {
-        // Stub implementation when pystacks feature is disabled
     }
 
     pub fn merge_pystacks(
@@ -751,24 +633,15 @@ impl StackWalkerRun {
         Vec::new()
     }
 
-    pub fn load_pystack_symbols(&self, _event: &stack_event) {
-        // Stub implementation when pystacks feature is disabled
-    }
+    pub fn load_pystack_symbols(&self, _event: &stack_event) {}
 
-    pub fn init_pystacks(&mut self, _pids: &[u32], _bpf_object: &Object, _debug: bool) {
-        // Stub implementation when pystacks feature is disabled
-    }
+    pub fn init_pystacks(&mut self, _pids: &[u32], _bpf_object: &Object, _debug: bool) {}
 
-    pub fn add_pid(&self, _pid: i32) {
-        // Stub implementation when pystacks feature is disabled
-    }
+    pub fn add_pid(&self, _pid: i32) {}
 
-    pub fn print_debug_stats(&self) {
-        // Stub implementation when pystacks feature is disabled
-    }
+    pub fn print_debug_stats(&self) {}
 
     pub fn get_python_frame_names(&self, _py_stack: &[PyAddr]) -> Vec<String> {
-        // Stub implementation when pystacks feature is disabled
         Vec::new()
     }
 }
@@ -782,9 +655,7 @@ impl Default for StackWalkerRun {
 
 #[cfg(not(feature = "pystacks"))]
 impl Drop for StackWalkerRun {
-    fn drop(&mut self) {
-        // Stub implementation when pystacks feature is disabled
-    }
+    fn drop(&mut self) {}
 }
 
 #[cfg(not(feature = "pystacks"))]

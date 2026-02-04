@@ -1,4 +1,0 @@
-[submodule "strobelight-libs"]
-	path = strobelight-libs
-	url = https://github.com/josefbacik/strobelight-libs.git
-	branch = python313
