@@ -1024,6 +1024,21 @@ static u64 task_cg_id(struct task_struct *task)
 	return cgrp->kn->id;
 }
 
+/*
+ * Read icsk_timeout from inet_connection_sock, handling kernel version differences.
+ * The icsk_timeout field was removed in kernel 6.18+ (commit a7c428ee8f59).
+ * On newer kernels, the timeout value is stored in icsk_retransmit_timer.expires.
+ */
+static __always_inline void read_icsk_timeout(struct inet_connection_sock *icsk,
+					      u64 *timeout)
+{
+	if (bpf_core_field_exists(icsk->icsk_timeout)) {
+		bpf_probe_read_kernel(timeout, sizeof(*timeout), &icsk->icsk_timeout);
+	} else {
+		bpf_probe_read_kernel(timeout, sizeof(*timeout), &icsk->icsk_retransmit_timer.expires);
+	}
+}
+
 static u64 task_key(struct task_struct *task)
 {
 	return ((u64)task->tgid << 32) | task->pid;
@@ -1352,7 +1367,7 @@ int BPF_PROG(systing_sched_wakeup_new, struct task_struct *task)
 }
 
 static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev,
-			       struct task_struct *next)
+			       struct task_struct *next, unsigned int prev_state)
 {
 	struct task_event *event;
 	long flags;
@@ -1384,10 +1399,11 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 	/*
 	 * Convert raw task state to ftrace format (mask to TASK_REPORT bits + preemption).
 	 * The kernel stores exit states (EXIT_ZOMBIE, EXIT_DEAD) in a separate exit_state
-	 * field, so we must OR it with __state to get the complete task state.
+	 * field, so we must OR the kernel-provided prev_state (captured at the right moment)
+	 * with exit_state to get the complete task state.
 	 * See kernel's __task_state_index() in include/linux/sched.h.
 	 */
-	event->prev_state = preempt ? TASK_REPORT_MAX : ((prev->__state | prev->exit_state) & TASK_REPORT);
+	event->prev_state = preempt ? TASK_REPORT_MAX : ((prev_state | prev->exit_state) & TASK_REPORT);
 	event->next_prio = next->prio;
 	event->prev_prio = prev->prio;
 	bpf_ringbuf_submit(event, flags);
@@ -1401,25 +1417,31 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 	 * Use the same timestamp as the sched_switch event so the stack sample
 	 * timestamp matches the end of the sched_slice.
 	 *
-	 * Note: Only check __state here, not exit_state. Exit states (EXIT_DEAD,
+	 * Note: Only check prev_state here, not exit_state. Exit states (EXIT_DEAD,
 	 * EXIT_ZOMBIE) should not trigger sleep stack recording - we only want
 	 * stacks for tasks that are blocked waiting for something.
 	 */
 	if (!tool_config.no_sleep_stack_traces) {
-		if (prev->__state & TASK_UNINTERRUPTIBLE)
+		if (prev_state & TASK_UNINTERRUPTIBLE)
 			emit_stack_event_with_ts(ctx, prev, STACK_SLEEP_UNINTERRUPTIBLE, ts);
 		else if (!tool_config.no_interruptible_stack_traces &&
-			 prev->__state & TASK_INTERRUPTIBLE)
+			 prev_state & TASK_INTERRUPTIBLE)
 			emit_stack_event_with_ts(ctx, prev, STACK_SLEEP_INTERRUPTIBLE, ts);
 	}
 	return 0;
 }
 
+/*
+ * The kernel captures prev_state (prev->__state) at exactly the right moment
+ * before the context switch. Reading prev->__state directly in BPF could race
+ * with state changes. We use the kernel-provided prev_state and OR it with
+ * prev->exit_state to capture EXIT_DEAD/EXIT_ZOMBIE states.
+ */
 SEC("tp_btf/sched_switch")
 int BPF_PROG(systing_sched_switch, bool preempt, struct task_struct *prev,
-	     struct task_struct *next)
+	     struct task_struct *next, unsigned int prev_state)
 {
-	return handle_sched_switch(ctx, preempt, prev, next);
+	return handle_sched_switch(ctx, preempt, prev, next, prev_state);
 }
 
 static int handle_sched_waking(struct task_struct *task)
@@ -2799,7 +2821,7 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	// Read persist timer state from inet_connection_sock
 	struct inet_connection_sock *icsk = (struct inet_connection_sock *)sk;
 	bpf_probe_read_kernel(&event->icsk_pending, sizeof(event->icsk_pending), &icsk->icsk_pending);
-	bpf_probe_read_kernel(&event->icsk_timeout, sizeof(event->icsk_timeout), &icsk->icsk_timeout);
+	read_icsk_timeout(icsk, &event->icsk_timeout);
 	bpf_probe_read_kernel(&event->rto_jiffies, sizeof(event->rto_jiffies), &icsk->icsk_rto);
 	bpf_probe_read_kernel(&event->probe_count, sizeof(event->probe_count), &icsk->icsk_probes_out);
 	bpf_probe_read_kernel(&event->backoff, sizeof(event->backoff), &icsk->icsk_backoff);
@@ -3294,7 +3316,7 @@ int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 
 	// Read persist timer state (since this is a zero window probe, timer is active)
 	bpf_probe_read_kernel(&event->icsk_pending, sizeof(event->icsk_pending), &icsk->icsk_pending);
-	bpf_probe_read_kernel(&event->icsk_timeout, sizeof(event->icsk_timeout), &icsk->icsk_timeout);
+	read_icsk_timeout(icsk, &event->icsk_timeout);
 	bpf_probe_read_kernel(&event->rto_jiffies, sizeof(event->rto_jiffies), &icsk->icsk_rto);
 	bpf_probe_read_kernel(&event->backoff, sizeof(event->backoff), &icsk->icsk_backoff);
 
@@ -3519,7 +3541,7 @@ int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 
 	// Read persist timer state
 	bpf_probe_read_kernel(&event->icsk_pending, sizeof(event->icsk_pending), &icsk->icsk_pending);
-	bpf_probe_read_kernel(&event->icsk_timeout, sizeof(event->icsk_timeout), &icsk->icsk_timeout);
+	read_icsk_timeout(icsk, &event->icsk_timeout);
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;

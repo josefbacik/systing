@@ -42,9 +42,10 @@ const NETNS_BPF_INIT_WAIT_SECS: u64 = 7;
 const NETNS_RECORDING_DURATION_SECS: u64 = 10;
 
 /// Recording duration for the basic validation suite (seconds).
-/// Set to 2s (instead of 1s) to give the exit workload time to generate
-/// EXIT_DEAD/EXIT_ZOMBIE states during the trace.
-const VALIDATION_SUITE_DURATION_SECS: u64 = 2;
+/// Set to 4s to give the exit workload time to generate EXIT_DEAD/EXIT_ZOMBIE
+/// states during the trace. The workload starts 500ms after trace begins (to
+/// allow BPF initialization) and runs 20 rounds of 50 processes.
+const VALIDATION_SUITE_DURATION_SECS: u64 = 4;
 
 /// Recording duration for the network suite (seconds).
 /// Set to 3s to allow time for traffic generation after BPF init (~500ms).
@@ -281,17 +282,24 @@ fn test_e2e_validation_suite() {
     let trace_path = dir.path().join("trace.pb");
 
     // Spawn exit workload to generate EXIT_DEAD/EXIT_ZOMBIE states
+    // We run many short-lived processes to ensure we reliably capture exit states
+    // during the trace window. The 500ms initial delay gives BPF programs time to
+    // fully initialize before we start generating exit events.
     let workload_handle = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(100));
-        for _ in 0..2 {
+        thread::sleep(Duration::from_millis(500));
+        // Run multiple rounds of short-lived processes. Each round spawns 50 subshells
+        // that immediately exit, which should generate EXIT_DEAD/EXIT_ZOMBIE states.
+        // We run continuously throughout the trace window.
+        for _ in 0..20 {
             let mut child = Command::new("bash")
                 .arg("-c")
-                .arg("for i in $(seq 1 5); do sleep 0.01 & done; wait")
+                .arg("for i in $(seq 1 50); do (exit 0) & done; wait")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("Failed to spawn workload");
             child.wait().expect("Failed to wait for workload");
+            thread::sleep(Duration::from_millis(50));
         }
     });
 
