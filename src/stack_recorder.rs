@@ -152,8 +152,7 @@ impl GlobalFunctionManager {
             .collect()
     }
 
-    /// Get function IDs matching a pattern (used by pystacks feature)
-    #[cfg(feature = "pystacks")]
+    /// Get function IDs matching a pattern (used by pystacks)
     pub fn get_function_ids_matching(&self, pattern: &str) -> Vec<u64> {
         self.global_functions
             .read()
@@ -1237,10 +1236,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
         &mut self.ringbuf
     }
     fn handle_event(&mut self, event: stack_event) {
-        #[cfg(feature = "pystacks")]
         let py_stack_len = event.py_msg_buffer.stack_len;
-        #[cfg(not(feature = "pystacks"))]
-        let py_stack_len = 0;
 
         let has_stack =
             event.user_stack_length > 0 || event.kernel_stack_length > 0 || py_stack_len > 0;

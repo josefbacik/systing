@@ -2,15 +2,12 @@ use crate::stack_recorder::{LocalFrame, Stack};
 use crate::systing_core::types::stack_event;
 use libbpf_rs::Object;
 use std::collections::HashMap;
-#[cfg(feature = "pystacks")]
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-#[cfg(feature = "pystacks")]
 use std::time::Instant;
 
-#[cfg(feature = "pystacks")]
 use {
     crate::pystacks::bpf_maps::PystacksMaps, crate::pystacks::discovery,
     crate::pystacks::symbols::SymbolResolver, crate::pystacks::types::StackWalkerFrame,
@@ -19,17 +16,10 @@ use {
 
 #[derive(Debug, Clone)]
 pub struct PyAddr {
-    #[cfg(feature = "pystacks")]
     pub addr: StackWalkerFrame,
 }
 
 impl PartialEq for PyAddr {
-    #[cfg(not(feature = "pystacks"))]
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-
-    #[cfg(feature = "pystacks")]
     fn eq(&self, other: &Self) -> bool {
         self.addr.symbol_id == other.addr.symbol_id && self.addr.inst_idx == other.addr.inst_idx
     }
@@ -37,17 +27,12 @@ impl PartialEq for PyAddr {
 impl Eq for PyAddr {}
 
 impl Hash for PyAddr {
-    #[cfg(not(feature = "pystacks"))]
-    fn hash<H: Hasher>(&self, _: &mut H) {}
-
-    #[cfg(feature = "pystacks")]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.addr.symbol_id.hash(state);
         self.addr.inst_idx.hash(state);
     }
 }
 
-#[cfg(feature = "pystacks")]
 impl From<&crate::systing_core::types::stack_walker_frame> for StackWalkerFrame {
     fn from(frame: &crate::systing_core::types::stack_walker_frame) -> Self {
         StackWalkerFrame {
@@ -57,7 +42,6 @@ impl From<&crate::systing_core::types::stack_walker_frame> for StackWalkerFrame 
     }
 }
 
-#[cfg(feature = "pystacks")]
 impl fmt::Display for crate::systing_core::types::stack_walker_frame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -68,7 +52,6 @@ impl fmt::Display for crate::systing_core::types::stack_walker_frame {
     }
 }
 
-#[cfg(feature = "pystacks")]
 impl fmt::Display for StackWalkerFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -79,14 +62,9 @@ impl fmt::Display for StackWalkerFrame {
     }
 }
 
-//
-// Implementation when pystacks feature is ENABLED
-//
 /// Maximum number of sample events/frames to log in debug mode.
-#[cfg(feature = "pystacks")]
 const DEBUG_SAMPLE_LOG_LIMIT: u64 = 10;
 
-#[cfg(feature = "pystacks")]
 pub struct StackWalkerRun {
     resolver: Option<SymbolResolver>,
     maps: Option<PystacksMaps>,
@@ -103,7 +81,6 @@ pub struct StackWalkerRun {
     frames_unknown: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(feature = "pystacks")]
 impl StackWalkerRun {
     fn new() -> Self {
         use std::sync::atomic::AtomicBool;
@@ -569,96 +546,17 @@ impl StackWalkerRun {
     }
 }
 
-#[cfg(feature = "pystacks")]
 impl Default for StackWalkerRun {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(feature = "pystacks")]
 impl Drop for StackWalkerRun {
     fn drop(&mut self) {
         self.print_debug_stats();
     }
 }
 
-#[cfg(feature = "pystacks")]
 unsafe impl Send for StackWalkerRun {}
-#[cfg(feature = "pystacks")]
-unsafe impl Sync for StackWalkerRun {}
-
-//
-// Implementation when pystacks feature is DISABLED
-//
-#[cfg(not(feature = "pystacks"))]
-pub struct StackWalkerRun {}
-
-#[cfg(not(feature = "pystacks"))]
-impl StackWalkerRun {
-    fn new() -> Self {
-        StackWalkerRun {}
-    }
-
-    #[allow(clippy::ptr_arg)]
-    pub fn pystacks_to_frames_mapping(
-        &self,
-        _frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-        _global_func_manager: &Arc<crate::stack_recorder::GlobalFunctionManager>,
-        _id_counter: &Arc<AtomicUsize>,
-        _python_stack_markers: &mut Vec<u64>,
-        _stack: &[PyAddr],
-    ) {
-    }
-
-    #[allow(clippy::ptr_arg)]
-    pub fn user_stack_to_python_calls(
-        &self,
-        _frame_map: &mut HashMap<u64, Vec<LocalFrame>>,
-        _global_func_manager: &Arc<crate::stack_recorder::GlobalFunctionManager>,
-        _python_calls: &mut Vec<u64>,
-    ) {
-    }
-
-    pub fn merge_pystacks(
-        &self,
-        _stack: &Stack,
-        _python_calls: &[u64],
-        _python_stack_markers: &[u64],
-    ) -> Vec<u64> {
-        Vec::new()
-    }
-
-    pub fn get_pystack_from_event(&self, _event: &stack_event) -> Vec<PyAddr> {
-        Vec::new()
-    }
-
-    pub fn load_pystack_symbols(&self, _event: &stack_event) {}
-
-    pub fn init_pystacks(&mut self, _pids: &[u32], _bpf_object: &Object, _debug: bool) {}
-
-    pub fn add_pid(&self, _pid: i32) {}
-
-    pub fn print_debug_stats(&self) {}
-
-    pub fn get_python_frame_names(&self, _py_stack: &[PyAddr]) -> Vec<String> {
-        Vec::new()
-    }
-}
-
-#[cfg(not(feature = "pystacks"))]
-impl Default for StackWalkerRun {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(not(feature = "pystacks"))]
-impl Drop for StackWalkerRun {
-    fn drop(&mut self) {}
-}
-
-#[cfg(not(feature = "pystacks"))]
-unsafe impl Send for StackWalkerRun {}
-#[cfg(not(feature = "pystacks"))]
 unsafe impl Sync for StackWalkerRun {}

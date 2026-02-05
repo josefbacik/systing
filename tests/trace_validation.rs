@@ -18,9 +18,7 @@ use common::{
     assert_poll_events_recorded, validate_network_trace, NetnsTestEnv, NetworkTestConfig,
 };
 use std::io::{Read, Write};
-use std::path::Path;
-#[cfg(feature = "pystacks")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use systing::{
     bump_memlock_rlimit, systing, validate_duckdb, validate_parquet_dir, validate_perfetto_trace,
     Config,
@@ -61,24 +59,17 @@ fn setup_bpf_environment() {
 ///
 /// Per-version tests (test_pystacks_python38 .. test_pystacks_python313)
 /// exercise each version individually so failures can be narrowed down.
-#[cfg(feature = "pystacks")]
 const PYTHON_38_VERSION: &str = "3.8.20";
-#[cfg(feature = "pystacks")]
 const PYTHON_39_VERSION: &str = "3.9.25";
-#[cfg(feature = "pystacks")]
 const PYTHON_310_VERSION: &str = "3.10.19";
-#[cfg(feature = "pystacks")]
 const PYTHON_311_VERSION: &str = "3.11.14";
-#[cfg(feature = "pystacks")]
 const PYTHON_312_VERSION: &str = "3.12.12";
-#[cfg(feature = "pystacks")]
 const PYTHON_313_VERSION: &str = "3.13.11";
 
 /// Get the path to a pyenv-installed Python binary.
 ///
 /// Resolves `$HOME/.pyenv/versions/<version>/bin/python<major.minor>`.
 /// Returns `None` if the binary is not found (caller decides whether to skip or panic).
-#[cfg(feature = "pystacks")]
 fn try_pyenv_python(version: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let parts: Vec<&str> = version.split('.').collect();
@@ -93,7 +84,6 @@ fn try_pyenv_python(version: &str) -> Option<PathBuf> {
 }
 
 /// Get the path to a pyenv-installed Python binary, panicking if not found.
-#[cfg(feature = "pystacks")]
 fn pyenv_python(version: &str) -> PathBuf {
     try_pyenv_python(version).unwrap_or_else(|| {
         panic!("Python {version} not found. Install it with: ./scripts/setup-pystacks.sh")
@@ -102,7 +92,6 @@ fn pyenv_python(version: &str) -> PathBuf {
 
 /// Scan a stack.parquet file for Python symbols and a specific target function name.
 /// Returns `(found_python_symbols, found_target_function)`.
-#[cfg(feature = "pystacks")]
 fn find_python_symbols_in_parquet(
     parquet_path: &std::path::Path,
     target_function: &str,
@@ -1063,12 +1052,11 @@ fn test_network_recording_with_netns() {
 }
 
 // =============================================================================
-// Pystacks tests (feature-gated, each needs its own Python process)
+// Pystacks tests (each needs its own Python process)
 // =============================================================================
 
 #[test]
-#[ignore] // Requires root/BPF privileges and pystacks feature
-#[cfg(feature = "pystacks")]
+#[ignore] // Requires root/BPF privileges
 fn test_pystacks_symbol_resolution() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File;
@@ -1330,7 +1318,6 @@ if __name__ == "__main__":
 
 #[test]
 #[ignore] // Requires root/BPF privileges
-#[cfg(feature = "pystacks")]
 fn test_pystacks_sleep_stacks() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::collections::HashMap;
@@ -1560,7 +1547,6 @@ if __name__ == "__main__":
 
 #[test]
 #[ignore] // Requires root/BPF privileges
-#[cfg(feature = "pystacks")]
 fn test_pystacks_frame_error_rate() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File;
@@ -1739,7 +1725,6 @@ if __name__ == "__main__":
 // =============================================================================
 
 /// Helper: trace a Python script with pystacks and verify symbols appear.
-#[cfg(feature = "pystacks")]
 fn run_pystacks_version_test(full_ver: &str) {
     use std::fs::File;
     use std::io::Write;
@@ -1836,42 +1821,36 @@ if __name__ == "__main__":
 
 #[test]
 #[ignore]
-#[cfg(feature = "pystacks")]
 fn test_pystacks_python38() {
     run_pystacks_version_test(PYTHON_38_VERSION);
 }
 
 #[test]
 #[ignore]
-#[cfg(feature = "pystacks")]
 fn test_pystacks_python39() {
     run_pystacks_version_test(PYTHON_39_VERSION);
 }
 
 #[test]
 #[ignore]
-#[cfg(feature = "pystacks")]
 fn test_pystacks_python310() {
     run_pystacks_version_test(PYTHON_310_VERSION);
 }
 
 #[test]
 #[ignore]
-#[cfg(feature = "pystacks")]
 fn test_pystacks_python311() {
     run_pystacks_version_test(PYTHON_311_VERSION);
 }
 
 #[test]
 #[ignore]
-#[cfg(feature = "pystacks")]
 fn test_pystacks_python312() {
     run_pystacks_version_test(PYTHON_312_VERSION);
 }
 
 #[test]
 #[ignore]
-#[cfg(feature = "pystacks")]
 fn test_pystacks_python313() {
     run_pystacks_version_test(PYTHON_313_VERSION);
 }
@@ -2147,8 +2126,7 @@ fn test_run_command_suite() {
 // =============================================================================
 
 #[test]
-#[ignore] // Requires root/BPF privileges and pystacks feature
-#[cfg(feature = "pystacks")]
+#[ignore] // Requires root/BPF privileges
 fn test_pystacks_run_and_trace() {
     use std::fs::File;
     use std::io::Write;
@@ -2252,8 +2230,7 @@ if __name__ == "__main__":
 /// pystacks init, so it must be dynamically discovered via the exec event
 /// handler.
 #[test]
-#[ignore] // Requires root/BPF privileges and pystacks feature
-#[cfg(feature = "pystacks")]
+#[ignore] // Requires root/BPF privileges
 fn test_pystacks_exec_discovery() {
     use std::fs::File;
     use std::io::Write;

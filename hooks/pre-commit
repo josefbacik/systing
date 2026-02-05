@@ -22,48 +22,22 @@ else
     FAILED=1
 fi
 
-# Check clippy with no-default-features
-echo -ne "Checking clippy (no-default-features)... "
-if cargo clippy --all-targets --no-default-features -- -D warnings &> /dev/null; then
+# Check clippy
+echo -ne "Checking clippy... "
+if cargo clippy --all-targets -- -D warnings &> /dev/null; then
     echo -e "${GREEN}✓${NC}"
 else
     echo -e "${RED}✗${NC}"
     FAILED=1
 fi
 
-# Check clippy with pystacks feature (only if dependencies are available)
-echo -ne "Checking clippy (pystacks)... "
-if pkg-config --exists fmt re2 libcap 2>/dev/null; then
-    if cargo clippy --all-targets --features pystacks -- -D warnings &> /dev/null; then
-        echo -e "${GREEN}✓${NC}"
-    else
-        echo -e "${RED}✗${NC}"
-        FAILED=1
-    fi
-else
-    echo -e "${GREEN}⊘ (dependencies not installed)${NC}"
-fi
-
-# Run tests with no-default-features
-echo -ne "Running tests (no-default-features)... "
-if cargo test --no-default-features &> /dev/null; then
+# Run tests
+echo -ne "Running tests... "
+if cargo test &> /dev/null; then
     echo -e "${GREEN}✓${NC}"
 else
     echo -e "${RED}✗${NC}"
     FAILED=1
-fi
-
-# Run tests with pystacks feature (only if dependencies are available)
-echo -ne "Running tests (pystacks)... "
-if pkg-config --exists fmt re2 libcap 2>/dev/null; then
-    if cargo test --features pystacks &> /dev/null; then
-        echo -e "${GREEN}✓${NC}"
-    else
-        echo -e "${RED}✗${NC}"
-        FAILED=1
-    fi
-else
-    echo -e "${GREEN}⊘ (dependencies not installed)${NC}"
 fi
 
 # Exit with failure if any check failed

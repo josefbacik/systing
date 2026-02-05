@@ -54,11 +54,9 @@ struct Command {
     trace_event_config: Vec<String>,
     #[arg(long, default_value = "0")]
     continuous: u64,
-    #[cfg(feature = "pystacks")]
     #[arg(long)]
     collect_pystacks: bool,
     /// Enable debug output for pystacks (Python stack tracing)
-    #[cfg(feature = "pystacks")]
     #[arg(long)]
     pystacks_debug: bool,
     /// Enable debuginfod for enhanced symbol resolution (requires DEBUGINFOD_URLS environment variable)
@@ -125,11 +123,8 @@ impl From<Command> for Config {
             no_interruptible_stack_traces: cmd.no_interruptible_stack_traces,
             trace_event_config: cmd.trace_event_config,
             continuous: cmd.continuous,
-            #[cfg(feature = "pystacks")]
             collect_pystacks: cmd.collect_pystacks,
-            #[cfg(feature = "pystacks")]
             pystacks_pids: Vec::new(), // CLI doesn't expose this yet, uses discovery
-            #[cfg(feature = "pystacks")]
             pystacks_debug: cmd.pystacks_debug,
             enable_debuginfod: cmd.enable_debuginfod,
             no_sched: cmd.no_sched,
@@ -156,7 +151,6 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
         "interruptible-stacks" => opts.no_interruptible_stack_traces = !enable,
         "cpu-stacks" => opts.no_cpu_stack_traces = !enable,
         "network" => opts.network = enable,
-        #[cfg(feature = "pystacks")]
         "pystacks" => opts.collect_pystacks = enable,
         _ => {}
     }
@@ -174,10 +168,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         opts.no_interruptible_stack_traces = true;
         opts.no_cpu_stack_traces = true;
         opts.network = false;
-        #[cfg(feature = "pystacks")]
-        {
-            opts.collect_pystacks = false;
-        }
+        opts.collect_pystacks = false;
 
         // Then enable only the specified recorders
         let recorders = opts.only_recorder.clone();
@@ -307,7 +298,6 @@ fn main() -> Result<()> {
     }
 
     // Auto-enable pystacks for Python commands
-    #[cfg(feature = "pystacks")]
     if !opts.run_command.is_empty()
         && !opts.collect_pystacks
         && traced_command::is_python_command(&opts.run_command)

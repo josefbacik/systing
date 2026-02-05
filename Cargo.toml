@@ -42,13 +42,12 @@ syscalls = "0.6"
 sysinfo = "0.33.1"
 tempfile = "3.13"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "io-std"] }
-object = { version = "0.36", default-features = false, features = ["read", "elf"], optional = true }
+object = { version = "0.36", default-features = false, features = ["read", "elf"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "time"] }
 
 [features]
 generate-vmlinux-header = []
-pystacks = ["dep:object"]
 
 [lib]
 name = "systing"
