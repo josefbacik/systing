@@ -383,7 +383,7 @@ fn find_module_base_address(maps: &[MemoryMapping], module_path: &str) -> Option
     let fallback = maps
         .iter()
         .filter(|m| m.name == module_path && m.offset == 0)
-        .last()
+        .next_back()
         .map(|m| m.start);
     if fallback.is_some() {
         eprintln!(
