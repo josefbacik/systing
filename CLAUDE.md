@@ -8,8 +8,8 @@ This document contains information for Claude (AI assistant) when working on the
 - **Build Tool**: Cargo
 - **Main Binary**: systing
 - **Features**:
-  - `pystacks` - Optional Python stack tracing support (pure Rust implementation)
   - `generate-vmlinux-header` - Optional VMLinux header generation
+- **Built-in support**: Python stack tracing (pystacks) is always compiled in, enabled at runtime with `--collect-pystacks`
 
 ## Running Tests
 
@@ -43,8 +43,8 @@ Integration tests require root/BPF privileges and are marked as `#[ignore]` in t
 # Run specific test within a file
 ./scripts/run-integration-tests.sh trace_validation test_e2e_parquet_validation
 
-# Run with features enabled
-CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh
+# Run with extra features enabled
+CARGO_FEATURES=generate-vmlinux-header ./scripts/run-integration-tests.sh
 ```
 
 **Why use the script:**
@@ -59,7 +59,7 @@ CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh
 
 ## Pystacks Architecture
 
-The `pystacks` feature provides Python stack tracing via BPF. The implementation is split into:
+Pystacks provides Python stack tracing via BPF. It is always compiled in but only active when `--collect-pystacks` is passed. The implementation is split into:
 
 - **BPF kernel code** (`src/pystacks/bpf/`) - C code compiled by clang for BPF, walks Python frames in-kernel
 - **Rust userspace code** (`src/pystacks/`) - Process discovery, symbol resolution, line table parsing
@@ -97,8 +97,8 @@ git config core.hooksPath hooks
 
 - **pre-commit**: Runs comprehensive checks before each commit:
   - `cargo fmt --check`
-  - `cargo clippy` (both with and without features)
-  - `cargo test` (both with and without features)
+  - `cargo clippy`
+  - `cargo test`
   - Note: Integration tests run in CI only (GitHub Actions), not in the pre-commit hook
 
 ## Temporary Files and Scratch Work
