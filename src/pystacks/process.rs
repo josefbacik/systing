@@ -63,15 +63,6 @@ fn parse_maps_line(line: &str) -> Option<MemoryMapping> {
     })
 }
 
-/// Find the base load address for a module in the process's memory maps.
-/// Returns the start address of the first mapping with offset 0 for the given path.
-pub fn find_base_address(pid: i32, module_path: &str) -> Option<usize> {
-    let maps = parse_proc_maps(pid);
-    maps.iter()
-        .find(|m| m.offset == 0 && m.name == module_path)
-        .map(|m| m.start)
-}
-
 /// Read memory from a process via /proc/pid/mem.
 pub fn read_process_memory(pid: i32, addr: usize, buf: &mut [u8]) -> std::io::Result<usize> {
     let path = format!("/proc/{pid}/mem");
