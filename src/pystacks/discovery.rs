@@ -373,7 +373,8 @@ fn find_module_base_address(maps: &[MemoryMapping], module_path: &str) -> Option
         .iter()
         .find(|m| m.name == module_path && m.perms.contains('x'))
     {
-        return exec_map.start.checked_sub(exec_map.offset as usize);
+        let offset = usize::try_from(exec_map.offset).ok()?;
+        return exec_map.start.checked_sub(offset);
     }
 
     // Fallback: use the last offset=0 mapping (the dynamic linker creates
