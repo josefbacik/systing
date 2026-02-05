@@ -1,8 +1,12 @@
 /// Python version-specific offset configurations.
 ///
-/// Each configuration matches the hardcoded offsets from the corresponding
-/// Py*Offsets.cpp file in strobelight-libs.
+/// Offsets are computed from bindgen-generated CPython struct definitions
+/// using `std::mem::offset_of!()` and `std::mem::size_of()`.
+/// Compound offsets (nested structs that bindgen cannot resolve) are
+/// computed by the generation script via a C program.
+use super::bindings;
 use super::types::OffsetConfig;
+use super::types::BPF_LIB_DEFAULT_FIELD_OFFSET;
 
 /// Returns the OffsetConfig for a given Python (major, minor) version.
 /// Returns None if the version is not supported.
@@ -25,25 +29,40 @@ pub fn for_version(major: i32, minor: i32) -> Option<OffsetConfig> {
 
 #[allow(clippy::field_reassign_with_default)]
 pub fn py38() -> OffsetConfig {
+    use bindings::v3_8_0::*;
     let mut c = OffsetConfig::default();
-    c.py_object_type = 8;
-    c.py_type_object_name = 24;
-    c.py_thread_state_frame = 24;
-    c.py_thread_state_thread = 176;
-    c.py_frame_object_back = 24;
-    c.py_frame_object_code = 32;
-    c.py_frame_object_localsplus = 360;
-    c.py_frame_object_gen = 96;
-    c.py_code_object_co_flags = 36;
-    c.py_code_object_filename = 104;
-    c.py_code_object_name = 112;
-    c.py_code_object_varnames = 72;
-    c.py_tuple_object_item = 24;
-    c.string_data = 48;
-    c.tls_key_offset = 1396;
-    c.t_current_state_offset = 1368;
-    c.py_gil_offset = 1168;
-    c.py_gil_last_holder = 1160;
+
+    // Common offsets
+    // Note: py_var_object_size, py_bytes_object_data, py_code_object_firstlineno are
+    // left at sentinel (9999) for 3.8. The BPF code checks against the sentinel before
+    // use; these features (line table parsing, bytes object reading) were added in 3.9+.
+    c.py_object_type = std::mem::offset_of!(_object, ob_type);
+    c.py_type_object_name = std::mem::offset_of!(_typeobject, tp_name);
+    c.py_tuple_object_item = std::mem::offset_of!(PyTupleObject, ob_item);
+    c.string_data = std::mem::size_of::<PyASCIIObject>();
+
+    // Thread state (traditional frame)
+    c.py_thread_state_frame = std::mem::offset_of!(_ts, frame);
+    c.py_thread_state_thread = std::mem::offset_of!(_ts, thread_id);
+
+    // Frame object (old-style _frame)
+    c.py_frame_object_back = std::mem::offset_of!(_frame, f_back);
+    c.py_frame_object_code = std::mem::offset_of!(_frame, f_code);
+    c.py_frame_object_localsplus = std::mem::offset_of!(_frame, f_localsplus);
+    c.py_frame_object_gen = std::mem::offset_of!(_frame, f_gen);
+
+    // Code object
+    c.py_code_object_co_flags = std::mem::offset_of!(PyCodeObject, co_flags);
+    c.py_code_object_filename = std::mem::offset_of!(PyCodeObject, co_filename);
+    c.py_code_object_name = std::mem::offset_of!(PyCodeObject, co_name);
+    c.py_code_object_varnames = std::mem::offset_of!(PyCodeObject, co_varnames);
+
+    // Compound offsets (from C program)
+    c.tls_key_offset = PYRUNTIME_TLS_KEY_OFFSET;
+    c.t_current_state_offset = PYRUNTIME_TSTATE_CURRENT_OFFSET;
+    c.py_gil_offset = PYRUNTIME_GIL_LOCKED_OFFSET;
+    c.py_gil_last_holder = PYRUNTIME_GIL_LAST_HOLDER_OFFSET;
+
     c.py_version_major = 3;
     c.py_version_minor = 8;
     c.py_version_micro = 0;
@@ -52,29 +71,41 @@ pub fn py38() -> OffsetConfig {
 
 #[allow(clippy::field_reassign_with_default)]
 pub fn py39() -> OffsetConfig {
+    use bindings::v3_9_0::*;
     let mut c = OffsetConfig::default();
-    c.py_object_type = 8;
-    c.py_type_object_name = 24;
-    c.py_thread_state_frame = 24;
-    c.py_thread_state_thread = 176;
-    c.py_frame_object_back = 24;
-    c.py_frame_object_code = 32;
-    c.py_frame_object_lasti = 104;
-    c.py_frame_object_localsplus = 360;
-    c.py_frame_object_gen = 96;
-    c.py_code_object_co_flags = 36;
-    c.py_code_object_filename = 104;
-    c.py_code_object_name = 112;
-    c.py_code_object_varnames = 72;
-    c.py_code_object_firstlineno = 40;
-    c.py_tuple_object_item = 24;
-    c.string_data = 48;
-    c.tls_key_offset = 588;
-    c.t_current_state_offset = 568;
-    c.py_gil_offset = 368;
-    c.py_gil_last_holder = 360;
-    c.py_bytes_object_data = 32;
-    c.py_var_object_size = 16;
+
+    // Common offsets
+    c.py_object_type = std::mem::offset_of!(_object, ob_type);
+    c.py_type_object_name = std::mem::offset_of!(_typeobject, tp_name);
+    c.py_var_object_size = std::mem::offset_of!(PyVarObject, ob_size);
+    c.py_tuple_object_item = std::mem::offset_of!(PyTupleObject, ob_item);
+    c.py_bytes_object_data = std::mem::offset_of!(PyBytesObject, ob_sval);
+    c.string_data = std::mem::size_of::<PyASCIIObject>();
+
+    // Thread state (traditional frame)
+    c.py_thread_state_frame = std::mem::offset_of!(_ts, frame);
+    c.py_thread_state_thread = std::mem::offset_of!(_ts, thread_id);
+
+    // Frame object (old-style _frame)
+    c.py_frame_object_back = std::mem::offset_of!(_frame, f_back);
+    c.py_frame_object_code = std::mem::offset_of!(_frame, f_code);
+    c.py_frame_object_lasti = std::mem::offset_of!(_frame, f_lasti);
+    c.py_frame_object_localsplus = std::mem::offset_of!(_frame, f_localsplus);
+    c.py_frame_object_gen = std::mem::offset_of!(_frame, f_gen);
+
+    // Code object
+    c.py_code_object_co_flags = std::mem::offset_of!(PyCodeObject, co_flags);
+    c.py_code_object_filename = std::mem::offset_of!(PyCodeObject, co_filename);
+    c.py_code_object_name = std::mem::offset_of!(PyCodeObject, co_name);
+    c.py_code_object_varnames = std::mem::offset_of!(PyCodeObject, co_varnames);
+    c.py_code_object_firstlineno = std::mem::offset_of!(PyCodeObject, co_firstlineno);
+
+    // Compound offsets (from C program)
+    c.tls_key_offset = PYRUNTIME_TLS_KEY_OFFSET;
+    c.t_current_state_offset = PYRUNTIME_TSTATE_CURRENT_OFFSET;
+    c.py_gil_offset = PYRUNTIME_GIL_LOCKED_OFFSET;
+    c.py_gil_last_holder = PYRUNTIME_GIL_LAST_HOLDER_OFFSET;
+
     c.py_version_major = 3;
     c.py_version_minor = 9;
     c.py_version_micro = 0;
@@ -83,32 +114,44 @@ pub fn py39() -> OffsetConfig {
 
 #[allow(clippy::field_reassign_with_default)]
 pub fn py310() -> OffsetConfig {
+    use bindings::v3_10_0::*;
     let mut c = OffsetConfig::default();
-    c.py_object_type = 8;
-    c.py_type_object_name = 24;
-    c.py_thread_state_frame = 24;
-    c.py_thread_state_thread = 176;
-    c.py_thread_state_interp = 16;
-    c.py_interpreter_state_modules = 856;
-    c.py_frame_object_back = 24;
-    c.py_frame_object_code = 32;
-    c.py_frame_object_lasti = 96;
-    c.py_frame_object_localsplus = 352;
-    c.py_frame_object_gen = 88;
-    c.py_code_object_co_flags = 36;
-    c.py_code_object_filename = 104;
-    c.py_code_object_name = 112;
-    c.py_code_object_varnames = 72;
-    c.py_code_object_firstlineno = 40;
-    c.py_code_object_linetable = 120;
-    c.py_tuple_object_item = 24;
-    c.string_data = 48;
-    c.tls_key_offset = 588;
-    c.t_current_state_offset = 568;
-    c.py_gil_offset = 368;
-    c.py_gil_last_holder = 360;
-    c.py_bytes_object_data = 32;
-    c.py_var_object_size = 16;
+
+    // Common offsets
+    c.py_object_type = std::mem::offset_of!(_object, ob_type);
+    c.py_type_object_name = std::mem::offset_of!(_typeobject, tp_name);
+    c.py_var_object_size = std::mem::offset_of!(PyVarObject, ob_size);
+    c.py_tuple_object_item = std::mem::offset_of!(PyTupleObject, ob_item);
+    c.py_bytes_object_data = std::mem::offset_of!(PyBytesObject, ob_sval);
+    c.string_data = std::mem::size_of::<PyASCIIObject>();
+
+    // Thread state (traditional frame)
+    c.py_thread_state_frame = std::mem::offset_of!(_ts, frame);
+    c.py_thread_state_thread = std::mem::offset_of!(_ts, thread_id);
+    c.py_thread_state_interp = std::mem::offset_of!(_ts, interp);
+
+    // Frame object (old-style _frame)
+    c.py_frame_object_back = std::mem::offset_of!(_frame, f_back);
+    c.py_frame_object_code = std::mem::offset_of!(_frame, f_code);
+    c.py_frame_object_lasti = std::mem::offset_of!(_frame, f_lasti);
+    c.py_frame_object_localsplus = std::mem::offset_of!(_frame, f_localsplus);
+    c.py_frame_object_gen = std::mem::offset_of!(_frame, f_gen);
+
+    // Code object
+    c.py_code_object_co_flags = std::mem::offset_of!(PyCodeObject, co_flags);
+    c.py_code_object_filename = std::mem::offset_of!(PyCodeObject, co_filename);
+    c.py_code_object_name = std::mem::offset_of!(PyCodeObject, co_name);
+    c.py_code_object_varnames = std::mem::offset_of!(PyCodeObject, co_varnames);
+    c.py_code_object_firstlineno = std::mem::offset_of!(PyCodeObject, co_firstlineno);
+    c.py_code_object_linetable = std::mem::offset_of!(PyCodeObject, co_linetable);
+
+    // Compound offsets (from C program)
+    c.tls_key_offset = PYRUNTIME_TLS_KEY_OFFSET;
+    c.t_current_state_offset = PYRUNTIME_TSTATE_CURRENT_OFFSET;
+    c.py_gil_offset = PYRUNTIME_GIL_LOCKED_OFFSET;
+    c.py_gil_last_holder = PYRUNTIME_GIL_LAST_HOLDER_OFFSET;
+    c.py_interpreter_state_modules = PYINTERP_MODULES_OFFSET;
+
     c.py_version_major = 3;
     c.py_version_minor = 10;
     c.py_version_micro = 0;
@@ -117,30 +160,44 @@ pub fn py310() -> OffsetConfig {
 
 #[allow(clippy::field_reassign_with_default)]
 pub fn py311() -> OffsetConfig {
+    use bindings::v3_11_0::*;
     let mut c = OffsetConfig::default();
-    c.py_object_type = 8;
-    c.py_type_object_name = 24;
-    c.py_thread_state_cframe = 56;
-    c.py_thread_state_thread = 152;
-    c.py_cframe_current_frame = 8;
-    c.py_interpreter_frame_code = 32;
-    c.py_interpreter_frame_previous = 48;
-    c.py_interpreter_frame_localsplus = 72;
-    c.py_interpreter_frame_prev_instr = 56;
-    c.py_code_object_co_flags = 48;
-    c.py_code_object_filename = 112;
-    c.py_code_object_name = 120;
-    c.py_code_object_qualname = 128;
-    c.py_code_object_linetable = 136;
-    c.py_code_object_firstlineno = 72;
-    c.py_tuple_object_item = 24;
-    c.py_bytes_object_data = 32;
-    c.py_var_object_size = 16;
-    c.string_data = 48;
-    c.tls_key_offset = 596;
-    c.t_current_state_offset = 576;
-    c.py_gil_offset = 376;
-    c.py_gil_last_holder = 368;
+
+    // Common offsets
+    c.py_object_type = std::mem::offset_of!(_object, ob_type);
+    c.py_type_object_name = std::mem::offset_of!(_typeobject, tp_name);
+    c.py_var_object_size = std::mem::offset_of!(PyVarObject, ob_size);
+    c.py_tuple_object_item = std::mem::offset_of!(PyTupleObject, ob_item);
+    c.py_bytes_object_data = std::mem::offset_of!(PyBytesObject, ob_sval);
+    c.string_data = std::mem::size_of::<PyASCIIObject>();
+
+    // Thread state (new-style via _PyCFrame)
+    c.py_thread_state_cframe = std::mem::offset_of!(_ts, cframe);
+    c.py_thread_state_thread = std::mem::offset_of!(_ts, thread_id);
+
+    // CFrame -> interpreter frame
+    c.py_cframe_current_frame = std::mem::offset_of!(_PyCFrame, current_frame);
+
+    // Interpreter frame (new-style)
+    c.py_interpreter_frame_code = std::mem::offset_of!(_PyInterpreterFrame, f_code);
+    c.py_interpreter_frame_previous = std::mem::offset_of!(_PyInterpreterFrame, previous);
+    c.py_interpreter_frame_localsplus = std::mem::offset_of!(_PyInterpreterFrame, localsplus);
+    c.py_interpreter_frame_prev_instr = std::mem::offset_of!(_PyInterpreterFrame, prev_instr);
+
+    // Code object
+    c.py_code_object_co_flags = std::mem::offset_of!(PyCodeObject, co_flags);
+    c.py_code_object_filename = std::mem::offset_of!(PyCodeObject, co_filename);
+    c.py_code_object_name = std::mem::offset_of!(PyCodeObject, co_name);
+    c.py_code_object_qualname = std::mem::offset_of!(PyCodeObject, co_qualname);
+    c.py_code_object_linetable = std::mem::offset_of!(PyCodeObject, co_linetable);
+    c.py_code_object_firstlineno = std::mem::offset_of!(PyCodeObject, co_firstlineno);
+
+    // Compound offsets (from C program)
+    c.tls_key_offset = PYRUNTIME_TLS_KEY_OFFSET;
+    c.t_current_state_offset = PYRUNTIME_TSTATE_CURRENT_OFFSET;
+    c.py_gil_offset = PYRUNTIME_GIL_LOCKED_OFFSET;
+    c.py_gil_last_holder = PYRUNTIME_GIL_LAST_HOLDER_OFFSET;
+
     c.py_version_major = 3;
     c.py_version_minor = 11;
     c.py_version_micro = 0;
@@ -149,71 +206,103 @@ pub fn py311() -> OffsetConfig {
 
 #[allow(clippy::field_reassign_with_default)]
 pub fn py312() -> OffsetConfig {
+    use bindings::v3_12_0::*;
     let mut c = OffsetConfig::default();
-    c.py_object_type = 8;
-    c.py_type_object_name = 24;
-    c.py_thread_state_cframe = 56;
-    c.py_thread_state_thread = 136;
-    c.py_thread_state_interp = 16;
-    c.py_interpreter_state_modules = 944;
-    c.py_cframe_current_frame = 0;
-    c.py_interpreter_frame_code = 0;
-    c.py_interpreter_frame_previous = 8;
-    c.py_interpreter_frame_localsplus = 72;
-    c.py_interpreter_frame_prev_instr = 56;
-    c.py_code_object_co_flags = 48;
-    c.py_code_object_filename = 112;
-    c.py_code_object_name = 120;
-    c.py_code_object_qualname = 128;
-    c.py_code_object_linetable = 136;
-    c.py_code_object_firstlineno = 68;
-    c.py_code_object_code_adaptive = 192;
-    c.py_tuple_object_item = 24;
-    c.tls_key_offset = 1548;
-    c.py_bytes_object_data = 32;
-    c.py_var_object_size = 16;
-    c.string_data = 40;
-    c.py_coro_object_cr_awaiter = 64;
-    c.py_gen_object_iframe = 80;
-    c.py_frame_object_owner = 70;
+
+    // Common offsets
+    c.py_object_type = std::mem::offset_of!(_object, ob_type);
+    c.py_type_object_name = std::mem::offset_of!(_typeobject, tp_name);
+    c.py_var_object_size = std::mem::offset_of!(PyVarObject, ob_size);
+    c.py_tuple_object_item = std::mem::offset_of!(PyTupleObject, ob_item);
+    c.py_bytes_object_data = std::mem::offset_of!(PyBytesObject, ob_sval);
+    c.string_data = std::mem::size_of::<PyASCIIObject>(); // Changed in 3.12
+
+    // Thread state (via _PyCFrame)
+    c.py_thread_state_cframe = std::mem::offset_of!(_ts, cframe);
+    c.py_thread_state_thread = std::mem::offset_of!(_ts, thread_id);
+    c.py_thread_state_interp = std::mem::offset_of!(_ts, interp);
+
+    // CFrame -> interpreter frame
+    c.py_cframe_current_frame = std::mem::offset_of!(_PyCFrame, current_frame);
+
+    // Interpreter frame (new-style)
+    c.py_interpreter_frame_code = std::mem::offset_of!(_PyInterpreterFrame, f_code);
+    c.py_interpreter_frame_previous = std::mem::offset_of!(_PyInterpreterFrame, previous);
+    c.py_interpreter_frame_localsplus = std::mem::offset_of!(_PyInterpreterFrame, localsplus);
+    c.py_interpreter_frame_prev_instr = std::mem::offset_of!(_PyInterpreterFrame, prev_instr);
+
+    // Code object
+    c.py_code_object_co_flags = std::mem::offset_of!(PyCodeObject, co_flags);
+    c.py_code_object_filename = std::mem::offset_of!(PyCodeObject, co_filename);
+    c.py_code_object_name = std::mem::offset_of!(PyCodeObject, co_name);
+    c.py_code_object_qualname = std::mem::offset_of!(PyCodeObject, co_qualname);
+    c.py_code_object_linetable = std::mem::offset_of!(PyCodeObject, co_linetable);
+    c.py_code_object_firstlineno = std::mem::offset_of!(PyCodeObject, co_firstlineno);
+    c.py_code_object_code_adaptive = std::mem::offset_of!(PyCodeObject, co_code_adaptive);
+
+    // 3.12+ generator/coroutine offsets
+    c.py_coro_object_cr_awaiter = std::mem::offset_of!(PyCoroObject, cr_origin_or_finalizer);
+    c.py_gen_object_iframe = std::mem::offset_of!(PyGenObject, gi_iframe);
+    c.py_frame_object_owner = std::mem::offset_of!(_PyInterpreterFrame, owner);
+
+    // Compound offsets (from C program)
+    c.tls_key_offset = PYRUNTIME_TLS_KEY_OFFSET;
+    c.py_interpreter_state_modules = PYINTERP_MODULES_OFFSET;
+
     c.py_version_major = 3;
     c.py_version_minor = 12;
-    c.py_version_micro = 4;
+    c.py_version_micro = 0;
     c
 }
 
 #[allow(clippy::field_reassign_with_default)]
 pub fn py313() -> OffsetConfig {
+    use bindings::v3_13_0::*;
     let mut c = OffsetConfig::default();
-    c.py_object_type = 8;
-    c.py_type_object_name = 24;
-    c.py_thread_state_cframe = 72;
-    c.py_thread_state_thread = 152;
-    c.py_thread_state_interp = 16;
-    c.py_interpreter_state_modules = 944;
-    c.py_cframe_current_frame = super::types::BPF_LIB_DEFAULT_FIELD_OFFSET;
-    c.py_interpreter_frame_code = 0;
-    c.py_interpreter_frame_previous = 8;
-    c.py_interpreter_frame_localsplus = 72;
-    c.py_interpreter_frame_prev_instr = 56;
-    c.py_code_object_co_flags = 48;
-    c.py_code_object_filename = 112;
-    c.py_code_object_name = 120;
-    c.py_code_object_qualname = 128;
-    c.py_code_object_linetable = 136;
-    c.py_code_object_firstlineno = 68;
-    c.py_code_object_code_adaptive = 200;
-    c.py_tuple_object_item = 24;
-    c.tls_key_offset = 2164;
-    c.py_bytes_object_data = 32;
-    c.py_var_object_size = 16;
-    c.string_data = 40;
-    c.py_coro_object_cr_awaiter = 64;
-    c.py_gen_object_iframe = 80;
-    c.py_frame_object_owner = 70;
-    c.py_runtime_state_interpreters_head = 632;
-    c.py_interpreter_state_gil_locked = 7768;
-    c.py_interpreter_state_gil_last_holder = 7760;
+
+    // Common offsets
+    c.py_object_type = std::mem::offset_of!(_object, ob_type);
+    c.py_type_object_name = std::mem::offset_of!(_typeobject, tp_name);
+    c.py_var_object_size = std::mem::offset_of!(PyVarObject, ob_size);
+    c.py_tuple_object_item = std::mem::offset_of!(PyTupleObject, ob_item);
+    c.py_bytes_object_data = std::mem::offset_of!(PyBytesObject, ob_sval);
+    c.string_data = std::mem::size_of::<PyASCIIObject>(); // Changed in 3.12+
+
+    // Thread state (3.13: current_frame is directly on _ts, no _PyCFrame)
+    c.py_thread_state_cframe = std::mem::offset_of!(_ts, current_frame);
+    c.py_thread_state_thread = std::mem::offset_of!(_ts, thread_id);
+    c.py_thread_state_interp = std::mem::offset_of!(_ts, interp);
+
+    // 3.13: No _PyCFrame indirection - sentinel means "no second dereference"
+    c.py_cframe_current_frame = BPF_LIB_DEFAULT_FIELD_OFFSET;
+
+    // Interpreter frame (new-style, f_code renamed to f_executable)
+    c.py_interpreter_frame_code = std::mem::offset_of!(_PyInterpreterFrame, f_executable);
+    c.py_interpreter_frame_previous = std::mem::offset_of!(_PyInterpreterFrame, previous);
+    c.py_interpreter_frame_localsplus = std::mem::offset_of!(_PyInterpreterFrame, localsplus);
+    c.py_interpreter_frame_prev_instr = std::mem::offset_of!(_PyInterpreterFrame, instr_ptr);
+
+    // Code object
+    c.py_code_object_co_flags = std::mem::offset_of!(PyCodeObject, co_flags);
+    c.py_code_object_filename = std::mem::offset_of!(PyCodeObject, co_filename);
+    c.py_code_object_name = std::mem::offset_of!(PyCodeObject, co_name);
+    c.py_code_object_qualname = std::mem::offset_of!(PyCodeObject, co_qualname);
+    c.py_code_object_linetable = std::mem::offset_of!(PyCodeObject, co_linetable);
+    c.py_code_object_firstlineno = std::mem::offset_of!(PyCodeObject, co_firstlineno);
+    c.py_code_object_code_adaptive = std::mem::offset_of!(PyCodeObject, co_code_adaptive);
+
+    // 3.12+ generator/coroutine offsets
+    c.py_coro_object_cr_awaiter = std::mem::offset_of!(PyCoroObject, cr_origin_or_finalizer);
+    c.py_gen_object_iframe = std::mem::offset_of!(PyGenObject, gi_iframe);
+    c.py_frame_object_owner = std::mem::offset_of!(_PyInterpreterFrame, owner);
+
+    // Compound offsets (from C program)
+    c.tls_key_offset = PYRUNTIME_TLS_KEY_OFFSET;
+    c.py_runtime_state_interpreters_head = PYRUNTIME_INTERPRETERS_HEAD_OFFSET;
+    c.py_interpreter_state_modules = PYINTERP_MODULES_OFFSET;
+    c.py_interpreter_state_gil_locked = PYINTERP_GIL_LOCKED_OFFSET;
+    c.py_interpreter_state_gil_last_holder = PYINTERP_GIL_LAST_HOLDER_OFFSET;
+
     c.py_version_major = 3;
     c.py_version_minor = 13;
     c.py_version_micro = 0;
@@ -223,6 +312,31 @@ pub fn py313() -> OffsetConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_for_version_known() {
+        assert!(for_version(3, 8).is_some());
+        assert!(for_version(3, 13).is_some());
+    }
+
+    #[test]
+    fn test_for_version_unknown() {
+        assert!(for_version(2, 7).is_none());
+        assert!(for_version(3, 7).is_none());
+    }
+
+    #[test]
+    fn test_for_version_future_fallback() {
+        let future = for_version(3, 14).unwrap();
+        assert_eq!(future.py_version_minor, 13); // falls back to 3.13
+    }
+
+    #[test]
+    fn test_default_offset_sentinel() {
+        let c = OffsetConfig::default();
+        assert_eq!(c.py_object_type, 9999);
+        assert_eq!(c.py_shadow_frame_prev, 9999);
+    }
 
     #[test]
     fn test_py38_offsets() {
@@ -269,30 +383,5 @@ mod tests {
         assert_eq!(c.py_runtime_state_interpreters_head, 632);
         assert_eq!(c.py_interpreter_state_gil_locked, 7768);
         assert_eq!(c.py_interpreter_state_gil_last_holder, 7760);
-    }
-
-    #[test]
-    fn test_for_version_known() {
-        assert!(for_version(3, 8).is_some());
-        assert!(for_version(3, 13).is_some());
-    }
-
-    #[test]
-    fn test_for_version_unknown() {
-        assert!(for_version(2, 7).is_none());
-        assert!(for_version(3, 7).is_none());
-    }
-
-    #[test]
-    fn test_for_version_future_fallback() {
-        let future = for_version(3, 14).unwrap();
-        assert_eq!(future.py_version_minor, 13); // falls back to 3.13
-    }
-
-    #[test]
-    fn test_default_offset_sentinel() {
-        let c = OffsetConfig::default();
-        assert_eq!(c.py_object_type, 9999);
-        assert_eq!(c.py_shadow_frame_prev, 9999);
     }
 }
