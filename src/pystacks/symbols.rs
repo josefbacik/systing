@@ -292,7 +292,7 @@ fn get_module_name_from_filename(path: &str) -> String {
     for keyword in KEYWORDS {
         if let Some(pos) = path.rfind(keyword) {
             let boundary = pos + keyword.len();
-            if max_boundary.is_none() || boundary > max_boundary.unwrap() {
+            if max_boundary.map_or(true, |mb| boundary > mb) {
                 max_boundary = Some(boundary);
                 matched_keyword = keyword;
             }
