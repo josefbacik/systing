@@ -1,4 +1,6 @@
 #[cfg(feature = "pystacks")]
+pub mod bindings;
+#[cfg(feature = "pystacks")]
 pub mod bpf_maps;
 #[cfg(feature = "pystacks")]
 pub mod discovery;
