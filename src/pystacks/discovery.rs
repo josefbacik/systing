@@ -119,10 +119,12 @@ fn try_python_module(
     // Find base load address from maps
     let base_addr = find_module_base_address(maps, module_path).unwrap_or(0);
 
-    // Build binary ID from the first mapping
+    // Build binary ID — prefer the executable mapping for consistency with
+    // base address computation, fall back to any mapping for this module.
     let binary_id = maps
         .iter()
-        .find(|m| m.name == module_path && m.offset == 0)
+        .find(|m| m.name == module_path && m.perms.contains('x'))
+        .or_else(|| maps.iter().find(|m| m.name == module_path))
         .map(|m| BpfLibBinaryId {
             dev: kmkdev(m.dev_major, m.dev_minor),
             inode: m.inode,
@@ -355,10 +357,39 @@ fn parse_version_from_path(path: &str) -> Option<(i32, i32, i32)> {
 }
 
 /// Find the base load address for a module in process maps.
+///
+/// When a shared library is loaded, the dynamic linker may leave a stale
+/// read-only mmap of the file at a lower address in addition to the final
+/// LOAD segment mappings. If there are multiple mappings with offset == 0
+/// for the same file, we can't simply pick the first one.
+///
+/// Instead, we compute the base from the executable (r-xp) mapping:
+///   base = exec_mapping.start - exec_mapping.offset
+/// This is reliable because there is exactly one executable mapping per
+/// loaded module, and its file offset tells us where vaddr 0 would be.
 fn find_module_base_address(maps: &[MemoryMapping], module_path: &str) -> Option<usize> {
-    maps.iter()
-        .find(|m| m.name == module_path && m.offset == 0)
-        .map(|m| m.start)
+    // Prefer computing base from the executable mapping
+    if let Some(exec_map) = maps
+        .iter()
+        .find(|m| m.name == module_path && m.perms.contains('x'))
+    {
+        return exec_map.start.checked_sub(exec_map.offset as usize);
+    }
+
+    // Fallback: use the last offset=0 mapping (the dynamic linker creates
+    // the active mapping after any stale reservations). This path should
+    // rarely be hit — log a warning so it's visible in diagnostic output.
+    let fallback = maps
+        .iter()
+        .rfind(|m| m.name == module_path && m.offset == 0)
+        .map(|m| m.start);
+    if fallback.is_some() {
+        eprintln!(
+            "[pystacks] Warning: no executable mapping for {}, using fallback base address",
+            module_path
+        );
+    }
+    fallback
 }
 
 #[cfg(test)]
@@ -389,5 +420,139 @@ mod tests {
     #[test]
     fn test_kmkdev() {
         assert_eq!(kmkdev(8, 1), (8 << 20) | 1);
+    }
+
+    #[test]
+    fn test_find_module_base_address_single_mapping() {
+        let maps = vec![
+            MemoryMapping {
+                start: 0x7f0000000000,
+                end: 0x7f0000100000,
+                perms: "r--p".to_string(),
+                offset: 0,
+                dev_major: 8,
+                dev_minor: 1,
+                inode: 12345,
+                name: "/usr/lib/libpython3.13.so.1.0".to_string(),
+            },
+            MemoryMapping {
+                start: 0x7f0000100000,
+                end: 0x7f0000400000,
+                perms: "r-xp".to_string(),
+                offset: 0x100000,
+                dev_major: 8,
+                dev_minor: 1,
+                inode: 12345,
+                name: "/usr/lib/libpython3.13.so.1.0".to_string(),
+            },
+        ];
+        assert_eq!(
+            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0"),
+            Some(0x7f0000000000)
+        );
+    }
+
+    #[test]
+    fn test_find_module_base_address_stale_mapping() {
+        // Simulates the case where a stale mmap reservation exists at a lower
+        // address, as seen when libpython is loaded alongside a Rust extension.
+        let maps = vec![
+            // Stale read-only mmap at a lower address (from dynamic linker reservation)
+            MemoryMapping {
+                start: 0x7cfa18000000,
+                end: 0x7cfa1a000000,
+                perms: "r--p".to_string(),
+                offset: 0,
+                dev_major: 8,
+                dev_minor: 1,
+                inode: 12345,
+                name: "/usr/lib/libpython3.13.so.1.0".to_string(),
+            },
+            // Correct offset=0 mapping
+            MemoryMapping {
+                start: 0x7cfdaf421000,
+                end: 0x7cfdaf4a0000,
+                perms: "r--p".to_string(),
+                offset: 0,
+                dev_major: 8,
+                dev_minor: 1,
+                inode: 12345,
+                name: "/usr/lib/libpython3.13.so.1.0".to_string(),
+            },
+            // Executable mapping
+            MemoryMapping {
+                start: 0x7cfdaf4a0000,
+                end: 0x7cfdaf7f5000,
+                perms: "r-xp".to_string(),
+                offset: 0x7f000,
+                dev_major: 8,
+                dev_minor: 1,
+                inode: 12345,
+                name: "/usr/lib/libpython3.13.so.1.0".to_string(),
+            },
+            // Data mapping
+            MemoryMapping {
+                start: 0x7cfdaf9a2000,
+                end: 0x7cfdafa23000,
+                perms: "rw-p".to_string(),
+                offset: 0x580000,
+                dev_major: 8,
+                dev_minor: 1,
+                inode: 12345,
+                name: "/usr/lib/libpython3.13.so.1.0".to_string(),
+            },
+        ];
+        // Should compute base from exec mapping: 0x7cfdaf4a0000 - 0x7f000 = 0x7cfdaf421000
+        assert_eq!(
+            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0"),
+            Some(0x7cfdaf421000)
+        );
+    }
+
+    #[test]
+    fn test_find_module_base_address_no_exec_mapping() {
+        // Fallback: if no executable mapping exists, use the last offset=0 mapping
+        let maps = vec![
+            MemoryMapping {
+                start: 0x7f0000000000,
+                end: 0x7f0000100000,
+                perms: "r--p".to_string(),
+                offset: 0,
+                dev_major: 8,
+                dev_minor: 1,
+                inode: 12345,
+                name: "/usr/lib/libpython3.13.so.1.0".to_string(),
+            },
+            MemoryMapping {
+                start: 0x7f0000200000,
+                end: 0x7f0000300000,
+                perms: "r--p".to_string(),
+                offset: 0,
+                dev_major: 8,
+                dev_minor: 1,
+                inode: 12345,
+                name: "/usr/lib/libpython3.13.so.1.0".to_string(),
+            },
+        ];
+        // Should use the last offset=0 mapping
+        assert_eq!(
+            find_module_base_address(&maps, "/usr/lib/libpython3.13.so.1.0"),
+            Some(0x7f0000200000)
+        );
+    }
+
+    #[test]
+    fn test_find_module_base_address_no_match() {
+        let maps = vec![MemoryMapping {
+            start: 0x7f0000000000,
+            end: 0x7f0000100000,
+            perms: "r-xp".to_string(),
+            offset: 0x1000,
+            dev_major: 8,
+            dev_minor: 1,
+            inode: 12345,
+            name: "/usr/lib/libpython3.13.so.1.0".to_string(),
+        }];
+        assert_eq!(find_module_base_address(&maps, "/nonexistent.so"), None);
     }
 }

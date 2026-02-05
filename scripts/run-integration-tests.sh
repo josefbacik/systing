@@ -8,7 +8,7 @@
 #   ./scripts/run-integration-tests.sh                    # Run all ignored tests
 #   ./scripts/run-integration-tests.sh trace_validation   # Specify test name
 #   ./scripts/run-integration-tests.sh trace_validation test_e2e_parquet_validation  # Run specific test
-#   CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh  # With features
+#   CARGO_FEATURES=generate-vmlinux-header ./scripts/run-integration-tests.sh  # With extra features
 
 set -euo pipefail
 

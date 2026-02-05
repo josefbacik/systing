@@ -41,8 +41,6 @@ Integration tests require root/BPF privileges and are marked as `#[ignore]` by d
 # Run a specific test
 ./scripts/run-integration-tests.sh trace_validation test_e2e_parquet_validation
 
-# Run with pystacks feature
-CARGO_FEATURES=pystacks ./scripts/run-integration-tests.sh
 ```
 
 The script builds as your user (preserving artifact ownership), then runs only the test binary with sudo.
@@ -79,7 +77,7 @@ This will display all available recorders and their default states:
 - `interruptible-stacks` - Interruptible sleep stack traces (on by default, requires sleep-stacks)
 - `cpu-stacks` - CPU perf stack traces (on by default)
 - `network` - Network traffic recording (TCP/UDP send/receive and packet-level latency)
-- `pystacks` - Python stack tracing (requires pystacks feature)
+- `pystacks` - Python stack tracing
 
 Note: `sleep-stacks` acts as a master switch for all sleep stack collection. When enabled,
 both uninterruptible (D state) and interruptible (S state) sleep stacks are collected by

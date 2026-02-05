@@ -138,8 +138,7 @@ pub struct RecorderInfo {
 
 /// Get list of all available recorders.
 pub fn get_available_recorders() -> Vec<RecorderInfo> {
-    #[allow(unused_mut)]
-    let mut recorders = vec![
+    vec![
         RecorderInfo {
             name: "sched",
             description: "Scheduler event tracing",
@@ -170,16 +169,12 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             description: "Network traffic recording",
             default_enabled: false,
         },
-    ];
-
-    #[cfg(feature = "pystacks")]
-    recorders.push(RecorderInfo {
-        name: "pystacks",
-        description: "Python stack tracing",
-        default_enabled: false,
-    });
-
-    recorders
+        RecorderInfo {
+            name: "pystacks",
+            description: "Python stack tracing",
+            default_enabled: false,
+        },
+    ]
 }
 
 /// Validate that recorder names are valid.
@@ -237,13 +232,10 @@ pub struct Config {
     /// Continuous mode duration in seconds (0 = disabled)
     pub continuous: u64,
     /// Collect Python stack traces
-    #[cfg(feature = "pystacks")]
     pub collect_pystacks: bool,
     /// Explicit PIDs for pystacks (bypasses auto-discovery)
-    #[cfg(feature = "pystacks")]
     pub pystacks_pids: Vec<u32>,
     /// Enable debug output for pystacks
-    #[cfg(feature = "pystacks")]
     pub pystacks_debug: bool,
     /// Enable debuginfod for symbol resolution
     pub enable_debuginfod: bool,
@@ -284,11 +276,8 @@ impl Default for Config {
             no_interruptible_stack_traces: false,
             trace_event_config: Vec::new(),
             continuous: 0,
-            #[cfg(feature = "pystacks")]
             collect_pystacks: false,
-            #[cfg(feature = "pystacks")]
             pystacks_pids: Vec::new(),
-            #[cfg(feature = "pystacks")]
             pystacks_debug: false,
             enable_debuginfod: false,
             no_sched: false,
@@ -421,14 +410,12 @@ unsafe impl Plain for arg_desc_array {}
 
 /// BPF exec event - delivered via dedicated ringbuf when a traced process execs.
 /// Used to dynamically discover Python PIDs for pystacks.
-#[cfg(feature = "pystacks")]
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 #[allow(non_camel_case_types)]
 struct exec_event {
     pid: u32,
 }
-#[cfg(feature = "pystacks")]
 unsafe impl Plain for exec_event {}
 
 /// Trait for events that can be recorded in a ring buffer.
@@ -504,14 +491,7 @@ impl SystingEvent for stack_event {
         Some(&self.task)
     }
     fn has_pystack(&self) -> bool {
-        #[cfg(feature = "pystacks")]
-        {
-            self.py_msg_buffer.stack_len > 0
-        }
-        #[cfg(not(feature = "pystacks"))]
-        {
-            false
-        }
+        self.py_msg_buffer.stack_len > 0
     }
 }
 
@@ -637,7 +617,6 @@ struct RecorderChannels {
     network_rx: Receiver<network_event>,
     packet_rx: Receiver<packet_event>,
     epoll_rx: Receiver<epoll_event_bpf>,
-    #[cfg(feature = "pystacks")]
     exec_event_rx: Option<Receiver<exec_event>>,
 }
 
@@ -1003,7 +982,6 @@ fn resolve_library_path_for_pid(pid: u32, lib_name: &str) -> Option<String> {
 }
 
 /// Convenience function to discover all Python processes by checking their main executable.
-#[cfg(feature = "pystacks")]
 fn discover_python_processes(debug: bool) -> Vec<u32> {
     use std::io::{BufRead, BufReader};
 
@@ -1111,7 +1089,6 @@ fn discover_python_processes(debug: bool) -> Vec<u32> {
 /// When a traced process execs into a pyenv launcher (e.g., forkapple's `fa`), scans
 /// /proc for all Python processes since the actual Python workers may be outside the
 /// traced process tree (pre-forked by a server like forkapple).
-#[cfg(feature = "pystacks")]
 fn handle_exec_events(
     exec_rx: Receiver<exec_event>,
     psr: Arc<crate::pystacks::stack_walker::StackWalkerRun>,
@@ -1311,7 +1288,7 @@ fn setup_ringbuffers<'a>(
     skel: &SystingSystemSkel,
     opts: &Config,
     perf_counter_names: &[String],
-    _collect_pystacks: bool,
+    collect_pystacks: bool,
 ) -> Result<(Vec<(String, libbpf_rs::RingBuffer<'a>)>, RecorderChannels)> {
     let mut rings = Vec::new();
     let (event_tx, event_rx) = channel();
@@ -1321,9 +1298,7 @@ fn setup_ringbuffers<'a>(
     let (network_tx, network_rx) = channel();
     let (packet_tx, packet_rx) = channel();
     let (epoll_tx, epoll_rx) = channel();
-    #[cfg(feature = "pystacks")]
     let (exec_tx, exec_rx) = channel();
-    #[cfg(feature = "pystacks")]
     let mut has_exec_ringbuf = false;
 
     let object = skel.object();
@@ -1356,8 +1331,7 @@ fn setup_ringbuffers<'a>(
         }
     }
 
-    #[cfg(feature = "pystacks")]
-    if _collect_pystacks {
+    if collect_pystacks {
         for map in object.maps() {
             if map.name().to_str().unwrap() == "ringbuf_exec_events" {
                 let ring = create_ring::<exec_event>(&map, exec_tx.clone())?;
@@ -1368,7 +1342,6 @@ fn setup_ringbuffers<'a>(
         }
     }
 
-    #[cfg(feature = "pystacks")]
     let exec_event_rx = if has_exec_ringbuf {
         Some(exec_rx)
     } else {
@@ -1383,7 +1356,6 @@ fn setup_ringbuffers<'a>(
         network_rx,
         packet_rx,
         epoll_rx,
-        #[cfg(feature = "pystacks")]
         exec_event_rx,
     };
 
@@ -1418,7 +1390,6 @@ fn warn_failed_probe_attachments(skel: &SystingSystemSkel) {
             "systing_sched_waking" => skel.links.systing_sched_waking.is_none(),
             "systing_sched_process_exit" => skel.links.systing_sched_process_exit.is_none(),
             "systing_sched_process_fork" => skel.links.systing_sched_process_fork.is_none(),
-            #[cfg(feature = "pystacks")]
             "systing_sched_process_exec" => skel.links.systing_sched_process_exec.is_none(),
             // IRQ probes
             "systing_irq_handler_entry" => skel.links.systing_irq_handler_entry.is_none(),
@@ -1628,15 +1599,11 @@ fn configure_bpf_skeleton(
 
     // Only load exec tracepoint when pystacks is enabled with PID filtering.
     // This delivers exec events so userspace can dynamically add Python PIDs.
-    #[cfg(feature = "pystacks")]
-    {
-        let load_exec = collect_pystacks && !opts.pid.is_empty();
-        if !load_exec {
-            open_skel
-                .progs
-                .systing_sched_process_exec
-                .set_autoload(false);
-        }
+    if !collect_pystacks || opts.pid.is_empty() {
+        open_skel
+            .progs
+            .systing_sched_process_exec
+            .set_autoload(false);
     }
 
     // Only load syscall tracepoints when syscall tracing is enabled OR marker events are configured
@@ -2358,9 +2325,6 @@ pub fn systing(
             skel_builder.obj_builder.debug(true);
         }
 
-        #[cfg(not(feature = "pystacks"))] // set to false when feature is off
-        let collect_pystacks = false;
-        #[cfg(feature = "pystacks")] // use option value if feature is on
         let collect_pystacks = opts.collect_pystacks;
 
         let mut open_object = MaybeUninit::uninit();
@@ -2450,7 +2414,6 @@ pub fn systing(
         // Initialize pystacks for the non-run-command case (normal path).
         // When tracing a run command, pystacks init is deferred until after the
         // child has exec'd (so /proc/PID/exe points to the real Python binary).
-        #[cfg(feature = "pystacks")]
         if collect_pystacks && traced_child.is_none() {
             let pystacks_debug = opts.pystacks_debug;
 
@@ -2513,14 +2476,9 @@ pub fn systing(
             );
         }
 
-        #[cfg(not(feature = "pystacks"))]
-        let (rings, channels) =
-            setup_ringbuffers(&skel, &opts, &perf_counter_names, collect_pystacks)?;
-        #[cfg(feature = "pystacks")]
         let (rings, mut channels) =
             setup_ringbuffers(&skel, &opts, &perf_counter_names, collect_pystacks)?;
         // Take exec_event_rx out before channels is moved into spawn_recorder_threads
-        #[cfg(feature = "pystacks")]
         let exec_event_rx = channels.exec_event_rx.take();
 
         // Create shutdown signal for receiver threads
@@ -2583,7 +2541,6 @@ pub fn systing(
         // processes in that case, but the library is still initialized correctly.
         // The symbol loader thread below handles adding PIDs when they later
         // exec into Python.
-        #[cfg(feature = "pystacks")]
         if collect_pystacks && traced_child.is_some() {
             let pystacks_debug = opts.pystacks_debug;
             // Use all PIDs in the filter (includes child PID + any --pid args)
@@ -2615,9 +2572,7 @@ pub fn systing(
 
         // Spawn exec event handler thread to dynamically add Python PIDs.
         // See handle_exec_events() for details.
-        #[cfg(feature = "pystacks")]
         let mut exec_handler_thread: Option<thread::JoinHandle<()>> = None;
-        #[cfg(feature = "pystacks")]
         if let Some(exec_rx) = exec_event_rx {
             let exec_psr = psr.clone();
             let pystacks_debug = opts.pystacks_debug;
@@ -2717,8 +2672,6 @@ pub fn systing(
             );
         }
 
-        #[cfg(not(feature = "pystacks"))]
-        let exec_handler_thread: Option<thread::JoinHandle<()>> = None;
         let handles = ThreadHandles {
             ringbuf_threads,
             sysinfo_thread,

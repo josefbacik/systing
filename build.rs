@@ -49,7 +49,6 @@ fn detect_multiarch_include() -> Option<String> {
         .map(|t| format!("-I/usr/include/{t}"))
 }
 
-#[cfg(feature = "pystacks")]
 fn build_pystacks_bpf(out_dir: &Path, multiarch_include: &Option<String>) {
     let bpf_include_arg = format!(
         "-I{}",
@@ -118,9 +117,6 @@ fn build_pystacks_bpf(out_dir: &Path, multiarch_include: &Option<String>) {
     }
 }
 
-#[cfg(not(feature = "pystacks"))]
-fn build_pystacks_bpf(_: &Path, _: &Option<String>) {}
-
 #[cfg(not(feature = "generate-vmlinux-header"))]
 fn generate_vmlinux_header() {}
 
@@ -151,7 +147,7 @@ fn main() {
     // Detect multiarch include path once for all BPF compilations
     let multiarch_include = detect_multiarch_include();
 
-    // Build pystacks BPF object (when feature enabled)
+    // Build pystacks BPF object
     build_pystacks_bpf(&out_dir, &multiarch_include);
 
     let include_arg = format!("-I{}", out_dir.display());
@@ -160,6 +156,20 @@ fn main() {
         Path::new("src/bpf")
             .canonicalize()
             .expect("src directory exists")
+            .display()
+    );
+    let pystacks_inc_arg = format!(
+        "-I{}",
+        Path::new("src/pystacks/bpf/include")
+            .canonicalize()
+            .expect("pystacks bpf include dir exists")
+            .display()
+    );
+    let pystacks_bpf_arg = format!(
+        "-I{}",
+        Path::new("src/pystacks/bpf")
+            .canonicalize()
+            .expect("pystacks bpf dir exists")
             .display()
     );
     for src in SRC {
@@ -171,42 +181,17 @@ fn main() {
         };
         let obj_path = out_dir.join(format!("{prefix}_tmp.bpf.o"));
 
-        // allow mut for feature pystacks
-        #[allow(unused_mut)]
         let mut clang_args = vec![
             OsStr::new(&bpf_include_arg),
             OsStr::new(&include_arg),
             OsStr::new("-D__x86_64__"),
+            OsStr::new("-DSYSTING_PYSTACKS"),
+            OsStr::new(&pystacks_inc_arg),
+            OsStr::new(&pystacks_bpf_arg),
         ];
 
         if let Some(ref include_path) = multiarch_include {
             clang_args.push(OsStr::new(include_path));
-        }
-
-        #[cfg(feature = "pystacks")]
-        {
-            clang_args.push(OsStr::new("-DSYSTING_PYSTACKS"));
-
-            let pystacks_inc = format!(
-                "-I{}",
-                Path::new("src/pystacks/bpf/include")
-                    .canonicalize()
-                    .expect("pystacks bpf include dir exists")
-                    .display()
-            );
-            // Leak the string so OsStr can reference it for the clang_args lifetime
-            let pystacks_inc: &'static str = Box::leak(pystacks_inc.into_boxed_str());
-            clang_args.push(OsStr::new(pystacks_inc));
-
-            let pystacks_bpf = format!(
-                "-I{}",
-                Path::new("src/pystacks/bpf")
-                    .canonicalize()
-                    .expect("pystacks bpf dir exists")
-                    .display()
-            );
-            let pystacks_bpf: &'static str = Box::leak(pystacks_bpf.into_boxed_str());
-            clang_args.push(OsStr::new(pystacks_bpf));
         }
 
         SkeletonBuilder::new()
@@ -227,7 +212,6 @@ fn main() {
         .add_file(out_dir.join("systing_system_tmp.bpf.o"))
         .expect("Failed to add systing_system BPF object");
 
-    #[cfg(feature = "pystacks")]
     linker
         .add_file(out_dir.join("pystacks.bpf.o"))
         .expect("Failed to add pystacks BPF object");
