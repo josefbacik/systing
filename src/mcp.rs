@@ -16,6 +16,7 @@ use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -23,17 +24,16 @@ use tokio::sync::{mpsc, oneshot};
 // -- Database thread communication --
 
 enum DbRequest {
-    OpenDatabase(PathBuf),
-    Query(String),
-    ListTables,
-    DescribeTable(String),
-    Flamegraph(FlamegraphParams),
-    SchedStats(SchedStatsParams),
-    CpuStats(CpuStatsParams),
-    TraceInfo,
-    NetworkConnections(NetworkConnectionsParams),
-    NetworkInterfaces(NetworkInterfacesParams),
-    NetworkSocketPairs(NetworkSocketPairsParams),
+    Query(Option<PathBuf>, String),
+    ListTables(Option<PathBuf>),
+    DescribeTable(Option<PathBuf>, String),
+    Flamegraph(Option<PathBuf>, FlamegraphParams),
+    SchedStats(Option<PathBuf>, SchedStatsParams),
+    CpuStats(Option<PathBuf>, CpuStatsParams),
+    TraceInfo(Option<PathBuf>),
+    NetworkConnections(Option<PathBuf>, NetworkConnectionsParams),
+    NetworkInterfaces(Option<PathBuf>, NetworkInterfacesParams),
+    NetworkSocketPairs(Option<PathBuf>, NetworkSocketPairsParams),
 }
 
 type DbResponse = std::result::Result<serde_json::Value, String>;
@@ -50,17 +50,24 @@ impl DbHandle {
         let (sender, mut receiver) = mpsc::channel::<(DbRequest, oneshot::Sender<DbResponse>)>(32);
 
         std::thread::spawn(move || {
-            let mut db: Option<AnalyzeDb> =
-                initial_db.and_then(|p| match AnalyzeDb::open(&p, true) {
-                    Ok(db) => Some(db),
-                    Err(e) => {
-                        eprintln!("Warning: failed to open initial database: {e}");
-                        None
-                    }
-                });
+            let mut dbs: HashMap<PathBuf, AnalyzeDb> = HashMap::new();
+            let mut last_used: Option<PathBuf> = None;
+
+            if let Some(path) = initial_db {
+                match std::fs::canonicalize(&path) {
+                    Ok(canonical) => match AnalyzeDb::open(&canonical, true) {
+                        Ok(db) => {
+                            dbs.insert(canonical.clone(), db);
+                            last_used = Some(canonical);
+                        }
+                        Err(e) => eprintln!("Warning: failed to open initial database: {e}"),
+                    },
+                    Err(e) => eprintln!("Warning: cannot resolve path '{}': {e}", path.display()),
+                }
+            }
 
             while let Some((request, reply)) = receiver.blocking_recv() {
-                let result = handle_db_request(&mut db, request);
+                let result = handle_db_request(&mut dbs, &mut last_used, request);
                 let _ = reply.send(result);
             }
         });
@@ -81,72 +88,133 @@ impl DbHandle {
     }
 }
 
+const MAX_CACHED_DBS: usize = 8;
+
+fn get_or_open<'a>(
+    dbs: &'a mut HashMap<PathBuf, AnalyzeDb>,
+    last_used: &mut Option<PathBuf>,
+    path: Option<PathBuf>,
+) -> Result<&'a AnalyzeDb, String> {
+    let raw_path = match path {
+        Some(p) => p,
+        None => last_used.clone().ok_or_else(|| {
+            "No database path provided and no database has been used yet. \
+             Pass a 'path' parameter."
+                .to_string()
+        })?,
+    };
+
+    let canonical = std::fs::canonicalize(&raw_path)
+        .map_err(|e| format!("Cannot resolve path '{}': {e}", raw_path.display()))?;
+
+    if !dbs.contains_key(&canonical) {
+        if dbs.len() >= MAX_CACHED_DBS {
+            // Keep the last-used database, evict the rest.
+            let kept = last_used.as_ref().and_then(|k| {
+                let db = dbs.remove(k)?;
+                Some((k.clone(), db))
+            });
+            dbs.clear();
+            if let Some((k, db)) = kept {
+                dbs.insert(k, db);
+            }
+        }
+        let db = AnalyzeDb::open(&canonical, true)
+            .map_err(|e| format!("Failed to open database '{}': {e}", canonical.display()))?;
+        dbs.insert(canonical.clone(), db);
+    }
+
+    let db_ref = dbs.get(&canonical).unwrap();
+    *last_used = Some(canonical);
+    Ok(db_ref)
+}
+
 /// Process a single database request on the DB thread.
-fn handle_db_request(db: &mut Option<AnalyzeDb>, request: DbRequest) -> DbResponse {
+fn handle_db_request(
+    dbs: &mut HashMap<PathBuf, AnalyzeDb>,
+    last_used: &mut Option<PathBuf>,
+    request: DbRequest,
+) -> DbResponse {
     match request {
-        DbRequest::OpenDatabase(path) => match AnalyzeDb::open(&path, true) {
-            Ok(new_db) => {
-                let info = new_db.trace_info();
-                *db = Some(new_db);
-                match info {
-                    Ok(info) => {
-                        serde_json::to_value(info).map_err(|e| format!("Serialization error: {e}"))
-                    }
-                    Err(e) => Ok(serde_json::json!({
-                        "status": "opened",
-                        "note": format!("Database opened but error getting full info: {e}")
-                    })),
-                }
-            }
-            Err(e) => Err(format!("Failed to open database: {e}")),
-        },
-        _ => {
-            let Some(db) = db.as_ref() else {
-                return Err("No database is open. Use the open_database tool first.".to_string());
-            };
-            match request {
-                DbRequest::Query(sql) => db
-                    .query(&sql)
-                    .map(|r| serde_json::to_value(r).unwrap_or_default())
-                    .map_err(|e| format!("Query error: {e}")),
-                DbRequest::ListTables => db
-                    .list_tables()
-                    .map(|r| serde_json::to_value(r).unwrap_or_default())
-                    .map_err(|e| format!("Error listing tables: {e}")),
-                DbRequest::DescribeTable(name) => db
-                    .describe_table(&name)
-                    .map(|r| serde_json::to_value(r).unwrap_or_default())
-                    .map_err(|e| format!("Error describing table: {e}")),
-                DbRequest::Flamegraph(params) => db
-                    .flamegraph(&params)
-                    .map(|r| serde_json::to_value(r).unwrap_or_default())
-                    .map_err(|e| format!("Flamegraph error: {e}")),
-                DbRequest::SchedStats(params) => db
-                    .sched_stats(&params)
-                    .map(|r| serde_json::to_value(r).unwrap_or_default())
-                    .map_err(|e| format!("Sched stats error: {e}")),
-                DbRequest::CpuStats(params) => db
-                    .cpu_stats(&params)
-                    .map(|r| serde_json::to_value(r).unwrap_or_default())
-                    .map_err(|e| format!("CPU stats error: {e}")),
-                DbRequest::TraceInfo => db
-                    .trace_info()
-                    .map(|r| serde_json::to_value(r).unwrap_or_default())
-                    .map_err(|e| format!("Error getting trace info: {e}")),
-                DbRequest::NetworkConnections(params) => db
-                    .network_connections(&params)
-                    .map(|r| serde_json::to_value(r).unwrap_or_default())
-                    .map_err(|e| format!("Network connections error: {e}")),
-                DbRequest::NetworkInterfaces(params) => db
-                    .network_interfaces(&params)
-                    .map(|r| serde_json::to_value(r).unwrap_or_default())
-                    .map_err(|e| format!("Network interfaces error: {e}")),
-                DbRequest::NetworkSocketPairs(params) => db
-                    .network_socket_pairs(&params)
-                    .map(|r| serde_json::to_value(r).unwrap_or_default())
-                    .map_err(|e| format!("Network socket pairs error: {e}")),
-                DbRequest::OpenDatabase(_) => unreachable!(),
-            }
+        DbRequest::Query(path, sql) => {
+            let db = get_or_open(dbs, last_used, path)?;
+            db.query(&sql)
+                .and_then(|r| {
+                    serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
+                })
+                .map_err(|e| format!("Query error: {e}"))
+        }
+        DbRequest::ListTables(path) => {
+            let db = get_or_open(dbs, last_used, path)?;
+            db.list_tables()
+                .and_then(|r| {
+                    serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
+                })
+                .map_err(|e| format!("Error listing tables: {e}"))
+        }
+        DbRequest::DescribeTable(path, name) => {
+            let db = get_or_open(dbs, last_used, path)?;
+            db.describe_table(&name)
+                .and_then(|r| {
+                    serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
+                })
+                .map_err(|e| format!("Error describing table: {e}"))
+        }
+        DbRequest::Flamegraph(path, params) => {
+            let db = get_or_open(dbs, last_used, path)?;
+            db.flamegraph(&params)
+                .and_then(|r| {
+                    serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
+                })
+                .map_err(|e| format!("Flamegraph error: {e}"))
+        }
+        DbRequest::SchedStats(path, params) => {
+            let db = get_or_open(dbs, last_used, path)?;
+            db.sched_stats(&params)
+                .and_then(|r| {
+                    serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
+                })
+                .map_err(|e| format!("Sched stats error: {e}"))
+        }
+        DbRequest::CpuStats(path, params) => {
+            let db = get_or_open(dbs, last_used, path)?;
+            db.cpu_stats(&params)
+                .and_then(|r| {
+                    serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
+                })
+                .map_err(|e| format!("CPU stats error: {e}"))
+        }
+        DbRequest::TraceInfo(path) => {
+            let db = get_or_open(dbs, last_used, path)?;
+            db.trace_info()
+                .and_then(|r| {
+                    serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
+                })
+                .map_err(|e| format!("Error getting trace info: {e}"))
+        }
+        DbRequest::NetworkConnections(path, params) => {
+            let db = get_or_open(dbs, last_used, path)?;
+            db.network_connections(&params)
+                .and_then(|r| {
+                    serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
+                })
+                .map_err(|e| format!("Network connections error: {e}"))
+        }
+        DbRequest::NetworkInterfaces(path, params) => {
+            let db = get_or_open(dbs, last_used, path)?;
+            db.network_interfaces(&params)
+                .and_then(|r| {
+                    serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
+                })
+                .map_err(|e| format!("Network interfaces error: {e}"))
+        }
+        DbRequest::NetworkSocketPairs(path, params) => {
+            let db = get_or_open(dbs, last_used, path)?;
+            db.network_socket_pairs(&params)
+                .and_then(|r| {
+                    serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
+                })
+                .map_err(|e| format!("Network socket pairs error: {e}"))
         }
     }
 }
@@ -245,25 +313,34 @@ mod string_or_number {
 // -- Tool parameter types --
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct OpenDatabaseParams {
-    /// Absolute path to a .duckdb trace database file.
-    path: String,
+struct DatabasePathParams {
+    /// Absolute path to a .duckdb trace database file. If omitted, uses the most recently accessed database.
+    path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct QueryParams {
+    /// Absolute path to a .duckdb trace database file. If omitted, uses the most recently accessed database.
+    path: Option<String>,
+
     /// SQL query to execute. The database is opened read-only, so DML/DDL will fail.
     sql: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct DescribeTableParams {
+    /// Absolute path to a .duckdb trace database file. If omitted, uses the most recently accessed database.
+    path: Option<String>,
+
     /// Name of the table to describe.
     table_name: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct FlamegraphToolParams {
+    /// Absolute path to a .duckdb trace database file. If omitted, uses the most recently accessed database.
+    path: Option<String>,
+
     /// Stack type filter: "cpu", "interruptible-sleep", "uninterruptible-sleep",
     /// "all-sleep", or "all". Defaults to "cpu".
     stack_type: Option<String>,
@@ -300,6 +377,9 @@ struct FlamegraphToolParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SchedStatsToolParams {
+    /// Absolute path to a .duckdb trace database file. If omitted, uses the most recently accessed database.
+    path: Option<String>,
+
     /// Filter to a specific process ID.
     #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     pid: Option<u32>,
@@ -318,12 +398,18 @@ struct SchedStatsToolParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CpuStatsToolParams {
+    /// Absolute path to a .duckdb trace database file. If omitted, uses the most recently accessed database.
+    path: Option<String>,
+
     /// Filter to a specific trace ID (for multi-trace databases).
     trace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct NetworkConnectionsToolParams {
+    /// Absolute path to a .duckdb trace database file. If omitted, uses the most recently accessed database.
+    path: Option<String>,
+
     /// Filter to a specific trace ID (for multi-trace databases).
     trace_id: Option<String>,
 
@@ -342,12 +428,18 @@ struct NetworkConnectionsToolParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct NetworkInterfacesToolParams {
+    /// Absolute path to a .duckdb trace database file. If omitted, uses the most recently accessed database.
+    path: Option<String>,
+
     /// Filter to a specific trace ID (for multi-trace databases).
     trace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct NetworkSocketPairsToolParams {
+    /// Absolute path to a .duckdb trace database file. If omitted, uses the most recently accessed database.
+    path: Option<String>,
+
     /// Filter to a specific trace ID. Shows pairs where at least one side is in this trace.
     trace_id: Option<String>,
 
@@ -398,29 +490,15 @@ impl SystingMcpServer {
     }
 
     #[tool(
-        name = "open_database",
-        description = "Open a DuckDB trace database for analysis. Replaces any previously opened database. The database is opened read-only. Returns basic info about the database contents including table counts, trace IDs, total process count, and the top 25 processes by thread count. Use the query tool to explore the full process list if needed."
-    )]
-    async fn open_database(
-        &self,
-        Parameters(params): Parameters<OpenDatabaseParams>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        let path = PathBuf::from(&params.path);
-        match self.db.request(DbRequest::OpenDatabase(path)).await {
-            Ok(value) => Ok(make_tool_result(value)),
-            Err(e) => Ok(make_error_result(&e)),
-        }
-    }
-
-    #[tool(
         name = "query",
-        description = "Execute a read-only SQL query against the open trace database. Returns JSON with 'columns' (array of column names), 'rows' (array of arrays with properly typed values — numbers as numbers, not strings), and 'row_count'. Results are capped at 10,000 rows; if truncated, includes 'truncated: true' and 'total_row_count'. Use SQL LIMIT/OFFSET for pagination. The database is read-only, so INSERT/UPDATE/DELETE will fail."
+        description = "Execute a read-only SQL query against a trace database. Returns JSON with 'columns' (array of column names), 'rows' (array of arrays with properly typed values — numbers as numbers, not strings), and 'row_count'. Results are capped at 10,000 rows; if truncated, includes 'truncated: true' and 'total_row_count'. Use SQL LIMIT/OFFSET for pagination. The database is read-only, so INSERT/UPDATE/DELETE will fail."
     )]
     async fn query(
         &self,
         Parameters(params): Parameters<QueryParams>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        match self.db.request(DbRequest::Query(params.sql)).await {
+        let path = params.path.map(PathBuf::from);
+        match self.db.request(DbRequest::Query(path, params.sql)).await {
             Ok(value) => Ok(make_tool_result(value)),
             Err(e) => Ok(make_error_result(&e)),
         }
@@ -428,10 +506,14 @@ impl SystingMcpServer {
 
     #[tool(
         name = "list_tables",
-        description = "List all tables in the open database with their row counts."
+        description = "List all tables in the database with their row counts."
     )]
-    async fn list_tables(&self) -> std::result::Result<CallToolResult, McpError> {
-        match self.db.request(DbRequest::ListTables).await {
+    async fn list_tables(
+        &self,
+        Parameters(params): Parameters<DatabasePathParams>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let path = params.path.map(PathBuf::from);
+        match self.db.request(DbRequest::ListTables(path)).await {
             Ok(value) => Ok(make_tool_result(value)),
             Err(e) => Ok(make_error_result(&e)),
         }
@@ -439,15 +521,16 @@ impl SystingMcpServer {
 
     #[tool(
         name = "describe_table",
-        description = "Get column names and types for a specific table in the open database."
+        description = "Get column names and types for a specific table in the database."
     )]
     async fn describe_table(
         &self,
         Parameters(params): Parameters<DescribeTableParams>,
     ) -> std::result::Result<CallToolResult, McpError> {
+        let path = params.path.map(PathBuf::from);
         match self
             .db
-            .request(DbRequest::DescribeTable(params.table_name))
+            .request(DbRequest::DescribeTable(path, params.table_name))
             .await
         {
             Ok(value) => Ok(make_tool_result(value)),
@@ -463,6 +546,7 @@ impl SystingMcpServer {
         &self,
         Parameters(params): Parameters<FlamegraphToolParams>,
     ) -> std::result::Result<CallToolResult, McpError> {
+        let path = params.path.map(PathBuf::from);
         let stack_type_str = params.stack_type.as_deref().unwrap_or("cpu");
         let stack_type = match stack_type_str.parse::<StackTypeFilter>() {
             Ok(st) => st,
@@ -480,7 +564,11 @@ impl SystingMcpServer {
             top_n: params.top_n.unwrap_or(500),
         };
 
-        match self.db.request(DbRequest::Flamegraph(fg_params)).await {
+        match self
+            .db
+            .request(DbRequest::Flamegraph(path, fg_params))
+            .await
+        {
             Ok(value) => Ok(make_tool_result(value)),
             Err(e) => Ok(make_error_result(&e)),
         }
@@ -488,10 +576,14 @@ impl SystingMcpServer {
 
     #[tool(
         name = "trace_info",
-        description = "Get metadata about the open trace database: database path, trace IDs, time range (in nanoseconds and seconds), non-empty tables with row counts, total process count, and the top 25 processes by thread count. Use the query tool to explore the full process list if needed."
+        description = "Get metadata about a trace database: database path, trace IDs, time range (in nanoseconds and seconds), non-empty tables with row counts, total process count, and the top 25 processes by thread count. Use the query tool to explore the full process list if needed."
     )]
-    async fn trace_info(&self) -> std::result::Result<CallToolResult, McpError> {
-        match self.db.request(DbRequest::TraceInfo).await {
+    async fn trace_info(
+        &self,
+        Parameters(params): Parameters<DatabasePathParams>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let path = params.path.map(PathBuf::from);
+        match self.db.request(DbRequest::TraceInfo(path)).await {
             Ok(value) => Ok(make_tool_result(value)),
             Err(e) => Ok(make_error_result(&e)),
         }
@@ -505,6 +597,7 @@ impl SystingMcpServer {
         &self,
         Parameters(params): Parameters<SchedStatsToolParams>,
     ) -> std::result::Result<CallToolResult, McpError> {
+        let path = params.path.map(PathBuf::from);
         if params.pid.is_some() && params.tid.is_some() {
             return Ok(make_error_result(
                 "pid and tid are mutually exclusive. Provide one or neither.",
@@ -518,7 +611,11 @@ impl SystingMcpServer {
             top_n: params.top_n.unwrap_or(20),
         };
 
-        match self.db.request(DbRequest::SchedStats(sched_params)).await {
+        match self
+            .db
+            .request(DbRequest::SchedStats(path, sched_params))
+            .await
+        {
             Ok(value) => Ok(make_tool_result(value)),
             Err(e) => Ok(make_error_result(&e)),
         }
@@ -532,11 +629,12 @@ impl SystingMcpServer {
         &self,
         Parameters(params): Parameters<CpuStatsToolParams>,
     ) -> std::result::Result<CallToolResult, McpError> {
+        let path = params.path.map(PathBuf::from);
         let cpu_params = CpuStatsParams {
             trace_id: params.trace_id,
         };
 
-        match self.db.request(DbRequest::CpuStats(cpu_params)).await {
+        match self.db.request(DbRequest::CpuStats(path, cpu_params)).await {
             Ok(value) => Ok(make_tool_result(value)),
             Err(e) => Ok(make_error_result(&e)),
         }
@@ -550,6 +648,7 @@ impl SystingMcpServer {
         &self,
         Parameters(params): Parameters<NetworkConnectionsToolParams>,
     ) -> std::result::Result<CallToolResult, McpError> {
+        let path = params.path.map(PathBuf::from);
         if params.pid.is_some() && params.tid.is_some() {
             return Ok(make_error_result(
                 "pid and tid are mutually exclusive. Provide one or neither.",
@@ -565,7 +664,7 @@ impl SystingMcpServer {
 
         match self
             .db
-            .request(DbRequest::NetworkConnections(nc_params))
+            .request(DbRequest::NetworkConnections(path, nc_params))
             .await
         {
             Ok(value) => Ok(make_tool_result(value)),
@@ -581,13 +680,14 @@ impl SystingMcpServer {
         &self,
         Parameters(params): Parameters<NetworkInterfacesToolParams>,
     ) -> std::result::Result<CallToolResult, McpError> {
+        let path = params.path.map(PathBuf::from);
         let ni_params = NetworkInterfacesParams {
             trace_id: params.trace_id,
         };
 
         match self
             .db
-            .request(DbRequest::NetworkInterfaces(ni_params))
+            .request(DbRequest::NetworkInterfaces(path, ni_params))
             .await
         {
             Ok(value) => Ok(make_tool_result(value)),
@@ -603,6 +703,7 @@ impl SystingMcpServer {
         &self,
         Parameters(params): Parameters<NetworkSocketPairsToolParams>,
     ) -> std::result::Result<CallToolResult, McpError> {
+        let path = params.path.map(PathBuf::from);
         let nsp_params = NetworkSocketPairsParams {
             trace_id: params.trace_id,
             dest_port: params.dest_port,
@@ -613,7 +714,7 @@ impl SystingMcpServer {
 
         match self
             .db
-            .request(DbRequest::NetworkSocketPairs(nsp_params))
+            .request(DbRequest::NetworkSocketPairs(path, nsp_params))
             .await
         {
             Ok(value) => Ok(make_tool_result(value)),
@@ -651,27 +752,30 @@ network activity, and performance counters. Traces are stored in DuckDB database
 - Tables are linked by trace_id (for multi-trace databases).
 
 # Recommended workflow
-1. open_database — Open a trace .duckdb file (required first step).
-2. trace_info — Get overview: traces, time range, tables, processes.
-3. list_tables — See all tables and row counts.
-4. describe_table — Get column names and types for a table of interest.
-5. query — Run SQL queries. Results are capped at 10,000 rows; \
+All tools accept an optional `path` parameter pointing to a .duckdb trace database file. \
+The database is opened automatically on first use and cached for subsequent calls. \
+If `path` is omitted, the most recently accessed database is used.
+1. trace_info \u{2014} Get overview: traces, time range, tables, processes. \
+   Good first call with a new database path.
+2. list_tables \u{2014} See all tables and row counts.
+3. describe_table \u{2014} Get column names and types for a table of interest.
+4. query \u{2014} Run SQL queries. Results are capped at 10,000 rows; \
    use SQL LIMIT/OFFSET for larger result sets.
-6. flamegraph — Structured stack trace analysis with filtering.
-7. sched_stats — Scheduling timing statistics. Shows CPU time, event counts, \
+5. flamegraph \u{2014} Structured stack trace analysis with filtering.
+6. sched_stats \u{2014} Scheduling timing statistics. Shows CPU time, event counts, \
    slice durations, preemption rates, and CPU migrations. Three modes: \
    no filter = whole-trace with per-process ranking, \
    pid = process detail with per-thread breakdown, \
    tid = single thread detail with end-state distribution.
-8. cpu_stats — Per-CPU scheduling statistics. Shows utilization, idle%, \
+7. cpu_stats \u{2014} Per-CPU scheduling statistics. Shows utilization, idle%, \
    thread count, IRQ/softIRQ time, and runqueue depth percentiles per CPU.
-9. network_connections — Per-connection traffic summary. Shows protocol, \
+8. network_connections \u{2014} Per-connection traffic summary. Shows protocol, \
    source/dest IP:port, interface, send/recv bytes, and TCP retransmit rate.
-10. network_interfaces — Per-interface traffic summary. Shows namespace, \
+9. network_interfaces \u{2014} Per-interface traffic summary. Shows namespace, \
    interface, IP addresses, and per-protocol traffic breakdown.
-11. network_socket_pairs — Find matched socket pairs (both sides of a \
-   connection captured). Shows traffic stats for both sides, useful for \
-   analyzing cross-node or same-node connection pairs in multi-trace databases.
+10. network_socket_pairs \u{2014} Find matched socket pairs (both sides of a \
+    connection captured). Shows traffic stats for both sides, useful for \
+    analyzing cross-node or same-node connection pairs in multi-trace databases.
 
 # Query result limits
 Queries return at most 10,000 rows. If results are truncated, the response \
@@ -725,7 +829,6 @@ mod tests {
         // new analysis tools.
         let expected: BTreeSet<String> = [
             // Core utilities
-            "open_database",
             "query",
             "list_tables",
             "describe_table",
