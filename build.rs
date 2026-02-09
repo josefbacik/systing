@@ -49,7 +49,9 @@ fn detect_multiarch_include() -> Option<String> {
         .map(|t| format!("-I/usr/include/{t}"))
 }
 
-fn build_pystacks_bpf(out_dir: &Path, multiarch_include: &Option<String>) {
+fn build_pystacks_bpf(out_dir: &Path, arch_define: &str, multiarch_include: &Option<String>) {
+    let out_dir_include_arg = format!("-I{}", out_dir.display());
+
     let bpf_include_arg = format!(
         "-I{}",
         Path::new("src/bpf")
@@ -77,10 +79,11 @@ fn build_pystacks_bpf(out_dir: &Path, multiarch_include: &Option<String>) {
     let obj_path = out_dir.join("pystacks.bpf.o");
 
     let mut clang_args = vec![
+        OsStr::new(&out_dir_include_arg),
         OsStr::new(&bpf_include_arg),
         OsStr::new(&pystacks_include_arg),
         OsStr::new(&pystacks_bpf_arg),
-        OsStr::new("-D__x86_64__"),
+        OsStr::new(arch_define),
     ];
 
     if let Some(ref include_path) = multiarch_include {
@@ -122,7 +125,24 @@ fn generate_vmlinux_header() {}
 
 #[cfg(feature = "generate-vmlinux-header")]
 fn generate_vmlinux_header() {
-    let vmlinux_path = PathBuf::from("src/bpf/").join("vmlinux.h");
+    // Use the HOST architecture (uname -m) for naming, not CARGO_CFG_TARGET_ARCH.
+    // bpftool reads /sys/kernel/btf/vmlinux from the currently running kernel,
+    // so the generated header always matches the host, not the cross-compilation target.
+    let uname = std::process::Command::new("uname")
+        .arg("-m")
+        .output()
+        .expect("Failed to run uname -m");
+    if !uname.status.success() {
+        panic!("uname -m failed with status {}", uname.status);
+    }
+    // NOTE: uname -m output (e.g. "x86_64", "aarch64") must match the arch
+    // strings used in get_arch_config() for filename consistency.
+    let host_arch = String::from_utf8(uname.stdout)
+        .expect("Invalid uname output")
+        .trim()
+        .to_string();
+
+    let vmlinux_path = PathBuf::from("src/bpf/").join(format!("vmlinux_{host_arch}.h"));
 
     let bpftool_output = std::process::Command::new("bpftool")
         .args([
@@ -135,7 +155,29 @@ fn generate_vmlinux_header() {
         ])
         .output()
         .expect("Failed to execute bpftool");
-    std::fs::write(&vmlinux_path, bpftool_output.stdout).expect("Failed to write vmlinux.h");
+
+    if !bpftool_output.status.success() {
+        let stderr = String::from_utf8_lossy(&bpftool_output.stderr);
+        panic!("bpftool failed (exit {}): {stderr}", bpftool_output.status);
+    }
+
+    std::fs::write(&vmlinux_path, bpftool_output.stdout).expect("Failed to write vmlinux header");
+}
+
+/// Detect the target architecture and return the corresponding clang define
+/// and vmlinux header filename.
+///
+/// Note: clang does NOT define `__x86_64__` or `__aarch64__` when compiling with
+/// `-target bpf`. libbpf-cargo auto-adds `-D__TARGET_ARCH_x86` (used by
+/// `bpf/bpf_tracing.h`), but our BPF C code uses `__x86_64__`/`__aarch64__` guards,
+/// so we must pass the explicit `-D__<arch>__` define ourselves.
+fn get_arch_config() -> (&'static str, &'static str) {
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH not set");
+    match arch.as_str() {
+        "x86_64" => ("-D__x86_64__", "vmlinux_x86_64.h"),
+        "aarch64" => ("-D__aarch64__", "vmlinux_aarch64.h"),
+        _ => panic!("Unsupported architecture: {arch}. Only x86_64 and aarch64 are supported."),
+    }
 }
 
 fn main() {
@@ -144,11 +186,37 @@ fn main() {
 
     generate_vmlinux_header();
 
+    // Detect target architecture for vmlinux header selection and clang defines
+    let (arch_define, vmlinux_filename) = get_arch_config();
+
+    // Copy the arch-specific vmlinux header to OUT_DIR as vmlinux.h so that
+    // BPF C code can find it via -I$OUT_DIR with `#include "vmlinux.h"` or
+    // `#include <vmlinux.h>` unchanged.
+    let vmlinux_src = PathBuf::from("src/bpf").join(vmlinux_filename);
+    let vmlinux_dst = out_dir.join("vmlinux.h");
+
+    if !vmlinux_src.exists() {
+        panic!(
+            "Architecture-specific vmlinux header not found: {}\n\
+             Generate it on a {} machine with: cargo build --features generate-vmlinux-header",
+            vmlinux_src.display(),
+            env::var("CARGO_CFG_TARGET_ARCH").unwrap()
+        );
+    }
+
+    std::fs::copy(&vmlinux_src, &vmlinux_dst)
+        .unwrap_or_else(|e| panic!("Failed to copy {}: {e}", vmlinux_src.display()));
+
+    println!("cargo:rerun-if-changed={}", vmlinux_src.display());
+    // Defensive: Cargo already re-runs build scripts when the target changes, but
+    // this makes the dependency on the target architecture explicit.
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
+
     // Detect multiarch include path once for all BPF compilations
     let multiarch_include = detect_multiarch_include();
 
     // Build pystacks BPF object
-    build_pystacks_bpf(&out_dir, &multiarch_include);
+    build_pystacks_bpf(&out_dir, arch_define, &multiarch_include);
 
     let include_arg = format!("-I{}", out_dir.display());
     let bpf_include_arg = format!(
@@ -182,9 +250,9 @@ fn main() {
         let obj_path = out_dir.join(format!("{prefix}_tmp.bpf.o"));
 
         let mut clang_args = vec![
-            OsStr::new(&bpf_include_arg),
             OsStr::new(&include_arg),
-            OsStr::new("-D__x86_64__"),
+            OsStr::new(&bpf_include_arg),
+            OsStr::new(arch_define),
             OsStr::new("-DSYSTING_PYSTACKS"),
             OsStr::new(&pystacks_inc_arg),
             OsStr::new(&pystacks_bpf_arg),
