@@ -2,6 +2,10 @@
 
 #include <vmlinux.h>
 
+#ifndef int8_t
+typedef __s8 int8_t;
+#endif
+
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
