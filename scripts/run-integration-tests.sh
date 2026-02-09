@@ -31,6 +31,28 @@ if ! grep -q 'tracefs' /proc/mounts; then
     exit 1
 fi
 
+# Check if pystacks Python versions are installed (needed for pystacks integration tests)
+SETUP_PYSTACKS="$(dirname "$0")/setup-pystacks.sh"
+if [[ -f "$SETUP_PYSTACKS" ]]; then
+    if ! command -v pyenv &>/dev/null; then
+        echo "WARNING: pyenv is not installed. Pystacks integration tests will fail."
+        echo "Install pyenv and run: ./scripts/setup-pystacks.sh"
+    else
+        mapfile -t REQUIRED_PYVERSIONS < <(grep -o '"[0-9]*\.[0-9]*\.[0-9]*"' "$SETUP_PYSTACKS" | tr -d '"')
+        NEEDS_PYSETUP=false
+        for ver in "${REQUIRED_PYVERSIONS[@]}"; do
+            if ! pyenv versions --bare 2>/dev/null | grep -qx "$ver"; then
+                NEEDS_PYSETUP=true
+                break
+            fi
+        done
+        if [[ "$NEEDS_PYSETUP" == true ]]; then
+            echo "Some pystacks Python versions are missing. Running setup-pystacks.sh..."
+            "$SETUP_PYSTACKS"
+        fi
+    fi
+fi
+
 # Parse flags
 USE_SUDO=true
 POSITIONAL=()
