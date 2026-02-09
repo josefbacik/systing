@@ -120,50 +120,6 @@ fn build_pystacks_bpf(out_dir: &Path, arch_define: &str, multiarch_include: &Opt
     }
 }
 
-#[cfg(not(feature = "generate-vmlinux-header"))]
-fn generate_vmlinux_header() {}
-
-#[cfg(feature = "generate-vmlinux-header")]
-fn generate_vmlinux_header() {
-    // Use the HOST architecture (uname -m) for naming, not CARGO_CFG_TARGET_ARCH.
-    // bpftool reads /sys/kernel/btf/vmlinux from the currently running kernel,
-    // so the generated header always matches the host, not the cross-compilation target.
-    let uname = std::process::Command::new("uname")
-        .arg("-m")
-        .output()
-        .expect("Failed to run uname -m");
-    if !uname.status.success() {
-        panic!("uname -m failed with status {}", uname.status);
-    }
-    // NOTE: uname -m output (e.g. "x86_64", "aarch64") must match the arch
-    // strings used in get_arch_config() for filename consistency.
-    let host_arch = String::from_utf8(uname.stdout)
-        .expect("Invalid uname output")
-        .trim()
-        .to_string();
-
-    let vmlinux_path = PathBuf::from("src/bpf/").join(format!("vmlinux_{host_arch}.h"));
-
-    let bpftool_output = std::process::Command::new("bpftool")
-        .args([
-            "btf",
-            "dump",
-            "file",
-            "/sys/kernel/btf/vmlinux",
-            "format",
-            "c",
-        ])
-        .output()
-        .expect("Failed to execute bpftool");
-
-    if !bpftool_output.status.success() {
-        let stderr = String::from_utf8_lossy(&bpftool_output.stderr);
-        panic!("bpftool failed (exit {}): {stderr}", bpftool_output.status);
-    }
-
-    std::fs::write(&vmlinux_path, bpftool_output.stdout).expect("Failed to write vmlinux header");
-}
-
 /// Detect the target architecture and return the corresponding clang define
 /// and vmlinux header filename.
 ///
@@ -184,8 +140,6 @@ fn main() {
     let out_dir =
         PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set in build script"));
 
-    generate_vmlinux_header();
-
     // Detect target architecture for vmlinux header selection and clang defines
     let (arch_define, vmlinux_filename) = get_arch_config();
 
@@ -198,7 +152,7 @@ fn main() {
     if !vmlinux_src.exists() {
         panic!(
             "Architecture-specific vmlinux header not found: {}\n\
-             Generate it on a {} machine with: cargo build --features generate-vmlinux-header",
+             Generate it on a {} machine with: ./scripts/generate-vmlinux-header.sh",
             vmlinux_src.display(),
             env::var("CARGO_CFG_TARGET_ARCH").unwrap()
         );
