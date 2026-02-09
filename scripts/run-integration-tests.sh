@@ -19,6 +19,18 @@ if ! command -v jq &>/dev/null; then
     exit 1
 fi
 
+# Check that tracefs is mounted (required for BPF tracepoints used by integration tests)
+if ! grep -q 'tracefs' /proc/mounts; then
+    echo "ERROR: tracefs is not mounted"
+    echo ""
+    echo "Integration tests require tracefs for BPF tracepoints. Mount it with:"
+    echo "  mount -t tracefs tracefs /sys/kernel/tracing"
+    echo ""
+    echo "Or if using debugfs (older kernels):"
+    echo "  mount -t debugfs debugfs /sys/kernel/debug"
+    exit 1
+fi
+
 # Parse flags
 USE_SUDO=true
 POSITIONAL=()
