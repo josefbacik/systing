@@ -1025,6 +1025,15 @@ static u64 task_cg_id(struct task_struct *task)
 }
 
 /*
+ * CO-RE flavor type for kernels < 6.18 that have icsk_timeout as a separate field.
+ * The ___pre618 suffix is ignored by CO-RE type matching, so this matches the
+ * kernel's actual struct inet_connection_sock at runtime.
+ */
+struct inet_connection_sock___pre618 {
+	long unsigned int icsk_timeout;
+};
+
+/*
  * Read icsk_timeout from inet_connection_sock, handling kernel version differences.
  * The icsk_timeout field was removed in kernel 6.18+ (commit a7c428ee8f59).
  * On newer kernels, the timeout value is stored in icsk_retransmit_timer.expires.
@@ -1032,8 +1041,10 @@ static u64 task_cg_id(struct task_struct *task)
 static __always_inline void read_icsk_timeout(struct inet_connection_sock *icsk,
 					      u64 *timeout)
 {
-	if (bpf_core_field_exists(icsk->icsk_timeout)) {
-		bpf_probe_read_kernel(timeout, sizeof(*timeout), &icsk->icsk_timeout);
+	struct inet_connection_sock___pre618 *old = (void *)icsk;
+
+	if (bpf_core_field_exists(old->icsk_timeout)) {
+		bpf_probe_read_kernel(timeout, sizeof(*timeout), &old->icsk_timeout);
 	} else {
 		bpf_probe_read_kernel(timeout, sizeof(*timeout), &icsk->icsk_retransmit_timer.expires);
 	}

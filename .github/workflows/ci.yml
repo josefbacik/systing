@@ -7,39 +7,67 @@ on:
     pull_request:
       branches:
         - main
-
-env:
-  CARGO_BUILD_JOBS: 2
-  CARGO_INCREMENTAL: 0
-
 jobs:
-  format_check:
+  test:
+    name: Test Suite
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Check formatting
-        run: cargo fmt --check
-
-  check_build_test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Set Swap Space
-        uses: pierotofy/set-swap-space@master
-        with:
-          swap-size-gb: 10
-
-      - uses: actions/checkout@v4
-
-      - name: Install Deps.
-        run: ./.github/workflows/install_deps.sh
-
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq
+      - uses: actions/checkout@v2
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: true
+          cache-on-failure: "true"
+      - name: Download pre-built DuckDB library
+        run: |
+          wget -q https://github.com/duckdb/duckdb/releases/download/v1.4.2/libduckdb-linux-amd64.zip -O /tmp/libduckdb.zip
+          unzip /tmp/libduckdb.zip -d ${{ github.workspace }}/libduckdb
+      - name: Run Tests
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+        run: cargo test --no-default-features
 
-      - name: Unit tests
-        run: cargo test
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --all -- --check
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq
+      - uses: actions/checkout@v2
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+      - name: Download pre-built DuckDB library
+        run: |
+          wget -q https://github.com/duckdb/duckdb/releases/download/v1.4.2/libduckdb-linux-amd64.zip -O /tmp/libduckdb.zip
+          unzip /tmp/libduckdb.zip -d ${{ github.workspace }}/libduckdb
+      - name: Run Clippy
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+        run: cargo clippy --no-default-features -- -D warnings

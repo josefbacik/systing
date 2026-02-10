@@ -7,8 +7,6 @@ This document contains information for Claude (AI assistant) when working on the
 - **Language**: Rust
 - **Build Tool**: Cargo
 - **Main Binary**: systing
-- **Features**:
-  - `generate-vmlinux-header` - Optional VMLinux header generation
 - **Built-in support**: Python stack tracing (pystacks) is always compiled in, enabled at runtime with `--collect-pystacks`
 
 ## Running Tests
@@ -43,8 +41,6 @@ Integration tests require root/BPF privileges and are marked as `#[ignore]` in t
 # Run specific test within a file
 ./scripts/run-integration-tests.sh trace_validation test_e2e_parquet_validation
 
-# Run with extra features enabled
-CARGO_FEATURES=generate-vmlinux-header ./scripts/run-integration-tests.sh
 ```
 
 **Why use the script:**

@@ -10,6 +10,10 @@ description = "A libbpf based tracer to figure out what an application is doing"
 libbpf-cargo = "0.25.0-beta"
 libbpf-rs = "0.25.0"
 
+[features]
+default = ["duckdb-bundled"]
+duckdb-bundled = ["duckdb/bundled", "duckdb/parquet"]
+
 [dependencies]
 anyhow = "1.0"
 bitfield = "0.19.0"
@@ -19,7 +23,7 @@ ctrlc = "3.4"
 dashmap = "6"
 debuginfod = { version = "0.2.1", features = ["fs-cache", "tracing"] }
 dns-lookup = "2.0"
-duckdb = { version = "1.1.1", features = ["bundled", "parquet"] }
+duckdb = "1.1.1"
 parquet = "54"
 arrow = "54"
 flate2 = "1.0"
@@ -45,9 +49,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "io-std"] }
 object = { version = "0.36", default-features = false, features = ["read", "elf"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "time"] }
-
-[features]
-generate-vmlinux-header = []
 
 [lib]
 name = "systing"
