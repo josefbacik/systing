@@ -8,10 +8,6 @@ on:
       branches:
         - main
 
-env:
-  CARGO_BUILD_JOBS: 2
-  CARGO_INCREMENTAL: 0
-
 jobs:
   format_check:
     runs-on: ubuntu-latest
@@ -24,11 +20,6 @@ jobs:
   check_build_test:
     runs-on: ubuntu-latest
     steps:
-      - name: Set Swap Space
-        uses: pierotofy/set-swap-space@master
-        with:
-          swap-size-gb: 10
-
       - uses: actions/checkout@v4
 
       - name: Install Deps.
