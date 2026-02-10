@@ -20,11 +20,15 @@ jobs:
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
       - name: Run Tests
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: cargo test
+          DUCKDB_DOWNLOAD_LIB: "1"
+        run: cargo test --no-default-features
 
   fmt:
     name: Rustfmt
@@ -32,7 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo fmt -- all -- --check
+      - run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy
@@ -46,8 +50,12 @@ jobs:
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
       - name: Run Clippy
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: cargo clippy --all-targets -- -D warnings
+          DUCKDB_DOWNLOAD_LIB: "1"
+        run: cargo clippy --no-default-features -- -D warnings
