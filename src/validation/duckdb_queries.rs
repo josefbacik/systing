@@ -238,12 +238,22 @@ impl ValidationQueries for DuckDbQueries {
             });
         }
 
-        // Count total and empty cmdlines (excluding pid=0)
+        // Build filter: exclude pid=0 and kernel threads (if column exists)
+        let has_kernel_col = self.column_exists("process", "is_kernel_thread");
+        let filter = if has_kernel_col {
+            "pid != 0 AND is_kernel_thread = FALSE"
+        } else {
+            "pid != 0"
+        };
+
+        // Count total and empty cmdlines (excluding pid=0 and kernel threads)
         let (total_count, empty_count): (i64, i64) = self.conn.query_row(
-            "SELECT
-                COUNT(*) FILTER (WHERE pid != 0),
-                COUNT(*) FILTER (WHERE pid != 0 AND (cmdline IS NULL OR len(cmdline) = 0))
-             FROM process",
+            &format!(
+                "SELECT
+                    COUNT(*) FILTER (WHERE {filter}),
+                    COUNT(*) FILTER (WHERE {filter} AND (cmdline IS NULL OR len(cmdline) = 0))
+                 FROM process"
+            ),
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;

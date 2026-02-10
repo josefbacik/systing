@@ -4,7 +4,9 @@
 //! native Arrow columnar scans with HashSet lookups.
 
 use anyhow::{Context, Result};
-use arrow::array::{Array, Int32Array, Int64Array, Int8Array, ListArray, StringArray};
+use arrow::array::{
+    Array, BooleanArray, Int32Array, Int64Array, Int8Array, ListArray, StringArray,
+};
 use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::HashSet;
@@ -212,6 +214,11 @@ impl ValidationQueries for ParquetQueries {
             });
         }
 
+        let has_kernel_col = schema
+            .fields()
+            .iter()
+            .any(|f| f.name() == "is_kernel_thread");
+
         let reader = builder.build()?;
         let mut total_count = 0i64;
         let mut empty_count = 0i64;
@@ -234,6 +241,16 @@ impl ValidationQueries for ParquetQueries {
                 .downcast_ref::<ListArray>();
             let pid_array = batch.column(pid_idx).as_any().downcast_ref::<Int32Array>();
 
+            // Read is_kernel_thread column if present
+            let kernel_array = if has_kernel_col {
+                schema
+                    .index_of("is_kernel_thread")
+                    .ok()
+                    .and_then(|idx| batch.column(idx).as_any().downcast_ref::<BooleanArray>())
+            } else {
+                None
+            };
+
             if let (Some(list_array), Some(pid_int_array)) = (cmdline_array, pid_array) {
                 for i in 0..list_array.len() {
                     let pid = if pid_int_array.is_null(i) {
@@ -245,6 +262,13 @@ impl ValidationQueries for ParquetQueries {
                     // Skip pid 0 (kernel/swapper process)
                     if pid == 0 {
                         continue;
+                    }
+
+                    // Skip kernel threads if column is present
+                    if let Some(ka) = kernel_array {
+                        if !ka.is_null(i) && ka.value(i) {
+                            continue;
+                        }
                     }
 
                     total_count += 1;
@@ -810,6 +834,8 @@ mod tests {
 
     /// Helper to create a valid process.parquet with required cmdline field.
     fn create_valid_process_parquet(dir: &Path, upid: i64, pid: i32, name: &str) {
+        use arrow::array::BooleanArray;
+
         let process_schema = Arc::new(Schema::new(vec![
             Field::new("upid", DataType::Int64, false),
             Field::new("pid", DataType::Int32, false),
@@ -820,6 +846,7 @@ mod tests {
                 DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
                 false,
             ),
+            Field::new("is_kernel_thread", DataType::Boolean, false),
         ]));
 
         let mut name_builder = StringBuilder::new();
@@ -837,6 +864,7 @@ mod tests {
                 Arc::new(name_builder.finish()),
                 Arc::new(Int64Array::from(vec![None::<i64>])),
                 Arc::new(cmdline_builder.finish()),
+                Arc::new(BooleanArray::from(vec![false])),
             ],
         )
         .unwrap();
@@ -1116,9 +1144,11 @@ mod tests {
 
     #[test]
     fn test_empty_process_cmdline_parquet() {
+        use arrow::array::BooleanArray;
+
         let dir = TempDir::new().unwrap();
 
-        // Create process.parquet with empty cmdline
+        // Create process.parquet with empty cmdline (non-kernel-thread)
         let process_schema = Arc::new(Schema::new(vec![
             Field::new("upid", DataType::Int64, false),
             Field::new("pid", DataType::Int32, false),
@@ -1129,6 +1159,7 @@ mod tests {
                 DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
                 false,
             ),
+            Field::new("is_kernel_thread", DataType::Boolean, false),
         ]));
 
         let mut name_builder = StringBuilder::new();
@@ -1146,6 +1177,7 @@ mod tests {
                 Arc::new(name_builder.finish()),
                 Arc::new(Int64Array::from(vec![None::<i64>])),
                 Arc::new(cmdline_builder.finish()),
+                Arc::new(BooleanArray::from(vec![false])),
             ],
         )
         .unwrap();
@@ -1154,10 +1186,10 @@ mod tests {
 
         let result = validate_parquet_dir(dir.path());
 
-        // Should have warning about empty cmdline
-        assert!(result.warnings.iter().any(|w| matches!(
-            w,
-            super::super::ValidationWarning::AllNullColumn {
+        // Should have error about empty cmdline
+        assert!(result.errors.iter().any(|e| matches!(
+            e,
+            super::super::ValidationError::InvalidValue {
                 table,
                 column,
                 ..

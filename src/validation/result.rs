@@ -210,8 +210,7 @@ impl fmt::Display for ValidationWarning {
             } => {
                 write!(
                     f,
-                    "{table}.{column}: all {total_rows} rows have NULL values - \
-                     thread state transitions may not be captured correctly"
+                    "{table}.{column}: all {total_rows} rows have NULL values"
                 )
             }
         }
@@ -289,14 +288,13 @@ mod tests {
     #[test]
     fn test_all_null_column_warning_display() {
         let warning = ValidationWarning::AllNullColumn {
-            table: "process".to_string(),
-            column: "cmdline".to_string(),
+            table: "sched_slice".to_string(),
+            column: "end_state".to_string(),
             total_rows: 100,
         };
         assert_eq!(
             format!("{warning}"),
-            "process.cmdline: all 100 rows have NULL values - \
-             thread state transitions may not be captured correctly"
+            "sched_slice.end_state: all 100 rows have NULL values"
         );
     }
 

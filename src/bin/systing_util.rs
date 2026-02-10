@@ -423,6 +423,7 @@ struct ProcessRecord {
     name: Option<String>,
     parent_upid: Option<i64>,
     cmdline: Vec<String>,
+    is_kernel_thread: bool,
 }
 
 #[derive(Clone)]
@@ -978,6 +979,7 @@ impl TraceExtractor {
                         name: proc.process_name.clone(),
                         parent_upid: None,
                         cmdline: proc.cmdline.clone(),
+                        is_kernel_thread: false,
                     });
                 }
                 // Also create a thread entry for the main thread (tid == pid).
@@ -1016,6 +1018,7 @@ impl TraceExtractor {
                         name: None,
                         parent_upid: None,
                         cmdline: Vec::new(),
+                        is_kernel_thread: false,
                     });
                 }
 
@@ -1122,6 +1125,7 @@ impl TraceExtractor {
                         name: proc.cmdline.first().cloned(),
                         parent_upid: self.pid_to_upid.get(&proc.ppid()).copied(),
                         cmdline: proc.cmdline.clone(),
+                        is_kernel_thread: false,
                     });
                 }
             }
@@ -1145,6 +1149,7 @@ impl TraceExtractor {
                             name: None,
                             parent_upid: None,
                             cmdline: Vec::new(),
+                            is_kernel_thread: false,
                         });
                     }
 
@@ -1484,6 +1489,7 @@ impl TraceExtractor {
                     name: name.map(str::to_string),
                     parent_upid: None,
                     cmdline: Vec::new(),
+                    is_kernel_thread: false,
                 });
                 upid
             };
@@ -1532,6 +1538,7 @@ impl TraceExtractor {
                     name: None,
                     parent_upid: None,
                     cmdline: Vec::new(),
+                    is_kernel_thread: false,
                 });
             }
 
@@ -2069,6 +2076,7 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
                 DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
                 false,
             ),
+            Field::new("is_kernel_thread", DataType::Boolean, false),
         ]));
 
         let mut trace_id_builder = StringBuilder::new();
@@ -2077,6 +2085,7 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
         let mut name_builder = StringBuilder::new();
         let mut parent_upid_builder = Int64Builder::new();
         let mut cmdline_builder = ListBuilder::new(StringBuilder::new());
+        let mut is_kernel_thread_builder = BooleanBuilder::new();
 
         for proc in &data.processes {
             trace_id_builder.append_value(trace_id);
@@ -2089,6 +2098,7 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
                 cmdline_builder.values().append_value(arg);
             }
             cmdline_builder.append(true);
+            is_kernel_thread_builder.append_value(proc.is_kernel_thread);
         }
 
         let batch = RecordBatch::try_new(
@@ -2100,6 +2110,7 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
                 Arc::new(name_builder.finish()),
                 Arc::new(parent_upid_builder.finish()),
                 Arc::new(cmdline_builder.finish()),
+                Arc::new(is_kernel_thread_builder.finish()),
             ],
         )?;
 
