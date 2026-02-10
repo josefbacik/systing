@@ -236,7 +236,7 @@ Example:
 === *--trace-event* _EVENT_
 
 This is a special option that takes a format similar to https://bpftrace.org[`bpftrace`].
-Currently the supported events are `usdt`, `uprobe`, `uretprobe`, `kprobe`, `kretprobe`, `tracepoint`, and `marker`.
+Currently the supported events are `usdt`, `uprobe`, `uretprobe`, `kprobe`, `kretprobe`, and `tracepoint`.
 For userspace related events (uprobe, uretprobe, usdt), you can optionally specify *--trace-event-pid* to target specific processes.
 If no PIDs are specified, systing will automatically discover and attach to all processes that have the specified binary or library loaded.
 The following is an exhaustive list of the supported formats
@@ -254,7 +254,6 @@ The following is an exhaustive list of the supported formats
 * `kretprobe:kernel_function_name`
 * `kretprobe:offset`
 * `tracepoint:subystem:tracepoint_name`
-* `marker:match_string`
 
 === *--trace-event-pid* _PID_
 
@@ -378,75 +377,41 @@ When set to `true`, systing will capture and emit a stack trace whenever this ev
 The stack trace will appear in the perfetto trace alongside the event, showing the call stack at the point where the event occurred.
 This is useful for debugging and performance analysis.
 
-==== Marker Events
+==== Userspace Marker Events
 
-Marker events provide a way for userspace applications to emit trace events without any special libraries or dependencies.
-Applications emit markers by calling the `faccessat2` syscall with a specific match string:
+Userspace applications can emit self-describing trace events without any special libraries or configuration.
+Enable marker collection with `--add-recorder markers`, then call `faccessat2` with the sentinel mode value `-975`:
 
 [source, c]
 ----
-#include <fcntl.h>
-#include <unistd.h>
 #include <sys/syscall.h>
+#include <unistd.h>
 
-// Emit a marker event
-syscall(SYS_faccessat2, request_id, "myapp:request:start", F_OK, 0);
+#define SYSTING_MARKER_MODE (-975)
+#define SYSTING_MARKER_START   0
+#define SYSTING_MARKER_END     1
+#define SYSTING_MARKER_INSTANT 2
+
+// Start a range (name format: "TrackName:EventName", or just "EventName" for default track)
+syscall(SYS_faccessat2, SYSTING_MARKER_START,   "Training:fwd_bwd",    SYSTING_MARKER_MODE, 0);
+// End the range
+syscall(SYS_faccessat2, SYSTING_MARKER_END,     "Training:fwd_bwd",    SYSTING_MARKER_MODE, 0);
+// Emit an instant event
+syscall(SYS_faccessat2, SYSTING_MARKER_INSTANT, "Training:checkpoint", SYSTING_MARKER_MODE, 0);
 ----
 
-The first argument (`dfd`) can be used to pass additional context (like a request ID) that will be captured if configured in `args`.
+The calling convention:
 
-Example configuration:
+* `dirfd` (arg 0): event type — `0` = range start, `1` = range end, `2` = instant
+* `pathname` (arg 1): `"TrackName:EventName"` — the colon separates track from event name.
+  If no colon is present, the track defaults to `"Markers"`.
+* `mode` (arg 2): must be `-975` to identify the call as a systing marker
+* `flags` (arg 3): ignored
 
-[source, json]
-----
-{
-  "events": [
-    {
-      "name": "request_start",
-      "event": "marker:myapp:request:start",
-      "args": [
-        {
-          "arg_index": 0,
-          "arg_type": "long",
-          "arg_name": "request_id"
-        }
-      ]
-    },
-    {
-      "name": "request_end",
-      "event": "marker:myapp:request:end",
-      "args": [
-        {
-          "arg_index": 0,
-          "arg_type": "long",
-          "arg_name": "request_id"
-        }
-      ]
-    }
-  ],
-  "tracks": [
-    {
-      "track_name": "Requests",
-      "ranges": [
-        {
-          "name": "request",
-          "start": "request_start",
-          "end": "request_end"
-        }
-      ]
-    }
-  ]
-}
-----
+Start/end ranges are matched by thread (same TGIDPID) and `(track, event)` name pair.
+No JSON config is required — markers are collected into their own tracks automatically.
 
-For marker events, the `arg_index` refers to the `faccessat2` syscall arguments:
-
-* `0` - `dfd` (directory file descriptor, can be used to pass context like request IDs)
-* `1` - `filename` (the match string itself)
-* `2` - `mode`
-* `3` - `flags`
-
-NOTE: The `retval` arg type is not supported for marker events since they are captured on syscall entry.
+NOTE: Marker collection is off by default. Enable it with `--add-recorder markers`.
 
 === *-v, --verbose*
 

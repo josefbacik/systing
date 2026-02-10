@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::Result;
 
 use crate::events::SystingProbeRecorder;
+use crate::marker_recorder::MarkerRecorder;
 use crate::network_recorder::NetworkRecorder;
 use crate::parquet::StreamingParquetWriter;
 use crate::perf_recorder::PerfCounterRecorder;
@@ -74,6 +75,7 @@ pub struct SessionRecorder {
     pub sysinfo_recorder: Mutex<SysinfoRecorder>,
     pub probe_recorder: Mutex<SystingProbeRecorder>,
     pub network_recorder: Mutex<NetworkRecorder>,
+    pub marker_recorder: Mutex<MarkerRecorder>,
     pub process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
     pub processes: RwLock<HashMap<u64, ProtoProcess>>,
     pub threads: RwLock<HashMap<u64, ThreadDescriptor>>,
@@ -530,6 +532,7 @@ impl SessionRecorder {
                 resolve_network_addresses,
                 Arc::clone(&utid_generator),
             )),
+            marker_recorder: Mutex::new(MarkerRecorder::default()),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
@@ -1136,6 +1139,20 @@ impl SessionRecorder {
             )?;
         }
 
+        // Write marker records (only if any were collected)
+        {
+            let marker_recorder = self.marker_recorder.lock().unwrap();
+            if marker_recorder.has_data() {
+                eprintln!("Writing marker records...");
+                marker_recorder.write_records(
+                    &mut *writer,
+                    &mut track_id_counter,
+                    &mut slice_id_counter,
+                    &mut instant_id_counter,
+                )?;
+            }
+        }
+
         // Step 6: Finish writing and close all files
         eprintln!("Finishing Parquet trace...");
         // Flush and properly close all Parquet writers
@@ -1187,6 +1204,7 @@ mod tests {
             recorder.sysinfo_recorder.lock().unwrap().min_timestamp(),
             recorder.probe_recorder.lock().unwrap().min_timestamp(),
             recorder.network_recorder.lock().unwrap().min_timestamp(),
+            recorder.marker_recorder.lock().unwrap().min_timestamp(),
         ]
         .into_iter()
         .flatten()
@@ -1358,6 +1376,7 @@ mod tests {
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::new(Arc::clone(&utid_generator))),
             network_recorder: Mutex::new(NetworkRecorder::default()),
+            marker_recorder: Mutex::new(MarkerRecorder::default()),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),

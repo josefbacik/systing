@@ -140,6 +140,18 @@ struct probe_event {
 	struct arg_value args[MAX_ARGS];
 };
 
+#define MAX_MARKER_NAME_LEN 64
+/* Sentinel value for faccessat2 mode argument that identifies a systing marker.
+ * Chosen to be an invalid mode value unlikely to appear in real faccessat2 calls. */
+#define SYSTING_MARKER_MODE (-975)
+struct marker_event {
+	u64 ts;
+	u32 cpu;
+	u32 marker_type;   // 0=start, 1=end, 2=instant
+	struct task_info task;
+	u8 name[MAX_MARKER_NAME_LEN];
+};
+
 struct stack_event {
 	enum stack_event_type stack_event_type;
 	u64 ts;
@@ -303,6 +315,7 @@ struct packet_event _packet_event = {0};
 struct epoll_event_bpf _epoll_event = {0};
 struct task_info _task_info = {0};
 struct probe_event _uprobe_event = {0};
+struct marker_event _marker_event = {0};
 #ifdef SYSTING_PYSTACKS
 struct exec_event _exec_event = {0};
 #endif
@@ -364,22 +377,6 @@ struct {
 	__uint(max_entries, 10240);
 } event_stack_capture SEC(".maps");
 
-#define MAX_MARKER_LEN 64
-#define MAX_MARKERS 64
-
-struct marker_match {
-	u64 cookie;
-	u8 num_args;
-	u8 pad[3];
-	struct arg_desc args[MAX_ARGS];
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, MAX_MARKERS);
-	__type(key, char[MAX_MARKER_LEN]);
-	__type(value, struct marker_match);
-} marker_matches SEC(".maps");
 
 struct arg_desc_array _arg_desc_array = {0};
 
@@ -489,7 +486,8 @@ struct {
 #define MISSED_NETWORK_EVENT 4
 #define MISSED_PACKET_EVENT 5
 #define MISSED_EPOLL_EVENT 6
-#define MISSED_EVENT_MAX 7
+#define MISSED_MARKER_EVENT 7
+#define MISSED_EVENT_MAX 8
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
@@ -595,6 +593,11 @@ struct {
 	__uint(max_entries, 4096 /* 4KB - exec events are tiny and rare */);
 } ringbuf_exec_events SEC(".maps");
 #endif
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024 /* 256KB */);
+} ringbuf_marker SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
@@ -1900,96 +1903,37 @@ int systing_tracepoint(struct bpf_raw_tracepoint_args *args)
 	return 0;
 }
 
-// Helper function to handle marker events from syscalls (e.g., faccessat2)
-// faccessat2(dfd, pathname, mode, flags) - we use:
-//   dfd (arg[0]): file descriptor to resolve socket_id from
-//   pathname (arg[1]): the marker string to match
+// Helper function to handle marker events from syscalls (faccessat2)
+// faccessat2(dirfd, pathname, mode, flags) - we use:
+//   mode (arg[2]): must be SYSTING_MARKER_MODE (-975) to identify call as a systing marker
+//   pathname (arg[1]): "<trackname>:<eventname>" or "<eventname>"
+//   dirfd (arg[0]): 0=start, 1=end, 2=instant
 static __always_inline int handle_marker_event(struct trace_event_raw_sys_enter *ctx,
 					       struct task_struct *task)
 {
-	// Read filename from arg[1] (the marker string)
-	char marker[MAX_MARKER_LEN] = {};
-	int len = bpf_probe_read_user_str(marker, sizeof(marker),
-					  (void *)ctx->args[1]);
-	if (len <= 0)
+	// Validate marker_type
+	u32 mtype = (u32)ctx->args[0];
+	if (mtype > 2)
 		return 0;
 
-	// Look up in marker_matches map
-	struct marker_match *match = bpf_map_lookup_elem(&marker_matches, marker);
-	if (!match)
-		return 0;
-
-	// Resolve socket_id from the dfd (arg[0])
-	// If dfd is a valid socket fd that we've seen before, we'll get its socket_id
-	u32 dfd = (u32)ctx->args[0];
-	u64 socket_id = 0;
-
-	// Only try to resolve if dfd looks like a valid fd (not AT_FDCWD which is -100)
-	if ((s32)dfd >= 0) {
-		socket_id = lookup_socket_id_from_fd(task, dfd);
-	}
-
-	// Emit probe_event with cookie and captured args
-	long flags;
-	struct probe_event *event = reserve_probe_event(&flags);
+	struct marker_event *event = bpf_ringbuf_reserve(&ringbuf_marker,
+							  sizeof(struct marker_event), 0);
 	if (!event) {
-		handle_missed_event(MISSED_PROBE_EVENT);
+		handle_missed_event(MISSED_MARKER_EVENT);
 		return 0;
 	}
-
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
-	event->cookie = match->cookie;
-
-	// First arg is always the socket_id (0 if not found/not a socket)
-	event->args[0].type = ARG_LONG;
-	event->args[0].size = sizeof(u64);
-	__builtin_memcpy(&event->args[0].value, &socket_id, sizeof(u64));
-
-	// Remaining args from the configured match (shifted by 1)
-	u8 num_configured_args = match->num_args < (MAX_ARGS - 1) ? match->num_args : (MAX_ARGS - 1);
-	event->num_args = 1 + num_configured_args;
-
-	// Copy ctx->args to a local array to allow variable indexing
-	// (BPF verifier doesn't allow variable indexing into ctx directly)
-	u64 syscall_args[6];
-	syscall_args[0] = ctx->args[0];
-	syscall_args[1] = ctx->args[1];
-	syscall_args[2] = ctx->args[2];
-	syscall_args[3] = ctx->args[3];
-	syscall_args[4] = ctx->args[4];
-	syscall_args[5] = ctx->args[5];
-
-	#pragma unroll
-	for (int i = 0; i < MAX_ARGS - 1; i++) {
-		if (i >= num_configured_args)
-			break;
-
-		struct arg_desc *desc = &match->args[i];
-		if (desc->arg_index < 0 || desc->arg_index > 5)
-			continue;
-
-		u64 arg = syscall_args[desc->arg_index];
-		int out_idx = i + 1; // Shift by 1 since socket_id is at index 0
-
-		if (desc->arg_type == ARG_LONG) {
-			event->args[out_idx].type = ARG_LONG;
-			event->args[out_idx].size = sizeof(u64);
-			__builtin_memcpy(&event->args[out_idx].value, &arg, sizeof(u64));
-		} else if (desc->arg_type == ARG_STRING) {
-			// Read string from userspace pointer
-			int slen = bpf_probe_read_user_str(
-				event->args[out_idx].value,
-				sizeof(event->args[out_idx].value),
-				(void *)arg);
-			event->args[out_idx].type = ARG_STRING;
-			event->args[out_idx].size = slen > 0 ? slen : 0;
-		}
+	event->marker_type = mtype;
+	int len = bpf_probe_read_user_str(event->name, sizeof(event->name),
+					  (void *)ctx->args[1]);
+	if (len <= 0) {
+		bpf_ringbuf_discard(event, 0);
+		return 0;
 	}
-
-	bpf_ringbuf_submit(event, flags);
-	return 1; // Marker was handled
+	bpf_ringbuf_submit(event, 0);
+	return 1;
 }
 
 SEC("tracepoint/raw_syscalls/sys_enter")
@@ -1999,8 +1943,10 @@ int tracepoint__raw_syscalls__sys_enter(struct trace_event_raw_sys_enter *ctx)
 	if (!trace_task(task))
 		return 0;
 
-	// Check for marker syscall (e.g., faccessat2)
-	if (tool_config.marker_syscall_nr && ctx->id == tool_config.marker_syscall_nr) {
+	// Check for marker syscall (faccessat2 with mode == SYSTING_MARKER_MODE)
+	// Note: when collect_syscalls is enabled, these calls are also recorded as raw syscalls.
+	if (tool_config.marker_syscall_nr && ctx->id == tool_config.marker_syscall_nr
+	    && (s64)ctx->args[2] == SYSTING_MARKER_MODE) {
 		handle_marker_event(ctx, task);
 		// Don't return - continue to record syscall if collect_syscalls is enabled
 	}

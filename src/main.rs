@@ -71,6 +71,9 @@ struct Command {
     // Network recording enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     network: bool,
+    // Marker recording enabled state (set by recorder management, not a CLI flag)
+    #[arg(skip)]
+    markers: bool,
     /// Skip DNS resolution for network addresses (show IP addresses instead of hostnames)
     #[arg(long)]
     no_resolve_addresses: bool,
@@ -129,6 +132,7 @@ impl From<Command> for Config {
             enable_debuginfod: cmd.enable_debuginfod,
             no_sched: cmd.no_sched,
             syscalls: cmd.syscalls,
+            markers: cmd.markers,
             network: cmd.network,
             no_resolve_addresses: cmd.no_resolve_addresses,
             output_dir: cmd.output_dir,
@@ -152,6 +156,7 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
         "cpu-stacks" => opts.no_cpu_stack_traces = !enable,
         "network" => opts.network = enable,
         "pystacks" => opts.collect_pystacks = enable,
+        "markers" => opts.markers = enable,
         _ => {}
     }
 }
@@ -169,6 +174,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         opts.no_cpu_stack_traces = true;
         opts.network = false;
         opts.collect_pystacks = false;
+        opts.markers = false;
 
         // Then enable only the specified recorders
         let recorders = opts.only_recorder.clone();

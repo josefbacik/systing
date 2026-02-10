@@ -174,6 +174,11 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             description: "Python stack tracing",
             default_enabled: false,
         },
+        RecorderInfo {
+            name: "markers",
+            description: "Userspace marker events (faccessat2 with mode=-975)",
+            default_enabled: false,
+        },
     ]
 }
 
@@ -243,6 +248,8 @@ pub struct Config {
     pub no_sched: bool,
     /// Enable syscall tracing
     pub syscalls: bool,
+    /// Enable marker recording (faccessat2-based userspace markers)
+    pub markers: bool,
     /// Enable network recording
     pub network: bool,
     /// Skip DNS resolution for network addresses
@@ -282,6 +289,7 @@ impl Default for Config {
             enable_debuginfod: false,
             no_sched: false,
             syscalls: false,
+            markers: false,
             network: false,
             no_resolve_addresses: false,
             output_dir: PathBuf::from("./traces"),
@@ -389,7 +397,7 @@ pub use types::arg_desc_array;
 pub use types::arg_type;
 pub use types::epoll_event_bpf;
 pub use types::event_type;
-pub use types::marker_match;
+pub use types::marker_event;
 pub use types::network_event;
 pub use types::packet_event;
 pub use types::perf_counter_event;
@@ -407,6 +415,7 @@ unsafe impl Plain for packet_event {}
 unsafe impl Plain for epoll_event_bpf {}
 unsafe impl Plain for arg_desc {}
 unsafe impl Plain for arg_desc_array {}
+unsafe impl Plain for marker_event {}
 
 /// BPF exec event - delivered via dedicated ringbuf when a traced process execs.
 /// Used to dynamically discover Python PIDs for pystacks.
@@ -540,6 +549,15 @@ impl SystingEvent for epoll_event_bpf {
     }
 }
 
+impl SystingEvent for marker_event {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+    fn next_task_info(&self) -> Option<&task_info> {
+        Some(&self.task)
+    }
+}
+
 fn create_ring<'a, T>(
     map: &dyn libbpf_rs::MapCore,
     tx: Sender<T>,
@@ -617,6 +635,7 @@ struct RecorderChannels {
     network_rx: Receiver<network_event>,
     packet_rx: Receiver<packet_event>,
     epoll_rx: Receiver<epoll_event_bpf>,
+    marker_rx: Receiver<marker_event>,
     exec_event_rx: Option<Receiver<exec_event>>,
 }
 
@@ -637,6 +656,7 @@ fn spawn_recorder_threads(
         network_rx,
         packet_rx,
         epoll_rx,
+        marker_rx,
         ..
     } = channels;
 
@@ -799,6 +819,29 @@ fn spawn_recorder_threads(
                     0
                 })?,
         );
+    }
+
+    // Conditionally spawn marker recorder
+    if opts.markers {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        let my_task_tx = task_info_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("marker_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<crate::marker_recorder::MarkerRecorder, marker_event>(
+                        &session_recorder.marker_recorder,
+                        marker_rx,
+                        my_stop_tx,
+                        my_task_tx,
+                        None,
+                    );
+                    0
+                })?,
+        );
+    } else {
+        drop(marker_rx);
     }
 
     Ok(threads)
@@ -1298,6 +1341,7 @@ fn setup_ringbuffers<'a>(
     let (network_tx, network_rx) = channel();
     let (packet_tx, packet_rx) = channel();
     let (epoll_tx, epoll_rx) = channel();
+    let (marker_tx, marker_rx) = channel();
     let (exec_tx, exec_rx) = channel();
     let mut has_exec_ringbuf = false;
 
@@ -1342,6 +1386,16 @@ fn setup_ringbuffers<'a>(
         }
     }
 
+    if opts.markers {
+        for map in object.maps() {
+            if map.name().to_str().unwrap() == "ringbuf_marker" {
+                let ring = create_ring::<marker_event>(&map, marker_tx.clone())?;
+                rings.push(("ringbuf_marker".to_string(), ring));
+                break;
+            }
+        }
+    }
+
     let exec_event_rx = if has_exec_ringbuf {
         Some(exec_rx)
     } else {
@@ -1356,6 +1410,7 @@ fn setup_ringbuffers<'a>(
         network_rx,
         packet_rx,
         epoll_rx,
+        marker_rx,
         exec_event_rx,
     };
 
@@ -1457,9 +1512,8 @@ fn configure_bpf_skeleton(
     collect_pystacks: bool,
     recorder: &Arc<SessionRecorder>,
 ) -> Result<()> {
-    // Setup probe recorder with trace events FIRST
-    // We need to know if any marker events are configured before setting up rodata
-    let has_markers = {
+    // Setup probe recorder with trace events
+    {
         let mut probe_recorder = recorder.probe_recorder.lock().unwrap();
         let mut rng = rand::rng();
         for tracepoint in opts.trace_event.iter() {
@@ -1473,15 +1527,7 @@ fn configure_bpf_skeleton(
                 .load_config(config, &mut rng)
                 .with_context(|| format!("Failed to load trace event config file: '{config}'"))?;
         }
-
-        // UPROBE/USDT validation removed: PIDs are now auto-discovered if not specified
-
-        // Check if any marker events are configured
-        probe_recorder
-            .cookies
-            .values()
-            .any(|e| matches!(e.event, EventProbe::Marker(_)))
-    };
+    }
 
     // Configure rodata with tool settings
     {
@@ -1517,7 +1563,7 @@ fn configure_bpf_skeleton(
             rodata.tool_config.collect_syscalls = 1;
         }
 
-        if has_markers {
+        if opts.markers {
             use syscalls::Sysno;
             rodata.tool_config.marker_syscall_nr = Sysno::faccessat2 as u32;
         }
@@ -1606,10 +1652,10 @@ fn configure_bpf_skeleton(
             .set_autoload(false);
     }
 
-    // Only load syscall tracepoints when syscall tracing is enabled OR marker events are configured
-    // Marker events use the sys_enter tracepoint to intercept faccessat2 syscalls
+    // Only load syscall tracepoints when syscall tracing is enabled OR marker recording is enabled
+    // Marker recording uses the sys_enter tracepoint to intercept faccessat2 syscalls
     // This prevents unnecessary overhead from loading unused tracepoints
-    if !opts.syscalls && !has_markers {
+    if !opts.syscalls && !opts.markers {
         open_skel
             .progs
             .tracepoint__raw_syscalls__sys_enter
@@ -2093,40 +2139,6 @@ fn attach_probes(
                     tracepoint.category, tracepoint.name, tracepoint.category, tracepoint.name
                 ))?;
                 probe_links.push(link);
-            }
-            EventProbe::Marker(marker) => {
-                let mut key = [0u8; 64];
-                let bytes = marker.match_string.as_bytes();
-                let len = bytes.len().min(63);
-                key[..len].copy_from_slice(&bytes[..len]);
-
-                let mut args = [arg_desc {
-                    arg_type: arg_type::ARG_NONE,
-                    arg_index: 0,
-                }; 4];
-                for (i, arg) in event.args.iter().enumerate() {
-                    let bpf_arg_type = match arg.arg_type {
-                        EventKeyType::String => arg_type::ARG_STRING,
-                        EventKeyType::Long => arg_type::ARG_LONG,
-                        EventKeyType::Retval => arg_type::ARG_RETVAL,
-                    };
-                    args[i] = arg_desc {
-                        arg_type: bpf_arg_type,
-                        arg_index: arg.arg_index as i32,
-                    };
-                }
-
-                let marker_match_value = marker_match {
-                    cookie: event.cookie,
-                    num_args: event.args.len() as u8,
-                    args,
-                    ..Default::default()
-                };
-
-                let value_data = unsafe { plain::as_bytes(&marker_match_value) };
-                skel.maps
-                    .marker_matches
-                    .update(&key, value_data, libbpf_rs::MapFlags::ANY)?;
             }
             _ => {}
         }
