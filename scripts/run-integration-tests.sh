@@ -128,7 +128,7 @@ if [[ -z "$TEST_BINARY" || ! -x "$TEST_BINARY" ]]; then
 fi
 
 echo "Found test binary: $TEST_BINARY"
-echo "Running: $TEST_BINARY --ignored $*"
+echo "Running: $TEST_BINARY --ignored --test-threads=1 $*"
 
 # Run tests serially: systing attaches system-wide BPF tracepoints, so only
 # one instance can run at a time without ring buffer contention and event drops.

@@ -17,7 +17,7 @@ use crate::utid::UtidGenerator;
 
 use anyhow::Result;
 use plain::Plain;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use perfetto_protos::debug_annotation::DebugAnnotation;
 use perfetto_protos::interned_data::InternedData;
@@ -25,6 +25,22 @@ use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::{EventName, TrackEvent};
+
+/// Controls how a probe event is attributed in Perfetto traces and how start/end
+/// range keys are matched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EventScope {
+    /// Attribute to the specific thread (TGIDPID). Default for all events.
+    #[default]
+    Thread,
+    /// Attribute to the process (TGID). Useful for async tasks that migrate
+    /// between threads, where start and end markers may fire on different threads.
+    Process,
+    /// Attribute to the CPU. Events appear on per-CPU tracks under the
+    /// top-level Systing track in Perfetto.
+    Cpu,
+}
 
 const SYS_ENTER_COOKIE: u64 = 0xFFFFFFFFFFFFFFFE;
 const SYSCALLS_TRACK_NAME: &str = "syscalls";
@@ -249,7 +265,7 @@ pub struct SystingEvent {
     pub cookie: u64,
     pub event: EventProbe,
     pub args: Vec<EventKey>,
-    percpu: bool,
+    scope: EventScope,
     pub stack: bool,
 }
 
@@ -259,7 +275,7 @@ pub struct SystingEvent {
 //     {
 //       "name": "event_name",
 //       "event": "<PROBE TYPE SPECIFIC FORMAT>",
-//       "percpu": false,
+//       "scope": "thread",
 //       "stack": false,
 //       "args": [
 //         {
@@ -350,7 +366,7 @@ struct SystingJSONTrackConfig {
 struct SystingJSONEvent {
     name: String,
     event: String,
-    percpu: Option<bool>,
+    scope: Option<EventScope>,
     args: Option<Vec<SystingJSONEventKey>>,
     stack: Option<bool>,
 }
@@ -665,10 +681,12 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
                 _ => {}
             }
         }
-        if systing_event.percpu {
-            self.handle_cpu_event(event, arg_data);
-        } else {
-            self.handle_process_event(event, arg_data, is_marker);
+        let scope = systing_event.scope;
+        match scope {
+            EventScope::Cpu => self.handle_cpu_event(event, arg_data),
+            EventScope::Thread | EventScope::Process => {
+                self.handle_process_event(event, arg_data, is_marker, scope)
+            }
         }
     }
 
@@ -1035,6 +1053,7 @@ impl SystingProbeRecorder {
         event: probe_event,
         arg_data: Vec<(String, ArgValue)>,
         is_marker: bool,
+        scope: EventScope,
     ) {
         // Clone data we need from systing_event early to avoid borrow conflicts
         let systing_event = self.cookies.get(&event.cookie).unwrap();
@@ -1101,14 +1120,13 @@ impl SystingProbeRecorder {
             return;
         }
 
-        // For marker events, use TGID (process ID) instead of TGIDPID (thread ID) as the key.
-        // This allows matching start/end markers when async tasks migrate between threads.
-        // We also include socket_id in the range key to distinguish concurrent operations
-        // on different sockets within the same process.
-        let range_key = if is_marker {
-            event.task.tgidpid >> 32 // Use TGID only
-        } else {
-            event.task.tgidpid // Use full TGIDPID for non-marker events
+        // Use TGID (process ID) as the range key for process-scoped events, allowing
+        // start/end matching when async tasks migrate between threads. For thread-scoped
+        // events use the full TGIDPID. Note: socket_id inclusion in the lookup key is
+        // marker-specific (BPF arg layout), not scope-specific.
+        let range_key = match scope {
+            EventScope::Process => event.task.tgidpid >> 32,
+            EventScope::Thread | EventScope::Cpu => event.task.tgidpid,
         };
 
         // For marker events, include socket_id in the range name to handle concurrent
@@ -1860,7 +1878,7 @@ impl SystingProbeRecorder {
             cookie: rng.next_u64(),
             event: probe,
             args,
-            percpu: event.percpu.unwrap_or(false),
+            scope: event.scope.unwrap_or_default(),
             stack: event.stack.unwrap_or(false),
         };
         if self.config_events.contains_key(&event.name) {
@@ -1969,6 +1987,14 @@ impl SystingProbeRecorder {
                     }
                     if self.stop_events.contains_key(&end_event) {
                         Err(anyhow::anyhow!("Stop event {} already exists", end_event))?;
+                    }
+                    let start_scope = self.config_events.get(&start_event).unwrap().scope;
+                    let end_scope = self.config_events.get(&end_event).unwrap().scope;
+                    if start_scope != end_scope {
+                        Err(anyhow::anyhow!(
+                            "Range '{}': start event '{}' has scope {:?} but end event '{}' has scope {:?}; they must match",
+                            range.name, start_event, start_scope, end_event, end_scope
+                        ))?;
                     }
                     self.start_events.insert(start_event, range.name.clone());
                     self.stop_events.insert(end_event, range.name.clone());
@@ -3961,7 +3987,7 @@ mod tests {
     }
 
     #[test]
-    fn test_event_percpu() {
+    fn test_event_cpu_scope() {
         let mut rng = StepRng::new(0, 1);
         let mut recorder = SystingProbeRecorder::default();
         let json = r#"
@@ -3970,7 +3996,7 @@ mod tests {
                 {
                     "name": "event_percpu",
                     "event": "usdt:/path/to/file:provider:name",
-                    "percpu": true
+                    "scope": "cpu"
                 }
             ],
             "tracks": [
@@ -3990,7 +4016,7 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(recorder.config_events.len(), 1);
         let event = recorder.config_events.get("event_percpu").unwrap();
-        assert!(event.percpu);
+        assert_eq!(event.scope, EventScope::Cpu);
 
         let event = probe_event {
             task: task_info {
@@ -4617,5 +4643,134 @@ mod tests {
         assert_eq!(packets[1].track_event().type_(), Type::TYPE_SLICE_BEGIN);
         assert_eq!(packets[1].track_event().name(), "my_span");
         assert_eq!(packets[2].track_event().type_(), Type::TYPE_SLICE_END);
+    }
+
+    #[test]
+    fn test_marker_thread_scope_no_cross_thread_match() {
+        // With default Thread scope, markers on different TGIDPIDs do not match.
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                { "name": "span_start", "event": "marker:myapp:begin" },
+                { "name": "span_end",   "event": "marker:myapp:end" }
+            ],
+            "tracks": [{
+                "track_name": "spans",
+                "ranges": [{ "name": "my_span", "start": "span_start", "end": "span_end" }]
+            }]
+        }
+        "#;
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        assert_eq!(
+            recorder.config_events.get("span_start").unwrap().scope,
+            EventScope::Thread
+        );
+
+        let start_cookie = recorder.config_events.get("span_start").unwrap().cookie;
+        let end_cookie = recorder.config_events.get("span_end").unwrap().cookie;
+
+        // TGID=100, TID=200 starts; TGID=100, TID=300 ends (same process, different thread)
+        let tgidpid_thread1: u64 = (100u64 << 32) | 200;
+        let tgidpid_thread2: u64 = (100u64 << 32) | 300;
+        recorder.handle_event(probe_event {
+            task: task_info {
+                tgidpid: tgidpid_thread1,
+                ..Default::default()
+            },
+            ts: 1000,
+            cookie: start_cookie,
+            ..Default::default()
+        });
+        recorder.handle_event(probe_event {
+            task: task_info {
+                tgidpid: tgidpid_thread2,
+                ..Default::default()
+            },
+            ts: 2000,
+            cookie: end_cookie,
+            ..Default::default()
+        });
+
+        // No completed ranges — cross-thread start/end did not match under Thread scope
+        assert!(recorder.recorded_ranges.is_empty());
+    }
+
+    #[test]
+    fn test_marker_process_scope_cross_thread_match() {
+        // With Process scope, markers on different TGIDPIDs within the same process match.
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                { "name": "span_start", "event": "marker:myapp:begin", "scope": "process" },
+                { "name": "span_end",   "event": "marker:myapp:end",   "scope": "process" }
+            ],
+            "tracks": [{
+                "track_name": "spans",
+                "ranges": [{ "name": "my_span", "start": "span_start", "end": "span_end" }]
+            }]
+        }
+        "#;
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        assert_eq!(
+            recorder.config_events.get("span_start").unwrap().scope,
+            EventScope::Process
+        );
+
+        let start_cookie = recorder.config_events.get("span_start").unwrap().cookie;
+        let end_cookie = recorder.config_events.get("span_end").unwrap().cookie;
+
+        // TGID=100, TID=200 starts; TGID=100, TID=300 ends (same process 100, different threads)
+        let tgidpid_thread1: u64 = (100u64 << 32) | 200;
+        let tgidpid_thread2: u64 = (100u64 << 32) | 300;
+        recorder.handle_event(probe_event {
+            task: task_info {
+                tgidpid: tgidpid_thread1,
+                ..Default::default()
+            },
+            ts: 1000,
+            cookie: start_cookie,
+            ..Default::default()
+        });
+        recorder.handle_event(probe_event {
+            task: task_info {
+                tgidpid: tgidpid_thread2,
+                ..Default::default()
+            },
+            ts: 2000,
+            cookie: end_cookie,
+            ..Default::default()
+        });
+
+        // Range matched across threads via TGID key
+        assert!(!recorder.recorded_ranges.is_empty());
+        let ranges = recorder.recorded_ranges.values().next().unwrap();
+        let track_ranges = ranges.values().next().unwrap();
+        assert_eq!(track_ranges[0].start, 1000);
+        assert_eq!(track_ranges[0].end, 2000);
+    }
+
+    #[test]
+    fn test_range_mismatched_scope_is_rejected() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                { "name": "span_start", "event": "marker:myapp:begin", "scope": "process" },
+                { "name": "span_end",   "event": "marker:myapp:end" }
+            ],
+            "tracks": [{
+                "track_name": "spans",
+                "ranges": [{ "name": "my_span", "start": "span_start", "end": "span_end" }]
+            }]
+        }
+        "#;
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("scope"));
     }
 }

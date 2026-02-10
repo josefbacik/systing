@@ -298,7 +298,7 @@ The configuration is a JSON file with the following format.
     {
       "name": "tracepoint_instant",
       "event": "_EVENT_",
-      "percpu": true,
+      "scope": "cpu",
       "stack": true,
       "args": [
         {
@@ -367,8 +367,11 @@ Available arg types:
 
 NOTE: For `tracepoint` events we use `raw_tracepoint`, which reads the args from the TP_EVENT definition, not what is found in /sys/kernel/debug/tracing/events/category/name/format.
 
-`percpu` is set to true if the event is keyed to a CPU and not a specific thread.
-These events will show up under the `Systing` track in `perfetto`, each event as it's own category and then each CPU having its own track.
+`scope` controls how the event is attributed in the trace output. Valid values:
+
+* `"thread"` (default) - Event is attributed to the specific thread (TGIDPID).
+* `"process"` - Event is attributed to the process (TGID). Useful for async tasks that may migrate between threads, where start and end markers can fire on different threads.
+* `"cpu"` - Event is attributed to the CPU. These events will show up under the `Systing` track in `perfetto`, each event as its own category and then each CPU having its own track.
 
 `stack` is an optional field (defaults to `false`).
 When set to `true`, systing will capture and emit a stack trace whenever this event fires.
