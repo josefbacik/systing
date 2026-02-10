@@ -12,7 +12,7 @@ libbpf-rs = "0.25.0"
 
 [features]
 default = ["duckdb-bundled"]
-duckdb-bundled = ["duckdb/bundled"]
+duckdb-bundled = ["duckdb/bundled", "duckdb/parquet"]
 
 [dependencies]
 anyhow = "1.0"
@@ -23,7 +23,7 @@ ctrlc = "3.4"
 dashmap = "6"
 debuginfod = { version = "0.2.1", features = ["fs-cache", "tracing"] }
 dns-lookup = "2.0"
-duckdb = { version = "1.1.1", features = ["parquet"] }
+duckdb = "1.1.1"
 parquet = "54"
 arrow = "54"
 flate2 = "1.0"

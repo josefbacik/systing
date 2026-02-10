@@ -23,11 +23,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: "true"
+      - name: Download pre-built DuckDB library
+        run: |
+          wget -q https://github.com/duckdb/duckdb/releases/download/v1.4.2/libduckdb-linux-amd64.zip -O /tmp/libduckdb.zip
+          unzip /tmp/libduckdb.zip -d ${{ github.workspace }}/libduckdb
       - name: Run Tests
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-          DUCKDB_DOWNLOAD_LIB: "1"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
         run: cargo test --no-default-features
 
   fmt:
@@ -53,9 +59,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: "true"
+      - name: Download pre-built DuckDB library
+        run: |
+          wget -q https://github.com/duckdb/duckdb/releases/download/v1.4.2/libduckdb-linux-amd64.zip -O /tmp/libduckdb.zip
+          unzip /tmp/libduckdb.zip -d ${{ github.workspace }}/libduckdb
       - name: Run Clippy
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-          DUCKDB_DOWNLOAD_LIB: "1"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
         run: cargo clippy --no-default-features -- -D warnings
