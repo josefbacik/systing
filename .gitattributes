@@ -1,1 +1,1 @@
-src/bpf/vmlinux.h linguist-generated
+src/bpf/vmlinux_*.h linguist-generated
