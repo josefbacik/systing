@@ -143,11 +143,15 @@ fn validate_required_fields<Q: ValidationQueries>(
                     column: "cmdline".into(),
                     message: "missing required column: cmdline".into(),
                 });
-            } else if stats.mostly_empty() {
-                result.add_warning(ValidationWarning::AllNullColumn {
+            } else if stats.all_empty() {
+                result.add_error(ValidationError::InvalidValue {
                     table: "process".into(),
                     column: "cmdline".into(),
-                    total_rows: stats.empty_count,
+                    message: format!(
+                        "all {} non-kernel processes have empty cmdline - \
+                         cmdline collection may be broken",
+                        stats.total_count
+                    ),
                 });
             }
         }

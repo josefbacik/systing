@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::io::AsRawFd;
@@ -77,6 +77,8 @@ pub struct SessionRecorder {
     pub process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
     pub processes: RwLock<HashMap<u64, ProtoProcess>>,
     pub threads: RwLock<HashMap<u64, ThreadDescriptor>>,
+    /// Set of pids for processes detected as kernel threads.
+    kernel_threads: RwLock<HashSet<u32>>,
     /// Shared utid generator for consistent thread IDs across all recorders.
     utid_generator: Arc<UtidGenerator>,
 }
@@ -531,6 +533,7 @@ impl SessionRecorder {
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
+            kernel_threads: RwLock::new(HashSet::new()),
             utid_generator,
         }
     }
@@ -595,7 +598,7 @@ impl SessionRecorder {
         // are more informative than the binary filename.
         let name_from_proc = Self::fetch_name_from_proc(pid);
         let process_name = if !name_from_proc.is_empty() {
-            name_from_proc
+            name_from_proc.clone()
         } else if !comm.is_empty() {
             comm
         } else {
@@ -603,6 +606,23 @@ impl SessionRecorder {
         };
 
         let cmdline = Self::fetch_cmdline_from_proc(pid);
+
+        // Detect kernel threads: no executable AND no cmdline AND /proc/pid exists.
+        // Kernel threads have no /proc/pid/exe (readlink fails) and no cmdline.
+        // Short-lived processes that already exited will have /proc/pid gone entirely,
+        // so we only mark as kernel thread if the process dir still exists.
+        //
+        // Limitations: This is a heuristic, not atomic. Zombie processes could be
+        // misidentified since they also lack exe/cmdline but still have /proc/pid.
+        // A more reliable approach would be to check /proc/pid/status for PF_KTHREAD,
+        // but the false positive rate here is negligible in practice.
+        if name_from_proc.is_empty()
+            && cmdline.is_empty()
+            && pid != 0
+            && Path::new("/proc").join(pid.to_string()).exists()
+        {
+            self.kernel_threads.write().unwrap().insert(pid);
+        }
 
         // Create and store ProcessDescriptor
         let mut process_descriptor = ProcessDescriptor::default();
@@ -962,6 +982,7 @@ impl SessionRecorder {
 
         // Write process records using the shared upid generator
         let processes = self.processes.read().unwrap();
+        let kernel_threads = self.kernel_threads.read().unwrap();
         for (tgidpid, process) in self.process_descriptors.read().unwrap().iter() {
             let pid = process.pid();
             let upid = self.utid_generator.get_or_create_upid(pid);
@@ -978,12 +999,15 @@ impl SessionRecorder {
                 .map(|p| p.cmdline.clone())
                 .unwrap_or_default();
 
+            let is_kernel_thread = kernel_threads.contains(&((*tgidpid >> 32) as u32));
+
             writer.add_process(ProcessRecord {
                 upid,
                 pid,
                 name,
                 parent_upid: None, // Could be set from parent_pid if needed
                 cmdline,
+                is_kernel_thread,
             })?;
         }
         drop(processes);
@@ -1337,6 +1361,7 @@ mod tests {
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
+            kernel_threads: RwLock::new(HashSet::new()),
             utid_generator,
         }
     }

@@ -1139,6 +1139,7 @@ fn build_process_batch(records: &[ProcessRecord], schema: &Arc<Schema>) -> Resul
     let mut name_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
     let mut parent_upid_builder = Int64Builder::with_capacity(records.len());
     let mut cmdline_builder = ListBuilder::new(StringBuilder::new());
+    let mut is_kernel_thread_builder = BooleanBuilder::with_capacity(records.len());
 
     for record in records {
         upid_builder.append_value(record.upid);
@@ -1151,6 +1152,8 @@ fn build_process_batch(records: &[ProcessRecord], schema: &Arc<Schema>) -> Resul
             cmdline_builder.values().append_value(arg);
         }
         cmdline_builder.append(true);
+
+        is_kernel_thread_builder.append_value(record.is_kernel_thread);
     }
 
     Ok(RecordBatch::try_new(
@@ -1161,6 +1164,7 @@ fn build_process_batch(records: &[ProcessRecord], schema: &Arc<Schema>) -> Resul
             Arc::new(name_builder.finish()),
             Arc::new(parent_upid_builder.finish()),
             Arc::new(cmdline_builder.finish()),
+            Arc::new(is_kernel_thread_builder.finish()),
         ],
     )?)
 }

@@ -12,7 +12,9 @@
 /// - `parent_upid`: Parent process's upid (for process tree)
 /// - `cmdline`: Full command line arguments (from /proc/pid/cmdline).
 ///   May be empty for short-lived processes that exit before cmdline can be read,
-///   or for kernel threads (pid 0) which have no cmdline.
+///   or for kernel threads which have no cmdline (see `is_kernel_thread`).
+/// - `is_kernel_thread`: Whether this process is a kernel thread (e.g., kworker,
+///   migration, ksoftirqd). Kernel threads have no executable or cmdline.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ProcessRecord {
     pub upid: i64,
@@ -20,6 +22,7 @@ pub struct ProcessRecord {
     pub name: Option<String>,
     pub parent_upid: Option<i64>,
     pub cmdline: Vec<String>,
+    pub is_kernel_thread: bool,
 }
 
 /// Thread information extracted from trace.

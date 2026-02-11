@@ -79,7 +79,8 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             pid INTEGER,
             name VARCHAR,
             parent_upid BIGINT,
-            cmdline VARCHAR[]
+            cmdline VARCHAR[],
+            is_kernel_thread BOOLEAN NOT NULL DEFAULT FALSE
         );
 
         CREATE TABLE IF NOT EXISTS thread (
@@ -477,7 +478,7 @@ fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Res
         let escaped_trace_id = trace_id.replace('\'', "''");
 
         conn.execute_batch(&format!(
-            "INSERT INTO {table_name} SELECT '{escaped_trace_id}' as trace_id, * FROM read_parquet('{escaped_path}')"
+            "INSERT INTO {table_name} BY NAME SELECT '{escaped_trace_id}' as trace_id, * FROM read_parquet('{escaped_path}')"
         ))
         .with_context(|| format!("Failed to import table '{}' from '{}'", table_name, path.display()))?;
 
@@ -726,19 +727,21 @@ fn import_duckdb_traces_inner(conn: &Connection, mappings: &[TraceImportMapping]
             continue;
         }
 
-        // Build SELECT expressions: use source column if present, NULL otherwise
-        let select_exprs: Vec<String> = target_columns
+        // Only include columns that exist in both source and target.
+        // Missing target columns will use their DEFAULT values (e.g., is_kernel_thread defaults
+        // to FALSE when importing old databases that don't have the column).
+        let common_columns: Vec<&String> = target_columns
             .iter()
-            .map(|col| {
-                if source_columns.contains(col) {
-                    format!("\"{col}\"")
-                } else {
-                    format!("NULL AS \"{col}\"")
-                }
-            })
+            .filter(|col| source_columns.contains(*col))
             .collect();
 
-        let target_col_list: String = target_columns
+        let target_col_list: String = common_columns
+            .iter()
+            .map(|col| format!("\"{col}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let select_exprs: String = common_columns
             .iter()
             .map(|col| format!("\"{col}\""))
             .collect::<Vec<_>>()
@@ -746,9 +749,8 @@ fn import_duckdb_traces_inner(conn: &Connection, mappings: &[TraceImportMapping]
 
         let sql = format!(
             "INSERT INTO main.\"{table_name}\" (trace_id, {target_col_list}) \
-             SELECT {case_expr} AS trace_id, {} \
+             SELECT {case_expr} AS trace_id, {select_exprs} \
              FROM input_db.\"{table_name}\" {where_clause}",
-            select_exprs.join(", ")
         );
 
         conn.execute_batch(&sql).with_context(|| {

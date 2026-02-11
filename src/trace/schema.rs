@@ -31,6 +31,7 @@ pub fn process_schema() -> Arc<Schema> {
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             false,
         ),
+        Field::new("is_kernel_thread", DataType::Boolean, false),
     ]))
 }
 

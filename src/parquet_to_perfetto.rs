@@ -2606,7 +2606,7 @@ fn read_stack_data(input_dir: &Path) -> Result<HashMap<i64, StackData>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::ListBuilder;
+    use arrow::array::{BooleanArray, ListBuilder};
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use std::sync::Arc;
@@ -2625,6 +2625,7 @@ mod tests {
                 DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
                 false,
             ),
+            Field::new("is_kernel_thread", DataType::Boolean, false),
         ]));
 
         let upids = Int64Array::from(vec![upid]);
@@ -2639,6 +2640,8 @@ mod tests {
         cmdline_builder.append(true);
         let cmdlines = cmdline_builder.finish();
 
+        let is_kernel_thread = BooleanArray::from(vec![false]);
+
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -2647,6 +2650,7 @@ mod tests {
                 Arc::new(names),
                 Arc::new(parent_upids),
                 Arc::new(cmdlines),
+                Arc::new(is_kernel_thread),
             ],
         )?;
 

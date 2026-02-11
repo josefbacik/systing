@@ -154,6 +154,15 @@ impl CmdlineStats {
     pub fn mostly_empty(&self) -> bool {
         self.total_count > 0 && self.empty_count * 2 > self.total_count
     }
+
+    /// Returns true if all records have empty cmdline.
+    ///
+    /// This indicates that cmdline collection is completely broken, as opposed to
+    /// `mostly_empty()` which can trigger on valid traces where kernel threads
+    /// (which legitimately have no cmdline) outnumber userspace processes.
+    pub fn all_empty(&self) -> bool {
+        self.total_count > 0 && self.empty_count == self.total_count
+    }
 }
 
 /// Result of schema check.
