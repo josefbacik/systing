@@ -2342,3 +2342,156 @@ if __name__ == "__main__":
 
     eprintln!("  Pystacks exec event discovery passed");
 }
+
+// =============================================================================
+// Marker recording integration test
+// =============================================================================
+
+/// Recording duration for marker tests (seconds).
+/// 3s provides ~10+ loop iterations at 250ms/iteration, giving ample margin
+/// for events to be captured after BPF initialization (~500ms).
+const MARKER_RECORDING_DURATION_SECS: u64 = 3;
+
+/// Search a parquet file's column for a row matching `target`.
+/// Returns true if any matching row is found.
+fn parquet_column_contains(path: &std::path::Path, column: &str, target: &str) -> bool {
+    use arrow::array::StringArray;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|e| panic!("Failed to open {}: {e}", path.display()));
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .expect("Failed to create reader")
+        .build()
+        .expect("Failed to build reader");
+
+    for batch in reader {
+        let batch = batch.expect("Failed to read batch");
+        if let Some(col) = batch.column_by_name(column) {
+            let arr = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("column is not StringArray");
+            for i in 0..arr.len() {
+                if !arr.is_null(i) && arr.value(i) == target {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_marker_recording() {
+    use std::ffi::CString;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+    use syscalls::Sysno;
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+
+    // Spawn a workload thread that emits marker events via faccessat2.
+    // Runs continuously until signaled to stop, ensuring events are emitted
+    // throughout the entire trace window.
+    let workload_handle = thread::spawn(move || {
+        const SYSTING_MARKER_MODE: i64 = -975;
+        let sysno = Sysno::faccessat2 as i64;
+        let range_name = CString::new("MyTrack:range_event").unwrap();
+        let instant_name = CString::new("checkpoint").unwrap();
+
+        // Allow time for BPF probe attachment before emitting markers
+        thread::sleep(Duration::from_millis(500));
+
+        // SAFETY: CString pointers remain valid for the duration of each syscall.
+        // faccessat2 reads the pathname argument but does not store the pointer.
+        while !stop_clone.load(Ordering::Relaxed) {
+            unsafe {
+                // START: "MyTrack:range_event" -> track="MyTrack", name="range_event"
+                libc::syscall(sysno, 0i64, range_name.as_ptr(), SYSTING_MARKER_MODE, 0i64);
+            }
+            thread::sleep(Duration::from_millis(50));
+            unsafe {
+                // END: same name to close the range
+                libc::syscall(sysno, 1i64, range_name.as_ptr(), SYSTING_MARKER_MODE, 0i64);
+            }
+            unsafe {
+                // INSTANT: "checkpoint" (no colon -> default track "Markers")
+                libc::syscall(
+                    sysno,
+                    2i64,
+                    instant_name.as_ptr(),
+                    SYSTING_MARKER_MODE,
+                    0i64,
+                );
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    });
+
+    // Disable everything except markers
+    let config = Config {
+        duration: MARKER_RECORDING_DURATION_SECS,
+        output_dir: dir.path().to_path_buf(),
+        no_sched: true,
+        no_cpu_stack_traces: true,
+        no_sleep_stack_traces: true,
+        no_interruptible_stack_traces: true,
+        network: false,
+        collect_pystacks: false,
+        markers: true,
+        parquet_only: true,
+        ..Config::default()
+    };
+
+    systing(config, None).expect("systing recording failed");
+    stop.store(true, Ordering::Relaxed);
+    workload_handle.join().expect("Workload thread panicked");
+
+    // --- Validate slice.parquet contains the range event ---
+    eprintln!("  marker recording: validating slice.parquet...");
+    let slice_path = dir.path().join("slice.parquet");
+    assert!(
+        slice_path.exists(),
+        "slice.parquet not found - marker range event was not recorded"
+    );
+    assert!(
+        parquet_column_contains(&slice_path, "name", "range_event"),
+        "range_event not found in slice.parquet"
+    );
+
+    // --- Validate instant.parquet contains the instant event ---
+    eprintln!("  marker recording: validating instant.parquet...");
+    let instant_path = dir.path().join("instant.parquet");
+    assert!(
+        instant_path.exists(),
+        "instant.parquet not found - marker instant event was not recorded"
+    );
+    assert!(
+        parquet_column_contains(&instant_path, "name", "checkpoint"),
+        "checkpoint instant not found in instant.parquet"
+    );
+
+    // --- Validate track.parquet has both track names ---
+    eprintln!("  marker recording: validating track.parquet...");
+    let track_path = dir.path().join("track.parquet");
+    assert!(track_path.exists(), "track.parquet not found");
+    assert!(
+        parquet_column_contains(&track_path, "name", "MyTrack"),
+        "MyTrack not found in track.parquet"
+    );
+    assert!(
+        parquet_column_contains(&track_path, "name", "Markers"),
+        "Markers track not found in track.parquet"
+    );
+
+    eprintln!("  All marker recording checks passed");
+}

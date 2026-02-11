@@ -49,7 +49,7 @@ The top-level structure of a trace configuration file:
 {
   "name": "event_name",
   "event": "<probe_specification>",
-  "percpu": false,
+  "scope": "thread",
   "stack": false,
   "args": [ ... ]
 }
@@ -59,7 +59,7 @@ The top-level structure of a trace configuration file:
 |-------|------|----------|---------|-------------|
 | `name` | String | **Yes** | - | Unique identifier for this event (used in tracks) |
 | `event` | String | **Yes** | - | Probe specification (format depends on probe type) |
-| `percpu` | Boolean | No | `false` | If true, creates separate track per CPU |
+| `scope` | String | No | `"thread"` | Track attribution: `"thread"` (TGIDPID), `"process"` (TGID, for async tasks that migrate between threads), or `"cpu"` (per-CPU tracks) |
 | `stack` | Boolean | No | `false` | If true, captures stack trace when event fires |
 | `args` | Array of Argument objects | No | `[]` | Arguments to capture (max 4 per event) |
 
@@ -804,7 +804,7 @@ Traces in a 60-second rolling buffer and stops when any request takes longer tha
     {
       "name": "sched_switch",
       "event": "tracepoint:sched:sched_switch",
-      "percpu": true
+      "scope": "cpu"
     }
   ],
   "tracks": [

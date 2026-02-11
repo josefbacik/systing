@@ -3,7 +3,7 @@
     {
       "name": "sched_ext_event",
       "event": "tracepoint:sched_ext:sched_ext_event",
-      "percpu": true,
+      "scope": "cpu",
       "keys" : [
         {
 	  "key_index": 0,

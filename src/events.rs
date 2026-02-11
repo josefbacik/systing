@@ -17,7 +17,7 @@ use crate::utid::UtidGenerator;
 
 use anyhow::Result;
 use plain::Plain;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use perfetto_protos::debug_annotation::DebugAnnotation;
 use perfetto_protos::interned_data::InternedData;
@@ -25,6 +25,22 @@ use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
 use perfetto_protos::trace_packet::TracePacket;
 use perfetto_protos::track_event::track_event::Type;
 use perfetto_protos::track_event::{EventName, TrackEvent};
+
+/// Controls how a probe event is attributed in Perfetto traces and how start/end
+/// range keys are matched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EventScope {
+    /// Attribute to the specific thread (TGIDPID). Default for all events.
+    #[default]
+    Thread,
+    /// Attribute to the process (TGID). Useful for async tasks that migrate
+    /// between threads, where start and end markers may fire on different threads.
+    Process,
+    /// Attribute to the CPU. Events appear on per-CPU tracks under the
+    /// top-level Systing track in Perfetto.
+    Cpu,
+}
 
 const SYS_ENTER_COOKIE: u64 = 0xFFFFFFFFFFFFFFFE;
 const SYSCALLS_TRACK_NAME: &str = "syscalls";
@@ -210,20 +226,12 @@ pub struct TracepointEvent {
     pub name: String,
 }
 
-// Format is
-// marker:<match_string>
-#[derive(Clone, Default)]
-pub struct MarkerEvent {
-    pub match_string: String,
-}
-
 #[derive(Clone, Default)]
 pub enum EventProbe {
     UProbe(UProbeEvent),
     Usdt(UsdtProbeEvent),
     KProbe(KProbeEvent),
     Tracepoint(TracepointEvent),
-    Marker(MarkerEvent),
     #[default]
     Undefined,
 }
@@ -249,7 +257,7 @@ pub struct SystingEvent {
     pub cookie: u64,
     pub event: EventProbe,
     pub args: Vec<EventKey>,
-    percpu: bool,
+    scope: EventScope,
     pub stack: bool,
 }
 
@@ -259,7 +267,7 @@ pub struct SystingEvent {
 //     {
 //       "name": "event_name",
 //       "event": "<PROBE TYPE SPECIFIC FORMAT>",
-//       "percpu": false,
+//       "scope": "thread",
 //       "stack": false,
 //       "args": [
 //         {
@@ -293,13 +301,6 @@ pub struct SystingEvent {
 //     - "kprobe:<symbol>" or "kprobe:<symbol>+<offset>" - Kernel probe
 //     - "kretprobe:<symbol>" - Kernel return probe
 //     - "tracepoint:<category>:<name>" - Kernel tracepoint
-//     - "marker:<match_string>" - Userspace marker via faccessat2 syscall
-//
-//   Marker events allow userspace code to emit trace events by calling:
-//     faccessat2(fd, "<match_string>", F_OK, 0)
-//   The fd argument and other syscall args can be captured using the "args" field.
-//   For markers, arg_index refers to the faccessat2 syscall arguments:
-//     0 = dfd, 1 = filename (the match string), 2 = mode, 3 = flags
 //
 //   "tracks": [
 //     {
@@ -350,7 +351,7 @@ struct SystingJSONTrackConfig {
 struct SystingJSONEvent {
     name: String,
     event: String,
-    percpu: Option<bool>,
+    scope: Option<EventScope>,
     args: Option<Vec<SystingJSONEventKey>>,
     stack: Option<bool>,
 }
@@ -531,28 +532,9 @@ impl TracepointEvent {
     }
 }
 
-impl MarkerEvent {
-    fn from_parts(parts: Vec<&str>) -> Result<Self, anyhow::Error> {
-        if parts.len() < 2 {
-            return Err(anyhow::anyhow!(
-                "Invalid marker format, expected marker:<match_string>"
-            ));
-        }
-        // Join with colons since match_string can contain colons
-        let match_string = parts[1..].join(":");
-        Ok(MarkerEvent { match_string })
-    }
-}
-
 impl fmt::Display for TracepointEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "tracepoint:{}:{}", self.category, self.name)
-    }
-}
-
-impl fmt::Display for MarkerEvent {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "marker:{}", self.match_string)
     }
 }
 
@@ -585,7 +567,6 @@ impl fmt::Display for SystingEvent {
             EventProbe::Usdt(usdt) => write!(f, "{usdt}"),
             EventProbe::KProbe(kprobe) => write!(f, "{kprobe}"),
             EventProbe::Tracepoint(tracepoint) => write!(f, "{tracepoint}"),
-            EventProbe::Marker(marker) => write!(f, "{marker}"),
             _ => write!(f, "Invalid event"),
         }
     }
@@ -611,25 +592,9 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
         };
         let mut arg_data: Vec<(String, ArgValue)> = Vec::new();
 
-        // For marker events, args[0] is always socket_id (injected by BPF),
-        // and user-configured args start at args[1]
-        let is_marker = matches!(systing_event.event, EventProbe::Marker(_));
-        let arg_offset: usize = if is_marker { 1 } else { 0 };
-
-        // For marker events, extract socket_id from args[0]
-        if is_marker && event.num_args > 0 {
-            let bpf_arg = &event.args[0];
-            if bpf_arg.r#type == crate::systing_core::types::arg_type::ARG_LONG {
-                let mut bytes: [u8; 8] = [0; 8];
-                let _ = bytes.copy_from_bytes(&bpf_arg.value[..8]);
-                let val = u64::from_ne_bytes(bytes);
-                arg_data.push(("socket_id".to_string(), ArgValue::Long(val)));
-            }
-        }
-
         let num_args = event.num_args.min(event.args.len() as u8);
-        for i in arg_offset..num_args as usize {
-            let config_idx = i - arg_offset;
+        for i in 0..num_args as usize {
+            let config_idx = i;
             if config_idx >= systing_event.args.len() {
                 break;
             }
@@ -665,10 +630,12 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
                 _ => {}
             }
         }
-        if systing_event.percpu {
-            self.handle_cpu_event(event, arg_data);
-        } else {
-            self.handle_process_event(event, arg_data, is_marker);
+        let scope = systing_event.scope;
+        match scope {
+            EventScope::Cpu => self.handle_cpu_event(event, arg_data),
+            EventScope::Thread | EventScope::Process => {
+                self.handle_process_event(event, arg_data, scope)
+            }
         }
     }
 
@@ -1034,7 +1001,7 @@ impl SystingProbeRecorder {
         &mut self,
         event: probe_event,
         arg_data: Vec<(String, ArgValue)>,
-        is_marker: bool,
+        scope: EventScope,
     ) {
         // Clone data we need from systing_event early to avoid borrow conflicts
         let systing_event = self.cookies.get(&event.cookie).unwrap();
@@ -1101,34 +1068,18 @@ impl SystingProbeRecorder {
             return;
         }
 
-        // For marker events, use TGID (process ID) instead of TGIDPID (thread ID) as the key.
-        // This allows matching start/end markers when async tasks migrate between threads.
-        // We also include socket_id in the range key to distinguish concurrent operations
-        // on different sockets within the same process.
-        let range_key = if is_marker {
-            event.task.tgidpid >> 32 // Use TGID only
-        } else {
-            event.task.tgidpid // Use full TGIDPID for non-marker events
-        };
-
-        // For marker events, include socket_id in the range name to handle concurrent
-        // operations on different sockets within the same process
-        let get_range_lookup_key = |range_name: &str, args: &[(String, ArgValue)]| -> String {
-            if is_marker {
-                // Extract socket_id from args if present
-                if let Some((_, ArgValue::Long(socket_id))) =
-                    args.iter().find(|(k, _)| k == "socket_id")
-                {
-                    return format!("{range_name}:{socket_id}");
-                }
-            }
-            range_name.to_string()
+        // Use TGID (process ID) as the range key for process-scoped events, allowing
+        // start/end matching when async tasks migrate between threads. For thread-scoped
+        // events use the full TGIDPID.
+        let range_key = match scope {
+            EventScope::Process => event.task.tgidpid >> 32,
+            EventScope::Thread | EventScope::Cpu => event.task.tgidpid,
         };
 
         // First check to see if this is an end event, since we can have the same event for a start
         // event and an end event
         if let Some(range_name) = self.stop_events.get(&systing_event_name) {
-            let lookup_key = get_range_lookup_key(range_name, &arg_data);
+            let lookup_key = range_name.to_string();
             if let Some(ranges) = self.outstanding_ranges.get_mut(&range_key) {
                 if let Some(mut range) = ranges.remove(&lookup_key) {
                     let track_name = self.ranges.get(range_name).unwrap().clone();
@@ -1187,7 +1138,7 @@ impl SystingProbeRecorder {
 
         // Now handle the start event case
         if let Some(range_name) = self.start_events.get(&systing_event_name) {
-            let lookup_key = get_range_lookup_key(range_name, &arg_data);
+            let lookup_key = range_name.to_string();
             if let Some(ranges) = self.outstanding_ranges.get_mut(&range_key) {
                 if let Some(range) = ranges.get_mut(&lookup_key) {
                     range.start = event.ts;
@@ -1805,7 +1756,6 @@ impl SystingProbeRecorder {
             "uprobe" | "uretprobe" => EventProbe::UProbe(UProbeEvent::from_parts(parts)?),
             "kprobe" | "kretprobe" => EventProbe::KProbe(KProbeEvent::from_parts(parts)?),
             "tracepoint" => EventProbe::Tracepoint(TracepointEvent::from_parts(parts)?),
-            "marker" => EventProbe::Marker(MarkerEvent::from_parts(parts)?),
             _ => return Err(anyhow::anyhow!("Invalid event type")),
         };
 
@@ -1839,12 +1789,6 @@ impl SystingProbeRecorder {
                             event.name
                         ));
                     }
-                    EventProbe::Marker(_) => {
-                        return Err(anyhow::anyhow!(
-                            "retval arg type is not supported for marker events: {}",
-                            event.name
-                        ));
-                    }
                     _ => {
                         return Err(anyhow::anyhow!(
                             "retval arg type is only valid for kretprobe and uretprobe events: {}",
@@ -1860,7 +1804,7 @@ impl SystingProbeRecorder {
             cookie: rng.next_u64(),
             event: probe,
             args,
-            percpu: event.percpu.unwrap_or(false),
+            scope: event.scope.unwrap_or_default(),
             stack: event.stack.unwrap_or(false),
         };
         if self.config_events.contains_key(&event.name) {
@@ -1969,6 +1913,14 @@ impl SystingProbeRecorder {
                     }
                     if self.stop_events.contains_key(&end_event) {
                         Err(anyhow::anyhow!("Stop event {} already exists", end_event))?;
+                    }
+                    let start_scope = self.config_events.get(&start_event).unwrap().scope;
+                    let end_scope = self.config_events.get(&end_event).unwrap().scope;
+                    if start_scope != end_scope {
+                        Err(anyhow::anyhow!(
+                            "Range '{}': start event '{}' has scope {:?} but end event '{}' has scope {:?}; they must match",
+                            range.name, start_event, start_scope, end_event, end_scope
+                        ))?;
                     }
                     self.start_events.insert(start_event, range.name.clone());
                     self.stop_events.insert(end_event, range.name.clone());
@@ -3961,7 +3913,7 @@ mod tests {
     }
 
     #[test]
-    fn test_event_percpu() {
+    fn test_event_cpu_scope() {
         let mut rng = StepRng::new(0, 1);
         let mut recorder = SystingProbeRecorder::default();
         let json = r#"
@@ -3970,7 +3922,7 @@ mod tests {
                 {
                     "name": "event_percpu",
                     "event": "usdt:/path/to/file:provider:name",
-                    "percpu": true
+                    "scope": "cpu"
                 }
             ],
             "tracks": [
@@ -3990,7 +3942,7 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(recorder.config_events.len(), 1);
         let event = recorder.config_events.get("event_percpu").unwrap();
-        assert!(event.percpu);
+        assert_eq!(event.scope, EventScope::Cpu);
 
         let event = probe_event {
             task: task_info {
@@ -4297,325 +4249,131 @@ mod tests {
     }
 
     #[test]
-    fn test_marker_event_basic() {
+    fn test_thread_scope_no_cross_thread_match() {
+        // With default Thread scope, start/end on different TGIDPIDs do not match.
         let mut rng = StepRng::new(0, 1);
         let mut recorder = SystingProbeRecorder::default();
         let json = r#"
         {
             "events": [
-                {
-                    "name": "my_marker",
-                    "event": "marker:myapp:start"
-                }
+                { "name": "span_start", "event": "usdt:/bin/app:myapp:begin" },
+                { "name": "span_end",   "event": "usdt:/bin/app:myapp:end" }
             ],
-            "tracks": [
-                {
-                    "track_name": "markers",
-                    "instants": [
-                      {
-                        "event": "my_marker"
-                      }
-                    ]
-                }
-            ]
+            "tracks": [{
+                "track_name": "spans",
+                "ranges": [{ "name": "my_span", "start": "span_start", "end": "span_end" }]
+            }]
         }
         "#;
-
         recorder.load_config_from_json(json, &mut rng).unwrap();
-        assert_eq!(recorder.config_events.len(), 1);
-
-        let event = recorder.config_events.get("my_marker").unwrap();
-        match &event.event {
-            EventProbe::Marker(marker) => {
-                assert_eq!(marker.match_string, "myapp:start");
-            }
-            _ => panic!("Expected Marker event"),
-        }
-    }
-
-    #[test]
-    fn test_marker_event_with_colons_in_match_string() {
-        let mut rng = StepRng::new(0, 1);
-        let mut recorder = SystingProbeRecorder::default();
-        let json = r#"
-        {
-            "events": [
-                {
-                    "name": "complex_marker",
-                    "event": "marker:myapp:api:v2:request:start"
-                }
-            ],
-            "tracks": []
-        }
-        "#;
-
-        recorder.load_config_from_json(json, &mut rng).unwrap();
-        let event = recorder.config_events.get("complex_marker").unwrap();
-        match &event.event {
-            EventProbe::Marker(marker) => {
-                assert_eq!(marker.match_string, "myapp:api:v2:request:start");
-            }
-            _ => panic!("Expected Marker event"),
-        }
-    }
-
-    #[test]
-    fn test_marker_event_with_args() {
-        let mut rng = StepRng::new(0, 1);
-        let mut recorder = SystingProbeRecorder::default();
-        let json = r#"
-        {
-            "events": [
-                {
-                    "name": "marker_with_args",
-                    "event": "marker:myapp:request",
-                    "args": [
-                      {
-                        "arg_index": 0,
-                        "arg_type": "long",
-                        "arg_name": "request_id"
-                      },
-                      {
-                        "arg_index": 3,
-                        "arg_type": "long",
-                        "arg_name": "flags"
-                      }
-                    ]
-                }
-            ],
-            "tracks": []
-        }
-        "#;
-
-        recorder.load_config_from_json(json, &mut rng).unwrap();
-        let event = recorder.config_events.get("marker_with_args").unwrap();
-        assert_eq!(event.args.len(), 2);
-        assert_eq!(event.args[0].arg_index, 0);
-        assert_eq!(event.args[0].arg_name, "request_id");
-        assert_eq!(event.args[1].arg_index, 3);
-        assert_eq!(event.args[1].arg_name, "flags");
-    }
-
-    #[test]
-    fn test_marker_event_retval_not_supported() {
-        let mut rng = StepRng::new(0, 1);
-        let mut recorder = SystingProbeRecorder::default();
-        let json = r#"
-        {
-            "events": [
-                {
-                    "name": "marker_with_retval",
-                    "event": "marker:myapp:request",
-                    "args": [
-                      {
-                        "arg_index": 0,
-                        "arg_type": "retval",
-                        "arg_name": "return_value"
-                      }
-                    ]
-                }
-            ],
-            "tracks": []
-        }
-        "#;
-
-        let result = recorder.load_config_from_json(json, &mut rng);
-        assert!(result.is_err());
         assert_eq!(
-            result.unwrap_err().to_string(),
-            "retval arg type is not supported for marker events: marker_with_retval"
+            recorder.config_events.get("span_start").unwrap().scope,
+            EventScope::Thread
         );
-    }
-
-    #[test]
-    fn test_marker_event_invalid_format_missing_match_string() {
-        let mut rng = StepRng::new(0, 1);
-        let mut recorder = SystingProbeRecorder::default();
-        let json = r#"
-        {
-            "events": [
-                {
-                    "name": "invalid_marker",
-                    "event": "marker"
-                }
-            ],
-            "tracks": []
-        }
-        "#;
-
-        let result = recorder.load_config_from_json(json, &mut rng);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid marker format"));
-    }
-
-    #[test]
-    fn test_marker_event_as_range_start_end() {
-        let mut rng = StepRng::new(0, 1);
-        let mut recorder = SystingProbeRecorder::default();
-        let json = r#"
-        {
-            "events": [
-                {
-                    "name": "request_start",
-                    "event": "marker:myapp:request:start"
-                },
-                {
-                    "name": "request_end",
-                    "event": "marker:myapp:request:end"
-                }
-            ],
-            "tracks": [
-                {
-                    "track_name": "requests",
-                    "ranges": [
-                        {
-                            "name": "request",
-                            "start": "request_start",
-                            "end": "request_end"
-                        }
-                    ]
-                }
-            ]
-        }
-        "#;
-
-        recorder.load_config_from_json(json, &mut rng).unwrap();
-        assert_eq!(recorder.config_events.len(), 2);
-        assert!(recorder.start_events.contains_key("request_start"));
-        assert!(recorder.stop_events.contains_key("request_end"));
-        assert_eq!(
-            recorder.ranges.get("request"),
-            Some(&"requests".to_string())
-        );
-    }
-
-    #[test]
-    fn test_marker_event_generates_instant_packet() {
-        let mut rng = StepRng::new(0, 1);
-        let mut recorder = SystingProbeRecorder::default();
-        let json = r#"
-        {
-            "events": [
-                {
-                    "name": "checkpoint",
-                    "event": "marker:myapp:checkpoint"
-                }
-            ],
-            "tracks": [
-                {
-                    "track_name": "checkpoints",
-                    "instants": [
-                      {
-                        "event": "checkpoint"
-                      }
-                    ]
-                }
-            ]
-        }
-        "#;
-
-        recorder.load_config_from_json(json, &mut rng).unwrap();
-
-        let cookie = recorder.config_events.get("checkpoint").unwrap().cookie;
-        let event = probe_event {
-            task: task_info {
-                tgidpid: 1234,
-                ..Default::default()
-            },
-            ts: 5000,
-            cookie,
-            ..Default::default()
-        };
-        recorder.handle_event(event);
-
-        let mut thread_uuids = HashMap::new();
-        thread_uuids.insert(1234, 1);
-        let packets = generate_trace(
-            &mut recorder,
-            &HashMap::new(),
-            &thread_uuids,
-            &Arc::new(AtomicUsize::new(0)),
-        );
-
-        assert_eq!(packets.len(), 2);
-        assert_eq!(packets[0].track_descriptor().name(), "checkpoints");
-        assert_eq!(packets[1].track_event().name(), "marker:myapp:checkpoint");
-    }
-
-    #[test]
-    fn test_marker_event_generates_range_packets() {
-        let mut rng = StepRng::new(0, 1);
-        let mut recorder = SystingProbeRecorder::default();
-        let json = r#"
-        {
-            "events": [
-                {
-                    "name": "span_start",
-                    "event": "marker:myapp:span:begin"
-                },
-                {
-                    "name": "span_end",
-                    "event": "marker:myapp:span:end"
-                }
-            ],
-            "tracks": [
-                {
-                    "track_name": "spans",
-                    "ranges": [
-                        {
-                            "name": "my_span",
-                            "start": "span_start",
-                            "end": "span_end"
-                        }
-                    ]
-                }
-            ]
-        }
-        "#;
-
-        recorder.load_config_from_json(json, &mut rng).unwrap();
 
         let start_cookie = recorder.config_events.get("span_start").unwrap().cookie;
         let end_cookie = recorder.config_events.get("span_end").unwrap().cookie;
 
-        let start_event = probe_event {
+        // TGID=100, TID=200 starts; TGID=100, TID=300 ends (same process, different thread)
+        let tgidpid_thread1: u64 = (100u64 << 32) | 200;
+        let tgidpid_thread2: u64 = (100u64 << 32) | 300;
+        recorder.handle_event(probe_event {
             task: task_info {
-                tgidpid: 1234,
+                tgidpid: tgidpid_thread1,
                 ..Default::default()
             },
             ts: 1000,
             cookie: start_cookie,
             ..Default::default()
-        };
-        recorder.handle_event(start_event);
-
-        let end_event = probe_event {
+        });
+        recorder.handle_event(probe_event {
             task: task_info {
-                tgidpid: 1234,
+                tgidpid: tgidpid_thread2,
                 ..Default::default()
             },
             ts: 2000,
             cookie: end_cookie,
             ..Default::default()
-        };
-        recorder.handle_event(end_event);
+        });
 
-        let mut thread_uuids = HashMap::new();
-        thread_uuids.insert(1234, 1);
-        let packets = generate_trace(
-            &mut recorder,
-            &HashMap::new(),
-            &thread_uuids,
-            &Arc::new(AtomicUsize::new(0)),
+        // No completed ranges — cross-thread start/end did not match under Thread scope
+        assert!(recorder.recorded_ranges.is_empty());
+    }
+
+    #[test]
+    fn test_process_scope_cross_thread_match() {
+        // With Process scope, start/end on different TGIDPIDs within the same process match.
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                { "name": "span_start", "event": "usdt:/bin/app:myapp:begin", "scope": "process" },
+                { "name": "span_end",   "event": "usdt:/bin/app:myapp:end",   "scope": "process" }
+            ],
+            "tracks": [{
+                "track_name": "spans",
+                "ranges": [{ "name": "my_span", "start": "span_start", "end": "span_end" }]
+            }]
+        }
+        "#;
+        recorder.load_config_from_json(json, &mut rng).unwrap();
+        assert_eq!(
+            recorder.config_events.get("span_start").unwrap().scope,
+            EventScope::Process
         );
 
-        assert_eq!(packets.len(), 3);
-        assert_eq!(packets[0].track_descriptor().name(), "spans");
-        assert_eq!(packets[1].track_event().type_(), Type::TYPE_SLICE_BEGIN);
-        assert_eq!(packets[1].track_event().name(), "my_span");
-        assert_eq!(packets[2].track_event().type_(), Type::TYPE_SLICE_END);
+        let start_cookie = recorder.config_events.get("span_start").unwrap().cookie;
+        let end_cookie = recorder.config_events.get("span_end").unwrap().cookie;
+
+        // TGID=100, TID=200 starts; TGID=100, TID=300 ends (same process, different threads)
+        let tgidpid_thread1: u64 = (100u64 << 32) | 200;
+        let tgidpid_thread2: u64 = (100u64 << 32) | 300;
+        recorder.handle_event(probe_event {
+            task: task_info {
+                tgidpid: tgidpid_thread1,
+                ..Default::default()
+            },
+            ts: 1000,
+            cookie: start_cookie,
+            ..Default::default()
+        });
+        recorder.handle_event(probe_event {
+            task: task_info {
+                tgidpid: tgidpid_thread2,
+                ..Default::default()
+            },
+            ts: 2000,
+            cookie: end_cookie,
+            ..Default::default()
+        });
+
+        // Range matched across threads via TGID key
+        assert!(!recorder.recorded_ranges.is_empty());
+        let ranges = recorder.recorded_ranges.values().next().unwrap();
+        let track_ranges = ranges.values().next().unwrap();
+        assert_eq!(track_ranges[0].start, 1000);
+        assert_eq!(track_ranges[0].end, 2000);
+    }
+
+    #[test]
+    fn test_range_mismatched_scope_is_rejected() {
+        let mut rng = StepRng::new(0, 1);
+        let mut recorder = SystingProbeRecorder::default();
+        let json = r#"
+        {
+            "events": [
+                { "name": "span_start", "event": "usdt:/bin/app:myapp:begin", "scope": "process" },
+                { "name": "span_end",   "event": "usdt:/bin/app:myapp:end" }
+            ],
+            "tracks": [{
+                "track_name": "spans",
+                "ranges": [{ "name": "my_span", "start": "span_start", "end": "span_end" }]
+            }]
+        }
+        "#;
+        let result = recorder.load_config_from_json(json, &mut rng);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("scope"));
     }
 }
