@@ -2294,7 +2294,10 @@ fn run_tracing_loop(
         println!("Missed poll events: {}", dump_missed_events(skel, 6));
     }
     if opts.markers {
-        println!("Missed marker events (ringbuf full): {}", dump_missed_events(skel, 7));
+        println!(
+            "Missed marker events (ringbuf full): {}",
+            dump_missed_events(skel, 7)
+        );
     }
 
     Ok(())

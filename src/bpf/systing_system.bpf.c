@@ -1055,9 +1055,9 @@ static __always_inline void read_icsk_timeout(struct inet_connection_sock *icsk,
 	struct inet_connection_sock___pre618 *old = (void *)icsk;
 
 	if (bpf_core_field_exists(old->icsk_timeout)) {
-		bpf_probe_read_kernel(timeout, sizeof(*timeout), &old->icsk_timeout);
+		*timeout = BPF_CORE_READ(old, icsk_timeout);
 	} else {
-		bpf_probe_read_kernel(timeout, sizeof(*timeout), &icsk->icsk_retransmit_timer.expires);
+		*timeout = BPF_CORE_READ(icsk, icsk_retransmit_timer.expires);
 	}
 }
 
