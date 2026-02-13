@@ -2382,9 +2382,27 @@ fn parquet_column_contains(path: &std::path::Path, column: &str, target: &str) -
     false
 }
 
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_e2e_marker_recording() {
+/// Parameters for a marker workload used by [`run_marker_recording`].
+struct MarkerWorkloadConfig {
+    /// Syscall mode value passed as arg 2 to faccessat2.
+    /// Use `-975i64` for the C sign-extended form, or `(-975i32 as u32) as i64` for
+    /// the zero-extended form produced by Python ctypes and some JVM runtimes.
+    mode: i64,
+    /// Pathname for START/END range events. Format: `"Track:event"` or just `"event"`
+    /// to use the default `"Markers"` track.
+    range_name: &'static str,
+    /// Pathname for INSTANT events.
+    instant_name: &'static str,
+}
+
+/// Run a marker-only systing recording while a workload thread emits faccessat2 marker events.
+///
+/// Spawns a thread that loops: START range → sleep 50 ms → END range → INSTANT → sleep 200 ms.
+/// The thread waits 500 ms first to allow BPF probe attachment.
+///
+/// Returns the [`TempDir`] holding the output Parquet files. The caller is responsible
+/// for asserting the expected contents.
+fn run_marker_recording(cfg: MarkerWorkloadConfig) -> TempDir {
     use std::ffi::CString;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -2392,52 +2410,34 @@ fn test_e2e_marker_recording() {
     use std::time::Duration;
     use syscalls::Sysno;
 
-    setup_bpf_environment();
-
     let dir = TempDir::new().expect("Failed to create temp dir");
-
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
 
-    // Spawn a workload thread that emits marker events via faccessat2.
-    // Runs continuously until signaled to stop, ensuring events are emitted
-    // throughout the entire trace window.
+    let mode = cfg.mode;
+    let range_name = CString::new(cfg.range_name).unwrap();
+    let instant_name = CString::new(cfg.instant_name).unwrap();
+    let sysno = Sysno::faccessat2 as i64;
+
     let workload_handle = thread::spawn(move || {
-        const SYSTING_MARKER_MODE: i64 = -975;
-        let sysno = Sysno::faccessat2 as i64;
-        let range_name = CString::new("MyTrack:range_event").unwrap();
-        let instant_name = CString::new("checkpoint").unwrap();
-
-        // Allow time for BPF probe attachment before emitting markers
         thread::sleep(Duration::from_millis(500));
-
         // SAFETY: CString pointers remain valid for the duration of each syscall.
         // faccessat2 reads the pathname argument but does not store the pointer.
         while !stop_clone.load(Ordering::Relaxed) {
             unsafe {
-                // START: "MyTrack:range_event" -> track="MyTrack", name="range_event"
-                libc::syscall(sysno, 0i64, range_name.as_ptr(), SYSTING_MARKER_MODE, 0i64);
+                libc::syscall(sysno, 0i64, range_name.as_ptr(), mode, 0i64); // START
             }
             thread::sleep(Duration::from_millis(50));
             unsafe {
-                // END: same name to close the range
-                libc::syscall(sysno, 1i64, range_name.as_ptr(), SYSTING_MARKER_MODE, 0i64);
+                libc::syscall(sysno, 1i64, range_name.as_ptr(), mode, 0i64); // END
             }
             unsafe {
-                // INSTANT: "checkpoint" (no colon -> default track "Markers")
-                libc::syscall(
-                    sysno,
-                    2i64,
-                    instant_name.as_ptr(),
-                    SYSTING_MARKER_MODE,
-                    0i64,
-                );
+                libc::syscall(sysno, 2i64, instant_name.as_ptr(), mode, 0i64); // INSTANT
             }
             thread::sleep(Duration::from_millis(200));
         }
     });
 
-    // Disable everything except markers
     let config = Config {
         duration: MARKER_RECORDING_DURATION_SECS,
         output_dir: dir.path().to_path_buf(),
@@ -2455,6 +2455,24 @@ fn test_e2e_marker_recording() {
     systing(config, None).expect("systing recording failed");
     stop.store(true, Ordering::Relaxed);
     workload_handle.join().expect("Workload thread panicked");
+
+    dir
+}
+
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_marker_recording() {
+    // Pass mode as i64 = -975: libc::syscall promotes this to a 64-bit register
+    // value of 0xFFFFFFFFFFFFFC31 (sign-extended). This exercises the sign-extended
+    // calling convention. See test_e2e_marker_recording_zero_extended for the
+    // zero-extended path (e.g. Python ctypes, some JVM runtimes).
+    setup_bpf_environment();
+
+    let dir = run_marker_recording(MarkerWorkloadConfig {
+        mode: -975i64,
+        range_name: "MyTrack:range_event",
+        instant_name: "checkpoint",
+    });
 
     // --- Validate slice.parquet contains the range event ---
     eprintln!("  marker recording: validating slice.parquet...");
@@ -2494,4 +2512,66 @@ fn test_e2e_marker_recording() {
     );
 
     eprintln!("  All marker recording checks passed");
+}
+
+/// Regression test for the zero-extended calling convention.
+///
+/// Some language runtimes (Python ctypes, certain JVM variants) pass a 32-bit
+/// mode argument as an unsigned zero-extended 64-bit value. For -975, that
+/// puts 0x00000000FFFFFC31 in the register instead of 0xFFFFFFFFFFFFFC31
+/// (sign-extended, as C default-argument promotion produces). The BPF sentinel
+/// check must use a 32-bit comparison to match both forms; this test exercises
+/// the zero-extended path to ensure it is never broken again.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_marker_recording_zero_extended() {
+    // Cast i32(-975) to u32 (0xFFFFFC31), then to i64 (4294966321 = 0x00000000FFFFFC31).
+    // libc::syscall places this directly in the register, simulating runtimes that
+    // do not sign-extend their mode argument.
+    let mode_zero_extended: i64 = (-975i32 as u32) as i64;
+    debug_assert_ne!(
+        mode_zero_extended,
+        -975i64,
+        "zero-extended and sign-extended representations must differ for this test to be meaningful"
+    );
+
+    setup_bpf_environment();
+
+    let dir = run_marker_recording(MarkerWorkloadConfig {
+        mode: mode_zero_extended,
+        range_name: "ZETrack:ze_range",
+        instant_name: "ze_instant",
+    });
+
+    eprintln!("  zero-extended marker: validating slice.parquet...");
+    let slice_path = dir.path().join("slice.parquet");
+    assert!(
+        slice_path.exists(),
+        "slice.parquet not found - zero-extended marker range was not recorded"
+    );
+    assert!(
+        parquet_column_contains(&slice_path, "name", "ze_range"),
+        "ze_range not found in slice.parquet - zero-extended sentinel comparison failed"
+    );
+
+    eprintln!("  zero-extended marker: validating instant.parquet...");
+    let instant_path = dir.path().join("instant.parquet");
+    assert!(
+        instant_path.exists(),
+        "instant.parquet not found - zero-extended marker instant was not recorded"
+    );
+    assert!(
+        parquet_column_contains(&instant_path, "name", "ze_instant"),
+        "ze_instant not found in instant.parquet"
+    );
+
+    eprintln!("  zero-extended marker: validating track.parquet...");
+    let track_path = dir.path().join("track.parquet");
+    assert!(track_path.exists(), "track.parquet not found");
+    assert!(
+        parquet_column_contains(&track_path, "name", "ZETrack"),
+        "ZETrack not found in track.parquet"
+    );
+
+    eprintln!("  All zero-extended marker recording checks passed");
 }

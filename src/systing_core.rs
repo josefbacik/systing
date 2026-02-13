@@ -1387,12 +1387,17 @@ fn setup_ringbuffers<'a>(
     }
 
     if opts.markers {
+        let mut found_ringbuf = false;
         for map in object.maps() {
             if map.name().to_str().unwrap() == "ringbuf_marker" {
                 let ring = create_ring::<marker_event>(&map, marker_tx.clone())?;
                 rings.push(("ringbuf_marker".to_string(), ring));
+                found_ringbuf = true;
                 break;
             }
+        }
+        if !found_ringbuf {
+            eprintln!("ERROR: ringbuf_marker map not found in BPF object - marker events will not be collected");
         }
     }
 
@@ -2287,6 +2292,9 @@ fn run_tracing_loop(
         println!("Missed network events: {}", dump_missed_events(skel, 4));
         println!("Missed packet events: {}", dump_missed_events(skel, 5));
         println!("Missed poll events: {}", dump_missed_events(skel, 6));
+    }
+    if opts.markers {
+        println!("Missed marker events (ringbuf full): {}", dump_missed_events(skel, 7));
     }
 
     Ok(())

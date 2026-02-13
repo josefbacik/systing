@@ -30,6 +30,12 @@ pub struct MarkerRecorder {
     instants: Vec<MarkerInstant>,
 }
 
+/// Marker type values passed in the `dirfd` argument of the `faccessat2` syscall.
+/// These must stay in sync with the BPF-side definitions in `systing_system.bpf.c`.
+pub const MARKER_TYPE_START: u32 = 0;
+pub const MARKER_TYPE_END: u32 = 1;
+pub const MARKER_TYPE_INSTANT: u32 = 2;
+
 fn parse_name(raw: &[u8; 64]) -> (String, String) {
     let s = CStr::from_bytes_until_nul(raw)
         .ok()
@@ -54,12 +60,10 @@ impl SystingRecordEvent<marker_event> for MarkerRecorder {
         let ts = event.ts;
 
         match event.marker_type {
-            0 => {
-                // START
+            MARKER_TYPE_START => {
                 self.outstanding_ranges.insert((tgidpid, track, name), ts);
             }
-            1 => {
-                // END
+            MARKER_TYPE_END => {
                 let key = (tgidpid, track.clone(), name.clone());
                 if let Some(start) = self.outstanding_ranges.remove(&key) {
                     self.recorded_ranges.push(MarkerRange {
@@ -69,13 +73,11 @@ impl SystingRecordEvent<marker_event> for MarkerRecorder {
                         end: ts,
                     });
                 }
-                // orphan ENDs are silently dropped
             }
-            2 => {
-                // INSTANT
+            MARKER_TYPE_INSTANT => {
                 self.instants.push(MarkerInstant { track, name, ts });
             }
-            _ => {} // invalid type: ignore
+            _ => {}
         }
     }
 }
