@@ -644,11 +644,12 @@ impl NetworkRecorder {
 
     /// Helper function to convert kernel jiffies to microseconds for streaming.
     fn jiffies_to_us(jiffies: u64) -> i64 {
-        ((jiffies * 1000000) / system_hz()) as i64
+        ((jiffies as u128 * 1_000_000) / system_hz() as u128) as i64
     }
 
     /// Helper function to convert kernel jiffies to milliseconds for streaming.
     fn jiffies_to_ms(jiffies: u32) -> i32 {
+        // u32::MAX * 1000 fits in u64, so no widening needed here
         ((jiffies as u64 * 1000) / system_hz()) as i32
     }
 
@@ -1366,8 +1367,7 @@ impl NetworkRecorder {
     /// Add RTO timeout annotations with jiffies-to-microseconds conversion
     fn add_rto_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
         if pkt.rto_jiffies > 0 {
-            // Convert jiffies to microseconds using cached system HZ
-            let rto_us = (pkt.rto_jiffies as u64 * 1_000_000) / system_hz();
+            let rto_us = Self::jiffies_to_us(pkt.rto_jiffies as u64) as u64;
 
             event.add_uint("rto_jiffies", pkt.rto_jiffies as u64);
             event.add_uint("rto_us", rto_us);
@@ -1660,7 +1660,7 @@ impl NetworkRecorder {
         pkt: &PacketEvent,
     ) -> Result<()> {
         if pkt.rto_jiffies > 0 {
-            let rto_us = (pkt.rto_jiffies as u64 * 1_000_000) / system_hz();
+            let rto_us = Self::jiffies_to_us(pkt.rto_jiffies as u64) as u64;
 
             collector.add_instant_arg(InstantArgRecord {
                 instant_id,

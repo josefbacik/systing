@@ -142,7 +142,15 @@ struct probe_event {
 
 #define MAX_MARKER_NAME_LEN 64
 /* Sentinel value for faccessat2 mode argument that identifies a systing marker.
- * Chosen to be an invalid mode value unlikely to appear in real faccessat2 calls. */
+ * Value: -975 (0xFFFFFC31 as u32). Chosen to be an invalid mode value that cannot
+ * arise from legitimate faccessat2 access-check bits (R_OK/W_OK/X_OK/F_OK).
+ *
+ * IMPORTANT: All comparisons against this constant must use (s32) rather than (s64).
+ * Language runtimes differ in how they widen a 32-bit mode value to a 64-bit register:
+ * C default-argument promotion sign-extends (giving 0xFFFFFFFFFFFFFC31), while other
+ * runtimes (Python ctypes, some JVM variants, etc.) zero-extend (0x00000000FFFFFC31).
+ * Both forms have identical lower 32 bits (0xFFFFFC31 = -975 as s32), so comparing
+ * as s32 correctly matches both calling conventions with a single comparison. */
 #define SYSTING_MARKER_MODE (-975)
 struct marker_event {
 	u64 ts;
@@ -1047,9 +1055,9 @@ static __always_inline void read_icsk_timeout(struct inet_connection_sock *icsk,
 	struct inet_connection_sock___pre618 *old = (void *)icsk;
 
 	if (bpf_core_field_exists(old->icsk_timeout)) {
-		bpf_probe_read_kernel(timeout, sizeof(*timeout), &old->icsk_timeout);
+		*timeout = BPF_CORE_READ(old, icsk_timeout);
 	} else {
-		bpf_probe_read_kernel(timeout, sizeof(*timeout), &icsk->icsk_retransmit_timer.expires);
+		*timeout = BPF_CORE_READ(icsk, icsk_retransmit_timer.expires);
 	}
 }
 
@@ -1943,12 +1951,12 @@ int tracepoint__raw_syscalls__sys_enter(struct trace_event_raw_sys_enter *ctx)
 	if (!trace_task(task))
 		return 0;
 
-	// Check for marker syscall (faccessat2 with mode == SYSTING_MARKER_MODE)
-	// Note: when collect_syscalls is enabled, these calls are also recorded as raw syscalls.
-	if (tool_config.marker_syscall_nr && ctx->id == tool_config.marker_syscall_nr
-	    && (s64)ctx->args[2] == SYSTING_MARKER_MODE) {
-		handle_marker_event(ctx, task);
-		// Don't return - continue to record syscall if collect_syscalls is enabled
+	/* Note: when collect_syscalls is enabled these calls are also recorded as
+	 * raw syscalls -- do not return early after handling the marker. */
+	if (tool_config.marker_syscall_nr && ctx->id == tool_config.marker_syscall_nr) {
+		/* Use s32 comparison -- see SYSTING_MARKER_MODE comment for details. */
+		if ((s32)ctx->args[2] == (s32)SYSTING_MARKER_MODE)
+			handle_marker_event(ctx, task);
 	}
 
 	if (!tool_config.collect_syscalls)

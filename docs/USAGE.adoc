@@ -403,9 +403,13 @@ syscall(SYS_faccessat2, SYSTING_MARKER_INSTANT, "Training:checkpoint", SYSTING_M
 The calling convention:
 
 * `dirfd` (arg 0): event type — `0` = range start, `1` = range end, `2` = instant
-* `pathname` (arg 1): `"TrackName:EventName"` — the colon separates track from event name.
+* `pathname` (arg 1): `"TrackName:EventName"` — the first colon separates track from event name.
   If no colon is present, the track defaults to `"Markers"`.
-* `mode` (arg 2): must be `-975` to identify the call as a systing marker
+  Additional colons are treated as part of the event name (e.g. `"Track:a:b"` → track=`"Track"`, name=`"a:b"`).
+* `mode` (arg 2): must be `-975` to identify the call as a systing marker.
+  The BPF check compares only the lower 32 bits, so both sign-extended and
+  zero-extended representations of `-975` are accepted — passing the value as
+  a C `int`, a Python `ctypes` integer, or an unsigned `0xFFFFFC31` all work.
 * `flags` (arg 3): ignored
 
 Start/end ranges are matched by thread (same TGIDPID) and `(track, event)` name pair.
