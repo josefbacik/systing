@@ -949,6 +949,40 @@ fn test_e2e_network_suite() {
             "[network duckdb] No ESTABLISHED state transitions found. \
              TCP connections should produce SYN_SENT/SYN_RECV -> ESTABLISHED transitions."
         );
+
+        // Check that TIME_WAIT transitions are captured (via tcp_time_wait kprobe rewrite)
+        let time_wait_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM network_packet \
+                 WHERE event_type = 'TCP state_change' \
+                 AND new_state_str = 'TIME_WAIT'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        eprintln!("    {} transitions to TIME_WAIT state", time_wait_count);
+        assert!(
+            time_wait_count > 0,
+            "[network duckdb] No TIME_WAIT state transitions found. \
+             TCP connections should produce FIN_WAIT2/CLOSING -> TIME_WAIT transitions."
+        );
+
+        // Check that TIME_WAIT -> CLOSE transitions exist (via inet_twsk_deschedule_put kprobe).
+        // Note: these only appear if TIME_WAIT sockets are destroyed during the trace.
+        // With short-lived connections on loopback, tw_reuse or RST may destroy them quickly.
+        let tw_close_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM network_packet \
+                 WHERE event_type = 'TCP state_change' \
+                 AND old_state_str = 'TIME_WAIT' \
+                 AND new_state_str = 'CLOSE'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        eprintln!("    {} transitions from TIME_WAIT to CLOSE", tw_close_count);
+        // Don't assert on tw_close_count > 0 because TIME_WAIT lasts 60s and
+        // the test trace is only 3s. TIME_WAIT → CLOSE may not happen during the trace.
     }
 
     eprintln!("\n  All network suite checks passed");
