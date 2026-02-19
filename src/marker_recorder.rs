@@ -23,11 +23,18 @@ struct MarkerInstant {
 
 #[derive(Default)]
 pub struct MarkerRecorder {
-    ringbuf: RingBuffer<marker_event>,
+    pub ringbuf: RingBuffer<marker_event>,
     // Key: (tgidpid, track, name) -> start_ts
     outstanding_ranges: HashMap<(u64, String, String), u64>,
     recorded_ranges: Vec<MarkerRange>,
     instants: Vec<MarkerInstant>,
+    // Threshold tracking: count completed ranges and stop when threshold is hit
+    range_count: u64,
+    threshold: Option<u64>,
+    // Separate from `outstanding_ranges` because `maybe_trigger` runs on the
+    // ingestion path (before events enter the ring buffer), while `handle_event`
+    // runs on the drain path. They observe events at different times.
+    outstanding_triggers: HashMap<(u64, String, String), u64>,
 }
 
 /// Marker type values passed in the `dirfd` argument of the `faccessat2` syscall.
@@ -54,6 +61,38 @@ impl SystingRecordEvent<marker_event> for MarkerRecorder {
     fn ringbuf_mut(&mut self) -> &mut RingBuffer<marker_event> {
         &mut self.ringbuf
     }
+    fn maybe_trigger(&mut self, event: &marker_event) -> bool {
+        let Some(threshold) = self.threshold else {
+            return false;
+        };
+
+        let (track, name) = parse_name(&event.name);
+        let tgidpid = event.task.tgidpid;
+
+        match event.marker_type {
+            MARKER_TYPE_START => {
+                self.outstanding_triggers
+                    .insert((tgidpid, track, name), event.ts);
+                false
+            }
+            MARKER_TYPE_END => {
+                let key = (tgidpid, track, name);
+                if self.outstanding_triggers.remove(&key).is_some() {
+                    self.range_count += 1;
+                    if self.range_count >= threshold {
+                        println!(
+                            "Marker threshold reached: {} completed ranges observed",
+                            self.range_count
+                        );
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     fn handle_event(&mut self, event: marker_event) {
         let (track, name) = parse_name(&event.name);
         let tgidpid = event.task.tgidpid;
@@ -83,6 +122,11 @@ impl SystingRecordEvent<marker_event> for MarkerRecorder {
 }
 
 impl MarkerRecorder {
+    pub fn with_threshold(mut self, threshold: Option<u64>) -> Self {
+        self.threshold = threshold;
+        self
+    }
+
     pub fn has_data(&self) -> bool {
         !self.recorded_ranges.is_empty() || !self.instants.is_empty()
     }
@@ -280,5 +324,54 @@ mod tests {
         // The slice and instant share the same track_id
         assert_eq!(data.slices[0].track_id, data.tracks[0].id);
         assert_eq!(data.instants[0].track_id, data.tracks[0].id);
+    }
+
+    #[test]
+    fn test_threshold_none_never_triggers() {
+        let mut recorder = MarkerRecorder::default();
+        // No threshold set, completed ranges should never trigger
+        for i in 0..100 {
+            assert!(!recorder.maybe_trigger(&make_event(0, "T:evt", 1, i * 100)));
+            assert!(!recorder.maybe_trigger(&make_event(1, "T:evt", 1, i * 100 + 50)));
+        }
+    }
+
+    #[test]
+    fn test_threshold_triggers_at_count() {
+        let mut recorder = MarkerRecorder::default().with_threshold(Some(3));
+        // First two completed ranges should not trigger
+        for i in 0..2 {
+            assert!(!recorder.maybe_trigger(&make_event(0, "T:evt", 1, i * 100)));
+            assert!(!recorder.maybe_trigger(&make_event(1, "T:evt", 1, i * 100 + 50)));
+        }
+        // Third completed range should trigger
+        assert!(!recorder.maybe_trigger(&make_event(0, "T:evt", 1, 200)));
+        assert!(recorder.maybe_trigger(&make_event(1, "T:evt", 1, 250)));
+    }
+
+    #[test]
+    fn test_threshold_one_triggers_immediately() {
+        let mut recorder = MarkerRecorder::default().with_threshold(Some(1));
+        assert!(!recorder.maybe_trigger(&make_event(0, "T:evt", 1, 100)));
+        assert!(recorder.maybe_trigger(&make_event(1, "T:evt", 1, 200)));
+    }
+
+    #[test]
+    fn test_threshold_ignores_instants() {
+        let mut recorder = MarkerRecorder::default().with_threshold(Some(1));
+        // Instants should not count toward threshold
+        assert!(!recorder.maybe_trigger(&make_event(2, "T:check", 1, 100)));
+        assert!(!recorder.maybe_trigger(&make_event(2, "T:check", 1, 200)));
+        // Only a completed range should trigger
+        assert!(!recorder.maybe_trigger(&make_event(0, "T:evt", 1, 300)));
+        assert!(recorder.maybe_trigger(&make_event(1, "T:evt", 1, 400)));
+    }
+
+    #[test]
+    fn test_threshold_ignores_orphan_end() {
+        let mut recorder = MarkerRecorder::default().with_threshold(Some(1));
+        // End without matching start should not count
+        assert!(!recorder.maybe_trigger(&make_event(1, "T:evt", 1, 100)));
+        assert_eq!(recorder.range_count, 0);
     }
 }

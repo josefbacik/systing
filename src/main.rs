@@ -74,6 +74,9 @@ struct Command {
     // Marker recording enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     markers: bool,
+    /// Stop tracing after this many completed marker range events are observed
+    #[arg(long)]
+    marker_threshold: Option<u64>,
     /// Skip DNS resolution for network addresses (show IP addresses instead of hostnames)
     #[arg(long)]
     no_resolve_addresses: bool,
@@ -133,6 +136,7 @@ impl From<Command> for Config {
             no_sched: cmd.no_sched,
             syscalls: cmd.syscalls,
             markers: cmd.markers,
+            marker_threshold: cmd.marker_threshold,
             network: cmd.network,
             no_resolve_addresses: cmd.no_resolve_addresses,
             output_dir: cmd.output_dir,
@@ -301,6 +305,14 @@ fn main() -> Result<()> {
     // Validate incompatible options
     if !opts.run_command.is_empty() && opts.continuous > 0 {
         anyhow::bail!("--continuous cannot be used with a run command (-- <command>)");
+    }
+
+    // Auto-enable markers when marker-threshold is set
+    if opts.marker_threshold.is_some() {
+        opts.markers = true;
+        if opts.continuous == 0 {
+            anyhow::bail!("--marker-threshold requires --continuous <seconds>");
+        }
     }
 
     // Auto-enable pystacks for Python commands

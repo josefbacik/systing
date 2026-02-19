@@ -2663,3 +2663,126 @@ fn test_e2e_marker_recording_zero_extended() {
 
     eprintln!("  All zero-extended marker recording checks passed");
 }
+
+/// Count rows in a parquet file.
+fn parquet_row_count(path: &std::path::Path) -> usize {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|e| panic!("Failed to open {}: {e}", path.display()));
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .expect("Failed to create reader")
+        .build()
+        .expect("Failed to build reader");
+
+    reader
+        .into_iter()
+        .map(|batch| batch.expect("Failed to read batch").num_rows())
+        .sum()
+}
+
+/// Integration test for marker threshold in continuous mode.
+///
+/// Configures systing with `--continuous 3` (3-second ring buffer window) and
+/// `--marker-threshold 2` (stop after 2 completed marker ranges). A workload
+/// thread emits START → sleep 1s → END pairs. After the second completed range
+/// the threshold triggers and systing stops. We validate that the trace contains
+/// exactly the expected marker range events.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_marker_threshold() {
+    use std::ffi::CString;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use syscalls::Sysno;
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+
+    let mode = -975i64;
+    let range_name = CString::new("Threshold:range_evt").unwrap();
+    let sysno = Sysno::faccessat2 as i64;
+
+    // Workload: emit START, sleep 1s, emit END, repeat.
+    // With marker_threshold=2 the second completed range triggers shutdown.
+    let workload_handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(500)); // Wait for BPF init
+        while !stop_clone.load(Ordering::Relaxed) {
+            unsafe {
+                libc::syscall(sysno, 0i64, range_name.as_ptr(), mode, 0i64); // START
+            }
+            thread::sleep(Duration::from_secs(1));
+            unsafe {
+                libc::syscall(sysno, 1i64, range_name.as_ptr(), mode, 0i64); // END
+            }
+            thread::sleep(Duration::from_millis(100)); // Brief pause between ranges
+        }
+    });
+
+    let start = Instant::now();
+
+    let config = Config {
+        continuous: 3,             // 3-second ring buffer window
+        marker_threshold: Some(2), // Stop after 2 completed ranges
+        output_dir: dir.path().to_path_buf(),
+        no_sched: true,
+        no_cpu_stack_traces: true,
+        no_sleep_stack_traces: true,
+        no_interruptible_stack_traces: true,
+        network: false,
+        collect_pystacks: false,
+        markers: true,
+        parquet_only: true,
+        ..Config::default()
+    };
+
+    systing(config, None).expect("systing recording failed");
+    let elapsed = start.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    workload_handle.join().expect("Workload thread panicked");
+
+    // The threshold should have triggered after ~2.5s (500ms init + 2×~1.1s per range).
+    // If it ran for the full continuous window without triggering, something is wrong.
+    eprintln!(
+        "  marker threshold: recording took {:.1}s",
+        elapsed.as_secs_f64()
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "Threshold should have triggered well before timeout; took {:.1}s",
+        elapsed.as_secs_f64()
+    );
+
+    // --- Validate slice.parquet contains the range events ---
+    eprintln!("  marker threshold: validating slice.parquet...");
+    let slice_path = dir.path().join("slice.parquet");
+    assert!(
+        slice_path.exists(),
+        "slice.parquet not found - marker range events were not recorded"
+    );
+    assert!(
+        parquet_column_contains(&slice_path, "name", "range_evt"),
+        "range_evt not found in slice.parquet"
+    );
+    let range_count = parquet_row_count(&slice_path);
+    assert!(
+        range_count >= 2,
+        "Expected at least 2 completed ranges, got {range_count}"
+    );
+
+    // --- Validate track.parquet has the threshold track ---
+    eprintln!("  marker threshold: validating track.parquet...");
+    let track_path = dir.path().join("track.parquet");
+    assert!(track_path.exists(), "track.parquet not found");
+    assert!(
+        parquet_column_contains(&track_path, "name", "Threshold"),
+        "Threshold track not found in track.parquet"
+    );
+
+    eprintln!("  All marker threshold checks passed");
+}

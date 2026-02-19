@@ -250,6 +250,8 @@ pub struct Config {
     pub syscalls: bool,
     /// Enable marker recording (faccessat2-based userspace markers)
     pub markers: bool,
+    /// Stop tracing after this many completed marker range events
+    pub marker_threshold: Option<u64>,
     /// Enable network recording
     pub network: bool,
     /// Skip DNS resolution for network addresses
@@ -290,6 +292,7 @@ impl Default for Config {
             no_sched: false,
             syscalls: false,
             markers: false,
+            marker_threshold: None,
             network: false,
             no_resolve_addresses: false,
             output_dir: PathBuf::from("./traces"),
@@ -939,6 +942,12 @@ fn set_ringbuf_duration(recorder: &Arc<SessionRecorder>, duration_nanos: u64) {
         .set_max_duration(duration_nanos);
     recorder
         .probe_recorder
+        .lock()
+        .unwrap()
+        .ringbuf
+        .set_max_duration(duration_nanos);
+    recorder
+        .marker_recorder
         .lock()
         .unwrap()
         .ringbuf
@@ -2341,6 +2350,7 @@ pub fn systing(
     let recorder = Arc::new(SessionRecorder::new(
         opts.enable_debuginfod,
         !opts.no_resolve_addresses,
+        opts.marker_threshold,
     ));
     configure_recorder(&opts, &recorder);
     recorder.snapshot_clocks();
