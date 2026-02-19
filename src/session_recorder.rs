@@ -516,7 +516,11 @@ impl SysinfoRecorder {
 }
 
 impl SessionRecorder {
-    pub fn new(enable_debuginfod: bool, resolve_network_addresses: bool) -> Self {
+    pub fn new(
+        enable_debuginfod: bool,
+        resolve_network_addresses: bool,
+        marker_threshold: Option<u64>,
+    ) -> Self {
         let utid_generator = Arc::new(UtidGenerator::new());
         Self {
             clock_snapshot: Mutex::new(ClockSnapshot::default()),
@@ -532,7 +536,7 @@ impl SessionRecorder {
                 resolve_network_addresses,
                 Arc::clone(&utid_generator),
             )),
-            marker_recorder: Mutex::new(MarkerRecorder::default()),
+            marker_recorder: Mutex::new(MarkerRecorder::default().with_threshold(marker_threshold)),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
@@ -719,6 +723,7 @@ impl SessionRecorder {
         self.sysinfo_recorder.lock().unwrap().drain_ringbuf();
         self.probe_recorder.lock().unwrap().drain_ringbuf();
         self.network_recorder.lock().unwrap().drain_ringbuf();
+        self.marker_recorder.lock().unwrap().drain_ringbuf();
     }
 
     pub fn snapshot_clocks(&self) {
