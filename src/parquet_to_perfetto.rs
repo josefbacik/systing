@@ -1921,6 +1921,12 @@ impl ParquetToPerfettoConverter {
                 let tcp_flags = batch
                     .column_by_name("tcp_flags")
                     .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+                let old_state_strs = batch
+                    .column_by_name("old_state_str")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+                let new_state_strs = batch
+                    .column_by_name("new_state_str")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
                 for i in 0..batch.num_rows() {
                     let ts = timestamps.value(i);
@@ -1974,6 +1980,20 @@ impl ParquetToPerfettoConverter {
                         flags_ann.set_name("tcp_flags".to_string());
                         flags_ann.set_string_value(flags);
                         event.debug_annotations.push(flags_ann);
+                    }
+
+                    if let Some(old_state) = get_optional_string(old_state_strs, i) {
+                        let mut ann = DebugAnnotation::default();
+                        ann.set_name("old_state".to_string());
+                        ann.set_string_value(old_state);
+                        event.debug_annotations.push(ann);
+                    }
+
+                    if let Some(new_state) = get_optional_string(new_state_strs, i) {
+                        let mut ann = DebugAnnotation::default();
+                        ann.set_name("new_state".to_string());
+                        ann.set_string_value(new_state);
+                        event.debug_annotations.push(ann);
                     }
 
                     let mut packet = TracePacket::default();
@@ -3068,6 +3088,10 @@ mod tests {
             Field::new("qdisc_backlog", DataType::Int64, true),
             Field::new("skb_addr", DataType::Int64, true),
             Field::new("qdisc_latency_us", DataType::Int32, true),
+            Field::new("old_state", DataType::Int16, true),
+            Field::new("old_state_str", DataType::Utf8, true),
+            Field::new("new_state", DataType::Int16, true),
+            Field::new("new_state_str", DataType::Utf8, true),
         ]));
 
         use arrow::array::{BooleanArray, Int16Array};
@@ -3110,6 +3134,10 @@ mod tests {
         let qdisc_backlog: Int64Array = vec![None::<i64>].into_iter().collect();
         let skb_addr: Int64Array = vec![None::<i64>].into_iter().collect();
         let qdisc_latency_us: Int32Array = vec![None::<i32>].into_iter().collect();
+        let old_state: Int16Array = vec![None::<i16>].into_iter().collect();
+        let old_state_str: StringArray = vec![None::<&str>].into_iter().collect();
+        let new_state: Int16Array = vec![None::<i16>].into_iter().collect();
+        let new_state_str: StringArray = vec![None::<&str>].into_iter().collect();
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -3153,6 +3181,10 @@ mod tests {
                 Arc::new(qdisc_backlog),
                 Arc::new(skb_addr),
                 Arc::new(qdisc_latency_us),
+                Arc::new(old_state),
+                Arc::new(old_state_str),
+                Arc::new(new_state),
+                Arc::new(new_state_str),
             ],
         )?;
 
@@ -3432,5 +3464,197 @@ mod tests {
             .iter()
             .any(|p| p.has_track_event() && p.track_event().name() == "UDP send");
         assert!(has_udp_event, "Should have 'UDP send' event");
+    }
+
+    /// Helper to create network_packet.parquet with a TCP state change event
+    fn create_test_tcp_state_change_parquet(
+        dir: &Path,
+        socket_id: i64,
+        ts: i64,
+        old_state: i16,
+        old_state_str: &str,
+        new_state: i16,
+        new_state_str: &str,
+    ) -> Result<()> {
+        let path = dir.join("network_packet.parquet");
+        let schema = crate::trace::network_packet_schema();
+
+        use arrow::array::{BooleanArray, Int16Array};
+        let ids = Int64Array::from(vec![1i64]);
+        let timestamps = Int64Array::from(vec![ts]);
+        let socket_ids = Int64Array::from(vec![socket_id]);
+        let event_types: StringArray = vec![Some("TCP state_change")].into_iter().collect();
+        let seqs: Int64Array = vec![None::<i64>].into_iter().collect();
+        let lengths = Int32Array::from(vec![0i32]);
+        let tcp_flags: StringArray = vec![None::<&str>].into_iter().collect();
+        let sndbuf_used: Int64Array = vec![None::<i64>].into_iter().collect();
+        let sndbuf_limit: Int64Array = vec![None::<i64>].into_iter().collect();
+        let sndbuf_fill_pct: Int16Array = vec![None::<i16>].into_iter().collect();
+        let is_retransmit = BooleanArray::from(vec![false]);
+        let retransmit_count: Int16Array = vec![None::<i16>].into_iter().collect();
+        let rto_ms: Int32Array = vec![None::<i32>].into_iter().collect();
+        let srtt_ms: Int32Array = vec![None::<i32>].into_iter().collect();
+        let rttvar_us: Int32Array = vec![None::<i32>].into_iter().collect();
+        let backoff: Int16Array = vec![None::<i16>].into_iter().collect();
+        let is_zero_window_probe = BooleanArray::from(vec![false]);
+        let is_zero_window_ack = BooleanArray::from(vec![false]);
+        let probe_count: Int16Array = vec![None::<i16>].into_iter().collect();
+        let snd_wnd: Int32Array = vec![None::<i32>].into_iter().collect();
+        let rcv_wnd: Int32Array = vec![None::<i32>].into_iter().collect();
+        let rcv_buf_used: Int64Array = vec![None::<i64>].into_iter().collect();
+        let rcv_buf_limit: Int64Array = vec![None::<i64>].into_iter().collect();
+        let window_clamp: Int32Array = vec![None::<i32>].into_iter().collect();
+        let rcv_wscale: Int16Array = vec![None::<i16>].into_iter().collect();
+        let icsk_pending: Int16Array = vec![None::<i16>].into_iter().collect();
+        let icsk_timeout: Int64Array = vec![None::<i64>].into_iter().collect();
+        let drop_reason: Int32Array = vec![None::<i32>].into_iter().collect();
+        let drop_reason_str_arr: StringArray = vec![None::<&str>].into_iter().collect();
+        let drop_location: Int64Array = vec![None::<i64>].into_iter().collect();
+        let qlen: Int32Array = vec![None::<i32>].into_iter().collect();
+        let qlen_limit: Int32Array = vec![None::<i32>].into_iter().collect();
+        let sk_wmem_alloc: Int64Array = vec![None::<i64>].into_iter().collect();
+        let tsq_limit: Int64Array = vec![None::<i64>].into_iter().collect();
+        let txq_state: Int32Array = vec![None::<i32>].into_iter().collect();
+        let qdisc_state: Int32Array = vec![None::<i32>].into_iter().collect();
+        let qdisc_backlog: Int64Array = vec![None::<i64>].into_iter().collect();
+        let skb_addr: Int64Array = vec![None::<i64>].into_iter().collect();
+        let qdisc_latency_us: Int32Array = vec![None::<i32>].into_iter().collect();
+        let old_state_arr: Int16Array = vec![Some(old_state)].into_iter().collect();
+        let old_state_str_arr: StringArray = vec![Some(old_state_str)].into_iter().collect();
+        let new_state_arr: Int16Array = vec![Some(new_state)].into_iter().collect();
+        let new_state_str_arr: StringArray = vec![Some(new_state_str)].into_iter().collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(timestamps),
+                Arc::new(socket_ids),
+                Arc::new(event_types),
+                Arc::new(seqs),
+                Arc::new(lengths),
+                Arc::new(tcp_flags),
+                Arc::new(sndbuf_used),
+                Arc::new(sndbuf_limit),
+                Arc::new(sndbuf_fill_pct),
+                Arc::new(is_retransmit),
+                Arc::new(retransmit_count),
+                Arc::new(rto_ms),
+                Arc::new(srtt_ms),
+                Arc::new(rttvar_us),
+                Arc::new(backoff),
+                Arc::new(is_zero_window_probe),
+                Arc::new(is_zero_window_ack),
+                Arc::new(probe_count),
+                Arc::new(snd_wnd),
+                Arc::new(rcv_wnd),
+                Arc::new(rcv_buf_used),
+                Arc::new(rcv_buf_limit),
+                Arc::new(window_clamp),
+                Arc::new(rcv_wscale),
+                Arc::new(icsk_pending),
+                Arc::new(icsk_timeout),
+                Arc::new(drop_reason),
+                Arc::new(drop_reason_str_arr),
+                Arc::new(drop_location),
+                Arc::new(qlen),
+                Arc::new(qlen_limit),
+                Arc::new(sk_wmem_alloc),
+                Arc::new(tsq_limit),
+                Arc::new(txq_state),
+                Arc::new(qdisc_state),
+                Arc::new(qdisc_backlog),
+                Arc::new(skb_addr),
+                Arc::new(qdisc_latency_us),
+                Arc::new(old_state_arr),
+                Arc::new(old_state_str_arr),
+                Arc::new(new_state_arr),
+                Arc::new(new_state_str_arr),
+            ],
+        )?;
+
+        let file = File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_tcp_state_change_event_in_perfetto() {
+        use crate::perfetto::VecTraceWriter;
+
+        let dir = tempdir().unwrap();
+
+        // Create network_socket for the socket referenced by the state change event
+        create_test_network_socket_parquet(
+            dir.path(),
+            42,        // socket_id
+            "TCP",     // protocol
+            "1.2.3.4", // src_ip
+            8080,      // src_port
+            "5.6.7.8", // dest_ip
+            443,       // dest_port
+        )
+        .unwrap();
+
+        // Create a TCP state change event: ESTABLISHED -> TIME_WAIT
+        create_test_tcp_state_change_parquet(
+            dir.path(),
+            42,            // socket_id
+            2000000,       // timestamp
+            1,             // old_state = ESTABLISHED
+            "ESTABLISHED", // old_state_str
+            6,             // new_state = TIME_WAIT
+            "TIME_WAIT",   // new_state_str
+        )
+        .unwrap();
+
+        // Convert network data to Perfetto
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut writer = VecTraceWriter::default();
+        converter
+            .write_network_data(dir.path(), &mut writer)
+            .unwrap();
+
+        // Verify the state change event exists with correct name
+        let has_state_change = writer
+            .packets
+            .iter()
+            .any(|p| p.has_track_event() && p.track_event().name() == "TCP state_change");
+        assert!(has_state_change, "Should have 'TCP state_change' event");
+
+        // Find the state change event and verify its annotations
+        let event = writer
+            .packets
+            .iter()
+            .find(|p| p.has_track_event() && p.track_event().name() == "TCP state_change")
+            .expect("Should have TCP state_change event");
+
+        // Verify it's an instant event
+        assert_eq!(
+            event.track_event().type_(),
+            Type::TYPE_INSTANT,
+            "State change event should be TYPE_INSTANT"
+        );
+
+        // Verify old_state and new_state annotations
+        let annotations = &event.track_event().debug_annotations;
+
+        let has_old_state = annotations
+            .iter()
+            .any(|a| a.name() == "old_state" && a.string_value() == "ESTABLISHED");
+        assert!(
+            has_old_state,
+            "TCP state_change event should have old_state=ESTABLISHED annotation"
+        );
+
+        let has_new_state = annotations
+            .iter()
+            .any(|a| a.name() == "new_state" && a.string_value() == "TIME_WAIT");
+        assert!(
+            has_new_state,
+            "TCP state_change event should have new_state=TIME_WAIT annotation"
+        );
     }
 }

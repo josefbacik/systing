@@ -240,6 +240,7 @@ enum packet_event_type {
 	PACKET_QDISC_DEQUEUE,     // Packet left qdisc queue
 	PACKET_TX_QUEUE_STOP,     // TX queue stopped by driver (NIC ring full)
 	PACKET_TX_QUEUE_WAKE,     // TX queue resumed by driver
+	PACKET_TCP_STATE_CHANGE,  // TCP socket state transition (inet_sock_set_state)
 };
 
 struct packet_event {
@@ -294,6 +295,9 @@ struct packet_event {
 	u32 qdisc_backlog;        // Bytes queued in qdisc
 	u64 skb_addr;             // SKB address for packet correlation
 	u32 qdisc_latency_us;     // Qdisc residence time in microseconds (dequeue only)
+	// TCP state change fields (for PACKET_TCP_STATE_CHANGE)
+	u8 old_state;             // Previous TCP state
+	u8 new_state;             // New TCP state
 };
 
 struct epoll_event_bpf {
@@ -4073,5 +4077,69 @@ int tracepoint__qdisc__qdisc_dequeue(struct trace_event_raw_qdisc_dequeue *ctx)
 // Note: netif_tx_stop_queue and netif_tx_wake_queue probes removed because they are
 // inline functions on most kernels. TX queue state is captured via the txq_state field
 // in qdisc_enqueue and qdisc_dequeue events instead.
+
+// ========== TCP State Change Tracing ==========
+
+// Trace TCP socket state transitions via the inet_sock_set_state tracepoint.
+SEC("tp_btf/inet_sock_set_state")
+int BPF_PROG(inet_sock_set_state, const struct sock *sk, int oldstate, int newstate)
+{
+	if (!tracing_enabled)
+		return 0;
+
+	// Only trace TCP sockets
+	u8 protocol = BPF_CORE_READ(sk, sk_protocol);
+	if (protocol != IPPROTO_TCP)
+		return 0;
+
+	// Only trace IPv4 and IPv6
+	u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	if (family != AF_INET && family != AF_INET6)
+		return 0;
+
+	// Read the 4-tuple from the socket
+	enum network_address_family af;
+	u8 src_addr[16] = {0};
+	u16 src_port = 0;
+	u8 dest_addr[16] = {0};
+	u16 dest_port = 0;
+
+	if (read_socket_addrs((struct sock *)sk, &af, src_addr, &src_port,
+			      dest_addr, &dest_port) < 0)
+		return 0;
+
+	// Get or create socket ID - use get_or_create_socket_id so that
+	// early transitions (SYN_SENT, SYN_RECV -> ESTABLISHED) create
+	// socket entries even before any sendmsg/recvmsg occurs.
+	// Note: tgidpid may not be the socket owner in softirq/timer context,
+	// but get_or_create_socket_id does not use it for identification.
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	u64 socket_id = get_or_create_socket_id(
+		(struct sock *)sk, NETWORK_TCP, af,
+		src_addr, src_port, dest_addr, dest_port, tgidpid);
+	if (socket_id == 0)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_TCP;
+	event->event_type = PACKET_TCP_STATE_CHANGE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->af = af;
+	__builtin_memcpy(event->src_addr, src_addr, 16);
+	event->src_port = src_port;
+	__builtin_memcpy(event->dest_addr, dest_addr, 16);
+	event->dest_port = dest_port;
+	event->socket_id = socket_id;
+	event->old_state = (u8)oldstate;
+	event->new_state = (u8)newstate;
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
 
 char LICENSE[] SEC("license") = "GPL";

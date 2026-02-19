@@ -895,6 +895,60 @@ fn test_e2e_network_suite() {
             "[network duckdb] network_interface table is empty"
         );
         eprintln!("    {} interfaces in DuckDB", interface_count);
+
+        // Check for TCP state change events
+        let state_change_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM network_packet WHERE event_type = 'TCP state_change'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        eprintln!(
+            "    {} TCP state change events in DuckDB",
+            state_change_count
+        );
+
+        assert!(
+            state_change_count > 0,
+            "[network duckdb] No TCP state change events recorded. \
+             The inet_sock_set_state tracepoint should capture connection lifecycle events."
+        );
+
+        // Verify state change events have valid old_state_str and new_state_str values
+        let valid_states_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM network_packet \
+                 WHERE event_type = 'TCP state_change' \
+                 AND old_state_str IS NOT NULL \
+                 AND new_state_str IS NOT NULL \
+                 AND old_state_str != 'UNKNOWN' \
+                 AND new_state_str != 'UNKNOWN'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        assert!(
+            valid_states_count > 0,
+            "[network duckdb] TCP state change events have no valid state strings"
+        );
+
+        // Check that we see at least ESTABLISHED transitions (from connection setup)
+        let established_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM network_packet \
+                 WHERE event_type = 'TCP state_change' \
+                 AND new_state_str = 'ESTABLISHED'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        eprintln!("    {} transitions to ESTABLISHED state", established_count);
+        assert!(
+            established_count > 0,
+            "[network duckdb] No ESTABLISHED state transitions found. \
+             TCP connections should produce SYN_SENT/SYN_RECV -> ESTABLISHED transitions."
+        );
     }
 
     eprintln!("\n  All network suite checks passed");

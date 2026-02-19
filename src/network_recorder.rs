@@ -120,6 +120,26 @@ fn protocol_str(protocol: u32) -> &'static str {
     }
 }
 
+/// Convert TCP state code to human-readable string.
+/// Based on enum tcp_state from include/uapi/linux/tcp.h.
+fn tcp_state_name(state: u8) -> &'static str {
+    match state {
+        1 => "ESTABLISHED",
+        2 => "SYN_SENT",
+        3 => "SYN_RECV",
+        4 => "FIN_WAIT1",
+        5 => "FIN_WAIT2",
+        6 => "TIME_WAIT",
+        7 => "CLOSE",
+        8 => "CLOSE_WAIT",
+        9 => "LAST_ACK",
+        10 => "LISTEN",
+        11 => "CLOSING",
+        12 => "NEW_SYN_RECV",
+        _ => "UNKNOWN",
+    }
+}
+
 /// Convert SKB_DROP_REASON_* code to human-readable string
 /// Based on enum skb_drop_reason from include/net/dropreason-core.h
 fn drop_reason_str(reason: u32) -> &'static str {
@@ -350,6 +370,9 @@ struct PacketEvent {
     qdisc_backlog: u32,    // Bytes queued in qdisc
     skb_addr: u64,         // SKB address for packet correlation
     qdisc_latency_us: u32, // Qdisc residence time in microseconds (dequeue only)
+    // TCP state change fields (for PACKET_TCP_STATE_CHANGE)
+    old_state: u8, // Previous TCP state
+    new_state: u8, // New TCP state
 }
 
 #[derive(Clone, Copy)]
@@ -382,6 +405,8 @@ enum EventEntry {
     // Qdisc tracing events
     QdiscEnqueue(PacketEvent), // Packet entered qdisc queue
     QdiscDequeue(PacketEvent), // Packet left qdisc queue
+    // TCP state change events
+    TcpStateChange(PacketEvent), // TCP socket state transition
 }
 
 impl EventEntry {
@@ -403,7 +428,8 @@ impl EventEntry {
             | EventEntry::CpuBacklogDrop(e)
             | EventEntry::MemPressure(e)
             | EventEntry::QdiscEnqueue(e)
-            | EventEntry::QdiscDequeue(e) => e.ts,
+            | EventEntry::QdiscDequeue(e)
+            | EventEntry::TcpStateChange(e) => e.ts,
             EventEntry::PollReady(e) => e.ts,
         }
     }
@@ -456,6 +482,9 @@ impl ConnectionEvents {
     // Qdisc events
     packet_event_iter!(iter_qdisc_enqueue, QdiscEnqueue);
     packet_event_iter!(iter_qdisc_dequeue, QdiscDequeue);
+
+    // TCP state change events
+    packet_event_iter!(iter_tcp_state_changes, TcpStateChange);
 }
 
 #[derive(Default)]
@@ -926,6 +955,27 @@ impl NetworkRecorder {
             } else {
                 None
             },
+            // TCP state change fields
+            old_state: if event.old_state > 0 {
+                Some(event.old_state as i16)
+            } else {
+                None
+            },
+            old_state_str: if event.old_state > 0 {
+                Some(tcp_state_name(event.old_state).to_string())
+            } else {
+                None
+            },
+            new_state: if event.new_state > 0 {
+                Some(event.new_state as i16)
+            } else {
+                None
+            },
+            new_state_str: if event.new_state > 0 {
+                Some(tcp_state_name(event.new_state).to_string())
+            } else {
+                None
+            },
         };
 
         // Add send buffer fields
@@ -1140,6 +1190,9 @@ impl NetworkRecorder {
             qdisc_backlog: event.qdisc_backlog,
             skb_addr: event.skb_addr,
             qdisc_latency_us: event.qdisc_latency_us,
+            // TCP state change fields
+            old_state: event.old_state,
+            new_state: event.new_state,
         };
 
         // Dispatch based on event type - streaming uses event names, non-streaming uses EventEntry
@@ -1201,6 +1254,10 @@ impl NetworkRecorder {
             }
             x if x == packet_event_type::PACKET_QDISC_DEQUEUE.0 => {
                 ("qdisc_dequeue", EventEntry::QdiscDequeue(pkt_event))
+            }
+            // TCP state change events
+            x if x == packet_event_type::PACKET_TCP_STATE_CHANGE.0 => {
+                ("TCP state_change", EventEntry::TcpStateChange(pkt_event))
             }
             // Unknown event type - skip
             _ => return,
@@ -1415,6 +1472,15 @@ impl NetworkRecorder {
         event.add_uint_nonzero("qdisc_backlog", pkt.qdisc_backlog as u64);
         event.add_uint_nonzero("skb_addr", pkt.skb_addr);
         event.add_uint_nonzero("qdisc_latency_us", pkt.qdisc_latency_us as u64);
+    }
+
+    fn add_tcp_state_change_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
+        if pkt.old_state > 0 {
+            event.add_string("old_state", tcp_state_name(pkt.old_state).to_string());
+        }
+        if pkt.new_state > 0 {
+            event.add_string("new_state", tcp_state_name(pkt.new_state).to_string());
+        }
     }
 
     // ========================================================================
@@ -1866,6 +1932,32 @@ impl NetworkRecorder {
         Ok(())
     }
 
+    fn add_tcp_state_change_arg(
+        collector: &mut dyn RecordCollector,
+        instant_id: i64,
+        pkt: &PacketEvent,
+    ) -> Result<()> {
+        if pkt.old_state > 0 {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "old_state".to_string(),
+                int_value: None,
+                string_value: Some(tcp_state_name(pkt.old_state).to_string()),
+                real_value: None,
+            })?;
+        }
+        if pkt.new_state > 0 {
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "new_state".to_string(),
+                int_value: None,
+                string_value: Some(tcp_state_name(pkt.new_state).to_string()),
+                real_value: None,
+            })?;
+        }
+        Ok(())
+    }
+
     /// Helper to emit packet events for a given event type.
     /// Uses peekable to check emptiness without collecting, then emits events directly.
     fn write_packet_events<'a>(
@@ -1917,6 +2009,7 @@ impl NetworkRecorder {
         Self::add_queue_annotations(&mut instant_event, pkt);
         Self::add_memory_pressure_annotations(&mut instant_event, pkt);
         Self::add_qdisc_annotations(&mut instant_event, pkt);
+        Self::add_tcp_state_change_annotations(&mut instant_event, pkt);
 
         let mut packet = TracePacket::default();
         packet.set_timestamp(pkt.ts);
@@ -2117,6 +2210,8 @@ impl NetworkRecorder {
         // Qdisc tracing event types
         self.get_or_create_event_name_iid("qdisc_enqueue".to_string(), id_counter);
         self.get_or_create_event_name_iid("qdisc_dequeue".to_string(), id_counter);
+        // TCP state change event type
+        self.get_or_create_event_name_iid("TCP state_change".to_string(), id_counter);
 
         // Build and sort event names array
         let mut event_names = Vec::new();
@@ -2353,6 +2448,15 @@ impl NetworkRecorder {
                     instant_id_counter,
                     "qdisc_dequeue",
                     conn_events.iter_qdisc_dequeue(),
+                )?;
+
+                // TCP state change events
+                self.write_packet_events_records(
+                    collector,
+                    socket_track_id,
+                    instant_id_counter,
+                    "TCP state_change",
+                    conn_events.iter_tcp_state_changes(),
                 )?;
             }
         }
@@ -2593,6 +2697,7 @@ impl NetworkRecorder {
             Self::add_queue_arg(collector, instant_id, pkt)?;
             Self::add_memory_pressure_arg(collector, instant_id, pkt)?;
             Self::add_qdisc_arg(collector, instant_id, pkt)?;
+            Self::add_tcp_state_change_arg(collector, instant_id, pkt)?;
         }
         Ok(())
     }
@@ -2794,6 +2899,15 @@ impl NetworkRecorder {
                     socket_track_uuid,
                     "qdisc_dequeue",
                     events.iter_qdisc_dequeue(),
+                )?;
+
+                // TCP state change events
+                self.write_packet_events(
+                    writer,
+                    sequence_id,
+                    socket_track_uuid,
+                    "TCP state_change",
+                    events.iter_tcp_state_changes(),
                 )?;
             }
         }
@@ -4391,5 +4505,24 @@ mod tests {
             socket_track_name.contains("UDP"),
             "Socket track should be identified as UDP: {socket_track_name}"
         );
+    }
+
+    #[test]
+    fn test_tcp_state_name_values() {
+        assert_eq!(tcp_state_name(0), "UNKNOWN");
+        assert_eq!(tcp_state_name(1), "ESTABLISHED");
+        assert_eq!(tcp_state_name(2), "SYN_SENT");
+        assert_eq!(tcp_state_name(3), "SYN_RECV");
+        assert_eq!(tcp_state_name(4), "FIN_WAIT1");
+        assert_eq!(tcp_state_name(5), "FIN_WAIT2");
+        assert_eq!(tcp_state_name(6), "TIME_WAIT");
+        assert_eq!(tcp_state_name(7), "CLOSE");
+        assert_eq!(tcp_state_name(8), "CLOSE_WAIT");
+        assert_eq!(tcp_state_name(9), "LAST_ACK");
+        assert_eq!(tcp_state_name(10), "LISTEN");
+        assert_eq!(tcp_state_name(11), "CLOSING");
+        assert_eq!(tcp_state_name(12), "NEW_SYN_RECV");
+        assert_eq!(tcp_state_name(13), "UNKNOWN");
+        assert_eq!(tcp_state_name(255), "UNKNOWN");
     }
 }

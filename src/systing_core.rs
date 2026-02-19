@@ -1710,6 +1710,8 @@ fn configure_bpf_skeleton(
         // Disable socket poll probes when network is disabled
         open_skel.progs.tcp_poll_entry.set_autoload(false);
         open_skel.progs.tcp_poll_exit.set_autoload(false);
+        // Disable TCP state change tracing when network is disabled
+        open_skel.progs.inet_sock_set_state.set_autoload(false);
     }
 
     Ok(())
