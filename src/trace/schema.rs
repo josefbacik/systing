@@ -351,6 +351,11 @@ pub fn network_packet_schema() -> Arc<Schema> {
         // SKB correlation
         Field::new("skb_addr", DataType::Int64, true),
         Field::new("qdisc_latency_us", DataType::Int32, true),
+        // TCP state change fields
+        Field::new("old_state", DataType::Int16, true),
+        Field::new("old_state_str", DataType::Utf8, true),
+        Field::new("new_state", DataType::Int16, true),
+        Field::new("new_state_str", DataType::Utf8, true),
     ]))
 }
 

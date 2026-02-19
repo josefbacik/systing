@@ -1844,6 +1844,10 @@ fn build_network_packet_batch(
     let mut qdisc_backlog_builder = Int64Builder::with_capacity(records.len());
     let mut skb_addr_builder = Int64Builder::with_capacity(records.len());
     let mut qdisc_latency_us_builder = Int32Builder::with_capacity(records.len());
+    let mut old_state_builder = Int16Builder::with_capacity(records.len());
+    let mut old_state_str_builder = StringBuilder::with_capacity(records.len(), records.len() * 12);
+    let mut new_state_builder = Int16Builder::with_capacity(records.len());
+    let mut new_state_str_builder = StringBuilder::with_capacity(records.len(), records.len() * 12);
 
     for record in records {
         id_builder.append_value(record.id);
@@ -1885,6 +1889,10 @@ fn build_network_packet_batch(
         qdisc_backlog_builder.append_option(record.qdisc_backlog);
         skb_addr_builder.append_option(record.skb_addr);
         qdisc_latency_us_builder.append_option(record.qdisc_latency_us);
+        old_state_builder.append_option(record.old_state);
+        old_state_str_builder.append_option(record.old_state_str.as_deref());
+        new_state_builder.append_option(record.new_state);
+        new_state_str_builder.append_option(record.new_state_str.as_deref());
     }
 
     Ok(RecordBatch::try_new(
@@ -1929,6 +1937,10 @@ fn build_network_packet_batch(
             Arc::new(qdisc_backlog_builder.finish()),
             Arc::new(skb_addr_builder.finish()),
             Arc::new(qdisc_latency_us_builder.finish()),
+            Arc::new(old_state_builder.finish()),
+            Arc::new(old_state_str_builder.finish()),
+            Arc::new(new_state_builder.finish()),
+            Arc::new(new_state_str_builder.finish()),
         ],
     )?)
 }

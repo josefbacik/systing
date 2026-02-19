@@ -356,7 +356,12 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             qdisc_backlog BIGINT,
             -- SKB correlation
             skb_addr BIGINT,
-            qdisc_latency_us INTEGER
+            qdisc_latency_us INTEGER,
+            -- TCP state change fields
+            old_state SMALLINT,
+            old_state_str VARCHAR,
+            new_state SMALLINT,
+            new_state_str VARCHAR
         );
 
         CREATE TABLE IF NOT EXISTS network_socket (

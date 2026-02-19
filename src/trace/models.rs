@@ -387,6 +387,11 @@ pub struct NetworkPacketRecord {
     // SKB correlation
     pub skb_addr: Option<i64>,
     pub qdisc_latency_us: Option<i32>,
+    // TCP state change fields
+    pub old_state: Option<i16>,
+    pub old_state_str: Option<String>,
+    pub new_state: Option<i16>,
+    pub new_state_str: Option<String>,
 }
 
 /// Network socket record - represents socket metadata.

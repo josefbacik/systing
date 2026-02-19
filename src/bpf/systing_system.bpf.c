@@ -240,6 +240,7 @@ enum packet_event_type {
 	PACKET_QDISC_DEQUEUE,     // Packet left qdisc queue
 	PACKET_TX_QUEUE_STOP,     // TX queue stopped by driver (NIC ring full)
 	PACKET_TX_QUEUE_WAKE,     // TX queue resumed by driver
+	PACKET_TCP_STATE_CHANGE,  // TCP socket state transition (inet_sock_set_state)
 };
 
 struct packet_event {
@@ -294,6 +295,9 @@ struct packet_event {
 	u32 qdisc_backlog;        // Bytes queued in qdisc
 	u64 skb_addr;             // SKB address for packet correlation
 	u32 qdisc_latency_us;     // Qdisc residence time in microseconds (dequeue only)
+	// TCP state change fields (for PACKET_TCP_STATE_CHANGE)
+	u8 old_state;             // Previous TCP state
+	u8 new_state;             // New TCP state
 };
 
 struct epoll_event_bpf {
@@ -486,6 +490,33 @@ struct {
 	__type(value, u64); // socket_id
 	__uint(max_entries, 10240);
 } sk_socket_id_map SEC(".maps");
+
+// Maps inet_timewait_sock pointer to socket_id for TIME_WAIT lifecycle tracking.
+// Populated in inet_twsk_hashdance_schedule, consumed in inet_twsk_deschedule_put.
+// Separate from sk_socket_id_map to avoid competing for entries with regular sockets,
+// since TIME_WAIT sockets accumulate over 60s and can be numerous.
+// Capacity: 65536 handles ~1000 connections/sec over the 60s TIME_WAIT window.
+// When full, new tw sockets silently lose TIME_WAIT->CLOSE tracking (graceful degradation).
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);   // tw sock pointer (struct inet_timewait_sock * cast to u64)
+	__type(value, u64); // socket_id
+	__uint(max_entries, 65536);
+} tw_socket_id_map SEC(".maps");
+
+// Per-CPU flag to detect when inet_sock_set_state fires inside tcp_time_wait().
+// Used to rewrite the CLOSE transition to TIME_WAIT for correct lifecycle reporting.
+struct tw_pending_info {
+	u64 sk_ptr;       // original sk pointer for verification
+	u64 socket_id;    // socket_id from sk_socket_id_map
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, struct tw_pending_info);
+	__uint(max_entries, 1);
+} pending_tw SEC(".maps");
 
 #define MISSED_SCHED_EVENT 0
 #define MISSED_STACK_EVENT 1
@@ -4073,5 +4104,189 @@ int tracepoint__qdisc__qdisc_dequeue(struct trace_event_raw_qdisc_dequeue *ctx)
 // Note: netif_tx_stop_queue and netif_tx_wake_queue probes removed because they are
 // inline functions on most kernels. TX queue state is captured via the txq_state field
 // in qdisc_enqueue and qdisc_dequeue events instead.
+
+// ========== TCP State Change Tracing ==========
+
+// Trace TCP socket state transitions via the inet_sock_set_state tracepoint.
+SEC("tp_btf/inet_sock_set_state")
+int BPF_PROG(inet_sock_set_state, const struct sock *sk, int oldstate, int newstate)
+{
+	if (!tracing_enabled)
+		return 0;
+
+	// Only trace TCP sockets
+	u8 protocol = BPF_CORE_READ(sk, sk_protocol);
+	if (protocol != IPPROTO_TCP)
+		return 0;
+
+	// Only trace IPv4 and IPv6
+	u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	if (family != AF_INET && family != AF_INET6)
+		return 0;
+
+	// Read the 4-tuple from the socket
+	enum network_address_family af;
+	u8 src_addr[16] = {0};
+	u16 src_port = 0;
+	u8 dest_addr[16] = {0};
+	u16 dest_port = 0;
+
+	if (read_socket_addrs((struct sock *)sk, &af, src_addr, &src_port,
+			      dest_addr, &dest_port) < 0)
+		return 0;
+
+	// Get or create socket ID - use get_or_create_socket_id so that
+	// early transitions (SYN_SENT, SYN_RECV -> ESTABLISHED) create
+	// socket entries even before any sendmsg/recvmsg occurs.
+	// Note: tgidpid may not be the socket owner in softirq/timer context,
+	// but get_or_create_socket_id does not use it for identification.
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	u64 socket_id = get_or_create_socket_id(
+		(struct sock *)sk, NETWORK_TCP, af,
+		src_addr, src_port, dest_addr, dest_port, tgidpid);
+	if (socket_id == 0)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_PACKET_EVENT);
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_TCP;
+	event->event_type = PACKET_TCP_STATE_CHANGE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->af = af;
+	__builtin_memcpy(event->src_addr, src_addr, 16);
+	event->src_port = src_port;
+	__builtin_memcpy(event->dest_addr, dest_addr, 16);
+	event->dest_port = dest_port;
+	event->socket_id = socket_id;
+	event->old_state = (u8)oldstate;
+	event->new_state = (u8)newstate;
+
+	// If this CLOSE transition is happening inside tcp_time_wait(),
+	// the socket is actually entering TIME_WAIT, not CLOSE.
+	// Rewrite new_state for correct lifecycle reporting.
+	// Note: if tcp_time_wait() fails to allocate the tw sock (OOM), it still
+	// calls tcp_done(sk) which fires this tracepoint. The per-CPU flag will
+	// cause a spurious TIME_WAIT rewrite. This is rare and produces a
+	// TIME_WAIT entry with no subsequent TIME_WAIT->CLOSE, which is
+	// distinguishable in analysis.
+	if (newstate == TCP_CLOSE) {
+		u32 tw_key = 0;
+		struct tw_pending_info *pending = bpf_map_lookup_elem(&pending_tw, &tw_key);
+		if (pending && pending->sk_ptr == (u64)sk) {
+			event->new_state = TCP_TIME_WAIT;
+			// Clear the per-CPU flag
+			struct tw_pending_info empty = {};
+			bpf_map_update_elem(&pending_tw, &tw_key, &empty, BPF_ANY);
+		}
+	}
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+// ========== TIME_WAIT Lifecycle Tracking ==========
+//
+// The kernel never fires inet_sock_set_state with TCP_TIME_WAIT.
+// Instead, tcp_time_wait() creates a lightweight inet_timewait_sock and
+// calls tcp_done(sk) which fires the tracepoint with new_state=TCP_CLOSE.
+// These kprobes fix the gap:
+// 1. tcp_time_wait entry: set per-CPU flag so inet_sock_set_state rewrites CLOSE->TIME_WAIT
+// 2. inet_twsk_hashdance_schedule: map tw sock pointer -> socket_id
+// 3. inet_twsk_deschedule_put: emit TIME_WAIT -> CLOSE when tw sock is destroyed
+//
+// Note: inet_twsk_hashdance_schedule was introduced in kernel 6.12 (commit ec94c2696f0b).
+// On older kernels the function was named inet_twsk_hashdance with a different signature.
+
+// Set per-CPU flag when entering tcp_time_wait().
+// The flag is checked by inet_sock_set_state (above) to rewrite CLOSE -> TIME_WAIT.
+// Safe to use per-CPU because tcp_time_wait runs with BH disabled (softirq or lock_sock).
+SEC("kprobe/tcp_time_wait")
+int BPF_KPROBE(tcp_time_wait_entry, struct sock *sk, int state, int timeo)
+{
+	if (!tracing_enabled)
+		return 0;
+
+	u64 sk_ptr = (u64)sk;
+	u64 *sid = bpf_map_lookup_elem(&sk_socket_id_map, &sk_ptr);
+	if (!sid || *sid == 0)
+		return 0;
+
+	u32 key = 0;
+	struct tw_pending_info info = {
+		.sk_ptr = sk_ptr,
+		.socket_id = *sid,
+	};
+	bpf_map_update_elem(&pending_tw, &key, &info, BPF_ANY);
+	return 0;
+}
+
+// Map the tw sock pointer to the original socket_id.
+// Called from tcp_time_wait() after tw allocation, before tcp_done() destroys the original sk.
+SEC("kprobe/inet_twsk_hashdance_schedule")
+int BPF_KPROBE(inet_twsk_hashdance_schedule_entry,
+	       struct inet_timewait_sock *tw, struct sock *sk,
+	       struct inet_hashinfo *hashinfo, int timeo)
+{
+	if (!tracing_enabled)
+		return 0;
+
+	u64 sk_ptr = (u64)sk;
+	u64 *sid = bpf_map_lookup_elem(&sk_socket_id_map, &sk_ptr);
+	if (!sid || *sid == 0)
+		return 0;
+
+	// Map tw sock pointer to the same socket_id so we can correlate
+	// the TIME_WAIT → CLOSE transition when the tw sock is destroyed.
+	u64 tw_ptr = (u64)tw;
+	bpf_map_update_elem(&tw_socket_id_map, &tw_ptr, sid, BPF_ANY);
+
+	return 0;
+}
+
+// Emit TIME_WAIT → CLOSE when a timewait socket is destroyed.
+// inet_twsk_deschedule_put is the universal destruction point for all TIME_WAIT
+// sockets: timer expiry, RST received, tw_reuse, and namespace purge.
+SEC("kprobe/inet_twsk_deschedule_put")
+int BPF_KPROBE(inet_twsk_deschedule_put_entry, struct inet_timewait_sock *tw)
+{
+	if (!tracing_enabled)
+		return 0;
+
+	u64 tw_ptr = (u64)tw;
+	u64 *sid = bpf_map_lookup_elem(&tw_socket_id_map, &tw_ptr);
+	if (!sid || *sid == 0)
+		return 0;
+
+	long flags;
+	struct packet_event *event = reserve_packet_event(&flags);
+	if (!event) {
+		bpf_map_delete_elem(&tw_socket_id_map, &tw_ptr);
+		return handle_missed_event(MISSED_PACKET_EVENT);
+	}
+
+	event->ts = bpf_ktime_get_boot_ns();
+	event->protocol = NETWORK_TCP;
+	event->event_type = PACKET_TCP_STATE_CHANGE;
+	event->cpu = bpf_get_smp_processor_id();
+	event->socket_id = *sid;
+	event->old_state = TCP_TIME_WAIT;
+	event->new_state = TCP_CLOSE;
+
+	// SAFETY: inet_timewait_sock embeds sock_common at offset 0 (__tw_common),
+	// matching sock's __sk_common at offset 0. read_socket_addrs only touches
+	// skc_* fields within sock_common via bpf_probe_read_kernel (raw pointer
+	// arithmetic, no CO-RE relocations), so the byte offsets are identical.
+	read_socket_addrs((struct sock *)tw, &event->af, event->src_addr,
+			  &event->src_port, event->dest_addr, &event->dest_port);
+
+	bpf_ringbuf_submit(event, flags);
+
+	bpf_map_delete_elem(&tw_socket_id_map, &tw_ptr);
+	return 0;
+}
 
 char LICENSE[] SEC("license") = "GPL";
