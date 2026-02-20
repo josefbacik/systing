@@ -252,6 +252,8 @@ pub struct Config {
     pub markers: bool,
     /// Stop tracing after this many completed marker range events
     pub marker_threshold: Option<u64>,
+    /// Stop tracing when any marker range event exceeds this duration in milliseconds
+    pub marker_duration_threshold: Option<u64>,
     /// Enable network recording
     pub network: bool,
     /// Skip DNS resolution for network addresses
@@ -293,6 +295,7 @@ impl Default for Config {
             syscalls: false,
             markers: false,
             marker_threshold: None,
+            marker_duration_threshold: None,
             network: false,
             no_resolve_addresses: false,
             output_dir: PathBuf::from("./traces"),
@@ -2351,6 +2354,7 @@ pub fn systing(
         opts.enable_debuginfod,
         !opts.no_resolve_addresses,
         opts.marker_threshold,
+        opts.marker_duration_threshold,
     ));
     configure_recorder(&opts, &recorder);
     recorder.snapshot_clocks();

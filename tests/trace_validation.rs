@@ -2786,3 +2786,161 @@ fn test_e2e_marker_threshold() {
 
     eprintln!("  All marker threshold checks passed");
 }
+
+/// Integration test for marker duration threshold in continuous mode.
+///
+/// Configures systing with `--continuous 3` and `--marker-duration-threshold 800`
+/// (stop when any marker range exceeds 800ms). A workload thread continuously
+/// emits short ranges (200ms) followed by a long range (1000ms) in a loop.
+/// The long range exceeds the 800ms threshold and triggers shutdown.
+/// We validate that the trace captured the expected events and that the
+/// triggering range's duration is >= 800ms.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_marker_duration_threshold() {
+    use std::ffi::CString;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use syscalls::Sysno;
+
+    use arrow::array::Int64Array;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+
+    let mode = -975i64;
+    let range_name = CString::new("DurTest:slow_op").unwrap();
+    let sysno = Sysno::faccessat2 as i64;
+
+    // Workload: continuously emit a short range (200ms) then a long range (1000ms).
+    // The long range exceeds the 800ms threshold and triggers shutdown.
+    // Loop repeats until stopped, so BPF probes have time to attach.
+    let workload_handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(500)); // Wait for BPF init
+        while !stop_clone.load(Ordering::Relaxed) {
+            // Short range (below threshold)
+            unsafe {
+                libc::syscall(sysno, 0i64, range_name.as_ptr(), mode, 0i64); // START
+            }
+            thread::sleep(Duration::from_millis(200));
+            unsafe {
+                libc::syscall(sysno, 1i64, range_name.as_ptr(), mode, 0i64); // END
+            }
+            thread::sleep(Duration::from_millis(50));
+
+            if stop_clone.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // Long range (exceeds 800ms threshold)
+            unsafe {
+                libc::syscall(sysno, 0i64, range_name.as_ptr(), mode, 0i64); // START
+            }
+            thread::sleep(Duration::from_millis(1000));
+            unsafe {
+                libc::syscall(sysno, 1i64, range_name.as_ptr(), mode, 0i64); // END
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    let start = Instant::now();
+
+    let config = Config {
+        continuous: 3,                        // 3-second ring buffer window
+        marker_duration_threshold: Some(800), // Stop when any range >= 800ms
+        output_dir: dir.path().to_path_buf(),
+        no_sched: true,
+        no_cpu_stack_traces: true,
+        no_sleep_stack_traces: true,
+        no_interruptible_stack_traces: true,
+        network: false,
+        collect_pystacks: false,
+        markers: true,
+        parquet_only: true,
+        ..Config::default()
+    };
+
+    systing(config, None).expect("systing recording failed");
+    let elapsed = start.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    workload_handle.join().expect("Workload thread panicked");
+
+    // The duration threshold should trigger once BPF captures a 1000ms range.
+    eprintln!(
+        "  marker duration threshold: recording took {:.1}s",
+        elapsed.as_secs_f64()
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "Duration threshold should have triggered well before timeout; took {:.1}s",
+        elapsed.as_secs_f64()
+    );
+
+    // --- Validate slice.parquet contains the range events ---
+    eprintln!("  marker duration threshold: validating slice.parquet...");
+    let slice_path = dir.path().join("slice.parquet");
+    assert!(
+        slice_path.exists(),
+        "slice.parquet not found - marker range events were not recorded"
+    );
+    assert!(
+        parquet_column_contains(&slice_path, "name", "slow_op"),
+        "slow_op not found in slice.parquet"
+    );
+
+    // At least the triggering range should be present
+    let range_count = parquet_row_count(&slice_path);
+    assert!(
+        range_count >= 1,
+        "Expected at least 1 completed range, got {range_count}"
+    );
+
+    // Verify that at least one range has dur >= 800ms (800_000_000 ns)
+    let file = std::fs::File::open(&slice_path).expect("Failed to open slice.parquet");
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .expect("Failed to create reader")
+        .build()
+        .expect("Failed to build reader");
+
+    let mut found_long_range = false;
+    for batch in reader {
+        let batch = batch.expect("Failed to read batch");
+        if let Some(col) = batch.column_by_name("dur") {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("dur column is not Int64Array");
+            for i in 0..arr.len() {
+                if !arr.is_null(i) && arr.value(i) >= 800_000_000 {
+                    found_long_range = true;
+                    eprintln!(
+                        "  marker duration threshold: found range with dur={}ms",
+                        arr.value(i) / 1_000_000
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        found_long_range,
+        "No range with duration >= 800ms found in slice.parquet"
+    );
+
+    // --- Validate track.parquet has the DurTest track ---
+    eprintln!("  marker duration threshold: validating track.parquet...");
+    let track_path = dir.path().join("track.parquet");
+    assert!(track_path.exists(), "track.parquet not found");
+    assert!(
+        parquet_column_contains(&track_path, "name", "DurTest"),
+        "DurTest track not found in track.parquet"
+    );
+
+    eprintln!("  All marker duration threshold checks passed");
+}
