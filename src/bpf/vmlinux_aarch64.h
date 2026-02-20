@@ -39779,52 +39779,10 @@ enum vfio_device_mig_state {
 	VFIO_DEVICE_STATE_NR = 8,
 };
 
-enum vfio_device_mig_state___2 {
-	VFIO_DEVICE_STATE_ERROR___2 = 0,
-	VFIO_DEVICE_STATE_STOP___2 = 1,
-	VFIO_DEVICE_STATE_RUNNING___2 = 2,
-	VFIO_DEVICE_STATE_STOP_COPY___2 = 3,
-	VFIO_DEVICE_STATE_RESUMING___2 = 4,
-	VFIO_DEVICE_STATE_RUNNING_P2P___2 = 5,
-	VFIO_DEVICE_STATE_PRE_COPY___2 = 6,
-	VFIO_DEVICE_STATE_PRE_COPY_P2P___2 = 7,
-	VFIO_DEVICE_STATE_NR___2 = 8,
-};
-
-enum vfio_device_mig_state___3 {
-	VFIO_DEVICE_STATE_ERROR___3 = 0,
-	VFIO_DEVICE_STATE_STOP___3 = 1,
-	VFIO_DEVICE_STATE_RUNNING___3 = 2,
-	VFIO_DEVICE_STATE_STOP_COPY___3 = 3,
-	VFIO_DEVICE_STATE_RESUMING___3 = 4,
-	VFIO_DEVICE_STATE_RUNNING_P2P___3 = 5,
-	VFIO_DEVICE_STATE_PRE_COPY___3 = 6,
-	VFIO_DEVICE_STATE_PRE_COPY_P2P___3 = 7,
-	VFIO_DEVICE_STATE_NR___3 = 8,
-};
-
-enum vfio_device_mig_state___4 {
-	VFIO_DEVICE_STATE_ERROR___4 = 0,
-	VFIO_DEVICE_STATE_STOP___4 = 1,
-	VFIO_DEVICE_STATE_RUNNING___4 = 2,
-	VFIO_DEVICE_STATE_STOP_COPY___4 = 3,
-	VFIO_DEVICE_STATE_RESUMING___4 = 4,
-	VFIO_DEVICE_STATE_RUNNING_P2P___4 = 5,
-	VFIO_DEVICE_STATE_PRE_COPY___4 = 6,
-	VFIO_DEVICE_STATE_PRE_COPY_P2P___4 = 7,
-	VFIO_DEVICE_STATE_NR___4 = 8,
-};
-
 enum vfio_group_type {
 	VFIO_IOMMU = 0,
 	VFIO_EMULATED_IOMMU = 1,
 	VFIO_NO_IOMMU = 2,
-};
-
-enum vfio_group_type___2 {
-	VFIO_IOMMU___2 = 0,
-	VFIO_EMULATED_IOMMU___2 = 1,
-	VFIO_NO_IOMMU___2 = 2,
 };
 
 enum vfio_pci_io_width {
@@ -171266,120 +171224,6 @@ struct vfio_device {
 	struct dentry *debug_root;
 };
 
-struct vfio_group;
-
-struct vfio_device_ops___2;
-
-struct vfio_migration_ops___2;
-
-struct vfio_log_ops___2;
-
-struct vfio_device_set___2;
-
-struct vfio_device___2 {
-	struct device *dev;
-	const struct vfio_device_ops___2 *ops;
-	const struct vfio_migration_ops___2 *mig_ops;
-	const struct vfio_log_ops___2 *log_ops;
-	struct vfio_group *group;
-	struct list_head group_next;
-	struct list_head iommu_entry;
-	struct vfio_device_set___2 *dev_set;
-	struct list_head dev_set_list;
-	unsigned int migration_flags;
-	struct kvm *kvm;
-	unsigned int index;
-	struct device device;
-	struct cdev cdev;
-	refcount_t refcount;
-	unsigned int open_count;
-	struct completion comp;
-	struct iommufd_access *iommufd_access;
-	void (*put_kvm)(struct kvm *);
-	struct inode *inode;
-	struct iommufd_device *iommufd_device;
-	struct ida pasids;
-	u8 iommufd_attached: 1;
-	u8 cdev_opened: 1;
-	struct dentry *debug_root;
-};
-
-struct vfio_group;
-
-struct vfio_device_ops___3;
-
-struct vfio_migration_ops___3;
-
-struct vfio_log_ops___3;
-
-struct vfio_device_set___3;
-
-struct vfio_device___3 {
-	struct device *dev;
-	const struct vfio_device_ops___3 *ops;
-	const struct vfio_migration_ops___3 *mig_ops;
-	const struct vfio_log_ops___3 *log_ops;
-	struct vfio_group *group;
-	struct list_head group_next;
-	struct list_head iommu_entry;
-	struct vfio_device_set___3 *dev_set;
-	struct list_head dev_set_list;
-	unsigned int migration_flags;
-	struct kvm *kvm;
-	unsigned int index;
-	struct device device;
-	struct cdev cdev;
-	refcount_t refcount;
-	unsigned int open_count;
-	struct completion comp;
-	struct iommufd_access *iommufd_access;
-	void (*put_kvm)(struct kvm *);
-	struct inode *inode;
-	struct iommufd_device *iommufd_device;
-	struct ida pasids;
-	u8 iommufd_attached: 1;
-	u8 cdev_opened: 1;
-	struct dentry *debug_root;
-};
-
-struct vfio_device_ops___4;
-
-struct vfio_migration_ops___4;
-
-struct vfio_log_ops___4;
-
-struct vfio_group___2;
-
-struct vfio_device_set___4;
-
-struct vfio_device___4 {
-	struct device *dev;
-	const struct vfio_device_ops___4 *ops;
-	const struct vfio_migration_ops___4 *mig_ops;
-	const struct vfio_log_ops___4 *log_ops;
-	struct vfio_group___2 *group;
-	struct list_head group_next;
-	struct list_head iommu_entry;
-	struct vfio_device_set___4 *dev_set;
-	struct list_head dev_set_list;
-	unsigned int migration_flags;
-	struct kvm *kvm;
-	unsigned int index;
-	struct device device;
-	struct cdev cdev;
-	refcount_t refcount;
-	unsigned int open_count;
-	struct completion comp;
-	struct iommufd_access *iommufd_access;
-	void (*put_kvm)(struct kvm *);
-	struct inode *inode;
-	struct iommufd_device *iommufd_device;
-	struct ida pasids;
-	u8 iommufd_attached: 1;
-	u8 cdev_opened: 1;
-	struct dentry *debug_root;
-};
-
 struct vfio_device_attach_iommufd_pt {
 	__u32 argsz;
 	__u32 flags;
@@ -171507,97 +171351,7 @@ struct vfio_device_ops {
 	int (*device_feature)(struct vfio_device *, u32, void *, size_t);
 };
 
-struct vfio_device_ops___2 {
-	char *name;
-	int (*init)(struct vfio_device___2 *);
-	void (*release)(struct vfio_device___2 *);
-	int (*bind_iommufd)(struct vfio_device___2 *, struct iommufd_ctx *, u32 *);
-	void (*unbind_iommufd)(struct vfio_device___2 *);
-	int (*attach_ioas)(struct vfio_device___2 *, u32 *);
-	void (*detach_ioas)(struct vfio_device___2 *);
-	int (*pasid_attach_ioas)(struct vfio_device___2 *, u32, u32 *);
-	void (*pasid_detach_ioas)(struct vfio_device___2 *, u32);
-	int (*open_device)(struct vfio_device___2 *);
-	void (*close_device)(struct vfio_device___2 *);
-	ssize_t (*read)(struct vfio_device___2 *, char *, size_t, loff_t *);
-	ssize_t (*write)(struct vfio_device___2 *, const char *, size_t, loff_t *);
-	long int (*ioctl)(struct vfio_device___2 *, unsigned int, long unsigned int);
-	int (*mmap)(struct vfio_device___2 *, struct vm_area_struct *);
-	void (*request)(struct vfio_device___2 *, unsigned int);
-	int (*match)(struct vfio_device___2 *, char *);
-	int (*match_token_uuid)(struct vfio_device___2 *, const uuid_t *);
-	void (*dma_unmap)(struct vfio_device___2 *, u64, u64);
-	int (*device_feature)(struct vfio_device___2 *, u32, void *, size_t);
-};
-
-struct vfio_device_ops___3 {
-	char *name;
-	int (*init)(struct vfio_device___3 *);
-	void (*release)(struct vfio_device___3 *);
-	int (*bind_iommufd)(struct vfio_device___3 *, struct iommufd_ctx *, u32 *);
-	void (*unbind_iommufd)(struct vfio_device___3 *);
-	int (*attach_ioas)(struct vfio_device___3 *, u32 *);
-	void (*detach_ioas)(struct vfio_device___3 *);
-	int (*pasid_attach_ioas)(struct vfio_device___3 *, u32, u32 *);
-	void (*pasid_detach_ioas)(struct vfio_device___3 *, u32);
-	int (*open_device)(struct vfio_device___3 *);
-	void (*close_device)(struct vfio_device___3 *);
-	ssize_t (*read)(struct vfio_device___3 *, char *, size_t, loff_t *);
-	ssize_t (*write)(struct vfio_device___3 *, const char *, size_t, loff_t *);
-	long int (*ioctl)(struct vfio_device___3 *, unsigned int, long unsigned int);
-	int (*mmap)(struct vfio_device___3 *, struct vm_area_struct *);
-	void (*request)(struct vfio_device___3 *, unsigned int);
-	int (*match)(struct vfio_device___3 *, char *);
-	int (*match_token_uuid)(struct vfio_device___3 *, const uuid_t *);
-	void (*dma_unmap)(struct vfio_device___3 *, u64, u64);
-	int (*device_feature)(struct vfio_device___3 *, u32, void *, size_t);
-};
-
-struct vfio_device_ops___4 {
-	char *name;
-	int (*init)(struct vfio_device___4 *);
-	void (*release)(struct vfio_device___4 *);
-	int (*bind_iommufd)(struct vfio_device___4 *, struct iommufd_ctx *, u32 *);
-	void (*unbind_iommufd)(struct vfio_device___4 *);
-	int (*attach_ioas)(struct vfio_device___4 *, u32 *);
-	void (*detach_ioas)(struct vfio_device___4 *);
-	int (*pasid_attach_ioas)(struct vfio_device___4 *, u32, u32 *);
-	void (*pasid_detach_ioas)(struct vfio_device___4 *, u32);
-	int (*open_device)(struct vfio_device___4 *);
-	void (*close_device)(struct vfio_device___4 *);
-	ssize_t (*read)(struct vfio_device___4 *, char *, size_t, loff_t *);
-	ssize_t (*write)(struct vfio_device___4 *, const char *, size_t, loff_t *);
-	long int (*ioctl)(struct vfio_device___4 *, unsigned int, long unsigned int);
-	int (*mmap)(struct vfio_device___4 *, struct vm_area_struct *);
-	void (*request)(struct vfio_device___4 *, unsigned int);
-	int (*match)(struct vfio_device___4 *, char *);
-	int (*match_token_uuid)(struct vfio_device___4 *, const uuid_t *);
-	void (*dma_unmap)(struct vfio_device___4 *, u64, u64);
-	int (*device_feature)(struct vfio_device___4 *, u32, void *, size_t);
-};
-
 struct vfio_device_set {
-	void *set_id;
-	struct mutex lock;
-	struct list_head device_list;
-	unsigned int device_count;
-};
-
-struct vfio_device_set___2 {
-	void *set_id;
-	struct mutex lock;
-	struct list_head device_list;
-	unsigned int device_count;
-};
-
-struct vfio_device_set___3 {
-	void *set_id;
-	struct mutex lock;
-	struct list_head device_list;
-	unsigned int device_count;
-};
-
-struct vfio_device_set___4 {
 	void *set_id;
 	struct mutex lock;
 	struct list_head device_list;
@@ -171649,76 +171403,14 @@ struct vfio_group {
 	unsigned int cdev_device_open_cnt;
 };
 
-struct vfio_container;
-
-struct vfio_group___2 {
-	struct device dev;
-	struct cdev cdev;
-	refcount_t drivers;
-	unsigned int container_users;
-	struct iommu_group *iommu_group;
-	struct vfio_container *container;
-	struct list_head device_list;
-	struct mutex device_lock;
-	struct list_head vfio_next;
-	struct list_head container_next;
-	enum vfio_group_type___2 type;
-	struct mutex group_lock;
-	struct kvm *kvm;
-	struct file *opened_file;
-	struct blocking_notifier_head notifier;
-	struct iommufd_ctx *iommufd;
-	spinlock_t kvm_ref_lock;
-	unsigned int cdev_device_open_cnt;
-};
-
 struct vfio_group_status {
 	__u32 argsz;
 	__u32 flags;
 };
 
-struct vfio_info_cap_header___2;
-
 struct vfio_info_cap {
-	struct vfio_info_cap_header___2 *buf;
-	size_t size;
-};
-
-struct vfio_info_cap_header___3;
-
-struct vfio_info_cap___2 {
-	struct vfio_info_cap_header___3 *buf;
-	size_t size;
-};
-
-struct vfio_info_cap___3 {
 	struct vfio_info_cap_header *buf;
 	size_t size;
-};
-
-struct vfio_info_cap_header___4;
-
-struct vfio_info_cap___4 {
-	struct vfio_info_cap_header___4 *buf;
-	size_t size;
-};
-
-struct vfio_info_cap_header___2 {
-	__u16 id;
-	__u16 version;
-	__u32 next;
-};
-
-struct vfio_info_cap_header___3 {
-	__u16 id;
-	__u16 version;
-	__u32 next;
-};
-
-struct vfio_info_cap_header___4 {
-	__u16 id;
-	__u16 version;
-	__u32 next;
 };
 
 struct vfio_iommu {
@@ -171756,22 +171448,6 @@ struct vfio_iommu_driver_ops {
 	void (*unpin_pages)(void *, dma_addr_t, int);
 	void (*register_device)(void *, struct vfio_device *);
 	void (*unregister_device)(void *, struct vfio_device *);
-	int (*dma_rw)(void *, dma_addr_t, void *, size_t, bool);
-	struct iommu_domain * (*group_iommu_domain)(void *, struct iommu_group *);
-};
-
-struct vfio_iommu_driver_ops___2 {
-	char *name;
-	struct module *owner;
-	void * (*open)(long unsigned int);
-	void (*release)(void *);
-	long int (*ioctl)(void *, unsigned int, long unsigned int);
-	int (*attach_group)(void *, struct iommu_group *, enum vfio_group_type___2);
-	void (*detach_group)(void *, struct iommu_group *);
-	int (*pin_pages)(void *, struct iommu_group *, dma_addr_t, int, int, struct page **);
-	void (*unpin_pages)(void *, dma_addr_t, int);
-	void (*register_device)(void *, struct vfio_device___4 *);
-	void (*unregister_device)(void *, struct vfio_device___4 *);
 	int (*dma_rw)(void *, dma_addr_t, void *, size_t, bool);
 	struct iommu_domain * (*group_iommu_domain)(void *, struct iommu_group *);
 };
@@ -171824,21 +171500,21 @@ struct vfio_iova_range {
 };
 
 struct vfio_iommu_type1_info_cap_iova_range {
-	struct vfio_info_cap_header___4 header;
+	struct vfio_info_cap_header header;
 	__u32 nr_iovas;
 	__u32 reserved;
 	struct vfio_iova_range iova_ranges[0];
 };
 
 struct vfio_iommu_type1_info_cap_migration {
-	struct vfio_info_cap_header___4 header;
+	struct vfio_info_cap_header header;
 	__u32 flags;
 	__u64 pgsize_bitmap;
 	__u64 max_dirty_bitmap_size;
 };
 
 struct vfio_iommu_type1_info_dma_avail {
-	struct vfio_info_cap_header___4 header;
+	struct vfio_info_cap_header header;
 	__u32 avail;
 };
 
@@ -171864,37 +171540,10 @@ struct vfio_irq_set {
 	__u8 data[0];
 };
 
-struct vfio_irq_set___2 {
-	__u32 argsz;
-	__u32 flags;
-	__u32 index;
-	__u32 start;
-	__u32 count;
-	__u8 data[0];
-};
-
 struct vfio_log_ops {
 	int (*log_start)(struct vfio_device *, struct rb_root_cached *, u32, u64 *);
 	int (*log_stop)(struct vfio_device *);
 	int (*log_read_and_clear)(struct vfio_device *, long unsigned int, long unsigned int, struct iova_bitmap *);
-};
-
-struct vfio_log_ops___2 {
-	int (*log_start)(struct vfio_device___2 *, struct rb_root_cached *, u32, u64 *);
-	int (*log_stop)(struct vfio_device___2 *);
-	int (*log_read_and_clear)(struct vfio_device___2 *, long unsigned int, long unsigned int, struct iova_bitmap *);
-};
-
-struct vfio_log_ops___3 {
-	int (*log_start)(struct vfio_device___3 *, struct rb_root_cached *, u32, u64 *);
-	int (*log_stop)(struct vfio_device___3 *);
-	int (*log_read_and_clear)(struct vfio_device___3 *, long unsigned int, long unsigned int, struct iova_bitmap *);
-};
-
-struct vfio_log_ops___4 {
-	int (*log_start)(struct vfio_device___4 *, struct rb_root_cached *, u32, u64 *);
-	int (*log_stop)(struct vfio_device___4 *);
-	int (*log_read_and_clear)(struct vfio_device___4 *, long unsigned int, long unsigned int, struct iova_bitmap *);
 };
 
 struct vfio_migration_ops {
@@ -171903,34 +171552,14 @@ struct vfio_migration_ops {
 	int (*migration_get_data_size)(struct vfio_device *, long unsigned int *);
 };
 
-struct vfio_migration_ops___2 {
-	struct file * (*migration_set_state)(struct vfio_device___2 *, enum vfio_device_mig_state___2);
-	int (*migration_get_state)(struct vfio_device___2 *, enum vfio_device_mig_state___2 *);
-	int (*migration_get_data_size)(struct vfio_device___2 *, long unsigned int *);
-};
-
-struct vfio_migration_ops___3 {
-	struct file * (*migration_set_state)(struct vfio_device___3 *, enum vfio_device_mig_state___3);
-	int (*migration_get_state)(struct vfio_device___3 *, enum vfio_device_mig_state___3 *);
-	int (*migration_get_data_size)(struct vfio_device___3 *, long unsigned int *);
-};
-
-struct vfio_migration_ops___4 {
-	struct file * (*migration_set_state)(struct vfio_device___4 *, enum vfio_device_mig_state___4);
-	int (*migration_get_state)(struct vfio_device___4 *, enum vfio_device_mig_state___4 *);
-	int (*migration_get_data_size)(struct vfio_device___4 *, long unsigned int *);
-};
-
-struct perm_bits;
-
-struct vfio_pci_vf_token;
-
 struct vfio_pci_region;
 
 struct vfio_pci_eventfd;
 
-struct vfio_pci_core_device___2 {
-	struct vfio_device___2 vdev;
+struct vfio_pci_vf_token;
+
+struct vfio_pci_core_device {
+	struct vfio_device vdev;
 	struct pci_dev *pdev;
 	void *barmap[6];
 	bool bar_mmap_supported[6];
@@ -171971,59 +171600,6 @@ struct vfio_pci_core_device___2 {
 	struct list_head ioeventfds_list;
 	struct vfio_pci_vf_token *vf_token;
 	struct list_head sriov_pfs_item;
-	struct vfio_pci_core_device___2 *sriov_pf_core_dev;
-	struct notifier_block nb;
-	struct rw_semaphore memory_lock;
-};
-
-struct vfio_pci_region___2;
-
-struct vfio_pci_eventfd___2;
-
-struct vfio_pci_vf_token;
-
-struct vfio_pci_core_device {
-	struct vfio_device___3 vdev;
-	struct pci_dev *pdev;
-	void *barmap[6];
-	bool bar_mmap_supported[6];
-	u8 *pci_config_map;
-	u8 *vconfig;
-	struct perm_bits *msi_perm;
-	spinlock_t irqlock;
-	struct mutex igate;
-	struct xarray ctx;
-	int irq_type;
-	int num_regions;
-	struct vfio_pci_region___2 *region;
-	u8 msi_qmax;
-	u8 msix_bar;
-	u16 msix_size;
-	u32 msix_offset;
-	u32 rbar[7];
-	bool has_dyn_msix: 1;
-	bool pci_2_3: 1;
-	bool virq_disabled: 1;
-	bool reset_works: 1;
-	bool extended_caps: 1;
-	bool bardirty: 1;
-	bool has_vga: 1;
-	bool needs_reset: 1;
-	bool nointx: 1;
-	bool needs_pm_restore: 1;
-	bool pm_intx_masked: 1;
-	bool pm_runtime_engaged: 1;
-	struct pci_saved_state *pci_saved_state;
-	struct pci_saved_state *pm_save;
-	int ioeventfds_nr;
-	struct vfio_pci_eventfd___2 *err_trigger;
-	struct vfio_pci_eventfd___2 *req_trigger;
-	struct eventfd_ctx *pm_wake_eventfd_ctx;
-	struct list_head dummy_resources_list;
-	struct mutex ioeventfds_lock;
-	struct list_head ioeventfds_list;
-	struct vfio_pci_vf_token *vf_token;
-	struct list_head sriov_pfs_item;
 	struct vfio_pci_core_device *sriov_pf_core_dev;
 	struct notifier_block nb;
 	struct rw_semaphore memory_lock;
@@ -172050,13 +171626,8 @@ struct vfio_pci_eventfd {
 	struct callback_head rcu;
 };
 
-struct vfio_pci_eventfd___2 {
-	struct eventfd_ctx *ctx;
-	struct callback_head rcu;
-};
-
 struct vfio_pci_fill_info {
-	struct vfio_device___3 *vdev;
+	struct vfio_device *vdev;
 	struct vfio_pci_dependent_device *devices;
 	int nr_devices;
 	u32 count;
@@ -172117,29 +171688,11 @@ struct vfio_pci_region {
 	u32 flags;
 };
 
-struct vfio_pci_regops___2;
-
-struct vfio_pci_region___2 {
-	u32 type;
-	u32 subtype;
-	const struct vfio_pci_regops___2 *ops;
-	void *data;
-	size_t size;
-	u32 flags;
-};
-
 struct vfio_pci_regops {
-	ssize_t (*rw)(struct vfio_pci_core_device___2 *, char *, size_t, loff_t *, bool);
-	void (*release)(struct vfio_pci_core_device___2 *, struct vfio_pci_region *);
-	int (*mmap)(struct vfio_pci_core_device___2 *, struct vfio_pci_region *, struct vm_area_struct *);
-	int (*add_capability)(struct vfio_pci_core_device___2 *, struct vfio_pci_region *, struct vfio_info_cap___2 *);
-};
-
-struct vfio_pci_regops___2 {
 	ssize_t (*rw)(struct vfio_pci_core_device *, char *, size_t, loff_t *, bool);
-	void (*release)(struct vfio_pci_core_device *, struct vfio_pci_region___2 *);
-	int (*mmap)(struct vfio_pci_core_device *, struct vfio_pci_region___2 *, struct vm_area_struct *);
-	int (*add_capability)(struct vfio_pci_core_device *, struct vfio_pci_region___2 *, struct vfio_info_cap___3 *);
+	void (*release)(struct vfio_pci_core_device *, struct vfio_pci_region *);
+	int (*mmap)(struct vfio_pci_core_device *, struct vfio_pci_region *, struct vm_area_struct *);
+	int (*add_capability)(struct vfio_pci_core_device *, struct vfio_pci_region *, struct vfio_info_cap *);
 };
 
 struct vfio_pci_vf_token {
@@ -172518,20 +172071,6 @@ struct viot_iommu {
 	unsigned int offset;
 	struct fwnode_handle *fwnode;
 	struct list_head list;
-};
-
-struct virqfd___2 {
-	void *opaque;
-	struct eventfd_ctx *eventfd;
-	int (*handler)(void *, void *);
-	void (*thread)(void *, void *);
-	void *data;
-	struct work_struct inject;
-	wait_queue_entry_t wait;
-	poll_table pt;
-	struct work_struct shutdown;
-	struct work_struct flush_inject;
-	struct virqfd___2 **pvirqfd;
 };
 
 struct virqfd {
