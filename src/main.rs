@@ -74,7 +74,7 @@ struct Command {
     // Marker recording enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     markers: bool,
-    /// Stop tracing after this many completed marker range events are observed
+    /// Stop tracing after this many marker instant events are observed
     #[arg(long)]
     marker_threshold: Option<u64>,
     /// Stop tracing when any marker range event exceeds this duration in milliseconds

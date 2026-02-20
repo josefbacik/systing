@@ -28,8 +28,8 @@ pub struct MarkerRecorder {
     outstanding_ranges: HashMap<(u64, String, String), u64>,
     recorded_ranges: Vec<MarkerRange>,
     instants: Vec<MarkerInstant>,
-    // Threshold tracking: count completed ranges and stop when threshold is hit
-    range_count: u64,
+    // Count threshold: count instant events and stop when threshold is hit
+    instant_count: u64,
     threshold: Option<u64>,
     // Duration threshold in nanoseconds: stop when any range exceeds this duration
     duration_threshold_ns: Option<u64>,
@@ -68,39 +68,44 @@ impl SystingRecordEvent<marker_event> for MarkerRecorder {
             return false;
         }
 
-        let (track, name) = parse_name(&event.name);
-        let tgidpid = event.task.tgidpid;
-
         match event.marker_type {
+            MARKER_TYPE_INSTANT => {
+                // Count threshold: count instant events
+                if let Some(threshold) = self.threshold {
+                    self.instant_count += 1;
+                    if self.instant_count >= threshold {
+                        println!(
+                            "Marker threshold reached: {} instant events observed",
+                            self.instant_count
+                        );
+                        return true;
+                    }
+                }
+                false
+            }
             MARKER_TYPE_START => {
-                self.outstanding_triggers
-                    .insert((tgidpid, track, name), event.ts);
+                // Duration threshold: record start timestamp
+                if self.duration_threshold_ns.is_some() {
+                    let (track, name) = parse_name(&event.name);
+                    let tgidpid = event.task.tgidpid;
+                    self.outstanding_triggers
+                        .insert((tgidpid, track, name), event.ts);
+                }
                 false
             }
             MARKER_TYPE_END => {
-                let key = (tgidpid, track, name);
-                if let Some(start_ts) = self.outstanding_triggers.remove(&key) {
-                    self.range_count += 1;
-
-                    // Check duration threshold first
-                    if let Some(dur_threshold_ns) = self.duration_threshold_ns {
+                // Duration threshold: check completed range duration
+                if let Some(dur_threshold_ns) = self.duration_threshold_ns {
+                    let (track, name) = parse_name(&event.name);
+                    let tgidpid = event.task.tgidpid;
+                    let key = (tgidpid, track, name);
+                    if let Some(start_ts) = self.outstanding_triggers.remove(&key) {
                         let duration_ns = event.ts.saturating_sub(start_ts);
                         if duration_ns >= dur_threshold_ns {
                             println!(
                                 "Marker duration threshold reached: range lasted {}ms (threshold {}ms)",
                                 duration_ns / 1_000_000,
                                 dur_threshold_ns / 1_000_000
-                            );
-                            return true;
-                        }
-                    }
-
-                    // Check count threshold
-                    if let Some(threshold) = self.threshold {
-                        if self.range_count >= threshold {
-                            println!(
-                                "Marker threshold reached: {} completed ranges observed",
-                                self.range_count
                             );
                             return true;
                         }
@@ -353,50 +358,36 @@ mod tests {
     #[test]
     fn test_threshold_none_never_triggers() {
         let mut recorder = MarkerRecorder::default();
-        // No threshold set, completed ranges should never trigger
+        // No threshold set, instants should never trigger
         for i in 0..100 {
-            assert!(!recorder.maybe_trigger(&make_event(0, "T:evt", 1, i * 100)));
-            assert!(!recorder.maybe_trigger(&make_event(1, "T:evt", 1, i * 100 + 50)));
+            assert!(!recorder.maybe_trigger(&make_event(2, "T:check", 1, i * 100)));
         }
     }
 
     #[test]
     fn test_threshold_triggers_at_count() {
         let mut recorder = MarkerRecorder::default().with_threshold(Some(3));
-        // First two completed ranges should not trigger
-        for i in 0..2 {
-            assert!(!recorder.maybe_trigger(&make_event(0, "T:evt", 1, i * 100)));
-            assert!(!recorder.maybe_trigger(&make_event(1, "T:evt", 1, i * 100 + 50)));
-        }
-        // Third completed range should trigger
-        assert!(!recorder.maybe_trigger(&make_event(0, "T:evt", 1, 200)));
-        assert!(recorder.maybe_trigger(&make_event(1, "T:evt", 1, 250)));
+        // First two instants should not trigger
+        assert!(!recorder.maybe_trigger(&make_event(2, "T:check", 1, 100)));
+        assert!(!recorder.maybe_trigger(&make_event(2, "T:check", 1, 200)));
+        // Third instant should trigger
+        assert!(recorder.maybe_trigger(&make_event(2, "T:check", 1, 300)));
     }
 
     #[test]
     fn test_threshold_one_triggers_immediately() {
         let mut recorder = MarkerRecorder::default().with_threshold(Some(1));
+        assert!(recorder.maybe_trigger(&make_event(2, "T:check", 1, 100)));
+    }
+
+    #[test]
+    fn test_threshold_ignores_ranges() {
+        let mut recorder = MarkerRecorder::default().with_threshold(Some(1));
+        // Start/end range events should not count toward instant threshold
         assert!(!recorder.maybe_trigger(&make_event(0, "T:evt", 1, 100)));
-        assert!(recorder.maybe_trigger(&make_event(1, "T:evt", 1, 200)));
-    }
-
-    #[test]
-    fn test_threshold_ignores_instants() {
-        let mut recorder = MarkerRecorder::default().with_threshold(Some(1));
-        // Instants should not count toward threshold
-        assert!(!recorder.maybe_trigger(&make_event(2, "T:check", 1, 100)));
-        assert!(!recorder.maybe_trigger(&make_event(2, "T:check", 1, 200)));
-        // Only a completed range should trigger
-        assert!(!recorder.maybe_trigger(&make_event(0, "T:evt", 1, 300)));
-        assert!(recorder.maybe_trigger(&make_event(1, "T:evt", 1, 400)));
-    }
-
-    #[test]
-    fn test_threshold_ignores_orphan_end() {
-        let mut recorder = MarkerRecorder::default().with_threshold(Some(1));
-        // End without matching start should not count
-        assert!(!recorder.maybe_trigger(&make_event(1, "T:evt", 1, 100)));
-        assert_eq!(recorder.range_count, 0);
+        assert!(!recorder.maybe_trigger(&make_event(1, "T:evt", 1, 200)));
+        // Only an instant should trigger
+        assert!(recorder.maybe_trigger(&make_event(2, "T:check", 1, 300)));
     }
 
     #[test]
@@ -442,31 +433,32 @@ mod tests {
 
     #[test]
     fn test_both_thresholds_duration_fires_first() {
-        // Both count (10) and duration (100ms) thresholds set
-        // Duration should fire before count is reached
+        // Both instant count (10) and duration (100ms) thresholds set
+        // A long range should fire duration before enough instants are seen
         let mut recorder = MarkerRecorder::default()
             .with_threshold(Some(10))
             .with_duration_threshold(Some(100));
-        // Short range - neither threshold fires
-        assert!(!recorder.maybe_trigger(&make_event(0, "T:evt", 1, 0)));
-        assert!(!recorder.maybe_trigger(&make_event(1, "T:evt", 1, 50_000_000)));
-        // Long range - duration threshold fires
+        // Instants don't fire yet (only 2 of 10)
+        assert!(!recorder.maybe_trigger(&make_event(2, "T:check", 1, 0)));
+        assert!(!recorder.maybe_trigger(&make_event(2, "T:check", 1, 10_000_000)));
+        // Long range fires duration threshold
         assert!(!recorder.maybe_trigger(&make_event(0, "T:evt", 1, 100_000_000)));
         assert!(recorder.maybe_trigger(&make_event(1, "T:evt", 1, 300_000_000)));
     }
 
     #[test]
     fn test_both_thresholds_count_fires_first() {
-        // Both count (2) and duration (1s) thresholds set
-        // Short ranges should trigger count before duration is ever reached
+        // Both instant count (2) and duration (1s) thresholds set
+        // Instants trigger count before any range is long enough for duration
         let mut recorder = MarkerRecorder::default()
             .with_threshold(Some(2))
             .with_duration_threshold(Some(1000));
-        // First short range (1ms) - no trigger
+        // Short range - no duration trigger
         assert!(!recorder.maybe_trigger(&make_event(0, "T:evt", 1, 0)));
         assert!(!recorder.maybe_trigger(&make_event(1, "T:evt", 1, 1_000_000)));
-        // Second short range (1ms) - count threshold fires
-        assert!(!recorder.maybe_trigger(&make_event(0, "T:evt", 1, 2_000_000)));
-        assert!(recorder.maybe_trigger(&make_event(1, "T:evt", 1, 3_000_000)));
+        // First instant - not yet
+        assert!(!recorder.maybe_trigger(&make_event(2, "T:check", 1, 2_000_000)));
+        // Second instant - count threshold fires
+        assert!(recorder.maybe_trigger(&make_event(2, "T:check", 1, 3_000_000)));
     }
 }

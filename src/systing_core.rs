@@ -250,7 +250,7 @@ pub struct Config {
     pub syscalls: bool,
     /// Enable marker recording (faccessat2-based userspace markers)
     pub markers: bool,
-    /// Stop tracing after this many completed marker range events
+    /// Stop tracing after this many marker instant events
     pub marker_threshold: Option<u64>,
     /// Stop tracing when any marker range event exceeds this duration in milliseconds
     pub marker_duration_threshold: Option<u64>,

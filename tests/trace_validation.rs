@@ -2681,13 +2681,13 @@ fn parquet_row_count(path: &std::path::Path) -> usize {
         .sum()
 }
 
-/// Integration test for marker threshold in continuous mode.
+/// Integration test for marker threshold (instant event counting) in continuous mode.
 ///
 /// Configures systing with `--continuous 3` (3-second ring buffer window) and
-/// `--marker-threshold 2` (stop after 2 completed marker ranges). A workload
-/// thread emits START → sleep 1s → END pairs. After the second completed range
-/// the threshold triggers and systing stops. We validate that the trace contains
-/// exactly the expected marker range events.
+/// `--marker-threshold 3` (stop after 3 instant marker events). A workload
+/// thread emits instant events in a loop. After the third instant event
+/// the threshold triggers and systing stops. We validate that the trace
+/// contains the expected instant events.
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_marker_threshold() {
@@ -2705,22 +2705,18 @@ fn test_e2e_marker_threshold() {
     let stop_clone = stop.clone();
 
     let mode = -975i64;
-    let range_name = CString::new("Threshold:range_evt").unwrap();
+    let instant_name = CString::new("Threshold:ping").unwrap();
     let sysno = Sysno::faccessat2 as i64;
 
-    // Workload: emit START, sleep 1s, emit END, repeat.
-    // With marker_threshold=2 the second completed range triggers shutdown.
+    // Workload: emit INSTANT events in a loop with 500ms pauses.
+    // With marker_threshold=3 the third instant triggers shutdown.
     let workload_handle = thread::spawn(move || {
         thread::sleep(Duration::from_millis(500)); // Wait for BPF init
         while !stop_clone.load(Ordering::Relaxed) {
             unsafe {
-                libc::syscall(sysno, 0i64, range_name.as_ptr(), mode, 0i64); // START
+                libc::syscall(sysno, 2i64, instant_name.as_ptr(), mode, 0i64); // INSTANT
             }
-            thread::sleep(Duration::from_secs(1));
-            unsafe {
-                libc::syscall(sysno, 1i64, range_name.as_ptr(), mode, 0i64); // END
-            }
-            thread::sleep(Duration::from_millis(100)); // Brief pause between ranges
+            thread::sleep(Duration::from_millis(500));
         }
     });
 
@@ -2728,7 +2724,7 @@ fn test_e2e_marker_threshold() {
 
     let config = Config {
         continuous: 3,             // 3-second ring buffer window
-        marker_threshold: Some(2), // Stop after 2 completed ranges
+        marker_threshold: Some(3), // Stop after 3 instant events
         output_dir: dir.path().to_path_buf(),
         no_sched: true,
         no_cpu_stack_traces: true,
@@ -2746,8 +2742,6 @@ fn test_e2e_marker_threshold() {
     stop.store(true, Ordering::Relaxed);
     workload_handle.join().expect("Workload thread panicked");
 
-    // The threshold should have triggered after ~2.5s (500ms init + 2×~1.1s per range).
-    // If it ran for the full continuous window without triggering, something is wrong.
     eprintln!(
         "  marker threshold: recording took {:.1}s",
         elapsed.as_secs_f64()
@@ -2758,21 +2752,21 @@ fn test_e2e_marker_threshold() {
         elapsed.as_secs_f64()
     );
 
-    // --- Validate slice.parquet contains the range events ---
-    eprintln!("  marker threshold: validating slice.parquet...");
-    let slice_path = dir.path().join("slice.parquet");
+    // --- Validate instant.parquet contains the instant events ---
+    eprintln!("  marker threshold: validating instant.parquet...");
+    let instant_path = dir.path().join("instant.parquet");
     assert!(
-        slice_path.exists(),
-        "slice.parquet not found - marker range events were not recorded"
+        instant_path.exists(),
+        "instant.parquet not found - marker instant events were not recorded"
     );
     assert!(
-        parquet_column_contains(&slice_path, "name", "range_evt"),
-        "range_evt not found in slice.parquet"
+        parquet_column_contains(&instant_path, "name", "ping"),
+        "ping not found in instant.parquet"
     );
-    let range_count = parquet_row_count(&slice_path);
+    let instant_count = parquet_row_count(&instant_path);
     assert!(
-        range_count >= 2,
-        "Expected at least 2 completed ranges, got {range_count}"
+        instant_count >= 3,
+        "Expected at least 3 instant events, got {instant_count}"
     );
 
     // --- Validate track.parquet has the threshold track ---
