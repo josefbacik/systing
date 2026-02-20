@@ -7260,6 +7260,10 @@ enum {
 };
 
 enum {
+	PCI_ID_F_VFIO_DRIVER_OVERRIDE = 1,
+};
+
+enum {
 	PCI_REASSIGN_ALL_RSRC = 1,
 	PCI_REASSIGN_ALL_BUS = 2,
 	PCI_PROBE_ONLY = 4,
@@ -9371,6 +9375,41 @@ enum {
 
 enum {
 	VFIO_DEVICE_NUM_STATES = 8,
+};
+
+enum {
+	VFIO_PCI_BAR0_REGION_INDEX = 0,
+	VFIO_PCI_BAR1_REGION_INDEX = 1,
+	VFIO_PCI_BAR2_REGION_INDEX = 2,
+	VFIO_PCI_BAR3_REGION_INDEX = 3,
+	VFIO_PCI_BAR4_REGION_INDEX = 4,
+	VFIO_PCI_BAR5_REGION_INDEX = 5,
+	VFIO_PCI_ROM_REGION_INDEX = 6,
+	VFIO_PCI_CONFIG_REGION_INDEX = 7,
+	VFIO_PCI_VGA_REGION_INDEX = 8,
+	VFIO_PCI_NUM_REGIONS = 9,
+};
+
+enum {
+	VFIO_PCI_BAR0_REGION_INDEX___2 = 0,
+	VFIO_PCI_BAR1_REGION_INDEX___2 = 1,
+	VFIO_PCI_BAR2_REGION_INDEX___2 = 2,
+	VFIO_PCI_BAR3_REGION_INDEX___2 = 3,
+	VFIO_PCI_BAR4_REGION_INDEX___2 = 4,
+	VFIO_PCI_BAR5_REGION_INDEX___2 = 5,
+	VFIO_PCI_ROM_REGION_INDEX___2 = 6,
+	VFIO_PCI_CONFIG_REGION_INDEX___2 = 7,
+	VFIO_PCI_VGA_REGION_INDEX___2 = 8,
+	VFIO_PCI_NUM_REGIONS___2 = 9,
+};
+
+enum {
+	VFIO_PCI_INTX_IRQ_INDEX = 0,
+	VFIO_PCI_MSI_IRQ_INDEX = 1,
+	VFIO_PCI_MSIX_IRQ_INDEX = 2,
+	VFIO_PCI_ERR_IRQ_INDEX = 3,
+	VFIO_PCI_REQ_IRQ_INDEX = 4,
+	VFIO_PCI_NUM_IRQS = 5,
 };
 
 enum {
@@ -30121,10 +30160,59 @@ enum vfio_device_mig_state {
 	VFIO_DEVICE_STATE_NR = 8,
 };
 
+enum vfio_device_mig_state___2 {
+	VFIO_DEVICE_STATE_ERROR___2 = 0,
+	VFIO_DEVICE_STATE_STOP___2 = 1,
+	VFIO_DEVICE_STATE_RUNNING___2 = 2,
+	VFIO_DEVICE_STATE_STOP_COPY___2 = 3,
+	VFIO_DEVICE_STATE_RESUMING___2 = 4,
+	VFIO_DEVICE_STATE_RUNNING_P2P___2 = 5,
+	VFIO_DEVICE_STATE_PRE_COPY___2 = 6,
+	VFIO_DEVICE_STATE_PRE_COPY_P2P___2 = 7,
+	VFIO_DEVICE_STATE_NR___2 = 8,
+};
+
+enum vfio_device_mig_state___3 {
+	VFIO_DEVICE_STATE_ERROR___3 = 0,
+	VFIO_DEVICE_STATE_STOP___3 = 1,
+	VFIO_DEVICE_STATE_RUNNING___3 = 2,
+	VFIO_DEVICE_STATE_STOP_COPY___3 = 3,
+	VFIO_DEVICE_STATE_RESUMING___3 = 4,
+	VFIO_DEVICE_STATE_RUNNING_P2P___3 = 5,
+	VFIO_DEVICE_STATE_PRE_COPY___3 = 6,
+	VFIO_DEVICE_STATE_PRE_COPY_P2P___3 = 7,
+	VFIO_DEVICE_STATE_NR___3 = 8,
+};
+
+enum vfio_device_mig_state___4 {
+	VFIO_DEVICE_STATE_ERROR___4 = 0,
+	VFIO_DEVICE_STATE_STOP___4 = 1,
+	VFIO_DEVICE_STATE_RUNNING___4 = 2,
+	VFIO_DEVICE_STATE_STOP_COPY___4 = 3,
+	VFIO_DEVICE_STATE_RESUMING___4 = 4,
+	VFIO_DEVICE_STATE_RUNNING_P2P___4 = 5,
+	VFIO_DEVICE_STATE_PRE_COPY___4 = 6,
+	VFIO_DEVICE_STATE_PRE_COPY_P2P___4 = 7,
+	VFIO_DEVICE_STATE_NR___4 = 8,
+};
+
 enum vfio_group_type {
 	VFIO_IOMMU = 0,
 	VFIO_EMULATED_IOMMU = 1,
 	VFIO_NO_IOMMU = 2,
+};
+
+enum vfio_group_type___2 {
+	VFIO_IOMMU___2 = 0,
+	VFIO_EMULATED_IOMMU___2 = 1,
+	VFIO_NO_IOMMU___2 = 2,
+};
+
+enum vfio_pci_io_width {
+	VFIO_PCI_IO_WIDTH_1 = 1,
+	VFIO_PCI_IO_WIDTH_2 = 2,
+	VFIO_PCI_IO_WIDTH_4 = 4,
+	VFIO_PCI_IO_WIDTH_8 = 8,
 };
 
 enum vga_switcheroo_client_id {
@@ -35209,6 +35297,33 @@ struct _ddebug_info___2 {
 	unsigned int num_classes;
 };
 
+struct ddebug_class_map___3;
+
+struct _ddebug_info___3 {
+	struct _ddebug *descs;
+	struct ddebug_class_map___3 *classes;
+	unsigned int num_descs;
+	unsigned int num_classes;
+};
+
+struct ddebug_class_map___4;
+
+struct _ddebug_info___4 {
+	struct _ddebug *descs;
+	struct ddebug_class_map___4 *classes;
+	unsigned int num_descs;
+	unsigned int num_classes;
+};
+
+struct ddebug_class_map___5;
+
+struct _ddebug_info___5 {
+	struct _ddebug *descs;
+	struct ddebug_class_map___5 *classes;
+	unsigned int num_descs;
+	unsigned int num_classes;
+};
+
 struct _flow_keys_digest_data {
 	__be16 n_proto;
 	u8 ip_proto;
@@ -40036,6 +40151,75 @@ struct address_space___2 {
 	void *i_private_data;
 };
 
+struct inode___3;
+
+struct address_space_operations___3;
+
+struct address_space___3 {
+	struct inode___3 *host;
+	struct xarray i_pages;
+	struct rw_semaphore invalidate_lock;
+	gfp_t gfp_mask;
+	atomic_t i_mmap_writable;
+	atomic_t nr_thps;
+	struct rb_root_cached i_mmap;
+	long unsigned int nrpages;
+	long unsigned int writeback_index;
+	const struct address_space_operations___3 *a_ops;
+	long unsigned int flags;
+	errseq_t wb_err;
+	spinlock_t i_private_lock;
+	struct list_head i_private_list;
+	struct rw_semaphore i_mmap_rwsem;
+	void *i_private_data;
+};
+
+struct inode___4;
+
+struct address_space_operations___4;
+
+struct address_space___4 {
+	struct inode___4 *host;
+	struct xarray i_pages;
+	struct rw_semaphore invalidate_lock;
+	gfp_t gfp_mask;
+	atomic_t i_mmap_writable;
+	atomic_t nr_thps;
+	struct rb_root_cached i_mmap;
+	long unsigned int nrpages;
+	long unsigned int writeback_index;
+	const struct address_space_operations___4 *a_ops;
+	long unsigned int flags;
+	errseq_t wb_err;
+	spinlock_t i_private_lock;
+	struct list_head i_private_list;
+	struct rw_semaphore i_mmap_rwsem;
+	void *i_private_data;
+};
+
+struct inode___5;
+
+struct address_space_operations___5;
+
+struct address_space___5 {
+	struct inode___5 *host;
+	struct xarray i_pages;
+	struct rw_semaphore invalidate_lock;
+	gfp_t gfp_mask;
+	atomic_t i_mmap_writable;
+	atomic_t nr_thps;
+	struct rb_root_cached i_mmap;
+	long unsigned int nrpages;
+	long unsigned int writeback_index;
+	const struct address_space_operations___5 *a_ops;
+	long unsigned int flags;
+	errseq_t wb_err;
+	spinlock_t i_private_lock;
+	struct list_head i_private_list;
+	struct rw_semaphore i_mmap_rwsem;
+	void *i_private_data;
+};
+
 struct writeback_control;
 
 struct readahead_control;
@@ -40098,6 +40282,98 @@ struct address_space_operations___2 {
 	int (*swap_activate)(struct swap_info_struct *, struct file___2 *, sector_t *);
 	void (*swap_deactivate)(struct file___2 *);
 	int (*swap_rw)(struct kiocb___2 *, struct iov_iter___2 *);
+};
+
+struct file___3;
+
+struct folio___3;
+
+struct kiocb___3;
+
+struct address_space_operations___3 {
+	int (*read_folio)(struct file___3 *, struct folio___3 *);
+	int (*writepages)(struct address_space___3 *, struct writeback_control *);
+	bool (*dirty_folio)(struct address_space___3 *, struct folio___3 *);
+	void (*readahead)(struct readahead_control *);
+	int (*write_begin)(const struct kiocb___3 *, struct address_space___3 *, loff_t, unsigned int, struct folio___3 **, void **);
+	int (*write_end)(const struct kiocb___3 *, struct address_space___3 *, loff_t, unsigned int, unsigned int, struct folio___3 *, void *);
+	sector_t (*bmap)(struct address_space___3 *, sector_t);
+	void (*invalidate_folio)(struct folio___3 *, size_t, size_t);
+	bool (*release_folio)(struct folio___3 *, gfp_t);
+	void (*free_folio)(struct folio___3 *);
+	ssize_t (*direct_IO)(struct kiocb___3 *, struct iov_iter *);
+	int (*migrate_folio)(struct address_space___3 *, struct folio___3 *, struct folio___3 *, enum migrate_mode);
+	int (*launder_folio)(struct folio___3 *);
+	bool (*is_partially_uptodate)(struct folio___3 *, size_t, size_t);
+	void (*is_dirty_writeback)(struct folio___3 *, bool *, bool *);
+	int (*error_remove_folio)(struct address_space___3 *, struct folio___3 *);
+	int (*swap_activate)(struct swap_info_struct *, struct file___3 *, sector_t *);
+	void (*swap_deactivate)(struct file___3 *);
+	int (*swap_rw)(struct kiocb___3 *, struct iov_iter *);
+};
+
+struct file___4;
+
+struct folio___4;
+
+struct kiocb___4;
+
+struct address_space_operations___4 {
+	int (*read_folio)(struct file___4 *, struct folio___4 *);
+	int (*writepages)(struct address_space___4 *, struct writeback_control *);
+	bool (*dirty_folio)(struct address_space___4 *, struct folio___4 *);
+	void (*readahead)(struct readahead_control *);
+	int (*write_begin)(const struct kiocb___4 *, struct address_space___4 *, loff_t, unsigned int, struct folio___4 **, void **);
+	int (*write_end)(const struct kiocb___4 *, struct address_space___4 *, loff_t, unsigned int, unsigned int, struct folio___4 *, void *);
+	sector_t (*bmap)(struct address_space___4 *, sector_t);
+	void (*invalidate_folio)(struct folio___4 *, size_t, size_t);
+	bool (*release_folio)(struct folio___4 *, gfp_t);
+	void (*free_folio)(struct folio___4 *);
+	ssize_t (*direct_IO)(struct kiocb___4 *, struct iov_iter *);
+	int (*migrate_folio)(struct address_space___4 *, struct folio___4 *, struct folio___4 *, enum migrate_mode);
+	int (*launder_folio)(struct folio___4 *);
+	bool (*is_partially_uptodate)(struct folio___4 *, size_t, size_t);
+	void (*is_dirty_writeback)(struct folio___4 *, bool *, bool *);
+	int (*error_remove_folio)(struct address_space___4 *, struct folio___4 *);
+	int (*swap_activate)(struct swap_info_struct *, struct file___4 *, sector_t *);
+	void (*swap_deactivate)(struct file___4 *);
+	int (*swap_rw)(struct kiocb___4 *, struct iov_iter *);
+};
+
+struct file___5;
+
+struct folio___5;
+
+struct writeback_control___3;
+
+struct readahead_control___2;
+
+struct kiocb___5;
+
+struct iov_iter___3;
+
+struct swap_info_struct___2;
+
+struct address_space_operations___5 {
+	int (*read_folio)(struct file___5 *, struct folio___5 *);
+	int (*writepages)(struct address_space___5 *, struct writeback_control___3 *);
+	bool (*dirty_folio)(struct address_space___5 *, struct folio___5 *);
+	void (*readahead)(struct readahead_control___2 *);
+	int (*write_begin)(const struct kiocb___5 *, struct address_space___5 *, loff_t, unsigned int, struct folio___5 **, void **);
+	int (*write_end)(const struct kiocb___5 *, struct address_space___5 *, loff_t, unsigned int, unsigned int, struct folio___5 *, void *);
+	sector_t (*bmap)(struct address_space___5 *, sector_t);
+	void (*invalidate_folio)(struct folio___5 *, size_t, size_t);
+	bool (*release_folio)(struct folio___5 *, gfp_t);
+	void (*free_folio)(struct folio___5 *);
+	ssize_t (*direct_IO)(struct kiocb___5 *, struct iov_iter___3 *);
+	int (*migrate_folio)(struct address_space___5 *, struct folio___5 *, struct folio___5 *, enum migrate_mode);
+	int (*launder_folio)(struct folio___5 *);
+	bool (*is_partially_uptodate)(struct folio___5 *, size_t, size_t);
+	void (*is_dirty_writeback)(struct folio___5 *, bool *, bool *);
+	int (*error_remove_folio)(struct address_space___5 *, struct folio___5 *);
+	int (*swap_activate)(struct swap_info_struct___2 *, struct file___5 *, sector_t *);
+	void (*swap_deactivate)(struct file___5 *);
+	int (*swap_rw)(struct kiocb___5 *, struct iov_iter___3 *);
 };
 
 struct audit_ntp_val {
@@ -43978,6 +44254,45 @@ struct attribute_group___2 {
 	const struct bin_attribute___2 * const *bin_attrs;
 };
 
+struct kobject___3;
+
+struct bin_attribute___3;
+
+struct attribute_group___3 {
+	const char *name;
+	umode_t (*is_visible)(struct kobject___3 *, struct attribute *, int);
+	umode_t (*is_bin_visible)(struct kobject___3 *, const struct bin_attribute___3 *, int);
+	size_t (*bin_size)(struct kobject___3 *, const struct bin_attribute___3 *, int);
+	struct attribute **attrs;
+	const struct bin_attribute___3 * const *bin_attrs;
+};
+
+struct kobject___4;
+
+struct bin_attribute___4;
+
+struct attribute_group___4 {
+	const char *name;
+	umode_t (*is_visible)(struct kobject___4 *, struct attribute *, int);
+	umode_t (*is_bin_visible)(struct kobject___4 *, const struct bin_attribute___4 *, int);
+	size_t (*bin_size)(struct kobject___4 *, const struct bin_attribute___4 *, int);
+	struct attribute **attrs;
+	const struct bin_attribute___4 * const *bin_attrs;
+};
+
+struct kobject___5;
+
+struct bin_attribute___5;
+
+struct attribute_group___5 {
+	const char *name;
+	umode_t (*is_visible)(struct kobject___5 *, struct attribute *, int);
+	umode_t (*is_bin_visible)(struct kobject___5 *, const struct bin_attribute___5 *, int);
+	size_t (*bin_size)(struct kobject___5 *, const struct bin_attribute___5 *, int);
+	struct attribute **attrs;
+	const struct bin_attribute___5 * const *bin_attrs;
+};
+
 struct audit_aux_data {
 	struct audit_aux_data *next;
 	int type;
@@ -45063,6 +45378,82 @@ struct backing_dev_info___2 {
 	struct dentry___2 *debug_dir;
 };
 
+struct backing_dev_info___3;
+
+struct cgroup_subsys_state___3;
+
+struct bdi_writeback___3 {
+	struct backing_dev_info___3 *bdi;
+	long unsigned int state;
+	long unsigned int last_old_flush;
+	struct list_head b_dirty;
+	struct list_head b_io;
+	struct list_head b_more_io;
+	struct list_head b_dirty_time;
+	spinlock_t list_lock;
+	atomic_t writeback_inodes;
+	struct percpu_counter stat[4];
+	long unsigned int bw_time_stamp;
+	long unsigned int dirtied_stamp;
+	long unsigned int written_stamp;
+	long unsigned int write_bandwidth;
+	long unsigned int avg_write_bandwidth;
+	long unsigned int dirty_ratelimit;
+	long unsigned int balanced_dirty_ratelimit;
+	struct fprop_local_percpu completions;
+	int dirty_exceeded;
+	enum wb_reason start_all_reason;
+	spinlock_t work_lock;
+	struct list_head work_list;
+	struct delayed_work dwork;
+	struct delayed_work bw_dwork;
+	struct list_head bdi_node;
+	struct percpu_ref refcnt;
+	struct fprop_local_percpu memcg_completions;
+	struct cgroup_subsys_state___3 *memcg_css;
+	struct cgroup_subsys_state___3 *blkcg_css;
+	struct list_head memcg_node;
+	struct list_head blkcg_node;
+	struct list_head b_attached;
+	struct list_head offline_node;
+	struct work_struct switch_work;
+	struct llist_head switch_wbs_ctxs;
+	union {
+		struct work_struct release_work;
+		struct callback_head rcu;
+	};
+};
+
+struct device___3;
+
+struct dentry___3;
+
+struct backing_dev_info___3 {
+	u64 id;
+	struct rb_node rb_node;
+	struct list_head bdi_list;
+	long unsigned int ra_pages;
+	long unsigned int io_pages;
+	struct kref refcnt;
+	unsigned int capabilities;
+	unsigned int min_ratio;
+	unsigned int max_ratio;
+	unsigned int max_prop_frac;
+	atomic_long_t tot_write_bandwidth;
+	long unsigned int last_bdp_sleep;
+	struct bdi_writeback___3 wb;
+	struct list_head wb_list;
+	struct xarray cgwb_tree;
+	struct mutex cgwb_release_mutex;
+	struct rw_semaphore wb_switch_rwsem;
+	wait_queue_head_t wb_waitq;
+	struct device___3 *dev;
+	char dev_name[64];
+	struct device___3 *owner;
+	struct timer_list laptop_mode_wb_timer;
+	struct dentry___3 *debug_dir;
+};
+
 struct file_ra_state {
 	long unsigned int start;
 	unsigned int size;
@@ -45748,6 +46139,45 @@ struct bin_attribute___2 {
 	int (*mmap)(struct file___2 *, struct kobject___2 *, const struct bin_attribute___2 *, struct vm_area_struct___2 *);
 };
 
+struct vm_area_struct___3;
+
+struct bin_attribute___3 {
+	struct attribute attr;
+	size_t size;
+	void *private;
+	struct address_space___3 * (*f_mapping)(void);
+	ssize_t (*read)(struct file___3 *, struct kobject___3 *, const struct bin_attribute___3 *, char *, loff_t, size_t);
+	ssize_t (*write)(struct file___3 *, struct kobject___3 *, const struct bin_attribute___3 *, char *, loff_t, size_t);
+	loff_t (*llseek)(struct file___3 *, struct kobject___3 *, const struct bin_attribute___3 *, loff_t, int);
+	int (*mmap)(struct file___3 *, struct kobject___3 *, const struct bin_attribute___3 *, struct vm_area_struct___3 *);
+};
+
+struct vm_area_struct___4;
+
+struct bin_attribute___4 {
+	struct attribute attr;
+	size_t size;
+	void *private;
+	struct address_space___4 * (*f_mapping)(void);
+	ssize_t (*read)(struct file___4 *, struct kobject___4 *, const struct bin_attribute___4 *, char *, loff_t, size_t);
+	ssize_t (*write)(struct file___4 *, struct kobject___4 *, const struct bin_attribute___4 *, char *, loff_t, size_t);
+	loff_t (*llseek)(struct file___4 *, struct kobject___4 *, const struct bin_attribute___4 *, loff_t, int);
+	int (*mmap)(struct file___4 *, struct kobject___4 *, const struct bin_attribute___4 *, struct vm_area_struct___4 *);
+};
+
+struct vm_area_struct___5;
+
+struct bin_attribute___5 {
+	struct attribute attr;
+	size_t size;
+	void *private;
+	struct address_space___5 * (*f_mapping)(void);
+	ssize_t (*read)(struct file___5 *, struct kobject___5 *, const struct bin_attribute___5 *, char *, loff_t, size_t);
+	ssize_t (*write)(struct file___5 *, struct kobject___5 *, const struct bin_attribute___5 *, char *, loff_t, size_t);
+	loff_t (*llseek)(struct file___5 *, struct kobject___5 *, const struct bin_attribute___5 *, loff_t, int);
+	int (*mmap)(struct file___5 *, struct kobject___5 *, const struct bin_attribute___5 *, struct vm_area_struct___5 *);
+};
+
 struct list_lru;
 
 struct binder_alloc {
@@ -46312,6 +46742,45 @@ struct bio___2 {
 	struct bio_set___2 *bi_pool;
 };
 
+struct bio___3;
+
+typedef void bio_end_io_t___3(struct bio___3 *);
+
+struct block_device___3;
+
+struct bio_vec___3;
+
+struct bio_set___3;
+
+struct bio___3 {
+	struct bio___3 *bi_next;
+	struct block_device___3 *bi_bdev;
+	blk_opf_t bi_opf;
+	short unsigned int bi_flags;
+	short unsigned int bi_ioprio;
+	enum rw_hint bi_write_hint;
+	u8 bi_write_stream;
+	blk_status_t bi_status;
+	atomic_t __bi_remaining;
+	struct bvec_iter bi_iter;
+	union {
+		blk_qc_t bi_cookie;
+		unsigned int __bi_nr_segments;
+	};
+	bio_end_io_t___3 *bi_end_io;
+	void *bi_private;
+	struct blkcg_gq *bi_blkg;
+	u64 issue_time_ns;
+	u64 bi_iocost_cost;
+	struct bio_crypt_ctx *bi_crypt_context;
+	struct bio_integrity_payload *bi_integrity;
+	short unsigned int bi_vcnt;
+	short unsigned int bi_max_vecs;
+	atomic_t __bi_cnt;
+	struct bio_vec___3 *bi_io_vec;
+	struct bio_set___3 *bi_pool;
+};
+
 struct bio_alloc_cache {
 	struct bio *free_list;
 	struct bio *free_list_irq;
@@ -46362,6 +46831,11 @@ struct bio_list {
 struct bio_list___2 {
 	struct bio___2 *head;
 	struct bio___2 *tail;
+};
+
+struct bio_list___3 {
+	struct bio___3 *head;
+	struct bio___3 *tail;
 };
 
 struct iovec {
@@ -46458,6 +46932,20 @@ struct bio_set___2 {
 	struct hlist_node cpuhp_dead;
 };
 
+struct bio_set___3 {
+	struct kmem_cache *bio_slab;
+	unsigned int front_pad;
+	struct bio_alloc_cache *cache;
+	mempool_t bio_pool;
+	mempool_t bvec_pool;
+	unsigned int back_pad;
+	spinlock_t rescue_lock;
+	struct bio_list___3 rescue_list;
+	struct work_struct rescue_work;
+	struct workqueue_struct *rescue_workqueue;
+	struct hlist_node cpuhp_dead;
+};
+
 struct bio_slab {
 	struct kmem_cache *slab;
 	unsigned int slab_ref;
@@ -46469,6 +46957,14 @@ struct page___2;
 
 struct bio_vec___2 {
 	struct page___2 *bv_page;
+	unsigned int bv_len;
+	unsigned int bv_offset;
+};
+
+struct page___3;
+
+struct bio_vec___3 {
+	struct page___3 *bv_page;
 	unsigned int bv_len;
 	unsigned int bv_offset;
 };
@@ -47490,6 +47986,181 @@ struct block_device___2 {
 	int bd_writers;
 	void *bd_security;
 	struct device___2 bd_device;
+};
+
+struct kset___3;
+
+struct kobj_type___3;
+
+struct kernfs_node___3;
+
+struct kobject___5 {
+	const char *name;
+	struct list_head entry;
+	struct kobject___5 *parent;
+	struct kset___3 *kset;
+	const struct kobj_type___3 *ktype;
+	struct kernfs_node___3 *sd;
+	struct kref kref;
+	unsigned int state_initialized: 1;
+	unsigned int state_in_sysfs: 1;
+	unsigned int state_add_uevent_sent: 1;
+	unsigned int state_remove_uevent_sent: 1;
+	unsigned int uevent_suppress: 1;
+};
+
+struct wakeup_source___3;
+
+struct dev_pm_info___3 {
+	pm_message_t power_state;
+	bool can_wakeup: 1;
+	bool async_suspend: 1;
+	bool in_dpm_list: 1;
+	bool is_prepared: 1;
+	bool is_suspended: 1;
+	bool is_noirq_suspended: 1;
+	bool is_late_suspended: 1;
+	bool no_pm: 1;
+	bool early_init: 1;
+	bool direct_complete: 1;
+	u32 driver_flags;
+	spinlock_t lock;
+	struct list_head entry;
+	struct completion completion;
+	struct wakeup_source___3 *wakeup;
+	bool wakeup_path: 1;
+	bool syscore: 1;
+	bool no_pm_callbacks: 1;
+	bool work_in_progress: 1;
+	bool smart_suspend: 1;
+	bool must_resume: 1;
+	bool may_skip_resume: 1;
+	bool strict_midlayer: 1;
+	struct hrtimer suspend_timer;
+	u64 timer_expires;
+	struct work_struct work;
+	wait_queue_head_t wait_queue;
+	struct wake_irq *wakeirq;
+	atomic_t usage_count;
+	atomic_t child_count;
+	unsigned int disable_depth: 3;
+	bool idle_notification: 1;
+	bool request_pending: 1;
+	bool deferred_resume: 1;
+	bool needs_force_resume: 1;
+	bool runtime_auto: 1;
+	bool ignore_children: 1;
+	bool no_callbacks: 1;
+	bool irq_safe: 1;
+	bool use_autosuspend: 1;
+	bool timer_autosuspends: 1;
+	bool memalloc_noio: 1;
+	unsigned int links_count;
+	enum rpm_request request;
+	enum rpm_status runtime_status;
+	enum rpm_status last_status;
+	int runtime_error;
+	int autosuspend_delay;
+	u64 last_busy;
+	u64 active_time;
+	u64 suspended_time;
+	u64 accounting_timestamp;
+	struct pm_subsys_data *subsys_data;
+	void (*set_latency_tolerance)(struct device___3 *, s32);
+	struct dev_pm_qos *qos;
+	bool detach_power_off: 1;
+};
+
+struct device_type___3;
+
+struct bus_type___3;
+
+struct device_driver___3;
+
+struct dev_pm_domain___3;
+
+struct device_node___3;
+
+struct fwnode_handle___3;
+
+struct class___3;
+
+struct dev_iommu___3;
+
+struct device___3 {
+	struct kobject___5 kobj;
+	struct device___3 *parent;
+	struct device_private *p;
+	const char *init_name;
+	const struct device_type___3 *type;
+	const struct bus_type___3 *bus;
+	struct device_driver___3 *driver;
+	void *platform_data;
+	void *driver_data;
+	struct mutex mutex;
+	struct dev_links_info links;
+	struct dev_pm_info___3 power;
+	struct dev_pm_domain___3 *pm_domain;
+	struct em_perf_domain *em_pd;
+	struct dev_pin_info *pins;
+	struct dev_msi_info msi;
+	const struct dma_map_ops *dma_ops;
+	u64 *dma_mask;
+	u64 coherent_dma_mask;
+	u64 bus_dma_limit;
+	const struct bus_dma_region *dma_range_map;
+	struct device_dma_parameters *dma_parms;
+	struct list_head dma_pools;
+	struct cma *cma_area;
+	struct io_tlb_mem *dma_io_tlb_mem;
+	struct dev_archdata archdata;
+	struct device_node___3 *of_node;
+	struct fwnode_handle___3 *fwnode;
+	int numa_node;
+	dev_t devt;
+	u32 id;
+	spinlock_t devres_lock;
+	struct list_head devres_head;
+	const struct class___3 *class;
+	const struct attribute_group___5 **groups;
+	void (*release)(struct device___3 *);
+	struct iommu_group *iommu_group;
+	struct dev_iommu___3 *iommu;
+	struct device_physical_location *physical_location;
+	enum device_removable removable;
+	bool offline_disabled: 1;
+	bool offline: 1;
+	bool of_node_reused: 1;
+	bool state_synced: 1;
+	bool can_match: 1;
+	bool dma_skip_sync: 1;
+	bool dma_iommu: 1;
+};
+
+struct block_device___3 {
+	sector_t bd_start_sect;
+	sector_t bd_nr_sectors;
+	struct gendisk *bd_disk;
+	struct request_queue *bd_queue;
+	struct disk_stats *bd_stats;
+	long unsigned int bd_stamp;
+	atomic_t __bd_flags;
+	dev_t bd_dev;
+	struct address_space___5 *bd_mapping;
+	atomic_t bd_openers;
+	spinlock_t bd_size_lock;
+	void *bd_claiming;
+	void *bd_holder;
+	const struct blk_holder_ops *bd_holder_ops;
+	struct mutex bd_holder_lock;
+	int bd_holders;
+	struct kobject___5 *bd_holder_dir;
+	atomic_t bd_fsfreeze_count;
+	struct mutex bd_fsfreeze_mutex;
+	struct partition_meta_info *bd_meta_info;
+	int bd_writers;
+	void *bd_security;
+	struct device___3 bd_device;
 };
 
 typedef int (*report_zones_cb)(struct blk_zone *, unsigned int, void *);
@@ -59308,6 +59979,122 @@ struct bus_type___2 {
 	bool need_parent_lock;
 };
 
+struct device___4;
+
+struct device_driver___4;
+
+struct dev_pm_ops___3;
+
+struct bus_type___4 {
+	const char *name;
+	const char *dev_name;
+	const struct attribute_group___3 **bus_groups;
+	const struct attribute_group___3 **dev_groups;
+	const struct attribute_group___3 **drv_groups;
+	int (*match)(struct device___4 *, const struct device_driver___4 *);
+	int (*uevent)(const struct device___4 *, struct kobj_uevent_env *);
+	int (*probe)(struct device___4 *);
+	void (*sync_state)(struct device___4 *);
+	void (*remove)(struct device___4 *);
+	void (*shutdown)(struct device___4 *);
+	const struct cpumask * (*irq_get_affinity)(struct device___4 *, unsigned int);
+	int (*online)(struct device___4 *);
+	int (*offline)(struct device___4 *);
+	int (*suspend)(struct device___4 *, pm_message_t);
+	int (*resume)(struct device___4 *);
+	int (*num_vf)(struct device___4 *);
+	int (*dma_configure)(struct device___4 *);
+	void (*dma_cleanup)(struct device___4 *);
+	const struct dev_pm_ops___3 *pm;
+	bool need_parent_lock;
+};
+
+struct device___5;
+
+struct device_driver___5;
+
+struct dev_pm_ops___4;
+
+struct bus_type___5 {
+	const char *name;
+	const char *dev_name;
+	const struct attribute_group___4 **bus_groups;
+	const struct attribute_group___4 **dev_groups;
+	const struct attribute_group___4 **drv_groups;
+	int (*match)(struct device___5 *, const struct device_driver___5 *);
+	int (*uevent)(const struct device___5 *, struct kobj_uevent_env *);
+	int (*probe)(struct device___5 *);
+	void (*sync_state)(struct device___5 *);
+	void (*remove)(struct device___5 *);
+	void (*shutdown)(struct device___5 *);
+	const struct cpumask * (*irq_get_affinity)(struct device___5 *, unsigned int);
+	int (*online)(struct device___5 *);
+	int (*offline)(struct device___5 *);
+	int (*suspend)(struct device___5 *, pm_message_t);
+	int (*resume)(struct device___5 *);
+	int (*num_vf)(struct device___5 *);
+	int (*dma_configure)(struct device___5 *);
+	void (*dma_cleanup)(struct device___5 *);
+	const struct dev_pm_ops___4 *pm;
+	bool need_parent_lock;
+};
+
+struct device___6;
+
+struct device_driver___6;
+
+struct dev_pm_ops___5;
+
+struct bus_type___6 {
+	const char *name;
+	const char *dev_name;
+	const struct attribute_group___4 **bus_groups;
+	const struct attribute_group___4 **dev_groups;
+	const struct attribute_group___4 **drv_groups;
+	int (*match)(struct device___6 *, const struct device_driver___6 *);
+	int (*uevent)(const struct device___6 *, struct kobj_uevent_env *);
+	int (*probe)(struct device___6 *);
+	void (*sync_state)(struct device___6 *);
+	void (*remove)(struct device___6 *);
+	void (*shutdown)(struct device___6 *);
+	const struct cpumask * (*irq_get_affinity)(struct device___6 *, unsigned int);
+	int (*online)(struct device___6 *);
+	int (*offline)(struct device___6 *);
+	int (*suspend)(struct device___6 *, pm_message_t);
+	int (*resume)(struct device___6 *);
+	int (*num_vf)(struct device___6 *);
+	int (*dma_configure)(struct device___6 *);
+	void (*dma_cleanup)(struct device___6 *);
+	const struct dev_pm_ops___5 *pm;
+	bool need_parent_lock;
+};
+
+struct dev_pm_ops___6;
+
+struct bus_type___3 {
+	const char *name;
+	const char *dev_name;
+	const struct attribute_group___5 **bus_groups;
+	const struct attribute_group___5 **dev_groups;
+	const struct attribute_group___5 **drv_groups;
+	int (*match)(struct device___3 *, const struct device_driver___3 *);
+	int (*uevent)(const struct device___3 *, struct kobj_uevent_env *);
+	int (*probe)(struct device___3 *);
+	void (*sync_state)(struct device___3 *);
+	void (*remove)(struct device___3 *);
+	void (*shutdown)(struct device___3 *);
+	const struct cpumask * (*irq_get_affinity)(struct device___3 *, unsigned int);
+	int (*online)(struct device___3 *);
+	int (*offline)(struct device___3 *);
+	int (*suspend)(struct device___3 *, pm_message_t);
+	int (*resume)(struct device___3 *);
+	int (*num_vf)(struct device___3 *);
+	int (*dma_configure)(struct device___3 *);
+	void (*dma_cleanup)(struct device___3 *);
+	const struct dev_pm_ops___6 *pm;
+	bool need_parent_lock;
+};
+
 struct bvec_iter_all {
 	struct bio_vec bv;
 	int idx;
@@ -60249,6 +61036,87 @@ struct cdev___2 {
 	unsigned int count;
 };
 
+struct kset___4;
+
+struct kobj_type___4;
+
+struct kernfs_node___4;
+
+struct kobject___3 {
+	const char *name;
+	struct list_head entry;
+	struct kobject___3 *parent;
+	struct kset___4 *kset;
+	const struct kobj_type___4 *ktype;
+	struct kernfs_node___4 *sd;
+	struct kref kref;
+	unsigned int state_initialized: 1;
+	unsigned int state_in_sysfs: 1;
+	unsigned int state_add_uevent_sent: 1;
+	unsigned int state_remove_uevent_sent: 1;
+	unsigned int uevent_suppress: 1;
+};
+
+struct module___3;
+
+struct file_operations___3;
+
+struct cdev___3 {
+	struct kobject___3 kobj;
+	struct module___3 *owner;
+	const struct file_operations___3 *ops;
+	struct list_head list;
+	dev_t dev;
+	unsigned int count;
+};
+
+struct kset___5;
+
+struct kobj_type___5;
+
+struct kernfs_node___5;
+
+struct kobject___4 {
+	const char *name;
+	struct list_head entry;
+	struct kobject___4 *parent;
+	struct kset___5 *kset;
+	const struct kobj_type___5 *ktype;
+	struct kernfs_node___5 *sd;
+	struct kref kref;
+	unsigned int state_initialized: 1;
+	unsigned int state_in_sysfs: 1;
+	unsigned int state_add_uevent_sent: 1;
+	unsigned int state_remove_uevent_sent: 1;
+	unsigned int uevent_suppress: 1;
+};
+
+struct module___4;
+
+struct file_operations___4;
+
+struct cdev___4 {
+	struct kobject___4 kobj;
+	struct module___4 *owner;
+	const struct file_operations___4 *ops;
+	struct list_head list;
+	dev_t dev;
+	unsigned int count;
+};
+
+struct module___5;
+
+struct file_operations___5;
+
+struct cdev___5 {
+	struct kobject___5 kobj;
+	struct module___5 *owner;
+	const struct file_operations___5 *ops;
+	struct list_head list;
+	dev_t dev;
+	unsigned int count;
+};
+
 struct cdrom_msf0 {
 	__u8 minute;
 	__u8 second;
@@ -60700,6 +61568,40 @@ struct cftype___2 {
 	struct lock_class_key lockdep_key;
 };
 
+struct cgroup_subsys___3;
+
+struct kernfs_ops___3;
+
+struct kernfs_open_file___3;
+
+struct seq_file___3;
+
+struct poll_table_struct___3;
+
+struct cftype___3 {
+	char name[64];
+	long unsigned int private;
+	size_t max_write_len;
+	unsigned int flags;
+	unsigned int file_offset;
+	struct cgroup_subsys___3 *ss;
+	struct list_head node;
+	struct kernfs_ops___3 *kf_ops;
+	int (*open)(struct kernfs_open_file___3 *);
+	void (*release)(struct kernfs_open_file___3 *);
+	u64 (*read_u64)(struct cgroup_subsys_state___3 *, struct cftype___3 *);
+	s64 (*read_s64)(struct cgroup_subsys_state___3 *, struct cftype___3 *);
+	int (*seq_show)(struct seq_file___3 *, void *);
+	void * (*seq_start)(struct seq_file___3 *, loff_t *);
+	void * (*seq_next)(struct seq_file___3 *, void *, loff_t *);
+	void (*seq_stop)(struct seq_file___3 *, void *);
+	int (*write_u64)(struct cgroup_subsys_state___3 *, struct cftype___3 *, u64);
+	int (*write_s64)(struct cgroup_subsys_state___3 *, struct cftype___3 *, s64);
+	ssize_t (*write)(struct kernfs_open_file___3 *, char *, size_t, loff_t);
+	__poll_t (*poll)(struct kernfs_open_file___3 *, struct poll_table_struct___3 *);
+	struct lock_class_key lockdep_key;
+};
+
 struct cgroup_file {
 	struct kernfs_node *kn;
 	long unsigned int notified_at;
@@ -60882,6 +61784,83 @@ struct cgroup___2 {
 	struct cgroup___2 *ancestors[0];
 };
 
+struct cgroup___3;
+
+struct css_rstat_cpu___3;
+
+struct cgroup_subsys_state___3 {
+	struct cgroup___3 *cgroup;
+	struct cgroup_subsys___3 *ss;
+	struct percpu_ref refcnt;
+	struct css_rstat_cpu___3 *rstat_cpu;
+	struct list_head sibling;
+	struct list_head children;
+	int id;
+	unsigned int flags;
+	u64 serial_nr;
+	atomic_t online_cnt;
+	struct work_struct destroy_work;
+	struct rcu_work destroy_rwork;
+	struct cgroup_subsys_state___3 *parent;
+	int nr_descendants;
+	struct cgroup_subsys_state___3 *rstat_flush_next;
+};
+
+struct cgroup_file___3 {
+	struct kernfs_node___3 *kn;
+	long unsigned int notified_at;
+	struct timer_list notify_timer;
+};
+
+struct cgroup_root___3;
+
+struct psi_group___3;
+
+struct cgroup___3 {
+	struct cgroup_subsys_state___3 self;
+	long unsigned int flags;
+	int level;
+	int max_depth;
+	int nr_descendants;
+	int nr_dying_descendants;
+	int max_descendants;
+	int nr_populated_csets;
+	int nr_populated_domain_children;
+	int nr_populated_threaded_children;
+	int nr_threaded_children;
+	unsigned int kill_seq;
+	struct kernfs_node___3 *kn;
+	struct cgroup_file___3 procs_file;
+	struct cgroup_file___3 events_file;
+	struct cgroup_file___3 psi_files[4];
+	u16 subtree_control;
+	u16 subtree_ss_mask;
+	u16 old_subtree_control;
+	u16 old_subtree_ss_mask;
+	struct cgroup_subsys_state___3 *subsys[15];
+	int nr_dying_subsys[15];
+	struct cgroup_root___3 *root;
+	struct list_head cset_links;
+	struct list_head e_csets[15];
+	struct cgroup___3 *dom_cgrp;
+	struct cgroup___3 *old_dom_cgrp;
+	struct cgroup_rstat_base_cpu *rstat_base_cpu;
+	long: 64;
+	struct cacheline_padding _pad_;
+	struct cgroup_base_stat last_bstat;
+	struct cgroup_base_stat bstat;
+	struct prev_cputime prev_cputime;
+	struct list_head pidlists;
+	struct mutex pidlist_mutex;
+	wait_queue_head_t offline_waitq;
+	struct work_struct release_agent_work;
+	struct psi_group___3 *psi;
+	struct cgroup_bpf bpf;
+	struct cgroup_freezer_state freezer;
+	struct bpf_local_storage *bpf_cgrp_storage;
+	struct cgroup___3 *ancestors[0];
+};
+
 struct cgroup__safe_rcu {
 	struct kernfs_node *kn;
 };
@@ -61037,6 +62016,35 @@ struct cgroup_namespace___2 {
 	struct css_set___2 *root_cset;
 };
 
+struct ns_common___3 {
+	u32 ns_type;
+	struct dentry___3 *stashed;
+	const struct proc_ns_operations *ops;
+	unsigned int inum;
+	refcount_t __ns_ref;
+	union {
+		struct {
+			u64 ns_id;
+			struct rb_node ns_tree_node;
+			struct list_head ns_list_node;
+		};
+		struct callback_head ns_rcu;
+	};
+};
+
+struct user_namespace___3;
+
+struct ucounts___3;
+
+struct css_set___3;
+
+struct cgroup_namespace___3 {
+	struct ns_common___3 ns;
+	struct user_namespace___3 *user_ns;
+	struct ucounts___3 *ucounts;
+	struct css_set___3 *root_cset;
+};
+
 struct cgroup_pidlist {
 	struct {
 		enum cgroup_filetype type;
@@ -61081,6 +62089,28 @@ struct cgroup_root___2 {
 	long: 64;
 	struct cgroup___2 cgrp;
 	struct cgroup___2 *cgrp_ancestor_storage;
+	atomic_t nr_cgrps;
+	unsigned int flags;
+	char release_agent_path[4096];
+	char name[64];
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
+struct cgroup_root___3 {
+	struct kernfs_root *kf_root;
+	unsigned int subsys_mask;
+	int hierarchy_id;
+	struct list_head root_list;
+	struct callback_head rcu;
+	long: 64;
+	long: 64;
+	struct cgroup___3 cgrp;
+	struct cgroup___3 *cgrp_ancestor_storage;
 	atomic_t nr_cgrps;
 	unsigned int flags;
 	char release_agent_path[4096];
@@ -61176,6 +62206,44 @@ struct cgroup_subsys___2 {
 	struct list_head cfts;
 	struct cftype___2 *dfl_cftypes;
 	struct cftype___2 *legacy_cftypes;
+	unsigned int depends_on;
+	spinlock_t rstat_ss_lock;
+	struct llist_head *lhead;
+};
+
+struct task_struct___3;
+
+struct cgroup_subsys___3 {
+	struct cgroup_subsys_state___3 * (*css_alloc)(struct cgroup_subsys_state___3 *);
+	int (*css_online)(struct cgroup_subsys_state___3 *);
+	void (*css_offline)(struct cgroup_subsys_state___3 *);
+	void (*css_released)(struct cgroup_subsys_state___3 *);
+	void (*css_free)(struct cgroup_subsys_state___3 *);
+	void (*css_reset)(struct cgroup_subsys_state___3 *);
+	void (*css_killed)(struct cgroup_subsys_state___3 *);
+	void (*css_rstat_flush)(struct cgroup_subsys_state___3 *, int);
+	int (*css_extra_stat_show)(struct seq_file___3 *, struct cgroup_subsys_state___3 *);
+	int (*css_local_stat_show)(struct seq_file___3 *, struct cgroup_subsys_state___3 *);
+	int (*can_attach)(struct cgroup_taskset *);
+	void (*cancel_attach)(struct cgroup_taskset *);
+	void (*attach)(struct cgroup_taskset *);
+	int (*can_fork)(struct task_struct___3 *, struct css_set___3 *);
+	void (*cancel_fork)(struct task_struct___3 *, struct css_set___3 *);
+	void (*fork)(struct task_struct___3 *);
+	void (*exit)(struct task_struct___3 *);
+	void (*release)(struct task_struct___3 *);
+	void (*bind)(struct cgroup_subsys_state___3 *);
+	bool early_init: 1;
+	bool implicit_on_dfl: 1;
+	bool threaded: 1;
+	int id;
+	const char *name;
+	const char *legacy_name;
+	struct cgroup_root___3 *root;
+	struct idr css_idr;
+	struct list_head cfts;
+	struct cftype___3 *dfl_cftypes;
+	struct cftype___3 *legacy_cftypes;
 	unsigned int depends_on;
 	spinlock_t rstat_ss_lock;
 	struct llist_head *lhead;
@@ -61652,6 +62720,66 @@ struct class___2 {
 	const void * (*namespace)(const struct device___2 *);
 	void (*get_ownership)(const struct device___2 *, kuid_t *, kgid_t *);
 	const struct dev_pm_ops___2 *pm;
+};
+
+struct class___4 {
+	const char *name;
+	const struct attribute_group___3 **class_groups;
+	const struct attribute_group___3 **dev_groups;
+	int (*dev_uevent)(const struct device___4 *, struct kobj_uevent_env *);
+	char * (*devnode)(const struct device___4 *, umode_t *);
+	void (*class_release)(const struct class___4 *);
+	void (*dev_release)(struct device___4 *);
+	int (*shutdown_pre)(struct device___4 *);
+	const struct kobj_ns_type_operations *ns_type;
+	const void * (*namespace)(const struct device___4 *);
+	void (*get_ownership)(const struct device___4 *, kuid_t *, kgid_t *);
+	const struct dev_pm_ops___3 *pm;
+};
+
+struct class___5 {
+	const char *name;
+	const struct attribute_group___4 **class_groups;
+	const struct attribute_group___4 **dev_groups;
+	int (*dev_uevent)(const struct device___5 *, struct kobj_uevent_env *);
+	char * (*devnode)(const struct device___5 *, umode_t *);
+	void (*class_release)(const struct class___5 *);
+	void (*dev_release)(struct device___5 *);
+	int (*shutdown_pre)(struct device___5 *);
+	const struct kobj_ns_type_operations *ns_type;
+	const void * (*namespace)(const struct device___5 *);
+	void (*get_ownership)(const struct device___5 *, kuid_t *, kgid_t *);
+	const struct dev_pm_ops___4 *pm;
+};
+
+struct class___6 {
+	const char *name;
+	const struct attribute_group___4 **class_groups;
+	const struct attribute_group___4 **dev_groups;
+	int (*dev_uevent)(const struct device___6 *, struct kobj_uevent_env *);
+	char * (*devnode)(const struct device___6 *, umode_t *);
+	void (*class_release)(const struct class___6 *);
+	void (*dev_release)(struct device___6 *);
+	int (*shutdown_pre)(struct device___6 *);
+	const struct kobj_ns_type_operations *ns_type;
+	const void * (*namespace)(const struct device___6 *);
+	void (*get_ownership)(const struct device___6 *, kuid_t *, kgid_t *);
+	const struct dev_pm_ops___5 *pm;
+};
+
+struct class___3 {
+	const char *name;
+	const struct attribute_group___5 **class_groups;
+	const struct attribute_group___5 **dev_groups;
+	int (*dev_uevent)(const struct device___3 *, struct kobj_uevent_env *);
+	char * (*devnode)(const struct device___3 *, umode_t *);
+	void (*class_release)(const struct class___3 *);
+	void (*dev_release)(struct device___3 *);
+	int (*shutdown_pre)(struct device___3 *);
+	const struct kobj_ns_type_operations *ns_type;
+	const void * (*namespace)(const struct device___3 *);
+	void (*get_ownership)(const struct device___3 *, kuid_t *, kgid_t *);
+	const struct dev_pm_ops___6 *pm;
 };
 
 struct class_attribute {
@@ -64290,6 +65418,43 @@ struct core_state___2 {
 	struct completion startup;
 };
 
+struct task_struct___4;
+
+struct core_thread___3 {
+	struct task_struct___4 *task;
+	struct core_thread___3 *next;
+};
+
+struct core_state___3 {
+	atomic_t nr_threads;
+	struct core_thread___3 dumper;
+	struct completion startup;
+};
+
+struct task_struct___5;
+
+struct core_thread___4 {
+	struct task_struct___5 *task;
+	struct core_thread___4 *next;
+};
+
+struct core_state___4 {
+	atomic_t nr_threads;
+	struct core_thread___4 dumper;
+	struct completion startup;
+};
+
+struct core_thread___5 {
+	struct task_struct___3 *task;
+	struct core_thread___5 *next;
+};
+
+struct core_state___5 {
+	atomic_t nr_threads;
+	struct core_thread___5 dumper;
+	struct completion startup;
+};
+
 struct core_text {
 	long unsigned int base;
 	long unsigned int end;
@@ -66447,6 +67612,38 @@ struct cred___2 {
 	};
 };
 
+struct cred___3 {
+	atomic_long_t usage;
+	kuid_t uid;
+	kgid_t gid;
+	kuid_t suid;
+	kgid_t sgid;
+	kuid_t euid;
+	kgid_t egid;
+	kuid_t fsuid;
+	kgid_t fsgid;
+	unsigned int securebits;
+	kernel_cap_t cap_inheritable;
+	kernel_cap_t cap_permitted;
+	kernel_cap_t cap_effective;
+	kernel_cap_t cap_bset;
+	kernel_cap_t cap_ambient;
+	unsigned char jit_keyring;
+	struct key *session_keyring;
+	struct key *process_keyring;
+	struct key *thread_keyring;
+	struct key *request_key_auth;
+	void *security;
+	struct user_struct *user;
+	struct user_namespace___3 *user_ns;
+	struct ucounts___3 *ucounts;
+	struct group_info *group_info;
+	union {
+		int non_rcu;
+		struct callback_head rcu;
+	};
+};
+
 struct cred_security_struct {
 	u32 osid;
 	u32 sid;
@@ -67011,6 +68208,13 @@ struct css_rstat_cpu___2 {
 	struct cgroup_subsys_state___2 *owner;
 };
 
+struct css_rstat_cpu___3 {
+	struct cgroup_subsys_state___3 *updated_children;
+	struct cgroup_subsys_state___3 *updated_next;
+	struct llist_node lnode;
+	struct cgroup_subsys_state___3 *owner;
+};
+
 struct css_set {
 	struct cgroup_subsys_state *subsys[15];
 	refcount_t refcount;
@@ -67057,6 +68261,31 @@ struct css_set___2 {
 	struct cgroup___2 *mg_src_cgrp;
 	struct cgroup___2 *mg_dst_cgrp;
 	struct css_set___2 *mg_dst_cset;
+	bool dead;
+	struct callback_head callback_head;
+};
+
+struct css_set___3 {
+	struct cgroup_subsys_state___3 *subsys[15];
+	refcount_t refcount;
+	struct css_set___3 *dom_cset;
+	struct cgroup___3 *dfl_cgrp;
+	int nr_tasks;
+	struct list_head tasks;
+	struct list_head mg_tasks;
+	struct list_head dying_tasks;
+	struct list_head task_iters;
+	struct list_head e_cset_node[15];
+	struct list_head threaded_csets;
+	struct list_head threaded_csets_node;
+	struct hlist_node hlist;
+	struct list_head cgrp_links;
+	struct list_head mg_src_preload_node;
+	struct list_head mg_dst_preload_node;
+	struct list_head mg_node;
+	struct cgroup___3 *mg_src_cgrp;
+	struct cgroup___3 *mg_dst_cgrp;
+	struct css_set___3 *mg_dst_cset;
 	bool dead;
 	struct callback_head callback_head;
 };
@@ -68484,6 +69713,36 @@ struct ddebug_class_map___2 {
 	enum class_map_type map_type;
 };
 
+struct ddebug_class_map___3 {
+	struct list_head link;
+	struct module___3 *mod;
+	const char *mod_name;
+	const char **class_names;
+	const int length;
+	const int base;
+	enum class_map_type map_type;
+};
+
+struct ddebug_class_map___4 {
+	struct list_head link;
+	struct module___4 *mod;
+	const char *mod_name;
+	const char **class_names;
+	const int length;
+	const int base;
+	enum class_map_type map_type;
+};
+
+struct ddebug_class_map___5 {
+	struct list_head link;
+	struct module___5 *mod;
+	const char *mod_name;
+	const char **class_names;
+	const int length;
+	const int base;
+	enum class_map_type map_type;
+};
+
 struct ddebug_class_param {
 	union {
 		long unsigned int *bits;
@@ -68906,6 +70165,105 @@ struct dentry___2 {
 	} d_u;
 };
 
+struct dentry_operations___3;
+
+struct super_block___3;
+
+struct dentry___4 {
+	unsigned int d_flags;
+	seqcount_spinlock_t d_seq;
+	struct hlist_bl_node d_hash;
+	struct dentry___4 *d_parent;
+	union {
+		struct qstr __d_name;
+		const struct qstr d_name;
+	};
+	struct inode___3 *d_inode;
+	union shortname_store d_shortname;
+	const struct dentry_operations___3 *d_op;
+	struct super_block___3 *d_sb;
+	long unsigned int d_time;
+	void *d_fsdata;
+	struct lockref d_lockref;
+	union {
+		struct list_head d_lru;
+		wait_queue_head_t *d_wait;
+	};
+	struct hlist_node d_sib;
+	struct hlist_head d_children;
+	union {
+		struct hlist_node d_alias;
+		struct hlist_bl_node d_in_lookup_hash;
+		struct callback_head d_rcu;
+	} d_u;
+};
+
+struct dentry_operations___4;
+
+struct super_block___4;
+
+struct dentry___5 {
+	unsigned int d_flags;
+	seqcount_spinlock_t d_seq;
+	struct hlist_bl_node d_hash;
+	struct dentry___5 *d_parent;
+	union {
+		struct qstr __d_name;
+		const struct qstr d_name;
+	};
+	struct inode___4 *d_inode;
+	union shortname_store d_shortname;
+	const struct dentry_operations___4 *d_op;
+	struct super_block___4 *d_sb;
+	long unsigned int d_time;
+	void *d_fsdata;
+	struct lockref d_lockref;
+	union {
+		struct list_head d_lru;
+		wait_queue_head_t *d_wait;
+	};
+	struct hlist_node d_sib;
+	struct hlist_head d_children;
+	union {
+		struct hlist_node d_alias;
+		struct hlist_bl_node d_in_lookup_hash;
+		struct callback_head d_rcu;
+	} d_u;
+};
+
+struct dentry_operations___5;
+
+struct super_block___5;
+
+struct dentry___3 {
+	unsigned int d_flags;
+	seqcount_spinlock_t d_seq;
+	struct hlist_bl_node d_hash;
+	struct dentry___3 *d_parent;
+	union {
+		struct qstr __d_name;
+		const struct qstr d_name;
+	};
+	struct inode___5 *d_inode;
+	union shortname_store d_shortname;
+	const struct dentry_operations___5 *d_op;
+	struct super_block___5 *d_sb;
+	long unsigned int d_time;
+	void *d_fsdata;
+	struct lockref d_lockref;
+	union {
+		struct list_head d_lru;
+		wait_queue_head_t *d_wait;
+	};
+	struct hlist_node d_sib;
+	struct hlist_head d_children;
+	union {
+		struct hlist_node d_alias;
+		struct hlist_bl_node d_in_lookup_hash;
+		struct callback_head d_rcu;
+	} d_u;
+};
+
 struct dentry__safe_trusted_or_null {
 	struct inode *d_inode;
 };
@@ -68957,6 +70315,75 @@ struct dentry_operations___2 {
 	struct dentry___2 * (*d_real)(struct dentry___2 *, enum d_real_type);
 	bool (*d_unalias_trylock)(const struct dentry___2 *);
 	void (*d_unalias_unlock)(const struct dentry___2 *);
+	long: 64;
+};
+
+struct vfsmount___3;
+
+struct path___3;
+
+struct dentry_operations___3 {
+	int (*d_revalidate)(struct inode___3 *, const struct qstr *, struct dentry___4 *, unsigned int);
+	int (*d_weak_revalidate)(struct dentry___4 *, unsigned int);
+	int (*d_hash)(const struct dentry___4 *, struct qstr *);
+	int (*d_compare)(const struct dentry___4 *, unsigned int, const char *, const struct qstr *);
+	int (*d_delete)(const struct dentry___4 *);
+	int (*d_init)(struct dentry___4 *);
+	void (*d_release)(struct dentry___4 *);
+	void (*d_prune)(struct dentry___4 *);
+	void (*d_iput)(struct dentry___4 *, struct inode___3 *);
+	char * (*d_dname)(struct dentry___4 *, char *, int);
+	struct vfsmount___3 * (*d_automount)(struct path___3 *);
+	int (*d_manage)(const struct path___3 *, bool);
+	struct dentry___4 * (*d_real)(struct dentry___4 *, enum d_real_type);
+	bool (*d_unalias_trylock)(const struct dentry___4 *);
+	void (*d_unalias_unlock)(const struct dentry___4 *);
+	long: 64;
+};
+
+struct vfsmount___4;
+
+struct path___4;
+
+struct dentry_operations___4 {
+	int (*d_revalidate)(struct inode___4 *, const struct qstr *, struct dentry___5 *, unsigned int);
+	int (*d_weak_revalidate)(struct dentry___5 *, unsigned int);
+	int (*d_hash)(const struct dentry___5 *, struct qstr *);
+	int (*d_compare)(const struct dentry___5 *, unsigned int, const char *, const struct qstr *);
+	int (*d_delete)(const struct dentry___5 *);
+	int (*d_init)(struct dentry___5 *);
+	void (*d_release)(struct dentry___5 *);
+	void (*d_prune)(struct dentry___5 *);
+	void (*d_iput)(struct dentry___5 *, struct inode___4 *);
+	char * (*d_dname)(struct dentry___5 *, char *, int);
+	struct vfsmount___4 * (*d_automount)(struct path___4 *);
+	int (*d_manage)(const struct path___4 *, bool);
+	struct dentry___5 * (*d_real)(struct dentry___5 *, enum d_real_type);
+	bool (*d_unalias_trylock)(const struct dentry___5 *);
+	void (*d_unalias_unlock)(const struct dentry___5 *);
+	long: 64;
+};
+
+struct vfsmount___5;
+
+struct path___5;
+
+struct dentry_operations___5 {
+	int (*d_revalidate)(struct inode___5 *, const struct qstr *, struct dentry___3 *, unsigned int);
+	int (*d_weak_revalidate)(struct dentry___3 *, unsigned int);
+	int (*d_hash)(const struct dentry___3 *, struct qstr *);
+	int (*d_compare)(const struct dentry___3 *, unsigned int, const char *, const struct qstr *);
+	int (*d_delete)(const struct dentry___3 *);
+	int (*d_init)(struct dentry___3 *);
+	void (*d_release)(struct dentry___3 *);
+	void (*d_prune)(struct dentry___3 *);
+	void (*d_iput)(struct dentry___3 *, struct inode___5 *);
+	char * (*d_dname)(struct dentry___3 *, char *, int);
+	struct vfsmount___5 * (*d_automount)(struct path___5 *);
+	int (*d_manage)(const struct path___5 *, bool);
+	struct dentry___3 * (*d_real)(struct dentry___3 *, enum d_real_type);
+	bool (*d_unalias_trylock)(const struct dentry___3 *);
+	void (*d_unalias_unlock)(const struct dentry___3 *);
 	long: 64;
 };
 
@@ -69240,8 +70667,91 @@ struct dev_iommu___2 {
 	u32 shadow_on_flush: 1;
 };
 
+struct iommu_fault_param___3;
+
+struct iommu_fwspec___3;
+
+struct iommu_device___3;
+
+struct dev_iommu___4 {
+	struct mutex lock;
+	struct iommu_fault_param___3 *fault_param;
+	struct iommu_fwspec___3 *fwspec;
+	struct iommu_device___3 *iommu_dev;
+	void *priv;
+	u32 max_pasids;
+	u32 attach_deferred: 1;
+	u32 pci_32bit_workaround: 1;
+	u32 require_direct: 1;
+	u32 shadow_on_flush: 1;
+};
+
+struct iommu_fault_param___4;
+
+struct iommu_fwspec___4;
+
+struct iommu_device___4;
+
+struct dev_iommu___5 {
+	struct mutex lock;
+	struct iommu_fault_param___4 *fault_param;
+	struct iommu_fwspec___4 *fwspec;
+	struct iommu_device___4 *iommu_dev;
+	void *priv;
+	u32 max_pasids;
+	u32 attach_deferred: 1;
+	u32 pci_32bit_workaround: 1;
+	u32 require_direct: 1;
+	u32 shadow_on_flush: 1;
+};
+
+struct iommu_fault_param___5;
+
+struct iommu_fwspec___5;
+
+struct iommu_device___5;
+
+struct dev_iommu___6 {
+	struct mutex lock;
+	struct iommu_fault_param___5 *fault_param;
+	struct iommu_fwspec___5 *fwspec;
+	struct iommu_device___5 *iommu_dev;
+	void *priv;
+	u32 max_pasids;
+	u32 attach_deferred: 1;
+	u32 pci_32bit_workaround: 1;
+	u32 require_direct: 1;
+	u32 shadow_on_flush: 1;
+};
+
+struct iommu_fault_param___6;
+
+struct iommu_fwspec___6;
+
+struct iommu_device___6;
+
+struct dev_iommu___3 {
+	struct mutex lock;
+	struct iommu_fault_param___6 *fault_param;
+	struct iommu_fwspec___6 *fwspec;
+	struct iommu_device___6 *iommu_dev;
+	void *priv;
+	u32 max_pasids;
+	u32 attach_deferred: 1;
+	u32 pci_32bit_workaround: 1;
+	u32 require_direct: 1;
+	u32 shadow_on_flush: 1;
+};
+
 struct dev_kfree_skb_cb {
 	enum skb_drop_reason reason;
+};
+
+struct irq_domain___3;
+
+struct dev_msi_info___3 {
+	struct irq_domain___3 *domain;
+	struct msi_device_data *data;
 };
 
 struct vmem_altmap {
@@ -69296,6 +70806,69 @@ struct dev_pagemap___2 {
 	};
 };
 
+struct dev_pagemap_ops___3;
+
+struct dev_pagemap___3 {
+	struct vmem_altmap altmap;
+	struct percpu_ref ref;
+	struct completion done;
+	enum memory_type type;
+	unsigned int flags;
+	long unsigned int vmemmap_shift;
+	const struct dev_pagemap_ops___3 *ops;
+	void *owner;
+	int nr_range;
+	union {
+		struct range range;
+		struct {
+			struct {} __empty_ranges;
+			struct range ranges[0];
+		};
+	};
+};
+
+struct dev_pagemap_ops___4;
+
+struct dev_pagemap___4 {
+	struct vmem_altmap altmap;
+	struct percpu_ref ref;
+	struct completion done;
+	enum memory_type type;
+	unsigned int flags;
+	long unsigned int vmemmap_shift;
+	const struct dev_pagemap_ops___4 *ops;
+	void *owner;
+	int nr_range;
+	union {
+		struct range range;
+		struct {
+			struct {} __empty_ranges;
+			struct range ranges[0];
+		};
+	};
+};
+
+struct dev_pagemap_ops___5;
+
+struct dev_pagemap___5 {
+	struct vmem_altmap altmap;
+	struct percpu_ref ref;
+	struct completion done;
+	enum memory_type type;
+	unsigned int flags;
+	long unsigned int vmemmap_shift;
+	const struct dev_pagemap_ops___5 *ops;
+	void *owner;
+	int nr_range;
+	union {
+		struct range range;
+		struct {
+			struct {} __empty_ranges;
+			struct range ranges[0];
+		};
+	};
+};
+
 struct vm_fault;
 
 struct dev_pagemap_ops {
@@ -69310,6 +70883,34 @@ struct dev_pagemap_ops___2 {
 	void (*page_free)(struct page___2 *);
 	vm_fault_t (*migrate_to_ram)(struct vm_fault___2 *);
 	int (*memory_failure)(struct dev_pagemap___2 *, long unsigned int, long unsigned int, int);
+};
+
+struct page___4;
+
+struct vm_fault___3;
+
+struct dev_pagemap_ops___3 {
+	void (*page_free)(struct page___4 *);
+	vm_fault_t (*migrate_to_ram)(struct vm_fault___3 *);
+	int (*memory_failure)(struct dev_pagemap___3 *, long unsigned int, long unsigned int, int);
+};
+
+struct page___5;
+
+struct vm_fault___4;
+
+struct dev_pagemap_ops___4 {
+	void (*page_free)(struct page___5 *);
+	vm_fault_t (*migrate_to_ram)(struct vm_fault___4 *);
+	int (*memory_failure)(struct dev_pagemap___4 *, long unsigned int, long unsigned int, int);
+};
+
+struct vm_fault___5;
+
+struct dev_pagemap_ops___5 {
+	void (*page_free)(struct page___3 *);
+	vm_fault_t (*migrate_to_ram)(struct vm_fault___5 *);
+	int (*memory_failure)(struct dev_pagemap___5 *, long unsigned int, long unsigned int, int);
 };
 
 struct dev_pasid_info {
@@ -69402,6 +71003,150 @@ struct dev_pm_domain___2 {
 	int (*set_performance_state)(struct device___2 *, unsigned int);
 };
 
+struct dev_pm_ops___3 {
+	int (*prepare)(struct device___4 *);
+	void (*complete)(struct device___4 *);
+	int (*suspend)(struct device___4 *);
+	int (*resume)(struct device___4 *);
+	int (*freeze)(struct device___4 *);
+	int (*thaw)(struct device___4 *);
+	int (*poweroff)(struct device___4 *);
+	int (*restore)(struct device___4 *);
+	int (*suspend_late)(struct device___4 *);
+	int (*resume_early)(struct device___4 *);
+	int (*freeze_late)(struct device___4 *);
+	int (*thaw_early)(struct device___4 *);
+	int (*poweroff_late)(struct device___4 *);
+	int (*restore_early)(struct device___4 *);
+	int (*suspend_noirq)(struct device___4 *);
+	int (*resume_noirq)(struct device___4 *);
+	int (*freeze_noirq)(struct device___4 *);
+	int (*thaw_noirq)(struct device___4 *);
+	int (*poweroff_noirq)(struct device___4 *);
+	int (*restore_noirq)(struct device___4 *);
+	int (*runtime_suspend)(struct device___4 *);
+	int (*runtime_resume)(struct device___4 *);
+	int (*runtime_idle)(struct device___4 *);
+};
+
+struct dev_pm_domain___4 {
+	struct dev_pm_ops___3 ops;
+	int (*start)(struct device___4 *);
+	void (*detach)(struct device___4 *, bool);
+	int (*activate)(struct device___4 *);
+	void (*sync)(struct device___4 *);
+	void (*dismiss)(struct device___4 *);
+	int (*set_performance_state)(struct device___4 *, unsigned int);
+};
+
+struct dev_pm_ops___4 {
+	int (*prepare)(struct device___5 *);
+	void (*complete)(struct device___5 *);
+	int (*suspend)(struct device___5 *);
+	int (*resume)(struct device___5 *);
+	int (*freeze)(struct device___5 *);
+	int (*thaw)(struct device___5 *);
+	int (*poweroff)(struct device___5 *);
+	int (*restore)(struct device___5 *);
+	int (*suspend_late)(struct device___5 *);
+	int (*resume_early)(struct device___5 *);
+	int (*freeze_late)(struct device___5 *);
+	int (*thaw_early)(struct device___5 *);
+	int (*poweroff_late)(struct device___5 *);
+	int (*restore_early)(struct device___5 *);
+	int (*suspend_noirq)(struct device___5 *);
+	int (*resume_noirq)(struct device___5 *);
+	int (*freeze_noirq)(struct device___5 *);
+	int (*thaw_noirq)(struct device___5 *);
+	int (*poweroff_noirq)(struct device___5 *);
+	int (*restore_noirq)(struct device___5 *);
+	int (*runtime_suspend)(struct device___5 *);
+	int (*runtime_resume)(struct device___5 *);
+	int (*runtime_idle)(struct device___5 *);
+};
+
+struct dev_pm_domain___5 {
+	struct dev_pm_ops___4 ops;
+	int (*start)(struct device___5 *);
+	void (*detach)(struct device___5 *, bool);
+	int (*activate)(struct device___5 *);
+	void (*sync)(struct device___5 *);
+	void (*dismiss)(struct device___5 *);
+	int (*set_performance_state)(struct device___5 *, unsigned int);
+};
+
+struct dev_pm_ops___5 {
+	int (*prepare)(struct device___6 *);
+	void (*complete)(struct device___6 *);
+	int (*suspend)(struct device___6 *);
+	int (*resume)(struct device___6 *);
+	int (*freeze)(struct device___6 *);
+	int (*thaw)(struct device___6 *);
+	int (*poweroff)(struct device___6 *);
+	int (*restore)(struct device___6 *);
+	int (*suspend_late)(struct device___6 *);
+	int (*resume_early)(struct device___6 *);
+	int (*freeze_late)(struct device___6 *);
+	int (*thaw_early)(struct device___6 *);
+	int (*poweroff_late)(struct device___6 *);
+	int (*restore_early)(struct device___6 *);
+	int (*suspend_noirq)(struct device___6 *);
+	int (*resume_noirq)(struct device___6 *);
+	int (*freeze_noirq)(struct device___6 *);
+	int (*thaw_noirq)(struct device___6 *);
+	int (*poweroff_noirq)(struct device___6 *);
+	int (*restore_noirq)(struct device___6 *);
+	int (*runtime_suspend)(struct device___6 *);
+	int (*runtime_resume)(struct device___6 *);
+	int (*runtime_idle)(struct device___6 *);
+};
+
+struct dev_pm_domain___6 {
+	struct dev_pm_ops___5 ops;
+	int (*start)(struct device___6 *);
+	void (*detach)(struct device___6 *, bool);
+	int (*activate)(struct device___6 *);
+	void (*sync)(struct device___6 *);
+	void (*dismiss)(struct device___6 *);
+	int (*set_performance_state)(struct device___6 *, unsigned int);
+};
+
+struct dev_pm_ops___6 {
+	int (*prepare)(struct device___3 *);
+	void (*complete)(struct device___3 *);
+	int (*suspend)(struct device___3 *);
+	int (*resume)(struct device___3 *);
+	int (*freeze)(struct device___3 *);
+	int (*thaw)(struct device___3 *);
+	int (*poweroff)(struct device___3 *);
+	int (*restore)(struct device___3 *);
+	int (*suspend_late)(struct device___3 *);
+	int (*resume_early)(struct device___3 *);
+	int (*freeze_late)(struct device___3 *);
+	int (*thaw_early)(struct device___3 *);
+	int (*poweroff_late)(struct device___3 *);
+	int (*restore_early)(struct device___3 *);
+	int (*suspend_noirq)(struct device___3 *);
+	int (*resume_noirq)(struct device___3 *);
+	int (*freeze_noirq)(struct device___3 *);
+	int (*thaw_noirq)(struct device___3 *);
+	int (*poweroff_noirq)(struct device___3 *);
+	int (*restore_noirq)(struct device___3 *);
+	int (*runtime_suspend)(struct device___3 *);
+	int (*runtime_resume)(struct device___3 *);
+	int (*runtime_idle)(struct device___3 *);
+};
+
+struct dev_pm_domain___3 {
+	struct dev_pm_ops___6 ops;
+	int (*start)(struct device___3 *);
+	void (*detach)(struct device___3 *, bool);
+	int (*activate)(struct device___3 *);
+	void (*sync)(struct device___3 *);
+	void (*dismiss)(struct device___3 *);
+	int (*set_performance_state)(struct device___3 *, unsigned int);
+};
+
 struct dev_pm_domain_attach_data {
 	const char * const *pd_names;
 	const u32 num_pd_names;
@@ -69415,6 +71160,192 @@ struct dev_pm_domain_list {
 	struct device_link **pd_links;
 	u32 *opp_tokens;
 	u32 num_pds;
+};
+
+struct wakeup_source___4;
+
+struct dev_pm_info___4 {
+	pm_message_t power_state;
+	bool can_wakeup: 1;
+	bool async_suspend: 1;
+	bool in_dpm_list: 1;
+	bool is_prepared: 1;
+	bool is_suspended: 1;
+	bool is_noirq_suspended: 1;
+	bool is_late_suspended: 1;
+	bool no_pm: 1;
+	bool early_init: 1;
+	bool direct_complete: 1;
+	u32 driver_flags;
+	spinlock_t lock;
+	struct list_head entry;
+	struct completion completion;
+	struct wakeup_source___4 *wakeup;
+	bool wakeup_path: 1;
+	bool syscore: 1;
+	bool no_pm_callbacks: 1;
+	bool work_in_progress: 1;
+	bool smart_suspend: 1;
+	bool must_resume: 1;
+	bool may_skip_resume: 1;
+	bool strict_midlayer: 1;
+	struct hrtimer suspend_timer;
+	u64 timer_expires;
+	struct work_struct work;
+	wait_queue_head_t wait_queue;
+	struct wake_irq *wakeirq;
+	atomic_t usage_count;
+	atomic_t child_count;
+	unsigned int disable_depth: 3;
+	bool idle_notification: 1;
+	bool request_pending: 1;
+	bool deferred_resume: 1;
+	bool needs_force_resume: 1;
+	bool runtime_auto: 1;
+	bool ignore_children: 1;
+	bool no_callbacks: 1;
+	bool irq_safe: 1;
+	bool use_autosuspend: 1;
+	bool timer_autosuspends: 1;
+	bool memalloc_noio: 1;
+	unsigned int links_count;
+	enum rpm_request request;
+	enum rpm_status runtime_status;
+	enum rpm_status last_status;
+	int runtime_error;
+	int autosuspend_delay;
+	u64 last_busy;
+	u64 active_time;
+	u64 suspended_time;
+	u64 accounting_timestamp;
+	struct pm_subsys_data *subsys_data;
+	void (*set_latency_tolerance)(struct device___4 *, s32);
+	struct dev_pm_qos *qos;
+	bool detach_power_off: 1;
+};
+
+struct wakeup_source___5;
+
+struct dev_pm_info___5 {
+	pm_message_t power_state;
+	bool can_wakeup: 1;
+	bool async_suspend: 1;
+	bool in_dpm_list: 1;
+	bool is_prepared: 1;
+	bool is_suspended: 1;
+	bool is_noirq_suspended: 1;
+	bool is_late_suspended: 1;
+	bool no_pm: 1;
+	bool early_init: 1;
+	bool direct_complete: 1;
+	u32 driver_flags;
+	spinlock_t lock;
+	struct list_head entry;
+	struct completion completion;
+	struct wakeup_source___5 *wakeup;
+	bool wakeup_path: 1;
+	bool syscore: 1;
+	bool no_pm_callbacks: 1;
+	bool work_in_progress: 1;
+	bool smart_suspend: 1;
+	bool must_resume: 1;
+	bool may_skip_resume: 1;
+	bool strict_midlayer: 1;
+	struct hrtimer suspend_timer;
+	u64 timer_expires;
+	struct work_struct work;
+	wait_queue_head_t wait_queue;
+	struct wake_irq *wakeirq;
+	atomic_t usage_count;
+	atomic_t child_count;
+	unsigned int disable_depth: 3;
+	bool idle_notification: 1;
+	bool request_pending: 1;
+	bool deferred_resume: 1;
+	bool needs_force_resume: 1;
+	bool runtime_auto: 1;
+	bool ignore_children: 1;
+	bool no_callbacks: 1;
+	bool irq_safe: 1;
+	bool use_autosuspend: 1;
+	bool timer_autosuspends: 1;
+	bool memalloc_noio: 1;
+	unsigned int links_count;
+	enum rpm_request request;
+	enum rpm_status runtime_status;
+	enum rpm_status last_status;
+	int runtime_error;
+	int autosuspend_delay;
+	u64 last_busy;
+	u64 active_time;
+	u64 suspended_time;
+	u64 accounting_timestamp;
+	struct pm_subsys_data *subsys_data;
+	void (*set_latency_tolerance)(struct device___5 *, s32);
+	struct dev_pm_qos *qos;
+	bool detach_power_off: 1;
+};
+
+struct wakeup_source___6;
+
+struct dev_pm_info___6 {
+	pm_message_t power_state;
+	bool can_wakeup: 1;
+	bool async_suspend: 1;
+	bool in_dpm_list: 1;
+	bool is_prepared: 1;
+	bool is_suspended: 1;
+	bool is_noirq_suspended: 1;
+	bool is_late_suspended: 1;
+	bool no_pm: 1;
+	bool early_init: 1;
+	bool direct_complete: 1;
+	u32 driver_flags;
+	spinlock_t lock;
+	struct list_head entry;
+	struct completion completion;
+	struct wakeup_source___6 *wakeup;
+	bool wakeup_path: 1;
+	bool syscore: 1;
+	bool no_pm_callbacks: 1;
+	bool work_in_progress: 1;
+	bool smart_suspend: 1;
+	bool must_resume: 1;
+	bool may_skip_resume: 1;
+	bool strict_midlayer: 1;
+	struct hrtimer suspend_timer;
+	u64 timer_expires;
+	struct work_struct work;
+	wait_queue_head_t wait_queue;
+	struct wake_irq *wakeirq;
+	atomic_t usage_count;
+	atomic_t child_count;
+	unsigned int disable_depth: 3;
+	bool idle_notification: 1;
+	bool request_pending: 1;
+	bool deferred_resume: 1;
+	bool needs_force_resume: 1;
+	bool runtime_auto: 1;
+	bool ignore_children: 1;
+	bool no_callbacks: 1;
+	bool irq_safe: 1;
+	bool use_autosuspend: 1;
+	bool timer_autosuspends: 1;
+	bool memalloc_noio: 1;
+	unsigned int links_count;
+	enum rpm_request request;
+	enum rpm_status runtime_status;
+	enum rpm_status last_status;
+	int runtime_error;
+	int autosuspend_delay;
+	u64 last_busy;
+	u64 active_time;
+	u64 suspended_time;
+	u64 accounting_timestamp;
+	struct pm_subsys_data *subsys_data;
+	void (*set_latency_tolerance)(struct device___6 *, s32);
+	struct dev_pm_qos *qos;
+	bool detach_power_off: 1;
 };
 
 struct dev_pm_opp_supply;
@@ -69638,6 +71569,174 @@ typedef struct device *class_pm_runtime_active_t;
 
 typedef class_pm_runtime_active_t class_pm_runtime_active_try_t;
 
+struct device_type___4;
+
+struct device_node___4;
+
+struct fwnode_handle___4;
+
+struct device___4 {
+	struct kobject___3 kobj;
+	struct device___4 *parent;
+	struct device_private *p;
+	const char *init_name;
+	const struct device_type___4 *type;
+	const struct bus_type___4 *bus;
+	struct device_driver___4 *driver;
+	void *platform_data;
+	void *driver_data;
+	struct mutex mutex;
+	struct dev_links_info links;
+	struct dev_pm_info___4 power;
+	struct dev_pm_domain___4 *pm_domain;
+	struct em_perf_domain *em_pd;
+	struct dev_pin_info *pins;
+	struct dev_msi_info msi;
+	const struct dma_map_ops *dma_ops;
+	u64 *dma_mask;
+	u64 coherent_dma_mask;
+	u64 bus_dma_limit;
+	const struct bus_dma_region *dma_range_map;
+	struct device_dma_parameters *dma_parms;
+	struct list_head dma_pools;
+	struct cma *cma_area;
+	struct io_tlb_mem *dma_io_tlb_mem;
+	struct dev_archdata archdata;
+	struct device_node___4 *of_node;
+	struct fwnode_handle___4 *fwnode;
+	int numa_node;
+	dev_t devt;
+	u32 id;
+	spinlock_t devres_lock;
+	struct list_head devres_head;
+	const struct class___4 *class;
+	const struct attribute_group___3 **groups;
+	void (*release)(struct device___4 *);
+	struct iommu_group *iommu_group;
+	struct dev_iommu___4 *iommu;
+	struct device_physical_location *physical_location;
+	enum device_removable removable;
+	bool offline_disabled: 1;
+	bool offline: 1;
+	bool of_node_reused: 1;
+	bool state_synced: 1;
+	bool can_match: 1;
+	bool dma_skip_sync: 1;
+	bool dma_iommu: 1;
+};
+
+struct device_type___5;
+
+struct device_node___5;
+
+struct fwnode_handle___5;
+
+struct device___5 {
+	struct kobject___4 kobj;
+	struct device___5 *parent;
+	struct device_private *p;
+	const char *init_name;
+	const struct device_type___5 *type;
+	const struct bus_type___5 *bus;
+	struct device_driver___5 *driver;
+	void *platform_data;
+	void *driver_data;
+	struct mutex mutex;
+	struct dev_links_info links;
+	struct dev_pm_info___5 power;
+	struct dev_pm_domain___5 *pm_domain;
+	struct em_perf_domain *em_pd;
+	struct dev_pin_info *pins;
+	struct dev_msi_info msi;
+	const struct dma_map_ops *dma_ops;
+	u64 *dma_mask;
+	u64 coherent_dma_mask;
+	u64 bus_dma_limit;
+	const struct bus_dma_region *dma_range_map;
+	struct device_dma_parameters *dma_parms;
+	struct list_head dma_pools;
+	struct cma *cma_area;
+	struct io_tlb_mem *dma_io_tlb_mem;
+	struct dev_archdata archdata;
+	struct device_node___5 *of_node;
+	struct fwnode_handle___5 *fwnode;
+	int numa_node;
+	dev_t devt;
+	u32 id;
+	spinlock_t devres_lock;
+	struct list_head devres_head;
+	const struct class___5 *class;
+	const struct attribute_group___4 **groups;
+	void (*release)(struct device___5 *);
+	struct iommu_group *iommu_group;
+	struct dev_iommu___5 *iommu;
+	struct device_physical_location *physical_location;
+	enum device_removable removable;
+	bool offline_disabled: 1;
+	bool offline: 1;
+	bool of_node_reused: 1;
+	bool state_synced: 1;
+	bool can_match: 1;
+	bool dma_skip_sync: 1;
+	bool dma_iommu: 1;
+};
+
+struct device_type___6;
+
+struct device_node___6;
+
+struct fwnode_handle___6;
+
+struct device___6 {
+	struct kobject___4 kobj;
+	struct device___6 *parent;
+	struct device_private *p;
+	const char *init_name;
+	const struct device_type___6 *type;
+	const struct bus_type___6 *bus;
+	struct device_driver___6 *driver;
+	void *platform_data;
+	void *driver_data;
+	struct mutex mutex;
+	struct dev_links_info links;
+	struct dev_pm_info___6 power;
+	struct dev_pm_domain___6 *pm_domain;
+	struct em_perf_domain *em_pd;
+	struct dev_pin_info *pins;
+	struct dev_msi_info___3 msi;
+	const struct dma_map_ops *dma_ops;
+	u64 *dma_mask;
+	u64 coherent_dma_mask;
+	u64 bus_dma_limit;
+	const struct bus_dma_region *dma_range_map;
+	struct device_dma_parameters *dma_parms;
+	struct list_head dma_pools;
+	struct cma *cma_area;
+	struct io_tlb_mem *dma_io_tlb_mem;
+	struct dev_archdata archdata;
+	struct device_node___6 *of_node;
+	struct fwnode_handle___6 *fwnode;
+	int numa_node;
+	dev_t devt;
+	u32 id;
+	spinlock_t devres_lock;
+	struct list_head devres_head;
+	const struct class___6 *class;
+	const struct attribute_group___4 **groups;
+	void (*release)(struct device___6 *);
+	struct iommu_group *iommu_group;
+	struct dev_iommu___6 *iommu;
+	struct device_physical_location *physical_location;
+	enum device_removable removable;
+	bool offline_disabled: 1;
+	bool offline: 1;
+	bool of_node_reused: 1;
+	bool state_synced: 1;
+	bool can_match: 1;
+	bool dma_skip_sync: 1;
+	bool dma_iommu: 1;
+};
+
 struct device_attach_data {
 	struct device *dev;
 	bool check_async;
@@ -69654,6 +71753,12 @@ struct device_attribute___2 {
 	struct attribute attr;
 	ssize_t (*show)(struct device___2 *, struct device_attribute___2 *, char *);
 	ssize_t (*store)(struct device___2 *, struct device_attribute___2 *, const char *, size_t);
+};
+
+struct device_attribute___3 {
+	struct attribute attr;
+	ssize_t (*show)(struct device___6 *, struct device_attribute___3 *, char *);
+	ssize_t (*store)(struct device___6 *, struct device_attribute___3 *, const char *, size_t);
 };
 
 struct device_dma_parameters {
@@ -69708,6 +71813,94 @@ struct device_driver___2 {
 	const struct attribute_group___2 **dev_groups;
 	const struct dev_pm_ops___2 *pm;
 	void (*coredump)(struct device___2 *);
+	struct driver_private *p;
+};
+
+struct device_driver___4 {
+	const char *name;
+	const struct bus_type___4 *bus;
+	struct module___3 *owner;
+	const char *mod_name;
+	bool suppress_bind_attrs;
+	enum probe_type probe_type;
+	const struct of_device_id *of_match_table;
+	const struct acpi_device_id *acpi_match_table;
+	int (*probe)(struct device___4 *);
+	void (*sync_state)(struct device___4 *);
+	int (*remove)(struct device___4 *);
+	void (*shutdown)(struct device___4 *);
+	int (*suspend)(struct device___4 *, pm_message_t);
+	int (*resume)(struct device___4 *);
+	const struct attribute_group___3 **groups;
+	const struct attribute_group___3 **dev_groups;
+	const struct dev_pm_ops___3 *pm;
+	void (*coredump)(struct device___4 *);
+	struct driver_private *p;
+};
+
+struct device_driver___5 {
+	const char *name;
+	const struct bus_type___5 *bus;
+	struct module___4 *owner;
+	const char *mod_name;
+	bool suppress_bind_attrs;
+	enum probe_type probe_type;
+	const struct of_device_id *of_match_table;
+	const struct acpi_device_id *acpi_match_table;
+	int (*probe)(struct device___5 *);
+	void (*sync_state)(struct device___5 *);
+	int (*remove)(struct device___5 *);
+	void (*shutdown)(struct device___5 *);
+	int (*suspend)(struct device___5 *, pm_message_t);
+	int (*resume)(struct device___5 *);
+	const struct attribute_group___4 **groups;
+	const struct attribute_group___4 **dev_groups;
+	const struct dev_pm_ops___4 *pm;
+	void (*coredump)(struct device___5 *);
+	struct driver_private *p;
+};
+
+struct device_driver___6 {
+	const char *name;
+	const struct bus_type___6 *bus;
+	struct module___4 *owner;
+	const char *mod_name;
+	bool suppress_bind_attrs;
+	enum probe_type probe_type;
+	const struct of_device_id *of_match_table;
+	const struct acpi_device_id *acpi_match_table;
+	int (*probe)(struct device___6 *);
+	void (*sync_state)(struct device___6 *);
+	int (*remove)(struct device___6 *);
+	void (*shutdown)(struct device___6 *);
+	int (*suspend)(struct device___6 *, pm_message_t);
+	int (*resume)(struct device___6 *);
+	const struct attribute_group___4 **groups;
+	const struct attribute_group___4 **dev_groups;
+	const struct dev_pm_ops___5 *pm;
+	void (*coredump)(struct device___6 *);
+	struct driver_private *p;
+};
+
+struct device_driver___3 {
+	const char *name;
+	const struct bus_type___3 *bus;
+	struct module___5 *owner;
+	const char *mod_name;
+	bool suppress_bind_attrs;
+	enum probe_type probe_type;
+	const struct of_device_id *of_match_table;
+	const struct acpi_device_id *acpi_match_table;
+	int (*probe)(struct device___3 *);
+	void (*sync_state)(struct device___3 *);
+	int (*remove)(struct device___3 *);
+	void (*shutdown)(struct device___3 *);
+	int (*suspend)(struct device___3 *, pm_message_t);
+	int (*resume)(struct device___3 *);
+	const struct attribute_group___5 **groups;
+	const struct attribute_group___5 **dev_groups;
+	const struct dev_pm_ops___6 *pm;
+	void (*coredump)(struct device___3 *);
 	struct driver_private *p;
 };
 
@@ -69766,6 +71959,106 @@ struct device_node___2 {
 	void *data;
 };
 
+struct fwnode_operations___3;
+
+struct fwnode_handle___4 {
+	struct fwnode_handle___4 *secondary;
+	const struct fwnode_operations___3 *ops;
+	struct device___4 *dev;
+	struct list_head suppliers;
+	struct list_head consumers;
+	u8 flags;
+};
+
+struct device_node___4 {
+	const char *name;
+	phandle phandle;
+	const char *full_name;
+	struct fwnode_handle___4 fwnode;
+	struct property *properties;
+	struct property *deadprops;
+	struct device_node___4 *parent;
+	struct device_node___4 *child;
+	struct device_node___4 *sibling;
+	long unsigned int _flags;
+	void *data;
+};
+
+struct fwnode_operations___4;
+
+struct fwnode_handle___5 {
+	struct fwnode_handle___5 *secondary;
+	const struct fwnode_operations___4 *ops;
+	struct device___5 *dev;
+	struct list_head suppliers;
+	struct list_head consumers;
+	u8 flags;
+};
+
+struct device_node___5 {
+	const char *name;
+	phandle phandle;
+	const char *full_name;
+	struct fwnode_handle___5 fwnode;
+	struct property *properties;
+	struct property *deadprops;
+	struct device_node___5 *parent;
+	struct device_node___5 *child;
+	struct device_node___5 *sibling;
+	long unsigned int _flags;
+	void *data;
+};
+
+struct fwnode_operations___5;
+
+struct fwnode_handle___6 {
+	struct fwnode_handle___6 *secondary;
+	const struct fwnode_operations___5 *ops;
+	struct device___6 *dev;
+	struct list_head suppliers;
+	struct list_head consumers;
+	u8 flags;
+};
+
+struct device_node___6 {
+	const char *name;
+	phandle phandle;
+	const char *full_name;
+	struct fwnode_handle___6 fwnode;
+	struct property *properties;
+	struct property *deadprops;
+	struct device_node___6 *parent;
+	struct device_node___6 *child;
+	struct device_node___6 *sibling;
+	long unsigned int _flags;
+	void *data;
+};
+
+struct fwnode_operations___6;
+
+struct fwnode_handle___3 {
+	struct fwnode_handle___3 *secondary;
+	const struct fwnode_operations___6 *ops;
+	struct device___3 *dev;
+	struct list_head suppliers;
+	struct list_head consumers;
+	u8 flags;
+};
+
+struct device_node___3 {
+	const char *name;
+	phandle phandle;
+	const char *full_name;
+	struct fwnode_handle___3 fwnode;
+	struct property *properties;
+	struct property *deadprops;
+	struct device_node___3 *parent;
+	struct device_node___3 *child;
+	struct device_node___3 *sibling;
+	long unsigned int _flags;
+	void *data;
+};
+
 struct device_physical_location {
 	enum device_physical_location_panel panel;
 	enum device_physical_location_vertical_position vertical_position;
@@ -69809,6 +72102,42 @@ struct device_type___2 {
 	char * (*devnode)(const struct device___2 *, umode_t *, kuid_t *, kgid_t *);
 	void (*release)(struct device___2 *);
 	const struct dev_pm_ops___2 *pm;
+};
+
+struct device_type___4 {
+	const char *name;
+	const struct attribute_group___3 **groups;
+	int (*uevent)(const struct device___4 *, struct kobj_uevent_env *);
+	char * (*devnode)(const struct device___4 *, umode_t *, kuid_t *, kgid_t *);
+	void (*release)(struct device___4 *);
+	const struct dev_pm_ops___3 *pm;
+};
+
+struct device_type___5 {
+	const char *name;
+	const struct attribute_group___4 **groups;
+	int (*uevent)(const struct device___5 *, struct kobj_uevent_env *);
+	char * (*devnode)(const struct device___5 *, umode_t *, kuid_t *, kgid_t *);
+	void (*release)(struct device___5 *);
+	const struct dev_pm_ops___4 *pm;
+};
+
+struct device_type___6 {
+	const char *name;
+	const struct attribute_group___4 **groups;
+	int (*uevent)(const struct device___6 *, struct kobj_uevent_env *);
+	char * (*devnode)(const struct device___6 *, umode_t *, kuid_t *, kgid_t *);
+	void (*release)(struct device___6 *);
+	const struct dev_pm_ops___5 *pm;
+};
+
+struct device_type___3 {
+	const char *name;
+	const struct attribute_group___5 **groups;
+	int (*uevent)(const struct device___3 *, struct kobj_uevent_env *);
+	char * (*devnode)(const struct device___3 *, umode_t *, kuid_t *, kgid_t *);
+	void (*release)(struct device___3 *);
+	const struct dev_pm_ops___6 *pm;
 };
 
 struct devid_map {
@@ -72797,6 +75126,51 @@ struct dquot___2 {
 	struct mem_dqblk dq_dqb;
 };
 
+struct dquot___3 {
+	struct hlist_node dq_hash;
+	struct list_head dq_inuse;
+	struct list_head dq_free;
+	struct list_head dq_dirty;
+	struct mutex dq_lock;
+	spinlock_t dq_dqb_lock;
+	atomic_t dq_count;
+	struct super_block___3 *dq_sb;
+	struct kqid dq_id;
+	loff_t dq_off;
+	long unsigned int dq_flags;
+	struct mem_dqblk dq_dqb;
+};
+
+struct dquot___4 {
+	struct hlist_node dq_hash;
+	struct list_head dq_inuse;
+	struct list_head dq_free;
+	struct list_head dq_dirty;
+	struct mutex dq_lock;
+	spinlock_t dq_dqb_lock;
+	atomic_t dq_count;
+	struct super_block___4 *dq_sb;
+	struct kqid dq_id;
+	loff_t dq_off;
+	long unsigned int dq_flags;
+	struct mem_dqblk dq_dqb;
+};
+
+struct dquot___5 {
+	struct hlist_node dq_hash;
+	struct list_head dq_inuse;
+	struct list_head dq_free;
+	struct list_head dq_dirty;
+	struct mutex dq_lock;
+	spinlock_t dq_dqb_lock;
+	atomic_t dq_count;
+	struct super_block___5 *dq_sb;
+	struct kqid dq_id;
+	loff_t dq_off;
+	long unsigned int dq_flags;
+	struct mem_dqblk dq_dqb;
+};
+
 struct dquot_operations {
 	int (*write_dquot)(struct dquot *);
 	struct dquot * (*alloc_dquot)(struct super_block *, int);
@@ -72823,6 +75197,48 @@ struct dquot_operations___2 {
 	int (*get_projid)(struct inode___2 *, kprojid_t *);
 	int (*get_inode_usage)(struct inode___2 *, qsize_t *);
 	int (*get_next_id)(struct super_block___2 *, struct kqid *);
+};
+
+struct dquot_operations___3 {
+	int (*write_dquot)(struct dquot___3 *);
+	struct dquot___3 * (*alloc_dquot)(struct super_block___3 *, int);
+	void (*destroy_dquot)(struct dquot___3 *);
+	int (*acquire_dquot)(struct dquot___3 *);
+	int (*release_dquot)(struct dquot___3 *);
+	int (*mark_dirty)(struct dquot___3 *);
+	int (*write_info)(struct super_block___3 *, int);
+	qsize_t * (*get_reserved_space)(struct inode___3 *);
+	int (*get_projid)(struct inode___3 *, kprojid_t *);
+	int (*get_inode_usage)(struct inode___3 *, qsize_t *);
+	int (*get_next_id)(struct super_block___3 *, struct kqid *);
+};
+
+struct dquot_operations___4 {
+	int (*write_dquot)(struct dquot___4 *);
+	struct dquot___4 * (*alloc_dquot)(struct super_block___4 *, int);
+	void (*destroy_dquot)(struct dquot___4 *);
+	int (*acquire_dquot)(struct dquot___4 *);
+	int (*release_dquot)(struct dquot___4 *);
+	int (*mark_dirty)(struct dquot___4 *);
+	int (*write_info)(struct super_block___4 *, int);
+	qsize_t * (*get_reserved_space)(struct inode___4 *);
+	int (*get_projid)(struct inode___4 *, kprojid_t *);
+	int (*get_inode_usage)(struct inode___4 *, qsize_t *);
+	int (*get_next_id)(struct super_block___4 *, struct kqid *);
+};
+
+struct dquot_operations___5 {
+	int (*write_dquot)(struct dquot___5 *);
+	struct dquot___5 * (*alloc_dquot)(struct super_block___5 *, int);
+	void (*destroy_dquot)(struct dquot___5 *);
+	int (*acquire_dquot)(struct dquot___5 *);
+	int (*release_dquot)(struct dquot___5 *);
+	int (*mark_dirty)(struct dquot___5 *);
+	int (*write_info)(struct super_block___5 *, int);
+	qsize_t * (*get_reserved_space)(struct inode___5 *);
+	int (*get_projid)(struct inode___5 *, kprojid_t *);
+	int (*get_inode_usage)(struct inode___5 *, qsize_t *);
+	int (*get_next_id)(struct super_block___5 *, struct kqid *);
 };
 
 struct dquot_warn {
@@ -83411,6 +85827,126 @@ struct file___2 {
 	file_ref_t f_ref;
 };
 
+struct path___3 {
+	struct vfsmount___3 *mnt;
+	struct dentry___4 *dentry;
+};
+
+struct fown_struct___3;
+
+struct file___3 {
+	spinlock_t f_lock;
+	fmode_t f_mode;
+	const struct file_operations___3 *f_op;
+	struct address_space___3 *f_mapping;
+	void *private_data;
+	struct inode___3 *f_inode;
+	unsigned int f_flags;
+	unsigned int f_iocb_flags;
+	const struct cred *f_cred;
+	struct fown_struct___3 *f_owner;
+	union {
+		const struct path___3 f_path;
+		struct path___3 __f_path;
+	};
+	union {
+		struct mutex f_pos_lock;
+		u64 f_pipe;
+	};
+	loff_t f_pos;
+	void *f_security;
+	errseq_t f_wb_err;
+	errseq_t f_sb_err;
+	struct hlist_head *f_ep;
+	union {
+		struct callback_head f_task_work;
+		struct llist_node f_llist;
+		struct file_ra_state f_ra;
+		freeptr_t f_freeptr;
+	};
+	file_ref_t f_ref;
+};
+
+struct path___4 {
+	struct vfsmount___4 *mnt;
+	struct dentry___5 *dentry;
+};
+
+struct fown_struct___4;
+
+struct file___4 {
+	spinlock_t f_lock;
+	fmode_t f_mode;
+	const struct file_operations___4 *f_op;
+	struct address_space___4 *f_mapping;
+	void *private_data;
+	struct inode___4 *f_inode;
+	unsigned int f_flags;
+	unsigned int f_iocb_flags;
+	const struct cred *f_cred;
+	struct fown_struct___4 *f_owner;
+	union {
+		const struct path___4 f_path;
+		struct path___4 __f_path;
+	};
+	union {
+		struct mutex f_pos_lock;
+		u64 f_pipe;
+	};
+	loff_t f_pos;
+	void *f_security;
+	errseq_t f_wb_err;
+	errseq_t f_sb_err;
+	struct hlist_head *f_ep;
+	union {
+		struct callback_head f_task_work;
+		struct llist_node f_llist;
+		struct file_ra_state f_ra;
+		freeptr_t f_freeptr;
+	};
+	file_ref_t f_ref;
+};
+
+struct path___5 {
+	struct vfsmount___5 *mnt;
+	struct dentry___3 *dentry;
+};
+
+struct fown_struct___5;
+
+struct file___5 {
+	spinlock_t f_lock;
+	fmode_t f_mode;
+	const struct file_operations___5 *f_op;
+	struct address_space___5 *f_mapping;
+	void *private_data;
+	struct inode___5 *f_inode;
+	unsigned int f_flags;
+	unsigned int f_iocb_flags;
+	const struct cred___3 *f_cred;
+	struct fown_struct___5 *f_owner;
+	union {
+		const struct path___5 f_path;
+		struct path___5 __f_path;
+	};
+	union {
+		struct mutex f_pos_lock;
+		u64 f_pipe;
+	};
+	loff_t f_pos;
+	void *f_security;
+	errseq_t f_wb_err;
+	errseq_t f_sb_err;
+	struct hlist_head *f_ep;
+	union {
+		struct callback_head f_task_work;
+		struct llist_node f_llist;
+		struct file_ra_state f_ra;
+		freeptr_t f_freeptr;
+	};
+	file_ref_t f_ref;
+};
+
 struct file__safe_trusted {
 	struct inode *f_inode;
 };
@@ -83630,6 +86166,127 @@ struct file_operations___2 {
 	int (*mmap_prepare)(struct vm_area_desc___2 *);
 };
 
+struct poll_table_struct___4;
+
+struct vm_area_desc___3;
+
+struct file_operations___3 {
+	struct module___3 *owner;
+	fop_flags_t fop_flags;
+	loff_t (*llseek)(struct file___3 *, loff_t, int);
+	ssize_t (*read)(struct file___3 *, char *, size_t, loff_t *);
+	ssize_t (*write)(struct file___3 *, const char *, size_t, loff_t *);
+	ssize_t (*read_iter)(struct kiocb___3 *, struct iov_iter *);
+	ssize_t (*write_iter)(struct kiocb___3 *, struct iov_iter *);
+	int (*iopoll)(struct kiocb___3 *, struct io_comp_batch *, unsigned int);
+	int (*iterate_shared)(struct file___3 *, struct dir_context *);
+	__poll_t (*poll)(struct file___3 *, struct poll_table_struct___4 *);
+	long int (*unlocked_ioctl)(struct file___3 *, unsigned int, long unsigned int);
+	long int (*compat_ioctl)(struct file___3 *, unsigned int, long unsigned int);
+	int (*mmap)(struct file___3 *, struct vm_area_struct___3 *);
+	int (*open)(struct inode___3 *, struct file___3 *);
+	int (*flush)(struct file___3 *, fl_owner_t);
+	int (*release)(struct inode___3 *, struct file___3 *);
+	int (*fsync)(struct file___3 *, loff_t, loff_t, int);
+	int (*fasync)(int, struct file___3 *, int);
+	int (*lock)(struct file___3 *, int, struct file_lock *);
+	long unsigned int (*get_unmapped_area)(struct file___3 *, long unsigned int, long unsigned int, long unsigned int, long unsigned int);
+	int (*check_flags)(int);
+	int (*flock)(struct file___3 *, int, struct file_lock *);
+	ssize_t (*splice_write)(struct pipe_inode_info *, struct file___3 *, loff_t *, size_t, unsigned int);
+	ssize_t (*splice_read)(struct file___3 *, loff_t *, struct pipe_inode_info *, size_t, unsigned int);
+	void (*splice_eof)(struct file___3 *);
+	int (*setlease)(struct file___3 *, int, struct file_lease **, void **);
+	long int (*fallocate)(struct file___3 *, int, loff_t, loff_t);
+	void (*show_fdinfo)(struct seq_file *, struct file___3 *);
+	ssize_t (*copy_file_range)(struct file___3 *, loff_t, struct file___3 *, loff_t, size_t, unsigned int);
+	loff_t (*remap_file_range)(struct file___3 *, loff_t, struct file___3 *, loff_t, loff_t, unsigned int);
+	int (*fadvise)(struct file___3 *, loff_t, loff_t, int);
+	int (*uring_cmd)(struct io_uring_cmd *, unsigned int);
+	int (*uring_cmd_iopoll)(struct io_uring_cmd *, struct io_comp_batch *, unsigned int);
+	int (*mmap_prepare)(struct vm_area_desc___3 *);
+};
+
+struct poll_table_struct___5;
+
+struct vm_area_desc___4;
+
+struct file_operations___4 {
+	struct module___4 *owner;
+	fop_flags_t fop_flags;
+	loff_t (*llseek)(struct file___4 *, loff_t, int);
+	ssize_t (*read)(struct file___4 *, char *, size_t, loff_t *);
+	ssize_t (*write)(struct file___4 *, const char *, size_t, loff_t *);
+	ssize_t (*read_iter)(struct kiocb___4 *, struct iov_iter *);
+	ssize_t (*write_iter)(struct kiocb___4 *, struct iov_iter *);
+	int (*iopoll)(struct kiocb___4 *, struct io_comp_batch *, unsigned int);
+	int (*iterate_shared)(struct file___4 *, struct dir_context *);
+	__poll_t (*poll)(struct file___4 *, struct poll_table_struct___5 *);
+	long int (*unlocked_ioctl)(struct file___4 *, unsigned int, long unsigned int);
+	long int (*compat_ioctl)(struct file___4 *, unsigned int, long unsigned int);
+	int (*mmap)(struct file___4 *, struct vm_area_struct___4 *);
+	int (*open)(struct inode___4 *, struct file___4 *);
+	int (*flush)(struct file___4 *, fl_owner_t);
+	int (*release)(struct inode___4 *, struct file___4 *);
+	int (*fsync)(struct file___4 *, loff_t, loff_t, int);
+	int (*fasync)(int, struct file___4 *, int);
+	int (*lock)(struct file___4 *, int, struct file_lock *);
+	long unsigned int (*get_unmapped_area)(struct file___4 *, long unsigned int, long unsigned int, long unsigned int, long unsigned int);
+	int (*check_flags)(int);
+	int (*flock)(struct file___4 *, int, struct file_lock *);
+	ssize_t (*splice_write)(struct pipe_inode_info *, struct file___4 *, loff_t *, size_t, unsigned int);
+	ssize_t (*splice_read)(struct file___4 *, loff_t *, struct pipe_inode_info *, size_t, unsigned int);
+	void (*splice_eof)(struct file___4 *);
+	int (*setlease)(struct file___4 *, int, struct file_lease **, void **);
+	long int (*fallocate)(struct file___4 *, int, loff_t, loff_t);
+	void (*show_fdinfo)(struct seq_file *, struct file___4 *);
+	ssize_t (*copy_file_range)(struct file___4 *, loff_t, struct file___4 *, loff_t, size_t, unsigned int);
+	loff_t (*remap_file_range)(struct file___4 *, loff_t, struct file___4 *, loff_t, loff_t, unsigned int);
+	int (*fadvise)(struct file___4 *, loff_t, loff_t, int);
+	int (*uring_cmd)(struct io_uring_cmd *, unsigned int);
+	int (*uring_cmd_iopoll)(struct io_uring_cmd *, struct io_comp_batch *, unsigned int);
+	int (*mmap_prepare)(struct vm_area_desc___4 *);
+};
+
+struct vm_area_desc___5;
+
+struct file_operations___5 {
+	struct module___5 *owner;
+	fop_flags_t fop_flags;
+	loff_t (*llseek)(struct file___5 *, loff_t, int);
+	ssize_t (*read)(struct file___5 *, char *, size_t, loff_t *);
+	ssize_t (*write)(struct file___5 *, const char *, size_t, loff_t *);
+	ssize_t (*read_iter)(struct kiocb___5 *, struct iov_iter___3 *);
+	ssize_t (*write_iter)(struct kiocb___5 *, struct iov_iter___3 *);
+	int (*iopoll)(struct kiocb___5 *, struct io_comp_batch *, unsigned int);
+	int (*iterate_shared)(struct file___5 *, struct dir_context *);
+	__poll_t (*poll)(struct file___5 *, struct poll_table_struct___3 *);
+	long int (*unlocked_ioctl)(struct file___5 *, unsigned int, long unsigned int);
+	long int (*compat_ioctl)(struct file___5 *, unsigned int, long unsigned int);
+	int (*mmap)(struct file___5 *, struct vm_area_struct___5 *);
+	int (*open)(struct inode___5 *, struct file___5 *);
+	int (*flush)(struct file___5 *, fl_owner_t);
+	int (*release)(struct inode___5 *, struct file___5 *);
+	int (*fsync)(struct file___5 *, loff_t, loff_t, int);
+	int (*fasync)(int, struct file___5 *, int);
+	int (*lock)(struct file___5 *, int, struct file_lock *);
+	long unsigned int (*get_unmapped_area)(struct file___5 *, long unsigned int, long unsigned int, long unsigned int, long unsigned int);
+	int (*check_flags)(int);
+	int (*flock)(struct file___5 *, int, struct file_lock *);
+	ssize_t (*splice_write)(struct pipe_inode_info *, struct file___5 *, loff_t *, size_t, unsigned int);
+	ssize_t (*splice_read)(struct file___5 *, loff_t *, struct pipe_inode_info *, size_t, unsigned int);
+	void (*splice_eof)(struct file___5 *);
+	int (*setlease)(struct file___5 *, int, struct file_lease **, void **);
+	long int (*fallocate)(struct file___5 *, int, loff_t, loff_t);
+	void (*show_fdinfo)(struct seq_file___3 *, struct file___5 *);
+	ssize_t (*copy_file_range)(struct file___5 *, loff_t, struct file___5 *, loff_t, size_t, unsigned int);
+	loff_t (*remap_file_range)(struct file___5 *, loff_t, struct file___5 *, loff_t, loff_t, unsigned int);
+	int (*fadvise)(struct file___5 *, loff_t, loff_t, int);
+	int (*uring_cmd)(struct io_uring_cmd *, unsigned int);
+	int (*uring_cmd_iopoll)(struct io_uring_cmd *, struct io_comp_batch *, unsigned int);
+	int (*mmap_prepare)(struct vm_area_desc___5 *);
+};
+
 struct tpm_chip;
 
 struct tpm_space;
@@ -83704,6 +86361,66 @@ struct file_system_type___2 {
 	void (*kill_sb)(struct super_block___2 *);
 	struct module___2 *owner;
 	struct file_system_type___2 *next;
+	struct hlist_head fs_supers;
+	struct lock_class_key s_lock_key;
+	struct lock_class_key s_umount_key;
+	struct lock_class_key s_vfs_rename_key;
+	struct lock_class_key s_writers_key[3];
+	struct lock_class_key i_lock_key;
+	struct lock_class_key i_mutex_key;
+	struct lock_class_key invalidate_lock_key;
+	struct lock_class_key i_mutex_dir_key;
+};
+
+struct file_system_type___3 {
+	const char *name;
+	int fs_flags;
+	int (*init_fs_context)(struct fs_context *);
+	const struct fs_parameter_spec *parameters;
+	struct dentry___4 * (*mount)(struct file_system_type___3 *, int, const char *, void *);
+	void (*kill_sb)(struct super_block___3 *);
+	struct module___3 *owner;
+	struct file_system_type___3 *next;
+	struct hlist_head fs_supers;
+	struct lock_class_key s_lock_key;
+	struct lock_class_key s_umount_key;
+	struct lock_class_key s_vfs_rename_key;
+	struct lock_class_key s_writers_key[3];
+	struct lock_class_key i_lock_key;
+	struct lock_class_key i_mutex_key;
+	struct lock_class_key invalidate_lock_key;
+	struct lock_class_key i_mutex_dir_key;
+};
+
+struct file_system_type___4 {
+	const char *name;
+	int fs_flags;
+	int (*init_fs_context)(struct fs_context *);
+	const struct fs_parameter_spec *parameters;
+	struct dentry___5 * (*mount)(struct file_system_type___4 *, int, const char *, void *);
+	void (*kill_sb)(struct super_block___4 *);
+	struct module___4 *owner;
+	struct file_system_type___4 *next;
+	struct hlist_head fs_supers;
+	struct lock_class_key s_lock_key;
+	struct lock_class_key s_umount_key;
+	struct lock_class_key s_vfs_rename_key;
+	struct lock_class_key s_writers_key[3];
+	struct lock_class_key i_lock_key;
+	struct lock_class_key i_mutex_key;
+	struct lock_class_key invalidate_lock_key;
+	struct lock_class_key i_mutex_dir_key;
+};
+
+struct file_system_type___5 {
+	const char *name;
+	int fs_flags;
+	int (*init_fs_context)(struct fs_context *);
+	const struct fs_parameter_spec *parameters;
+	struct dentry___3 * (*mount)(struct file_system_type___5 *, int, const char *, void *);
+	void (*kill_sb)(struct super_block___5 *);
+	struct module___5 *owner;
+	struct file_system_type___5 *next;
 	struct hlist_head fs_supers;
 	struct lock_class_key s_lock_key;
 	struct lock_class_key s_umount_key;
@@ -84900,11 +87617,357 @@ struct folio___2 {
 	};
 };
 
+struct page___4 {
+	memdesc_flags_t flags;
+	union {
+		struct {
+			union {
+				struct list_head lru;
+				struct list_head buddy_list;
+				struct list_head pcp_list;
+				struct llist_node pcp_llist;
+			};
+			struct address_space___3 *mapping;
+			union {
+				long unsigned int __folio_index;
+				long unsigned int share;
+			};
+			long unsigned int private;
+		};
+		struct {
+			long unsigned int pp_magic;
+			struct page_pool *pp;
+			long unsigned int _pp_mapping_pad;
+			long unsigned int dma_addr;
+			atomic_long_t pp_ref_count;
+		};
+		struct {
+			long unsigned int compound_head;
+		};
+		struct {
+			void *_unused_pgmap_compound_head;
+			void *zone_device_data;
+		};
+		struct callback_head callback_head;
+	};
+	union {
+		unsigned int page_type;
+		atomic_t _mapcount;
+	};
+	atomic_t _refcount;
+	long unsigned int memcg_data;
+};
+
+struct folio___3 {
+	union {
+		struct {
+			memdesc_flags_t flags;
+			union {
+				struct list_head lru;
+				struct {
+					void *__filler;
+					unsigned int mlock_count;
+				};
+				struct dev_pagemap___3 *pgmap;
+			};
+			struct address_space___3 *mapping;
+			union {
+				long unsigned int index;
+				long unsigned int share;
+			};
+			union {
+				void *private;
+				swp_entry_t swap;
+			};
+			atomic_t _mapcount;
+			atomic_t _refcount;
+			long unsigned int memcg_data;
+		};
+		struct page___4 page;
+	};
+	union {
+		struct {
+			long unsigned int _flags_1;
+			long unsigned int _head_1;
+			union {
+				struct {
+					atomic_t _large_mapcount;
+					atomic_t _nr_pages_mapped;
+					atomic_t _entire_mapcount;
+					atomic_t _pincount;
+					mm_id_mapcount_t _mm_id_mapcount[2];
+					union {
+						mm_id_t _mm_id[2];
+						long unsigned int _mm_ids;
+					};
+				};
+				long unsigned int _usable_1[4];
+			};
+			atomic_t _mapcount_1;
+			atomic_t _refcount_1;
+			unsigned int _nr_pages;
+		};
+		struct page___4 __page_1;
+	};
+	union {
+		struct {
+			long unsigned int _flags_2;
+			long unsigned int _head_2;
+			struct list_head _deferred_list;
+		};
+		struct page___4 __page_2;
+	};
+	union {
+		struct {
+			long unsigned int _flags_3;
+			long unsigned int _head_3;
+			void *_hugetlb_subpool;
+			void *_hugetlb_cgroup;
+			void *_hugetlb_cgroup_rsvd;
+			void *_hugetlb_hwpoison;
+		};
+		struct page___4 __page_3;
+	};
+};
+
+struct page___5 {
+	memdesc_flags_t flags;
+	union {
+		struct {
+			union {
+				struct list_head lru;
+				struct list_head buddy_list;
+				struct list_head pcp_list;
+				struct llist_node pcp_llist;
+			};
+			struct address_space___4 *mapping;
+			union {
+				long unsigned int __folio_index;
+				long unsigned int share;
+			};
+			long unsigned int private;
+		};
+		struct {
+			long unsigned int pp_magic;
+			struct page_pool *pp;
+			long unsigned int _pp_mapping_pad;
+			long unsigned int dma_addr;
+			atomic_long_t pp_ref_count;
+		};
+		struct {
+			long unsigned int compound_head;
+		};
+		struct {
+			void *_unused_pgmap_compound_head;
+			void *zone_device_data;
+		};
+		struct callback_head callback_head;
+	};
+	union {
+		unsigned int page_type;
+		atomic_t _mapcount;
+	};
+	atomic_t _refcount;
+	long unsigned int memcg_data;
+};
+
+struct folio___4 {
+	union {
+		struct {
+			memdesc_flags_t flags;
+			union {
+				struct list_head lru;
+				struct {
+					void *__filler;
+					unsigned int mlock_count;
+				};
+				struct dev_pagemap___4 *pgmap;
+			};
+			struct address_space___4 *mapping;
+			union {
+				long unsigned int index;
+				long unsigned int share;
+			};
+			union {
+				void *private;
+				swp_entry_t swap;
+			};
+			atomic_t _mapcount;
+			atomic_t _refcount;
+			long unsigned int memcg_data;
+		};
+		struct page___5 page;
+	};
+	union {
+		struct {
+			long unsigned int _flags_1;
+			long unsigned int _head_1;
+			union {
+				struct {
+					atomic_t _large_mapcount;
+					atomic_t _nr_pages_mapped;
+					atomic_t _entire_mapcount;
+					atomic_t _pincount;
+					mm_id_mapcount_t _mm_id_mapcount[2];
+					union {
+						mm_id_t _mm_id[2];
+						long unsigned int _mm_ids;
+					};
+				};
+				long unsigned int _usable_1[4];
+			};
+			atomic_t _mapcount_1;
+			atomic_t _refcount_1;
+			unsigned int _nr_pages;
+		};
+		struct page___5 __page_1;
+	};
+	union {
+		struct {
+			long unsigned int _flags_2;
+			long unsigned int _head_2;
+			struct list_head _deferred_list;
+		};
+		struct page___5 __page_2;
+	};
+	union {
+		struct {
+			long unsigned int _flags_3;
+			long unsigned int _head_3;
+			void *_hugetlb_subpool;
+			void *_hugetlb_cgroup;
+			void *_hugetlb_cgroup_rsvd;
+			void *_hugetlb_hwpoison;
+		};
+		struct page___5 __page_3;
+	};
+};
+
+struct page___3 {
+	memdesc_flags_t flags;
+	union {
+		struct {
+			union {
+				struct list_head lru;
+				struct list_head buddy_list;
+				struct list_head pcp_list;
+				struct llist_node pcp_llist;
+			};
+			struct address_space___5 *mapping;
+			union {
+				long unsigned int __folio_index;
+				long unsigned int share;
+			};
+			long unsigned int private;
+		};
+		struct {
+			long unsigned int pp_magic;
+			struct page_pool *pp;
+			long unsigned int _pp_mapping_pad;
+			long unsigned int dma_addr;
+			atomic_long_t pp_ref_count;
+		};
+		struct {
+			long unsigned int compound_head;
+		};
+		struct {
+			void *_unused_pgmap_compound_head;
+			void *zone_device_data;
+		};
+		struct callback_head callback_head;
+	};
+	union {
+		unsigned int page_type;
+		atomic_t _mapcount;
+	};
+	atomic_t _refcount;
+	long unsigned int memcg_data;
+};
+
+struct folio___5 {
+	union {
+		struct {
+			memdesc_flags_t flags;
+			union {
+				struct list_head lru;
+				struct {
+					void *__filler;
+					unsigned int mlock_count;
+				};
+				struct dev_pagemap___5 *pgmap;
+			};
+			struct address_space___5 *mapping;
+			union {
+				long unsigned int index;
+				long unsigned int share;
+			};
+			union {
+				void *private;
+				swp_entry_t swap;
+			};
+			atomic_t _mapcount;
+			atomic_t _refcount;
+			long unsigned int memcg_data;
+		};
+		struct page___3 page;
+	};
+	union {
+		struct {
+			long unsigned int _flags_1;
+			long unsigned int _head_1;
+			union {
+				struct {
+					atomic_t _large_mapcount;
+					atomic_t _nr_pages_mapped;
+					atomic_t _entire_mapcount;
+					atomic_t _pincount;
+					mm_id_mapcount_t _mm_id_mapcount[2];
+					union {
+						mm_id_t _mm_id[2];
+						long unsigned int _mm_ids;
+					};
+				};
+				long unsigned int _usable_1[4];
+			};
+			atomic_t _mapcount_1;
+			atomic_t _refcount_1;
+			unsigned int _nr_pages;
+		};
+		struct page___3 __page_1;
+	};
+	union {
+		struct {
+			long unsigned int _flags_2;
+			long unsigned int _head_2;
+			struct list_head _deferred_list;
+		};
+		struct page___3 __page_2;
+	};
+	union {
+		struct {
+			long unsigned int _flags_3;
+			long unsigned int _head_3;
+			void *_hugetlb_subpool;
+			void *_hugetlb_cgroup;
+			void *_hugetlb_cgroup_rsvd;
+			void *_hugetlb_hwpoison;
+		};
+		struct page___3 __page_3;
+	};
+};
+
 struct folio_batch___2 {
 	unsigned char nr;
 	unsigned char i;
 	bool percpu_pvec_drained;
 	struct folio___2 *folios[31];
+};
+
+struct folio_batch___3 {
+	unsigned char nr;
+	unsigned char i;
+	bool percpu_pvec_drained;
+	struct folio___5 *folios[31];
 };
 
 struct folio_iter {
@@ -84961,6 +88024,18 @@ struct folio_walk {
 
 struct follow_pfnmap_args {
 	struct vm_area_struct *vma;
+	long unsigned int address;
+	spinlock_t *lock;
+	pte_t *ptep;
+	long unsigned int pfn;
+	long unsigned int addr_mask;
+	pgprot_t pgprot;
+	bool writable;
+	bool special;
+};
+
+struct follow_pfnmap_args___2 {
+	struct vm_area_struct___5 *vma;
 	long unsigned int address;
 	spinlock_t *lock;
 	pte_t *ptep;
@@ -85040,6 +88115,42 @@ struct fown_struct___2 {
 	struct file___2 *file;
 	rwlock_t lock;
 	struct pid___2 *pid;
+	enum pid_type pid_type;
+	kuid_t uid;
+	kuid_t euid;
+	int signum;
+};
+
+struct pid___3;
+
+struct fown_struct___3 {
+	struct file___3 *file;
+	rwlock_t lock;
+	struct pid___3 *pid;
+	enum pid_type pid_type;
+	kuid_t uid;
+	kuid_t euid;
+	int signum;
+};
+
+struct pid___4;
+
+struct fown_struct___4 {
+	struct file___4 *file;
+	rwlock_t lock;
+	struct pid___4 *pid;
+	enum pid_type pid_type;
+	kuid_t uid;
+	kuid_t euid;
+	int signum;
+};
+
+struct pid___5;
+
+struct fown_struct___5 {
+	struct file___5 *file;
+	rwlock_t lock;
+	struct pid___5 *pid;
 	enum pid_type pid_type;
 	kuid_t uid;
 	kuid_t euid;
@@ -86726,6 +89837,30 @@ struct fwnode_endpoint___2 {
 	const struct fwnode_handle___2 *local_fwnode;
 };
 
+struct fwnode_endpoint___3 {
+	unsigned int port;
+	unsigned int id;
+	const struct fwnode_handle___4 *local_fwnode;
+};
+
+struct fwnode_endpoint___4 {
+	unsigned int port;
+	unsigned int id;
+	const struct fwnode_handle___5 *local_fwnode;
+};
+
+struct fwnode_endpoint___5 {
+	unsigned int port;
+	unsigned int id;
+	const struct fwnode_handle___6 *local_fwnode;
+};
+
+struct fwnode_endpoint___6 {
+	unsigned int port;
+	unsigned int id;
+	const struct fwnode_handle___3 *local_fwnode;
+};
+
 struct fwnode_link {
 	struct fwnode_handle *supplier;
 	struct list_head s_hook;
@@ -86790,6 +89925,118 @@ struct fwnode_operations___2 {
 	int (*add_links)(struct fwnode_handle___2 *);
 };
 
+struct fwnode_reference_args___3;
+
+struct fwnode_operations___3 {
+	struct fwnode_handle___4 * (*get)(struct fwnode_handle___4 *);
+	void (*put)(struct fwnode_handle___4 *);
+	bool (*device_is_available)(const struct fwnode_handle___4 *);
+	const void * (*device_get_match_data)(const struct fwnode_handle___4 *, const struct device___4 *);
+	bool (*device_dma_supported)(const struct fwnode_handle___4 *);
+	enum dev_dma_attr (*device_get_dma_attr)(const struct fwnode_handle___4 *);
+	bool (*property_present)(const struct fwnode_handle___4 *, const char *);
+	bool (*property_read_bool)(const struct fwnode_handle___4 *, const char *);
+	int (*property_read_int_array)(const struct fwnode_handle___4 *, const char *, unsigned int, void *, size_t);
+	int (*property_read_string_array)(const struct fwnode_handle___4 *, const char *, const char **, size_t);
+	const char * (*get_name)(const struct fwnode_handle___4 *);
+	const char * (*get_name_prefix)(const struct fwnode_handle___4 *);
+	struct fwnode_handle___4 * (*get_parent)(const struct fwnode_handle___4 *);
+	struct fwnode_handle___4 * (*get_next_child_node)(const struct fwnode_handle___4 *, struct fwnode_handle___4 *);
+	struct fwnode_handle___4 * (*get_named_child_node)(const struct fwnode_handle___4 *, const char *);
+	int (*get_reference_args)(const struct fwnode_handle___4 *, const char *, const char *, unsigned int, unsigned int, struct fwnode_reference_args___3 *);
+	struct fwnode_handle___4 * (*graph_get_next_endpoint)(const struct fwnode_handle___4 *, struct fwnode_handle___4 *);
+	struct fwnode_handle___4 * (*graph_get_remote_endpoint)(const struct fwnode_handle___4 *);
+	struct fwnode_handle___4 * (*graph_get_port_parent)(struct fwnode_handle___4 *);
+	int (*graph_parse_endpoint)(const struct fwnode_handle___4 *, struct fwnode_endpoint___3 *);
+	void * (*iomap)(struct fwnode_handle___4 *, int);
+	int (*irq_get)(const struct fwnode_handle___4 *, unsigned int);
+	int (*add_links)(struct fwnode_handle___4 *);
+};
+
+struct fwnode_reference_args___4;
+
+struct fwnode_operations___4 {
+	struct fwnode_handle___5 * (*get)(struct fwnode_handle___5 *);
+	void (*put)(struct fwnode_handle___5 *);
+	bool (*device_is_available)(const struct fwnode_handle___5 *);
+	const void * (*device_get_match_data)(const struct fwnode_handle___5 *, const struct device___5 *);
+	bool (*device_dma_supported)(const struct fwnode_handle___5 *);
+	enum dev_dma_attr (*device_get_dma_attr)(const struct fwnode_handle___5 *);
+	bool (*property_present)(const struct fwnode_handle___5 *, const char *);
+	bool (*property_read_bool)(const struct fwnode_handle___5 *, const char *);
+	int (*property_read_int_array)(const struct fwnode_handle___5 *, const char *, unsigned int, void *, size_t);
+	int (*property_read_string_array)(const struct fwnode_handle___5 *, const char *, const char **, size_t);
+	const char * (*get_name)(const struct fwnode_handle___5 *);
+	const char * (*get_name_prefix)(const struct fwnode_handle___5 *);
+	struct fwnode_handle___5 * (*get_parent)(const struct fwnode_handle___5 *);
+	struct fwnode_handle___5 * (*get_next_child_node)(const struct fwnode_handle___5 *, struct fwnode_handle___5 *);
+	struct fwnode_handle___5 * (*get_named_child_node)(const struct fwnode_handle___5 *, const char *);
+	int (*get_reference_args)(const struct fwnode_handle___5 *, const char *, const char *, unsigned int, unsigned int, struct fwnode_reference_args___4 *);
+	struct fwnode_handle___5 * (*graph_get_next_endpoint)(const struct fwnode_handle___5 *, struct fwnode_handle___5 *);
+	struct fwnode_handle___5 * (*graph_get_remote_endpoint)(const struct fwnode_handle___5 *);
+	struct fwnode_handle___5 * (*graph_get_port_parent)(struct fwnode_handle___5 *);
+	int (*graph_parse_endpoint)(const struct fwnode_handle___5 *, struct fwnode_endpoint___4 *);
+	void * (*iomap)(struct fwnode_handle___5 *, int);
+	int (*irq_get)(const struct fwnode_handle___5 *, unsigned int);
+	int (*add_links)(struct fwnode_handle___5 *);
+};
+
+struct fwnode_reference_args___5;
+
+struct fwnode_operations___5 {
+	struct fwnode_handle___6 * (*get)(struct fwnode_handle___6 *);
+	void (*put)(struct fwnode_handle___6 *);
+	bool (*device_is_available)(const struct fwnode_handle___6 *);
+	const void * (*device_get_match_data)(const struct fwnode_handle___6 *, const struct device___6 *);
+	bool (*device_dma_supported)(const struct fwnode_handle___6 *);
+	enum dev_dma_attr (*device_get_dma_attr)(const struct fwnode_handle___6 *);
+	bool (*property_present)(const struct fwnode_handle___6 *, const char *);
+	bool (*property_read_bool)(const struct fwnode_handle___6 *, const char *);
+	int (*property_read_int_array)(const struct fwnode_handle___6 *, const char *, unsigned int, void *, size_t);
+	int (*property_read_string_array)(const struct fwnode_handle___6 *, const char *, const char **, size_t);
+	const char * (*get_name)(const struct fwnode_handle___6 *);
+	const char * (*get_name_prefix)(const struct fwnode_handle___6 *);
+	struct fwnode_handle___6 * (*get_parent)(const struct fwnode_handle___6 *);
+	struct fwnode_handle___6 * (*get_next_child_node)(const struct fwnode_handle___6 *, struct fwnode_handle___6 *);
+	struct fwnode_handle___6 * (*get_named_child_node)(const struct fwnode_handle___6 *, const char *);
+	int (*get_reference_args)(const struct fwnode_handle___6 *, const char *, const char *, unsigned int, unsigned int, struct fwnode_reference_args___5 *);
+	struct fwnode_handle___6 * (*graph_get_next_endpoint)(const struct fwnode_handle___6 *, struct fwnode_handle___6 *);
+	struct fwnode_handle___6 * (*graph_get_remote_endpoint)(const struct fwnode_handle___6 *);
+	struct fwnode_handle___6 * (*graph_get_port_parent)(struct fwnode_handle___6 *);
+	int (*graph_parse_endpoint)(const struct fwnode_handle___6 *, struct fwnode_endpoint___5 *);
+	void * (*iomap)(struct fwnode_handle___6 *, int);
+	int (*irq_get)(const struct fwnode_handle___6 *, unsigned int);
+	int (*add_links)(struct fwnode_handle___6 *);
+};
+
+struct fwnode_reference_args___6;
+
+struct fwnode_operations___6 {
+	struct fwnode_handle___3 * (*get)(struct fwnode_handle___3 *);
+	void (*put)(struct fwnode_handle___3 *);
+	bool (*device_is_available)(const struct fwnode_handle___3 *);
+	const void * (*device_get_match_data)(const struct fwnode_handle___3 *, const struct device___3 *);
+	bool (*device_dma_supported)(const struct fwnode_handle___3 *);
+	enum dev_dma_attr (*device_get_dma_attr)(const struct fwnode_handle___3 *);
+	bool (*property_present)(const struct fwnode_handle___3 *, const char *);
+	bool (*property_read_bool)(const struct fwnode_handle___3 *, const char *);
+	int (*property_read_int_array)(const struct fwnode_handle___3 *, const char *, unsigned int, void *, size_t);
+	int (*property_read_string_array)(const struct fwnode_handle___3 *, const char *, const char **, size_t);
+	const char * (*get_name)(const struct fwnode_handle___3 *);
+	const char * (*get_name_prefix)(const struct fwnode_handle___3 *);
+	struct fwnode_handle___3 * (*get_parent)(const struct fwnode_handle___3 *);
+	struct fwnode_handle___3 * (*get_next_child_node)(const struct fwnode_handle___3 *, struct fwnode_handle___3 *);
+	struct fwnode_handle___3 * (*get_named_child_node)(const struct fwnode_handle___3 *, const char *);
+	int (*get_reference_args)(const struct fwnode_handle___3 *, const char *, const char *, unsigned int, unsigned int, struct fwnode_reference_args___6 *);
+	struct fwnode_handle___3 * (*graph_get_next_endpoint)(const struct fwnode_handle___3 *, struct fwnode_handle___3 *);
+	struct fwnode_handle___3 * (*graph_get_remote_endpoint)(const struct fwnode_handle___3 *);
+	struct fwnode_handle___3 * (*graph_get_port_parent)(struct fwnode_handle___3 *);
+	int (*graph_parse_endpoint)(const struct fwnode_handle___3 *, struct fwnode_endpoint___6 *);
+	void * (*iomap)(struct fwnode_handle___3 *, int);
+	int (*irq_get)(const struct fwnode_handle___3 *, unsigned int);
+	int (*add_links)(struct fwnode_handle___3 *);
+};
+
 struct fwnode_reference_args {
 	struct fwnode_handle *fwnode;
 	unsigned int nargs;
@@ -86798,6 +90045,30 @@ struct fwnode_reference_args {
 
 struct fwnode_reference_args___2 {
 	struct fwnode_handle___2 *fwnode;
+	unsigned int nargs;
+	u64 args[16];
+};
+
+struct fwnode_reference_args___3 {
+	struct fwnode_handle___4 *fwnode;
+	unsigned int nargs;
+	u64 args[16];
+};
+
+struct fwnode_reference_args___4 {
+	struct fwnode_handle___5 *fwnode;
+	unsigned int nargs;
+	u64 args[16];
+};
+
+struct fwnode_reference_args___5 {
+	struct fwnode_handle___6 *fwnode;
+	unsigned int nargs;
+	u64 args[16];
+};
+
+struct fwnode_reference_args___6 {
+	struct fwnode_handle___3 *fwnode;
 	unsigned int nargs;
 	u64 args[16];
 };
@@ -91376,6 +94647,60 @@ struct iattr___2 {
 	struct file___2 *ia_file;
 };
 
+struct iattr___3 {
+	unsigned int ia_valid;
+	umode_t ia_mode;
+	union {
+		kuid_t ia_uid;
+		vfsuid_t ia_vfsuid;
+	};
+	union {
+		kgid_t ia_gid;
+		vfsgid_t ia_vfsgid;
+	};
+	loff_t ia_size;
+	struct timespec64 ia_atime;
+	struct timespec64 ia_mtime;
+	struct timespec64 ia_ctime;
+	struct file___3 *ia_file;
+};
+
+struct iattr___4 {
+	unsigned int ia_valid;
+	umode_t ia_mode;
+	union {
+		kuid_t ia_uid;
+		vfsuid_t ia_vfsuid;
+	};
+	union {
+		kgid_t ia_gid;
+		vfsgid_t ia_vfsgid;
+	};
+	loff_t ia_size;
+	struct timespec64 ia_atime;
+	struct timespec64 ia_mtime;
+	struct timespec64 ia_ctime;
+	struct file___4 *ia_file;
+};
+
+struct iattr___5 {
+	unsigned int ia_valid;
+	umode_t ia_mode;
+	union {
+		kuid_t ia_uid;
+		vfsuid_t ia_vfsuid;
+	};
+	union {
+		kgid_t ia_gid;
+		vfsgid_t ia_vfsgid;
+	};
+	loff_t ia_size;
+	struct timespec64 ia_atime;
+	struct timespec64 ia_mtime;
+	struct timespec64 ia_ctime;
+	struct file___5 *ia_file;
+};
+
 struct ib_pd;
 
 struct ib_uobject;
@@ -93442,6 +96767,11 @@ struct ifslave {
 
 typedef struct ifslave ifslave;
 
+struct igd_opregion_vbt {
+	void *opregion;
+	void *vbt_ex;
+};
+
 struct igmp6_mc_iter_state {
 	struct seq_net_private p;
 	struct net_device *dev;
@@ -94635,6 +97965,237 @@ struct inode___2 {
 	void *i_private;
 };
 
+struct inode_operations___3;
+
+struct inode___3 {
+	umode_t i_mode;
+	short unsigned int i_opflags;
+	kuid_t i_uid;
+	kgid_t i_gid;
+	unsigned int i_flags;
+	struct posix_acl *i_acl;
+	struct posix_acl *i_default_acl;
+	const struct inode_operations___3 *i_op;
+	struct super_block___3 *i_sb;
+	struct address_space___3 *i_mapping;
+	void *i_security;
+	long unsigned int i_ino;
+	union {
+		const unsigned int i_nlink;
+		unsigned int __i_nlink;
+	};
+	dev_t i_rdev;
+	loff_t i_size;
+	time64_t i_atime_sec;
+	time64_t i_mtime_sec;
+	time64_t i_ctime_sec;
+	u32 i_atime_nsec;
+	u32 i_mtime_nsec;
+	u32 i_ctime_nsec;
+	u32 i_generation;
+	spinlock_t i_lock;
+	short unsigned int i_bytes;
+	u8 i_blkbits;
+	enum rw_hint i_write_hint;
+	blkcnt_t i_blocks;
+	enum inode_state_flags_t i_state;
+	struct rw_semaphore i_rwsem;
+	long unsigned int dirtied_when;
+	long unsigned int dirtied_time_when;
+	struct hlist_node i_hash;
+	struct list_head i_io_list;
+	struct bdi_writeback *i_wb;
+	int i_wb_frn_winner;
+	u16 i_wb_frn_avg_time;
+	u16 i_wb_frn_history;
+	struct list_head i_lru;
+	struct list_head i_sb_list;
+	struct list_head i_wb_list;
+	union {
+		struct hlist_head i_dentry;
+		struct callback_head i_rcu;
+	};
+	atomic64_t i_version;
+	atomic64_t i_sequence;
+	atomic_t i_count;
+	atomic_t i_dio_count;
+	atomic_t i_writecount;
+	atomic_t i_readcount;
+	union {
+		const struct file_operations___3 *i_fop;
+		void (*free_inode)(struct inode___3 *);
+	};
+	struct file_lock_context *i_flctx;
+	struct address_space___3 i_data;
+	union {
+		struct list_head i_devices;
+		int i_linklen;
+	};
+	union {
+		struct pipe_inode_info *i_pipe;
+		struct cdev___3 *i_cdev;
+		char *i_link;
+		unsigned int i_dir_seq;
+	};
+	__u32 i_fsnotify_mask;
+	struct fsnotify_mark_connector *i_fsnotify_marks;
+	void *i_private;
+};
+
+struct inode_operations___4;
+
+struct inode___4 {
+	umode_t i_mode;
+	short unsigned int i_opflags;
+	kuid_t i_uid;
+	kgid_t i_gid;
+	unsigned int i_flags;
+	struct posix_acl *i_acl;
+	struct posix_acl *i_default_acl;
+	const struct inode_operations___4 *i_op;
+	struct super_block___4 *i_sb;
+	struct address_space___4 *i_mapping;
+	void *i_security;
+	long unsigned int i_ino;
+	union {
+		const unsigned int i_nlink;
+		unsigned int __i_nlink;
+	};
+	dev_t i_rdev;
+	loff_t i_size;
+	time64_t i_atime_sec;
+	time64_t i_mtime_sec;
+	time64_t i_ctime_sec;
+	u32 i_atime_nsec;
+	u32 i_mtime_nsec;
+	u32 i_ctime_nsec;
+	u32 i_generation;
+	spinlock_t i_lock;
+	short unsigned int i_bytes;
+	u8 i_blkbits;
+	enum rw_hint i_write_hint;
+	blkcnt_t i_blocks;
+	enum inode_state_flags_t i_state;
+	struct rw_semaphore i_rwsem;
+	long unsigned int dirtied_when;
+	long unsigned int dirtied_time_when;
+	struct hlist_node i_hash;
+	struct list_head i_io_list;
+	struct bdi_writeback *i_wb;
+	int i_wb_frn_winner;
+	u16 i_wb_frn_avg_time;
+	u16 i_wb_frn_history;
+	struct list_head i_lru;
+	struct list_head i_sb_list;
+	struct list_head i_wb_list;
+	union {
+		struct hlist_head i_dentry;
+		struct callback_head i_rcu;
+	};
+	atomic64_t i_version;
+	atomic64_t i_sequence;
+	atomic_t i_count;
+	atomic_t i_dio_count;
+	atomic_t i_writecount;
+	atomic_t i_readcount;
+	union {
+		const struct file_operations___4 *i_fop;
+		void (*free_inode)(struct inode___4 *);
+	};
+	struct file_lock_context *i_flctx;
+	struct address_space___4 i_data;
+	union {
+		struct list_head i_devices;
+		int i_linklen;
+	};
+	union {
+		struct pipe_inode_info *i_pipe;
+		struct cdev___4 *i_cdev;
+		char *i_link;
+		unsigned int i_dir_seq;
+	};
+	__u32 i_fsnotify_mask;
+	struct fsnotify_mark_connector *i_fsnotify_marks;
+	void *i_private;
+};
+
+struct inode_operations___5;
+
+struct inode___5 {
+	umode_t i_mode;
+	short unsigned int i_opflags;
+	kuid_t i_uid;
+	kgid_t i_gid;
+	unsigned int i_flags;
+	struct posix_acl *i_acl;
+	struct posix_acl *i_default_acl;
+	const struct inode_operations___5 *i_op;
+	struct super_block___5 *i_sb;
+	struct address_space___5 *i_mapping;
+	void *i_security;
+	long unsigned int i_ino;
+	union {
+		const unsigned int i_nlink;
+		unsigned int __i_nlink;
+	};
+	dev_t i_rdev;
+	loff_t i_size;
+	time64_t i_atime_sec;
+	time64_t i_mtime_sec;
+	time64_t i_ctime_sec;
+	u32 i_atime_nsec;
+	u32 i_mtime_nsec;
+	u32 i_ctime_nsec;
+	u32 i_generation;
+	spinlock_t i_lock;
+	short unsigned int i_bytes;
+	u8 i_blkbits;
+	enum rw_hint i_write_hint;
+	blkcnt_t i_blocks;
+	enum inode_state_flags_t i_state;
+	struct rw_semaphore i_rwsem;
+	long unsigned int dirtied_when;
+	long unsigned int dirtied_time_when;
+	struct hlist_node i_hash;
+	struct list_head i_io_list;
+	struct bdi_writeback___3 *i_wb;
+	int i_wb_frn_winner;
+	u16 i_wb_frn_avg_time;
+	u16 i_wb_frn_history;
+	struct list_head i_lru;
+	struct list_head i_sb_list;
+	struct list_head i_wb_list;
+	union {
+		struct hlist_head i_dentry;
+		struct callback_head i_rcu;
+	};
+	atomic64_t i_version;
+	atomic64_t i_sequence;
+	atomic_t i_count;
+	atomic_t i_dio_count;
+	atomic_t i_writecount;
+	atomic_t i_readcount;
+	union {
+		const struct file_operations___5 *i_fop;
+		void (*free_inode)(struct inode___5 *);
+	};
+	struct file_lock_context *i_flctx;
+	struct address_space___5 i_data;
+	union {
+		struct list_head i_devices;
+		int i_linklen;
+	};
+	union {
+		struct pipe_inode_info *i_pipe;
+		struct cdev___5 *i_cdev;
+		char *i_link;
+		unsigned int i_dir_seq;
+	};
+	__u32 i_fsnotify_mask;
+	struct fsnotify_mark_connector *i_fsnotify_marks;
+	void *i_private;
+};
+
 struct inode_defrag {
 	struct rb_node rb_node;
 	u64 ino;
@@ -94716,6 +98277,111 @@ struct inode_operations___2 {
 	int (*fileattr_set)(struct mnt_idmap *, struct dentry___2 *, struct file_kattr *);
 	int (*fileattr_get)(struct dentry___2 *, struct file_kattr *);
 	struct offset_ctx * (*get_offset_ctx)(struct inode___2 *);
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
+struct inode_operations___3 {
+	struct dentry___4 * (*lookup)(struct inode___3 *, struct dentry___4 *, unsigned int);
+	const char * (*get_link)(struct dentry___4 *, struct inode___3 *, struct delayed_call *);
+	int (*permission)(struct mnt_idmap *, struct inode___3 *, int);
+	struct posix_acl * (*get_inode_acl)(struct inode___3 *, int, bool);
+	int (*readlink)(struct dentry___4 *, char *, int);
+	int (*create)(struct mnt_idmap *, struct inode___3 *, struct dentry___4 *, umode_t, bool);
+	int (*link)(struct dentry___4 *, struct inode___3 *, struct dentry___4 *);
+	int (*unlink)(struct inode___3 *, struct dentry___4 *);
+	int (*symlink)(struct mnt_idmap *, struct inode___3 *, struct dentry___4 *, const char *);
+	struct dentry___4 * (*mkdir)(struct mnt_idmap *, struct inode___3 *, struct dentry___4 *, umode_t);
+	int (*rmdir)(struct inode___3 *, struct dentry___4 *);
+	int (*mknod)(struct mnt_idmap *, struct inode___3 *, struct dentry___4 *, umode_t, dev_t);
+	int (*rename)(struct mnt_idmap *, struct inode___3 *, struct dentry___4 *, struct inode___3 *, struct dentry___4 *, unsigned int);
+	int (*setattr)(struct mnt_idmap *, struct dentry___4 *, struct iattr___3 *);
+	int (*getattr)(struct mnt_idmap *, const struct path___3 *, struct kstat *, u32, unsigned int);
+	ssize_t (*listxattr)(struct dentry___4 *, char *, size_t);
+	int (*fiemap)(struct inode___3 *, struct fiemap_extent_info *, u64, u64);
+	int (*update_time)(struct inode___3 *, int);
+	int (*atomic_open)(struct inode___3 *, struct dentry___4 *, struct file___3 *, unsigned int, umode_t);
+	int (*tmpfile)(struct mnt_idmap *, struct inode___3 *, struct file___3 *, umode_t);
+	struct posix_acl * (*get_acl)(struct mnt_idmap *, struct dentry___4 *, int);
+	int (*set_acl)(struct mnt_idmap *, struct dentry___4 *, struct posix_acl *, int);
+	int (*fileattr_set)(struct mnt_idmap *, struct dentry___4 *, struct file_kattr *);
+	int (*fileattr_get)(struct dentry___4 *, struct file_kattr *);
+	struct offset_ctx * (*get_offset_ctx)(struct inode___3 *);
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
+struct inode_operations___4 {
+	struct dentry___5 * (*lookup)(struct inode___4 *, struct dentry___5 *, unsigned int);
+	const char * (*get_link)(struct dentry___5 *, struct inode___4 *, struct delayed_call *);
+	int (*permission)(struct mnt_idmap *, struct inode___4 *, int);
+	struct posix_acl * (*get_inode_acl)(struct inode___4 *, int, bool);
+	int (*readlink)(struct dentry___5 *, char *, int);
+	int (*create)(struct mnt_idmap *, struct inode___4 *, struct dentry___5 *, umode_t, bool);
+	int (*link)(struct dentry___5 *, struct inode___4 *, struct dentry___5 *);
+	int (*unlink)(struct inode___4 *, struct dentry___5 *);
+	int (*symlink)(struct mnt_idmap *, struct inode___4 *, struct dentry___5 *, const char *);
+	struct dentry___5 * (*mkdir)(struct mnt_idmap *, struct inode___4 *, struct dentry___5 *, umode_t);
+	int (*rmdir)(struct inode___4 *, struct dentry___5 *);
+	int (*mknod)(struct mnt_idmap *, struct inode___4 *, struct dentry___5 *, umode_t, dev_t);
+	int (*rename)(struct mnt_idmap *, struct inode___4 *, struct dentry___5 *, struct inode___4 *, struct dentry___5 *, unsigned int);
+	int (*setattr)(struct mnt_idmap *, struct dentry___5 *, struct iattr___4 *);
+	int (*getattr)(struct mnt_idmap *, const struct path___4 *, struct kstat *, u32, unsigned int);
+	ssize_t (*listxattr)(struct dentry___5 *, char *, size_t);
+	int (*fiemap)(struct inode___4 *, struct fiemap_extent_info *, u64, u64);
+	int (*update_time)(struct inode___4 *, int);
+	int (*atomic_open)(struct inode___4 *, struct dentry___5 *, struct file___4 *, unsigned int, umode_t);
+	int (*tmpfile)(struct mnt_idmap *, struct inode___4 *, struct file___4 *, umode_t);
+	struct posix_acl * (*get_acl)(struct mnt_idmap *, struct dentry___5 *, int);
+	int (*set_acl)(struct mnt_idmap *, struct dentry___5 *, struct posix_acl *, int);
+	int (*fileattr_set)(struct mnt_idmap *, struct dentry___5 *, struct file_kattr *);
+	int (*fileattr_get)(struct dentry___5 *, struct file_kattr *);
+	struct offset_ctx * (*get_offset_ctx)(struct inode___4 *);
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
+struct inode_operations___5 {
+	struct dentry___3 * (*lookup)(struct inode___5 *, struct dentry___3 *, unsigned int);
+	const char * (*get_link)(struct dentry___3 *, struct inode___5 *, struct delayed_call *);
+	int (*permission)(struct mnt_idmap *, struct inode___5 *, int);
+	struct posix_acl * (*get_inode_acl)(struct inode___5 *, int, bool);
+	int (*readlink)(struct dentry___3 *, char *, int);
+	int (*create)(struct mnt_idmap *, struct inode___5 *, struct dentry___3 *, umode_t, bool);
+	int (*link)(struct dentry___3 *, struct inode___5 *, struct dentry___3 *);
+	int (*unlink)(struct inode___5 *, struct dentry___3 *);
+	int (*symlink)(struct mnt_idmap *, struct inode___5 *, struct dentry___3 *, const char *);
+	struct dentry___3 * (*mkdir)(struct mnt_idmap *, struct inode___5 *, struct dentry___3 *, umode_t);
+	int (*rmdir)(struct inode___5 *, struct dentry___3 *);
+	int (*mknod)(struct mnt_idmap *, struct inode___5 *, struct dentry___3 *, umode_t, dev_t);
+	int (*rename)(struct mnt_idmap *, struct inode___5 *, struct dentry___3 *, struct inode___5 *, struct dentry___3 *, unsigned int);
+	int (*setattr)(struct mnt_idmap *, struct dentry___3 *, struct iattr___5 *);
+	int (*getattr)(struct mnt_idmap *, const struct path___5 *, struct kstat *, u32, unsigned int);
+	ssize_t (*listxattr)(struct dentry___3 *, char *, size_t);
+	int (*fiemap)(struct inode___5 *, struct fiemap_extent_info *, u64, u64);
+	int (*update_time)(struct inode___5 *, int);
+	int (*atomic_open)(struct inode___5 *, struct dentry___3 *, struct file___5 *, unsigned int, umode_t);
+	int (*tmpfile)(struct mnt_idmap *, struct inode___5 *, struct file___5 *, umode_t);
+	struct posix_acl * (*get_acl)(struct mnt_idmap *, struct dentry___3 *, int);
+	int (*set_acl)(struct mnt_idmap *, struct dentry___3 *, struct posix_acl *, int);
+	int (*fileattr_set)(struct mnt_idmap *, struct dentry___3 *, struct file_kattr *);
+	int (*fileattr_get)(struct dentry___3 *, struct file_kattr *);
+	struct offset_ctx * (*get_offset_ctx)(struct inode___5 *);
 	long: 64;
 	long: 64;
 	long: 64;
@@ -97684,6 +101350,30 @@ struct iommu_attach_handle___2 {
 	struct iommu_domain___2 *domain;
 };
 
+struct iommu_domain___3;
+
+struct iommu_attach_handle___3 {
+	struct iommu_domain___3 *domain;
+};
+
+struct iommu_domain___4;
+
+struct iommu_attach_handle___4 {
+	struct iommu_domain___4 *domain;
+};
+
+struct iommu_domain___5;
+
+struct iommu_attach_handle___5 {
+	struct iommu_domain___5 *domain;
+};
+
+struct iommu_domain___6;
+
+struct iommu_attach_handle___6 {
+	struct iommu_domain___6 *domain;
+};
+
 struct iommu_cmd {
 	u32 data[4];
 };
@@ -97725,6 +101415,54 @@ struct iommu_device___2 {
 	bool ready;
 };
 
+struct iommu_ops___3;
+
+struct iommu_device___3 {
+	struct list_head list;
+	const struct iommu_ops___3 *ops;
+	struct fwnode_handle___4 *fwnode;
+	struct device___4 *dev;
+	struct iommu_group *singleton_group;
+	u32 max_pasids;
+	bool ready;
+};
+
+struct iommu_ops___4;
+
+struct iommu_device___4 {
+	struct list_head list;
+	const struct iommu_ops___4 *ops;
+	struct fwnode_handle___5 *fwnode;
+	struct device___5 *dev;
+	struct iommu_group *singleton_group;
+	u32 max_pasids;
+	bool ready;
+};
+
+struct iommu_ops___5;
+
+struct iommu_device___5 {
+	struct list_head list;
+	const struct iommu_ops___5 *ops;
+	struct fwnode_handle___6 *fwnode;
+	struct device___6 *dev;
+	struct iommu_group *singleton_group;
+	u32 max_pasids;
+	bool ready;
+};
+
+struct iommu_ops___6;
+
+struct iommu_device___6 {
+	struct list_head list;
+	const struct iommu_ops___6 *ops;
+	struct fwnode_handle___3 *fwnode;
+	struct device___3 *dev;
+	struct iommu_group *singleton_group;
+	u32 max_pasids;
+	bool ready;
+};
+
 struct iova_bitmap;
 
 struct iommu_dirty_bitmap {
@@ -97740,6 +101478,26 @@ struct iommu_dirty_ops {
 struct iommu_dirty_ops___2 {
 	int (*set_dirty_tracking)(struct iommu_domain___2 *, bool);
 	int (*read_and_clear_dirty)(struct iommu_domain___2 *, long unsigned int, size_t, long unsigned int, struct iommu_dirty_bitmap *);
+};
+
+struct iommu_dirty_ops___3 {
+	int (*set_dirty_tracking)(struct iommu_domain___3 *, bool);
+	int (*read_and_clear_dirty)(struct iommu_domain___3 *, long unsigned int, size_t, long unsigned int, struct iommu_dirty_bitmap *);
+};
+
+struct iommu_dirty_ops___4 {
+	int (*set_dirty_tracking)(struct iommu_domain___4 *, bool);
+	int (*read_and_clear_dirty)(struct iommu_domain___4 *, long unsigned int, size_t, long unsigned int, struct iommu_dirty_bitmap *);
+};
+
+struct iommu_dirty_ops___5 {
+	int (*set_dirty_tracking)(struct iommu_domain___5 *, bool);
+	int (*read_and_clear_dirty)(struct iommu_domain___5 *, long unsigned int, size_t, long unsigned int, struct iommu_dirty_bitmap *);
+};
+
+struct iommu_dirty_ops___6 {
+	int (*set_dirty_tracking)(struct iommu_domain___6 *, bool);
+	int (*read_and_clear_dirty)(struct iommu_domain___6 *, long unsigned int, size_t, long unsigned int, struct iommu_dirty_bitmap *);
 };
 
 struct iova {
@@ -97831,6 +101589,136 @@ struct iommu_domain___2 {
 	};
 };
 
+typedef int (*iommu_fault_handler_t___3)(struct iommu_domain___3 *, struct device___4 *, long unsigned int, int, void *);
+
+struct iommu_domain_ops___3;
+
+struct iopf_group___3;
+
+struct mm_struct___3;
+
+struct iommu_domain___3 {
+	unsigned int type;
+	enum iommu_domain_cookie_type cookie_type;
+	const struct iommu_domain_ops___3 *ops;
+	const struct iommu_dirty_ops___3 *dirty_ops;
+	const struct iommu_ops___3 *owner;
+	long unsigned int pgsize_bitmap;
+	struct iommu_domain_geometry geometry;
+	int (*iopf_handler)(struct iopf_group___3 *);
+	union {
+		struct iommu_dma_cookie *iova_cookie;
+		struct iommu_dma_msi_cookie *msi_cookie;
+		struct iommufd_hw_pagetable *iommufd_hwpt;
+		struct {
+			iommu_fault_handler_t___3 handler;
+			void *handler_token;
+		};
+		struct {
+			struct mm_struct___3 *mm;
+			int users;
+			struct list_head next;
+		};
+	};
+};
+
+typedef int (*iommu_fault_handler_t___4)(struct iommu_domain___4 *, struct device___5 *, long unsigned int, int, void *);
+
+struct iommu_domain_ops___4;
+
+struct iopf_group___4;
+
+struct mm_struct___4;
+
+struct iommu_domain___4 {
+	unsigned int type;
+	enum iommu_domain_cookie_type cookie_type;
+	const struct iommu_domain_ops___4 *ops;
+	const struct iommu_dirty_ops___4 *dirty_ops;
+	const struct iommu_ops___4 *owner;
+	long unsigned int pgsize_bitmap;
+	struct iommu_domain_geometry geometry;
+	int (*iopf_handler)(struct iopf_group___4 *);
+	union {
+		struct iommu_dma_cookie *iova_cookie;
+		struct iommu_dma_msi_cookie *msi_cookie;
+		struct iommufd_hw_pagetable *iommufd_hwpt;
+		struct {
+			iommu_fault_handler_t___4 handler;
+			void *handler_token;
+		};
+		struct {
+			struct mm_struct___4 *mm;
+			int users;
+			struct list_head next;
+		};
+	};
+};
+
+typedef int (*iommu_fault_handler_t___5)(struct iommu_domain___5 *, struct device___6 *, long unsigned int, int, void *);
+
+struct iommu_domain_ops___5;
+
+struct iopf_group___5;
+
+struct iommu_domain___5 {
+	unsigned int type;
+	enum iommu_domain_cookie_type cookie_type;
+	const struct iommu_domain_ops___5 *ops;
+	const struct iommu_dirty_ops___5 *dirty_ops;
+	const struct iommu_ops___5 *owner;
+	long unsigned int pgsize_bitmap;
+	struct iommu_domain_geometry geometry;
+	int (*iopf_handler)(struct iopf_group___5 *);
+	union {
+		struct iommu_dma_cookie *iova_cookie;
+		struct iommu_dma_msi_cookie *msi_cookie;
+		struct iommufd_hw_pagetable *iommufd_hwpt;
+		struct {
+			iommu_fault_handler_t___5 handler;
+			void *handler_token;
+		};
+		struct {
+			struct mm_struct___4 *mm;
+			int users;
+			struct list_head next;
+		};
+	};
+};
+
+typedef int (*iommu_fault_handler_t___6)(struct iommu_domain___6 *, struct device___3 *, long unsigned int, int, void *);
+
+struct iommu_domain_ops___6;
+
+struct iopf_group___6;
+
+struct mm_struct___5;
+
+struct iommu_domain___6 {
+	unsigned int type;
+	enum iommu_domain_cookie_type cookie_type;
+	const struct iommu_domain_ops___6 *ops;
+	const struct iommu_dirty_ops___6 *dirty_ops;
+	const struct iommu_ops___6 *owner;
+	long unsigned int pgsize_bitmap;
+	struct iommu_domain_geometry geometry;
+	int (*iopf_handler)(struct iopf_group___6 *);
+	union {
+		struct iommu_dma_cookie *iova_cookie;
+		struct iommu_dma_msi_cookie *msi_cookie;
+		struct iommufd_hw_pagetable *iommufd_hwpt;
+		struct {
+			iommu_fault_handler_t___6 handler;
+			void *handler_token;
+		};
+		struct {
+			struct mm_struct___5 *mm;
+			int users;
+			struct list_head next;
+		};
+	};
+};
+
 struct iommu_domain_info {
 	struct intel_iommu *iommu;
 	unsigned int refcnt;
@@ -97869,6 +101757,66 @@ struct iommu_domain_ops___2 {
 	void (*free)(struct iommu_domain___2 *);
 };
 
+struct iommu_domain_ops___3 {
+	int (*attach_dev)(struct iommu_domain___3 *, struct device___4 *);
+	int (*set_dev_pasid)(struct iommu_domain___3 *, struct device___4 *, ioasid_t, struct iommu_domain___3 *);
+	int (*map_pages)(struct iommu_domain___3 *, long unsigned int, phys_addr_t, size_t, size_t, int, gfp_t, size_t *);
+	size_t (*unmap_pages)(struct iommu_domain___3 *, long unsigned int, size_t, size_t, struct iommu_iotlb_gather *);
+	void (*flush_iotlb_all)(struct iommu_domain___3 *);
+	int (*iotlb_sync_map)(struct iommu_domain___3 *, long unsigned int, size_t);
+	void (*iotlb_sync)(struct iommu_domain___3 *, struct iommu_iotlb_gather *);
+	int (*cache_invalidate_user)(struct iommu_domain___3 *, struct iommu_user_data_array *);
+	phys_addr_t (*iova_to_phys)(struct iommu_domain___3 *, dma_addr_t);
+	bool (*enforce_cache_coherency)(struct iommu_domain___3 *);
+	int (*set_pgtable_quirks)(struct iommu_domain___3 *, long unsigned int);
+	void (*free)(struct iommu_domain___3 *);
+};
+
+struct iommu_domain_ops___4 {
+	int (*attach_dev)(struct iommu_domain___4 *, struct device___5 *);
+	int (*set_dev_pasid)(struct iommu_domain___4 *, struct device___5 *, ioasid_t, struct iommu_domain___4 *);
+	int (*map_pages)(struct iommu_domain___4 *, long unsigned int, phys_addr_t, size_t, size_t, int, gfp_t, size_t *);
+	size_t (*unmap_pages)(struct iommu_domain___4 *, long unsigned int, size_t, size_t, struct iommu_iotlb_gather *);
+	void (*flush_iotlb_all)(struct iommu_domain___4 *);
+	int (*iotlb_sync_map)(struct iommu_domain___4 *, long unsigned int, size_t);
+	void (*iotlb_sync)(struct iommu_domain___4 *, struct iommu_iotlb_gather *);
+	int (*cache_invalidate_user)(struct iommu_domain___4 *, struct iommu_user_data_array *);
+	phys_addr_t (*iova_to_phys)(struct iommu_domain___4 *, dma_addr_t);
+	bool (*enforce_cache_coherency)(struct iommu_domain___4 *);
+	int (*set_pgtable_quirks)(struct iommu_domain___4 *, long unsigned int);
+	void (*free)(struct iommu_domain___4 *);
+};
+
+struct iommu_domain_ops___5 {
+	int (*attach_dev)(struct iommu_domain___5 *, struct device___6 *);
+	int (*set_dev_pasid)(struct iommu_domain___5 *, struct device___6 *, ioasid_t, struct iommu_domain___5 *);
+	int (*map_pages)(struct iommu_domain___5 *, long unsigned int, phys_addr_t, size_t, size_t, int, gfp_t, size_t *);
+	size_t (*unmap_pages)(struct iommu_domain___5 *, long unsigned int, size_t, size_t, struct iommu_iotlb_gather *);
+	void (*flush_iotlb_all)(struct iommu_domain___5 *);
+	int (*iotlb_sync_map)(struct iommu_domain___5 *, long unsigned int, size_t);
+	void (*iotlb_sync)(struct iommu_domain___5 *, struct iommu_iotlb_gather *);
+	int (*cache_invalidate_user)(struct iommu_domain___5 *, struct iommu_user_data_array *);
+	phys_addr_t (*iova_to_phys)(struct iommu_domain___5 *, dma_addr_t);
+	bool (*enforce_cache_coherency)(struct iommu_domain___5 *);
+	int (*set_pgtable_quirks)(struct iommu_domain___5 *, long unsigned int);
+	void (*free)(struct iommu_domain___5 *);
+};
+
+struct iommu_domain_ops___6 {
+	int (*attach_dev)(struct iommu_domain___6 *, struct device___3 *);
+	int (*set_dev_pasid)(struct iommu_domain___6 *, struct device___3 *, ioasid_t, struct iommu_domain___6 *);
+	int (*map_pages)(struct iommu_domain___6 *, long unsigned int, phys_addr_t, size_t, size_t, int, gfp_t, size_t *);
+	size_t (*unmap_pages)(struct iommu_domain___6 *, long unsigned int, size_t, size_t, struct iommu_iotlb_gather *);
+	void (*flush_iotlb_all)(struct iommu_domain___6 *);
+	int (*iotlb_sync_map)(struct iommu_domain___6 *, long unsigned int, size_t);
+	void (*iotlb_sync)(struct iommu_domain___6 *, struct iommu_iotlb_gather *);
+	int (*cache_invalidate_user)(struct iommu_domain___6 *, struct iommu_user_data_array *);
+	phys_addr_t (*iova_to_phys)(struct iommu_domain___6 *, dma_addr_t);
+	bool (*enforce_cache_coherency)(struct iommu_domain___6 *);
+	int (*set_pgtable_quirks)(struct iommu_domain___6 *, long unsigned int);
+	void (*free)(struct iommu_domain___6 *);
+};
+
 struct iommu_fault_page_request {
 	u32 flags;
 	u32 pasid;
@@ -97905,6 +101853,50 @@ struct iommu_fault_param___2 {
 	struct list_head faults;
 };
 
+struct iommu_fault_param___3 {
+	struct mutex lock;
+	refcount_t users;
+	struct callback_head rcu;
+	struct device___4 *dev;
+	struct iopf_queue *queue;
+	struct list_head queue_list;
+	struct list_head partial;
+	struct list_head faults;
+};
+
+struct iommu_fault_param___4 {
+	struct mutex lock;
+	refcount_t users;
+	struct callback_head rcu;
+	struct device___5 *dev;
+	struct iopf_queue *queue;
+	struct list_head queue_list;
+	struct list_head partial;
+	struct list_head faults;
+};
+
+struct iommu_fault_param___5 {
+	struct mutex lock;
+	refcount_t users;
+	struct callback_head rcu;
+	struct device___6 *dev;
+	struct iopf_queue *queue;
+	struct list_head queue_list;
+	struct list_head partial;
+	struct list_head faults;
+};
+
+struct iommu_fault_param___6 {
+	struct mutex lock;
+	refcount_t users;
+	struct callback_head rcu;
+	struct device___3 *dev;
+	struct iopf_queue *queue;
+	struct list_head queue_list;
+	struct list_head partial;
+	struct list_head faults;
+};
+
 struct iommu_flush_ops {
 	void (*tlb_flush_all)(void *);
 	void (*tlb_flush_walk)(long unsigned int, size_t, size_t, void *);
@@ -97920,6 +101912,34 @@ struct iommu_fwspec {
 
 struct iommu_fwspec___2 {
 	struct fwnode_handle___2 *iommu_fwnode;
+	u32 flags;
+	unsigned int num_ids;
+	u32 ids[0];
+};
+
+struct iommu_fwspec___3 {
+	struct fwnode_handle___4 *iommu_fwnode;
+	u32 flags;
+	unsigned int num_ids;
+	u32 ids[0];
+};
+
+struct iommu_fwspec___4 {
+	struct fwnode_handle___5 *iommu_fwnode;
+	u32 flags;
+	unsigned int num_ids;
+	u32 ids[0];
+};
+
+struct iommu_fwspec___5 {
+	struct fwnode_handle___6 *iommu_fwnode;
+	u32 flags;
+	unsigned int num_ids;
+	u32 ids[0];
+};
+
+struct iommu_fwspec___6 {
+	struct fwnode_handle___3 *iommu_fwnode;
 	u32 flags;
 	unsigned int num_ids;
 	u32 ids[0];
@@ -97985,6 +102005,27 @@ struct iommu_mm_data {
 struct iommu_mm_data___2 {
 	u32 pasid;
 	struct mm_struct___2 *mm;
+	struct list_head sva_domains;
+	struct list_head mm_list_elm;
+};
+
+struct iommu_mm_data___3 {
+	u32 pasid;
+	struct mm_struct___3 *mm;
+	struct list_head sva_domains;
+	struct list_head mm_list_elm;
+};
+
+struct iommu_mm_data___4 {
+	u32 pasid;
+	struct mm_struct___4 *mm;
+	struct list_head sva_domains;
+	struct list_head mm_list_elm;
+};
+
+struct iommu_mm_data___5 {
+	u32 pasid;
+	struct mm_struct___5 *mm;
 	struct list_head sva_domains;
 	struct list_head mm_list_elm;
 };
@@ -98057,6 +102098,128 @@ struct iommu_ops___2 {
 	u8 user_pasid_table: 1;
 };
 
+struct of_phandle_args___3;
+
+struct iommu_ops___3 {
+	bool (*capable)(struct device___4 *, enum iommu_cap);
+	void * (*hw_info)(struct device___4 *, u32 *, enum iommu_hw_info_type *);
+	struct iommu_domain___3 * (*domain_alloc_identity)(struct device___4 *);
+	struct iommu_domain___3 * (*domain_alloc_paging_flags)(struct device___4 *, u32, const struct iommu_user_data *);
+	struct iommu_domain___3 * (*domain_alloc_paging)(struct device___4 *);
+	struct iommu_domain___3 * (*domain_alloc_sva)(struct device___4 *, struct mm_struct___3 *);
+	struct iommu_domain___3 * (*domain_alloc_nested)(struct device___4 *, struct iommu_domain___3 *, u32, const struct iommu_user_data *);
+	struct iommu_device___3 * (*probe_device)(struct device___4 *);
+	void (*release_device)(struct device___4 *);
+	void (*probe_finalize)(struct device___4 *);
+	struct iommu_group * (*device_group)(struct device___4 *);
+	void (*get_resv_regions)(struct device___4 *, struct list_head *);
+	int (*of_xlate)(struct device___4 *, const struct of_phandle_args___3 *);
+	bool (*is_attach_deferred)(struct device___4 *);
+	void (*page_response)(struct device___4 *, struct iopf_fault *, struct iommu_page_response *);
+	int (*def_domain_type)(struct device___4 *);
+	size_t (*get_viommu_size)(struct device___4 *, enum iommu_viommu_type);
+	int (*viommu_init)(struct iommufd_viommu *, struct iommu_domain___3 *, const struct iommu_user_data *);
+	const struct iommu_domain_ops___3 *default_domain_ops;
+	struct module___3 *owner;
+	struct iommu_domain___3 *identity_domain;
+	struct iommu_domain___3 *blocked_domain;
+	struct iommu_domain___3 *release_domain;
+	struct iommu_domain___3 *default_domain;
+	u8 user_pasid_table: 1;
+};
+
+struct of_phandle_args___4;
+
+struct iommufd_viommu___3;
+
+struct iommu_ops___4 {
+	bool (*capable)(struct device___5 *, enum iommu_cap);
+	void * (*hw_info)(struct device___5 *, u32 *, enum iommu_hw_info_type *);
+	struct iommu_domain___4 * (*domain_alloc_identity)(struct device___5 *);
+	struct iommu_domain___4 * (*domain_alloc_paging_flags)(struct device___5 *, u32, const struct iommu_user_data *);
+	struct iommu_domain___4 * (*domain_alloc_paging)(struct device___5 *);
+	struct iommu_domain___4 * (*domain_alloc_sva)(struct device___5 *, struct mm_struct___4 *);
+	struct iommu_domain___4 * (*domain_alloc_nested)(struct device___5 *, struct iommu_domain___4 *, u32, const struct iommu_user_data *);
+	struct iommu_device___4 * (*probe_device)(struct device___5 *);
+	void (*release_device)(struct device___5 *);
+	void (*probe_finalize)(struct device___5 *);
+	struct iommu_group * (*device_group)(struct device___5 *);
+	void (*get_resv_regions)(struct device___5 *, struct list_head *);
+	int (*of_xlate)(struct device___5 *, const struct of_phandle_args___4 *);
+	bool (*is_attach_deferred)(struct device___5 *);
+	void (*page_response)(struct device___5 *, struct iopf_fault *, struct iommu_page_response *);
+	int (*def_domain_type)(struct device___5 *);
+	size_t (*get_viommu_size)(struct device___5 *, enum iommu_viommu_type);
+	int (*viommu_init)(struct iommufd_viommu___3 *, struct iommu_domain___4 *, const struct iommu_user_data *);
+	const struct iommu_domain_ops___4 *default_domain_ops;
+	struct module___4 *owner;
+	struct iommu_domain___4 *identity_domain;
+	struct iommu_domain___4 *blocked_domain;
+	struct iommu_domain___4 *release_domain;
+	struct iommu_domain___4 *default_domain;
+	u8 user_pasid_table: 1;
+};
+
+struct of_phandle_args___5;
+
+struct iommu_ops___5 {
+	bool (*capable)(struct device___6 *, enum iommu_cap);
+	void * (*hw_info)(struct device___6 *, u32 *, enum iommu_hw_info_type *);
+	struct iommu_domain___5 * (*domain_alloc_identity)(struct device___6 *);
+	struct iommu_domain___5 * (*domain_alloc_paging_flags)(struct device___6 *, u32, const struct iommu_user_data *);
+	struct iommu_domain___5 * (*domain_alloc_paging)(struct device___6 *);
+	struct iommu_domain___5 * (*domain_alloc_sva)(struct device___6 *, struct mm_struct___4 *);
+	struct iommu_domain___5 * (*domain_alloc_nested)(struct device___6 *, struct iommu_domain___5 *, u32, const struct iommu_user_data *);
+	struct iommu_device___5 * (*probe_device)(struct device___6 *);
+	void (*release_device)(struct device___6 *);
+	void (*probe_finalize)(struct device___6 *);
+	struct iommu_group * (*device_group)(struct device___6 *);
+	void (*get_resv_regions)(struct device___6 *, struct list_head *);
+	int (*of_xlate)(struct device___6 *, const struct of_phandle_args___5 *);
+	bool (*is_attach_deferred)(struct device___6 *);
+	void (*page_response)(struct device___6 *, struct iopf_fault *, struct iommu_page_response *);
+	int (*def_domain_type)(struct device___6 *);
+	size_t (*get_viommu_size)(struct device___6 *, enum iommu_viommu_type);
+	int (*viommu_init)(struct iommufd_viommu___3 *, struct iommu_domain___5 *, const struct iommu_user_data *);
+	const struct iommu_domain_ops___5 *default_domain_ops;
+	struct module___4 *owner;
+	struct iommu_domain___5 *identity_domain;
+	struct iommu_domain___5 *blocked_domain;
+	struct iommu_domain___5 *release_domain;
+	struct iommu_domain___5 *default_domain;
+	u8 user_pasid_table: 1;
+};
+
+struct of_phandle_args___6;
+
+struct iommu_ops___6 {
+	bool (*capable)(struct device___3 *, enum iommu_cap);
+	void * (*hw_info)(struct device___3 *, u32 *, enum iommu_hw_info_type *);
+	struct iommu_domain___6 * (*domain_alloc_identity)(struct device___3 *);
+	struct iommu_domain___6 * (*domain_alloc_paging_flags)(struct device___3 *, u32, const struct iommu_user_data *);
+	struct iommu_domain___6 * (*domain_alloc_paging)(struct device___3 *);
+	struct iommu_domain___6 * (*domain_alloc_sva)(struct device___3 *, struct mm_struct___5 *);
+	struct iommu_domain___6 * (*domain_alloc_nested)(struct device___3 *, struct iommu_domain___6 *, u32, const struct iommu_user_data *);
+	struct iommu_device___6 * (*probe_device)(struct device___3 *);
+	void (*release_device)(struct device___3 *);
+	void (*probe_finalize)(struct device___3 *);
+	struct iommu_group * (*device_group)(struct device___3 *);
+	void (*get_resv_regions)(struct device___3 *, struct list_head *);
+	int (*of_xlate)(struct device___3 *, const struct of_phandle_args___6 *);
+	bool (*is_attach_deferred)(struct device___3 *);
+	void (*page_response)(struct device___3 *, struct iopf_fault *, struct iommu_page_response *);
+	int (*def_domain_type)(struct device___3 *);
+	size_t (*get_viommu_size)(struct device___3 *, enum iommu_viommu_type);
+	int (*viommu_init)(struct iommufd_viommu *, struct iommu_domain___6 *, const struct iommu_user_data *);
+	const struct iommu_domain_ops___6 *default_domain_ops;
+	struct module___5 *owner;
+	struct iommu_domain___6 *identity_domain;
+	struct iommu_domain___6 *blocked_domain;
+	struct iommu_domain___6 *release_domain;
+	struct iommu_domain___6 *default_domain;
+	u8 user_pasid_table: 1;
+};
+
 struct iommu_page_response {
 	u32 pasid;
 	u32 grpid;
@@ -98089,6 +102252,15 @@ struct iommu_resv_region {
 	int prot;
 	enum iommu_resv_type type;
 	void (*free)(struct device *, struct iommu_resv_region *);
+};
+
+struct iommu_resv_region___2 {
+	struct list_head list;
+	phys_addr_t start;
+	size_t length;
+	int prot;
+	enum iommu_resv_type type;
+	void (*free)(struct device___3 *, struct iommu_resv_region___2 *);
 };
 
 struct iommu_sva {
@@ -98226,6 +102398,16 @@ struct iommufd_hw_queue___2 {
 	void (*destroy)(struct iommufd_hw_queue___2 *);
 };
 
+struct iommufd_hw_queue___3 {
+	struct iommufd_object obj;
+	struct iommufd_viommu___3 *viommu;
+	struct iommufd_access *access;
+	u64 base_addr;
+	size_t length;
+	enum iommu_hw_queue_type type;
+	void (*destroy)(struct iommufd_hw_queue___3 *);
+};
+
 struct iommufd_hwpt_paging {
 	struct iommufd_hw_pagetable common;
 	struct iommufd_ioas *ioas;
@@ -98264,6 +102446,14 @@ struct iommufd_vdevice___2 {
 	struct iommufd_device *idev;
 	u64 virt_id;
 	void (*destroy)(struct iommufd_vdevice___2 *);
+};
+
+struct iommufd_vdevice___3 {
+	struct iommufd_object obj;
+	struct iommufd_viommu___3 *viommu;
+	struct iommufd_device *idev;
+	u64 virt_id;
+	void (*destroy)(struct iommufd_vdevice___3 *);
 };
 
 struct iommufd_vevent_header {
@@ -98317,6 +102507,20 @@ struct iommufd_viommu___2 {
 	enum iommu_viommu_type type;
 };
 
+struct iommufd_viommu_ops___3;
+
+struct iommufd_viommu___3 {
+	struct iommufd_object obj;
+	struct iommufd_ctx *ictx;
+	struct iommu_device___4 *iommu_dev;
+	struct iommufd_hwpt_paging *hwpt;
+	const struct iommufd_viommu_ops___3 *ops;
+	struct xarray vdevs;
+	struct list_head veventqs;
+	struct rw_semaphore veventqs_rwsem;
+	enum iommu_viommu_type type;
+};
+
 struct iommufd_viommu_ops {
 	void (*destroy)(struct iommufd_viommu *);
 	struct iommu_domain * (*alloc_domain_nested)(struct iommufd_viommu *, u32, const struct iommu_user_data *);
@@ -98335,6 +102539,16 @@ struct iommufd_viommu_ops___2 {
 	int (*vdevice_init)(struct iommufd_vdevice___2 *);
 	size_t (*get_hw_queue_size)(struct iommufd_viommu___2 *, enum iommu_hw_queue_type);
 	int (*hw_queue_init_phys)(struct iommufd_hw_queue___2 *, u32, phys_addr_t);
+};
+
+struct iommufd_viommu_ops___3 {
+	void (*destroy)(struct iommufd_viommu___3 *);
+	struct iommu_domain___4 * (*alloc_domain_nested)(struct iommufd_viommu___3 *, u32, const struct iommu_user_data *);
+	int (*cache_invalidate)(struct iommufd_viommu___3 *, struct iommu_user_data_array *);
+	const size_t vdevice_size;
+	int (*vdevice_init)(struct iommufd_vdevice___3 *);
+	size_t (*get_hw_queue_size)(struct iommufd_viommu___3 *, enum iommu_hw_queue_type);
+	int (*hw_queue_init_phys)(struct iommufd_hw_queue___3 *, u32, phys_addr_t);
 };
 
 struct iopf_fault {
@@ -98362,6 +102576,54 @@ struct iopf_group___2 {
 	struct work_struct work;
 	struct iommu_attach_handle___2 *attach_handle;
 	struct iommu_fault_param___2 *fault_param;
+	struct list_head node;
+	u32 cookie;
+};
+
+struct iopf_group___3 {
+	struct iopf_fault last_fault;
+	struct list_head faults;
+	size_t fault_count;
+	struct list_head pending_node;
+	struct work_struct work;
+	struct iommu_attach_handle___3 *attach_handle;
+	struct iommu_fault_param___3 *fault_param;
+	struct list_head node;
+	u32 cookie;
+};
+
+struct iopf_group___4 {
+	struct iopf_fault last_fault;
+	struct list_head faults;
+	size_t fault_count;
+	struct list_head pending_node;
+	struct work_struct work;
+	struct iommu_attach_handle___4 *attach_handle;
+	struct iommu_fault_param___4 *fault_param;
+	struct list_head node;
+	u32 cookie;
+};
+
+struct iopf_group___5 {
+	struct iopf_fault last_fault;
+	struct list_head faults;
+	size_t fault_count;
+	struct list_head pending_node;
+	struct work_struct work;
+	struct iommu_attach_handle___5 *attach_handle;
+	struct iommu_fault_param___5 *fault_param;
+	struct list_head node;
+	u32 cookie;
+};
+
+struct iopf_group___6 {
+	struct iopf_fault last_fault;
+	struct list_head faults;
+	size_t fault_count;
+	struct list_head pending_node;
+	struct work_struct work;
+	struct iommu_attach_handle___6 *attach_handle;
+	struct iommu_fault_param___6 *fault_param;
 	struct list_head node;
 	u32 cookie;
 };
@@ -98404,6 +102666,32 @@ struct iov_iter___2 {
 				const struct iovec *__iov;
 				const struct kvec *kvec;
 				const struct bio_vec___2 *bvec;
+				const struct folio_queue *folioq;
+				struct xarray *xarray;
+				void *ubuf;
+			};
+			size_t count;
+		};
+	};
+	union {
+		long unsigned int nr_segs;
+		u8 folioq_slot;
+		loff_t xarray_start;
+	};
+};
+
+struct iov_iter___3 {
+	u8 iter_type;
+	bool nofault;
+	bool data_source;
+	size_t iov_offset;
+	union {
+		struct iovec __ubuf_iovec;
+		struct {
+			union {
+				const struct iovec *__iov;
+				const struct kvec *kvec;
+				const struct bio_vec___3 *bvec;
 				const struct folio_queue *folioq;
 				struct xarray *xarray;
 				void *ubuf;
@@ -99629,7 +103917,46 @@ struct irq_alloc_info___2 {
 	};
 };
 
+struct msi_desc___3;
+
+struct irq_alloc_info___3 {
+	enum irq_alloc_type type;
+	u32 flags;
+	u32 devid;
+	irq_hw_number_t hwirq;
+	const struct cpumask *mask;
+	struct msi_desc___3 *desc;
+	void *data;
+	union {
+		struct ioapic_alloc_info ioapic;
+		struct uv_alloc_info uv;
+	};
+};
+
 typedef struct irq_alloc_info___2 msi_alloc_info_t___2;
+
+typedef struct irq_alloc_info___3 msi_alloc_info_t___3;
+
+struct irq_bypass_producer;
+
+struct irq_bypass_consumer {
+	struct eventfd_ctx *eventfd;
+	struct irq_bypass_producer *producer;
+	int (*add_producer)(struct irq_bypass_consumer *, struct irq_bypass_producer *);
+	void (*del_producer)(struct irq_bypass_consumer *, struct irq_bypass_producer *);
+	void (*stop)(struct irq_bypass_consumer *);
+	void (*start)(struct irq_bypass_consumer *);
+};
+
+struct irq_bypass_producer {
+	struct eventfd_ctx *eventfd;
+	struct irq_bypass_consumer *consumer;
+	int irq;
+	int (*add_consumer)(struct irq_bypass_producer *, struct irq_bypass_consumer *);
+	void (*del_consumer)(struct irq_bypass_producer *, struct irq_bypass_consumer *);
+	void (*stop)(struct irq_bypass_producer *);
+	void (*start)(struct irq_bypass_producer *);
+};
 
 struct irq_chip {
 	const char *name;
@@ -99707,6 +104034,45 @@ struct irq_chip___2 {
 	long unsigned int flags;
 };
 
+struct irq_data___3;
+
+struct irq_chip___3 {
+	const char *name;
+	unsigned int (*irq_startup)(struct irq_data___3 *);
+	void (*irq_shutdown)(struct irq_data___3 *);
+	void (*irq_enable)(struct irq_data___3 *);
+	void (*irq_disable)(struct irq_data___3 *);
+	void (*irq_ack)(struct irq_data___3 *);
+	void (*irq_mask)(struct irq_data___3 *);
+	void (*irq_mask_ack)(struct irq_data___3 *);
+	void (*irq_unmask)(struct irq_data___3 *);
+	void (*irq_eoi)(struct irq_data___3 *);
+	int (*irq_set_affinity)(struct irq_data___3 *, const struct cpumask *, bool);
+	int (*irq_retrigger)(struct irq_data___3 *);
+	int (*irq_set_type)(struct irq_data___3 *, unsigned int);
+	int (*irq_set_wake)(struct irq_data___3 *, unsigned int);
+	void (*irq_bus_lock)(struct irq_data___3 *);
+	void (*irq_bus_sync_unlock)(struct irq_data___3 *);
+	void (*irq_suspend)(struct irq_data___3 *);
+	void (*irq_resume)(struct irq_data___3 *);
+	void (*irq_pm_shutdown)(struct irq_data___3 *);
+	void (*irq_calc_mask)(struct irq_data___3 *);
+	void (*irq_print_chip)(struct irq_data___3 *, struct seq_file *);
+	int (*irq_request_resources)(struct irq_data___3 *);
+	void (*irq_release_resources)(struct irq_data___3 *);
+	void (*irq_compose_msi_msg)(struct irq_data___3 *, struct msi_msg *);
+	void (*irq_write_msi_msg)(struct irq_data___3 *, struct msi_msg *);
+	int (*irq_get_irqchip_state)(struct irq_data___3 *, enum irqchip_irq_state, bool *);
+	int (*irq_set_irqchip_state)(struct irq_data___3 *, enum irqchip_irq_state, bool);
+	int (*irq_set_vcpu_affinity)(struct irq_data___3 *, void *);
+	void (*ipi_send_single)(struct irq_data___3 *, unsigned int);
+	void (*ipi_send_mask)(struct irq_data___3 *, const struct cpumask *);
+	int (*irq_nmi_setup)(struct irq_data___3 *);
+	void (*irq_nmi_teardown)(struct irq_data___3 *);
+	void (*irq_force_complete_move)(struct irq_data___3 *);
+	long unsigned int flags;
+};
+
 struct irq_chip_regs {
 	long unsigned int enable;
 	long unsigned int disable;
@@ -99780,6 +104146,40 @@ struct irq_chip_generic___2 {
 	struct irq_chip_type___2 chip_types[0];
 };
 
+struct irq_desc___3;
+
+typedef void (*irq_flow_handler_t___3)(struct irq_desc___3 *);
+
+struct irq_chip_type___3 {
+	struct irq_chip___3 chip;
+	struct irq_chip_regs regs;
+	irq_flow_handler_t___3 handler;
+	u32 type;
+	u32 mask_cache_priv;
+	u32 *mask_cache;
+};
+
+struct irq_chip_generic___3 {
+	raw_spinlock_t lock;
+	void *reg_base;
+	u32 (*reg_readl)(void *);
+	void (*reg_writel)(u32, void *);
+	void (*suspend)(struct irq_chip_generic___3 *);
+	void (*resume)(struct irq_chip_generic___3 *);
+	unsigned int irq_base;
+	unsigned int irq_cnt;
+	u32 mask_cache;
+	u32 wake_enabled;
+	u32 wake_active;
+	unsigned int num_ct;
+	void *private;
+	long unsigned int installed;
+	long unsigned int unused;
+	struct irq_domain___3 *domain;
+	struct list_head list;
+	struct irq_chip_type___3 chip_types[0];
+};
+
 struct irq_common_data {
 	unsigned int state_use_accessors;
 	unsigned int node;
@@ -99794,6 +104194,15 @@ struct irq_common_data___2 {
 	unsigned int node;
 	void *handler_data;
 	struct msi_desc___2 *msi_desc;
+	cpumask_var_t affinity;
+	cpumask_var_t effective_affinity;
+};
+
+struct irq_common_data___3 {
+	unsigned int state_use_accessors;
+	unsigned int node;
+	void *handler_data;
+	struct msi_desc___3 *msi_desc;
 	cpumask_var_t affinity;
 	cpumask_var_t effective_affinity;
 };
@@ -99822,6 +104231,17 @@ struct irq_data___2 {
 	struct irq_chip___2 *chip;
 	struct irq_domain___2 *domain;
 	struct irq_data___2 *parent_data;
+	void *chip_data;
+};
+
+struct irq_data___3 {
+	u32 mask;
+	unsigned int irq;
+	irq_hw_number_t hwirq;
+	struct irq_common_data___3 *common;
+	struct irq_chip___3 *chip;
+	struct irq_domain___3 *domain;
+	struct irq_data___3 *parent_data;
 	void *chip_data;
 };
 
@@ -99915,6 +104335,50 @@ struct irq_desc___2 {
 	long: 64;
 };
 
+struct irqaction___3;
+
+struct irq_desc___3 {
+	struct irq_common_data___3 irq_common_data;
+	struct irq_data___3 irq_data;
+	struct irqstat *kstat_irqs;
+	irq_flow_handler_t___3 handle_irq;
+	struct irqaction___3 *action;
+	unsigned int status_use_accessors;
+	unsigned int core_internal_state__do_not_mess_with_it;
+	unsigned int depth;
+	unsigned int wake_depth;
+	unsigned int tot_count;
+	unsigned int irq_count;
+	long unsigned int last_unhandled;
+	unsigned int irqs_unhandled;
+	atomic_t threads_handled;
+	int threads_handled_last;
+	raw_spinlock_t lock;
+	struct cpumask *percpu_enabled;
+	const struct cpumask *percpu_affinity;
+	const struct cpumask *affinity_hint;
+	struct irq_affinity_notify *affinity_notify;
+	cpumask_var_t pending_mask;
+	long unsigned int threads_oneshot;
+	atomic_t threads_active;
+	wait_queue_head_t wait_for_threads;
+	unsigned int nr_actions;
+	unsigned int no_suspend_depth;
+	unsigned int cond_suspend_depth;
+	unsigned int force_resume_depth;
+	struct proc_dir_entry *dir;
+	struct callback_head rcu;
+	struct kobject___4 kobj;
+	struct mutex request_mutex;
+	int parent_irq;
+	struct module___4 *owner;
+	const char *name;
+	struct hlist_node resend_node;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
 typedef struct irq_desc *vector_irq_t[256];
 
 struct irq_desc_devres {
@@ -99983,6 +104447,35 @@ struct irq_domain___2 {
 	struct irq_data___2 *revmap[0];
 };
 
+struct irq_domain_ops___3;
+
+struct irq_domain_chip_generic___3;
+
+struct msi_parent_ops___3;
+
+struct irq_domain___3 {
+	struct list_head link;
+	const char *name;
+	const struct irq_domain_ops___3 *ops;
+	void *host_data;
+	unsigned int flags;
+	unsigned int mapcount;
+	struct mutex mutex;
+	struct irq_domain___3 *root;
+	struct fwnode_handle___6 *fwnode;
+	enum irq_domain_bus_token bus_token;
+	struct irq_domain_chip_generic___3 *gc;
+	struct device___6 *dev;
+	struct device___6 *pm_dev;
+	struct irq_domain___3 *parent;
+	const struct msi_parent_ops___3 *msi_parent_ops;
+	void (*exit)(struct irq_domain___3 *);
+	irq_hw_number_t hwirq_max;
+	unsigned int revmap_size;
+	struct xarray revmap_tree;
+	struct irq_data___3 *revmap[0];
+};
+
 struct irq_domain_chip_generic {
 	unsigned int irqs_per_chip;
 	unsigned int num_chips;
@@ -100001,6 +104494,16 @@ struct irq_domain_chip_generic___2 {
 	enum irq_gc_flags gc_flags;
 	void (*exit)(struct irq_chip_generic___2 *);
 	struct irq_chip_generic___2 *gc[0];
+};
+
+struct irq_domain_chip_generic___3 {
+	unsigned int irqs_per_chip;
+	unsigned int num_chips;
+	unsigned int irq_flags_to_clear;
+	unsigned int irq_flags_to_set;
+	enum irq_gc_flags gc_flags;
+	void (*exit)(struct irq_chip_generic___3 *);
+	struct irq_chip_generic___3 *gc[0];
 };
 
 struct irq_domain_chip_generic_info {
@@ -100049,8 +104552,29 @@ struct irq_domain_ops___2 {
 	int (*translate)(struct irq_domain___2 *, struct irq_fwspec___2 *, long unsigned int *, unsigned int *);
 };
 
+struct irq_fwspec___3;
+
+struct irq_domain_ops___3 {
+	int (*match)(struct irq_domain___3 *, struct device_node___6 *, enum irq_domain_bus_token);
+	int (*select)(struct irq_domain___3 *, struct irq_fwspec___3 *, enum irq_domain_bus_token);
+	int (*map)(struct irq_domain___3 *, unsigned int, irq_hw_number_t);
+	void (*unmap)(struct irq_domain___3 *, unsigned int);
+	int (*xlate)(struct irq_domain___3 *, struct device_node___6 *, const u32 *, unsigned int, long unsigned int *, unsigned int *);
+	int (*alloc)(struct irq_domain___3 *, unsigned int, unsigned int, void *);
+	void (*free)(struct irq_domain___3 *, unsigned int, unsigned int);
+	int (*activate)(struct irq_domain___3 *, struct irq_data___3 *, bool);
+	void (*deactivate)(struct irq_domain___3 *, struct irq_data___3 *);
+	int (*translate)(struct irq_domain___3 *, struct irq_fwspec___3 *, long unsigned int *, unsigned int *);
+};
+
 struct irq_fwspec___2 {
 	struct fwnode_handle___2 *fwnode;
+	int param_count;
+	u32 param[16];
+};
+
+struct irq_fwspec___3 {
+	struct fwnode_handle___6 *fwnode;
 	int param_count;
 	u32 param[16];
 };
@@ -100250,6 +104774,26 @@ struct irqaction___2 {
 	irq_handler_t thread_fn;
 	struct task_struct___2 *thread;
 	struct irqaction___2 *secondary;
+	unsigned int irq;
+	unsigned int flags;
+	long unsigned int thread_flags;
+	long unsigned int thread_mask;
+	const char *name;
+	struct proc_dir_entry *dir;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
+struct irqaction___3 {
+	irq_handler_t handler;
+	void *dev_id;
+	void *percpu_dev_id;
+	struct irqaction___3 *next;
+	irq_handler_t thread_fn;
+	struct task_struct___5 *thread;
+	struct irqaction___3 *secondary;
 	unsigned int irq;
 	unsigned int flags;
 	long unsigned int thread_flags;
@@ -101146,6 +105690,60 @@ struct kernel_param___2 {
 	};
 };
 
+struct kernel_param_ops___3;
+
+struct kparam_array___3;
+
+struct kernel_param___3 {
+	const char *name;
+	struct module___3 *mod;
+	const struct kernel_param_ops___3 *ops;
+	const u16 perm;
+	s8 level;
+	u8 flags;
+	union {
+		void *arg;
+		const struct kparam_string *str;
+		const struct kparam_array___3 *arr;
+	};
+};
+
+struct kernel_param_ops___4;
+
+struct kparam_array___4;
+
+struct kernel_param___4 {
+	const char *name;
+	struct module___4 *mod;
+	const struct kernel_param_ops___4 *ops;
+	const u16 perm;
+	s8 level;
+	u8 flags;
+	union {
+		void *arg;
+		const struct kparam_string *str;
+		const struct kparam_array___4 *arr;
+	};
+};
+
+struct kernel_param_ops___5;
+
+struct kparam_array___5;
+
+struct kernel_param___5 {
+	const char *name;
+	struct module___5 *mod;
+	const struct kernel_param_ops___5 *ops;
+	const u16 perm;
+	s8 level;
+	u8 flags;
+	union {
+		void *arg;
+		const struct kparam_string *str;
+		const struct kparam_array___5 *arr;
+	};
+};
+
 struct kernel_param_ops {
 	unsigned int flags;
 	int (*set)(const char *, const struct kernel_param *);
@@ -101157,6 +105755,27 @@ struct kernel_param_ops___2 {
 	unsigned int flags;
 	int (*set)(const char *, const struct kernel_param___2 *);
 	int (*get)(char *, const struct kernel_param___2 *);
+	void (*free)(void *);
+};
+
+struct kernel_param_ops___3 {
+	unsigned int flags;
+	int (*set)(const char *, const struct kernel_param___3 *);
+	int (*get)(char *, const struct kernel_param___3 *);
+	void (*free)(void *);
+};
+
+struct kernel_param_ops___4 {
+	unsigned int flags;
+	int (*set)(const char *, const struct kernel_param___4 *);
+	int (*get)(char *, const struct kernel_param___4 *);
+	void (*free)(void *);
+};
+
+struct kernel_param_ops___5 {
+	unsigned int flags;
+	int (*set)(const char *, const struct kernel_param___5 *);
+	int (*get)(char *, const struct kernel_param___5 *);
 	void (*free)(void *);
 };
 
@@ -101221,6 +105840,31 @@ struct kernfs_elem_attr___2 {
 	struct kernfs_node___2 *notify_next;
 };
 
+struct kernfs_ops___4;
+
+struct kernfs_elem_attr___3 {
+	const struct kernfs_ops___4 *ops;
+	struct kernfs_open_node *open;
+	loff_t size;
+	struct kernfs_node___4 *notify_next;
+};
+
+struct kernfs_ops___5;
+
+struct kernfs_elem_attr___4 {
+	const struct kernfs_ops___5 *ops;
+	struct kernfs_open_node *open;
+	loff_t size;
+	struct kernfs_node___5 *notify_next;
+};
+
+struct kernfs_elem_attr___5 {
+	const struct kernfs_ops___3 *ops;
+	struct kernfs_open_node *open;
+	loff_t size;
+	struct kernfs_node___3 *notify_next;
+};
+
 struct kernfs_elem_dir {
 	long unsigned int subdirs;
 	struct rb_root children;
@@ -101234,6 +105878,18 @@ struct kernfs_elem_symlink {
 
 struct kernfs_elem_symlink___2 {
 	struct kernfs_node___2 *target_kn;
+};
+
+struct kernfs_elem_symlink___3 {
+	struct kernfs_node___4 *target_kn;
+};
+
+struct kernfs_elem_symlink___4 {
+	struct kernfs_node___5 *target_kn;
+};
+
+struct kernfs_elem_symlink___5 {
+	struct kernfs_node___3 *target_kn;
 };
 
 struct kernfs_global_locks {
@@ -101298,6 +105954,69 @@ struct kernfs_node___2 {
 	struct callback_head rcu;
 };
 
+struct kernfs_node___4 {
+	atomic_t count;
+	atomic_t active;
+	struct kernfs_node___4 *__parent;
+	const char *name;
+	struct rb_node rb;
+	const void *ns;
+	unsigned int hash;
+	short unsigned int flags;
+	umode_t mode;
+	union {
+		struct kernfs_elem_dir dir;
+		struct kernfs_elem_symlink___3 symlink;
+		struct kernfs_elem_attr___3 attr;
+	};
+	u64 id;
+	void *priv;
+	struct kernfs_iattrs *iattr;
+	struct callback_head rcu;
+};
+
+struct kernfs_node___5 {
+	atomic_t count;
+	atomic_t active;
+	struct kernfs_node___5 *__parent;
+	const char *name;
+	struct rb_node rb;
+	const void *ns;
+	unsigned int hash;
+	short unsigned int flags;
+	umode_t mode;
+	union {
+		struct kernfs_elem_dir dir;
+		struct kernfs_elem_symlink___4 symlink;
+		struct kernfs_elem_attr___4 attr;
+	};
+	u64 id;
+	void *priv;
+	struct kernfs_iattrs *iattr;
+	struct callback_head rcu;
+};
+
+struct kernfs_node___3 {
+	atomic_t count;
+	atomic_t active;
+	struct kernfs_node___3 *__parent;
+	const char *name;
+	struct rb_node rb;
+	const void *ns;
+	unsigned int hash;
+	short unsigned int flags;
+	umode_t mode;
+	union {
+		struct kernfs_elem_dir dir;
+		struct kernfs_elem_symlink___5 symlink;
+		struct kernfs_elem_attr___5 attr;
+	};
+	u64 id;
+	void *priv;
+	struct kernfs_iattrs *iattr;
+	struct callback_head rcu;
+};
+
 struct kernfs_open_file {
 	struct kernfs_node *kn;
 	struct file *file;
@@ -101330,6 +106049,60 @@ struct kernfs_open_file___2 {
 	bool mmapped: 1;
 	bool released: 1;
 	const struct vm_operations_struct___2 *vm_ops;
+};
+
+struct vm_operations_struct___3;
+
+struct kernfs_open_file___4 {
+	struct kernfs_node___4 *kn;
+	struct file___3 *file;
+	struct seq_file *seq_file;
+	void *priv;
+	struct mutex mutex;
+	struct mutex prealloc_mutex;
+	int event;
+	struct list_head list;
+	char *prealloc_buf;
+	size_t atomic_write_len;
+	bool mmapped: 1;
+	bool released: 1;
+	const struct vm_operations_struct___3 *vm_ops;
+};
+
+struct vm_operations_struct___4;
+
+struct kernfs_open_file___5 {
+	struct kernfs_node___5 *kn;
+	struct file___4 *file;
+	struct seq_file *seq_file;
+	void *priv;
+	struct mutex mutex;
+	struct mutex prealloc_mutex;
+	int event;
+	struct list_head list;
+	char *prealloc_buf;
+	size_t atomic_write_len;
+	bool mmapped: 1;
+	bool released: 1;
+	const struct vm_operations_struct___4 *vm_ops;
+};
+
+struct vm_operations_struct___5;
+
+struct kernfs_open_file___3 {
+	struct kernfs_node___3 *kn;
+	struct file___5 *file;
+	struct seq_file___3 *seq_file;
+	void *priv;
+	struct mutex mutex;
+	struct mutex prealloc_mutex;
+	int event;
+	struct list_head list;
+	char *prealloc_buf;
+	size_t atomic_write_len;
+	bool mmapped: 1;
+	bool released: 1;
+	const struct vm_operations_struct___5 *vm_ops;
 };
 
 struct kernfs_open_node {
@@ -101371,6 +106144,54 @@ struct kernfs_ops___2 {
 	__poll_t (*poll)(struct kernfs_open_file___2 *, struct poll_table_struct___2 *);
 	int (*mmap)(struct kernfs_open_file___2 *, struct vm_area_struct___2 *);
 	loff_t (*llseek)(struct kernfs_open_file___2 *, loff_t, int);
+};
+
+struct kernfs_ops___4 {
+	int (*open)(struct kernfs_open_file___4 *);
+	void (*release)(struct kernfs_open_file___4 *);
+	int (*seq_show)(struct seq_file *, void *);
+	void * (*seq_start)(struct seq_file *, loff_t *);
+	void * (*seq_next)(struct seq_file *, void *, loff_t *);
+	void (*seq_stop)(struct seq_file *, void *);
+	ssize_t (*read)(struct kernfs_open_file___4 *, char *, size_t, loff_t);
+	size_t atomic_write_len;
+	bool prealloc;
+	ssize_t (*write)(struct kernfs_open_file___4 *, char *, size_t, loff_t);
+	__poll_t (*poll)(struct kernfs_open_file___4 *, struct poll_table_struct___4 *);
+	int (*mmap)(struct kernfs_open_file___4 *, struct vm_area_struct___3 *);
+	loff_t (*llseek)(struct kernfs_open_file___4 *, loff_t, int);
+};
+
+struct kernfs_ops___5 {
+	int (*open)(struct kernfs_open_file___5 *);
+	void (*release)(struct kernfs_open_file___5 *);
+	int (*seq_show)(struct seq_file *, void *);
+	void * (*seq_start)(struct seq_file *, loff_t *);
+	void * (*seq_next)(struct seq_file *, void *, loff_t *);
+	void (*seq_stop)(struct seq_file *, void *);
+	ssize_t (*read)(struct kernfs_open_file___5 *, char *, size_t, loff_t);
+	size_t atomic_write_len;
+	bool prealloc;
+	ssize_t (*write)(struct kernfs_open_file___5 *, char *, size_t, loff_t);
+	__poll_t (*poll)(struct kernfs_open_file___5 *, struct poll_table_struct___5 *);
+	int (*mmap)(struct kernfs_open_file___5 *, struct vm_area_struct___4 *);
+	loff_t (*llseek)(struct kernfs_open_file___5 *, loff_t, int);
+};
+
+struct kernfs_ops___3 {
+	int (*open)(struct kernfs_open_file___3 *);
+	void (*release)(struct kernfs_open_file___3 *);
+	int (*seq_show)(struct seq_file___3 *, void *);
+	void * (*seq_start)(struct seq_file___3 *, loff_t *);
+	void * (*seq_next)(struct seq_file___3 *, void *, loff_t *);
+	void (*seq_stop)(struct seq_file___3 *, void *);
+	ssize_t (*read)(struct kernfs_open_file___3 *, char *, size_t, loff_t);
+	size_t atomic_write_len;
+	bool prealloc;
+	ssize_t (*write)(struct kernfs_open_file___3 *, char *, size_t, loff_t);
+	__poll_t (*poll)(struct kernfs_open_file___3 *, struct poll_table_struct___3 *);
+	int (*mmap)(struct kernfs_open_file___3 *, struct vm_area_struct___5 *);
+	loff_t (*llseek)(struct kernfs_open_file___3 *, loff_t, int);
 };
 
 struct kernfs_syscall_ops;
@@ -102025,6 +106846,50 @@ struct kiocb___2 {
 	};
 };
 
+struct kiocb___3 {
+	struct file___3 *ki_filp;
+	loff_t ki_pos;
+	void (*ki_complete)(struct kiocb___3 *, long int);
+	void *private;
+	int ki_flags;
+	u16 ki_ioprio;
+	u8 ki_write_stream;
+	union {
+		struct wait_page_queue *ki_waitq;
+		ssize_t (*dio_complete)(void *);
+	};
+};
+
+struct kiocb___4 {
+	struct file___4 *ki_filp;
+	loff_t ki_pos;
+	void (*ki_complete)(struct kiocb___4 *, long int);
+	void *private;
+	int ki_flags;
+	u16 ki_ioprio;
+	u8 ki_write_stream;
+	union {
+		struct wait_page_queue *ki_waitq;
+		ssize_t (*dio_complete)(void *);
+	};
+};
+
+struct wait_page_queue___2;
+
+struct kiocb___5 {
+	struct file___5 *ki_filp;
+	loff_t ki_pos;
+	void (*ki_complete)(struct kiocb___5 *, long int);
+	void *private;
+	int ki_flags;
+	u16 ki_ioprio;
+	u8 ki_write_stream;
+	union {
+		struct wait_page_queue___2 *ki_waitq;
+		ssize_t (*dio_complete)(void *);
+	};
+};
+
 struct kioctx_cpu;
 
 struct kioctx {
@@ -102409,6 +107274,39 @@ struct kobj_type___2 {
 	void (*get_ownership)(const struct kobject___2 *, kuid_t *, kgid_t *);
 };
 
+struct sysfs_ops___3;
+
+struct kobj_type___4 {
+	void (*release)(struct kobject___3 *);
+	const struct sysfs_ops___3 *sysfs_ops;
+	const struct attribute_group___3 **default_groups;
+	const struct kobj_ns_type_operations * (*child_ns_type)(const struct kobject___3 *);
+	const void * (*namespace)(const struct kobject___3 *);
+	void (*get_ownership)(const struct kobject___3 *, kuid_t *, kgid_t *);
+};
+
+struct sysfs_ops___4;
+
+struct kobj_type___5 {
+	void (*release)(struct kobject___4 *);
+	const struct sysfs_ops___4 *sysfs_ops;
+	const struct attribute_group___4 **default_groups;
+	const struct kobj_ns_type_operations * (*child_ns_type)(const struct kobject___4 *);
+	const void * (*namespace)(const struct kobject___4 *);
+	void (*get_ownership)(const struct kobject___4 *, kuid_t *, kgid_t *);
+};
+
+struct sysfs_ops___5;
+
+struct kobj_type___3 {
+	void (*release)(struct kobject___5 *);
+	const struct sysfs_ops___5 *sysfs_ops;
+	const struct attribute_group___5 **default_groups;
+	const struct kobj_ns_type_operations * (*child_ns_type)(const struct kobject___5 *);
+	const void * (*namespace)(const struct kobject___5 *);
+	void (*get_ownership)(const struct kobject___5 *, kuid_t *, kgid_t *);
+};
+
 struct kparam_array {
 	unsigned int max;
 	unsigned int elemsize;
@@ -102422,6 +107320,30 @@ struct kparam_array___2 {
 	unsigned int elemsize;
 	unsigned int *num;
 	const struct kernel_param_ops___2 *ops;
+	void *elem;
+};
+
+struct kparam_array___3 {
+	unsigned int max;
+	unsigned int elemsize;
+	unsigned int *num;
+	const struct kernel_param_ops___3 *ops;
+	void *elem;
+};
+
+struct kparam_array___4 {
+	unsigned int max;
+	unsigned int elemsize;
+	unsigned int *num;
+	const struct kernel_param_ops___4 *ops;
+	void *elem;
+};
+
+struct kparam_array___5 {
+	unsigned int max;
+	unsigned int elemsize;
+	unsigned int *num;
+	const struct kernel_param_ops___5 *ops;
 	void *elem;
 };
 
@@ -102601,6 +107523,33 @@ struct kset___2 {
 	const struct kset_uevent_ops___2 *uevent_ops;
 };
 
+struct kset_uevent_ops___3;
+
+struct kset___4 {
+	struct list_head list;
+	spinlock_t list_lock;
+	struct kobject___3 kobj;
+	const struct kset_uevent_ops___3 *uevent_ops;
+};
+
+struct kset_uevent_ops___4;
+
+struct kset___5 {
+	struct list_head list;
+	spinlock_t list_lock;
+	struct kobject___4 kobj;
+	const struct kset_uevent_ops___4 *uevent_ops;
+};
+
+struct kset_uevent_ops___5;
+
+struct kset___3 {
+	struct list_head list;
+	spinlock_t list_lock;
+	struct kobject___5 kobj;
+	const struct kset_uevent_ops___5 *uevent_ops;
+};
+
 struct kset_uevent_ops {
 	int (* const filter)(const struct kobject *);
 	const char * (* const name)(const struct kobject *);
@@ -102611,6 +107560,24 @@ struct kset_uevent_ops___2 {
 	int (* const filter)(const struct kobject___2 *);
 	const char * (* const name)(const struct kobject___2 *);
 	int (* const uevent)(const struct kobject___2 *, struct kobj_uevent_env *);
+};
+
+struct kset_uevent_ops___3 {
+	int (* const filter)(const struct kobject___3 *);
+	const char * (* const name)(const struct kobject___3 *);
+	int (* const uevent)(const struct kobject___3 *, struct kobj_uevent_env *);
+};
+
+struct kset_uevent_ops___4 {
+	int (* const filter)(const struct kobject___4 *);
+	const char * (* const name)(const struct kobject___4 *);
+	int (* const uevent)(const struct kobject___4 *, struct kobj_uevent_env *);
+};
+
+struct kset_uevent_ops___5 {
+	int (* const filter)(const struct kobject___5 *);
+	const char * (* const name)(const struct kobject___5 *);
+	int (* const uevent)(const struct kobject___5 *, struct kobj_uevent_env *);
 };
 
 struct ksignal {
@@ -105894,6 +110861,19 @@ struct lru_gen_mm_walk___2 {
 	bool force_scan;
 };
 
+struct lruvec___3;
+
+struct lru_gen_mm_walk___3 {
+	struct lruvec___3 *lruvec;
+	long unsigned int seq;
+	long unsigned int next_addr;
+	int nr_pages[40];
+	int mm_stats[4];
+	int batched;
+	int swappiness;
+	bool force_scan;
+};
+
 struct lru_iter {
 	struct lru *lru;
 	struct list_head list;
@@ -105934,6 +110914,22 @@ struct lruvec___2 {
 	struct lru_gen_folio lrugen;
 	struct lru_gen_mm_state mm_state;
 	struct pglist_data___2 *pgdat;
+	struct zswap_lruvec_state zswap_lruvec_state;
+};
+
+struct pglist_data___3;
+
+struct lruvec___3 {
+	struct list_head lists[5];
+	spinlock_t lru_lock;
+	long unsigned int anon_cost;
+	long unsigned int file_cost;
+	atomic_long_t nonresident_age;
+	long unsigned int refaults[2];
+	long unsigned int flags;
+	struct lru_gen_folio lrugen;
+	struct lru_gen_mm_state mm_state;
+	struct pglist_data___3 *pgdat;
 	struct zswap_lruvec_state zswap_lruvec_state;
 };
 
@@ -108047,6 +113043,75 @@ struct mem_cgroup___2 {
 	long: 64;
 };
 
+struct obj_cgroup___3;
+
+struct mem_cgroup_per_node___3;
+
+struct mem_cgroup___3 {
+	struct cgroup_subsys_state___3 css;
+	struct mem_cgroup_id id;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	struct page_counter memory;
+	union {
+		struct page_counter swap;
+		struct page_counter memsw;
+	};
+	struct list_head memory_peaks;
+	struct list_head swap_peaks;
+	spinlock_t peaks_lock;
+	struct work_struct high_work;
+	long unsigned int zswap_max;
+	bool zswap_writeback;
+	struct vmpressure vmpressure;
+	bool oom_group;
+	int swappiness;
+	struct cgroup_file___3 events_file;
+	struct cgroup_file___3 events_local_file;
+	struct cgroup_file___3 swap_events_file;
+	struct memcg_vmstats *vmstats;
+	atomic_long_t memory_events[9];
+	atomic_long_t memory_events_local[9];
+	u64 socket_pressure;
+	int kmemcg_id;
+	struct obj_cgroup___3 *objcg;
+	struct obj_cgroup___3 *orig_objcg;
+	struct list_head objcg_list;
+	struct memcg_vmstats_percpu *vmstats_percpu;
+	struct list_head cgwb_list;
+	struct wb_domain cgwb_domain;
+	struct memcg_cgwb_frn cgwb_frn[4];
+	struct deferred_split deferred_split_queue;
+	struct lru_gen_mm_list mm_list;
+	long: 64;
+	long: 64;
+	struct page_counter kmem;
+	struct page_counter tcpmem;
+	struct memcg1_events_percpu *events_percpu;
+	long unsigned int soft_limit;
+	bool oom_lock;
+	int under_oom;
+	int oom_kill_disable;
+	struct mutex thresholds_lock;
+	struct mem_cgroup_thresholds thresholds;
+	struct mem_cgroup_thresholds memsw_thresholds;
+	struct list_head oom_notify;
+	bool tcpmem_active;
+	int tcpmem_pressure;
+	struct list_head event_list;
+	spinlock_t event_list_lock;
+	struct mem_cgroup_per_node___3 *nodeinfo[0];
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
 struct mem_cgroup_event {
 	struct mem_cgroup *memcg;
 	struct eventfd_ctx *eventfd;
@@ -108109,6 +113174,31 @@ struct mem_cgroup_per_node___2 {
 	struct cacheline_padding _pad2_;
 	long unsigned int lru_zone_size[25];
 	struct mem_cgroup_reclaim_iter___2 iter;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
+struct mem_cgroup_reclaim_iter___3 {
+	struct mem_cgroup___3 *position;
+	atomic_t generation;
+};
+
+struct mem_cgroup_per_node___3 {
+	struct mem_cgroup___3 *memcg;
+	struct lruvec_stats_percpu *lruvec_stats_percpu;
+	struct lruvec_stats *lruvec_stats;
+	struct shrinker_info *shrinker_info;
+	struct rb_node tree_node;
+	long unsigned int usage_in_excess;
+	bool on_tree;
+	struct lruvec___3 lruvec;
+	long: 64;
+	struct cacheline_padding _pad2_;
+	long unsigned int lru_zone_size[25];
+	struct mem_cgroup_reclaim_iter___3 iter;
 	long: 64;
 	long: 64;
 	long: 64;
@@ -108210,6 +113300,48 @@ struct quota_format_type___2;
 
 struct mem_dqinfo___2 {
 	struct quota_format_type___2 *dqi_format;
+	int dqi_fmt_id;
+	struct list_head dqi_dirty_list;
+	long unsigned int dqi_flags;
+	unsigned int dqi_bgrace;
+	unsigned int dqi_igrace;
+	qsize_t dqi_max_spc_limit;
+	qsize_t dqi_max_ino_limit;
+	void *dqi_priv;
+};
+
+struct quota_format_type___3;
+
+struct mem_dqinfo___3 {
+	struct quota_format_type___3 *dqi_format;
+	int dqi_fmt_id;
+	struct list_head dqi_dirty_list;
+	long unsigned int dqi_flags;
+	unsigned int dqi_bgrace;
+	unsigned int dqi_igrace;
+	qsize_t dqi_max_spc_limit;
+	qsize_t dqi_max_ino_limit;
+	void *dqi_priv;
+};
+
+struct quota_format_type___4;
+
+struct mem_dqinfo___4 {
+	struct quota_format_type___4 *dqi_format;
+	int dqi_fmt_id;
+	struct list_head dqi_dirty_list;
+	long unsigned int dqi_flags;
+	unsigned int dqi_bgrace;
+	unsigned int dqi_igrace;
+	qsize_t dqi_max_spc_limit;
+	qsize_t dqi_max_ino_limit;
+	void *dqi_priv;
+};
+
+struct quota_format_type___5;
+
+struct mem_dqinfo___5 {
+	struct quota_format_type___5 *dqi_format;
 	int dqi_fmt_id;
 	struct list_head dqi_dirty_list;
 	long unsigned int dqi_flags;
@@ -109338,6 +114470,309 @@ struct mm_struct___2 {
 	long unsigned int cpu_bitmap[0];
 };
 
+struct rcuwait___3 {
+	struct task_struct___4 *task;
+};
+
+struct mm_struct___3 {
+	struct {
+		struct {
+			atomic_t mm_count;
+			long: 64;
+			long: 64;
+			long: 64;
+			long: 64;
+			long: 64;
+			long: 64;
+			long: 64;
+		};
+		struct maple_tree mm_mt;
+		long unsigned int mmap_base;
+		long unsigned int mmap_legacy_base;
+		long unsigned int mmap_compat_base;
+		long unsigned int mmap_compat_legacy_base;
+		long unsigned int task_size;
+		pgd_t *pgd;
+		atomic_t membarrier_state;
+		atomic_t mm_users;
+		struct mm_cid *pcpu_cid;
+		long unsigned int mm_cid_next_scan;
+		unsigned int nr_cpus_allowed;
+		atomic_t max_nr_cid;
+		raw_spinlock_t cpus_allowed_lock;
+		atomic_long_t pgtables_bytes;
+		int map_count;
+		spinlock_t page_table_lock;
+		struct rw_semaphore mmap_lock;
+		struct list_head mmlist;
+		struct rcuwait___3 vma_writer_wait;
+		seqcount_t mm_lock_seq;
+		struct mutex futex_hash_lock;
+		struct futex_private_hash *futex_phash;
+		struct futex_private_hash *futex_phash_new;
+		long unsigned int futex_batches;
+		struct callback_head futex_rcu;
+		atomic_long_t futex_atomic;
+		unsigned int *futex_ref;
+		long unsigned int hiwater_rss;
+		long unsigned int hiwater_vm;
+		long unsigned int total_vm;
+		long unsigned int locked_vm;
+		atomic64_t pinned_vm;
+		long unsigned int data_vm;
+		long unsigned int exec_vm;
+		long unsigned int stack_vm;
+		vm_flags_t def_flags;
+		seqcount_t write_protect_seq;
+		spinlock_t arg_lock;
+		long unsigned int start_code;
+		long unsigned int end_code;
+		long unsigned int start_data;
+		long unsigned int end_data;
+		long unsigned int start_brk;
+		long unsigned int brk;
+		long unsigned int start_stack;
+		long unsigned int arg_start;
+		long unsigned int arg_end;
+		long unsigned int env_start;
+		long unsigned int env_end;
+		long unsigned int saved_auxv[52];
+		struct percpu_counter rss_stat[4];
+		struct linux_binfmt *binfmt;
+		mm_context_t context;
+		mm_flags_t flags;
+		spinlock_t ioctx_lock;
+		struct kioctx_table *ioctx_table;
+		struct task_struct___4 *owner;
+		struct user_namespace *user_ns;
+		struct file___3 *exe_file;
+		struct mmu_notifier_subscriptions *notifier_subscriptions;
+		long unsigned int numa_next_scan;
+		long unsigned int numa_scan_offset;
+		int numa_scan_seq;
+		atomic_t tlb_flush_pending;
+		atomic_t tlb_flush_batched;
+		struct uprobes_state uprobes_state;
+		atomic_long_t hugetlb_usage;
+		struct work_struct async_put_work;
+		struct iommu_mm_data___3 *iommu_mm;
+		long unsigned int ksm_merging_pages;
+		long unsigned int ksm_rmap_items;
+		atomic_long_t ksm_zero_pages;
+		struct {
+			struct list_head list;
+			long unsigned int bitmap;
+			struct mem_cgroup *memcg;
+		} lru_gen;
+		mm_id_t mm_id;
+		long: 64;
+		long: 64;
+	};
+	long unsigned int cpu_bitmap[0];
+};
+
+struct rcuwait___4 {
+	struct task_struct___5 *task;
+};
+
+struct mm_struct___4 {
+	struct {
+		struct {
+			atomic_t mm_count;
+			long: 64;
+			long: 64;
+			long: 64;
+			long: 64;
+			long: 64;
+			long: 64;
+			long: 64;
+		};
+		struct maple_tree mm_mt;
+		long unsigned int mmap_base;
+		long unsigned int mmap_legacy_base;
+		long unsigned int mmap_compat_base;
+		long unsigned int mmap_compat_legacy_base;
+		long unsigned int task_size;
+		pgd_t *pgd;
+		atomic_t membarrier_state;
+		atomic_t mm_users;
+		struct mm_cid *pcpu_cid;
+		long unsigned int mm_cid_next_scan;
+		unsigned int nr_cpus_allowed;
+		atomic_t max_nr_cid;
+		raw_spinlock_t cpus_allowed_lock;
+		atomic_long_t pgtables_bytes;
+		int map_count;
+		spinlock_t page_table_lock;
+		struct rw_semaphore mmap_lock;
+		struct list_head mmlist;
+		struct rcuwait___4 vma_writer_wait;
+		seqcount_t mm_lock_seq;
+		struct mutex futex_hash_lock;
+		struct futex_private_hash *futex_phash;
+		struct futex_private_hash *futex_phash_new;
+		long unsigned int futex_batches;
+		struct callback_head futex_rcu;
+		atomic_long_t futex_atomic;
+		unsigned int *futex_ref;
+		long unsigned int hiwater_rss;
+		long unsigned int hiwater_vm;
+		long unsigned int total_vm;
+		long unsigned int locked_vm;
+		atomic64_t pinned_vm;
+		long unsigned int data_vm;
+		long unsigned int exec_vm;
+		long unsigned int stack_vm;
+		vm_flags_t def_flags;
+		seqcount_t write_protect_seq;
+		spinlock_t arg_lock;
+		long unsigned int start_code;
+		long unsigned int end_code;
+		long unsigned int start_data;
+		long unsigned int end_data;
+		long unsigned int start_brk;
+		long unsigned int brk;
+		long unsigned int start_stack;
+		long unsigned int arg_start;
+		long unsigned int arg_end;
+		long unsigned int env_start;
+		long unsigned int env_end;
+		long unsigned int saved_auxv[52];
+		struct percpu_counter rss_stat[4];
+		struct linux_binfmt *binfmt;
+		mm_context_t context;
+		mm_flags_t flags;
+		spinlock_t ioctx_lock;
+		struct kioctx_table *ioctx_table;
+		struct task_struct___5 *owner;
+		struct user_namespace *user_ns;
+		struct file___4 *exe_file;
+		struct mmu_notifier_subscriptions *notifier_subscriptions;
+		long unsigned int numa_next_scan;
+		long unsigned int numa_scan_offset;
+		int numa_scan_seq;
+		atomic_t tlb_flush_pending;
+		atomic_t tlb_flush_batched;
+		struct uprobes_state uprobes_state;
+		atomic_long_t hugetlb_usage;
+		struct work_struct async_put_work;
+		struct iommu_mm_data___4 *iommu_mm;
+		long unsigned int ksm_merging_pages;
+		long unsigned int ksm_rmap_items;
+		atomic_long_t ksm_zero_pages;
+		struct {
+			struct list_head list;
+			long unsigned int bitmap;
+			struct mem_cgroup *memcg;
+		} lru_gen;
+		mm_id_t mm_id;
+		long: 64;
+		long: 64;
+	};
+	long unsigned int cpu_bitmap[0];
+};
+
+struct rcuwait___5 {
+	struct task_struct___3 *task;
+};
+
+struct mm_struct___5 {
+	struct {
+		struct {
+			atomic_t mm_count;
+			long: 64;
+			long: 64;
+			long: 64;
+			long: 64;
+			long: 64;
+			long: 64;
+			long: 64;
+		};
+		struct maple_tree mm_mt;
+		long unsigned int mmap_base;
+		long unsigned int mmap_legacy_base;
+		long unsigned int mmap_compat_base;
+		long unsigned int mmap_compat_legacy_base;
+		long unsigned int task_size;
+		pgd_t *pgd;
+		atomic_t membarrier_state;
+		atomic_t mm_users;
+		struct mm_cid *pcpu_cid;
+		long unsigned int mm_cid_next_scan;
+		unsigned int nr_cpus_allowed;
+		atomic_t max_nr_cid;
+		raw_spinlock_t cpus_allowed_lock;
+		atomic_long_t pgtables_bytes;
+		int map_count;
+		spinlock_t page_table_lock;
+		struct rw_semaphore mmap_lock;
+		struct list_head mmlist;
+		struct rcuwait___5 vma_writer_wait;
+		seqcount_t mm_lock_seq;
+		struct mutex futex_hash_lock;
+		struct futex_private_hash *futex_phash;
+		struct futex_private_hash *futex_phash_new;
+		long unsigned int futex_batches;
+		struct callback_head futex_rcu;
+		atomic_long_t futex_atomic;
+		unsigned int *futex_ref;
+		long unsigned int hiwater_rss;
+		long unsigned int hiwater_vm;
+		long unsigned int total_vm;
+		long unsigned int locked_vm;
+		atomic64_t pinned_vm;
+		long unsigned int data_vm;
+		long unsigned int exec_vm;
+		long unsigned int stack_vm;
+		vm_flags_t def_flags;
+		seqcount_t write_protect_seq;
+		spinlock_t arg_lock;
+		long unsigned int start_code;
+		long unsigned int end_code;
+		long unsigned int start_data;
+		long unsigned int end_data;
+		long unsigned int start_brk;
+		long unsigned int brk;
+		long unsigned int start_stack;
+		long unsigned int arg_start;
+		long unsigned int arg_end;
+		long unsigned int env_start;
+		long unsigned int env_end;
+		long unsigned int saved_auxv[52];
+		struct percpu_counter rss_stat[4];
+		struct linux_binfmt *binfmt;
+		mm_context_t context;
+		mm_flags_t flags;
+		spinlock_t ioctx_lock;
+		struct kioctx_table *ioctx_table;
+		struct task_struct___3 *owner;
+		struct user_namespace___3 *user_ns;
+		struct file___5 *exe_file;
+		struct mmu_notifier_subscriptions *notifier_subscriptions;
+		long unsigned int numa_next_scan;
+		long unsigned int numa_scan_offset;
+		int numa_scan_seq;
+		atomic_t tlb_flush_pending;
+		atomic_t tlb_flush_batched;
+		struct uprobes_state uprobes_state;
+		atomic_long_t hugetlb_usage;
+		struct work_struct async_put_work;
+		struct iommu_mm_data___5 *iommu_mm;
+		long unsigned int ksm_merging_pages;
+		long unsigned int ksm_rmap_items;
+		atomic_long_t ksm_zero_pages;
+		struct {
+			struct list_head list;
+			long unsigned int bitmap;
+			struct mem_cgroup___3 *memcg;
+		} lru_gen;
+		mm_id_t mm_id;
+		long: 64;
+		long: 64;
+	};
+	long unsigned int cpu_bitmap[0];
+};
+
 struct mm_struct__safe_rcu_or_null {
 	struct file *exe_file;
 };
@@ -109703,6 +115138,21 @@ struct mod_tree_node___2 {
 	struct latch_tree_node node;
 };
 
+struct mod_tree_node___3 {
+	struct module___3 *mod;
+	struct latch_tree_node node;
+};
+
+struct mod_tree_node___4 {
+	struct module___4 *mod;
+	struct latch_tree_node node;
+};
+
+struct mod_tree_node___5 {
+	struct module___5 *mod;
+	struct latch_tree_node node;
+};
+
 struct mod_tree_root {
 	struct latch_tree_root root;
 	long unsigned int addr_min;
@@ -109989,6 +115439,339 @@ struct module___2 {
 	long: 64;
 };
 
+struct module_kobject___3 {
+	struct kobject___3 kobj;
+	struct module___3 *mod;
+	struct kobject___3 *drivers_dir;
+	struct module_param_attrs *mp;
+	struct completion *kobj_completion;
+};
+
+struct module_memory___3 {
+	void *base;
+	bool is_rox;
+	unsigned int size;
+	struct mod_tree_node___3 mtn;
+};
+
+struct module_attribute___3;
+
+struct module___3 {
+	enum module_state state;
+	struct list_head list;
+	char name[56];
+	struct module_kobject___3 mkobj;
+	struct module_attribute___3 *modinfo_attrs;
+	const char *version;
+	const char *srcversion;
+	const char *rhelversion;
+	struct kobject___3 *holders_dir;
+	const struct kernel_symbol *syms;
+	const u32 *crcs;
+	unsigned int num_syms;
+	struct mutex param_lock;
+	struct kernel_param___3 *kp;
+	unsigned int num_kp;
+	unsigned int num_gpl_syms;
+	const struct kernel_symbol *gpl_syms;
+	const u32 *gpl_crcs;
+	bool using_gplonly_symbols;
+	bool sig_ok;
+	bool async_probe_requested;
+	unsigned int num_exentries;
+	struct exception_table_entry *extable;
+	int (*init)(void);
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	struct module_memory___3 mem[7];
+	struct mod_arch_specific arch;
+	long unsigned int taints;
+	unsigned int num_bugs;
+	struct list_head bug_list;
+	struct bug_entry *bug_table;
+	struct mod_kallsyms *kallsyms;
+	struct mod_kallsyms core_kallsyms;
+	struct module_sect_attrs *sect_attrs;
+	struct module_notes_attrs *notes_attrs;
+	char *args;
+	void *percpu;
+	unsigned int percpu_size;
+	void *noinstr_text_start;
+	unsigned int noinstr_text_size;
+	unsigned int num_tracepoints;
+	tracepoint_ptr_t *tracepoints_ptrs;
+	unsigned int num_srcu_structs;
+	struct srcu_struct **srcu_struct_ptrs;
+	unsigned int num_bpf_raw_events;
+	struct bpf_raw_event_map *bpf_raw_events;
+	unsigned int btf_data_size;
+	unsigned int btf_base_data_size;
+	void *btf_data;
+	void *btf_base_data;
+	struct jump_entry *jump_entries;
+	unsigned int num_jump_entries;
+	unsigned int num_trace_bprintk_fmt;
+	const char **trace_bprintk_fmt_start;
+	struct trace_event_call **trace_events;
+	unsigned int num_trace_events;
+	struct trace_eval_map **trace_evals;
+	unsigned int num_trace_evals;
+	unsigned int num_ftrace_callsites;
+	long unsigned int *ftrace_callsites;
+	void *kprobes_text_start;
+	unsigned int kprobes_text_size;
+	long unsigned int *kprobe_blacklist;
+	unsigned int num_kprobe_blacklist;
+	int num_static_call_sites;
+	struct static_call_site *static_call_sites;
+	int num_kunit_init_suites;
+	struct kunit_suite **kunit_init_suites;
+	int num_kunit_suites;
+	struct kunit_suite **kunit_suites;
+	bool klp;
+	bool klp_alive;
+	struct klp_modinfo *klp_info;
+	unsigned int printk_index_size;
+	struct pi_entry **printk_index_start;
+	struct list_head source_list;
+	struct list_head target_list;
+	void (*exit)(void);
+	atomic_t refcnt;
+	struct _ddebug_info___3 dyndbg_info;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
+struct module_kobject___4 {
+	struct kobject___4 kobj;
+	struct module___4 *mod;
+	struct kobject___4 *drivers_dir;
+	struct module_param_attrs *mp;
+	struct completion *kobj_completion;
+};
+
+struct module_memory___4 {
+	void *base;
+	bool is_rox;
+	unsigned int size;
+	struct mod_tree_node___4 mtn;
+};
+
+struct module_attribute___4;
+
+struct module___4 {
+	enum module_state state;
+	struct list_head list;
+	char name[56];
+	struct module_kobject___4 mkobj;
+	struct module_attribute___4 *modinfo_attrs;
+	const char *version;
+	const char *srcversion;
+	const char *rhelversion;
+	struct kobject___4 *holders_dir;
+	const struct kernel_symbol *syms;
+	const u32 *crcs;
+	unsigned int num_syms;
+	struct mutex param_lock;
+	struct kernel_param___4 *kp;
+	unsigned int num_kp;
+	unsigned int num_gpl_syms;
+	const struct kernel_symbol *gpl_syms;
+	const u32 *gpl_crcs;
+	bool using_gplonly_symbols;
+	bool sig_ok;
+	bool async_probe_requested;
+	unsigned int num_exentries;
+	struct exception_table_entry *extable;
+	int (*init)(void);
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	struct module_memory___4 mem[7];
+	struct mod_arch_specific arch;
+	long unsigned int taints;
+	unsigned int num_bugs;
+	struct list_head bug_list;
+	struct bug_entry *bug_table;
+	struct mod_kallsyms *kallsyms;
+	struct mod_kallsyms core_kallsyms;
+	struct module_sect_attrs *sect_attrs;
+	struct module_notes_attrs *notes_attrs;
+	char *args;
+	void *percpu;
+	unsigned int percpu_size;
+	void *noinstr_text_start;
+	unsigned int noinstr_text_size;
+	unsigned int num_tracepoints;
+	tracepoint_ptr_t *tracepoints_ptrs;
+	unsigned int num_srcu_structs;
+	struct srcu_struct **srcu_struct_ptrs;
+	unsigned int num_bpf_raw_events;
+	struct bpf_raw_event_map *bpf_raw_events;
+	unsigned int btf_data_size;
+	unsigned int btf_base_data_size;
+	void *btf_data;
+	void *btf_base_data;
+	struct jump_entry *jump_entries;
+	unsigned int num_jump_entries;
+	unsigned int num_trace_bprintk_fmt;
+	const char **trace_bprintk_fmt_start;
+	struct trace_event_call **trace_events;
+	unsigned int num_trace_events;
+	struct trace_eval_map **trace_evals;
+	unsigned int num_trace_evals;
+	unsigned int num_ftrace_callsites;
+	long unsigned int *ftrace_callsites;
+	void *kprobes_text_start;
+	unsigned int kprobes_text_size;
+	long unsigned int *kprobe_blacklist;
+	unsigned int num_kprobe_blacklist;
+	int num_static_call_sites;
+	struct static_call_site *static_call_sites;
+	int num_kunit_init_suites;
+	struct kunit_suite **kunit_init_suites;
+	int num_kunit_suites;
+	struct kunit_suite **kunit_suites;
+	bool klp;
+	bool klp_alive;
+	struct klp_modinfo *klp_info;
+	unsigned int printk_index_size;
+	struct pi_entry **printk_index_start;
+	struct list_head source_list;
+	struct list_head target_list;
+	void (*exit)(void);
+	atomic_t refcnt;
+	struct _ddebug_info___4 dyndbg_info;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
+struct module_kobject___5 {
+	struct kobject___5 kobj;
+	struct module___5 *mod;
+	struct kobject___5 *drivers_dir;
+	struct module_param_attrs *mp;
+	struct completion *kobj_completion;
+};
+
+struct module_memory___5 {
+	void *base;
+	bool is_rox;
+	unsigned int size;
+	struct mod_tree_node___5 mtn;
+};
+
+struct module_attribute___5;
+
+struct module___5 {
+	enum module_state state;
+	struct list_head list;
+	char name[56];
+	struct module_kobject___5 mkobj;
+	struct module_attribute___5 *modinfo_attrs;
+	const char *version;
+	const char *srcversion;
+	const char *rhelversion;
+	struct kobject___5 *holders_dir;
+	const struct kernel_symbol *syms;
+	const u32 *crcs;
+	unsigned int num_syms;
+	struct mutex param_lock;
+	struct kernel_param___5 *kp;
+	unsigned int num_kp;
+	unsigned int num_gpl_syms;
+	const struct kernel_symbol *gpl_syms;
+	const u32 *gpl_crcs;
+	bool using_gplonly_symbols;
+	bool sig_ok;
+	bool async_probe_requested;
+	unsigned int num_exentries;
+	struct exception_table_entry *extable;
+	int (*init)(void);
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	struct module_memory___5 mem[7];
+	struct mod_arch_specific arch;
+	long unsigned int taints;
+	unsigned int num_bugs;
+	struct list_head bug_list;
+	struct bug_entry *bug_table;
+	struct mod_kallsyms *kallsyms;
+	struct mod_kallsyms core_kallsyms;
+	struct module_sect_attrs *sect_attrs;
+	struct module_notes_attrs *notes_attrs;
+	char *args;
+	void *percpu;
+	unsigned int percpu_size;
+	void *noinstr_text_start;
+	unsigned int noinstr_text_size;
+	unsigned int num_tracepoints;
+	tracepoint_ptr_t *tracepoints_ptrs;
+	unsigned int num_srcu_structs;
+	struct srcu_struct **srcu_struct_ptrs;
+	unsigned int num_bpf_raw_events;
+	struct bpf_raw_event_map *bpf_raw_events;
+	unsigned int btf_data_size;
+	unsigned int btf_base_data_size;
+	void *btf_data;
+	void *btf_base_data;
+	struct jump_entry *jump_entries;
+	unsigned int num_jump_entries;
+	unsigned int num_trace_bprintk_fmt;
+	const char **trace_bprintk_fmt_start;
+	struct trace_event_call **trace_events;
+	unsigned int num_trace_events;
+	struct trace_eval_map **trace_evals;
+	unsigned int num_trace_evals;
+	unsigned int num_ftrace_callsites;
+	long unsigned int *ftrace_callsites;
+	void *kprobes_text_start;
+	unsigned int kprobes_text_size;
+	long unsigned int *kprobe_blacklist;
+	unsigned int num_kprobe_blacklist;
+	int num_static_call_sites;
+	struct static_call_site *static_call_sites;
+	int num_kunit_init_suites;
+	struct kunit_suite **kunit_init_suites;
+	int num_kunit_suites;
+	struct kunit_suite **kunit_suites;
+	bool klp;
+	bool klp_alive;
+	struct klp_modinfo *klp_info;
+	unsigned int printk_index_size;
+	struct pi_entry **printk_index_start;
+	struct list_head source_list;
+	struct list_head target_list;
+	void (*exit)(void);
+	atomic_t refcnt;
+	struct _ddebug_info___5 dyndbg_info;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
 struct module_attribute {
 	struct attribute attr;
 	ssize_t (*show)(const struct module_attribute *, struct module_kobject *, char *);
@@ -110005,6 +115788,33 @@ struct module_attribute___2 {
 	void (*setup)(struct module___2 *, const char *);
 	int (*test)(struct module___2 *);
 	void (*free)(struct module___2 *);
+};
+
+struct module_attribute___3 {
+	struct attribute attr;
+	ssize_t (*show)(const struct module_attribute___3 *, struct module_kobject___3 *, char *);
+	ssize_t (*store)(const struct module_attribute___3 *, struct module_kobject___3 *, const char *, size_t);
+	void (*setup)(struct module___3 *, const char *);
+	int (*test)(struct module___3 *);
+	void (*free)(struct module___3 *);
+};
+
+struct module_attribute___4 {
+	struct attribute attr;
+	ssize_t (*show)(const struct module_attribute___4 *, struct module_kobject___4 *, char *);
+	ssize_t (*store)(const struct module_attribute___4 *, struct module_kobject___4 *, const char *, size_t);
+	void (*setup)(struct module___4 *, const char *);
+	int (*test)(struct module___4 *);
+	void (*free)(struct module___4 *);
+};
+
+struct module_attribute___5 {
+	struct attribute attr;
+	ssize_t (*show)(const struct module_attribute___5 *, struct module_kobject___5 *, char *);
+	ssize_t (*store)(const struct module_attribute___5 *, struct module_kobject___5 *, const char *, size_t);
+	void (*setup)(struct module___5 *, const char *);
+	int (*test)(struct module___5 *);
+	void (*free)(struct module___5 *);
 };
 
 struct module_notes_attrs {
@@ -111456,6 +117266,22 @@ struct msi_desc___2 {
 	};
 };
 
+struct msi_desc___3 {
+	unsigned int irq;
+	unsigned int nvec_used;
+	struct device___6 *dev;
+	struct msi_msg msg;
+	struct irq_affinity_desc *affinity;
+	struct device_attribute___3 *sysfs_attrs;
+	void (*write_msi_msg)(struct msi_desc___3 *, void *);
+	void *write_msi_msg_data;
+	u16 msi_index;
+	union {
+		struct pci_msi_desc pci;
+		struct msi_desc_data data;
+	};
+};
+
 struct msi_dev_domain {
 	struct xarray store;
 	struct irq_domain *domain;
@@ -111502,6 +117328,23 @@ struct msi_domain_info___2 {
 	void *data;
 };
 
+struct msi_domain_ops___3;
+
+struct msi_domain_info___3 {
+	u32 flags;
+	enum irq_domain_bus_token bus_token;
+	unsigned int hwsize;
+	struct msi_domain_ops___3 *ops;
+	struct device___6 *dev;
+	struct irq_chip___3 *chip;
+	void *chip_data;
+	irq_flow_handler_t___3 handler;
+	void *handler_data;
+	const char *handler_name;
+	msi_alloc_info_t___3 *alloc_data;
+	void *data;
+};
+
 struct msi_domain_ops {
 	irq_hw_number_t (*get_hwirq)(struct msi_domain_info *, msi_alloc_info_t *);
 	int (*msi_init)(struct irq_domain *, struct msi_domain_info *, unsigned int, irq_hw_number_t, msi_alloc_info_t *);
@@ -111526,6 +117369,19 @@ struct msi_domain_ops___2 {
 	int (*domain_alloc_irqs)(struct irq_domain___2 *, struct device___2 *, int);
 	void (*domain_free_irqs)(struct irq_domain___2 *, struct device___2 *);
 	int (*msi_translate)(struct irq_domain___2 *, struct irq_fwspec___2 *, irq_hw_number_t *, unsigned int *);
+};
+
+struct msi_domain_ops___3 {
+	irq_hw_number_t (*get_hwirq)(struct msi_domain_info___3 *, msi_alloc_info_t___3 *);
+	int (*msi_init)(struct irq_domain___3 *, struct msi_domain_info___3 *, unsigned int, irq_hw_number_t, msi_alloc_info_t___3 *);
+	void (*msi_free)(struct irq_domain___3 *, struct msi_domain_info___3 *, unsigned int);
+	int (*msi_prepare)(struct irq_domain___3 *, struct device___6 *, int, msi_alloc_info_t___3 *);
+	void (*msi_teardown)(struct irq_domain___3 *, msi_alloc_info_t___3 *);
+	void (*prepare_desc)(struct irq_domain___3 *, msi_alloc_info_t___3 *, struct msi_desc___3 *);
+	void (*set_desc)(msi_alloc_info_t___3 *, struct msi_desc___3 *);
+	int (*domain_alloc_irqs)(struct irq_domain___3 *, struct device___6 *, int);
+	void (*domain_free_irqs)(struct irq_domain___3 *, struct device___6 *);
+	int (*msi_translate)(struct irq_domain___3 *, struct irq_fwspec___3 *, irq_hw_number_t *, unsigned int *);
 };
 
 struct msi_domain_template {
@@ -111559,6 +117415,16 @@ struct msi_parent_ops___2 {
 	u32 bus_select_mask;
 	const char *prefix;
 	bool (*init_dev_msi_info)(struct device___2 *, struct irq_domain___2 *, struct irq_domain___2 *, struct msi_domain_info___2 *);
+};
+
+struct msi_parent_ops___3 {
+	u32 supported_flags;
+	u32 required_flags;
+	u32 chip_flags;
+	u32 bus_select_token;
+	u32 bus_select_mask;
+	const char *prefix;
+	bool (*init_dev_msi_info)(struct device___6 *, struct irq_domain___3 *, struct irq_domain___3 *, struct msi_domain_info___3 *);
 };
 
 struct msix_entry {
@@ -117093,6 +122959,18 @@ struct nsproxy___2 {
 	struct cgroup_namespace___2 *cgroup_ns;
 };
 
+struct nsproxy___3 {
+	refcount_t count;
+	struct uts_namespace *uts_ns;
+	struct ipc_namespace *ipc_ns;
+	struct mnt_namespace *mnt_ns;
+	struct pid_namespace *pid_ns_for_children;
+	struct net *net_ns;
+	struct time_namespace *time_ns;
+	struct time_namespace *time_ns_for_children;
+	struct cgroup_namespace___3 *cgroup_ns;
+};
+
 struct nsset {
 	unsigned int flags;
 	struct nsproxy *nsproxy;
@@ -117442,6 +123320,16 @@ struct obj_cgroup___2 {
 	};
 };
 
+struct obj_cgroup___3 {
+	struct percpu_ref refcnt;
+	struct mem_cgroup___3 *memcg;
+	atomic_t nr_charged_bytes;
+	union {
+		struct list_head list;
+		struct callback_head rcu;
+	};
+};
+
 struct obj_stock_pcp {
 	local_trylock_t lock;
 	unsigned int nr_bytes;
@@ -117608,6 +123496,30 @@ struct of_phandle_args {
 
 struct of_phandle_args___2 {
 	struct device_node___2 *np;
+	int args_count;
+	uint32_t args[16];
+};
+
+struct of_phandle_args___3 {
+	struct device_node___4 *np;
+	int args_count;
+	uint32_t args[16];
+};
+
+struct of_phandle_args___4 {
+	struct device_node___5 *np;
+	int args_count;
+	uint32_t args[16];
+};
+
+struct of_phandle_args___5 {
+	struct device_node___6 *np;
+	int args_count;
+	uint32_t args[16];
+};
+
+struct of_phandle_args___6 {
+	struct device_node___3 *np;
 	int args_count;
 	uint32_t args[16];
 };
@@ -118593,6 +124505,12 @@ typedef struct page *pgtable_t;
 
 typedef struct page___2 *pgtable_t___2;
 
+typedef struct page___4 *pgtable_t___3;
+
+typedef struct page___5 *pgtable_t___4;
+
+typedef struct page___3 *pgtable_t___5;
+
 struct page_ext {
 	long unsigned int flags;
 };
@@ -118623,6 +124541,24 @@ struct page_flags_fields {
 
 struct page_frag___2 {
 	struct page___2 *page;
+	__u32 offset;
+	__u32 size;
+};
+
+struct page_frag___3 {
+	struct page___4 *page;
+	__u32 offset;
+	__u32 size;
+};
+
+struct page_frag___4 {
+	struct page___5 *page;
+	__u32 offset;
+	__u32 size;
+};
+
+struct page_frag___5 {
+	struct page___3 *page;
 	__u32 offset;
 	__u32 size;
 };
@@ -119334,6 +125270,105 @@ struct pci_bus {
 	unsigned int flit_mode: 1;
 };
 
+struct pci_dev___2;
+
+struct pci_ops___2;
+
+struct pci_bus___2 {
+	struct list_head node;
+	struct pci_bus___2 *parent;
+	struct list_head children;
+	struct list_head devices;
+	struct pci_dev___2 *self;
+	struct list_head slots;
+	struct resource *resource[4];
+	struct list_head resources;
+	struct resource busn_res;
+	struct pci_ops___2 *ops;
+	void *sysdata;
+	struct proc_dir_entry *procdir;
+	unsigned char number;
+	unsigned char primary;
+	unsigned char max_bus_speed;
+	unsigned char cur_bus_speed;
+	char name[48];
+	short unsigned int bridge_ctl;
+	pci_bus_flags_t bus_flags;
+	struct device___4 *bridge;
+	struct device___4 dev;
+	struct bin_attribute___3 *legacy_io;
+	struct bin_attribute___3 *legacy_mem;
+	unsigned int is_added: 1;
+	unsigned int unsafe_warn: 1;
+	unsigned int flit_mode: 1;
+};
+
+struct pci_dev___3;
+
+struct pci_ops___3;
+
+struct pci_bus___3 {
+	struct list_head node;
+	struct pci_bus___3 *parent;
+	struct list_head children;
+	struct list_head devices;
+	struct pci_dev___3 *self;
+	struct list_head slots;
+	struct resource *resource[4];
+	struct list_head resources;
+	struct resource busn_res;
+	struct pci_ops___3 *ops;
+	void *sysdata;
+	struct proc_dir_entry *procdir;
+	unsigned char number;
+	unsigned char primary;
+	unsigned char max_bus_speed;
+	unsigned char cur_bus_speed;
+	char name[48];
+	short unsigned int bridge_ctl;
+	pci_bus_flags_t bus_flags;
+	struct device___5 *bridge;
+	struct device___5 dev;
+	struct bin_attribute___4 *legacy_io;
+	struct bin_attribute___4 *legacy_mem;
+	unsigned int is_added: 1;
+	unsigned int unsafe_warn: 1;
+	unsigned int flit_mode: 1;
+};
+
+struct pci_dev___4;
+
+struct pci_ops___4;
+
+struct pci_bus___4 {
+	struct list_head node;
+	struct pci_bus___4 *parent;
+	struct list_head children;
+	struct list_head devices;
+	struct pci_dev___4 *self;
+	struct list_head slots;
+	struct resource *resource[4];
+	struct list_head resources;
+	struct resource busn_res;
+	struct pci_ops___4 *ops;
+	void *sysdata;
+	struct proc_dir_entry *procdir;
+	unsigned char number;
+	unsigned char primary;
+	unsigned char max_bus_speed;
+	unsigned char cur_bus_speed;
+	char name[48];
+	short unsigned int bridge_ctl;
+	pci_bus_flags_t bus_flags;
+	struct device___6 *bridge;
+	struct device___6 dev;
+	struct bin_attribute___4 *legacy_io;
+	struct bin_attribute___4 *legacy_mem;
+	unsigned int is_added: 1;
+	unsigned int unsafe_warn: 1;
+	unsigned int flit_mode: 1;
+};
+
 struct pci_bus_region {
 	pci_bus_addr_t start;
 	pci_bus_addr_t end;
@@ -119529,6 +125564,474 @@ struct pci_dev {
 	u8 tph_req_type;
 };
 
+struct pci_slot___2;
+
+struct pci_driver___2;
+
+struct pci_dev___2 {
+	struct list_head bus_list;
+	struct pci_bus___2 *bus;
+	struct pci_bus___2 *subordinate;
+	void *sysdata;
+	struct proc_dir_entry *procent;
+	struct pci_slot___2 *slot;
+	unsigned int devfn;
+	short unsigned int vendor;
+	short unsigned int device;
+	short unsigned int subsystem_vendor;
+	short unsigned int subsystem_device;
+	unsigned int class;
+	u8 revision;
+	u8 hdr_type;
+	u16 aer_cap;
+	struct aer_info *aer_info;
+	struct rcec_ea *rcec_ea;
+	struct pci_dev___2 *rcec;
+	u32 devcap;
+	u16 rebar_cap;
+	u8 pcie_cap;
+	u8 msi_cap;
+	u8 msix_cap;
+	u8 pcie_mpss: 3;
+	u8 rom_base_reg;
+	u8 pin;
+	u16 pcie_flags_reg;
+	long unsigned int *dma_alias_mask;
+	struct pci_driver___2 *driver;
+	u64 dma_mask;
+	struct device_dma_parameters dma_parms;
+	pci_power_t current_state;
+	u8 pm_cap;
+	unsigned int pme_support: 5;
+	unsigned int pme_poll: 1;
+	unsigned int pinned: 1;
+	unsigned int config_rrs_sv: 1;
+	unsigned int imm_ready: 1;
+	unsigned int d1_support: 1;
+	unsigned int d2_support: 1;
+	unsigned int no_d1d2: 1;
+	unsigned int no_d3cold: 1;
+	unsigned int bridge_d3: 1;
+	unsigned int d3cold_allowed: 1;
+	unsigned int mmio_always_on: 1;
+	unsigned int wakeup_prepared: 1;
+	unsigned int skip_bus_pm: 1;
+	unsigned int ignore_hotplug: 1;
+	unsigned int hotplug_user_indicators: 1;
+	unsigned int clear_retrain_link: 1;
+	unsigned int d3hot_delay;
+	unsigned int d3cold_delay;
+	u16 l1ss;
+	struct pcie_link_state *link_state;
+	unsigned int aspm_l0s_support: 1;
+	unsigned int aspm_l1_support: 1;
+	unsigned int ltr_path: 1;
+	unsigned int pasid_no_tlp: 1;
+	unsigned int eetlp_prefix_max: 3;
+	pci_channel_state_t error_state;
+	struct device___4 dev;
+	int cfg_size;
+	unsigned int irq;
+	struct resource resource[17];
+	struct resource driver_exclusive_resource;
+	unsigned int transparent: 1;
+	unsigned int io_window: 1;
+	unsigned int pref_window: 1;
+	unsigned int pref_64_window: 1;
+	unsigned int multifunction: 1;
+	unsigned int is_busmaster: 1;
+	unsigned int no_msi: 1;
+	unsigned int no_64bit_msi: 1;
+	unsigned int block_cfg_access: 1;
+	unsigned int broken_parity_status: 1;
+	unsigned int irq_reroute_variant: 2;
+	unsigned int msi_enabled: 1;
+	unsigned int msix_enabled: 1;
+	unsigned int ari_enabled: 1;
+	unsigned int ats_enabled: 1;
+	unsigned int pasid_enabled: 1;
+	unsigned int pri_enabled: 1;
+	unsigned int tph_enabled: 1;
+	unsigned int is_managed: 1;
+	unsigned int is_msi_managed: 1;
+	unsigned int needs_freset: 1;
+	unsigned int state_saved: 1;
+	unsigned int is_physfn: 1;
+	unsigned int is_virtfn: 1;
+	unsigned int is_hotplug_bridge: 1;
+	unsigned int is_pciehp: 1;
+	unsigned int shpc_managed: 1;
+	unsigned int is_thunderbolt: 1;
+	unsigned int untrusted: 1;
+	unsigned int external_facing: 1;
+	unsigned int broken_intx_masking: 1;
+	unsigned int io_window_1k: 1;
+	unsigned int irq_managed: 1;
+	unsigned int non_compliant_bars: 1;
+	unsigned int is_probed: 1;
+	unsigned int link_active_reporting: 1;
+	unsigned int no_vf_scan: 1;
+	unsigned int no_command_memory: 1;
+	unsigned int rom_bar_overlap: 1;
+	unsigned int rom_attr_enabled: 1;
+	unsigned int non_mappable_bars: 1;
+	pci_dev_flags_t dev_flags;
+	atomic_t enable_cnt;
+	spinlock_t pcie_cap_lock;
+	u32 saved_config_space[16];
+	struct hlist_head saved_cap_space;
+	struct bin_attribute___3 *res_attr[17];
+	struct bin_attribute___3 *res_attr_wc[17];
+	unsigned int broken_cmd_compl: 1;
+	u16 ptm_cap;
+	unsigned int ptm_root: 1;
+	unsigned int ptm_enabled: 1;
+	u8 ptm_granularity;
+	void *msix_base;
+	raw_spinlock_t msi_lock;
+	struct pci_vpd vpd;
+	u16 dpc_cap;
+	unsigned int dpc_rp_extensions: 1;
+	u8 dpc_rp_log_size;
+	struct pcie_bwctrl_data *link_bwctrl;
+	union {
+		struct pci_sriov *sriov;
+		struct pci_dev___2 *physfn;
+	};
+	u16 ats_cap;
+	u8 ats_stu;
+	u16 pri_cap;
+	u32 pri_reqs_alloc;
+	unsigned int pasid_required: 1;
+	u16 pasid_cap;
+	u16 pasid_features;
+	struct pci_p2pdma *p2pdma;
+	struct xarray doe_mbs;
+	struct npem *npem;
+	u16 acs_cap;
+	u8 supported_speeds;
+	phys_addr_t rom;
+	size_t romlen;
+	const char *driver_override;
+	long unsigned int priv_flags;
+	u8 reset_methods[8];
+	u16 tph_cap;
+	u8 tph_mode;
+	u8 tph_req_type;
+};
+
+struct pci_slot___3;
+
+struct pci_driver___3;
+
+struct pci_dev___3 {
+	struct list_head bus_list;
+	struct pci_bus___3 *bus;
+	struct pci_bus___3 *subordinate;
+	void *sysdata;
+	struct proc_dir_entry *procent;
+	struct pci_slot___3 *slot;
+	unsigned int devfn;
+	short unsigned int vendor;
+	short unsigned int device;
+	short unsigned int subsystem_vendor;
+	short unsigned int subsystem_device;
+	unsigned int class;
+	u8 revision;
+	u8 hdr_type;
+	u16 aer_cap;
+	struct aer_info *aer_info;
+	struct rcec_ea *rcec_ea;
+	struct pci_dev___3 *rcec;
+	u32 devcap;
+	u16 rebar_cap;
+	u8 pcie_cap;
+	u8 msi_cap;
+	u8 msix_cap;
+	u8 pcie_mpss: 3;
+	u8 rom_base_reg;
+	u8 pin;
+	u16 pcie_flags_reg;
+	long unsigned int *dma_alias_mask;
+	struct pci_driver___3 *driver;
+	u64 dma_mask;
+	struct device_dma_parameters dma_parms;
+	pci_power_t current_state;
+	u8 pm_cap;
+	unsigned int pme_support: 5;
+	unsigned int pme_poll: 1;
+	unsigned int pinned: 1;
+	unsigned int config_rrs_sv: 1;
+	unsigned int imm_ready: 1;
+	unsigned int d1_support: 1;
+	unsigned int d2_support: 1;
+	unsigned int no_d1d2: 1;
+	unsigned int no_d3cold: 1;
+	unsigned int bridge_d3: 1;
+	unsigned int d3cold_allowed: 1;
+	unsigned int mmio_always_on: 1;
+	unsigned int wakeup_prepared: 1;
+	unsigned int skip_bus_pm: 1;
+	unsigned int ignore_hotplug: 1;
+	unsigned int hotplug_user_indicators: 1;
+	unsigned int clear_retrain_link: 1;
+	unsigned int d3hot_delay;
+	unsigned int d3cold_delay;
+	u16 l1ss;
+	struct pcie_link_state *link_state;
+	unsigned int aspm_l0s_support: 1;
+	unsigned int aspm_l1_support: 1;
+	unsigned int ltr_path: 1;
+	unsigned int pasid_no_tlp: 1;
+	unsigned int eetlp_prefix_max: 3;
+	pci_channel_state_t error_state;
+	struct device___5 dev;
+	int cfg_size;
+	unsigned int irq;
+	struct resource resource[17];
+	struct resource driver_exclusive_resource;
+	unsigned int transparent: 1;
+	unsigned int io_window: 1;
+	unsigned int pref_window: 1;
+	unsigned int pref_64_window: 1;
+	unsigned int multifunction: 1;
+	unsigned int is_busmaster: 1;
+	unsigned int no_msi: 1;
+	unsigned int no_64bit_msi: 1;
+	unsigned int block_cfg_access: 1;
+	unsigned int broken_parity_status: 1;
+	unsigned int irq_reroute_variant: 2;
+	unsigned int msi_enabled: 1;
+	unsigned int msix_enabled: 1;
+	unsigned int ari_enabled: 1;
+	unsigned int ats_enabled: 1;
+	unsigned int pasid_enabled: 1;
+	unsigned int pri_enabled: 1;
+	unsigned int tph_enabled: 1;
+	unsigned int is_managed: 1;
+	unsigned int is_msi_managed: 1;
+	unsigned int needs_freset: 1;
+	unsigned int state_saved: 1;
+	unsigned int is_physfn: 1;
+	unsigned int is_virtfn: 1;
+	unsigned int is_hotplug_bridge: 1;
+	unsigned int is_pciehp: 1;
+	unsigned int shpc_managed: 1;
+	unsigned int is_thunderbolt: 1;
+	unsigned int untrusted: 1;
+	unsigned int external_facing: 1;
+	unsigned int broken_intx_masking: 1;
+	unsigned int io_window_1k: 1;
+	unsigned int irq_managed: 1;
+	unsigned int non_compliant_bars: 1;
+	unsigned int is_probed: 1;
+	unsigned int link_active_reporting: 1;
+	unsigned int no_vf_scan: 1;
+	unsigned int no_command_memory: 1;
+	unsigned int rom_bar_overlap: 1;
+	unsigned int rom_attr_enabled: 1;
+	unsigned int non_mappable_bars: 1;
+	pci_dev_flags_t dev_flags;
+	atomic_t enable_cnt;
+	spinlock_t pcie_cap_lock;
+	u32 saved_config_space[16];
+	struct hlist_head saved_cap_space;
+	struct bin_attribute___4 *res_attr[17];
+	struct bin_attribute___4 *res_attr_wc[17];
+	unsigned int broken_cmd_compl: 1;
+	u16 ptm_cap;
+	unsigned int ptm_root: 1;
+	unsigned int ptm_enabled: 1;
+	u8 ptm_granularity;
+	void *msix_base;
+	raw_spinlock_t msi_lock;
+	struct pci_vpd vpd;
+	u16 dpc_cap;
+	unsigned int dpc_rp_extensions: 1;
+	u8 dpc_rp_log_size;
+	struct pcie_bwctrl_data *link_bwctrl;
+	union {
+		struct pci_sriov *sriov;
+		struct pci_dev___3 *physfn;
+	};
+	u16 ats_cap;
+	u8 ats_stu;
+	u16 pri_cap;
+	u32 pri_reqs_alloc;
+	unsigned int pasid_required: 1;
+	u16 pasid_cap;
+	u16 pasid_features;
+	struct pci_p2pdma *p2pdma;
+	struct xarray doe_mbs;
+	struct npem *npem;
+	u16 acs_cap;
+	u8 supported_speeds;
+	phys_addr_t rom;
+	size_t romlen;
+	const char *driver_override;
+	long unsigned int priv_flags;
+	u8 reset_methods[8];
+	u16 tph_cap;
+	u8 tph_mode;
+	u8 tph_req_type;
+};
+
+struct pci_slot___4;
+
+struct pci_driver___4;
+
+struct pci_dev___4 {
+	struct list_head bus_list;
+	struct pci_bus___4 *bus;
+	struct pci_bus___4 *subordinate;
+	void *sysdata;
+	struct proc_dir_entry *procent;
+	struct pci_slot___4 *slot;
+	unsigned int devfn;
+	short unsigned int vendor;
+	short unsigned int device;
+	short unsigned int subsystem_vendor;
+	short unsigned int subsystem_device;
+	unsigned int class;
+	u8 revision;
+	u8 hdr_type;
+	u16 aer_cap;
+	struct aer_info *aer_info;
+	struct rcec_ea *rcec_ea;
+	struct pci_dev___4 *rcec;
+	u32 devcap;
+	u16 rebar_cap;
+	u8 pcie_cap;
+	u8 msi_cap;
+	u8 msix_cap;
+	u8 pcie_mpss: 3;
+	u8 rom_base_reg;
+	u8 pin;
+	u16 pcie_flags_reg;
+	long unsigned int *dma_alias_mask;
+	struct pci_driver___4 *driver;
+	u64 dma_mask;
+	struct device_dma_parameters dma_parms;
+	pci_power_t current_state;
+	u8 pm_cap;
+	unsigned int pme_support: 5;
+	unsigned int pme_poll: 1;
+	unsigned int pinned: 1;
+	unsigned int config_rrs_sv: 1;
+	unsigned int imm_ready: 1;
+	unsigned int d1_support: 1;
+	unsigned int d2_support: 1;
+	unsigned int no_d1d2: 1;
+	unsigned int no_d3cold: 1;
+	unsigned int bridge_d3: 1;
+	unsigned int d3cold_allowed: 1;
+	unsigned int mmio_always_on: 1;
+	unsigned int wakeup_prepared: 1;
+	unsigned int skip_bus_pm: 1;
+	unsigned int ignore_hotplug: 1;
+	unsigned int hotplug_user_indicators: 1;
+	unsigned int clear_retrain_link: 1;
+	unsigned int d3hot_delay;
+	unsigned int d3cold_delay;
+	u16 l1ss;
+	struct pcie_link_state *link_state;
+	unsigned int aspm_l0s_support: 1;
+	unsigned int aspm_l1_support: 1;
+	unsigned int ltr_path: 1;
+	unsigned int pasid_no_tlp: 1;
+	unsigned int eetlp_prefix_max: 3;
+	pci_channel_state_t error_state;
+	struct device___6 dev;
+	int cfg_size;
+	unsigned int irq;
+	struct resource resource[17];
+	struct resource driver_exclusive_resource;
+	unsigned int transparent: 1;
+	unsigned int io_window: 1;
+	unsigned int pref_window: 1;
+	unsigned int pref_64_window: 1;
+	unsigned int multifunction: 1;
+	unsigned int is_busmaster: 1;
+	unsigned int no_msi: 1;
+	unsigned int no_64bit_msi: 1;
+	unsigned int block_cfg_access: 1;
+	unsigned int broken_parity_status: 1;
+	unsigned int irq_reroute_variant: 2;
+	unsigned int msi_enabled: 1;
+	unsigned int msix_enabled: 1;
+	unsigned int ari_enabled: 1;
+	unsigned int ats_enabled: 1;
+	unsigned int pasid_enabled: 1;
+	unsigned int pri_enabled: 1;
+	unsigned int tph_enabled: 1;
+	unsigned int is_managed: 1;
+	unsigned int is_msi_managed: 1;
+	unsigned int needs_freset: 1;
+	unsigned int state_saved: 1;
+	unsigned int is_physfn: 1;
+	unsigned int is_virtfn: 1;
+	unsigned int is_hotplug_bridge: 1;
+	unsigned int is_pciehp: 1;
+	unsigned int shpc_managed: 1;
+	unsigned int is_thunderbolt: 1;
+	unsigned int untrusted: 1;
+	unsigned int external_facing: 1;
+	unsigned int broken_intx_masking: 1;
+	unsigned int io_window_1k: 1;
+	unsigned int irq_managed: 1;
+	unsigned int non_compliant_bars: 1;
+	unsigned int is_probed: 1;
+	unsigned int link_active_reporting: 1;
+	unsigned int no_vf_scan: 1;
+	unsigned int no_command_memory: 1;
+	unsigned int rom_bar_overlap: 1;
+	unsigned int rom_attr_enabled: 1;
+	unsigned int non_mappable_bars: 1;
+	pci_dev_flags_t dev_flags;
+	atomic_t enable_cnt;
+	spinlock_t pcie_cap_lock;
+	u32 saved_config_space[16];
+	struct hlist_head saved_cap_space;
+	struct bin_attribute___4 *res_attr[17];
+	struct bin_attribute___4 *res_attr_wc[17];
+	unsigned int broken_cmd_compl: 1;
+	u16 ptm_cap;
+	unsigned int ptm_root: 1;
+	unsigned int ptm_enabled: 1;
+	u8 ptm_granularity;
+	void *msix_base;
+	raw_spinlock_t msi_lock;
+	struct pci_vpd vpd;
+	u16 dpc_cap;
+	unsigned int dpc_rp_extensions: 1;
+	u8 dpc_rp_log_size;
+	struct pcie_bwctrl_data *link_bwctrl;
+	union {
+		struct pci_sriov *sriov;
+		struct pci_dev___4 *physfn;
+	};
+	u16 ats_cap;
+	u8 ats_stu;
+	u16 pri_cap;
+	u32 pri_reqs_alloc;
+	unsigned int pasid_required: 1;
+	u16 pasid_cap;
+	u16 pasid_features;
+	struct pci_p2pdma *p2pdma;
+	struct xarray doe_mbs;
+	struct npem *npem;
+	u16 acs_cap;
+	u8 supported_speeds;
+	phys_addr_t rom;
+	size_t romlen;
+	const char *driver_override;
+	long unsigned int priv_flags;
+	u8 reset_methods[8];
+	u16 tph_cap;
+	u8 tph_mode;
+	u8 tph_req_type;
+};
+
 struct pci_dev_acs_enabled {
 	u16 vendor;
 	u16 device;
@@ -119641,6 +126144,69 @@ struct pci_driver {
 	bool driver_managed_dma;
 };
 
+struct pci_error_handlers___2;
+
+struct pci_driver___2 {
+	const char *name;
+	const struct pci_device_id *id_table;
+	int (*probe)(struct pci_dev___2 *, const struct pci_device_id *);
+	void (*remove)(struct pci_dev___2 *);
+	int (*suspend)(struct pci_dev___2 *, pm_message_t);
+	int (*resume)(struct pci_dev___2 *);
+	void (*shutdown)(struct pci_dev___2 *);
+	int (*sriov_configure)(struct pci_dev___2 *, int);
+	int (*sriov_set_msix_vec_count)(struct pci_dev___2 *, int);
+	u32 (*sriov_get_vf_total_msix)(struct pci_dev___2 *);
+	const struct pci_error_handlers___2 *err_handler;
+	const struct attribute_group___3 **groups;
+	const struct attribute_group___3 **dev_groups;
+	struct device_driver___4 driver;
+	struct pci_dynids dynids;
+	bool driver_managed_dma;
+};
+
+struct pci_error_handlers___3;
+
+struct pci_driver___3 {
+	const char *name;
+	const struct pci_device_id *id_table;
+	int (*probe)(struct pci_dev___3 *, const struct pci_device_id *);
+	void (*remove)(struct pci_dev___3 *);
+	int (*suspend)(struct pci_dev___3 *, pm_message_t);
+	int (*resume)(struct pci_dev___3 *);
+	void (*shutdown)(struct pci_dev___3 *);
+	int (*sriov_configure)(struct pci_dev___3 *, int);
+	int (*sriov_set_msix_vec_count)(struct pci_dev___3 *, int);
+	u32 (*sriov_get_vf_total_msix)(struct pci_dev___3 *);
+	const struct pci_error_handlers___3 *err_handler;
+	const struct attribute_group___4 **groups;
+	const struct attribute_group___4 **dev_groups;
+	struct device_driver___5 driver;
+	struct pci_dynids dynids;
+	bool driver_managed_dma;
+};
+
+struct pci_error_handlers___4;
+
+struct pci_driver___4 {
+	const char *name;
+	const struct pci_device_id *id_table;
+	int (*probe)(struct pci_dev___4 *, const struct pci_device_id *);
+	void (*remove)(struct pci_dev___4 *);
+	int (*suspend)(struct pci_dev___4 *, pm_message_t);
+	int (*resume)(struct pci_dev___4 *);
+	void (*shutdown)(struct pci_dev___4 *);
+	int (*sriov_configure)(struct pci_dev___4 *, int);
+	int (*sriov_set_msix_vec_count)(struct pci_dev___4 *, int);
+	u32 (*sriov_get_vf_total_msix)(struct pci_dev___4 *);
+	const struct pci_error_handlers___4 *err_handler;
+	const struct attribute_group___4 **groups;
+	const struct attribute_group___4 **dev_groups;
+	struct device_driver___6 driver;
+	struct pci_dynids dynids;
+	bool driver_managed_dma;
+};
+
 struct pci_dynid {
 	struct list_head node;
 	struct pci_device_id id;
@@ -119654,6 +126220,36 @@ struct pci_error_handlers {
 	void (*reset_done)(struct pci_dev *);
 	void (*resume)(struct pci_dev *);
 	void (*cor_error_detected)(struct pci_dev *);
+};
+
+struct pci_error_handlers___2 {
+	pci_ers_result_t (*error_detected)(struct pci_dev___2 *, pci_channel_state_t);
+	pci_ers_result_t (*mmio_enabled)(struct pci_dev___2 *);
+	pci_ers_result_t (*slot_reset)(struct pci_dev___2 *);
+	void (*reset_prepare)(struct pci_dev___2 *);
+	void (*reset_done)(struct pci_dev___2 *);
+	void (*resume)(struct pci_dev___2 *);
+	void (*cor_error_detected)(struct pci_dev___2 *);
+};
+
+struct pci_error_handlers___3 {
+	pci_ers_result_t (*error_detected)(struct pci_dev___3 *, pci_channel_state_t);
+	pci_ers_result_t (*mmio_enabled)(struct pci_dev___3 *);
+	pci_ers_result_t (*slot_reset)(struct pci_dev___3 *);
+	void (*reset_prepare)(struct pci_dev___3 *);
+	void (*reset_done)(struct pci_dev___3 *);
+	void (*resume)(struct pci_dev___3 *);
+	void (*cor_error_detected)(struct pci_dev___3 *);
+};
+
+struct pci_error_handlers___4 {
+	pci_ers_result_t (*error_detected)(struct pci_dev___4 *, pci_channel_state_t);
+	pci_ers_result_t (*mmio_enabled)(struct pci_dev___4 *);
+	pci_ers_result_t (*slot_reset)(struct pci_dev___4 *);
+	void (*reset_prepare)(struct pci_dev___4 *);
+	void (*reset_done)(struct pci_dev___4 *);
+	void (*resume)(struct pci_dev___4 *);
+	void (*cor_error_detected)(struct pci_dev___4 *);
 };
 
 struct pci_filp_private {
@@ -119734,6 +126330,30 @@ struct pci_ops {
 	void * (*map_bus)(struct pci_bus *, unsigned int, int);
 	int (*read)(struct pci_bus *, unsigned int, int, int, u32 *);
 	int (*write)(struct pci_bus *, unsigned int, int, int, u32);
+};
+
+struct pci_ops___2 {
+	int (*add_bus)(struct pci_bus___2 *);
+	void (*remove_bus)(struct pci_bus___2 *);
+	void * (*map_bus)(struct pci_bus___2 *, unsigned int, int);
+	int (*read)(struct pci_bus___2 *, unsigned int, int, int, u32 *);
+	int (*write)(struct pci_bus___2 *, unsigned int, int, int, u32);
+};
+
+struct pci_ops___3 {
+	int (*add_bus)(struct pci_bus___3 *);
+	void (*remove_bus)(struct pci_bus___3 *);
+	void * (*map_bus)(struct pci_bus___3 *, unsigned int, int);
+	int (*read)(struct pci_bus___3 *, unsigned int, int, int, u32 *);
+	int (*write)(struct pci_bus___3 *, unsigned int, int, int, u32);
+};
+
+struct pci_ops___4 {
+	int (*add_bus)(struct pci_bus___4 *);
+	void (*remove_bus)(struct pci_bus___4 *);
+	void * (*map_bus)(struct pci_bus___4 *, unsigned int, int);
+	int (*read)(struct pci_bus___4 *, unsigned int, int, int, u32 *);
+	int (*write)(struct pci_bus___4 *, unsigned int, int, int, u32);
 };
 
 struct pci_osc_bit_struct {
@@ -119856,6 +126476,30 @@ struct pci_slot {
 	struct kobject kobj;
 };
 
+struct pci_slot___2 {
+	struct pci_bus___2 *bus;
+	struct list_head list;
+	struct hotplug_slot *hotplug;
+	unsigned char number;
+	struct kobject___3 kobj;
+};
+
+struct pci_slot___3 {
+	struct pci_bus___3 *bus;
+	struct list_head list;
+	struct hotplug_slot *hotplug;
+	unsigned char number;
+	struct kobject___4 kobj;
+};
+
+struct pci_slot___4 {
+	struct pci_bus___4 *bus;
+	struct list_head list;
+	struct hotplug_slot *hotplug;
+	unsigned char number;
+	struct kobject___4 kobj;
+};
+
 struct pci_slot_attribute {
 	struct attribute attr;
 	ssize_t (*show)(struct pci_slot *, char *);
@@ -119886,6 +126530,15 @@ struct pci_sriov {
 	resource_size_t barsz[6];
 	u16 vf_rebar_cap;
 	bool drivers_autoprobe;
+};
+
+struct pci_sysdata___2 {
+	int domain;
+	int node;
+	struct acpi_device *companion;
+	void *iommu;
+	void *fwnode;
+	struct pci_dev___3 *vmd_dev;
 };
 
 struct pcibios_fwaddrmap {
@@ -120612,6 +127265,30 @@ struct percpu_rw_semaphore___2 {
 	struct rcu_sync rss;
 	unsigned int *read_count;
 	struct rcuwait___2 writer;
+	wait_queue_head_t waiters;
+	atomic_t block;
+};
+
+struct percpu_rw_semaphore___3 {
+	struct rcu_sync rss;
+	unsigned int *read_count;
+	struct rcuwait___3 writer;
+	wait_queue_head_t waiters;
+	atomic_t block;
+};
+
+struct percpu_rw_semaphore___4 {
+	struct rcu_sync rss;
+	unsigned int *read_count;
+	struct rcuwait___4 writer;
+	wait_queue_head_t waiters;
+	atomic_t block;
+};
+
+struct percpu_rw_semaphore___5 {
+	struct rcu_sync rss;
+	unsigned int *read_count;
+	struct rcuwait___5 writer;
 	wait_queue_head_t waiters;
 	atomic_t block;
 };
@@ -121478,6 +128155,15 @@ struct pericom8250 {
 	int line[0];
 };
 
+struct vfio_pci_core_device;
+
+struct perm_bits {
+	u8 *virt;
+	u8 *write;
+	int (*readfn)(struct vfio_pci_core_device *, int, int, struct perm_bits *, int, __le32 *);
+	int (*writefn)(struct vfio_pci_core_device *, int, int, struct perm_bits *, int, __le32);
+};
+
 struct perm_datum {
 	u32 value;
 };
@@ -121776,6 +128462,127 @@ struct pglist_data___2 {
 	struct lruvec___2 __lruvec;
 	long unsigned int flags;
 	struct lru_gen_mm_walk___2 mm_walk;
+	struct lru_gen_memcg memcg_lru;
+	long: 64;
+	struct cacheline_padding _pad2_;
+	struct per_cpu_nodestat *per_cpu_nodestats;
+	atomic_long_t vm_stat[51];
+	struct memory_tier *memtier;
+	struct memory_failure_stats mf_stats;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
+struct zone___3 {
+	long unsigned int _watermark[4];
+	long unsigned int watermark_boost;
+	long unsigned int nr_reserved_highatomic;
+	long unsigned int nr_free_highatomic;
+	long int lowmem_reserve[5];
+	int node;
+	struct pglist_data___3 *zone_pgdat;
+	struct per_cpu_pages *per_cpu_pageset;
+	struct per_cpu_zonestat *per_cpu_zonestats;
+	int pageset_high_min;
+	int pageset_high_max;
+	int pageset_batch;
+	long unsigned int zone_start_pfn;
+	atomic_long_t managed_pages;
+	long unsigned int spanned_pages;
+	long unsigned int present_pages;
+	long unsigned int present_early_pages;
+	long unsigned int cma_pages;
+	const char *name;
+	long unsigned int nr_isolate_pageblock;
+	seqlock_t span_seqlock;
+	int initialized;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	struct cacheline_padding _pad1_;
+	struct free_area free_area[11];
+	struct list_head unaccepted_pages;
+	struct work_struct unaccepted_cleanup;
+	long unsigned int flags;
+	spinlock_t lock;
+	struct llist_head trylock_free_pages;
+	struct cacheline_padding _pad2_;
+	long unsigned int percpu_drift_mark;
+	long unsigned int compact_cached_free_pfn;
+	long unsigned int compact_cached_migrate_pfn[2];
+	long unsigned int compact_init_migrate_pfn;
+	long unsigned int compact_init_free_pfn;
+	unsigned int compact_considered;
+	unsigned int compact_defer_shift;
+	int compact_order_failed;
+	bool compact_blockskip_flush;
+	bool contiguous;
+	long: 0;
+	struct cacheline_padding _pad3_;
+	atomic_long_t vm_stat[12];
+	atomic_long_t vm_numa_event[6];
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
+struct zoneref___3 {
+	struct zone___3 *zone;
+	int zone_idx;
+};
+
+struct zonelist___3 {
+	struct zoneref___3 _zonerefs[5121];
+};
+
+struct pglist_data___3 {
+	struct zone___3 node_zones[5];
+	struct zonelist___3 node_zonelists[2];
+	int nr_zones;
+	spinlock_t node_size_lock;
+	long unsigned int node_start_pfn;
+	long unsigned int node_present_pages;
+	long unsigned int node_spanned_pages;
+	int node_id;
+	wait_queue_head_t kswapd_wait;
+	wait_queue_head_t pfmemalloc_wait;
+	wait_queue_head_t reclaim_wait[4];
+	atomic_t nr_writeback_throttled;
+	long unsigned int nr_reclaim_start;
+	struct mutex kswapd_lock;
+	struct task_struct___3 *kswapd;
+	int kswapd_order;
+	enum zone_type kswapd_highest_zoneidx;
+	atomic_t kswapd_failures;
+	int kcompactd_max_order;
+	enum zone_type kcompactd_highest_zoneidx;
+	wait_queue_head_t kcompactd_wait;
+	struct task_struct___3 *kcompactd;
+	bool proactive_compact_trigger;
+	long unsigned int totalreserve_pages;
+	long unsigned int min_unmapped_pages;
+	long unsigned int min_slab_pages;
+	long: 64;
+	long: 64;
+	long: 64;
+	struct cacheline_padding _pad1_;
+	struct deferred_split deferred_split_queue;
+	unsigned int nbp_rl_start;
+	long unsigned int nbp_rl_nr_cand;
+	unsigned int nbp_threshold;
+	unsigned int nbp_th_start;
+	long unsigned int nbp_th_nr_cand;
+	struct lruvec___3 __lruvec;
+	long unsigned int flags;
+	struct lru_gen_mm_walk___3 mm_walk;
 	struct lru_gen_memcg memcg_lru;
 	long: 64;
 	struct cacheline_padding _pad2_;
@@ -122372,6 +129179,57 @@ struct pid___2 {
 	wait_queue_head_t wait_pidfd;
 	struct callback_head rcu;
 	struct upid___2 numbers[0];
+};
+
+struct pid___3 {
+	refcount_t count;
+	unsigned int level;
+	spinlock_t lock;
+	struct {
+		u64 ino;
+		struct rb_node pidfs_node;
+		struct dentry___4 *stashed;
+		struct pidfs_attr *attr;
+	};
+	struct hlist_head tasks[4];
+	struct hlist_head inodes;
+	wait_queue_head_t wait_pidfd;
+	struct callback_head rcu;
+	struct upid numbers[0];
+};
+
+struct pid___4 {
+	refcount_t count;
+	unsigned int level;
+	spinlock_t lock;
+	struct {
+		u64 ino;
+		struct rb_node pidfs_node;
+		struct dentry___5 *stashed;
+		struct pidfs_attr *attr;
+	};
+	struct hlist_head tasks[4];
+	struct hlist_head inodes;
+	wait_queue_head_t wait_pidfd;
+	struct callback_head rcu;
+	struct upid numbers[0];
+};
+
+struct pid___5 {
+	refcount_t count;
+	unsigned int level;
+	spinlock_t lock;
+	struct {
+		u64 ino;
+		struct rb_node pidfs_node;
+		struct dentry___3 *stashed;
+		struct pidfs_attr *attr;
+	};
+	struct hlist_head tasks[4];
+	struct hlist_head inodes;
+	wait_queue_head_t wait_pidfd;
+	struct callback_head rcu;
+	struct upid numbers[0];
 };
 
 union proc_op {
@@ -123491,6 +130349,29 @@ struct poll_table_struct___2 {
 };
 
 typedef struct poll_table_struct___2 poll_table___2;
+
+typedef void (*poll_queue_proc___3)(struct file___4 *, wait_queue_head_t *, struct poll_table_struct___5 *);
+
+struct poll_table_struct___5 {
+	poll_queue_proc___3 _qproc;
+	__poll_t _key;
+};
+
+typedef struct poll_table_struct___5 poll_table___3;
+
+typedef void (*poll_queue_proc___4)(struct file___3 *, wait_queue_head_t *, struct poll_table_struct___4 *);
+
+struct poll_table_struct___4 {
+	poll_queue_proc___4 _qproc;
+	__poll_t _key;
+};
+
+typedef void (*poll_queue_proc___5)(struct file___5 *, wait_queue_head_t *, struct poll_table_struct___3 *);
+
+struct poll_table_struct___3 {
+	poll_queue_proc___5 _qproc;
+	__poll_t _key;
+};
 
 struct poll_wqueues {
 	poll_table pt;
@@ -124997,6 +131878,34 @@ struct psi_group___2 {
 	u64 rtpoll_until;
 };
 
+struct psi_group___3 {
+	struct psi_group___3 *parent;
+	bool enabled;
+	struct mutex avgs_lock;
+	struct psi_group_cpu *pcpu;
+	u64 avg_total[7];
+	u64 avg_last_update;
+	u64 avg_next_update;
+	struct delayed_work avgs_work;
+	struct list_head avg_triggers;
+	u32 avg_nr_triggers[7];
+	u64 total[14];
+	long unsigned int avg[21];
+	struct task_struct___3 *rtpoll_task;
+	struct timer_list rtpoll_timer;
+	wait_queue_head_t rtpoll_wait;
+	atomic_t rtpoll_wakeup;
+	atomic_t rtpoll_scheduled;
+	struct mutex rtpoll_trigger_lock;
+	struct list_head rtpoll_triggers;
+	u32 rtpoll_nr_triggers[7];
+	u32 rtpoll_states;
+	u64 rtpoll_min_period;
+	u64 rtpoll_total[7];
+	u64 rtpoll_next_update;
+	u64 rtpoll_until;
+};
+
 struct psi_group_cpu {
 	unsigned int tasks[4];
 	u32 state_mask;
@@ -126183,6 +133092,39 @@ struct quota_format_ops___2 {
 	int (*get_next_id)(struct super_block___2 *, struct kqid *);
 };
 
+struct quota_format_ops___3 {
+	int (*check_quota_file)(struct super_block___3 *, int);
+	int (*read_file_info)(struct super_block___3 *, int);
+	int (*write_file_info)(struct super_block___3 *, int);
+	int (*free_file_info)(struct super_block___3 *, int);
+	int (*read_dqblk)(struct dquot___3 *);
+	int (*commit_dqblk)(struct dquot___3 *);
+	int (*release_dqblk)(struct dquot___3 *);
+	int (*get_next_id)(struct super_block___3 *, struct kqid *);
+};
+
+struct quota_format_ops___4 {
+	int (*check_quota_file)(struct super_block___4 *, int);
+	int (*read_file_info)(struct super_block___4 *, int);
+	int (*write_file_info)(struct super_block___4 *, int);
+	int (*free_file_info)(struct super_block___4 *, int);
+	int (*read_dqblk)(struct dquot___4 *);
+	int (*commit_dqblk)(struct dquot___4 *);
+	int (*release_dqblk)(struct dquot___4 *);
+	int (*get_next_id)(struct super_block___4 *, struct kqid *);
+};
+
+struct quota_format_ops___5 {
+	int (*check_quota_file)(struct super_block___5 *, int);
+	int (*read_file_info)(struct super_block___5 *, int);
+	int (*write_file_info)(struct super_block___5 *, int);
+	int (*free_file_info)(struct super_block___5 *, int);
+	int (*read_dqblk)(struct dquot___5 *);
+	int (*commit_dqblk)(struct dquot___5 *);
+	int (*release_dqblk)(struct dquot___5 *);
+	int (*get_next_id)(struct super_block___5 *, struct kqid *);
+};
+
 struct quota_format_type {
 	int qf_fmt_id;
 	const struct quota_format_ops *qf_ops;
@@ -126195,6 +133137,27 @@ struct quota_format_type___2 {
 	const struct quota_format_ops___2 *qf_ops;
 	struct module___2 *qf_owner;
 	struct quota_format_type___2 *qf_next;
+};
+
+struct quota_format_type___3 {
+	int qf_fmt_id;
+	const struct quota_format_ops___3 *qf_ops;
+	struct module___3 *qf_owner;
+	struct quota_format_type___3 *qf_next;
+};
+
+struct quota_format_type___4 {
+	int qf_fmt_id;
+	const struct quota_format_ops___4 *qf_ops;
+	struct module___4 *qf_owner;
+	struct quota_format_type___4 *qf_next;
+};
+
+struct quota_format_type___5 {
+	int qf_fmt_id;
+	const struct quota_format_ops___5 *qf_ops;
+	struct module___5 *qf_owner;
+	struct quota_format_type___5 *qf_next;
 };
 
 struct quota_id {
@@ -126220,6 +133183,30 @@ struct quota_info___2 {
 	struct inode___2 *files[3];
 	struct mem_dqinfo___2 info[3];
 	const struct quota_format_ops___2 *ops[3];
+};
+
+struct quota_info___3 {
+	unsigned int flags;
+	struct rw_semaphore dqio_sem;
+	struct inode___3 *files[3];
+	struct mem_dqinfo___3 info[3];
+	const struct quota_format_ops___3 *ops[3];
+};
+
+struct quota_info___4 {
+	unsigned int flags;
+	struct rw_semaphore dqio_sem;
+	struct inode___4 *files[3];
+	struct mem_dqinfo___4 info[3];
+	const struct quota_format_ops___4 *ops[3];
+};
+
+struct quota_info___5 {
+	unsigned int flags;
+	struct rw_semaphore dqio_sem;
+	struct inode___5 *files[3];
+	struct mem_dqinfo___5 info[3];
+	const struct quota_format_ops___5 *ops[3];
 };
 
 struct quota_module_name {
@@ -126253,6 +133240,48 @@ struct quotactl_ops___2 {
 	int (*set_dqblk)(struct super_block___2 *, struct kqid, struct qc_dqblk *);
 	int (*get_state)(struct super_block___2 *, struct qc_state *);
 	int (*rm_xquota)(struct super_block___2 *, unsigned int);
+};
+
+struct quotactl_ops___3 {
+	int (*quota_on)(struct super_block___3 *, int, int, const struct path___3 *);
+	int (*quota_off)(struct super_block___3 *, int);
+	int (*quota_enable)(struct super_block___3 *, unsigned int);
+	int (*quota_disable)(struct super_block___3 *, unsigned int);
+	int (*quota_sync)(struct super_block___3 *, int);
+	int (*set_info)(struct super_block___3 *, int, struct qc_info *);
+	int (*get_dqblk)(struct super_block___3 *, struct kqid, struct qc_dqblk *);
+	int (*get_nextdqblk)(struct super_block___3 *, struct kqid *, struct qc_dqblk *);
+	int (*set_dqblk)(struct super_block___3 *, struct kqid, struct qc_dqblk *);
+	int (*get_state)(struct super_block___3 *, struct qc_state *);
+	int (*rm_xquota)(struct super_block___3 *, unsigned int);
+};
+
+struct quotactl_ops___4 {
+	int (*quota_on)(struct super_block___4 *, int, int, const struct path___4 *);
+	int (*quota_off)(struct super_block___4 *, int);
+	int (*quota_enable)(struct super_block___4 *, unsigned int);
+	int (*quota_disable)(struct super_block___4 *, unsigned int);
+	int (*quota_sync)(struct super_block___4 *, int);
+	int (*set_info)(struct super_block___4 *, int, struct qc_info *);
+	int (*get_dqblk)(struct super_block___4 *, struct kqid, struct qc_dqblk *);
+	int (*get_nextdqblk)(struct super_block___4 *, struct kqid *, struct qc_dqblk *);
+	int (*set_dqblk)(struct super_block___4 *, struct kqid, struct qc_dqblk *);
+	int (*get_state)(struct super_block___4 *, struct qc_state *);
+	int (*rm_xquota)(struct super_block___4 *, unsigned int);
+};
+
+struct quotactl_ops___5 {
+	int (*quota_on)(struct super_block___5 *, int, int, const struct path___5 *);
+	int (*quota_off)(struct super_block___5 *, int);
+	int (*quota_enable)(struct super_block___5 *, unsigned int);
+	int (*quota_disable)(struct super_block___5 *, unsigned int);
+	int (*quota_sync)(struct super_block___5 *, int);
+	int (*set_info)(struct super_block___5 *, int, struct qc_info *);
+	int (*get_dqblk)(struct super_block___5 *, struct kqid, struct qc_dqblk *);
+	int (*get_nextdqblk)(struct super_block___5 *, struct kqid *, struct qc_dqblk *);
+	int (*set_dqblk)(struct super_block___5 *, struct kqid, struct qc_dqblk *);
+	int (*get_state)(struct super_block___5 *, struct qc_state *);
+	int (*rm_xquota)(struct super_block___5 *, unsigned int);
 };
 
 struct ra_msg {
@@ -127272,6 +134301,18 @@ struct readahead_control {
 	long unsigned int _pflags;
 };
 
+struct readahead_control___2 {
+	struct file___5 *file;
+	struct address_space___5 *mapping;
+	struct file_ra_state *ra;
+	long unsigned int _index;
+	unsigned int _nr_pages;
+	unsigned int _batch_count;
+	bool dropbehind;
+	bool _workingset;
+	long unsigned int _pflags;
+};
+
 struct readdir_callback {
 	struct dir_context ctx;
 	struct old_linux_dirent *dirent;
@@ -127316,6 +134357,11 @@ struct reclaim_stat {
 struct reclaim_state {
 	long unsigned int reclaimed;
 	struct lru_gen_mm_walk *mm_walk;
+};
+
+struct reclaim_state___2 {
+	long unsigned int reclaimed;
+	struct lru_gen_mm_walk___3 *mm_walk;
 };
 
 struct recorded_ref {
@@ -130669,6 +137715,30 @@ struct sb_writers___2 {
 	struct percpu_rw_semaphore___2 rw_sem[3];
 };
 
+struct sb_writers___3 {
+	short unsigned int frozen;
+	int freeze_kcount;
+	int freeze_ucount;
+	const void *freeze_owner;
+	struct percpu_rw_semaphore___3 rw_sem[3];
+};
+
+struct sb_writers___4 {
+	short unsigned int frozen;
+	int freeze_kcount;
+	int freeze_ucount;
+	const void *freeze_owner;
+	struct percpu_rw_semaphore___4 rw_sem[3];
+};
+
+struct sb_writers___5 {
+	short unsigned int frozen;
+	int freeze_kcount;
+	int freeze_ucount;
+	const void *freeze_owner;
+	struct percpu_rw_semaphore___5 rw_sem[3];
+};
+
 struct sbitmap_word {
 	long unsigned int word;
 	long: 64;
@@ -130840,6 +137910,96 @@ struct sched_dl_entity___2 {
 	struct rq *rq;
 	dl_server_pick_f___2 server_pick_task;
 	struct sched_dl_entity___2 *pi_se;
+};
+
+struct sched_dl_entity___3;
+
+typedef struct task_struct___4 * (*dl_server_pick_f___3)(struct sched_dl_entity___3 *);
+
+struct sched_dl_entity___3 {
+	struct rb_node rb_node;
+	u64 dl_runtime;
+	u64 dl_deadline;
+	u64 dl_period;
+	u64 dl_bw;
+	u64 dl_density;
+	s64 runtime;
+	u64 deadline;
+	unsigned int flags;
+	unsigned int dl_throttled: 1;
+	unsigned int dl_yielded: 1;
+	unsigned int dl_non_contending: 1;
+	unsigned int dl_overrun: 1;
+	unsigned int dl_server: 1;
+	unsigned int dl_server_active: 1;
+	unsigned int dl_defer: 1;
+	unsigned int dl_defer_armed: 1;
+	unsigned int dl_defer_running: 1;
+	struct hrtimer dl_timer;
+	struct hrtimer inactive_timer;
+	struct rq *rq;
+	dl_server_pick_f___3 server_pick_task;
+	struct sched_dl_entity___3 *pi_se;
+};
+
+struct sched_dl_entity___4;
+
+typedef struct task_struct___5 * (*dl_server_pick_f___4)(struct sched_dl_entity___4 *);
+
+struct sched_dl_entity___4 {
+	struct rb_node rb_node;
+	u64 dl_runtime;
+	u64 dl_deadline;
+	u64 dl_period;
+	u64 dl_bw;
+	u64 dl_density;
+	s64 runtime;
+	u64 deadline;
+	unsigned int flags;
+	unsigned int dl_throttled: 1;
+	unsigned int dl_yielded: 1;
+	unsigned int dl_non_contending: 1;
+	unsigned int dl_overrun: 1;
+	unsigned int dl_server: 1;
+	unsigned int dl_server_active: 1;
+	unsigned int dl_defer: 1;
+	unsigned int dl_defer_armed: 1;
+	unsigned int dl_defer_running: 1;
+	struct hrtimer dl_timer;
+	struct hrtimer inactive_timer;
+	struct rq *rq;
+	dl_server_pick_f___4 server_pick_task;
+	struct sched_dl_entity___4 *pi_se;
+};
+
+struct sched_dl_entity___5;
+
+typedef struct task_struct___3 * (*dl_server_pick_f___5)(struct sched_dl_entity___5 *);
+
+struct sched_dl_entity___5 {
+	struct rb_node rb_node;
+	u64 dl_runtime;
+	u64 dl_deadline;
+	u64 dl_period;
+	u64 dl_bw;
+	u64 dl_density;
+	s64 runtime;
+	u64 deadline;
+	unsigned int flags;
+	unsigned int dl_throttled: 1;
+	unsigned int dl_yielded: 1;
+	unsigned int dl_non_contending: 1;
+	unsigned int dl_overrun: 1;
+	unsigned int dl_server: 1;
+	unsigned int dl_server_active: 1;
+	unsigned int dl_defer: 1;
+	unsigned int dl_defer_armed: 1;
+	unsigned int dl_defer_running: 1;
+	struct hrtimer dl_timer;
+	struct hrtimer inactive_timer;
+	struct rq *rq;
+	dl_server_pick_f___5 server_pick_task;
+	struct sched_dl_entity___5 *pi_se;
 };
 
 struct sched_group;
@@ -131060,6 +138220,84 @@ struct sched_ext_entity___2 {
 	u64 dsq_vtime;
 	bool disallow;
 	struct cgroup___2 *cgrp_moving_from;
+	struct list_head tasks_node;
+};
+
+struct sched_ext_entity___3 {
+	struct scx_dispatch_q *dsq;
+	struct scx_dsq_list_node dsq_list;
+	struct rb_node dsq_priq;
+	u32 dsq_seq;
+	u32 dsq_flags;
+	u32 flags;
+	u32 weight;
+	s32 sticky_cpu;
+	s32 holding_cpu;
+	s32 selected_cpu;
+	u32 kf_mask;
+	struct task_struct___4 *kf_tasks[2];
+	atomic_long_t ops_state;
+	struct list_head runnable_node;
+	long unsigned int runnable_at;
+	u64 core_sched_at;
+	u64 ddsp_dsq_id;
+	u64 ddsp_enq_flags;
+	u64 slice;
+	u64 dsq_vtime;
+	bool disallow;
+	struct cgroup *cgrp_moving_from;
+	struct list_head tasks_node;
+};
+
+struct sched_ext_entity___4 {
+	struct scx_dispatch_q *dsq;
+	struct scx_dsq_list_node dsq_list;
+	struct rb_node dsq_priq;
+	u32 dsq_seq;
+	u32 dsq_flags;
+	u32 flags;
+	u32 weight;
+	s32 sticky_cpu;
+	s32 holding_cpu;
+	s32 selected_cpu;
+	u32 kf_mask;
+	struct task_struct___5 *kf_tasks[2];
+	atomic_long_t ops_state;
+	struct list_head runnable_node;
+	long unsigned int runnable_at;
+	u64 core_sched_at;
+	u64 ddsp_dsq_id;
+	u64 ddsp_enq_flags;
+	u64 slice;
+	u64 dsq_vtime;
+	bool disallow;
+	struct cgroup *cgrp_moving_from;
+	struct list_head tasks_node;
+};
+
+struct sched_ext_entity___5 {
+	struct scx_dispatch_q *dsq;
+	struct scx_dsq_list_node dsq_list;
+	struct rb_node dsq_priq;
+	u32 dsq_seq;
+	u32 dsq_flags;
+	u32 flags;
+	u32 weight;
+	s32 sticky_cpu;
+	s32 holding_cpu;
+	s32 selected_cpu;
+	u32 kf_mask;
+	struct task_struct___3 *kf_tasks[2];
+	atomic_long_t ops_state;
+	struct list_head runnable_node;
+	long unsigned int runnable_at;
+	u64 core_sched_at;
+	u64 ddsp_dsq_id;
+	u64 ddsp_enq_flags;
+	u64 slice;
+	u64 dsq_vtime;
+	bool disallow;
+	struct cgroup___3 *cgrp_moving_from;
 	struct list_head tasks_node;
 };
 
@@ -133817,6 +141055,23 @@ struct seq_file___2 {
 	void *private;
 };
 
+struct seq_operations___3;
+
+struct seq_file___3 {
+	char *buf;
+	size_t size;
+	size_t from;
+	size_t count;
+	size_t pad_until;
+	loff_t index;
+	loff_t read_pos;
+	struct mutex lock;
+	const struct seq_operations___3 *op;
+	int poll_event;
+	const struct file___5 *file;
+	void *private;
+};
+
 struct seq_operations {
 	void * (*start)(struct seq_file *, loff_t *);
 	void (*stop)(struct seq_file *, void *);
@@ -133829,6 +141084,13 @@ struct seq_operations___2 {
 	void (*stop)(struct seq_file___2 *, void *);
 	void * (*next)(struct seq_file___2 *, void *, loff_t *);
 	int (*show)(struct seq_file___2 *, void *);
+};
+
+struct seq_operations___3 {
+	void * (*start)(struct seq_file___3 *, loff_t *);
+	void (*stop)(struct seq_file___3 *, void *);
+	void * (*next)(struct seq_file___3 *, void *, loff_t *);
+	int (*show)(struct seq_file___3 *, void *);
 };
 
 struct seqcount_rwlock {
@@ -135507,6 +142769,14 @@ struct shrink_control___2 {
 	struct mem_cgroup___2 *memcg;
 };
 
+struct shrink_control___3 {
+	gfp_t gfp_mask;
+	int nid;
+	long unsigned int nr_to_scan;
+	long unsigned int nr_scanned;
+	struct mem_cgroup___3 *memcg;
+};
+
 struct shrinker {
 	long unsigned int (*count_objects)(struct shrinker *, struct shrink_control *);
 	long unsigned int (*scan_objects)(struct shrinker *, struct shrink_control *);
@@ -135525,6 +142795,21 @@ struct shrinker {
 struct shrinker___2 {
 	long unsigned int (*count_objects)(struct shrinker___2 *, struct shrink_control___2 *);
 	long unsigned int (*scan_objects)(struct shrinker___2 *, struct shrink_control___2 *);
+	long int batch;
+	int seeks;
+	unsigned int flags;
+	refcount_t refcount;
+	struct completion done;
+	struct callback_head rcu;
+	void *private_data;
+	struct list_head list;
+	int id;
+	atomic_long_t *nr_deferred;
+};
+
+struct shrinker___3 {
+	long unsigned int (*count_objects)(struct shrinker___3 *, struct shrink_control___3 *);
+	long unsigned int (*scan_objects)(struct shrinker___3 *, struct shrink_control___3 *);
 	long int batch;
 	int seeks;
 	unsigned int flags;
@@ -135831,6 +143116,219 @@ struct signal_struct___2 {
 	short int oom_score_adj;
 	short int oom_score_adj_min;
 	struct mm_struct___2 *oom_mm;
+	struct mutex cred_guard_mutex;
+	struct rw_semaphore exec_update_lock;
+};
+
+struct signal_struct___3 {
+	refcount_t sigcnt;
+	atomic_t live;
+	int nr_threads;
+	int quick_threads;
+	struct list_head thread_head;
+	wait_queue_head_t wait_chldexit;
+	struct task_struct___4 *curr_target;
+	struct sigpending shared_pending;
+	struct hlist_head multiprocess;
+	int group_exit_code;
+	int notify_count;
+	struct task_struct___4 *group_exec_task;
+	int group_stop_count;
+	unsigned int flags;
+	struct core_state___3 *core_state;
+	unsigned int is_child_subreaper: 1;
+	unsigned int has_child_subreaper: 1;
+	unsigned int timer_create_restore_ids: 1;
+	atomic_t next_posix_timer_id;
+	struct hlist_head posix_timers;
+	struct hlist_head ignored_posix_timers;
+	struct hrtimer real_timer;
+	ktime_t it_real_incr;
+	struct cpu_itimer it[2];
+	struct thread_group_cputimer cputimer;
+	struct posix_cputimers posix_cputimers;
+	struct pid___3 *pids[4];
+	atomic_t tick_dep_mask;
+	struct pid___3 *tty_old_pgrp;
+	int leader;
+	struct tty_struct *tty;
+	struct autogroup *autogroup;
+	seqlock_t stats_lock;
+	u64 utime;
+	u64 stime;
+	u64 cutime;
+	u64 cstime;
+	u64 gtime;
+	u64 cgtime;
+	struct prev_cputime prev_cputime;
+	long unsigned int nvcsw;
+	long unsigned int nivcsw;
+	long unsigned int cnvcsw;
+	long unsigned int cnivcsw;
+	long unsigned int min_flt;
+	long unsigned int maj_flt;
+	long unsigned int cmin_flt;
+	long unsigned int cmaj_flt;
+	long unsigned int inblock;
+	long unsigned int oublock;
+	long unsigned int cinblock;
+	long unsigned int coublock;
+	long unsigned int maxrss;
+	long unsigned int cmaxrss;
+	struct task_io_accounting ioac;
+	long long unsigned int sum_sched_runtime;
+	struct rlimit rlim[16];
+	struct pacct_struct pacct;
+	struct taskstats *stats;
+	unsigned int audit_tty;
+	struct tty_audit_buf *tty_audit_buf;
+	struct rw_semaphore cgroup_threadgroup_rwsem;
+	bool oom_flag_origin;
+	short int oom_score_adj;
+	short int oom_score_adj_min;
+	struct mm_struct___3 *oom_mm;
+	struct mutex cred_guard_mutex;
+	struct rw_semaphore exec_update_lock;
+};
+
+struct signal_struct___4 {
+	refcount_t sigcnt;
+	atomic_t live;
+	int nr_threads;
+	int quick_threads;
+	struct list_head thread_head;
+	wait_queue_head_t wait_chldexit;
+	struct task_struct___5 *curr_target;
+	struct sigpending shared_pending;
+	struct hlist_head multiprocess;
+	int group_exit_code;
+	int notify_count;
+	struct task_struct___5 *group_exec_task;
+	int group_stop_count;
+	unsigned int flags;
+	struct core_state___4 *core_state;
+	unsigned int is_child_subreaper: 1;
+	unsigned int has_child_subreaper: 1;
+	unsigned int timer_create_restore_ids: 1;
+	atomic_t next_posix_timer_id;
+	struct hlist_head posix_timers;
+	struct hlist_head ignored_posix_timers;
+	struct hrtimer real_timer;
+	ktime_t it_real_incr;
+	struct cpu_itimer it[2];
+	struct thread_group_cputimer cputimer;
+	struct posix_cputimers posix_cputimers;
+	struct pid___4 *pids[4];
+	atomic_t tick_dep_mask;
+	struct pid___4 *tty_old_pgrp;
+	int leader;
+	struct tty_struct *tty;
+	struct autogroup *autogroup;
+	seqlock_t stats_lock;
+	u64 utime;
+	u64 stime;
+	u64 cutime;
+	u64 cstime;
+	u64 gtime;
+	u64 cgtime;
+	struct prev_cputime prev_cputime;
+	long unsigned int nvcsw;
+	long unsigned int nivcsw;
+	long unsigned int cnvcsw;
+	long unsigned int cnivcsw;
+	long unsigned int min_flt;
+	long unsigned int maj_flt;
+	long unsigned int cmin_flt;
+	long unsigned int cmaj_flt;
+	long unsigned int inblock;
+	long unsigned int oublock;
+	long unsigned int cinblock;
+	long unsigned int coublock;
+	long unsigned int maxrss;
+	long unsigned int cmaxrss;
+	struct task_io_accounting ioac;
+	long long unsigned int sum_sched_runtime;
+	struct rlimit rlim[16];
+	struct pacct_struct pacct;
+	struct taskstats *stats;
+	unsigned int audit_tty;
+	struct tty_audit_buf *tty_audit_buf;
+	struct rw_semaphore cgroup_threadgroup_rwsem;
+	bool oom_flag_origin;
+	short int oom_score_adj;
+	short int oom_score_adj_min;
+	struct mm_struct___4 *oom_mm;
+	struct mutex cred_guard_mutex;
+	struct rw_semaphore exec_update_lock;
+};
+
+struct signal_struct___5 {
+	refcount_t sigcnt;
+	atomic_t live;
+	int nr_threads;
+	int quick_threads;
+	struct list_head thread_head;
+	wait_queue_head_t wait_chldexit;
+	struct task_struct___3 *curr_target;
+	struct sigpending shared_pending;
+	struct hlist_head multiprocess;
+	int group_exit_code;
+	int notify_count;
+	struct task_struct___3 *group_exec_task;
+	int group_stop_count;
+	unsigned int flags;
+	struct core_state___5 *core_state;
+	unsigned int is_child_subreaper: 1;
+	unsigned int has_child_subreaper: 1;
+	unsigned int timer_create_restore_ids: 1;
+	atomic_t next_posix_timer_id;
+	struct hlist_head posix_timers;
+	struct hlist_head ignored_posix_timers;
+	struct hrtimer real_timer;
+	ktime_t it_real_incr;
+	struct cpu_itimer it[2];
+	struct thread_group_cputimer cputimer;
+	struct posix_cputimers posix_cputimers;
+	struct pid___5 *pids[4];
+	atomic_t tick_dep_mask;
+	struct pid___5 *tty_old_pgrp;
+	int leader;
+	struct tty_struct *tty;
+	struct autogroup *autogroup;
+	seqlock_t stats_lock;
+	u64 utime;
+	u64 stime;
+	u64 cutime;
+	u64 cstime;
+	u64 gtime;
+	u64 cgtime;
+	struct prev_cputime prev_cputime;
+	long unsigned int nvcsw;
+	long unsigned int nivcsw;
+	long unsigned int cnvcsw;
+	long unsigned int cnivcsw;
+	long unsigned int min_flt;
+	long unsigned int maj_flt;
+	long unsigned int cmin_flt;
+	long unsigned int cmaj_flt;
+	long unsigned int inblock;
+	long unsigned int oublock;
+	long unsigned int cinblock;
+	long unsigned int coublock;
+	long unsigned int maxrss;
+	long unsigned int cmaxrss;
+	struct task_io_accounting ioac;
+	long long unsigned int sum_sched_runtime;
+	struct rlimit rlim[16];
+	struct pacct_struct pacct;
+	struct taskstats *stats;
+	unsigned int audit_tty;
+	struct tty_audit_buf *tty_audit_buf;
+	struct rw_semaphore cgroup_threadgroup_rwsem;
+	bool oom_flag_origin;
+	short int oom_score_adj;
+	short int oom_score_adj_min;
+	struct mm_struct___5 *oom_mm;
 	struct mutex cred_guard_mutex;
 	struct rw_semaphore exec_update_lock;
 };
@@ -138125,6 +145623,228 @@ struct super_block___2 {
 	long: 64;
 };
 
+struct super_operations___3;
+
+struct super_block___3 {
+	struct list_head s_list;
+	dev_t s_dev;
+	unsigned char s_blocksize_bits;
+	long unsigned int s_blocksize;
+	loff_t s_maxbytes;
+	struct file_system_type___3 *s_type;
+	const struct super_operations___3 *s_op;
+	const struct dquot_operations___3 *dq_op;
+	const struct quotactl_ops___3 *s_qcop;
+	const struct export_operations *s_export_op;
+	long unsigned int s_flags;
+	long unsigned int s_iflags;
+	long unsigned int s_magic;
+	struct dentry___4 *s_root;
+	struct rw_semaphore s_umount;
+	int s_count;
+	atomic_t s_active;
+	void *s_security;
+	const struct xattr_handler * const *s_xattr;
+	const struct fscrypt_operations *s_cop;
+	struct fscrypt_keyring *s_master_keys;
+	const struct fsverity_operations *s_vop;
+	struct unicode_map *s_encoding;
+	__u16 s_encoding_flags;
+	struct hlist_bl_head s_roots;
+	struct mount *s_mounts;
+	struct block_device *s_bdev;
+	struct file___3 *s_bdev_file;
+	struct backing_dev_info *s_bdi;
+	struct mtd_info *s_mtd;
+	struct hlist_node s_instances;
+	unsigned int s_quota_types;
+	struct quota_info___3 s_dquot;
+	struct sb_writers___3 s_writers;
+	void *s_fs_info;
+	u32 s_time_gran;
+	time64_t s_time_min;
+	time64_t s_time_max;
+	u32 s_fsnotify_mask;
+	struct fsnotify_sb_info *s_fsnotify_info;
+	char s_id[32];
+	uuid_t s_uuid;
+	u8 s_uuid_len;
+	char s_sysfs_name[37];
+	unsigned int s_max_links;
+	unsigned int s_d_flags;
+	struct mutex s_vfs_rename_mutex;
+	const char *s_subtype;
+	const struct dentry_operations___3 *__s_d_op;
+	struct shrinker *s_shrink;
+	atomic_long_t s_remove_count;
+	int s_readonly_remount;
+	errseq_t s_wb_err;
+	struct workqueue_struct *s_dio_done_wq;
+	struct hlist_head s_pins;
+	struct user_namespace *s_user_ns;
+	struct list_lru s_dentry_lru;
+	struct list_lru s_inode_lru;
+	struct callback_head rcu;
+	struct work_struct destroy_work;
+	struct mutex s_sync_lock;
+	int s_stack_depth;
+	long: 64;
+	spinlock_t s_inode_list_lock;
+	struct list_head s_inodes;
+	spinlock_t s_inode_wblist_lock;
+	struct list_head s_inodes_wb;
+	long: 64;
+	long: 64;
+};
+
+struct super_operations___4;
+
+struct super_block___4 {
+	struct list_head s_list;
+	dev_t s_dev;
+	unsigned char s_blocksize_bits;
+	long unsigned int s_blocksize;
+	loff_t s_maxbytes;
+	struct file_system_type___4 *s_type;
+	const struct super_operations___4 *s_op;
+	const struct dquot_operations___4 *dq_op;
+	const struct quotactl_ops___4 *s_qcop;
+	const struct export_operations *s_export_op;
+	long unsigned int s_flags;
+	long unsigned int s_iflags;
+	long unsigned int s_magic;
+	struct dentry___5 *s_root;
+	struct rw_semaphore s_umount;
+	int s_count;
+	atomic_t s_active;
+	void *s_security;
+	const struct xattr_handler * const *s_xattr;
+	const struct fscrypt_operations *s_cop;
+	struct fscrypt_keyring *s_master_keys;
+	const struct fsverity_operations *s_vop;
+	struct unicode_map *s_encoding;
+	__u16 s_encoding_flags;
+	struct hlist_bl_head s_roots;
+	struct mount *s_mounts;
+	struct block_device *s_bdev;
+	struct file___4 *s_bdev_file;
+	struct backing_dev_info *s_bdi;
+	struct mtd_info *s_mtd;
+	struct hlist_node s_instances;
+	unsigned int s_quota_types;
+	struct quota_info___4 s_dquot;
+	struct sb_writers___4 s_writers;
+	void *s_fs_info;
+	u32 s_time_gran;
+	time64_t s_time_min;
+	time64_t s_time_max;
+	u32 s_fsnotify_mask;
+	struct fsnotify_sb_info *s_fsnotify_info;
+	char s_id[32];
+	uuid_t s_uuid;
+	u8 s_uuid_len;
+	char s_sysfs_name[37];
+	unsigned int s_max_links;
+	unsigned int s_d_flags;
+	struct mutex s_vfs_rename_mutex;
+	const char *s_subtype;
+	const struct dentry_operations___4 *__s_d_op;
+	struct shrinker *s_shrink;
+	atomic_long_t s_remove_count;
+	int s_readonly_remount;
+	errseq_t s_wb_err;
+	struct workqueue_struct *s_dio_done_wq;
+	struct hlist_head s_pins;
+	struct user_namespace *s_user_ns;
+	struct list_lru s_dentry_lru;
+	struct list_lru s_inode_lru;
+	struct callback_head rcu;
+	struct work_struct destroy_work;
+	struct mutex s_sync_lock;
+	int s_stack_depth;
+	long: 64;
+	spinlock_t s_inode_list_lock;
+	struct list_head s_inodes;
+	spinlock_t s_inode_wblist_lock;
+	struct list_head s_inodes_wb;
+	long: 64;
+	long: 64;
+};
+
+struct super_operations___5;
+
+struct super_block___5 {
+	struct list_head s_list;
+	dev_t s_dev;
+	unsigned char s_blocksize_bits;
+	long unsigned int s_blocksize;
+	loff_t s_maxbytes;
+	struct file_system_type___5 *s_type;
+	const struct super_operations___5 *s_op;
+	const struct dquot_operations___5 *dq_op;
+	const struct quotactl_ops___5 *s_qcop;
+	const struct export_operations *s_export_op;
+	long unsigned int s_flags;
+	long unsigned int s_iflags;
+	long unsigned int s_magic;
+	struct dentry___3 *s_root;
+	struct rw_semaphore s_umount;
+	int s_count;
+	atomic_t s_active;
+	void *s_security;
+	const struct xattr_handler * const *s_xattr;
+	const struct fscrypt_operations *s_cop;
+	struct fscrypt_keyring *s_master_keys;
+	const struct fsverity_operations *s_vop;
+	struct unicode_map *s_encoding;
+	__u16 s_encoding_flags;
+	struct hlist_bl_head s_roots;
+	struct mount *s_mounts;
+	struct block_device___3 *s_bdev;
+	struct file___5 *s_bdev_file;
+	struct backing_dev_info___3 *s_bdi;
+	struct mtd_info *s_mtd;
+	struct hlist_node s_instances;
+	unsigned int s_quota_types;
+	struct quota_info___5 s_dquot;
+	struct sb_writers___5 s_writers;
+	void *s_fs_info;
+	u32 s_time_gran;
+	time64_t s_time_min;
+	time64_t s_time_max;
+	u32 s_fsnotify_mask;
+	struct fsnotify_sb_info *s_fsnotify_info;
+	char s_id[32];
+	uuid_t s_uuid;
+	u8 s_uuid_len;
+	char s_sysfs_name[37];
+	unsigned int s_max_links;
+	unsigned int s_d_flags;
+	struct mutex s_vfs_rename_mutex;
+	const char *s_subtype;
+	const struct dentry_operations___5 *__s_d_op;
+	struct shrinker___3 *s_shrink;
+	atomic_long_t s_remove_count;
+	int s_readonly_remount;
+	errseq_t s_wb_err;
+	struct workqueue_struct *s_dio_done_wq;
+	struct hlist_head s_pins;
+	struct user_namespace___3 *s_user_ns;
+	struct list_lru s_dentry_lru;
+	struct list_lru s_inode_lru;
+	struct callback_head rcu;
+	struct work_struct destroy_work;
+	struct mutex s_sync_lock;
+	int s_stack_depth;
+	long: 64;
+	spinlock_t s_inode_list_lock;
+	struct list_head s_inodes;
+	spinlock_t s_inode_wblist_lock;
+	struct list_head s_inodes_wb;
+	long: 64;
+	long: 64;
+};
+
 struct super_operations {
 	struct inode * (*alloc_inode)(struct super_block *);
 	void (*destroy_inode)(struct inode *);
@@ -138183,6 +145903,96 @@ struct super_operations___2 {
 	long int (*free_cached_objects)(struct super_block___2 *, struct shrink_control___2 *);
 	int (*remove_bdev)(struct super_block___2 *, struct block_device___2 *);
 	void (*shutdown)(struct super_block___2 *);
+};
+
+struct super_operations___3 {
+	struct inode___3 * (*alloc_inode)(struct super_block___3 *);
+	void (*destroy_inode)(struct inode___3 *);
+	void (*free_inode)(struct inode___3 *);
+	void (*dirty_inode)(struct inode___3 *, int);
+	int (*write_inode)(struct inode___3 *, struct writeback_control *);
+	int (*drop_inode)(struct inode___3 *);
+	void (*evict_inode)(struct inode___3 *);
+	void (*put_super)(struct super_block___3 *);
+	int (*sync_fs)(struct super_block___3 *, int);
+	int (*freeze_super)(struct super_block___3 *, enum freeze_holder, const void *);
+	int (*freeze_fs)(struct super_block___3 *);
+	int (*thaw_super)(struct super_block___3 *, enum freeze_holder, const void *);
+	int (*unfreeze_fs)(struct super_block___3 *);
+	int (*statfs)(struct dentry___4 *, struct kstatfs *);
+	int (*remount_fs)(struct super_block___3 *, int *, char *);
+	void (*umount_begin)(struct super_block___3 *);
+	int (*show_options)(struct seq_file *, struct dentry___4 *);
+	int (*show_devname)(struct seq_file *, struct dentry___4 *);
+	int (*show_path)(struct seq_file *, struct dentry___4 *);
+	int (*show_stats)(struct seq_file *, struct dentry___4 *);
+	ssize_t (*quota_read)(struct super_block___3 *, int, char *, size_t, loff_t);
+	ssize_t (*quota_write)(struct super_block___3 *, int, const char *, size_t, loff_t);
+	struct dquot___3 ** (*get_dquots)(struct inode___3 *);
+	long int (*nr_cached_objects)(struct super_block___3 *, struct shrink_control *);
+	long int (*free_cached_objects)(struct super_block___3 *, struct shrink_control *);
+	int (*remove_bdev)(struct super_block___3 *, struct block_device *);
+	void (*shutdown)(struct super_block___3 *);
+};
+
+struct super_operations___4 {
+	struct inode___4 * (*alloc_inode)(struct super_block___4 *);
+	void (*destroy_inode)(struct inode___4 *);
+	void (*free_inode)(struct inode___4 *);
+	void (*dirty_inode)(struct inode___4 *, int);
+	int (*write_inode)(struct inode___4 *, struct writeback_control *);
+	int (*drop_inode)(struct inode___4 *);
+	void (*evict_inode)(struct inode___4 *);
+	void (*put_super)(struct super_block___4 *);
+	int (*sync_fs)(struct super_block___4 *, int);
+	int (*freeze_super)(struct super_block___4 *, enum freeze_holder, const void *);
+	int (*freeze_fs)(struct super_block___4 *);
+	int (*thaw_super)(struct super_block___4 *, enum freeze_holder, const void *);
+	int (*unfreeze_fs)(struct super_block___4 *);
+	int (*statfs)(struct dentry___5 *, struct kstatfs *);
+	int (*remount_fs)(struct super_block___4 *, int *, char *);
+	void (*umount_begin)(struct super_block___4 *);
+	int (*show_options)(struct seq_file *, struct dentry___5 *);
+	int (*show_devname)(struct seq_file *, struct dentry___5 *);
+	int (*show_path)(struct seq_file *, struct dentry___5 *);
+	int (*show_stats)(struct seq_file *, struct dentry___5 *);
+	ssize_t (*quota_read)(struct super_block___4 *, int, char *, size_t, loff_t);
+	ssize_t (*quota_write)(struct super_block___4 *, int, const char *, size_t, loff_t);
+	struct dquot___4 ** (*get_dquots)(struct inode___4 *);
+	long int (*nr_cached_objects)(struct super_block___4 *, struct shrink_control *);
+	long int (*free_cached_objects)(struct super_block___4 *, struct shrink_control *);
+	int (*remove_bdev)(struct super_block___4 *, struct block_device *);
+	void (*shutdown)(struct super_block___4 *);
+};
+
+struct super_operations___5 {
+	struct inode___5 * (*alloc_inode)(struct super_block___5 *);
+	void (*destroy_inode)(struct inode___5 *);
+	void (*free_inode)(struct inode___5 *);
+	void (*dirty_inode)(struct inode___5 *, int);
+	int (*write_inode)(struct inode___5 *, struct writeback_control___3 *);
+	int (*drop_inode)(struct inode___5 *);
+	void (*evict_inode)(struct inode___5 *);
+	void (*put_super)(struct super_block___5 *);
+	int (*sync_fs)(struct super_block___5 *, int);
+	int (*freeze_super)(struct super_block___5 *, enum freeze_holder, const void *);
+	int (*freeze_fs)(struct super_block___5 *);
+	int (*thaw_super)(struct super_block___5 *, enum freeze_holder, const void *);
+	int (*unfreeze_fs)(struct super_block___5 *);
+	int (*statfs)(struct dentry___3 *, struct kstatfs *);
+	int (*remount_fs)(struct super_block___5 *, int *, char *);
+	void (*umount_begin)(struct super_block___5 *);
+	int (*show_options)(struct seq_file___3 *, struct dentry___3 *);
+	int (*show_devname)(struct seq_file___3 *, struct dentry___3 *);
+	int (*show_path)(struct seq_file___3 *, struct dentry___3 *);
+	int (*show_stats)(struct seq_file___3 *, struct dentry___3 *);
+	ssize_t (*quota_read)(struct super_block___5 *, int, char *, size_t, loff_t);
+	ssize_t (*quota_write)(struct super_block___5 *, int, const char *, size_t, loff_t);
+	struct dquot___5 ** (*get_dquots)(struct inode___5 *);
+	long int (*nr_cached_objects)(struct super_block___5 *, struct shrink_control___3 *);
+	long int (*free_cached_objects)(struct super_block___5 *, struct shrink_control___3 *);
+	int (*remove_bdev)(struct super_block___5 *, struct block_device___3 *);
+	void (*shutdown)(struct super_block___5 *);
 };
 
 struct super_type {
@@ -138590,6 +146400,36 @@ struct swap_info_struct {
 	struct rb_root swap_extent_root;
 	struct block_device *bdev;
 	struct file *swap_file;
+	struct completion comp;
+	spinlock_t lock;
+	spinlock_t cont_lock;
+	struct work_struct discard_work;
+	struct work_struct reclaim_work;
+	struct list_head discard_clusters;
+	struct plist_node avail_lists[0];
+};
+
+struct swap_info_struct___2 {
+	struct percpu_ref users;
+	long unsigned int flags;
+	short int prio;
+	struct plist_node list;
+	signed char type;
+	unsigned int max;
+	unsigned char *swap_map;
+	long unsigned int *zeromap;
+	struct swap_cluster_info *cluster_info;
+	struct list_head free_clusters;
+	struct list_head full_clusters;
+	struct list_head nonfull_clusters[10];
+	struct list_head frag_clusters[10];
+	unsigned int pages;
+	atomic_long_t inuse_pages;
+	struct swap_sequential_cluster *global_cluster;
+	spinlock_t global_cluster_lock;
+	struct rb_root swap_extent_root;
+	struct block_device___3 *bdev;
+	struct file___5 *swap_file;
 	struct completion comp;
 	spinlock_t lock;
 	spinlock_t cont_lock;
@@ -139623,6 +147463,21 @@ struct sysfs_ops___2 {
 	ssize_t (*store)(struct kobject___2 *, struct attribute *, const char *, size_t);
 };
 
+struct sysfs_ops___3 {
+	ssize_t (*show)(struct kobject___3 *, struct attribute *, char *);
+	ssize_t (*store)(struct kobject___3 *, struct attribute *, const char *, size_t);
+};
+
+struct sysfs_ops___4 {
+	ssize_t (*show)(struct kobject___4 *, struct attribute *, char *);
+	ssize_t (*store)(struct kobject___4 *, struct attribute *, const char *, size_t);
+};
+
+struct sysfs_ops___5 {
+	ssize_t (*show)(struct kobject___5 *, struct attribute *, char *);
+	ssize_t (*store)(struct kobject___5 *, struct attribute *, const char *, size_t);
+};
+
 struct sysfs_wi_group {
 	struct kobject wi_kobj;
 	struct mutex kobj_lock;
@@ -140569,6 +148424,879 @@ struct task_struct___2 {
 	struct callback_head l1d_flush_kill;
 	union rv_task_monitor rv[3];
 	struct thread_struct___2 thread;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
+struct task_struct___4 {
+	struct thread_info thread_info;
+	unsigned int __state;
+	unsigned int saved_state;
+	void *stack;
+	refcount_t usage;
+	unsigned int flags;
+	unsigned int ptrace;
+	int on_cpu;
+	struct __call_single_node wake_entry;
+	unsigned int wakee_flips;
+	long unsigned int wakee_flip_decay_ts;
+	struct task_struct___4 *last_wakee;
+	int recent_used_cpu;
+	int wake_cpu;
+	int on_rq;
+	int prio;
+	int static_prio;
+	int normal_prio;
+	unsigned int rt_priority;
+	struct sched_entity se;
+	struct sched_rt_entity rt;
+	struct sched_dl_entity___3 dl;
+	struct sched_dl_entity___3 *dl_server;
+	struct sched_ext_entity___3 scx;
+	const struct sched_class *sched_class;
+	struct rb_node core_node;
+	long unsigned int core_cookie;
+	unsigned int core_occupation;
+	struct task_group *sched_task_group;
+	struct callback_head sched_throttle_work;
+	struct list_head throttle_node;
+	bool throttled;
+	struct uclamp_se uclamp_req[2];
+	struct uclamp_se uclamp[2];
+	long: 64;
+	long: 64;
+	long: 64;
+	struct sched_statistics stats;
+	struct hlist_head preempt_notifiers;
+	unsigned int btrace_seq;
+	unsigned int policy;
+	long unsigned int max_allowed_capacity;
+	int nr_cpus_allowed;
+	const cpumask_t *cpus_ptr;
+	cpumask_t *user_cpus_ptr;
+	cpumask_t cpus_mask;
+	void *migration_pending;
+	short unsigned int migration_disabled;
+	short unsigned int migration_flags;
+	int rcu_read_lock_nesting;
+	union rcu_special rcu_read_unlock_special;
+	struct list_head rcu_node_entry;
+	struct rcu_node *rcu_blocked_node;
+	long unsigned int rcu_tasks_nvcsw;
+	u8 rcu_tasks_holdout;
+	u8 rcu_tasks_idx;
+	int rcu_tasks_idle_cpu;
+	struct list_head rcu_tasks_holdout_list;
+	int rcu_tasks_exit_cpu;
+	struct list_head rcu_tasks_exit_list;
+	int trc_reader_nesting;
+	int trc_ipi_to_cpu;
+	union rcu_special trc_reader_special;
+	struct list_head trc_holdout_list;
+	struct list_head trc_blkd_node;
+	int trc_blkd_cpu;
+	struct sched_info sched_info;
+	struct list_head tasks;
+	struct plist_node pushable_tasks;
+	struct rb_node pushable_dl_tasks;
+	struct mm_struct___3 *mm;
+	struct mm_struct___3 *active_mm;
+	struct address_space___3 *faults_disabled_mapping;
+	int exit_state;
+	int exit_code;
+	int exit_signal;
+	int pdeath_signal;
+	long unsigned int jobctl;
+	unsigned int personality;
+	unsigned int sched_reset_on_fork: 1;
+	unsigned int sched_contributes_to_load: 1;
+	unsigned int sched_migrated: 1;
+	unsigned int sched_task_hot: 1;
+	long: 28;
+	unsigned int sched_remote_wakeup: 1;
+	unsigned int sched_rt_mutex: 1;
+	unsigned int in_execve: 1;
+	unsigned int in_iowait: 1;
+	unsigned int restore_sigmask: 1;
+	unsigned int in_user_fault: 1;
+	unsigned int in_lru_fault: 1;
+	unsigned int no_cgroup_migration: 1;
+	unsigned int frozen: 1;
+	unsigned int use_memdelay: 1;
+	unsigned int in_memstall: 1;
+	unsigned int in_page_owner: 1;
+	unsigned int in_eventfd: 1;
+	unsigned int pasid_activated: 1;
+	unsigned int reported_split_lock: 1;
+	unsigned int in_thrashing: 1;
+	unsigned int in_nf_duplicate: 1;
+	long unsigned int atomic_flags;
+	struct restart_block restart_block;
+	pid_t pid;
+	pid_t tgid;
+	long unsigned int stack_canary;
+	struct task_struct___4 *real_parent;
+	struct task_struct___4 *parent;
+	struct list_head children;
+	struct list_head sibling;
+	struct task_struct___4 *group_leader;
+	struct list_head ptraced;
+	struct list_head ptrace_entry;
+	struct pid___3 *thread_pid;
+	struct hlist_node pid_links[4];
+	struct list_head thread_node;
+	struct completion *vfork_done;
+	int *set_child_tid;
+	int *clear_child_tid;
+	void *worker_private;
+	u64 utime;
+	u64 stime;
+	u64 gtime;
+	struct prev_cputime prev_cputime;
+	struct vtime vtime;
+	atomic_t tick_dep_mask;
+	long unsigned int nvcsw;
+	long unsigned int nivcsw;
+	u64 start_time;
+	u64 start_boottime;
+	long unsigned int min_flt;
+	long unsigned int maj_flt;
+	struct posix_cputimers posix_cputimers;
+	struct posix_cputimers_work posix_cputimers_work;
+	const struct cred *ptracer_cred;
+	const struct cred *real_cred;
+	const struct cred *cred;
+	struct key *cached_requested_key;
+	char comm[16];
+	struct nameidata *nameidata;
+	struct sysv_sem sysvsem;
+	struct sysv_shm sysvshm;
+	struct fs_struct *fs;
+	struct files_struct *files;
+	struct io_uring_task *io_uring;
+	struct nsproxy *nsproxy;
+	struct signal_struct___3 *signal;
+	struct sighand_struct *sighand;
+	sigset_t blocked;
+	sigset_t real_blocked;
+	sigset_t saved_sigmask;
+	struct sigpending pending;
+	long unsigned int sas_ss_sp;
+	size_t sas_ss_size;
+	unsigned int sas_ss_flags;
+	struct callback_head *task_works;
+	struct audit_context *audit_context;
+	kuid_t loginuid;
+	unsigned int sessionid;
+	struct seccomp seccomp;
+	struct syscall_user_dispatch syscall_dispatch;
+	u64 parent_exec_id;
+	u64 self_exec_id;
+	spinlock_t alloc_lock;
+	raw_spinlock_t pi_lock;
+	struct wake_q_node wake_q;
+	struct rb_root_cached pi_waiters;
+	struct task_struct___4 *pi_top_task;
+	struct rt_mutex_waiter *pi_blocked_on;
+	struct mutex *blocked_on;
+	unsigned int in_ubsan;
+	void *journal_info;
+	struct bio_list *bio_list;
+	struct blk_plug *plug;
+	struct reclaim_state *reclaim_state;
+	struct io_context *io_context;
+	struct capture_control *capture_control;
+	long unsigned int ptrace_message;
+	kernel_siginfo_t *last_siginfo;
+	struct task_io_accounting ioac;
+	unsigned int psi_flags;
+	u64 acct_rss_mem1;
+	u64 acct_vm_mem1;
+	u64 acct_timexpd;
+	nodemask_t mems_allowed;
+	seqcount_spinlock_t mems_allowed_seq;
+	int cpuset_mem_spread_rotor;
+	struct css_set *cgroups;
+	struct list_head cg_list;
+	u32 closid;
+	u32 rmid;
+	struct robust_list_head *robust_list;
+	struct compat_robust_list_head *compat_robust_list;
+	struct list_head pi_state_list;
+	struct futex_pi_state *pi_state_cache;
+	struct mutex futex_exit_mutex;
+	unsigned int futex_state;
+	u8 perf_recursion[4];
+	struct perf_event_context *perf_event_ctxp;
+	struct mutex perf_event_mutex;
+	struct list_head perf_event_list;
+	struct perf_ctx_data *perf_ctx_data;
+	struct mempolicy *mempolicy;
+	short int il_prev;
+	u8 il_weight;
+	short int pref_node_fork;
+	int numa_scan_seq;
+	unsigned int numa_scan_period;
+	unsigned int numa_scan_period_max;
+	int numa_preferred_nid;
+	long unsigned int numa_migrate_retry;
+	u64 node_stamp;
+	u64 last_task_numa_placement;
+	u64 last_sum_exec_runtime;
+	struct callback_head numa_work;
+	struct numa_group *numa_group;
+	long unsigned int *numa_faults;
+	long unsigned int total_numa_faults;
+	long unsigned int numa_faults_locality[3];
+	long unsigned int numa_pages_migrated;
+	struct rseq *rseq;
+	u32 rseq_len;
+	u32 rseq_sig;
+	long unsigned int rseq_event_mask;
+	int mm_cid;
+	int last_mm_cid;
+	int migrate_from_cpu;
+	int mm_cid_active;
+	struct callback_head cid_work;
+	struct tlbflush_unmap_batch tlb_ubc;
+	struct pipe_inode_info *splice_pipe;
+	struct page_frag___3 task_frag;
+	struct task_delay_info *delays;
+	int nr_dirtied;
+	int nr_dirtied_pause;
+	long unsigned int dirty_paused_when;
+	int latency_record_count;
+	struct latency_record latency_record[32];
+	u64 timer_slack_ns;
+	u64 default_timer_slack_ns;
+	struct kunit *kunit_test;
+	int curr_ret_stack;
+	int curr_ret_depth;
+	long unsigned int *ret_stack;
+	long long unsigned int ftrace_timestamp;
+	long long unsigned int ftrace_sleeptime;
+	atomic_t trace_overrun;
+	atomic_t tracing_graph_pause;
+	long unsigned int trace_recursion;
+	struct mem_cgroup *memcg_in_oom;
+	unsigned int memcg_nr_pages_over_high;
+	struct mem_cgroup *active_memcg;
+	struct obj_cgroup *objcg;
+	struct gendisk *throttle_disk;
+	struct uprobe_task *utask;
+	unsigned int sequential_io;
+	unsigned int sequential_io_avg;
+	struct kmap_ctrl kmap_ctrl;
+	struct callback_head rcu;
+	refcount_t rcu_users;
+	int pagefault_disabled;
+	struct task_struct___4 *oom_reaper_list;
+	struct timer_list oom_reaper_timer;
+	struct vm_struct *stack_vm_area;
+	refcount_t stack_refcount;
+	int patch_state;
+	void *security;
+	struct bpf_local_storage *bpf_storage;
+	struct bpf_run_ctx *bpf_ctx;
+	struct bpf_net_context *bpf_net_context;
+	void *mce_vaddr;
+	__u64 mce_kflags;
+	u64 mce_addr;
+	__u64 mce_ripv: 1;
+	__u64 mce_whole_page: 1;
+	__u64 __mce_reserved: 62;
+	struct callback_head mce_kill_me;
+	int mce_count;
+	struct llist_head kretprobe_instances;
+	struct llist_head rethooks;
+	struct callback_head l1d_flush_kill;
+	union rv_task_monitor rv[3];
+	struct thread_struct thread;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
+struct task_struct___5 {
+	struct thread_info thread_info;
+	unsigned int __state;
+	unsigned int saved_state;
+	void *stack;
+	refcount_t usage;
+	unsigned int flags;
+	unsigned int ptrace;
+	int on_cpu;
+	struct __call_single_node wake_entry;
+	unsigned int wakee_flips;
+	long unsigned int wakee_flip_decay_ts;
+	struct task_struct___5 *last_wakee;
+	int recent_used_cpu;
+	int wake_cpu;
+	int on_rq;
+	int prio;
+	int static_prio;
+	int normal_prio;
+	unsigned int rt_priority;
+	struct sched_entity se;
+	struct sched_rt_entity rt;
+	struct sched_dl_entity___4 dl;
+	struct sched_dl_entity___4 *dl_server;
+	struct sched_ext_entity___4 scx;
+	const struct sched_class *sched_class;
+	struct rb_node core_node;
+	long unsigned int core_cookie;
+	unsigned int core_occupation;
+	struct task_group *sched_task_group;
+	struct callback_head sched_throttle_work;
+	struct list_head throttle_node;
+	bool throttled;
+	struct uclamp_se uclamp_req[2];
+	struct uclamp_se uclamp[2];
+	long: 64;
+	long: 64;
+	long: 64;
+	struct sched_statistics stats;
+	struct hlist_head preempt_notifiers;
+	unsigned int btrace_seq;
+	unsigned int policy;
+	long unsigned int max_allowed_capacity;
+	int nr_cpus_allowed;
+	const cpumask_t *cpus_ptr;
+	cpumask_t *user_cpus_ptr;
+	cpumask_t cpus_mask;
+	void *migration_pending;
+	short unsigned int migration_disabled;
+	short unsigned int migration_flags;
+	int rcu_read_lock_nesting;
+	union rcu_special rcu_read_unlock_special;
+	struct list_head rcu_node_entry;
+	struct rcu_node *rcu_blocked_node;
+	long unsigned int rcu_tasks_nvcsw;
+	u8 rcu_tasks_holdout;
+	u8 rcu_tasks_idx;
+	int rcu_tasks_idle_cpu;
+	struct list_head rcu_tasks_holdout_list;
+	int rcu_tasks_exit_cpu;
+	struct list_head rcu_tasks_exit_list;
+	int trc_reader_nesting;
+	int trc_ipi_to_cpu;
+	union rcu_special trc_reader_special;
+	struct list_head trc_holdout_list;
+	struct list_head trc_blkd_node;
+	int trc_blkd_cpu;
+	struct sched_info sched_info;
+	struct list_head tasks;
+	struct plist_node pushable_tasks;
+	struct rb_node pushable_dl_tasks;
+	struct mm_struct___4 *mm;
+	struct mm_struct___4 *active_mm;
+	struct address_space___4 *faults_disabled_mapping;
+	int exit_state;
+	int exit_code;
+	int exit_signal;
+	int pdeath_signal;
+	long unsigned int jobctl;
+	unsigned int personality;
+	unsigned int sched_reset_on_fork: 1;
+	unsigned int sched_contributes_to_load: 1;
+	unsigned int sched_migrated: 1;
+	unsigned int sched_task_hot: 1;
+	long: 28;
+	unsigned int sched_remote_wakeup: 1;
+	unsigned int sched_rt_mutex: 1;
+	unsigned int in_execve: 1;
+	unsigned int in_iowait: 1;
+	unsigned int restore_sigmask: 1;
+	unsigned int in_user_fault: 1;
+	unsigned int in_lru_fault: 1;
+	unsigned int no_cgroup_migration: 1;
+	unsigned int frozen: 1;
+	unsigned int use_memdelay: 1;
+	unsigned int in_memstall: 1;
+	unsigned int in_page_owner: 1;
+	unsigned int in_eventfd: 1;
+	unsigned int pasid_activated: 1;
+	unsigned int reported_split_lock: 1;
+	unsigned int in_thrashing: 1;
+	unsigned int in_nf_duplicate: 1;
+	long unsigned int atomic_flags;
+	struct restart_block restart_block;
+	pid_t pid;
+	pid_t tgid;
+	long unsigned int stack_canary;
+	struct task_struct___5 *real_parent;
+	struct task_struct___5 *parent;
+	struct list_head children;
+	struct list_head sibling;
+	struct task_struct___5 *group_leader;
+	struct list_head ptraced;
+	struct list_head ptrace_entry;
+	struct pid___4 *thread_pid;
+	struct hlist_node pid_links[4];
+	struct list_head thread_node;
+	struct completion *vfork_done;
+	int *set_child_tid;
+	int *clear_child_tid;
+	void *worker_private;
+	u64 utime;
+	u64 stime;
+	u64 gtime;
+	struct prev_cputime prev_cputime;
+	struct vtime vtime;
+	atomic_t tick_dep_mask;
+	long unsigned int nvcsw;
+	long unsigned int nivcsw;
+	u64 start_time;
+	u64 start_boottime;
+	long unsigned int min_flt;
+	long unsigned int maj_flt;
+	struct posix_cputimers posix_cputimers;
+	struct posix_cputimers_work posix_cputimers_work;
+	const struct cred *ptracer_cred;
+	const struct cred *real_cred;
+	const struct cred *cred;
+	struct key *cached_requested_key;
+	char comm[16];
+	struct nameidata *nameidata;
+	struct sysv_sem sysvsem;
+	struct sysv_shm sysvshm;
+	struct fs_struct *fs;
+	struct files_struct *files;
+	struct io_uring_task *io_uring;
+	struct nsproxy *nsproxy;
+	struct signal_struct___4 *signal;
+	struct sighand_struct *sighand;
+	sigset_t blocked;
+	sigset_t real_blocked;
+	sigset_t saved_sigmask;
+	struct sigpending pending;
+	long unsigned int sas_ss_sp;
+	size_t sas_ss_size;
+	unsigned int sas_ss_flags;
+	struct callback_head *task_works;
+	struct audit_context *audit_context;
+	kuid_t loginuid;
+	unsigned int sessionid;
+	struct seccomp seccomp;
+	struct syscall_user_dispatch syscall_dispatch;
+	u64 parent_exec_id;
+	u64 self_exec_id;
+	spinlock_t alloc_lock;
+	raw_spinlock_t pi_lock;
+	struct wake_q_node wake_q;
+	struct rb_root_cached pi_waiters;
+	struct task_struct___5 *pi_top_task;
+	struct rt_mutex_waiter *pi_blocked_on;
+	struct mutex *blocked_on;
+	unsigned int in_ubsan;
+	void *journal_info;
+	struct bio_list *bio_list;
+	struct blk_plug *plug;
+	struct reclaim_state *reclaim_state;
+	struct io_context *io_context;
+	struct capture_control *capture_control;
+	long unsigned int ptrace_message;
+	kernel_siginfo_t *last_siginfo;
+	struct task_io_accounting ioac;
+	unsigned int psi_flags;
+	u64 acct_rss_mem1;
+	u64 acct_vm_mem1;
+	u64 acct_timexpd;
+	nodemask_t mems_allowed;
+	seqcount_spinlock_t mems_allowed_seq;
+	int cpuset_mem_spread_rotor;
+	struct css_set *cgroups;
+	struct list_head cg_list;
+	u32 closid;
+	u32 rmid;
+	struct robust_list_head *robust_list;
+	struct compat_robust_list_head *compat_robust_list;
+	struct list_head pi_state_list;
+	struct futex_pi_state *pi_state_cache;
+	struct mutex futex_exit_mutex;
+	unsigned int futex_state;
+	u8 perf_recursion[4];
+	struct perf_event_context *perf_event_ctxp;
+	struct mutex perf_event_mutex;
+	struct list_head perf_event_list;
+	struct perf_ctx_data *perf_ctx_data;
+	struct mempolicy *mempolicy;
+	short int il_prev;
+	u8 il_weight;
+	short int pref_node_fork;
+	int numa_scan_seq;
+	unsigned int numa_scan_period;
+	unsigned int numa_scan_period_max;
+	int numa_preferred_nid;
+	long unsigned int numa_migrate_retry;
+	u64 node_stamp;
+	u64 last_task_numa_placement;
+	u64 last_sum_exec_runtime;
+	struct callback_head numa_work;
+	struct numa_group *numa_group;
+	long unsigned int *numa_faults;
+	long unsigned int total_numa_faults;
+	long unsigned int numa_faults_locality[3];
+	long unsigned int numa_pages_migrated;
+	struct rseq *rseq;
+	u32 rseq_len;
+	u32 rseq_sig;
+	long unsigned int rseq_event_mask;
+	int mm_cid;
+	int last_mm_cid;
+	int migrate_from_cpu;
+	int mm_cid_active;
+	struct callback_head cid_work;
+	struct tlbflush_unmap_batch tlb_ubc;
+	struct pipe_inode_info *splice_pipe;
+	struct page_frag___4 task_frag;
+	struct task_delay_info *delays;
+	int nr_dirtied;
+	int nr_dirtied_pause;
+	long unsigned int dirty_paused_when;
+	int latency_record_count;
+	struct latency_record latency_record[32];
+	u64 timer_slack_ns;
+	u64 default_timer_slack_ns;
+	struct kunit *kunit_test;
+	int curr_ret_stack;
+	int curr_ret_depth;
+	long unsigned int *ret_stack;
+	long long unsigned int ftrace_timestamp;
+	long long unsigned int ftrace_sleeptime;
+	atomic_t trace_overrun;
+	atomic_t tracing_graph_pause;
+	long unsigned int trace_recursion;
+	struct mem_cgroup *memcg_in_oom;
+	unsigned int memcg_nr_pages_over_high;
+	struct mem_cgroup *active_memcg;
+	struct obj_cgroup *objcg;
+	struct gendisk *throttle_disk;
+	struct uprobe_task *utask;
+	unsigned int sequential_io;
+	unsigned int sequential_io_avg;
+	struct kmap_ctrl kmap_ctrl;
+	struct callback_head rcu;
+	refcount_t rcu_users;
+	int pagefault_disabled;
+	struct task_struct___5 *oom_reaper_list;
+	struct timer_list oom_reaper_timer;
+	struct vm_struct *stack_vm_area;
+	refcount_t stack_refcount;
+	int patch_state;
+	void *security;
+	struct bpf_local_storage *bpf_storage;
+	struct bpf_run_ctx *bpf_ctx;
+	struct bpf_net_context *bpf_net_context;
+	void *mce_vaddr;
+	__u64 mce_kflags;
+	u64 mce_addr;
+	__u64 mce_ripv: 1;
+	__u64 mce_whole_page: 1;
+	__u64 __mce_reserved: 62;
+	struct callback_head mce_kill_me;
+	int mce_count;
+	struct llist_head kretprobe_instances;
+	struct llist_head rethooks;
+	struct callback_head l1d_flush_kill;
+	union rv_task_monitor rv[3];
+	struct thread_struct thread;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
+struct task_struct___3 {
+	struct thread_info thread_info;
+	unsigned int __state;
+	unsigned int saved_state;
+	void *stack;
+	refcount_t usage;
+	unsigned int flags;
+	unsigned int ptrace;
+	int on_cpu;
+	struct __call_single_node wake_entry;
+	unsigned int wakee_flips;
+	long unsigned int wakee_flip_decay_ts;
+	struct task_struct___3 *last_wakee;
+	int recent_used_cpu;
+	int wake_cpu;
+	int on_rq;
+	int prio;
+	int static_prio;
+	int normal_prio;
+	unsigned int rt_priority;
+	struct sched_entity se;
+	struct sched_rt_entity rt;
+	struct sched_dl_entity___5 dl;
+	struct sched_dl_entity___5 *dl_server;
+	struct sched_ext_entity___5 scx;
+	const struct sched_class *sched_class;
+	struct rb_node core_node;
+	long unsigned int core_cookie;
+	unsigned int core_occupation;
+	struct task_group *sched_task_group;
+	struct callback_head sched_throttle_work;
+	struct list_head throttle_node;
+	bool throttled;
+	struct uclamp_se uclamp_req[2];
+	struct uclamp_se uclamp[2];
+	long: 64;
+	long: 64;
+	long: 64;
+	struct sched_statistics stats;
+	struct hlist_head preempt_notifiers;
+	unsigned int btrace_seq;
+	unsigned int policy;
+	long unsigned int max_allowed_capacity;
+	int nr_cpus_allowed;
+	const cpumask_t *cpus_ptr;
+	cpumask_t *user_cpus_ptr;
+	cpumask_t cpus_mask;
+	void *migration_pending;
+	short unsigned int migration_disabled;
+	short unsigned int migration_flags;
+	int rcu_read_lock_nesting;
+	union rcu_special rcu_read_unlock_special;
+	struct list_head rcu_node_entry;
+	struct rcu_node *rcu_blocked_node;
+	long unsigned int rcu_tasks_nvcsw;
+	u8 rcu_tasks_holdout;
+	u8 rcu_tasks_idx;
+	int rcu_tasks_idle_cpu;
+	struct list_head rcu_tasks_holdout_list;
+	int rcu_tasks_exit_cpu;
+	struct list_head rcu_tasks_exit_list;
+	int trc_reader_nesting;
+	int trc_ipi_to_cpu;
+	union rcu_special trc_reader_special;
+	struct list_head trc_holdout_list;
+	struct list_head trc_blkd_node;
+	int trc_blkd_cpu;
+	struct sched_info sched_info;
+	struct list_head tasks;
+	struct plist_node pushable_tasks;
+	struct rb_node pushable_dl_tasks;
+	struct mm_struct___5 *mm;
+	struct mm_struct___5 *active_mm;
+	struct address_space___5 *faults_disabled_mapping;
+	int exit_state;
+	int exit_code;
+	int exit_signal;
+	int pdeath_signal;
+	long unsigned int jobctl;
+	unsigned int personality;
+	unsigned int sched_reset_on_fork: 1;
+	unsigned int sched_contributes_to_load: 1;
+	unsigned int sched_migrated: 1;
+	unsigned int sched_task_hot: 1;
+	long: 28;
+	unsigned int sched_remote_wakeup: 1;
+	unsigned int sched_rt_mutex: 1;
+	unsigned int in_execve: 1;
+	unsigned int in_iowait: 1;
+	unsigned int restore_sigmask: 1;
+	unsigned int in_user_fault: 1;
+	unsigned int in_lru_fault: 1;
+	unsigned int no_cgroup_migration: 1;
+	unsigned int frozen: 1;
+	unsigned int use_memdelay: 1;
+	unsigned int in_memstall: 1;
+	unsigned int in_page_owner: 1;
+	unsigned int in_eventfd: 1;
+	unsigned int pasid_activated: 1;
+	unsigned int reported_split_lock: 1;
+	unsigned int in_thrashing: 1;
+	unsigned int in_nf_duplicate: 1;
+	long unsigned int atomic_flags;
+	struct restart_block restart_block;
+	pid_t pid;
+	pid_t tgid;
+	long unsigned int stack_canary;
+	struct task_struct___3 *real_parent;
+	struct task_struct___3 *parent;
+	struct list_head children;
+	struct list_head sibling;
+	struct task_struct___3 *group_leader;
+	struct list_head ptraced;
+	struct list_head ptrace_entry;
+	struct pid___5 *thread_pid;
+	struct hlist_node pid_links[4];
+	struct list_head thread_node;
+	struct completion *vfork_done;
+	int *set_child_tid;
+	int *clear_child_tid;
+	void *worker_private;
+	u64 utime;
+	u64 stime;
+	u64 gtime;
+	struct prev_cputime prev_cputime;
+	struct vtime vtime;
+	atomic_t tick_dep_mask;
+	long unsigned int nvcsw;
+	long unsigned int nivcsw;
+	u64 start_time;
+	u64 start_boottime;
+	long unsigned int min_flt;
+	long unsigned int maj_flt;
+	struct posix_cputimers posix_cputimers;
+	struct posix_cputimers_work posix_cputimers_work;
+	const struct cred___3 *ptracer_cred;
+	const struct cred___3 *real_cred;
+	const struct cred___3 *cred;
+	struct key *cached_requested_key;
+	char comm[16];
+	struct nameidata *nameidata;
+	struct sysv_sem sysvsem;
+	struct sysv_shm sysvshm;
+	struct fs_struct *fs;
+	struct files_struct *files;
+	struct io_uring_task *io_uring;
+	struct nsproxy___3 *nsproxy;
+	struct signal_struct___5 *signal;
+	struct sighand_struct *sighand;
+	sigset_t blocked;
+	sigset_t real_blocked;
+	sigset_t saved_sigmask;
+	struct sigpending pending;
+	long unsigned int sas_ss_sp;
+	size_t sas_ss_size;
+	unsigned int sas_ss_flags;
+	struct callback_head *task_works;
+	struct audit_context *audit_context;
+	kuid_t loginuid;
+	unsigned int sessionid;
+	struct seccomp seccomp;
+	struct syscall_user_dispatch syscall_dispatch;
+	u64 parent_exec_id;
+	u64 self_exec_id;
+	spinlock_t alloc_lock;
+	raw_spinlock_t pi_lock;
+	struct wake_q_node wake_q;
+	struct rb_root_cached pi_waiters;
+	struct task_struct___3 *pi_top_task;
+	struct rt_mutex_waiter *pi_blocked_on;
+	struct mutex *blocked_on;
+	unsigned int in_ubsan;
+	void *journal_info;
+	struct bio_list___3 *bio_list;
+	struct blk_plug *plug;
+	struct reclaim_state___2 *reclaim_state;
+	struct io_context *io_context;
+	struct capture_control *capture_control;
+	long unsigned int ptrace_message;
+	kernel_siginfo_t *last_siginfo;
+	struct task_io_accounting ioac;
+	unsigned int psi_flags;
+	u64 acct_rss_mem1;
+	u64 acct_vm_mem1;
+	u64 acct_timexpd;
+	nodemask_t mems_allowed;
+	seqcount_spinlock_t mems_allowed_seq;
+	int cpuset_mem_spread_rotor;
+	struct css_set___3 *cgroups;
+	struct list_head cg_list;
+	u32 closid;
+	u32 rmid;
+	struct robust_list_head *robust_list;
+	struct compat_robust_list_head *compat_robust_list;
+	struct list_head pi_state_list;
+	struct futex_pi_state *pi_state_cache;
+	struct mutex futex_exit_mutex;
+	unsigned int futex_state;
+	u8 perf_recursion[4];
+	struct perf_event_context *perf_event_ctxp;
+	struct mutex perf_event_mutex;
+	struct list_head perf_event_list;
+	struct perf_ctx_data *perf_ctx_data;
+	struct mempolicy *mempolicy;
+	short int il_prev;
+	u8 il_weight;
+	short int pref_node_fork;
+	int numa_scan_seq;
+	unsigned int numa_scan_period;
+	unsigned int numa_scan_period_max;
+	int numa_preferred_nid;
+	long unsigned int numa_migrate_retry;
+	u64 node_stamp;
+	u64 last_task_numa_placement;
+	u64 last_sum_exec_runtime;
+	struct callback_head numa_work;
+	struct numa_group *numa_group;
+	long unsigned int *numa_faults;
+	long unsigned int total_numa_faults;
+	long unsigned int numa_faults_locality[3];
+	long unsigned int numa_pages_migrated;
+	struct rseq *rseq;
+	u32 rseq_len;
+	u32 rseq_sig;
+	long unsigned int rseq_event_mask;
+	int mm_cid;
+	int last_mm_cid;
+	int migrate_from_cpu;
+	int mm_cid_active;
+	struct callback_head cid_work;
+	struct tlbflush_unmap_batch tlb_ubc;
+	struct pipe_inode_info *splice_pipe;
+	struct page_frag___5 task_frag;
+	struct task_delay_info *delays;
+	int nr_dirtied;
+	int nr_dirtied_pause;
+	long unsigned int dirty_paused_when;
+	int latency_record_count;
+	struct latency_record latency_record[32];
+	u64 timer_slack_ns;
+	u64 default_timer_slack_ns;
+	struct kunit *kunit_test;
+	int curr_ret_stack;
+	int curr_ret_depth;
+	long unsigned int *ret_stack;
+	long long unsigned int ftrace_timestamp;
+	long long unsigned int ftrace_sleeptime;
+	atomic_t trace_overrun;
+	atomic_t tracing_graph_pause;
+	long unsigned int trace_recursion;
+	struct mem_cgroup___3 *memcg_in_oom;
+	unsigned int memcg_nr_pages_over_high;
+	struct mem_cgroup___3 *active_memcg;
+	struct obj_cgroup___3 *objcg;
+	struct gendisk *throttle_disk;
+	struct uprobe_task *utask;
+	unsigned int sequential_io;
+	unsigned int sequential_io_avg;
+	struct kmap_ctrl kmap_ctrl;
+	struct callback_head rcu;
+	refcount_t rcu_users;
+	int pagefault_disabled;
+	struct task_struct___3 *oom_reaper_list;
+	struct timer_list oom_reaper_timer;
+	struct vm_struct *stack_vm_area;
+	refcount_t stack_refcount;
+	int patch_state;
+	void *security;
+	struct bpf_local_storage *bpf_storage;
+	struct bpf_run_ctx *bpf_ctx;
+	struct bpf_net_context *bpf_net_context;
+	void *mce_vaddr;
+	__u64 mce_kflags;
+	u64 mce_addr;
+	__u64 mce_ripv: 1;
+	__u64 mce_whole_page: 1;
+	__u64 __mce_reserved: 62;
+	struct callback_head mce_kill_me;
+	int mce_count;
+	struct llist_head kretprobe_instances;
+	struct llist_head rethooks;
+	struct callback_head l1d_flush_kill;
+	union rv_task_monitor rv[3];
+	struct thread_struct thread;
 	long: 64;
 	long: 64;
 	long: 64;
@@ -155321,6 +164049,16 @@ struct ucounts___2 {
 	atomic_long_t rlimit[4];
 };
 
+struct ucounts___3 {
+	struct hlist_nulls_node node;
+	struct user_namespace___3 *ns;
+	kuid_t uid;
+	struct callback_head rcu;
+	rcuref_t count;
+	atomic_long_t ucount[12];
+	atomic_long_t rlimit[4];
+};
+
 struct ucred {
 	__u32 pid;
 	__u32 uid;
@@ -157494,6 +166232,30 @@ struct user_namespace___2 {
 	struct binfmt_misc *binfmt_misc;
 };
 
+struct user_namespace___3 {
+	struct uid_gid_map uid_map;
+	struct uid_gid_map gid_map;
+	struct uid_gid_map projid_map;
+	struct user_namespace___3 *parent;
+	int level;
+	kuid_t owner;
+	kgid_t group;
+	struct ns_common___3 ns;
+	long unsigned int flags;
+	bool parent_could_setfcap;
+	struct list_head keyring_name_list;
+	struct key *user_keyring_register;
+	struct rw_semaphore keyring_sem;
+	struct key *persistent_keyring_register;
+	struct work_struct work;
+	struct ctl_table_set set;
+	struct ctl_table_header *sysctls;
+	struct ucounts___3 *ucounts;
+	long int ucount_max[12];
+	long int rlimit_max[4];
+	struct binfmt_misc *binfmt_misc;
+};
+
 struct user_regset;
 
 typedef int user_regset_get2_fn(struct task_struct *, const struct user_regset *, struct membuf);
@@ -157567,6 +166329,21 @@ struct userfaultfd_ctx {
 	struct rw_semaphore map_changing_lock;
 	atomic_t mmap_changing;
 	struct mm_struct *mm;
+};
+
+struct userfaultfd_ctx___2 {
+	wait_queue_head_t fault_pending_wqh;
+	wait_queue_head_t fault_wqh;
+	wait_queue_head_t fd_wqh;
+	wait_queue_head_t event_wqh;
+	seqcount_spinlock_t refile_seq;
+	refcount_t refcount;
+	unsigned int flags;
+	unsigned int features;
+	bool released;
+	struct rw_semaphore map_changing_lock;
+	atomic_t mmap_changing;
+	struct mm_struct___5 *mm;
 };
 
 struct userfaultfd_fork_ctx {
@@ -159236,6 +168013,20 @@ struct vfio___3 {
 	dev_t group_devt;
 };
 
+struct vfio_batch {
+	struct page___3 **pages;
+	struct page___3 *fallback_page;
+	unsigned int capacity;
+	unsigned int size;
+	unsigned int offset;
+};
+
+struct vfio_bitmap {
+	__u64 pgsize;
+	__u64 size;
+	__u64 *data;
+};
+
 struct vfio_iommu_driver;
 
 struct vfio_container {
@@ -159283,6 +168074,154 @@ struct vfio_device {
 	u8 iommufd_attached: 1;
 	u8 cdev_opened: 1;
 	struct dentry___2 *debug_root;
+};
+
+struct vfio_group;
+
+struct vfio_device_ops___2;
+
+struct vfio_migration_ops___2;
+
+struct vfio_log_ops___2;
+
+struct vfio_device_set___2;
+
+struct vfio_device___2 {
+	struct device___4 *dev;
+	const struct vfio_device_ops___2 *ops;
+	const struct vfio_migration_ops___2 *mig_ops;
+	const struct vfio_log_ops___2 *log_ops;
+	struct vfio_group *group;
+	struct list_head group_next;
+	struct list_head iommu_entry;
+	struct vfio_device_set___2 *dev_set;
+	struct list_head dev_set_list;
+	unsigned int migration_flags;
+	struct kvm *kvm;
+	unsigned int index;
+	struct device___4 device;
+	struct cdev___3 cdev;
+	refcount_t refcount;
+	unsigned int open_count;
+	struct completion comp;
+	struct iommufd_access *iommufd_access;
+	void (*put_kvm)(struct kvm *);
+	struct inode___3 *inode;
+	struct iommufd_device *iommufd_device;
+	struct ida pasids;
+	u8 iommufd_attached: 1;
+	u8 cdev_opened: 1;
+	struct dentry___4 *debug_root;
+};
+
+struct vfio_group;
+
+struct vfio_device_ops___3;
+
+struct vfio_migration_ops___3;
+
+struct vfio_log_ops___3;
+
+struct vfio_device_set___3;
+
+struct vfio_device___3 {
+	struct device___5 *dev;
+	const struct vfio_device_ops___3 *ops;
+	const struct vfio_migration_ops___3 *mig_ops;
+	const struct vfio_log_ops___3 *log_ops;
+	struct vfio_group *group;
+	struct list_head group_next;
+	struct list_head iommu_entry;
+	struct vfio_device_set___3 *dev_set;
+	struct list_head dev_set_list;
+	unsigned int migration_flags;
+	struct kvm *kvm;
+	unsigned int index;
+	struct device___5 device;
+	struct cdev___4 cdev;
+	refcount_t refcount;
+	unsigned int open_count;
+	struct completion comp;
+	struct iommufd_access *iommufd_access;
+	void (*put_kvm)(struct kvm *);
+	struct inode___4 *inode;
+	struct iommufd_device *iommufd_device;
+	struct ida pasids;
+	u8 iommufd_attached: 1;
+	u8 cdev_opened: 1;
+	struct dentry___5 *debug_root;
+};
+
+struct vfio_device_ops___4;
+
+struct vfio_migration_ops___4;
+
+struct vfio_log_ops___4;
+
+struct vfio_device___4 {
+	struct device___6 *dev;
+	const struct vfio_device_ops___4 *ops;
+	const struct vfio_migration_ops___4 *mig_ops;
+	const struct vfio_log_ops___4 *log_ops;
+	struct vfio_group *group;
+	struct list_head group_next;
+	struct list_head iommu_entry;
+	struct vfio_device_set___3 *dev_set;
+	struct list_head dev_set_list;
+	unsigned int migration_flags;
+	struct kvm *kvm;
+	unsigned int index;
+	struct device___6 device;
+	struct cdev___4 cdev;
+	refcount_t refcount;
+	unsigned int open_count;
+	struct completion comp;
+	struct iommufd_access *iommufd_access;
+	void (*put_kvm)(struct kvm *);
+	struct inode___4 *inode;
+	struct iommufd_device *iommufd_device;
+	struct ida pasids;
+	u8 iommufd_attached: 1;
+	u8 cdev_opened: 1;
+	struct dentry___5 *debug_root;
+};
+
+struct vfio_device_ops___5;
+
+struct vfio_migration_ops___5;
+
+struct vfio_log_ops___5;
+
+struct vfio_group___2;
+
+struct vfio_device_set___4;
+
+struct vfio_device___5 {
+	struct device___3 *dev;
+	const struct vfio_device_ops___5 *ops;
+	const struct vfio_migration_ops___5 *mig_ops;
+	const struct vfio_log_ops___5 *log_ops;
+	struct vfio_group___2 *group;
+	struct list_head group_next;
+	struct list_head iommu_entry;
+	struct vfio_device_set___4 *dev_set;
+	struct list_head dev_set_list;
+	unsigned int migration_flags;
+	struct kvm *kvm;
+	unsigned int index;
+	struct device___3 device;
+	struct cdev___5 cdev;
+	refcount_t refcount;
+	unsigned int open_count;
+	struct completion comp;
+	struct iommufd_access *iommufd_access;
+	void (*put_kvm)(struct kvm *);
+	struct inode___5 *inode;
+	struct iommufd_device *iommufd_device;
+	struct ida pasids;
+	u8 iommufd_attached: 1;
+	u8 cdev_opened: 1;
+	struct dentry___3 *debug_root;
 };
 
 struct vfio_device_attach_iommufd_pt {
@@ -159354,6 +168293,41 @@ struct vfio_device_file {
 	struct iommufd_ctx *iommufd;
 };
 
+struct vfio_device_info {
+	__u32 argsz;
+	__u32 flags;
+	__u32 num_regions;
+	__u32 num_irqs;
+	__u32 cap_offset;
+	__u32 pad;
+};
+
+struct vfio_info_cap_header {
+	__u16 id;
+	__u16 version;
+	__u32 next;
+};
+
+struct vfio_device_info_cap_pci_atomic_comp {
+	struct vfio_info_cap_header header;
+	__u32 flags;
+	__u32 reserved;
+};
+
+struct vfio_device_ioeventfd {
+	__u32 argsz;
+	__u32 flags;
+	__u64 offset;
+	__u64 data;
+	__s32 fd;
+	__u32 reserved;
+};
+
+struct vfio_device_low_power_entry_with_wakeup {
+	__s32 wakeup_eventfd;
+	__u32 reserved;
+};
+
 struct vfio_device_ops {
 	char *name;
 	int (*init)(struct vfio_device *);
@@ -159377,11 +168351,148 @@ struct vfio_device_ops {
 	int (*device_feature)(struct vfio_device *, u32, void *, size_t);
 };
 
+struct vfio_device_ops___2 {
+	char *name;
+	int (*init)(struct vfio_device___2 *);
+	void (*release)(struct vfio_device___2 *);
+	int (*bind_iommufd)(struct vfio_device___2 *, struct iommufd_ctx *, u32 *);
+	void (*unbind_iommufd)(struct vfio_device___2 *);
+	int (*attach_ioas)(struct vfio_device___2 *, u32 *);
+	void (*detach_ioas)(struct vfio_device___2 *);
+	int (*pasid_attach_ioas)(struct vfio_device___2 *, u32, u32 *);
+	void (*pasid_detach_ioas)(struct vfio_device___2 *, u32);
+	int (*open_device)(struct vfio_device___2 *);
+	void (*close_device)(struct vfio_device___2 *);
+	ssize_t (*read)(struct vfio_device___2 *, char *, size_t, loff_t *);
+	ssize_t (*write)(struct vfio_device___2 *, const char *, size_t, loff_t *);
+	long int (*ioctl)(struct vfio_device___2 *, unsigned int, long unsigned int);
+	int (*mmap)(struct vfio_device___2 *, struct vm_area_struct___3 *);
+	void (*request)(struct vfio_device___2 *, unsigned int);
+	int (*match)(struct vfio_device___2 *, char *);
+	int (*match_token_uuid)(struct vfio_device___2 *, const uuid_t *);
+	void (*dma_unmap)(struct vfio_device___2 *, u64, u64);
+	int (*device_feature)(struct vfio_device___2 *, u32, void *, size_t);
+};
+
+struct vfio_device_ops___3 {
+	char *name;
+	int (*init)(struct vfio_device___3 *);
+	void (*release)(struct vfio_device___3 *);
+	int (*bind_iommufd)(struct vfio_device___3 *, struct iommufd_ctx *, u32 *);
+	void (*unbind_iommufd)(struct vfio_device___3 *);
+	int (*attach_ioas)(struct vfio_device___3 *, u32 *);
+	void (*detach_ioas)(struct vfio_device___3 *);
+	int (*pasid_attach_ioas)(struct vfio_device___3 *, u32, u32 *);
+	void (*pasid_detach_ioas)(struct vfio_device___3 *, u32);
+	int (*open_device)(struct vfio_device___3 *);
+	void (*close_device)(struct vfio_device___3 *);
+	ssize_t (*read)(struct vfio_device___3 *, char *, size_t, loff_t *);
+	ssize_t (*write)(struct vfio_device___3 *, const char *, size_t, loff_t *);
+	long int (*ioctl)(struct vfio_device___3 *, unsigned int, long unsigned int);
+	int (*mmap)(struct vfio_device___3 *, struct vm_area_struct___4 *);
+	void (*request)(struct vfio_device___3 *, unsigned int);
+	int (*match)(struct vfio_device___3 *, char *);
+	int (*match_token_uuid)(struct vfio_device___3 *, const uuid_t *);
+	void (*dma_unmap)(struct vfio_device___3 *, u64, u64);
+	int (*device_feature)(struct vfio_device___3 *, u32, void *, size_t);
+};
+
+struct vfio_device_ops___4 {
+	char *name;
+	int (*init)(struct vfio_device___4 *);
+	void (*release)(struct vfio_device___4 *);
+	int (*bind_iommufd)(struct vfio_device___4 *, struct iommufd_ctx *, u32 *);
+	void (*unbind_iommufd)(struct vfio_device___4 *);
+	int (*attach_ioas)(struct vfio_device___4 *, u32 *);
+	void (*detach_ioas)(struct vfio_device___4 *);
+	int (*pasid_attach_ioas)(struct vfio_device___4 *, u32, u32 *);
+	void (*pasid_detach_ioas)(struct vfio_device___4 *, u32);
+	int (*open_device)(struct vfio_device___4 *);
+	void (*close_device)(struct vfio_device___4 *);
+	ssize_t (*read)(struct vfio_device___4 *, char *, size_t, loff_t *);
+	ssize_t (*write)(struct vfio_device___4 *, const char *, size_t, loff_t *);
+	long int (*ioctl)(struct vfio_device___4 *, unsigned int, long unsigned int);
+	int (*mmap)(struct vfio_device___4 *, struct vm_area_struct___4 *);
+	void (*request)(struct vfio_device___4 *, unsigned int);
+	int (*match)(struct vfio_device___4 *, char *);
+	int (*match_token_uuid)(struct vfio_device___4 *, const uuid_t *);
+	void (*dma_unmap)(struct vfio_device___4 *, u64, u64);
+	int (*device_feature)(struct vfio_device___4 *, u32, void *, size_t);
+};
+
+struct vfio_device_ops___5 {
+	char *name;
+	int (*init)(struct vfio_device___5 *);
+	void (*release)(struct vfio_device___5 *);
+	int (*bind_iommufd)(struct vfio_device___5 *, struct iommufd_ctx *, u32 *);
+	void (*unbind_iommufd)(struct vfio_device___5 *);
+	int (*attach_ioas)(struct vfio_device___5 *, u32 *);
+	void (*detach_ioas)(struct vfio_device___5 *);
+	int (*pasid_attach_ioas)(struct vfio_device___5 *, u32, u32 *);
+	void (*pasid_detach_ioas)(struct vfio_device___5 *, u32);
+	int (*open_device)(struct vfio_device___5 *);
+	void (*close_device)(struct vfio_device___5 *);
+	ssize_t (*read)(struct vfio_device___5 *, char *, size_t, loff_t *);
+	ssize_t (*write)(struct vfio_device___5 *, const char *, size_t, loff_t *);
+	long int (*ioctl)(struct vfio_device___5 *, unsigned int, long unsigned int);
+	int (*mmap)(struct vfio_device___5 *, struct vm_area_struct___5 *);
+	void (*request)(struct vfio_device___5 *, unsigned int);
+	int (*match)(struct vfio_device___5 *, char *);
+	int (*match_token_uuid)(struct vfio_device___5 *, const uuid_t *);
+	void (*dma_unmap)(struct vfio_device___5 *, u64, u64);
+	int (*device_feature)(struct vfio_device___5 *, u32, void *, size_t);
+};
+
 struct vfio_device_set {
 	void *set_id;
 	struct mutex lock;
 	struct list_head device_list;
 	unsigned int device_count;
+};
+
+struct vfio_device_set___2 {
+	void *set_id;
+	struct mutex lock;
+	struct list_head device_list;
+	unsigned int device_count;
+};
+
+struct vfio_device_set___3 {
+	void *set_id;
+	struct mutex lock;
+	struct list_head device_list;
+	unsigned int device_count;
+};
+
+struct vfio_device_set___4 {
+	void *set_id;
+	struct mutex lock;
+	struct list_head device_list;
+	unsigned int device_count;
+};
+
+struct vfio_dma {
+	struct rb_node node;
+	dma_addr_t iova;
+	long unsigned int vaddr;
+	size_t size;
+	int prot;
+	bool iommu_mapped;
+	bool lock_cap;
+	bool vaddr_invalid;
+	bool has_rsvd;
+	struct task_struct___3 *task;
+	struct rb_root pfn_list;
+	long unsigned int *bitmap;
+	struct mm_struct___5 *mm;
+	size_t locked_vm;
+};
+
+struct vfio_domain {
+	struct iommu_domain___6 *domain;
+	struct list_head next;
+	struct list_head group_list;
+	bool enforce_cache_coherency: 1;
 };
 
 struct vfio_group {
@@ -159405,22 +168516,92 @@ struct vfio_group {
 	unsigned int cdev_device_open_cnt;
 };
 
+struct vfio_container;
+
+struct vfio_group___2 {
+	struct device___3 dev;
+	struct cdev___5 cdev;
+	refcount_t drivers;
+	unsigned int container_users;
+	struct iommu_group *iommu_group;
+	struct vfio_container *container;
+	struct list_head device_list;
+	struct mutex device_lock;
+	struct list_head vfio_next;
+	struct list_head container_next;
+	enum vfio_group_type___2 type;
+	struct mutex group_lock;
+	struct kvm *kvm;
+	struct file___5 *opened_file;
+	struct blocking_notifier_head notifier;
+	struct iommufd_ctx *iommufd;
+	spinlock_t kvm_ref_lock;
+	unsigned int cdev_device_open_cnt;
+};
+
 struct vfio_group_status {
 	__u32 argsz;
 	__u32 flags;
 };
 
-struct vfio_info_cap_header;
+struct vfio_info_cap_header___2;
 
 struct vfio_info_cap {
+	struct vfio_info_cap_header___2 *buf;
+	size_t size;
+};
+
+struct vfio_info_cap_header___3;
+
+struct vfio_info_cap___2 {
+	struct vfio_info_cap_header___3 *buf;
+	size_t size;
+};
+
+struct vfio_info_cap___3 {
 	struct vfio_info_cap_header *buf;
 	size_t size;
 };
 
-struct vfio_info_cap_header {
+struct vfio_info_cap_header___4;
+
+struct vfio_info_cap___4 {
+	struct vfio_info_cap_header___4 *buf;
+	size_t size;
+};
+
+struct vfio_info_cap_header___2 {
 	__u16 id;
 	__u16 version;
 	__u32 next;
+};
+
+struct vfio_info_cap_header___3 {
+	__u16 id;
+	__u16 version;
+	__u32 next;
+};
+
+struct vfio_info_cap_header___4 {
+	__u16 id;
+	__u16 version;
+	__u32 next;
+};
+
+struct vfio_iommu {
+	struct list_head domain_list;
+	struct list_head iova_list;
+	struct mutex lock;
+	struct rb_root dma_list;
+	struct list_head device_list;
+	struct mutex device_list_lock;
+	unsigned int dma_avail;
+	unsigned int vaddr_invalid_count;
+	uint64_t pgsize_bitmap;
+	uint64_t num_non_pinned_groups;
+	bool v2;
+	bool dirty_page_tracking;
+	struct list_head emulated_iommu_groups;
 };
 
 struct vfio_iommu_driver_ops;
@@ -159446,7 +168627,111 @@ struct vfio_iommu_driver_ops {
 	struct iommu_domain___2 * (*group_iommu_domain)(void *, struct iommu_group *);
 };
 
+struct vfio_iommu_driver_ops___2 {
+	char *name;
+	struct module___5 *owner;
+	void * (*open)(long unsigned int);
+	void (*release)(void *);
+	long int (*ioctl)(void *, unsigned int, long unsigned int);
+	int (*attach_group)(void *, struct iommu_group *, enum vfio_group_type___2);
+	void (*detach_group)(void *, struct iommu_group *);
+	int (*pin_pages)(void *, struct iommu_group *, dma_addr_t, int, int, struct page___3 **);
+	void (*unpin_pages)(void *, dma_addr_t, int);
+	void (*register_device)(void *, struct vfio_device___5 *);
+	void (*unregister_device)(void *, struct vfio_device___5 *);
+	int (*dma_rw)(void *, dma_addr_t, void *, size_t, bool);
+	struct iommu_domain___6 * (*group_iommu_domain)(void *, struct iommu_group *);
+};
+
+struct vfio_iommu_group {
+	struct iommu_group *iommu_group;
+	struct list_head next;
+	bool pinned_page_dirty_scope;
+};
+
+struct vfio_iommu_type1_dirty_bitmap {
+	__u32 argsz;
+	__u32 flags;
+	__u8 data[0];
+};
+
+struct vfio_iommu_type1_dirty_bitmap_get {
+	__u64 iova;
+	__u64 size;
+	struct vfio_bitmap bitmap;
+};
+
+struct vfio_iommu_type1_dma_map {
+	__u32 argsz;
+	__u32 flags;
+	__u64 vaddr;
+	__u64 iova;
+	__u64 size;
+};
+
+struct vfio_iommu_type1_dma_unmap {
+	__u32 argsz;
+	__u32 flags;
+	__u64 iova;
+	__u64 size;
+	__u8 data[0];
+};
+
+struct vfio_iommu_type1_info {
+	__u32 argsz;
+	__u32 flags;
+	__u64 iova_pgsizes;
+	__u32 cap_offset;
+	__u32 pad;
+};
+
+struct vfio_iova_range {
+	__u64 start;
+	__u64 end;
+};
+
+struct vfio_iommu_type1_info_cap_iova_range {
+	struct vfio_info_cap_header___4 header;
+	__u32 nr_iovas;
+	__u32 reserved;
+	struct vfio_iova_range iova_ranges[0];
+};
+
+struct vfio_iommu_type1_info_cap_migration {
+	struct vfio_info_cap_header___4 header;
+	__u32 flags;
+	__u64 pgsize_bitmap;
+	__u64 max_dirty_bitmap_size;
+};
+
+struct vfio_iommu_type1_info_dma_avail {
+	struct vfio_info_cap_header___4 header;
+	__u32 avail;
+};
+
+struct vfio_iova {
+	struct list_head list;
+	dma_addr_t start;
+	dma_addr_t end;
+};
+
+struct vfio_irq_info {
+	__u32 argsz;
+	__u32 flags;
+	__u32 index;
+	__u32 count;
+};
+
 struct vfio_irq_set {
+	__u32 argsz;
+	__u32 flags;
+	__u32 index;
+	__u32 start;
+	__u32 count;
+	__u8 data[0];
+};
+
+struct vfio_irq_set___2 {
 	__u32 argsz;
 	__u32 flags;
 	__u32 index;
@@ -159461,10 +168746,389 @@ struct vfio_log_ops {
 	int (*log_read_and_clear)(struct vfio_device *, long unsigned int, long unsigned int, struct iova_bitmap *);
 };
 
+struct vfio_log_ops___2 {
+	int (*log_start)(struct vfio_device___2 *, struct rb_root_cached *, u32, u64 *);
+	int (*log_stop)(struct vfio_device___2 *);
+	int (*log_read_and_clear)(struct vfio_device___2 *, long unsigned int, long unsigned int, struct iova_bitmap *);
+};
+
+struct vfio_log_ops___3 {
+	int (*log_start)(struct vfio_device___3 *, struct rb_root_cached *, u32, u64 *);
+	int (*log_stop)(struct vfio_device___3 *);
+	int (*log_read_and_clear)(struct vfio_device___3 *, long unsigned int, long unsigned int, struct iova_bitmap *);
+};
+
+struct vfio_log_ops___4 {
+	int (*log_start)(struct vfio_device___4 *, struct rb_root_cached *, u32, u64 *);
+	int (*log_stop)(struct vfio_device___4 *);
+	int (*log_read_and_clear)(struct vfio_device___4 *, long unsigned int, long unsigned int, struct iova_bitmap *);
+};
+
+struct vfio_log_ops___5 {
+	int (*log_start)(struct vfio_device___5 *, struct rb_root_cached *, u32, u64 *);
+	int (*log_stop)(struct vfio_device___5 *);
+	int (*log_read_and_clear)(struct vfio_device___5 *, long unsigned int, long unsigned int, struct iova_bitmap *);
+};
+
 struct vfio_migration_ops {
 	struct file___2 * (*migration_set_state)(struct vfio_device *, enum vfio_device_mig_state);
 	int (*migration_get_state)(struct vfio_device *, enum vfio_device_mig_state *);
 	int (*migration_get_data_size)(struct vfio_device *, long unsigned int *);
+};
+
+struct vfio_migration_ops___2 {
+	struct file___3 * (*migration_set_state)(struct vfio_device___2 *, enum vfio_device_mig_state___2);
+	int (*migration_get_state)(struct vfio_device___2 *, enum vfio_device_mig_state___2 *);
+	int (*migration_get_data_size)(struct vfio_device___2 *, long unsigned int *);
+};
+
+struct vfio_migration_ops___3 {
+	struct file___4 * (*migration_set_state)(struct vfio_device___3 *, enum vfio_device_mig_state___3);
+	int (*migration_get_state)(struct vfio_device___3 *, enum vfio_device_mig_state___3 *);
+	int (*migration_get_data_size)(struct vfio_device___3 *, long unsigned int *);
+};
+
+struct vfio_migration_ops___4 {
+	struct file___4 * (*migration_set_state)(struct vfio_device___4 *, enum vfio_device_mig_state___3);
+	int (*migration_get_state)(struct vfio_device___4 *, enum vfio_device_mig_state___3 *);
+	int (*migration_get_data_size)(struct vfio_device___4 *, long unsigned int *);
+};
+
+struct vfio_migration_ops___5 {
+	struct file___5 * (*migration_set_state)(struct vfio_device___5 *, enum vfio_device_mig_state___4);
+	int (*migration_get_state)(struct vfio_device___5 *, enum vfio_device_mig_state___4 *);
+	int (*migration_get_data_size)(struct vfio_device___5 *, long unsigned int *);
+};
+
+struct perm_bits;
+
+struct vfio_pci_vf_token;
+
+struct vfio_pci_region;
+
+struct vfio_pci_eventfd;
+
+struct vfio_pci_core_device___2 {
+	struct vfio_device___2 vdev;
+	struct pci_dev___2 *pdev;
+	void *barmap[6];
+	bool bar_mmap_supported[6];
+	u8 *pci_config_map;
+	u8 *vconfig;
+	struct perm_bits *msi_perm;
+	spinlock_t irqlock;
+	struct mutex igate;
+	struct xarray ctx;
+	int irq_type;
+	int num_regions;
+	struct vfio_pci_region *region;
+	u8 msi_qmax;
+	u8 msix_bar;
+	u16 msix_size;
+	u32 msix_offset;
+	u32 rbar[7];
+	bool has_dyn_msix: 1;
+	bool pci_2_3: 1;
+	bool virq_disabled: 1;
+	bool reset_works: 1;
+	bool extended_caps: 1;
+	bool bardirty: 1;
+	bool has_vga: 1;
+	bool needs_reset: 1;
+	bool nointx: 1;
+	bool needs_pm_restore: 1;
+	bool pm_intx_masked: 1;
+	bool pm_runtime_engaged: 1;
+	struct pci_saved_state *pci_saved_state;
+	struct pci_saved_state *pm_save;
+	int ioeventfds_nr;
+	struct vfio_pci_eventfd *err_trigger;
+	struct vfio_pci_eventfd *req_trigger;
+	struct eventfd_ctx *pm_wake_eventfd_ctx;
+	struct list_head dummy_resources_list;
+	struct mutex ioeventfds_lock;
+	struct list_head ioeventfds_list;
+	struct vfio_pci_vf_token *vf_token;
+	struct list_head sriov_pfs_item;
+	struct vfio_pci_core_device___2 *sriov_pf_core_dev;
+	struct notifier_block nb;
+	struct rw_semaphore memory_lock;
+};
+
+struct vfio_pci_region___2;
+
+struct vfio_pci_eventfd___2;
+
+struct vfio_pci_vf_token;
+
+struct vfio_pci_core_device___3 {
+	struct vfio_device___3 vdev;
+	struct pci_dev___3 *pdev;
+	void *barmap[6];
+	bool bar_mmap_supported[6];
+	u8 *pci_config_map;
+	u8 *vconfig;
+	struct perm_bits *msi_perm;
+	spinlock_t irqlock;
+	struct mutex igate;
+	struct xarray ctx;
+	int irq_type;
+	int num_regions;
+	struct vfio_pci_region___2 *region;
+	u8 msi_qmax;
+	u8 msix_bar;
+	u16 msix_size;
+	u32 msix_offset;
+	u32 rbar[7];
+	bool has_dyn_msix: 1;
+	bool pci_2_3: 1;
+	bool virq_disabled: 1;
+	bool reset_works: 1;
+	bool extended_caps: 1;
+	bool bardirty: 1;
+	bool has_vga: 1;
+	bool needs_reset: 1;
+	bool nointx: 1;
+	bool needs_pm_restore: 1;
+	bool pm_intx_masked: 1;
+	bool pm_runtime_engaged: 1;
+	struct pci_saved_state *pci_saved_state;
+	struct pci_saved_state *pm_save;
+	int ioeventfds_nr;
+	struct vfio_pci_eventfd___2 *err_trigger;
+	struct vfio_pci_eventfd___2 *req_trigger;
+	struct eventfd_ctx *pm_wake_eventfd_ctx;
+	struct list_head dummy_resources_list;
+	struct mutex ioeventfds_lock;
+	struct list_head ioeventfds_list;
+	struct vfio_pci_vf_token *vf_token;
+	struct list_head sriov_pfs_item;
+	struct vfio_pci_core_device___3 *sriov_pf_core_dev;
+	struct notifier_block nb;
+	struct rw_semaphore memory_lock;
+};
+
+struct vfio_pci_region___3;
+
+struct vfio_pci_core_device {
+	struct vfio_device___4 vdev;
+	struct pci_dev___4 *pdev;
+	void *barmap[6];
+	bool bar_mmap_supported[6];
+	u8 *pci_config_map;
+	u8 *vconfig;
+	struct perm_bits *msi_perm;
+	spinlock_t irqlock;
+	struct mutex igate;
+	struct xarray ctx;
+	int irq_type;
+	int num_regions;
+	struct vfio_pci_region___3 *region;
+	u8 msi_qmax;
+	u8 msix_bar;
+	u16 msix_size;
+	u32 msix_offset;
+	u32 rbar[7];
+	bool has_dyn_msix: 1;
+	bool pci_2_3: 1;
+	bool virq_disabled: 1;
+	bool reset_works: 1;
+	bool extended_caps: 1;
+	bool bardirty: 1;
+	bool has_vga: 1;
+	bool needs_reset: 1;
+	bool nointx: 1;
+	bool needs_pm_restore: 1;
+	bool pm_intx_masked: 1;
+	bool pm_runtime_engaged: 1;
+	struct pci_saved_state *pci_saved_state;
+	struct pci_saved_state *pm_save;
+	int ioeventfds_nr;
+	struct vfio_pci_eventfd___2 *err_trigger;
+	struct vfio_pci_eventfd___2 *req_trigger;
+	struct eventfd_ctx *pm_wake_eventfd_ctx;
+	struct list_head dummy_resources_list;
+	struct mutex ioeventfds_lock;
+	struct list_head ioeventfds_list;
+	struct vfio_pci_vf_token *vf_token;
+	struct list_head sriov_pfs_item;
+	struct vfio_pci_core_device *sriov_pf_core_dev;
+	struct notifier_block nb;
+	struct rw_semaphore memory_lock;
+};
+
+struct vfio_pci_dependent_device {
+	union {
+		__u32 group_id;
+		__u32 devid;
+	};
+	__u16 segment;
+	__u8 bus;
+	__u8 devfn;
+};
+
+struct vfio_pci_dummy_resource {
+	struct resource resource;
+	int index;
+	struct list_head res_next;
+};
+
+struct vfio_pci_eventfd {
+	struct eventfd_ctx *ctx;
+	struct callback_head rcu;
+};
+
+struct vfio_pci_eventfd___2 {
+	struct eventfd_ctx *ctx;
+	struct callback_head rcu;
+};
+
+struct vfio_pci_fill_info {
+	struct vfio_device___3 *vdev;
+	struct vfio_pci_dependent_device *devices;
+	int nr_devices;
+	u32 count;
+	u32 flags;
+};
+
+struct vfio_pci_group_info {
+	int count;
+	struct file___4 **files;
+};
+
+struct vfio_pci_hot_reset {
+	__u32 argsz;
+	__u32 flags;
+	__u32 count;
+	__s32 group_fds[0];
+};
+
+struct vfio_pci_hot_reset_info {
+	__u32 argsz;
+	__u32 flags;
+	__u32 count;
+	struct vfio_pci_dependent_device devices[0];
+};
+
+struct virqfd;
+
+struct vfio_pci_ioeventfd {
+	struct list_head next;
+	struct vfio_pci_core_device___3 *vdev;
+	struct virqfd *virqfd;
+	void *addr;
+	uint64_t data;
+	loff_t pos;
+	int bar;
+	int count;
+	bool test_mem;
+};
+
+struct vfio_pci_irq_ctx {
+	struct vfio_pci_core_device *vdev;
+	struct eventfd_ctx *trigger;
+	struct virqfd *unmask;
+	struct virqfd *mask;
+	char *name;
+	bool masked;
+	struct irq_bypass_producer producer;
+};
+
+struct vfio_pci_regops;
+
+struct vfio_pci_region {
+	u32 type;
+	u32 subtype;
+	const struct vfio_pci_regops *ops;
+	void *data;
+	size_t size;
+	u32 flags;
+};
+
+struct vfio_pci_regops___2;
+
+struct vfio_pci_region___2 {
+	u32 type;
+	u32 subtype;
+	const struct vfio_pci_regops___2 *ops;
+	void *data;
+	size_t size;
+	u32 flags;
+};
+
+struct vfio_pci_regops___3;
+
+struct vfio_pci_region___3 {
+	u32 type;
+	u32 subtype;
+	const struct vfio_pci_regops___3 *ops;
+	void *data;
+	size_t size;
+	u32 flags;
+};
+
+struct vfio_pci_regops {
+	ssize_t (*rw)(struct vfio_pci_core_device___2 *, char *, size_t, loff_t *, bool);
+	void (*release)(struct vfio_pci_core_device___2 *, struct vfio_pci_region *);
+	int (*mmap)(struct vfio_pci_core_device___2 *, struct vfio_pci_region *, struct vm_area_struct___3 *);
+	int (*add_capability)(struct vfio_pci_core_device___2 *, struct vfio_pci_region *, struct vfio_info_cap___2 *);
+};
+
+struct vfio_pci_regops___2 {
+	ssize_t (*rw)(struct vfio_pci_core_device___3 *, char *, size_t, loff_t *, bool);
+	void (*release)(struct vfio_pci_core_device___3 *, struct vfio_pci_region___2 *);
+	int (*mmap)(struct vfio_pci_core_device___3 *, struct vfio_pci_region___2 *, struct vm_area_struct___4 *);
+	int (*add_capability)(struct vfio_pci_core_device___3 *, struct vfio_pci_region___2 *, struct vfio_info_cap___3 *);
+};
+
+struct vfio_pci_regops___3 {
+	ssize_t (*rw)(struct vfio_pci_core_device *, char *, size_t, loff_t *, bool);
+	void (*release)(struct vfio_pci_core_device *, struct vfio_pci_region___3 *);
+	int (*mmap)(struct vfio_pci_core_device *, struct vfio_pci_region___3 *, struct vm_area_struct___4 *);
+	int (*add_capability)(struct vfio_pci_core_device *, struct vfio_pci_region___3 *, struct vfio_info_cap___3 *);
+};
+
+struct vfio_pci_vf_token {
+	struct mutex lock;
+	uuid_t uuid;
+	int users;
+};
+
+struct vfio_pci_walk_info {
+	int (*fn)(struct pci_dev___3 *, void *);
+	void *data;
+	struct pci_dev___3 *pdev;
+	bool slot;
+	int ret;
+};
+
+struct vfio_pfn {
+	struct rb_node node;
+	dma_addr_t iova;
+	long unsigned int pfn;
+	unsigned int ref_count;
+};
+
+struct vfio_region_info {
+	__u32 argsz;
+	__u32 flags;
+	__u32 index;
+	__u32 cap_offset;
+	__u64 size;
+	__u64 offset;
+};
+
+struct vfio_region_info_cap_type {
+	struct vfio_info_cap_header header;
+	__u32 type;
+	__u32 subtype;
+};
+
+struct vfio_regions {
+	struct list_head list;
+	dma_addr_t iova;
+	phys_addr_t phys;
+	size_t len;
 };
 
 struct vfree_deferred {
@@ -159492,6 +169156,27 @@ struct vfs_ns_cap_data {
 struct vfsmount___2 {
 	struct dentry___2 *mnt_root;
 	struct super_block___2 *mnt_sb;
+	int mnt_flags;
+	struct mnt_idmap *mnt_idmap;
+};
+
+struct vfsmount___3 {
+	struct dentry___4 *mnt_root;
+	struct super_block___3 *mnt_sb;
+	int mnt_flags;
+	struct mnt_idmap *mnt_idmap;
+};
+
+struct vfsmount___4 {
+	struct dentry___5 *mnt_root;
+	struct super_block___4 *mnt_sb;
+	int mnt_flags;
+	struct mnt_idmap *mnt_idmap;
+};
+
+struct vfsmount___5 {
+	struct dentry___3 *mnt_root;
+	struct super_block___5 *mnt_sb;
 	int mnt_flags;
 	struct mnt_idmap *mnt_idmap;
 };
@@ -159722,7 +169407,7 @@ struct viot_iommu {
 	struct list_head list;
 };
 
-struct virqfd {
+struct virqfd___2 {
 	void *opaque;
 	struct eventfd_ctx *eventfd;
 	int (*handler)(void *, void *);
@@ -159731,6 +169416,20 @@ struct virqfd {
 	struct work_struct inject;
 	wait_queue_entry_t wait;
 	poll_table___2 pt;
+	struct work_struct shutdown;
+	struct work_struct flush_inject;
+	struct virqfd___2 **pvirqfd;
+};
+
+struct virqfd {
+	void *opaque;
+	struct eventfd_ctx *eventfd;
+	int (*handler)(void *, void *);
+	void (*thread)(void *, void *);
+	void *data;
+	struct work_struct inject;
+	wait_queue_entry_t wait;
+	poll_table___3 pt;
 	struct work_struct shutdown;
 	struct work_struct flush_inject;
 	struct virqfd **pvirqfd;
@@ -160429,6 +170128,45 @@ struct vm_area_desc___2 {
 	void *private_data;
 };
 
+struct vm_area_desc___3 {
+	const struct mm_struct___3 * const mm;
+	struct file___3 * const file;
+	long unsigned int start;
+	long unsigned int end;
+	long unsigned int pgoff;
+	struct file___3 *vm_file;
+	vm_flags_t vm_flags;
+	pgprot_t page_prot;
+	const struct vm_operations_struct___3 *vm_ops;
+	void *private_data;
+};
+
+struct vm_area_desc___4 {
+	const struct mm_struct___4 * const mm;
+	struct file___4 * const file;
+	long unsigned int start;
+	long unsigned int end;
+	long unsigned int pgoff;
+	struct file___4 *vm_file;
+	vm_flags_t vm_flags;
+	pgprot_t page_prot;
+	const struct vm_operations_struct___4 *vm_ops;
+	void *private_data;
+};
+
+struct vm_area_desc___5 {
+	const struct mm_struct___5 * const mm;
+	struct file___5 * const file;
+	long unsigned int start;
+	long unsigned int end;
+	long unsigned int pgoff;
+	struct file___5 *vm_file;
+	vm_flags_t vm_flags;
+	pgprot_t page_prot;
+	const struct vm_operations_struct___5 *vm_ops;
+	void *private_data;
+};
+
 struct vm_userfaultfd_ctx {
 	struct userfaultfd_ctx *ctx;
 };
@@ -160503,6 +170241,112 @@ struct vm_area_struct___2 {
 	long: 64;
 };
 
+struct vm_area_struct___3 {
+	union {
+		struct {
+			long unsigned int vm_start;
+			long unsigned int vm_end;
+		};
+		freeptr_t vm_freeptr;
+	};
+	struct mm_struct___3 *vm_mm;
+	pgprot_t vm_page_prot;
+	union {
+		const vm_flags_t vm_flags;
+		vm_flags_t __vm_flags;
+	};
+	unsigned int vm_lock_seq;
+	struct list_head anon_vma_chain;
+	struct anon_vma *anon_vma;
+	const struct vm_operations_struct___3 *vm_ops;
+	long unsigned int vm_pgoff;
+	struct file___3 *vm_file;
+	void *vm_private_data;
+	atomic_long_t swap_readahead_info;
+	struct mempolicy *vm_policy;
+	struct vma_numab_state *numab_state;
+	refcount_t vm_refcnt;
+	struct {
+		struct rb_node rb;
+		long unsigned int rb_subtree_last;
+	} shared;
+	struct vm_userfaultfd_ctx vm_userfaultfd_ctx;
+	struct pfnmap_track_ctx *pfnmap_track_ctx;
+	long: 64;
+};
+
+struct vm_area_struct___4 {
+	union {
+		struct {
+			long unsigned int vm_start;
+			long unsigned int vm_end;
+		};
+		freeptr_t vm_freeptr;
+	};
+	struct mm_struct___4 *vm_mm;
+	pgprot_t vm_page_prot;
+	union {
+		const vm_flags_t vm_flags;
+		vm_flags_t __vm_flags;
+	};
+	unsigned int vm_lock_seq;
+	struct list_head anon_vma_chain;
+	struct anon_vma *anon_vma;
+	const struct vm_operations_struct___4 *vm_ops;
+	long unsigned int vm_pgoff;
+	struct file___4 *vm_file;
+	void *vm_private_data;
+	atomic_long_t swap_readahead_info;
+	struct mempolicy *vm_policy;
+	struct vma_numab_state *numab_state;
+	refcount_t vm_refcnt;
+	struct {
+		struct rb_node rb;
+		long unsigned int rb_subtree_last;
+	} shared;
+	struct vm_userfaultfd_ctx vm_userfaultfd_ctx;
+	struct pfnmap_track_ctx *pfnmap_track_ctx;
+	long: 64;
+};
+
+struct vm_userfaultfd_ctx___2 {
+	struct userfaultfd_ctx___2 *ctx;
+};
+
+struct vm_area_struct___5 {
+	union {
+		struct {
+			long unsigned int vm_start;
+			long unsigned int vm_end;
+		};
+		freeptr_t vm_freeptr;
+	};
+	struct mm_struct___5 *vm_mm;
+	pgprot_t vm_page_prot;
+	union {
+		const vm_flags_t vm_flags;
+		vm_flags_t __vm_flags;
+	};
+	unsigned int vm_lock_seq;
+	struct list_head anon_vma_chain;
+	struct anon_vma *anon_vma;
+	const struct vm_operations_struct___5 *vm_ops;
+	long unsigned int vm_pgoff;
+	struct file___5 *vm_file;
+	void *vm_private_data;
+	atomic_long_t swap_readahead_info;
+	struct mempolicy *vm_policy;
+	struct vma_numab_state *numab_state;
+	refcount_t vm_refcnt;
+	struct {
+		struct rb_node rb;
+		long unsigned int rb_subtree_last;
+	} shared;
+	struct vm_userfaultfd_ctx___2 vm_userfaultfd_ctx;
+	struct pfnmap_track_ctx *pfnmap_track_ctx;
+	long: 64;
+};
+
 struct vm_event_state {
 	long unsigned int event[121];
 };
@@ -160551,6 +170395,72 @@ struct vm_fault___2 {
 	pgtable_t___2 prealloc_pte;
 };
 
+struct vm_fault___3 {
+	const struct {
+		struct vm_area_struct___3 *vma;
+		gfp_t gfp_mask;
+		long unsigned int pgoff;
+		long unsigned int address;
+		long unsigned int real_address;
+	};
+	enum fault_flag flags;
+	pmd_t *pmd;
+	pud_t *pud;
+	union {
+		pte_t orig_pte;
+		pmd_t orig_pmd;
+	};
+	struct page___4 *cow_page;
+	struct page___4 *page;
+	pte_t *pte;
+	spinlock_t *ptl;
+	pgtable_t___3 prealloc_pte;
+};
+
+struct vm_fault___4 {
+	const struct {
+		struct vm_area_struct___4 *vma;
+		gfp_t gfp_mask;
+		long unsigned int pgoff;
+		long unsigned int address;
+		long unsigned int real_address;
+	};
+	enum fault_flag flags;
+	pmd_t *pmd;
+	pud_t *pud;
+	union {
+		pte_t orig_pte;
+		pmd_t orig_pmd;
+	};
+	struct page___5 *cow_page;
+	struct page___5 *page;
+	pte_t *pte;
+	spinlock_t *ptl;
+	pgtable_t___4 prealloc_pte;
+};
+
+struct vm_fault___5 {
+	const struct {
+		struct vm_area_struct___5 *vma;
+		gfp_t gfp_mask;
+		long unsigned int pgoff;
+		long unsigned int address;
+		long unsigned int real_address;
+	};
+	enum fault_flag flags;
+	pmd_t *pmd;
+	pud_t *pud;
+	union {
+		pte_t orig_pte;
+		pmd_t orig_pmd;
+	};
+	struct page___3 *cow_page;
+	struct page___3 *page;
+	pte_t *pte;
+	spinlock_t *ptl;
+	pgtable_t___5 prealloc_pte;
+};
+
 struct vm_operations_struct {
 	void (*open)(struct vm_area_struct *);
 	void (*close)(struct vm_area_struct *);
@@ -160587,6 +170497,63 @@ struct vm_operations_struct___2 {
 	int (*set_policy)(struct vm_area_struct___2 *, struct mempolicy *);
 	struct mempolicy * (*get_policy)(struct vm_area_struct___2 *, long unsigned int, long unsigned int *);
 	struct page___2 * (*find_normal_page)(struct vm_area_struct___2 *, long unsigned int);
+};
+
+struct vm_operations_struct___3 {
+	void (*open)(struct vm_area_struct___3 *);
+	void (*close)(struct vm_area_struct___3 *);
+	int (*may_split)(struct vm_area_struct___3 *, long unsigned int);
+	int (*mremap)(struct vm_area_struct___3 *);
+	int (*mprotect)(struct vm_area_struct___3 *, long unsigned int, long unsigned int, long unsigned int);
+	vm_fault_t (*fault)(struct vm_fault___3 *);
+	vm_fault_t (*huge_fault)(struct vm_fault___3 *, unsigned int);
+	vm_fault_t (*map_pages)(struct vm_fault___3 *, long unsigned int, long unsigned int);
+	long unsigned int (*pagesize)(struct vm_area_struct___3 *);
+	vm_fault_t (*page_mkwrite)(struct vm_fault___3 *);
+	vm_fault_t (*pfn_mkwrite)(struct vm_fault___3 *);
+	int (*access)(struct vm_area_struct___3 *, long unsigned int, void *, int, int);
+	const char * (*name)(struct vm_area_struct___3 *);
+	int (*set_policy)(struct vm_area_struct___3 *, struct mempolicy *);
+	struct mempolicy * (*get_policy)(struct vm_area_struct___3 *, long unsigned int, long unsigned int *);
+	struct page___4 * (*find_normal_page)(struct vm_area_struct___3 *, long unsigned int);
+};
+
+struct vm_operations_struct___4 {
+	void (*open)(struct vm_area_struct___4 *);
+	void (*close)(struct vm_area_struct___4 *);
+	int (*may_split)(struct vm_area_struct___4 *, long unsigned int);
+	int (*mremap)(struct vm_area_struct___4 *);
+	int (*mprotect)(struct vm_area_struct___4 *, long unsigned int, long unsigned int, long unsigned int);
+	vm_fault_t (*fault)(struct vm_fault___4 *);
+	vm_fault_t (*huge_fault)(struct vm_fault___4 *, unsigned int);
+	vm_fault_t (*map_pages)(struct vm_fault___4 *, long unsigned int, long unsigned int);
+	long unsigned int (*pagesize)(struct vm_area_struct___4 *);
+	vm_fault_t (*page_mkwrite)(struct vm_fault___4 *);
+	vm_fault_t (*pfn_mkwrite)(struct vm_fault___4 *);
+	int (*access)(struct vm_area_struct___4 *, long unsigned int, void *, int, int);
+	const char * (*name)(struct vm_area_struct___4 *);
+	int (*set_policy)(struct vm_area_struct___4 *, struct mempolicy *);
+	struct mempolicy * (*get_policy)(struct vm_area_struct___4 *, long unsigned int, long unsigned int *);
+	struct page___5 * (*find_normal_page)(struct vm_area_struct___4 *, long unsigned int);
+};
+
+struct vm_operations_struct___5 {
+	void (*open)(struct vm_area_struct___5 *);
+	void (*close)(struct vm_area_struct___5 *);
+	int (*may_split)(struct vm_area_struct___5 *, long unsigned int);
+	int (*mremap)(struct vm_area_struct___5 *);
+	int (*mprotect)(struct vm_area_struct___5 *, long unsigned int, long unsigned int, long unsigned int);
+	vm_fault_t (*fault)(struct vm_fault___5 *);
+	vm_fault_t (*huge_fault)(struct vm_fault___5 *, unsigned int);
+	vm_fault_t (*map_pages)(struct vm_fault___5 *, long unsigned int, long unsigned int);
+	long unsigned int (*pagesize)(struct vm_area_struct___5 *);
+	vm_fault_t (*page_mkwrite)(struct vm_fault___5 *);
+	vm_fault_t (*pfn_mkwrite)(struct vm_fault___5 *);
+	int (*access)(struct vm_area_struct___5 *, long unsigned int, void *, int, int);
+	const char * (*name)(struct vm_area_struct___5 *);
+	int (*set_policy)(struct vm_area_struct___5 *, struct mempolicy *);
+	struct mempolicy * (*get_policy)(struct vm_area_struct___5 *, long unsigned int, long unsigned int *);
+	struct page___3 * (*find_normal_page)(struct vm_area_struct___5 *, long unsigned int);
 };
 
 struct vm_special_mapping {
@@ -161048,6 +171015,12 @@ struct wait_page_key {
 	int page_match;
 };
 
+struct wait_page_queue___2 {
+	struct folio___5 *folio;
+	int bit_nr;
+	wait_queue_entry_t wait;
+};
+
 struct waiting_dir_move {
 	struct rb_node node;
 	u64 ino;
@@ -161123,6 +171096,98 @@ struct wakeup_source___2 {
 	long unsigned int expire_count;
 	long unsigned int wakeup_count;
 	struct device___2 *dev;
+	bool active: 1;
+	bool autosleep_enabled: 1;
+};
+
+struct wakeup_source___4 {
+	const char *name;
+	int id;
+	struct list_head entry;
+	spinlock_t lock;
+	struct wake_irq *wakeirq;
+	struct timer_list timer;
+	long unsigned int timer_expires;
+	ktime_t total_time;
+	ktime_t max_time;
+	ktime_t last_time;
+	ktime_t start_prevent_time;
+	ktime_t prevent_sleep_time;
+	long unsigned int event_count;
+	long unsigned int active_count;
+	long unsigned int relax_count;
+	long unsigned int expire_count;
+	long unsigned int wakeup_count;
+	struct device___4 *dev;
+	bool active: 1;
+	bool autosleep_enabled: 1;
+};
+
+struct wakeup_source___5 {
+	const char *name;
+	int id;
+	struct list_head entry;
+	spinlock_t lock;
+	struct wake_irq *wakeirq;
+	struct timer_list timer;
+	long unsigned int timer_expires;
+	ktime_t total_time;
+	ktime_t max_time;
+	ktime_t last_time;
+	ktime_t start_prevent_time;
+	ktime_t prevent_sleep_time;
+	long unsigned int event_count;
+	long unsigned int active_count;
+	long unsigned int relax_count;
+	long unsigned int expire_count;
+	long unsigned int wakeup_count;
+	struct device___5 *dev;
+	bool active: 1;
+	bool autosleep_enabled: 1;
+};
+
+struct wakeup_source___6 {
+	const char *name;
+	int id;
+	struct list_head entry;
+	spinlock_t lock;
+	struct wake_irq *wakeirq;
+	struct timer_list timer;
+	long unsigned int timer_expires;
+	ktime_t total_time;
+	ktime_t max_time;
+	ktime_t last_time;
+	ktime_t start_prevent_time;
+	ktime_t prevent_sleep_time;
+	long unsigned int event_count;
+	long unsigned int active_count;
+	long unsigned int relax_count;
+	long unsigned int expire_count;
+	long unsigned int wakeup_count;
+	struct device___6 *dev;
+	bool active: 1;
+	bool autosleep_enabled: 1;
+};
+
+struct wakeup_source___3 {
+	const char *name;
+	int id;
+	struct list_head entry;
+	spinlock_t lock;
+	struct wake_irq *wakeirq;
+	struct timer_list timer;
+	long unsigned int timer_expires;
+	ktime_t total_time;
+	ktime_t max_time;
+	ktime_t last_time;
+	ktime_t start_prevent_time;
+	ktime_t prevent_sleep_time;
+	long unsigned int event_count;
+	long unsigned int active_count;
+	long unsigned int relax_count;
+	long unsigned int expire_count;
+	long unsigned int wakeup_count;
+	struct device___3 *dev;
 	bool active: 1;
 	bool autosleep_enabled: 1;
 };
@@ -161726,6 +171791,32 @@ struct writeback_control___2 {
 	int saved_err;
 	struct bdi_writeback___2 *wb;
 	struct inode___2 *inode;
+	int wb_id;
+	int wb_lcand_id;
+	int wb_tcand_id;
+	size_t wb_bytes;
+	size_t wb_lcand_bytes;
+	size_t wb_tcand_bytes;
+};
+
+struct writeback_control___3 {
+	long int nr_to_write;
+	long int pages_skipped;
+	loff_t range_start;
+	loff_t range_end;
+	enum writeback_sync_modes sync_mode;
+	unsigned int for_kupdate: 1;
+	unsigned int for_background: 1;
+	unsigned int tagged_writepages: 1;
+	unsigned int range_cyclic: 1;
+	unsigned int for_sync: 1;
+	unsigned int unpinned_netfs_wb: 1;
+	unsigned int no_cgroup_owner: 1;
+	struct folio_batch___3 fbatch;
+	long unsigned int index;
+	int saved_err;
+	struct bdi_writeback___3 *wb;
+	struct inode___5 *inode;
 	int wb_id;
 	int wb_lcand_id;
 	int wb_tcand_id;
