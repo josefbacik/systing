@@ -4774,6 +4774,13 @@ enum {
 };
 
 enum {
+	IOMMUFD_ACCESS_RW_READ = 0,
+	IOMMUFD_ACCESS_RW_WRITE = 1,
+	IOMMUFD_ACCESS_RW_KTHREAD = 2,
+	__IOMMUFD_ACCESS_RW_SLOW_PATH = 4,
+};
+
+enum {
 	IOMMU_PASID_ARRAY_DOMAIN = 0,
 	IOMMU_PASID_ARRAY_HANDLE = 1,
 };
@@ -13224,6 +13231,10 @@ enum {
 	UNIX_DIAG_SHUTDOWN = 6,
 	UNIX_DIAG_UID = 7,
 	__UNIX_DIAG_MAX = 8,
+};
+
+enum {
+	VFIO_DEVICE_NUM_STATES = 8,
 };
 
 enum {
@@ -39728,6 +39739,24 @@ enum vexpress_reset_func {
 	FUNC_RESET = 0,
 	FUNC_SHUTDOWN = 1,
 	FUNC_REBOOT = 2,
+};
+
+enum vfio_device_mig_state {
+	VFIO_DEVICE_STATE_ERROR = 0,
+	VFIO_DEVICE_STATE_STOP = 1,
+	VFIO_DEVICE_STATE_RUNNING = 2,
+	VFIO_DEVICE_STATE_STOP_COPY = 3,
+	VFIO_DEVICE_STATE_RESUMING = 4,
+	VFIO_DEVICE_STATE_RUNNING_P2P = 5,
+	VFIO_DEVICE_STATE_PRE_COPY = 6,
+	VFIO_DEVICE_STATE_PRE_COPY_P2P = 7,
+	VFIO_DEVICE_STATE_NR = 8,
+};
+
+enum vfio_group_type {
+	VFIO_IOMMU = 0,
+	VFIO_EMULATED_IOMMU = 1,
+	VFIO_NO_IOMMU = 2,
 };
 
 enum vgic_irq_config {
@@ -171070,6 +171099,257 @@ struct vf610_gpio_port {
 	int irq;
 };
 
+struct vfio {
+	struct list_head iommu_drivers_list;
+	struct mutex iommu_drivers_lock;
+};
+
+struct vfio___2 {
+	struct class *device_class;
+	struct ida device_ida;
+	struct vfsmount *vfs_mount;
+	int fs_count;
+};
+
+struct vfio___3 {
+	struct class *class;
+	struct list_head group_list;
+	struct mutex group_lock;
+	struct ida group_ida;
+	dev_t group_devt;
+};
+
+struct vfio_iommu_driver;
+
+struct vfio_container {
+	struct kref kref;
+	struct list_head group_list;
+	struct rw_semaphore group_lock;
+	struct vfio_iommu_driver *iommu_driver;
+	void *iommu_data;
+	bool noiommu;
+};
+
+struct vfio_device_ops;
+
+struct vfio_migration_ops;
+
+struct vfio_log_ops;
+
+struct vfio_group;
+
+struct vfio_device_set;
+
+struct vfio_device {
+	struct device *dev;
+	const struct vfio_device_ops *ops;
+	const struct vfio_migration_ops *mig_ops;
+	const struct vfio_log_ops *log_ops;
+	struct vfio_group *group;
+	struct list_head group_next;
+	struct list_head iommu_entry;
+	struct vfio_device_set *dev_set;
+	struct list_head dev_set_list;
+	unsigned int migration_flags;
+	struct kvm *kvm;
+	unsigned int index;
+	struct device device;
+	struct cdev cdev;
+	refcount_t refcount;
+	unsigned int open_count;
+	struct completion comp;
+	struct iommufd_access *iommufd_access;
+	void (*put_kvm)(struct kvm *);
+	struct inode *inode;
+	struct iommufd_device *iommufd_device;
+	struct ida pasids;
+	u8 iommufd_attached: 1;
+	u8 cdev_opened: 1;
+	struct dentry *debug_root;
+};
+
+struct vfio_device_attach_iommufd_pt {
+	__u32 argsz;
+	__u32 flags;
+	__u32 pt_id;
+	__u32 pasid;
+};
+
+struct vfio_device_bind_iommufd {
+	__u32 argsz;
+	__u32 flags;
+	__s32 iommufd;
+	__u32 out_devid;
+	__u64 token_uuid_ptr;
+};
+
+struct vfio_device_detach_iommufd_pt {
+	__u32 argsz;
+	__u32 flags;
+	__u32 pasid;
+};
+
+struct vfio_device_feature {
+	__u32 argsz;
+	__u32 flags;
+	__u8 data[0];
+};
+
+struct vfio_device_feature_dma_logging_control {
+	__u64 page_size;
+	__u32 num_ranges;
+	__u32 __reserved;
+	__u64 ranges;
+};
+
+struct vfio_device_feature_dma_logging_range {
+	__u64 iova;
+	__u64 length;
+};
+
+struct vfio_device_feature_dma_logging_report {
+	__u64 iova;
+	__u64 length;
+	__u64 page_size;
+	__u64 bitmap;
+};
+
+struct vfio_device_feature_mig_data_size {
+	__u64 stop_copy_length;
+};
+
+struct vfio_device_feature_mig_state {
+	__u32 device_state;
+	__s32 data_fd;
+};
+
+struct vfio_device_feature_migration {
+	__u64 flags;
+};
+
+struct vfio_device_file {
+	struct vfio_device *device;
+	struct vfio_group *group;
+	u8 access_granted;
+	u32 devid;
+	spinlock_t kvm_ref_lock;
+	struct kvm *kvm;
+	struct iommufd_ctx *iommufd;
+};
+
+struct vfio_device_ops {
+	char *name;
+	int (*init)(struct vfio_device *);
+	void (*release)(struct vfio_device *);
+	int (*bind_iommufd)(struct vfio_device *, struct iommufd_ctx *, u32 *);
+	void (*unbind_iommufd)(struct vfio_device *);
+	int (*attach_ioas)(struct vfio_device *, u32 *);
+	void (*detach_ioas)(struct vfio_device *);
+	int (*pasid_attach_ioas)(struct vfio_device *, u32, u32 *);
+	void (*pasid_detach_ioas)(struct vfio_device *, u32);
+	int (*open_device)(struct vfio_device *);
+	void (*close_device)(struct vfio_device *);
+	ssize_t (*read)(struct vfio_device *, char *, size_t, loff_t *);
+	ssize_t (*write)(struct vfio_device *, const char *, size_t, loff_t *);
+	long int (*ioctl)(struct vfio_device *, unsigned int, long unsigned int);
+	int (*mmap)(struct vfio_device *, struct vm_area_struct *);
+	void (*request)(struct vfio_device *, unsigned int);
+	int (*match)(struct vfio_device *, char *);
+	int (*match_token_uuid)(struct vfio_device *, const uuid_t *);
+	void (*dma_unmap)(struct vfio_device *, u64, u64);
+	int (*device_feature)(struct vfio_device *, u32, void *, size_t);
+};
+
+struct vfio_device_set {
+	void *set_id;
+	struct mutex lock;
+	struct list_head device_list;
+	unsigned int device_count;
+};
+
+struct vfio_group {
+	struct device dev;
+	struct cdev cdev;
+	refcount_t drivers;
+	unsigned int container_users;
+	struct iommu_group *iommu_group;
+	struct vfio_container *container;
+	struct list_head device_list;
+	struct mutex device_lock;
+	struct list_head vfio_next;
+	struct list_head container_next;
+	enum vfio_group_type type;
+	struct mutex group_lock;
+	struct kvm *kvm;
+	struct file *opened_file;
+	struct blocking_notifier_head notifier;
+	struct iommufd_ctx *iommufd;
+	spinlock_t kvm_ref_lock;
+	unsigned int cdev_device_open_cnt;
+};
+
+struct vfio_group_status {
+	__u32 argsz;
+	__u32 flags;
+};
+
+struct vfio_info_cap_header;
+
+struct vfio_info_cap {
+	struct vfio_info_cap_header *buf;
+	size_t size;
+};
+
+struct vfio_info_cap_header {
+	__u16 id;
+	__u16 version;
+	__u32 next;
+};
+
+struct vfio_iommu_driver_ops;
+
+struct vfio_iommu_driver {
+	const struct vfio_iommu_driver_ops *ops;
+	struct list_head vfio_next;
+};
+
+struct vfio_iommu_driver_ops {
+	char *name;
+	struct module *owner;
+	void * (*open)(long unsigned int);
+	void (*release)(void *);
+	long int (*ioctl)(void *, unsigned int, long unsigned int);
+	int (*attach_group)(void *, struct iommu_group *, enum vfio_group_type);
+	void (*detach_group)(void *, struct iommu_group *);
+	int (*pin_pages)(void *, struct iommu_group *, dma_addr_t, int, int, struct page **);
+	void (*unpin_pages)(void *, dma_addr_t, int);
+	void (*register_device)(void *, struct vfio_device *);
+	void (*unregister_device)(void *, struct vfio_device *);
+	int (*dma_rw)(void *, dma_addr_t, void *, size_t, bool);
+	struct iommu_domain * (*group_iommu_domain)(void *, struct iommu_group *);
+};
+
+struct vfio_irq_set {
+	__u32 argsz;
+	__u32 flags;
+	__u32 index;
+	__u32 start;
+	__u32 count;
+	__u8 data[0];
+};
+
+struct vfio_log_ops {
+	int (*log_start)(struct vfio_device *, struct rb_root_cached *, u32, u64 *);
+	int (*log_stop)(struct vfio_device *);
+	int (*log_read_and_clear)(struct vfio_device *, long unsigned int, long unsigned int, struct iova_bitmap *);
+};
+
+struct vfio_migration_ops {
+	struct file * (*migration_set_state)(struct vfio_device *, enum vfio_device_mig_state);
+	int (*migration_get_state)(struct vfio_device *, enum vfio_device_mig_state *);
+	int (*migration_get_data_size)(struct vfio_device *, long unsigned int *);
+};
+
 struct vfree_deferred {
 	struct llist_head list;
 	struct work_struct wq;
@@ -171403,6 +171683,20 @@ struct viot_iommu {
 	unsigned int offset;
 	struct fwnode_handle *fwnode;
 	struct list_head list;
+};
+
+struct virqfd {
+	void *opaque;
+	struct eventfd_ctx *eventfd;
+	int (*handler)(void *, void *);
+	void (*thread)(void *, void *);
+	void *data;
+	struct work_struct inject;
+	wait_queue_entry_t wait;
+	poll_table pt;
+	struct work_struct shutdown;
+	struct work_struct flush_inject;
+	struct virqfd **pvirqfd;
 };
 
 struct virtio_blk_outhdr {
