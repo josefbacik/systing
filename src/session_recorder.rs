@@ -520,6 +520,7 @@ impl SessionRecorder {
         enable_debuginfod: bool,
         resolve_network_addresses: bool,
         marker_threshold: Option<u64>,
+        marker_duration_threshold: Option<u64>,
     ) -> Self {
         let utid_generator = Arc::new(UtidGenerator::new());
         Self {
@@ -536,7 +537,11 @@ impl SessionRecorder {
                 resolve_network_addresses,
                 Arc::clone(&utid_generator),
             )),
-            marker_recorder: Mutex::new(MarkerRecorder::default().with_threshold(marker_threshold)),
+            marker_recorder: Mutex::new(
+                MarkerRecorder::default()
+                    .with_threshold(marker_threshold)
+                    .with_duration_threshold(marker_duration_threshold),
+            ),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),

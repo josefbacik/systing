@@ -74,9 +74,12 @@ struct Command {
     // Marker recording enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     markers: bool,
-    /// Stop tracing after this many completed marker range events are observed
+    /// Stop tracing after this many marker instant events are observed
     #[arg(long)]
     marker_threshold: Option<u64>,
+    /// Stop tracing when any marker range event exceeds this duration in milliseconds
+    #[arg(long)]
+    marker_duration_threshold: Option<u64>,
     /// Skip DNS resolution for network addresses (show IP addresses instead of hostnames)
     #[arg(long)]
     no_resolve_addresses: bool,
@@ -137,6 +140,7 @@ impl From<Command> for Config {
             syscalls: cmd.syscalls,
             markers: cmd.markers,
             marker_threshold: cmd.marker_threshold,
+            marker_duration_threshold: cmd.marker_duration_threshold,
             network: cmd.network,
             no_resolve_addresses: cmd.no_resolve_addresses,
             output_dir: cmd.output_dir,
@@ -307,11 +311,13 @@ fn main() -> Result<()> {
         anyhow::bail!("--continuous cannot be used with a run command (-- <command>)");
     }
 
-    // Auto-enable markers when marker-threshold is set
-    if opts.marker_threshold.is_some() {
+    // Auto-enable markers when marker-threshold or marker-duration-threshold is set
+    if opts.marker_threshold.is_some() || opts.marker_duration_threshold.is_some() {
         opts.markers = true;
         if opts.continuous == 0 {
-            anyhow::bail!("--marker-threshold requires --continuous <seconds>");
+            anyhow::bail!(
+                "--marker-threshold/--marker-duration-threshold requires --continuous <seconds>"
+            );
         }
     }
 
