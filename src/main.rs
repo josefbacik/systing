@@ -77,6 +77,9 @@ struct Command {
     /// Stop tracing after this many completed marker range events are observed
     #[arg(long)]
     marker_threshold: Option<u64>,
+    // VFIO recording enabled state (set by recorder management, not a CLI flag)
+    #[arg(skip)]
+    vfio: bool,
     /// Skip DNS resolution for network addresses (show IP addresses instead of hostnames)
     #[arg(long)]
     no_resolve_addresses: bool,
@@ -138,6 +141,7 @@ impl From<Command> for Config {
             markers: cmd.markers,
             marker_threshold: cmd.marker_threshold,
             network: cmd.network,
+            vfio: cmd.vfio,
             no_resolve_addresses: cmd.no_resolve_addresses,
             output_dir: cmd.output_dir,
             output: cmd.output,
@@ -161,6 +165,7 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
         "network" => opts.network = enable,
         "pystacks" => opts.collect_pystacks = enable,
         "markers" => opts.markers = enable,
+        "vfio" => opts.vfio = enable,
         _ => {}
     }
 }
@@ -179,6 +184,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         opts.network = false;
         opts.collect_pystacks = false;
         opts.markers = false;
+        opts.vfio = false;
 
         // Then enable only the specified recorders
         let recorders = opts.only_recorder.clone();

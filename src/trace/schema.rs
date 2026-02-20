@@ -390,3 +390,40 @@ pub fn network_poll_schema() -> Arc<Schema> {
         Field::new("returned_events", DataType::Utf8, false),
     ]))
 }
+
+/// Schema for vfio_device.parquet
+///
+/// VFIO device metadata records.
+pub fn vfio_device_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("device_id", DataType::Int32, false),
+        Field::new("domain", DataType::Int32, false),
+        Field::new("bus", DataType::Int32, false),
+        Field::new("dev", DataType::Int32, false),
+        Field::new("func", DataType::Int32, false),
+        Field::new("vendor_id", DataType::Int32, false),
+        Field::new("device_id_pci", DataType::Int32, false),
+        Field::new("subsystem_vendor", DataType::Int32, false),
+        Field::new("subsystem_device", DataType::Int32, false),
+        Field::new("bdf", DataType::Utf8, false),
+    ]))
+}
+
+/// Schema for vfio_event.parquet
+///
+/// VFIO event records with duration.
+pub fn vfio_event_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("device_id", DataType::Int32, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("dur", DataType::Int64, false),
+        Field::new("pid", DataType::Int64, false),
+        Field::new("tid", DataType::Int64, false),
+        Field::new("command", DataType::Int32, false),
+        Field::new("command_name", DataType::Utf8, false),
+        Field::new("arg1", DataType::Int64, false),
+        Field::new("arg2", DataType::Int64, false),
+        Field::new("arg3", DataType::Int64, false),
+        Field::new("ret", DataType::Int32, false),
+    ]))
+}

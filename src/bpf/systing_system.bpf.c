@@ -160,6 +160,18 @@ struct marker_event {
 	u8 name[MAX_MARKER_NAME_LEN];
 };
 
+struct vfio_event {
+	struct task_info task;
+	u64 start_ts;
+	u64 end_ts;
+	u32 command;
+	u32 device_id;
+	u64 arg1;
+	u64 arg2;
+	u64 arg3;
+	s32 ret;
+};
+
 struct stack_event {
 	enum stack_event_type stack_event_type;
 	u64 ts;
@@ -328,6 +340,7 @@ struct epoll_event_bpf _epoll_event = {0};
 struct task_info _task_info = {0};
 struct probe_event _uprobe_event = {0};
 struct marker_event _marker_event = {0};
+struct vfio_event _vfio_event = {0};
 #ifdef SYSTING_PYSTACKS
 struct exec_event _exec_event = {0};
 #endif
@@ -518,6 +531,60 @@ struct {
 	__uint(max_entries, 1);
 } pending_tw SEC(".maps");
 
+/* VFIO pending operation tracking */
+struct vfio_pending_info {
+	u64 start_ts;
+	u32 command;
+	u32 device_id;
+	u64 arg1;
+	u64 arg2;
+	u64 arg3;
+};
+
+/* VFIO device metadata stored in map, readable by userspace after tracing */
+struct vfio_device_meta {
+	u32 domain;
+	u8 bus;
+	u8 devfn;
+	u16 vendor_id;
+	u16 device_id_pci;
+	u16 subsystem_vendor;
+	u16 subsystem_device;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);  /* tgidpid */
+	__type(value, struct vfio_pending_info);
+	__uint(max_entries, 10240);
+} pending_vfio_ops SEC(".maps");
+
+/* Maps vfio_device pointer to a unique device ID */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);  /* device pointer */
+	__type(value, u32); /* device_id */
+	__uint(max_entries, 256);
+} vfio_device_id_map SEC(".maps");
+
+/* Atomic counter for generating unique VFIO device IDs */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, u64);
+	__uint(max_entries, 1);
+} vfio_device_id_counter SEC(".maps");
+
+/* VFIO device metadata, readable by userspace after tracing */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u32);  /* device_id */
+	__type(value, struct vfio_device_meta);
+	__uint(max_entries, 256);
+} vfio_device_metadata SEC(".maps");
+
+struct vfio_device_meta _vfio_device_meta = {0};
+
 #define MISSED_SCHED_EVENT 0
 #define MISSED_STACK_EVENT 1
 #define MISSED_PROBE_EVENT 2
@@ -526,7 +593,8 @@ struct {
 #define MISSED_PACKET_EVENT 5
 #define MISSED_EPOLL_EVENT 6
 #define MISSED_MARKER_EVENT 7
-#define MISSED_EVENT_MAX 8
+#define MISSED_VFIO_EVENT 8
+#define MISSED_EVENT_MAX 9
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
@@ -637,6 +705,11 @@ struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 256 * 1024 /* 256KB */);
 } ringbuf_marker SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024 /* 256KB */);
+} ringbuf_vfio SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
@@ -1046,6 +1119,16 @@ static struct epoll_event_bpf *reserve_epoll_event(long *flags)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
 	struct epoll_event_bpf *event = bpf_ringbuf_reserve(rb, sizeof(struct epoll_event_bpf), 0);
+	if (event)
+		__builtin_memset(event, 0, sizeof(*event));
+	return event;
+}
+
+static struct vfio_event *reserve_vfio_event(long *flags)
+{
+	void *rb = &ringbuf_vfio;
+	*flags = get_ringbuf_flags(rb);
+	struct vfio_event *event = bpf_ringbuf_reserve(rb, sizeof(struct vfio_event), 0);
 	if (event)
 		__builtin_memset(event, 0, sizeof(*event));
 	return event;
@@ -4286,6 +4369,311 @@ int BPF_KPROBE(inet_twsk_deschedule_put_entry, struct inet_timewait_sock *tw)
 	bpf_ringbuf_submit(event, flags);
 
 	bpf_map_delete_elem(&tw_socket_id_map, &tw_ptr);
+	return 0;
+}
+
+/* =========================================================================
+ * VFIO device tracing
+ * ========================================================================= */
+
+/*
+ * VFIO IOCTL command numbers from <uapi/linux/vfio.h>
+ * _IO(';', VFIO_BASE + N) where VFIO_TYPE=';'=0x3b, VFIO_BASE=100
+ */
+#define VFIO_CMD_DEVICE_GET_INFO	0x3b6b  /* _IO(';', 107) */
+#define VFIO_CMD_DEVICE_GET_REGION_INFO	0x3b6c  /* _IO(';', 108) */
+#define VFIO_CMD_DEVICE_GET_IRQ_INFO	0x3b6d  /* _IO(';', 109) */
+#define VFIO_CMD_DEVICE_SET_IRQS	0x3b6e  /* _IO(';', 110) */
+#define VFIO_CMD_DEVICE_RESET		0x3b6f  /* _IO(';', 111) */
+#define VFIO_CMD_DEVICE_IOEVENTFD	0x3b74  /* _IO(';', 116) */
+#define VFIO_CMD_IOMMU_MAP_DMA		0x3b71  /* _IO(';', 113) */
+#define VFIO_CMD_IOMMU_UNMAP_DMA	0x3b72  /* _IO(';', 114) */
+
+/* Pseudo-commands for DMA operations (not real VFIO ioctls) */
+#define VFIO_PSEUDO_MAP_DMA		0x80000001
+#define VFIO_PSEUDO_UNMAP_DMA		0x80000002
+
+/*
+ * Assign a unique device ID based on the kernel vfio_device pointer.
+ * Populates device metadata (PCI BDF, vendor/device IDs) via CO-RE using
+ * module BTF (vfio.ko, vfio_pci_core.ko). The vfio_device and
+ * vfio_pci_core_device types are resolved from module BTF at load time.
+ */
+static __always_inline u32 get_or_create_vfio_device_id(struct vfio_device *vdev)
+{
+	u64 dev_ptr = (u64)vdev;
+	u32 *existing = bpf_map_lookup_elem(&vfio_device_id_map, &dev_ptr);
+	if (existing)
+		return *existing;
+
+	u32 zero = 0;
+	u64 *counter = bpf_map_lookup_elem(&vfio_device_id_counter, &zero);
+	if (!counter)
+		return 0;
+	u32 new_id = (u32)(__sync_fetch_and_add(counter, 1) + 1);  /* IDs start at 1; 0 = DMA */
+	bpf_map_update_elem(&vfio_device_id_map, &dev_ptr, &new_id, BPF_NOEXIST);
+
+	/* Re-lookup in case of race (another CPU inserted first) */
+	existing = bpf_map_lookup_elem(&vfio_device_id_map, &dev_ptr);
+	if (!existing)
+		return 0;
+	u32 device_id = *existing;
+
+	/* Populate device metadata from pci_dev via CO-RE.
+	 * vfio_pci_core_device has vfio_device as its first field (vdev),
+	 * so the pointer is the same. Use bpf_core_cast to navigate. */
+	struct vfio_device_meta meta = {0};
+	struct vfio_pci_core_device *core_dev = bpf_core_cast(vdev,
+							      struct vfio_pci_core_device);
+	struct pci_dev *pdev = BPF_CORE_READ(core_dev, pdev);
+	if (pdev) {
+		BPF_CORE_READ_INTO(&meta.bus, pdev, bus, number);
+		BPF_CORE_READ_INTO(&meta.devfn, pdev, devfn);
+		BPF_CORE_READ_INTO(&meta.vendor_id, pdev, vendor);
+		BPF_CORE_READ_INTO(&meta.device_id_pci, pdev, device);
+		BPF_CORE_READ_INTO(&meta.subsystem_vendor, pdev, subsystem_vendor);
+		BPF_CORE_READ_INTO(&meta.subsystem_device, pdev, subsystem_device);
+		/* domain defaults to 0; domain_nr is behind CONFIG_PCI_DOMAINS
+		 * and may not exist in all kernel configs. */
+	}
+	bpf_map_update_elem(&vfio_device_metadata, &device_id, &meta, BPF_ANY);
+	return device_id;
+}
+
+SEC("kprobe/vfio_pci_core_ioctl")
+int BPF_KPROBE(vfio_pci_core_ioctl_entry, struct vfio_device *core_vdev,
+	       unsigned int cmd, unsigned long arg)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct vfio_pending_info info = {0};
+	info.start_ts = bpf_ktime_get_boot_ns();
+	info.command = cmd;
+	info.device_id = get_or_create_vfio_device_id(core_vdev);
+
+	/* Decode command-specific arguments from userspace struct */
+	switch (cmd) {
+	case VFIO_CMD_DEVICE_GET_REGION_INFO: {
+		/* struct vfio_region_info { __u32 argsz; __u32 flags; __u32 index; ... } */
+		u32 index = 0;
+		bpf_probe_read_user(&index, sizeof(index),
+				    (void *)(arg + 8)); /* offset of index field */
+		info.arg1 = index;
+		break;
+	}
+	case VFIO_CMD_DEVICE_GET_IRQ_INFO: {
+		/* struct vfio_irq_info { __u32 argsz; __u32 flags; __u32 index; __u32 count; } */
+		u32 index = 0;
+		bpf_probe_read_user(&index, sizeof(index),
+				    (void *)(arg + 8));
+		info.arg1 = index;
+		break;
+	}
+	case VFIO_CMD_DEVICE_SET_IRQS: {
+		/* struct vfio_irq_set { __u32 argsz(+0); __u32 flags(+4);
+		 *   __u32 index(+8); __u32 start(+12); __u32 count(+16); } */
+		u32 flags_val = 0, index = 0, count = 0;
+		bpf_probe_read_user(&flags_val, sizeof(flags_val), (void *)(arg + 4));
+		bpf_probe_read_user(&index, sizeof(index), (void *)(arg + 8));
+		bpf_probe_read_user(&count, sizeof(count), (void *)(arg + 16));
+		info.arg1 = index;
+		info.arg2 = count;
+		info.arg3 = flags_val;
+		break;
+	}
+	case VFIO_CMD_DEVICE_IOEVENTFD: {
+		/* struct vfio_device_ioeventfd { __u32 argsz; __u32 flags; __u64 offset; __u64 data; ... } */
+		u32 flags_val = 0;
+		u64 offset = 0;
+		u64 data = 0;
+		bpf_probe_read_user(&flags_val, sizeof(flags_val),
+				    (void *)(arg + 4));
+		bpf_probe_read_user(&offset, sizeof(offset),
+				    (void *)(arg + 8));
+		bpf_probe_read_user(&data, sizeof(data),
+				    (void *)(arg + 16));
+		info.arg1 = offset;
+		info.arg2 = data;
+		info.arg3 = flags_val;
+		break;
+	}
+	default:
+		/* GET_INFO, RESET, and unknown commands: no extra args */
+		break;
+	}
+
+	bpf_map_update_elem(&pending_vfio_ops, &tgidpid, &info, BPF_ANY);
+	return 0;
+}
+
+SEC("kretprobe/vfio_pci_core_ioctl")
+int BPF_KRETPROBE(vfio_pci_core_ioctl_exit, long ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct vfio_pending_info *info = bpf_map_lookup_elem(&pending_vfio_ops, &tgidpid);
+	if (!info) {
+		return 0;
+	}
+
+	long flags;
+	struct vfio_event *event = reserve_vfio_event(&flags);
+	if (!event) {
+		bpf_map_delete_elem(&pending_vfio_ops, &tgidpid);
+		return handle_missed_event(MISSED_VFIO_EVENT);
+	}
+
+	event->start_ts = info->start_ts;
+	event->end_ts = bpf_ktime_get_boot_ns();
+	event->command = info->command;
+	event->device_id = info->device_id;
+	event->arg1 = info->arg1;
+	event->arg2 = info->arg2;
+	event->arg3 = info->arg3;
+	event->ret = (s32)ret;
+	record_task_info(&event->task, task);
+
+	bpf_ringbuf_submit(event, flags);
+	bpf_map_delete_elem(&pending_vfio_ops, &tgidpid);
+	return 0;
+}
+
+/* DMA map/unmap operations on the IOMMU container fd.
+ * These are not device-specific, so we use device_id=0 (DMA track). */
+
+SEC("kprobe/vfio_iommu_type1_map_dma")
+int BPF_KPROBE(vfio_dma_map_entry, void *iommu, unsigned long arg)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct vfio_pending_info info = {0};
+	info.start_ts = bpf_ktime_get_boot_ns();
+	info.command = VFIO_PSEUDO_MAP_DMA;
+	info.device_id = 0;  /* DMA track */
+
+	/* struct vfio_iommu_type1_dma_map { __u32 argsz; __u32 flags; __u64 vaddr; __u64 iova; __u64 size; } */
+	u32 dma_flags = 0;
+	u64 iova = 0;
+	u64 size = 0;
+	bpf_probe_read_user(&dma_flags, sizeof(dma_flags), (void *)(arg + 4));
+	bpf_probe_read_user(&iova, sizeof(iova), (void *)(arg + 16));
+	bpf_probe_read_user(&size, sizeof(size), (void *)(arg + 24));
+	info.arg1 = iova;
+	info.arg2 = size;
+	info.arg3 = dma_flags;
+
+	bpf_map_update_elem(&pending_vfio_ops, &tgidpid, &info, BPF_ANY);
+	return 0;
+}
+
+SEC("kretprobe/vfio_iommu_type1_map_dma")
+int BPF_KRETPROBE(vfio_dma_map_exit, long ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct vfio_pending_info *info = bpf_map_lookup_elem(&pending_vfio_ops, &tgidpid);
+	if (!info || info->command != VFIO_PSEUDO_MAP_DMA)
+		return 0;
+
+	long flags;
+	struct vfio_event *event = reserve_vfio_event(&flags);
+	if (!event) {
+		bpf_map_delete_elem(&pending_vfio_ops, &tgidpid);
+		return handle_missed_event(MISSED_VFIO_EVENT);
+	}
+
+	event->start_ts = info->start_ts;
+	event->end_ts = bpf_ktime_get_boot_ns();
+	event->command = info->command;
+	event->device_id = 0;
+	event->arg1 = info->arg1;
+	event->arg2 = info->arg2;
+	event->arg3 = info->arg3;
+	event->ret = (s32)ret;
+	record_task_info(&event->task, task);
+
+	bpf_ringbuf_submit(event, flags);
+	bpf_map_delete_elem(&pending_vfio_ops, &tgidpid);
+	return 0;
+}
+
+SEC("kprobe/vfio_iommu_type1_unmap_dma")
+int BPF_KPROBE(vfio_dma_unmap_entry, void *iommu, unsigned long arg)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct vfio_pending_info info = {0};
+	info.start_ts = bpf_ktime_get_boot_ns();
+	info.command = VFIO_PSEUDO_UNMAP_DMA;
+	info.device_id = 0;
+
+	/* struct vfio_iommu_type1_dma_unmap { __u32 argsz; __u32 flags; __u64 iova; __u64 size; } */
+	u32 dma_flags = 0;
+	u64 iova = 0;
+	u64 size = 0;
+	bpf_probe_read_user(&dma_flags, sizeof(dma_flags), (void *)(arg + 4));
+	bpf_probe_read_user(&iova, sizeof(iova), (void *)(arg + 8));
+	bpf_probe_read_user(&size, sizeof(size), (void *)(arg + 16));
+	info.arg1 = iova;
+	info.arg2 = size;
+	info.arg3 = dma_flags;
+
+	bpf_map_update_elem(&pending_vfio_ops, &tgidpid, &info, BPF_ANY);
+	return 0;
+}
+
+SEC("kretprobe/vfio_iommu_type1_unmap_dma")
+int BPF_KRETPROBE(vfio_dma_unmap_exit, long ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct vfio_pending_info *info = bpf_map_lookup_elem(&pending_vfio_ops, &tgidpid);
+	if (!info || info->command != VFIO_PSEUDO_UNMAP_DMA)
+		return 0;
+
+	long flags;
+	struct vfio_event *event = reserve_vfio_event(&flags);
+	if (!event) {
+		bpf_map_delete_elem(&pending_vfio_ops, &tgidpid);
+		return handle_missed_event(MISSED_VFIO_EVENT);
+	}
+
+	event->start_ts = info->start_ts;
+	event->end_ts = bpf_ktime_get_boot_ns();
+	event->command = info->command;
+	event->device_id = 0;
+	event->arg1 = info->arg1;
+	event->arg2 = info->arg2;
+	event->arg3 = info->arg3;
+	event->ret = (s32)ret;
+	record_task_info(&event->task, task);
+
+	bpf_ringbuf_submit(event, flags);
+	bpf_map_delete_elem(&pending_vfio_ops, &tgidpid);
 	return 0;
 }
 

@@ -765,6 +765,7 @@ pub fn validate_parquet_dir(dir: &Path) -> ValidationResult {
     // Additional Parquet-specific validation: thread_state schema
     let paths = ParquetPaths::new(dir);
     validate_thread_state_schema(&paths, &mut result);
+    validate_vfio_event_schema(&paths, &mut result);
 
     result
 }
@@ -818,6 +819,50 @@ fn get_column_type(path: &Path, column: &str) -> anyhow::Result<Option<DataType>
     }
 
     Ok(None)
+}
+
+/// Validate vfio_event.parquet schema if present.
+///
+/// Checks that required columns have correct types:
+/// - ts: Int64
+/// - dur: Int64
+/// - device_id: Int32
+/// - command: Int32
+fn validate_vfio_event_schema(paths: &ParquetPaths, result: &mut ValidationResult) {
+    let path = &paths.vfio_event;
+
+    if !path.exists() {
+        return; // VFIO recording was not enabled
+    }
+
+    let checks = [
+        ("ts", DataType::Int64),
+        ("dur", DataType::Int64),
+        ("device_id", DataType::Int32),
+        ("command", DataType::Int32),
+    ];
+
+    for (column, expected_type) in &checks {
+        match check_column_type(path, column, expected_type.clone()) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Ok(Some(actual)) = get_column_type(path, column) {
+                    result.add_error(ValidationError::WrongColumnType {
+                        table: "vfio_event".to_string(),
+                        column: column.to_string(),
+                        expected: format!("{expected_type:?}"),
+                        got: format!("{actual:?}"),
+                    });
+                }
+            }
+            Err(e) => {
+                result.add_error(ValidationError::ReadError {
+                    table: "vfio_event".to_string(),
+                    message: e.to_string(),
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]

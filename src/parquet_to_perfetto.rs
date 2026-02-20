@@ -171,6 +171,9 @@ impl ParquetToPerfettoConverter {
         // 11. Write network interface metadata
         self.write_network_interfaces(input_dir, writer)?;
 
+        // 12. Write VFIO data (devices and events)
+        self.write_vfio_data(input_dir, writer)?;
+
         Ok(())
     }
 
@@ -2393,6 +2396,250 @@ impl ParquetToPerfettoConverter {
                 packet.set_track_event(event);
                 packet.set_trusted_packet_sequence_id(seq_id);
                 writer.write_packet(&packet)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write VFIO device and event data to Perfetto trace.
+    ///
+    /// Creates a "VFIO Devices" root track with per-device child tracks and
+    /// a "DMA Operations" track for container-level DMA operations (device_id=0).
+    fn write_vfio_data(&mut self, input_dir: &Path, writer: &mut dyn TraceWriter) -> Result<()> {
+        let device_path = input_dir.join("vfio_device.parquet");
+        let event_path = input_dir.join("vfio_event.parquet");
+
+        if !device_path.exists() && !event_path.exists() {
+            return Ok(());
+        }
+
+        // Create root "VFIO Devices" track
+        let root_uuid = self.alloc_uuid();
+        let mut root_desc = TrackDescriptor::default();
+        root_desc.set_uuid(root_uuid);
+        root_desc.set_name("VFIO Devices".to_string());
+
+        let mut root_packet = TracePacket::default();
+        root_packet.set_track_descriptor(root_desc);
+        writer.write_packet(&root_packet)?;
+
+        // Create DMA Operations track (for device_id=0)
+        let dma_uuid = self.alloc_uuid();
+        let mut dma_desc = TrackDescriptor::default();
+        dma_desc.set_uuid(dma_uuid);
+        dma_desc.set_name("DMA Operations".to_string());
+        dma_desc.set_parent_uuid(root_uuid);
+
+        let mut dma_packet = TracePacket::default();
+        dma_packet.set_track_descriptor(dma_desc);
+        writer.write_packet(&dma_packet)?;
+
+        // Load device metadata and create per-device tracks
+        let mut device_to_uuid: HashMap<i32, u64> = HashMap::new();
+        device_to_uuid.insert(0, dma_uuid); // device_id=0 -> DMA track
+
+        if device_path.exists() {
+            let batches = read_parquet_file(&device_path)?;
+
+            for batch in &batches {
+                let device_ids = batch
+                    .column_by_name("device_id")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing device_id column in vfio_device")?;
+                let bdfs = batch
+                    .column_by_name("bdf")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .context("Missing bdf column in vfio_device")?;
+                let vendor_ids = batch
+                    .column_by_name("vendor_id")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing vendor_id column in vfio_device")?;
+                let device_id_pcis = batch
+                    .column_by_name("device_id_pci")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing device_id_pci column in vfio_device")?;
+
+                for i in 0..batch.num_rows() {
+                    let device_id = device_ids.value(i);
+                    let bdf = bdfs.value(i);
+                    let vendor_id = vendor_ids.value(i);
+                    let device_id_pci = device_id_pcis.value(i);
+
+                    let track_uuid = self.alloc_uuid();
+                    device_to_uuid.insert(device_id, track_uuid);
+
+                    let track_name = format!("{bdf} [{vendor_id:04x}:{device_id_pci:04x}]");
+
+                    let mut track_desc = TrackDescriptor::default();
+                    track_desc.set_uuid(track_uuid);
+                    track_desc.set_name(track_name);
+                    track_desc.set_parent_uuid(root_uuid);
+
+                    let mut track_packet = TracePacket::default();
+                    track_packet.set_track_descriptor(track_desc);
+                    writer.write_packet(&track_packet)?;
+                }
+            }
+        }
+
+        // Write VFIO events as slices (begin/end pairs)
+        if event_path.exists() {
+            let batches = read_parquet_file(&event_path)?;
+            let seq_id = self.alloc_seq_id();
+
+            for batch in &batches {
+                let device_ids = batch
+                    .column_by_name("device_id")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing device_id column in vfio_event")?;
+                let timestamps = batch
+                    .column_by_name("ts")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing ts column in vfio_event")?;
+                let durations = batch
+                    .column_by_name("dur")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing dur column in vfio_event")?;
+                let pids = batch
+                    .column_by_name("pid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing pid column in vfio_event")?;
+                let tids = batch
+                    .column_by_name("tid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing tid column in vfio_event")?;
+                let command_names = batch
+                    .column_by_name("command_name")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .context("Missing command_name column in vfio_event")?;
+                let arg1s = batch
+                    .column_by_name("arg1")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing arg1 column in vfio_event")?;
+                let arg2s = batch
+                    .column_by_name("arg2")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing arg2 column in vfio_event")?;
+                let rets = batch
+                    .column_by_name("ret")
+                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                    .context("Missing ret column in vfio_event")?;
+
+                for i in 0..batch.num_rows() {
+                    let device_id = device_ids.value(i);
+                    let ts = timestamps.value(i);
+                    let dur = durations.value(i);
+                    let command_name = command_names.value(i);
+                    let pid = pids.value(i);
+                    let tid = tids.value(i);
+                    let arg1 = arg1s.value(i);
+                    let arg2 = arg2s.value(i);
+                    let ret = rets.value(i);
+
+                    let track_uuid = match device_to_uuid.get(&device_id) {
+                        Some(&uuid) => uuid,
+                        None => {
+                            // Unknown device, create a track on the fly
+                            let uuid = self.alloc_uuid();
+                            device_to_uuid.insert(device_id, uuid);
+
+                            let mut track_desc = TrackDescriptor::default();
+                            track_desc.set_uuid(uuid);
+                            track_desc.set_name(format!("VFIO Device {device_id}"));
+                            track_desc.set_parent_uuid(root_uuid);
+
+                            let mut track_packet = TracePacket::default();
+                            track_packet.set_track_descriptor(track_desc);
+                            writer.write_packet(&track_packet)?;
+
+                            uuid
+                        }
+                    };
+
+                    // Build debug annotations
+                    let mut annotations = Vec::new();
+
+                    let mut pid_ann = DebugAnnotation::default();
+                    pid_ann.set_name("pid".to_string());
+                    pid_ann.set_int_value(pid);
+                    annotations.push(pid_ann);
+
+                    let mut tid_ann = DebugAnnotation::default();
+                    tid_ann.set_name("tid".to_string());
+                    tid_ann.set_int_value(tid);
+                    annotations.push(tid_ann);
+
+                    // Add context-appropriate arg annotations
+                    match command_name {
+                        "GET_REGION_INFO" | "GET_IRQ_INFO" => {
+                            let mut ann = DebugAnnotation::default();
+                            ann.set_name("index".to_string());
+                            ann.set_int_value(arg1);
+                            annotations.push(ann);
+                        }
+                        "SET_IRQS" => {
+                            let mut idx_ann = DebugAnnotation::default();
+                            idx_ann.set_name("irq_index".to_string());
+                            idx_ann.set_int_value(arg1);
+                            annotations.push(idx_ann);
+
+                            let mut cnt_ann = DebugAnnotation::default();
+                            cnt_ann.set_name("count".to_string());
+                            cnt_ann.set_int_value(arg2);
+                            annotations.push(cnt_ann);
+                        }
+                        "MAP_DMA" | "UNMAP_DMA" => {
+                            let mut iova_ann = DebugAnnotation::default();
+                            iova_ann.set_name("iova".to_string());
+                            iova_ann.set_string_value(format!("0x{arg1:x}"));
+                            annotations.push(iova_ann);
+
+                            let mut size_ann = DebugAnnotation::default();
+                            size_ann.set_name("size".to_string());
+                            size_ann.set_int_value(arg2);
+                            annotations.push(size_ann);
+                        }
+                        "IOEVENTFD" => {
+                            let mut off_ann = DebugAnnotation::default();
+                            off_ann.set_name("offset".to_string());
+                            off_ann.set_string_value(format!("0x{arg1:x}"));
+                            annotations.push(off_ann);
+                        }
+                        _ => {}
+                    }
+
+                    if ret != 0 {
+                        let mut ret_ann = DebugAnnotation::default();
+                        ret_ann.set_name("ret".to_string());
+                        ret_ann.set_int_value(ret as i64);
+                        annotations.push(ret_ann);
+                    }
+
+                    // Emit SLICE_BEGIN
+                    let mut begin_event = TrackEvent::default();
+                    begin_event.set_type(Type::TYPE_SLICE_BEGIN);
+                    begin_event.set_track_uuid(track_uuid);
+                    begin_event.set_name(command_name.to_string());
+                    begin_event.debug_annotations = annotations;
+
+                    let mut begin_packet = TracePacket::default();
+                    begin_packet.set_timestamp(ts as u64);
+                    begin_packet.set_track_event(begin_event);
+                    begin_packet.set_trusted_packet_sequence_id(seq_id);
+                    writer.write_packet(&begin_packet)?;
+
+                    // Emit SLICE_END
+                    let mut end_event = TrackEvent::default();
+                    end_event.set_type(Type::TYPE_SLICE_END);
+                    end_event.set_track_uuid(track_uuid);
+
+                    let mut end_packet = TracePacket::default();
+                    end_packet.set_timestamp((ts + dur) as u64);
+                    end_packet.set_track_event(end_event);
+                    end_packet.set_trusted_packet_sequence_id(seq_id);
+                    writer.write_packet(&end_packet)?;
+                }
             }
         }
 

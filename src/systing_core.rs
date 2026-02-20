@@ -179,6 +179,11 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             description: "Userspace marker events (faccessat2 with mode=-975)",
             default_enabled: false,
         },
+        RecorderInfo {
+            name: "vfio",
+            description: "VFIO device interaction tracing",
+            default_enabled: false,
+        },
     ]
 }
 
@@ -254,6 +259,8 @@ pub struct Config {
     pub marker_threshold: Option<u64>,
     /// Enable network recording
     pub network: bool,
+    /// Enable VFIO device interaction tracing
+    pub vfio: bool,
     /// Skip DNS resolution for network addresses
     pub no_resolve_addresses: bool,
     /// Output directory for parquet files
@@ -294,6 +301,7 @@ impl Default for Config {
             markers: false,
             marker_threshold: None,
             network: false,
+            vfio: false,
             no_resolve_addresses: false,
             output_dir: PathBuf::from("./traces"),
             output: PathBuf::from("trace.pb"),
@@ -408,6 +416,8 @@ pub use types::probe_event;
 pub use types::stack_event;
 pub use types::task_event;
 pub use types::task_info;
+pub use types::vfio_device_meta;
+pub use types::vfio_event;
 
 unsafe impl Plain for task_event {}
 unsafe impl Plain for stack_event {}
@@ -419,6 +429,8 @@ unsafe impl Plain for epoll_event_bpf {}
 unsafe impl Plain for arg_desc {}
 unsafe impl Plain for arg_desc_array {}
 unsafe impl Plain for marker_event {}
+unsafe impl Plain for vfio_event {}
+unsafe impl Plain for vfio_device_meta {}
 
 /// BPF exec event - delivered via dedicated ringbuf when a traced process execs.
 /// Used to dynamically discover Python PIDs for pystacks.
@@ -561,6 +573,15 @@ impl SystingEvent for marker_event {
     }
 }
 
+impl SystingEvent for vfio_event {
+    fn ts(&self) -> u64 {
+        self.start_ts
+    }
+    fn next_task_info(&self) -> Option<&task_info> {
+        Some(&self.task)
+    }
+}
+
 fn create_ring<'a, T>(
     map: &dyn libbpf_rs::MapCore,
     tx: Sender<T>,
@@ -639,6 +660,7 @@ struct RecorderChannels {
     packet_rx: Receiver<packet_event>,
     epoll_rx: Receiver<epoll_event_bpf>,
     marker_rx: Receiver<marker_event>,
+    vfio_rx: Receiver<vfio_event>,
     exec_event_rx: Option<Receiver<exec_event>>,
 }
 
@@ -660,6 +682,7 @@ fn spawn_recorder_threads(
         packet_rx,
         epoll_rx,
         marker_rx,
+        vfio_rx,
         ..
     } = channels;
 
@@ -845,6 +868,29 @@ fn spawn_recorder_threads(
         );
     } else {
         drop(marker_rx);
+    }
+
+    // Conditionally spawn VFIO recorder
+    if opts.vfio {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        let my_task_tx = task_info_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("vfio_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<crate::vfio_recorder::VfioRecorder, vfio_event>(
+                        &session_recorder.vfio_recorder,
+                        vfio_rx,
+                        my_stop_tx,
+                        my_task_tx,
+                        None,
+                    );
+                    0
+                })?,
+        );
+    } else {
+        drop(vfio_rx);
     }
 
     Ok(threads)
@@ -1351,6 +1397,7 @@ fn setup_ringbuffers<'a>(
     let (packet_tx, packet_rx) = channel();
     let (epoll_tx, epoll_rx) = channel();
     let (marker_tx, marker_rx) = channel();
+    let (vfio_tx, vfio_rx) = channel();
     let (exec_tx, exec_rx) = channel();
     let mut has_exec_ringbuf = false;
 
@@ -1410,6 +1457,21 @@ fn setup_ringbuffers<'a>(
         }
     }
 
+    if opts.vfio {
+        let mut found_ringbuf = false;
+        for map in object.maps() {
+            if map.name().to_str().unwrap() == "ringbuf_vfio" {
+                let ring = create_ring::<vfio_event>(&map, vfio_tx.clone())?;
+                rings.push(("ringbuf_vfio".to_string(), ring));
+                found_ringbuf = true;
+                break;
+            }
+        }
+        if !found_ringbuf {
+            eprintln!("ERROR: ringbuf_vfio map not found in BPF object - VFIO events will not be collected");
+        }
+    }
+
     let exec_event_rx = if has_exec_ringbuf {
         Some(exec_rx)
     } else {
@@ -1425,6 +1487,7 @@ fn setup_ringbuffers<'a>(
         packet_rx,
         epoll_rx,
         marker_rx,
+        vfio_rx,
         exec_event_rx,
     };
 
@@ -1497,6 +1560,13 @@ fn warn_failed_probe_attachments(skel: &SystingSystemSkel) {
             // Socket poll probes (for epoll/poll/select tracking)
             "tcp_poll_entry" => skel.links.tcp_poll_entry.is_none(),
             "tcp_poll_exit" => skel.links.tcp_poll_exit.is_none(),
+            // VFIO probes
+            "vfio_pci_core_ioctl_entry" => skel.links.vfio_pci_core_ioctl_entry.is_none(),
+            "vfio_pci_core_ioctl_exit" => skel.links.vfio_pci_core_ioctl_exit.is_none(),
+            "vfio_dma_map_entry" => skel.links.vfio_dma_map_entry.is_none(),
+            "vfio_dma_map_exit" => skel.links.vfio_dma_map_exit.is_none(),
+            "vfio_dma_unmap_entry" => skel.links.vfio_dma_unmap_entry.is_none(),
+            "vfio_dma_unmap_exit" => skel.links.vfio_dma_unmap_exit.is_none(),
             // Programs that are manually attached (skip auto-attach check)
             // These include: systing_usdt, systing_uprobe, systing_kprobe,
             // systing_tracepoint, systing_raw_tracepoint, systing_perf_event_clock
@@ -1678,6 +1748,30 @@ fn configure_bpf_skeleton(
             .progs
             .tracepoint__raw_syscalls__sys_exit
             .set_autoload(false);
+    }
+
+    // Only load VFIO programs when VFIO recording is enabled
+    if !opts.vfio {
+        open_skel
+            .progs
+            .vfio_pci_core_ioctl_entry
+            .set_autoload(false);
+        open_skel.progs.vfio_pci_core_ioctl_exit.set_autoload(false);
+        open_skel.progs.vfio_dma_map_entry.set_autoload(false);
+        open_skel.progs.vfio_dma_map_exit.set_autoload(false);
+        open_skel.progs.vfio_dma_unmap_entry.set_autoload(false);
+        open_skel.progs.vfio_dma_unmap_exit.set_autoload(false);
+
+        // Minimize ring buffer when VFIO is disabled
+        let object = open_skel.open_object_mut();
+        for mut map in object.maps_mut() {
+            let name = map.name().to_str().unwrap().to_string();
+            if name == "ringbuf_vfio" {
+                map.set_max_entries(1).with_context(|| {
+                    format!("Failed to set VFIO ringbuf map '{name}' to zero capacity")
+                })?;
+            }
+        }
     }
 
     // Only load network programs when network recording is enabled
@@ -2737,6 +2831,16 @@ pub fn systing(
             &mut skel,
             &traced_child,
         )?;
+
+        // Load VFIO device metadata from BPF map after tracing completes
+        // This must be done while skel is still alive
+        if opts.vfio {
+            recorder
+                .vfio_recorder
+                .lock()
+                .unwrap()
+                .load_device_metadata(&skel.maps.vfio_device_metadata);
+        }
 
         // Load socket metadata from BPF map after tracing completes
         // This must be done while skel is still alive

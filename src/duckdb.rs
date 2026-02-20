@@ -50,6 +50,8 @@ pub const DATA_TABLES: &[&str] = &[
     "network_packet",
     "network_socket",
     "network_poll",
+    "vfio_device",
+    "vfio_event",
     "clock_snapshot",
     "sysinfo",
 ];
@@ -388,6 +390,35 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             returned_events VARCHAR
         );
 
+        CREATE TABLE IF NOT EXISTS vfio_device (
+            trace_id VARCHAR,
+            device_id INTEGER,
+            domain INTEGER,
+            bus INTEGER,
+            dev INTEGER,
+            func INTEGER,
+            vendor_id INTEGER,
+            device_id_pci INTEGER,
+            subsystem_vendor INTEGER,
+            subsystem_device INTEGER,
+            bdf VARCHAR
+        );
+
+        CREATE TABLE IF NOT EXISTS vfio_event (
+            trace_id VARCHAR,
+            device_id INTEGER,
+            ts BIGINT,
+            dur BIGINT,
+            pid BIGINT,
+            tid BIGINT,
+            command INTEGER,
+            command_name VARCHAR,
+            arg1 BIGINT,
+            arg2 BIGINT,
+            arg3 BIGINT,
+            ret INTEGER
+        );
+
         CREATE TABLE IF NOT EXISTS clock_snapshot (
             trace_id VARCHAR,
             clock_id INTEGER,
@@ -531,6 +562,10 @@ fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Res
     import_table("network_packet", &paths.network_packet)?;
     import_table("network_socket", &paths.network_socket)?;
     import_table("network_poll", &paths.network_poll)?;
+
+    // VFIO tables
+    import_table("vfio_device", &paths.vfio_device)?;
+    import_table("vfio_event", &paths.vfio_event)?;
 
     // Clock snapshot
     import_table("clock_snapshot", &paths.clock_snapshot)?;
@@ -884,6 +919,10 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
     export_table("network_packet", &paths.network_packet)?;
     export_table("network_socket", &paths.network_socket)?;
     export_table("network_poll", &paths.network_poll)?;
+
+    // VFIO tables
+    export_table("vfio_device", &paths.vfio_device)?;
+    export_table("vfio_event", &paths.vfio_event)?;
 
     // Clock snapshot
     export_table("clock_snapshot", &paths.clock_snapshot)?;

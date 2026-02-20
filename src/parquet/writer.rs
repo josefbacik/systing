@@ -29,7 +29,8 @@ use crate::trace::{
     InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, NetworkPacketRecord, NetworkPollRecord,
     NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord, SchedSliceRecord,
     SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord,
-    SysInfoRecord, ThreadRecord, ThreadStateRecord, TrackRecord, WakeupNewRecord,
+    SysInfoRecord, ThreadRecord, ThreadStateRecord, TrackRecord, VfioDeviceRecord, VfioEventRecord,
+    WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -74,6 +75,8 @@ pub struct StreamingParquetWriter {
     network_packets: Vec<NetworkPacketRecord>,
     network_sockets: Vec<NetworkSocketRecord>,
     network_polls: Vec<NetworkPollRecord>,
+    vfio_devices: Vec<VfioDeviceRecord>,
+    vfio_events: Vec<VfioEventRecord>,
     clock_snapshots: Vec<ClockSnapshotRecord>,
     sysinfo: Option<SysInfoRecord>,
 
@@ -101,6 +104,8 @@ pub struct StreamingParquetWriter {
     network_packet_writer: Option<ArrowWriter<File>>,
     network_socket_writer: Option<ArrowWriter<File>>,
     network_poll_writer: Option<ArrowWriter<File>>,
+    vfio_device_writer: Option<ArrowWriter<File>>,
+    vfio_event_writer: Option<ArrowWriter<File>>,
     clock_snapshot_writer: Option<ArrowWriter<File>>,
     sysinfo_writer: Option<ArrowWriter<File>>,
 
@@ -173,6 +178,8 @@ impl StreamingParquetWriter {
             network_packets: Vec::new(),
             network_sockets: Vec::new(),
             network_polls: Vec::new(),
+            vfio_devices: Vec::new(),
+            vfio_events: Vec::new(),
             clock_snapshots: Vec::new(),
             sysinfo: None,
             // Writers start as None, created lazily
@@ -199,6 +206,8 @@ impl StreamingParquetWriter {
             network_packet_writer: None,
             network_socket_writer: None,
             network_poll_writer: None,
+            vfio_device_writer: None,
+            vfio_event_writer: None,
             clock_snapshot_writer: None,
             sysinfo_writer: None,
             total_records: 0,
@@ -757,6 +766,44 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    fn flush_vfio_devices(&mut self) -> Result<()> {
+        if self.vfio_devices.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::vfio_device_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.vfio_device_writer,
+            &self.paths.vfio_device,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_vfio_device_batch(&self.vfio_devices, &schema)?;
+        writer.write(&batch)?;
+        self.vfio_devices.clear();
+        Ok(())
+    }
+
+    fn flush_vfio_events(&mut self) -> Result<()> {
+        if self.vfio_events.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::vfio_event_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.vfio_event_writer,
+            &self.paths.vfio_event,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_vfio_event_batch(&self.vfio_events, &schema)?;
+        writer.write(&batch)?;
+        self.vfio_events.clear();
+        Ok(())
+    }
+
     // Close all writers, attempting to close all even if some fail
     fn close_writers(&mut self) -> Result<()> {
         let mut first_error: Option<anyhow::Error> = None;
@@ -797,6 +844,8 @@ impl StreamingParquetWriter {
         close_writer!(self.network_packet_writer);
         close_writer!(self.network_socket_writer);
         close_writer!(self.network_poll_writer);
+        close_writer!(self.vfio_device_writer);
+        close_writer!(self.vfio_event_writer);
         close_writer!(self.clock_snapshot_writer);
         close_writer!(self.sysinfo_writer);
 
@@ -1080,6 +1129,25 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn add_vfio_device(&mut self, record: VfioDeviceRecord) -> Result<()> {
+        self.vfio_devices.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.vfio_devices, self.batch_size) {
+            self.flush_vfio_devices()?;
+        }
+        Ok(())
+    }
+
+    fn add_vfio_event(&mut self, record: VfioEventRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.vfio_events, self.batch_size);
+        self.vfio_events.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.vfio_events, self.batch_size) {
+            self.flush_vfio_events()?;
+        }
+        Ok(())
+    }
+
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()> {
         self.sysinfo = Some(record);
         self.total_records += 1;
@@ -1110,6 +1178,8 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_network_packets()?;
         self.flush_network_sockets()?;
         self.flush_network_polls()?;
+        self.flush_vfio_devices()?;
+        self.flush_vfio_events()?;
         self.flush_clock_snapshots()?;
         self.flush_sysinfo()?;
         Ok(())
@@ -2021,6 +2091,99 @@ fn build_network_poll_batch(
             Arc::new(socket_id_builder.finish()),
             Arc::new(requested_events_builder.finish()),
             Arc::new(returned_events_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_vfio_device_batch(
+    records: &[VfioDeviceRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut device_id_builder = Int32Builder::with_capacity(records.len());
+    let mut domain_builder = Int32Builder::with_capacity(records.len());
+    let mut bus_builder = Int32Builder::with_capacity(records.len());
+    let mut dev_builder = Int32Builder::with_capacity(records.len());
+    let mut func_builder = Int32Builder::with_capacity(records.len());
+    let mut vendor_id_builder = Int32Builder::with_capacity(records.len());
+    let mut device_id_pci_builder = Int32Builder::with_capacity(records.len());
+    let mut subsystem_vendor_builder = Int32Builder::with_capacity(records.len());
+    let mut subsystem_device_builder = Int32Builder::with_capacity(records.len());
+    let mut bdf_builder = StringBuilder::with_capacity(records.len(), records.len() * 16);
+
+    for record in records {
+        device_id_builder.append_value(record.device_id);
+        domain_builder.append_value(record.domain);
+        bus_builder.append_value(record.bus);
+        dev_builder.append_value(record.dev);
+        func_builder.append_value(record.func);
+        vendor_id_builder.append_value(record.vendor_id);
+        device_id_pci_builder.append_value(record.device_id_pci);
+        subsystem_vendor_builder.append_value(record.subsystem_vendor);
+        subsystem_device_builder.append_value(record.subsystem_device);
+        bdf_builder.append_value(&record.bdf);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(device_id_builder.finish()),
+            Arc::new(domain_builder.finish()),
+            Arc::new(bus_builder.finish()),
+            Arc::new(dev_builder.finish()),
+            Arc::new(func_builder.finish()),
+            Arc::new(vendor_id_builder.finish()),
+            Arc::new(device_id_pci_builder.finish()),
+            Arc::new(subsystem_vendor_builder.finish()),
+            Arc::new(subsystem_device_builder.finish()),
+            Arc::new(bdf_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_vfio_event_batch(
+    records: &[VfioEventRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut device_id_builder = Int32Builder::with_capacity(records.len());
+    let mut ts_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_builder = Int64Builder::with_capacity(records.len());
+    let mut pid_builder = Int64Builder::with_capacity(records.len());
+    let mut tid_builder = Int64Builder::with_capacity(records.len());
+    let mut command_builder = Int32Builder::with_capacity(records.len());
+    let mut command_name_builder = StringBuilder::with_capacity(records.len(), records.len() * 16);
+    let mut arg1_builder = Int64Builder::with_capacity(records.len());
+    let mut arg2_builder = Int64Builder::with_capacity(records.len());
+    let mut arg3_builder = Int64Builder::with_capacity(records.len());
+    let mut ret_builder = Int32Builder::with_capacity(records.len());
+
+    for record in records {
+        device_id_builder.append_value(record.device_id);
+        ts_builder.append_value(record.ts);
+        dur_builder.append_value(record.dur);
+        pid_builder.append_value(record.pid);
+        tid_builder.append_value(record.tid);
+        command_builder.append_value(record.command);
+        command_name_builder.append_value(&record.command_name);
+        arg1_builder.append_value(record.arg1);
+        arg2_builder.append_value(record.arg2);
+        arg3_builder.append_value(record.arg3);
+        ret_builder.append_value(record.ret);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(device_id_builder.finish()),
+            Arc::new(ts_builder.finish()),
+            Arc::new(dur_builder.finish()),
+            Arc::new(pid_builder.finish()),
+            Arc::new(tid_builder.finish()),
+            Arc::new(command_builder.finish()),
+            Arc::new(command_name_builder.finish()),
+            Arc::new(arg1_builder.finish()),
+            Arc::new(arg2_builder.finish()),
+            Arc::new(arg3_builder.finish()),
+            Arc::new(ret_builder.finish()),
         ],
     )?)
 }

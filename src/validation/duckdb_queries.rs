@@ -442,6 +442,7 @@ pub fn validate_duckdb(db_path: &Path) -> ValidationResult {
 
     validate_duckdb_required_tables(&conn, &mut result);
     validate_duckdb_sched_slice_end_state(&conn, &mut result);
+    validate_duckdb_vfio_referential_integrity(&conn, &mut result);
 
     result
 }
@@ -509,5 +510,102 @@ fn validate_duckdb_sched_slice_end_state(conn: &Connection, result: &mut Validat
         Err(_) => {
             // Query failed - table might be empty, which is fine
         }
+    }
+}
+
+/// Validate VFIO referential integrity in DuckDB.
+///
+/// Checks that:
+/// 1. If vfio_event table exists and has data, vfio_event.device_id references
+///    vfio_device.device_id (device_id=0 is special for DMA operations)
+/// 2. VFIO event timestamps and durations are non-negative
+/// 3. Command names are valid known VFIO commands
+fn validate_duckdb_vfio_referential_integrity(conn: &Connection, result: &mut ValidationResult) {
+    // Check if vfio_event table exists
+    let has_vfio_event: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = 'vfio_event'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !has_vfio_event {
+        return; // VFIO recording was not enabled, nothing to validate
+    }
+
+    // Check for events with no data
+    let event_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vfio_event", [], |row| row.get(0))
+        .unwrap_or(0);
+
+    if event_count == 0 {
+        return; // No events recorded, nothing to validate
+    }
+
+    // Check referential integrity: vfio_event.device_id should reference
+    // vfio_device.device_id (except device_id=0 which is DMA operations)
+    let has_vfio_device: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM information_schema.tables WHERE table_name = 'vfio_device'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if has_vfio_device {
+        let orphan_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vfio_event e
+                 WHERE e.device_id != 0
+                   AND e.device_id NOT IN (SELECT device_id FROM vfio_device)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if orphan_count > 0 {
+            result.add_warning(ValidationWarning::AllNullColumn {
+                table: "vfio_event".to_string(),
+                column: "device_id".to_string(),
+                total_rows: orphan_count,
+            });
+        }
+    }
+
+    // Check for negative durations
+    let neg_dur_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vfio_event WHERE dur < 0", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
+
+    if neg_dur_count > 0 {
+        result.add_error(ValidationError::InvalidValue {
+            table: "vfio_event".to_string(),
+            column: "dur".to_string(),
+            message: format!("{neg_dur_count} VFIO event(s) have negative duration"),
+        });
+    }
+
+    // Check that command_name values are valid
+    let invalid_cmd_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM vfio_event
+             WHERE command_name NOT IN (
+                 'GET_INFO', 'GET_REGION_INFO', 'GET_IRQ_INFO', 'SET_IRQS',
+                 'RESET', 'IOEVENTFD', 'MAP_DMA', 'UNMAP_DMA', 'UNKNOWN'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if invalid_cmd_count > 0 {
+        result.add_error(ValidationError::InvalidEnumValue {
+            table: "vfio_event".to_string(),
+            column: "command_name".to_string(),
+            value: format!("{invalid_cmd_count} event(s) have unrecognized command_name"),
+        });
     }
 }

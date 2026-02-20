@@ -74,6 +74,12 @@ pub struct PerfettoContext {
     /// UUID of the "Network Packets" root track, if present
     pub network_packets_root_uuid: Option<u64>,
 
+    // === VFIO Event Validation ===
+    /// UUID of the "VFIO Devices" root track, if present
+    pub vfio_devices_root_uuid: Option<u64>,
+    /// VFIO slice events: (track_uuid, event_name) -> first timestamp
+    pub vfio_slice_events: HashMap<(u64, String), u64>,
+
     // === Clock/System Info ===
     /// Whether we've seen a clock snapshot
     pub has_clock_snapshot: bool,
@@ -282,6 +288,90 @@ impl PerfettoQueries {
         }
     }
 
+    /// Validate VFIO events are on tracks under the "VFIO Devices" root.
+    pub fn validate_vfio_events_on_vfio_tracks(&self, result: &mut ValidationResult) {
+        if self.context.vfio_slice_events.is_empty() {
+            return;
+        }
+
+        for ((track_uuid, event_name), ts) in &self.context.vfio_slice_events {
+            // Check the track has a parent
+            let parent_uuid = match self.context.parent_refs.get(track_uuid) {
+                Some(&parent) => parent,
+                None => {
+                    result.add_error(ValidationError::PerfettoError {
+                        message: format!(
+                            "VFIO event '{event_name}' (track_uuid={track_uuid}, ts={ts}) \
+                             is on a track with no parent. Expected parent to be 'VFIO Devices'."
+                        ),
+                    });
+                    continue;
+                }
+            };
+
+            // The parent should be the "VFIO Devices" root track, OR
+            // the track's parent should be "VFIO Devices" (the track itself is a device track)
+            let is_under_vfio_root = if let Some(vfio_root) = self.context.vfio_devices_root_uuid {
+                // Direct child of root (device tracks or DMA track)
+                parent_uuid == vfio_root
+            } else {
+                false
+            };
+
+            if !is_under_vfio_root {
+                // Check if parent is named appropriately (may be a dynamically created device track)
+                let parent_name = self.context.track_names.get(&parent_uuid);
+                let parent_is_valid = parent_name.map(|n| n == "VFIO Devices").unwrap_or(false);
+                if !parent_is_valid {
+                    result.add_error(ValidationError::PerfettoError {
+                        message: format!(
+                            "VFIO event '{event_name}' (track_uuid={track_uuid}, ts={ts}) \
+                             is on a track not parented under 'VFIO Devices'."
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Validate that VFIO device tracks have proper naming (BDF format or "DMA Operations").
+    pub fn validate_vfio_device_track_names(&self, result: &mut ValidationResult) {
+        let Some(vfio_root_uuid) = self.context.vfio_devices_root_uuid else {
+            return;
+        };
+
+        for (track_uuid, parent_uuid) in &self.context.parent_refs {
+            if *parent_uuid != vfio_root_uuid {
+                continue;
+            }
+
+            let Some(track_name) = self.context.track_names.get(track_uuid) else {
+                result.add_error(ValidationError::PerfettoError {
+                    message: format!(
+                        "VFIO device track (track_uuid={track_uuid}) under 'VFIO Devices' has no name"
+                    ),
+                });
+                continue;
+            };
+
+            // Valid names: "DMA Operations", BDF format like "0000:03:00.0 [1ae0:0042]",
+            // or fallback "VFIO Device N"
+            let is_valid = track_name == "DMA Operations"
+                || track_name.starts_with("VFIO Device ")
+                || (track_name.len() >= 12 && track_name.chars().nth(4) == Some(':'));
+
+            if !is_valid {
+                result.add_error(ValidationError::PerfettoError {
+                    message: format!(
+                        "VFIO device track '{track_name}' under 'VFIO Devices' has unexpected name. \
+                         Expected 'DMA Operations', 'VFIO Device N', or BDF format like \
+                         '0000:03:00.0 [vendor:device]' (track_uuid={track_uuid})"
+                    ),
+                });
+            }
+        }
+    }
+
     /// Validate swapper/idle thread names.
     pub fn validate_swapper_thread_names(
         &self,
@@ -465,6 +555,9 @@ fn process_packet(
             if name == "Network Packets" {
                 context.network_packets_root_uuid = Some(uuid);
             }
+            if name == "VFIO Devices" {
+                context.vfio_devices_root_uuid = Some(uuid);
+            }
             context.track_names.insert(uuid, name);
         }
 
@@ -553,6 +646,29 @@ fn process_packet(
             if is_network_syscall {
                 context
                     .network_syscall_events
+                    .entry((track_uuid, event.name().to_string()))
+                    .or_insert(ts);
+            }
+
+            // VFIO events (SLICE_BEGIN on tracks under VFIO Devices root)
+            if event.has_name()
+                && event.type_()
+                    == perfetto_protos::track_event::track_event::Type::TYPE_SLICE_BEGIN
+                && matches!(
+                    event.name(),
+                    "GET_INFO"
+                        | "GET_REGION_INFO"
+                        | "GET_IRQ_INFO"
+                        | "SET_IRQS"
+                        | "RESET"
+                        | "IOEVENTFD"
+                        | "MAP_DMA"
+                        | "UNMAP_DMA"
+                        | "UNKNOWN"
+                )
+            {
+                context
+                    .vfio_slice_events
                     .entry((track_uuid, event.name().to_string()))
                     .or_insert(ts);
             }
@@ -724,6 +840,8 @@ pub fn validate_perfetto_trace(path: &Path) -> ValidationResult {
     queries.validate_system_info_exists(&mut result);
     queries.validate_network_syscalls_on_network_tracks(&mut result);
     queries.validate_socket_tracks_have_socket_id(&mut result);
+    queries.validate_vfio_events_on_vfio_tracks(&mut result);
+    queries.validate_vfio_device_track_names(&mut result);
     queries
         .validate_swapper_thread_names(config.min_sched_events_for_swapper_validation, &mut result);
 

@@ -42,6 +42,9 @@ pub struct ParquetPaths {
     pub network_packet: PathBuf,
     pub network_socket: PathBuf,
     pub network_poll: PathBuf,
+    // VFIO tables
+    pub vfio_device: PathBuf,
+    pub vfio_event: PathBuf,
     // Clock snapshot table
     pub clock_snapshot: PathBuf,
     // System info table
@@ -92,6 +95,9 @@ impl ParquetPaths {
             network_packet: dir.join("network_packet.parquet"),
             network_socket: dir.join("network_socket.parquet"),
             network_poll: dir.join("network_poll.parquet"),
+            // VFIO tables
+            vfio_device: dir.join("vfio_device.parquet"),
+            vfio_event: dir.join("vfio_event.parquet"),
             // Clock snapshot table
             clock_snapshot: dir.join("clock_snapshot.parquet"),
             // System info table
@@ -132,13 +138,15 @@ impl ParquetPaths {
             network_packet: dir.join(format!("{trace_id}_network_packet.parquet")),
             network_socket: dir.join(format!("{trace_id}_network_socket.parquet")),
             network_poll: dir.join(format!("{trace_id}_network_poll.parquet")),
+            vfio_device: dir.join(format!("{trace_id}_vfio_device.parquet")),
+            vfio_event: dir.join(format!("{trace_id}_vfio_event.parquet")),
             clock_snapshot: dir.join(format!("{trace_id}_clock_snapshot.parquet")),
             sysinfo: dir.join(format!("{trace_id}_sysinfo.parquet")),
         }
     }
 
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 30] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 32] {
         [
             PathEntry {
                 path: &self.process,
@@ -252,6 +260,14 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.network_poll,
                 name: "network_poll",
+            },
+            PathEntry {
+                path: &self.vfio_device,
+                name: "vfio_device",
+            },
+            PathEntry {
+                path: &self.vfio_event,
+                name: "vfio_event",
             },
             PathEntry {
                 path: &self.clock_snapshot,

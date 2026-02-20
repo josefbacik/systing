@@ -55,6 +55,7 @@ pub mod systing_core;
 pub mod trace;
 pub mod traced_command;
 pub mod utid;
+pub mod vfio_recorder;
 
 // Re-export for convenience
 pub use parquet_paths::ParquetPaths;

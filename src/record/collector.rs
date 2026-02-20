@@ -12,7 +12,7 @@ use crate::trace::{
     NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord,
     SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord,
     StackSampleRecord, SysInfoRecord, ThreadRecord, ThreadStateRecord, TrackRecord,
-    WakeupNewRecord,
+    VfioDeviceRecord, VfioEventRecord, WakeupNewRecord,
 };
 
 /// Trait for collecting trace records during recording.
@@ -102,6 +102,12 @@ pub trait RecordCollector {
 
     /// Add a network poll record.
     fn add_network_poll(&mut self, record: NetworkPollRecord) -> Result<()>;
+
+    /// Add a VFIO device record.
+    fn add_vfio_device(&mut self, record: VfioDeviceRecord) -> Result<()>;
+
+    /// Add a VFIO event record.
+    fn add_vfio_event(&mut self, record: VfioEventRecord) -> Result<()>;
 
     /// Set the system info record (only one per trace).
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()>;
@@ -264,6 +270,16 @@ impl RecordCollector for InMemoryCollector {
 
     fn add_network_poll(&mut self, record: NetworkPollRecord) -> Result<()> {
         self.data.network_polls.push(record);
+        Ok(())
+    }
+
+    fn add_vfio_device(&mut self, record: VfioDeviceRecord) -> Result<()> {
+        self.data.vfio_devices.push(record);
+        Ok(())
+    }
+
+    fn add_vfio_event(&mut self, record: VfioEventRecord) -> Result<()> {
+        self.data.vfio_events.push(record);
         Ok(())
     }
 

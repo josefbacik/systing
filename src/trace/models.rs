@@ -445,6 +445,37 @@ pub struct NetworkPollRecord {
     pub returned_events: String,
 }
 
+/// VFIO device metadata record - one per VFIO device observed during tracing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VfioDeviceRecord {
+    pub device_id: i32,
+    pub domain: i32,
+    pub bus: i32,
+    pub dev: i32,
+    pub func: i32,
+    pub vendor_id: i32,
+    pub device_id_pci: i32,
+    pub subsystem_vendor: i32,
+    pub subsystem_device: i32,
+    pub bdf: String,
+}
+
+/// VFIO event record - represents a VFIO ioctl or DMA operation with duration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VfioEventRecord {
+    pub device_id: i32,
+    pub ts: i64,
+    pub dur: i64,
+    pub pid: i64,
+    pub tid: i64,
+    pub command: i32,
+    pub command_name: String,
+    pub arg1: i64,
+    pub arg2: i64,
+    pub arg3: i64,
+    pub ret: i32,
+}
+
 /// Clock snapshot record - for timestamp correlation between clock domains.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClockSnapshotRecord {
@@ -489,6 +520,8 @@ pub struct ExtractedData {
     pub network_packets: Vec<NetworkPacketRecord>,
     pub network_sockets: Vec<NetworkSocketRecord>,
     pub network_polls: Vec<NetworkPollRecord>,
+    pub vfio_devices: Vec<VfioDeviceRecord>,
+    pub vfio_events: Vec<VfioEventRecord>,
     pub clock_snapshots: Vec<ClockSnapshotRecord>,
     pub sysinfo: Option<SysInfoRecord>,
 }
