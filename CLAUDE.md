@@ -97,6 +97,20 @@ git config core.hooksPath hooks
   - `cargo test`
   - Note: Integration tests run in CI only (GitHub Actions), not in the pre-commit hook
 
+## Versioning Policy
+
+systing uses semantic versioning with the following rules:
+
+- **Schema changes** (modifications to `create_schema()` in `src/duckdb.rs` or `src/trace/schema.rs`):
+  1. Increment `SCHEMA_VERSION` in `src/duckdb.rs`
+  2. Add an entry to `SCHEMA_CHANGES.md` describing the change
+  3. Bump the **minor** version in `Cargo.toml` (e.g., 1.0.0 → 1.1.0)
+- **Non-schema changes**: Bump the **patch** version in `Cargo.toml` (e.g., 1.0.0 → 1.0.1)
+
+The database records version information in two places:
+- `_traces.systing_version` — the systing binary version that produced each trace (per-trace)
+- `_schema_version.version` — the schema version of the database (database-wide)
+
 ## Temporary Files and Scratch Work
 
 **IMPORTANT**: All temporary files, scratch scripts, and working files MUST be placed in the `./scratch` directory.

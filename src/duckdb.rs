@@ -20,6 +20,9 @@ pub struct TraceImportMapping {
     pub source_path: String,
 }
 
+/// Current schema version. See SCHEMA_CHANGES.md for history.
+pub const SCHEMA_VERSION: u32 = 1;
+
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
     "process",
@@ -70,7 +73,13 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS _traces (
             trace_id VARCHAR PRIMARY KEY,
             source_path VARCHAR,
-            import_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            import_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            systing_version VARCHAR NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS _schema_version (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            version INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS process (
@@ -455,8 +464,18 @@ pub fn parquet_to_duckdb(parquet_dir: &Path, db_path: &Path, trace_id: &str) -> 
 
     // Insert trace metadata
     conn.execute(
-        "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
-        [trace_id, &parquet_dir.to_string_lossy()],
+        "INSERT INTO _traces (trace_id, source_path, systing_version) VALUES (?, ?, ?)",
+        [
+            trace_id,
+            &parquet_dir.to_string_lossy(),
+            env!("CARGO_PKG_VERSION"),
+        ],
+    )?;
+
+    // Insert schema version
+    conn.execute(
+        "INSERT OR REPLACE INTO _schema_version (id, version) VALUES (1, ?)",
+        [SCHEMA_VERSION],
     )?;
 
     // Import each table from Parquet files
@@ -577,15 +596,23 @@ pub fn get_trace_ids(db_path: &Path) -> Result<Vec<String>> {
     Ok(trace_ids)
 }
 
-/// Get trace IDs and their source paths from a DuckDB database.
+/// Metadata for a single trace in a DuckDB database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceMetadata {
+    pub trace_id: String,
+    pub source_path: String,
+    pub systing_version: String,
+}
+
+/// Get trace metadata from a DuckDB database.
 ///
-/// Returns a vector of (trace_id, source_path) pairs found in the _traces table.
-pub fn get_trace_info(db_path: &Path) -> Result<Vec<(String, String)>> {
+/// Returns a vector of [`TraceMetadata`] for each trace in the `_traces` table.
+pub fn get_trace_info(db_path: &Path) -> Result<Vec<TraceMetadata>> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("Failed to open DuckDB database: {}", db_path.display()))?;
 
     let mut stmt = conn
-        .prepare("SELECT trace_id, COALESCE(source_path, '') FROM _traces ORDER BY trace_id")
+        .prepare("SELECT trace_id, COALESCE(source_path, ''), COALESCE(systing_version, '') FROM _traces ORDER BY trace_id")
         .with_context(|| {
             format!(
                 "Failed to query _traces table in '{}' - file may not be a valid systing trace database",
@@ -593,8 +620,14 @@ pub fn get_trace_info(db_path: &Path) -> Result<Vec<(String, String)>> {
             )
         })?;
 
-    let traces: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+    let traces: Vec<TraceMetadata> = stmt
+        .query_map([], |row| {
+            Ok(TraceMetadata {
+                trace_id: row.get(0)?,
+                source_path: row.get(1)?,
+                systing_version: row.get(2)?,
+            })
+        })
         .with_context(|| "Failed to execute query on _traces table")?
         .filter_map(|r| r.ok())
         .collect();
@@ -647,13 +680,34 @@ pub fn import_duckdb_traces(
 
 /// Inner implementation of DuckDB trace import (called after ATTACH).
 fn import_duckdb_traces_inner(conn: &Connection, mappings: &[TraceImportMapping]) -> Result<()> {
-    // Insert _traces metadata for each mapped trace
+    // Check if the source _traces table has a systing_version column
+    let source_has_version: bool = {
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*) FROM duckdb_columns() \
+             WHERE database_name = 'input_db' AND schema_name = 'main' \
+             AND table_name = '_traces' AND column_name = 'systing_version'",
+        )?;
+        let count: u32 = stmt.query_row([], |row| row.get(0))?;
+        count > 0
+    };
+
+    // Insert _traces metadata for each mapped trace, preserving systing_version from source
     for mapping in mappings {
-        conn.execute(
-            "INSERT INTO main._traces (trace_id, source_path) VALUES (?, ?)",
-            duckdb::params![mapping.new_id, mapping.source_path],
-        )
-        .with_context(|| format!("Failed to insert trace metadata for '{}'", mapping.new_id))?;
+        if source_has_version {
+            conn.execute(
+                "INSERT INTO main._traces (trace_id, source_path, systing_version) \
+                 SELECT ?, ?, COALESCE(systing_version, '') \
+                 FROM input_db._traces WHERE trace_id = ?",
+                duckdb::params![mapping.new_id, mapping.source_path, mapping.old_id],
+            )
+            .with_context(|| format!("Failed to insert trace metadata for '{}'", mapping.new_id))?;
+        } else {
+            conn.execute(
+                "INSERT INTO main._traces (trace_id, source_path) VALUES (?, ?)",
+                duckdb::params![mapping.new_id, mapping.source_path],
+            )
+            .with_context(|| format!("Failed to insert trace metadata for '{}'", mapping.new_id))?;
+        }
     }
 
     // Get the set of tables that exist in the input database
@@ -1082,8 +1136,113 @@ mod tests {
 
         let info = get_trace_info(&db_path).unwrap();
         assert_eq!(info.len(), 2);
-        assert_eq!(info[0], ("trace_a".to_string(), "/path/to/a".to_string()));
-        assert_eq!(info[1], ("trace_b".to_string(), "/path/to/b".to_string()));
+        assert_eq!(info[0].trace_id, "trace_a");
+        assert_eq!(info[0].source_path, "/path/to/a");
+        assert_eq!(info[0].systing_version, "");
+        assert_eq!(info[1].trace_id, "trace_b");
+        assert_eq!(info[1].source_path, "/path/to/b");
+        assert_eq!(info[1].systing_version, "");
+    }
+
+    #[test]
+    fn test_schema_version() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.duckdb");
+
+        let conn = Connection::open(&db_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        // Insert schema version as parquet_to_duckdb would
+        conn.execute(
+            "INSERT OR REPLACE INTO _schema_version (id, version) VALUES (1, ?)",
+            [SCHEMA_VERSION],
+        )
+        .unwrap();
+
+        // Verify it reads back correctly
+        let version: u32 = conn
+            .query_row(
+                "SELECT version FROM _schema_version WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // Verify the single-row constraint works (INSERT OR REPLACE overwrites)
+        conn.execute(
+            "INSERT OR REPLACE INTO _schema_version (id, version) VALUES (1, ?)",
+            [SCHEMA_VERSION + 1],
+        )
+        .unwrap();
+        let count: u32 = conn
+            .query_row("SELECT COUNT(*) FROM _schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_trace_metadata_version() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.duckdb");
+
+        let conn = Connection::open(&db_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        // Insert a trace with systing_version set
+        conn.execute(
+            "INSERT INTO _traces (trace_id, source_path, systing_version) VALUES (?, ?, ?)",
+            ["trace_a", "/path/to/a", "1.0.0"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let info = get_trace_info(&db_path).unwrap();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].systing_version, "1.0.0");
+    }
+
+    #[test]
+    fn test_import_preserves_systing_version() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a source database with systing_version set
+        let input_path = temp_dir.path().join("input.duckdb");
+        let conn = Connection::open(&input_path).unwrap();
+        create_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _traces (trace_id, source_path, systing_version) VALUES (?, ?, ?)",
+            ["trace_a", "/original/path", "0.9.0"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO process (trace_id, upid, pid, name) VALUES (?, ?, ?, ?)",
+            duckdb::params!["trace_a", 1i64, 100, "test_proc"],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Import into a new database
+        let output_path = temp_dir.path().join("output.duckdb");
+        let conn = Connection::open(&output_path).unwrap();
+        create_schema(&conn).unwrap();
+        import_duckdb_traces(
+            &conn,
+            &input_path,
+            &[TraceImportMapping {
+                old_id: "trace_a".into(),
+                new_id: "imported".into(),
+                source_path: "/new/path".into(),
+            }],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Verify the systing_version was preserved from the source
+        let info = get_trace_info(&output_path).unwrap();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].trace_id, "imported");
+        assert_eq!(info[0].systing_version, "0.9.0");
     }
 
     #[test]
@@ -1547,7 +1706,7 @@ mod tests {
         let schema_tables: HashSet<String> = conn
             .prepare(
                 "SELECT table_name FROM information_schema.tables \
-                 WHERE table_schema = 'main' AND table_name != '_traces'",
+                 WHERE table_schema = 'main' AND table_name NOT IN ('_traces', '_schema_version')",
             )
             .unwrap()
             .query_map([], |row| row.get(0))
