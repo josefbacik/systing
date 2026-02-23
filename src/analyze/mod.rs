@@ -91,11 +91,21 @@ pub struct TimeRange {
     pub duration_seconds: f64,
 }
 
+/// Per-trace version information.
+#[derive(Debug, Serialize)]
+pub struct TraceVersionInfo {
+    pub trace_id: String,
+    pub systing_version: String,
+}
+
 /// Trace metadata.
 #[derive(Debug, Serialize)]
 pub struct TraceInfo {
     pub database_path: String,
     pub traces: Vec<String>,
+    pub trace_versions: Vec<TraceVersionInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_range: Option<TimeRange>,
     pub tables: Vec<TableInfo>,
@@ -256,6 +266,8 @@ impl AnalyzeDb {
         let tables: Vec<TableInfo> = all_tables.into_iter().filter(|t| t.row_count > 0).collect();
 
         let traces = self.get_trace_ids()?;
+        let trace_versions = self.get_trace_versions();
+        let schema_version = self.get_schema_version();
 
         let time_range =
             if self.table_exists("stack_sample")? && self.table_has_rows("stack_sample")? {
@@ -277,6 +289,8 @@ impl AnalyzeDb {
         Ok(TraceInfo {
             database_path: self.path.display().to_string(),
             traces,
+            trace_versions,
+            schema_version,
             time_range,
             tables,
             total_process_count,
@@ -342,6 +356,50 @@ impl AnalyzeDb {
             }
         }
         Ok(Vec::new())
+    }
+
+    /// Returns version info from `_traces`. Returns an empty vec for databases
+    /// that predate the `systing_version` column.
+    fn get_trace_versions(&self) -> Vec<TraceVersionInfo> {
+        // Check if the systing_version column exists (older databases won't have it)
+        let has_version: bool = self
+            .conn
+            .prepare(
+                "SELECT COUNT(*) FROM information_schema.columns \
+                 WHERE table_name = '_traces' AND column_name = 'systing_version'",
+            )
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, u32>(0)))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if !has_version {
+            return Vec::new();
+        }
+
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT trace_id, COALESCE(systing_version, '') FROM _traces ORDER BY trace_id",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok(TraceVersionInfo {
+                trace_id: row.get(0)?,
+                systing_version: row.get(1)?,
+            })
+        }) else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    fn get_schema_version(&self) -> Option<u32> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT version FROM _schema_version LIMIT 1")
+            .ok()?;
+        let mut rows = stmt.query([]).ok()?;
+        let row = rows.next().ok()??;
+        row.get(0).ok()
     }
 
     fn get_process_count(&self) -> Result<u64> {

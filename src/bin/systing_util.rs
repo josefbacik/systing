@@ -32,7 +32,9 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::thread;
 use std::time::Instant;
-use systing::duckdb::{create_schema, get_trace_info, import_duckdb_traces, TraceImportMapping};
+use systing::duckdb::{
+    create_schema, get_trace_info, import_duckdb_traces, TraceImportMapping, SCHEMA_VERSION,
+};
 use systing::ParquetPaths;
 
 /// Track name for network interface metadata in Perfetto traces.
@@ -3182,19 +3184,19 @@ fn run_convert(
         }
 
         let mut mappings = Vec::new();
-        for (old_id, source_path) in &trace_info {
+        for meta in &trace_info {
             let base_id = generate_trace_id(db_file);
             // If the DuckDB has multiple traces, incorporate the original trace ID into the base
             let base_id = if trace_info.len() > 1 {
-                format!("{base_id}_{old_id}")
+                format!("{base_id}_{}", meta.trace_id)
             } else {
                 base_id
             };
             let new_id = make_unique_trace_id(base_id, &mut id_counts);
             mappings.push(TraceImportMapping {
-                old_id: old_id.clone(),
+                old_id: meta.trace_id.clone(),
                 new_id,
-                source_path: source_path.clone(),
+                source_path: meta.source_path.clone(),
             });
         }
 
@@ -3342,13 +3344,20 @@ fn run_convert(
     // Wrap all imports in a single transaction for performance
     conn.execute_batch("BEGIN TRANSACTION")?;
 
+    // Insert schema version
+    conn.execute(
+        "INSERT OR REPLACE INTO _schema_version (id, version) VALUES (1, ?)",
+        params![SCHEMA_VERSION],
+    )?;
+
     // Import _traces table for Parquet/.pb results
     for result in &successful_results {
         conn.execute(
-            "INSERT INTO _traces (trace_id, source_path) VALUES (?, ?)",
+            "INSERT INTO _traces (trace_id, source_path, systing_version) VALUES (?, ?, ?)",
             params![
                 result.trace_id,
-                result.source_path.to_string_lossy().to_string()
+                result.source_path.to_string_lossy().to_string(),
+                env!("CARGO_PKG_VERSION")
             ],
         )?;
     }

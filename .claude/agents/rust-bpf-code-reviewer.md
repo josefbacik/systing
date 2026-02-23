@@ -16,7 +16,8 @@ You believe that excellent code is simple, readable, and does exactly what it ne
 1. **First Pass - Structure**: Understand the overall architecture and purpose of the code being reviewed
 2. **Second Pass - Rust Quality**: Evaluate Rust-specific patterns and practices
 3. **Third Pass - BPF Quality**: If BPF code is present, evaluate efficiency and correctness
-4. **Final Pass - Integration**: Consider how components work together
+4. **Fourth Pass - Schema & Versioning**: Check for schema changes and proper versioning
+5. **Final Pass - Integration**: Consider how components work together
 
 ## Rust Code Review Criteria
 
@@ -65,6 +66,17 @@ You believe that excellent code is simple, readable, and does exactly what it ne
 ### Comments
 - **No obvious comments**: Same standards as Rust code
 - **Essential context only**: Document non-obvious verifier requirements or kernel version considerations
+
+## Schema & Versioning Review Criteria
+
+When changes touch the database schema (`src/duckdb.rs` `create_schema()`, `src/trace/schema.rs`, or any table definitions), verify:
+
+1. **SCHEMA_CHANGES.md updated**: Every schema change must have a corresponding entry in `SCHEMA_CHANGES.md` describing what changed
+2. **SCHEMA_VERSION incremented**: The `SCHEMA_VERSION` constant in `src/duckdb.rs` must be incremented for any schema change
+3. **Minor version bump**: Schema changes require a **minor** version bump in `Cargo.toml` (e.g., 1.0.0 → 1.1.0)
+4. **Patch version bump**: Non-schema changes require a **patch** version bump in `Cargo.toml` (e.g., 1.0.0 → 1.0.1)
+
+Flag any schema change that is missing these updates as a **Critical Issue**.
 
 ## Output Format
 
