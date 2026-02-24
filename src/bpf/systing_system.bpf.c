@@ -158,6 +158,7 @@ struct marker_event {
 	u32 marker_type;   // 0=start, 1=end, 2=instant
 	struct task_info task;
 	u8 name[MAX_MARKER_NAME_LEN];
+	u64 info;          // from args[3] (flags param of faccessat2)
 };
 
 struct stack_event {
@@ -1971,6 +1972,7 @@ static __always_inline int handle_marker_event(struct trace_event_raw_sys_enter 
 		bpf_ringbuf_discard(event, 0);
 		return 0;
 	}
+	event->info = (u64)ctx->args[3];
 	bpf_ringbuf_submit(event, 0);
 	return 1;
 }

@@ -2470,6 +2470,35 @@ fn parquet_column_contains(path: &std::path::Path, column: &str, target: &str) -
     false
 }
 
+/// Check whether a parquet file contains a specific i64 value in a named column.
+fn parquet_int_column_contains(path: &std::path::Path, column: &str, target: i64) -> bool {
+    use arrow::array::Int64Array;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|e| panic!("Failed to open {}: {e}", path.display()));
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .expect("Failed to create reader")
+        .build()
+        .expect("Failed to build reader");
+
+    for batch in reader {
+        let batch = batch.expect("Failed to read batch");
+        if let Some(col) = batch.column_by_name(column) {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("column is not Int64Array");
+            for i in 0..arr.len() {
+                if !arr.is_null(i) && arr.value(i) == target {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Parameters for a marker workload used by [`run_marker_recording`].
 struct MarkerWorkloadConfig {
     /// Syscall mode value passed as arg 2 to faccessat2.
@@ -2481,6 +2510,10 @@ struct MarkerWorkloadConfig {
     range_name: &'static str,
     /// Pathname for INSTANT events.
     instant_name: &'static str,
+    /// Info value passed as arg 3 (flags) for range START/END events.
+    range_info: i64,
+    /// Info value passed as arg 3 (flags) for INSTANT events.
+    instant_info: i64,
 }
 
 /// Run a marker-only systing recording while a workload thread emits faccessat2 marker events.
@@ -2503,6 +2536,8 @@ fn run_marker_recording(cfg: MarkerWorkloadConfig) -> TempDir {
     let stop_clone = stop.clone();
 
     let mode = cfg.mode;
+    let range_info = cfg.range_info;
+    let instant_info = cfg.instant_info;
     let range_name = CString::new(cfg.range_name).unwrap();
     let instant_name = CString::new(cfg.instant_name).unwrap();
     let sysno = Sysno::faccessat2 as i64;
@@ -2513,14 +2548,17 @@ fn run_marker_recording(cfg: MarkerWorkloadConfig) -> TempDir {
         // faccessat2 reads the pathname argument but does not store the pointer.
         while !stop_clone.load(Ordering::Relaxed) {
             unsafe {
-                libc::syscall(sysno, 0i64, range_name.as_ptr(), mode, 0i64); // START
+                libc::syscall(sysno, 0i64, range_name.as_ptr(), mode, range_info);
+                // START
             }
             thread::sleep(Duration::from_millis(50));
             unsafe {
-                libc::syscall(sysno, 1i64, range_name.as_ptr(), mode, 0i64); // END
+                libc::syscall(sysno, 1i64, range_name.as_ptr(), mode, range_info);
+                // END
             }
             unsafe {
-                libc::syscall(sysno, 2i64, instant_name.as_ptr(), mode, 0i64); // INSTANT
+                libc::syscall(sysno, 2i64, instant_name.as_ptr(), mode, instant_info);
+                // INSTANT
             }
             thread::sleep(Duration::from_millis(200));
         }
@@ -2560,6 +2598,8 @@ fn test_e2e_marker_recording() {
         mode: -975i64,
         range_name: "MyTrack:range_event",
         instant_name: "checkpoint",
+        range_info: 42,
+        instant_info: 77,
     });
 
     // --- Validate slice.parquet contains the range event ---
@@ -2599,6 +2639,38 @@ fn test_e2e_marker_recording() {
         "Markers track not found in track.parquet"
     );
 
+    // --- Validate args.parquet contains the info value for the range event ---
+    eprintln!("  marker recording: validating args.parquet...");
+    let args_path = dir.path().join("args.parquet");
+    assert!(
+        args_path.exists(),
+        "args.parquet not found - marker info was not recorded"
+    );
+    assert!(
+        parquet_column_contains(&args_path, "key", "info"),
+        "info key not found in args.parquet"
+    );
+    assert!(
+        parquet_int_column_contains(&args_path, "int_value", 42),
+        "info value 42 not found in args.parquet"
+    );
+
+    // --- Validate instant_args.parquet contains the info value for the instant event ---
+    eprintln!("  marker recording: validating instant_args.parquet...");
+    let instant_args_path = dir.path().join("instant_args.parquet");
+    assert!(
+        instant_args_path.exists(),
+        "instant_args.parquet not found - marker instant info was not recorded"
+    );
+    assert!(
+        parquet_column_contains(&instant_args_path, "key", "info"),
+        "info key not found in instant_args.parquet"
+    );
+    assert!(
+        parquet_int_column_contains(&instant_args_path, "int_value", 77),
+        "info value 77 not found in instant_args.parquet"
+    );
+
     eprintln!("  All marker recording checks passed");
 }
 
@@ -2629,6 +2701,8 @@ fn test_e2e_marker_recording_zero_extended() {
         mode: mode_zero_extended,
         range_name: "ZETrack:ze_range",
         instant_name: "ze_instant",
+        range_info: 0,
+        instant_info: 0,
     });
 
     eprintln!("  zero-extended marker: validating slice.parquet...");

@@ -6,26 +6,28 @@ use anyhow::Result;
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing_core::{marker_event, SystingRecordEvent};
-use crate::trace::{InstantRecord, SliceRecord, TrackRecord};
+use crate::trace::{ArgRecord, InstantArgRecord, InstantRecord, SliceRecord, TrackRecord};
 
 struct MarkerRange {
     track: String,
     name: String,
     start: u64,
     end: u64,
+    info: u64,
 }
 
 struct MarkerInstant {
     track: String,
     name: String,
     ts: u64,
+    info: u64,
 }
 
 #[derive(Default)]
 pub struct MarkerRecorder {
     pub ringbuf: RingBuffer<marker_event>,
-    // Key: (tgidpid, track, name) -> start_ts
-    outstanding_ranges: HashMap<(u64, String, String), u64>,
+    // Key: (tgidpid, track, name) -> (start_ts, info)
+    outstanding_ranges: HashMap<(u64, String, String), (u64, u64)>,
     recorded_ranges: Vec<MarkerRange>,
     instants: Vec<MarkerInstant>,
     // Count threshold: count instant events and stop when threshold is hit
@@ -121,24 +123,33 @@ impl SystingRecordEvent<marker_event> for MarkerRecorder {
         let (track, name) = parse_name(&event.name);
         let tgidpid = event.task.tgidpid;
         let ts = event.ts;
+        let info = event.info;
 
         match event.marker_type {
             MARKER_TYPE_START => {
-                self.outstanding_ranges.insert((tgidpid, track, name), ts);
+                self.outstanding_ranges
+                    .insert((tgidpid, track, name), (ts, info));
             }
             MARKER_TYPE_END => {
                 let key = (tgidpid, track.clone(), name.clone());
-                if let Some(start) = self.outstanding_ranges.remove(&key) {
+                // Info is captured from the START event; the END event's info is intentionally ignored.
+                if let Some((start, start_info)) = self.outstanding_ranges.remove(&key) {
                     self.recorded_ranges.push(MarkerRange {
                         track,
                         name,
                         start,
                         end: ts,
+                        info: start_info,
                     });
                 }
             }
             MARKER_TYPE_INSTANT => {
-                self.instants.push(MarkerInstant { track, name, ts });
+                self.instants.push(MarkerInstant {
+                    track,
+                    name,
+                    ts,
+                    info,
+                });
             }
             _ => {}
         }
@@ -222,6 +233,14 @@ impl MarkerRecorder {
                 category: None,
                 depth: 0,
             })?;
+            // u64 -> i64: values with the high bit set will appear negative in queries
+            collector.add_arg(ArgRecord {
+                slice_id,
+                key: "info".to_string(),
+                int_value: Some(r.info as i64),
+                string_value: None,
+                real_value: None,
+            })?;
         }
 
         // Emit instants
@@ -238,6 +257,14 @@ impl MarkerRecorder {
                 name: i.name.clone(),
                 category: None,
             })?;
+            // u64 -> i64: values with the high bit set will appear negative in queries
+            collector.add_instant_arg(InstantArgRecord {
+                instant_id,
+                key: "info".to_string(),
+                int_value: Some(i.info as i64),
+                string_value: None,
+                real_value: None,
+            })?;
         }
 
         Ok(())
@@ -250,6 +277,16 @@ mod tests {
     use crate::systing_core::task_info;
 
     fn make_event(marker_type: u32, name: &str, tgidpid: u64, ts: u64) -> marker_event {
+        make_event_with_info(marker_type, name, tgidpid, ts, 0)
+    }
+
+    fn make_event_with_info(
+        marker_type: u32,
+        name: &str,
+        tgidpid: u64,
+        ts: u64,
+        info: u64,
+    ) -> marker_event {
         let bytes = name.as_bytes();
         let len = bytes.len().min(63);
         let mut raw_name = [0u8; 64];
@@ -257,6 +294,7 @@ mod tests {
         marker_event {
             marker_type,
             ts,
+            info,
             task: task_info {
                 tgidpid,
                 ..Default::default()
@@ -460,5 +498,51 @@ mod tests {
         assert!(!recorder.maybe_trigger(&make_event(2, "T:check", 1, 2_000_000)));
         // Second instant - count threshold fires
         assert!(recorder.maybe_trigger(&make_event(2, "T:check", 1, 3_000_000)));
+    }
+
+    #[test]
+    fn test_range_captures_info() {
+        let mut recorder = MarkerRecorder::default();
+        recorder.handle_event(make_event_with_info(0, "T:evt", 1, 1000, 42));
+        recorder.handle_event(make_event_with_info(1, "T:evt", 1, 2000, 99));
+
+        assert_eq!(recorder.recorded_ranges.len(), 1);
+        // Info comes from the START event
+        assert_eq!(recorder.recorded_ranges[0].info, 42);
+    }
+
+    #[test]
+    fn test_instant_captures_info() {
+        let mut recorder = MarkerRecorder::default();
+        recorder.handle_event(make_event_with_info(2, "T:check", 1, 5000, 123));
+
+        assert_eq!(recorder.instants.len(), 1);
+        assert_eq!(recorder.instants[0].info, 123);
+    }
+
+    #[test]
+    fn test_info_emitted_as_arg_records() {
+        let mut recorder = MarkerRecorder::default();
+        recorder.handle_event(make_event_with_info(0, "T:range", 1, 100, 42));
+        recorder.handle_event(make_event_with_info(1, "T:range", 1, 200, 0));
+        recorder.handle_event(make_event_with_info(2, "T:instant", 1, 150, 77));
+
+        let mut collector = crate::record::collector::InMemoryCollector::new();
+        recorder
+            .write_records(&mut collector, &mut 0, &mut 0, &mut 0)
+            .unwrap();
+
+        let data = collector.into_data();
+        // Should have one arg for the slice
+        assert_eq!(data.args.len(), 1);
+        assert_eq!(data.args[0].key, "info");
+        assert_eq!(data.args[0].int_value, Some(42));
+        assert_eq!(data.args[0].slice_id, data.slices[0].id);
+
+        // Should have one instant_arg for the instant
+        assert_eq!(data.instant_args.len(), 1);
+        assert_eq!(data.instant_args[0].key, "info");
+        assert_eq!(data.instant_args[0].int_value, Some(77));
+        assert_eq!(data.instant_args[0].instant_id, data.instants[0].id);
     }
 }
