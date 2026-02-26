@@ -81,6 +81,18 @@ impl TpuMetricsClient {
             response_desc.full_name()
         );
 
+        // Log the response schema so users can see what fields are available
+        info!("Response schema for {}:", response_desc.full_name());
+        for field in response_desc.fields() {
+            info!(
+                "  field #{}: '{}' type={:?} cardinality={:?}",
+                field.number(),
+                field.name(),
+                field.kind(),
+                field.cardinality()
+            );
+        }
+
         // Step 3: Discover available metrics via ListSupportedMetrics
         let available_metrics = Self::list_supported_metrics(&pool, &service_name, channel.clone())
             .await
@@ -134,14 +146,34 @@ impl TpuMetricsClient {
         .context("metric RPC failed")?;
 
         let response_bytes = response.into_inner();
+        debug!(
+            "Got response for '{}': {} bytes",
+            metric_name,
+            response_bytes.len()
+        );
 
         // Decode response
         let response_msg =
             DynamicMessage::decode(self.response_desc.clone(), response_bytes.as_slice())
                 .context("failed to decode metric response")?;
 
+        // Log the decoded response structure for debugging
+        debug!(
+            "Decoded response for '{}': {}",
+            metric_name,
+            format_dynamic_message(&response_msg)
+        );
+
         // Extract per-device values from the response
         let device_values = Self::extract_device_values(&response_msg);
+        if device_values.is_empty() {
+            warn!(
+                "No device values extracted from response for '{}'. \
+                 Response fields: {}",
+                metric_name,
+                format_dynamic_message(&response_msg)
+            );
+        }
 
         Ok(MetricResult {
             metric_name: metric_name.to_string(),
@@ -395,10 +427,17 @@ impl TpuMetricsClient {
         for field in response.descriptor().fields() {
             let field_name = field.name();
             if let Some(val) = response.get_field_by_name(field_name) {
+                debug!(
+                    "  field '{}': type={}",
+                    field_name,
+                    format_value_type(val.as_ref())
+                );
                 match val.as_ref() {
                     Value::List(list) => {
+                        debug!("    list field '{}' has {} items", field_name, list.len());
                         for (i, item) in list.iter().enumerate() {
                             if let Value::Message(msg) = item {
+                                debug!("      item[{}]: {}", i, format_dynamic_message(msg));
                                 let device_id = Self::extract_int_field(
                                     msg,
                                     &["device_id", "device_ordinal", "chip_id"],
@@ -410,7 +449,18 @@ impl TpuMetricsClient {
                                     &["value", "metric_value", "duty_cycle", "usage", "percent"],
                                 ) {
                                     values.push(DeviceMetricValue { device_id, value });
+                                } else {
+                                    debug!(
+                                        "      item[{}]: no float value found in known field names",
+                                        i
+                                    );
                                 }
+                            } else {
+                                debug!(
+                                    "      item[{}]: not a message, type={}",
+                                    i,
+                                    format_value_type(item)
+                                );
                             }
                         }
                         if !values.is_empty() {
@@ -492,5 +542,68 @@ impl TpuMetricsClient {
             }
         }
         None
+    }
+}
+
+/// Format a DynamicMessage for debug logging, showing field names and values.
+fn format_dynamic_message(msg: &DynamicMessage) -> String {
+    let mut parts = Vec::new();
+    for field in msg.descriptor().fields() {
+        let name = field.name();
+        if let Some(val) = msg.get_field_by_name(name) {
+            parts.push(format!("{}={}", name, format_value_brief(val.as_ref())));
+        }
+    }
+    if parts.is_empty() {
+        format!("{{}} (type: {})", msg.descriptor().full_name())
+    } else {
+        format!("{{{}}}", parts.join(", "))
+    }
+}
+
+/// Format a Value type name for debug logging.
+fn format_value_type(val: &Value) -> &'static str {
+    match val {
+        Value::Bool(_) => "bool",
+        Value::I32(_) => "i32",
+        Value::I64(_) => "i64",
+        Value::U32(_) => "u32",
+        Value::U64(_) => "u64",
+        Value::F32(_) => "f32",
+        Value::F64(_) => "f64",
+        Value::String(_) => "string",
+        Value::Bytes(_) => "bytes",
+        Value::EnumNumber(_) => "enum",
+        Value::Message(_) => "message",
+        Value::List(_) => "list",
+        Value::Map(_) => "map",
+    }
+}
+
+/// Format a Value briefly for debug logging.
+fn format_value_brief(val: &Value) -> String {
+    match val {
+        Value::Bool(v) => format!("{}", v),
+        Value::I32(v) => format!("{}", v),
+        Value::I64(v) => format!("{}", v),
+        Value::U32(v) => format!("{}", v),
+        Value::U64(v) => format!("{}", v),
+        Value::F32(v) => format!("{}", v),
+        Value::F64(v) => format!("{}", v),
+        Value::String(v) => {
+            if v.len() > 50 {
+                format!("\"{}...\"", &v[..50])
+            } else {
+                format!("\"{}\"", v)
+            }
+        }
+        Value::Bytes(v) => format!("<{} bytes>", v.len()),
+        Value::EnumNumber(v) => format!("enum({})", v),
+        Value::Message(msg) => {
+            let field_count = msg.descriptor().fields().len();
+            format!("<{} with {} fields>", msg.descriptor().name(), field_count)
+        }
+        Value::List(list) => format!("[{} items]", list.len()),
+        Value::Map(map) => format!("{{{}}} entries", map.len()),
     }
 }
