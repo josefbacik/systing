@@ -14,6 +14,18 @@ use std::path::Path;
 use anyhow::{bail, Result};
 use tracing::{debug, info, warn};
 
+/// Result of service discovery, including namespace information.
+#[derive(Debug, Clone)]
+pub struct DiscoveredService {
+    /// Address to connect to (host:port).
+    pub addr: String,
+    /// PID whose network namespace contains the service.
+    /// `None` means the service is in the host namespace.
+    /// When `Some`, the caller should `setns` into `/proc/{pid}/ns/net`
+    /// before connecting.
+    pub namespace_pid: Option<u32>,
+}
+
 /// The well-known port used by the XLA/TPU runtime's profiler service.
 pub const TPU_PROFILER_PORT: u16 = 8466;
 
@@ -30,10 +42,48 @@ pub fn discover_profiler_service() -> Result<Option<String>> {
 
 /// Discover the TPU metrics service address by scanning for listeners on port 8431.
 ///
-/// Returns `Some(addr)` if exactly one listener is found, `None` if no listeners are found.
-/// Returns an error if multiple listeners are found (user must specify `--tpu-metrics-addr`).
-pub fn discover_metrics_service() -> Result<Option<String>> {
-    discover_service_on_port(TPU_METRICS_PORT, "TPU metrics")
+/// Returns `Some(DiscoveredService)` if exactly one listener is found.
+/// The result includes namespace info so the caller can `setns` if needed.
+pub fn discover_metrics_service() -> Result<Option<DiscoveredService>> {
+    match discover_service_on_port(TPU_METRICS_PORT, "TPU metrics")? {
+        Some(addr) => {
+            // Check if this came from a non-host namespace by re-checking
+            // whether port 8431 is in the host namespace
+            let host_has_port = [Path::new("/proc/net/tcp"), Path::new("/proc/net/tcp6")]
+                .iter()
+                .any(|p| {
+                    scan_proc_net_tcp(p, TPU_METRICS_PORT)
+                        .map(|(addrs, _)| !addrs.is_empty())
+                        .unwrap_or(false)
+                });
+            if host_has_port {
+                Ok(Some(DiscoveredService {
+                    addr,
+                    namespace_pid: None,
+                }))
+            } else {
+                // Service is in a non-host namespace. Find which PID's namespace has it.
+                let ns_pid = find_namespace_pid_for_port(TPU_METRICS_PORT);
+                if let Some(pid) = ns_pid {
+                    info!(
+                        "TPU metrics service in non-host namespace (accessible via PID {}), will use setns",
+                        pid
+                    );
+                    Ok(Some(DiscoveredService {
+                        addr: format!("127.0.0.1:{}", TPU_METRICS_PORT),
+                        namespace_pid: Some(pid),
+                    }))
+                } else {
+                    // Couldn't determine namespace PID, use discovered addr as-is
+                    Ok(Some(DiscoveredService {
+                        addr,
+                        namespace_pid: None,
+                    }))
+                }
+            }
+        }
+        None => Ok(None),
+    }
 }
 
 /// Shared discovery logic: scan `/proc/net/tcp` (and network namespaces)
@@ -48,7 +98,7 @@ fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<Stri
     // Scan host /proc/net/tcp first — this covers the host network namespace
     for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
         let p = Path::new(path);
-        match scan_proc_net_tcp(p, port, true) {
+        match scan_proc_net_tcp(p, port) {
             Ok((found, listener_count)) => {
                 total_listeners_scanned += listener_count;
                 total_namespaces_scanned += 1;
@@ -106,7 +156,7 @@ fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<Stri
 
                 for suffix in &["net/tcp", "net/tcp6"] {
                     let tcp_path = entry.path().join(suffix);
-                    match scan_proc_net_tcp(&tcp_path, port, false) {
+                    match scan_proc_net_tcp(&tcp_path, port) {
                         Ok((found, listener_count)) => {
                             total_listeners_scanned += listener_count;
                             if !found.is_empty() {
@@ -174,27 +224,15 @@ fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<Stri
 
 /// Scan a /proc/net/tcp file for listeners on the given port.
 ///
-/// `is_host_ns` indicates whether this is the host network namespace.
-/// When false (container/pod namespace), a service listening on 0.0.0.0/::
-/// cannot be reached via 127.0.0.1 from the host. In that case, we infer a
-/// routable IP by looking at other listeners' local addresses in the same file.
-///
-/// **Limitation:** This is a heuristic that works when the container has a single
-/// routable IP and the target service listens on all interfaces (0.0.0.0). In
-/// multi-homed containers, the chosen IP may not be the one reachable from the host.
+/// Listeners on 0.0.0.0/:: are translated to 127.0.0.1 for the address string.
+/// The caller is responsible for determining reachability (e.g. via `setns` for
+/// services in non-host namespaces).
 ///
 /// Returns (matching addresses in "host:port" format, total listener count).
-fn scan_proc_net_tcp(
-    path: &Path,
-    target_port: u16,
-    is_host_ns: bool,
-) -> Result<(Vec<String>, u64)> {
+fn scan_proc_net_tcp(path: &Path, target_port: u16) -> Result<(Vec<String>, u64)> {
     let content = fs::read_to_string(path)?;
     let mut addrs = Vec::new();
     let mut listener_count = 0u64;
-    // Only track routable IPs when scanning non-host namespaces
-    let mut all_listener_ips: Vec<IpAddr> = Vec::new();
-    let mut unspecified_match = false;
 
     for line in content.lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -217,32 +255,14 @@ fn scan_proc_net_tcp(
                 "  listener: {} port {} (raw: {}) in {:?}",
                 ip, port, local_addr, path
             );
-
-            // Track non-loopback, non-unspecified IPs for routable address discovery
-            if !is_host_ns && !ip.is_unspecified() && !ip.is_loopback() {
-                all_listener_ips.push(ip);
-            }
-
             if port == target_port {
-                if ip.is_unspecified() {
-                    if is_host_ns {
-                        // Host namespace: 0.0.0.0 -> use loopback
-                        let host = format!("127.0.0.1:{}", port);
-                        info!("Match! listener: {} (from {:?})", host, path);
-                        addrs.push(host);
-                    } else {
-                        // Non-host namespace: need to find a routable IP (resolved below)
-                        unspecified_match = true;
-                        debug!(
-                            "Match on {}:{} in non-host namespace, will resolve routable IP",
-                            ip, port
-                        );
-                    }
+                let host = if ip.is_unspecified() {
+                    format!("127.0.0.1:{}", port)
                 } else {
-                    let host = format!("{}:{}", ip, port);
-                    info!("Match! listener: {} (from {:?})", host, path);
-                    addrs.push(host);
-                }
+                    format!("{}:{}", ip, port)
+                };
+                info!("Match! listener: {} (from {:?})", host, path);
+                addrs.push(host);
             }
         } else {
             debug!(
@@ -252,31 +272,47 @@ fn scan_proc_net_tcp(
         }
     }
 
-    // For non-host namespaces listening on the unspecified address, find a routable IP.
-    // If a specific-IP match was also found, it takes precedence (addrs won't be empty).
-    if unspecified_match && addrs.is_empty() {
-        // Heuristic: use the first non-loopback IP seen on any listener in this namespace.
-        // This works for typical single-IP containers (e.g. TPU pods).
-        if let Some(routable_ip) = all_listener_ips.first() {
-            let host = format!("{}:{}", routable_ip, target_port);
-            info!(
-                "Resolved unspecified:{} to routable address {} (from {:?})",
-                target_port, host, path
-            );
-            addrs.push(host);
-        } else {
-            // No routable IPs found; fall back to loopback as last resort
-            let host = format!("127.0.0.1:{}", target_port);
-            warn!(
-                "Service on unspecified:{} in non-host namespace but no routable IP found, \
-                 falling back to {} (this likely won't work)",
-                target_port, host
-            );
-            addrs.push(host);
-        }
+    Ok((addrs, listener_count))
+}
+
+/// Find a PID whose network namespace contains a listener on the given port.
+/// Used to determine which namespace to `setns` into.
+fn find_namespace_pid_for_port(port: u16) -> Option<u32> {
+    let mut seen_ns_inodes = std::collections::HashSet::new();
+
+    // Skip the host namespace
+    if let Ok(link) = fs::read_link("/proc/1/ns/net") {
+        seen_ns_inodes.insert(link);
     }
 
-    Ok((addrs, listener_count))
+    let pids = fs::read_dir("/proc").ok()?;
+    for entry in pids.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let pid: u32 = match name_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Deduplicate by namespace inode
+        let ns_path = entry.path().join("ns/net");
+        if let Ok(link) = fs::read_link(&ns_path) {
+            if !seen_ns_inodes.insert(link) {
+                continue;
+            }
+        }
+
+        // Check if this namespace has a listener on the target port
+        for suffix in &["net/tcp", "net/tcp6"] {
+            let tcp_path = entry.path().join(suffix);
+            if let Ok((found, _)) = scan_proc_net_tcp(&tcp_path, port) {
+                if !found.is_empty() {
+                    return Some(pid);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Parse a hex address from /proc/net/tcp format (e.g., "0100007F:2112").
@@ -386,55 +422,38 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_host_ns_unspecified_uses_loopback() {
+    fn test_scan_unspecified_uses_loopback() {
         let dir = tempfile::TempDir::new().unwrap();
         // 0.0.0.0:8431 listening (port 0x20EF = 8431, state 0A = LISTEN)
         let path = write_proc_net_tcp(dir.path(), &[
             "   0: 00000000:20EF 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0",
         ]);
-        let (addrs, count) = scan_proc_net_tcp(&path, 8431, true).unwrap();
+        let (addrs, count) = scan_proc_net_tcp(&path, 8431).unwrap();
         assert_eq!(count, 1);
         assert_eq!(addrs, vec!["127.0.0.1:8431"]);
     }
 
     #[test]
-    fn test_scan_container_ns_resolves_routable_ip() {
+    fn test_scan_specific_ip() {
         let dir = tempfile::TempDir::new().unwrap();
-        // Container with 0.0.0.0:8431 + another service on 10.0.1.5:9090
-        // 0A00010A = 10.0.1.10 in little-endian, port 0x2382 = 9090
+        // 10.0.1.10:8431 listening
         let path = write_proc_net_tcp(dir.path(), &[
-            "   0: 00000000:20EF 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0",
-            "   1: 0A01000A:2382 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12346 1 0000000000000000 100 0 0 10 0",
+            "   0: 0A01000A:20EF 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0",
         ]);
-        let (addrs, count) = scan_proc_net_tcp(&path, 8431, false).unwrap();
-        assert_eq!(count, 2);
-        assert_eq!(addrs, vec!["10.0.1.10:8431"]);
-    }
-
-    #[test]
-    fn test_scan_container_ns_no_routable_ip_falls_back() {
-        let dir = tempfile::TempDir::new().unwrap();
-        // Container with only 0.0.0.0:8431, no other listeners
-        let path = write_proc_net_tcp(dir.path(), &[
-            "   0: 00000000:20EF 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0",
-        ]);
-        let (addrs, count) = scan_proc_net_tcp(&path, 8431, false).unwrap();
+        let (addrs, count) = scan_proc_net_tcp(&path, 8431).unwrap();
         assert_eq!(count, 1);
-        // Falls back to 127.0.0.1 (with a warning)
-        assert_eq!(addrs, vec!["127.0.0.1:8431"]);
+        assert_eq!(addrs, vec!["10.0.1.10:8431"]);
     }
 
     #[test]
-    fn test_scan_container_ns_specific_ip_takes_precedence() {
+    fn test_scan_no_match() {
         let dir = tempfile::TempDir::new().unwrap();
-        // Container with both 0.0.0.0:8431 and 10.0.1.10:8431
+        // Listener on port 9090, not 8431
         let path = write_proc_net_tcp(dir.path(), &[
-            "   0: 00000000:20EF 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0",
-            "   1: 0A01000A:20EF 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12346 1 0000000000000000 100 0 0 10 0",
+            "   0: 00000000:2382 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0",
         ]);
-        let (addrs, count) = scan_proc_net_tcp(&path, 8431, false).unwrap();
-        assert_eq!(count, 2);
-        // Specific IP match takes precedence over 0.0.0.0 resolution
-        assert_eq!(addrs, vec!["10.0.1.10:8431"]);
+        let (addrs, count) = scan_proc_net_tcp(&path, 8431).unwrap();
+        assert_eq!(count, 1); // 1 listener scanned
+        assert!(addrs.is_empty()); // but no match on our port
     }
 }

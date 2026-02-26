@@ -4,6 +4,7 @@
 //! receives metric values from a polling thread, and writes them as
 //! `TpuMetricRecord` rows.
 
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,7 +98,39 @@ pub fn run_tpu_metrics_thread(
     poll_interval_ms: u64,
     shutdown: Arc<AtomicBool>,
     recorder: Arc<crate::session_recorder::SessionRecorder>,
+    namespace_pid: Option<u32>,
 ) -> i32 {
+    // If the service is in a different network namespace, switch this thread into it.
+    // setns only affects the calling thread, so the rest of systing stays in the host namespace.
+    //
+    // Note: There is a TOCTOU race between discovery (which found the PID) and this
+    // setns call. If the container exits and the PID is recycled, we could enter the
+    // wrong namespace. This is safe because the subsequent connection to 127.0.0.1:port
+    // would simply fail.
+    if let Some(pid) = namespace_pid {
+        let ns_path = format!("/proc/{}/ns/net", pid);
+        let fd = match std::fs::File::open(&ns_path) {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to open namespace {}: {:#}", ns_path, e);
+                return 1;
+            }
+        };
+        // SAFETY: fd is a valid open file descriptor to a namespace file.
+        let ret = unsafe { libc::setns(fd.as_raw_fd(), libc::CLONE_NEWNET) };
+        if ret != 0 {
+            error!(
+                "setns to {} failed: {}",
+                ns_path,
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        info!(
+            "Entered network namespace (via PID {}) for TPU metrics",
+            pid
+        );
+    }
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

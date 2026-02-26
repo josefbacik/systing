@@ -2788,33 +2788,44 @@ pub fn systing(
         // Start TPU metrics polling thread if enabled
         let mut tpu_metrics_thread = None;
         if opts.tpu_metrics {
-            let metrics_addr = opts.tpu_metrics_addr.clone().or_else(|| {
+            let discovered = if let Some(addr) = opts.tpu_metrics_addr.clone() {
+                // User-specified address: assume host namespace (no setns needed)
+                Some(crate::tpu::discovery::DiscoveredService {
+                    addr,
+                    namespace_pid: None,
+                })
+            } else {
                 match crate::tpu::discovery::discover_metrics_service() {
-                    Ok(addr) => addr,
+                    Ok(svc) => svc,
                     Err(e) => {
                         eprintln!("TPU metrics service discovery failed: {:#}", e);
                         None
                     }
                 }
-            });
+            };
 
-            if let Some(addr) = metrics_addr {
+            if let Some(svc) = discovered {
                 let poll_interval_ms = opts.tpu_metrics_interval;
                 let shutdown_clone = shutdown_signal.clone();
                 let recorder_clone = recorder.clone();
+                let ns_info = svc
+                    .namespace_pid
+                    .map(|pid| format!(" (via setns PID {})", pid))
+                    .unwrap_or_default();
                 eprintln!(
-                    "Starting TPU metrics polling from {} every {}ms...",
-                    addr, poll_interval_ms
+                    "Starting TPU metrics polling from {}{} every {}ms...",
+                    svc.addr, ns_info, poll_interval_ms
                 );
                 tpu_metrics_thread = Some(
                     thread::Builder::new()
                         .name("tpu_metrics".to_string())
                         .spawn(move || {
                             crate::tpu::metrics_recorder::run_tpu_metrics_thread(
-                                &addr,
+                                &svc.addr,
                                 poll_interval_ms,
                                 shutdown_clone,
                                 recorder_clone,
+                                svc.namespace_pid,
                             )
                         })?,
                 );
