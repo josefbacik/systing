@@ -465,3 +465,14 @@ pub fn tpu_counter_schema() -> Arc<Schema> {
         Field::new("ici_bandwidth_utilization", DataType::Float64, false),
     ]))
 }
+
+/// Schema for tpu_metric.parquet
+pub fn tpu_metric_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("device_id", DataType::Int32, false),
+        Field::new("metric_name", DataType::Utf8, false),
+        Field::new("value", DataType::Float64, false),
+    ]))
+}

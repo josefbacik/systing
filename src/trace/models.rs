@@ -495,8 +495,8 @@ pub struct ExtractedData {
     pub tpu_ops: Vec<TpuOpRecord>,
     pub tpu_steps: Vec<TpuStepRecord>,
     pub tpu_counters: Vec<TpuCounterRecord>,
+    pub tpu_metrics: Vec<TpuMetricRecord>,
 }
-
 // TPU profiling records
 
 /// TPU device metadata record.
@@ -566,4 +566,18 @@ pub struct TpuCounterRecord {
     pub xlu_utilization: f64,
     pub hbm_bandwidth_utilization: f64,
     pub ici_bandwidth_utilization: f64,
+}
+
+/// TPU runtime metric record (lightweight polling from RuntimeMetricService).
+///
+/// Stores a single metric value per device per sample in a normalized format.
+/// Metric names come directly from the RuntimeMetricService, so the schema
+/// adapts automatically to new metrics without code changes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TpuMetricRecord {
+    pub id: i64,
+    pub ts: i64,
+    pub device_id: i32,
+    pub metric_name: String,
+    pub value: f64,
 }

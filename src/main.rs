@@ -89,6 +89,15 @@ struct Command {
     /// TPU profiler service address (host:port, overrides auto-discovery)
     #[arg(long)]
     tpu_service_addr: Option<String>,
+    /// Enable lightweight TPU metrics polling (port 8431, always available)
+    #[arg(long)]
+    tpu_metrics: bool,
+    /// TPU metrics service address (host:port, overrides auto-discovery)
+    #[arg(long)]
+    tpu_metrics_addr: Option<String>,
+    /// TPU metrics polling interval in milliseconds (default: 1000)
+    #[arg(long, default_value = "1000")]
+    tpu_metrics_interval: u64,
     /// List all available recorders and their default states
     #[arg(long)]
     list_recorders: bool,
@@ -151,6 +160,9 @@ impl From<Command> for Config {
             no_resolve_addresses: cmd.no_resolve_addresses,
             tpu_profile: cmd.tpu_profile,
             tpu_service_addr: cmd.tpu_service_addr,
+            tpu_metrics: cmd.tpu_metrics,
+            tpu_metrics_addr: cmd.tpu_metrics_addr,
+            tpu_metrics_interval: cmd.tpu_metrics_interval,
             output_dir: cmd.output_dir,
             output: cmd.output,
             parquet_only: cmd.parquet_only,
@@ -174,6 +186,7 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
         "network" => opts.network = enable,
         "pystacks" => opts.collect_pystacks = enable,
         "markers" => opts.markers = enable,
+        "tpu-metrics" => opts.tpu_metrics = enable,
         _ => {}
     }
 }
@@ -192,6 +205,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         opts.network = false;
         opts.collect_pystacks = false;
         opts.markers = false;
+        opts.tpu_metrics = false;
 
         // Then enable only the specified recorders
         let recorders = opts.only_recorder.clone();

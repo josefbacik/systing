@@ -23,6 +23,7 @@ pub fn run_common_validations<Q: ValidationQueries>(
     validate_required_fields(queries, config, result);
     validate_schema(queries, result);
     validate_stack_timing(queries, config, result);
+    validate_tpu_metrics(queries, result);
 }
 
 /// Validate reference integrity (foreign key relationships).
@@ -267,6 +268,60 @@ fn validate_stack_timing<Q: ValidationQueries>(
         }
         Err(_) => {
             // Stack sample table is optional
+        }
+    }
+}
+
+/// Validate TPU metric data integrity.
+fn validate_tpu_metrics<Q: ValidationQueries>(queries: &mut Q, result: &mut ValidationResult) {
+    match queries.check_tpu_metrics() {
+        Ok(Some(check)) => {
+            if check.bad_timestamp_count > 0 {
+                result.add_error(ValidationError::InvalidValue {
+                    table: "tpu_metric".into(),
+                    column: "ts".into(),
+                    message: format!(
+                        "{} of {} rows have non-positive timestamps",
+                        check.bad_timestamp_count, check.total_count
+                    ),
+                });
+            }
+            if check.empty_name_count > 0 {
+                result.add_error(ValidationError::InvalidValue {
+                    table: "tpu_metric".into(),
+                    column: "metric_name".into(),
+                    message: format!(
+                        "{} of {} rows have empty metric_name",
+                        check.empty_name_count, check.total_count
+                    ),
+                });
+            }
+            if check.non_finite_value_count > 0 {
+                result.add_error(ValidationError::InvalidValue {
+                    table: "tpu_metric".into(),
+                    column: "value".into(),
+                    message: format!(
+                        "{} of {} rows have non-finite values (NaN/Inf)",
+                        check.non_finite_value_count, check.total_count
+                    ),
+                });
+            }
+            if check.negative_device_id_count > 0 {
+                result.add_error(ValidationError::InvalidValue {
+                    table: "tpu_metric".into(),
+                    column: "device_id".into(),
+                    message: format!(
+                        "{} of {} rows have negative device_id",
+                        check.negative_device_id_count, check.total_count
+                    ),
+                });
+            }
+        }
+        Ok(None) => {
+            // Table doesn't exist or has no data - that's fine
+        }
+        Err(_) => {
+            // TPU metric table is optional, errors reading it are not fatal
         }
     }
 }

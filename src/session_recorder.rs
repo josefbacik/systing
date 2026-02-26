@@ -19,6 +19,7 @@ use crate::sched::SchedEventRecorder;
 use crate::stack_recorder::StackRecorder;
 use crate::systing_core::types::task_info;
 use crate::systing_core::SystingRecordEvent;
+use crate::tpu::metrics_recorder::TpuMetricsRecorder;
 use crate::trace::{
     ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ProcessRecord, ThreadRecord,
 };
@@ -76,6 +77,7 @@ pub struct SessionRecorder {
     pub probe_recorder: Mutex<SystingProbeRecorder>,
     pub network_recorder: Mutex<NetworkRecorder>,
     pub marker_recorder: Mutex<MarkerRecorder>,
+    pub tpu_metrics_recorder: Option<Mutex<TpuMetricsRecorder>>,
     pub process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
     pub processes: RwLock<HashMap<u64, ProtoProcess>>,
     pub threads: RwLock<HashMap<u64, ThreadDescriptor>>,
@@ -521,6 +523,7 @@ impl SessionRecorder {
         resolve_network_addresses: bool,
         marker_threshold: Option<u64>,
         marker_duration_threshold: Option<u64>,
+        tpu_metrics_enabled: bool,
     ) -> Self {
         let utid_generator = Arc::new(UtidGenerator::new());
         Self {
@@ -542,6 +545,11 @@ impl SessionRecorder {
                     .with_threshold(marker_threshold)
                     .with_duration_threshold(marker_duration_threshold),
             ),
+            tpu_metrics_recorder: if tpu_metrics_enabled {
+                Some(Mutex::new(TpuMetricsRecorder::new()))
+            } else {
+                None
+            },
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
@@ -907,6 +915,15 @@ impl SessionRecorder {
             .unwrap()
             .set_streaming_collector(Box::new(sysinfo_writer));
 
+        // Set up streaming collector for TPU metrics recorder (if enabled).
+        if let Some(ref tpu_metrics) = self.tpu_metrics_recorder {
+            let tpu_metrics_writer = StreamingParquetWriter::new(output_dir)?;
+            tpu_metrics
+                .lock()
+                .unwrap()
+                .set_streaming_collector(Box::new(tpu_metrics_writer));
+        }
+
         Ok(())
     }
 
@@ -1168,9 +1185,16 @@ impl SessionRecorder {
         }
 
         // Write TPU profiling records (if any were captured)
-        if let Some(tpu) = &tpu_recorder {
+        if let Some(tpu) = tpu_recorder {
             eprintln!("Writing TPU profiling records...");
             tpu.write_records(&mut *writer, &mut slice_id_counter)?;
+        }
+
+        // Finish TPU metrics streaming collector (if enabled)
+        if let Some(ref tpu_metrics) = self.tpu_metrics_recorder {
+            if let Some(collector) = tpu_metrics.lock().unwrap().finish()? {
+                collector.finish_boxed()?;
+            }
         }
 
         // Step 6: Finish writing and close all files
@@ -1402,6 +1426,7 @@ mod tests {
             threads: RwLock::new(HashMap::new()),
             kernel_threads: RwLock::new(HashSet::new()),
             utid_generator,
+            tpu_metrics_recorder: None,
         }
     }
 

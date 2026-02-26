@@ -59,3 +59,10 @@ Added TPU profiling tables for capturing XLA/TPU runtime profiling data.
 - `tpu_op` — Per-HLO-operation execution events (ts, dur, tpu_device_id, step_id, op_name, category, stream, flops, bytes_accessed, bytes per memory type)
 - `tpu_step` — Training step boundaries with timing breakdowns (dur_compute, dur_infeed, dur_outfeed, dur_allreduce, dur_send, dur_recv, dur_idle, dur_megacore_sync)
 - `tpu_counter` — TPU hardware performance counter samples (mxu_utilization, vector_alu_utilization, scalar_alu_utilization, xlu_utilization, hbm_bandwidth_utilization, ici_bandwidth_utilization)
+
+## Schema Version 3 (systing 1.2.0) — 2026-02-26
+
+Added lightweight TPU runtime metrics table for polling data from RuntimeMetricService (port 8431).
+
+### New tables
+- `tpu_metric` — TPU runtime metric samples in normalized name/value format (ts, device_id, metric_name, value). Adapts automatically to any metrics the RuntimeMetricService exposes.

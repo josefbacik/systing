@@ -10,7 +10,6 @@ use tracing::{error, info};
 use crate::record::RecordCollector;
 use crate::tpu::client::TpuProfilerClient;
 use crate::tpu::xspace::{self, TpuRecordData};
-use crate::trace::{TpuCounterRecord, TpuDeviceRecord, TpuOpRecord, TpuStepRecord};
 
 /// TPU profiling recorder.
 ///
@@ -78,11 +77,11 @@ impl TpuRecorder {
     /// Uses the shared ID counter to assign globally unique IDs.
     /// Returns `Ok(())` even if no TPU data was captured.
     pub fn write_records(
-        &self,
+        self,
         collector: &mut dyn RecordCollector,
         id_counter: &mut i64,
     ) -> Result<()> {
-        let records = match &self.records {
+        let records = match self.records {
             Some(r) => r,
             None => return Ok(()),
         };
@@ -94,15 +93,11 @@ impl TpuRecorder {
         let mut device_id_map: std::collections::HashMap<i64, i64> =
             std::collections::HashMap::new();
 
+        // Build ID maps first (needs original IDs), then consume records
         for device in &records.devices {
             let final_id = *id_counter;
             *id_counter += 1;
             device_id_map.insert(device.id, final_id);
-
-            collector.add_tpu_device(TpuDeviceRecord {
-                id: final_id,
-                ..device.clone()
-            })?;
         }
 
         let mut step_id_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
@@ -110,46 +105,43 @@ impl TpuRecorder {
             let final_id = *id_counter;
             *id_counter += 1;
             step_id_map.insert(step.id, final_id);
-            let final_device_id = device_id_map.get(&step.tpu_device_id).copied().unwrap_or(0);
-
-            collector.add_tpu_step(TpuStepRecord {
-                id: final_id,
-                tpu_device_id: final_device_id,
-                ..step.clone()
-            })?;
         }
 
-        for op in &records.ops {
-            let final_id = *id_counter;
-            *id_counter += 1;
-            let final_device_id = device_id_map.get(&op.tpu_device_id).copied().unwrap_or(0);
-            let final_step_id = op.step_id.and_then(|sid| step_id_map.get(&sid).copied());
-
-            collector.add_tpu_op(TpuOpRecord {
-                id: final_id,
-                tpu_device_id: final_device_id,
-                step_id: final_step_id,
-                ..op.clone()
-            })?;
+        // Now consume and write, moving records instead of cloning
+        for mut device in records.devices {
+            let final_id = device_id_map[&device.id];
+            device.id = final_id;
+            collector.add_tpu_device(device)?;
         }
 
-        for counter in &records.counters {
+        for mut step in records.steps {
+            let final_id = step_id_map[&step.id];
+            step.id = final_id;
+            step.tpu_device_id = device_id_map.get(&step.tpu_device_id).copied().unwrap_or(0);
+            collector.add_tpu_step(step)?;
+        }
+
+        for mut op in records.ops {
             let final_id = *id_counter;
             *id_counter += 1;
-            let final_device_id = device_id_map
+            op.id = final_id;
+            op.tpu_device_id = device_id_map.get(&op.tpu_device_id).copied().unwrap_or(0);
+            op.step_id = op.step_id.and_then(|sid| step_id_map.get(&sid).copied());
+            collector.add_tpu_op(op)?;
+        }
+
+        for mut counter in records.counters {
+            let final_id = *id_counter;
+            *id_counter += 1;
+            counter.id = final_id;
+            counter.tpu_device_id = device_id_map
                 .get(&counter.tpu_device_id)
                 .copied()
                 .unwrap_or(0);
-            let final_step_id = counter
+            counter.step_id = counter
                 .step_id
                 .and_then(|sid| step_id_map.get(&sid).copied());
-
-            collector.add_tpu_counter(TpuCounterRecord {
-                id: final_id,
-                tpu_device_id: final_device_id,
-                step_id: final_step_id,
-                ..counter.clone()
-            })?;
+            collector.add_tpu_counter(counter)?;
         }
 
         Ok(())
@@ -160,6 +152,10 @@ impl TpuRecorder {
 ///
 /// Returns `boottime_ns - realtime_ns`. Add this to any CLOCK_REALTIME timestamp
 /// to convert it to CLOCK_BOOTTIME.
+///
+/// Note: This duplicates the `clock_gettime` call from `session_recorder::get_clock_value`
+/// because we need both clocks read atomically and `get_clock_value` silently returns 0
+/// on failure, which would produce a wrong offset.
 fn compute_clock_offset() -> Result<i64> {
     let mut boottime = libc::timespec {
         tv_sec: 0,

@@ -12,7 +12,7 @@ use crate::trace::{
     NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord,
     SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord,
     StackSampleRecord, SysInfoRecord, ThreadRecord, ThreadStateRecord, TpuCounterRecord,
-    TpuDeviceRecord, TpuOpRecord, TpuStepRecord, TrackRecord, WakeupNewRecord,
+    TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TpuStepRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Trait for collecting trace records during recording.
@@ -119,6 +119,9 @@ pub trait RecordCollector {
 
     /// Add a TPU hardware counter sample record.
     fn add_tpu_counter(&mut self, record: TpuCounterRecord) -> Result<()>;
+
+    /// Add a TPU runtime metric record.
+    fn add_tpu_metric(&mut self, record: TpuMetricRecord) -> Result<()>;
 
     /// Flush any buffered records to storage.
     fn flush(&mut self) -> Result<()>;
@@ -303,6 +306,11 @@ impl RecordCollector for InMemoryCollector {
 
     fn add_tpu_counter(&mut self, record: TpuCounterRecord) -> Result<()> {
         self.data.tpu_counters.push(record);
+        Ok(())
+    }
+
+    fn add_tpu_metric(&mut self, record: TpuMetricRecord) -> Result<()> {
+        self.data.tpu_metrics.push(record);
         Ok(())
     }
 

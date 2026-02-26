@@ -184,6 +184,11 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             description: "TPU profiling (gRPC to XLA runtime profiler service)",
             default_enabled: false,
         },
+        RecorderInfo {
+            name: "tpu-metrics",
+            description: "TPU runtime metrics polling (port 8431, always available)",
+            default_enabled: false,
+        },
     ]
 }
 
@@ -267,6 +272,12 @@ pub struct Config {
     pub tpu_profile: bool,
     /// TPU profiler service address (overrides auto-discovery)
     pub tpu_service_addr: Option<String>,
+    /// Enable lightweight TPU metrics polling (port 8431)
+    pub tpu_metrics: bool,
+    /// TPU metrics service address (overrides auto-discovery)
+    pub tpu_metrics_addr: Option<String>,
+    /// TPU metrics polling interval in milliseconds
+    pub tpu_metrics_interval: u64,
     /// Output directory for parquet files
     pub output_dir: PathBuf,
     /// Output path (format auto-detected from extension: .pb = Perfetto, .duckdb = DuckDB)
@@ -309,6 +320,9 @@ impl Default for Config {
             no_resolve_addresses: false,
             tpu_profile: false,
             tpu_service_addr: None,
+            tpu_metrics: false,
+            tpu_metrics_addr: None,
+            tpu_metrics_interval: 1000,
             output_dir: PathBuf::from("./traces"),
             output: PathBuf::from("trace.pb"),
             parquet_only: false,
@@ -2193,6 +2207,7 @@ struct ThreadHandles {
     discovery_thread: thread::JoinHandle<i32>,
     symbol_loader_thread: thread::JoinHandle<i32>,
     exec_handler_thread: Option<thread::JoinHandle<()>>,
+    tpu_metrics_thread: Option<thread::JoinHandle<i32>>,
     task_info_tx: Sender<task_info>,
     pystack_symbol_tx: Sender<stack_event>,
 }
@@ -2303,6 +2318,9 @@ fn run_tracing_loop(
     if let Some(thread) = handles.sysinfo_thread {
         thread.join().expect("Failed to join sysinfo thread");
     }
+    if let Some(thread) = handles.tpu_metrics_thread {
+        thread.join().expect("Failed to join TPU metrics thread");
+    }
     for thread in handles.recorder_threads {
         thread.join().expect("Failed to join receiver thread");
     }
@@ -2366,6 +2384,7 @@ pub fn systing(
         !opts.no_resolve_addresses,
         opts.marker_threshold,
         opts.marker_duration_threshold,
+        opts.tpu_metrics,
     ));
     configure_recorder(&opts, &recorder);
     recorder.snapshot_clocks();
@@ -2766,6 +2785,42 @@ pub fn systing(
             }
         }
 
+        // Start TPU metrics polling thread if enabled
+        let mut tpu_metrics_thread = None;
+        if opts.tpu_metrics {
+            let metrics_addr = opts.tpu_metrics_addr.clone().or_else(|| {
+                match crate::tpu::discovery::discover_metrics_service() {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        eprintln!("TPU metrics service discovery failed: {:#}", e);
+                        None
+                    }
+                }
+            });
+
+            if let Some(addr) = metrics_addr {
+                let poll_interval_ms = opts.tpu_metrics_interval;
+                let shutdown_clone = shutdown_signal.clone();
+                let recorder_clone = recorder.clone();
+                eprintln!(
+                    "Starting TPU metrics polling from {} every {}ms...",
+                    addr, poll_interval_ms
+                );
+                tpu_metrics_thread = Some(
+                    thread::Builder::new()
+                        .name("tpu_metrics".to_string())
+                        .spawn(move || {
+                            crate::tpu::metrics_recorder::run_tpu_metrics_thread(
+                                &addr,
+                                poll_interval_ms,
+                                shutdown_clone,
+                                recorder_clone,
+                            )
+                        })?,
+                );
+            }
+        }
+
         let handles = ThreadHandles {
             ringbuf_threads,
             sysinfo_thread,
@@ -2775,6 +2830,7 @@ pub fn systing(
             exec_handler_thread,
             task_info_tx,
             pystack_symbol_tx,
+            tpu_metrics_thread,
         };
 
         run_tracing_loop(

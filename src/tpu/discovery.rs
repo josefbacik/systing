@@ -1,7 +1,9 @@
-//! Auto-discovery of TPU profiler service on port 8466.
+//! Auto-discovery of TPU services by scanning for listeners on well-known ports.
 //!
-//! Scans `/proc/net/tcp` (and network namespaces) for listeners on the
-//! well-known TPU profiler service port.
+//! - Port 8466: XLA/TPU runtime profiler service
+//! - Port 8431: TPU RuntimeMetricService (lightweight metrics)
+//!
+//! Scans `/proc/net/tcp` (and network namespaces) for listeners on these ports.
 //!
 //! Use `-v` (info) or `-vv` (debug) to see discovery diagnostics.
 
@@ -15,15 +17,29 @@ use tracing::{debug, info, warn};
 /// The well-known port used by the XLA/TPU runtime's profiler service.
 pub const TPU_PROFILER_PORT: u16 = 8466;
 
+/// The well-known port used by the TPU RuntimeMetricService.
+pub const TPU_METRICS_PORT: u16 = 8431;
+
 /// Discover the TPU profiler service address by scanning for listeners on port 8466.
 ///
 /// Returns `Some(addr)` if exactly one listener is found, `None` if no listeners are found.
 /// Returns an error if multiple listeners are found (user must specify `--tpu-service-addr`).
 pub fn discover_profiler_service() -> Result<Option<String>> {
-    info!(
-        "Searching for TPU profiler service on port {}...",
-        TPU_PROFILER_PORT
-    );
+    discover_service_on_port(TPU_PROFILER_PORT, "TPU profiler")
+}
+
+/// Discover the TPU metrics service address by scanning for listeners on port 8431.
+///
+/// Returns `Some(addr)` if exactly one listener is found, `None` if no listeners are found.
+/// Returns an error if multiple listeners are found (user must specify `--tpu-metrics-addr`).
+pub fn discover_metrics_service() -> Result<Option<String>> {
+    discover_service_on_port(TPU_METRICS_PORT, "TPU metrics")
+}
+
+/// Shared discovery logic: scan `/proc/net/tcp` (and network namespaces)
+/// for listeners on the given port.
+fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<String>> {
+    info!("Searching for {} service on port {}...", service_name, port);
 
     let mut addrs = Vec::new();
     let mut total_listeners_scanned = 0u64;
@@ -32,7 +48,7 @@ pub fn discover_profiler_service() -> Result<Option<String>> {
     // Scan host /proc/net/tcp first — this covers the host network namespace
     for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
         let p = Path::new(path);
-        match scan_proc_net_tcp(p) {
+        match scan_proc_net_tcp(p, port) {
             Ok((found, listener_count)) => {
                 total_listeners_scanned += listener_count;
                 total_namespaces_scanned += 1;
@@ -42,7 +58,7 @@ pub fn discover_profiler_service() -> Result<Option<String>> {
                 } else {
                     debug!(
                         "{}: scanned {} listeners, no match on port {}",
-                        path, listener_count, TPU_PROFILER_PORT
+                        path, listener_count, port
                     );
                 }
             }
@@ -53,8 +69,6 @@ pub fn discover_profiler_service() -> Result<Option<String>> {
     }
 
     // Only scan per-PID network namespaces if the host scan found nothing.
-    // Most processes share the host network namespace, so per-PID scanning
-    // is only useful for finding listeners in other network namespaces (e.g., pods).
     if addrs.is_empty() {
         info!("No match in host netns, scanning other network namespaces...");
         let mut seen_ns_inodes = std::collections::HashSet::new();
@@ -84,7 +98,7 @@ pub fn discover_profiler_service() -> Result<Option<String>> {
                 if let Ok(link) = fs::read_link(&ns_path) {
                     if !seen_ns_inodes.insert(link) {
                         namespaces_skipped += 1;
-                        continue; // Already scanned this network namespace
+                        continue;
                     }
                 }
 
@@ -92,7 +106,7 @@ pub fn discover_profiler_service() -> Result<Option<String>> {
 
                 for suffix in &["net/tcp", "net/tcp6"] {
                     let tcp_path = entry.path().join(suffix);
-                    match scan_proc_net_tcp(&tcp_path) {
+                    match scan_proc_net_tcp(&tcp_path, port) {
                         Ok((found, listener_count)) => {
                             total_listeners_scanned += listener_count;
                             if !found.is_empty() {
@@ -130,45 +144,43 @@ pub fn discover_profiler_service() -> Result<Option<String>> {
 
     info!(
         "Discovery complete: {} total listeners scanned across {} namespace(s), {} match(es) on port {}",
-        total_listeners_scanned, total_namespaces_scanned, addrs.len(), TPU_PROFILER_PORT
+        total_listeners_scanned, total_namespaces_scanned, addrs.len(), port
     );
 
     match addrs.len() {
         0 => {
             warn!(
-                "No TPU profiler service detected on port {}. Is a TPU workload running?",
-                TPU_PROFILER_PORT
+                "No {} service detected on port {}. Is a TPU workload running?",
+                service_name, port
             );
             Ok(None)
         }
         1 => {
             let addr = &addrs[0];
-            info!("Discovered TPU profiler service at {}", addr);
+            info!("Discovered {} service at {}", service_name, addr);
             Ok(Some(addr.clone()))
         }
         _ => {
             bail!(
-                "Multiple TPU profiler service listeners found on port {}: {}. \
-                 Please specify --tpu-service-addr to select one.",
-                TPU_PROFILER_PORT,
+                "Multiple {} service listeners found on port {}: {}. \
+                 Please specify the address explicitly.",
+                service_name,
+                port,
                 addrs.join(", ")
             );
         }
     }
 }
 
-/// Scan a /proc/net/tcp file for listeners on the TPU profiler port.
+/// Scan a /proc/net/tcp file for listeners on the given port.
 ///
 /// Returns (matching addresses in "host:port" format, total listener count).
-fn scan_proc_net_tcp(path: &Path) -> Result<(Vec<String>, u64)> {
+fn scan_proc_net_tcp(path: &Path, target_port: u16) -> Result<(Vec<String>, u64)> {
     let content = fs::read_to_string(path)?;
     let mut addrs = Vec::new();
     let mut listener_count = 0u64;
 
     for line in content.lines().skip(1) {
-        // Format: sl local_address rem_address st ...
-        // local_address is hex_ip:hex_port
-        // st: 0A = TCP_LISTEN
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 4 {
             continue;
@@ -177,6 +189,7 @@ fn scan_proc_net_tcp(path: &Path) -> Result<(Vec<String>, u64)> {
         let local_addr = fields[1];
         let state = fields[3];
 
+        // 0A = TCP_LISTEN
         if state != "0A" {
             continue;
         }
@@ -188,14 +201,13 @@ fn scan_proc_net_tcp(path: &Path) -> Result<(Vec<String>, u64)> {
                 "  listener: {} port {} (raw: {}) in {:?}",
                 ip, port, local_addr, path
             );
-            if port == TPU_PROFILER_PORT {
+            if port == target_port {
                 let host = if ip.is_unspecified() {
-                    // Listening on 0.0.0.0 / :: — connect via loopback
                     format!("127.0.0.1:{}", port)
                 } else {
                     format!("{}:{}", ip, port)
                 };
-                info!("Match! TPU profiler listener: {} (from {:?})", host, path);
+                info!("Match! listener: {} (from {:?})", host, path);
                 addrs.push(host);
             }
         } else {

@@ -51,6 +51,7 @@ pub struct ParquetPaths {
     pub tpu_op: PathBuf,
     pub tpu_step: PathBuf,
     pub tpu_counter: PathBuf,
+    pub tpu_metric: PathBuf,
 }
 
 /// Named path entry for iteration with names.
@@ -106,6 +107,7 @@ impl ParquetPaths {
             tpu_op: dir.join("tpu_op.parquet"),
             tpu_step: dir.join("tpu_step.parquet"),
             tpu_counter: dir.join("tpu_counter.parquet"),
+            tpu_metric: dir.join("tpu_metric.parquet"),
         }
     }
 
@@ -149,11 +151,12 @@ impl ParquetPaths {
             tpu_op: dir.join(format!("{trace_id}_tpu_op.parquet")),
             tpu_step: dir.join(format!("{trace_id}_tpu_step.parquet")),
             tpu_counter: dir.join(format!("{trace_id}_tpu_counter.parquet")),
+            tpu_metric: dir.join(format!("{trace_id}_tpu_metric.parquet")),
         }
     }
 
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 34] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 35] {
         [
             PathEntry {
                 path: &self.process,
@@ -291,6 +294,10 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.tpu_counter,
                 name: "tpu_counter",
+            },
+            PathEntry {
+                path: &self.tpu_metric,
+                name: "tpu_metric",
             },
         ]
     }

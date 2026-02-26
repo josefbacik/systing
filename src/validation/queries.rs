@@ -73,6 +73,12 @@ pub trait ValidationQueries {
     /// - STACK_RUNNING (1): Should be within a running slice
     /// - STACK_SLEEP_INTERRUPTIBLE (2): Should be at/near end of a sleep slice
     fn find_stack_timing_violations(&mut self, tolerance_ns: i64) -> Result<Vec<StackViolation>>;
+
+    // === TPU Metric Queries ===
+
+    /// Validate tpu_metric table data: timestamps > 0, metric_name not empty, values finite.
+    /// Returns None if the table doesn't exist, or Some(TpuMetricCheck) with results.
+    fn check_tpu_metrics(&mut self) -> Result<Option<TpuMetricCheck>>;
 }
 
 /// Result of reference integrity check - includes sample IDs for debugging.
@@ -226,4 +232,19 @@ pub struct StackViolation {
     pub event_type: i8,
     /// Description of the violation.
     pub message: String,
+}
+
+/// Result of tpu_metric data validity check.
+#[derive(Debug, Default)]
+pub struct TpuMetricCheck {
+    /// Total number of rows in the table.
+    pub total_count: i64,
+    /// Number of rows with non-positive timestamps.
+    pub bad_timestamp_count: i64,
+    /// Number of rows with empty metric_name.
+    pub empty_name_count: i64,
+    /// Number of rows with non-finite (NaN/Inf) values.
+    pub non_finite_value_count: i64,
+    /// Number of rows with negative device_id.
+    pub negative_device_id_count: i64,
 }
