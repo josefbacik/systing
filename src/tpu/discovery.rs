@@ -48,7 +48,7 @@ fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<Stri
     // Scan host /proc/net/tcp first — this covers the host network namespace
     for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
         let p = Path::new(path);
-        match scan_proc_net_tcp(p, port) {
+        match scan_proc_net_tcp(p, port, true) {
             Ok((found, listener_count)) => {
                 total_listeners_scanned += listener_count;
                 total_namespaces_scanned += 1;
@@ -106,7 +106,7 @@ fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<Stri
 
                 for suffix in &["net/tcp", "net/tcp6"] {
                     let tcp_path = entry.path().join(suffix);
-                    match scan_proc_net_tcp(&tcp_path, port) {
+                    match scan_proc_net_tcp(&tcp_path, port, false) {
                         Ok((found, listener_count)) => {
                             total_listeners_scanned += listener_count;
                             if !found.is_empty() {
@@ -174,11 +174,27 @@ fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<Stri
 
 /// Scan a /proc/net/tcp file for listeners on the given port.
 ///
+/// `is_host_ns` indicates whether this is the host network namespace.
+/// When false (container/pod namespace), a service listening on 0.0.0.0/::
+/// cannot be reached via 127.0.0.1 from the host. In that case, we infer a
+/// routable IP by looking at other listeners' local addresses in the same file.
+///
+/// **Limitation:** This is a heuristic that works when the container has a single
+/// routable IP and the target service listens on all interfaces (0.0.0.0). In
+/// multi-homed containers, the chosen IP may not be the one reachable from the host.
+///
 /// Returns (matching addresses in "host:port" format, total listener count).
-fn scan_proc_net_tcp(path: &Path, target_port: u16) -> Result<(Vec<String>, u64)> {
+fn scan_proc_net_tcp(
+    path: &Path,
+    target_port: u16,
+    is_host_ns: bool,
+) -> Result<(Vec<String>, u64)> {
     let content = fs::read_to_string(path)?;
     let mut addrs = Vec::new();
     let mut listener_count = 0u64;
+    // Only track routable IPs when scanning non-host namespaces
+    let mut all_listener_ips: Vec<IpAddr> = Vec::new();
+    let mut unspecified_match = false;
 
     for line in content.lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -201,20 +217,62 @@ fn scan_proc_net_tcp(path: &Path, target_port: u16) -> Result<(Vec<String>, u64)
                 "  listener: {} port {} (raw: {}) in {:?}",
                 ip, port, local_addr, path
             );
+
+            // Track non-loopback, non-unspecified IPs for routable address discovery
+            if !is_host_ns && !ip.is_unspecified() && !ip.is_loopback() {
+                all_listener_ips.push(ip);
+            }
+
             if port == target_port {
-                let host = if ip.is_unspecified() {
-                    format!("127.0.0.1:{}", port)
+                if ip.is_unspecified() {
+                    if is_host_ns {
+                        // Host namespace: 0.0.0.0 -> use loopback
+                        let host = format!("127.0.0.1:{}", port);
+                        info!("Match! listener: {} (from {:?})", host, path);
+                        addrs.push(host);
+                    } else {
+                        // Non-host namespace: need to find a routable IP (resolved below)
+                        unspecified_match = true;
+                        debug!(
+                            "Match on {}:{} in non-host namespace, will resolve routable IP",
+                            ip, port
+                        );
+                    }
                 } else {
-                    format!("{}:{}", ip, port)
-                };
-                info!("Match! listener: {} (from {:?})", host, path);
-                addrs.push(host);
+                    let host = format!("{}:{}", ip, port);
+                    info!("Match! listener: {} (from {:?})", host, path);
+                    addrs.push(host);
+                }
             }
         } else {
             debug!(
                 "  could not parse listener address: {} in {:?}",
                 local_addr, path
             );
+        }
+    }
+
+    // For non-host namespaces listening on the unspecified address, find a routable IP.
+    // If a specific-IP match was also found, it takes precedence (addrs won't be empty).
+    if unspecified_match && addrs.is_empty() {
+        // Heuristic: use the first non-loopback IP seen on any listener in this namespace.
+        // This works for typical single-IP containers (e.g. TPU pods).
+        if let Some(routable_ip) = all_listener_ips.first() {
+            let host = format!("{}:{}", routable_ip, target_port);
+            info!(
+                "Resolved unspecified:{} to routable address {} (from {:?})",
+                target_port, host, path
+            );
+            addrs.push(host);
+        } else {
+            // No routable IPs found; fall back to loopback as last resort
+            let host = format!("127.0.0.1:{}", target_port);
+            warn!(
+                "Service on unspecified:{} in non-host namespace but no routable IP found, \
+                 falling back to {} (this likely won't work)",
+                target_port, host
+            );
+            addrs.push(host);
         }
     }
 
@@ -311,5 +369,72 @@ mod tests {
         assert!(parse_proc_net_addr("invalid").is_none());
         assert!(parse_proc_net_addr("ZZZZZZZZ:2112").is_none());
         assert!(parse_proc_net_addr("0100007F").is_none());
+    }
+
+    /// Helper to write a synthetic /proc/net/tcp file for testing.
+    fn write_proc_net_tcp(dir: &std::path::Path, lines: &[&str]) -> std::path::PathBuf {
+        let path = dir.join("net_tcp");
+        let mut content = String::from(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+        );
+        for line in lines {
+            content.push_str(line);
+            content.push('\n');
+        }
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_scan_host_ns_unspecified_uses_loopback() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // 0.0.0.0:8431 listening (port 0x20EF = 8431, state 0A = LISTEN)
+        let path = write_proc_net_tcp(dir.path(), &[
+            "   0: 00000000:20EF 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0",
+        ]);
+        let (addrs, count) = scan_proc_net_tcp(&path, 8431, true).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(addrs, vec!["127.0.0.1:8431"]);
+    }
+
+    #[test]
+    fn test_scan_container_ns_resolves_routable_ip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Container with 0.0.0.0:8431 + another service on 10.0.1.5:9090
+        // 0A00010A = 10.0.1.10 in little-endian, port 0x2382 = 9090
+        let path = write_proc_net_tcp(dir.path(), &[
+            "   0: 00000000:20EF 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0",
+            "   1: 0A01000A:2382 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12346 1 0000000000000000 100 0 0 10 0",
+        ]);
+        let (addrs, count) = scan_proc_net_tcp(&path, 8431, false).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(addrs, vec!["10.0.1.10:8431"]);
+    }
+
+    #[test]
+    fn test_scan_container_ns_no_routable_ip_falls_back() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Container with only 0.0.0.0:8431, no other listeners
+        let path = write_proc_net_tcp(dir.path(), &[
+            "   0: 00000000:20EF 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0",
+        ]);
+        let (addrs, count) = scan_proc_net_tcp(&path, 8431, false).unwrap();
+        assert_eq!(count, 1);
+        // Falls back to 127.0.0.1 (with a warning)
+        assert_eq!(addrs, vec!["127.0.0.1:8431"]);
+    }
+
+    #[test]
+    fn test_scan_container_ns_specific_ip_takes_precedence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Container with both 0.0.0.0:8431 and 10.0.1.10:8431
+        let path = write_proc_net_tcp(dir.path(), &[
+            "   0: 00000000:20EF 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0",
+            "   1: 0A01000A:20EF 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12346 1 0000000000000000 100 0 0 10 0",
+        ]);
+        let (addrs, count) = scan_proc_net_tcp(&path, 8431, false).unwrap();
+        assert_eq!(count, 2);
+        // Specific IP match takes precedence over 0.0.0.0 resolution
+        assert_eq!(addrs, vec!["10.0.1.10:8431"]);
     }
 }
