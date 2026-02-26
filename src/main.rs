@@ -83,6 +83,12 @@ struct Command {
     /// Skip DNS resolution for network addresses (show IP addresses instead of hostnames)
     #[arg(long)]
     no_resolve_addresses: bool,
+    /// Enable TPU profiling (auto-discovers profiler service on port 8466)
+    #[arg(long)]
+    tpu_profile: bool,
+    /// TPU profiler service address (host:port, overrides auto-discovery)
+    #[arg(long)]
+    tpu_service_addr: Option<String>,
     /// List all available recorders and their default states
     #[arg(long)]
     list_recorders: bool,
@@ -143,6 +149,8 @@ impl From<Command> for Config {
             marker_duration_threshold: cmd.marker_duration_threshold,
             network: cmd.network,
             no_resolve_addresses: cmd.no_resolve_addresses,
+            tpu_profile: cmd.tpu_profile,
+            tpu_service_addr: cmd.tpu_service_addr,
             output_dir: cmd.output_dir,
             output: cmd.output,
             parquet_only: cmd.parquet_only,
@@ -161,6 +169,7 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
         "sched" => opts.no_sched = !enable,
         "sleep-stacks" => opts.no_sleep_stack_traces = !enable,
         "interruptible-stacks" => opts.no_interruptible_stack_traces = !enable,
+        "tpu" => opts.tpu_profile = enable,
         "cpu-stacks" => opts.no_cpu_stack_traces = !enable,
         "network" => opts.network = enable,
         "pystacks" => opts.collect_pystacks = enable,

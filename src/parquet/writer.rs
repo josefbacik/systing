@@ -29,7 +29,8 @@ use crate::trace::{
     InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, NetworkPacketRecord, NetworkPollRecord,
     NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord, SchedSliceRecord,
     SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord,
-    SysInfoRecord, ThreadRecord, ThreadStateRecord, TrackRecord, WakeupNewRecord,
+    SysInfoRecord, ThreadRecord, ThreadStateRecord, TpuCounterRecord, TpuDeviceRecord, TpuOpRecord,
+    TpuStepRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -76,6 +77,10 @@ pub struct StreamingParquetWriter {
     network_polls: Vec<NetworkPollRecord>,
     clock_snapshots: Vec<ClockSnapshotRecord>,
     sysinfo: Option<SysInfoRecord>,
+    tpu_devices: Vec<TpuDeviceRecord>,
+    tpu_ops: Vec<TpuOpRecord>,
+    tpu_steps: Vec<TpuStepRecord>,
+    tpu_counters: Vec<TpuCounterRecord>,
 
     // Persistent writers (created lazily on first flush, kept alive until finish)
     process_writer: Option<ArrowWriter<File>>,
@@ -103,6 +108,10 @@ pub struct StreamingParquetWriter {
     network_poll_writer: Option<ArrowWriter<File>>,
     clock_snapshot_writer: Option<ArrowWriter<File>>,
     sysinfo_writer: Option<ArrowWriter<File>>,
+    tpu_device_writer: Option<ArrowWriter<File>>,
+    tpu_op_writer: Option<ArrowWriter<File>>,
+    tpu_step_writer: Option<ArrowWriter<File>>,
+    tpu_counter_writer: Option<ArrowWriter<File>>,
 
     // Track counts for statistics
     total_records: usize,
@@ -175,6 +184,10 @@ impl StreamingParquetWriter {
             network_polls: Vec::new(),
             clock_snapshots: Vec::new(),
             sysinfo: None,
+            tpu_devices: Vec::new(),
+            tpu_ops: Vec::new(),
+            tpu_steps: Vec::new(),
+            tpu_counters: Vec::new(),
             // Writers start as None, created lazily
             process_writer: None,
             thread_writer: None,
@@ -201,6 +214,10 @@ impl StreamingParquetWriter {
             network_poll_writer: None,
             clock_snapshot_writer: None,
             sysinfo_writer: None,
+            tpu_device_writer: None,
+            tpu_op_writer: None,
+            tpu_step_writer: None,
+            tpu_counter_writer: None,
             total_records: 0,
         })
     }
@@ -757,6 +774,86 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    // Flush tpu_devices buffer
+    fn flush_tpu_devices(&mut self) -> Result<()> {
+        if self.tpu_devices.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::tpu_device_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.tpu_device_writer,
+            &self.paths.tpu_device,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_tpu_device_batch(&self.tpu_devices, &schema)?;
+        writer.write(&batch)?;
+        self.tpu_devices.clear();
+        Ok(())
+    }
+
+    // Flush tpu_ops buffer
+    fn flush_tpu_ops(&mut self) -> Result<()> {
+        if self.tpu_ops.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::tpu_op_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.tpu_op_writer,
+            &self.paths.tpu_op,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_tpu_op_batch(&self.tpu_ops, &schema)?;
+        writer.write(&batch)?;
+        self.tpu_ops.clear();
+        Ok(())
+    }
+
+    // Flush tpu_steps buffer
+    fn flush_tpu_steps(&mut self) -> Result<()> {
+        if self.tpu_steps.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::tpu_step_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.tpu_step_writer,
+            &self.paths.tpu_step,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_tpu_step_batch(&self.tpu_steps, &schema)?;
+        writer.write(&batch)?;
+        self.tpu_steps.clear();
+        Ok(())
+    }
+
+    // Flush tpu_counters buffer
+    fn flush_tpu_counters(&mut self) -> Result<()> {
+        if self.tpu_counters.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::tpu_counter_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.tpu_counter_writer,
+            &self.paths.tpu_counter,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_tpu_counter_batch(&self.tpu_counters, &schema)?;
+        writer.write(&batch)?;
+        self.tpu_counters.clear();
+        Ok(())
+    }
+
     // Close all writers, attempting to close all even if some fail
     fn close_writers(&mut self) -> Result<()> {
         let mut first_error: Option<anyhow::Error> = None;
@@ -799,6 +896,10 @@ impl StreamingParquetWriter {
         close_writer!(self.network_poll_writer);
         close_writer!(self.clock_snapshot_writer);
         close_writer!(self.sysinfo_writer);
+        close_writer!(self.tpu_device_writer);
+        close_writer!(self.tpu_op_writer);
+        close_writer!(self.tpu_step_writer);
+        close_writer!(self.tpu_counter_writer);
 
         match first_error {
             Some(e) => Err(e),
@@ -834,7 +935,11 @@ impl Drop for StreamingParquetWriter {
             || self.network_socket_writer.is_some()
             || self.network_poll_writer.is_some()
             || self.clock_snapshot_writer.is_some()
-            || self.sysinfo_writer.is_some();
+            || self.sysinfo_writer.is_some()
+            || self.tpu_device_writer.is_some()
+            || self.tpu_op_writer.is_some()
+            || self.tpu_step_writer.is_some()
+            || self.tpu_counter_writer.is_some();
 
         if has_open_writers {
             eprintln!(
@@ -1080,6 +1185,34 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn add_tpu_device(&mut self, record: TpuDeviceRecord) -> Result<()> {
+        self.tpu_devices.push(record);
+        self.total_records += 1;
+        Ok(())
+    }
+
+    fn add_tpu_op(&mut self, record: TpuOpRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.tpu_ops, self.batch_size);
+        self.tpu_ops.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.tpu_ops, self.batch_size) {
+            self.flush_tpu_ops()?;
+        }
+        Ok(())
+    }
+
+    fn add_tpu_step(&mut self, record: TpuStepRecord) -> Result<()> {
+        self.tpu_steps.push(record);
+        self.total_records += 1;
+        Ok(())
+    }
+
+    fn add_tpu_counter(&mut self, record: TpuCounterRecord) -> Result<()> {
+        self.tpu_counters.push(record);
+        self.total_records += 1;
+        Ok(())
+    }
+
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()> {
         self.sysinfo = Some(record);
         self.total_records += 1;
@@ -1112,6 +1245,10 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_network_polls()?;
         self.flush_clock_snapshots()?;
         self.flush_sysinfo()?;
+        self.flush_tpu_devices()?;
+        self.flush_tpu_ops()?;
+        self.flush_tpu_steps()?;
+        self.flush_tpu_counters()?;
         Ok(())
     }
 
@@ -2021,6 +2158,207 @@ fn build_network_poll_batch(
             Arc::new(socket_id_builder.finish()),
             Arc::new(requested_events_builder.finish()),
             Arc::new(returned_events_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_tpu_device_batch(
+    records: &[TpuDeviceRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut id_builder = Int64Builder::with_capacity(records.len());
+    let mut device_ordinal_builder = Int32Builder::with_capacity(records.len());
+    let mut chip_id_builder = Int32Builder::with_capacity(records.len());
+    let mut core_id_builder = Int32Builder::with_capacity(records.len());
+    let mut hostname_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
+    let mut device_type_builder = StringBuilder::with_capacity(records.len(), records.len() * 16);
+    let mut topology_x_builder = Int32Builder::with_capacity(records.len());
+    let mut topology_y_builder = Int32Builder::with_capacity(records.len());
+    let mut topology_z_builder = Int32Builder::with_capacity(records.len());
+    let mut clock_rate_ghz_builder = Float64Builder::with_capacity(records.len());
+    let mut hbm_size_bytes_builder = Int64Builder::with_capacity(records.len());
+    let mut hbm_bandwidth_gbps_builder = Float64Builder::with_capacity(records.len());
+
+    for record in records {
+        id_builder.append_value(record.id);
+        device_ordinal_builder.append_value(record.device_ordinal);
+        chip_id_builder.append_value(record.chip_id);
+        core_id_builder.append_value(record.core_id);
+        hostname_builder.append_value(&record.hostname);
+        device_type_builder.append_value(&record.device_type);
+        topology_x_builder.append_value(record.topology_x);
+        topology_y_builder.append_value(record.topology_y);
+        topology_z_builder.append_value(record.topology_z);
+        clock_rate_ghz_builder.append_value(record.clock_rate_ghz);
+        hbm_size_bytes_builder.append_value(record.hbm_size_bytes);
+        hbm_bandwidth_gbps_builder.append_value(record.hbm_bandwidth_gbps);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_builder.finish()),
+            Arc::new(device_ordinal_builder.finish()),
+            Arc::new(chip_id_builder.finish()),
+            Arc::new(core_id_builder.finish()),
+            Arc::new(hostname_builder.finish()),
+            Arc::new(device_type_builder.finish()),
+            Arc::new(topology_x_builder.finish()),
+            Arc::new(topology_y_builder.finish()),
+            Arc::new(topology_z_builder.finish()),
+            Arc::new(clock_rate_ghz_builder.finish()),
+            Arc::new(hbm_size_bytes_builder.finish()),
+            Arc::new(hbm_bandwidth_gbps_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_tpu_op_batch(records: &[TpuOpRecord], schema: &Arc<Schema>) -> Result<RecordBatch> {
+    let mut id_builder = Int64Builder::with_capacity(records.len());
+    let mut tpu_device_id_builder = Int64Builder::with_capacity(records.len());
+    let mut ts_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_builder = Int64Builder::with_capacity(records.len());
+    let mut step_id_builder = Int64Builder::with_capacity(records.len());
+    let mut op_name_builder = StringBuilder::with_capacity(records.len(), records.len() * 64);
+    let mut category_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
+    let mut stream_builder = StringBuilder::with_capacity(records.len(), records.len() * 16);
+    let mut flops_builder = Int64Builder::with_capacity(records.len());
+    let mut bytes_accessed_builder = Int64Builder::with_capacity(records.len());
+    let mut bytes_hbm_builder = Int64Builder::with_capacity(records.len());
+    let mut bytes_cmem_builder = Int64Builder::with_capacity(records.len());
+    let mut bytes_vmem_builder = Int64Builder::with_capacity(records.len());
+
+    for record in records {
+        id_builder.append_value(record.id);
+        tpu_device_id_builder.append_value(record.tpu_device_id);
+        ts_builder.append_value(record.ts);
+        dur_builder.append_value(record.dur);
+        step_id_builder.append_option(record.step_id);
+        op_name_builder.append_value(&record.op_name);
+        category_builder.append_value(&record.category);
+        stream_builder.append_value(&record.stream);
+        flops_builder.append_value(record.flops);
+        bytes_accessed_builder.append_value(record.bytes_accessed);
+        bytes_hbm_builder.append_value(record.bytes_hbm);
+        bytes_cmem_builder.append_value(record.bytes_cmem);
+        bytes_vmem_builder.append_value(record.bytes_vmem);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_builder.finish()),
+            Arc::new(tpu_device_id_builder.finish()),
+            Arc::new(ts_builder.finish()),
+            Arc::new(dur_builder.finish()),
+            Arc::new(step_id_builder.finish()),
+            Arc::new(op_name_builder.finish()),
+            Arc::new(category_builder.finish()),
+            Arc::new(stream_builder.finish()),
+            Arc::new(flops_builder.finish()),
+            Arc::new(bytes_accessed_builder.finish()),
+            Arc::new(bytes_hbm_builder.finish()),
+            Arc::new(bytes_cmem_builder.finish()),
+            Arc::new(bytes_vmem_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_tpu_step_batch(records: &[TpuStepRecord], schema: &Arc<Schema>) -> Result<RecordBatch> {
+    let mut id_builder = Int64Builder::with_capacity(records.len());
+    let mut tpu_device_id_builder = Int64Builder::with_capacity(records.len());
+    let mut ts_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_builder = Int64Builder::with_capacity(records.len());
+    let mut step_num_builder = Int32Builder::with_capacity(records.len());
+    let mut dur_compute_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_infeed_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_outfeed_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_allreduce_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_send_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_recv_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_idle_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_megacore_sync_builder = Int64Builder::with_capacity(records.len());
+
+    for record in records {
+        id_builder.append_value(record.id);
+        tpu_device_id_builder.append_value(record.tpu_device_id);
+        ts_builder.append_value(record.ts);
+        dur_builder.append_value(record.dur);
+        step_num_builder.append_value(record.step_num);
+        dur_compute_builder.append_value(record.dur_compute);
+        dur_infeed_builder.append_value(record.dur_infeed);
+        dur_outfeed_builder.append_value(record.dur_outfeed);
+        dur_allreduce_builder.append_value(record.dur_allreduce);
+        dur_send_builder.append_value(record.dur_send);
+        dur_recv_builder.append_value(record.dur_recv);
+        dur_idle_builder.append_value(record.dur_idle);
+        dur_megacore_sync_builder.append_value(record.dur_megacore_sync);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_builder.finish()),
+            Arc::new(tpu_device_id_builder.finish()),
+            Arc::new(ts_builder.finish()),
+            Arc::new(dur_builder.finish()),
+            Arc::new(step_num_builder.finish()),
+            Arc::new(dur_compute_builder.finish()),
+            Arc::new(dur_infeed_builder.finish()),
+            Arc::new(dur_outfeed_builder.finish()),
+            Arc::new(dur_allreduce_builder.finish()),
+            Arc::new(dur_send_builder.finish()),
+            Arc::new(dur_recv_builder.finish()),
+            Arc::new(dur_idle_builder.finish()),
+            Arc::new(dur_megacore_sync_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_tpu_counter_batch(
+    records: &[TpuCounterRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut id_builder = Int64Builder::with_capacity(records.len());
+    let mut tpu_device_id_builder = Int64Builder::with_capacity(records.len());
+    let mut ts_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_builder = Int64Builder::with_capacity(records.len());
+    let mut step_id_builder = Int64Builder::with_capacity(records.len());
+    let mut mxu_utilization_builder = Float64Builder::with_capacity(records.len());
+    let mut vector_alu_utilization_builder = Float64Builder::with_capacity(records.len());
+    let mut scalar_alu_utilization_builder = Float64Builder::with_capacity(records.len());
+    let mut xlu_utilization_builder = Float64Builder::with_capacity(records.len());
+    let mut hbm_bandwidth_utilization_builder = Float64Builder::with_capacity(records.len());
+    let mut ici_bandwidth_utilization_builder = Float64Builder::with_capacity(records.len());
+
+    for record in records {
+        id_builder.append_value(record.id);
+        tpu_device_id_builder.append_value(record.tpu_device_id);
+        ts_builder.append_value(record.ts);
+        dur_builder.append_value(record.dur);
+        step_id_builder.append_option(record.step_id);
+        mxu_utilization_builder.append_value(record.mxu_utilization);
+        vector_alu_utilization_builder.append_value(record.vector_alu_utilization);
+        scalar_alu_utilization_builder.append_value(record.scalar_alu_utilization);
+        xlu_utilization_builder.append_value(record.xlu_utilization);
+        hbm_bandwidth_utilization_builder.append_value(record.hbm_bandwidth_utilization);
+        ici_bandwidth_utilization_builder.append_value(record.ici_bandwidth_utilization);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_builder.finish()),
+            Arc::new(tpu_device_id_builder.finish()),
+            Arc::new(ts_builder.finish()),
+            Arc::new(dur_builder.finish()),
+            Arc::new(step_id_builder.finish()),
+            Arc::new(mxu_utilization_builder.finish()),
+            Arc::new(vector_alu_utilization_builder.finish()),
+            Arc::new(scalar_alu_utilization_builder.finish()),
+            Arc::new(xlu_utilization_builder.finish()),
+            Arc::new(hbm_bandwidth_utilization_builder.finish()),
+            Arc::new(ici_bandwidth_utilization_builder.finish()),
         ],
     )?)
 }

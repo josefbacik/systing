@@ -49,3 +49,13 @@ Initial schema baseline.
 - `network_poll` — Network poll events
 - `clock_snapshot` — Clock snapshot data
 - `sysinfo` — System information (sysname, release, version, machine)
+
+## Schema Version 2 (systing 1.1.0) — 2026-02-26
+
+Added TPU profiling tables for capturing XLA/TPU runtime profiling data.
+
+### New tables
+- `tpu_device` — TPU device metadata and topology (device_ordinal, chip_id, core_id, hostname, device_type, topology coordinates, clock rate, HBM size/bandwidth)
+- `tpu_op` — Per-HLO-operation execution events (ts, dur, tpu_device_id, step_id, op_name, category, stream, flops, bytes_accessed, bytes per memory type)
+- `tpu_step` — Training step boundaries with timing breakdowns (dur_compute, dur_infeed, dur_outfeed, dur_allreduce, dur_send, dur_recv, dur_idle, dur_megacore_sync)
+- `tpu_counter` — TPU hardware performance counter samples (mxu_utilization, vector_alu_utilization, scalar_alu_utilization, xlu_utilization, hbm_bandwidth_utilization, ici_bandwidth_utilization)

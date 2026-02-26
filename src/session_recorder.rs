@@ -918,7 +918,11 @@ impl SessionRecorder {
     ///
     /// # Arguments
     /// * `output_dir` - Directory to write Parquet files to
-    pub fn generate_parquet_trace(&self, output_dir: &Path) -> Result<()> {
+    pub fn generate_parquet_trace(
+        &self,
+        output_dir: &Path,
+        tpu_recorder: Option<crate::tpu::recorder::TpuRecorder>,
+    ) -> Result<()> {
         eprintln!("Generating Parquet trace to {output_dir:?}...");
 
         // Get the end timestamp for flushing streaming data
@@ -1161,6 +1165,12 @@ impl SessionRecorder {
                     &mut instant_id_counter,
                 )?;
             }
+        }
+
+        // Write TPU profiling records (if any were captured)
+        if let Some(tpu) = &tpu_recorder {
+            eprintln!("Writing TPU profiling records...");
+            tpu.write_records(&mut *writer, &mut slice_id_counter)?;
         }
 
         // Step 6: Finish writing and close all files

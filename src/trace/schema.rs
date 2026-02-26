@@ -390,3 +390,78 @@ pub fn network_poll_schema() -> Arc<Schema> {
         Field::new("returned_events", DataType::Utf8, false),
     ]))
 }
+
+// TPU profiling schemas
+
+/// Schema for tpu_device.parquet
+pub fn tpu_device_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("device_ordinal", DataType::Int32, false),
+        Field::new("chip_id", DataType::Int32, false),
+        Field::new("core_id", DataType::Int32, false),
+        Field::new("hostname", DataType::Utf8, false),
+        Field::new("device_type", DataType::Utf8, false),
+        Field::new("topology_x", DataType::Int32, false),
+        Field::new("topology_y", DataType::Int32, false),
+        Field::new("topology_z", DataType::Int32, false),
+        Field::new("clock_rate_ghz", DataType::Float64, false),
+        Field::new("hbm_size_bytes", DataType::Int64, false),
+        Field::new("hbm_bandwidth_gbps", DataType::Float64, false),
+    ]))
+}
+
+/// Schema for tpu_op.parquet
+pub fn tpu_op_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("tpu_device_id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("dur", DataType::Int64, false),
+        Field::new("step_id", DataType::Int64, true),
+        Field::new("op_name", DataType::Utf8, false),
+        Field::new("category", DataType::Utf8, false),
+        Field::new("stream", DataType::Utf8, false),
+        Field::new("flops", DataType::Int64, false),
+        Field::new("bytes_accessed", DataType::Int64, false),
+        Field::new("bytes_hbm", DataType::Int64, false),
+        Field::new("bytes_cmem", DataType::Int64, false),
+        Field::new("bytes_vmem", DataType::Int64, false),
+    ]))
+}
+
+/// Schema for tpu_step.parquet
+pub fn tpu_step_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("tpu_device_id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("dur", DataType::Int64, false),
+        Field::new("step_num", DataType::Int32, false),
+        Field::new("dur_compute", DataType::Int64, false),
+        Field::new("dur_infeed", DataType::Int64, false),
+        Field::new("dur_outfeed", DataType::Int64, false),
+        Field::new("dur_allreduce", DataType::Int64, false),
+        Field::new("dur_send", DataType::Int64, false),
+        Field::new("dur_recv", DataType::Int64, false),
+        Field::new("dur_idle", DataType::Int64, false),
+        Field::new("dur_megacore_sync", DataType::Int64, false),
+    ]))
+}
+
+/// Schema for tpu_counter.parquet
+pub fn tpu_counter_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("tpu_device_id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("dur", DataType::Int64, false),
+        Field::new("step_id", DataType::Int64, true),
+        Field::new("mxu_utilization", DataType::Float64, false),
+        Field::new("vector_alu_utilization", DataType::Float64, false),
+        Field::new("scalar_alu_utilization", DataType::Float64, false),
+        Field::new("xlu_utilization", DataType::Float64, false),
+        Field::new("hbm_bandwidth_utilization", DataType::Float64, false),
+        Field::new("ici_bandwidth_utilization", DataType::Float64, false),
+    ]))
+}

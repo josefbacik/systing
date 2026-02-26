@@ -46,6 +46,11 @@ pub struct ParquetPaths {
     pub clock_snapshot: PathBuf,
     // System info table
     pub sysinfo: PathBuf,
+    // TPU tables
+    pub tpu_device: PathBuf,
+    pub tpu_op: PathBuf,
+    pub tpu_step: PathBuf,
+    pub tpu_counter: PathBuf,
 }
 
 /// Named path entry for iteration with names.
@@ -96,6 +101,11 @@ impl ParquetPaths {
             clock_snapshot: dir.join("clock_snapshot.parquet"),
             // System info table
             sysinfo: dir.join("sysinfo.parquet"),
+            // TPU tables
+            tpu_device: dir.join("tpu_device.parquet"),
+            tpu_op: dir.join("tpu_op.parquet"),
+            tpu_step: dir.join("tpu_step.parquet"),
+            tpu_counter: dir.join("tpu_counter.parquet"),
         }
     }
 
@@ -134,11 +144,16 @@ impl ParquetPaths {
             network_poll: dir.join(format!("{trace_id}_network_poll.parquet")),
             clock_snapshot: dir.join(format!("{trace_id}_clock_snapshot.parquet")),
             sysinfo: dir.join(format!("{trace_id}_sysinfo.parquet")),
+            // TPU tables
+            tpu_device: dir.join(format!("{trace_id}_tpu_device.parquet")),
+            tpu_op: dir.join(format!("{trace_id}_tpu_op.parquet")),
+            tpu_step: dir.join(format!("{trace_id}_tpu_step.parquet")),
+            tpu_counter: dir.join(format!("{trace_id}_tpu_counter.parquet")),
         }
     }
 
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 30] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 34] {
         [
             PathEntry {
                 path: &self.process,
@@ -260,6 +275,22 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.sysinfo,
                 name: "sysinfo",
+            },
+            PathEntry {
+                path: &self.tpu_device,
+                name: "tpu_device",
+            },
+            PathEntry {
+                path: &self.tpu_op,
+                name: "tpu_op",
+            },
+            PathEntry {
+                path: &self.tpu_step,
+                name: "tpu_step",
+            },
+            PathEntry {
+                path: &self.tpu_counter,
+                name: "tpu_counter",
             },
         ]
     }

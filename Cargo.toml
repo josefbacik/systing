@@ -1,6 +1,6 @@
 [package]
 name = "systing"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 authors = ["Josef Bacik <josef@toxicpanda.com>"]
 license = "MIT"
@@ -49,6 +49,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "io-std"] }
 object = { version = "0.36", default-features = false, features = ["read", "elf"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "time"] }
+prost = "0.13"
+tonic = "0.12"
 
 [lib]
 name = "systing"

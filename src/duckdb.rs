@@ -21,7 +21,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -55,6 +55,10 @@ pub const DATA_TABLES: &[&str] = &[
     "network_poll",
     "clock_snapshot",
     "sysinfo",
+    "tpu_device",
+    "tpu_op",
+    "tpu_step",
+    "tpu_counter",
 ];
 
 /// Create DuckDB schema with all tables.
@@ -411,6 +415,72 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             release VARCHAR,
             version VARCHAR,
             machine VARCHAR
+        );
+
+        -- TPU profiling tables
+        CREATE TABLE IF NOT EXISTS tpu_device (
+            trace_id VARCHAR,
+            id BIGINT,
+            device_ordinal INTEGER,
+            chip_id INTEGER,
+            core_id INTEGER,
+            hostname VARCHAR,
+            device_type VARCHAR,
+            topology_x INTEGER,
+            topology_y INTEGER,
+            topology_z INTEGER,
+            clock_rate_ghz DOUBLE,
+            hbm_size_bytes BIGINT,
+            hbm_bandwidth_gbps DOUBLE
+        );
+
+        CREATE TABLE IF NOT EXISTS tpu_op (
+            trace_id VARCHAR,
+            id BIGINT,
+            tpu_device_id BIGINT,
+            ts BIGINT,
+            dur BIGINT,
+            step_id BIGINT,
+            op_name VARCHAR,
+            category VARCHAR,
+            stream VARCHAR,
+            flops BIGINT,
+            bytes_accessed BIGINT,
+            bytes_hbm BIGINT,
+            bytes_cmem BIGINT,
+            bytes_vmem BIGINT
+        );
+
+        CREATE TABLE IF NOT EXISTS tpu_step (
+            trace_id VARCHAR,
+            id BIGINT,
+            tpu_device_id BIGINT,
+            ts BIGINT,
+            dur BIGINT,
+            step_num INTEGER,
+            dur_compute BIGINT,
+            dur_infeed BIGINT,
+            dur_outfeed BIGINT,
+            dur_allreduce BIGINT,
+            dur_send BIGINT,
+            dur_recv BIGINT,
+            dur_idle BIGINT,
+            dur_megacore_sync BIGINT
+        );
+
+        CREATE TABLE IF NOT EXISTS tpu_counter (
+            trace_id VARCHAR,
+            id BIGINT,
+            tpu_device_id BIGINT,
+            ts BIGINT,
+            dur BIGINT,
+            step_id BIGINT,
+            mxu_utilization DOUBLE,
+            vector_alu_utilization DOUBLE,
+            scalar_alu_utilization DOUBLE,
+            xlu_utilization DOUBLE,
+            hbm_bandwidth_utilization DOUBLE,
+            ici_bandwidth_utilization DOUBLE
         );
         ",
     )?;

@@ -179,6 +179,11 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             description: "Userspace marker events (faccessat2 with mode=-975)",
             default_enabled: false,
         },
+        RecorderInfo {
+            name: "tpu",
+            description: "TPU profiling (gRPC to XLA runtime profiler service)",
+            default_enabled: false,
+        },
     ]
 }
 
@@ -258,6 +263,10 @@ pub struct Config {
     pub network: bool,
     /// Skip DNS resolution for network addresses
     pub no_resolve_addresses: bool,
+    /// Enable TPU profiling
+    pub tpu_profile: bool,
+    /// TPU profiler service address (overrides auto-discovery)
+    pub tpu_service_addr: Option<String>,
     /// Output directory for parquet files
     pub output_dir: PathBuf,
     /// Output path (format auto-detected from extension: .pb = Perfetto, .duckdb = DuckDB)
@@ -298,6 +307,8 @@ impl Default for Config {
             marker_duration_threshold: None,
             network: false,
             no_resolve_addresses: false,
+            tpu_profile: false,
+            tpu_service_addr: None,
             output_dir: PathBuf::from("./traces"),
             output: PathBuf::from("trace.pb"),
             parquet_only: false,
@@ -2367,6 +2378,11 @@ pub fn systing(
         opts.output_dir
     );
 
+    // TPU profiling thread handle - declared outside skel scope so it can be
+    // joined after skel is dropped.
+    let mut tpu_thread: Option<std::thread::JoinHandle<Result<crate::tpu::recorder::TpuRecorder>>> =
+        None;
+
     {
         let mut skel_builder = SystingSystemSkelBuilder::default();
         if opts.verbosity > 0 {
@@ -2720,6 +2736,36 @@ pub fn systing(
             );
         }
 
+        // Start TPU profiling thread if enabled
+        // Spawn TPU thread (assigns to outer tpu_thread variable)
+        if opts.tpu_profile {
+            let service_addr = opts.tpu_service_addr.clone().or_else(|| {
+                match crate::tpu::discovery::discover_profiler_service() {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        eprintln!("TPU profiler discovery failed: {:#}", e);
+                        None
+                    }
+                }
+            });
+
+            if let Some(addr) = service_addr {
+                let duration_ms = if opts.duration > 0 {
+                    opts.duration * 1000
+                } else {
+                    30_000
+                };
+                eprintln!(
+                    "Starting TPU profile capture from {} for {}ms...",
+                    addr, duration_ms
+                );
+                match crate::tpu::recorder::spawn_tpu_thread(addr, duration_ms) {
+                    Ok(handle) => tpu_thread = Some(handle),
+                    Err(e) => eprintln!("Failed to spawn TPU profiler thread: {:#}", e),
+                }
+            }
+        }
+
         let handles = ThreadHandles {
             ringbuf_threads,
             sysinfo_thread,
@@ -2758,12 +2804,33 @@ pub fn systing(
         recorder.drain_all_ringbufs();
     }
 
+    // Join TPU profiling thread and collect results
+    let tpu_recorder = if let Some(handle) = tpu_thread {
+        eprintln!("Waiting for TPU profile capture to complete...");
+        match handle.join() {
+            Ok(Ok(rec)) => {
+                eprintln!("TPU profile capture complete.");
+                Some(rec)
+            }
+            Ok(Err(e)) => {
+                eprintln!("TPU profile capture failed: {:#}", e);
+                None
+            }
+            Err(_) => {
+                eprintln!("TPU profiler thread panicked");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Write trace files directly to Parquet
     println!(
         "Writing Parquet trace files to {}...",
         opts.output_dir.display()
     );
-    recorder.generate_parquet_trace(&opts.output_dir)?;
+    recorder.generate_parquet_trace(&opts.output_dir, tpu_recorder)?;
     println!("Successfully wrote Parquet trace files");
 
     // Generate output trace (unless --parquet-only)

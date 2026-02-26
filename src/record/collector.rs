@@ -11,8 +11,8 @@ use crate::trace::{
     InstantArgRecord, InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, NetworkPacketRecord,
     NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord,
     SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord,
-    StackSampleRecord, SysInfoRecord, ThreadRecord, ThreadStateRecord, TrackRecord,
-    WakeupNewRecord,
+    StackSampleRecord, SysInfoRecord, ThreadRecord, ThreadStateRecord, TpuCounterRecord,
+    TpuDeviceRecord, TpuOpRecord, TpuStepRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Trait for collecting trace records during recording.
@@ -105,6 +105,20 @@ pub trait RecordCollector {
 
     /// Set the system info record (only one per trace).
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()>;
+
+    // TPU profiling records
+
+    /// Add a TPU device metadata record.
+    fn add_tpu_device(&mut self, record: TpuDeviceRecord) -> Result<()>;
+
+    /// Add a TPU operation execution record.
+    fn add_tpu_op(&mut self, record: TpuOpRecord) -> Result<()>;
+
+    /// Add a TPU training step record.
+    fn add_tpu_step(&mut self, record: TpuStepRecord) -> Result<()>;
+
+    /// Add a TPU hardware counter sample record.
+    fn add_tpu_counter(&mut self, record: TpuCounterRecord) -> Result<()>;
 
     /// Flush any buffered records to storage.
     fn flush(&mut self) -> Result<()>;
@@ -269,6 +283,26 @@ impl RecordCollector for InMemoryCollector {
 
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()> {
         self.data.sysinfo = Some(record);
+        Ok(())
+    }
+
+    fn add_tpu_device(&mut self, record: TpuDeviceRecord) -> Result<()> {
+        self.data.tpu_devices.push(record);
+        Ok(())
+    }
+
+    fn add_tpu_op(&mut self, record: TpuOpRecord) -> Result<()> {
+        self.data.tpu_ops.push(record);
+        Ok(())
+    }
+
+    fn add_tpu_step(&mut self, record: TpuStepRecord) -> Result<()> {
+        self.data.tpu_steps.push(record);
+        Ok(())
+    }
+
+    fn add_tpu_counter(&mut self, record: TpuCounterRecord) -> Result<()> {
+        self.data.tpu_counters.push(record);
         Ok(())
     }
 
