@@ -226,24 +226,13 @@ impl TpuMetricsClient {
         .await?;
 
         // Step 4: Build descriptor pool from all collected file descriptors.
-        // Files must be added in dependency order. Since we collected them
-        // depth-first, reverse so dependencies come before dependents.
+        // Add them all at once so prost-reflect can resolve cross-references.
         let mut pool = DescriptorPool::new();
-        let mut reversed_fds: Vec<_> = file_descriptors.into_iter().collect();
-        reversed_fds.reverse();
-
-        for fd_proto in &reversed_fds {
-            let fds = prost_types::FileDescriptorSet {
-                file: vec![fd_proto.clone()],
-            };
-            match pool.add_file_descriptor_set(fds) {
-                Ok(()) => debug!("Added proto file: {}", fd_proto.name()),
-                Err(e) => {
-                    // Some well-known types may already be built-in to prost-reflect
-                    debug!("Skipping file descriptor {}: {}", fd_proto.name(), e);
-                }
-            }
-        }
+        let fds = prost_types::FileDescriptorSet {
+            file: file_descriptors,
+        };
+        pool.add_file_descriptor_set(fds)
+            .context("failed to build descriptor pool from reflected proto files")?;
 
         Ok(pool)
     }
