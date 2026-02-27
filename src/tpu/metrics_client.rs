@@ -166,6 +166,14 @@ fn extract_metric_values(response: &MetricResponse, metric_name: &str) -> Vec<De
                             device_id: i as i32,
                             value: v as f64,
                         });
+                    } else if let Some(ref dist) = point.distribution_value {
+                        // For distributions, use the mean as the representative value
+                        if let Some(mean) = dist.mean {
+                            values.push(DeviceMetricValue {
+                                device_id: i as i32,
+                                value: mean,
+                            });
+                        }
                     }
                 }
             }

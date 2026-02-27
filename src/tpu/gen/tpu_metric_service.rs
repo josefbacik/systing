@@ -81,8 +81,24 @@ pub struct StreamzPoint {
     pub int64_value: ::core::option::Option<i64>,
     #[prost(double, optional, tag = "5")]
     pub double_value: ::core::option::Option<f64>,
-    // field #6 is Distribution — we use the dedicated Distribution type instead
+    #[prost(message, optional, tag = "6")]
+    pub distribution_value: ::core::option::Option<StreamzDistribution>,
     // field #7, #8 are timestamps — skipped
+}
+
+/// Subset of streamz.Distribution — distribution statistics.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StreamzDistribution {
+    #[prost(int64, optional, tag = "1")]
+    pub count: ::core::option::Option<i64>,
+    #[prost(double, optional, tag = "2")]
+    pub mean: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "3")]
+    pub sum_of_squared_deviation: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "4")]
+    pub minimum: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "5")]
+    pub maximum: ::core::option::Option<f64>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
