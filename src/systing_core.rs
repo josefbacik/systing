@@ -2319,7 +2319,9 @@ fn run_tracing_loop(
         thread.join().expect("Failed to join sysinfo thread");
     }
     if let Some(thread) = handles.tpu_metrics_thread {
-        thread.join().expect("Failed to join TPU metrics thread");
+        if let Err(e) = thread.join() {
+            eprintln!("TPU metrics thread panicked: {:?}", e);
+        }
     }
     for thread in handles.recorder_threads {
         thread.join().expect("Failed to join receiver thread");

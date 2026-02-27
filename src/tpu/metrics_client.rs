@@ -182,49 +182,20 @@ impl TpuMetricsClient {
     }
 
     /// Perform gRPC reflection to discover the proto schema.
+    ///
+    /// Recursively resolves all proto file dependencies so that
+    /// `DescriptorPool::add_file_descriptor_set` doesn't panic on
+    /// unresolved imports.
     async fn discover_schema(channel: Channel) -> Result<DescriptorPool> {
         let mut reflection_client = ServerReflectionClient::new(channel);
 
-        // First, list all services
-        let request = ServerReflectionRequest {
-            message_request: Some(MessageRequest::ListServices(String::new())),
-            ..Default::default()
-        };
-
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        tx.send(request)
-            .await
-            .context("failed to send reflection request")?;
-
-        let request_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        let mut response_stream = reflection_client
-            .server_reflection_info(request_stream)
-            .await
-            .context("reflection RPC failed")?
-            .into_inner();
-
-        // Collect service names
-        use tokio_stream::StreamExt;
-        let mut service_names = Vec::new();
-        if let Some(response) = response_stream.next().await {
-            let response = response.context("reflection response error")?;
-            if let Some(
-                tonic_reflection::pb::v1alpha::server_reflection_response::MessageResponse::ListServicesResponse(list),
-            ) = response.message_response
-            {
-                for svc in &list.service {
-                    debug!("Discovered service: {}", svc.name);
-                    service_names.push(svc.name.clone());
-                }
-            }
-        }
-        drop(response_stream);
-
+        // Step 1: List all services
+        let service_names = Self::reflection_list_services(&mut reflection_client).await?;
         if service_names.is_empty() {
             bail!("No services found via gRPC reflection");
         }
 
-        // Find the RuntimeMetric service
+        // Step 2: Find the target service
         let target_service = service_names
             .iter()
             .find(|s| {
@@ -247,28 +218,175 @@ impl TpuMetricsClient {
 
         info!("Using service for reflection: {}", target_service);
 
-        // Get the file descriptor for this service
-        let request2 = ServerReflectionRequest {
-            message_request: Some(MessageRequest::FileContainingSymbol(target_service.clone())),
+        // Step 3: Get file descriptors for the service, recursively resolving dependencies
+        let file_descriptors = Self::reflection_get_file_descriptors_recursive(
+            &mut reflection_client,
+            &target_service,
+        )
+        .await?;
+
+        // Step 4: Build descriptor pool from all collected file descriptors.
+        // Files must be added in dependency order. Since we collected them
+        // depth-first, reverse so dependencies come before dependents.
+        let mut pool = DescriptorPool::new();
+        let mut reversed_fds: Vec<_> = file_descriptors.into_iter().collect();
+        reversed_fds.reverse();
+
+        for fd_proto in &reversed_fds {
+            let fds = prost_types::FileDescriptorSet {
+                file: vec![fd_proto.clone()],
+            };
+            match pool.add_file_descriptor_set(fds) {
+                Ok(()) => debug!("Added proto file: {}", fd_proto.name()),
+                Err(e) => {
+                    // Some well-known types may already be built-in to prost-reflect
+                    debug!("Skipping file descriptor {}: {}", fd_proto.name(), e);
+                }
+            }
+        }
+
+        Ok(pool)
+    }
+
+    /// List all services via gRPC reflection.
+    async fn reflection_list_services(
+        client: &mut ServerReflectionClient<Channel>,
+    ) -> Result<Vec<String>> {
+        let request = ServerReflectionRequest {
+            message_request: Some(MessageRequest::ListServices(String::new())),
             ..Default::default()
         };
 
-        let (tx2, rx2) = tokio::sync::mpsc::channel(1);
-        tx2.send(request2)
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(request)
             .await
             .context("failed to send reflection request")?;
 
-        let request_stream2 = tokio_stream::wrappers::ReceiverStream::new(rx2);
-        let mut response_stream2 = reflection_client
-            .server_reflection_info(request_stream2)
+        use tokio_stream::StreamExt;
+        let request_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let mut response_stream = client
+            .server_reflection_info(request_stream)
             .await
-            .context("reflection RPC for file descriptor failed")?
+            .context("reflection RPC failed")?
             .into_inner();
 
-        let mut pool = DescriptorPool::new();
+        let mut service_names = Vec::new();
+        if let Some(response) = response_stream.next().await {
+            let response = response.context("reflection response error")?;
+            if let Some(
+                tonic_reflection::pb::v1alpha::server_reflection_response::MessageResponse::ListServicesResponse(list),
+            ) = response.message_response
+            {
+                for svc in &list.service {
+                    debug!("Discovered service: {}", svc.name);
+                    service_names.push(svc.name.clone());
+                }
+            }
+        }
+        Ok(service_names)
+    }
 
-        if let Some(response) = response_stream2.next().await {
-            let response = response.context("reflection file descriptor response error")?;
+    /// Get file descriptors for a service symbol, recursively resolving all imports.
+    async fn reflection_get_file_descriptors_recursive(
+        client: &mut ServerReflectionClient<Channel>,
+        symbol: &str,
+    ) -> Result<Vec<prost_types::FileDescriptorProto>> {
+        use std::collections::HashSet;
+
+        let mut all_fds = Vec::new();
+        let mut seen_files = HashSet::new();
+        let mut pending_files = Vec::new();
+
+        // Start by getting the file containing the target symbol
+        let initial_fds = Self::reflection_file_containing_symbol(client, symbol).await?;
+        for fd in initial_fds {
+            let name = fd.name().to_string();
+            for dep in &fd.dependency {
+                if !seen_files.contains(dep) {
+                    pending_files.push(dep.clone());
+                }
+            }
+            if seen_files.insert(name) {
+                all_fds.push(fd);
+            }
+        }
+
+        // Recursively resolve dependencies
+        while let Some(filename) = pending_files.pop() {
+            if seen_files.contains(&filename) {
+                continue;
+            }
+            debug!("Resolving proto dependency: {}", filename);
+            match Self::reflection_file_by_filename(client, &filename).await {
+                Ok(fds) => {
+                    for fd in fds {
+                        let name = fd.name().to_string();
+                        for dep in &fd.dependency {
+                            if !seen_files.contains(dep) {
+                                pending_files.push(dep.clone());
+                            }
+                        }
+                        if seen_files.insert(name) {
+                            all_fds.push(fd);
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("Could not resolve dependency '{}': {:#}", filename, e);
+                    seen_files.insert(filename);
+                }
+            }
+        }
+
+        info!("Resolved {} proto file descriptors", all_fds.len());
+        Ok(all_fds)
+    }
+
+    /// Get file descriptors containing a given symbol.
+    async fn reflection_file_containing_symbol(
+        client: &mut ServerReflectionClient<Channel>,
+        symbol: &str,
+    ) -> Result<Vec<prost_types::FileDescriptorProto>> {
+        let request = ServerReflectionRequest {
+            message_request: Some(MessageRequest::FileContainingSymbol(symbol.to_string())),
+            ..Default::default()
+        };
+        Self::send_reflection_request(client, request).await
+    }
+
+    /// Get file descriptors by filename.
+    async fn reflection_file_by_filename(
+        client: &mut ServerReflectionClient<Channel>,
+        filename: &str,
+    ) -> Result<Vec<prost_types::FileDescriptorProto>> {
+        let request = ServerReflectionRequest {
+            message_request: Some(MessageRequest::FileByFilename(filename.to_string())),
+            ..Default::default()
+        };
+        Self::send_reflection_request(client, request).await
+    }
+
+    /// Send a single reflection request and collect file descriptors from the response.
+    async fn send_reflection_request(
+        client: &mut ServerReflectionClient<Channel>,
+        request: ServerReflectionRequest,
+    ) -> Result<Vec<prost_types::FileDescriptorProto>> {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(request)
+            .await
+            .context("failed to send reflection request")?;
+
+        use tokio_stream::StreamExt;
+        let request_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let mut response_stream = client
+            .server_reflection_info(request_stream)
+            .await
+            .context("reflection RPC failed")?
+            .into_inner();
+
+        let mut fds = Vec::new();
+        if let Some(response) = response_stream.next().await {
+            let response = response.context("reflection response error")?;
             if let Some(
                 tonic_reflection::pb::v1alpha::server_reflection_response::MessageResponse::FileDescriptorResponse(fdr),
             ) = response.message_response
@@ -277,20 +395,11 @@ impl TpuMetricsClient {
                     let fd_proto =
                         prost_types::FileDescriptorProto::decode(fd_bytes.as_slice())
                             .context("failed to decode FileDescriptorProto")?;
-                    let fds = prost_types::FileDescriptorSet {
-                        file: vec![fd_proto],
-                    };
-                    if let Err(e) = pool.add_file_descriptor_set(fds) {
-                        debug!(
-                            "Skipping file descriptor (may have deps already loaded): {}",
-                            e
-                        );
-                    }
+                    fds.push(fd_proto);
                 }
             }
         }
-
-        Ok(pool)
+        Ok(fds)
     }
 
     /// Find the RuntimeMetricService name in the descriptor pool.
