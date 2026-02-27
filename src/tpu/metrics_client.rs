@@ -153,9 +153,34 @@ fn extract_metric_values(response: &MetricResponse, metric_name: &str) -> Vec<De
     // StreamzMetric (MetricType::STREAMZ) — extract values from PointSet -> Point
     if let Some(ref streamz) = response.streamz_metric {
         let mut values = Vec::new();
-        for read_resp in &streamz.read_response {
-            for point_set in &read_resp.point_set {
+        debug!(
+            "StreamzMetric '{}': {} read_responses",
+            metric_name,
+            streamz.read_response.len()
+        );
+        for (ri, read_resp) in streamz.read_response.iter().enumerate() {
+            debug!(
+                "  read_response[{}]: {} point_sets",
+                ri,
+                read_resp.point_set.len()
+            );
+            for (pi, point_set) in read_resp.point_set.iter().enumerate() {
+                debug!(
+                    "    point_set[{}] name={:?}: {} points",
+                    pi,
+                    point_set.metric_name,
+                    point_set.point.len()
+                );
                 for (i, point) in point_set.point.iter().enumerate() {
+                    debug!(
+                        "      point[{}]: double={:?} int64={:?} bool={:?} string={:?} dist={}",
+                        i,
+                        point.double_value,
+                        point.int64_value,
+                        point.bool_value,
+                        point.string_value,
+                        point.distribution_value.is_some()
+                    );
                     if let Some(v) = point.double_value {
                         values.push(DeviceMetricValue {
                             device_id: i as i32,
@@ -167,7 +192,6 @@ fn extract_metric_values(response: &MetricResponse, metric_name: &str) -> Vec<De
                             value: v as f64,
                         });
                     } else if let Some(ref dist) = point.distribution_value {
-                        // For distributions, use the mean as the representative value
                         if let Some(mean) = dist.mean {
                             values.push(DeviceMetricValue {
                                 device_id: i as i32,
