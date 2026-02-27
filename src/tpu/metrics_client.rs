@@ -106,27 +106,6 @@ impl TpuMetricsClient {
                 .context("metric RPC failed")?
                 .into_inner();
 
-        // For Streamz metrics, log the raw encoded size to verify data is being decoded
-        if let Some(ref sm) = response.streamz_metric {
-            use prost::Message;
-            let encoded_size = sm.encoded_len();
-            debug!(
-                "StreamzMetric raw: name={:?}, encoded_size={}, read_response_count={}",
-                sm.name,
-                encoded_size,
-                sm.read_response.len()
-            );
-            for (i, rr) in sm.read_response.iter().enumerate() {
-                let rr_size = rr.encoded_len();
-                debug!(
-                    "  read_response[{}]: encoded_size={}, point_set_count={}",
-                    i,
-                    rr_size,
-                    rr.point_set.len()
-                );
-            }
-        }
-
         let device_values = extract_metric_values(&response, metric_name);
 
         debug!(
@@ -174,34 +153,9 @@ fn extract_metric_values(response: &MetricResponse, metric_name: &str) -> Vec<De
     // StreamzMetric (MetricType::STREAMZ) — extract values from PointSet -> Point
     if let Some(ref streamz) = response.streamz_metric {
         let mut values = Vec::new();
-        debug!(
-            "StreamzMetric '{}': {} read_responses",
-            metric_name,
-            streamz.read_response.len()
-        );
-        for (ri, read_resp) in streamz.read_response.iter().enumerate() {
-            debug!(
-                "  read_response[{}]: {} point_sets",
-                ri,
-                read_resp.point_set.len()
-            );
-            for (pi, point_set) in read_resp.point_set.iter().enumerate() {
-                debug!(
-                    "    point_set[{}] name={:?}: {} points",
-                    pi,
-                    point_set.metric_name,
-                    point_set.point.len()
-                );
+        for read_resp in &streamz.read_response {
+            for point_set in &read_resp.point_set {
                 for (i, point) in point_set.point.iter().enumerate() {
-                    debug!(
-                        "      point[{}]: double={:?} int64={:?} bool={:?} string={:?} dist={}",
-                        i,
-                        point.double_value,
-                        point.int64_value,
-                        point.bool_value,
-                        point.string_value,
-                        point.distribution_value.is_some()
-                    );
                     if let Some(v) = point.double_value {
                         values.push(DeviceMetricValue {
                             device_id: i as i32,
