@@ -98,6 +98,10 @@ struct Command {
     /// TPU metrics polling interval in milliseconds (default: 1000)
     #[arg(long, default_value = "1000")]
     tpu_metrics_interval: u64,
+    /// Dump TPU metrics proto definitions via gRPC reflection and exit.
+    /// Requires --tpu-metrics-addr or auto-discovery of the service.
+    #[arg(long)]
+    dump_tpu_proto: bool,
     /// List all available recorders and their default states
     #[arg(long)]
     list_recorders: bool,
@@ -324,6 +328,36 @@ fn main() -> Result<()> {
                 recorder.name, recorder.description, default_text
             );
         }
+        return Ok(());
+    }
+
+    if opts.dump_tpu_proto {
+        // Discover or use explicit address, handling namespace if needed
+        let addr = if let Some(addr) = opts.tpu_metrics_addr.clone() {
+            (addr, None)
+        } else {
+            match systing::tpu::discovery::discover_metrics_service()? {
+                Some(svc) => {
+                    // If in a non-host namespace, setns this thread
+                    if let Some(pid) = svc.namespace_pid {
+                        use std::os::unix::io::AsRawFd;
+                        let ns_path = format!("/proc/{}/ns/net", pid);
+                        let fd = std::fs::File::open(&ns_path)?;
+                        let ret = unsafe { libc::setns(fd.as_raw_fd(), libc::CLONE_NEWNET) };
+                        if ret != 0 {
+                            anyhow::bail!("setns failed: {}", std::io::Error::last_os_error());
+                        }
+                        eprintln!("Entered network namespace via PID {}", pid);
+                    }
+                    (svc.addr, svc.namespace_pid)
+                }
+                None => anyhow::bail!("No TPU metrics service found. Use --tpu-metrics-addr."),
+            }
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(systing::tpu::metrics_client::dump_tpu_protos(&addr.0))?;
         return Ok(());
     }
 

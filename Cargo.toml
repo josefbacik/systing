@@ -51,6 +51,7 @@ object = { version = "0.36", default-features = false, features = ["read", "elf"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "time"] }
 prost = "0.14"
+prost-types = "0.14"
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
 tokio-stream = "0.1"
