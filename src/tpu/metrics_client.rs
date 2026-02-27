@@ -122,24 +122,22 @@ impl TpuMetricsClient {
             response_bytes.len()
         );
 
+        // Log the raw field structure for debugging
+        log_proto_fields(metric_name, &response_bytes);
+
         // Parse the raw protobuf response to extract numeric values
         let device_values = parse_metric_response(&response_bytes);
         if device_values.is_empty() {
             debug!(
-                "No device values extracted from response for '{}' ({} bytes: {:?})",
+                "No device values extracted from response for '{}'",
                 metric_name,
-                response_bytes.len(),
-                if response_bytes.len() <= 200 {
-                    format!("{:02x?}", &response_bytes)
-                } else {
-                    format!("{:02x?}...", &response_bytes[..200])
-                }
             );
         } else {
             debug!(
-                "Extracted {} device values for '{}'",
+                "Extracted {} device values for '{}': {:?}",
                 device_values.len(),
-                metric_name
+                metric_name,
+                device_values
             );
         }
 
@@ -227,6 +225,93 @@ impl TpuMetricsClient {
 }
 
 // === Raw protobuf encoding/decoding helpers ===
+
+/// Log the protobuf field structure of a response for debugging.
+fn log_proto_fields(metric_name: &str, data: &[u8]) {
+    let fields = parse_proto_fields(data);
+    debug!("  Response fields for '{}':", metric_name);
+    for (i, field) in fields.iter().enumerate() {
+        let wire_name = match field.wire_type {
+            0 => "varint",
+            1 => "64bit",
+            2 => "len-delim",
+            5 => "32bit",
+            _ => "unknown",
+        };
+        match field.wire_type {
+            0 => debug!(
+                "    field[{}] #{} {}: varint={}",
+                i,
+                field.field_number,
+                wire_name,
+                field.varint_value.unwrap_or(0)
+            ),
+            1 => {
+                let bits = field.fixed64_value.unwrap_or(0);
+                debug!(
+                    "    field[{}] #{} {}: 0x{:016x} (as f64: {}, as i64: {})",
+                    i,
+                    field.field_number,
+                    wire_name,
+                    bits,
+                    f64::from_bits(bits),
+                    bits as i64
+                );
+            }
+            2 => {
+                let preview = if field.data.len() <= 40 {
+                    if let Ok(s) = std::str::from_utf8(&field.data) {
+                        format!("\"{}\"", s)
+                    } else {
+                        format!("{:02x?}", &field.data)
+                    }
+                } else {
+                    format!("{} bytes", field.data.len())
+                };
+                // Try to parse as sub-message and show its fields
+                let sub_info = if let Some(sub_fields) = try_parse_as_message(&field.data) {
+                    let sub_descs: Vec<String> = sub_fields
+                        .iter()
+                        .map(|sf| match sf.wire_type {
+                            0 => format!(
+                                "#{}=varint({})",
+                                sf.field_number,
+                                sf.varint_value.unwrap_or(0)
+                            ),
+                            1 => {
+                                let bits = sf.fixed64_value.unwrap_or(0);
+                                format!("#{}=f64({})", sf.field_number, f64::from_bits(bits))
+                            }
+                            2 => format!("#{}=bytes({})", sf.field_number, sf.data.len()),
+                            5 => format!(
+                                "#{}=f32({})",
+                                sf.field_number,
+                                f32::from_bits(sf.fixed32_value.unwrap_or(0))
+                            ),
+                            _ => format!("#{}=?", sf.field_number),
+                        })
+                        .collect();
+                    format!(" -> sub-message: [{}]", sub_descs.join(", "))
+                } else {
+                    String::new()
+                };
+                debug!(
+                    "    field[{}] #{} {}: {}{}",
+                    i, field.field_number, wire_name, preview, sub_info
+                );
+            }
+            5 => debug!(
+                "    field[{}] #{} {}: 0x{:08x} (as f32: {})",
+                i,
+                field.field_number,
+                wire_name,
+                field.fixed32_value.unwrap_or(0),
+                f32::from_bits(field.fixed32_value.unwrap_or(0))
+            ),
+            _ => debug!("    field[{}] #{} {}", i, field.field_number, wire_name),
+        }
+    }
+}
 
 /// Encode a protobuf message with a single string field.
 fn encode_string_field(field_number: u32, value: &str) -> Vec<u8> {
