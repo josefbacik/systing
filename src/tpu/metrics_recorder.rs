@@ -168,13 +168,12 @@ pub fn run_tpu_metrics_thread(
                 Ok(c) => break c,
                 Err(e) => {
                     let err_msg = format!("{:#}", e);
-                    // Proto/schema errors won't be fixed by retrying
-                    if err_msg.contains("prost-reflect panicked")
-                        || err_msg.contains("descriptor pool")
-                        || err_msg.contains("RuntimeMetricService not found")
+                    // Service-not-found errors won't be fixed by retrying
+                    if err_msg.contains("RuntimeMetricService not found")
+                        || err_msg.contains("No services found")
                     {
                         error!(
-                            "TPU metrics service proto schema is incompatible, disabling metrics: {:#}",
+                            "TPU metrics service not available, disabling metrics: {:#}",
                             e
                         );
                         return 1;

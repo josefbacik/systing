@@ -1,15 +1,15 @@
 //! gRPC client for the TPU RuntimeMetricService.
 //!
-//! Uses runtime gRPC reflection to discover the proto schema dynamically,
-//! then fetches metrics using `DynamicMessage` from `prost-reflect`.
+//! Uses raw protobuf encoding/decoding to avoid depending on prost-reflect's
+//! DescriptorPool, which panics on some TPU runtime proto schemas.
+//! The gRPC reflection API is used only to discover the service name and
+//! method path — the actual metric request/response is hand-encoded/decoded.
 
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use prost::Message;
-use prost_reflect::{DescriptorPool, DynamicMessage, ReflectMessage, Value};
 use tonic::transport::Channel;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use tonic_reflection::pb::v1alpha::server_reflection_client::ServerReflectionClient;
 use tonic_reflection::pb::v1alpha::server_reflection_request::MessageRequest;
@@ -29,20 +29,21 @@ pub struct MetricResult {
     pub device_values: Vec<DeviceMetricValue>,
 }
 
-/// Client for the TPU RuntimeMetricService using dynamic gRPC reflection.
+/// Client for the TPU RuntimeMetricService.
+///
+/// Uses gRPC reflection to discover the service method path, then makes
+/// raw gRPC calls with hand-encoded protobuf. This avoids prost-reflect's
+/// DescriptorPool which panics on some proto schemas.
 pub struct TpuMetricsClient {
     channel: Channel,
-    request_desc: prost_reflect::MessageDescriptor,
-    response_desc: prost_reflect::MessageDescriptor,
-    /// Full gRPC method path.
+    /// Full gRPC method path (e.g. "/tpu.monitoring.runtime.RuntimeMetricService/GetRuntimeMetric").
     method_path: String,
     /// Metrics available from the service.
     available_metrics: Vec<String>,
 }
 
 impl TpuMetricsClient {
-    /// Connect to the RuntimeMetricService, perform reflection discovery,
-    /// and validate available metrics.
+    /// Connect to the RuntimeMetricService and discover the method path via reflection.
     pub async fn connect(addr: &str, timeout: Duration) -> Result<Self> {
         let endpoint = format!("http://{}", addr);
         info!("Connecting to TPU metrics service at {}", endpoint);
@@ -55,52 +56,18 @@ impl TpuMetricsClient {
             .await
             .with_context(|| format!("Failed to connect to TPU metrics service at {}", addr))?;
 
-        // Step 1: Use gRPC reflection to discover the proto schema
-        let pool = Self::discover_schema(channel.clone()).await?;
+        // Use reflection just to discover the service name (no DescriptorPool needed)
+        let service_name = Self::discover_service_name(channel.clone()).await?;
+        let method_path = format!("/{}/GetRuntimeMetric", service_name);
 
-        // Step 2: Find the service and method descriptors
-        let service_name = Self::find_runtime_metric_service(&pool)?;
-        let service = pool
-            .get_service_by_name(&service_name)
-            .with_context(|| format!("Service {} not found in descriptor pool", service_name))?;
+        info!("Discovered TPU metrics method: {}", method_path);
 
-        // Find the GetRuntimeMetric method
-        let method = service
-            .methods()
-            .find(|m| m.name() == "GetRuntimeMetric")
-            .with_context(|| format!("GetRuntimeMetric method not found in {}", service_name))?;
-
-        let request_desc = method.input();
-        let response_desc = method.output();
-        let method_path = format!("/{}/{}", service_name, method.name());
-
-        info!(
-            "Discovered method: {} (request: {}, response: {})",
-            method_path,
-            request_desc.full_name(),
-            response_desc.full_name()
-        );
-
-        // Log the response schema so users can see what fields are available
-        info!("Response schema for {}:", response_desc.full_name());
-        for field in response_desc.fields() {
-            info!(
-                "  field #{}: '{}' type={:?} cardinality={:?}",
-                field.number(),
-                field.name(),
-                field.kind(),
-                field.cardinality()
-            );
-        }
-
-        // Step 3: Discover available metrics via ListSupportedMetrics
-        let available_metrics = Self::list_supported_metrics(&pool, &service_name, channel.clone())
+        // Try to discover available metrics (optional, best-effort)
+        let list_method = format!("/{}/ListSupportedMetrics", service_name);
+        let available_metrics = Self::try_list_metrics(channel.clone(), &list_method)
             .await
             .unwrap_or_else(|e| {
-                warn!(
-                    "Could not list supported metrics: {:#}. Will attempt default metrics.",
-                    e
-                );
+                debug!("Could not list supported metrics: {:#}", e);
                 Vec::new()
             });
 
@@ -110,8 +77,6 @@ impl TpuMetricsClient {
 
         Ok(Self {
             channel,
-            request_desc,
-            response_desc,
             method_path,
             available_metrics,
         })
@@ -124,10 +89,14 @@ impl TpuMetricsClient {
 
     /// Fetch a single metric from the service.
     pub async fn get_metric(&self, metric_name: &str, timeout: Duration) -> Result<MetricResult> {
-        // Build request using DynamicMessage
-        let mut request = DynamicMessage::new(self.request_desc.clone());
-        request.set_field_by_name("metric_name", Value::String(metric_name.to_string()));
-        let request_bytes = request.encode_to_vec();
+        // Hand-encode the request: a simple message with field 1 = metric_name (string)
+        let request_bytes = encode_string_field(1, metric_name);
+
+        debug!(
+            "Requesting metric '{}' ({} request bytes)",
+            metric_name,
+            request_bytes.len()
+        );
 
         // Make raw gRPC call
         let mut grpc = tonic::client::Grpc::new(self.channel.clone());
@@ -152,31 +121,24 @@ impl TpuMetricsClient {
             response_bytes.len()
         );
 
-        // Decode response. Wrap in catch_unwind because prost-reflect can panic
-        // on unexpected proto wire formats.
-        let desc = self.response_desc.clone();
-        let bytes = response_bytes.clone();
-        let response_msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            DynamicMessage::decode(desc, bytes.as_slice())
-        }))
-        .map_err(|_| anyhow::anyhow!("prost-reflect panicked decoding metric response"))?
-        .context("failed to decode metric response")?;
-
-        // Log the decoded response structure for debugging
-        debug!(
-            "Decoded response for '{}': {}",
-            metric_name,
-            format_dynamic_message(&response_msg)
-        );
-
-        // Extract per-device values from the response
-        let device_values = Self::extract_device_values(&response_msg);
+        // Parse the raw protobuf response to extract numeric values
+        let device_values = parse_metric_response(&response_bytes);
         if device_values.is_empty() {
-            warn!(
-                "No device values extracted from response for '{}'. \
-                 Response fields: {}",
+            debug!(
+                "No device values extracted from response for '{}' ({} bytes: {:?})",
                 metric_name,
-                format_dynamic_message(&response_msg)
+                response_bytes.len(),
+                if response_bytes.len() <= 200 {
+                    format!("{:02x?}", &response_bytes)
+                } else {
+                    format!("{:02x?}...", &response_bytes[..200])
+                }
+            );
+        } else {
+            debug!(
+                "Extracted {} device values for '{}'",
+                device_values.len(),
+                metric_name
             );
         }
 
@@ -186,76 +148,10 @@ impl TpuMetricsClient {
         })
     }
 
-    /// Perform gRPC reflection to discover the proto schema.
-    ///
-    /// Recursively resolves all proto file dependencies so that
-    /// `DescriptorPool::add_file_descriptor_set` doesn't panic on
-    /// unresolved imports.
-    async fn discover_schema(channel: Channel) -> Result<DescriptorPool> {
+    /// Use gRPC reflection to discover the RuntimeMetricService name.
+    async fn discover_service_name(channel: Channel) -> Result<String> {
         let mut reflection_client = ServerReflectionClient::new(channel);
 
-        // Step 1: List all services
-        let service_names = Self::reflection_list_services(&mut reflection_client).await?;
-        if service_names.is_empty() {
-            bail!("No services found via gRPC reflection");
-        }
-
-        // Step 2: Find the target service
-        let target_service = service_names
-            .iter()
-            .find(|s| {
-                s.contains("RuntimeMetric")
-                    || s.contains("runtime_metric")
-                    || s.contains("runtime.RuntimeMetric")
-            })
-            .or_else(|| {
-                service_names
-                    .iter()
-                    .find(|s| s.contains("runtime") || s.contains("monitoring"))
-            })
-            .with_context(|| {
-                format!(
-                    "No RuntimeMetricService found. Available services: {:?}",
-                    service_names
-                )
-            })?
-            .clone();
-
-        info!("Using service for reflection: {}", target_service);
-
-        // Step 3: Get file descriptors for the service, recursively resolving dependencies
-        let file_descriptors = Self::reflection_get_file_descriptors_recursive(
-            &mut reflection_client,
-            &target_service,
-        )
-        .await?;
-
-        // Step 4: Build descriptor pool from all collected file descriptors.
-        // Add them all at once so prost-reflect can resolve cross-references.
-        // Wrap in catch_unwind because prost-reflect can panic on unexpected
-        // proto structures (e.g. index out of bounds on malformed descriptors).
-        let pool = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let mut pool = DescriptorPool::new();
-            let fds = prost_types::FileDescriptorSet {
-                file: file_descriptors,
-            };
-            pool.add_file_descriptor_set(fds)?;
-            Ok::<_, prost_reflect::DescriptorError>(pool)
-        }))
-        .map_err(|_panic| {
-            anyhow::anyhow!(
-                "prost-reflect panicked building descriptor pool (proto schema may be incompatible)"
-            )
-        })?
-        .context("failed to build descriptor pool from reflected proto files")?;
-
-        Ok(pool)
-    }
-
-    /// List all services via gRPC reflection.
-    async fn reflection_list_services(
-        client: &mut ServerReflectionClient<Channel>,
-    ) -> Result<Vec<String>> {
         let request = ServerReflectionRequest {
             message_request: Some(MessageRequest::ListServices(String::new())),
             ..Default::default()
@@ -268,7 +164,7 @@ impl TpuMetricsClient {
 
         use tokio_stream::StreamExt;
         let request_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        let mut response_stream = client
+        let mut response_stream = reflection_client
             .server_reflection_info(request_stream)
             .await
             .context("reflection RPC failed")?
@@ -287,436 +183,322 @@ impl TpuMetricsClient {
                 }
             }
         }
-        Ok(service_names)
-    }
 
-    /// Get file descriptors for a service symbol, recursively resolving all imports.
-    async fn reflection_get_file_descriptors_recursive(
-        client: &mut ServerReflectionClient<Channel>,
-        symbol: &str,
-    ) -> Result<Vec<prost_types::FileDescriptorProto>> {
-        use std::collections::HashSet;
-
-        let mut all_fds = Vec::new();
-        let mut seen_files = HashSet::new();
-        let mut pending_files = Vec::new();
-
-        // Start by getting the file containing the target symbol
-        let initial_fds = Self::reflection_file_containing_symbol(client, symbol).await?;
-        for fd in initial_fds {
-            let name = fd.name().to_string();
-            for dep in &fd.dependency {
-                if !seen_files.contains(dep) {
-                    pending_files.push(dep.clone());
-                }
-            }
-            if seen_files.insert(name) {
-                all_fds.push(fd);
-            }
+        if service_names.is_empty() {
+            bail!("No services found via gRPC reflection");
         }
 
-        // Recursively resolve dependencies
-        while let Some(filename) = pending_files.pop() {
-            if seen_files.contains(&filename) {
-                continue;
-            }
-            debug!("Resolving proto dependency: {}", filename);
-            match Self::reflection_file_by_filename(client, &filename).await {
-                Ok(fds) => {
-                    for fd in fds {
-                        let name = fd.name().to_string();
-                        for dep in &fd.dependency {
-                            if !seen_files.contains(dep) {
-                                pending_files.push(dep.clone());
-                            }
-                        }
-                        if seen_files.insert(name) {
-                            all_fds.push(fd);
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!("Could not resolve dependency '{}': {:#}", filename, e);
-                    seen_files.insert(filename);
-                }
-            }
-        }
+        // Find the RuntimeMetric service
+        let target = service_names
+            .iter()
+            .find(|s| s.contains("RuntimeMetric"))
+            .or_else(|| service_names.iter().find(|s| s.contains("runtime")))
+            .with_context(|| {
+                format!(
+                    "No RuntimeMetricService found. Available services: {:?}",
+                    service_names
+                )
+            })?
+            .clone();
 
-        info!("Resolved {} proto file descriptors", all_fds.len());
-        Ok(all_fds)
+        Ok(target)
     }
 
-    /// Get file descriptors containing a given symbol.
-    async fn reflection_file_containing_symbol(
-        client: &mut ServerReflectionClient<Channel>,
-        symbol: &str,
-    ) -> Result<Vec<prost_types::FileDescriptorProto>> {
-        let request = ServerReflectionRequest {
-            message_request: Some(MessageRequest::FileContainingSymbol(symbol.to_string())),
-            ..Default::default()
-        };
-        Self::send_reflection_request(client, request).await
-    }
-
-    /// Get file descriptors by filename.
-    async fn reflection_file_by_filename(
-        client: &mut ServerReflectionClient<Channel>,
-        filename: &str,
-    ) -> Result<Vec<prost_types::FileDescriptorProto>> {
-        let request = ServerReflectionRequest {
-            message_request: Some(MessageRequest::FileByFilename(filename.to_string())),
-            ..Default::default()
-        };
-        Self::send_reflection_request(client, request).await
-    }
-
-    /// Send a single reflection request and collect file descriptors from the response.
-    async fn send_reflection_request(
-        client: &mut ServerReflectionClient<Channel>,
-        request: ServerReflectionRequest,
-    ) -> Result<Vec<prost_types::FileDescriptorProto>> {
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        tx.send(request)
-            .await
-            .context("failed to send reflection request")?;
-
-        use tokio_stream::StreamExt;
-        let request_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        let mut response_stream = client
-            .server_reflection_info(request_stream)
-            .await
-            .context("reflection RPC failed")?
-            .into_inner();
-
-        let mut fds = Vec::new();
-        if let Some(response) = response_stream.next().await {
-            let response = response.context("reflection response error")?;
-            if let Some(
-                tonic_reflection::pb::v1alpha::server_reflection_response::MessageResponse::FileDescriptorResponse(fdr),
-            ) = response.message_response
-            {
-                for fd_bytes in &fdr.file_descriptor_proto {
-                    let fd_proto =
-                        prost_types::FileDescriptorProto::decode(fd_bytes.as_slice())
-                            .context("failed to decode FileDescriptorProto")?;
-                    fds.push(fd_proto);
-                }
-            }
-        }
-        Ok(fds)
-    }
-
-    /// Find the RuntimeMetricService name in the descriptor pool.
-    fn find_runtime_metric_service(pool: &DescriptorPool) -> Result<String> {
-        let candidates = [
-            "tpu.monitoring.runtime.RuntimeMetricService",
-            "tpu.monitoring.RuntimeMetricService",
-            "RuntimeMetricService",
-        ];
-
-        for name in &candidates {
-            if pool.get_service_by_name(name).is_some() {
-                return Ok(name.to_string());
-            }
-        }
-
-        // Search all services in the pool
-        for service in pool.services() {
-            let full_name = service.full_name().to_string();
-            if full_name.contains("RuntimeMetric") || full_name.contains("runtime_metric") {
-                return Ok(full_name);
-            }
-        }
-
-        bail!("RuntimeMetricService not found in descriptor pool")
-    }
-
-    /// Call ListSupportedMetrics to discover available metrics.
-    async fn list_supported_metrics(
-        pool: &DescriptorPool,
-        service_name: &str,
-        channel: Channel,
-    ) -> Result<Vec<String>> {
-        let service = pool
-            .get_service_by_name(service_name)
-            .context("service not found")?;
-
-        let method = match service
-            .methods()
-            .find(|m| m.name() == "ListSupportedMetrics")
-        {
-            Some(m) => m,
-            None => {
-                debug!("ListSupportedMetrics method not found, skipping metric discovery");
-                return Ok(Vec::new());
-            }
-        };
-
-        let request = DynamicMessage::new(method.input());
-        let request_bytes = request.encode_to_vec();
-
-        let method_path = format!("/{}/{}", service_name, method.name());
-        let path = http::uri::PathAndQuery::from_maybe_shared(method_path)
-            .context("invalid method path")?;
-
+    /// Try to list supported metrics via a ListSupportedMetrics RPC.
+    /// Returns empty vec on failure (this is best-effort).
+    async fn try_list_metrics(channel: Channel, method_path: &str) -> Result<Vec<String>> {
         let mut grpc = tonic::client::Grpc::new(channel);
         grpc.ready().await.context("channel not ready")?;
 
+        let path = http::uri::PathAndQuery::try_from(method_path).context("invalid method path")?;
+
+        // Empty request
         let codec = tonic_prost::ProstCodec::<Vec<u8>, Vec<u8>>::default();
         let response: tonic::Response<Vec<u8>> = grpc
-            .unary(tonic::Request::new(request_bytes), path, codec)
+            .unary(tonic::Request::new(Vec::new()), path, codec)
             .await
             .context("ListSupportedMetrics RPC failed")?;
 
         let response_bytes = response.into_inner();
-        let response_msg = DynamicMessage::decode(method.output(), response_bytes.as_slice())
-            .context("failed to decode ListSupportedMetrics response")?;
+        // Parse response for string fields (metric names)
+        Ok(extract_all_strings(&response_bytes))
+    }
+}
 
-        // Extract metric names from the response
-        let mut metrics = Vec::new();
-        for field_name in &["metrics", "metric_names", "supported_metrics"] {
-            if let Some(value) = response_msg.get_field_by_name(field_name) {
-                if let Value::List(list) = value.as_ref() {
-                    for item in list {
-                        if let Value::String(s) = item {
-                            metrics.push(s.clone());
-                        } else if let Value::Message(msg) = item {
-                            if let Some(name_val) = msg.get_field_by_name("name") {
-                                if let Value::String(s) = name_val.as_ref() {
-                                    metrics.push(s.clone());
-                                }
-                            }
-                            if let Some(name_val) = msg.get_field_by_name("metric_name") {
-                                if let Value::String(s) = name_val.as_ref() {
-                                    metrics.push(s.clone());
-                                }
-                            }
+// === Raw protobuf encoding/decoding helpers ===
+
+/// Encode a protobuf message with a single string field.
+fn encode_string_field(field_number: u32, value: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // Wire type 2 (length-delimited) for strings
+    let tag = (field_number << 3) | 2;
+    prost::encoding::encode_varint(tag as u64, &mut buf);
+    prost::encoding::encode_varint(value.len() as u64, &mut buf);
+    buf.extend_from_slice(value.as_bytes());
+    buf
+}
+
+/// Parse a metric response to extract per-device values.
+///
+/// Tries multiple strategies since we don't know the exact proto schema:
+/// 1. Look for repeated sub-messages containing numeric values (per-device results)
+/// 2. Look for top-level numeric values (single-device response)
+fn parse_metric_response(data: &[u8]) -> Vec<DeviceMetricValue> {
+    let fields = parse_proto_fields(data);
+
+    // Strategy 1: Look for repeated sub-messages (field type = length-delimited)
+    // that contain numeric fields (likely per-device results)
+    for field in &fields {
+        if field.wire_type == 2 {
+            // Could be a sub-message or a string
+            if try_parse_as_message(&field.data).is_some() {
+                // Check if this sub-message has numeric fields
+                let mut values_from_submessages = Vec::new();
+                // First occurrence is already parsed, collect from all same-field-number entries
+                let all_same_field: Vec<_> = fields
+                    .iter()
+                    .filter(|f| f.field_number == field.field_number && f.wire_type == 2)
+                    .collect();
+
+                for (i, sub) in all_same_field.iter().enumerate() {
+                    if let Some(sub_fields) = try_parse_as_message(&sub.data) {
+                        let device_id = find_int_field(&sub_fields).unwrap_or(i as i64) as i32;
+                        if let Some(value) = find_float_field(&sub_fields) {
+                            values_from_submessages.push(DeviceMetricValue { device_id, value });
                         }
                     }
+                }
+
+                if !values_from_submessages.is_empty() {
+                    return values_from_submessages;
+                }
+            }
+        }
+    }
+
+    // Strategy 2: Top-level numeric value (single device)
+    if let Some(value) = find_float_field(&fields) {
+        return vec![DeviceMetricValue {
+            device_id: 0,
+            value,
+        }];
+    }
+    if let Some(value) = find_int_field(&fields) {
+        return vec![DeviceMetricValue {
+            device_id: 0,
+            value: value as f64,
+        }];
+    }
+
+    Vec::new()
+}
+
+/// A parsed protobuf field.
+struct ProtoField {
+    field_number: u32,
+    wire_type: u32,
+    data: Vec<u8>,
+    /// For varint fields, the decoded value.
+    varint_value: Option<u64>,
+    /// For 64-bit fixed fields, the raw bytes.
+    fixed64_value: Option<u64>,
+    /// For 32-bit fixed fields, the raw bytes.
+    fixed32_value: Option<u32>,
+}
+
+/// Parse raw protobuf bytes into fields.
+fn parse_proto_fields(data: &[u8]) -> Vec<ProtoField> {
+    let mut fields = Vec::new();
+    let mut pos = 0;
+
+    while pos < data.len() {
+        let (tag, bytes_read) = match decode_varint(&data[pos..]) {
+            Some(v) => v,
+            None => break,
+        };
+        pos += bytes_read;
+
+        let field_number = (tag >> 3) as u32;
+        let wire_type = (tag & 0x7) as u32;
+
+        if field_number == 0 {
+            break; // Invalid
+        }
+
+        match wire_type {
+            0 => {
+                // Varint
+                if let Some((value, vbytes)) = decode_varint(&data[pos..]) {
+                    pos += vbytes;
+                    fields.push(ProtoField {
+                        field_number,
+                        wire_type,
+                        data: Vec::new(),
+                        varint_value: Some(value),
+                        fixed64_value: None,
+                        fixed32_value: None,
+                    });
+                } else {
                     break;
                 }
             }
+            1 => {
+                // 64-bit (fixed64, double)
+                if pos + 8 <= data.len() {
+                    let value = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                    pos += 8;
+                    fields.push(ProtoField {
+                        field_number,
+                        wire_type,
+                        data: Vec::new(),
+                        varint_value: None,
+                        fixed64_value: Some(value),
+                        fixed32_value: None,
+                    });
+                } else {
+                    break;
+                }
+            }
+            2 => {
+                // Length-delimited (string, bytes, sub-message)
+                if let Some((len, lbytes)) = decode_varint(&data[pos..]) {
+                    pos += lbytes;
+                    let len = len as usize;
+                    if pos + len <= data.len() {
+                        fields.push(ProtoField {
+                            field_number,
+                            wire_type,
+                            data: data[pos..pos + len].to_vec(),
+                            varint_value: None,
+                            fixed64_value: None,
+                            fixed32_value: None,
+                        });
+                        pos += len;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            5 => {
+                // 32-bit (fixed32, float)
+                if pos + 4 <= data.len() {
+                    let value = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+                    pos += 4;
+                    fields.push(ProtoField {
+                        field_number,
+                        wire_type,
+                        data: Vec::new(),
+                        varint_value: None,
+                        fixed64_value: None,
+                        fixed32_value: Some(value),
+                    });
+                } else {
+                    break;
+                }
+            }
+            _ => break, // Unknown wire type (3, 4 are deprecated groups)
         }
-
-        Ok(metrics)
     }
 
-    /// Extract per-device metric values from a response message.
-    ///
-    /// Uses heuristics to find per-device results in the dynamically-discovered
-    /// response proto. Prefers list fields (repeated per-device messages) over
-    /// scalar fields. Logs which field was matched for debuggability.
-    fn extract_device_values(response: &DynamicMessage) -> Vec<DeviceMetricValue> {
-        let mut values = Vec::new();
+    fields
+}
 
-        // Count scalar numeric fields for ambiguity detection
-        let numeric_field_count = response
-            .descriptor()
-            .fields()
-            .filter(|f| {
-                response
-                    .get_field_by_name(f.name())
-                    .map(|v| {
-                        matches!(
-                            v.as_ref(),
-                            Value::F64(_)
-                                | Value::F32(_)
-                                | Value::I64(_)
-                                | Value::U64(_)
-                                | Value::I32(_)
-                                | Value::U32(_)
-                        )
-                    })
-                    .unwrap_or(false)
-            })
-            .count();
-        if numeric_field_count > 1 {
-            debug!(
-                "Response has {} candidate fields; extraction may be ambiguous",
-                numeric_field_count
-            );
+/// Try to parse bytes as a protobuf sub-message. Returns None if it doesn't look like valid protobuf.
+fn try_parse_as_message(data: &[u8]) -> Option<Vec<ProtoField>> {
+    if data.is_empty() {
+        return None;
+    }
+    let fields = parse_proto_fields(data);
+    // Heuristic: if we parsed at least one field and consumed most of the data,
+    // it's probably a valid sub-message
+    if fields.is_empty() {
+        return None;
+    }
+    Some(fields)
+}
+
+/// Find the first float/double field value in a set of proto fields.
+fn find_float_field(fields: &[ProtoField]) -> Option<f64> {
+    for field in fields {
+        // Wire type 1 = 64-bit (could be double or fixed64)
+        if field.wire_type == 1 {
+            if let Some(bits) = field.fixed64_value {
+                let value = f64::from_bits(bits);
+                if value.is_finite() {
+                    return Some(value);
+                }
+            }
         }
+        // Wire type 5 = 32-bit (could be float or fixed32)
+        if field.wire_type == 5 {
+            if let Some(bits) = field.fixed32_value {
+                let value = f32::from_bits(bits) as f64;
+                if value.is_finite() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
 
-        for field in response.descriptor().fields() {
-            let field_name = field.name();
-            if let Some(val) = response.get_field_by_name(field_name) {
-                debug!(
-                    "  field '{}': type={}",
-                    field_name,
-                    format_value_type(val.as_ref())
-                );
-                match val.as_ref() {
-                    Value::List(list) => {
-                        debug!("    list field '{}' has {} items", field_name, list.len());
-                        for (i, item) in list.iter().enumerate() {
-                            if let Value::Message(msg) = item {
-                                debug!("      item[{}]: {}", i, format_dynamic_message(msg));
-                                let device_id = Self::extract_int_field(
-                                    msg,
-                                    &["device_id", "device_ordinal", "chip_id"],
-                                )
-                                .unwrap_or(i as i64)
-                                    as i32;
-                                if let Some(value) = Self::extract_float_field(
-                                    msg,
-                                    &["value", "metric_value", "duty_cycle", "usage", "percent"],
-                                ) {
-                                    values.push(DeviceMetricValue { device_id, value });
-                                } else {
-                                    debug!(
-                                        "      item[{}]: no float value found in known field names",
-                                        i
-                                    );
-                                }
-                            } else {
-                                debug!(
-                                    "      item[{}]: not a message, type={}",
-                                    i,
-                                    format_value_type(item)
-                                );
+/// Find the first integer field value (varint or fixed).
+fn find_int_field(fields: &[ProtoField]) -> Option<i64> {
+    for field in fields {
+        if field.wire_type == 0 {
+            if let Some(v) = field.varint_value {
+                return Some(v as i64);
+            }
+        }
+    }
+    None
+}
+
+/// Extract all string values from a protobuf message (for ListSupportedMetrics).
+fn extract_all_strings(data: &[u8]) -> Vec<String> {
+    let mut strings = Vec::new();
+    let fields = parse_proto_fields(data);
+    for field in &fields {
+        if field.wire_type == 2 {
+            // Try as UTF-8 string
+            if let Ok(s) = std::str::from_utf8(&field.data) {
+                if !s.is_empty() && s.chars().all(|c| c.is_ascii_graphic() || c == '.') {
+                    strings.push(s.to_string());
+                }
+            }
+            // Also check sub-messages for nested strings
+            if let Some(sub_fields) = try_parse_as_message(&field.data) {
+                for sf in &sub_fields {
+                    if sf.wire_type == 2 {
+                        if let Ok(s) = std::str::from_utf8(&sf.data) {
+                            if !s.is_empty() && s.chars().all(|c| c.is_ascii_graphic() || c == '.')
+                            {
+                                strings.push(s.to_string());
                             }
                         }
-                        if !values.is_empty() {
-                            debug!(
-                                "Extracted {} device values from list field '{}'",
-                                values.len(),
-                                field_name
-                            );
-                            return values;
-                        }
                     }
-                    Value::Message(msg) => {
-                        if let Some(value) =
-                            Self::extract_float_field(msg, &["value", "metric_value"])
-                        {
-                            let device_id =
-                                Self::extract_int_field(msg, &["device_id", "device_ordinal"])
-                                    .unwrap_or(0) as i32;
-                            values.push(DeviceMetricValue { device_id, value });
-                            return values;
-                        }
-                    }
-                    val @ (Value::F64(_)
-                    | Value::F32(_)
-                    | Value::I64(_)
-                    | Value::U64(_)
-                    | Value::I32(_)
-                    | Value::U32(_)) => {
-                        let v = match val {
-                            Value::F64(v) => *v,
-                            Value::F32(v) => *v as f64,
-                            Value::I64(v) => *v as f64,
-                            Value::U64(v) => *v as f64,
-                            Value::I32(v) => *v as f64,
-                            Value::U32(v) => *v as f64,
-                            _ => unreachable!(),
-                        };
-                        values.push(DeviceMetricValue {
-                            device_id: 0,
-                            value: v,
-                        });
-                        return values;
-                    }
-                    _ => {}
                 }
             }
         }
-
-        values
     }
-
-    fn extract_int_field(msg: &DynamicMessage, field_names: &[&str]) -> Option<i64> {
-        for name in field_names {
-            if let Some(val) = msg.get_field_by_name(name) {
-                match val.as_ref() {
-                    Value::I32(v) => return Some(*v as i64),
-                    Value::I64(v) => return Some(*v),
-                    Value::U32(v) => return Some(*v as i64),
-                    Value::U64(v) => return Some(*v as i64),
-                    _ => {}
-                }
-            }
-        }
-        None
-    }
-
-    fn extract_float_field(msg: &DynamicMessage, field_names: &[&str]) -> Option<f64> {
-        for name in field_names {
-            if let Some(val) = msg.get_field_by_name(name) {
-                match val.as_ref() {
-                    Value::F64(v) => return Some(*v),
-                    Value::F32(v) => return Some(*v as f64),
-                    Value::I64(v) => return Some(*v as f64),
-                    Value::U64(v) => return Some(*v as f64),
-                    Value::I32(v) => return Some(*v as f64),
-                    Value::U32(v) => return Some(*v as f64),
-                    _ => {}
-                }
-            }
-        }
-        None
-    }
+    strings
 }
 
-/// Format a DynamicMessage for debug logging, showing field names and values.
-fn format_dynamic_message(msg: &DynamicMessage) -> String {
-    let mut parts = Vec::new();
-    for field in msg.descriptor().fields() {
-        let name = field.name();
-        if let Some(val) = msg.get_field_by_name(name) {
-            parts.push(format!("{}={}", name, format_value_brief(val.as_ref())));
+/// Decode a varint from a byte slice. Returns (value, bytes_consumed).
+fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
+    let mut value: u64 = 0;
+    let mut shift = 0u32;
+    for (i, &byte) in data.iter().enumerate() {
+        if shift >= 64 {
+            return None;
         }
-    }
-    if parts.is_empty() {
-        format!("{{}} (type: {})", msg.descriptor().full_name())
-    } else {
-        format!("{{{}}}", parts.join(", "))
-    }
-}
-
-/// Format a Value type name for debug logging.
-fn format_value_type(val: &Value) -> &'static str {
-    match val {
-        Value::Bool(_) => "bool",
-        Value::I32(_) => "i32",
-        Value::I64(_) => "i64",
-        Value::U32(_) => "u32",
-        Value::U64(_) => "u64",
-        Value::F32(_) => "f32",
-        Value::F64(_) => "f64",
-        Value::String(_) => "string",
-        Value::Bytes(_) => "bytes",
-        Value::EnumNumber(_) => "enum",
-        Value::Message(_) => "message",
-        Value::List(_) => "list",
-        Value::Map(_) => "map",
-    }
-}
-
-/// Format a Value briefly for debug logging.
-fn format_value_brief(val: &Value) -> String {
-    match val {
-        Value::Bool(v) => format!("{}", v),
-        Value::I32(v) => format!("{}", v),
-        Value::I64(v) => format!("{}", v),
-        Value::U32(v) => format!("{}", v),
-        Value::U64(v) => format!("{}", v),
-        Value::F32(v) => format!("{}", v),
-        Value::F64(v) => format!("{}", v),
-        Value::String(v) => {
-            if v.len() > 50 {
-                format!("\"{}...\"", &v[..50])
-            } else {
-                format!("\"{}\"", v)
-            }
+        value |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, i + 1));
         }
-        Value::Bytes(v) => format!("<{} bytes>", v.len()),
-        Value::EnumNumber(v) => format!("enum({})", v),
-        Value::Message(msg) => {
-            let field_count = msg.descriptor().fields().len();
-            format!("<{} with {} fields>", msg.descriptor().name(), field_count)
-        }
-        Value::List(list) => format!("[{} items]", list.len()),
-        Value::Map(map) => format!("{{{}}} entries", map.len()),
+        shift += 7;
     }
+    None
 }
