@@ -149,7 +149,7 @@ pub fn run_tpu_metrics_thread(
     // Use a shorter per-attempt timeout so we get multiple retries within the overall budget.
     // If connect fails due to a schema/proto issue (not a transient network error),
     // give up immediately rather than retrying.
-    let client = {
+    let mut client = {
         let overall_deadline = Duration::from_secs(10);
         let per_attempt_timeout = Duration::from_secs(3);
         let start = std::time::Instant::now();

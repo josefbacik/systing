@@ -16,3 +16,10 @@ pub mod profiler_service {
 pub mod xplane {
     pub use super::profiler_service::profiler::*;
 }
+
+/// Generated RuntimeMetricService gRPC client and types (tpu.monitoring.runtime package).
+pub mod tpu_metric_service {
+    include!("tpu_metric_service.rs");
+
+    pub use runtime_metric_service_client::RuntimeMetricServiceClient;
+}
