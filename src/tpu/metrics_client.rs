@@ -152,9 +152,13 @@ impl TpuMetricsClient {
             response_bytes.len()
         );
 
-        // Decode response
+        // Decode response. Wrap in catch_unwind because prost-reflect can panic
+        // on unexpected proto wire formats.
+        let desc = self.response_desc.clone();
+        let bytes = response_bytes.clone();
         let response_msg =
-            DynamicMessage::decode(self.response_desc.clone(), response_bytes.as_slice())
+            std::panic::catch_unwind(move || DynamicMessage::decode(desc, bytes.as_slice()))
+                .map_err(|_| anyhow::anyhow!("prost-reflect panicked decoding metric response"))?
                 .context("failed to decode metric response")?;
 
         // Log the decoded response structure for debugging
@@ -227,12 +231,22 @@ impl TpuMetricsClient {
 
         // Step 4: Build descriptor pool from all collected file descriptors.
         // Add them all at once so prost-reflect can resolve cross-references.
-        let mut pool = DescriptorPool::new();
-        let fds = prost_types::FileDescriptorSet {
-            file: file_descriptors,
-        };
-        pool.add_file_descriptor_set(fds)
-            .context("failed to build descriptor pool from reflected proto files")?;
+        // Wrap in catch_unwind because prost-reflect can panic on unexpected
+        // proto structures (e.g. index out of bounds on malformed descriptors).
+        let pool = std::panic::catch_unwind(move || {
+            let mut pool = DescriptorPool::new();
+            let fds = prost_types::FileDescriptorSet {
+                file: file_descriptors,
+            };
+            pool.add_file_descriptor_set(fds)?;
+            Ok::<_, prost_reflect::DescriptorError>(pool)
+        })
+        .map_err(|_panic| {
+            anyhow::anyhow!(
+                "prost-reflect panicked building descriptor pool (proto schema may be incompatible)"
+            )
+        })?
+        .context("failed to build descriptor pool from reflected proto files")?;
 
         Ok(pool)
     }
