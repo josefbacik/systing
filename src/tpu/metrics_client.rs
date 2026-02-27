@@ -282,7 +282,36 @@ fn log_proto_fields(metric_name: &str, data: &[u8]) {
                                 let bits = sf.fixed64_value.unwrap_or(0);
                                 format!("#{}=f64({})", sf.field_number, f64::from_bits(bits))
                             }
-                            2 => format!("#{}=bytes({})", sf.field_number, sf.data.len()),
+                            2 => {
+                                // Recurse one more level to show sub-sub-message fields
+                                if let Some(ssf) = try_parse_as_message(&sf.data) {
+                                    let ss_descs: Vec<String> = ssf
+                                        .iter()
+                                        .map(|f| match f.wire_type {
+                                            0 => format!(
+                                                "#{}=v({})",
+                                                f.field_number,
+                                                f.varint_value.unwrap_or(0)
+                                            ),
+                                            1 => format!(
+                                                "#{}=f64({})",
+                                                f.field_number,
+                                                f64::from_bits(f.fixed64_value.unwrap_or(0))
+                                            ),
+                                            2 => format!("#{}=b({})", f.field_number, f.data.len()),
+                                            5 => format!(
+                                                "#{}=f32({})",
+                                                f.field_number,
+                                                f32::from_bits(f.fixed32_value.unwrap_or(0))
+                                            ),
+                                            _ => format!("#{}=?", f.field_number),
+                                        })
+                                        .collect();
+                                    format!("#{}=msg[{}]", sf.field_number, ss_descs.join(", "))
+                                } else {
+                                    format!("#{}=bytes({})", sf.field_number, sf.data.len())
+                                }
+                            }
                             5 => format!(
                                 "#{}=f32({})",
                                 sf.field_number,
