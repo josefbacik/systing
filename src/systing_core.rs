@@ -2306,6 +2306,7 @@ fn run_tracing_loop(
     println!("Stopping...");
     skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
     ringbuf_shutdown.signal();
+    eprintln!("Joining ringbuf threads...");
     for thread in handles.ringbuf_threads {
         thread.join().expect("Failed to join thread");
     }
@@ -2318,11 +2319,13 @@ fn run_tracing_loop(
     if let Some(thread) = handles.sysinfo_thread {
         thread.join().expect("Failed to join sysinfo thread");
     }
+    eprintln!("Joining TPU metrics thread...");
     if let Some(thread) = handles.tpu_metrics_thread {
         if let Err(e) = thread.join() {
             eprintln!("TPU metrics thread panicked: {:?}", e);
         }
     }
+    eprintln!("Joining recorder threads...");
     for thread in handles.recorder_threads {
         thread.join().expect("Failed to join receiver thread");
     }
