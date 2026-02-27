@@ -106,6 +106,27 @@ impl TpuMetricsClient {
                 .context("metric RPC failed")?
                 .into_inner();
 
+        // For Streamz metrics, log the raw encoded size to verify data is being decoded
+        if let Some(ref sm) = response.streamz_metric {
+            use prost::Message;
+            let encoded_size = sm.encoded_len();
+            debug!(
+                "StreamzMetric raw: name={:?}, encoded_size={}, read_response_count={}",
+                sm.name,
+                encoded_size,
+                sm.read_response.len()
+            );
+            for (i, rr) in sm.read_response.iter().enumerate() {
+                let rr_size = rr.encoded_len();
+                debug!(
+                    "  read_response[{}]: encoded_size={}, point_set_count={}",
+                    i,
+                    rr_size,
+                    rr.point_set.len()
+                );
+            }
+        }
+
         let device_values = extract_metric_values(&response, metric_name);
 
         debug!(
