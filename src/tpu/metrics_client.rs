@@ -150,10 +150,31 @@ fn extract_metric_values(response: &MetricResponse, metric_name: &str) -> Vec<De
         return values;
     }
 
-    // StreamzMetric (MetricType::STREAMZ) — we don't parse these yet
-    if response.streamz_metric.is_some() {
+    // StreamzMetric (MetricType::STREAMZ) — extract values from PointSet -> Point
+    if let Some(ref streamz) = response.streamz_metric {
+        let mut values = Vec::new();
+        for read_resp in &streamz.read_response {
+            for point_set in &read_resp.point_set {
+                for (i, point) in point_set.point.iter().enumerate() {
+                    if let Some(v) = point.double_value {
+                        values.push(DeviceMetricValue {
+                            device_id: i as i32,
+                            value: v,
+                        });
+                    } else if let Some(v) = point.int64_value {
+                        values.push(DeviceMetricValue {
+                            device_id: i as i32,
+                            value: v as f64,
+                        });
+                    }
+                }
+            }
+        }
+        if !values.is_empty() {
+            return values;
+        }
         debug!(
-            "Metric '{}' is Streamz type, skipping (not yet supported)",
+            "StreamzMetric '{}' has read_responses but no extractable point values",
             metric_name
         );
     }

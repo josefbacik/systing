@@ -43,11 +43,46 @@ pub struct TpuMetric {
 }
 
 /// Streamz metric (opaque for now — we focus on TPUMetric/LIBTPU type).
+/// Streamz metric — wraps streamz.ReadResponse for Streamz-type metrics.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StreamzMetric {
     #[prost(string, optional, tag = "1")]
     pub name: ::core::option::Option<::prost::alloc::string::String>,
-    // field #2 is repeated streamz.ReadResponse — complex nested type, skipped
+    #[prost(message, repeated, tag = "2")]
+    pub read_response: ::prost::alloc::vec::Vec<StreamzReadResponse>,
+}
+
+/// Subset of streamz.ReadResponse — contains point sets with metric values.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StreamzReadResponse {
+    // field #1 is Entity (labels) — skipped for now
+    #[prost(message, repeated, tag = "2")]
+    pub point_set: ::prost::alloc::vec::Vec<StreamzPointSet>,
+}
+
+/// Subset of streamz.PointSet — a named set of data points.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StreamzPointSet {
+    #[prost(string, optional, tag = "1")]
+    pub metric_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "2")]
+    pub point: ::prost::alloc::vec::Vec<StreamzPoint>,
+}
+
+/// Subset of streamz.Point — a single data point with typed value.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StreamzPoint {
+    // field #1 is repeated Column (labels) — skipped
+    #[prost(bool, optional, tag = "2")]
+    pub bool_value: ::core::option::Option<bool>,
+    #[prost(string, optional, tag = "3")]
+    pub string_value: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "4")]
+    pub int64_value: ::core::option::Option<i64>,
+    #[prost(double, optional, tag = "5")]
+    pub double_value: ::core::option::Option<f64>,
+    // field #6 is Distribution — we use the dedicated Distribution type instead
+    // field #7, #8 are timestamps — skipped
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
