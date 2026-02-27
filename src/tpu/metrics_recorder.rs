@@ -145,8 +145,10 @@ pub fn run_tpu_metrics_thread(
     let poll_interval = Duration::from_millis(poll_interval_ms);
     let rpc_timeout = Duration::from_millis(poll_interval_ms * 2);
 
-    // Connect with retries (up to 10 seconds)
+    // Connect to the metrics service.
     // Use a shorter per-attempt timeout so we get multiple retries within the overall budget.
+    // If connect fails due to a schema/proto issue (not a transient network error),
+    // give up immediately rather than retrying.
     let client = {
         let overall_deadline = Duration::from_secs(10);
         let per_attempt_timeout = Duration::from_secs(3);
@@ -165,6 +167,18 @@ pub fn run_tpu_metrics_thread(
             )) {
                 Ok(c) => break c,
                 Err(e) => {
+                    let err_msg = format!("{:#}", e);
+                    // Proto/schema errors won't be fixed by retrying
+                    if err_msg.contains("prost-reflect panicked")
+                        || err_msg.contains("descriptor pool")
+                        || err_msg.contains("RuntimeMetricService not found")
+                    {
+                        error!(
+                            "TPU metrics service proto schema is incompatible, disabling metrics: {:#}",
+                            e
+                        );
+                        return 1;
+                    }
                     if start.elapsed() >= overall_deadline {
                         error!(
                             "Failed to connect to TPU metrics service at {} after {:?}: {:#}",
@@ -174,6 +188,7 @@ pub fn run_tpu_metrics_thread(
                         );
                         return 1;
                     }
+                    warn!("TPU metrics connection attempt failed: {:#}", e);
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(Duration::from_secs(5));
                 }
