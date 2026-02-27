@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use prost::bytes::{Buf, BufMut, Bytes};
 use tonic::transport::Channel;
 use tracing::{debug, info};
 
@@ -105,9 +106,9 @@ impl TpuMetricsClient {
         let path = http::uri::PathAndQuery::from_maybe_shared(self.method_path.clone())
             .context("invalid method path")?;
 
-        let codec = tonic_prost::ProstCodec::<Vec<u8>, Vec<u8>>::default();
-        let response: tonic::Response<Vec<u8>> = tokio::time::timeout(timeout, async {
-            grpc.unary(tonic::Request::new(request_bytes), path, codec)
+        let codec = RawBytesCodec;
+        let response: tonic::Response<Bytes> = tokio::time::timeout(timeout, async {
+            grpc.unary(tonic::Request::new(request_bytes.into()), path, codec)
                 .await
         })
         .await
@@ -213,9 +214,9 @@ impl TpuMetricsClient {
         let path = http::uri::PathAndQuery::try_from(method_path).context("invalid method path")?;
 
         // Empty request
-        let codec = tonic_prost::ProstCodec::<Vec<u8>, Vec<u8>>::default();
-        let response: tonic::Response<Vec<u8>> = grpc
-            .unary(tonic::Request::new(Vec::new()), path, codec)
+        let codec = RawBytesCodec;
+        let response: tonic::Response<Bytes> = grpc
+            .unary(tonic::Request::new(Bytes::new()), path, codec)
             .await
             .context("ListSupportedMetrics RPC failed")?;
 
@@ -501,4 +502,61 @@ fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
         shift += 7;
     }
     None
+}
+
+// === Raw bytes gRPC codec ===
+
+/// A gRPC codec that passes raw bytes through without protobuf encoding/decoding.
+#[derive(Debug, Clone, Copy)]
+struct RawBytesCodec;
+
+impl tonic::codec::Codec for RawBytesCodec {
+    type Encode = Bytes;
+    type Decode = Bytes;
+    type Encoder = RawBytesEncoder;
+    type Decoder = RawBytesDecoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        RawBytesEncoder
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        RawBytesDecoder
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RawBytesEncoder;
+
+impl tonic::codec::Encoder for RawBytesEncoder {
+    type Item = Bytes;
+    type Error = tonic::Status;
+
+    fn encode(
+        &mut self,
+        item: Self::Item,
+        dst: &mut tonic::codec::EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
+        dst.put(item);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RawBytesDecoder;
+
+impl tonic::codec::Decoder for RawBytesDecoder {
+    type Item = Bytes;
+    type Error = tonic::Status;
+
+    fn decode(
+        &mut self,
+        src: &mut tonic::codec::DecodeBuf<'_>,
+    ) -> Result<Option<Self::Item>, Self::Error> {
+        let len = src.remaining();
+        if len == 0 {
+            return Ok(None);
+        }
+        Ok(Some(src.copy_to_bytes(len)))
+    }
 }
