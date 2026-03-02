@@ -1,0 +1,114 @@
+// TPU RuntimeMetricService proto definitions.
+//
+// Captured from a live TPU runtime via gRPC reflection using:
+//   systing-util dump-tpu-proto
+//
+// Only the types needed for metric polling are included here.
+// The full service also has StreamzMetric and GetTpuRuntimeStatus RPCs.
+
+syntax = "proto3";
+
+package tpu.monitoring.runtime;
+
+message MetricRequest {
+  string metric_name = 1;
+  bool skip_node_aggregation = 2;
+}
+
+message MetricResponse {
+  TPUMetric metric = 1;
+  StreamzMetric streamz_metric = 2;
+  MetricType metric_type = 3;
+}
+
+enum MetricType {
+  UNKNOWN = 0;
+  LIBTPU = 1;
+  STREAMZ = 2;
+}
+
+message TPUMetric {
+  string name = 1;
+  string description = 2;
+  repeated Metric metrics = 3;
+}
+
+message StreamzMetric {
+  string name = 1;
+  // StreamzMetric wraps streamz.ReadResponse (parsed in tpu_metric_service.rs
+  // as a subset: ReadResponse -> PointSet -> Point with typed values).
+}
+
+message Metric {
+  Attribute attribute = 1;
+  google.protobuf.Timestamp start_timestamp = 7;
+  google.protobuf.Timestamp timestamp = 2;
+  Gauge gauge = 3;
+  Counter counter = 4;
+  Distribution distribution = 5;
+  Summary summary = 6;
+}
+
+message Attribute {
+  string key = 1;
+  AttrValue value = 2;
+}
+
+message AttrValue {
+  string string_attr = 1;
+  bool bool_attr = 2;
+  int64 int_attr = 3;
+  double double_attr = 4;
+}
+
+message Gauge {
+  double as_double = 1;
+  int64 as_int = 2;
+  string as_string = 3;
+  bool as_bool = 4;
+}
+
+message Counter {
+  double as_double = 1;
+  uint64 as_int = 2;
+}
+
+message Distribution {
+  int64 count = 1;
+  double mean = 2;
+  double min = 3;
+  double max = 4;
+  double sum_of_squared_deviation = 5;
+}
+
+message Summary {
+  uint64 sample_count = 1;
+  double sample_sum = 2;
+}
+
+// Subset of google.protobuf.Timestamp (we don't want to import the full google proto).
+message google {
+  message protobuf {
+    message Timestamp {
+      int64 seconds = 1;
+      int32 nanos = 2;
+    }
+  }
+}
+
+message SupportedMetric {
+  string metric_name = 1;
+}
+
+message ListSupportedMetricsRequest {
+  string filter = 1;
+}
+
+message ListSupportedMetricsResponse {
+  repeated SupportedMetric supported_metric = 1;
+}
+
+service RuntimeMetricService {
+  rpc GetRuntimeMetric(MetricRequest) returns (MetricResponse);
+  rpc ListSupportedMetrics(ListSupportedMetricsRequest) returns (ListSupportedMetricsResponse);
+}

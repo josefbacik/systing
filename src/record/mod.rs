@@ -5,4 +5,4 @@
 
 pub mod collector;
 
-pub use collector::RecordCollector;
+pub use collector::{InMemoryCollector, RecordCollector};

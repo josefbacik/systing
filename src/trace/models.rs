@@ -491,4 +491,58 @@ pub struct ExtractedData {
     pub network_polls: Vec<NetworkPollRecord>,
     pub clock_snapshots: Vec<ClockSnapshotRecord>,
     pub sysinfo: Option<SysInfoRecord>,
+    pub tpu_devices: Vec<TpuDeviceRecord>,
+    pub tpu_ops: Vec<TpuOpRecord>,
+    pub tpu_metrics: Vec<TpuMetricRecord>,
+}
+// TPU profiling records
+
+/// TPU device metadata record.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TpuDeviceRecord {
+    pub id: i64,
+    pub device_ordinal: i32,
+    pub chip_id: i32,
+    pub core_id: i32,
+    pub hostname: String,
+    pub device_type: String,
+    pub topology_x: i32,
+    pub topology_y: i32,
+    pub topology_z: i32,
+    pub clock_rate_ghz: f64,
+    pub hbm_size_bytes: i64,
+    pub hbm_bandwidth_gbps: f64,
+}
+
+/// TPU per-HLO-operation execution record.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TpuOpRecord {
+    pub id: i64,
+    pub tpu_device_id: i64,
+    pub ts: i64,
+    pub dur: i64,
+    /// XSpace group_id (training step identifier). Raw value from XLA profiler.
+    pub group_id: Option<i64>,
+    pub op_name: String,
+    pub category: String,
+    pub stream: String,
+    pub flops: i64,
+    pub bytes_accessed: i64,
+    pub bytes_hbm: i64,
+    pub bytes_cmem: i64,
+    pub bytes_vmem: i64,
+}
+
+/// TPU runtime metric record (lightweight polling from RuntimeMetricService).
+///
+/// Stores a single metric value per device per sample in a normalized format.
+/// Metric names come directly from the RuntimeMetricService, so the schema
+/// adapts automatically to new metrics without code changes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TpuMetricRecord {
+    pub id: i64,
+    pub ts: i64,
+    pub device_id: i32,
+    pub metric_name: String,
+    pub value: f64,
 }

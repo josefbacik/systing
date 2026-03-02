@@ -179,6 +179,16 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             description: "Userspace marker events (faccessat2 with mode=-975)",
             default_enabled: false,
         },
+        RecorderInfo {
+            name: "tpu",
+            description: "TPU profiling (gRPC to XLA runtime profiler service)",
+            default_enabled: false,
+        },
+        RecorderInfo {
+            name: "tpu-metrics",
+            description: "TPU runtime metrics polling (port 8431, always available)",
+            default_enabled: false,
+        },
     ]
 }
 
@@ -258,6 +268,16 @@ pub struct Config {
     pub network: bool,
     /// Skip DNS resolution for network addresses
     pub no_resolve_addresses: bool,
+    /// Enable TPU profiling
+    pub tpu_profile: bool,
+    /// TPU profiler service address (overrides auto-discovery)
+    pub tpu_service_addr: Option<String>,
+    /// Enable lightweight TPU metrics polling (port 8431)
+    pub tpu_metrics: bool,
+    /// TPU metrics service address (overrides auto-discovery)
+    pub tpu_metrics_addr: Option<String>,
+    /// TPU metrics polling interval in milliseconds
+    pub tpu_metrics_interval: u64,
     /// Output directory for parquet files
     pub output_dir: PathBuf,
     /// Output path (format auto-detected from extension: .pb = Perfetto, .duckdb = DuckDB)
@@ -298,6 +318,11 @@ impl Default for Config {
             marker_duration_threshold: None,
             network: false,
             no_resolve_addresses: false,
+            tpu_profile: false,
+            tpu_service_addr: None,
+            tpu_metrics: false,
+            tpu_metrics_addr: None,
+            tpu_metrics_interval: 1000,
             output_dir: PathBuf::from("./traces"),
             output: PathBuf::from("trace.pb"),
             parquet_only: false,
@@ -2182,6 +2207,7 @@ struct ThreadHandles {
     discovery_thread: thread::JoinHandle<i32>,
     symbol_loader_thread: thread::JoinHandle<i32>,
     exec_handler_thread: Option<thread::JoinHandle<()>>,
+    tpu_metrics_thread: Option<thread::JoinHandle<i32>>,
     task_info_tx: Sender<task_info>,
     pystack_symbol_tx: Sender<stack_event>,
 }
@@ -2292,6 +2318,11 @@ fn run_tracing_loop(
     if let Some(thread) = handles.sysinfo_thread {
         thread.join().expect("Failed to join sysinfo thread");
     }
+    if let Some(thread) = handles.tpu_metrics_thread {
+        if let Err(e) = thread.join() {
+            eprintln!("TPU metrics thread panicked: {:?}", e);
+        }
+    }
     for thread in handles.recorder_threads {
         thread.join().expect("Failed to join receiver thread");
     }
@@ -2355,6 +2386,7 @@ pub fn systing(
         !opts.no_resolve_addresses,
         opts.marker_threshold,
         opts.marker_duration_threshold,
+        opts.tpu_metrics,
     ));
     configure_recorder(&opts, &recorder);
     recorder.snapshot_clocks();
@@ -2366,6 +2398,11 @@ pub fn systing(
         "Initialized streaming parquet output to {:?}",
         opts.output_dir
     );
+
+    // TPU profiling thread handle - declared outside skel scope so it can be
+    // joined after skel is dropped.
+    let mut tpu_thread: Option<std::thread::JoinHandle<Result<crate::tpu::recorder::TpuRecorder>>> =
+        None;
 
     {
         let mut skel_builder = SystingSystemSkelBuilder::default();
@@ -2720,6 +2757,100 @@ pub fn systing(
             );
         }
 
+        // Start TPU profiling thread if enabled.
+        // The XLA ProfilerService requires a fixed capture duration upfront, so
+        // --tpu-profile is incompatible with indefinite tracing (duration == 0).
+        if opts.tpu_profile {
+            if opts.duration == 0 {
+                bail!(
+                    "--tpu-profile requires a fixed --duration (not --continuous or \
+                     indefinite tracing): the XLA ProfilerService needs a capture window \
+                     specified upfront"
+                );
+            }
+            let discovered = if let Some(addr) = opts.tpu_service_addr.clone() {
+                Some(crate::tpu::discovery::DiscoveredService {
+                    addr,
+                    namespace_pid: None,
+                })
+            } else {
+                match crate::tpu::discovery::discover_profiler_service() {
+                    Ok(svc) => svc,
+                    Err(e) => {
+                        eprintln!("TPU profiler discovery failed: {:#}", e);
+                        None
+                    }
+                }
+            };
+
+            if let Some(svc) = discovered {
+                let duration_ms = opts.duration * 1000;
+                let ns_info = svc
+                    .namespace_pid
+                    .map(|pid| format!(" (via setns PID {})", pid))
+                    .unwrap_or_default();
+                eprintln!(
+                    "Starting TPU profile capture from {}{} for {}ms...",
+                    svc.addr, ns_info, duration_ms
+                );
+                match crate::tpu::recorder::spawn_tpu_thread(
+                    svc.addr,
+                    duration_ms,
+                    svc.namespace_pid,
+                ) {
+                    Ok(handle) => tpu_thread = Some(handle),
+                    Err(e) => eprintln!("Failed to spawn TPU profiler thread: {:#}", e),
+                }
+            }
+        }
+
+        // Start TPU metrics polling thread if enabled
+        let mut tpu_metrics_thread = None;
+        if opts.tpu_metrics {
+            let discovered = if let Some(addr) = opts.tpu_metrics_addr.clone() {
+                // User-specified address: assume host namespace (no setns needed)
+                Some(crate::tpu::discovery::DiscoveredService {
+                    addr,
+                    namespace_pid: None,
+                })
+            } else {
+                match crate::tpu::discovery::discover_metrics_service() {
+                    Ok(svc) => svc,
+                    Err(e) => {
+                        eprintln!("TPU metrics service discovery failed: {:#}", e);
+                        None
+                    }
+                }
+            };
+
+            if let Some(svc) = discovered {
+                let poll_interval_ms = opts.tpu_metrics_interval;
+                let shutdown_clone = shutdown_signal.clone();
+                let recorder_clone = recorder.clone();
+                let ns_info = svc
+                    .namespace_pid
+                    .map(|pid| format!(" (via setns PID {})", pid))
+                    .unwrap_or_default();
+                eprintln!(
+                    "Starting TPU metrics polling from {}{} every {}ms...",
+                    svc.addr, ns_info, poll_interval_ms
+                );
+                tpu_metrics_thread = Some(
+                    thread::Builder::new()
+                        .name("tpu_metrics".to_string())
+                        .spawn(move || {
+                            crate::tpu::metrics_recorder::run_tpu_metrics_thread(
+                                &svc.addr,
+                                poll_interval_ms,
+                                shutdown_clone,
+                                recorder_clone,
+                                svc.namespace_pid,
+                            )
+                        })?,
+                );
+            }
+        }
+
         let handles = ThreadHandles {
             ringbuf_threads,
             sysinfo_thread,
@@ -2729,6 +2860,7 @@ pub fn systing(
             exec_handler_thread,
             task_info_tx,
             pystack_symbol_tx,
+            tpu_metrics_thread,
         };
 
         run_tracing_loop(
@@ -2758,12 +2890,33 @@ pub fn systing(
         recorder.drain_all_ringbufs();
     }
 
+    // Join TPU profiling thread and collect results
+    let tpu_recorder = if let Some(handle) = tpu_thread {
+        eprintln!("Waiting for TPU profile capture to complete...");
+        match handle.join() {
+            Ok(Ok(rec)) => {
+                eprintln!("TPU profile capture complete.");
+                Some(rec)
+            }
+            Ok(Err(e)) => {
+                eprintln!("TPU profile capture failed: {:#}", e);
+                None
+            }
+            Err(_) => {
+                eprintln!("TPU profiler thread panicked");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Write trace files directly to Parquet
     println!(
         "Writing Parquet trace files to {}...",
         opts.output_dir.display()
     );
-    recorder.generate_parquet_trace(&opts.output_dir)?;
+    recorder.generate_parquet_trace(&opts.output_dir, tpu_recorder)?;
     println!("Successfully wrote Parquet trace files");
 
     // Generate output trace (unless --parquet-only)

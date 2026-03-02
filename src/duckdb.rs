@@ -21,7 +21,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -55,6 +55,9 @@ pub const DATA_TABLES: &[&str] = &[
     "network_poll",
     "clock_snapshot",
     "sysinfo",
+    "tpu_device",
+    "tpu_op",
+    "tpu_metric",
 ];
 
 /// Create DuckDB schema with all tables.
@@ -412,6 +415,49 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             version VARCHAR,
             machine VARCHAR
         );
+
+        -- TPU profiling tables
+        CREATE TABLE IF NOT EXISTS tpu_device (
+            trace_id VARCHAR,
+            id BIGINT,
+            device_ordinal INTEGER,
+            chip_id INTEGER,
+            core_id INTEGER,
+            hostname VARCHAR,
+            device_type VARCHAR,
+            topology_x INTEGER,
+            topology_y INTEGER,
+            topology_z INTEGER,
+            clock_rate_ghz DOUBLE,
+            hbm_size_bytes BIGINT,
+            hbm_bandwidth_gbps DOUBLE
+        );
+
+        CREATE TABLE IF NOT EXISTS tpu_op (
+            trace_id VARCHAR,
+            id BIGINT,
+            tpu_device_id BIGINT,
+            ts BIGINT,
+            dur BIGINT,
+            group_id BIGINT,
+            op_name VARCHAR,
+            category VARCHAR,
+            stream VARCHAR,
+            flops BIGINT,
+            bytes_accessed BIGINT,
+            bytes_hbm BIGINT,
+            bytes_cmem BIGINT,
+            bytes_vmem BIGINT
+        );
+
+        CREATE TABLE IF NOT EXISTS tpu_metric (
+            trace_id VARCHAR,
+            id BIGINT,
+            ts BIGINT,
+            device_id INTEGER,
+            metric_name VARCHAR,
+            value DOUBLE
+        );
         ",
     )?;
 
@@ -556,6 +602,11 @@ fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Res
 
     // System info
     import_table("sysinfo", &paths.sysinfo)?;
+
+    // TPU tables
+    import_table("tpu_device", &paths.tpu_device)?;
+    import_table("tpu_op", &paths.tpu_op)?;
+    import_table("tpu_metric", &paths.tpu_metric)?;
 
     Ok(())
 }
@@ -944,6 +995,11 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
 
     // System info
     export_table("sysinfo", &paths.sysinfo)?;
+
+    // TPU tables
+    export_table("tpu_device", &paths.tpu_device)?;
+    export_table("tpu_op", &paths.tpu_op)?;
+    export_table("tpu_metric", &paths.tpu_metric)?;
 
     Ok(())
 }

@@ -390,3 +390,53 @@ pub fn network_poll_schema() -> Arc<Schema> {
         Field::new("returned_events", DataType::Utf8, false),
     ]))
 }
+
+// TPU profiling schemas
+
+/// Schema for tpu_device.parquet
+pub fn tpu_device_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("device_ordinal", DataType::Int32, false),
+        Field::new("chip_id", DataType::Int32, false),
+        Field::new("core_id", DataType::Int32, false),
+        Field::new("hostname", DataType::Utf8, false),
+        Field::new("device_type", DataType::Utf8, false),
+        Field::new("topology_x", DataType::Int32, false),
+        Field::new("topology_y", DataType::Int32, false),
+        Field::new("topology_z", DataType::Int32, false),
+        Field::new("clock_rate_ghz", DataType::Float64, false),
+        Field::new("hbm_size_bytes", DataType::Int64, false),
+        Field::new("hbm_bandwidth_gbps", DataType::Float64, false),
+    ]))
+}
+
+/// Schema for tpu_op.parquet
+pub fn tpu_op_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("tpu_device_id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("dur", DataType::Int64, false),
+        Field::new("group_id", DataType::Int64, true),
+        Field::new("op_name", DataType::Utf8, false),
+        Field::new("category", DataType::Utf8, false),
+        Field::new("stream", DataType::Utf8, false),
+        Field::new("flops", DataType::Int64, false),
+        Field::new("bytes_accessed", DataType::Int64, false),
+        Field::new("bytes_hbm", DataType::Int64, false),
+        Field::new("bytes_cmem", DataType::Int64, false),
+        Field::new("bytes_vmem", DataType::Int64, false),
+    ]))
+}
+
+/// Schema for tpu_metric.parquet
+pub fn tpu_metric_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("device_id", DataType::Int32, false),
+        Field::new("metric_name", DataType::Utf8, false),
+        Field::new("value", DataType::Float64, false),
+    ]))
+}

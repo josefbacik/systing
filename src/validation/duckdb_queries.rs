@@ -9,7 +9,8 @@ use std::path::Path;
 
 use super::config::ValidationConfig;
 use super::queries::{
-    CmdlineStats, FieldCheck, OrphanCheck, SchemaResult, StackViolation, ValidationQueries,
+    CmdlineStats, FieldCheck, OrphanCheck, SchemaResult, StackViolation, TpuMetricCheck,
+    ValidationQueries,
 };
 use super::result::{ValidationError, ValidationResult, ValidationWarning};
 use super::runner::run_common_validations;
@@ -380,6 +381,62 @@ impl ValidationQueries for DuckDbQueries {
         }
 
         Ok(violations)
+    }
+
+    fn check_tpu_metrics(&mut self) -> Result<Option<TpuMetricCheck>> {
+        if !self.table_exists("tpu_metric") {
+            return Ok(None);
+        }
+
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM tpu_metric", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        if count == 0 {
+            return Ok(None);
+        }
+
+        let mut check = TpuMetricCheck {
+            total_count: count,
+            ..Default::default()
+        };
+
+        check.bad_timestamp_count = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM tpu_metric WHERE ts <= 0", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+
+        check.empty_name_count = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tpu_metric WHERE metric_name IS NULL OR metric_name = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        check.non_finite_value_count = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tpu_metric WHERE isnan(value) OR isinf(value)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        check.negative_device_id_count = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tpu_metric WHERE device_id < 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        Ok(Some(check))
     }
 }
 

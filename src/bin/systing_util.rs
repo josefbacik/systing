@@ -96,6 +96,18 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Dump TPU metrics proto definitions via gRPC reflection.
+    ///
+    /// Connects to the TPU RuntimeMetricService (port 8431), fetches proto
+    /// descriptors via server reflection, prints them to stdout, and writes a
+    /// serialized FileDescriptorSet to ./tpu_metrics_descriptor.bin.
+    DumpTpuProto {
+        /// TPU metrics service address (host:port). If omitted, auto-discovers
+        /// on port 8431 (including containerized workloads via /proc scan).
+        #[arg(long)]
+        addr: Option<String>,
+    },
 }
 
 /// Information about a trace being processed
@@ -3654,6 +3666,35 @@ fn run_validate(path: PathBuf, verbose: bool, json: bool) -> Result<()> {
     }
 }
 
+fn run_dump_tpu_proto(addr: Option<String>) -> Result<()> {
+    // Discovery (which reads /proc) must happen in the host namespace, but the
+    // gRPC connection may need to happen inside a container's namespace. To keep
+    // the main thread's namespace clean, spawn a dedicated thread that (a) does
+    // setns if needed and (b) owns the tokio runtime for all network I/O.
+    let (addr, namespace_pid) = match addr {
+        Some(a) => (a, None),
+        None => match systing::tpu::discovery::discover_metrics_service()? {
+            Some(svc) => (svc.addr, svc.namespace_pid),
+            None => bail!("No TPU metrics service found. Use --addr to specify."),
+        },
+    };
+
+    std::thread::Builder::new()
+        .name("tpu-proto-dump".to_string())
+        .spawn(move || -> Result<()> {
+            if let Some(pid) = namespace_pid {
+                systing::tpu::discovery::enter_netns_permanent(pid)?;
+                eprintln!("Entered network namespace via PID {}", pid);
+            }
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(systing::tpu::proto_dump::dump_tpu_protos(&addr))
+        })?
+        .join()
+        .map_err(|_| anyhow::anyhow!("proto-dump thread panicked"))?
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -3670,6 +3711,7 @@ fn main() -> Result<()> {
             verbose,
             json,
         } => run_validate(path, verbose, json),
+        Commands::DumpTpuProto { addr } => run_dump_tpu_proto(addr),
     }
 }
 

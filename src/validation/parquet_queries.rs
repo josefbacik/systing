@@ -17,8 +17,8 @@ use crate::parquet_paths::ParquetPaths;
 
 use super::config::ValidationConfig;
 use super::queries::{
-    CmdlineStats, FieldCheck, OrphanCheck, SchemaResult, StackViolation, ValidationQueries,
-    STACK_RUNNING, STACK_SLEEP_INTERRUPTIBLE, STACK_SLEEP_UNINTERRUPTIBLE,
+    CmdlineStats, FieldCheck, OrphanCheck, SchemaResult, StackViolation, TpuMetricCheck,
+    ValidationQueries, STACK_RUNNING, STACK_SLEEP_INTERRUPTIBLE, STACK_SLEEP_UNINTERRUPTIBLE,
 };
 use super::result::{ValidationError, ValidationResult};
 use super::runner::run_common_validations;
@@ -477,6 +477,75 @@ impl ValidationQueries for ParquetQueries {
         }
 
         Ok(violations)
+    }
+
+    fn check_tpu_metrics(&mut self) -> Result<Option<TpuMetricCheck>> {
+        let path = &self.paths.tpu_metric;
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let file = File::open(path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let reader = builder.build()?;
+
+        let mut check = TpuMetricCheck::default();
+
+        for batch_result in reader {
+            let batch = batch_result?;
+            check.total_count += batch.num_rows() as i64;
+
+            if let Some(ts_col) = batch.column_by_name("ts") {
+                let ts_array = ts_col.as_any().downcast_ref::<Int64Array>();
+                if let Some(arr) = ts_array {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) && arr.value(i) <= 0 {
+                            check.bad_timestamp_count += 1;
+                        }
+                    }
+                }
+            }
+
+            if let Some(name_col) = batch.column_by_name("metric_name") {
+                let name_array = name_col.as_any().downcast_ref::<StringArray>();
+                if let Some(arr) = name_array {
+                    for i in 0..arr.len() {
+                        if arr.is_null(i) || arr.value(i).is_empty() {
+                            check.empty_name_count += 1;
+                        }
+                    }
+                }
+            }
+
+            if let Some(val_col) = batch.column_by_name("value") {
+                let val_array = val_col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Float64Array>();
+                if let Some(arr) = val_array {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) && !arr.value(i).is_finite() {
+                            check.non_finite_value_count += 1;
+                        }
+                    }
+                }
+            }
+
+            if let Some(dev_col) = batch.column_by_name("device_id") {
+                let dev_array = dev_col.as_any().downcast_ref::<Int32Array>();
+                if let Some(arr) = dev_array {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) && arr.value(i) < 0 {
+                            check.negative_device_id_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if check.total_count == 0 {
+            return Ok(None);
+        }
+        Ok(Some(check))
     }
 }
 

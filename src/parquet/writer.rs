@@ -29,7 +29,8 @@ use crate::trace::{
     InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, NetworkPacketRecord, NetworkPollRecord,
     NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord, SchedSliceRecord,
     SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord,
-    SysInfoRecord, ThreadRecord, ThreadStateRecord, TrackRecord, WakeupNewRecord,
+    SysInfoRecord, ThreadRecord, ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord,
+    TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -76,6 +77,9 @@ pub struct StreamingParquetWriter {
     network_polls: Vec<NetworkPollRecord>,
     clock_snapshots: Vec<ClockSnapshotRecord>,
     sysinfo: Option<SysInfoRecord>,
+    tpu_devices: Vec<TpuDeviceRecord>,
+    tpu_ops: Vec<TpuOpRecord>,
+    tpu_metrics: Vec<TpuMetricRecord>,
 
     // Persistent writers (created lazily on first flush, kept alive until finish)
     process_writer: Option<ArrowWriter<File>>,
@@ -103,6 +107,9 @@ pub struct StreamingParquetWriter {
     network_poll_writer: Option<ArrowWriter<File>>,
     clock_snapshot_writer: Option<ArrowWriter<File>>,
     sysinfo_writer: Option<ArrowWriter<File>>,
+    tpu_device_writer: Option<ArrowWriter<File>>,
+    tpu_op_writer: Option<ArrowWriter<File>>,
+    tpu_metric_writer: Option<ArrowWriter<File>>,
 
     // Track counts for statistics
     total_records: usize,
@@ -175,6 +182,9 @@ impl StreamingParquetWriter {
             network_polls: Vec::new(),
             clock_snapshots: Vec::new(),
             sysinfo: None,
+            tpu_devices: Vec::new(),
+            tpu_ops: Vec::new(),
+            tpu_metrics: Vec::new(),
             // Writers start as None, created lazily
             process_writer: None,
             thread_writer: None,
@@ -201,6 +211,9 @@ impl StreamingParquetWriter {
             network_poll_writer: None,
             clock_snapshot_writer: None,
             sysinfo_writer: None,
+            tpu_device_writer: None,
+            tpu_op_writer: None,
+            tpu_metric_writer: None,
             total_records: 0,
         })
     }
@@ -757,6 +770,66 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    // Flush tpu_devices buffer
+    fn flush_tpu_devices(&mut self) -> Result<()> {
+        if self.tpu_devices.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::tpu_device_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.tpu_device_writer,
+            &self.paths.tpu_device,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_tpu_device_batch(&self.tpu_devices, &schema)?;
+        writer.write(&batch)?;
+        self.tpu_devices.clear();
+        Ok(())
+    }
+
+    // Flush tpu_ops buffer
+    fn flush_tpu_ops(&mut self) -> Result<()> {
+        if self.tpu_ops.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::tpu_op_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.tpu_op_writer,
+            &self.paths.tpu_op,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_tpu_op_batch(&self.tpu_ops, &schema)?;
+        writer.write(&batch)?;
+        self.tpu_ops.clear();
+        Ok(())
+    }
+
+    // Flush tpu_metrics buffer
+    fn flush_tpu_metrics(&mut self) -> Result<()> {
+        if self.tpu_metrics.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::tpu_metric_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.tpu_metric_writer,
+            &self.paths.tpu_metric,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_tpu_metric_batch(&self.tpu_metrics, &schema)?;
+        writer.write(&batch)?;
+        self.tpu_metrics.clear();
+        Ok(())
+    }
+
     // Close all writers, attempting to close all even if some fail
     fn close_writers(&mut self) -> Result<()> {
         let mut first_error: Option<anyhow::Error> = None;
@@ -799,6 +872,9 @@ impl StreamingParquetWriter {
         close_writer!(self.network_poll_writer);
         close_writer!(self.clock_snapshot_writer);
         close_writer!(self.sysinfo_writer);
+        close_writer!(self.tpu_device_writer);
+        close_writer!(self.tpu_op_writer);
+        close_writer!(self.tpu_metric_writer);
 
         match first_error {
             Some(e) => Err(e),
@@ -834,7 +910,10 @@ impl Drop for StreamingParquetWriter {
             || self.network_socket_writer.is_some()
             || self.network_poll_writer.is_some()
             || self.clock_snapshot_writer.is_some()
-            || self.sysinfo_writer.is_some();
+            || self.sysinfo_writer.is_some()
+            || self.tpu_device_writer.is_some()
+            || self.tpu_op_writer.is_some()
+            || self.tpu_metric_writer.is_some();
 
         if has_open_writers {
             eprintln!(
@@ -1080,6 +1159,32 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn add_tpu_device(&mut self, record: TpuDeviceRecord) -> Result<()> {
+        self.tpu_devices.push(record);
+        self.total_records += 1;
+        Ok(())
+    }
+
+    fn add_tpu_op(&mut self, record: TpuOpRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.tpu_ops, self.batch_size);
+        self.tpu_ops.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.tpu_ops, self.batch_size) {
+            self.flush_tpu_ops()?;
+        }
+        Ok(())
+    }
+
+    fn add_tpu_metric(&mut self, record: TpuMetricRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.tpu_metrics, self.batch_size);
+        self.tpu_metrics.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.tpu_metrics, self.batch_size) {
+            self.flush_tpu_metrics()?;
+        }
+        Ok(())
+    }
+
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()> {
         self.sysinfo = Some(record);
         self.total_records += 1;
@@ -1112,6 +1217,9 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_network_polls()?;
         self.flush_clock_snapshots()?;
         self.flush_sysinfo()?;
+        self.flush_tpu_devices()?;
+        self.flush_tpu_ops()?;
+        self.flush_tpu_metrics()?;
         Ok(())
     }
 
@@ -2023,4 +2131,302 @@ fn build_network_poll_batch(
             Arc::new(returned_events_builder.finish()),
         ],
     )?)
+}
+
+fn build_tpu_device_batch(
+    records: &[TpuDeviceRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut id_builder = Int64Builder::with_capacity(records.len());
+    let mut device_ordinal_builder = Int32Builder::with_capacity(records.len());
+    let mut chip_id_builder = Int32Builder::with_capacity(records.len());
+    let mut core_id_builder = Int32Builder::with_capacity(records.len());
+    let mut hostname_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
+    let mut device_type_builder = StringBuilder::with_capacity(records.len(), records.len() * 16);
+    let mut topology_x_builder = Int32Builder::with_capacity(records.len());
+    let mut topology_y_builder = Int32Builder::with_capacity(records.len());
+    let mut topology_z_builder = Int32Builder::with_capacity(records.len());
+    let mut clock_rate_ghz_builder = Float64Builder::with_capacity(records.len());
+    let mut hbm_size_bytes_builder = Int64Builder::with_capacity(records.len());
+    let mut hbm_bandwidth_gbps_builder = Float64Builder::with_capacity(records.len());
+
+    for record in records {
+        id_builder.append_value(record.id);
+        device_ordinal_builder.append_value(record.device_ordinal);
+        chip_id_builder.append_value(record.chip_id);
+        core_id_builder.append_value(record.core_id);
+        hostname_builder.append_value(&record.hostname);
+        device_type_builder.append_value(&record.device_type);
+        topology_x_builder.append_value(record.topology_x);
+        topology_y_builder.append_value(record.topology_y);
+        topology_z_builder.append_value(record.topology_z);
+        clock_rate_ghz_builder.append_value(record.clock_rate_ghz);
+        hbm_size_bytes_builder.append_value(record.hbm_size_bytes);
+        hbm_bandwidth_gbps_builder.append_value(record.hbm_bandwidth_gbps);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_builder.finish()),
+            Arc::new(device_ordinal_builder.finish()),
+            Arc::new(chip_id_builder.finish()),
+            Arc::new(core_id_builder.finish()),
+            Arc::new(hostname_builder.finish()),
+            Arc::new(device_type_builder.finish()),
+            Arc::new(topology_x_builder.finish()),
+            Arc::new(topology_y_builder.finish()),
+            Arc::new(topology_z_builder.finish()),
+            Arc::new(clock_rate_ghz_builder.finish()),
+            Arc::new(hbm_size_bytes_builder.finish()),
+            Arc::new(hbm_bandwidth_gbps_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_tpu_op_batch(records: &[TpuOpRecord], schema: &Arc<Schema>) -> Result<RecordBatch> {
+    let mut id_builder = Int64Builder::with_capacity(records.len());
+    let mut tpu_device_id_builder = Int64Builder::with_capacity(records.len());
+    let mut ts_builder = Int64Builder::with_capacity(records.len());
+    let mut dur_builder = Int64Builder::with_capacity(records.len());
+    let mut group_id_builder = Int64Builder::with_capacity(records.len());
+    let mut op_name_builder = StringBuilder::with_capacity(records.len(), records.len() * 64);
+    let mut category_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
+    let mut stream_builder = StringBuilder::with_capacity(records.len(), records.len() * 16);
+    let mut flops_builder = Int64Builder::with_capacity(records.len());
+    let mut bytes_accessed_builder = Int64Builder::with_capacity(records.len());
+    let mut bytes_hbm_builder = Int64Builder::with_capacity(records.len());
+    let mut bytes_cmem_builder = Int64Builder::with_capacity(records.len());
+    let mut bytes_vmem_builder = Int64Builder::with_capacity(records.len());
+
+    for record in records {
+        id_builder.append_value(record.id);
+        tpu_device_id_builder.append_value(record.tpu_device_id);
+        ts_builder.append_value(record.ts);
+        dur_builder.append_value(record.dur);
+        group_id_builder.append_option(record.group_id);
+        op_name_builder.append_value(&record.op_name);
+        category_builder.append_value(&record.category);
+        stream_builder.append_value(&record.stream);
+        flops_builder.append_value(record.flops);
+        bytes_accessed_builder.append_value(record.bytes_accessed);
+        bytes_hbm_builder.append_value(record.bytes_hbm);
+        bytes_cmem_builder.append_value(record.bytes_cmem);
+        bytes_vmem_builder.append_value(record.bytes_vmem);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_builder.finish()),
+            Arc::new(tpu_device_id_builder.finish()),
+            Arc::new(ts_builder.finish()),
+            Arc::new(dur_builder.finish()),
+            Arc::new(group_id_builder.finish()),
+            Arc::new(op_name_builder.finish()),
+            Arc::new(category_builder.finish()),
+            Arc::new(stream_builder.finish()),
+            Arc::new(flops_builder.finish()),
+            Arc::new(bytes_accessed_builder.finish()),
+            Arc::new(bytes_hbm_builder.finish()),
+            Arc::new(bytes_cmem_builder.finish()),
+            Arc::new(bytes_vmem_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_tpu_metric_batch(
+    records: &[TpuMetricRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut id_builder = Int64Builder::with_capacity(records.len());
+    let mut ts_builder = Int64Builder::with_capacity(records.len());
+    let mut device_id_builder = Int32Builder::with_capacity(records.len());
+    let mut metric_name_builder = StringBuilder::with_capacity(records.len(), records.len() * 50);
+    let mut value_builder = Float64Builder::with_capacity(records.len());
+
+    for record in records {
+        id_builder.append_value(record.id);
+        ts_builder.append_value(record.ts);
+        device_id_builder.append_value(record.device_id);
+        metric_name_builder.append_value(&record.metric_name);
+        value_builder.append_value(record.value);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_builder.finish()),
+            Arc::new(ts_builder.finish()),
+            Arc::new(device_id_builder.finish()),
+            Arc::new(metric_name_builder.finish()),
+            Arc::new(value_builder.finish()),
+        ],
+    )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::AsArray;
+    use arrow::array::{Float64Array, Int32Array, Int64Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_tpu_metric_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = StreamingParquetWriter::new(dir.path()).unwrap();
+
+        // Write a batch of TPU metric records
+        let records = vec![
+            TpuMetricRecord {
+                id: 1,
+                ts: 1_000_000_000,
+                device_id: 0,
+                metric_name: "tpu.runtime.tensorcore.dutycycle.percent".to_string(),
+                value: 85.5,
+            },
+            TpuMetricRecord {
+                id: 2,
+                ts: 1_000_000_000,
+                device_id: 1,
+                metric_name: "tpu.runtime.tensorcore.dutycycle.percent".to_string(),
+                value: 90.2,
+            },
+            TpuMetricRecord {
+                id: 3,
+                ts: 1_000_000_000,
+                device_id: 0,
+                metric_name: "tpu.runtime.hbm.memory.usage.bytes".to_string(),
+                value: 536_870_912.0,
+            },
+            TpuMetricRecord {
+                id: 4,
+                ts: 2_000_000_000,
+                device_id: 0,
+                metric_name: "tpu.runtime.tensorcore.dutycycle.percent".to_string(),
+                value: 72.1,
+            },
+        ];
+
+        for record in records {
+            writer.add_tpu_metric(record).unwrap();
+        }
+        writer.finish().unwrap();
+
+        // Read back and validate
+        let parquet_path = dir.path().join("tpu_metric.parquet");
+        assert!(
+            parquet_path.exists(),
+            "tpu_metric.parquet should be created"
+        );
+
+        let file = File::open(&parquet_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+
+        // Validate schema
+        let schema = builder.schema();
+        assert_eq!(schema.fields().len(), 5, "tpu_metric should have 5 columns");
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "ts");
+        assert_eq!(schema.field(2).name(), "device_id");
+        assert_eq!(schema.field(3).name(), "metric_name");
+        assert_eq!(schema.field(4).name(), "value");
+
+        let reader = builder.build().unwrap();
+        let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 4, "should have 4 rows");
+
+        // Validate first batch data
+        let batch = &batches[0];
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let timestamps = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let device_ids = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let metric_names: &arrow::array::StringArray = batch.column(3).as_string();
+        let values = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        assert_eq!(ids.value(0), 1);
+        assert_eq!(timestamps.value(0), 1_000_000_000);
+        assert_eq!(device_ids.value(0), 0);
+        assert_eq!(
+            metric_names.value(0),
+            "tpu.runtime.tensorcore.dutycycle.percent"
+        );
+        assert!((values.value(0) - 85.5).abs() < f64::EPSILON);
+
+        assert_eq!(ids.value(1), 2);
+        assert_eq!(device_ids.value(1), 1);
+        assert!((values.value(1) - 90.2).abs() < f64::EPSILON);
+
+        assert_eq!(metric_names.value(2), "tpu.runtime.hbm.memory.usage.bytes");
+        assert!((values.value(2) - 536_870_912.0).abs() < f64::EPSILON);
+
+        assert_eq!(timestamps.value(3), 2_000_000_000);
+        assert!((values.value(3) - 72.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_tpu_metric_duckdb_import() {
+        use crate::duckdb::parquet_to_duckdb;
+        use duckdb::Connection;
+
+        let dir = TempDir::new().unwrap();
+        let mut writer = StreamingParquetWriter::new(dir.path()).unwrap();
+
+        writer
+            .add_tpu_metric(TpuMetricRecord {
+                id: 1,
+                ts: 1_000_000_000,
+                device_id: 0,
+                metric_name: "test.metric".to_string(),
+                value: 42.0,
+            })
+            .unwrap();
+        writer.finish().unwrap();
+
+        // Import into DuckDB
+        let db_path = dir.path().join("test.duckdb");
+        parquet_to_duckdb(dir.path(), &db_path, "test-trace")
+            .expect("DuckDB import should succeed");
+
+        // Query the imported data
+        let conn = Connection::open(&db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT trace_id, id, ts, device_id, metric_name, value FROM tpu_metric")
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let row = rows.next().unwrap().expect("should have one row");
+
+        let trace_id: String = row.get(0).unwrap();
+        let id: i64 = row.get(1).unwrap();
+        let ts: i64 = row.get(2).unwrap();
+        let device_id: i32 = row.get(3).unwrap();
+        let metric_name: String = row.get(4).unwrap();
+        let value: f64 = row.get(5).unwrap();
+
+        assert_eq!(trace_id, "test-trace");
+        assert_eq!(id, 1);
+        assert_eq!(ts, 1_000_000_000);
+        assert_eq!(device_id, 0);
+        assert_eq!(metric_name, "test.metric");
+        assert!((value - 42.0).abs() < f64::EPSILON);
+    }
 }

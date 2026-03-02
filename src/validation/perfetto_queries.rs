@@ -15,7 +15,8 @@ use std::path::Path;
 use super::config::ValidationConfig;
 use super::perfetto_reader::{open_trace_reader, TracePacketIterator};
 use super::queries::{
-    CmdlineStats, FieldCheck, OrphanCheck, SchemaResult, StackViolation, ValidationQueries,
+    CmdlineStats, FieldCheck, OrphanCheck, SchemaResult, StackViolation, TpuMetricCheck,
+    ValidationQueries,
 };
 use super::result::{ValidationError, ValidationResult, ValidationWarning};
 use super::runner::run_common_validations;
@@ -420,6 +421,11 @@ impl ValidationQueries for PerfettoQueries {
         // Stack timing validation doesn't apply to Perfetto in the same way.
         // Perfetto PerfSamples are validated separately.
         Ok(Vec::new())
+    }
+
+    fn check_tpu_metrics(&mut self) -> Result<Option<TpuMetricCheck>> {
+        // TPU metrics are not stored in Perfetto traces
+        Ok(None)
     }
 }
 

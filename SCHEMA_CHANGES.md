@@ -49,3 +49,31 @@ Initial schema baseline.
 - `network_poll` — Network poll events
 - `clock_snapshot` — Clock snapshot data
 - `sysinfo` — System information (sysname, release, version, machine)
+
+## Schema Version 2 (systing 1.1.0) — 2026-02-26
+
+Added TPU profiling tables for capturing XLA/TPU runtime profiling data.
+
+### New tables
+- `tpu_device` — TPU device metadata and topology (device_ordinal, chip_id, core_id, hostname, device_type, topology coordinates, clock rate, HBM size/bandwidth)
+- `tpu_op` — Per-HLO-operation execution events (ts, dur, tpu_device_id, step_id, op_name, category, stream, flops, bytes_accessed, bytes per memory type)
+- `tpu_step` — Training step boundaries with timing breakdowns (dur_compute, dur_infeed, dur_outfeed, dur_allreduce, dur_send, dur_recv, dur_idle, dur_megacore_sync). **Note: Removed in schema version 4 — never populated.**
+- `tpu_counter` — TPU hardware performance counter samples (mxu_utilization, vector_alu_utilization, scalar_alu_utilization, xlu_utilization, hbm_bandwidth_utilization, ici_bandwidth_utilization). **Note: Removed in schema version 4 — never populated.**
+
+## Schema Version 3 (systing 1.2.0) — 2026-02-26
+
+Added lightweight TPU runtime metrics table for polling data from RuntimeMetricService (port 8431).
+
+### New tables
+- `tpu_metric` — TPU runtime metric samples in normalized name/value format (ts, device_id, metric_name, value). Adapts automatically to any metrics the RuntimeMetricService exposes.
+
+## Schema Version 4 (systing 1.3.0) — 2026-03-02
+
+Cleanup of unused TPU tables and rename of `tpu_op.step_id`.
+
+### Removed tables
+- `tpu_step` — never populated (XSpace step parsing was not implemented)
+- `tpu_counter` — never populated (XSpace hardware counter extraction was not implemented)
+
+### Changed columns
+- `tpu_op.step_id` → `tpu_op.group_id` — Now stores the raw XSpace `group_id` (training step identifier) directly. Previously this was always NULL due to a remapping bug.

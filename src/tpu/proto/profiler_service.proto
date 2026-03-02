@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package tensorflow;
+
+import "xplane.proto";
+
+// The TPU profiler service, runs on port 8466 as part of the XLA runtime.
+service ProfilerService {
+  // Capture a profile for the specified duration.
+  rpc Profile(ProfileRequest) returns (ProfileResponse) {}
+}
+
+// Options controlling what to profile.
+// Next ID: 16
+message ProfileOptions {
+  uint32 version = 5;
+
+  enum DeviceType {
+    UNSPECIFIED = 0;
+    CPU = 1;
+    GPU = 2;
+    TPU = 3;
+    PLUGGABLE_DEVICE = 4;
+  }
+
+  DeviceType device_type = 6;
+  bool include_dataset_ops = 1;
+  uint32 host_tracer_level = 2;
+  uint32 device_tracer_level = 3;
+  uint32 python_tracer_level = 4;
+  bool enable_hlo_proto = 7;
+  uint64 start_timestamp_ns = 8;
+  uint64 duration_ms = 9;
+  string repository_path = 10;
+}
+
+message ToolRequestOptions {
+  string output_formats = 2;
+  bool save_to_repo = 3;
+}
+
+// Next-ID: 10
+message ProfileRequest {
+  uint64 duration_ms = 1;
+  uint64 max_events = 2;
+  repeated string tools = 3;
+  map<string, ToolRequestOptions> tool_options = 8;
+  ProfileOptions opts = 4;
+  string repository_root = 5;
+  string session_id = 6;
+  string host_name = 7;
+  bool emit_xspace = 9;
+}
+
+message ProfileToolData {
+  string name = 1;
+  bytes data = 2;
+}
+
+// Next-ID: 9
+message ProfileResponse {
+  repeated ProfileToolData tool_data = 6;
+  bool empty_trace = 7;
+  tensorflow.profiler.XSpace xspace = 8;
+  reserved 1, 2, 3, 4, 5;
+}
