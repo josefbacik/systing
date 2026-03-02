@@ -1,7 +1,7 @@
 // TPU RuntimeMetricService proto definitions.
 //
 // Captured from a live TPU runtime via gRPC reflection using:
-//   systing --dump-tpu-proto
+//   systing-util dump-tpu-proto
 //
 // Only the types needed for metric polling are included here.
 // The full service also has StreamzMetric and GetTpuRuntimeStatus RPCs.
@@ -35,8 +35,8 @@ message TPUMetric {
 
 message StreamzMetric {
   string name = 1;
-  // StreamzMetric contains streamz.ReadResponse which has complex nested types.
-  // We skip parsing these for now and focus on TPUMetric (MetricType::LIBTPU).
+  // StreamzMetric wraps streamz.ReadResponse (parsed in tpu_metric_service.rs
+  // as a subset: ReadResponse -> PointSet -> Point with typed values).
 }
 
 message Metric {

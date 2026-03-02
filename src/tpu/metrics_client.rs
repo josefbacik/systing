@@ -21,13 +21,6 @@ pub struct DeviceMetricValue {
     pub value: f64,
 }
 
-/// Result of a single metric poll.
-#[derive(Debug, Clone)]
-pub struct MetricResult {
-    pub metric_name: String,
-    pub device_values: Vec<DeviceMetricValue>,
-}
-
 /// Client for the TPU RuntimeMetricService.
 pub struct TpuMetricsClient {
     client: RuntimeMetricServiceClient<Channel>,
@@ -89,11 +82,13 @@ impl TpuMetricsClient {
     }
 
     /// Fetch a single metric from the service.
+    ///
+    /// Returns per-device values (one entry per TPU device that reported).
     pub async fn get_metric(
         &mut self,
         metric_name: &str,
         timeout: Duration,
-    ) -> Result<MetricResult> {
+    ) -> Result<Vec<DeviceMetricValue>> {
         let request = MetricRequest {
             metric_name: Some(metric_name.to_string()),
             skip_node_aggregation: None,
@@ -115,10 +110,7 @@ impl TpuMetricsClient {
             response.metric_type,
         );
 
-        Ok(MetricResult {
-            metric_name: metric_name.to_string(),
-            device_values,
-        })
+        Ok(device_values)
     }
 }
 
@@ -150,30 +142,29 @@ fn extract_metric_values(response: &MetricResponse, metric_name: &str) -> Vec<De
         return values;
     }
 
-    // StreamzMetric (MetricType::STREAMZ) — extract values from PointSet -> Point
+    // StreamzMetric (MetricType::STREAMZ) — extract values from PointSet -> Point.
+    //
+    // Note: device_id is a running index across all points. The real device identity
+    // is in the Column labels (field #1 of StreamzPoint, not currently parsed). Using
+    // a flat index is a heuristic that works when the TPU runtime emits one point per
+    // device in stable order.
     if let Some(ref streamz) = response.streamz_metric {
         let mut values = Vec::new();
+        let mut idx: i32 = 0;
         for read_resp in &streamz.read_response {
             for point_set in &read_resp.point_set {
-                for (i, point) in point_set.point.iter().enumerate() {
-                    if let Some(v) = point.double_value {
+                for point in &point_set.point {
+                    let v = point
+                        .double_value
+                        .or(point.int64_value.map(|v| v as f64))
+                        .or(point.distribution_value.as_ref().and_then(|d| d.mean));
+                    if let Some(v) = v {
                         values.push(DeviceMetricValue {
-                            device_id: i as i32,
+                            device_id: idx,
                             value: v,
                         });
-                    } else if let Some(v) = point.int64_value {
-                        values.push(DeviceMetricValue {
-                            device_id: i as i32,
-                            value: v as f64,
-                        });
-                    } else if let Some(ref dist) = point.distribution_value {
-                        if let Some(mean) = dist.mean {
-                            values.push(DeviceMetricValue {
-                                device_id: i as i32,
-                                value: mean,
-                            });
-                        }
                     }
+                    idx += 1;
                 }
             }
         }
@@ -191,320 +182,177 @@ fn extract_metric_values(response: &MetricResponse, metric_name: &str) -> Vec<De
 
 /// Extract a numeric value from a Metric.
 fn extract_value(metric: &tpu_metric_service::Metric) -> Option<f64> {
-    // Try gauge first
+    // Try gauge → counter → distribution.mean → summary.sample_sum
     if let Some(ref gauge) = metric.gauge {
         return extract_gauge_value(gauge);
     }
-
-    // Try counter
     if let Some(ref counter) = metric.counter {
-        if let Some(v) = counter.as_double {
-            return Some(v);
-        }
-        if let Some(v) = counter.as_int {
-            return Some(v as f64);
-        }
+        return counter.as_double.or(counter.as_int.map(|v| v as f64));
     }
-
-    // Try distribution (use mean as the representative value)
     if let Some(ref dist) = metric.distribution {
-        if let Some(mean) = dist.mean {
-            return Some(mean);
-        }
+        return dist.mean;
     }
-
-    // Try summary
     if let Some(ref summary) = metric.summary {
-        if let Some(sum) = summary.sample_sum {
-            return Some(sum);
-        }
+        return summary.sample_sum;
     }
-
     None
 }
 
 /// Extract value from a Gauge message.
 fn extract_gauge_value(gauge: &Gauge) -> Option<f64> {
-    if let Some(v) = gauge.as_double {
-        return Some(v);
-    }
-    if let Some(v) = gauge.as_int {
-        return Some(v as f64);
-    }
-    None
+    gauge.as_double.or(gauge.as_int.map(|v| v as f64))
 }
 
 /// Extract device_id from a Metric's attribute.
 fn extract_device_id(metric: &tpu_metric_service::Metric) -> Option<i32> {
-    if let Some(ref attr) = metric.attribute {
-        if let Some(ref value) = attr.value {
-            if let Some(v) = value.int_attr {
-                return Some(v as i32);
-            }
-            if let Some(ref s) = value.string_attr {
-                if let Ok(v) = s.parse::<i32>() {
-                    return Some(v);
-                }
-            }
-        }
-    }
-    None
+    let value = metric.attribute.as_ref()?.value.as_ref()?;
+    value
+        .int_attr
+        .map(|v| v as i32)
+        .or_else(|| value.string_attr.as_ref()?.parse().ok())
 }
 
-// === Proto dump functionality (for --dump-tpu-proto) ===
-
-/// Dump proto file descriptors from a TPU RuntimeMetricService via gRPC reflection.
-pub async fn dump_tpu_protos(addr: &str) -> Result<()> {
-    use prost::Message;
-    use std::collections::HashSet;
-    use tonic_reflection::pb::v1alpha::server_reflection_client::ServerReflectionClient;
-
-    let endpoint = format!("http://{}", addr);
-    println!("Connecting to {}...", endpoint);
-
-    let channel = Channel::from_shared(endpoint)?
-        .connect_timeout(Duration::from_secs(10))
-        .connect()
-        .await
-        .context("failed to connect")?;
-
-    let mut client = ServerReflectionClient::new(channel);
-
-    println!("\n=== Services ===");
-    let services = reflection_list_services(&mut client).await?;
-    for svc in &services {
-        println!("  {}", svc);
-    }
-
-    let target = services
-        .iter()
-        .find(|s| s.contains("RuntimeMetric"))
-        .or_else(|| services.iter().find(|s| s.contains("runtime")))
-        .context("RuntimeMetricService not found")?
-        .clone();
-
-    println!("\nFetching proto descriptors for: {}", target);
-
-    let mut all_fds = Vec::new();
-    let mut seen = HashSet::new();
-    let mut pending = vec![target.clone()];
-    let mut is_first = true;
-
-    while let Some(name) = pending.pop() {
-        if seen.contains(name.as_str()) {
-            continue;
-        }
-
-        let fds = if is_first {
-            is_first = false;
-            reflection_file_containing_symbol(&mut client, &name).await?
-        } else {
-            match reflection_file_by_name(&mut client, &name).await {
-                Ok(fds) => fds,
-                Err(e) => {
-                    eprintln!("  Could not fetch '{}': {:#}", name, e);
-                    seen.insert(name);
-                    continue;
-                }
-            }
-        };
-
-        for fd in fds {
-            let fname = fd.name.clone().unwrap_or_default();
-            for dep in &fd.dependency {
-                if !seen.contains(dep.as_str()) {
-                    pending.push(dep.clone());
-                }
-            }
-            if seen.insert(fname.clone()) {
-                all_fds.push(fd);
-            }
-        }
-    }
-
-    println!("\n=== Proto File Descriptors ({} files) ===", all_fds.len());
-    for fd in &all_fds {
-        let name = fd.name.as_deref().unwrap_or("<unknown>");
-        let pkg = fd.package.as_deref().unwrap_or("");
-        println!("\n--- {} (package: {}) ---", name, pkg);
-        println!("  Dependencies: {:?}", fd.dependency);
-        for msg in &fd.message_type {
-            print_message_type(msg, 1);
-        }
-        for svc in &fd.service {
-            let svc_name = svc.name.as_deref().unwrap_or("?");
-            println!("  service {} {{", svc_name);
-            for method in &svc.method {
-                println!(
-                    "    rpc {}({}) returns ({});",
-                    method.name.as_deref().unwrap_or("?"),
-                    method.input_type.as_deref().unwrap_or("?"),
-                    method.output_type.as_deref().unwrap_or("?"),
-                );
-            }
-            println!("  }}");
-        }
-        for en in &fd.enum_type {
-            println!("  enum {} {{", en.name.as_deref().unwrap_or("?"));
-            for val in &en.value {
-                println!(
-                    "    {} = {};",
-                    val.name.as_deref().unwrap_or("?"),
-                    val.number.unwrap_or(0)
-                );
-            }
-            println!("  }}");
-        }
-    }
-
-    let fds = prost_types::FileDescriptorSet {
-        file: all_fds.clone(),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tpu::gen::tpu_metric_service::{
+        AttrValue, Attribute, Metric, StreamzMetric, StreamzPoint, StreamzPointSet,
+        StreamzReadResponse, TpuMetric,
     };
-    let encoded = fds.encode_to_vec();
-    let dump_path = "tpu_metrics_descriptor.bin";
-    std::fs::write(dump_path, &encoded)?;
-    println!(
-        "\nWrote serialized FileDescriptorSet to {} ({} bytes, {} files)",
-        dump_path,
-        encoded.len(),
-        all_fds.len()
-    );
 
-    Ok(())
-}
-
-fn print_message_type(msg: &prost_types::DescriptorProto, indent: usize) {
-    let pad = "  ".repeat(indent);
-    let name = msg.name.as_deref().unwrap_or("?");
-    println!("{}message {} {{", pad, name);
-    for field in &msg.field {
-        let f_name = field.name.as_deref().unwrap_or("?");
-        let f_num = field.number.unwrap_or(0);
-        let f_type_name = field.type_name.as_deref().unwrap_or("");
-        let label = match field.label.unwrap_or(0) {
-            1 => "optional ",
-            2 => "required ",
-            3 => "repeated ",
-            _ => "",
-        };
-        let type_str = match field.r#type.unwrap_or(0) {
-            1 => "double".to_string(),
-            2 => "float".to_string(),
-            3 => "int64".to_string(),
-            4 => "uint64".to_string(),
-            5 => "int32".to_string(),
-            8 => "bool".to_string(),
-            9 => "string".to_string(),
-            11 => format!("message {}", f_type_name),
-            12 => "bytes".to_string(),
-            13 => "uint32".to_string(),
-            14 => format!("enum {}", f_type_name),
-            _ => format!("type({})", field.r#type.unwrap_or(0)),
-        };
-        println!("{}  {}{} {} = {};", pad, label, type_str, f_name, f_num);
-    }
-    for nested in &msg.nested_type {
-        print_message_type(nested, indent + 1);
-    }
-    for en in &msg.enum_type {
-        println!("{}  enum {} {{", pad, en.name.as_deref().unwrap_or("?"));
-        for val in &en.value {
-            println!(
-                "{}    {} = {};",
-                pad,
-                val.name.as_deref().unwrap_or("?"),
-                val.number.unwrap_or(0)
-            );
-        }
-        println!("{}  }}", pad);
-    }
-    println!("{}}}", pad);
-}
-
-async fn reflection_list_services(
-    client: &mut tonic_reflection::pb::v1alpha::server_reflection_client::ServerReflectionClient<
-        Channel,
-    >,
-) -> Result<Vec<String>> {
-    use tonic_reflection::pb::v1alpha::server_reflection_request::MessageRequest;
-    use tonic_reflection::pb::v1alpha::ServerReflectionRequest;
-    let request = ServerReflectionRequest {
-        message_request: Some(MessageRequest::ListServices(String::new())),
-        ..Default::default()
-    };
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-    tx.send(request).await?;
-    use tokio_stream::StreamExt;
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let mut resp = client.server_reflection_info(stream).await?.into_inner();
-    let mut names = Vec::new();
-    if let Some(r) = resp.next().await {
-        let r = r?;
-        if let Some(tonic_reflection::pb::v1alpha::server_reflection_response::MessageResponse::ListServicesResponse(list)) = r.message_response {
-            for svc in &list.service {
-                names.push(svc.name.clone());
-            }
-        }
-    }
-    Ok(names)
-}
-
-async fn reflection_file_containing_symbol(
-    client: &mut tonic_reflection::pb::v1alpha::server_reflection_client::ServerReflectionClient<
-        Channel,
-    >,
-    symbol: &str,
-) -> Result<Vec<prost_types::FileDescriptorProto>> {
-    use tonic_reflection::pb::v1alpha::server_reflection_request::MessageRequest;
-    use tonic_reflection::pb::v1alpha::ServerReflectionRequest;
-    reflection_fetch_fds(
-        client,
-        ServerReflectionRequest {
-            message_request: Some(MessageRequest::FileContainingSymbol(symbol.to_string())),
+    fn point_f64(v: f64) -> StreamzPoint {
+        StreamzPoint {
+            double_value: Some(v),
             ..Default::default()
-        },
-    )
-    .await
-}
-
-async fn reflection_file_by_name(
-    client: &mut tonic_reflection::pb::v1alpha::server_reflection_client::ServerReflectionClient<
-        Channel,
-    >,
-    filename: &str,
-) -> Result<Vec<prost_types::FileDescriptorProto>> {
-    use tonic_reflection::pb::v1alpha::server_reflection_request::MessageRequest;
-    use tonic_reflection::pb::v1alpha::ServerReflectionRequest;
-    reflection_fetch_fds(
-        client,
-        ServerReflectionRequest {
-            message_request: Some(MessageRequest::FileByFilename(filename.to_string())),
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-async fn reflection_fetch_fds(
-    client: &mut tonic_reflection::pb::v1alpha::server_reflection_client::ServerReflectionClient<
-        Channel,
-    >,
-    request: tonic_reflection::pb::v1alpha::ServerReflectionRequest,
-) -> Result<Vec<prost_types::FileDescriptorProto>> {
-    use prost::Message;
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-    tx.send(request).await?;
-    use tokio_stream::StreamExt;
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let mut resp = client.server_reflection_info(stream).await?.into_inner();
-    let mut fds = Vec::new();
-    if let Some(r) = resp.next().await {
-        let r = r?;
-        if let Some(tonic_reflection::pb::v1alpha::server_reflection_response::MessageResponse::FileDescriptorResponse(fdr)) = r.message_response {
-            for fd_bytes in &fdr.file_descriptor_proto {
-                fds.push(prost_types::FileDescriptorProto::decode(fd_bytes.as_slice())?);
-            }
         }
     }
-    Ok(fds)
+
+    /// Regression test: device_id must be a running counter across ALL point_sets,
+    /// not reset per point_set. With 2 point_sets × 2 points each, IDs should be
+    /// [0,1,2,3], not [0,1,0,1].
+    #[test]
+    fn test_streamz_device_id_runs_across_point_sets() {
+        let resp = MetricResponse {
+            metric: None,
+            metric_type: None,
+            streamz_metric: Some(StreamzMetric {
+                name: None,
+                read_response: vec![StreamzReadResponse {
+                    point_set: vec![
+                        StreamzPointSet {
+                            metric_name: None,
+                            point: vec![point_f64(10.0), point_f64(20.0)],
+                        },
+                        StreamzPointSet {
+                            metric_name: None,
+                            point: vec![point_f64(30.0), point_f64(40.0)],
+                        },
+                    ],
+                }],
+            }),
+        };
+
+        let values = extract_metric_values(&resp, "test.metric");
+        assert_eq!(values.len(), 4);
+        let ids: Vec<i32> = values.iter().map(|v| v.device_id).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+        let vals: Vec<f64> = values.iter().map(|v| v.value).collect();
+        assert_eq!(vals, vec![10.0, 20.0, 30.0, 40.0]);
+    }
+
+    /// The index should track point position, not extraction count. If a point
+    /// has no extractable value, the next point's device_id should still be
+    /// its positional index.
+    #[test]
+    fn test_streamz_device_id_increments_on_skip() {
+        let resp = MetricResponse {
+            metric: None,
+            metric_type: None,
+            streamz_metric: Some(StreamzMetric {
+                name: None,
+                read_response: vec![StreamzReadResponse {
+                    point_set: vec![StreamzPointSet {
+                        metric_name: None,
+                        point: vec![
+                            point_f64(1.0),
+                            StreamzPoint::default(), // no extractable value
+                            point_f64(3.0),
+                        ],
+                    }],
+                }],
+            }),
+        };
+
+        let values = extract_metric_values(&resp, "test.metric");
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].device_id, 0);
+        assert_eq!(values[0].value, 1.0);
+        // Device 1 had no value, so index 1 is skipped.
+        assert_eq!(values[1].device_id, 2);
+        assert_eq!(values[1].value, 3.0);
+    }
+
+    #[test]
+    fn test_libtpu_gauge_extraction() {
+        let resp = MetricResponse {
+            streamz_metric: None,
+            metric_type: None,
+            metric: Some(TpuMetric {
+                name: None,
+                description: None,
+                metrics: vec![
+                    Metric {
+                        attribute: Some(Attribute {
+                            key: Some("device".to_string()),
+                            value: Some(AttrValue {
+                                int_attr: Some(7),
+                                ..Default::default()
+                            }),
+                        }),
+                        gauge: Some(Gauge {
+                            as_double: Some(85.5),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    Metric {
+                        // No attribute: device_id falls back to array index (1)
+                        gauge: Some(Gauge {
+                            as_int: Some(42),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+            }),
+        };
+
+        let values = extract_metric_values(&resp, "test.metric");
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].device_id, 7);
+        assert_eq!(values[0].value, 85.5);
+        assert_eq!(values[1].device_id, 1); // fallback to index
+        assert_eq!(values[1].value, 42.0);
+    }
+
+    #[test]
+    fn test_extract_device_id_from_string_attr() {
+        let metric = Metric {
+            attribute: Some(Attribute {
+                key: None,
+                value: Some(AttrValue {
+                    string_attr: Some("3".to_string()),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(extract_device_id(&metric), Some(3));
+    }
+
+    #[test]
+    fn test_extract_device_id_none_when_missing() {
+        let metric = Metric::default();
+        assert_eq!(extract_device_id(&metric), None);
+    }
 }

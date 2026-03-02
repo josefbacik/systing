@@ -5,7 +5,7 @@
 //! finalization.
 
 use anyhow::{Context, Result};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::record::RecordCollector;
 use crate::tpu::client::TpuProfilerClient;
@@ -61,11 +61,9 @@ impl TpuRecorder {
         let data = xspace::parse_xspace(&xspace, clock_offset_ns);
 
         info!(
-            "TPU profile captured: {} devices, {} ops, {} steps, {} counters",
+            "TPU profile captured: {} devices, {} ops",
             data.devices.len(),
-            data.ops.len(),
-            data.steps.len(),
-            data.counters.len()
+            data.ops.len()
         );
 
         self.records = Some(data);
@@ -90,58 +88,37 @@ impl TpuRecorder {
             return Ok(());
         }
 
+        // Assign globally unique IDs and remap device references.
         let mut device_id_map: std::collections::HashMap<i64, i64> =
             std::collections::HashMap::new();
 
-        // Build ID maps first (needs original IDs), then consume records
         for device in &records.devices {
             let final_id = *id_counter;
             *id_counter += 1;
             device_id_map.insert(device.id, final_id);
         }
 
-        let mut step_id_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-        for step in &records.steps {
-            let final_id = *id_counter;
-            *id_counter += 1;
-            step_id_map.insert(step.id, final_id);
-        }
-
-        // Now consume and write, moving records instead of cloning
         for mut device in records.devices {
             let final_id = device_id_map[&device.id];
             device.id = final_id;
             collector.add_tpu_device(device)?;
         }
 
-        for mut step in records.steps {
-            let final_id = step_id_map[&step.id];
-            step.id = final_id;
-            step.tpu_device_id = device_id_map.get(&step.tpu_device_id).copied().unwrap_or(0);
-            collector.add_tpu_step(step)?;
-        }
-
         for mut op in records.ops {
             let final_id = *id_counter;
             *id_counter += 1;
             op.id = final_id;
-            op.tpu_device_id = device_id_map.get(&op.tpu_device_id).copied().unwrap_or(0);
-            op.step_id = op.step_id.and_then(|sid| step_id_map.get(&sid).copied());
+            op.tpu_device_id = match device_id_map.get(&op.tpu_device_id) {
+                Some(&id) => id,
+                None => {
+                    warn!(
+                        "TPU op '{}' references unknown device {}, setting to 0",
+                        op.op_name, op.tpu_device_id
+                    );
+                    0
+                }
+            };
             collector.add_tpu_op(op)?;
-        }
-
-        for mut counter in records.counters {
-            let final_id = *id_counter;
-            *id_counter += 1;
-            counter.id = final_id;
-            counter.tpu_device_id = device_id_map
-                .get(&counter.tpu_device_id)
-                .copied()
-                .unwrap_or(0);
-            counter.step_id = counter
-                .step_id
-                .and_then(|sid| step_id_map.get(&sid).copied());
-            collector.add_tpu_counter(counter)?;
         }
 
         Ok(())
@@ -154,7 +131,7 @@ impl TpuRecorder {
 /// to convert it to CLOCK_BOOTTIME.
 ///
 /// Note: This duplicates the `clock_gettime` call from `session_recorder::get_clock_value`
-/// because we need both clocks read atomically and `get_clock_value` silently returns 0
+/// because we need both clocks read consecutively and `get_clock_value` silently returns 0
 /// on failure, which would produce a wrong offset.
 fn compute_clock_offset() -> Result<i64> {
     let mut boottime = libc::timespec {
@@ -185,14 +162,26 @@ fn compute_clock_offset() -> Result<i64> {
 
 /// Spawn the TPU recording thread.
 ///
+/// If `namespace_pid` is `Some`, the thread enters that PID's network namespace
+/// before connecting (for containerized TPU workloads).
+///
 /// Returns a join handle that yields the TpuRecorder (with captured data) on success.
 pub fn spawn_tpu_thread(
     service_addr: String,
     duration_ms: u64,
+    namespace_pid: Option<u32>,
 ) -> Result<std::thread::JoinHandle<Result<TpuRecorder>>> {
     std::thread::Builder::new()
         .name("tpu-profiler".to_string())
         .spawn(move || {
+            if let Some(pid) = namespace_pid {
+                crate::tpu::discovery::enter_netns_permanent(pid)
+                    .context("Failed to enter TPU network namespace")?;
+                info!(
+                    "Entered network namespace (via PID {}) for TPU profiler",
+                    pid
+                );
+            }
             let mut recorder = TpuRecorder::new(service_addr, duration_ms);
             match recorder.capture() {
                 Ok(()) => Ok(recorder),

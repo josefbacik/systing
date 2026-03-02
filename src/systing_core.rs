@@ -2306,7 +2306,6 @@ fn run_tracing_loop(
     println!("Stopping...");
     skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
     ringbuf_shutdown.signal();
-    eprintln!("Joining ringbuf threads...");
     for thread in handles.ringbuf_threads {
         thread.join().expect("Failed to join thread");
     }
@@ -2319,13 +2318,11 @@ fn run_tracing_loop(
     if let Some(thread) = handles.sysinfo_thread {
         thread.join().expect("Failed to join sysinfo thread");
     }
-    eprintln!("Joining TPU metrics thread...");
     if let Some(thread) = handles.tpu_metrics_thread {
         if let Err(e) = thread.join() {
             eprintln!("TPU metrics thread panicked: {:?}", e);
         }
     }
-    eprintln!("Joining recorder threads...");
     for thread in handles.recorder_threads {
         thread.join().expect("Failed to join receiver thread");
     }
@@ -2760,30 +2757,47 @@ pub fn systing(
             );
         }
 
-        // Start TPU profiling thread if enabled
-        // Spawn TPU thread (assigns to outer tpu_thread variable)
+        // Start TPU profiling thread if enabled.
+        // The XLA ProfilerService requires a fixed capture duration upfront, so
+        // --tpu-profile is incompatible with indefinite tracing (duration == 0).
         if opts.tpu_profile {
-            let service_addr = opts.tpu_service_addr.clone().or_else(|| {
+            if opts.duration == 0 {
+                bail!(
+                    "--tpu-profile requires a fixed --duration (not --continuous or \
+                     indefinite tracing): the XLA ProfilerService needs a capture window \
+                     specified upfront"
+                );
+            }
+            let discovered = if let Some(addr) = opts.tpu_service_addr.clone() {
+                Some(crate::tpu::discovery::DiscoveredService {
+                    addr,
+                    namespace_pid: None,
+                })
+            } else {
                 match crate::tpu::discovery::discover_profiler_service() {
-                    Ok(addr) => addr,
+                    Ok(svc) => svc,
                     Err(e) => {
                         eprintln!("TPU profiler discovery failed: {:#}", e);
                         None
                     }
                 }
-            });
+            };
 
-            if let Some(addr) = service_addr {
-                let duration_ms = if opts.duration > 0 {
-                    opts.duration * 1000
-                } else {
-                    30_000
-                };
+            if let Some(svc) = discovered {
+                let duration_ms = opts.duration * 1000;
+                let ns_info = svc
+                    .namespace_pid
+                    .map(|pid| format!(" (via setns PID {})", pid))
+                    .unwrap_or_default();
                 eprintln!(
-                    "Starting TPU profile capture from {} for {}ms...",
-                    addr, duration_ms
+                    "Starting TPU profile capture from {}{} for {}ms...",
+                    svc.addr, ns_info, duration_ms
                 );
-                match crate::tpu::recorder::spawn_tpu_thread(addr, duration_ms) {
+                match crate::tpu::recorder::spawn_tpu_thread(
+                    svc.addr,
+                    duration_ms,
+                    svc.namespace_pid,
+                ) {
                     Ok(handle) => tpu_thread = Some(handle),
                     Err(e) => eprintln!("Failed to spawn TPU profiler thread: {:#}", e),
                 }

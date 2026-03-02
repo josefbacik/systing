@@ -3,8 +3,9 @@
 // Proto source: cloud/tpu/lib/monitoring/runtime/proto/tpu_metric_service.proto
 // Package: tpu.monitoring.runtime
 //
-// Captured from a live TPU runtime via gRPC reflection (systing --dump-tpu-proto).
-// Only the types needed for metric polling are included.
+// Types were reverse-engineered from a live TPU runtime via gRPC reflection
+// (`systing-util dump-tpu-proto`). Only the types needed for metric polling
+// are included — timestamps and Streamz column labels are skipped.
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MetricRequest {
@@ -42,7 +43,6 @@ pub struct TpuMetric {
     pub metrics: ::prost::alloc::vec::Vec<Metric>,
 }
 
-/// Streamz metric (opaque for now — we focus on TPUMetric/LIBTPU type).
 /// Streamz metric — wraps streamz.ReadResponse for Streamz-type metrics.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StreamzMetric {

@@ -21,7 +21,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -57,8 +57,6 @@ pub const DATA_TABLES: &[&str] = &[
     "sysinfo",
     "tpu_device",
     "tpu_op",
-    "tpu_step",
-    "tpu_counter",
     "tpu_metric",
 ];
 
@@ -441,7 +439,7 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             tpu_device_id BIGINT,
             ts BIGINT,
             dur BIGINT,
-            step_id BIGINT,
+            group_id BIGINT,
             op_name VARCHAR,
             category VARCHAR,
             stream VARCHAR,
@@ -450,38 +448,6 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             bytes_hbm BIGINT,
             bytes_cmem BIGINT,
             bytes_vmem BIGINT
-        );
-
-        CREATE TABLE IF NOT EXISTS tpu_step (
-            trace_id VARCHAR,
-            id BIGINT,
-            tpu_device_id BIGINT,
-            ts BIGINT,
-            dur BIGINT,
-            step_num INTEGER,
-            dur_compute BIGINT,
-            dur_infeed BIGINT,
-            dur_outfeed BIGINT,
-            dur_allreduce BIGINT,
-            dur_send BIGINT,
-            dur_recv BIGINT,
-            dur_idle BIGINT,
-            dur_megacore_sync BIGINT
-        );
-
-        CREATE TABLE IF NOT EXISTS tpu_counter (
-            trace_id VARCHAR,
-            id BIGINT,
-            tpu_device_id BIGINT,
-            ts BIGINT,
-            dur BIGINT,
-            step_id BIGINT,
-            mxu_utilization DOUBLE,
-            vector_alu_utilization DOUBLE,
-            scalar_alu_utilization DOUBLE,
-            xlu_utilization DOUBLE,
-            hbm_bandwidth_utilization DOUBLE,
-            ici_bandwidth_utilization DOUBLE
         );
 
         CREATE TABLE IF NOT EXISTS tpu_metric (
@@ -640,8 +606,6 @@ fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Res
     // TPU tables
     import_table("tpu_device", &paths.tpu_device)?;
     import_table("tpu_op", &paths.tpu_op)?;
-    import_table("tpu_step", &paths.tpu_step)?;
-    import_table("tpu_counter", &paths.tpu_counter)?;
     import_table("tpu_metric", &paths.tpu_metric)?;
 
     Ok(())
@@ -1035,8 +999,6 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
     // TPU tables
     export_table("tpu_device", &paths.tpu_device)?;
     export_table("tpu_op", &paths.tpu_op)?;
-    export_table("tpu_step", &paths.tpu_step)?;
-    export_table("tpu_counter", &paths.tpu_counter)?;
     export_table("tpu_metric", &paths.tpu_metric)?;
 
     Ok(())

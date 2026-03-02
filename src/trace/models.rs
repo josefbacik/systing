@@ -493,8 +493,6 @@ pub struct ExtractedData {
     pub sysinfo: Option<SysInfoRecord>,
     pub tpu_devices: Vec<TpuDeviceRecord>,
     pub tpu_ops: Vec<TpuOpRecord>,
-    pub tpu_steps: Vec<TpuStepRecord>,
-    pub tpu_counters: Vec<TpuCounterRecord>,
     pub tpu_metrics: Vec<TpuMetricRecord>,
 }
 // TPU profiling records
@@ -523,7 +521,8 @@ pub struct TpuOpRecord {
     pub tpu_device_id: i64,
     pub ts: i64,
     pub dur: i64,
-    pub step_id: Option<i64>,
+    /// XSpace group_id (training step identifier). Raw value from XLA profiler.
+    pub group_id: Option<i64>,
     pub op_name: String,
     pub category: String,
     pub stream: String,
@@ -532,40 +531,6 @@ pub struct TpuOpRecord {
     pub bytes_hbm: i64,
     pub bytes_cmem: i64,
     pub bytes_vmem: i64,
-}
-
-/// TPU training step record with timing breakdown.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TpuStepRecord {
-    pub id: i64,
-    pub tpu_device_id: i64,
-    pub ts: i64,
-    pub dur: i64,
-    pub step_num: i32,
-    pub dur_compute: i64,
-    pub dur_infeed: i64,
-    pub dur_outfeed: i64,
-    pub dur_allreduce: i64,
-    pub dur_send: i64,
-    pub dur_recv: i64,
-    pub dur_idle: i64,
-    pub dur_megacore_sync: i64,
-}
-
-/// TPU hardware performance counter sample.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct TpuCounterRecord {
-    pub id: i64,
-    pub tpu_device_id: i64,
-    pub ts: i64,
-    pub dur: i64,
-    pub step_id: Option<i64>,
-    pub mxu_utilization: f64,
-    pub vector_alu_utilization: f64,
-    pub scalar_alu_utilization: f64,
-    pub xlu_utilization: f64,
-    pub hbm_bandwidth_utilization: f64,
-    pub ici_bandwidth_utilization: f64,
 }
 
 /// TPU runtime metric record (lightweight polling from RuntimeMetricService).

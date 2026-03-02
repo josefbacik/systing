@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use tracing::{debug, warn};
 
 use super::gen::xplane::{self, x_stat};
-use crate::trace::{TpuCounterRecord, TpuDeviceRecord, TpuOpRecord, TpuStepRecord};
+use crate::trace::{TpuDeviceRecord, TpuOpRecord};
 
 /// Parsed TPU record data ready for writing to Parquet.
 ///
@@ -21,8 +21,6 @@ use crate::trace::{TpuCounterRecord, TpuDeviceRecord, TpuOpRecord, TpuStepRecord
 pub struct TpuRecordData {
     pub devices: Vec<TpuDeviceRecord>,
     pub ops: Vec<TpuOpRecord>,
-    pub steps: Vec<TpuStepRecord>,
-    pub counters: Vec<TpuCounterRecord>,
 }
 
 /// Well-known XPlane names from the XLA profiler.
@@ -45,10 +43,6 @@ mod stat_names {
 /// `clock_offset_ns` is the offset to apply to convert CLOCK_REALTIME timestamps
 /// (from XSpace) to CLOCK_BOOTTIME (used by systing BPF events).
 /// Computed as: `boottime_ns - realtime_ns` at the time of capture.
-///
-/// Note: Step and counter parsing is not yet implemented — the `tpu_step` and
-/// `tpu_counter` tables will be empty until XSpace step-grouping and hardware
-/// counter extraction logic is added.
 pub fn parse_xspace(xspace: &xplane::XSpace, clock_offset_ns: i64) -> TpuRecordData {
     let mut data = TpuRecordData::default();
     let mut device_id_counter: i64 = 0;
@@ -151,7 +145,7 @@ pub fn parse_xspace(xspace: &xplane::XSpace, clock_offset_ns: i64) -> TpuRecordD
                     tpu_device_id: device_id,
                     ts: ts_boottime,
                     dur: dur_ns,
-                    step_id: group_id,
+                    group_id,
                     op_name: event_name.to_string(),
                     category,
                     stream: stream_name.to_string(),

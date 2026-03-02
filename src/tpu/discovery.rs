@@ -9,9 +9,10 @@
 
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::Path;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use tracing::{debug, info, warn};
 
 /// Result of service discovery, including namespace information.
@@ -34,9 +35,10 @@ pub const TPU_METRICS_PORT: u16 = 8431;
 
 /// Discover the TPU profiler service address by scanning for listeners on port 8466.
 ///
-/// Returns `Some(addr)` if exactly one listener is found, `None` if no listeners are found.
-/// Returns an error if multiple listeners are found (user must specify `--tpu-service-addr`).
-pub fn discover_profiler_service() -> Result<Option<String>> {
+/// Returns `Some(DiscoveredService)` if exactly one listener is found, `None` if no listeners
+/// are found. Returns an error if multiple listeners are found (user must specify
+/// `--tpu-service-addr`).
+pub fn discover_profiler_service() -> Result<Option<DiscoveredService>> {
     discover_service_on_port(TPU_PROFILER_PORT, "TPU profiler")
 }
 
@@ -45,55 +47,54 @@ pub fn discover_profiler_service() -> Result<Option<String>> {
 /// Returns `Some(DiscoveredService)` if exactly one listener is found.
 /// The result includes namespace info so the caller can `setns` if needed.
 pub fn discover_metrics_service() -> Result<Option<DiscoveredService>> {
-    match discover_service_on_port(TPU_METRICS_PORT, "TPU metrics")? {
-        Some(addr) => {
-            // Check if this came from a non-host namespace by re-checking
-            // whether port 8431 is in the host namespace
-            let host_has_port = [Path::new("/proc/net/tcp"), Path::new("/proc/net/tcp6")]
-                .iter()
-                .any(|p| {
-                    scan_proc_net_tcp(p, TPU_METRICS_PORT)
-                        .map(|(addrs, _)| !addrs.is_empty())
-                        .unwrap_or(false)
-                });
-            if host_has_port {
-                Ok(Some(DiscoveredService {
-                    addr,
-                    namespace_pid: None,
-                }))
-            } else {
-                // Service is in a non-host namespace. Find which PID's namespace has it.
-                let ns_pid = find_namespace_pid_for_port(TPU_METRICS_PORT);
-                if let Some(pid) = ns_pid {
-                    info!(
-                        "TPU metrics service in non-host namespace (accessible via PID {}), will use setns",
-                        pid
-                    );
-                    Ok(Some(DiscoveredService {
-                        addr: format!("127.0.0.1:{}", TPU_METRICS_PORT),
-                        namespace_pid: Some(pid),
-                    }))
-                } else {
-                    // Couldn't determine namespace PID, use discovered addr as-is
-                    Ok(Some(DiscoveredService {
-                        addr,
-                        namespace_pid: None,
-                    }))
-                }
-            }
-        }
-        None => Ok(None),
+    discover_service_on_port(TPU_METRICS_PORT, "TPU metrics")
+}
+
+/// Switch the calling thread's network namespace to that of the given PID.
+///
+/// **IMPORTANT**: This does NOT restore the original namespace. The calling thread
+/// stays in the target namespace for the remainder of its lifetime. Intended for
+/// dedicated worker threads that do all their I/O in the target namespace.
+///
+/// For callers that need to restore (e.g. brief enumeration), save
+/// `/proc/self/ns/net` before calling and `setns` back manually.
+pub fn enter_netns_permanent(pid: u32) -> Result<()> {
+    let ns_path = format!("/proc/{}/ns/net", pid);
+    let fd =
+        std::fs::File::open(&ns_path).with_context(|| format!("Failed to open {}", ns_path))?;
+    // SAFETY: fd is a valid open file descriptor to a namespace file.
+    // CLONE_NEWNET is a valid namespace type. setns only affects the calling thread.
+    let ret = unsafe { libc::setns(fd.as_raw_fd(), libc::CLONE_NEWNET) };
+    if ret != 0 {
+        bail!(
+            "setns to {} failed: {}",
+            ns_path,
+            std::io::Error::last_os_error()
+        );
     }
+    Ok(())
+}
+
+/// A candidate listener found during the scan, with provenance for deduplication.
+#[derive(Debug)]
+struct Candidate {
+    addr: String,
+    /// PID whose namespace contains this listener. `None` for host namespace.
+    namespace_pid: Option<u32>,
+    /// Namespace inode symlink target, for deduplication.
+    ns_inode: Option<PathBuf>,
 }
 
 /// Shared discovery logic: scan `/proc/net/tcp` (and network namespaces)
 /// for listeners on the given port.
-fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<String>> {
+fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<DiscoveredService>> {
     info!("Searching for {} service on port {}...", service_name, port);
 
-    let mut addrs = Vec::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
     let mut total_listeners_scanned = 0u64;
     let mut total_namespaces_scanned = 0u64;
+
+    let host_ns_inode = fs::read_link("/proc/1/ns/net").ok();
 
     // Scan host /proc/net/tcp first — this covers the host network namespace
     for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
@@ -104,7 +105,13 @@ fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<Stri
                 total_namespaces_scanned += 1;
                 if !found.is_empty() {
                     info!("Found {} match(es) in {}", found.len(), path);
-                    addrs.extend(found);
+                    for addr in found {
+                        candidates.push(Candidate {
+                            addr,
+                            namespace_pid: None,
+                            ns_inode: host_ns_inode.clone(),
+                        });
+                    }
                 } else {
                     debug!(
                         "{}: scanned {} listeners, no match on port {}",
@@ -119,14 +126,14 @@ fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<Stri
     }
 
     // Only scan per-PID network namespaces if the host scan found nothing.
-    if addrs.is_empty() {
+    if candidates.is_empty() {
         info!("No match in host netns, scanning other network namespaces...");
         let mut seen_ns_inodes = std::collections::HashSet::new();
 
         // Record the host netns inode to skip duplicates
-        if let Ok(link) = fs::read_link("/proc/1/ns/net") {
+        if let Some(ref link) = host_ns_inode {
             debug!("Host network namespace inode: {:?}", link);
-            seen_ns_inodes.insert(link);
+            seen_ns_inodes.insert(link.clone());
         } else {
             debug!("Could not read /proc/1/ns/net (not running as PID 1's namespace?)");
         }
@@ -138,18 +145,23 @@ fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<Stri
             for entry in pids.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if !name_str.chars().all(|c| c.is_ascii_digit()) {
-                    continue;
-                }
+                let pid: u32 = match name_str.parse() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
                 pids_checked += 1;
 
-                // Deduplicate by network namespace inode
+                // Deduplicate by network namespace inode. If we can't read the
+                // ns link (race: process exited, or permission denied), skip —
+                // we can't setns into an unknown namespace anyway.
                 let ns_path = entry.path().join("ns/net");
-                if let Ok(link) = fs::read_link(&ns_path) {
-                    if !seen_ns_inodes.insert(link) {
-                        namespaces_skipped += 1;
-                        continue;
-                    }
+                let ns_link = match fs::read_link(&ns_path) {
+                    Ok(link) => link,
+                    Err(_) => continue,
+                };
+                if !seen_ns_inodes.insert(ns_link.clone()) {
+                    namespaces_skipped += 1;
+                    continue;
                 }
 
                 total_namespaces_scanned += 1;
@@ -164,13 +176,15 @@ fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<Stri
                                     "Found {} match(es) in {} (pid {})",
                                     found.len(),
                                     tcp_path.display(),
-                                    name_str
+                                    pid
                                 );
                             }
                             for addr in found {
-                                if !addrs.contains(&addr) {
-                                    addrs.push(addr);
-                                }
+                                candidates.push(Candidate {
+                                    addr,
+                                    namespace_pid: Some(pid),
+                                    ns_inode: Some(ns_link.clone()),
+                                });
                             }
                         }
                         Err(e) => {
@@ -189,15 +203,17 @@ fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<Stri
         );
     }
 
-    addrs.sort();
-    addrs.dedup();
+    // Dedup by (addr, ns_inode) so two containers each binding 127.0.0.1:PORT
+    // are correctly reported as distinct listeners.
+    candidates.sort_by(|a, b| (a.addr.as_str(), &a.ns_inode).cmp(&(b.addr.as_str(), &b.ns_inode)));
+    candidates.dedup_by(|a, b| a.addr == b.addr && a.ns_inode == b.ns_inode);
 
     info!(
         "Discovery complete: {} total listeners scanned across {} namespace(s), {} match(es) on port {}",
-        total_listeners_scanned, total_namespaces_scanned, addrs.len(), port
+        total_listeners_scanned, total_namespaces_scanned, candidates.len(), port
     );
 
-    match addrs.len() {
+    match candidates.len() {
         0 => {
             warn!(
                 "No {} service detected on port {}. Is a TPU workload running?",
@@ -206,11 +222,28 @@ fn discover_service_on_port(port: u16, service_name: &str) -> Result<Option<Stri
             Ok(None)
         }
         1 => {
-            let addr = &addrs[0];
-            info!("Discovered {} service at {}", service_name, addr);
-            Ok(Some(addr.clone()))
+            let c = candidates.into_iter().next().unwrap();
+            info!(
+                "Discovered {} service at {}{}",
+                service_name,
+                c.addr,
+                c.namespace_pid
+                    .map(|p| format!(" (in netns of PID {})", p))
+                    .unwrap_or_default()
+            );
+            Ok(Some(DiscoveredService {
+                addr: c.addr,
+                namespace_pid: c.namespace_pid,
+            }))
         }
         _ => {
+            let addrs: Vec<String> = candidates
+                .iter()
+                .map(|c| match c.namespace_pid {
+                    Some(p) => format!("{} (netns pid {})", c.addr, p),
+                    None => c.addr.clone(),
+                })
+                .collect();
             bail!(
                 "Multiple {} service listeners found on port {}: {}. \
                  Please specify the address explicitly.",
@@ -273,46 +306,6 @@ fn scan_proc_net_tcp(path: &Path, target_port: u16) -> Result<(Vec<String>, u64)
     }
 
     Ok((addrs, listener_count))
-}
-
-/// Find a PID whose network namespace contains a listener on the given port.
-/// Used to determine which namespace to `setns` into.
-fn find_namespace_pid_for_port(port: u16) -> Option<u32> {
-    let mut seen_ns_inodes = std::collections::HashSet::new();
-
-    // Skip the host namespace
-    if let Ok(link) = fs::read_link("/proc/1/ns/net") {
-        seen_ns_inodes.insert(link);
-    }
-
-    let pids = fs::read_dir("/proc").ok()?;
-    for entry in pids.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        let pid: u32 = match name_str.parse() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        // Deduplicate by namespace inode
-        let ns_path = entry.path().join("ns/net");
-        if let Ok(link) = fs::read_link(&ns_path) {
-            if !seen_ns_inodes.insert(link) {
-                continue;
-            }
-        }
-
-        // Check if this namespace has a listener on the target port
-        for suffix in &["net/tcp", "net/tcp6"] {
-            let tcp_path = entry.path().join(suffix);
-            if let Ok((found, _)) = scan_proc_net_tcp(&tcp_path, port) {
-                if !found.is_empty() {
-                    return Some(pid);
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Parse a hex address from /proc/net/tcp format (e.g., "0100007F:2112").

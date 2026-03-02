@@ -11,8 +11,8 @@ use crate::trace::{
     InstantArgRecord, InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, NetworkPacketRecord,
     NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord,
     SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord,
-    StackSampleRecord, SysInfoRecord, ThreadRecord, ThreadStateRecord, TpuCounterRecord,
-    TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TpuStepRecord, TrackRecord, WakeupNewRecord,
+    StackSampleRecord, SysInfoRecord, ThreadRecord, ThreadStateRecord, TpuDeviceRecord,
+    TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Trait for collecting trace records during recording.
@@ -113,12 +113,6 @@ pub trait RecordCollector {
 
     /// Add a TPU operation execution record.
     fn add_tpu_op(&mut self, record: TpuOpRecord) -> Result<()>;
-
-    /// Add a TPU training step record.
-    fn add_tpu_step(&mut self, record: TpuStepRecord) -> Result<()>;
-
-    /// Add a TPU hardware counter sample record.
-    fn add_tpu_counter(&mut self, record: TpuCounterRecord) -> Result<()>;
 
     /// Add a TPU runtime metric record.
     fn add_tpu_metric(&mut self, record: TpuMetricRecord) -> Result<()>;
@@ -296,16 +290,6 @@ impl RecordCollector for InMemoryCollector {
 
     fn add_tpu_op(&mut self, record: TpuOpRecord) -> Result<()> {
         self.data.tpu_ops.push(record);
-        Ok(())
-    }
-
-    fn add_tpu_step(&mut self, record: TpuStepRecord) -> Result<()> {
-        self.data.tpu_steps.push(record);
-        Ok(())
-    }
-
-    fn add_tpu_counter(&mut self, record: TpuCounterRecord) -> Result<()> {
-        self.data.tpu_counters.push(record);
         Ok(())
     }
 

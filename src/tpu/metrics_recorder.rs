@@ -4,7 +4,6 @@
 //! receives metric values from a polling thread, and writes them as
 //! `TpuMetricRecord` rows.
 
-use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,22 +107,8 @@ pub fn run_tpu_metrics_thread(
     // wrong namespace. This is safe because the subsequent connection to 127.0.0.1:port
     // would simply fail.
     if let Some(pid) = namespace_pid {
-        let ns_path = format!("/proc/{}/ns/net", pid);
-        let fd = match std::fs::File::open(&ns_path) {
-            Ok(f) => f,
-            Err(e) => {
-                error!("Failed to open namespace {}: {:#}", ns_path, e);
-                return 1;
-            }
-        };
-        // SAFETY: fd is a valid open file descriptor to a namespace file.
-        let ret = unsafe { libc::setns(fd.as_raw_fd(), libc::CLONE_NEWNET) };
-        if ret != 0 {
-            error!(
-                "setns to {} failed: {}",
-                ns_path,
-                std::io::Error::last_os_error()
-            );
+        if let Err(e) = crate::tpu::discovery::enter_netns_permanent(pid) {
+            error!("Failed to enter TPU network namespace: {:#}", e);
             return 1;
         }
         info!(
@@ -143,12 +128,10 @@ pub fn run_tpu_metrics_thread(
     };
 
     let poll_interval = Duration::from_millis(poll_interval_ms);
-    let rpc_timeout = Duration::from_millis(poll_interval_ms * 2);
+    let rpc_timeout = Duration::from_millis(poll_interval_ms * 2)
+        .clamp(Duration::from_secs(1), Duration::from_secs(30));
 
-    // Connect to the metrics service.
-    // Use a shorter per-attempt timeout so we get multiple retries within the overall budget.
-    // If connect fails due to a schema/proto issue (not a transient network error),
-    // give up immediately rather than retrying.
+    // Connect to the metrics service with retries for transient failures.
     let mut client = {
         let overall_deadline = Duration::from_secs(10);
         let per_attempt_timeout = Duration::from_secs(3);
@@ -167,17 +150,6 @@ pub fn run_tpu_metrics_thread(
             )) {
                 Ok(c) => break c,
                 Err(e) => {
-                    let err_msg = format!("{:#}", e);
-                    // Service-not-found errors won't be fixed by retrying
-                    if err_msg.contains("RuntimeMetricService not found")
-                        || err_msg.contains("No services found")
-                    {
-                        error!(
-                            "TPU metrics service not available, disabling metrics: {:#}",
-                            e
-                        );
-                        return 1;
-                    }
                     if start.elapsed() >= overall_deadline {
                         error!(
                             "Failed to connect to TPU metrics service at {} after {:?}: {:#}",
@@ -220,7 +192,7 @@ pub fn run_tpu_metrics_thread(
             }
 
             match rt.block_on(client.get_metric(metric_name, rpc_timeout)) {
-                Ok(result) => {
+                Ok(device_values) => {
                     if let Some(ref tpu_metrics) = recorder.tpu_metrics_recorder {
                         let mut rec = match tpu_metrics.lock() {
                             Ok(guard) => guard,
@@ -229,7 +201,7 @@ pub fn run_tpu_metrics_thread(
                                 poisoned.into_inner()
                             }
                         };
-                        for dv in &result.device_values {
+                        for dv in &device_values {
                             if let Err(e) =
                                 rec.record_metric(ts, dv.device_id, metric_name, dv.value)
                             {
@@ -237,11 +209,7 @@ pub fn run_tpu_metrics_thread(
                             }
                         }
                     }
-                    debug!(
-                        "Polled {} ({} devices)",
-                        metric_name,
-                        result.device_values.len()
-                    );
+                    debug!("Polled {} ({} devices)", metric_name, device_values.len());
                 }
                 Err(e) => {
                     poll_ok = false;
