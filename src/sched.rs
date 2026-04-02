@@ -232,12 +232,14 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                     }
                 }
 
-                // Always add to compact_sched for both SCHED_SWITCH and SCHED_WAKING.
-                // This is intentional even in streaming mode: compact_sched is used by
-                // write_trace() for Perfetto output, allowing both Parquet and Perfetto
-                // formats from a single recording session.
-                let compact_sched = self.compact_sched.entry(event.cpu).or_default();
-                compact_sched.add_task_event(&event);
+                // Only accumulate in compact_sched for the non-streaming path.
+                // In streaming mode, sched slices are emitted directly above and
+                // Perfetto output is generated from Parquet files, so retaining
+                // every event here is pure memory overhead on busy systems.
+                if self.streaming_collector.is_none() {
+                    let compact_sched = self.compact_sched.entry(event.cpu).or_default();
+                    compact_sched.add_task_event(&event);
+                }
             }
 
             // IRQ handler entry - track for pairing with exit
@@ -421,7 +423,14 @@ impl SchedEventRecorder {
     }
 
     /// Add an event to the ftrace events map for Perfetto output.
+    ///
+    /// Skipped entirely in streaming mode: the ftrace event map is only read by
+    /// write_trace()/write_records() on the non-streaming path, and accumulating
+    /// every IRQ/softirq/wakeup event for the whole trace is a major memory cost.
     fn add_ftrace_event(&mut self, event: &task_event) {
+        if self.streaming_collector.is_some() {
+            return;
+        }
         let ftrace_event = FtraceEvent::from(event);
         let cpu_event = self.events.entry(event.cpu).or_default();
         cpu_event.insert(event.ts, ftrace_event);
