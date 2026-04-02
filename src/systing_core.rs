@@ -1637,7 +1637,7 @@ fn configure_bpf_skeleton(
         let object = open_skel.open_object_mut();
         for mut map in object.maps_mut() {
             let name = map.name().to_str().unwrap().to_string();
-            if name.starts_with("node") {
+            if name.starts_with("ringbuf_") && name.contains("_node") {
                 map.set_max_entries(size).with_context(|| {
                     format!(
                         "Failed to set ringbuf size to {} MiB for map '{}'",
