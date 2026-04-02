@@ -122,7 +122,7 @@ fn protocol_str(protocol: u32) -> &'static str {
 
 /// Convert TCP state code to human-readable string.
 /// Based on enum tcp_state from include/uapi/linux/tcp.h.
-fn tcp_state_name(state: u8) -> &'static str {
+pub(crate) fn tcp_state_name(state: u8) -> &'static str {
     match state {
         1 => "ESTABLISHED",
         2 => "SYN_SENT",
@@ -142,7 +142,7 @@ fn tcp_state_name(state: u8) -> &'static str {
 
 /// Convert SKB_DROP_REASON_* code to human-readable string
 /// Based on enum skb_drop_reason from include/net/dropreason-core.h
-fn drop_reason_str(reason: u32) -> &'static str {
+pub(crate) fn drop_reason_str(reason: u32) -> &'static str {
     match reason {
         0 => "NOT_DROPPED_YET",
         1 => "CONSUMED",
@@ -261,6 +261,36 @@ fn drop_reason_str(reason: u32) -> &'static str {
         114 => "BRIDGE_INGRESS_STP_STATE",
         _ => "UNKNOWN",
     }
+}
+
+pub(crate) fn format_tcp_flags(flags: u8) -> String {
+    if flags == 0 {
+        return "NONE".to_string();
+    }
+
+    let mut result = String::with_capacity(32);
+    let mut first = true;
+
+    for (mask, name) in [
+        (0x01, "FIN"),
+        (0x02, "SYN"),
+        (0x04, "RST"),
+        (0x08, "PSH"),
+        (0x10, "ACK"),
+        (0x20, "URG"),
+        (0x40, "ECE"),
+        (0x80, "CWR"),
+    ] {
+        if flags & mask != 0 {
+            if !first {
+                result.push('|');
+            }
+            result.push_str(name);
+            first = false;
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -663,14 +693,6 @@ impl NetworkRecorder {
         Ok(true)
     }
 
-    /// Helper to format TCP flags for packet records. Returns None if no flags set.
-    fn format_tcp_flags_str(flags: u8) -> Option<String> {
-        if flags == 0 {
-            return None;
-        }
-        Some(Self::format_tcp_flags(flags))
-    }
-
     /// Helper function to convert kernel jiffies to microseconds for streaming.
     fn jiffies_to_us(jiffies: u64) -> i64 {
         ((jiffies as u128 * 1_000_000) / system_hz() as u128) as i64
@@ -777,7 +799,7 @@ impl NetworkRecorder {
     fn stream_packet_event(
         &mut self,
         event: &crate::systing_core::types::packet_event,
-        event_name: &str,
+        event_name: &'static str,
     ) -> Result<()> {
         let socket_id = event.socket_id;
         let ts = event.ts as i64;
@@ -809,14 +831,18 @@ impl NetworkRecorder {
             id,
             ts,
             socket_id: socket_id as i64,
-            event_type: event_name.to_string(),
+            event_type: event_name,
             seq: if event.seq > 0 {
                 Some(event.seq as i64)
             } else {
                 None
             },
             length: event.length as i32,
-            tcp_flags: Self::format_tcp_flags_str(event.tcp_flags),
+            tcp_flags: if event.tcp_flags != 0 {
+                Some(event.tcp_flags)
+            } else {
+                None
+            },
             sndbuf_used: None,
             sndbuf_limit: None,
             sndbuf_fill_pct: None,
@@ -900,11 +926,6 @@ impl NetworkRecorder {
             } else {
                 None
             },
-            drop_reason_str: if event.drop_reason > 0 {
-                Some(drop_reason_str(event.drop_reason).to_string())
-            } else {
-                None
-            },
             drop_location: if event.drop_location > 0 {
                 Some(event.drop_location as i64)
             } else {
@@ -961,18 +982,8 @@ impl NetworkRecorder {
             } else {
                 None
             },
-            old_state_str: if event.old_state > 0 {
-                Some(tcp_state_name(event.old_state).to_string())
-            } else {
-                None
-            },
             new_state: if event.new_state > 0 {
                 Some(event.new_state as i16)
-            } else {
-                None
-            },
-            new_state_str: if event.new_state > 0 {
-                Some(tcp_state_name(event.new_state).to_string())
             } else {
                 None
             },
@@ -1078,36 +1089,6 @@ impl NetworkRecorder {
         if count > 0 {
             tracing::info!("Loaded {} socket metadata entries from BPF map", count);
         }
-    }
-
-    fn format_tcp_flags(flags: u8) -> String {
-        if flags == 0 {
-            return "NONE".to_string();
-        }
-
-        let mut result = String::with_capacity(32);
-        let mut first = true;
-
-        for (mask, name) in [
-            (0x01, "FIN"),
-            (0x02, "SYN"),
-            (0x04, "RST"),
-            (0x08, "PSH"),
-            (0x10, "ACK"),
-            (0x20, "URG"),
-            (0x40, "ECE"),
-            (0x80, "CWR"),
-        ] {
-            if flags & mask != 0 {
-                if !first {
-                    result.push('|');
-                }
-                result.push_str(name);
-                first = false;
-            }
-        }
-
-        result
     }
 
     fn poll_events_to_str(events: u32) -> String {
@@ -1366,7 +1347,7 @@ impl NetworkRecorder {
         event.add_uint_nonzero("seq", pkt.seq as u64);
         event.add_uint("length", pkt.length as u64);
         if pkt.tcp_flags != 0 {
-            event.add_string("flags", Self::format_tcp_flags(pkt.tcp_flags));
+            event.add_string("flags", format_tcp_flags(pkt.tcp_flags));
         }
     }
 
@@ -1514,7 +1495,7 @@ impl NetworkRecorder {
                 instant_id,
                 key: "flags".to_string(),
                 int_value: None,
-                string_value: Some(Self::format_tcp_flags(pkt.tcp_flags)),
+                string_value: Some(format_tcp_flags(pkt.tcp_flags)),
                 real_value: None,
             })?;
         }

@@ -336,15 +336,15 @@ pub struct NetworkSyscallRecord {
 /// buffer_queue, zero_window_probe, zero_window_ack, rto_timeout, udp_send, udp_receive,
 /// udp_enqueue, packet_drop, cpu_backlog_drop, mem_pressure, tsq_throttle, qdisc_enqueue,
 /// qdisc_dequeue, tx_queue_stop, tx_queue_wake
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetworkPacketRecord {
     pub id: i64,
     pub ts: i64,
     pub socket_id: i64,
-    pub event_type: String,
+    pub event_type: &'static str,
     pub seq: Option<i64>,
     pub length: i32,
-    pub tcp_flags: Option<String>,
+    pub tcp_flags: Option<u8>,
     // Send buffer fields
     pub sndbuf_used: Option<i64>,
     pub sndbuf_limit: Option<i64>,
@@ -372,7 +372,6 @@ pub struct NetworkPacketRecord {
     pub icsk_timeout: Option<i64>,
     // Drop fields
     pub drop_reason: Option<i32>,
-    pub drop_reason_str: Option<String>,
     pub drop_location: Option<i64>,
     // Queue fields
     pub qlen: Option<i32>,
@@ -389,9 +388,7 @@ pub struct NetworkPacketRecord {
     pub qdisc_latency_us: Option<i32>,
     // TCP state change fields
     pub old_state: Option<i16>,
-    pub old_state_str: Option<String>,
     pub new_state: Option<i16>,
-    pub new_state_str: Option<String>,
 }
 
 /// Network socket record - represents socket metadata.
