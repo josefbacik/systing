@@ -14,7 +14,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -591,7 +591,7 @@ impl SystingEvent for marker_event {
 
 fn create_ring<'a, T>(
     map: &dyn libbpf_rs::MapCore,
-    tx: Sender<T>,
+    tx: SyncSender<T>,
 ) -> Result<libbpf_rs::RingBuffer<'a>, libbpf_rs::Error>
 where
     T: Default + Plain + 'a,
@@ -600,6 +600,10 @@ where
     builder.add(map, move |data: &[u8]| {
         let mut event = T::default();
         plain::copy_from_bytes(&mut event, data).expect("Data buffer was too short");
+        // SyncSender::send blocks when the channel is full, applying backpressure
+        // to ringbuf consumption. If the recorder thread can't keep up, events
+        // back up in the kernel ringbuf (which is bounded) rather than in an
+        // unbounded userspace queue.
         if tx.send(event).is_err() {
             // Receiver has been dropped, we can silently ignore this
             return -1;
@@ -1370,16 +1374,23 @@ fn setup_ringbuffers<'a>(
     perf_counter_names: &[String],
     collect_pystacks: bool,
 ) -> Result<(Vec<(String, libbpf_rs::RingBuffer<'a>)>, RecorderChannels)> {
+    // Per-event-type channel capacity. Bounded so that a slow recorder thread
+    // applies backpressure to the ringbuf reader instead of letting an unbounded
+    // queue grow until OOM. If the kernel ringbuf fills as a result, BPF drops
+    // events and increments the missed-events counter, which is the intended
+    // behaviour under sustained overload.
+    const CHANNEL_CAPACITY: usize = 100_000;
+
     let mut rings = Vec::new();
-    let (event_tx, event_rx) = channel();
-    let (stack_tx, stack_rx) = channel();
-    let (cache_tx, cache_rx) = channel();
-    let (probe_tx, probe_rx) = channel();
-    let (network_tx, network_rx) = channel();
-    let (packet_tx, packet_rx) = channel();
-    let (epoll_tx, epoll_rx) = channel();
-    let (marker_tx, marker_rx) = channel();
-    let (exec_tx, exec_rx) = channel();
+    let (event_tx, event_rx) = sync_channel(CHANNEL_CAPACITY);
+    let (stack_tx, stack_rx) = sync_channel(CHANNEL_CAPACITY);
+    let (cache_tx, cache_rx) = sync_channel(CHANNEL_CAPACITY);
+    let (probe_tx, probe_rx) = sync_channel(CHANNEL_CAPACITY);
+    let (network_tx, network_rx) = sync_channel(CHANNEL_CAPACITY);
+    let (packet_tx, packet_rx) = sync_channel(CHANNEL_CAPACITY);
+    let (epoll_tx, epoll_rx) = sync_channel(CHANNEL_CAPACITY);
+    let (marker_tx, marker_rx) = sync_channel(CHANNEL_CAPACITY);
+    let (exec_tx, exec_rx) = sync_channel(CHANNEL_CAPACITY);
     let mut has_exec_ringbuf = false;
 
     let object = skel.object();
