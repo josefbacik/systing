@@ -1648,6 +1648,27 @@ fn configure_bpf_skeleton(
         }
     }
 
+    // BPF selects a per-CPU ringbuf via `cpu_id % NR_RINGBUFS` (NR_RINGBUFS = 8).
+    // On hosts with fewer than 8 possible CPUs, ringbufs whose index is >= num_cpus
+    // can never be selected, so shrink them to the minimum to avoid wasting up to
+    // hundreds of MiB of mlocked kernel memory per unused slot.
+    const NR_RINGBUFS: u32 = 8;
+    if num_cpus < NR_RINGBUFS {
+        let object = open_skel.open_object_mut();
+        for mut map in object.maps_mut() {
+            let name = map.name().to_str().unwrap().to_string();
+            if let Some(idx) = name
+                .rfind("_node")
+                .and_then(|pos| name[pos + 5..].parse::<u32>().ok())
+            {
+                if idx >= num_cpus {
+                    map.set_max_entries(1)
+                        .with_context(|| format!("Failed to shrink unused ringbuf map '{name}'"))?;
+                }
+            }
+        }
+    }
+
     // Set network ringbuffer maps to zero capacity if network recording is disabled
     if !opts.network {
         let object = open_skel.open_object_mut();
