@@ -880,8 +880,13 @@ impl SessionRecorder {
             .unwrap()
             .set_streaming_collector(Box::new(writer));
 
-        // Enable streaming mode for stack recorder (samples buffered, written at end)
-        self.stack_recorder.lock().unwrap().enable_streaming();
+        // Set up streaming collector for stack recorder so samples are written
+        // incrementally instead of buffered for the entire trace.
+        let stack_writer = StreamingParquetWriter::new(output_dir)?;
+        self.stack_recorder
+            .lock()
+            .unwrap()
+            .set_streaming_collector(Box::new(stack_writer));
 
         // Set up streaming collector for network recorder (events emitted immediately)
         let network_writer = StreamingParquetWriter::new(output_dir)?;
