@@ -1077,19 +1077,42 @@ struct inet_connection_sock___pre618 {
 };
 
 /*
- * Read icsk_timeout from inet_connection_sock, handling kernel version differences.
- * The icsk_timeout field was removed in kernel 6.18+ (commit a7c428ee8f59).
- * On newer kernels, the timeout value is stored in icsk_retransmit_timer.expires.
+ * CO-RE flavor type for kernels 6.18 that have icsk_retransmit_timer in
+ * inet_connection_sock.
  */
-static __always_inline void read_icsk_timeout(struct inet_connection_sock *icsk,
+struct inet_connection_sock___has_retransmit {
+	struct timer_list icsk_retransmit_timer;
+};
+
+/*
+ * CO-RE flavor type for kernels 6.19+ where the retransmit timer moved to
+ * struct sock as tcp_retransmit_timer (in a union with sk_timer).
+ */
+struct sock___has_tcp_retransmit {
+	struct timer_list tcp_retransmit_timer;
+};
+
+/*
+ * Read icsk_timeout from inet_connection_sock, handling kernel version differences.
+ *
+ * - Kernels < 6.18: icsk_timeout is a separate field in inet_connection_sock.
+ * - Kernel 6.18: icsk_timeout removed, timeout in icsk_retransmit_timer.expires.
+ * - Kernel 6.19+: icsk_retransmit_timer moved to struct sock as tcp_retransmit_timer.
+ */
+static __always_inline void read_icsk_timeout(struct sock *sk,
+					      struct inet_connection_sock *icsk,
 					      u64 *timeout)
 {
 	struct inet_connection_sock___pre618 *old = (void *)icsk;
+	struct inet_connection_sock___has_retransmit *mid = (void *)icsk;
+	struct sock___has_tcp_retransmit *new_sk = (void *)sk;
 
 	if (bpf_core_field_exists(old->icsk_timeout)) {
 		*timeout = BPF_CORE_READ(old, icsk_timeout);
+	} else if (bpf_core_field_exists(mid->icsk_retransmit_timer)) {
+		*timeout = BPF_CORE_READ(mid, icsk_retransmit_timer.expires);
 	} else {
-		*timeout = BPF_CORE_READ(icsk, icsk_retransmit_timer.expires);
+		*timeout = BPF_CORE_READ(new_sk, tcp_retransmit_timer.expires);
 	}
 }
 
@@ -2819,7 +2842,7 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	// Read persist timer state from inet_connection_sock
 	struct inet_connection_sock *icsk = (struct inet_connection_sock *)sk;
 	bpf_probe_read_kernel(&event->icsk_pending, sizeof(event->icsk_pending), &icsk->icsk_pending);
-	read_icsk_timeout(icsk, &event->icsk_timeout);
+	read_icsk_timeout(sk, icsk, &event->icsk_timeout);
 	bpf_probe_read_kernel(&event->rto_jiffies, sizeof(event->rto_jiffies), &icsk->icsk_rto);
 	bpf_probe_read_kernel(&event->probe_count, sizeof(event->probe_count), &icsk->icsk_probes_out);
 	bpf_probe_read_kernel(&event->backoff, sizeof(event->backoff), &icsk->icsk_backoff);
@@ -3314,7 +3337,7 @@ int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 
 	// Read persist timer state (since this is a zero window probe, timer is active)
 	bpf_probe_read_kernel(&event->icsk_pending, sizeof(event->icsk_pending), &icsk->icsk_pending);
-	read_icsk_timeout(icsk, &event->icsk_timeout);
+	read_icsk_timeout(sk, icsk, &event->icsk_timeout);
 	bpf_probe_read_kernel(&event->rto_jiffies, sizeof(event->rto_jiffies), &icsk->icsk_rto);
 	bpf_probe_read_kernel(&event->backoff, sizeof(event->backoff), &icsk->icsk_backoff);
 
@@ -3539,7 +3562,7 @@ int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 
 	// Read persist timer state
 	bpf_probe_read_kernel(&event->icsk_pending, sizeof(event->icsk_pending), &icsk->icsk_pending);
-	read_icsk_timeout(icsk, &event->icsk_timeout);
+	read_icsk_timeout(sk, icsk, &event->icsk_timeout);
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
