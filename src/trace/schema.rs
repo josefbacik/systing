@@ -391,6 +391,16 @@ pub fn network_poll_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Schema for network_dns.parquet
+///
+/// DNS resolution records mapping IP addresses to hostnames.
+pub fn network_dns_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ip_address", DataType::Utf8, false),
+        Field::new("hostname", DataType::Utf8, false),
+    ]))
+}
+
 // TPU profiling schemas
 
 /// Schema for tpu_device.parquet

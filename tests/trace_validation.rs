@@ -3349,3 +3349,124 @@ fn test_e2e_event_scope_cpu() {
 
     eprintln!("  All event scope cpu checks passed");
 }
+
+/// Test that DNS resolution populates the network_dns table.
+///
+/// This test enables `resolve_addresses` and generates traffic to a well-known
+/// hostname (google.com) so that at least one IP address resolves to a hostname.
+/// It then validates that:
+/// 1. The network_dns.parquet file is produced
+/// 2. The network_dns DuckDB table has at least one entry
+/// 3. The resolved hostname is not just the raw IP address
+#[test]
+#[ignore]
+fn test_network_dns_resolution() {
+    use std::net::TcpStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+
+    let config = Config {
+        duration: NETWORK_SUITE_DURATION_SECS,
+        parquet_only: true,
+        network: true,
+        resolve_addresses: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.duckdb"),
+        ..Config::default()
+    };
+
+    // Spawn traffic thread that connects to google.com:80 repeatedly.
+    // This ensures we have at least one socket with a publicly-resolvable IP.
+    // Note: This test requires network access to resolve and connect to google.com.
+    let stop_traffic = Arc::new(AtomicBool::new(false));
+    let stop_flag = stop_traffic.clone();
+    let traffic_thread = thread::spawn(move || {
+        use std::net::ToSocketAddrs;
+        let addr = "google.com:80"
+            .to_socket_addrs()
+            .expect("Failed to resolve google.com")
+            .next()
+            .expect("No addresses for google.com");
+
+        while !stop_flag.load(Ordering::Relaxed) {
+            // Connect to google.com on HTTP port - we just need the TCP handshake
+            // to create a socket with a resolvable IP address.
+            if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+                drop(stream);
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+
+    eprintln!(
+        "Recording trace ({}s, network=true, resolve_addresses=true)...",
+        NETWORK_SUITE_DURATION_SECS
+    );
+    systing(config, None).expect("systing recording failed");
+    stop_traffic.store(true, Ordering::Relaxed);
+    traffic_thread.join().expect("Traffic thread panicked");
+
+    // Validate network_dns.parquet exists
+    let dns_parquet = dir.path().join("network_dns.parquet");
+    assert!(
+        dns_parquet.exists(),
+        "network_dns.parquet not found in output directory"
+    );
+
+    // Convert to DuckDB and query
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "dns_test")
+        .expect("DuckDB conversion failed");
+
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    // Check that network_dns table has entries
+    let dns_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM network_dns", [], |row| row.get(0))
+        .unwrap_or(0);
+
+    eprintln!("  network_dns table has {dns_count} entries");
+    assert!(
+        dns_count > 0,
+        "network_dns table is empty - DNS resolution produced no results"
+    );
+
+    // Verify that the hostname column contains something that is NOT just an IP address
+    // (i.e., at least one entry actually resolved to a hostname)
+    let has_hostname: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM network_dns WHERE hostname != ip_address",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    assert!(
+        has_hostname,
+        "network_dns has entries but none resolved to a hostname different from the IP"
+    );
+
+    // Log some entries for debugging
+    let mut stmt = conn
+        .prepare("SELECT ip_address, hostname FROM network_dns LIMIT 10")
+        .expect("Failed to prepare query");
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0).unwrap_or_default(),
+                row.get::<_, String>(1).unwrap_or_default(),
+            ))
+        })
+        .expect("Failed to query");
+    for (ip, hostname) in rows.flatten() {
+        eprintln!("    {ip} -> {hostname}");
+    }
+
+    eprintln!("  All DNS resolution checks passed");
+}

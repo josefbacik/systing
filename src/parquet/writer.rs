@@ -27,11 +27,11 @@ use crate::parquet::ParquetPaths;
 use crate::record::RecordCollector;
 use crate::trace::{
     self, ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, InstantArgRecord,
-    InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, NetworkPacketRecord, NetworkPollRecord,
-    NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord, SchedSliceRecord,
-    SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord,
-    SysInfoRecord, ThreadRecord, ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord,
-    TrackRecord, WakeupNewRecord,
+    InstantRecord, IrqSliceRecord, NetworkDnsRecord, NetworkInterfaceRecord, NetworkPacketRecord,
+    NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord,
+    SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord,
+    StackSampleRecord, SysInfoRecord, ThreadRecord, ThreadStateRecord, TpuDeviceRecord,
+    TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -76,6 +76,7 @@ pub struct StreamingParquetWriter {
     network_packets: Vec<NetworkPacketRecord>,
     network_sockets: Vec<NetworkSocketRecord>,
     network_polls: Vec<NetworkPollRecord>,
+    network_dns: Vec<NetworkDnsRecord>,
     clock_snapshots: Vec<ClockSnapshotRecord>,
     sysinfo: Option<SysInfoRecord>,
     tpu_devices: Vec<TpuDeviceRecord>,
@@ -106,6 +107,7 @@ pub struct StreamingParquetWriter {
     network_packet_writer: Option<ArrowWriter<File>>,
     network_socket_writer: Option<ArrowWriter<File>>,
     network_poll_writer: Option<ArrowWriter<File>>,
+    network_dns_writer: Option<ArrowWriter<File>>,
     clock_snapshot_writer: Option<ArrowWriter<File>>,
     sysinfo_writer: Option<ArrowWriter<File>>,
     tpu_device_writer: Option<ArrowWriter<File>>,
@@ -181,6 +183,7 @@ impl StreamingParquetWriter {
             network_packets: Vec::new(),
             network_sockets: Vec::new(),
             network_polls: Vec::new(),
+            network_dns: Vec::new(),
             clock_snapshots: Vec::new(),
             sysinfo: None,
             tpu_devices: Vec::new(),
@@ -210,6 +213,7 @@ impl StreamingParquetWriter {
             network_packet_writer: None,
             network_socket_writer: None,
             network_poll_writer: None,
+            network_dns_writer: None,
             clock_snapshot_writer: None,
             sysinfo_writer: None,
             tpu_device_writer: None,
@@ -771,6 +775,26 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    // Flush network_dns buffer
+    fn flush_network_dns(&mut self) -> Result<()> {
+        if self.network_dns.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::network_dns_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.network_dns_writer,
+            &self.paths.network_dns,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_network_dns_batch(&self.network_dns, &schema)?;
+        writer.write(&batch)?;
+        self.network_dns.clear();
+        Ok(())
+    }
+
     // Flush tpu_devices buffer
     fn flush_tpu_devices(&mut self) -> Result<()> {
         if self.tpu_devices.is_empty() {
@@ -871,6 +895,7 @@ impl StreamingParquetWriter {
         close_writer!(self.network_packet_writer);
         close_writer!(self.network_socket_writer);
         close_writer!(self.network_poll_writer);
+        close_writer!(self.network_dns_writer);
         close_writer!(self.clock_snapshot_writer);
         close_writer!(self.sysinfo_writer);
         close_writer!(self.tpu_device_writer);
@@ -910,6 +935,7 @@ impl Drop for StreamingParquetWriter {
             || self.network_packet_writer.is_some()
             || self.network_socket_writer.is_some()
             || self.network_poll_writer.is_some()
+            || self.network_dns_writer.is_some()
             || self.clock_snapshot_writer.is_some()
             || self.sysinfo_writer.is_some()
             || self.tpu_device_writer.is_some()
@@ -1160,6 +1186,15 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn add_network_dns(&mut self, record: NetworkDnsRecord) -> Result<()> {
+        self.network_dns.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.network_dns, self.batch_size) {
+            self.flush_network_dns()?;
+        }
+        Ok(())
+    }
+
     fn add_tpu_device(&mut self, record: TpuDeviceRecord) -> Result<()> {
         self.tpu_devices.push(record);
         self.total_records += 1;
@@ -1216,6 +1251,7 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_network_packets()?;
         self.flush_network_sockets()?;
         self.flush_network_polls()?;
+        self.flush_network_dns()?;
         self.flush_clock_snapshots()?;
         self.flush_sysinfo()?;
         self.flush_tpu_devices()?;
@@ -2134,6 +2170,27 @@ fn build_network_poll_batch(
             Arc::new(socket_id_builder.finish()),
             Arc::new(requested_events_builder.finish()),
             Arc::new(returned_events_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_network_dns_batch(
+    records: &[NetworkDnsRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut ip_address_builder = StringBuilder::with_capacity(records.len(), records.len() * 40);
+    let mut hostname_builder = StringBuilder::with_capacity(records.len(), records.len() * 64);
+
+    for record in records {
+        ip_address_builder.append_value(&record.ip_address);
+        hostname_builder.append_value(&record.hostname);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(ip_address_builder.finish()),
+            Arc::new(hostname_builder.finish()),
         ],
     )?)
 }

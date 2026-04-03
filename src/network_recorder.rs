@@ -11,10 +11,12 @@ use crate::ringbuf::RingBuffer;
 use crate::systing_core::types::network_event;
 use crate::systing_core::SystingRecordEvent;
 use crate::trace::{
-    ArgRecord, InstantArgRecord, InstantRecord, NetworkPacketRecord, NetworkPollRecord,
-    NetworkSocketRecord, NetworkSyscallRecord, SliceRecord, SocketConnectionRecord, TrackRecord,
+    ArgRecord, InstantArgRecord, InstantRecord, NetworkDnsRecord, NetworkPacketRecord,
+    NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord, SliceRecord,
+    SocketConnectionRecord, TrackRecord,
 };
 use crate::utid::UtidGenerator;
+use indicatif::{ProgressBar, ProgressStyle};
 
 /// Unique socket identifier assigned by BPF during tracing
 pub type SocketId = u64;
@@ -1040,15 +1042,71 @@ impl NetworkRecorder {
         Ok(())
     }
 
+    /// Resolve hostnames for all known IPs and emit DNS records to the collector.
+    ///
+    /// Iterates all unique IPs from `socket_metadata`, resolves each via DNS,
+    /// and emits `NetworkDnsRecord` entries for successfully resolved addresses.
+    /// Shows a progress bar during resolution.
+    fn emit_dns_records(&mut self, collector: &mut dyn RecordCollector) -> Result<()> {
+        if !self.resolve_addresses {
+            return Ok(());
+        }
+
+        // Collect unique IPs from socket metadata
+        let ip_addrs: HashSet<_> = self
+            .socket_metadata
+            .values()
+            .flat_map(|m| [m.src_ip_addr(), m.dest_ip_addr()])
+            .collect();
+
+        if ip_addrs.is_empty() {
+            return Ok(());
+        }
+
+        // Create progress bar
+        let pb = ProgressBar::new(ip_addrs.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} DNS lookups ({per_sec}, {eta})"
+                )
+                .expect("valid progress bar template")
+                .progress_chars("##-"),
+        );
+
+        // Resolve all IPs (populates hostname_cache)
+        for ip_addr in &ip_addrs {
+            self.resolve_hostname(*ip_addr);
+            pb.inc(1);
+        }
+
+        pb.finish_with_message("DNS resolution complete");
+
+        // Emit DNS records for successfully resolved addresses
+        for (ip, hostname) in &self.hostname_cache {
+            let ip_str = ip.to_canonical().to_string();
+            if *hostname != ip_str {
+                collector.add_network_dns(NetworkDnsRecord {
+                    ip_address: ip_str,
+                    hostname: hostname.clone(),
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Finish streaming and flush the collector.
     ///
     /// In the new streaming architecture, records are emitted immediately during recording.
-    /// This method just flushes the collector and returns it.
+    /// This method also resolves DNS for all seen addresses and emits DNS records.
     ///
     /// Returns the collector so the caller can chain or finish it.
     pub fn finish(&mut self) -> Result<Option<Box<dyn RecordCollector + Send>>> {
         // Take ownership of the streaming collector if present
         if let Some(mut collector) = self.streaming_collector.take() {
+            // Resolve hostnames and emit DNS records before flushing
+            self.emit_dns_records(collector.as_mut())?;
             // Flush the collector
             collector.flush()?;
             Ok(Some(collector))
@@ -2245,18 +2303,8 @@ impl NetworkRecorder {
         slice_id_counter: &mut i64,
         instant_id_counter: &mut i64,
     ) -> Result<()> {
-        // Resolve hostnames if configured
-        if self.resolve_addresses {
-            let ip_addrs: Vec<_> = self
-                .socket_metadata
-                .values()
-                .flat_map(|m| [m.src_ip_addr(), m.dest_ip_addr()])
-                .collect();
-
-            for ip_addr in ip_addrs {
-                self.resolve_hostname(ip_addr);
-            }
-        }
+        // Resolve hostnames and emit DNS records if configured
+        self.emit_dns_records(collector)?;
 
         // Create "Network Packets" root track for socket packet events
         let network_packets_root_id = *track_id_counter;
