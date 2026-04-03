@@ -68,18 +68,23 @@ const PYTHON_313_VERSION: &str = "3.13.11";
 
 /// Get the path to a pyenv-installed Python binary.
 ///
-/// Resolves `$HOME/.pyenv/versions/<version>/bin/python<major.minor>`.
+/// Checks `$PYENV_ROOT/versions/<version>/bin/python<major.minor>` first
+/// (works under sudo -E where HOME is reset but PYENV_ROOT is preserved),
+/// then falls back to `$HOME/.pyenv/versions/<version>/bin/python<major.minor>`.
 /// Returns `None` if the binary is not found (caller decides whether to skip or panic).
 fn try_pyenv_python(version: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
     let parts: Vec<&str> = version.split('.').collect();
     if parts.len() != 3 {
         return None;
     }
     let short = format!("{}.{}", parts[0], parts[1]);
-    let path = PathBuf::from(format!(
-        "{home}/.pyenv/versions/{version}/bin/python{short}"
-    ));
+
+    // Prefer PYENV_ROOT (preserved by sudo -E even when HOME is reset to /root)
+    let pyenv_root = std::env::var("PYENV_ROOT")
+        .ok()
+        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.pyenv")))?;
+
+    let path = PathBuf::from(format!("{pyenv_root}/versions/{version}/bin/python{short}"));
     path.exists().then_some(path)
 }
 

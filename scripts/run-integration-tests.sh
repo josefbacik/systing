@@ -39,7 +39,7 @@ if [[ -f "$SETUP_PYSTACKS" ]]; then
         mapfile -t REQUIRED_PYVERSIONS < <(grep -o '"[0-9]*\.[0-9]*\.[0-9]*"' "$SETUP_PYSTACKS" | tr -d '"')
         NEEDS_PYSETUP=false
         for ver in "${REQUIRED_PYVERSIONS[@]}"; do
-            if ! pyenv versions --bare 2>/dev/null | grep -qx "$ver"; then
+            if ! pyenv versions --bare 2>/dev/null | sed 's/^[[:space:]]*//' | grep -qx "$ver"; then
                 NEEDS_PYSETUP=true
                 break
             fi
