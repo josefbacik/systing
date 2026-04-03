@@ -24,7 +24,7 @@ for version in "${PYTHON_VERSIONS[@]}"; do
         echo "Python $version already installed"
     else
         echo "Installing Python $version..."
-        pyenv install "$version"
+        pyenv install -s "$version"
     fi
 done
 
