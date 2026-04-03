@@ -46,7 +46,6 @@ const NETNS_RECORDING_DURATION_SECS: u64 = 10;
 const VALIDATION_SUITE_DURATION_SECS: u64 = 4;
 
 /// Recording duration for the network suite (seconds).
-/// Set to 3s to allow time for traffic generation after BPF init (~500ms).
 const NETWORK_SUITE_DURATION_SECS: u64 = 3;
 
 /// Helper to set up the environment for BPF tests.
@@ -743,37 +742,34 @@ fn test_e2e_network_suite() {
         ..Config::default()
     };
 
-    // Spawn traffic generation thread
-    let traffic_thread = thread::spawn(|| {
-        thread::sleep(Duration::from_millis(500));
+    // Spawn traffic generation thread that runs continuously until signaled to stop.
+    // BPF setup with network probes can take several seconds, so the thread must
+    // keep generating connections throughout the entire recording window.
+    // We sleep 200ms between rounds to keep traffic volume reasonable.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let stop_traffic = Arc::new(AtomicBool::new(false));
+    let stop_flag = stop_traffic.clone();
+    let traffic_thread = thread::spawn(move || {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind traffic listener");
+        let addr = listener.local_addr().unwrap();
 
-        // Start a local TCP listener and connect to it to guarantee socket data
-        if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") {
-            let addr = listener.local_addr().unwrap();
-            for _ in 0..3 {
-                if let Ok(_stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
-                    let _ = listener.accept();
-                }
-                thread::sleep(Duration::from_millis(200));
+        while !stop_flag.load(Ordering::Relaxed) {
+            // Make a single TCP connection per iteration
+            if let Ok(_stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+                let _ = listener.accept();
             }
-        }
-
-        // Also try connecting to common ports for additional network events
-        for _ in 0..3 {
-            let _ = TcpStream::connect_timeout(
-                &"127.0.0.1:22".parse().unwrap(),
-                Duration::from_millis(100),
-            );
-            let _ = TcpStream::connect_timeout(
-                &"127.0.0.1:80".parse().unwrap(),
-                Duration::from_millis(100),
-            );
             thread::sleep(Duration::from_millis(200));
         }
     });
 
-    eprintln!("Recording trace (3s, network=true, with traffic)...");
+    eprintln!(
+        "Recording trace ({}s, network=true, with traffic)...",
+        NETWORK_SUITE_DURATION_SECS
+    );
     systing(config, None).expect("systing recording failed");
+    stop_traffic.store(true, Ordering::Relaxed);
     traffic_thread.join().expect("Traffic thread panicked");
     eprintln!("Recording complete.\n");
 
@@ -2445,7 +2441,7 @@ if __name__ == "__main__":
 /// for events to be captured after BPF initialization (~500ms).
 const MARKER_RECORDING_DURATION_SECS: u64 = 3;
 
-/// Search a parquet file's column for a row matching `target`.
+/// Search a parquet file's column for a row matching a predicate.
 /// Returns true if any matching row is found.
 fn parquet_column_matches(
     path: &std::path::Path,
@@ -3064,28 +3060,24 @@ fn run_events_recording_with(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
 
-    let workload_handle = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(500)); // Wait for BPF init
-        match workload {
-            EventsWorkload::FileOpen => {
-                while !stop_clone.load(Ordering::Relaxed) {
-                    let _ = std::fs::File::open("/dev/null");
-                    thread::sleep(Duration::from_millis(10));
-                }
+    let workload_handle = thread::spawn(move || match workload {
+        EventsWorkload::FileOpen => {
+            while !stop_clone.load(Ordering::Relaxed) {
+                let _ = std::fs::File::open("/dev/null");
+                thread::sleep(Duration::from_millis(10));
             }
-            EventsWorkload::Signal => {
-                let pid = unsafe { libc::getpid() };
-                // Ignore SIGUSR1 so it doesn't kill us. This is process-wide
-                // but safe since these tests run in isolation (#[ignore]).
+        }
+        EventsWorkload::Signal => {
+            let pid = unsafe { libc::getpid() };
+            let prev = unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
+            while !stop_clone.load(Ordering::Relaxed) {
                 unsafe {
-                    libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+                    libc::kill(pid, libc::SIGUSR1);
                 }
-                while !stop_clone.load(Ordering::Relaxed) {
-                    unsafe {
-                        libc::kill(pid, libc::SIGUSR1);
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            unsafe {
+                libc::signal(libc::SIGUSR1, prev);
             }
         }
     });
