@@ -733,6 +733,9 @@ fn test_e2e_network_suite() {
     let trace_path = dir.path().join("trace.pb");
 
     // Record a trace with network enabled and traffic generation
+    // network_packets defaults to false, so only TCP state tracking probes are
+    // loaded (not the heavier packet-level kprobes). This keeps the test fast
+    // while still exercising the network state change and DuckDB validation paths.
     let config = Config {
         duration: NETWORK_SUITE_DURATION_SECS,
         parquet_only: false,

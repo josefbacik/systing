@@ -71,6 +71,9 @@ struct Command {
     // Network recording enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     network: bool,
+    // Network packet-level probes (set by recorder management, not a CLI flag)
+    #[arg(skip)]
+    network_packets: bool,
     // Marker recording enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     markers: bool,
@@ -157,6 +160,7 @@ impl From<Command> for Config {
             marker_threshold: cmd.marker_threshold,
             marker_duration_threshold: cmd.marker_duration_threshold,
             network: cmd.network,
+            network_packets: cmd.network_packets,
             resolve_addresses: cmd.resolve_addresses,
             tpu_profile: cmd.tpu_profile,
             tpu_service_addr: cmd.tpu_service_addr,
@@ -183,11 +187,25 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
         "interruptible-stacks" => opts.no_interruptible_stack_traces = !enable,
         "tpu" => opts.tpu_profile = enable,
         "cpu-stacks" => opts.no_cpu_stack_traces = !enable,
-        "network" => opts.network = enable,
+        "network" => {
+            opts.network = enable;
+            // Network and packet-level tracing are coupled: enabling network also
+            // enables packets by default, disabling network also disables packets.
+            // Users can override with --only-recorder network to get state-only.
+            opts.network_packets = enable;
+        }
+        "network-packets" => {
+            opts.network_packets = enable;
+            // Packet probes require the network infrastructure (ringbufs, consumers),
+            // so enabling network-packets also enables the base network recorder.
+            if enable {
+                opts.network = true;
+            }
+        }
         "pystacks" => opts.collect_pystacks = enable,
         "markers" => opts.markers = enable,
         "tpu-metrics" => opts.tpu_metrics = enable,
-        _ => {}
+        _ => unreachable!("validated recorder name not handled: {recorder_name}"),
     }
 }
 
@@ -203,8 +221,10 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         opts.no_interruptible_stack_traces = true;
         opts.no_cpu_stack_traces = true;
         opts.network = false;
+        opts.network_packets = false;
         opts.collect_pystacks = false;
         opts.markers = false;
+        opts.tpu_profile = false;
         opts.tpu_metrics = false;
 
         // Then enable only the specified recorders

@@ -3,7 +3,7 @@
 //! This module contains the main `systing()` function and all supporting code
 //! for BPF-based system tracing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io;
@@ -134,7 +134,72 @@ pub struct RecorderInfo {
     pub name: &'static str,
     pub description: &'static str,
     pub default_enabled: bool,
+    /// BPF programs required by this recorder. Empty for recorders that don't
+    /// need BPF programs (e.g., tpu, tpu-metrics).
+    pub bpf_programs: &'static [&'static str],
 }
+
+// BPF program lists for each recorder.
+// These are the program names as they appear in the BPF skeleton.
+
+const SCHED_BPF_PROGRAMS: &[&str] = &[
+    "systing_sched_wakeup",
+    "systing_sched_wakeup_new",
+    "systing_sched_switch",
+    "systing_sched_waking",
+    "systing_sched_process_exit",
+    "systing_irq_handler_entry",
+    "systing_irq_handler_exit",
+    "systing_softirq_entry",
+    "systing_softirq_exit",
+];
+
+const SYSCALL_BPF_PROGRAMS: &[&str] = &[
+    "tracepoint__raw_syscalls__sys_enter",
+    "tracepoint__raw_syscalls__sys_exit",
+];
+
+const NETWORK_BPF_PROGRAMS: &[&str] = &[
+    "inet_sock_set_state",
+    "tcp_time_wait_entry",
+    "inet_twsk_hashdance_schedule_entry",
+    "inet_twsk_deschedule_put_entry",
+];
+
+const NETWORK_PACKETS_BPF_PROGRAMS: &[&str] = &[
+    "tcp_sendmsg_entry",
+    "tcp_sendmsg_exit",
+    "udp_sendmsg_entry",
+    "udp_sendmsg_exit",
+    "tcp_recvmsg_entry",
+    "tcp_recvmsg_exit",
+    "udp_recvmsg_entry",
+    "udp_recvmsg_exit",
+    "udp_send_skb_entry",
+    "udp_queue_rcv_one_skb_entry",
+    "udp_enqueue_schedule_skb_entry",
+    "tcp_transmit_skb_entry",
+    "tcp_rcv_established_entry",
+    "tcp_queue_rcv_entry",
+    "tcp_data_queue_entry",
+    "net_dev_start_xmit",
+    "skb_copy_datagram_iovec",
+    "skb_recv_udp_exit",
+    "tcp_send_probe0_entry",
+    "tcp_send_ack_entry",
+    "tcp_retransmit_timer_entry",
+    "tcp_poll_entry",
+    "tcp_poll_exit",
+    "tracepoint__skb__kfree_skb",
+    "enqueue_to_backlog_entry",
+    "enqueue_to_backlog_exit",
+    "sk_stream_wait_memory_entry",
+    "tracepoint__qdisc__qdisc_enqueue",
+    "tracepoint__qdisc__qdisc_dequeue",
+];
+
+// Marker recording reuses the syscall tracepoints.
+const MARKER_BPF_PROGRAMS: &[&str] = SYSCALL_BPF_PROGRAMS;
 
 /// Get list of all available recorders.
 pub fn get_available_recorders() -> Vec<RecorderInfo> {
@@ -143,51 +208,67 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             name: "sched",
             description: "Scheduler event tracing",
             default_enabled: true,
+            bpf_programs: SCHED_BPF_PROGRAMS,
         },
         RecorderInfo {
             name: "syscalls",
             description: "Syscall tracing",
             default_enabled: false,
+            bpf_programs: SYSCALL_BPF_PROGRAMS,
         },
         RecorderInfo {
             name: "sleep-stacks",
             description: "Sleep stack traces",
             default_enabled: true,
+            bpf_programs: &[],
         },
         RecorderInfo {
             name: "interruptible-stacks",
             description: "Interruptible sleep stack traces",
             default_enabled: true,
+            bpf_programs: &[],
         },
         RecorderInfo {
             name: "cpu-stacks",
             description: "CPU perf stack traces",
             default_enabled: true,
+            bpf_programs: &[],
         },
         RecorderInfo {
             name: "network",
-            description: "Network traffic recording",
+            description: "Network connection state tracking",
             default_enabled: false,
+            bpf_programs: NETWORK_BPF_PROGRAMS,
+        },
+        RecorderInfo {
+            name: "network-packets",
+            description: "Network packet-level tracing (sendmsg, recvmsg, qdisc, drops)",
+            default_enabled: false,
+            bpf_programs: NETWORK_PACKETS_BPF_PROGRAMS,
         },
         RecorderInfo {
             name: "pystacks",
             description: "Python stack tracing",
             default_enabled: false,
+            bpf_programs: &[],
         },
         RecorderInfo {
             name: "markers",
             description: "Userspace marker events (faccessat2 with mode=-975)",
             default_enabled: false,
+            bpf_programs: MARKER_BPF_PROGRAMS,
         },
         RecorderInfo {
             name: "tpu",
             description: "TPU profiling (gRPC to XLA runtime profiler service)",
             default_enabled: false,
+            bpf_programs: &[],
         },
         RecorderInfo {
             name: "tpu-metrics",
             description: "TPU runtime metrics polling (port 8431, always available)",
             default_enabled: false,
+            bpf_programs: &[],
         },
     ]
 }
@@ -207,6 +288,76 @@ pub fn validate_recorder_names(names: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Returns whether a recorder is enabled based on the current Config.
+fn is_recorder_enabled(name: &str, opts: &Config) -> bool {
+    match name {
+        "sched" => !opts.no_sched,
+        "syscalls" => opts.syscalls,
+        "sleep-stacks" => !opts.no_sleep_stack_traces,
+        "interruptible-stacks" => !opts.no_interruptible_stack_traces,
+        "cpu-stacks" => !opts.no_cpu_stack_traces,
+        "network" => opts.network,
+        "network-packets" => opts.network_packets,
+        "pystacks" => opts.collect_pystacks,
+        "markers" => opts.markers,
+        "tpu" => opts.tpu_profile,
+        "tpu-metrics" => opts.tpu_metrics,
+        _ => false,
+    }
+}
+
+/// BPF programs that are always loaded regardless of recorder selection.
+/// These provide core infrastructure (clock sampling) and generic probe handlers
+/// that are needed for user-specified trace events.
+const CORE_BPF_PROGRAMS: &[&str] = &[
+    "systing_perf_event_clock",
+    "systing_usdt",
+    "systing_uprobe",
+    "systing_kprobe",
+];
+
+/// Collect the set of BPF programs required by all enabled recorders.
+///
+/// This coalesces programs from each enabled recorder's `bpf_programs` list,
+/// adds core infrastructure programs, and handles conditional programs that
+/// depend on kernel version or PID filtering.
+pub fn get_required_bpf_programs(
+    opts: &Config,
+    old_kernel: bool,
+    collect_pystacks: bool,
+) -> HashSet<&'static str> {
+    let mut required = HashSet::new();
+
+    // Core programs always loaded
+    required.extend(CORE_BPF_PROGRAMS);
+
+    // Kernel version determines which generic tracepoint handler to use
+    if old_kernel {
+        required.insert("systing_tracepoint");
+    } else {
+        required.insert("systing_raw_tracepoint");
+    }
+
+    // PID filtering needs fork tracking to follow child processes
+    if !opts.pid.is_empty() {
+        required.insert("systing_sched_process_fork");
+    }
+
+    // Pystacks with PID filtering needs exec tracking to discover new Python processes
+    if collect_pystacks && !opts.pid.is_empty() {
+        required.insert("systing_sched_process_exec");
+    }
+
+    // Add programs from each enabled recorder
+    for recorder in get_available_recorders() {
+        if is_recorder_enabled(recorder.name, opts) {
+            required.extend(recorder.bpf_programs);
+        }
+    }
+
+    required
 }
 
 /// Configuration for the systing system tracing.
@@ -266,6 +417,9 @@ pub struct Config {
     pub marker_duration_threshold: Option<u64>,
     /// Enable network recording
     pub network: bool,
+    /// Enable network packet-level probes (sendmsg, recvmsg, transmit, qdisc, drops).
+    /// Automatically enabled when "network" is enabled via `--add-recorder`.
+    pub network_packets: bool,
     /// Resolve network IP addresses to hostnames via DNS
     pub resolve_addresses: bool,
     /// Enable TPU profiling
@@ -317,6 +471,7 @@ impl Default for Config {
             marker_threshold: None,
             marker_duration_threshold: None,
             network: false,
+            network_packets: false,
             resolve_addresses: false,
             tpu_profile: false,
             tpu_service_addr: None,
@@ -1685,111 +1840,18 @@ fn configure_bpf_skeleton(
         }
     }
 
-    // Configure program autoload based on kernel version and options
-    // If we're on an older kernel we can't use the raw_tracepoint version since it doesn't
-    // have the cookie support. Newer kernels will use the raw_tracepoint version so don't need
-    // to load the old tracepoint program.
-    if old_kernel {
-        open_skel.progs.systing_raw_tracepoint.set_autoload(false);
-    } else {
-        open_skel.progs.systing_tracepoint.set_autoload(false);
-    }
+    // Determine which BPF programs are needed based on enabled recorders.
+    // Each recorder declares its required programs; we coalesce them and disable the rest.
+    let required_programs = get_required_bpf_programs(opts, old_kernel, collect_pystacks);
 
-    // Don't load scheduler tracepoints if --no-sched is set
-    // This prevents them from being loaded into the kernel at all
-    if opts.no_sched {
-        open_skel.progs.systing_sched_wakeup.set_autoload(false);
-        open_skel.progs.systing_sched_wakeup_new.set_autoload(false);
-        open_skel.progs.systing_sched_switch.set_autoload(false);
-        open_skel.progs.systing_sched_waking.set_autoload(false);
-        open_skel
-            .progs
-            .systing_sched_process_exit
-            .set_autoload(false);
-    }
-
-    // Only load fork tracepoint when --pid is specified
-    // This hook tracks child processes created by traced processes
-    if opts.pid.is_empty() {
-        open_skel
-            .progs
-            .systing_sched_process_fork
-            .set_autoload(false);
-    }
-
-    // Only load exec tracepoint when pystacks is enabled with PID filtering.
-    // This delivers exec events so userspace can dynamically add Python PIDs.
-    if !collect_pystacks || opts.pid.is_empty() {
-        open_skel
-            .progs
-            .systing_sched_process_exec
-            .set_autoload(false);
-    }
-
-    // Only load syscall tracepoints when syscall tracing is enabled OR marker recording is enabled
-    // Marker recording uses the sys_enter tracepoint to intercept faccessat2 syscalls
-    // This prevents unnecessary overhead from loading unused tracepoints
-    if !opts.syscalls && !opts.markers {
-        open_skel
-            .progs
-            .tracepoint__raw_syscalls__sys_enter
-            .set_autoload(false);
-        open_skel
-            .progs
-            .tracepoint__raw_syscalls__sys_exit
-            .set_autoload(false);
-    }
-
-    // Only load network programs when network recording is enabled
-    // This prevents unnecessary overhead from loading unused kprobes and tracepoints
-    if !opts.network {
-        open_skel.progs.tcp_sendmsg_entry.set_autoload(false);
-        open_skel.progs.tcp_sendmsg_exit.set_autoload(false);
-        open_skel.progs.udp_sendmsg_entry.set_autoload(false);
-        open_skel.progs.udp_sendmsg_exit.set_autoload(false);
-        open_skel.progs.tcp_recvmsg_entry.set_autoload(false);
-        open_skel.progs.tcp_recvmsg_exit.set_autoload(false);
-        open_skel.progs.udp_recvmsg_entry.set_autoload(false);
-        open_skel.progs.udp_recvmsg_exit.set_autoload(false);
-        open_skel.progs.udp_send_skb_entry.set_autoload(false);
-        open_skel
-            .progs
-            .udp_queue_rcv_one_skb_entry
-            .set_autoload(false);
-        open_skel
-            .progs
-            .udp_enqueue_schedule_skb_entry
-            .set_autoload(false);
-        open_skel.progs.tcp_transmit_skb_entry.set_autoload(false);
-        open_skel
-            .progs
-            .tcp_rcv_established_entry
-            .set_autoload(false);
-        open_skel.progs.tcp_queue_rcv_entry.set_autoload(false);
-        open_skel.progs.tcp_data_queue_entry.set_autoload(false);
-        open_skel.progs.net_dev_start_xmit.set_autoload(false);
-        open_skel.progs.skb_copy_datagram_iovec.set_autoload(false);
-        open_skel.progs.skb_recv_udp_exit.set_autoload(false);
-        open_skel.progs.tcp_send_probe0_entry.set_autoload(false);
-        open_skel.progs.tcp_send_ack_entry.set_autoload(false);
-        open_skel
-            .progs
-            .tcp_retransmit_timer_entry
-            .set_autoload(false);
-        // Disable socket poll probes when network is disabled
-        open_skel.progs.tcp_poll_entry.set_autoload(false);
-        open_skel.progs.tcp_poll_exit.set_autoload(false);
-        // Disable TCP state change and TIME_WAIT lifecycle tracing when network is disabled
-        open_skel.progs.inet_sock_set_state.set_autoload(false);
-        open_skel.progs.tcp_time_wait_entry.set_autoload(false);
-        open_skel
-            .progs
-            .inet_twsk_hashdance_schedule_entry
-            .set_autoload(false);
-        open_skel
-            .progs
-            .inet_twsk_deschedule_put_entry
-            .set_autoload(false);
+    for mut prog in open_skel.open_object_mut().progs_mut() {
+        let name = prog
+            .name()
+            .to_str()
+            .expect("BPF program name is not valid UTF-8");
+        if !required_programs.contains(name) {
+            prog.set_autoload(false);
+        }
     }
 
     Ok(())
