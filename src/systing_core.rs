@@ -266,8 +266,8 @@ pub struct Config {
     pub marker_duration_threshold: Option<u64>,
     /// Enable network recording
     pub network: bool,
-    /// Skip DNS resolution for network addresses
-    pub no_resolve_addresses: bool,
+    /// Resolve network IP addresses to hostnames via DNS
+    pub resolve_addresses: bool,
     /// Enable TPU profiling
     pub tpu_profile: bool,
     /// TPU profiler service address (overrides auto-discovery)
@@ -317,7 +317,7 @@ impl Default for Config {
             marker_threshold: None,
             marker_duration_threshold: None,
             network: false,
-            no_resolve_addresses: false,
+            resolve_addresses: false,
             tpu_profile: false,
             tpu_service_addr: None,
             tpu_metrics: false,
@@ -2415,7 +2415,7 @@ pub fn systing(
 
     let recorder = Arc::new(SessionRecorder::new(
         opts.enable_debuginfod,
-        !opts.no_resolve_addresses,
+        opts.resolve_addresses,
         opts.marker_threshold,
         opts.marker_duration_threshold,
         opts.tpu_metrics,

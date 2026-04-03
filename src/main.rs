@@ -80,9 +80,9 @@ struct Command {
     /// Stop tracing when any marker range event exceeds this duration in milliseconds
     #[arg(long)]
     marker_duration_threshold: Option<u64>,
-    /// Skip DNS resolution for network addresses (show IP addresses instead of hostnames)
+    /// Resolve network IP addresses to hostnames via DNS (off by default)
     #[arg(long)]
-    no_resolve_addresses: bool,
+    resolve_addresses: bool,
     /// Enable TPU profiling (auto-discovers profiler service on port 8466)
     #[arg(long)]
     tpu_profile: bool,
@@ -157,7 +157,7 @@ impl From<Command> for Config {
             marker_threshold: cmd.marker_threshold,
             marker_duration_threshold: cmd.marker_duration_threshold,
             network: cmd.network,
-            no_resolve_addresses: cmd.no_resolve_addresses,
+            resolve_addresses: cmd.resolve_addresses,
             tpu_profile: cmd.tpu_profile,
             tpu_service_addr: cmd.tpu_service_addr,
             tpu_metrics: cmd.tpu_metrics,
