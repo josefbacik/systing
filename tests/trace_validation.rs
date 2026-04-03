@@ -2447,7 +2447,11 @@ const MARKER_RECORDING_DURATION_SECS: u64 = 3;
 
 /// Search a parquet file's column for a row matching `target`.
 /// Returns true if any matching row is found.
-fn parquet_column_contains(path: &std::path::Path, column: &str, target: &str) -> bool {
+fn parquet_column_matches(
+    path: &std::path::Path,
+    column: &str,
+    pred: impl Fn(&str) -> bool,
+) -> bool {
     use arrow::array::StringArray;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -2466,13 +2470,17 @@ fn parquet_column_contains(path: &std::path::Path, column: &str, target: &str) -
                 .downcast_ref::<StringArray>()
                 .expect("column is not StringArray");
             for i in 0..arr.len() {
-                if !arr.is_null(i) && arr.value(i) == target {
+                if !arr.is_null(i) && pred(arr.value(i)) {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+fn parquet_column_contains(path: &std::path::Path, column: &str, target: &str) -> bool {
+    parquet_column_matches(path, column, |v| v == target)
 }
 
 /// Check whether a parquet file contains a specific i64 value in a named column.
@@ -2502,6 +2510,10 @@ fn parquet_int_column_contains(path: &std::path::Path, column: &str, target: i64
         }
     }
     false
+}
+
+fn parquet_column_contains_prefix(path: &std::path::Path, column: &str, prefix: &str) -> bool {
+    parquet_column_matches(path, column, |v| v.starts_with(prefix))
 }
 
 /// Parameters for a marker workload used by [`run_marker_recording`].
@@ -3016,4 +3028,329 @@ fn test_e2e_marker_duration_threshold() {
     );
 
     eprintln!("  All marker duration threshold checks passed");
+}
+
+// =============================================================================
+// Events / Probe integration tests
+// =============================================================================
+
+/// Recording duration for events integration tests (seconds).
+const EVENTS_RECORDING_DURATION_SECS: u64 = 3;
+
+/// Workload type for events integration tests.
+enum EventsWorkload {
+    /// Open /dev/null in a loop (triggers openat/do_sys_openat2).
+    FileOpen,
+    /// Send SIGUSR1 to self in a loop (triggers signal_generate).
+    Signal,
+}
+
+/// Helper to run a systing recording with a workload and custom config overrides.
+///
+/// Spawns a workload thread of the specified type and records for
+/// EVENTS_RECORDING_DURATION_SECS. The `customize` closure can modify the
+/// Config before recording starts (e.g. to set trace_event_config or syscalls).
+fn run_events_recording_with(
+    workload: EventsWorkload,
+    customize: impl FnOnce(&mut Config),
+) -> TempDir {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+
+    let workload_handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(500)); // Wait for BPF init
+        match workload {
+            EventsWorkload::FileOpen => {
+                while !stop_clone.load(Ordering::Relaxed) {
+                    let _ = std::fs::File::open("/dev/null");
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            EventsWorkload::Signal => {
+                let pid = unsafe { libc::getpid() };
+                // Ignore SIGUSR1 so it doesn't kill us. This is process-wide
+                // but safe since these tests run in isolation (#[ignore]).
+                unsafe {
+                    libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+                }
+                while !stop_clone.load(Ordering::Relaxed) {
+                    unsafe {
+                        libc::kill(pid, libc::SIGUSR1);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    });
+
+    let mut config = Config {
+        duration: EVENTS_RECORDING_DURATION_SECS,
+        output_dir: dir.path().to_path_buf(),
+        no_sched: true,
+        no_cpu_stack_traces: true,
+        no_sleep_stack_traces: true,
+        no_interruptible_stack_traces: true,
+        network: false,
+        collect_pystacks: false,
+        parquet_only: true,
+        ..Config::default()
+    };
+    customize(&mut config);
+
+    systing(config, None).expect("systing recording failed");
+    stop.store(true, Ordering::Relaxed);
+    workload_handle.join().expect("Workload thread panicked");
+
+    dir
+}
+
+/// Helper to run a systing recording with a JSON events config file.
+///
+/// Writes `config_json` to a temp file and delegates to run_events_recording_with.
+fn run_events_recording(config_json: &str, workload: EventsWorkload) -> TempDir {
+    // Write the JSON config to a temp file that outlives the recording
+    let config_file = tempfile::NamedTempFile::new().expect("Failed to create temp config file");
+    std::fs::write(config_file.path(), config_json).expect("Failed to write events config");
+    let config_path = config_file.path().to_string_lossy().to_string();
+
+    run_events_recording_with(workload, |config| {
+        config.trace_event_config = vec![config_path];
+    })
+}
+
+/// Integration test: tracepoint as instant event via JSON config.
+///
+/// Attaches `signal:signal_generate` as an instant event on a custom track.
+/// A workload sends SIGUSR1 to itself in a loop to generate events.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_tracepoint_instant() {
+    setup_bpf_environment();
+
+    let config_json = r#"
+    {
+        "events": [
+            { "name": "sig_generate", "event": "tracepoint:signal:signal_generate" }
+        ],
+        "tracks": [
+            { "track_name": "SignalEvents", "instants": [{ "event": "sig_generate" }] }
+        ]
+    }
+    "#;
+
+    let dir = run_events_recording(config_json, EventsWorkload::Signal);
+
+    // --- Validate instant.parquet contains the tracepoint events ---
+    eprintln!("  tracepoint instant: validating instant.parquet...");
+    let instant_path = dir.path().join("instant.parquet");
+    assert!(
+        instant_path.exists(),
+        "instant.parquet not found - tracepoint instant events were not recorded"
+    );
+    assert!(
+        parquet_column_contains(&instant_path, "name", "tracepoint:signal:signal_generate"),
+        "tracepoint:signal:signal_generate not found in instant.parquet"
+    );
+
+    // --- Validate track.parquet has the custom track ---
+    eprintln!("  tracepoint instant: validating track.parquet...");
+    let track_path = dir.path().join("track.parquet");
+    assert!(track_path.exists(), "track.parquet not found");
+    assert!(
+        parquet_column_contains(&track_path, "name", "SignalEvents"),
+        "SignalEvents not found in track.parquet"
+    );
+
+    eprintln!("  All tracepoint instant checks passed");
+}
+
+/// Integration test: tracepoint range event via JSON config.
+///
+/// Uses `raw_syscalls:sys_enter` as the start event and
+/// `raw_syscalls:sys_exit` as the end event to form a range.
+/// These are raw tracepoints that fire for every syscall.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_tracepoint_range() {
+    setup_bpf_environment();
+
+    let config_json = r#"
+    {
+        "events": [
+            { "name": "sys_enter", "event": "tracepoint:raw_syscalls:sys_enter" },
+            { "name": "sys_exit", "event": "tracepoint:raw_syscalls:sys_exit" }
+        ],
+        "tracks": [
+            {
+                "track_name": "SyscallRanges",
+                "ranges": [{ "name": "syscall_range", "start": "sys_enter", "end": "sys_exit" }]
+            }
+        ]
+    }
+    "#;
+
+    let dir = run_events_recording(config_json, EventsWorkload::FileOpen);
+
+    // --- Validate slice.parquet contains the range events ---
+    eprintln!("  tracepoint range: validating slice.parquet...");
+    let slice_path = dir.path().join("slice.parquet");
+    assert!(
+        slice_path.exists(),
+        "slice.parquet not found - tracepoint range events were not recorded"
+    );
+    assert!(
+        parquet_column_contains(&slice_path, "name", "syscall_range"),
+        "syscall_range not found in slice.parquet"
+    );
+
+    // --- Validate track.parquet has the custom track ---
+    eprintln!("  tracepoint range: validating track.parquet...");
+    let track_path = dir.path().join("track.parquet");
+    assert!(track_path.exists(), "track.parquet not found");
+    assert!(
+        parquet_column_contains(&track_path, "name", "SyscallRanges"),
+        "SyscallRanges not found in track.parquet"
+    );
+
+    eprintln!("  All tracepoint range checks passed");
+}
+
+/// Integration test: kprobe/kretprobe range event via JSON config.
+///
+/// Uses `kprobe:do_sys_openat2` as the start event and
+/// `kretprobe:do_sys_openat2` as the end event to form a range.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_kprobe_range() {
+    setup_bpf_environment();
+
+    let config_json = r#"
+    {
+        "events": [
+            { "name": "kp_openat", "event": "kprobe:do_sys_openat2" },
+            { "name": "kretp_openat", "event": "kretprobe:do_sys_openat2" }
+        ],
+        "tracks": [
+            {
+                "track_name": "KprobeRanges",
+                "ranges": [{ "name": "kp_openat_call", "start": "kp_openat", "end": "kretp_openat" }]
+            }
+        ]
+    }
+    "#;
+
+    let dir = run_events_recording(config_json, EventsWorkload::FileOpen);
+
+    // --- Validate slice.parquet contains the range events ---
+    eprintln!("  kprobe range: validating slice.parquet...");
+    let slice_path = dir.path().join("slice.parquet");
+    assert!(
+        slice_path.exists(),
+        "slice.parquet not found - kprobe range events were not recorded"
+    );
+    assert!(
+        parquet_column_contains(&slice_path, "name", "kp_openat_call"),
+        "kp_openat_call not found in slice.parquet"
+    );
+
+    // --- Validate track.parquet has the custom track ---
+    eprintln!("  kprobe range: validating track.parquet...");
+    let track_path = dir.path().join("track.parquet");
+    assert!(track_path.exists(), "track.parquet not found");
+    assert!(
+        parquet_column_contains(&track_path, "name", "KprobeRanges"),
+        "KprobeRanges not found in track.parquet"
+    );
+
+    eprintln!("  All kprobe range checks passed");
+}
+
+/// Integration test: syscall tracking via `--syscalls` flag.
+///
+/// Enables built-in syscall tracking (no JSON config needed). A workload opens
+/// `/dev/null` in a loop so `openat` syscalls appear in the trace.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_syscall_tracking() {
+    setup_bpf_environment();
+
+    let dir = run_events_recording_with(EventsWorkload::FileOpen, |config| {
+        config.syscalls = true;
+    });
+
+    // --- Validate slice.parquet contains syscall events ---
+    eprintln!("  syscall tracking: validating slice.parquet...");
+    let slice_path = dir.path().join("slice.parquet");
+    assert!(
+        slice_path.exists(),
+        "slice.parquet not found - syscall events were not recorded"
+    );
+    assert!(
+        parquet_column_contains(&slice_path, "name", "openat"),
+        "openat syscall not found in slice.parquet"
+    );
+
+    // --- Validate track.parquet has the syscalls track ---
+    eprintln!("  syscall tracking: validating track.parquet...");
+    let track_path = dir.path().join("track.parquet");
+    assert!(track_path.exists(), "track.parquet not found");
+    assert!(
+        parquet_column_contains(&track_path, "name", "syscalls"),
+        "syscalls track not found in track.parquet"
+    );
+
+    eprintln!("  All syscall tracking checks passed");
+}
+
+/// Integration test: CPU scope tracepoint instant event.
+///
+/// Attaches `signal:signal_generate` with `"scope": "cpu"` so events
+/// appear on per-CPU tracks rather than per-thread tracks.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_event_scope_cpu() {
+    setup_bpf_environment();
+
+    let config_json = r#"
+    {
+        "events": [
+            { "name": "sig_generate", "event": "tracepoint:signal:signal_generate", "scope": "cpu" }
+        ],
+        "tracks": [
+            { "track_name": "CpuSignal", "instants": [{ "event": "sig_generate" }] }
+        ]
+    }
+    "#;
+
+    let dir = run_events_recording(config_json, EventsWorkload::Signal);
+
+    // --- Validate instant.parquet contains the CPU-scoped events ---
+    eprintln!("  event scope cpu: validating instant.parquet...");
+    let instant_path = dir.path().join("instant.parquet");
+    assert!(
+        instant_path.exists(),
+        "instant.parquet not found - CPU-scoped instant events were not recorded"
+    );
+    assert!(
+        parquet_column_contains(&instant_path, "name", "tracepoint:signal:signal_generate"),
+        "tracepoint:signal:signal_generate not found in instant.parquet"
+    );
+
+    // --- Validate track.parquet has the custom track ---
+    eprintln!("  event scope cpu: validating track.parquet...");
+    let track_path = dir.path().join("track.parquet");
+    assert!(track_path.exists(), "track.parquet not found");
+    assert!(
+        parquet_column_contains_prefix(&track_path, "name", "CpuSignal CPU "),
+        "CpuSignal CPU track not found in track.parquet"
+    );
+
+    eprintln!("  All event scope cpu checks passed");
 }

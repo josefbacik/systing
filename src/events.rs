@@ -766,6 +766,11 @@ impl SystingProbeRecorder {
                 .insert(syscall_nr, event.ts);
         } else if let Some(pid_pending) = self.pending_syscalls.get_mut(&tgidpid) {
             if let Some(enter_ts) = pid_pending.remove(&syscall_nr) {
+                // Discard syscalls with out-of-order timestamps.
+                if event.ts < enter_ts {
+                    return;
+                }
+
                 // Stream the completed syscall if streaming is enabled
                 if let Some(mut collector) = self.streaming_collector.take() {
                     let key = TrackCacheKey::Thread {
@@ -921,48 +926,52 @@ impl SystingProbeRecorder {
                     let track_name = self.ranges.get(range_name).unwrap().clone();
                     range.end = event.ts;
 
-                    // Stream if enabled
-                    if let Some(mut collector) = self.streaming_collector.take() {
-                        let key = TrackCacheKey::Cpu {
-                            cpu: event.cpu,
-                            track_name: track_name.clone(),
-                        };
-                        if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
-                            self.slice_id_counter += 1;
-                            let slice_id = self.slice_id_counter;
+                    // Discard ranges with out-of-order timestamps (can happen
+                    // across CPUs with skewed TSC values).
+                    if range.end >= range.start {
+                        // Stream if enabled
+                        if let Some(mut collector) = self.streaming_collector.take() {
+                            let key = TrackCacheKey::Cpu {
+                                cpu: event.cpu,
+                                track_name: track_name.clone(),
+                            };
+                            if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
+                                self.slice_id_counter += 1;
+                                let slice_id = self.slice_id_counter;
 
-                            if let Err(e) = collector.add_slice(SliceRecord {
-                                id: slice_id,
-                                ts: range.start as i64,
-                                dur: (range.end - range.start) as i64,
-                                track_id,
-                                utid: None,
-                                name: range.range_name.clone(),
-                                category: None,
-                                depth: 0,
-                            }) {
-                                eprintln!("Warning: Failed to stream CPU range slice: {e}");
-                            }
-
-                            for arg in &range.args {
-                                let (key, int_value, string_value) = convert_arg(arg);
-                                if let Err(e) = collector.add_arg(ArgRecord {
-                                    slice_id,
-                                    key,
-                                    int_value,
-                                    string_value,
-                                    real_value: None,
+                                if let Err(e) = collector.add_slice(SliceRecord {
+                                    id: slice_id,
+                                    ts: range.start as i64,
+                                    dur: (range.end - range.start) as i64,
+                                    track_id,
+                                    utid: None,
+                                    name: range.range_name.clone(),
+                                    category: None,
+                                    depth: 0,
                                 }) {
-                                    eprintln!("Warning: Failed to stream CPU range arg: {e}");
+                                    eprintln!("Warning: Failed to stream CPU range slice: {e}");
+                                }
+
+                                for arg in &range.args {
+                                    let (key, int_value, string_value) = convert_arg(arg);
+                                    if let Err(e) = collector.add_arg(ArgRecord {
+                                        slice_id,
+                                        key,
+                                        int_value,
+                                        string_value,
+                                        real_value: None,
+                                    }) {
+                                        eprintln!("Warning: Failed to stream CPU range arg: {e}");
+                                    }
                                 }
                             }
+                            self.streaming_collector = Some(collector);
+                        } else {
+                            // Non-streaming path
+                            let track_hash = self.cpu_ranges.entry(event.cpu).or_default();
+                            let entry = track_hash.entry(track_name).or_default();
+                            entry.push(range);
                         }
-                        self.streaming_collector = Some(collector);
-                    } else {
-                        // Non-streaming path
-                        let track_hash = self.cpu_ranges.entry(event.cpu).or_default();
-                        let entry = track_hash.entry(track_name).or_default();
-                        entry.push(range);
                     }
                 }
             }
@@ -1085,52 +1094,56 @@ impl SystingProbeRecorder {
                     let track_name = self.ranges.get(range_name).unwrap().clone();
                     range.end = event.ts;
 
-                    // Stream if enabled (thread that receives END owns the track)
-                    if let Some(mut collector) = self.streaming_collector.take() {
-                        let key = TrackCacheKey::Thread {
-                            tgidpid: event.task.tgidpid,
-                            track_name: track_name.clone(),
-                        };
-                        if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
-                            self.slice_id_counter += 1;
-                            let slice_id = self.slice_id_counter;
-                            // Get consistent utid from shared generator
-                            let tid = event.task.tgidpid as i32;
-                            let utid = Some(self.utid_generator.get_or_create_utid(tid));
+                    // Discard ranges with out-of-order timestamps (can happen
+                    // across CPUs with skewed TSC values).
+                    if range.end >= range.start {
+                        // Stream if enabled (thread that receives END owns the track)
+                        if let Some(mut collector) = self.streaming_collector.take() {
+                            let key = TrackCacheKey::Thread {
+                                tgidpid: event.task.tgidpid,
+                                track_name: track_name.clone(),
+                            };
+                            if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
+                                self.slice_id_counter += 1;
+                                let slice_id = self.slice_id_counter;
+                                // Get consistent utid from shared generator
+                                let tid = event.task.tgidpid as i32;
+                                let utid = Some(self.utid_generator.get_or_create_utid(tid));
 
-                            if let Err(e) = collector.add_slice(SliceRecord {
-                                id: slice_id,
-                                ts: range.start as i64,
-                                dur: (range.end - range.start) as i64,
-                                track_id,
-                                utid,
-                                name: range.range_name.clone(),
-                                category: None,
-                                depth: 0,
-                            }) {
-                                eprintln!("Warning: Failed to stream range slice: {e}");
-                            }
-
-                            for arg in &range.args {
-                                let (key, int_value, string_value) = convert_arg(arg);
-                                if let Err(e) = collector.add_arg(ArgRecord {
-                                    slice_id,
-                                    key,
-                                    int_value,
-                                    string_value,
-                                    real_value: None,
+                                if let Err(e) = collector.add_slice(SliceRecord {
+                                    id: slice_id,
+                                    ts: range.start as i64,
+                                    dur: (range.end - range.start) as i64,
+                                    track_id,
+                                    utid,
+                                    name: range.range_name.clone(),
+                                    category: None,
+                                    depth: 0,
                                 }) {
-                                    eprintln!("Warning: Failed to stream range arg: {e}");
+                                    eprintln!("Warning: Failed to stream range slice: {e}");
+                                }
+
+                                for arg in &range.args {
+                                    let (key, int_value, string_value) = convert_arg(arg);
+                                    if let Err(e) = collector.add_arg(ArgRecord {
+                                        slice_id,
+                                        key,
+                                        int_value,
+                                        string_value,
+                                        real_value: None,
+                                    }) {
+                                        eprintln!("Warning: Failed to stream range arg: {e}");
+                                    }
                                 }
                             }
+                            self.streaming_collector = Some(collector);
+                        } else {
+                            // Non-streaming path
+                            let track_hash =
+                                self.recorded_ranges.entry(event.task.tgidpid).or_default();
+                            let entry = track_hash.entry(track_name).or_default();
+                            entry.push(range);
                         }
-                        self.streaming_collector = Some(collector);
-                    } else {
-                        // Non-streaming path
-                        let track_hash =
-                            self.recorded_ranges.entry(event.task.tgidpid).or_default();
-                        let entry = track_hash.entry(track_name).or_default();
-                        entry.push(range);
                     }
                 }
             }
@@ -1240,7 +1253,7 @@ impl SystingProbeRecorder {
                     parent_id: None,
                 })?;
 
-                for range in ranges.iter() {
+                for range in ranges.iter().filter(|r| r.end >= r.start) {
                     let slice_id = *slice_id_counter;
                     *slice_id_counter += 1;
 
@@ -1282,7 +1295,7 @@ impl SystingProbeRecorder {
                     parent_id: None,
                 })?;
 
-                for range in ranges.iter() {
+                for range in ranges.iter().filter(|r| r.end >= r.start) {
                     let slice_id = *slice_id_counter;
                     *slice_id_counter += 1;
 
@@ -1368,14 +1381,14 @@ impl SystingProbeRecorder {
                     parent_id: None,
                 })?;
 
-                for (start_ts, end_ts, syscall_nr) in syscalls.iter() {
+                for (start_ts, end_ts, syscall_nr) in syscalls.iter().filter(|(s, e, _)| e >= s) {
                     let slice_id = *slice_id_counter;
                     *slice_id_counter += 1;
 
                     collector.add_slice(SliceRecord {
                         id: slice_id,
                         ts: *start_ts as i64,
-                        dur: (*end_ts - *start_ts) as i64,
+                        dur: (end_ts - start_ts) as i64,
                         track_id,
                         utid,
                         name: syscall_name(*syscall_nr),
