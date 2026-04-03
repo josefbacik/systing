@@ -22,6 +22,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
+use crate::network_recorder::{drop_reason_str, format_tcp_flags, tcp_state_name};
 use crate::parquet::ParquetPaths;
 use crate::record::RecordCollector;
 use crate::trace::{
@@ -1961,10 +1962,13 @@ fn build_network_packet_batch(
         id_builder.append_value(record.id);
         ts_builder.append_value(record.ts);
         socket_id_builder.append_value(record.socket_id);
-        event_type_builder.append_value(&record.event_type);
+        event_type_builder.append_value(record.event_type);
         seq_builder.append_option(record.seq);
         length_builder.append_value(record.length);
-        tcp_flags_builder.append_option(record.tcp_flags.as_deref());
+        match record.tcp_flags {
+            Some(flags) => tcp_flags_builder.append_value(format_tcp_flags(flags)),
+            None => tcp_flags_builder.append_null(),
+        }
         sndbuf_used_builder.append_option(record.sndbuf_used);
         sndbuf_limit_builder.append_option(record.sndbuf_limit);
         sndbuf_fill_pct_builder.append_option(record.sndbuf_fill_pct);
@@ -1986,7 +1990,8 @@ fn build_network_packet_batch(
         icsk_pending_builder.append_option(record.icsk_pending);
         icsk_timeout_builder.append_option(record.icsk_timeout);
         drop_reason_builder.append_option(record.drop_reason);
-        drop_reason_str_builder.append_option(record.drop_reason_str.as_deref());
+        drop_reason_str_builder
+            .append_option(record.drop_reason.map(|r| drop_reason_str(r as u32)));
         drop_location_builder.append_option(record.drop_location);
         qlen_builder.append_option(record.qlen);
         qlen_limit_builder.append_option(record.qlen_limit);
@@ -1998,9 +2003,9 @@ fn build_network_packet_batch(
         skb_addr_builder.append_option(record.skb_addr);
         qdisc_latency_us_builder.append_option(record.qdisc_latency_us);
         old_state_builder.append_option(record.old_state);
-        old_state_str_builder.append_option(record.old_state_str.as_deref());
+        old_state_str_builder.append_option(record.old_state.map(|s| tcp_state_name(s as u8)));
         new_state_builder.append_option(record.new_state);
-        new_state_str_builder.append_option(record.new_state_str.as_deref());
+        new_state_str_builder.append_option(record.new_state.map(|s| tcp_state_name(s as u8)));
     }
 
     Ok(RecordBatch::try_new(

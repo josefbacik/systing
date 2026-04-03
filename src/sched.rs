@@ -1,10 +1,9 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::perfetto::TraceWriter;
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing_core::types::event_type;
@@ -15,16 +14,6 @@ use crate::trace::{
     WakeupNewRecord,
 };
 use crate::utid::UtidGenerator;
-
-use perfetto_protos::ftrace_event::FtraceEvent;
-use perfetto_protos::ftrace_event_bundle::ftrace_event_bundle::CompactSched;
-use perfetto_protos::ftrace_event_bundle::FtraceEventBundle;
-use perfetto_protos::irq::{
-    IrqHandlerEntryFtraceEvent, IrqHandlerExitFtraceEvent, SoftirqEntryFtraceEvent,
-    SoftirqExitFtraceEvent,
-};
-use perfetto_protos::sched::{SchedProcessExitFtraceEvent, SchedWakeupNewFtraceEvent};
-use perfetto_protos::trace_packet::TracePacket;
 
 /// Threshold for flushing streaming sched slices to the collector.
 /// Lower than Parquet batch size (200K) to reduce peak memory while maintaining I/O efficiency.
@@ -48,14 +37,6 @@ struct CpuRunningState {
     start_ts: i64,
     tid: i32,
     prio: i32,
-}
-
-#[derive(Default)]
-struct LocalCompactSched {
-    compact_sched: CompactSched,
-    comm_mapping: HashMap<String, u32>,
-    last_waking_ts: u64,
-    last_switch_ts: u64,
 }
 
 /// Pending IRQ entry waiting for matching exit.
@@ -115,8 +96,6 @@ struct ProcessExitEvent {
 
 pub struct SchedEventRecorder {
     pub ringbuf: RingBuffer<task_event>,
-    events: HashMap<u32, BTreeMap<u64, FtraceEvent>>,
-    compact_sched: HashMap<u32, LocalCompactSched>,
     // Pending IRQ/softirq events keyed by (cpu, irq/vec).
     // IRQs and softirqs cannot nest on the same CPU with the same IRQ number or
     // softirq vector, so (cpu, irq/vec) uniquely identifies a pending entry.
@@ -231,13 +210,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                         }
                     }
                 }
-
-                // Always add to compact_sched for both SCHED_SWITCH and SCHED_WAKING.
-                // This is intentional even in streaming mode: compact_sched is used by
-                // write_trace() for Perfetto output, allowing both Parquet and Perfetto
-                // formats from a single recording session.
-                let compact_sched = self.compact_sched.entry(event.cpu).or_default();
-                compact_sched.add_task_event(&event);
             }
 
             // IRQ handler entry - track for pairing with exit
@@ -254,7 +226,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                         name,
                     },
                 );
-                self.add_ftrace_event(&event);
             }
 
             // IRQ handler exit - pair with entry to create slice
@@ -288,7 +259,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                         });
                     }
                 }
-                self.add_ftrace_event(&event);
             }
 
             // Softirq entry - track for pairing with exit
@@ -296,7 +266,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                 let vec = event.target_cpu as i32;
                 self.pending_softirqs
                     .insert((event.cpu, vec), PendingSoftirq { ts: event.ts, vec });
-                self.add_ftrace_event(&event);
             }
 
             // Softirq exit - pair with entry to create slice
@@ -325,7 +294,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                         });
                     }
                 }
-                self.add_ftrace_event(&event);
             }
 
             // New process wakeup - the `next` field contains the newly woken process info
@@ -354,7 +322,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                         target_cpu: event.target_cpu as i32,
                     });
                 }
-                self.add_ftrace_event(&event);
             }
 
             // Process exit - the `prev` field contains the exiting process info
@@ -381,16 +348,12 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                         pid: tid,
                     });
                 }
-                self.add_ftrace_event(&event);
             }
 
             // Skip SCHED_WAKEUP (redundant with SCHED_WAKING)
             event_type::SCHED_WAKEUP => {}
 
-            // Other events go directly to ftrace
-            _ => {
-                self.add_ftrace_event(&event);
-            }
+            _ => {}
         }
     }
 }
@@ -400,8 +363,6 @@ impl SchedEventRecorder {
     pub fn new(utid_generator: Arc<UtidGenerator>) -> Self {
         Self {
             ringbuf: RingBuffer::default(),
-            events: HashMap::new(),
-            compact_sched: HashMap::new(),
             pending_irqs: HashMap::new(),
             pending_softirqs: HashMap::new(),
             completed_irqs: Vec::new(),
@@ -420,64 +381,10 @@ impl SchedEventRecorder {
         self.streaming_collector = Some(collector);
     }
 
-    /// Add an event to the ftrace events map for Perfetto output.
-    fn add_ftrace_event(&mut self, event: &task_event) {
-        let ftrace_event = FtraceEvent::from(event);
-        let cpu_event = self.events.entry(event.cpu).or_default();
-        cpu_event.insert(event.ts, ftrace_event);
-    }
-
     /// Write trace data directly to a RecordCollector (Parquet-first path).
     ///
     /// This method outputs records directly without going through Perfetto format.
-    /// It converts the delta-encoded CompactSched data back to absolute timestamps.
     pub fn write_records(&self, collector: &mut dyn RecordCollector) -> Result<()> {
-        // Process compact sched events (SCHED_SWITCH, SCHED_WAKING)
-        for (cpu, local_compact) in self.compact_sched.iter() {
-            let compact = &local_compact.compact_sched;
-
-            // Decode switch events to SchedSliceRecord
-            let mut switch_ts: i64 = 0;
-            for i in 0..compact.switch_timestamp.len() {
-                switch_ts += compact.switch_timestamp[i] as i64;
-                let next_pid = compact.switch_next_pid[i];
-                let next_prio = compact.switch_next_prio.get(i).copied().unwrap_or(0);
-                let prev_state = compact.switch_prev_state.get(i).copied().unwrap_or(0);
-
-                // Get or create utid for this thread
-                let utid = self.utid_generator.get_or_create_utid(next_pid);
-
-                let end_state = prev_state_to_end_state(prev_state);
-
-                collector.add_sched_slice(SchedSliceRecord {
-                    ts: switch_ts,
-                    dur: 0, // Duration computed later or left as 0 for streaming
-                    cpu: *cpu as i32,
-                    utid,
-                    end_state,
-                    priority: next_prio,
-                })?;
-            }
-
-            // Decode waking events to ThreadStateRecord
-            let mut waking_ts: i64 = 0;
-            for i in 0..compact.waking_timestamp.len() {
-                waking_ts += compact.waking_timestamp[i] as i64;
-                let pid = compact.waking_pid[i];
-                let target_cpu = compact.waking_target_cpu.get(i).copied().unwrap_or(0);
-
-                let utid = self.utid_generator.get_or_create_utid(pid);
-
-                collector.add_thread_state(ThreadStateRecord {
-                    ts: waking_ts,
-                    dur: 0,
-                    utid,
-                    state: 0, // TASK_RUNNING (runnable)
-                    cpu: Some(target_cpu),
-                })?;
-            }
-        }
-
         // Emit completed IRQ slices
         for irq in &self.completed_irqs {
             collector.add_irq_slice(IrqSliceRecord {
@@ -617,194 +524,14 @@ impl SchedEventRecorder {
         // Take ownership of the collector and return it
         Ok(self.streaming_collector.take())
     }
-
-    /// Write trace data to Perfetto format (used by parquet-to-perfetto conversion).
-    pub fn write_trace(&self, writer: &mut dyn TraceWriter) -> Result<()> {
-        // Pull all the compact scheduling events
-        for (cpu, compact_sched) in self.compact_sched.iter() {
-            let mut event_bundle = FtraceEventBundle::default();
-            event_bundle.set_cpu(*cpu);
-            event_bundle.compact_sched = Some(compact_sched.compact_sched.clone()).into();
-            let mut packet = TracePacket::default();
-            packet.set_ftrace_events(event_bundle);
-            writer.write_packet(&packet)?;
-        }
-
-        // Pull all the scheduling events.
-        for (cpu, events) in self.events.iter() {
-            let mut event_bundle = FtraceEventBundle::default();
-            event_bundle.set_cpu(*cpu);
-            event_bundle.event = events.values().cloned().collect();
-            let mut packet = TracePacket::default();
-            packet.set_ftrace_events(event_bundle);
-            writer.write_packet(&packet)?;
-        }
-
-        Ok(())
-    }
-
-    /// Returns the minimum timestamp from all events, or None if no events recorded.
-    pub fn min_timestamp(&self) -> Option<u64> {
-        let compact_min = self
-            .compact_sched
-            .values()
-            .filter_map(|cs| cs.compact_sched.switch_timestamp.first().copied())
-            .min();
-
-        // BTreeMap is sorted by key, so first key is min
-        let events_min = self
-            .events
-            .values()
-            .filter_map(|e| e.keys().next().copied())
-            .min();
-
-        [compact_min, events_min].into_iter().flatten().min()
-    }
-}
-
-impl From<&task_event> for FtraceEvent {
-    fn from(event: &task_event) -> Self {
-        let mut ftrace_event = FtraceEvent::default();
-        ftrace_event.set_pid(event.prev.tgidpid as u32);
-        ftrace_event.set_timestamp(event.ts);
-        match event.r#type {
-            event_type::SCHED_WAKEUP_NEW => {
-                ftrace_event.set_sched_wakeup_new(SchedWakeupNewFtraceEvent::from(event));
-            }
-            event_type::SCHED_IRQ_EXIT => {
-                ftrace_event.set_irq_handler_exit(IrqHandlerExitFtraceEvent::from(event));
-            }
-            event_type::SCHED_IRQ_ENTER => {
-                ftrace_event.set_irq_handler_entry(IrqHandlerEntryFtraceEvent::from(event));
-            }
-            event_type::SCHED_SOFTIRQ_EXIT => {
-                ftrace_event.set_softirq_exit(SoftirqExitFtraceEvent::from(event));
-            }
-            event_type::SCHED_SOFTIRQ_ENTER => {
-                ftrace_event.set_softirq_entry(SoftirqEntryFtraceEvent::from(event));
-            }
-            event_type::SCHED_PROCESS_EXIT => {
-                ftrace_event.set_sched_process_exit(SchedProcessExitFtraceEvent::from(event));
-            }
-            _ => {}
-        }
-        ftrace_event
-    }
-}
-
-impl From<&task_event> for SchedWakeupNewFtraceEvent {
-    fn from(event: &task_event) -> Self {
-        let comm_cstr = CStr::from_bytes_until_nul(&event.next.comm).unwrap();
-        let mut sched_wakeup_new = SchedWakeupNewFtraceEvent::default();
-        sched_wakeup_new.set_pid(event.next.tgidpid as i32);
-        sched_wakeup_new.set_comm(comm_cstr.to_str().unwrap().to_string());
-        sched_wakeup_new.set_prio(event.next_prio as i32);
-        sched_wakeup_new.set_target_cpu(event.target_cpu as i32);
-        sched_wakeup_new
-    }
-}
-
-impl From<&task_event> for IrqHandlerExitFtraceEvent {
-    fn from(event: &task_event) -> Self {
-        let mut irq_handler_exit = IrqHandlerExitFtraceEvent::default();
-        irq_handler_exit.set_irq(event.target_cpu as i32);
-        irq_handler_exit.set_ret(event.next_prio as i32);
-        irq_handler_exit
-    }
-}
-
-impl From<&task_event> for IrqHandlerEntryFtraceEvent {
-    fn from(event: &task_event) -> Self {
-        let mut irq_handler_entry = IrqHandlerEntryFtraceEvent::default();
-        let name_cstr = CStr::from_bytes_until_nul(&event.next.comm).unwrap();
-        irq_handler_entry.set_name(name_cstr.to_str().unwrap().to_string());
-        irq_handler_entry.set_irq(event.target_cpu as i32);
-        irq_handler_entry
-    }
-}
-
-impl From<&task_event> for SoftirqExitFtraceEvent {
-    fn from(event: &task_event) -> Self {
-        let mut softirq_exit = SoftirqExitFtraceEvent::default();
-        softirq_exit.set_vec(event.target_cpu);
-        softirq_exit
-    }
-}
-
-impl From<&task_event> for SoftirqEntryFtraceEvent {
-    fn from(event: &task_event) -> Self {
-        let mut softirq_entry = SoftirqEntryFtraceEvent::default();
-        softirq_entry.set_vec(event.target_cpu);
-        softirq_entry
-    }
-}
-
-impl From<&task_event> for SchedProcessExitFtraceEvent {
-    fn from(event: &task_event) -> Self {
-        let pid = event.prev.tgidpid as i32;
-        let tgid = (event.prev.tgidpid >> 32) as i32;
-        let name_cstr = CStr::from_bytes_until_nul(&event.prev.comm).unwrap();
-        let mut sched_process_exit = SchedProcessExitFtraceEvent::default();
-        sched_process_exit.set_pid(pid);
-        sched_process_exit.set_tgid(tgid);
-        sched_process_exit.set_prio(event.prev_prio as i32);
-        sched_process_exit.set_comm(name_cstr.to_str().unwrap().to_string());
-        sched_process_exit
-    }
-}
-
-impl LocalCompactSched {
-    fn add_task_event(&mut self, event: &task_event) {
-        let comm = CStr::from_bytes_until_nul(&event.next.comm)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let index = self.comm_mapping.entry(comm.clone()).or_insert_with(|| {
-            self.compact_sched.intern_table.push(comm);
-            (self.compact_sched.intern_table.len() as u32) - 1
-        });
-        if event.r#type == event_type::SCHED_WAKING {
-            self.compact_sched
-                .waking_timestamp
-                .push(event.ts - self.last_waking_ts);
-            self.last_waking_ts = event.ts;
-            self.compact_sched
-                .waking_pid
-                .push(event.next.tgidpid as i32);
-            self.compact_sched
-                .waking_target_cpu
-                .push(event.target_cpu as i32);
-            self.compact_sched.waking_prio.push(event.next_prio as i32);
-            self.compact_sched.waking_comm_index.push(*index);
-            self.compact_sched.waking_common_flags.push(1);
-        } else {
-            self.compact_sched
-                .switch_timestamp
-                .push(event.ts - self.last_switch_ts);
-            self.last_switch_ts = event.ts;
-            self.compact_sched
-                .switch_prev_state
-                .push(event.prev_state as i64);
-            self.compact_sched
-                .switch_next_pid
-                .push(event.next.tgidpid as i32);
-            self.compact_sched
-                .switch_next_prio
-                .push(event.next_prio as i32);
-            self.compact_sched.switch_next_comm_index.push(*index);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::perfetto::VecTraceWriter;
     use crate::systing_core::types::event_type;
     use crate::systing_core::types::task_info;
     use crate::utid::UtidGenerator;
-    use perfetto_protos::trace_packet::TracePacket;
 
     fn copy_to_comm(comm: &mut [u8], value: &CStr) {
         let bytes = value.to_bytes_with_nul();
@@ -813,251 +540,6 @@ mod tests {
 
     fn create_test_recorder() -> SchedEventRecorder {
         SchedEventRecorder::new(Arc::new(UtidGenerator::new()))
-    }
-
-    /// Helper to collect packets from SchedEventRecorder for tests
-    fn generate_trace(recorder: &SchedEventRecorder) -> Vec<TracePacket> {
-        let mut writer = VecTraceWriter::new();
-        recorder.write_trace(&mut writer).unwrap();
-        writer.packets
-    }
-
-    #[test]
-    fn test_handle_event() {
-        let mut recorder = create_test_recorder();
-        let prev_comm = c"prev";
-        let next_comm = c"next";
-
-        let mut event = task_event {
-            r#type: event_type::SCHED_SWITCH,
-            ts: 1000,
-            next: task_info {
-                tgidpid: 1234,
-                ..Default::default()
-            },
-            prev: task_info {
-                tgidpid: 5678,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        copy_to_comm(&mut event.next.comm, next_comm);
-        copy_to_comm(&mut event.prev.comm, prev_comm);
-        recorder.handle_event(event);
-        assert_eq!(recorder.compact_sched.len(), 1);
-        assert!(recorder.compact_sched.contains_key(&0));
-
-        event.ts = 2000;
-        event.next.tgidpid = 5678;
-        event.prev.tgidpid = 1234;
-        copy_to_comm(&mut event.next.comm, prev_comm);
-        copy_to_comm(&mut event.prev.comm, next_comm);
-        recorder.handle_event(event);
-
-        assert_eq!(recorder.compact_sched.len(), 1);
-
-        let packets = generate_trace(&recorder);
-        assert_eq!(packets.len(), 1);
-
-        let packet = &packets[0];
-        assert!(packet.has_ftrace_events());
-        let compact = packet.ftrace_events().compact_sched.as_ref().unwrap();
-        assert_eq!(compact.switch_timestamp.len(), 2);
-        assert_eq!(compact.switch_timestamp[0], 1000);
-        assert_eq!(compact.switch_timestamp[1], 1000);
-        assert_eq!(compact.intern_table.len(), 2);
-        assert_eq!(compact.intern_table[0], "next");
-        assert_eq!(compact.intern_table[1], "prev");
-        assert_eq!(compact.switch_next_comm_index[0], 0);
-        assert_eq!(compact.switch_next_comm_index[1], 1);
-    }
-
-    #[test]
-    fn test_wakeup_new() {
-        let mut recorder = create_test_recorder();
-        let next_comm = c"next";
-
-        let mut event = task_event {
-            r#type: event_type::SCHED_WAKEUP_NEW,
-            ts: 1000,
-            next: task_info {
-                tgidpid: 1234,
-                ..Default::default()
-            },
-            target_cpu: 0,
-            next_prio: 10,
-            ..Default::default()
-        };
-        copy_to_comm(&mut event.next.comm, next_comm);
-        recorder.handle_event(event);
-
-        assert_eq!(recorder.compact_sched.len(), 0);
-        assert_eq!(recorder.events.len(), 1);
-        assert!(recorder.events.contains_key(&0));
-
-        let packets = generate_trace(&recorder);
-        assert_eq!(packets.len(), 1);
-
-        let packet = &packets[0];
-        assert!(packet.has_ftrace_events());
-        let events = &packet.ftrace_events().event;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].sched_wakeup_new().comm(), "next");
-        assert_eq!(events[0].sched_wakeup_new().pid(), 1234);
-    }
-
-    #[test]
-    fn test_irq_handler_events() {
-        let mut recorder = create_test_recorder();
-        let next_comm = c"irq_handler";
-
-        let mut event = task_event {
-            r#type: event_type::SCHED_IRQ_ENTER,
-            ts: 1000,
-            target_cpu: 0,
-            next_prio: 5,
-            next: task_info {
-                tgidpid: 1234,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        copy_to_comm(&mut event.next.comm, next_comm);
-        recorder.handle_event(event);
-
-        assert_eq!(recorder.compact_sched.len(), 0);
-        assert_eq!(recorder.events.len(), 1);
-        assert!(recorder.events.contains_key(&0));
-
-        let packets = generate_trace(&recorder);
-        assert_eq!(packets.len(), 1);
-
-        let packet = &packets[0];
-        assert!(packet.has_ftrace_events());
-        let events = &packet.ftrace_events().event;
-        assert_eq!(events.len(), 1);
-        assert!(events[0].has_irq_handler_entry());
-        assert_eq!(events[0].irq_handler_entry().name(), "irq_handler");
-    }
-
-    #[test]
-    fn test_irq_exit_handler_events() {
-        let mut recorder = create_test_recorder();
-        let next_comm = c"irq_handler";
-
-        let mut event = task_event {
-            r#type: event_type::SCHED_IRQ_EXIT,
-            ts: 1000,
-            target_cpu: 0,
-            next_prio: 5,
-            next: task_info {
-                tgidpid: 1234,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        copy_to_comm(&mut event.next.comm, next_comm);
-        recorder.handle_event(event);
-
-        assert_eq!(recorder.compact_sched.len(), 0);
-        assert_eq!(recorder.events.len(), 1);
-        assert!(recorder.events.contains_key(&0));
-
-        let packets = generate_trace(&recorder);
-        assert_eq!(packets.len(), 1);
-
-        let packet = &packets[0];
-        assert!(packet.has_ftrace_events());
-        let events = &packet.ftrace_events().event;
-        assert_eq!(events.len(), 1);
-        assert!(events[0].has_irq_handler_exit());
-    }
-
-    #[test]
-    fn test_softirq_events() {
-        let mut recorder = create_test_recorder();
-
-        let event = task_event {
-            r#type: event_type::SCHED_SOFTIRQ_ENTER,
-            ts: 1000,
-            target_cpu: 0,
-            next_prio: 5,
-            ..Default::default()
-        };
-        recorder.handle_event(event);
-
-        assert_eq!(recorder.compact_sched.len(), 0);
-        assert_eq!(recorder.events.len(), 1);
-        assert!(recorder.events.contains_key(&0));
-
-        let packets = generate_trace(&recorder);
-        assert_eq!(packets.len(), 1);
-
-        let packet = &packets[0];
-        assert!(packet.has_ftrace_events());
-        let events = &packet.ftrace_events().event;
-        assert_eq!(events.len(), 1);
-        assert!(events[0].has_softirq_entry());
-    }
-
-    #[test]
-    fn test_softirq_exit_events() {
-        let mut recorder = create_test_recorder();
-
-        let event = task_event {
-            r#type: event_type::SCHED_SOFTIRQ_EXIT,
-            ts: 1000,
-            target_cpu: 0,
-            next_prio: 5,
-            ..Default::default()
-        };
-        recorder.handle_event(event);
-
-        assert_eq!(recorder.compact_sched.len(), 0);
-        assert_eq!(recorder.events.len(), 1);
-        assert!(recorder.events.contains_key(&0));
-
-        let packets = generate_trace(&recorder);
-        assert_eq!(packets.len(), 1);
-
-        let packet = &packets[0];
-        assert!(packet.has_ftrace_events());
-        let events = &packet.ftrace_events().event;
-        assert_eq!(events.len(), 1);
-        assert!(events[0].has_softirq_exit());
-    }
-
-    #[test]
-    fn test_process_exit_event() {
-        let mut recorder = create_test_recorder();
-        let prev_comm = c"prev";
-
-        let mut event = task_event {
-            r#type: event_type::SCHED_PROCESS_EXIT,
-            ts: 1000,
-            prev: task_info {
-                tgidpid: 1234,
-                ..Default::default()
-            },
-            prev_prio: 10,
-            ..Default::default()
-        };
-        copy_to_comm(&mut event.prev.comm, prev_comm);
-        recorder.handle_event(event);
-
-        assert_eq!(recorder.compact_sched.len(), 0);
-        assert_eq!(recorder.events.len(), 1);
-        assert!(recorder.events.contains_key(&0));
-
-        let packets = generate_trace(&recorder);
-        assert_eq!(packets.len(), 1);
-
-        let packet = &packets[0];
-        assert!(packet.has_ftrace_events());
-        let events = &packet.ftrace_events().event;
-        assert_eq!(events.len(), 1);
-        assert!(events[0].has_sched_process_exit());
-        assert_eq!(events[0].sched_process_exit().comm(), "prev");
     }
 
     #[test]

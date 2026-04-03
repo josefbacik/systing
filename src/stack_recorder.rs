@@ -171,17 +171,16 @@ pub struct StackRecorder {
     pub process_dispatcher: Option<Arc<ProcessDispatcher>>,
     pub global_func_manager: Arc<GlobalFunctionManager>,
     // Streaming support
-    /// Whether streaming mode is enabled. When true, stacks are deduplicated during
-    /// recording and samples are buffered for later writing via finish().
-    streaming_enabled: bool,
+    /// Collector for emitting StackSampleRecords as they arrive. When set, samples
+    /// are written immediately in handle_event() and stacks are deduplicated during
+    /// recording for end-of-trace symbolization via finish().
+    streaming_collector: Option<Box<dyn RecordCollector + Send>>,
     /// Maps (Stack, tgid) to stack_id for deduplication during streaming.
     /// The tgid is included in the key because the same addresses in different processes
     /// may resolve to different symbols (e.g., shared libraries at fixed addresses).
     unique_stacks: HashMap<(Stack, i32), i64>,
     /// Next stack_id to assign for new unique stacks.
     next_stack_id: i64,
-    /// Pending samples buffer for streaming.
-    pending_samples: Vec<StackSampleRecord>,
     /// Shared utid generator for consistent thread IDs across all recorders.
     utid_generator: Arc<UtidGenerator>,
 }
@@ -201,19 +200,18 @@ impl StackRecorder {
             psr: Arc::new(StackWalkerRun::default()),
             process_dispatcher,
             global_func_manager: Arc::new(GlobalFunctionManager::new(id_counter)),
-            streaming_enabled: false,
+            streaming_collector: None,
             unique_stacks: HashMap::new(),
             next_stack_id: 1,
-            pending_samples: Vec::new(),
             utid_generator,
         }
     }
 
-    /// Enable streaming mode for stack recording.
-    /// When enabled, stacks are deduplicated during recording and samples are
-    /// buffered for later writing via finish().
-    pub fn enable_streaming(&mut self) {
-        self.streaming_enabled = true;
+    /// Enable streaming mode and attach a collector so that StackSampleRecords
+    /// are emitted immediately in handle_event() rather than accumulated for the
+    /// entire trace. unique_stacks is still retained for end-of-trace symbolization.
+    pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
+        self.streaming_collector = Some(collector);
     }
 
     /// Create a symbolizer with the configured process dispatcher.
@@ -247,20 +245,28 @@ impl StackRecorder {
     /// Returns the collector so it can be passed to other recorders or finished.
     pub fn finish(
         &mut self,
-        mut collector: Box<dyn RecordCollector + Send>,
+        collector: Box<dyn RecordCollector + Send>,
     ) -> Result<Box<dyn RecordCollector + Send>> {
-        // Check if streaming was enabled (we have pending samples/unique stacks)
-        if self.unique_stacks.is_empty() {
+        // If we were given our own streaming collector at startup, stack samples
+        // have already been written to it incrementally. Route the symbolized
+        // stacks through it as well, finish it, and hand the caller's collector
+        // back untouched.
+        if let Some(mut own) = self.streaming_collector.take() {
+            self.finish_inner(own.as_mut())?;
+            own.flush()?;
+            own.finish_boxed()?;
             return Ok(collector);
         }
 
-        // Flush pending samples to the collector
-        eprintln!(
-            "Flushing {} pending stack samples...",
-            self.pending_samples.len()
-        );
-        for sample in self.pending_samples.drain(..) {
-            collector.add_stack_sample(sample)?;
+        let mut collector = collector;
+        self.finish_inner(collector.as_mut())?;
+        collector.flush()?;
+        Ok(collector)
+    }
+
+    fn finish_inner(&mut self, collector: &mut dyn RecordCollector) -> Result<()> {
+        if self.unique_stacks.is_empty() {
+            return Ok(());
         }
 
         // Now symbolize all unique stacks and stream StackRecords
@@ -349,14 +355,12 @@ impl StackRecorder {
             pb.finish_with_message("Stack symbolization complete");
         }
 
-        // Flush and return the collector
-        collector.flush()?;
-        Ok(collector)
+        Ok(())
     }
 
     /// Check if streaming mode is enabled.
     pub fn is_streaming(&self) -> bool {
-        self.streaming_enabled
+        self.streaming_collector.is_some()
     }
 
     /// Symbolize a single stack and return frame names.
@@ -1251,8 +1255,8 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
             let tid = event.task.tgidpid as i32;
             let tgid = stack_key; // tgid for process-specific symbolization
 
-            // Streaming mode: dedupe stacks and buffer samples for streaming
-            if self.streaming_enabled {
+            // Streaming mode: dedupe stacks and emit samples directly to the collector
+            if let Some(collector) = &mut self.streaming_collector {
                 // Get or assign stack_id for this (stack, tgid) pair
                 // Include tgid in key since same addresses may resolve differently per-process
                 let key = (stack, tgid);
@@ -1265,14 +1269,17 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
                     id
                 };
 
-                // Buffer the sample for streaming (will be flushed in finish())
-                self.pending_samples.push(StackSampleRecord {
+                let sample = StackSampleRecord {
                     ts: event.ts as i64,
                     utid: self.utid_generator.get_or_create_utid(tid),
                     cpu: Some(event.cpu as i32),
                     stack_id,
                     stack_event_type: convert_stack_event_type(event.stack_event_type.0),
-                });
+                };
+
+                if let Err(e) = collector.add_stack_sample(sample) {
+                    eprintln!("Warning: Failed to stream stack sample: {e}");
+                }
             } else {
                 // Non-streaming mode: store all events for later processing
                 let stack_event = StackEvent {
