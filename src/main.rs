@@ -300,15 +300,6 @@ fn reexec_with_systemd_run() -> Result<i32> {
 }
 
 fn main() -> Result<()> {
-    // Check if we've already been re-executed to prevent infinite loops
-    let already_reexeced = env::var("SYSTING_REEXECED").is_ok();
-
-    // Check if we have the necessary capabilities
-    if !already_reexeced && !has_bpf_capabilities() {
-        let exit_code = reexec_with_systemd_run()?;
-        process::exit(exit_code);
-    }
-
     let mut opts = Command::parse();
 
     if opts.list_recorders {
@@ -325,6 +316,15 @@ fn main() -> Result<()> {
             );
         }
         return Ok(());
+    }
+
+    // Check if we've already been re-executed to prevent infinite loops
+    let already_reexeced = env::var("SYSTING_REEXECED").is_ok();
+
+    // Check if we have the necessary capabilities
+    if !already_reexeced && !has_bpf_capabilities() {
+        let exit_code = reexec_with_systemd_run()?;
+        process::exit(exit_code);
     }
 
     process_recorder_options(&mut opts)?;
