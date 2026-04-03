@@ -464,10 +464,7 @@ impl SessionRecorder {
             perf_counter_recorder: Mutex::new(PerfCounterRecorder::default()),
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::new(Arc::clone(&utid_generator))),
-            network_recorder: Mutex::new(NetworkRecorder::new(
-                resolve_network_addresses,
-                Arc::clone(&utid_generator),
-            )),
+            network_recorder: Mutex::new(NetworkRecorder::new(resolve_network_addresses)),
             marker_recorder: Mutex::new(
                 MarkerRecorder::default()
                     .with_threshold(marker_threshold)
