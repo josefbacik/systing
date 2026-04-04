@@ -11,7 +11,6 @@ use crate::marker_recorder::MarkerRecorder;
 use crate::network_recorder::NetworkRecorder;
 use crate::parquet::StreamingParquetWriter;
 use crate::perf_recorder::PerfCounterRecorder;
-use crate::perfetto::TrackCounter;
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
@@ -44,7 +43,6 @@ pub struct SysInfoEvent {
 
 pub struct SysinfoRecorder {
     pub ringbuf: RingBuffer<SysInfoEvent>,
-    pub frequency: HashMap<u32, Vec<TrackCounter>>,
     // Streaming support
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
     track_ids: HashMap<u32, i64>,
@@ -55,7 +53,6 @@ impl Default for SysinfoRecorder {
     fn default() -> Self {
         Self {
             ringbuf: RingBuffer::default(),
-            frequency: HashMap::new(),
             streaming_collector: None,
             track_ids: HashMap::new(),
             next_track_id: 1,
@@ -363,59 +360,45 @@ impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
         &mut self.ringbuf
     }
     fn handle_event(&mut self, event: SysInfoEvent) {
-        if let Some(ref mut collector) = self.streaming_collector {
-            // STREAMING PATH: emit directly to collector
-            let cpu = event.cpu;
-            let track_id = if let Some(&id) = self.track_ids.get(&cpu) {
-                id
-            } else {
-                let track_id = self.next_track_id;
-                self.next_track_id += 1;
+        debug_assert!(
+            self.streaming_collector.is_some(),
+            "streaming collector must be set before handling events"
+        );
 
-                if let Err(e) = collector.add_counter_track(CounterTrackRecord {
-                    id: track_id,
-                    name: format!("CPU {cpu} frequency"),
-                    unit: Some("Hz".to_string()),
-                }) {
-                    eprintln!("Warning: Failed to create frequency track: {e}");
-                }
+        let Some(ref mut collector) = self.streaming_collector else {
+            return;
+        };
 
-                self.track_ids.insert(cpu, track_id);
-                track_id
-            };
-
-            if let Err(e) = collector.add_counter(CounterRecord {
-                ts: event.ts as i64,
-                track_id,
-                value: event.frequency as f64,
-            }) {
-                eprintln!("Warning: Failed to stream frequency record: {e}");
-            }
+        let cpu = event.cpu;
+        let track_id = if let Some(&id) = self.track_ids.get(&cpu) {
+            id
         } else {
-            // Fallback accumulation path — not reached in production since
-            // init_streaming_parquet() is always called before recording.
-            let freq = self.frequency.entry(event.cpu).or_default();
-            freq.push(TrackCounter {
-                ts: event.ts,
-                count: event.frequency,
-            });
+            let track_id = self.next_track_id;
+            self.next_track_id += 1;
+
+            if let Err(e) = collector.add_counter_track(CounterTrackRecord {
+                id: track_id,
+                name: format!("CPU {cpu} frequency"),
+                unit: Some("Hz".to_string()),
+            }) {
+                eprintln!("Warning: Failed to create frequency track: {e}");
+            }
+
+            self.track_ids.insert(cpu, track_id);
+            track_id
+        };
+
+        if let Err(e) = collector.add_counter(CounterRecord {
+            ts: event.ts as i64,
+            track_id,
+            value: event.frequency as f64,
+        }) {
+            eprintln!("Warning: Failed to stream frequency record: {e}");
         }
     }
 }
 
 impl SysinfoRecorder {
-    /// Returns the minimum timestamp from all frequency events, or None if no events recorded.
-    ///
-    /// Note: In streaming mode (always enabled in production), this returns `None` since
-    /// events bypass the frequency HashMap.
-    pub fn min_timestamp(&self) -> Option<u64> {
-        self.frequency
-            .values()
-            .filter_map(|counters| counters.first())
-            .map(|c| c.ts)
-            .min()
-    }
-
     /// Set the streaming collector for direct parquet output.
     ///
     /// When set, events will be streamed directly to the collector during
@@ -1093,12 +1076,6 @@ mod tests {
     /// Gets the minimum timestamp from all recorded events across all recorders.
     fn get_min_event_timestamp(recorder: &SessionRecorder) -> u64 {
         [
-            recorder
-                .perf_counter_recorder
-                .lock()
-                .unwrap()
-                .min_timestamp(),
-            recorder.sysinfo_recorder.lock().unwrap().min_timestamp(),
             recorder.network_recorder.lock().unwrap().min_timestamp(),
             recorder.marker_recorder.lock().unwrap().min_timestamp(),
         ]
