@@ -1093,7 +1093,6 @@ mod tests {
     /// Gets the minimum timestamp from all recorded events across all recorders.
     fn get_min_event_timestamp(recorder: &SessionRecorder) -> u64 {
         [
-            recorder.stack_recorder.lock().unwrap().min_timestamp(),
             recorder
                 .perf_counter_recorder
                 .lock()
