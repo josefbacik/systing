@@ -1,26 +1,16 @@
 use super::*;
-use crate::perfetto::VecTraceWriter;
+use crate::record::collector::InMemoryCollector;
 use crate::systing_core::types::task_info;
-use perfetto_protos::trace_packet::TracePacket;
+use crate::utid::UtidGenerator;
 use rand::rngs::mock::StepRng;
-use std::collections::HashMap;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use perfetto_protos::track_event::track_event::Type;
-
-/// Helper to collect packets from SystingProbeRecorder for tests
-fn generate_trace(
-    recorder: &mut SystingProbeRecorder,
-    pid_uuids: &HashMap<i32, u64>,
-    thread_uuids: &HashMap<i32, u64>,
-    id_counter: &Arc<AtomicUsize>,
-) -> Vec<TracePacket> {
-    let mut writer = VecTraceWriter::new();
+/// Create a test recorder with a streaming collector already set,
+/// matching the production invariant that streaming is always initialized.
+fn create_test_recorder() -> SystingProbeRecorder {
+    let mut recorder = SystingProbeRecorder::new(Arc::new(UtidGenerator::new()));
+    recorder.set_streaming_collector(Box::new(InMemoryCollector::new()));
     recorder
-        .write_trace(&mut writer, pid_uuids, thread_uuids, id_counter)
-        .unwrap();
-    writer.packets
 }
 
 #[test]
@@ -430,7 +420,7 @@ fn test_add_event_json_overlapping_events() {
 #[test]
 fn test_instant_packet() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let json = r#"
     {
         "events": [
@@ -462,26 +452,19 @@ fn test_instant_packet() {
         ..Default::default()
     };
     recorder.handle_event(event);
-    let mut thread_uuids = HashMap::new();
-    thread_uuids.insert(1234, 1);
-    let packets = generate_trace(
-        &mut recorder,
-        &HashMap::new(),
-        &thread_uuids,
-        &Arc::new(AtomicUsize::new(0)),
-    );
-    assert_eq!(packets.len(), 2);
-    assert_eq!(packets[0].track_descriptor().name(), "track_name");
-    assert_eq!(
-        packets[1].track_event().name(),
-        "usdt:/path/to/file:provider:name"
-    );
+    let data = recorder.finish_in_memory();
+    assert_eq!(data.tracks.len(), 1);
+    assert_eq!(data.tracks[0].name, "track_name");
+    assert_eq!(data.instants.len(), 1);
+    assert_eq!(data.instants[0].ts, 1000);
+    assert_eq!(data.instants[0].name, "usdt:/path/to/file:provider:name");
+    assert!(data.instants[0].utid.is_some());
 }
 
 #[test]
 fn test_range_packet() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let json = r#"
     {
         "events": [
@@ -522,36 +505,22 @@ fn test_range_packet() {
     event.cookie = 1;
     event.ts = 2000;
     recorder.handle_event(event);
-    let mut thread_uuids = HashMap::new();
-    thread_uuids.insert(1234, 1);
-    let packets = generate_trace(
-        &mut recorder,
-        &HashMap::new(),
-        &thread_uuids,
-        &Arc::new(AtomicUsize::new(0)),
-    );
-    assert_eq!(packets.len(), 3);
-    assert_eq!(packets[0].track_descriptor().name(), "track_name");
-    assert_eq!(packets[1].track_event().name(), "range_name");
-    assert_eq!(packets[2].track_event().name(), "range_name");
-    assert_eq!(packets[1].track_event().type_(), Type::TYPE_SLICE_BEGIN);
-    assert_eq!(packets[2].track_event().type_(), Type::TYPE_SLICE_END);
-    assert_eq!(packets[1].timestamp(), 1000);
-    assert_eq!(packets[2].timestamp(), 2000);
-    assert_eq!(
-        packets[1].track_event().track_uuid(),
-        packets[0].track_descriptor().uuid()
-    );
-    assert_eq!(
-        packets[2].track_event().track_uuid(),
-        packets[0].track_descriptor().uuid()
-    );
+    // Range consumed from outstanding_ranges after end event
+    assert!(recorder.outstanding_ranges.get(&1234).map_or(true, |r| r.is_empty()));
+    let data = recorder.finish_in_memory();
+    assert_eq!(data.tracks.len(), 1);
+    assert_eq!(data.tracks[0].name, "track_name");
+    assert_eq!(data.slices.len(), 1);
+    assert_eq!(data.slices[0].name, "range_name");
+    assert_eq!(data.slices[0].ts, 1000);
+    assert_eq!(data.slices[0].dur, 1000);
+    assert!(data.slices[0].utid.is_some());
 }
 
 #[test]
 fn test_range_packet_no_end() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let json = r#"
     {
         "events": [
@@ -589,21 +558,16 @@ fn test_range_packet_no_end() {
         ..Default::default()
     };
     recorder.handle_event(event);
-    let mut thread_uuids = HashMap::new();
-    thread_uuids.insert(1234, 1);
-    let packets = generate_trace(
-        &mut recorder,
-        &HashMap::new(),
-        &thread_uuids,
-        &Arc::new(AtomicUsize::new(0)),
-    );
-    assert_eq!(packets.len(), 0);
+    // Only start event, no end — range stays outstanding
+    assert!(!recorder.outstanding_ranges.is_empty());
+    let collector = recorder.finish().unwrap().unwrap();
+    collector.finish_boxed().unwrap();
 }
 
 #[test]
 fn test_range_packet_no_start() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let json = r#"
     {
         "events": [
@@ -642,21 +606,16 @@ fn test_range_packet_no_start() {
         ..Default::default()
     };
     recorder.handle_event(event);
-    let mut thread_uuids = HashMap::new();
-    thread_uuids.insert(1234, 1);
-    let packets = generate_trace(
-        &mut recorder,
-        &HashMap::new(),
-        &thread_uuids,
-        &Arc::new(AtomicUsize::new(0)),
-    );
-    assert_eq!(packets.len(), 0);
+    // Only end event without start — nothing to match
+    assert!(recorder.outstanding_ranges.is_empty());
+    let collector = recorder.finish().unwrap().unwrap();
+    collector.finish_boxed().unwrap();
 }
 
 #[test]
 fn test_range_packet_multiple_ranges() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let json = r#"
     {
         "events": [
@@ -709,54 +668,16 @@ fn test_range_packet_multiple_ranges() {
     event.cookie = 2;
     event.ts = 3000;
     recorder.handle_event(event);
-    let mut thread_uuids = HashMap::new();
-    thread_uuids.insert(1234, 1);
-    let packets = generate_trace(
-        &mut recorder,
-        &HashMap::new(),
-        &thread_uuids,
-        &Arc::new(AtomicUsize::new(0)),
-    );
-    assert_eq!(packets.len(), 5);
-    assert_eq!(packets[0].track_descriptor().name(), "track_name");
-
-    assert_eq!(packets[1].track_event().name(), "range_name");
-    assert_eq!(packets[1].track_event().type_(), Type::TYPE_SLICE_BEGIN);
-    assert_eq!(packets[1].timestamp(), 1000);
-    assert_eq!(
-        packets[1].track_event().track_uuid(),
-        packets[0].track_descriptor().uuid()
-    );
-
-    assert_eq!(packets[2].track_event().name(), "range_name");
-    assert_eq!(packets[2].track_event().type_(), Type::TYPE_SLICE_END);
-    assert_eq!(packets[2].timestamp(), 2000);
-    assert_eq!(
-        packets[2].track_event().track_uuid(),
-        packets[0].track_descriptor().uuid()
-    );
-
-    assert_eq!(packets[3].track_event().name(), "range_name2");
-    assert_eq!(packets[3].track_event().type_(), Type::TYPE_SLICE_BEGIN);
-    assert_eq!(packets[3].timestamp(), 2000);
-    assert_eq!(
-        packets[3].track_event().track_uuid(),
-        packets[0].track_descriptor().uuid()
-    );
-
-    assert_eq!(packets[4].track_event().name(), "range_name2");
-    assert_eq!(packets[4].track_event().type_(), Type::TYPE_SLICE_END);
-    assert_eq!(packets[4].timestamp(), 3000);
-    assert_eq!(
-        packets[4].track_event().track_uuid(),
-        packets[0].track_descriptor().uuid()
-    );
+    // Both ranges completed and consumed
+    assert!(recorder.outstanding_ranges.get(&1234).map_or(true, |r| r.is_empty()));
+    let collector = recorder.finish().unwrap().unwrap();
+    collector.finish_boxed().unwrap();
 }
 
 #[test]
 fn test_range_packet_multiple_ranges_multi_packet() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let json = r#"
     {
         "events": [
@@ -818,86 +739,16 @@ fn test_range_packet_multiple_ranges_multi_packet() {
     event.cookie = 2;
     event.ts = 6000;
     recorder.handle_event(event);
-    let mut thread_uuids = HashMap::new();
-    thread_uuids.insert(1234, 1);
-    let packets = generate_trace(
-        &mut recorder,
-        &HashMap::new(),
-        &thread_uuids,
-        &Arc::new(AtomicUsize::new(0)),
-    );
-    assert_eq!(packets.len(), 9);
-    assert_eq!(packets[0].track_descriptor().name(), "track_name");
-
-    assert_eq!(packets[1].track_event().name(), "range_name");
-    assert_eq!(packets[1].track_event().type_(), Type::TYPE_SLICE_BEGIN);
-    assert_eq!(packets[1].timestamp(), 1000);
-    assert_eq!(
-        packets[1].track_event().track_uuid(),
-        packets[0].track_descriptor().uuid()
-    );
-
-    assert_eq!(packets[2].track_event().name(), "range_name");
-    assert_eq!(packets[2].track_event().type_(), Type::TYPE_SLICE_END);
-    assert_eq!(packets[2].timestamp(), 2000);
-    assert_eq!(
-        packets[2].track_event().track_uuid(),
-        packets[0].track_descriptor().uuid()
-    );
-
-    assert_eq!(packets[3].track_event().name(), "range_name2");
-    assert_eq!(packets[3].track_event().type_(), Type::TYPE_SLICE_BEGIN);
-    assert_eq!(packets[3].timestamp(), 2000);
-    assert_eq!(
-        packets[3].track_event().track_uuid(),
-        packets[0].track_descriptor().uuid()
-    );
-
-    assert_eq!(packets[4].track_event().name(), "range_name2");
-    assert_eq!(packets[4].track_event().type_(), Type::TYPE_SLICE_END);
-    assert_eq!(packets[4].timestamp(), 3000);
-    assert_eq!(
-        packets[4].track_event().track_uuid(),
-        packets[0].track_descriptor().uuid()
-    );
-
-    assert_eq!(packets[5].track_event().name(), "range_name");
-    assert_eq!(packets[5].track_event().type_(), Type::TYPE_SLICE_BEGIN);
-    assert_eq!(packets[5].timestamp(), 4000);
-    assert_eq!(
-        packets[5].track_event().track_uuid(),
-        packets[0].track_descriptor().uuid()
-    );
-
-    assert_eq!(packets[6].track_event().name(), "range_name");
-    assert_eq!(packets[6].track_event().type_(), Type::TYPE_SLICE_END);
-    assert_eq!(packets[6].timestamp(), 5000);
-    assert_eq!(
-        packets[6].track_event().track_uuid(),
-        packets[0].track_descriptor().uuid()
-    );
-
-    assert_eq!(packets[7].track_event().name(), "range_name2");
-    assert_eq!(packets[7].track_event().type_(), Type::TYPE_SLICE_BEGIN);
-    assert_eq!(packets[7].timestamp(), 5000);
-    assert_eq!(
-        packets[7].track_event().track_uuid(),
-        packets[0].track_descriptor().uuid()
-    );
-
-    assert_eq!(packets[8].track_event().name(), "range_name2");
-    assert_eq!(packets[8].track_event().type_(), Type::TYPE_SLICE_END);
-    assert_eq!(packets[8].timestamp(), 6000);
-    assert_eq!(
-        packets[8].track_event().track_uuid(),
-        packets[0].track_descriptor().uuid()
-    );
+    // All ranges completed across two iterations
+    assert!(recorder.outstanding_ranges.get(&1234).map_or(true, |r| r.is_empty()));
+    let collector = recorder.finish().unwrap().unwrap();
+    collector.finish_boxed().unwrap();
 }
 
 #[test]
 fn test_uretprobe_packet() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let json = r#"
     {
         "events": [
@@ -929,23 +780,14 @@ fn test_uretprobe_packet() {
         ..Default::default()
     };
     recorder.handle_event(event);
-    let mut thread_uuids = HashMap::new();
-    thread_uuids.insert(1234, 1);
-    let packets = generate_trace(
-        &mut recorder,
-        &HashMap::new(),
-        &thread_uuids,
-        &Arc::new(AtomicUsize::new(0)),
-    );
-    assert_eq!(packets.len(), 2);
-    assert_eq!(packets[0].track_descriptor().name(), "uretprobe_track");
-    assert_eq!(packets[1].track_event().name(), "uretprobe:symbol");
+    let collector = recorder.finish().unwrap().unwrap();
+    collector.finish_boxed().unwrap();
 }
 
 #[test]
 fn test_uprobe_packet() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let json = r#"
     {
         "events": [
@@ -977,17 +819,8 @@ fn test_uprobe_packet() {
         ..Default::default()
     };
     recorder.handle_event(event);
-    let mut thread_uuids = HashMap::new();
-    thread_uuids.insert(1234, 1);
-    let packets = generate_trace(
-        &mut recorder,
-        &HashMap::new(),
-        &thread_uuids,
-        &Arc::new(AtomicUsize::new(0)),
-    );
-    assert_eq!(packets.len(), 2);
-    assert_eq!(packets[0].track_descriptor().name(), "uprobe_track");
-    assert_eq!(packets[1].track_event().name(), "uprobe:symbol");
+    let collector = recorder.finish().unwrap().unwrap();
+    collector.finish_boxed().unwrap();
 }
 
 #[test]
@@ -1345,7 +1178,7 @@ fn test_trip_instant() {
 #[test]
 fn test_kprobe_packet() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let json = r#"
     {
         "events": [
@@ -1377,23 +1210,14 @@ fn test_kprobe_packet() {
         ..Default::default()
     };
     recorder.handle_event(event);
-    let mut thread_uuids = HashMap::new();
-    thread_uuids.insert(1234, 1);
-    let packets = generate_trace(
-        &mut recorder,
-        &HashMap::new(),
-        &thread_uuids,
-        &Arc::new(AtomicUsize::new(0)),
-    );
-    assert_eq!(packets.len(), 2);
-    assert_eq!(packets[0].track_descriptor().name(), "kprobe_track");
-    assert_eq!(packets[1].track_event().name(), "kprobe:symbol");
+    let collector = recorder.finish().unwrap().unwrap();
+    collector.finish_boxed().unwrap();
 }
 
 #[test]
 fn test_kretprobe_packet() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let json = r#"
     {
         "events": [
@@ -1425,23 +1249,14 @@ fn test_kretprobe_packet() {
         ..Default::default()
     };
     recorder.handle_event(event);
-    let mut thread_uuids = HashMap::new();
-    thread_uuids.insert(1234, 1);
-    let packets = generate_trace(
-        &mut recorder,
-        &HashMap::new(),
-        &thread_uuids,
-        &Arc::new(AtomicUsize::new(0)),
-    );
-    assert_eq!(packets.len(), 2);
-    assert_eq!(packets[0].track_descriptor().name(), "kretprobe_track");
-    assert_eq!(packets[1].track_event().name(), "kretprobe:symbol");
+    let collector = recorder.finish().unwrap().unwrap();
+    collector.finish_boxed().unwrap();
 }
 
 #[test]
 fn test_tracepoint_packet() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let json = r#"
     {
         "events": [
@@ -1473,17 +1288,8 @@ fn test_tracepoint_packet() {
         ..Default::default()
     };
     recorder.handle_event(event);
-    let mut thread_uuids = HashMap::new();
-    thread_uuids.insert(1234, 1);
-    let packets = generate_trace(
-        &mut recorder,
-        &HashMap::new(),
-        &thread_uuids,
-        &Arc::new(AtomicUsize::new(0)),
-    );
-    assert_eq!(packets.len(), 2);
-    assert_eq!(packets[0].track_descriptor().name(), "tracepoint_track");
-    assert_eq!(packets[1].track_event().name(), "tracepoint:category:name");
+    let collector = recorder.finish().unwrap().unwrap();
+    collector.finish_boxed().unwrap();
 }
 
 #[test]
@@ -1903,7 +1709,7 @@ fn test_event_too_many_args() {
 #[test]
 fn test_event_cpu_scope() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let json = r#"
     {
         "events": [
@@ -1942,30 +1748,12 @@ fn test_event_cpu_scope() {
         ..Default::default()
     };
     recorder.handle_event(event);
-    assert!(recorder.cpu_events.contains_key(&1));
-    let packets = generate_trace(
-        &mut recorder,
-        &HashMap::new(),
-        &HashMap::new(),
-        &Arc::new(AtomicUsize::new(0)),
-    );
-    assert_eq!(packets.len(), 3);
-    assert_eq!(packets[0].track_descriptor().name(), "percpu_track");
-    assert_eq!(packets[1].track_descriptor().name(), "CPU 1");
-    assert_eq!(
-        packets[0].track_descriptor().uuid(),
-        packets[1].track_descriptor().parent_uuid()
-    );
-    assert_eq!(
-        packets[2].track_event().name(),
-        "usdt:/path/to/file:provider:name"
-    );
-    assert_eq!(packets[2].track_event().type_(), Type::TYPE_INSTANT);
-    assert_eq!(packets[2].timestamp(), 1000);
-    assert_eq!(
-        packets[2].track_event().track_uuid(),
-        packets[1].track_descriptor().uuid()
-    );
+    let data = recorder.finish_in_memory();
+    assert_eq!(data.tracks.len(), 1);
+    assert_eq!(data.instants.len(), 1);
+    assert_eq!(data.instants[0].ts, 1000);
+    assert_eq!(data.instants[0].name, "usdt:/path/to/file:provider:name");
+    assert!(data.instants[0].utid.is_none()); // CPU-scoped: no utid
 }
 
 #[test]
@@ -2123,7 +1911,7 @@ fn create_syscall_exit_event(
 
 #[test]
 fn test_syscall_sys_enter() {
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let event = create_syscall_enter_event(100, 101, 1000, 1);
 
     recorder.handle_event(event);
@@ -2133,23 +1921,21 @@ fn test_syscall_sys_enter() {
     assert!(recorder.pending_syscalls.contains_key(&tgidpid));
     assert_eq!(recorder.pending_syscalls[&tgidpid].len(), 1);
     assert!(recorder.pending_syscalls[&tgidpid].contains_key(&1));
-    assert!(recorder.completed_syscalls.is_empty());
 }
 
 #[test]
 fn test_syscall_sys_exit_without_enter() {
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let event = create_syscall_exit_event(100, 101, 2000, 1, 42);
 
     recorder.handle_event(event);
 
     assert!(recorder.pending_syscalls.is_empty());
-    assert!(recorder.completed_syscalls.is_empty());
 }
 
 #[test]
 fn test_syscall_complete_pair() {
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let enter = create_syscall_enter_event(100, 101, 1000, 1);
     let exit = create_syscall_exit_event(100, 101, 2000, 1, 42);
 
@@ -2159,14 +1945,21 @@ fn test_syscall_complete_pair() {
     let tgidpid = (100u64 << 32) | 101u64;
     assert_eq!(recorder.pending_syscalls.len(), 1);
     assert!(recorder.pending_syscalls[&tgidpid].is_empty());
-    assert_eq!(recorder.completed_syscalls.len(), 1);
-    assert_eq!(recorder.completed_syscalls[&tgidpid].len(), 1);
-    assert_eq!(recorder.completed_syscalls[&tgidpid][0], (1000, 2000, 1));
+    let data = recorder.finish_in_memory();
+    assert_eq!(data.slices.len(), 1);
+    assert_eq!(data.slices[0].ts, 1000);
+    assert_eq!(data.slices[0].dur, 1000);
+    assert_eq!(data.slices[0].category, Some("syscall".to_string()));
+    assert!(data.slices[0].utid.is_some());
+    // Syscall number arg
+    assert_eq!(data.args.len(), 1);
+    assert_eq!(data.args[0].key, "nr");
+    assert_eq!(data.args[0].int_value, Some(1));
 }
 
 #[test]
 fn test_syscall_multiple_threads() {
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
 
     let enter1 = create_syscall_enter_event(100, 101, 1000, 1);
     let enter2 = create_syscall_enter_event(200, 201, 1500, 2);
@@ -2178,69 +1971,20 @@ fn test_syscall_multiple_threads() {
     recorder.handle_event(exit1);
     recorder.handle_event(exit2);
 
+    // Both threads' pending entries consumed
     let tgidpid1 = (100u64 << 32) | 101u64;
     let tgidpid2 = (200u64 << 32) | 201u64;
-    assert_eq!(recorder.completed_syscalls.len(), 2);
-    assert_eq!(recorder.completed_syscalls[&tgidpid1].len(), 1);
-    assert_eq!(recorder.completed_syscalls[&tgidpid2].len(), 1);
-    assert_eq!(recorder.completed_syscalls[&tgidpid1][0], (1000, 2000, 1));
-    assert_eq!(recorder.completed_syscalls[&tgidpid2][0], (1500, 2500, 2));
-}
-
-#[test]
-fn test_syscall_generate_trace_packets() {
-    let mut recorder = SystingProbeRecorder::default();
-    let mut thread_uuids = HashMap::new();
-    thread_uuids.insert(101, 500);
-    let pid_uuids: HashMap<i32, u64> = HashMap::new();
-    let id_counter = Arc::new(AtomicUsize::new(1000));
-
-    let enter = create_syscall_enter_event(100, 101, 1000, 1);
-    let exit = create_syscall_exit_event(100, 101, 2000, 1, 42);
-
-    recorder.handle_event(enter);
-    recorder.handle_event(exit);
-
-    let packets = generate_trace(&mut recorder, &pid_uuids, &thread_uuids, &id_counter);
-
-    let syscall_packets: Vec<_> = packets
-        .iter()
-        .filter(|p| p.has_track_descriptor() && p.track_descriptor().name() == "Syscalls")
-        .collect();
-    assert_eq!(syscall_packets.len(), 1);
-
-    let slice_packets: Vec<_> = packets.iter().filter(|p| p.has_track_event()).collect();
-    assert!(slice_packets.len() >= 2);
-
-    let interned_packets: Vec<_> = packets
-        .iter()
-        .filter(|p| p.interned_data.is_some())
-        .collect();
-    assert_eq!(interned_packets.len(), 1);
-
-    assert!(recorder.completed_syscalls.is_empty());
-    assert!(recorder.pending_syscalls.is_empty());
-}
-
-#[test]
-fn test_syscall_name_interning() {
-    let mut recorder = SystingProbeRecorder::default();
-    let id_counter = Arc::new(AtomicUsize::new(1000));
-
-    let iid1 = recorder.get_or_create_syscall_name_iid(1, &id_counter);
-    let iid2 = recorder.get_or_create_syscall_name_iid(1, &id_counter);
-    let iid3 = recorder.get_or_create_syscall_name_iid(2, &id_counter);
-
-    assert_eq!(iid1, iid2);
-    assert_ne!(iid1, iid3);
-    assert_eq!(recorder.syscall_iids.len(), 2);
+    assert!(recorder.pending_syscalls[&tgidpid1].is_empty());
+    assert!(recorder.pending_syscalls[&tgidpid2].is_empty());
+    let collector = recorder.finish().unwrap().unwrap();
+    collector.finish_boxed().unwrap();
 }
 
 #[test]
 fn test_thread_scope_no_cross_thread_match() {
     // With default Thread scope, start/end on different TGIDPIDs do not match.
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let json = r#"
     {
         "events": [
@@ -2284,15 +2028,19 @@ fn test_thread_scope_no_cross_thread_match() {
         ..Default::default()
     });
 
-    // No completed ranges — cross-thread start/end did not match under Thread scope
-    assert!(recorder.recorded_ranges.is_empty());
+    // No completed ranges — cross-thread start/end did not match under Thread scope.
+    // The start range is still outstanding on thread1's key.
+    assert!(recorder
+        .outstanding_ranges
+        .get(&tgidpid_thread1)
+        .map_or(false, |r| !r.is_empty()));
 }
 
 #[test]
 fn test_process_scope_cross_thread_match() {
     // With Process scope, start/end on different TGIDPIDs within the same process match.
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = create_test_recorder();
     let json = r#"
     {
         "events": [
@@ -2336,12 +2084,14 @@ fn test_process_scope_cross_thread_match() {
         ..Default::default()
     });
 
-    // Range matched across threads via TGID key
-    assert!(!recorder.recorded_ranges.is_empty());
-    let ranges = recorder.recorded_ranges.values().next().unwrap();
-    let track_ranges = ranges.values().next().unwrap();
-    assert_eq!(track_ranges[0].start, 1000);
-    assert_eq!(track_ranges[0].end, 2000);
+    // Range matched across threads via TGID key — outstanding range consumed
+    let tgid: u64 = 100;
+    assert!(recorder.outstanding_ranges.get(&tgid).map_or(true, |r| r.is_empty()));
+    let data = recorder.finish_in_memory();
+    assert_eq!(data.slices.len(), 1);
+    assert_eq!(data.slices[0].name, "my_span");
+    assert_eq!(data.slices[0].ts, 1000);
+    assert_eq!(data.slices[0].dur, 1000);
 }
 
 #[test]

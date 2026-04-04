@@ -1,6 +1,5 @@
 mod config;
 mod probe;
-mod writer;
 
 use config::ThresholdStopTrigger;
 
@@ -51,12 +50,6 @@ fn syscall_name(nr: u64) -> String {
         .unwrap_or_else(|| format!("syscall_{nr}"))
 }
 
-struct TrackInstant {
-    ts: u64,
-    name: String,
-    args: Vec<(String, ArgValue)>,
-}
-
 struct TrackRange {
     range_name: String,
     start: u64,
@@ -80,30 +73,6 @@ pub struct SystingProbeRecorder {
     // The events tied to the cookie, so we know what event we're dealing with when we get a cookie
     // from bpf.
     pub cookies: HashMap<u64, SystingEvent>,
-
-    // The instant events that we've recorded so far, the key is the tgidpid of the thread, and the
-    // value is another hashmap with the track name as the key and the list of TrackInstant's that
-    // we've recorded.
-    events: HashMap<u64, HashMap<String, Vec<TrackInstant>>>,
-
-    // The recorded ranges, this is a hashmap of the tgidpid of the thread, and then a hashmap of
-    // the track name to track name, and then there's a list of TrackRange entries in there.  We
-    // keep track of the range name in here because perfetto expects that it sees all the packets
-    // for a track in chronological order, which means if we have something like
-    //
-    // range1 -> event1:event2
-    // range2 -> event2:event3
-    //
-    // We need to make sure the packets show up with
-    //
-    // [packet BEGIN range1][packet END range1][packet BEGIN range2][packet END range2]
-    recorded_ranges: HashMap<u64, HashMap<String, Vec<TrackRange>>>,
-
-    // CPU instant events, this works like events, but is indexed by CPU
-    cpu_events: HashMap<u32, HashMap<String, Vec<TrackInstant>>>,
-
-    // CPU range events, this works like recorded_ranges, but is indexed by CPU
-    cpu_ranges: HashMap<u32, HashMap<String, Vec<TrackRange>>>,
 
     // The ranges that we've recorded a start event for, the key is the tgidpid of the thread, and
     // the value is a hashmap of the track_name with a TrackRange that has the start time set.
@@ -145,13 +114,9 @@ pub struct SystingProbeRecorder {
 
     // Syscall tracking state (cookies >= SYS_ENTER_COOKIE)
     pending_syscalls: HashMap<u64, HashMap<u64, u64>>,
-    completed_syscalls: HashMap<u64, Vec<(u64, u64, u64)>>,
-    syscall_iids: HashMap<u64, u64>,
-    syscall_name_ids: HashMap<String, u64>,
 
-    // Streaming mode support
+    // Streaming support
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
-    streaming_enabled: bool, // Track if streaming was ever enabled (survives finish())
     track_id_counter: i64,
     slice_id_counter: i64,
     instant_id_counter: i64,
@@ -170,6 +135,11 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
     }
 
     fn handle_event(&mut self, event: probe_event) {
+        debug_assert!(
+            self.streaming_collector.is_some(),
+            "streaming_collector must be set before handling events"
+        );
+
         if event.cookie >= SYS_ENTER_COOKIE {
             self.handle_syscall_event(event);
             return;
@@ -290,12 +260,6 @@ impl SystingProbeRecorder {
     /// Set the streaming collector for Parquet output during recording.
     pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
         self.streaming_collector = Some(collector);
-        self.streaming_enabled = true;
-    }
-
-    /// Check if streaming mode is currently active (collector present).
-    pub fn is_streaming(&self) -> bool {
-        self.streaming_collector.is_some()
     }
 
     /// Get or create a track ID, caching to avoid duplicates.
@@ -327,8 +291,7 @@ impl SystingProbeRecorder {
     }
 
     /// Finish streaming and return the collector.
-    /// Incomplete events (outstanding_ranges, pending_syscalls) are discarded,
-    /// matching current write_records() behavior.
+    /// Incomplete events (outstanding_ranges, pending_syscalls) are discarded.
     pub fn finish(&mut self) -> Result<Option<Box<dyn RecordCollector + Send>>> {
         if let Some(mut collector) = self.streaming_collector.take() {
             collector.flush()?;
@@ -336,6 +299,21 @@ impl SystingProbeRecorder {
         } else {
             Ok(None)
         }
+    }
+
+    /// Finish streaming and downcast the collector to `InMemoryCollector` for test assertions.
+    #[cfg(test)]
+    fn finish_in_memory(
+        &mut self,
+    ) -> crate::trace::ExtractedData {
+        use crate::record::collector::InMemoryCollector;
+        let collector = self.finish().unwrap().expect("no streaming collector");
+        // SAFETY: In tests we always set an InMemoryCollector via create_test_recorder().
+        let collector: Box<InMemoryCollector> = unsafe {
+            let raw = Box::into_raw(collector) as *mut InMemoryCollector;
+            Box::from_raw(raw)
+        };
+        collector.into_data()
     }
 
     fn handle_syscall_event(&mut self, event: probe_event) {
@@ -360,7 +338,6 @@ impl SystingProbeRecorder {
                     return;
                 }
 
-                // Stream the completed syscall if streaming is enabled
                 if let Some(mut collector) = self.streaming_collector.take() {
                     let key = TrackCacheKey::Thread {
                         tgidpid,
@@ -370,7 +347,6 @@ impl SystingProbeRecorder {
                         self.slice_id_counter += 1;
                         let slice_id = self.slice_id_counter;
 
-                        // Get consistent utid from shared generator
                         let tid = tgidpid as i32;
                         let utid = Some(self.utid_generator.get_or_create_utid(tid));
 
@@ -398,12 +374,6 @@ impl SystingProbeRecorder {
                         }
                     }
                     self.streaming_collector = Some(collector);
-                } else {
-                    // Non-streaming path: store for batch write
-                    self.completed_syscalls
-                        .entry(tgidpid)
-                        .or_default()
-                        .push((enter_ts, event.ts, syscall_nr));
                 }
             }
         }
@@ -423,7 +393,6 @@ impl SystingProbeRecorder {
                 .unwrap()
                 .clone();
 
-            // Stream if enabled
             if let Some(mut collector) = self.streaming_collector.take() {
                 let key = TrackCacheKey::Cpu {
                     cpu: event.cpu,
@@ -458,16 +427,6 @@ impl SystingProbeRecorder {
                     }
                 }
                 self.streaming_collector = Some(collector);
-            } else {
-                // Non-streaming path
-                let entry = self.cpu_events.entry(event.cpu).or_default();
-                let instant_track = self.instant_events.get(&systing_event_name).unwrap();
-                let entry = entry.entry(instant_track.clone()).or_default();
-                entry.push(TrackInstant {
-                    ts: event.ts,
-                    name: event_display_name,
-                    args: arg_data,
-                });
             }
             return;
         }
@@ -483,7 +442,6 @@ impl SystingProbeRecorder {
                     // Discard ranges with out-of-order timestamps (can happen
                     // across CPUs with skewed TSC values).
                     if range.end >= range.start {
-                        // Stream if enabled
                         if let Some(mut collector) = self.streaming_collector.take() {
                             let key = TrackCacheKey::Cpu {
                                 cpu: event.cpu,
@@ -520,11 +478,6 @@ impl SystingProbeRecorder {
                                 }
                             }
                             self.streaming_collector = Some(collector);
-                        } else {
-                            // Non-streaming path
-                            let track_hash = self.cpu_ranges.entry(event.cpu).or_default();
-                            let entry = track_hash.entry(track_name).or_default();
-                            entry.push(range);
                         }
                     }
                 }
@@ -579,7 +532,6 @@ impl SystingProbeRecorder {
                 .unwrap()
                 .clone();
 
-            // Stream if enabled
             if let Some(mut collector) = self.streaming_collector.take() {
                 let key = TrackCacheKey::Thread {
                     tgidpid: event.task.tgidpid,
@@ -588,7 +540,6 @@ impl SystingProbeRecorder {
                 if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
                     self.instant_id_counter += 1;
                     let instant_id = self.instant_id_counter;
-                    // Get consistent utid from shared generator
                     let tid = event.task.tgidpid as i32;
                     let utid = Some(self.utid_generator.get_or_create_utid(tid));
 
@@ -617,16 +568,6 @@ impl SystingProbeRecorder {
                     }
                 }
                 self.streaming_collector = Some(collector);
-            } else {
-                // Non-streaming path
-                let entry = self.events.entry(event.task.tgidpid).or_default();
-                let instant_track = self.instant_events.get(&systing_event_name).unwrap();
-                let entry = entry.entry(instant_track.clone()).or_default();
-                entry.push(TrackInstant {
-                    ts: event.ts,
-                    name: event_display_name,
-                    args: arg_data,
-                });
             }
             return;
         }
@@ -651,7 +592,6 @@ impl SystingProbeRecorder {
                     // Discard ranges with out-of-order timestamps (can happen
                     // across CPUs with skewed TSC values).
                     if range.end >= range.start {
-                        // Stream if enabled (thread that receives END owns the track)
                         if let Some(mut collector) = self.streaming_collector.take() {
                             let key = TrackCacheKey::Thread {
                                 tgidpid: event.task.tgidpid,
@@ -660,7 +600,6 @@ impl SystingProbeRecorder {
                             if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
                                 self.slice_id_counter += 1;
                                 let slice_id = self.slice_id_counter;
-                                // Get consistent utid from shared generator
                                 let tid = event.task.tgidpid as i32;
                                 let utid = Some(self.utid_generator.get_or_create_utid(tid));
 
@@ -691,12 +630,6 @@ impl SystingProbeRecorder {
                                 }
                             }
                             self.streaming_collector = Some(collector);
-                        } else {
-                            // Non-streaming path
-                            let track_hash =
-                                self.recorded_ranges.entry(event.task.tgidpid).or_default();
-                            let entry = track_hash.entry(track_name).or_default();
-                            entry.push(range);
                         }
                     }
                 }

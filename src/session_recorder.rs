@@ -1100,7 +1100,6 @@ mod tests {
                 .unwrap()
                 .min_timestamp(),
             recorder.sysinfo_recorder.lock().unwrap().min_timestamp(),
-            recorder.probe_recorder.lock().unwrap().min_timestamp(),
             recorder.network_recorder.lock().unwrap().min_timestamp(),
             recorder.marker_recorder.lock().unwrap().min_timestamp(),
         ]
