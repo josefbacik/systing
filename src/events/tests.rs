@@ -506,7 +506,10 @@ fn test_range_packet() {
     event.ts = 2000;
     recorder.handle_event(event);
     // Range consumed from outstanding_ranges after end event
-    assert!(recorder.outstanding_ranges.get(&1234).map_or(true, |r| r.is_empty()));
+    assert!(recorder
+        .outstanding_ranges
+        .get(&1234)
+        .map_or(true, |r| r.is_empty()));
     let data = recorder.finish_in_memory();
     assert_eq!(data.tracks.len(), 1);
     assert_eq!(data.tracks[0].name, "track_name");
@@ -669,7 +672,10 @@ fn test_range_packet_multiple_ranges() {
     event.ts = 3000;
     recorder.handle_event(event);
     // Both ranges completed and consumed
-    assert!(recorder.outstanding_ranges.get(&1234).map_or(true, |r| r.is_empty()));
+    assert!(recorder
+        .outstanding_ranges
+        .get(&1234)
+        .map_or(true, |r| r.is_empty()));
     let collector = recorder.finish().unwrap().unwrap();
     collector.finish_boxed().unwrap();
 }
@@ -740,7 +746,10 @@ fn test_range_packet_multiple_ranges_multi_packet() {
     event.ts = 6000;
     recorder.handle_event(event);
     // All ranges completed across two iterations
-    assert!(recorder.outstanding_ranges.get(&1234).map_or(true, |r| r.is_empty()));
+    assert!(recorder
+        .outstanding_ranges
+        .get(&1234)
+        .map_or(true, |r| r.is_empty()));
     let collector = recorder.finish().unwrap().unwrap();
     collector.finish_boxed().unwrap();
 }
@@ -2086,7 +2095,10 @@ fn test_process_scope_cross_thread_match() {
 
     // Range matched across threads via TGID key — outstanding range consumed
     let tgid: u64 = 100;
-    assert!(recorder.outstanding_ranges.get(&tgid).map_or(true, |r| r.is_empty()));
+    assert!(recorder
+        .outstanding_ranges
+        .get(&tgid)
+        .map_or(true, |r| r.is_empty()));
     let data = recorder.finish_in_memory();
     assert_eq!(data.slices.len(), 1);
     assert_eq!(data.slices[0].name, "my_span");

@@ -303,9 +303,7 @@ impl SystingProbeRecorder {
 
     /// Finish streaming and downcast the collector to `InMemoryCollector` for test assertions.
     #[cfg(test)]
-    fn finish_in_memory(
-        &mut self,
-    ) -> crate::trace::ExtractedData {
+    fn finish_in_memory(&mut self) -> crate::trace::ExtractedData {
         use crate::record::collector::InMemoryCollector;
         let collector = self.finish().unwrap().expect("no streaming collector");
         // SAFETY: In tests we always set an InMemoryCollector via create_test_recorder().
