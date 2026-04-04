@@ -5,7 +5,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::Result;
 
-use crate::perfetto::TraceWriter;
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing_core::types::network_event;
@@ -19,16 +18,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 /// Unique socket identifier assigned by BPF during tracing
 pub type SocketId = u64;
 
-use perfetto_protos::debug_annotation::DebugAnnotation;
-use perfetto_protos::interned_data::InternedData;
-use perfetto_protos::trace_packet::trace_packet::SequenceFlags;
-use perfetto_protos::trace_packet::TracePacket;
-use perfetto_protos::track_descriptor::TrackDescriptor;
-use perfetto_protos::track_event::track_event::Type;
-use perfetto_protos::track_event::{EventName, TrackEvent};
-
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 /// Cached system HZ value (clock ticks per second).
 /// This is constant for the lifetime of the process.
@@ -44,43 +34,6 @@ fn system_hz() -> u64 {
             100
         }
     })
-}
-
-/// Extension trait for easier debug annotation building on TrackEvent.
-/// Reduces the 4-line annotation pattern to a single method call.
-trait DebugAnnotationBuilder {
-    fn add_uint(&mut self, name: &str, value: u64);
-    fn add_string(&mut self, name: &str, value: String);
-    fn add_uint_nonzero(&mut self, name: &str, value: u64);
-    fn add_bool(&mut self, name: &str, value: bool);
-}
-
-impl DebugAnnotationBuilder for TrackEvent {
-    fn add_uint(&mut self, name: &str, value: u64) {
-        let mut annotation = DebugAnnotation::default();
-        annotation.set_name(name.to_string());
-        annotation.set_uint_value(value);
-        self.debug_annotations.push(annotation);
-    }
-
-    fn add_string(&mut self, name: &str, value: String) {
-        let mut annotation = DebugAnnotation::default();
-        annotation.set_name(name.to_string());
-        annotation.set_string_value(value);
-        self.debug_annotations.push(annotation);
-    }
-
-    fn add_uint_nonzero(&mut self, name: &str, value: u64) {
-        if value > 0 {
-            self.add_uint(name, value);
-        }
-    }
-
-    fn add_bool(&mut self, name: &str, value: bool) {
-        if value {
-            self.add_uint(name, 1);
-        }
-    }
 }
 
 /// Unique identifier for a network connection (full 4-tuple).
@@ -109,6 +62,7 @@ fn parse_ip_addr(af: u32, addr: &[u8; 16]) -> IpAddr {
     }
 }
 
+#[cfg(test)]
 fn protocol_str(protocol: u32) -> &'static str {
     use crate::systing_core::types::network_protocol;
     if protocol == network_protocol::NETWORK_TCP.0 {
@@ -338,13 +292,10 @@ impl SocketMetadata {
     fn dest_ip_addr(&self) -> IpAddr {
         parse_ip_addr(self.af, &self.dest_addr)
     }
-
-    fn protocol_str(&self) -> &'static str {
-        protocol_str(self.protocol)
-    }
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct NetworkEvent {
     start_ts: u64,
     end_ts: u64,
@@ -359,6 +310,7 @@ struct NetworkEvent {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct PacketEvent {
     ts: u64, // Instant event timestamp
     seq: u32,
@@ -406,6 +358,7 @@ struct PacketEvent {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct PollEvent {
     ts: u64,
     socket_id: SocketId,
@@ -413,6 +366,7 @@ struct PollEvent {
     returned_events: u32,
 }
 
+#[allow(dead_code)]
 enum EventEntry {
     Send(NetworkEvent),
     Recv(NetworkEvent),
@@ -440,6 +394,7 @@ enum EventEntry {
 }
 
 impl EventEntry {
+    #[allow(dead_code)]
     fn ts(&self) -> u64 {
         match self {
             EventEntry::Send(e) | EventEntry::Recv(e) => e.start_ts,
@@ -468,6 +423,7 @@ impl EventEntry {
 /// Macro to generate iterator methods for ConnectionEvents that filter by event type.
 macro_rules! packet_event_iter {
     ($fn_name:ident, $variant:ident) => {
+        #[allow(dead_code)]
         fn $fn_name(&self) -> impl Iterator<Item = &PacketEvent> {
             self.events.iter().filter_map(|e| match e {
                 EventEntry::$variant(pkt) => Some(pkt),
@@ -483,6 +439,7 @@ struct ConnectionEvents {
 }
 
 impl ConnectionEvents {
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
@@ -517,29 +474,6 @@ impl ConnectionEvents {
     packet_event_iter!(iter_tcp_state_changes, TcpStateChange);
 }
 
-#[derive(Default)]
-struct DnsStats {
-    attempted: usize,
-    ipv4_succeeded: usize,
-    ipv4_failed: usize,
-    ipv6_succeeded: usize,
-    ipv6_failed: usize,
-}
-
-impl DnsStats {
-    fn succeeded(&self) -> usize {
-        self.ipv4_succeeded + self.ipv6_succeeded
-    }
-
-    fn success_rate(&self) -> f64 {
-        if self.attempted == 0 {
-            0.0
-        } else {
-            (self.succeeded() as f64 / self.attempted as f64) * 100.0
-        }
-    }
-}
-
 pub struct NetworkRecorder {
     pub ringbuf: RingBuffer<network_event>,
 
@@ -558,12 +492,13 @@ pub struct NetworkRecorder {
     /// Socket metadata cache (populated from BPF map after tracing)
     socket_metadata: HashMap<SocketId, SocketMetadata>,
 
-    event_name_ids: HashMap<String, u64>,
     hostname_cache: HashMap<IpAddr, String>,
-    dns_stats: DnsStats,
 
     /// Whether to resolve IP addresses to hostnames via DNS
     resolve_addresses: bool,
+
+    /// Minimum timestamp seen across all events (updated incrementally)
+    min_ts: Option<u64>,
 
     // Streaming support fields
     /// Track which sockets have had their NetworkSocketRecord emitted
@@ -583,10 +518,9 @@ impl Default for NetworkRecorder {
             syscall_events: HashMap::new(),
             packet_events: HashMap::new(),
             socket_metadata: HashMap::new(),
-            event_name_ids: HashMap::new(),
             hostname_cache: HashMap::new(),
-            dns_stats: DnsStats::default(),
             resolve_addresses: true,
+            min_ts: None,
             seen_sockets: HashSet::new(),
             streaming_collector: None,
             next_syscall_id: 1,
@@ -1179,6 +1113,8 @@ impl NetworkRecorder {
             return;
         }
 
+        self.track_min_ts(event.ts);
+
         let pkt_event = PacketEvent {
             ts: event.ts,
             seq: event.seq,
@@ -1222,8 +1158,7 @@ impl NetworkRecorder {
             new_state: event.new_state,
         };
 
-        // Dispatch based on event type - streaming uses event names, non-streaming uses EventEntry
-        // Single match handles both paths to avoid duplication
+        // Dispatch based on event type for streaming emission and in-memory storage
         let (event_name, event_entry) = match event.event_type.0 {
             // TCP packet events
             x if x == packet_event_type::PACKET_ENQUEUE.0 => {
@@ -1309,6 +1244,8 @@ impl NetworkRecorder {
             return;
         }
 
+        self.track_min_ts(event.ts);
+
         let poll_event = PollEvent {
             ts: event.ts,
             socket_id,
@@ -1328,17 +1265,6 @@ impl NetworkRecorder {
             .push(EventEntry::PollReady(poll_event));
     }
 
-    fn protocol_to_str(protocol: u32) -> &'static str {
-        use crate::systing_core::types::network_protocol;
-        if protocol == network_protocol::NETWORK_TCP.0 {
-            "tcp"
-        } else if protocol == network_protocol::NETWORK_UDP.0 {
-            "udp"
-        } else {
-            "network"
-        }
-    }
-
     fn resolve_hostname(&mut self, addr: IpAddr) -> &str {
         let resolve = self.resolve_addresses;
         self.hostname_cache.entry(addr).or_insert_with(|| {
@@ -1346,764 +1272,28 @@ impl NetworkRecorder {
                 return addr.to_canonical().to_string();
             }
 
-            self.dns_stats.attempted += 1;
-
             let lookup_addr = addr.to_canonical();
 
-            let (succeeded, hostname) = match dns_lookup::lookup_addr(&lookup_addr) {
+            match dns_lookup::lookup_addr(&lookup_addr) {
                 Ok(name) => {
                     tracing::debug!("DNS lookup succeeded for {}: {}", lookup_addr, name);
-                    (true, name)
+                    name
                 }
                 Err(err) => {
                     tracing::debug!("DNS lookup failed for {}: {}", lookup_addr, err);
-                    (false, lookup_addr.to_string())
+                    lookup_addr.to_string()
                 }
-            };
-
-            match (lookup_addr, succeeded) {
-                (IpAddr::V4(_), true) => self.dns_stats.ipv4_succeeded += 1,
-                (IpAddr::V4(_), false) => self.dns_stats.ipv4_failed += 1,
-                (IpAddr::V6(_), true) => self.dns_stats.ipv6_succeeded += 1,
-                (IpAddr::V6(_), false) => self.dns_stats.ipv6_failed += 1,
             }
-
-            hostname
         })
-    }
-
-    fn get_or_create_event_name_iid(&mut self, name: String, id_counter: &Arc<AtomicUsize>) -> u64 {
-        if let Some(&iid) = self.event_name_ids.get(&name) {
-            return iid;
-        }
-
-        let iid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-        self.event_name_ids.insert(name, iid);
-        iid
-    }
-
-    /// Add basic packet annotations: seq, length, flags
-    fn add_basic_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
-        event.add_uint_nonzero("seq", pkt.seq as u64);
-        event.add_uint("length", pkt.length as u64);
-        if pkt.tcp_flags != 0 {
-            event.add_string("flags", format_tcp_flags(pkt.tcp_flags));
-        }
-    }
-
-    /// Add send buffer annotations: sndbuf_used, sndbuf_limit, fill_pct
-    fn add_sndbuf_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
-        if pkt.sndbuf_limit > 0 {
-            event.add_uint("sndbuf_used", pkt.sndbuf_used as u64);
-            event.add_uint("sndbuf_limit", pkt.sndbuf_limit as u64);
-            let fill_pct = (pkt.sndbuf_used as u64 * 100) / pkt.sndbuf_limit as u64;
-            event.add_uint("sndbuf_fill_pct", fill_pct);
-        }
-    }
-
-    /// Add persist timer state annotations (icsk_pending, icsk_timeout, etc.)
-    fn add_timer_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
-        if pkt.icsk_pending > 0 {
-            event.add_uint("icsk_pending", pkt.icsk_pending as u64);
-            event.add_uint("icsk_timeout", pkt.icsk_timeout);
-            event.add_uint_nonzero("rto_jiffies", pkt.rto_jiffies as u64);
-            event.add_uint_nonzero("backoff", pkt.backoff as u64);
-            event.add_uint_nonzero("probe_count", pkt.probe_count as u64);
-        }
-    }
-
-    /// Add retransmit flag annotation
-    fn add_retransmit_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
-        event.add_bool("is_retransmit", pkt.is_retransmit);
-    }
-
-    /// Add zero window probe annotations (sender-side)
-    fn add_zero_window_probe_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
-        if pkt.is_zero_window_probe {
-            event.add_bool("is_zero_window_probe", true);
-            event.add_uint("probe_count", pkt.probe_count as u64);
-            event.add_uint("snd_wnd", pkt.snd_wnd as u64);
-        }
-    }
-
-    /// Add zero window ACK annotations (receiver-side)
-    fn add_zero_window_ack_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
-        if pkt.is_zero_window_ack {
-            event.add_bool("is_zero_window_ack", true);
-            event.add_uint("rcv_wnd", pkt.rcv_wnd as u64);
-            event.add_uint("rcv_buf_used", pkt.rcv_buf_used as u64);
-            event.add_uint("rcv_buf_limit", pkt.rcv_buf_limit as u64);
-            if pkt.rcv_buf_limit > 0 {
-                let fill_pct = (pkt.rcv_buf_used as u64 * 100) / pkt.rcv_buf_limit as u64;
-                event.add_uint("rcv_buf_fill_pct", fill_pct);
-            }
-            event.add_uint("window_clamp", pkt.window_clamp as u64);
-            event.add_uint("rcv_wscale", pkt.rcv_wscale as u64);
-        }
-    }
-
-    /// Add RTO timeout annotations with jiffies-to-microseconds conversion
-    fn add_rto_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
-        if pkt.rto_jiffies > 0 {
-            let rto_us = Self::jiffies_to_us(pkt.rto_jiffies as u64) as u64;
-
-            event.add_uint("rto_jiffies", pkt.rto_jiffies as u64);
-            event.add_uint("rto_us", rto_us);
-            event.add_uint("srtt_us", pkt.srtt_us as u64);
-            event.add_uint("rttvar_us", pkt.rttvar_us as u64);
-            event.add_uint("retransmit_count", pkt.retransmit_count as u64);
-            event.add_uint("backoff", pkt.backoff as u64);
-            event.add_uint("rto_ms", rto_us / 1000);
-            event.add_uint_nonzero("srtt_ms", (pkt.srtt_us / 1000) as u64);
-        }
-    }
-
-    /// Add drop event annotations (drop_reason, drop_location)
-    fn add_drop_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
-        if pkt.drop_reason > 0 {
-            event.add_uint("drop_reason", pkt.drop_reason as u64);
-            event.add_string(
-                "drop_reason_str",
-                drop_reason_str(pkt.drop_reason).to_string(),
-            );
-            event.add_uint_nonzero("drop_location", pkt.drop_location);
-        }
-    }
-
-    /// Add queue state annotations (qlen, qlen_limit)
-    fn add_queue_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
-        if pkt.qlen > 0 || pkt.qlen_limit > 0 {
-            event.add_uint("qlen", pkt.qlen as u64);
-            event.add_uint_nonzero("qlen_limit", pkt.qlen_limit as u64);
-        }
-    }
-
-    /// Add TSQ/memory pressure annotations
-    fn add_memory_pressure_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
-        if pkt.sk_wmem_alloc > 0 {
-            event.add_uint("sk_wmem_alloc", pkt.sk_wmem_alloc as u64);
-            event.add_uint_nonzero("tsq_limit", pkt.tsq_limit as u64);
-        }
-    }
-
-    /// Add qdisc-specific annotations
-    fn add_qdisc_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
-        event.add_uint_nonzero("txq_state", pkt.txq_state as u64);
-        event.add_uint_nonzero("qdisc_state", pkt.qdisc_state as u64);
-        event.add_uint_nonzero("qdisc_backlog", pkt.qdisc_backlog as u64);
-        event.add_uint_nonzero("skb_addr", pkt.skb_addr);
-        event.add_uint_nonzero("qdisc_latency_us", pkt.qdisc_latency_us as u64);
-    }
-
-    fn add_tcp_state_change_annotations(event: &mut TrackEvent, pkt: &PacketEvent) {
-        if pkt.old_state > 0 {
-            event.add_string("old_state", tcp_state_name(pkt.old_state).to_string());
-        }
-        if pkt.new_state > 0 {
-            event.add_string("new_state", tcp_state_name(pkt.new_state).to_string());
-        }
-    }
-
-    /// Helper to emit packet events for a given event type.
-    /// Uses peekable to check emptiness without collecting, then emits events directly.
-    fn write_packet_events<'a>(
-        &self,
-        writer: &mut dyn TraceWriter,
-        sequence_id: u32,
-        track_uuid: u64,
-        event_name: &str,
-        pkt_iter: impl Iterator<Item = &'a PacketEvent>,
-    ) -> Result<()> {
-        let mut pkt_iter = pkt_iter.peekable();
-        if pkt_iter.peek().is_none() {
-            return Ok(());
-        }
-        let iid = self.event_name_ids.get(event_name).copied().unwrap_or(0);
-        if iid == 0 {
-            tracing::warn!("Missing event name IID for: {}", event_name);
-            return Ok(());
-        }
-        for pkt in pkt_iter {
-            self.write_single_packet_event(writer, sequence_id, track_uuid, iid, pkt)?;
-        }
-        Ok(())
-    }
-
-    /// Write a single packet instant event
-    fn write_single_packet_event(
-        &self,
-        writer: &mut dyn TraceWriter,
-        sequence_id: u32,
-        track_uuid: u64,
-        name_iid: u64,
-        pkt: &PacketEvent,
-    ) -> Result<()> {
-        let mut instant_event = TrackEvent::default();
-        instant_event.set_type(Type::TYPE_INSTANT);
-        instant_event.set_name_iid(name_iid);
-        instant_event.set_track_uuid(track_uuid);
-
-        // Add all annotation groups
-        Self::add_basic_annotations(&mut instant_event, pkt);
-        Self::add_sndbuf_annotations(&mut instant_event, pkt);
-        Self::add_timer_annotations(&mut instant_event, pkt);
-        Self::add_retransmit_annotations(&mut instant_event, pkt);
-        Self::add_zero_window_probe_annotations(&mut instant_event, pkt);
-        Self::add_zero_window_ack_annotations(&mut instant_event, pkt);
-        Self::add_rto_annotations(&mut instant_event, pkt);
-        Self::add_drop_annotations(&mut instant_event, pkt);
-        Self::add_queue_annotations(&mut instant_event, pkt);
-        Self::add_memory_pressure_annotations(&mut instant_event, pkt);
-        Self::add_qdisc_annotations(&mut instant_event, pkt);
-        Self::add_tcp_state_change_annotations(&mut instant_event, pkt);
-
-        let mut packet = TracePacket::default();
-        packet.set_timestamp(pkt.ts);
-        packet.set_track_event(instant_event);
-        packet.set_trusted_packet_sequence_id(sequence_id);
-        writer.write_packet(&packet)
-    }
-
-    /// Write a syscall slice event (Send or Recv) with begin and end packets.
-    fn write_syscall_slice(
-        &self,
-        writer: &mut dyn TraceWriter,
-        sequence_id: u32,
-        track_uuid: u64,
-        event: &NetworkEvent,
-        is_send: bool,
-    ) -> Result<()> {
-        let protocol = self
-            .socket_metadata
-            .get(&event.socket_id)
-            .map(|m| m.protocol)
-            .unwrap_or_else(|| {
-                tracing::debug!("Missing socket metadata for socket_id {}", event.socket_id);
-                0
-            });
-
-        let proto_str = Self::protocol_to_str(protocol);
-        let event_name = if is_send {
-            format!("{proto_str}_send")
-        } else {
-            format!("{proto_str}_recv")
-        };
-        let name_iid = self.event_name_ids.get(&event_name).copied().unwrap_or(0);
-
-        // Build begin event
-        let mut begin_event = TrackEvent::default();
-        begin_event.set_type(Type::TYPE_SLICE_BEGIN);
-        if name_iid > 0 {
-            begin_event.set_name_iid(name_iid);
-        }
-        begin_event.set_track_uuid(track_uuid);
-
-        // Common annotations
-        begin_event.add_uint("socket_id", event.socket_id);
-        begin_event.add_string("socket", self.socket_track_name(event.socket_id));
-        begin_event.add_uint("bytes", event.bytes as u64);
-
-        if is_send {
-            // Send-specific annotations
-            begin_event.add_uint_nonzero("seq", event.sendmsg_seq as u64);
-            if event.sndbuf_limit > 0 {
-                begin_event.add_uint("sndbuf_used", event.sndbuf_used as u64);
-                begin_event.add_uint("sndbuf_limit", event.sndbuf_limit as u64);
-                let fill_pct = (event.sndbuf_used as u64 * 100) / event.sndbuf_limit as u64;
-                begin_event.add_uint("sndbuf_fill_pct", fill_pct);
-            }
-        } else {
-            // Recv-specific annotations
-            if event.recv_seq_start > 0 || event.recv_seq_end > 0 {
-                begin_event.add_uint("recv_seq_start", event.recv_seq_start as u64);
-                begin_event.add_uint("recv_seq_end", event.recv_seq_end as u64);
-                if event.rcv_nxt_at_entry > 0 {
-                    begin_event.add_uint("rcv_nxt", event.rcv_nxt_at_entry as u64);
-                    let bytes_available = event.rcv_nxt_at_entry.wrapping_sub(event.recv_seq_start);
-                    if bytes_available > 0 && bytes_available < 64 * 1024 * 1024 {
-                        begin_event.add_uint("bytes_available", bytes_available as u64);
-                    }
-                }
-            }
-        }
-
-        let mut begin_packet = TracePacket::default();
-        begin_packet.set_timestamp(event.start_ts);
-        begin_packet.set_track_event(begin_event);
-        begin_packet.set_trusted_packet_sequence_id(sequence_id);
-        writer.write_packet(&begin_packet)?;
-
-        // Build end event
-        let mut end_event = TrackEvent::default();
-        end_event.set_type(Type::TYPE_SLICE_END);
-        end_event.set_track_uuid(track_uuid);
-
-        let mut end_packet = TracePacket::default();
-        end_packet.set_timestamp(event.end_ts);
-        end_packet.set_track_event(end_event);
-        end_packet.set_trusted_packet_sequence_id(sequence_id);
-        writer.write_packet(&end_packet)
-    }
-
-    /// Write a poll_ready instant event
-    fn write_poll_ready(
-        &self,
-        writer: &mut dyn TraceWriter,
-        sequence_id: u32,
-        track_uuid: u64,
-        event: &PollEvent,
-    ) -> Result<()> {
-        let poll_name_iid = *self.event_name_ids.get("poll_ready").unwrap_or(&0);
-
-        let mut instant_event = TrackEvent::default();
-        instant_event.set_type(Type::TYPE_INSTANT);
-        instant_event.set_name_iid(poll_name_iid);
-        instant_event.set_track_uuid(track_uuid);
-
-        instant_event.add_uint("socket_id", event.socket_id);
-        instant_event.add_string("socket", self.socket_track_name(event.socket_id));
-        instant_event.add_string(
-            "requested",
-            Self::poll_events_to_str(event.requested_events),
-        );
-        instant_event.add_string("returned", Self::poll_events_to_str(event.returned_events));
-
-        let mut instant_packet = TracePacket::default();
-        instant_packet.set_timestamp(event.ts);
-        instant_packet.set_track_event(instant_event);
-        instant_packet.set_trusted_packet_sequence_id(sequence_id);
-        writer.write_packet(&instant_packet)
-    }
-
-    /// Prepares all metadata needed for packet generation, including:
-    /// - Resolving hostnames for all sockets
-    /// - Creating IIDs for protocol operations and packet events
-    /// - Building the event names array
-    fn prepare_event_metadata(&mut self, id_counter: &Arc<AtomicUsize>) -> Vec<EventName> {
-        use crate::systing_core::types::network_operation;
-
-        // Collect IP addresses first to avoid borrow issues
-        // We resolve both src and dest addresses for potential hostname lookups
-        let ip_addrs: Vec<_> = self
-            .socket_metadata
-            .values()
-            .flat_map(|m| [m.src_ip_addr(), m.dest_ip_addr()])
-            .collect();
-
-        // Resolve hostnames for all sockets
-        for ip_addr in ip_addrs {
-            self.resolve_hostname(ip_addr);
-        }
-
-        // Collect protocol operations used across all syscall events
-        let mut protocol_ops_used = std::collections::HashSet::new();
-        for events in self.syscall_events.values() {
-            for event in events.iter() {
-                let socket_id = match event {
-                    EventEntry::Send(e) | EventEntry::Recv(e) => e.socket_id,
-                    _ => continue,
-                };
-                if let Some(metadata) = self.socket_metadata.get(&socket_id) {
-                    match event {
-                        EventEntry::Send(_) => {
-                            protocol_ops_used
-                                .insert((metadata.protocol, network_operation::NETWORK_SEND.0));
-                        }
-                        EventEntry::Recv(_) => {
-                            protocol_ops_used
-                                .insert((metadata.protocol, network_operation::NETWORK_RECV.0));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        // Create IIDs for all protocol/operation combinations that were used
-        for (protocol, operation) in protocol_ops_used {
-            let proto_str = Self::protocol_to_str(protocol);
-
-            let op_str = if operation == network_operation::NETWORK_SEND.0 {
-                "send"
-            } else if operation == network_operation::NETWORK_RECV.0 {
-                "recv"
-            } else {
-                "op"
-            };
-
-            let event_name = format!("{proto_str}_{op_str}");
-            self.get_or_create_event_name_iid(event_name, id_counter);
-        }
-
-        // Create IIDs for packet event types unconditionally (only 10 strings)
-        self.get_or_create_event_name_iid("TCP packet_enqueue".to_string(), id_counter);
-        self.get_or_create_event_name_iid("TCP packet_send".to_string(), id_counter);
-        self.get_or_create_event_name_iid("TCP packet_rcv_established".to_string(), id_counter);
-        self.get_or_create_event_name_iid("TCP packet_queue_rcv".to_string(), id_counter);
-        self.get_or_create_event_name_iid("TCP buffer_queue".to_string(), id_counter);
-        self.get_or_create_event_name_iid("TCP zero_window_probe".to_string(), id_counter);
-        self.get_or_create_event_name_iid("TCP zero_window_ack".to_string(), id_counter);
-        self.get_or_create_event_name_iid("TCP rto_timeout".to_string(), id_counter);
-        self.get_or_create_event_name_iid("UDP send".to_string(), id_counter);
-        self.get_or_create_event_name_iid("UDP packet_send".to_string(), id_counter);
-        self.get_or_create_event_name_iid("UDP receive".to_string(), id_counter);
-        self.get_or_create_event_name_iid("UDP enqueue".to_string(), id_counter);
-        self.get_or_create_event_name_iid("poll_ready".to_string(), id_counter);
-        // New drop/throttle event types
-        self.get_or_create_event_name_iid("packet_drop".to_string(), id_counter);
-        self.get_or_create_event_name_iid("cpu_backlog_drop".to_string(), id_counter);
-        self.get_or_create_event_name_iid("TCP mem_pressure".to_string(), id_counter);
-        // Qdisc tracing event types
-        self.get_or_create_event_name_iid("qdisc_enqueue".to_string(), id_counter);
-        self.get_or_create_event_name_iid("qdisc_dequeue".to_string(), id_counter);
-        // TCP state change event type
-        self.get_or_create_event_name_iid("TCP state_change".to_string(), id_counter);
-
-        // Build and sort event names array
-        let mut event_names = Vec::new();
-        for (name, iid) in &self.event_name_ids {
-            let mut event_name = EventName::default();
-            event_name.set_iid(*iid);
-            event_name.set_name(name.clone());
-            event_names.push(event_name);
-        }
-        event_names.sort_by_key(|e| e.iid());
-
-        event_names
-    }
-
-    fn socket_track_name(&self, socket_id: SocketId) -> String {
-        if let Some(metadata) = self.socket_metadata.get(&socket_id) {
-            let src_ip = metadata.src_ip_addr();
-            let dest_ip = metadata.dest_ip_addr();
-            let src_host = self
-                .hostname_cache
-                .get(&src_ip)
-                .cloned()
-                .unwrap_or_else(|| src_ip.to_string());
-            let dest_host = self
-                .hostname_cache
-                .get(&dest_ip)
-                .cloned()
-                .unwrap_or_else(|| dest_ip.to_string());
-            format!(
-                "Socket {}:{}:{}:{}->{}:{}",
-                socket_id,
-                metadata.protocol_str(),
-                src_host,
-                metadata.src_port,
-                dest_host,
-                metadata.dest_port
-            )
-        } else {
-            format!("Socket {socket_id}")
-        }
-    }
-
-    /// Write trace data to Perfetto format (used by parquet-to-perfetto conversion).
-    pub fn write_trace_packets(
-        &mut self,
-        writer: &mut dyn TraceWriter,
-        pid_uuids: &HashMap<i32, u64>,
-        thread_uuids: &HashMap<i32, u64>,
-        id_counter: &Arc<AtomicUsize>,
-    ) -> Result<()> {
-        let sequence_id = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-
-        // Phase 1: Prepare all metadata (event names, IIDs, DNS resolution)
-        let event_names = self.prepare_event_metadata(id_counter);
-
-        // Phase 2: Create interned data packet if we have event names
-        if !event_names.is_empty() {
-            let mut interned_packet = TracePacket::default();
-            let interned_data = InternedData {
-                event_names,
-                ..Default::default()
-            };
-            interned_packet.interned_data = Some(interned_data).into();
-            interned_packet.set_trusted_packet_sequence_id(sequence_id);
-            interned_packet.set_sequence_flags(
-                SequenceFlags::SEQ_INCREMENTAL_STATE_CLEARED as u32
-                    | SequenceFlags::SEQ_NEEDS_INCREMENTAL_STATE as u32,
-            );
-            writer.write_packet(&interned_packet)?;
-        }
-
-        // ====================================================================
-        // Phase 3: Generate global "Network Packets" root with per-socket tracks
-        // ====================================================================
-        if !self.packet_events.is_empty() {
-            // Create global "Network Packets" root track
-            let network_packets_root_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-
-            let mut root_track_desc = TrackDescriptor::default();
-            root_track_desc.set_uuid(network_packets_root_uuid);
-            root_track_desc.set_name("Network Packets".to_string());
-
-            let mut root_track_packet = TracePacket::default();
-            root_track_packet.set_track_descriptor(root_track_desc);
-            writer.write_packet(&root_track_packet)?;
-
-            // Create per-socket packet tracks (flat - events directly under socket)
-            for (socket_id, events) in self.packet_events.iter() {
-                if events.is_empty() {
-                    continue;
-                }
-
-                // Create socket track under root
-                let socket_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-
-                let mut socket_track_desc = TrackDescriptor::default();
-                socket_track_desc.set_uuid(socket_track_uuid);
-                socket_track_desc.set_name(self.socket_track_name(*socket_id));
-                socket_track_desc.set_parent_uuid(network_packets_root_uuid);
-
-                let mut socket_track_packet = TracePacket::default();
-                socket_track_packet.set_track_descriptor(socket_track_desc);
-                writer.write_packet(&socket_track_packet)?;
-
-                // Determine protocol for this socket
-                let is_tcp = self
-                    .socket_metadata
-                    .get(socket_id)
-                    .map(|m| {
-                        m.protocol == crate::systing_core::types::network_protocol::NETWORK_TCP.0
-                    })
-                    .unwrap_or(false);
-
-                // Emit all packet events directly on this socket track (flat)
-                if is_tcp {
-                    // TCP packet events
-                    self.write_packet_events(
-                        writer,
-                        sequence_id,
-                        socket_track_uuid,
-                        "TCP packet_enqueue",
-                        events.iter_tcp_enqueue_packets(),
-                    )?;
-                    self.write_packet_events(
-                        writer,
-                        sequence_id,
-                        socket_track_uuid,
-                        "TCP packet_send",
-                        events.iter_shared_send_packets(),
-                    )?;
-                    self.write_packet_events(
-                        writer,
-                        sequence_id,
-                        socket_track_uuid,
-                        "TCP packet_rcv_established",
-                        events.iter_tcp_rcv_established_packets(),
-                    )?;
-                    self.write_packet_events(
-                        writer,
-                        sequence_id,
-                        socket_track_uuid,
-                        "TCP packet_queue_rcv",
-                        events.iter_tcp_queue_rcv_packets(),
-                    )?;
-                    self.write_packet_events(
-                        writer,
-                        sequence_id,
-                        socket_track_uuid,
-                        "TCP zero_window_probe",
-                        events.iter_zero_window_probes(),
-                    )?;
-                    self.write_packet_events(
-                        writer,
-                        sequence_id,
-                        socket_track_uuid,
-                        "TCP zero_window_ack",
-                        events.iter_zero_window_acks(),
-                    )?;
-                    self.write_packet_events(
-                        writer,
-                        sequence_id,
-                        socket_track_uuid,
-                        "TCP rto_timeout",
-                        events.iter_rto_timeouts(),
-                    )?;
-                    self.write_packet_events(
-                        writer,
-                        sequence_id,
-                        socket_track_uuid,
-                        "TCP buffer_queue",
-                        events.iter_tcp_buffer_queue_packets(),
-                    )?;
-                } else {
-                    // UDP packet events
-                    self.write_packet_events(
-                        writer,
-                        sequence_id,
-                        socket_track_uuid,
-                        "UDP send",
-                        events.iter_udp_send_packets(),
-                    )?;
-                    self.write_packet_events(
-                        writer,
-                        sequence_id,
-                        socket_track_uuid,
-                        "UDP receive",
-                        events.iter_udp_rcv_packets(),
-                    )?;
-                    self.write_packet_events(
-                        writer,
-                        sequence_id,
-                        socket_track_uuid,
-                        "UDP packet_send",
-                        events.iter_shared_send_packets(),
-                    )?;
-                    self.write_packet_events(
-                        writer,
-                        sequence_id,
-                        socket_track_uuid,
-                        "UDP enqueue",
-                        events.iter_udp_enqueue_packets(),
-                    )?;
-                }
-
-                // Drop/throttle events (apply to both TCP and UDP)
-                self.write_packet_events(
-                    writer,
-                    sequence_id,
-                    socket_track_uuid,
-                    "packet_drop",
-                    events.iter_skb_drops(),
-                )?;
-                self.write_packet_events(
-                    writer,
-                    sequence_id,
-                    socket_track_uuid,
-                    "cpu_backlog_drop",
-                    events.iter_cpu_backlog_drops(),
-                )?;
-                self.write_packet_events(
-                    writer,
-                    sequence_id,
-                    socket_track_uuid,
-                    "TCP mem_pressure",
-                    events.iter_mem_pressure(),
-                )?;
-                self.write_packet_events(
-                    writer,
-                    sequence_id,
-                    socket_track_uuid,
-                    "qdisc_enqueue",
-                    events.iter_qdisc_enqueue(),
-                )?;
-                self.write_packet_events(
-                    writer,
-                    sequence_id,
-                    socket_track_uuid,
-                    "qdisc_dequeue",
-                    events.iter_qdisc_dequeue(),
-                )?;
-
-                // TCP state change events
-                self.write_packet_events(
-                    writer,
-                    sequence_id,
-                    socket_track_uuid,
-                    "TCP state_change",
-                    events.iter_tcp_state_changes(),
-                )?;
-            }
-        }
-
-        // ====================================================================
-        // Phase 4: Generate per-thread "Network" tracks (single flat track per thread)
-        // ====================================================================
-        for (tgidpid, events) in self.syscall_events.iter() {
-            if events.is_empty() {
-                continue;
-            }
-
-            // Create a single "Network" track for this thread
-            let network_track_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-
-            let network_track_desc = crate::perfetto::generate_pidtgid_track_descriptor(
-                pid_uuids,
-                thread_uuids,
-                tgidpid,
-                "Network".to_string(),
-                network_track_uuid,
-            );
-
-            let mut network_track_packet = TracePacket::default();
-            network_track_packet.set_track_descriptor(network_track_desc);
-            writer.write_packet(&network_track_packet)?;
-
-            // Emit all events directly on this single track
-            for event_entry in events.iter() {
-                match event_entry {
-                    EventEntry::Send(event) => {
-                        self.write_syscall_slice(
-                            writer,
-                            sequence_id,
-                            network_track_uuid,
-                            event,
-                            true,
-                        )?;
-                    }
-                    EventEntry::Recv(event) => {
-                        self.write_syscall_slice(
-                            writer,
-                            sequence_id,
-                            network_track_uuid,
-                            event,
-                            false,
-                        )?;
-                    }
-                    EventEntry::PollReady(event) => {
-                        self.write_poll_ready(writer, sequence_id, network_track_uuid, event)?;
-                    }
-                    _ => {
-                        // Packet events are handled separately in Phase 3
-                    }
-                }
-            }
-        }
-
-        if self.dns_stats.attempted > 0 {
-            tracing::info!(
-                "DNS resolution stats: {} attempted, {} succeeded ({:.1}%), IPv4: {} succeeded / {} failed, IPv6: {} succeeded / {} failed",
-                self.dns_stats.attempted,
-                self.dns_stats.succeeded(),
-                self.dns_stats.success_rate(),
-                self.dns_stats.ipv4_succeeded,
-                self.dns_stats.ipv4_failed,
-                self.dns_stats.ipv6_succeeded,
-                self.dns_stats.ipv6_failed
-            );
-        }
-
-        self.syscall_events.clear();
-        self.packet_events.clear();
-        self.socket_metadata.clear();
-        self.event_name_ids.clear();
-        self.hostname_cache.clear();
-        self.dns_stats = Default::default();
-
-        Ok(())
     }
 
     /// Returns the minimum timestamp from all network events, or None if no events recorded.
     pub fn min_timestamp(&self) -> Option<u64> {
-        let syscall_min = self
-            .syscall_events
-            .values()
-            .filter_map(|events| events.first())
-            .map(|e| e.ts())
-            .min();
+        self.min_ts
+    }
 
-        let packet_min = self
-            .packet_events
-            .values()
-            .filter_map(|conn| conn.events.first())
-            .map(|e| e.ts())
-            .min();
-
-        syscall_min.into_iter().chain(packet_min).min()
+    fn track_min_ts(&mut self, ts: u64) {
+        self.min_ts = Some(self.min_ts.map_or(ts, |prev| prev.min(ts)));
     }
 }
 
@@ -2131,6 +1321,8 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
         if socket_id == 0 {
             return;
         }
+
+        self.track_min_ts(event.start_ts);
 
         let net_event = NetworkEvent {
             start_ts: event.start_ts,
@@ -2170,10 +1362,8 @@ impl SystingRecordEvent<network_event> for NetworkRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::perfetto::VecTraceWriter;
     use crate::record::collector::InMemoryCollector;
     use crate::systing_core::types::{network_protocol, task_info};
-    use perfetto_protos::trace_packet::TracePacket;
 
     /// Create a NetworkRecorder with a streaming collector set, matching the
     /// production invariant that streaming is always initialized before events.
@@ -2181,20 +1371,6 @@ mod tests {
         let mut recorder = NetworkRecorder::default();
         recorder.set_streaming_collector(Box::new(InMemoryCollector::new()));
         recorder
-    }
-
-    /// Helper to collect packets from NetworkRecorder for tests
-    fn generate_trace_packets(
-        recorder: &mut NetworkRecorder,
-        pid_uuids: &HashMap<i32, u64>,
-        thread_uuids: &HashMap<i32, u64>,
-        id_counter: &Arc<AtomicUsize>,
-    ) -> Vec<TracePacket> {
-        let mut writer = VecTraceWriter::new();
-        recorder
-            .write_trace_packets(&mut writer, pid_uuids, thread_uuids, id_counter)
-            .unwrap();
-        writer.packets
     }
 
     fn create_test_task_info(tgid: u32, pid: u32) -> task_info {
@@ -2410,93 +1586,6 @@ mod tests {
             .collect();
         assert!(socket_ids.contains(&tcp_socket_id));
         assert!(socket_ids.contains(&udp_socket_id));
-    }
-
-    #[test]
-    fn test_generate_trace_packets() {
-        use crate::systing_core::types::{network_address_family, network_operation};
-
-        let mut recorder = create_test_recorder();
-        let mut thread_uuids = HashMap::new();
-        thread_uuids.insert(101, 500);
-        let pid_uuids: HashMap<i32, u64> = HashMap::new();
-        let id_counter = Arc::new(AtomicUsize::new(1000));
-
-        let mut dest_addr = [0u8; 16];
-        dest_addr[0..4].copy_from_slice(&[127, 0, 0, 1]);
-        let socket_id: SocketId = 1;
-
-        insert_test_socket_metadata(
-            &mut recorder,
-            socket_id,
-            network_protocol::NETWORK_TCP.0,
-            network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            8080,
-        );
-
-        let event = network_event {
-            start_ts: 1000,
-            end_ts: 2000,
-            task: create_test_task_info(100, 101),
-            protocol: test_protocol_tcp(),
-            operation: network_operation::NETWORK_SEND,
-            af: network_address_family::NETWORK_AF_INET,
-            dest_addr,
-            dest_port: 8080,
-            bytes: 1024,
-            sendmsg_seq: 0,
-            cpu: 0,
-            socket_id,
-            ..Default::default()
-        };
-
-        recorder.handle_event(event);
-
-        let packets = generate_trace_packets(&mut recorder, &pid_uuids, &thread_uuids, &id_counter);
-
-        // Packets: interned data, network track, slice begin, slice end
-        assert_eq!(packets.len(), 4);
-
-        let interned_packet = &packets[0];
-        assert!(interned_packet.interned_data.is_some());
-
-        let network_track_packet = &packets[1];
-        assert!(network_track_packet.has_track_descriptor());
-        let network_track_desc = network_track_packet.track_descriptor();
-        assert_eq!(network_track_desc.name(), "Network");
-
-        let begin_packet = &packets[2];
-        assert!(begin_packet.has_track_event());
-        assert_eq!(begin_packet.timestamp(), 1000);
-        let begin_event = begin_packet.track_event();
-        assert_eq!(begin_event.type_(), Type::TYPE_SLICE_BEGIN);
-        assert_eq!(begin_event.track_uuid(), network_track_desc.uuid());
-
-        // Check debug annotations include socket_id, socket, and bytes
-        assert!(begin_event.debug_annotations.len() >= 3);
-        let socket_id_annotation = begin_event
-            .debug_annotations
-            .iter()
-            .find(|a| a.name() == "socket_id");
-        assert!(socket_id_annotation.is_some());
-        assert_eq!(socket_id_annotation.unwrap().uint_value(), socket_id);
-
-        let bytes_annotation = begin_event
-            .debug_annotations
-            .iter()
-            .find(|a| a.name() == "bytes");
-        assert!(bytes_annotation.is_some());
-        assert_eq!(bytes_annotation.unwrap().uint_value(), 1024);
-
-        let end_packet = &packets[3];
-        assert!(end_packet.has_track_event());
-        assert_eq!(end_packet.timestamp(), 2000);
-        let end_event = end_packet.track_event();
-        assert_eq!(end_event.type_(), Type::TYPE_SLICE_END);
-        assert_eq!(end_event.track_uuid(), network_track_desc.uuid());
-
-        assert!(recorder.syscall_events.is_empty());
     }
 
     #[test]
@@ -3125,93 +2214,6 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_trace_packets_with_receive_packets() {
-        use crate::systing_core::types::{network_address_family, packet_event_type};
-
-        let mut recorder = NetworkRecorder::default();
-        let mut thread_uuids = HashMap::new();
-        thread_uuids.insert(201, 500);
-        let pid_uuids: HashMap<i32, u64> = HashMap::new();
-        let id_counter = Arc::new(AtomicUsize::new(1000));
-
-        let mut dest_addr = [0u8; 16];
-        dest_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
-        let socket_id: SocketId = 1;
-
-        insert_test_socket_metadata(
-            &mut recorder,
-            socket_id,
-            network_protocol::NETWORK_TCP.0,
-            network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            8080,
-        );
-
-        let rcv_est = crate::systing_core::types::packet_event {
-            ts: 1000,
-            af: network_address_family::NETWORK_AF_INET,
-            dest_addr,
-            dest_port: 8080,
-            seq: 1000,
-            length: 500,
-            tcp_flags: 0x10,
-            event_type: packet_event_type::PACKET_RCV_ESTABLISHED,
-            cpu: 0,
-            socket_id,
-            ..Default::default()
-        };
-
-        let queue_rcv = crate::systing_core::types::packet_event {
-            ts: 1100,
-            af: network_address_family::NETWORK_AF_INET,
-            dest_addr,
-            dest_port: 8080,
-            seq: 1000,
-            length: 500,
-            tcp_flags: 0x10,
-            event_type: packet_event_type::PACKET_QUEUE_RCV,
-            cpu: 0,
-            socket_id,
-            ..Default::default()
-        };
-
-        let buffer_queue = crate::systing_core::types::packet_event {
-            ts: 1110,
-            af: network_address_family::NETWORK_AF_INET,
-            dest_addr,
-            dest_port: 8080,
-            seq: 1000,
-            length: 500,
-            tcp_flags: 0,
-            event_type: packet_event_type::PACKET_BUFFER_QUEUE,
-            cpu: 0,
-            socket_id,
-            ..Default::default()
-        };
-
-        recorder.handle_packet_event(rcv_est);
-        recorder.handle_packet_event(queue_rcv);
-        recorder.handle_packet_event(buffer_queue);
-
-        let packets = generate_trace_packets(&mut recorder, &pid_uuids, &thread_uuids, &id_counter);
-
-        assert!(!packets.is_empty());
-        let interned_packet = &packets[0];
-        assert!(interned_packet.interned_data.is_some());
-
-        let has_network_packets_track = packets
-            .iter()
-            .any(|p| p.has_track_descriptor() && p.track_descriptor().name() == "Network Packets");
-        assert!(
-            has_network_packets_track,
-            "Should have 'Network Packets' track"
-        );
-
-        // No syscall events in this test, so no "Network" track should be created
-        // (only packet events are present)
-    }
-
-    #[test]
     fn test_packet_events_send_and_receive() {
         use crate::systing_core::types::{network_address_family, packet_event_type};
 
@@ -3542,74 +2544,6 @@ mod tests {
         assert_eq!(
             udp_rcv[0].length, payload_size,
             "Length should be payload only"
-        );
-    }
-
-    #[test]
-    fn test_udp_packet_send_does_not_create_tcp_track() {
-        use crate::systing_core::types::{network_address_family, packet_event_type};
-        use std::sync::atomic::AtomicUsize;
-        use std::sync::Arc;
-
-        let mut recorder = NetworkRecorder::default();
-
-        let mut dest_addr = [0u8; 16];
-        dest_addr[0..4].copy_from_slice(&[8, 8, 8, 8]); // 8.8.8.8
-        let socket_id: SocketId = 1;
-
-        insert_test_socket_metadata(
-            &mut recorder,
-            socket_id,
-            network_protocol::NETWORK_UDP.0,
-            network_address_family::NETWORK_AF_INET.0,
-            dest_addr,
-            53,
-        );
-
-        // Create UDP PACKET_SEND event (qdisc->NIC, shared event type with TCP)
-        // Goes to global packet_events
-        let udp_packet_send_event = crate::systing_core::types::packet_event {
-            ts: 1000,
-            protocol: network_protocol::NETWORK_UDP, // UDP protocol
-            af: network_address_family::NETWORK_AF_INET,
-            dest_addr,
-            dest_port: 53,
-            seq: 0,
-            length: 512,
-            tcp_flags: 0,
-            event_type: packet_event_type::PACKET_SEND, // Shared with TCP!
-            cpu: 0,
-            socket_id,
-            ..Default::default()
-        };
-
-        recorder.handle_packet_event(udp_packet_send_event);
-
-        let id_counter = Arc::new(AtomicUsize::new(1000));
-        let pid_uuids = std::collections::HashMap::new();
-        let thread_uuids = std::collections::HashMap::new();
-
-        let packets = generate_trace_packets(&mut recorder, &pid_uuids, &thread_uuids, &id_counter);
-
-        // Find socket-level track descriptors
-        let socket_tracks: Vec<_> = packets
-            .iter()
-            .filter(|p| p.has_track_descriptor())
-            .filter(|p| p.track_descriptor().name().starts_with("Socket "))
-            .collect();
-
-        // Should have exactly 1 socket track for the UDP connection
-        assert_eq!(
-            socket_tracks.len(),
-            1,
-            "Should only create ONE socket track for UDP connection, not duplicate TCP+UDP tracks"
-        );
-
-        // Verify it's identified as UDP
-        let socket_track_name = socket_tracks[0].track_descriptor().name();
-        assert!(
-            socket_track_name.contains("UDP"),
-            "Socket track should be identified as UDP: {socket_track_name}"
         );
     }
 
