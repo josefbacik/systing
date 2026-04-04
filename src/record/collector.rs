@@ -8,11 +8,11 @@ use anyhow::Result;
 
 use crate::trace::{
     ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ExtractedData,
-    InstantArgRecord, InstantRecord, IrqSliceRecord, NetworkInterfaceRecord, NetworkPacketRecord,
-    NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord,
-    SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord,
-    StackSampleRecord, SysInfoRecord, ThreadRecord, ThreadStateRecord, TpuDeviceRecord,
-    TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
+    InstantArgRecord, InstantRecord, IrqSliceRecord, NetworkDnsRecord, NetworkInterfaceRecord,
+    NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord,
+    ProcessExitRecord, ProcessRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord,
+    SoftirqSliceRecord, StackRecord, StackSampleRecord, SysInfoRecord, ThreadRecord,
+    ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Trait for collecting trace records during recording.
@@ -102,6 +102,9 @@ pub trait RecordCollector {
 
     /// Add a network poll record.
     fn add_network_poll(&mut self, record: NetworkPollRecord) -> Result<()>;
+
+    /// Add a network DNS record.
+    fn add_network_dns(&mut self, record: NetworkDnsRecord) -> Result<()>;
 
     /// Set the system info record (only one per trace).
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()>;
@@ -275,6 +278,11 @@ impl RecordCollector for InMemoryCollector {
 
     fn add_network_poll(&mut self, record: NetworkPollRecord) -> Result<()> {
         self.data.network_polls.push(record);
+        Ok(())
+    }
+
+    fn add_network_dns(&mut self, record: NetworkDnsRecord) -> Result<()> {
+        self.data.network_dns.push(record);
         Ok(())
     }
 

@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
@@ -12,7 +11,6 @@ use crate::marker_recorder::MarkerRecorder;
 use crate::network_recorder::NetworkRecorder;
 use crate::parquet::StreamingParquetWriter;
 use crate::perf_recorder::PerfCounterRecorder;
-use crate::perfetto::{TraceWriter, TrackCounter};
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
@@ -28,14 +26,10 @@ use crate::utid::UtidGenerator;
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
 use perfetto_protos::clock_snapshot::ClockSnapshot;
-use perfetto_protos::counter_descriptor::counter_descriptor::Unit;
-use perfetto_protos::counter_descriptor::CounterDescriptor;
 use perfetto_protos::process_descriptor::ProcessDescriptor;
 use perfetto_protos::process_tree::process_tree::Process as ProtoProcess;
 use perfetto_protos::system_info::Utsname;
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
-use perfetto_protos::trace_packet::TracePacket;
-use perfetto_protos::track_descriptor::TrackDescriptor;
 use std::fs::{self, File};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -49,7 +43,6 @@ pub struct SysInfoEvent {
 
 pub struct SysinfoRecorder {
     pub ringbuf: RingBuffer<SysInfoEvent>,
-    pub frequency: HashMap<u32, Vec<TrackCounter>>,
     // Streaming support
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
     track_ids: HashMap<u32, i64>,
@@ -60,7 +53,6 @@ impl Default for SysinfoRecorder {
     fn default() -> Self {
         Self {
             ringbuf: RingBuffer::default(),
-            frequency: HashMap::new(),
             streaming_collector: None,
             track_ids: HashMap::new(),
             next_track_id: 1,
@@ -368,117 +360,45 @@ impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
         &mut self.ringbuf
     }
     fn handle_event(&mut self, event: SysInfoEvent) {
-        if let Some(ref mut collector) = self.streaming_collector {
-            // STREAMING PATH: emit directly to collector
-            let cpu = event.cpu;
-            let track_id = if let Some(&id) = self.track_ids.get(&cpu) {
-                id
-            } else {
-                let track_id = self.next_track_id;
-                self.next_track_id += 1;
+        debug_assert!(
+            self.streaming_collector.is_some(),
+            "streaming collector must be set before handling events"
+        );
 
-                if let Err(e) = collector.add_counter_track(CounterTrackRecord {
-                    id: track_id,
-                    name: format!("CPU {cpu} frequency"),
-                    unit: Some("Hz".to_string()),
-                }) {
-                    eprintln!("Warning: Failed to create frequency track: {e}");
-                }
+        let Some(ref mut collector) = self.streaming_collector else {
+            return;
+        };
 
-                self.track_ids.insert(cpu, track_id);
-                track_id
-            };
-
-            if let Err(e) = collector.add_counter(CounterRecord {
-                ts: event.ts as i64,
-                track_id,
-                value: event.frequency as f64,
-            }) {
-                eprintln!("Warning: Failed to stream frequency record: {e}");
-            }
+        let cpu = event.cpu;
+        let track_id = if let Some(&id) = self.track_ids.get(&cpu) {
+            id
         } else {
-            // NON-STREAMING PATH: accumulate (existing behavior)
-            let freq = self.frequency.entry(event.cpu).or_default();
-            freq.push(TrackCounter {
-                ts: event.ts,
-                count: event.frequency,
-            });
+            let track_id = self.next_track_id;
+            self.next_track_id += 1;
+
+            if let Err(e) = collector.add_counter_track(CounterTrackRecord {
+                id: track_id,
+                name: format!("CPU {cpu} frequency"),
+                unit: Some("Hz".to_string()),
+            }) {
+                eprintln!("Warning: Failed to create frequency track: {e}");
+            }
+
+            self.track_ids.insert(cpu, track_id);
+            track_id
+        };
+
+        if let Err(e) = collector.add_counter(CounterRecord {
+            ts: event.ts as i64,
+            track_id,
+            value: event.frequency as f64,
+        }) {
+            eprintln!("Warning: Failed to stream frequency record: {e}");
         }
     }
 }
 
 impl SysinfoRecorder {
-    /// Write trace data directly to a RecordCollector (Parquet-first path).
-    ///
-    /// This method outputs CPU frequency counter records directly.
-    pub fn write_records(
-        &self,
-        collector: &mut dyn RecordCollector,
-        track_id_counter: &mut i64,
-    ) -> Result<()> {
-        for (cpu, events) in self.frequency.iter() {
-            let track_id = *track_id_counter;
-            *track_id_counter += 1;
-
-            collector.add_counter_track(CounterTrackRecord {
-                id: track_id,
-                name: format!("CPU {cpu} frequency"),
-                unit: Some("Hz".to_string()),
-            })?;
-
-            for event in events.iter() {
-                collector.add_counter(CounterRecord {
-                    ts: event.ts as i64,
-                    track_id,
-                    value: event.count as f64,
-                })?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Write trace data to Perfetto format (used by parquet-to-perfetto conversion).
-    pub fn write_trace(
-        &self,
-        writer: &mut dyn TraceWriter,
-        id_counter: &Arc<AtomicUsize>,
-    ) -> Result<()> {
-        // Populate the sysinfo events
-        for (cpu, events) in self.frequency.iter() {
-            let desc_uuid = id_counter.fetch_add(1, Ordering::Relaxed) as u64;
-
-            let mut counter_desc = CounterDescriptor::default();
-            counter_desc.set_unit(Unit::UNIT_COUNT);
-            counter_desc.set_is_incremental(false);
-
-            let mut desc = TrackDescriptor::default();
-            desc.set_name(format!("CPU {cpu} frequency").to_string());
-            desc.set_uuid(desc_uuid);
-            desc.counter = Some(counter_desc).into();
-
-            let mut packet = TracePacket::default();
-            packet.set_track_descriptor(desc);
-            writer.write_packet(&packet)?;
-
-            let seq = id_counter.fetch_add(1, Ordering::Relaxed) as u32;
-            for event in events.iter() {
-                writer.write_packet(&event.to_track_event(desc_uuid, seq))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Returns the minimum timestamp from all frequency events, or None if no events recorded.
-    ///
-    /// Note: In streaming mode, this returns `None` since events bypass the frequency HashMap.
-    pub fn min_timestamp(&self) -> Option<u64> {
-        self.frequency
-            .values()
-            .filter_map(|counters| counters.first())
-            .map(|c| c.ts)
-            .min()
-    }
-
     /// Set the streaming collector for direct parquet output.
     ///
     /// When set, events will be streamed directly to the collector during
@@ -488,15 +408,6 @@ impl SysinfoRecorder {
     /// so local track IDs (starting at 1) are safe - they write to separate files.
     pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
         self.streaming_collector = Some(collector);
-    }
-
-    /// Returns true if streaming mode is enabled.
-    ///
-    /// When streaming is enabled, events are written directly to the collector
-    /// during `handle_event()` rather than being accumulated in memory.
-    /// Use `set_streaming_collector()` to enable streaming mode.
-    pub fn is_streaming(&self) -> bool {
-        self.streaming_collector.is_some()
     }
 
     /// Finish streaming and return the collector.
@@ -536,10 +447,7 @@ impl SessionRecorder {
             perf_counter_recorder: Mutex::new(PerfCounterRecorder::default()),
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::new(Arc::clone(&utid_generator))),
-            network_recorder: Mutex::new(NetworkRecorder::new(
-                resolve_network_addresses,
-                Arc::clone(&utid_generator),
-            )),
+            network_recorder: Mutex::new(NetworkRecorder::new(resolve_network_addresses)),
             marker_recorder: Mutex::new(
                 MarkerRecorder::default()
                     .with_threshold(marker_threshold)
@@ -932,14 +840,11 @@ impl SessionRecorder {
         Ok(())
     }
 
-    /// Generate trace data directly to Parquet files (Parquet-first path).
+    /// Finalize the streaming parquet trace.
     ///
-    /// This method outputs trace data directly to Parquet files without going through
-    /// the Perfetto format. It uses the StreamingParquetWriter and calls write_records()
-    /// on each recorder.
-    ///
-    /// # Arguments
-    /// * `output_dir` - Directory to write Parquet files to
+    /// Flushes all streaming recorders and writes process/thread metadata to the
+    /// parquet output directory. Streaming must have been initialized via
+    /// `init_streaming_parquet` before calling this method.
     pub fn generate_parquet_trace(
         &self,
         output_dir: &Path,
@@ -957,23 +862,15 @@ impl SessionRecorder {
             event_recorder.finish(end_ts)?
         };
 
-        // Track whether we got a collector from streaming
-        let has_streaming_collector = collector_opt.is_some();
-
-        // Use the streaming collector if available, otherwise create a new writer
-        let mut writer: Box<dyn RecordCollector + Send> = if let Some(collector) = collector_opt {
-            // We have a streaming collector with scheduler data already written
-            collector
-        } else {
-            // Streaming wasn't enabled, create a new writer
-            Box::new(StreamingParquetWriter::new(output_dir)?)
-        };
+        // The streaming collector has scheduler data already written
+        let mut writer: Box<dyn RecordCollector + Send> = collector_opt.ok_or_else(|| {
+            anyhow::anyhow!("streaming collector must be initialized before generating trace")
+        })?;
 
         // ID counters for generating unique IDs across all records
         let mut track_id_counter: i64 = 1;
         let mut slice_id_counter: i64 = 1;
         let mut instant_id_counter: i64 = 1;
-        let mut stack_id_counter: i64 = 1;
 
         // Step 2: Generate clock snapshot records
         eprintln!("Writing clock snapshot...");
@@ -1083,96 +980,30 @@ impl SessionRecorder {
         eprintln!("Writing network interface metadata...");
         self.write_network_interface_records(&mut *writer)?;
 
-        // Step 5: Write records from all recorders
-        // Note: We skip the scheduler trace records here because they were already written
-        // via streaming (if streaming was enabled), or will be written via write_records (if not).
-        // Only write scheduler records if streaming was not enabled.
-        if !has_streaming_collector {
-            eprintln!("Writing scheduler trace records...");
-            self.event_recorder
-                .lock()
-                .unwrap()
-                .write_records(&mut *writer)?;
+        // Step 5: Flush streaming records from all recorders
+        // Scheduler trace records were already written via streaming above.
+
+        eprintln!("Flushing stack samples and symbolizing stacks...");
+        writer = self.stack_recorder.lock().unwrap().finish(writer)?;
+
+        eprintln!("Flushing network trace records...");
+        if let Some(network_collector) = self.network_recorder.lock().unwrap().finish()? {
+            network_collector.finish_boxed()?;
         }
 
-        // Handle stack records - streaming mode uses finish(), non-streaming uses write_records()
-        let stack_streaming = self.stack_recorder.lock().unwrap().is_streaming();
-        if stack_streaming {
-            eprintln!("Flushing stack samples and symbolizing stacks...");
-            // Pass ownership to finish(), which returns it after writing
-            writer = self.stack_recorder.lock().unwrap().finish(writer)?;
-        } else {
-            eprintln!("Writing stack trace records...");
-            self.stack_recorder
-                .lock()
-                .unwrap()
-                .write_records(&mut *writer, &mut stack_id_counter)?;
+        eprintln!("Flushing perf counter records from streaming...");
+        if let Some(perf_collector) = self.perf_counter_recorder.lock().unwrap().finish()? {
+            perf_collector.finish_boxed()?;
         }
 
-        // Handle network records - streaming mode uses finish(), non-streaming uses write_records()
-        let network_streaming = self.network_recorder.lock().unwrap().is_streaming();
-        if network_streaming {
-            eprintln!("Flushing network trace records...");
-            // Finish returns the collector it was using for streaming
-            // We need to properly close it to finalize the Parquet files
-            if let Some(network_collector) = self.network_recorder.lock().unwrap().finish()? {
-                network_collector.finish_boxed()?;
-            }
-        } else {
-            eprintln!("Writing network trace records...");
-            self.network_recorder.lock().unwrap().write_records(
-                &mut *writer,
-                &mut track_id_counter,
-                &mut slice_id_counter,
-                &mut instant_id_counter,
-            )?;
+        eprintln!("Flushing sysinfo records from streaming...");
+        if let Some(sysinfo_collector) = self.sysinfo_recorder.lock().unwrap().finish()? {
+            sysinfo_collector.finish_boxed()?;
         }
 
-        // Handle perf counter records (streaming or non-streaming)
-        let perf_streaming = self.perf_counter_recorder.lock().unwrap().is_streaming();
-        if perf_streaming {
-            eprintln!("Flushing perf counter records from streaming...");
-            if let Some(perf_collector) = self.perf_counter_recorder.lock().unwrap().finish()? {
-                perf_collector.finish_boxed()?;
-            }
-        } else {
-            eprintln!("Writing perf counter records...");
-            self.perf_counter_recorder
-                .lock()
-                .unwrap()
-                .write_records(&mut *writer, &mut track_id_counter)?;
-        }
-
-        // Handle sysinfo records (streaming or non-streaming)
-        let sysinfo_streaming = self.sysinfo_recorder.lock().unwrap().is_streaming();
-        if sysinfo_streaming {
-            eprintln!("Flushing sysinfo records from streaming...");
-            if let Some(sysinfo_collector) = self.sysinfo_recorder.lock().unwrap().finish()? {
-                sysinfo_collector.finish_boxed()?;
-            }
-        } else {
-            eprintln!("Writing sysinfo records...");
-            self.sysinfo_recorder
-                .lock()
-                .unwrap()
-                .write_records(&mut *writer, &mut track_id_counter)?;
-        }
-
-        // Handle probe records - streaming mode uses finish(), non-streaming uses write_records()
-        let probe_streaming = self.probe_recorder.lock().unwrap().is_streaming();
-        if probe_streaming {
-            eprintln!("Flushing probe trace records...");
-            if let Some(probe_collector) = self.probe_recorder.lock().unwrap().finish()? {
-                probe_collector.finish_boxed()?;
-            }
-        } else {
-            eprintln!("Writing probe trace records...");
-            self.probe_recorder.lock().unwrap().write_records(
-                &mut *writer,
-                &mut track_id_counter,
-                &mut slice_id_counter,
-                &mut instant_id_counter,
-            )?;
+        eprintln!("Flushing probe trace records...");
+        if let Some(probe_collector) = self.probe_recorder.lock().unwrap().finish()? {
+            probe_collector.finish_boxed()?;
         }
 
         // Write marker records (only if any were collected)
@@ -1225,6 +1056,8 @@ mod tests {
     use perfetto_protos::process_tree::ProcessTree;
     use perfetto_protos::system_info::SystemInfo;
     use perfetto_protos::trace_packet::TracePacket;
+    use perfetto_protos::track_descriptor::TrackDescriptor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, RwLock};
 
     // PIDs above Linux's pid_max (4194304) to ensure /proc lookups never
@@ -1243,14 +1076,6 @@ mod tests {
     /// Gets the minimum timestamp from all recorded events across all recorders.
     fn get_min_event_timestamp(recorder: &SessionRecorder) -> u64 {
         [
-            recorder.stack_recorder.lock().unwrap().min_timestamp(),
-            recorder
-                .perf_counter_recorder
-                .lock()
-                .unwrap()
-                .min_timestamp(),
-            recorder.sysinfo_recorder.lock().unwrap().min_timestamp(),
-            recorder.probe_recorder.lock().unwrap().min_timestamp(),
             recorder.network_recorder.lock().unwrap().min_timestamp(),
             recorder.marker_recorder.lock().unwrap().min_timestamp(),
         ]

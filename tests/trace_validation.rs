@@ -46,7 +46,6 @@ const NETNS_RECORDING_DURATION_SECS: u64 = 10;
 const VALIDATION_SUITE_DURATION_SECS: u64 = 4;
 
 /// Recording duration for the network suite (seconds).
-/// Set to 3s to allow time for traffic generation after BPF init (~500ms).
 const NETWORK_SUITE_DURATION_SECS: u64 = 3;
 
 /// Helper to set up the environment for BPF tests.
@@ -734,6 +733,9 @@ fn test_e2e_network_suite() {
     let trace_path = dir.path().join("trace.pb");
 
     // Record a trace with network enabled and traffic generation
+    // network_packets defaults to false, so only TCP state tracking probes are
+    // loaded (not the heavier packet-level kprobes). This keeps the test fast
+    // while still exercising the network state change and DuckDB validation paths.
     let config = Config {
         duration: NETWORK_SUITE_DURATION_SECS,
         parquet_only: false,
@@ -743,37 +745,34 @@ fn test_e2e_network_suite() {
         ..Config::default()
     };
 
-    // Spawn traffic generation thread
-    let traffic_thread = thread::spawn(|| {
-        thread::sleep(Duration::from_millis(500));
+    // Spawn traffic generation thread that runs continuously until signaled to stop.
+    // BPF setup with network probes can take several seconds, so the thread must
+    // keep generating connections throughout the entire recording window.
+    // We sleep 200ms between rounds to keep traffic volume reasonable.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let stop_traffic = Arc::new(AtomicBool::new(false));
+    let stop_flag = stop_traffic.clone();
+    let traffic_thread = thread::spawn(move || {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind traffic listener");
+        let addr = listener.local_addr().unwrap();
 
-        // Start a local TCP listener and connect to it to guarantee socket data
-        if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") {
-            let addr = listener.local_addr().unwrap();
-            for _ in 0..3 {
-                if let Ok(_stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
-                    let _ = listener.accept();
-                }
-                thread::sleep(Duration::from_millis(200));
+        while !stop_flag.load(Ordering::Relaxed) {
+            // Make a single TCP connection per iteration
+            if let Ok(_stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+                let _ = listener.accept();
             }
-        }
-
-        // Also try connecting to common ports for additional network events
-        for _ in 0..3 {
-            let _ = TcpStream::connect_timeout(
-                &"127.0.0.1:22".parse().unwrap(),
-                Duration::from_millis(100),
-            );
-            let _ = TcpStream::connect_timeout(
-                &"127.0.0.1:80".parse().unwrap(),
-                Duration::from_millis(100),
-            );
             thread::sleep(Duration::from_millis(200));
         }
     });
 
-    eprintln!("Recording trace (3s, network=true, with traffic)...");
+    eprintln!(
+        "Recording trace ({}s, network=true, with traffic)...",
+        NETWORK_SUITE_DURATION_SECS
+    );
     systing(config, None).expect("systing recording failed");
+    stop_traffic.store(true, Ordering::Relaxed);
     traffic_thread.join().expect("Traffic thread panicked");
     eprintln!("Recording complete.\n");
 
@@ -2445,9 +2444,13 @@ if __name__ == "__main__":
 /// for events to be captured after BPF initialization (~500ms).
 const MARKER_RECORDING_DURATION_SECS: u64 = 3;
 
-/// Search a parquet file's column for a row matching `target`.
+/// Search a parquet file's column for a row matching a predicate.
 /// Returns true if any matching row is found.
-fn parquet_column_contains(path: &std::path::Path, column: &str, target: &str) -> bool {
+fn parquet_column_matches(
+    path: &std::path::Path,
+    column: &str,
+    pred: impl Fn(&str) -> bool,
+) -> bool {
     use arrow::array::StringArray;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -2466,13 +2469,17 @@ fn parquet_column_contains(path: &std::path::Path, column: &str, target: &str) -
                 .downcast_ref::<StringArray>()
                 .expect("column is not StringArray");
             for i in 0..arr.len() {
-                if !arr.is_null(i) && arr.value(i) == target {
+                if !arr.is_null(i) && pred(arr.value(i)) {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+fn parquet_column_contains(path: &std::path::Path, column: &str, target: &str) -> bool {
+    parquet_column_matches(path, column, |v| v == target)
 }
 
 /// Check whether a parquet file contains a specific i64 value in a named column.
@@ -2502,6 +2509,10 @@ fn parquet_int_column_contains(path: &std::path::Path, column: &str, target: i64
         }
     }
     false
+}
+
+fn parquet_column_contains_prefix(path: &std::path::Path, column: &str, prefix: &str) -> bool {
+    parquet_column_matches(path, column, |v| v.starts_with(prefix))
 }
 
 /// Parameters for a marker workload used by [`run_marker_recording`].
@@ -3016,4 +3027,446 @@ fn test_e2e_marker_duration_threshold() {
     );
 
     eprintln!("  All marker duration threshold checks passed");
+}
+
+// =============================================================================
+// Events / Probe integration tests
+// =============================================================================
+
+/// Recording duration for events integration tests (seconds).
+const EVENTS_RECORDING_DURATION_SECS: u64 = 3;
+
+/// Workload type for events integration tests.
+enum EventsWorkload {
+    /// Open /dev/null in a loop (triggers openat/do_sys_openat2).
+    FileOpen,
+    /// Send SIGUSR1 to self in a loop (triggers signal_generate).
+    Signal,
+}
+
+/// Helper to run a systing recording with a workload and custom config overrides.
+///
+/// Spawns a workload thread of the specified type and records for
+/// EVENTS_RECORDING_DURATION_SECS. The `customize` closure can modify the
+/// Config before recording starts (e.g. to set trace_event_config or syscalls).
+fn run_events_recording_with(
+    workload: EventsWorkload,
+    customize: impl FnOnce(&mut Config),
+) -> TempDir {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+
+    let workload_handle = thread::spawn(move || match workload {
+        EventsWorkload::FileOpen => {
+            while !stop_clone.load(Ordering::Relaxed) {
+                let _ = std::fs::File::open("/dev/null");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        EventsWorkload::Signal => {
+            let pid = unsafe { libc::getpid() };
+            let prev = unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
+            while !stop_clone.load(Ordering::Relaxed) {
+                unsafe {
+                    libc::kill(pid, libc::SIGUSR1);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            unsafe {
+                libc::signal(libc::SIGUSR1, prev);
+            }
+        }
+    });
+
+    let mut config = Config {
+        duration: EVENTS_RECORDING_DURATION_SECS,
+        output_dir: dir.path().to_path_buf(),
+        no_sched: true,
+        no_cpu_stack_traces: true,
+        no_sleep_stack_traces: true,
+        no_interruptible_stack_traces: true,
+        network: false,
+        collect_pystacks: false,
+        parquet_only: true,
+        ..Config::default()
+    };
+    customize(&mut config);
+
+    systing(config, None).expect("systing recording failed");
+    stop.store(true, Ordering::Relaxed);
+    workload_handle.join().expect("Workload thread panicked");
+
+    dir
+}
+
+/// Helper to run a systing recording with a JSON events config file.
+///
+/// Writes `config_json` to a temp file and delegates to run_events_recording_with.
+fn run_events_recording(config_json: &str, workload: EventsWorkload) -> TempDir {
+    // Write the JSON config to a temp file that outlives the recording
+    let config_file = tempfile::NamedTempFile::new().expect("Failed to create temp config file");
+    std::fs::write(config_file.path(), config_json).expect("Failed to write events config");
+    let config_path = config_file.path().to_string_lossy().to_string();
+
+    run_events_recording_with(workload, |config| {
+        config.trace_event_config = vec![config_path];
+    })
+}
+
+/// Integration test: tracepoint as instant event via JSON config.
+///
+/// Attaches `signal:signal_generate` as an instant event on a custom track.
+/// A workload sends SIGUSR1 to itself in a loop to generate events.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_tracepoint_instant() {
+    setup_bpf_environment();
+
+    let config_json = r#"
+    {
+        "events": [
+            { "name": "sig_generate", "event": "tracepoint:signal:signal_generate" }
+        ],
+        "tracks": [
+            { "track_name": "SignalEvents", "instants": [{ "event": "sig_generate" }] }
+        ]
+    }
+    "#;
+
+    let dir = run_events_recording(config_json, EventsWorkload::Signal);
+
+    // --- Validate instant.parquet contains the tracepoint events ---
+    eprintln!("  tracepoint instant: validating instant.parquet...");
+    let instant_path = dir.path().join("instant.parquet");
+    assert!(
+        instant_path.exists(),
+        "instant.parquet not found - tracepoint instant events were not recorded"
+    );
+    assert!(
+        parquet_column_contains(&instant_path, "name", "tracepoint:signal:signal_generate"),
+        "tracepoint:signal:signal_generate not found in instant.parquet"
+    );
+
+    // --- Validate track.parquet has the custom track ---
+    eprintln!("  tracepoint instant: validating track.parquet...");
+    let track_path = dir.path().join("track.parquet");
+    assert!(track_path.exists(), "track.parquet not found");
+    assert!(
+        parquet_column_contains(&track_path, "name", "SignalEvents"),
+        "SignalEvents not found in track.parquet"
+    );
+
+    eprintln!("  All tracepoint instant checks passed");
+}
+
+/// Integration test: tracepoint range event via JSON config.
+///
+/// Uses `raw_syscalls:sys_enter` as the start event and
+/// `raw_syscalls:sys_exit` as the end event to form a range.
+/// These are raw tracepoints that fire for every syscall.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_tracepoint_range() {
+    setup_bpf_environment();
+
+    let config_json = r#"
+    {
+        "events": [
+            { "name": "sys_enter", "event": "tracepoint:raw_syscalls:sys_enter" },
+            { "name": "sys_exit", "event": "tracepoint:raw_syscalls:sys_exit" }
+        ],
+        "tracks": [
+            {
+                "track_name": "SyscallRanges",
+                "ranges": [{ "name": "syscall_range", "start": "sys_enter", "end": "sys_exit" }]
+            }
+        ]
+    }
+    "#;
+
+    let dir = run_events_recording(config_json, EventsWorkload::FileOpen);
+
+    // --- Validate slice.parquet contains the range events ---
+    eprintln!("  tracepoint range: validating slice.parquet...");
+    let slice_path = dir.path().join("slice.parquet");
+    assert!(
+        slice_path.exists(),
+        "slice.parquet not found - tracepoint range events were not recorded"
+    );
+    assert!(
+        parquet_column_contains(&slice_path, "name", "syscall_range"),
+        "syscall_range not found in slice.parquet"
+    );
+
+    // --- Validate track.parquet has the custom track ---
+    eprintln!("  tracepoint range: validating track.parquet...");
+    let track_path = dir.path().join("track.parquet");
+    assert!(track_path.exists(), "track.parquet not found");
+    assert!(
+        parquet_column_contains(&track_path, "name", "SyscallRanges"),
+        "SyscallRanges not found in track.parquet"
+    );
+
+    eprintln!("  All tracepoint range checks passed");
+}
+
+/// Integration test: kprobe/kretprobe range event via JSON config.
+///
+/// Uses `kprobe:do_sys_openat2` as the start event and
+/// `kretprobe:do_sys_openat2` as the end event to form a range.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_kprobe_range() {
+    setup_bpf_environment();
+
+    let config_json = r#"
+    {
+        "events": [
+            { "name": "kp_openat", "event": "kprobe:do_sys_openat2" },
+            { "name": "kretp_openat", "event": "kretprobe:do_sys_openat2" }
+        ],
+        "tracks": [
+            {
+                "track_name": "KprobeRanges",
+                "ranges": [{ "name": "kp_openat_call", "start": "kp_openat", "end": "kretp_openat" }]
+            }
+        ]
+    }
+    "#;
+
+    let dir = run_events_recording(config_json, EventsWorkload::FileOpen);
+
+    // --- Validate slice.parquet contains the range events ---
+    eprintln!("  kprobe range: validating slice.parquet...");
+    let slice_path = dir.path().join("slice.parquet");
+    assert!(
+        slice_path.exists(),
+        "slice.parquet not found - kprobe range events were not recorded"
+    );
+    assert!(
+        parquet_column_contains(&slice_path, "name", "kp_openat_call"),
+        "kp_openat_call not found in slice.parquet"
+    );
+
+    // --- Validate track.parquet has the custom track ---
+    eprintln!("  kprobe range: validating track.parquet...");
+    let track_path = dir.path().join("track.parquet");
+    assert!(track_path.exists(), "track.parquet not found");
+    assert!(
+        parquet_column_contains(&track_path, "name", "KprobeRanges"),
+        "KprobeRanges not found in track.parquet"
+    );
+
+    eprintln!("  All kprobe range checks passed");
+}
+
+/// Integration test: syscall tracking via `--syscalls` flag.
+///
+/// Enables built-in syscall tracking (no JSON config needed). A workload opens
+/// `/dev/null` in a loop so `openat` syscalls appear in the trace.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_syscall_tracking() {
+    setup_bpf_environment();
+
+    let dir = run_events_recording_with(EventsWorkload::FileOpen, |config| {
+        config.syscalls = true;
+    });
+
+    // --- Validate slice.parquet contains syscall events ---
+    eprintln!("  syscall tracking: validating slice.parquet...");
+    let slice_path = dir.path().join("slice.parquet");
+    assert!(
+        slice_path.exists(),
+        "slice.parquet not found - syscall events were not recorded"
+    );
+    assert!(
+        parquet_column_contains(&slice_path, "name", "openat"),
+        "openat syscall not found in slice.parquet"
+    );
+
+    // --- Validate track.parquet has the syscalls track ---
+    eprintln!("  syscall tracking: validating track.parquet...");
+    let track_path = dir.path().join("track.parquet");
+    assert!(track_path.exists(), "track.parquet not found");
+    assert!(
+        parquet_column_contains(&track_path, "name", "syscalls"),
+        "syscalls track not found in track.parquet"
+    );
+
+    eprintln!("  All syscall tracking checks passed");
+}
+
+/// Integration test: CPU scope tracepoint instant event.
+///
+/// Attaches `signal:signal_generate` with `"scope": "cpu"` so events
+/// appear on per-CPU tracks rather than per-thread tracks.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_event_scope_cpu() {
+    setup_bpf_environment();
+
+    let config_json = r#"
+    {
+        "events": [
+            { "name": "sig_generate", "event": "tracepoint:signal:signal_generate", "scope": "cpu" }
+        ],
+        "tracks": [
+            { "track_name": "CpuSignal", "instants": [{ "event": "sig_generate" }] }
+        ]
+    }
+    "#;
+
+    let dir = run_events_recording(config_json, EventsWorkload::Signal);
+
+    // --- Validate instant.parquet contains the CPU-scoped events ---
+    eprintln!("  event scope cpu: validating instant.parquet...");
+    let instant_path = dir.path().join("instant.parquet");
+    assert!(
+        instant_path.exists(),
+        "instant.parquet not found - CPU-scoped instant events were not recorded"
+    );
+    assert!(
+        parquet_column_contains(&instant_path, "name", "tracepoint:signal:signal_generate"),
+        "tracepoint:signal:signal_generate not found in instant.parquet"
+    );
+
+    // --- Validate track.parquet has the custom track ---
+    eprintln!("  event scope cpu: validating track.parquet...");
+    let track_path = dir.path().join("track.parquet");
+    assert!(track_path.exists(), "track.parquet not found");
+    assert!(
+        parquet_column_contains_prefix(&track_path, "name", "CpuSignal CPU "),
+        "CpuSignal CPU track not found in track.parquet"
+    );
+
+    eprintln!("  All event scope cpu checks passed");
+}
+
+/// Test that DNS resolution populates the network_dns table.
+///
+/// This test enables `resolve_addresses` and generates traffic to a well-known
+/// hostname (google.com) so that at least one IP address resolves to a hostname.
+/// It then validates that:
+/// 1. The network_dns.parquet file is produced
+/// 2. The network_dns DuckDB table has at least one entry
+/// 3. The resolved hostname is not just the raw IP address
+#[test]
+#[ignore]
+fn test_network_dns_resolution() {
+    use std::net::TcpStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+
+    let config = Config {
+        duration: NETWORK_SUITE_DURATION_SECS,
+        parquet_only: true,
+        network: true,
+        resolve_addresses: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.duckdb"),
+        ..Config::default()
+    };
+
+    // Spawn traffic thread that connects to google.com:80 repeatedly.
+    // This ensures we have at least one socket with a publicly-resolvable IP.
+    // Note: This test requires network access to resolve and connect to google.com.
+    let stop_traffic = Arc::new(AtomicBool::new(false));
+    let stop_flag = stop_traffic.clone();
+    let traffic_thread = thread::spawn(move || {
+        use std::net::ToSocketAddrs;
+        let addr = "google.com:80"
+            .to_socket_addrs()
+            .expect("Failed to resolve google.com")
+            .next()
+            .expect("No addresses for google.com");
+
+        while !stop_flag.load(Ordering::Relaxed) {
+            // Connect to google.com on HTTP port - we just need the TCP handshake
+            // to create a socket with a resolvable IP address.
+            if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+                drop(stream);
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+
+    eprintln!(
+        "Recording trace ({}s, network=true, resolve_addresses=true)...",
+        NETWORK_SUITE_DURATION_SECS
+    );
+    systing(config, None).expect("systing recording failed");
+    stop_traffic.store(true, Ordering::Relaxed);
+    traffic_thread.join().expect("Traffic thread panicked");
+
+    // Validate network_dns.parquet exists
+    let dns_parquet = dir.path().join("network_dns.parquet");
+    assert!(
+        dns_parquet.exists(),
+        "network_dns.parquet not found in output directory"
+    );
+
+    // Convert to DuckDB and query
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "dns_test")
+        .expect("DuckDB conversion failed");
+
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    // Check that network_dns table has entries
+    let dns_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM network_dns", [], |row| row.get(0))
+        .unwrap_or(0);
+
+    eprintln!("  network_dns table has {dns_count} entries");
+    assert!(
+        dns_count > 0,
+        "network_dns table is empty - DNS resolution produced no results"
+    );
+
+    // Verify that the hostname column contains something that is NOT just an IP address
+    // (i.e., at least one entry actually resolved to a hostname)
+    let has_hostname: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM network_dns WHERE hostname != ip_address",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    assert!(
+        has_hostname,
+        "network_dns has entries but none resolved to a hostname different from the IP"
+    );
+
+    // Log some entries for debugging
+    let mut stmt = conn
+        .prepare("SELECT ip_address, hostname FROM network_dns LIMIT 10")
+        .expect("Failed to prepare query");
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0).unwrap_or_default(),
+                row.get::<_, String>(1).unwrap_or_default(),
+            ))
+        })
+        .expect("Failed to query");
+    for (ip, hostname) in rows.flatten() {
+        eprintln!("    {ip} -> {hostname}");
+    }
+
+    eprintln!("  All DNS resolution checks passed");
 }

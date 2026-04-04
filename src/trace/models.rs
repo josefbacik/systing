@@ -419,6 +419,17 @@ pub struct NetworkSocketRecord {
     pub last_seen_ts: Option<i64>,
 }
 
+/// Network DNS record - maps IP addresses to resolved hostnames.
+///
+/// # Fields
+/// - `ip_address`: IP address string
+/// - `hostname`: Resolved hostname
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkDnsRecord {
+    pub ip_address: String,
+    pub hostname: String,
+}
+
 /// Network poll record - represents socket poll events.
 ///
 /// Dedicated table for poll events that were previously mixed with other events.
@@ -486,6 +497,7 @@ pub struct ExtractedData {
     pub network_packets: Vec<NetworkPacketRecord>,
     pub network_sockets: Vec<NetworkSocketRecord>,
     pub network_polls: Vec<NetworkPollRecord>,
+    pub network_dns: Vec<NetworkDnsRecord>,
     pub clock_snapshots: Vec<ClockSnapshotRecord>,
     pub sysinfo: Option<SysInfoRecord>,
     pub tpu_devices: Vec<TpuDeviceRecord>,

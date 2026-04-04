@@ -77,3 +77,10 @@ Cleanup of unused TPU tables and rename of `tpu_op.step_id`.
 
 ### Changed columns
 - `tpu_op.step_id` → `tpu_op.group_id` — Now stores the raw XSpace `group_id` (training step identifier) directly. Previously this was always NULL due to a remapping bug.
+
+## Schema Version 5 (systing 1.4.0) — 2026-04-03
+
+Added DNS resolution lookup table for network traces.
+
+### New tables
+- `network_dns` — Maps IP addresses to resolved hostnames (ip_address, hostname). Populated at the end of recording when `--resolve-addresses` is enabled. Can be joined with `network_socket.src_ip` or `network_socket.dest_ip` for hostname lookups.

@@ -61,39 +61,6 @@ struct PendingSoftirq {
     vec: i32,
 }
 
-/// Completed IRQ slice (entry + exit paired).
-struct CompletedIrq {
-    ts: i64,
-    dur: i64,
-    cpu: i32,
-    irq: i32,
-    name: Option<String>,
-    ret: Option<i32>,
-}
-
-/// Completed softirq slice (entry + exit paired).
-struct CompletedSoftirq {
-    ts: i64,
-    dur: i64,
-    cpu: i32,
-    vec: i32,
-}
-
-/// Wakeup new event data.
-struct WakeupNewEvent {
-    ts: i64,
-    cpu: i32,
-    pid: i32,
-    target_cpu: i32,
-}
-
-/// Process exit event data.
-struct ProcessExitEvent {
-    ts: i64,
-    cpu: i32,
-    pid: i32,
-}
-
 pub struct SchedEventRecorder {
     pub ringbuf: RingBuffer<task_event>,
     // Pending IRQ/softirq events keyed by (cpu, irq/vec).
@@ -102,12 +69,7 @@ pub struct SchedEventRecorder {
     // When we receive an exit event, we look up the matching entry by this key.
     pending_irqs: HashMap<(u32, i32), PendingIrq>,
     pending_softirqs: HashMap<(u32, i32), PendingSoftirq>,
-    // Completed events for Parquet output
-    completed_irqs: Vec<CompletedIrq>,
-    completed_softirqs: Vec<CompletedSoftirq>,
-    wakeup_news: Vec<WakeupNewEvent>,
-    process_exits: Vec<ProcessExitEvent>,
-    // Streaming support: per-CPU state tracking
+    // Per-CPU state for building sched slices
     cpu_states: HashMap<u32, CpuRunningState>,
     pending_slices: Vec<SchedSliceRecord>,
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
@@ -125,11 +87,14 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
     }
 
     fn handle_event(&mut self, event: task_event) {
+        debug_assert!(
+            self.streaming_collector.is_some(),
+            "streaming_collector must be set before handling events"
+        );
+
         match event.r#type {
             // SCHED_SWITCH and SCHED_WAKING use compact sched format
             event_type::SCHED_SWITCH | event_type::SCHED_WAKING => {
-                // Handle streaming mode for SCHED_SWITCH
-                //
                 // Thread state model for Perfetto:
                 // - Wakeup events (SCHED_WAKING): emit ThreadStateRecord with state=0 (runnable)
                 // - Sleep events (SCHED_SWITCH with prev_state != 0): emit ThreadStateRecord
@@ -191,7 +156,7 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                     );
                 }
 
-                // Handle streaming mode for SCHED_WAKING: emit ThreadStateRecord immediately
+                // SCHED_WAKING: emit ThreadStateRecord
                 if event.r#type == event_type::SCHED_WAKING {
                     // Extract tid from lower 32 bits of tgidpid
                     // Get utid before borrowing collector mutably
@@ -235,7 +200,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                 if let Some(pending) = self.pending_irqs.remove(&(event.cpu, irq)) {
                     let dur = event.ts.saturating_sub(pending.ts) as i64;
 
-                    // If streaming, emit immediately and skip memory storage
                     if let Some(collector) = &mut self.streaming_collector {
                         if let Err(e) = collector.add_irq_slice(IrqSliceRecord {
                             ts: pending.ts as i64,
@@ -247,16 +211,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                         }) {
                             eprintln!("Warning: Failed to stream IRQ slice: {e}");
                         }
-                    } else {
-                        // Non-streaming: store in memory for later write_records()
-                        self.completed_irqs.push(CompletedIrq {
-                            ts: pending.ts as i64,
-                            dur,
-                            cpu: event.cpu as i32,
-                            irq: pending.irq,
-                            name: pending.name_option(),
-                            ret: Some(ret),
-                        });
                     }
                 }
             }
@@ -274,7 +228,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                 if let Some(pending) = self.pending_softirqs.remove(&(event.cpu, vec)) {
                     let dur = event.ts.saturating_sub(pending.ts) as i64;
 
-                    // If streaming, emit immediately and skip memory storage
                     if let Some(collector) = &mut self.streaming_collector {
                         if let Err(e) = collector.add_softirq_slice(SoftirqSliceRecord {
                             ts: pending.ts as i64,
@@ -284,14 +237,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                         }) {
                             eprintln!("Warning: Failed to stream softirq slice: {e}");
                         }
-                    } else {
-                        // Non-streaming: store in memory for later write_records()
-                        self.completed_softirqs.push(CompletedSoftirq {
-                            ts: pending.ts as i64,
-                            dur,
-                            cpu: event.cpu as i32,
-                            vec: pending.vec,
-                        });
                     }
                 }
             }
@@ -303,7 +248,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                 let tid = event.next.tgidpid as i32;
                 let utid = self.utid_generator.get_or_create_utid(tid);
 
-                // Stream immediately if streaming mode is enabled
                 if let Some(collector) = &mut self.streaming_collector {
                     if let Err(e) = collector.add_wakeup_new(WakeupNewRecord {
                         ts: event.ts as i64,
@@ -313,14 +257,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                     }) {
                         eprintln!("Warning: Failed to stream wakeup_new: {e}");
                     }
-                } else {
-                    // Non-streaming: buffer for later
-                    self.wakeup_news.push(WakeupNewEvent {
-                        ts: event.ts as i64,
-                        cpu: event.cpu as i32,
-                        pid: tid,
-                        target_cpu: event.target_cpu as i32,
-                    });
                 }
             }
 
@@ -331,7 +267,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                 let tid = event.prev.tgidpid as i32;
                 let utid = self.utid_generator.get_or_create_utid(tid);
 
-                // Stream immediately if streaming mode is enabled
                 if let Some(collector) = &mut self.streaming_collector {
                     if let Err(e) = collector.add_process_exit(ProcessExitRecord {
                         ts: event.ts as i64,
@@ -340,13 +275,6 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                     }) {
                         eprintln!("Warning: Failed to stream process_exit: {e}");
                     }
-                } else {
-                    // Non-streaming: buffer for later
-                    self.process_exits.push(ProcessExitEvent {
-                        ts: event.ts as i64,
-                        cpu: event.cpu as i32,
-                        pid: tid,
-                    });
                 }
             }
 
@@ -365,10 +293,6 @@ impl SchedEventRecorder {
             ringbuf: RingBuffer::default(),
             pending_irqs: HashMap::new(),
             pending_softirqs: HashMap::new(),
-            completed_irqs: Vec::new(),
-            completed_softirqs: Vec::new(),
-            wakeup_news: Vec::new(),
-            process_exits: Vec::new(),
             cpu_states: HashMap::new(),
             pending_slices: Vec::new(),
             streaming_collector: None,
@@ -379,83 +303,6 @@ impl SchedEventRecorder {
     /// Set the streaming collector for real-time event emission.
     pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
         self.streaming_collector = Some(collector);
-    }
-
-    /// Write trace data directly to a RecordCollector (Parquet-first path).
-    ///
-    /// This method outputs records directly without going through Perfetto format.
-    pub fn write_records(&self, collector: &mut dyn RecordCollector) -> Result<()> {
-        // Emit completed IRQ slices
-        for irq in &self.completed_irqs {
-            collector.add_irq_slice(IrqSliceRecord {
-                ts: irq.ts,
-                dur: irq.dur,
-                cpu: irq.cpu,
-                irq: irq.irq,
-                name: irq.name.clone(),
-                ret: irq.ret,
-            })?;
-        }
-
-        // Emit pending (unpaired) IRQ entries with dur=0 to indicate incomplete
-        // These represent IRQs that started but didn't finish before tracing ended
-        for ((cpu, _irq), pending) in &self.pending_irqs {
-            collector.add_irq_slice(IrqSliceRecord {
-                ts: pending.ts as i64,
-                dur: 0, // Incomplete - no exit event received
-                cpu: *cpu as i32,
-                irq: pending.irq,
-                name: if pending.name.is_empty() {
-                    None
-                } else {
-                    Some(pending.name.clone())
-                },
-                ret: None, // No return value without exit
-            })?;
-        }
-
-        // Emit completed softirq slices
-        for softirq in &self.completed_softirqs {
-            collector.add_softirq_slice(SoftirqSliceRecord {
-                ts: softirq.ts,
-                dur: softirq.dur,
-                cpu: softirq.cpu,
-                vec: softirq.vec,
-            })?;
-        }
-
-        // Emit pending (unpaired) softirq entries with dur=0
-        for ((cpu, _vec), pending) in &self.pending_softirqs {
-            collector.add_softirq_slice(SoftirqSliceRecord {
-                ts: pending.ts as i64,
-                dur: 0, // Incomplete - no exit event received
-                cpu: *cpu as i32,
-                vec: pending.vec,
-            })?;
-        }
-
-        // Emit wakeup_new events
-        for wakeup in &self.wakeup_news {
-            let utid = self.utid_generator.get_or_create_utid(wakeup.pid);
-            collector.add_wakeup_new(WakeupNewRecord {
-                ts: wakeup.ts,
-                cpu: wakeup.cpu,
-                utid,
-                target_cpu: wakeup.target_cpu,
-            })?;
-        }
-
-        // Emit process exit events
-        for exit in &self.process_exits {
-            let utid = self.utid_generator.get_or_create_utid(exit.pid);
-            collector.add_process_exit(ProcessExitRecord {
-                ts: exit.ts,
-                cpu: exit.cpu,
-                utid,
-            })?;
-        }
-
-        Ok(())
     }
 
     /// Finish streaming and emit final records for incomplete events.
