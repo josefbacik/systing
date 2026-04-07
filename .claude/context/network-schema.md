@@ -11,6 +11,7 @@ Network events are stored in dedicated tables (not shared with other recorders):
 - **`network_socket`** - Socket metadata (4-tuple: src/dest IP:port)
 - **`network_poll`** - Poll/epoll/select events
 - **`network_interface`** - Local network interface metadata
+- **`network_dns`** - IP-to-hostname resolution lookups (populated when `--resolve-addresses` is enabled)
 
 **Key Benefits of This Schema:**
 1. **No shared tables** - Network events don't overlap with other recorders
@@ -136,6 +137,16 @@ Local network interface metadata for cross-trace correlation.
 | interface_name | VARCHAR | Interface name (e.g., "eth0", "lo") |
 | ip_address | VARCHAR | IP address assigned to interface |
 | address_type | VARCHAR | "ipv4" or "ipv6" |
+
+### `network_dns`
+
+Reverse-DNS resolution results mapping IP addresses to hostnames. Populated at the end of recording when `--resolve-addresses` is enabled. Only contains entries where resolution succeeded (hostname differs from the raw IP). Join against `network_socket.src_ip` or `network_socket.dest_ip`.
+
+| Column | Type | Nullable | Description |
+|--------|------|----------|-------------|
+| trace_id | VARCHAR | No | Trace identifier (added during DuckDB import) |
+| ip_address | VARCHAR | No | IP address (matches `network_socket.src_ip` / `dest_ip`) |
+| hostname | VARCHAR | No | Resolved hostname |
 
 ## Common Queries
 
@@ -327,6 +338,19 @@ SELECT
 FROM network_interface ni
 JOIN network_socket sock ON ni.ip_address = sock.src_ip
 WHERE ni.namespace LIKE 'container:%';
+```
+
+### 16. Bytes by Resolved Hostname
+
+```sql
+SELECT COALESCE(dns.hostname, sock.dest_ip) as destination,
+       sock.dest_port,
+       SUM(ns.bytes) / 1048576.0 as total_mb
+FROM network_syscall ns
+JOIN network_socket sock ON ns.socket_id = sock.socket_id
+LEFT JOIN network_dns dns ON sock.dest_ip = dns.ip_address
+GROUP BY destination, sock.dest_port
+ORDER BY total_mb DESC;
 ```
 
 ## Notes
