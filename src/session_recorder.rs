@@ -8,6 +8,7 @@ use anyhow::Result;
 
 use crate::events::SystingProbeRecorder;
 use crate::marker_recorder::MarkerRecorder;
+use crate::memory_recorder::MemoryRecorder;
 use crate::network_recorder::NetworkRecorder;
 use crate::parquet::StreamingParquetWriter;
 use crate::perf_recorder::PerfCounterRecorder;
@@ -68,6 +69,7 @@ pub struct SessionRecorder {
     pub sysinfo_recorder: Mutex<SysinfoRecorder>,
     pub probe_recorder: Mutex<SystingProbeRecorder>,
     pub network_recorder: Mutex<NetworkRecorder>,
+    pub memory_recorder: Mutex<MemoryRecorder>,
     pub marker_recorder: Mutex<MarkerRecorder>,
     pub tpu_metrics_recorder: Option<Mutex<TpuMetricsRecorder>>,
     pub process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
@@ -448,6 +450,7 @@ impl SessionRecorder {
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::new(Arc::clone(&utid_generator))),
             network_recorder: Mutex::new(NetworkRecorder::new(resolve_network_addresses)),
+            memory_recorder: Mutex::new(MemoryRecorder::default()),
             marker_recorder: Mutex::new(
                 MarkerRecorder::new(Arc::clone(&utid_generator))
                     .with_threshold(marker_threshold)
@@ -803,6 +806,13 @@ impl SessionRecorder {
             .unwrap()
             .set_streaming_collector(Box::new(network_writer));
 
+        // Set up streaming collector for memory recorder (events emitted immediately)
+        let memory_writer = StreamingParquetWriter::new(output_dir)?;
+        self.memory_recorder
+            .lock()
+            .unwrap()
+            .set_streaming_collector(Box::new(memory_writer));
+
         // Set up streaming collector for probe recorder (events emitted on completion)
         let probe_writer = StreamingParquetWriter::new(output_dir)?;
         self.probe_recorder
@@ -982,6 +992,19 @@ impl SessionRecorder {
 
         // Step 5: Flush streaming records from all recorders
         // Scheduler trace records were already written via streaming above.
+
+        eprintln!("Flushing memory trace records...");
+        {
+            let mut memory = self.memory_recorder.lock().unwrap();
+            let memory_stacks = memory.take_unique_stacks();
+            if !memory_stacks.is_empty() {
+                self.stack_recorder
+                    .lock()
+                    .unwrap()
+                    .merge_external_stacks(memory_stacks);
+            }
+            writer = memory.finish(writer)?;
+        }
 
         eprintln!("Flushing stack samples and symbolizing stacks...");
         writer = self.stack_recorder.lock().unwrap().finish(writer)?;
@@ -1249,6 +1272,7 @@ mod tests {
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::new(Arc::clone(&utid_generator))),
             network_recorder: Mutex::new(NetworkRecorder::default()),
+            memory_recorder: Mutex::new(MemoryRecorder::default()),
             marker_recorder: Mutex::new(MarkerRecorder::new(Arc::clone(&utid_generator))),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),

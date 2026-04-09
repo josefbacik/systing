@@ -159,6 +159,17 @@ const SYSCALL_BPF_PROGRAMS: &[&str] = &[
     "tracepoint__raw_syscalls__sys_exit",
 ];
 
+const MEMORY_BPF_PROGRAMS: &[&str] = &[
+    "systing_rss_stat",
+    "systing_mmap_enter",
+    "systing_mmap_exit",
+    "systing_munmap_enter",
+    "systing_brk_enter",
+    "systing_brk_exit",
+    #[cfg(target_arch = "x86_64")]
+    "systing_page_fault_user",
+];
+
 const NETWORK_BPF_PROGRAMS: &[&str] = &[
     "inet_sock_set_state",
     "tcp_time_wait_entry",
@@ -247,6 +258,12 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             bpf_programs: NETWORK_PACKETS_BPF_PROGRAMS,
         },
         RecorderInfo {
+            name: "memory",
+            description: "Memory usage tracking (RSS, mmap/munmap/brk, page faults)",
+            default_enabled: false,
+            bpf_programs: MEMORY_BPF_PROGRAMS,
+        },
+        RecorderInfo {
             name: "pystacks",
             description: "Python stack tracing",
             default_enabled: false,
@@ -298,6 +315,7 @@ fn is_recorder_enabled(name: &str, opts: &Config) -> bool {
         "sleep-stacks" => !opts.no_sleep_stack_traces,
         "interruptible-stacks" => !opts.no_interruptible_stack_traces,
         "cpu-stacks" => !opts.no_cpu_stack_traces,
+        "memory" => opts.memory,
         "network" => opts.network,
         "network-packets" => opts.network_packets,
         "pystacks" => opts.collect_pystacks,
@@ -415,6 +433,10 @@ pub struct Config {
     pub marker_threshold: Option<u64>,
     /// Stop tracing when any marker range event exceeds this duration in milliseconds
     pub marker_duration_threshold: Option<u64>,
+    /// Enable memory recording (RSS, mmap/munmap/brk, page faults)
+    pub memory: bool,
+    /// Sample 1 in N user page faults (0 or 1 = record all)
+    pub memory_fault_sample_rate: u32,
     /// Enable network recording
     pub network: bool,
     /// Enable network packet-level probes (sendmsg, recvmsg, transmit, qdisc, drops).
@@ -470,6 +492,8 @@ impl Default for Config {
             markers: false,
             marker_threshold: None,
             marker_duration_threshold: None,
+            memory: false,
+            memory_fault_sample_rate: 97,
             network: false,
             network_packets: false,
             resolve_addresses: false,
@@ -584,6 +608,7 @@ pub use types::arg_type;
 pub use types::epoll_event_bpf;
 pub use types::event_type;
 pub use types::marker_event;
+pub use types::memory_event;
 pub use types::network_event;
 pub use types::packet_event;
 pub use types::perf_counter_event;
@@ -602,6 +627,7 @@ unsafe impl Plain for epoll_event_bpf {}
 unsafe impl Plain for arg_desc {}
 unsafe impl Plain for arg_desc_array {}
 unsafe impl Plain for marker_event {}
+unsafe impl Plain for memory_event {}
 
 /// BPF exec event - delivered via dedicated ringbuf when a traced process execs.
 /// Used to dynamically discover Python PIDs for pystacks.
@@ -735,6 +761,15 @@ impl SystingEvent for epoll_event_bpf {
     }
 }
 
+impl SystingEvent for memory_event {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+    fn next_task_info(&self) -> Option<&task_info> {
+        Some(&self.task)
+    }
+}
+
 impl SystingEvent for marker_event {
     fn ts(&self) -> u64 {
         self.ts
@@ -825,6 +860,7 @@ struct RecorderChannels {
     network_rx: Receiver<network_event>,
     packet_rx: Receiver<packet_event>,
     epoll_rx: Receiver<epoll_event_bpf>,
+    memory_rx: Receiver<memory_event>,
     marker_rx: Receiver<marker_event>,
     exec_event_rx: Option<Receiver<exec_event>>,
 }
@@ -846,6 +882,7 @@ fn spawn_recorder_threads(
         network_rx,
         packet_rx,
         epoll_rx,
+        memory_rx,
         marker_rx,
         ..
     } = channels;
@@ -1009,6 +1046,29 @@ fn spawn_recorder_threads(
                     0
                 })?,
         );
+    }
+
+    // Conditionally spawn memory recorder
+    if opts.memory {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        let my_task_tx = task_info_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("memory_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<crate::memory_recorder::MemoryRecorder, memory_event>(
+                        &session_recorder.memory_recorder,
+                        memory_rx,
+                        my_stop_tx,
+                        my_task_tx,
+                        None,
+                    );
+                    0
+                })?,
+        );
+    } else {
+        drop(memory_rx);
     }
 
     // Conditionally spawn marker recorder
@@ -1544,6 +1604,7 @@ fn setup_ringbuffers<'a>(
     let (network_tx, network_rx) = sync_channel(CHANNEL_CAPACITY);
     let (packet_tx, packet_rx) = sync_channel(CHANNEL_CAPACITY);
     let (epoll_tx, epoll_rx) = sync_channel(CHANNEL_CAPACITY);
+    let (memory_tx, memory_rx) = sync_channel(CHANNEL_CAPACITY);
     let (marker_tx, marker_rx) = sync_channel(CHANNEL_CAPACITY);
     let (exec_tx, exec_rx) = sync_channel(CHANNEL_CAPACITY);
     let mut has_exec_ringbuf = false;
@@ -1574,6 +1635,9 @@ fn setup_ringbuffers<'a>(
             rings.push((name.to_string(), ring));
         } else if name.starts_with("ringbuf_epoll") && opts.network {
             let ring = create_ring::<epoll_event_bpf>(&map, epoll_tx.clone())?;
+            rings.push((name.to_string(), ring));
+        } else if name.starts_with("ringbuf_memory") && opts.memory {
+            let ring = create_ring::<memory_event>(&map, memory_tx.clone())?;
             rings.push((name.to_string(), ring));
         }
     }
@@ -1615,6 +1679,7 @@ fn setup_ringbuffers<'a>(
         stack_rx,
         cache_rx,
         probe_rx,
+        memory_rx,
         network_rx,
         packet_rx,
         epoll_rx,
@@ -1775,6 +1840,10 @@ fn configure_bpf_skeleton(
             use syscalls::Sysno;
             rodata.tool_config.marker_syscall_nr = Sysno::faccessat2 as u32;
         }
+        if opts.memory {
+            rodata.tool_config.collect_memory = 1;
+            rodata.tool_config.memory_fault_sample_rate = opts.memory_fault_sample_rate;
+        }
 
         // Set wakeup threshold to 50% of ringbuf size for batched wakeups
         // Default ringbuf size is 50 MiB if not specified
@@ -1833,6 +1902,17 @@ fn configure_bpf_skeleton(
                 || name.starts_with("ringbuf_packet_events_")
                 || name.starts_with("ringbuf_epoll_events_")
             {
+                map.set_max_entries(1).with_context(|| {
+                    format!("Failed to shrink unused ringbuf map '{name}' to 1 entry")
+                })?;
+            }
+        }
+    }
+
+    if !opts.memory {
+        for mut map in open_skel.open_object_mut().maps_mut() {
+            let name = map.name().to_str().unwrap().to_owned();
+            if name.starts_with("ringbuf_memory_events_") {
                 map.set_max_entries(1).with_context(|| {
                     format!("Failed to set network ringbuf map '{name}' to zero capacity")
                 })?;
@@ -2441,6 +2521,9 @@ fn run_tracing_loop(
         println!("Missed packet events: {}", dump_missed_events(skel, 5));
         println!("Missed poll events: {}", dump_missed_events(skel, 6));
     }
+    if opts.memory {
+        println!("Missed memory events: {}", dump_missed_events(skel, 8));
+    }
     if opts.markers {
         println!(
             "Missed marker events (ringbuf full): {}",
@@ -2748,6 +2831,11 @@ pub fn systing(
         // access), which fails if the Arc has been cloned. Events queue in the
         // unbounded mpsc channel until this thread starts draining them.
         let psr = recorder.stack_recorder.lock().unwrap().psr.clone();
+        recorder
+            .memory_recorder
+            .lock()
+            .unwrap()
+            .set_pystacks_run(psr.clone());
 
         // Spawn exec event handler thread to dynamically add Python PIDs.
         // See handle_exec_events() for details.

@@ -84,3 +84,12 @@ Added DNS resolution lookup table for network traces.
 
 ### New tables
 - `network_dns` — Maps IP addresses to resolved hostnames (ip_address, hostname). Populated at the end of recording when `--resolve-addresses` is enabled. Can be joined with `network_socket.src_ip` or `network_socket.dest_ip` for hostname lookups.
+
+## Schema Version 6 (systing 1.5.0) — 2026-04-09
+
+Added memory-usage tables for the new `memory` recorder (enable with `--add-recorder memory`).
+
+### New tables
+- `memory_rss` — Per-process resident-set counter samples (ts, tid, pid, member, size). `member` indexes the kernel rss_stat counters: 0=file, 1=anon, 2=swap, 3=shmem. Synthetic members -1=hiwater_rss and -2=total_vm are emitted from periodic mm_struct snapshots.
+- `memory_map` — Virtual address-space changes (id, ts, tid, pid, event_type, addr, size, prot, flags, stack_id). `event_type` is `mmap`, `munmap`, or `brk`. `stack_id` joins to `stack` for allocation-site attribution.
+- `memory_fault` — Sampled user page faults (ts, tid, pid, addr, error_code, stack_id). Sampling rate is controlled by `--memory-fault-sample-rate`.

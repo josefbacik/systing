@@ -69,6 +69,8 @@ const volatile struct {
 	u32 confidentiality_mode;
 	u64 wakeup_data_size;  /* Ringbuf fill threshold for wakeup (0 = default) */
 	u32 marker_syscall_nr; /* Syscall number for marker events (0 = disabled) */
+	u32 collect_memory;    /* Memory recorder enabled */
+	u32 memory_fault_sample_rate; /* Sample 1 in N page faults (0 or 1 = all) */
 } tool_config = {};
 
 enum event_type {
@@ -310,6 +312,41 @@ struct epoll_event_bpf {
 	u32 cpu;
 };
 
+enum memory_event_type {
+	MEMORY_RSS_STAT,      // kmem:rss_stat - per-mm RSS counter change
+	MEMORY_MMAP,          // sys_exit_mmap - new VM area
+	MEMORY_MUNMAP,        // sys_enter_munmap - VM area removed
+	MEMORY_BRK,           // sys_exit_brk - heap boundary change
+	MEMORY_PAGE_FAULT,    // exceptions:page_fault_user - demand fault (sampled)
+	MEMORY_MM_SAMPLE,     // periodic mm_struct snapshot (from perf_event_clock)
+};
+
+/* RSS stat member indices (mirrors include/linux/mm_types_task.h) */
+enum memory_rss_member {
+	MEMORY_MM_FILEPAGES,
+	MEMORY_MM_ANONPAGES,
+	MEMORY_MM_SWAPENTS,
+	MEMORY_MM_SHMEMPAGES,
+};
+
+struct memory_event {
+	enum memory_event_type type;
+	u64 ts;
+	u32 cpu;
+	struct task_info task;
+	u64 addr;          // mmap ret / munmap addr / fault addr / brk new / hiwater_rss
+	u64 size;          // mmap len / munmap len / rss size (bytes) / total_vm (bytes)
+	u32 member;        // rss_stat: enum memory_rss_member; mmap: prot
+	u32 flags;         // mmap: MAP_* flags; page_fault: error_code
+	u64 kernel_stack_length;
+	u64 user_stack_length;
+	u64 kernel_stack[MAX_STACK_DEPTH];
+	u64 user_stack[MAX_STACK_DEPTH];
+#ifdef SYSTING_PYSTACKS
+	struct pystacks_message py_msg_buffer;
+#endif
+};
+
 /*
  * Dummy instance to get skeleton to generate definition for
  * `struct task_event`
@@ -329,6 +366,9 @@ struct epoll_event_bpf _epoll_event = {0};
 struct task_info _task_info = {0};
 struct probe_event _uprobe_event = {0};
 struct marker_event _marker_event = {0};
+struct memory_event _memory_event = {0};
+enum memory_event_type _memory_event_type = MEMORY_RSS_STAT;
+enum memory_rss_member _memory_rss_member = MEMORY_MM_FILEPAGES;
 #ifdef SYSTING_PYSTACKS
 struct exec_event _exec_event = {0};
 #endif
@@ -527,7 +567,8 @@ struct {
 #define MISSED_PACKET_EVENT 5
 #define MISSED_EPOLL_EVENT 6
 #define MISSED_MARKER_EVENT 7
-#define MISSED_EVENT_MAX 8
+#define MISSED_MEMORY_EVENT 8
+#define MISSED_EVENT_MAX 9
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
@@ -626,6 +667,18 @@ struct epoll_ringbuf_map {
 	ringbuf_epoll_events_node5 SEC(".maps"),
 	ringbuf_epoll_events_node6 SEC(".maps"),
 	ringbuf_epoll_events_node7 SEC(".maps");
+
+struct memory_ringbuf_map {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
+} ringbuf_memory_events_node0 SEC(".maps"),
+	ringbuf_memory_events_node1 SEC(".maps"),
+	ringbuf_memory_events_node2 SEC(".maps"),
+	ringbuf_memory_events_node3 SEC(".maps"),
+	ringbuf_memory_events_node4 SEC(".maps"),
+	ringbuf_memory_events_node5 SEC(".maps"),
+	ringbuf_memory_events_node6 SEC(".maps"),
+	ringbuf_memory_events_node7 SEC(".maps");
 
 #ifdef SYSTING_PYSTACKS
 struct {
@@ -764,6 +817,47 @@ struct {
 		&ringbuf_epoll_events_node7,
 	},
 };
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, NR_RINGBUFS);
+	__type(key, u32);
+	__array(values, struct memory_ringbuf_map);
+} memory_ringbufs SEC(".maps") = {
+	.values = {
+		&ringbuf_memory_events_node0,
+		&ringbuf_memory_events_node1,
+		&ringbuf_memory_events_node2,
+		&ringbuf_memory_events_node3,
+		&ringbuf_memory_events_node4,
+		&ringbuf_memory_events_node5,
+		&ringbuf_memory_events_node6,
+		&ringbuf_memory_events_node7,
+	},
+};
+
+/* Per-thread scratch map for pairing mmap/brk enter→exit. */
+struct memory_syscall_args {
+	u64 addr;
+	u64 size;
+	u32 prot;
+	u32 flags;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, u64);   // tgidpid
+	__type(value, struct memory_syscall_args);
+} memory_syscall_scratch SEC(".maps");
+
+/* Per-CPU counter for page-fault sampling. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_fault_counter SEC(".maps");
 
 // Generate new socket ID atomically
 // Returns socket IDs starting from 1 (0 indicates failure)
@@ -1034,6 +1128,34 @@ static struct packet_event *reserve_packet_event(long *flags)
 	struct packet_event *event = bpf_ringbuf_reserve(rb, sizeof(struct packet_event), 0);
 	if (event)
 		__builtin_memset(event, 0, sizeof(*event));
+	return event;
+}
+
+static struct memory_event *reserve_memory_event(long *flags)
+{
+	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
+	void *rb;
+
+	rb = bpf_map_lookup_elem(&memory_ringbufs, &rb_idx);
+	if (!rb)
+		return NULL;
+	*flags = get_ringbuf_flags(rb);
+	struct memory_event *event = bpf_ringbuf_reserve(rb, sizeof(struct memory_event), 0);
+	if (event) {
+		event->type = 0;
+		event->ts = 0;
+		event->cpu = 0;
+		__builtin_memset(&event->task, 0, sizeof(event->task));
+		event->addr = 0;
+		event->size = 0;
+		event->member = 0;
+		event->flags = 0;
+		event->kernel_stack_length = 0;
+		event->user_stack_length = 0;
+#ifdef SYSTING_PYSTACKS
+		event->py_msg_buffer.stack_len = 0;
+#endif
+	}
 	return event;
 }
 
@@ -1751,6 +1873,25 @@ int systing_perf_event_clock(void *ctx)
 	if (!tool_config.no_cpu_stack_traces)
 		emit_stack_event_with_ts(ctx, task, STACK_RUNNING, ts);
 	read_counters(ctx, task);
+
+	if (tool_config.collect_memory && trace_task(task)) {
+		struct mm_struct *mm = BPF_CORE_READ(task, mm);
+		if (mm) {
+			long mflags;
+			struct memory_event *mev = reserve_memory_event(&mflags);
+			if (mev) {
+				mev->type = MEMORY_MM_SAMPLE;
+				mev->ts = ts;
+				mev->cpu = bpf_get_smp_processor_id();
+				record_task_info(&mev->task, task);
+				mev->addr = BPF_CORE_READ(mm, hiwater_rss) * 4096;
+				mev->size = BPF_CORE_READ(mm, total_vm) * 4096;
+				bpf_ringbuf_submit(mev, mflags);
+			} else {
+				handle_missed_event(MISSED_MEMORY_EVENT);
+			}
+		}
+	}
 	return 0;
 }
 
@@ -4313,5 +4454,228 @@ int BPF_KPROBE(inet_twsk_deschedule_put_entry, struct inet_timewait_sock *tw)
 	bpf_map_delete_elem(&tw_socket_id_map, &tw_ptr);
 	return 0;
 }
+
+/* ===== Memory recorder ===== */
+
+static __always_inline void memory_capture_stack(void *ctx, struct memory_event *event,
+						 struct task_struct *task)
+{
+	long len;
+
+	if (!(task->flags & PF_KTHREAD)) {
+		len = bpf_get_stack(ctx, &event->user_stack,
+				    sizeof(event->user_stack),
+				    BPF_F_USER_STACK);
+		event->user_stack_length = len > 0 ? len / sizeof(u64) : 0;
+	} else {
+		event->user_stack_length = 0;
+	}
+
+	len = bpf_get_stack(ctx, &event->kernel_stack,
+			    sizeof(event->kernel_stack), SKIP_STACK_DEPTH);
+	event->kernel_stack_length = len > 0 ? len / sizeof(u64) : 0;
+
+#ifdef SYSTING_PYSTACKS
+	if (tool_config.collect_pystacks) {
+		struct pt_regs *pt_regs = (struct pt_regs *)bpf_task_pt_regs(task);
+		pystacks_read_stacks(pt_regs, NULL, &event->py_msg_buffer);
+	}
+#endif
+}
+
+SEC("tracepoint/kmem/rss_stat")
+int systing_rss_stat(struct trace_event_raw_rss_stat *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->type = MEMORY_RSS_STAT;
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->member = ctx->member;
+	/* ctx->size is in pages; convert to bytes. Cast via s64 so negative
+	 * counters from partial updates propagate correctly. */
+	event->size = (u64)((s64)ctx->size * 4096);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_mmap")
+int systing_mmap_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_syscall_args args = {
+		.addr = (u64)ctx->args[0],
+		.size = (u64)ctx->args[1],
+		.prot = (u32)ctx->args[2],
+		.flags = (u32)ctx->args[3],
+	};
+	bpf_map_update_elem(&memory_syscall_scratch, &tgidpid, &args, BPF_ANY);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_mmap")
+int systing_mmap_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_syscall_args *saved = bpf_map_lookup_elem(&memory_syscall_scratch, &tgidpid);
+	if (!saved)
+		return 0;
+	struct memory_syscall_args args = *saved;
+	bpf_map_delete_elem(&memory_syscall_scratch, &tgidpid);
+
+	/* mmap returns MAP_FAILED (-1) or -errno on failure; skip those. */
+	long ret = ctx->ret;
+	if (ret < 0 && ret > -4096)
+		return 0;
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->type = MEMORY_MMAP;
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->addr = (u64)ret;
+	event->size = args.size;
+	event->member = args.prot;
+	event->flags = args.flags;
+	memory_capture_stack(ctx, event, task);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_munmap")
+int systing_munmap_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->type = MEMORY_MUNMAP;
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->addr = (u64)ctx->args[0];
+	event->size = (u64)ctx->args[1];
+	memory_capture_stack(ctx, event, task);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_brk")
+int systing_brk_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_syscall_args args = { .addr = (u64)ctx->args[0] };
+	bpf_map_update_elem(&memory_syscall_scratch, &tgidpid, &args, BPF_ANY);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_brk")
+int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_syscall_args *saved = bpf_map_lookup_elem(&memory_syscall_scratch, &tgidpid);
+	if (!saved)
+		return 0;
+	u64 requested = saved->addr;
+	bpf_map_delete_elem(&memory_syscall_scratch, &tgidpid);
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->type = MEMORY_BRK;
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->addr = (u64)ctx->ret;   /* new brk */
+	event->size = requested;        /* requested brk (delta computed in userspace) */
+	memory_capture_stack(ctx, event, task);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+#if defined(__TARGET_ARCH_x86)
+/* vmlinux.h does not expose the exceptions tracepoint layout on all builds;
+ * define the fixed-layout args locally (matches format/exceptions/page_fault_user). */
+struct systing_pf_args {
+	u64 __pad;
+	unsigned long address;
+	unsigned long ip;
+	unsigned long error_code;
+};
+
+SEC("tracepoint/exceptions/page_fault_user")
+int systing_page_fault_user(struct systing_pf_args *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	/* Sample 1:N page faults to bound overhead on fault-heavy workloads. */
+	if (tool_config.memory_fault_sample_rate > 1) {
+		u32 zero = 0;
+		u64 *cnt = bpf_map_lookup_elem(&memory_fault_counter, &zero);
+		if (cnt) {
+			*cnt += 1;
+			if (*cnt % tool_config.memory_fault_sample_rate != 0)
+				return 0;
+		}
+	}
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->type = MEMORY_PAGE_FAULT;
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->addr = ctx->address;
+	event->flags = (u32)ctx->error_code;
+	memory_capture_stack(ctx, event, task);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+#endif
 
 char LICENSE[] SEC("license") = "GPL";
