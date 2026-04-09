@@ -43,6 +43,10 @@ pub struct ParquetPaths {
     pub network_socket: PathBuf,
     pub network_poll: PathBuf,
     pub network_dns: PathBuf,
+    // Memory tables
+    pub memory_rss: PathBuf,
+    pub memory_map: PathBuf,
+    pub memory_fault: PathBuf,
     // Clock snapshot table
     pub clock_snapshot: PathBuf,
     // System info table
@@ -98,6 +102,10 @@ impl ParquetPaths {
             network_socket: dir.join("network_socket.parquet"),
             network_poll: dir.join("network_poll.parquet"),
             network_dns: dir.join("network_dns.parquet"),
+            // Memory tables
+            memory_rss: dir.join("memory_rss.parquet"),
+            memory_map: dir.join("memory_map.parquet"),
+            memory_fault: dir.join("memory_fault.parquet"),
             // Clock snapshot table
             clock_snapshot: dir.join("clock_snapshot.parquet"),
             // System info table
@@ -143,6 +151,9 @@ impl ParquetPaths {
             network_socket: dir.join(format!("{trace_id}_network_socket.parquet")),
             network_poll: dir.join(format!("{trace_id}_network_poll.parquet")),
             network_dns: dir.join(format!("{trace_id}_network_dns.parquet")),
+            memory_rss: dir.join(format!("{trace_id}_memory_rss.parquet")),
+            memory_map: dir.join(format!("{trace_id}_memory_map.parquet")),
+            memory_fault: dir.join(format!("{trace_id}_memory_fault.parquet")),
             clock_snapshot: dir.join(format!("{trace_id}_clock_snapshot.parquet")),
             sysinfo: dir.join(format!("{trace_id}_sysinfo.parquet")),
             // TPU tables
@@ -153,7 +164,7 @@ impl ParquetPaths {
     }
 
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 34] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 37] {
         [
             PathEntry {
                 path: &self.process,
@@ -243,6 +254,18 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.perf_sample,
                 name: "perf_sample",
+            },
+            PathEntry {
+                path: &self.memory_rss,
+                name: "memory_rss",
+            },
+            PathEntry {
+                path: &self.memory_map,
+                name: "memory_map",
+            },
+            PathEntry {
+                path: &self.memory_fault,
+                name: "memory_fault",
             },
             PathEntry {
                 path: &self.network_interface,

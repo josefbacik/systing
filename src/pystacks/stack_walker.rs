@@ -1,4 +1,4 @@
-use crate::systing_core::types::stack_event;
+use crate::systing_core::types::{pystacks_message, stack_event};
 use libbpf_rs::Object;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
@@ -238,16 +238,18 @@ impl StackWalkerRun {
     }
 
     pub fn get_pystack_from_event(&self, event: &stack_event) -> Vec<PyAddr> {
+        self.get_pystack_from_buffer(&event.py_msg_buffer, event.task.tgidpid >> 32)
+    }
+
+    pub fn get_pystack_from_buffer(&self, buf: &pystacks_message, pid: u64) -> Vec<PyAddr> {
         use std::sync::atomic::Ordering;
 
-        let stack_len =
-            (event.py_msg_buffer.stack_len as usize).min(event.py_msg_buffer.buffer.len());
+        let stack_len = (buf.stack_len as usize).min(buf.buffer.len());
 
         if self.is_debug() {
             if stack_len > 0 {
                 let count = self.events_with_pystack.fetch_add(1, Ordering::Relaxed) + 1;
                 if count <= DEBUG_SAMPLE_LOG_LIMIT {
-                    let pid = event.task.tgidpid >> 32;
                     eprintln!(
                         "[pystacks debug] Event #{} with Python stack: PID={} stack_len={}",
                         count, pid, stack_len
@@ -258,7 +260,7 @@ impl StackWalkerRun {
             }
         }
 
-        Vec::from(&event.py_msg_buffer.buffer[..stack_len])
+        Vec::from(&buf.buffer[..stack_len])
             .iter()
             .map(|frame| PyAddr { addr: frame.into() })
             .collect()

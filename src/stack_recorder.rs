@@ -30,10 +30,10 @@ use debuginfod::{BuildId, CachingClient, Client};
 
 // Stack structure representing kernel, user, and Python stacks
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
-struct Stack {
-    kernel_stack: Vec<u64>,
-    user_stack: Vec<u64>,
-    py_stack: Vec<PyAddr>,
+pub struct Stack {
+    pub(crate) kernel_stack: Vec<u64>,
+    pub(crate) user_stack: Vec<u64>,
+    pub(crate) py_stack: Vec<PyAddr>,
 }
 
 /// Maximum valid user-space address (48-bit virtual address space boundary).
@@ -63,7 +63,7 @@ fn filter_and_reverse_kernel_stack(addrs: &[u64]) -> Vec<u64> {
 }
 
 impl Stack {
-    fn new(kernel_stack: &[u64], user_stack: &[u64], py_stack: &[PyAddr]) -> Self {
+    pub fn new(kernel_stack: &[u64], user_stack: &[u64], py_stack: &[PyAddr]) -> Self {
         Self {
             kernel_stack: filter_and_reverse_kernel_stack(kernel_stack),
             user_stack: filter_and_reverse_user_stack(user_stack),
@@ -128,6 +128,15 @@ impl StackRecorder {
     /// entire trace. unique_stacks is still retained for end-of-trace symbolization.
     pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
         self.streaming_collector = Some(collector);
+    }
+
+    /// Merge externally-deduped stacks (from another recorder) so they are
+    /// symbolized and emitted alongside profiler stacks in `finish()`. The
+    /// caller is responsible for choosing non-colliding stack_ids.
+    pub fn merge_external_stacks(&mut self, stacks: HashMap<(Stack, i32), i64>) {
+        for (key, id) in stacks {
+            self.unique_stacks.entry(key).or_insert(id);
+        }
     }
 
     /// Create a symbolizer with the configured process dispatcher.

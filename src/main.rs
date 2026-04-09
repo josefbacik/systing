@@ -68,6 +68,12 @@ struct Command {
     /// Enable syscall tracing (raw_syscalls:sys_enter and sys_exit tracepoints)
     #[arg(long)]
     syscalls: bool,
+    // Memory recording enabled state (set by recorder management, not a CLI flag)
+    #[arg(skip)]
+    memory: bool,
+    /// Sample 1 in N user page faults when the memory recorder is enabled (0 or 1 = record all)
+    #[arg(long, default_value = "97")]
+    memory_fault_sample_rate: u32,
     // Network recording enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     network: bool,
@@ -159,6 +165,8 @@ impl From<Command> for Config {
             markers: cmd.markers,
             marker_threshold: cmd.marker_threshold,
             marker_duration_threshold: cmd.marker_duration_threshold,
+            memory: cmd.memory,
+            memory_fault_sample_rate: cmd.memory_fault_sample_rate,
             network: cmd.network,
             network_packets: cmd.network_packets,
             resolve_addresses: cmd.resolve_addresses,
@@ -202,6 +210,7 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
                 opts.network = true;
             }
         }
+        "memory" => opts.memory = enable,
         "pystacks" => opts.collect_pystacks = enable,
         "markers" => opts.markers = enable,
         "tpu-metrics" => opts.tpu_metrics = enable,
@@ -220,6 +229,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         opts.no_sleep_stack_traces = true;
         opts.no_interruptible_stack_traces = true;
         opts.no_cpu_stack_traces = true;
+        opts.memory = false;
         opts.network = false;
         opts.network_packets = false;
         opts.collect_pystacks = false;

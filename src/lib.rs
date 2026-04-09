@@ -39,6 +39,7 @@ pub mod validation;
 // Tracing modules (previously in binary only)
 pub mod events;
 pub mod marker_recorder;
+pub mod memory_recorder;
 pub mod network_recorder;
 pub mod parquet;
 pub mod parquet_to_perfetto;

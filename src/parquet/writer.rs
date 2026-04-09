@@ -27,11 +27,12 @@ use crate::parquet::ParquetPaths;
 use crate::record::RecordCollector;
 use crate::trace::{
     self, ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, InstantArgRecord,
-    InstantRecord, IrqSliceRecord, NetworkDnsRecord, NetworkInterfaceRecord, NetworkPacketRecord,
-    NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord,
-    SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord,
-    StackSampleRecord, SysInfoRecord, ThreadRecord, ThreadStateRecord, TpuDeviceRecord,
-    TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
+    InstantRecord, IrqSliceRecord, MemoryFaultRecord, MemoryMapRecord, MemoryRssRecord,
+    NetworkDnsRecord, NetworkInterfaceRecord, NetworkPacketRecord, NetworkPollRecord,
+    NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord, SchedSliceRecord,
+    SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord,
+    SysInfoRecord, ThreadRecord, ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord,
+    TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -77,6 +78,9 @@ pub struct StreamingParquetWriter {
     network_sockets: Vec<NetworkSocketRecord>,
     network_polls: Vec<NetworkPollRecord>,
     network_dns: Vec<NetworkDnsRecord>,
+    memory_rss: Vec<MemoryRssRecord>,
+    memory_maps: Vec<MemoryMapRecord>,
+    memory_faults: Vec<MemoryFaultRecord>,
     clock_snapshots: Vec<ClockSnapshotRecord>,
     sysinfo: Option<SysInfoRecord>,
     tpu_devices: Vec<TpuDeviceRecord>,
@@ -108,6 +112,9 @@ pub struct StreamingParquetWriter {
     network_socket_writer: Option<ArrowWriter<File>>,
     network_poll_writer: Option<ArrowWriter<File>>,
     network_dns_writer: Option<ArrowWriter<File>>,
+    memory_rss_writer: Option<ArrowWriter<File>>,
+    memory_map_writer: Option<ArrowWriter<File>>,
+    memory_fault_writer: Option<ArrowWriter<File>>,
     clock_snapshot_writer: Option<ArrowWriter<File>>,
     sysinfo_writer: Option<ArrowWriter<File>>,
     tpu_device_writer: Option<ArrowWriter<File>>,
@@ -184,6 +191,9 @@ impl StreamingParquetWriter {
             network_sockets: Vec::new(),
             network_polls: Vec::new(),
             network_dns: Vec::new(),
+            memory_rss: Vec::new(),
+            memory_maps: Vec::new(),
+            memory_faults: Vec::new(),
             clock_snapshots: Vec::new(),
             sysinfo: None,
             tpu_devices: Vec::new(),
@@ -214,6 +224,9 @@ impl StreamingParquetWriter {
             network_socket_writer: None,
             network_poll_writer: None,
             network_dns_writer: None,
+            memory_rss_writer: None,
+            memory_map_writer: None,
+            memory_fault_writer: None,
             clock_snapshot_writer: None,
             sysinfo_writer: None,
             tpu_device_writer: None,
@@ -795,6 +808,57 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    fn flush_memory_rss(&mut self) -> Result<()> {
+        if self.memory_rss.is_empty() {
+            return Ok(());
+        }
+        let schema = trace::memory_rss_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.memory_rss_writer,
+            &self.paths.memory_rss,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+        let batch = build_memory_rss_batch(&self.memory_rss, &schema)?;
+        writer.write(&batch)?;
+        self.memory_rss.clear();
+        Ok(())
+    }
+
+    fn flush_memory_maps(&mut self) -> Result<()> {
+        if self.memory_maps.is_empty() {
+            return Ok(());
+        }
+        let schema = trace::memory_map_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.memory_map_writer,
+            &self.paths.memory_map,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+        let batch = build_memory_map_batch(&self.memory_maps, &schema)?;
+        writer.write(&batch)?;
+        self.memory_maps.clear();
+        Ok(())
+    }
+
+    fn flush_memory_faults(&mut self) -> Result<()> {
+        if self.memory_faults.is_empty() {
+            return Ok(());
+        }
+        let schema = trace::memory_fault_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.memory_fault_writer,
+            &self.paths.memory_fault,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+        let batch = build_memory_fault_batch(&self.memory_faults, &schema)?;
+        writer.write(&batch)?;
+        self.memory_faults.clear();
+        Ok(())
+    }
+
     // Flush tpu_devices buffer
     fn flush_tpu_devices(&mut self) -> Result<()> {
         if self.tpu_devices.is_empty() {
@@ -896,6 +960,9 @@ impl StreamingParquetWriter {
         close_writer!(self.network_socket_writer);
         close_writer!(self.network_poll_writer);
         close_writer!(self.network_dns_writer);
+        close_writer!(self.memory_rss_writer);
+        close_writer!(self.memory_map_writer);
+        close_writer!(self.memory_fault_writer);
         close_writer!(self.clock_snapshot_writer);
         close_writer!(self.sysinfo_writer);
         close_writer!(self.tpu_device_writer);
@@ -1195,6 +1262,36 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn add_memory_rss(&mut self, record: MemoryRssRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.memory_rss, self.batch_size);
+        self.memory_rss.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.memory_rss, self.batch_size) {
+            self.flush_memory_rss()?;
+        }
+        Ok(())
+    }
+
+    fn add_memory_map(&mut self, record: MemoryMapRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.memory_maps, self.batch_size);
+        self.memory_maps.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.memory_maps, self.batch_size) {
+            self.flush_memory_maps()?;
+        }
+        Ok(())
+    }
+
+    fn add_memory_fault(&mut self, record: MemoryFaultRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.memory_faults, self.batch_size);
+        self.memory_faults.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.memory_faults, self.batch_size) {
+            self.flush_memory_faults()?;
+        }
+        Ok(())
+    }
+
     fn add_tpu_device(&mut self, record: TpuDeviceRecord) -> Result<()> {
         self.tpu_devices.push(record);
         self.total_records += 1;
@@ -1252,6 +1349,9 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_network_sockets()?;
         self.flush_network_polls()?;
         self.flush_network_dns()?;
+        self.flush_memory_rss()?;
+        self.flush_memory_maps()?;
+        self.flush_memory_faults()?;
         self.flush_clock_snapshots()?;
         self.flush_sysinfo()?;
         self.flush_tpu_devices()?;
@@ -2170,6 +2270,114 @@ fn build_network_poll_batch(
             Arc::new(socket_id_builder.finish()),
             Arc::new(requested_events_builder.finish()),
             Arc::new(returned_events_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_memory_rss_batch(
+    records: &[MemoryRssRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    use arrow::array::{Int32Builder, Int64Builder, Int8Builder};
+    let n = records.len();
+    let mut ts = Int64Builder::with_capacity(n);
+    let mut tid = Int32Builder::with_capacity(n);
+    let mut pid = Int32Builder::with_capacity(n);
+    let mut member = Int8Builder::with_capacity(n);
+    let mut size = Int64Builder::with_capacity(n);
+    for r in records {
+        ts.append_value(r.ts);
+        tid.append_value(r.tid);
+        pid.append_value(r.pid);
+        member.append_value(r.member);
+        size.append_value(r.size);
+    }
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(ts.finish()),
+            Arc::new(tid.finish()),
+            Arc::new(pid.finish()),
+            Arc::new(member.finish()),
+            Arc::new(size.finish()),
+        ],
+    )?)
+}
+
+fn build_memory_map_batch(
+    records: &[MemoryMapRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    use arrow::array::{Int32Builder, Int64Builder};
+    let n = records.len();
+    let mut id = Int64Builder::with_capacity(n);
+    let mut ts = Int64Builder::with_capacity(n);
+    let mut tid = Int32Builder::with_capacity(n);
+    let mut pid = Int32Builder::with_capacity(n);
+    let mut event_type = StringBuilder::with_capacity(n, n * 8);
+    let mut addr = Int64Builder::with_capacity(n);
+    let mut size = Int64Builder::with_capacity(n);
+    let mut prot = Int32Builder::with_capacity(n);
+    let mut flags = Int32Builder::with_capacity(n);
+    let mut stack_id = Int64Builder::with_capacity(n);
+    for r in records {
+        id.append_value(r.id);
+        ts.append_value(r.ts);
+        tid.append_value(r.tid);
+        pid.append_value(r.pid);
+        event_type.append_value(&r.event_type);
+        addr.append_value(r.addr);
+        size.append_value(r.size);
+        prot.append_option(r.prot);
+        flags.append_option(r.flags);
+        stack_id.append_option(r.stack_id);
+    }
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id.finish()),
+            Arc::new(ts.finish()),
+            Arc::new(tid.finish()),
+            Arc::new(pid.finish()),
+            Arc::new(event_type.finish()),
+            Arc::new(addr.finish()),
+            Arc::new(size.finish()),
+            Arc::new(prot.finish()),
+            Arc::new(flags.finish()),
+            Arc::new(stack_id.finish()),
+        ],
+    )?)
+}
+
+fn build_memory_fault_batch(
+    records: &[MemoryFaultRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    use arrow::array::{Int32Builder, Int64Builder};
+    let n = records.len();
+    let mut ts = Int64Builder::with_capacity(n);
+    let mut tid = Int32Builder::with_capacity(n);
+    let mut pid = Int32Builder::with_capacity(n);
+    let mut addr = Int64Builder::with_capacity(n);
+    let mut error_code = Int32Builder::with_capacity(n);
+    let mut stack_id = Int64Builder::with_capacity(n);
+    for r in records {
+        ts.append_value(r.ts);
+        tid.append_value(r.tid);
+        pid.append_value(r.pid);
+        addr.append_value(r.addr);
+        error_code.append_value(r.error_code);
+        stack_id.append_option(r.stack_id);
+    }
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(ts.finish()),
+            Arc::new(tid.finish()),
+            Arc::new(pid.finish()),
+            Arc::new(addr.finish()),
+            Arc::new(error_code.finish()),
+            Arc::new(stack_id.finish()),
         ],
     )?)
 }
