@@ -212,9 +212,9 @@ impl StackWalkerRun {
         }
     }
 
-    pub fn add_pid(&self, pid: i32) {
+    pub fn add_pid(&self, pid: i32) -> bool {
         if !self.initialized() {
-            return;
+            return false;
         }
 
         if self.is_debug() {
@@ -230,10 +230,16 @@ impl StackWalkerRun {
                 );
             }
 
+            if let Some(resolver) = &self.resolver {
+                resolver.add_pid_version(pid, info.version_major, info.version_minor);
+            }
             if let Some(maps) = &self.maps {
                 maps.add_targeted_pid(pid);
                 maps.update_pid_config(pid, &info.pid_data);
             }
+            true
+        } else {
+            false
         }
     }
 

@@ -891,14 +891,27 @@ struct {
 struct memory_alloc_args {
 	u64 size;
 	u64 old_addr;  /* realloc: ptr; posix_memalign: &memptr */
+	/* User stack captured at the entry uprobe. The uretprobe trampoline
+	 * overwrites the caller's return address, so bpf_get_stack() at exit
+	 * produces a truncated/junk stack. */
+	u64 user_stack_length;
+	u64 user_stack[MAX_STACK_DEPTH];
 };
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 65536);
+	__uint(max_entries, 16384);
 	__type(key, u64);   // tgidpid
 	__type(value, struct memory_alloc_args);
 } memory_alloc_scratch SEC(".maps");
+
+/* Per-CPU scratch for building memory_alloc_args (too large for BPF stack). */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct memory_alloc_args);
+} memory_alloc_args_tmp SEC(".maps");
 
 /* Per-CPU counter for allocator sampling. */
 struct {
@@ -4547,22 +4560,11 @@ int BPF_KPROBE(inet_twsk_deschedule_put_entry, struct inet_timewait_sock *tw)
 
 /* ===== Memory recorder ===== */
 
-static __always_inline void memory_capture_stack(void *ctx, struct memory_event *event,
-						 struct task_struct *task)
+static __always_inline void memory_capture_kernel_and_py(void *ctx, struct memory_event *event,
+							  struct task_struct *task)
 {
-	long len;
-
-	if (!(task->flags & PF_KTHREAD)) {
-		len = bpf_get_stack(ctx, &event->user_stack,
-				    sizeof(event->user_stack),
-				    BPF_F_USER_STACK);
-		event->hdr.user_stack_length = len > 0 ? len / sizeof(u64) : 0;
-	} else {
-		event->hdr.user_stack_length = 0;
-	}
-
-	len = bpf_get_stack(ctx, &event->kernel_stack,
-			    sizeof(event->kernel_stack), SKIP_STACK_DEPTH);
+	long len = bpf_get_stack(ctx, &event->kernel_stack,
+				 sizeof(event->kernel_stack), SKIP_STACK_DEPTH);
 	event->hdr.kernel_stack_length = len > 0 ? len / sizeof(u64) : 0;
 
 #ifdef SYSTING_PYSTACKS
@@ -4571,6 +4573,21 @@ static __always_inline void memory_capture_stack(void *ctx, struct memory_event 
 		pystacks_read_stacks(pt_regs, NULL, &event->py_msg_buffer);
 	}
 #endif
+}
+
+static __always_inline void memory_capture_stack(void *ctx, struct memory_event *event,
+						 struct task_struct *task)
+{
+	if (!(task->flags & PF_KTHREAD)) {
+		long len = bpf_get_stack(ctx, &event->user_stack,
+					 sizeof(event->user_stack),
+					 BPF_F_USER_STACK);
+		event->hdr.user_stack_length = len > 0 ? len / sizeof(u64) : 0;
+	} else {
+		event->hdr.user_stack_length = 0;
+	}
+
+	memory_capture_kernel_and_py(ctx, event, task);
 }
 
 SEC("tracepoint/kmem/rss_stat")
@@ -4791,7 +4808,7 @@ static __always_inline bool memory_alloc_sample(void)
 	return (*cnt % tool_config.memory_alloc_sample_rate) == 0;
 }
 
-static __always_inline int memory_alloc_enter(u64 size, u64 old_addr)
+static __always_inline int memory_alloc_enter(struct pt_regs *ctx, u64 size, u64 old_addr)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	if (!trace_task(task))
@@ -4799,9 +4816,19 @@ static __always_inline int memory_alloc_enter(u64 size, u64 old_addr)
 	if (!memory_alloc_sample())
 		return 0;
 
+	u32 zero = 0;
+	struct memory_alloc_args *args =
+		bpf_map_lookup_elem(&memory_alloc_args_tmp, &zero);
+	if (!args)
+		return 0;
+	args->size = size;
+	args->old_addr = old_addr;
+	long len = bpf_get_stack(ctx, args->user_stack, sizeof(args->user_stack),
+				 BPF_F_USER_STACK);
+	args->user_stack_length = len > 0 ? len / sizeof(u64) : 0;
+
 	u64 tgidpid = bpf_get_current_pid_tgid();
-	struct memory_alloc_args args = { .size = size, .old_addr = old_addr };
-	bpf_map_update_elem(&memory_alloc_scratch, &tgidpid, &args, BPF_ANY);
+	bpf_map_update_elem(&memory_alloc_scratch, &tgidpid, args, BPF_ANY);
 	memory_alloc_count(&memory_alloc_enter_count);
 	return 0;
 }
@@ -4815,27 +4842,32 @@ static __always_inline int memory_alloc_exit(struct pt_regs *ctx, u64 addr,
 	if (!saved)
 		return 0;
 	memory_alloc_count(&memory_alloc_exit_count);
-	struct memory_alloc_args args = *saved;
-	bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
 
-	if (addr == 0)
+	if (addr == 0) {
+		bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
 		return 0;
+	}
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	long flags;
 	struct memory_event *event = reserve_memory_event(&flags);
-	if (!event)
+	if (!event) {
+		bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
 		return handle_missed_event(MISSED_MEMORY_EVENT);
+	}
 
 	event->hdr.type = MEMORY_ALLOC;
 	event->hdr.ts = bpf_ktime_get_boot_ns();
 	event->hdr.cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->hdr.task, task);
 	event->hdr.addr = addr;
-	event->hdr.size = args.size;
-	event->hdr.old_addr = args.old_addr;
+	event->hdr.size = saved->size;
+	event->hdr.old_addr = saved->old_addr;
 	event->hdr.member = op;
-	memory_capture_stack(ctx, event, task);
+	event->hdr.user_stack_length = saved->user_stack_length;
+	__builtin_memcpy(event->user_stack, saved->user_stack, sizeof(event->user_stack));
+	bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
+	memory_capture_kernel_and_py(ctx, event, task);
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
@@ -4844,7 +4876,7 @@ static __always_inline int memory_alloc_exit(struct pt_regs *ctx, u64 addr,
 SEC("uprobe")
 int BPF_UPROBE(systing_malloc_enter, size_t size)
 {
-	return memory_alloc_enter((u64)size, 0);
+	return memory_alloc_enter(ctx, (u64)size, 0);
 }
 
 SEC("uretprobe")
@@ -4856,7 +4888,7 @@ int BPF_URETPROBE(systing_malloc_exit, void *ret)
 SEC("uprobe")
 int BPF_UPROBE(systing_calloc_enter, size_t nmemb, size_t size)
 {
-	return memory_alloc_enter((u64)nmemb * (u64)size, 0);
+	return memory_alloc_enter(ctx, (u64)nmemb * (u64)size, 0);
 }
 
 SEC("uretprobe")
@@ -4868,7 +4900,7 @@ int BPF_URETPROBE(systing_calloc_exit, void *ret)
 SEC("uprobe")
 int BPF_UPROBE(systing_realloc_enter, void *ptr, size_t size)
 {
-	return memory_alloc_enter((u64)size, (u64)ptr);
+	return memory_alloc_enter(ctx, (u64)size, (u64)ptr);
 }
 
 SEC("uretprobe")
@@ -4880,7 +4912,7 @@ int BPF_URETPROBE(systing_realloc_exit, void *ret)
 SEC("uprobe")
 int BPF_UPROBE(systing_aligned_alloc_enter, size_t alignment, size_t size)
 {
-	return memory_alloc_enter((u64)size, 0);
+	return memory_alloc_enter(ctx, (u64)size, 0);
 }
 
 SEC("uretprobe")
@@ -4893,7 +4925,7 @@ SEC("uprobe")
 int BPF_UPROBE(systing_posix_memalign_enter, void **memptr, size_t alignment,
 	       size_t size)
 {
-	return memory_alloc_enter((u64)size, (u64)memptr);
+	return memory_alloc_enter(ctx, (u64)size, (u64)memptr);
 }
 
 SEC("uretprobe")
@@ -4905,32 +4937,34 @@ int BPF_URETPROBE(systing_posix_memalign_exit, int ret)
 	if (!saved)
 		return 0;
 	memory_alloc_count(&memory_alloc_exit_count);
-	u64 memptr = saved->old_addr;
-	u64 size = saved->size;
-	bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
-
-	if (ret != 0)
-		return 0;
 
 	u64 addr = 0;
-	bpf_probe_read_user(&addr, sizeof(addr), (void *)memptr);
-	if (addr == 0)
+	if (ret == 0)
+		bpf_probe_read_user(&addr, sizeof(addr), (void *)saved->old_addr);
+	if (addr == 0) {
+		bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
 		return 0;
+	}
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	long flags;
 	struct memory_event *event = reserve_memory_event(&flags);
-	if (!event)
+	if (!event) {
+		bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
 		return handle_missed_event(MISSED_MEMORY_EVENT);
+	}
 
 	event->hdr.type = MEMORY_ALLOC;
 	event->hdr.ts = bpf_ktime_get_boot_ns();
 	event->hdr.cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->hdr.task, task);
 	event->hdr.addr = addr;
-	event->hdr.size = size;
+	event->hdr.size = saved->size;
 	event->hdr.member = MEMORY_OP_POSIX_MEMALIGN;
-	memory_capture_stack(ctx, event, task);
+	event->hdr.user_stack_length = saved->user_stack_length;
+	__builtin_memcpy(event->user_stack, saved->user_stack, sizeof(event->user_stack));
+	bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
+	memory_capture_kernel_and_py(ctx, event, task);
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;

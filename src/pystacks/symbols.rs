@@ -21,7 +21,7 @@ struct PySymbol {
 pub struct SymbolResolver {
     symbols: RwLock<HashMap<SymbolIdT, PySymbol>>,
     /// Map of PID -> version info for line table construction.
-    pid_versions: HashMap<i32, (i32, i32)>,
+    pid_versions: RwLock<HashMap<i32, (i32, i32)>>,
     /// FD for the pystacks_symbols BPF map.
     symbols_fd: i32,
     /// FD for the pystacks_linetables BPF map.
@@ -41,10 +41,17 @@ impl SymbolResolver {
 
         Self {
             symbols: RwLock::new(HashMap::new()),
-            pid_versions,
+            pid_versions: RwLock::new(pid_versions),
             symbols_fd,
             linetables_fd,
         }
+    }
+
+    pub fn add_pid_version(&self, pid: i32, major: i32, minor: i32) {
+        self.pid_versions
+            .write()
+            .unwrap()
+            .insert(pid, (major, minor));
     }
 
     /// Load symbols from BPF maps.
@@ -175,7 +182,13 @@ impl SymbolResolver {
             return None;
         }
 
-        let (major, minor) = self.pid_versions.get(&lt.pid).copied().unwrap_or((3, 11));
+        let (major, minor) = self
+            .pid_versions
+            .read()
+            .unwrap()
+            .get(&lt.pid)
+            .copied()
+            .unwrap_or((3, 11));
 
         PyLineTable::from_process(
             lt.pid,

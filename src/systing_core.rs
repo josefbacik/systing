@@ -1488,19 +1488,16 @@ fn handle_exec_events(
         };
         let exe_str = exe.to_string_lossy();
 
-        if exe_str.contains("python") {
-            // Direct Python exec within a traced process — add to pystacks.
-            // No pids_map update needed here: the process is already in the
-            // BPF pids map (trace_task() passed in the BPF handler), so
-            // sched/stack events are already being generated for it.
-            if added_pids.insert(pid) {
-                eprintln!(
-                    "[pystacks] Dynamically added Python PID {} ({})",
-                    pid, exe_str
-                );
-                psr.add_pid(pid as i32);
-            }
-        } else if !did_scan && exe_str.contains(".pyenv/") {
+        // Try every traced exec: check_python_process() scans maps for
+        // libpython, so embedders (uwsgi, gunicorn, etc.) are covered and
+        // non-python processes are rejected there.
+        if added_pids.insert(pid) && psr.add_pid(pid as i32) {
+            eprintln!(
+                "[pystacks] Dynamically added Python PID {} ({})",
+                pid, exe_str
+            );
+        }
+        if !did_scan && exe_str.contains(".pyenv/") && !exe_str.contains("python") {
             // A pyenv binary but not Python itself (e.g., forkapple's `fa`).
             // The actual Python process may be outside our traced tree.
             // Scan /proc for all Python processes and add them.
