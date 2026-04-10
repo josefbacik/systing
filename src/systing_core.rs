@@ -1144,6 +1144,19 @@ fn dump_missed_events(skel: &SystingSystemSkel, index: u32) -> u64 {
     missed
 }
 
+fn sum_percpu_counter(map: &dyn libbpf_rs::MapCore) -> u64 {
+    let key = 0u32.to_ne_bytes();
+    let mut total = 0u64;
+    if let Ok(Some(results)) = map.lookup_percpu(&key, libbpf_rs::MapFlags::ANY) {
+        for cpu_data in results {
+            let mut v: u64 = 0;
+            plain::copy_from_bytes(&mut v, &cpu_data).unwrap();
+            total += v;
+        }
+    }
+    total
+}
+
 fn is_old_kernel() -> bool {
     if let Some(kernel_version) = sysinfo::System::kernel_version() {
         let parts = kernel_version.split('.').collect::<Vec<&str>>();
@@ -2157,20 +2170,31 @@ fn collect_memory_alloc_target_pids(opts: &Config) -> Vec<u32> {
     pids.into_iter().collect()
 }
 
-/// Resolve the set of distinct libc paths mapped by the target processes.
+/// Resolve the set of distinct libc binaries mapped by the target processes.
 /// Matches `libc.so`, `libc.so.6`, `libc-2.xx.so`, and musl's `libc.so`/
-/// `ld-musl-*.so` via `resolve_library_path_for_pid`.
-fn discover_libc_paths(pids: &[u32]) -> HashSet<String> {
-    let mut paths = HashSet::new();
+/// `ld-musl-*.so` via `resolve_library_path_for_pid`. Paths are deduplicated
+/// by `(st_dev, st_ino)` so containers that share an image get exactly one
+/// set of uprobes. Returns `(unique-inode paths, distinct path-string count)`.
+fn discover_libc_paths(pids: &[u32]) -> (Vec<String>, usize) {
+    let mut raw_paths = HashSet::new();
     for pid in pids {
         for name in ["libc.so.6", "libc.so", "ld-musl"] {
             if let Some(p) = resolve_library_path_for_pid(*pid, name) {
-                paths.insert(p);
+                raw_paths.insert(p);
                 break;
             }
         }
     }
-    paths
+    let raw_count = raw_paths.len();
+    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
+    let mut unique = Vec::new();
+    for p in raw_paths {
+        match std::fs::metadata(&p) {
+            Ok(meta) if !seen_inodes.insert((meta.dev(), meta.ino())) => {}
+            _ => unique.push(p),
+        }
+    }
+    (unique, raw_count)
 }
 
 /// Attach malloc/free/... uprobes to each discovered libc. Probes are attached
@@ -2188,7 +2212,7 @@ fn attach_memory_alloc_uprobes(
         return Ok(Vec::new());
     }
 
-    let libc_paths = discover_libc_paths(&pids);
+    let (libc_paths, raw_path_count) = discover_libc_paths(&pids);
     if libc_paths.is_empty() {
         eprintln!(
             "Warning: memory-alloc recorder could not locate libc in /proc/<pid>/maps for any target; no uprobes attached"
@@ -2284,9 +2308,10 @@ fn attach_memory_alloc_uprobes(
         }
     }
     println!(
-        "memory-alloc: attached {} uprobe(s) across {} libc path(s)",
+        "memory-alloc: attached {} uprobe(s) across {} libc inode(s) (from {} path(s))",
         links.len(),
-        libc_paths.len()
+        libc_paths.len(),
+        raw_path_count
     );
     Ok(links)
 }
@@ -2707,6 +2732,16 @@ fn run_tracing_loop(
     }
     if opts.memory {
         println!("Missed memory events: {}", dump_missed_events(skel, 8));
+    }
+    if opts.memory_alloc {
+        let enters = sum_percpu_counter(&skel.maps.memory_alloc_enter_count);
+        let exits = sum_percpu_counter(&skel.maps.memory_alloc_exit_count);
+        println!(
+            "memory-alloc: lost {} allocation return probes ({} entries, {} exits)",
+            enters.saturating_sub(exits),
+            enters,
+            exits
+        );
     }
     if opts.markers {
         println!(
