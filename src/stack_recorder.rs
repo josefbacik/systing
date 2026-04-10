@@ -98,6 +98,10 @@ pub struct StackRecorder {
     /// The tgid is included in the key because the same addresses in different processes
     /// may resolve to different symbols (e.g., shared libraries at fixed addresses).
     unique_stacks: HashMap<(Stack, i32), i64>,
+    /// External stack_ids that collided with an existing unique_stacks key during
+    /// merge_external_stacks. Emitted as duplicate StackRecords in finish so every
+    /// id referenced by a streamed record resolves.
+    alias_stacks: Vec<(Stack, i32, i64)>,
     /// Next stack_id to assign for new unique stacks.
     next_stack_id: i64,
     /// Shared utid generator for consistent thread IDs across all recorders.
@@ -118,6 +122,7 @@ impl StackRecorder {
             process_dispatcher,
             streaming_collector: None,
             unique_stacks: HashMap::new(),
+            alias_stacks: Vec::new(),
             next_stack_id: 1,
             utid_generator,
         }
@@ -131,11 +136,18 @@ impl StackRecorder {
     }
 
     /// Merge externally-deduped stacks (from another recorder) so they are
-    /// symbolized and emitted alongside profiler stacks in `finish()`. The
-    /// caller is responsible for choosing non-colliding stack_ids.
+    /// symbolized and emitted alongside profiler stacks in `finish()`. When an
+    /// external key collides with an existing entry, the external id is kept as
+    /// an alias so both ids are emitted as StackRecords.
     pub fn merge_external_stacks(&mut self, stacks: HashMap<(Stack, i32), i64>) {
         for (key, id) in stacks {
-            self.unique_stacks.entry(key).or_insert(id);
+            if let Some(&existing) = self.unique_stacks.get(&key) {
+                if existing != id {
+                    self.alias_stacks.push((key.0, key.1, id));
+                }
+            } else {
+                self.unique_stacks.insert(key, id);
+            }
         }
     }
 
@@ -191,12 +203,12 @@ impl StackRecorder {
     }
 
     fn finish_inner(&mut self, collector: &mut dyn RecordCollector) -> Result<()> {
-        if self.unique_stacks.is_empty() {
+        if self.unique_stacks.is_empty() && self.alias_stacks.is_empty() {
             return Ok(());
         }
 
         // Symbolize all unique stacks and stream StackRecords
-        let pb = ProgressBar::new(self.unique_stacks.len() as u64);
+        let pb = ProgressBar::new((self.unique_stacks.len() + self.alias_stacks.len()) as u64);
         pb.set_style(
             ProgressStyle::default_bar()
                 .template(
@@ -220,6 +232,12 @@ impl StackRecorder {
         // Group stacks by tgid to reuse process sources efficiently
         let mut stacks_by_tgid: HashMap<i32, Vec<(&Stack, i64)>> = HashMap::new();
         for ((stack, tgid), stack_id) in self.unique_stacks.iter() {
+            stacks_by_tgid
+                .entry(*tgid)
+                .or_default()
+                .push((stack, *stack_id));
+        }
+        for (stack, tgid, stack_id) in self.alias_stacks.iter() {
             stacks_by_tgid
                 .entry(*tgid)
                 .or_default()
