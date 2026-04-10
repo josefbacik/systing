@@ -3,6 +3,8 @@
 //! This module implements `ValidationQueries` for Parquet trace files using
 //! native Arrow columnar scans with HashSet lookups.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use arrow::array::{
     Array, BooleanArray, Int32Array, Int64Array, Int8Array, ListArray, StringArray,
@@ -188,6 +190,16 @@ impl ValidationQueries for ParquetQueries {
 
     fn count_empty_thread_names(&mut self) -> Result<FieldCheck> {
         count_empty_names(&self.paths.thread, "utid", "tid", 0)
+    }
+
+    fn find_slice_utid_violations(&mut self) -> Result<FieldCheck> {
+        let non_cpu_track_ids = load_thread_attributed_track_ids(&self.paths.track)?;
+        find_utid_violations(&self.paths.slice, &non_cpu_track_ids)
+    }
+
+    fn find_instant_utid_violations(&mut self) -> Result<FieldCheck> {
+        let non_cpu_track_ids = load_thread_attributed_track_ids(&self.paths.track)?;
+        find_utid_violations(&self.paths.instant, &non_cpu_track_ids)
     }
 
     fn get_cmdline_stats(&mut self) -> Result<CmdlineStats> {
@@ -626,6 +638,196 @@ fn count_empty_names(
     })
 }
 
+/// Returns true if a track name matches the per-CPU track naming pattern
+/// (`"{track_name} CPU {cpu}"`, where `{cpu}` is a decimal integer).
+///
+/// Per-CPU tracks are emitted by `events::mod` for events that are not bound
+/// to a specific thread; rows on those tracks legitimately have NULL `utid`.
+///
+/// Known ambiguity: a user-defined marker track literally named e.g.
+/// `"Request CPU 0"` would be misclassified as a CPU track and excluded
+/// from utid validation. In practice marker track names don't collide with
+/// this pattern.
+///
+/// Must stay in sync with the DuckDB regex ` CPU [0-9]+$` used in
+/// `duckdb_queries::find_utid_violations_table`.
+fn is_cpu_track_name(name: &str) -> bool {
+    match name.rsplit_once(" CPU ") {
+        Some((_, tail)) => !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// Returns true if a track name identifies a root-level non-thread track.
+///
+/// This catches tracks that are directly identifiable by name pattern. Child
+/// tracks of excluded roots (e.g. network namespace/interface tracks) are
+/// handled separately by the parent-chain walk in
+/// `load_thread_attributed_track_ids`.
+///
+/// Tracks excluded from utid validation:
+/// - Per-CPU tracks (`"{name} CPU {n}"`) — events are CPU-scoped, not thread-scoped
+/// - Network root tracks (`"Network Packets"`, `"Network Interfaces"`)
+/// - Socket tracks (`"Socket ..."`) — bound to a connection, not a thread
+///
+/// Must stay in sync with the DuckDB filter in
+/// `duckdb_queries::find_utid_violations_table`.
+fn is_non_thread_track(name: &str) -> bool {
+    if is_cpu_track_name(name) {
+        return true;
+    }
+    // Network root tracks
+    if name == "Network Packets" || name == "Network Interfaces" {
+        return true;
+    }
+    // Socket tracks: "Socket {id}:{protocol}:..."
+    if name.starts_with("Socket ") {
+        return true;
+    }
+    false
+}
+
+/// Load the set of track ids from `track.parquet` that are expected to carry
+/// per-thread utid attribution. Excludes CPU tracks and network tracks
+/// (including descendants of network root tracks).
+/// Returns an empty set if the file is missing.
+fn load_thread_attributed_track_ids(path: &Path) -> Result<HashSet<i64>> {
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+
+    // First pass: collect all tracks with their names and parent_ids
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut all_tracks: Vec<(i64, String, Option<i64>)> = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result?;
+        let id_col = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+        let name_col = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let parent_col = batch
+            .column_by_name("parent_id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+        if let (Some(id_col), Some(name_col)) = (id_col, name_col) {
+            for i in 0..batch.num_rows() {
+                if id_col.is_null(i) || name_col.is_null(i) {
+                    continue;
+                }
+                let parent_id =
+                    parent_col.and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
+                all_tracks.push((id_col.value(i), name_col.value(i).to_string(), parent_id));
+            }
+        }
+    }
+
+    // Identify non-thread tracks (CPU tracks, network roots, socket tracks)
+    // and propagate exclusion to all descendants via BFS.
+    let mut excluded: HashSet<i64> = HashSet::new();
+    let mut children_map: HashMap<i64, Vec<i64>> = HashMap::new();
+
+    for &(id, ref name, parent_id) in &all_tracks {
+        if is_non_thread_track(name) {
+            excluded.insert(id);
+        }
+        if let Some(pid) = parent_id {
+            children_map.entry(pid).or_default().push(id);
+        }
+    }
+
+    // BFS from excluded roots to propagate exclusion to descendants
+    let mut queue: Vec<i64> = excluded.iter().copied().collect();
+    while let Some(parent) = queue.pop() {
+        if let Some(children) = children_map.get(&parent) {
+            for &child in children {
+                if excluded.insert(child) {
+                    queue.push(child);
+                }
+            }
+        }
+    }
+
+    // Return tracks that are NOT excluded
+    let ids = all_tracks
+        .iter()
+        .filter(|(id, _, _)| !excluded.contains(id))
+        .map(|(id, _, _)| *id)
+        .collect();
+
+    Ok(ids)
+}
+
+/// Find rows in a slice or instant parquet file whose `utid` is NULL and
+/// whose `track_id` belongs to a non-CPU custom track (as determined by
+/// `non_cpu_track_ids`). Returns the violating count, the denominator of rows
+/// on non-CPU tracks, and up to 10 sample violating `id`s.
+fn find_utid_violations(path: &Path, non_cpu_track_ids: &HashSet<i64>) -> Result<FieldCheck> {
+    if !path.exists() || non_cpu_track_ids.is_empty() {
+        return Ok(FieldCheck::ok(0));
+    }
+
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut empty_count = 0i64;
+    let mut total_count = 0i64;
+    let mut sample_ids = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result?;
+        let track_col = batch
+            .column_by_name("track_id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+        let utid_col = batch
+            .column_by_name("utid")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+        let id_col = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+
+        let (Some(track_col), Some(utid_col)) = (track_col, utid_col) else {
+            eprintln!(
+                "warning: {} batch missing track_id or utid column; skipping utid violation scan",
+                path.display()
+            );
+            continue;
+        };
+
+        for i in 0..batch.num_rows() {
+            if track_col.is_null(i) {
+                continue;
+            }
+            let track_id = track_col.value(i);
+            if !non_cpu_track_ids.contains(&track_id) {
+                continue;
+            }
+            total_count += 1;
+            if utid_col.is_null(i) {
+                empty_count += 1;
+                if sample_ids.len() < 10 {
+                    if let Some(id_col) = id_col {
+                        if !id_col.is_null(i) {
+                            sample_ids.push(id_col.value(i));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(FieldCheck {
+        empty_count,
+        total_count,
+        sample_ids,
+    })
+}
+
 /// Collect all values from an Int64 column into a HashSet.
 fn collect_i64_column(path: &Path, column: &str, set: &mut HashSet<i64>) -> Result<()> {
     let file = File::open(path)?;
@@ -900,6 +1102,22 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use crate::validation::test_utils::create_test_parquet;
+
+    #[test]
+    fn test_is_cpu_track_name() {
+        // Matches per-CPU tracks emitted by events::mod.
+        assert!(is_cpu_track_name("Syscalls CPU 0"));
+        assert!(is_cpu_track_name("Syscalls CPU 15"));
+        assert!(is_cpu_track_name("Some Long Name CPU 127"));
+        // Must not match anything else — user marker names, thread tracks, etc.
+        assert!(!is_cpu_track_name("MyTrack"));
+        assert!(!is_cpu_track_name("Markers"));
+        assert!(!is_cpu_track_name("CPU 0"), "no prefix before ' CPU '");
+        assert!(!is_cpu_track_name("Syscalls CPU"), "no trailing digits");
+        assert!(!is_cpu_track_name("Syscalls CPU x"), "non-digit tail");
+        assert!(!is_cpu_track_name("Syscalls CPU 0a"), "trailing non-digit");
+        assert!(!is_cpu_track_name(""), "empty");
+    }
 
     /// Helper to create a valid process.parquet with required cmdline field.
     fn create_valid_process_parquet(dir: &Path, upid: i64, pid: i32, name: &str) {

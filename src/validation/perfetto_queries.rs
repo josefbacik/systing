@@ -396,6 +396,17 @@ impl ValidationQueries for PerfettoQueries {
         })
     }
 
+    fn find_slice_utid_violations(&mut self) -> Result<FieldCheck> {
+        // Perfetto TrackEvents are routed via `track_uuid`, not via a
+        // slice.utid column. The equivalent thread-attribution invariant is
+        // enforced by parent_uuid hierarchy validation.
+        Ok(FieldCheck::ok(0))
+    }
+
+    fn find_instant_utid_violations(&mut self) -> Result<FieldCheck> {
+        Ok(FieldCheck::ok(0))
+    }
+
     fn get_cmdline_stats(&mut self) -> Result<CmdlineStats> {
         let total = self.context.empty_cmdline_count + self.context.has_cmdline_count;
         Ok(CmdlineStats {

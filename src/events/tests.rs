@@ -509,7 +509,7 @@ fn test_range_packet() {
     assert!(recorder
         .outstanding_ranges
         .get(&1234)
-        .map_or(true, |r| r.is_empty()));
+        .is_none_or(|r| r.is_empty()));
     let data = recorder.finish_in_memory();
     assert_eq!(data.tracks.len(), 1);
     assert_eq!(data.tracks[0].name, "track_name");
@@ -675,7 +675,7 @@ fn test_range_packet_multiple_ranges() {
     assert!(recorder
         .outstanding_ranges
         .get(&1234)
-        .map_or(true, |r| r.is_empty()));
+        .is_none_or(|r| r.is_empty()));
     let collector = recorder.finish().unwrap().unwrap();
     collector.finish_boxed().unwrap();
 }
@@ -749,7 +749,7 @@ fn test_range_packet_multiple_ranges_multi_packet() {
     assert!(recorder
         .outstanding_ranges
         .get(&1234)
-        .map_or(true, |r| r.is_empty()));
+        .is_none_or(|r| r.is_empty()));
     let collector = recorder.finish().unwrap().unwrap();
     collector.finish_boxed().unwrap();
 }
@@ -2042,7 +2042,7 @@ fn test_thread_scope_no_cross_thread_match() {
     assert!(recorder
         .outstanding_ranges
         .get(&tgidpid_thread1)
-        .map_or(false, |r| !r.is_empty()));
+        .is_some_and(|r| !r.is_empty()));
 }
 
 #[test]
@@ -2098,7 +2098,7 @@ fn test_process_scope_cross_thread_match() {
     assert!(recorder
         .outstanding_ranges
         .get(&tgid)
-        .map_or(true, |r| r.is_empty()));
+        .is_none_or(|r| r.is_empty()));
     let data = recorder.finish_in_memory();
     assert_eq!(data.slices.len(), 1);
     assert_eq!(data.slices[0].name, "my_span");

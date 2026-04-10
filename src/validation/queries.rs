@@ -79,6 +79,33 @@ pub trait ValidationQueries {
     /// Validate tpu_metric table data: timestamps > 0, metric_name not empty, values finite.
     /// Returns None if the table doesn't exist, or Some(TpuMetricCheck) with results.
     fn check_tpu_metrics(&mut self) -> Result<Option<TpuMetricCheck>>;
+
+    /// Find slice rows on a non-CPU custom track whose `utid` is NULL.
+    ///
+    /// Two recorders write to `track.parquet`:
+    ///   - `marker_recorder` — user-emitted markers; rows MUST carry `utid` so
+    ///     downstream joins against `thread` work for per-thread attribution.
+    ///   - `events::mod` — emits both `Thread` tracks (rows MUST have `utid`)
+    ///     and `Cpu` tracks (rows legitimately have no `utid`).
+    ///
+    /// CPU tracks are identified by the ` CPU <digits>` suffix produced by
+    /// `events::mod` (`format!("{track_name} CPU {cpu}")`). Rows on all other
+    /// custom tracks must be thread-attributed.
+    ///
+    /// `FieldCheck::empty_count` counts violating rows, `total_count` counts
+    /// rows on non-CPU custom tracks (the denominator), and `sample_ids`
+    /// contains up to 10 violating `slice.id` values for the error message.
+    ///
+    /// Note: For Perfetto traces, this always returns `FieldCheck::ok(0)`
+    /// because Perfetto routes events via `track_uuid`, not a `slice.utid`
+    /// column; the equivalent invariant is covered by parent_uuid hierarchy
+    /// validation.
+    fn find_slice_utid_violations(&mut self) -> Result<FieldCheck>;
+
+    /// Find instant rows on a non-CPU custom track whose `utid` is NULL.
+    ///
+    /// See `find_slice_utid_violations` for the selection rules.
+    fn find_instant_utid_violations(&mut self) -> Result<FieldCheck>;
 }
 
 /// Result of reference integrity check - includes sample IDs for debugging.

@@ -1015,6 +1015,12 @@ impl TraceExtractor {
                     if let Some(&upid) = self.pid_to_upid.get(&pid) {
                         self.track_uuid_to_id.insert(desc.uuid(), upid);
                     }
+                    // Map the process track UUID to the main thread's utid so
+                    // child custom tracks (e.g. marker tracks) can inherit it
+                    // via parent_uuid propagation.
+                    if let Some(&utid) = self.tid_to_utid.get(&pid) {
+                        self.track_uuid_to_utid.insert(desc.uuid(), utid);
+                    }
                 }
             }
 
