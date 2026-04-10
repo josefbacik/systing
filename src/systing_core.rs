@@ -1496,7 +1496,10 @@ fn handle_exec_events(
         //
         // sched_process_exec fires before ld.so maps libpython, so for
         // dynamically-linked python stubs the first maps scan often finds
-        // nothing. Retry a few times with a short backoff.
+        // nothing. Retry a few times with a short backoff. This blocks the
+        // exec-handler thread for up to 100ms per miss, which is acceptable
+        // given the dedicated 100K-deep channel; a non-blocking retry queue
+        // is a follow-up if python fork-storms become an issue.
         if !added_pids.contains(&pid) {
             let looks_like_python = exe_str.contains("python");
             let mut registered = psr.add_pid(pid as i32);
@@ -1517,7 +1520,7 @@ fn handle_exec_events(
                 );
             } else if looks_like_python && pystacks_debug {
                 eprintln!(
-                    "[pystacks debug] Exec event for PID {} ({}), not Python",
+                    "[pystacks debug] python-named exe PID {} ({}) but libpython/_PyRuntime not found after retries",
                     pid, exe_str
                 );
             }
@@ -1535,12 +1538,12 @@ fn handle_exec_events(
             did_scan = true;
             let discovered = discover_python_processes(pystacks_debug);
             for py_pid in discovered {
-                if added_pids.insert(py_pid) {
+                if !added_pids.contains(&py_pid) && psr.add_pid(py_pid as i32) {
+                    added_pids.insert(py_pid);
                     eprintln!(
                         "[pystacks] Dynamically added Python PID {} (discovered via pyenv exec)",
                         py_pid
                     );
-                    psr.add_pid(py_pid as i32);
                     // Also add to the BPF pids map so this process
                     // generates sched/stack events
                     let val = (1_u8).to_ne_bytes();

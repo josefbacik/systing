@@ -61,6 +61,19 @@ pub fn check_python_process(pid: i32) -> Option<PyProcessInfo> {
     let exe_path = process::read_exe_path(pid)?;
     let exe_str = exe_path.to_string_lossy();
 
+    // Cheap gate: try_python_module() reads and ELF-parses the whole binary.
+    // This is now called for every traced exec, so short-circuit when neither
+    // the exe path nor any mapped module mentions python. Embedders like
+    // uwsgi/gunicorn are still detected via their libpython mapping.
+    let exe_lower = exe_str.to_lowercase();
+    let looks_like_python = exe_lower.contains("python")
+        || maps
+            .iter()
+            .any(|m| !m.name.is_empty() && m.name.to_lowercase().contains("python"));
+    if !looks_like_python {
+        return None;
+    }
+
     // Check exe first
     let mut checked_paths = std::collections::HashSet::new();
 
