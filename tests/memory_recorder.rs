@@ -206,3 +206,125 @@ fn test_memory_recorder_e2e() {
 
     eprintln!("\ntest_memory_recorder_e2e: all checks passed");
 }
+
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_alloc_e2e() {
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+
+    // Workload: many small allocations that stay below the glibc MMAP_THRESHOLD
+    // so they go through malloc (brk-backed), plus an explicit free pass.
+    const SMALL_COUNT: i64 = 4000;
+    const SMALL_SIZE: i64 = 512;
+    let py_prog = format!(
+        "objs=[bytes({size}) for _ in range({count})]\n\
+         del objs\n\
+         import time; time.sleep(0.1)\n",
+        count = SMALL_COUNT,
+        size = SMALL_SIZE,
+    );
+    let run_cmd = vec!["python3".to_string(), "-c".to_string(), py_prog];
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+    let child_pid = traced_child.pid as i32;
+
+    eprintln!(
+        "Recording memory-alloc trace (pid {}, {}x{}B allocs)...",
+        child_pid, SMALL_COUNT, SMALL_SIZE
+    );
+
+    let config = Config {
+        memory: true,
+        memory_alloc: true,
+        memory_alloc_sample_rate: 1,
+        memory_fault_sample_rate: 1,
+        parquet_only: true,
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path,
+        ..Config::default()
+    };
+
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+    assert_eq!(exit_code, 0, "allocator workload should exit with code 0");
+    eprintln!("Recording complete.\n");
+
+    assert!(
+        dir.path().join("memory_alloc.parquet").exists(),
+        "memory_alloc.parquet not found in output dir"
+    );
+
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "allotest")
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    // --- Check: memory_alloc has malloc rows for our workload ---
+    eprintln!("  memory_alloc malloc events...");
+    let (malloc_rows, free_rows): (i64, i64) = conn
+        .query_row(
+            "SELECT
+                 COUNT(*) FILTER (WHERE op = 'malloc'),
+                 COUNT(*) FILTER (WHERE op = 'free')
+             FROM memory_alloc WHERE pid = ?",
+            [child_pid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Failed to query memory_alloc");
+    // Python interpreter startup alone does thousands of mallocs; a loose floor
+    // keeps this robust across libc versions.
+    assert!(
+        malloc_rows >= SMALL_COUNT / 4,
+        "[memory_alloc] expected >= {} malloc rows, got {}",
+        SMALL_COUNT / 4,
+        malloc_rows
+    );
+    assert!(
+        free_rows > 0,
+        "[memory_alloc] no free rows for workload pid {child_pid}"
+    );
+    eprintln!("    {} malloc, {} free events", malloc_rows, free_rows);
+
+    // --- Check: malloc sizes look sane (non-zero, below 64GiB) ---
+    let max_size: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(size), 0) FROM memory_alloc
+             WHERE pid = ? AND op != 'free'",
+            [child_pid],
+            |row| row.get(0),
+        )
+        .expect("Failed to query memory_alloc max size");
+    assert!(
+        max_size > 0 && max_size < RSS_SANITY_CEILING_BYTES,
+        "[memory_alloc] max alloc size {} outside sane range",
+        max_size
+    );
+
+    // --- Check: memory_alloc.stack_id joins to stack.id ---
+    eprintln!("  memory_alloc.stack_id -> stack.id join...");
+    let (with_stack, joined): (i64, i64) = conn
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM memory_alloc
+                  WHERE stack_id IS NOT NULL AND pid = ?),
+                 (SELECT COUNT(*) FROM memory_alloc ma JOIN stack s ON s.id = ma.stack_id
+                  WHERE ma.pid = ?)",
+            [child_pid, child_pid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Failed to query memory_alloc/stack join");
+    assert!(
+        with_stack > 0,
+        "[memory_alloc] no rows with non-null stack_id for workload pid {child_pid}"
+    );
+    assert_eq!(
+        with_stack, joined,
+        "[memory_alloc] {} rows have stack_id but only {} join to stack.id",
+        with_stack, joined
+    );
+    eprintln!("    {} memory_alloc rows join to stack table", joined);
+
+    eprintln!("\ntest_memory_alloc_e2e: all checks passed");
+}

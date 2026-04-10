@@ -7,9 +7,9 @@ use crate::pystacks::stack_walker::StackWalkerRun;
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::stack_recorder::Stack;
-use crate::systing_core::types::{memory_event, memory_event_type};
+use crate::systing_core::types::{memory_alloc_op, memory_event, memory_event_type};
 use crate::systing_core::SystingRecordEvent;
-use crate::trace::{MemoryFaultRecord, MemoryMapRecord, MemoryRssRecord};
+use crate::trace::{MemoryAllocRecord, MemoryFaultRecord, MemoryMapRecord, MemoryRssRecord};
 
 /// stack_id offset for stacks interned by the memory recorder, to keep them
 /// disjoint from `StackRecorder`'s own ids prior to the end-of-trace merge.
@@ -27,6 +27,7 @@ pub struct MemoryRecorder {
     unique_stacks: HashMap<(Stack, i32), i64>,
     next_stack_id: i64,
     next_map_id: i64,
+    next_alloc_id: i64,
 }
 
 impl Default for MemoryRecorder {
@@ -38,7 +39,20 @@ impl Default for MemoryRecorder {
             unique_stacks: HashMap::new(),
             next_stack_id: MEMORY_STACK_ID_OFFSET,
             next_map_id: 1,
+            next_alloc_id: 1,
         }
+    }
+}
+
+fn alloc_op_name(op: u32) -> &'static str {
+    match memory_alloc_op(op) {
+        memory_alloc_op::MEMORY_OP_MALLOC => "malloc",
+        memory_alloc_op::MEMORY_OP_CALLOC => "calloc",
+        memory_alloc_op::MEMORY_OP_REALLOC => "realloc",
+        memory_alloc_op::MEMORY_OP_POSIX_MEMALIGN => "posix_memalign",
+        memory_alloc_op::MEMORY_OP_ALIGNED_ALLOC => "aligned_alloc",
+        memory_alloc_op::MEMORY_OP_FREE => "free",
+        _ => "unknown",
     }
 }
 
@@ -166,6 +180,28 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
                     pid: tgid,
                     addr: event.addr as i64,
                     error_code: event.flags as i32,
+                    stack_id,
+                });
+            }
+            memory_event_type::MEMORY_ALLOC | memory_event_type::MEMORY_FREE => {
+                let stack_id = self.intern_stack(&event, tgid);
+                let id = self.next_alloc_id;
+                self.next_alloc_id += 1;
+                let is_realloc =
+                    memory_alloc_op(event.member) == memory_alloc_op::MEMORY_OP_REALLOC;
+                let _ = collector.add_memory_alloc(MemoryAllocRecord {
+                    id,
+                    ts: event.ts as i64,
+                    tid,
+                    pid: tgid,
+                    op: alloc_op_name(event.member).to_string(),
+                    addr: event.addr as i64,
+                    size: event.size as i64,
+                    old_addr: if is_realloc {
+                        Some(event.old_addr as i64)
+                    } else {
+                        None
+                    },
                     stack_id,
                 });
             }

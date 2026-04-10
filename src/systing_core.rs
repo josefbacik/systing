@@ -170,6 +170,23 @@ const MEMORY_BPF_PROGRAMS: &[&str] = &[
     "systing_page_fault_user",
 ];
 
+/// Allocator uprobe programs. Listed here only so `enable_programs` loads them
+/// when the `memory-alloc` recorder is on; actual attachment is manual via
+/// `attach_memory_alloc_uprobes` (libbpf cannot auto-attach a bare SEC("uprobe")).
+const MEMORY_ALLOC_BPF_PROGRAMS: &[&str] = &[
+    "systing_malloc_enter",
+    "systing_malloc_exit",
+    "systing_calloc_enter",
+    "systing_calloc_exit",
+    "systing_realloc_enter",
+    "systing_realloc_exit",
+    "systing_aligned_alloc_enter",
+    "systing_aligned_alloc_exit",
+    "systing_posix_memalign_enter",
+    "systing_posix_memalign_exit",
+    "systing_free_enter",
+];
+
 const NETWORK_BPF_PROGRAMS: &[&str] = &[
     "inet_sock_set_state",
     "tcp_time_wait_entry",
@@ -264,6 +281,12 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             bpf_programs: MEMORY_BPF_PROGRAMS,
         },
         RecorderInfo {
+            name: "memory-alloc",
+            description: "Heap allocator uprobes (malloc/calloc/realloc/free) with stacks",
+            default_enabled: false,
+            bpf_programs: MEMORY_ALLOC_BPF_PROGRAMS,
+        },
+        RecorderInfo {
             name: "pystacks",
             description: "Python stack tracing",
             default_enabled: false,
@@ -316,6 +339,7 @@ fn is_recorder_enabled(name: &str, opts: &Config) -> bool {
         "interruptible-stacks" => !opts.no_interruptible_stack_traces,
         "cpu-stacks" => !opts.no_cpu_stack_traces,
         "memory" => opts.memory,
+        "memory-alloc" => opts.memory_alloc,
         "network" => opts.network,
         "network-packets" => opts.network_packets,
         "pystacks" => opts.collect_pystacks,
@@ -437,6 +461,10 @@ pub struct Config {
     pub memory: bool,
     /// Sample 1 in N user page faults (0 or 1 = record all)
     pub memory_fault_sample_rate: u32,
+    /// Enable heap allocator uprobes (malloc/free/calloc/realloc/...)
+    pub memory_alloc: bool,
+    /// Sample 1 in N allocator calls (0 or 1 = record all)
+    pub memory_alloc_sample_rate: u32,
     /// Enable network recording
     pub network: bool,
     /// Enable network packet-level probes (sendmsg, recvmsg, transmit, qdisc, drops).
@@ -494,6 +522,8 @@ impl Default for Config {
             marker_duration_threshold: None,
             memory: false,
             memory_fault_sample_rate: 97,
+            memory_alloc: false,
+            memory_alloc_sample_rate: 1,
             network: false,
             network_packets: false,
             resolve_addresses: false,
@@ -1844,6 +1874,9 @@ fn configure_bpf_skeleton(
             rodata.tool_config.collect_memory = 1;
             rodata.tool_config.memory_fault_sample_rate = opts.memory_fault_sample_rate;
         }
+        if opts.memory_alloc {
+            rodata.tool_config.memory_alloc_sample_rate = opts.memory_alloc_sample_rate;
+        }
 
         // Set wakeup threshold to 50% of ringbuf size for batched wakeups
         // Default ringbuf size is 50 MiB if not specified
@@ -2105,6 +2138,157 @@ fn resolve_pids_for_probe(
         }
         Ok((pid_map, false))
     }
+}
+
+/// Collect target PIDs for libc uprobe discovery (from `--pid` and each
+/// `--cgroup`'s `cgroup.procs`).
+fn collect_memory_alloc_target_pids(opts: &Config) -> Vec<u32> {
+    let mut pids: HashSet<u32> = opts.pid.iter().copied().collect();
+    for cgroup in &opts.cgroup {
+        let procs = std::path::Path::new(cgroup).join("cgroup.procs");
+        if let Ok(contents) = std::fs::read_to_string(&procs) {
+            for line in contents.lines() {
+                if let Ok(pid) = line.trim().parse::<u32>() {
+                    pids.insert(pid);
+                }
+            }
+        }
+    }
+    pids.into_iter().collect()
+}
+
+/// Resolve the set of distinct libc paths mapped by the target processes.
+/// Matches `libc.so`, `libc.so.6`, `libc-2.xx.so`, and musl's `libc.so`/
+/// `ld-musl-*.so` via `resolve_library_path_for_pid`.
+fn discover_libc_paths(pids: &[u32]) -> HashSet<String> {
+    let mut paths = HashSet::new();
+    for pid in pids {
+        for name in ["libc.so.6", "libc.so", "ld-musl"] {
+            if let Some(p) = resolve_library_path_for_pid(*pid, name) {
+                paths.insert(p);
+                break;
+            }
+        }
+    }
+    paths
+}
+
+/// Attach malloc/free/... uprobes to each discovered libc. Probes are attached
+/// with pid=-1 so every process sharing that libc is covered; BPF-side
+/// `trace_task()` enforces the configured pid/cgroup filter.
+fn attach_memory_alloc_uprobes(
+    skel: &mut SystingSystemSkel,
+    opts: &Config,
+) -> Result<Vec<libbpf_rs::Link>> {
+    let pids = collect_memory_alloc_target_pids(opts);
+    if pids.is_empty() {
+        eprintln!(
+            "Warning: memory-alloc recorder requires --pid, --cgroup, or a run command; no uprobes attached"
+        );
+        return Ok(Vec::new());
+    }
+
+    let libc_paths = discover_libc_paths(&pids);
+    if libc_paths.is_empty() {
+        eprintln!(
+            "Warning: memory-alloc recorder could not locate libc in /proc/<pid>/maps for any target; no uprobes attached"
+        );
+        return Ok(Vec::new());
+    }
+
+    struct Probe<'a> {
+        prog: &'a libbpf_rs::ProgramMut<'a>,
+        func: &'static str,
+        ret: bool,
+    }
+    let probes = [
+        Probe {
+            prog: &skel.progs.systing_malloc_enter,
+            func: "malloc",
+            ret: false,
+        },
+        Probe {
+            prog: &skel.progs.systing_malloc_exit,
+            func: "malloc",
+            ret: true,
+        },
+        Probe {
+            prog: &skel.progs.systing_calloc_enter,
+            func: "calloc",
+            ret: false,
+        },
+        Probe {
+            prog: &skel.progs.systing_calloc_exit,
+            func: "calloc",
+            ret: true,
+        },
+        Probe {
+            prog: &skel.progs.systing_realloc_enter,
+            func: "realloc",
+            ret: false,
+        },
+        Probe {
+            prog: &skel.progs.systing_realloc_exit,
+            func: "realloc",
+            ret: true,
+        },
+        Probe {
+            prog: &skel.progs.systing_aligned_alloc_enter,
+            func: "aligned_alloc",
+            ret: false,
+        },
+        Probe {
+            prog: &skel.progs.systing_aligned_alloc_exit,
+            func: "aligned_alloc",
+            ret: true,
+        },
+        Probe {
+            prog: &skel.progs.systing_posix_memalign_enter,
+            func: "posix_memalign",
+            ret: false,
+        },
+        Probe {
+            prog: &skel.progs.systing_posix_memalign_exit,
+            func: "posix_memalign",
+            ret: true,
+        },
+        Probe {
+            prog: &skel.progs.systing_free_enter,
+            func: "free",
+            ret: false,
+        },
+    ];
+
+    let mut links = Vec::new();
+    for path in &libc_paths {
+        for p in &probes {
+            match p.prog.attach_uprobe_with_opts(
+                -1,
+                path,
+                0,
+                UprobeOpts {
+                    retprobe: p.ret,
+                    func_name: Some(p.func.to_string()),
+                    ..Default::default()
+                },
+            ) {
+                Ok(link) => links.push(link),
+                Err(e) => eprintln!(
+                    "Warning: failed to attach {}uprobe {}:{}: {}",
+                    if p.ret { "ret" } else { "" },
+                    path,
+                    p.func,
+                    e
+                ),
+            }
+        }
+    }
+    println!(
+        "memory-alloc: attached {} uprobe(s) across {} libc path(s)",
+        links.len(),
+        libc_paths.len()
+    );
+    Ok(links)
 }
 
 fn attach_probes(
@@ -2787,6 +2971,12 @@ pub fn systing(
 
         // Attach any usdt's that we may have
         let _probe_links = attach_probes(&mut skel, &recorder, &opts, old_kernel)?;
+
+        let _memory_alloc_links = if opts.memory_alloc {
+            attach_memory_alloc_uprobes(&mut skel, &opts)?
+        } else {
+            Vec::new()
+        };
 
         // Signal the traced child to exec now that BPF is fully attached.
         // All tracing is active, so we capture everything from exec onwards.

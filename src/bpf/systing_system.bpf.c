@@ -71,6 +71,7 @@ const volatile struct {
 	u32 marker_syscall_nr; /* Syscall number for marker events (0 = disabled) */
 	u32 collect_memory;    /* Memory recorder enabled */
 	u32 memory_fault_sample_rate; /* Sample 1 in N page faults (0 or 1 = all) */
+	u32 memory_alloc_sample_rate; /* Sample 1 in N malloc/free calls (0 or 1 = all) */
 } tool_config = {};
 
 enum event_type {
@@ -319,6 +320,8 @@ enum memory_event_type {
 	MEMORY_BRK,           // sys_exit_brk - heap boundary change
 	MEMORY_PAGE_FAULT,    // exceptions:page_fault_user - demand fault (sampled)
 	MEMORY_MM_SAMPLE,     // periodic mm_struct snapshot (from perf_event_clock)
+	MEMORY_ALLOC,         // uretprobe malloc/calloc/realloc/... - heap object allocated
+	MEMORY_FREE,          // uprobe free - heap object released
 };
 
 /* RSS stat member indices (mirrors include/linux/mm_types_task.h) */
@@ -329,15 +332,26 @@ enum memory_rss_member {
 	MEMORY_MM_SHMEMPAGES,
 };
 
+/* Allocator operation, stored in memory_event.member for MEMORY_ALLOC/FREE. */
+enum memory_alloc_op {
+	MEMORY_OP_MALLOC,
+	MEMORY_OP_CALLOC,
+	MEMORY_OP_REALLOC,
+	MEMORY_OP_POSIX_MEMALIGN,
+	MEMORY_OP_ALIGNED_ALLOC,
+	MEMORY_OP_FREE,
+};
+
 struct memory_event {
 	enum memory_event_type type;
 	u64 ts;
 	u32 cpu;
 	struct task_info task;
-	u64 addr;          // mmap ret / munmap addr / fault addr / brk new / hiwater_rss
-	u64 size;          // mmap len / munmap len / rss size (bytes) / total_vm (bytes)
-	u32 member;        // rss_stat: enum memory_rss_member; mmap: prot
+	u64 addr;          // mmap ret / munmap addr / fault addr / brk new / hiwater_rss / alloc ret
+	u64 size;          // mmap len / munmap len / rss size (bytes) / total_vm (bytes) / alloc bytes
+	u32 member;        // rss_stat: enum memory_rss_member; mmap: prot; alloc: enum memory_alloc_op
 	u32 flags;         // mmap: MAP_* flags; page_fault: error_code
+	u64 old_addr;      // realloc: previous pointer (else 0)
 	u64 kernel_stack_length;
 	u64 user_stack_length;
 	u64 kernel_stack[MAX_STACK_DEPTH];
@@ -369,6 +383,7 @@ struct marker_event _marker_event = {0};
 struct memory_event _memory_event = {0};
 enum memory_event_type _memory_event_type = MEMORY_RSS_STAT;
 enum memory_rss_member _memory_rss_member = MEMORY_MM_FILEPAGES;
+enum memory_alloc_op _memory_alloc_op = MEMORY_OP_MALLOC;
 #ifdef SYSTING_PYSTACKS
 struct exec_event _exec_event = {0};
 #endif
@@ -859,6 +874,29 @@ struct {
 	__type(value, u64);
 } memory_fault_counter SEC(".maps");
 
+/* Per-thread scratch for pairing allocator uprobe enter→uretprobe exit.
+ * Separate from memory_syscall_scratch so a malloc that internally calls
+ * mmap does not clobber its own saved size. */
+struct memory_alloc_args {
+	u64 size;
+	u64 old_addr;  /* realloc: ptr; posix_memalign: &memptr */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, u64);   // tgidpid
+	__type(value, struct memory_alloc_args);
+} memory_alloc_scratch SEC(".maps");
+
+/* Per-CPU counter for allocator sampling. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_alloc_counter SEC(".maps");
+
 // Generate new socket ID atomically
 // Returns socket IDs starting from 1 (0 indicates failure)
 static __always_inline u64 generate_socket_id(void)
@@ -1150,6 +1188,7 @@ static struct memory_event *reserve_memory_event(long *flags)
 		event->size = 0;
 		event->member = 0;
 		event->flags = 0;
+		event->old_addr = 0;
 		event->kernel_stack_length = 0;
 		event->user_stack_length = 0;
 #ifdef SYSTING_PYSTACKS
@@ -4677,5 +4716,195 @@ int systing_page_fault_user(struct systing_pf_args *ctx)
 	return 0;
 }
 #endif
+
+/* ---- memory-alloc: libc allocator uprobes ----
+ *
+ * Attached manually from userspace (per unique libc path, pid=-1); BPF-side
+ * trace_task() enforces the pid/cgroup filter. Sampling keeps overhead bounded
+ * on malloc-heavy workloads: the entry probe decides whether to record, and the
+ * retprobe only emits if the entry stashed args. */
+
+static __always_inline bool memory_alloc_sample(void)
+{
+	if (tool_config.memory_alloc_sample_rate <= 1)
+		return true;
+	u32 zero = 0;
+	u64 *cnt = bpf_map_lookup_elem(&memory_alloc_counter, &zero);
+	if (!cnt)
+		return true;
+	*cnt += 1;
+	return (*cnt % tool_config.memory_alloc_sample_rate) == 0;
+}
+
+static __always_inline int memory_alloc_enter(u64 size, u64 old_addr)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	if (!memory_alloc_sample())
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_alloc_args args = { .size = size, .old_addr = old_addr };
+	bpf_map_update_elem(&memory_alloc_scratch, &tgidpid, &args, BPF_ANY);
+	return 0;
+}
+
+static __always_inline int memory_alloc_exit(struct pt_regs *ctx, u64 addr,
+					     enum memory_alloc_op op)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_alloc_args *saved =
+		bpf_map_lookup_elem(&memory_alloc_scratch, &tgidpid);
+	if (!saved)
+		return 0;
+	struct memory_alloc_args args = *saved;
+	bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
+
+	if (addr == 0)
+		return 0;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->type = MEMORY_ALLOC;
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->addr = addr;
+	event->size = args.size;
+	event->old_addr = args.old_addr;
+	event->member = op;
+	memory_capture_stack(ctx, event, task);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("uprobe")
+int BPF_UPROBE(systing_malloc_enter, size_t size)
+{
+	return memory_alloc_enter((u64)size, 0);
+}
+
+SEC("uretprobe")
+int BPF_URETPROBE(systing_malloc_exit, void *ret)
+{
+	return memory_alloc_exit(ctx, (u64)ret, MEMORY_OP_MALLOC);
+}
+
+SEC("uprobe")
+int BPF_UPROBE(systing_calloc_enter, size_t nmemb, size_t size)
+{
+	return memory_alloc_enter((u64)nmemb * (u64)size, 0);
+}
+
+SEC("uretprobe")
+int BPF_URETPROBE(systing_calloc_exit, void *ret)
+{
+	return memory_alloc_exit(ctx, (u64)ret, MEMORY_OP_CALLOC);
+}
+
+SEC("uprobe")
+int BPF_UPROBE(systing_realloc_enter, void *ptr, size_t size)
+{
+	return memory_alloc_enter((u64)size, (u64)ptr);
+}
+
+SEC("uretprobe")
+int BPF_URETPROBE(systing_realloc_exit, void *ret)
+{
+	return memory_alloc_exit(ctx, (u64)ret, MEMORY_OP_REALLOC);
+}
+
+SEC("uprobe")
+int BPF_UPROBE(systing_aligned_alloc_enter, size_t alignment, size_t size)
+{
+	return memory_alloc_enter((u64)size, 0);
+}
+
+SEC("uretprobe")
+int BPF_URETPROBE(systing_aligned_alloc_exit, void *ret)
+{
+	return memory_alloc_exit(ctx, (u64)ret, MEMORY_OP_ALIGNED_ALLOC);
+}
+
+SEC("uprobe")
+int BPF_UPROBE(systing_posix_memalign_enter, void **memptr, size_t alignment,
+	       size_t size)
+{
+	return memory_alloc_enter((u64)size, (u64)memptr);
+}
+
+SEC("uretprobe")
+int BPF_URETPROBE(systing_posix_memalign_exit, int ret)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_alloc_args *saved =
+		bpf_map_lookup_elem(&memory_alloc_scratch, &tgidpid);
+	if (!saved)
+		return 0;
+	u64 memptr = saved->old_addr;
+	u64 size = saved->size;
+	bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
+
+	if (ret != 0)
+		return 0;
+
+	u64 addr = 0;
+	bpf_probe_read_user(&addr, sizeof(addr), (void *)memptr);
+	if (addr == 0)
+		return 0;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->type = MEMORY_ALLOC;
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->addr = addr;
+	event->size = size;
+	event->member = MEMORY_OP_POSIX_MEMALIGN;
+	memory_capture_stack(ctx, event, task);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("uprobe")
+int BPF_UPROBE(systing_free_enter, void *ptr)
+{
+	if (ptr == NULL)
+		return 0;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	if (!memory_alloc_sample())
+		return 0;
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->type = MEMORY_FREE;
+	event->ts = bpf_ktime_get_boot_ns();
+	event->cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->task, task);
+	event->addr = (u64)ptr;
+	event->member = MEMORY_OP_FREE;
+	memory_capture_stack(ctx, event, task);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
 
 char LICENSE[] SEC("license") = "GPL";

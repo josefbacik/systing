@@ -57,6 +57,7 @@ pub const DATA_TABLES: &[&str] = &[
     "memory_rss",
     "memory_map",
     "memory_fault",
+    "memory_alloc",
     "clock_snapshot",
     "sysinfo",
     "tpu_device",
@@ -440,6 +441,18 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             error_code INTEGER,
             stack_id BIGINT
         );
+        CREATE TABLE IF NOT EXISTS memory_alloc (
+            trace_id VARCHAR,
+            id BIGINT,
+            ts BIGINT,
+            tid INTEGER,
+            pid INTEGER,
+            op VARCHAR,
+            addr BIGINT,
+            size BIGINT,
+            old_addr BIGINT,
+            stack_id BIGINT
+        );
         CREATE TABLE IF NOT EXISTS clock_snapshot (
             trace_id VARCHAR,
             clock_id INTEGER,
@@ -640,6 +653,7 @@ fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Res
     import_table("memory_rss", &paths.memory_rss)?;
     import_table("memory_map", &paths.memory_map)?;
     import_table("memory_fault", &paths.memory_fault)?;
+    import_table("memory_alloc", &paths.memory_alloc)?;
 
     // Clock snapshot
     import_table("clock_snapshot", &paths.clock_snapshot)?;
@@ -1037,6 +1051,7 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
     export_table("memory_rss", &paths.memory_rss)?;
     export_table("memory_map", &paths.memory_map)?;
     export_table("memory_fault", &paths.memory_fault)?;
+    export_table("memory_alloc", &paths.memory_alloc)?;
 
     // Clock snapshot
     export_table("clock_snapshot", &paths.clock_snapshot)?;

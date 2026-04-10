@@ -515,6 +515,25 @@ pub struct MemoryFaultRecord {
     pub stack_id: Option<i64>,
 }
 
+/// Heap allocator call (malloc/calloc/realloc/aligned_alloc/posix_memalign/free)
+/// captured via libc uprobes.
+///
+/// For `op == "free"`, `size` is 0. For `op == "realloc"`, `old_addr` is the
+/// pointer passed in (implicitly freed when `addr != old_addr`). `stack_id`
+/// joins to the `stack` table for allocation-site attribution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryAllocRecord {
+    pub id: i64,
+    pub ts: i64,
+    pub tid: i32,
+    pub pid: i32,
+    pub op: String,
+    pub addr: i64,
+    pub size: i64,
+    pub old_addr: Option<i64>,
+    pub stack_id: Option<i64>,
+}
+
 #[derive(Debug, Default)]
 pub struct ExtractedData {
     pub processes: Vec<ProcessRecord>,
@@ -544,6 +563,7 @@ pub struct ExtractedData {
     pub memory_rss: Vec<MemoryRssRecord>,
     pub memory_maps: Vec<MemoryMapRecord>,
     pub memory_faults: Vec<MemoryFaultRecord>,
+    pub memory_allocs: Vec<MemoryAllocRecord>,
     pub clock_snapshots: Vec<ClockSnapshotRecord>,
     pub sysinfo: Option<SysInfoRecord>,
     pub tpu_devices: Vec<TpuDeviceRecord>,
