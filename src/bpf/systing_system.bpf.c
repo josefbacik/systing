@@ -897,6 +897,30 @@ struct {
 	__type(value, u64);
 } memory_alloc_counter SEC(".maps");
 
+/* Per-CPU enter/exit counters for allocator uprobes, to quantify uretprobe
+ * loss (entry fires but the kernel drops the return probe under load). */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_alloc_enter_count SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_alloc_exit_count SEC(".maps");
+
+static __always_inline void memory_alloc_count(void *map)
+{
+	u32 zero = 0;
+	u64 *cnt = bpf_map_lookup_elem(map, &zero);
+	if (cnt)
+		*cnt += 1;
+}
+
 // Generate new socket ID atomically
 // Returns socket IDs starting from 1 (0 indicates failure)
 static __always_inline u64 generate_socket_id(void)
@@ -4747,6 +4771,7 @@ static __always_inline int memory_alloc_enter(u64 size, u64 old_addr)
 	u64 tgidpid = bpf_get_current_pid_tgid();
 	struct memory_alloc_args args = { .size = size, .old_addr = old_addr };
 	bpf_map_update_elem(&memory_alloc_scratch, &tgidpid, &args, BPF_ANY);
+	memory_alloc_count(&memory_alloc_enter_count);
 	return 0;
 }
 
@@ -4758,6 +4783,7 @@ static __always_inline int memory_alloc_exit(struct pt_regs *ctx, u64 addr,
 		bpf_map_lookup_elem(&memory_alloc_scratch, &tgidpid);
 	if (!saved)
 		return 0;
+	memory_alloc_count(&memory_alloc_exit_count);
 	struct memory_alloc_args args = *saved;
 	bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
 
@@ -4847,6 +4873,7 @@ int BPF_URETPROBE(systing_posix_memalign_exit, int ret)
 		bpf_map_lookup_elem(&memory_alloc_scratch, &tgidpid);
 	if (!saved)
 		return 0;
+	memory_alloc_count(&memory_alloc_exit_count);
 	u64 memptr = saved->old_addr;
 	u64 size = saved->size;
 	bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
