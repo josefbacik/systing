@@ -1490,8 +1490,11 @@ fn handle_exec_events(
 
         // Try every traced exec: check_python_process() scans maps for
         // libpython, so embedders (uwsgi, gunicorn, etc.) are covered and
-        // non-python processes are rejected there.
-        if added_pids.insert(pid) && psr.add_pid(pid as i32) {
+        // non-python processes are rejected there. Only mark the pid as
+        // handled on success so exec chains (e.g. bash -> `exec python3`)
+        // re-probe on the later exec.
+        if !added_pids.contains(&pid) && psr.add_pid(pid as i32) {
+            added_pids.insert(pid);
             eprintln!(
                 "[pystacks] Dynamically added Python PID {} ({})",
                 pid, exe_str
