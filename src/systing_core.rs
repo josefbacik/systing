@@ -1493,12 +1493,34 @@ fn handle_exec_events(
         // non-python processes are rejected there. Only mark the pid as
         // handled on success so exec chains (e.g. bash -> `exec python3`)
         // re-probe on the later exec.
-        if !added_pids.contains(&pid) && psr.add_pid(pid as i32) {
-            added_pids.insert(pid);
-            eprintln!(
-                "[pystacks] Dynamically added Python PID {} ({})",
-                pid, exe_str
-            );
+        //
+        // sched_process_exec fires before ld.so maps libpython, so for
+        // dynamically-linked python stubs the first maps scan often finds
+        // nothing. Retry a few times with a short backoff.
+        if !added_pids.contains(&pid) {
+            let looks_like_python = exe_str.contains("python");
+            let mut registered = psr.add_pid(pid as i32);
+            if !registered && looks_like_python {
+                for delay_ms in [10, 30, 60] {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    if psr.add_pid(pid as i32) {
+                        registered = true;
+                        break;
+                    }
+                }
+            }
+            if registered {
+                added_pids.insert(pid);
+                eprintln!(
+                    "[pystacks] Dynamically added Python PID {} ({})",
+                    pid, exe_str
+                );
+            } else if looks_like_python && pystacks_debug {
+                eprintln!(
+                    "[pystacks debug] Exec event for PID {} ({}), not Python",
+                    pid, exe_str
+                );
+            }
         }
         if !did_scan && exe_str.contains(".pyenv/") && !exe_str.contains("python") {
             // A pyenv binary but not Python itself (e.g., forkapple's `fa`).
@@ -1532,11 +1554,6 @@ fn handle_exec_events(
                     }
                 }
             }
-        } else if pystacks_debug {
-            eprintln!(
-                "[pystacks debug] Exec event for PID {} ({}), not Python",
-                pid, exe_str
-            );
         }
     }
 }
