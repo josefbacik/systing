@@ -91,5 +91,5 @@ Added memory-usage tables for the new `memory` recorder (enable with `--add-reco
 
 ### New tables
 - `memory_rss` — Per-process resident-set counter samples (ts, tid, pid, member, size). `member` indexes the kernel rss_stat counters: 0=file, 1=anon, 2=swap, 3=shmem. Synthetic members -1=hiwater_rss and -2=total_vm are emitted from periodic mm_struct snapshots.
-- `memory_map` — Virtual address-space changes (id, ts, tid, pid, event_type, addr, size, prot, flags, stack_id). `event_type` is `mmap`, `munmap`, or `brk`. `stack_id` joins to `stack` for allocation-site attribution.
+- `memory_map` — Virtual address-space changes (id, ts, tid, pid, event_type, addr, size, prot, flags, stack_id). `event_type` is `mmap`, `munmap`, or `brk`. For `brk`, `addr` is the new program break and `size` is the signed delta in bytes (negative on shrink). `stack_id` joins to `stack` for allocation-site attribution.
 - `memory_fault` — Sampled user page faults (ts, tid, pid, addr, error_code, stack_id). Sampling rate is controlled by `--memory-fault-sample-rate`.

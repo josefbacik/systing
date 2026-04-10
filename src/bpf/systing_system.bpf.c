@@ -4595,7 +4595,8 @@ int systing_brk_enter(struct trace_event_raw_sys_enter *ctx)
 		return 0;
 
 	u64 tgidpid = bpf_get_current_pid_tgid();
-	struct memory_syscall_args args = { .addr = (u64)ctx->args[0] };
+	/* Stash the current brk so exit can compute the delta. */
+	struct memory_syscall_args args = { .addr = BPF_CORE_READ(task, mm, brk) };
 	bpf_map_update_elem(&memory_syscall_scratch, &tgidpid, &args, BPF_ANY);
 	return 0;
 }
@@ -4611,7 +4612,7 @@ int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
 	struct memory_syscall_args *saved = bpf_map_lookup_elem(&memory_syscall_scratch, &tgidpid);
 	if (!saved)
 		return 0;
-	u64 requested = saved->addr;
+	u64 old_brk = saved->addr;
 	bpf_map_delete_elem(&memory_syscall_scratch, &tgidpid);
 
 	long flags;
@@ -4623,8 +4624,8 @@ int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
-	event->addr = (u64)ctx->ret;   /* new brk */
-	event->size = requested;        /* requested brk (delta computed in userspace) */
+	event->addr = (u64)ctx->ret;
+	event->size = (u64)((s64)ctx->ret - (s64)old_brk);
 	memory_capture_stack(ctx, event, task);
 
 	bpf_ringbuf_submit(event, flags);
