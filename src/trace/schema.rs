@@ -440,6 +440,21 @@ pub fn memory_fault_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Schema for memory_alloc.parquet
+pub fn memory_alloc_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("tid", DataType::Int32, false),
+        Field::new("pid", DataType::Int32, false),
+        Field::new("op", DataType::Utf8, false),
+        Field::new("addr", DataType::Int64, false),
+        Field::new("size", DataType::Int64, false),
+        Field::new("old_addr", DataType::Int64, true),
+        Field::new("stack_id", DataType::Int64, true),
+    ]))
+}
+
 // TPU profiling schemas
 
 /// Schema for tpu_device.parquet
