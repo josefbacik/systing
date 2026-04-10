@@ -488,8 +488,8 @@ pub struct MemoryRssRecord {
 /// Virtual address space change: mmap / munmap / brk.
 ///
 /// `addr` and `size` describe the affected region (for brk, `addr` is the new
-/// break and `size` is the requested break). `stack_id` joins to the `stack`
-/// table for allocation-site attribution.
+/// break and `size` is the signed delta in bytes, negative on shrink).
+/// `stack_id` joins to the `stack` table for allocation-site attribution.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryMapRecord {
     pub id: i64,

@@ -77,7 +77,7 @@ struct Command {
     // Heap-allocator tracing enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     memory_alloc: bool,
-    /// Sample 1 in N allocator calls (malloc/free/...) when the memory-alloc recorder is enabled (0 or 1 = record all)
+    /// Sample 1 in N allocator calls (malloc/free/...) when the memory-alloc recorder is enabled (0 or 1 = record all). Note: values > 1 sample alloc and free independently, so addr-based alloc/free pairing for leak detection is unreliable; use for hotspot profiling.
     #[arg(long, default_value = "1")]
     memory_alloc_sample_rate: u32,
     // Network recording enabled state (set by recorder management, not a CLI flag)
