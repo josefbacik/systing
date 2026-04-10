@@ -900,6 +900,8 @@ struct memory_alloc_args {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
+	/* 16384 * ~312 B ≈ 5 MB; keys are per-thread so this bounds concurrent
+	 * threads mid-malloc, not total allocs. */
 	__uint(max_entries, 16384);
 	__type(key, u64);   // tgidpid
 	__type(value, struct memory_alloc_args);
@@ -4560,11 +4562,22 @@ int BPF_KPROBE(inet_twsk_deschedule_put_entry, struct inet_timewait_sock *tw)
 
 /* ===== Memory recorder ===== */
 
-static __always_inline void memory_capture_kernel_and_py(void *ctx, struct memory_event *event,
-							  struct task_struct *task)
+static __always_inline void memory_capture_stack(void *ctx, struct memory_event *event,
+						 struct task_struct *task)
 {
-	long len = bpf_get_stack(ctx, &event->kernel_stack,
-				 sizeof(event->kernel_stack), SKIP_STACK_DEPTH);
+	long len;
+
+	if (!(task->flags & PF_KTHREAD)) {
+		len = bpf_get_stack(ctx, &event->user_stack,
+				    sizeof(event->user_stack),
+				    BPF_F_USER_STACK);
+		event->hdr.user_stack_length = len > 0 ? len / sizeof(u64) : 0;
+	} else {
+		event->hdr.user_stack_length = 0;
+	}
+
+	len = bpf_get_stack(ctx, &event->kernel_stack,
+			    sizeof(event->kernel_stack), SKIP_STACK_DEPTH);
 	event->hdr.kernel_stack_length = len > 0 ? len / sizeof(u64) : 0;
 
 #ifdef SYSTING_PYSTACKS
@@ -4573,21 +4586,6 @@ static __always_inline void memory_capture_kernel_and_py(void *ctx, struct memor
 		pystacks_read_stacks(pt_regs, NULL, &event->py_msg_buffer);
 	}
 #endif
-}
-
-static __always_inline void memory_capture_stack(void *ctx, struct memory_event *event,
-						 struct task_struct *task)
-{
-	if (!(task->flags & PF_KTHREAD)) {
-		long len = bpf_get_stack(ctx, &event->user_stack,
-					 sizeof(event->user_stack),
-					 BPF_F_USER_STACK);
-		event->hdr.user_stack_length = len > 0 ? len / sizeof(u64) : 0;
-	} else {
-		event->hdr.user_stack_length = 0;
-	}
-
-	memory_capture_kernel_and_py(ctx, event, task);
 }
 
 SEC("tracepoint/kmem/rss_stat")
@@ -4833,22 +4831,18 @@ static __always_inline int memory_alloc_enter(struct pt_regs *ctx, u64 size, u64
 	return 0;
 }
 
-static __always_inline int memory_alloc_exit(struct pt_regs *ctx, u64 addr,
-					     enum memory_alloc_op op)
+/* Emit a MEMORY_ALLOC event from a saved entry-time args record. Scratch is
+ * always deleted. addr==0 (failed allocation) is dropped. Kernel stack is not
+ * captured — at uretprobe time it is just the trampoline dispatch path. */
+static __always_inline int memory_alloc_emit(struct task_struct *task, u64 tgidpid,
+					     struct memory_alloc_args *saved, u64 addr,
+					     u64 old_addr, enum memory_alloc_op op)
 {
-	u64 tgidpid = bpf_get_current_pid_tgid();
-	struct memory_alloc_args *saved =
-		bpf_map_lookup_elem(&memory_alloc_scratch, &tgidpid);
-	if (!saved)
-		return 0;
-	memory_alloc_count(&memory_alloc_exit_count);
-
 	if (addr == 0) {
 		bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
 		return 0;
 	}
 
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	long flags;
 	struct memory_event *event = reserve_memory_event(&flags);
 	if (!event) {
@@ -4862,15 +4856,35 @@ static __always_inline int memory_alloc_exit(struct pt_regs *ctx, u64 addr,
 	record_task_info(&event->hdr.task, task);
 	event->hdr.addr = addr;
 	event->hdr.size = saved->size;
-	event->hdr.old_addr = saved->old_addr;
+	event->hdr.old_addr = old_addr;
 	event->hdr.member = op;
+	event->hdr.kernel_stack_length = 0;
 	event->hdr.user_stack_length = saved->user_stack_length;
 	__builtin_memcpy(event->user_stack, saved->user_stack, sizeof(event->user_stack));
 	bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
-	memory_capture_kernel_and_py(ctx, event, task);
+#ifdef SYSTING_PYSTACKS
+	if (tool_config.collect_pystacks) {
+		struct pt_regs *pt_regs = (struct pt_regs *)bpf_task_pt_regs(task);
+		pystacks_read_stacks(pt_regs, NULL, &event->py_msg_buffer);
+	}
+#endif
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
+}
+
+static __always_inline int memory_alloc_exit(struct pt_regs *ctx, u64 addr,
+					     enum memory_alloc_op op)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_alloc_args *saved =
+		bpf_map_lookup_elem(&memory_alloc_scratch, &tgidpid);
+	if (!saved)
+		return 0;
+	memory_alloc_count(&memory_alloc_exit_count);
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	return memory_alloc_emit(task, tgidpid, saved, addr, saved->old_addr, op);
 }
 
 SEC("uprobe")
@@ -4941,33 +4955,9 @@ int BPF_URETPROBE(systing_posix_memalign_exit, int ret)
 	u64 addr = 0;
 	if (ret == 0)
 		bpf_probe_read_user(&addr, sizeof(addr), (void *)saved->old_addr);
-	if (addr == 0) {
-		bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
-		return 0;
-	}
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
-	long flags;
-	struct memory_event *event = reserve_memory_event(&flags);
-	if (!event) {
-		bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
-		return handle_missed_event(MISSED_MEMORY_EVENT);
-	}
-
-	event->hdr.type = MEMORY_ALLOC;
-	event->hdr.ts = bpf_ktime_get_boot_ns();
-	event->hdr.cpu = bpf_get_smp_processor_id();
-	record_task_info(&event->hdr.task, task);
-	event->hdr.addr = addr;
-	event->hdr.size = saved->size;
-	event->hdr.member = MEMORY_OP_POSIX_MEMALIGN;
-	event->hdr.user_stack_length = saved->user_stack_length;
-	__builtin_memcpy(event->user_stack, saved->user_stack, sizeof(event->user_stack));
-	bpf_map_delete_elem(&memory_alloc_scratch, &tgidpid);
-	memory_capture_kernel_and_py(ctx, event, task);
-
-	bpf_ringbuf_submit(event, flags);
-	return 0;
+	return memory_alloc_emit(task, tgidpid, saved, addr, 0, MEMORY_OP_POSIX_MEMALIGN);
 }
 
 SEC("uprobe")
