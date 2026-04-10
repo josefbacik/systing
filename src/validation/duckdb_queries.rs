@@ -50,15 +50,15 @@ impl DuckDbQueries {
             .unwrap_or(false)
     }
 
-    /// Find rows in `table` whose `utid` column is NULL on a non-CPU custom track.
+    /// Find rows in `table` whose `utid` column is NULL on a thread-attributed
+    /// custom track.
     ///
-    /// Joins the table against `track` and excludes tracks whose name matches
-    /// the ` CPU <digits>` suffix produced by `events::mod` for per-CPU tracks.
-    /// All other custom tracks (markers + thread-scoped event tracks) must
-    /// carry a non-NULL `utid`.
+    /// Joins the table against `track` and excludes tracks that are not expected
+    /// to carry per-thread utid:
+    /// - Per-CPU tracks (`" CPU <digits>"` suffix from `events::mod`)
+    /// - Network tracks (`"Network Packets"`, `"Network Interfaces"`, `"Socket ..."`)
     ///
-    /// The ` CPU [0-9]+$` regex must stay in sync with the Rust classifier
-    /// `is_cpu_track_name` in `parquet_queries.rs`.
+    /// Must stay in sync with `is_non_thread_track` in `parquet_queries.rs`.
     ///
     /// Returns `FieldCheck::ok(0)` if the table, `track` table, or required
     /// columns are missing (e.g. a trace that did not collect any markers or
@@ -75,23 +75,47 @@ impl DuckDbQueries {
             return Ok(FieldCheck::ok(0));
         }
 
+        // Exclude tracks that legitimately have no thread attribution:
+        // - CPU tracks (per-CPU event tracks from events::mod)
+        // - Network hierarchy tracks (Network Packets, Network Interfaces,
+        //   and all their descendants: socket tracks, namespace tracks,
+        //   interface tracks)
+        //
+        // We use a recursive CTE to walk the parent_id chain and exclude
+        // the entire network track subtree.
+        let non_thread_tracks_cte = "\
+            WITH RECURSIVE network_roots AS ( \
+                SELECT id FROM track \
+                WHERE name IN ('Network Packets', 'Network Interfaces') \
+            ), network_tree AS ( \
+                SELECT id FROM network_roots \
+                UNION ALL \
+                SELECT t.id FROM track t \
+                JOIN network_tree nt ON t.parent_id = nt.id \
+            ) ";
+
+        let track_filter = "NOT regexp_matches(t.name, ' CPU [0-9]+$') \
+               AND t.id NOT IN (SELECT id FROM network_tree)";
+
         let denom_sql = format!(
-            "SELECT COUNT(*) \
+            "{non_thread_tracks_cte} \
+             SELECT COUNT(*) \
              FROM {table} s \
              JOIN track t ON s.track_id = t.id \
-             WHERE NOT regexp_matches(t.name, ' CPU [0-9]+$')"
+             WHERE {track_filter}"
         );
         let total_count: i64 = self
             .conn
             .query_row(&denom_sql, [], |row| row.get(0))
-            .with_context(|| format!("Failed to count non-CPU {table} rows"))?;
+            .with_context(|| format!("Failed to count thread-attributed {table} rows"))?;
 
         let viol_sql = format!(
-            "SELECT COUNT(*) \
+            "{non_thread_tracks_cte} \
+             SELECT COUNT(*) \
              FROM {table} s \
              JOIN track t ON s.track_id = t.id \
              WHERE s.utid IS NULL \
-               AND NOT regexp_matches(t.name, ' CPU [0-9]+$')"
+               AND {track_filter}"
         );
         let empty_count: i64 = self
             .conn
@@ -101,11 +125,12 @@ impl DuckDbQueries {
         let mut sample_ids = Vec::new();
         if empty_count > 0 {
             let sample_sql = format!(
-                "SELECT s.id \
+                "{non_thread_tracks_cte} \
+                 SELECT s.id \
                  FROM {table} s \
                  JOIN track t ON s.track_id = t.id \
                  WHERE s.utid IS NULL \
-                   AND NOT regexp_matches(t.name, ' CPU [0-9]+$') \
+                   AND {track_filter} \
                  LIMIT 10"
             );
             let mut stmt = self.conn.prepare(&sample_sql)?;

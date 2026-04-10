@@ -416,8 +416,13 @@ impl ParquetToPerfettoConverter {
                     // Look up the TGID from the parent process
                     let tgid = self.resolve_tgid(upid, tid);
 
-                    // Skip main threads (TID == TGID) - they're handled by ProcessDescriptor
+                    // Main threads (TID == TGID) already have a ProcessDescriptor
+                    // track, but we still need to record their utid so marker
+                    // tracks emitted by the main thread can parent to it.
                     if tid == tgid {
+                        if let Some(&uuid) = self.tid_to_uuid.get(&tid) {
+                            self.utid_to_uuid.insert(utid, uuid);
+                        }
                         continue;
                     }
 

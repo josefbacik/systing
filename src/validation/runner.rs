@@ -51,13 +51,13 @@ fn validate_custom_track_utid_attribution<Q: ValidationQueries>(
                 if check.empty_count > 0 {
                     let message = if check.sample_ids.is_empty() {
                         format!(
-                            "{} row(s) on non-CPU custom tracks have NULL utid \
+                            "{} row(s) on thread-attributed custom tracks have NULL utid \
                              (of {} such rows)",
                             check.empty_count, check.total_count,
                         )
                     } else {
                         format!(
-                            "{} row(s) on non-CPU custom tracks have NULL utid \
+                            "{} row(s) on thread-attributed custom tracks have NULL utid \
                              (of {} such rows); sample {}.id: {:?}",
                             check.empty_count, check.total_count, table, check.sample_ids,
                         )

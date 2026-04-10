@@ -215,36 +215,50 @@ impl MarkerRecorder {
         // thread-attributed via slice.utid / instant.utid. Resolve each row's
         // track id in a single pass so the emission loops below do zero
         // hashmap lookups.
-        let mut track_ids: HashMap<(i32, String), i64> = HashMap::new();
+        // Two-level map: tid -> (track_name -> track_id). The inner map
+        // keys on &str borrowed from the recorded ranges/instants, avoiding
+        // a String clone on every lookup hit.
+        let mut track_ids: HashMap<i32, HashMap<&str, i64>> = HashMap::new();
         let mut range_track_ids: Vec<i64> = Vec::with_capacity(self.recorded_ranges.len());
         let mut instant_track_ids: Vec<i64> = Vec::with_capacity(self.instants.len());
         for r in &self.recorded_ranges {
             let tid = r.tgidpid as i32;
-            let id = *track_ids.entry((tid, r.track.clone())).or_insert_with(|| {
-                let id = *track_id_counter;
-                *track_id_counter += 1;
-                id
-            });
+            let id = *track_ids
+                .entry(tid)
+                .or_default()
+                .entry(&r.track)
+                .or_insert_with(|| {
+                    let id = *track_id_counter;
+                    *track_id_counter += 1;
+                    id
+                });
             range_track_ids.push(id);
         }
         for i in &self.instants {
             let tid = i.tgidpid as i32;
-            let id = *track_ids.entry((tid, i.track.clone())).or_insert_with(|| {
-                let id = *track_id_counter;
-                *track_id_counter += 1;
-                id
-            });
+            let id = *track_ids
+                .entry(tid)
+                .or_default()
+                .entry(&i.track)
+                .or_insert_with(|| {
+                    let id = *track_id_counter;
+                    *track_id_counter += 1;
+                    id
+                });
             instant_track_ids.push(id);
         }
 
         // Emit track descriptors in stable id order (HashMap iteration is
         // non-deterministic; ids are monotonic from track_id_counter).
-        let mut ordered_tracks: Vec<(&(i32, String), &i64)> = track_ids.iter().collect();
-        ordered_tracks.sort_by_key(|(_, &id)| id);
-        for ((_tid, name), &id) in ordered_tracks {
+        let mut ordered_tracks: Vec<(&str, i64)> = track_ids
+            .values()
+            .flat_map(|inner| inner.iter().map(|(&name, &id)| (name, id)))
+            .collect();
+        ordered_tracks.sort_by_key(|&(_, id)| id);
+        for (name, id) in ordered_tracks {
             collector.add_track(TrackRecord {
                 id,
-                name: name.clone(),
+                name: name.to_string(),
                 parent_id: None,
             })?;
         }
@@ -680,5 +694,30 @@ mod tests {
         assert_eq!(data.instants[0].track_id, data.tracks[0].id);
         assert_eq!(data.slices[0].utid, Some(expected_utid));
         assert_eq!(data.instants[0].utid, Some(expected_utid));
+    }
+
+    #[test]
+    fn test_non_main_thread_uses_tid_not_tgid() {
+        // When tgid != tid (non-main thread), the track and utid must be keyed
+        // on the tid (lower 32 bits), not the tgid (upper 32 bits).
+        let gen = Arc::new(UtidGenerator::new());
+        let tgid: i32 = 99;
+        let tid: i32 = 42;
+        let tgidpid = ((tgid as u64) << 32) | (tid as u32 as u64);
+        let mut recorder = MarkerRecorder::new(Arc::clone(&gen));
+        recorder.handle_event(make_event(0, "T:evt", tgidpid, 100));
+        recorder.handle_event(make_event(1, "T:evt", tgidpid, 200));
+        recorder.handle_event(make_event(2, "T:inst", tgidpid, 150));
+
+        let mut collector = crate::record::collector::InMemoryCollector::new();
+        recorder
+            .write_records(&mut collector, &mut 0, &mut 0, &mut 0)
+            .unwrap();
+        let data = collector.into_data();
+
+        let utid = gen.get_utid(tid).expect("utid should exist for tid");
+        assert!(gen.get_utid(tgid).is_none(), "tgid should not have a utid");
+        assert_eq!(data.slices[0].utid, Some(utid));
+        assert_eq!(data.instants[0].utid, Some(utid));
     }
 }
