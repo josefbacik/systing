@@ -72,6 +72,7 @@ const volatile struct {
 	u32 collect_memory;    /* Memory recorder enabled */
 	u32 memory_fault_sample_rate; /* Sample 1 in N page faults (0 or 1 = all) */
 	u32 memory_alloc_sample_rate; /* Sample 1 in N malloc/free calls (0 or 1 = all) */
+	u32 page_size;         /* sysconf(_SC_PAGESIZE) for page-count -> byte conversion */
 } tool_config = {};
 
 enum event_type {
@@ -342,7 +343,12 @@ enum memory_alloc_op {
 	MEMORY_OP_FREE,
 };
 
-struct memory_event {
+/*
+ * memory_event is split so the high-frequency stack-less types
+ * (RSS_STAT, MM_SAMPLE, FREE) reserve only the ~80-byte header instead of the
+ * full struct with stack arrays and pystacks buffer.
+ */
+struct memory_event_header {
 	enum memory_event_type type;
 	u64 ts;
 	u32 cpu;
@@ -354,6 +360,10 @@ struct memory_event {
 	u64 old_addr;      // realloc: previous pointer (else 0)
 	u64 kernel_stack_length;
 	u64 user_stack_length;
+};
+
+struct memory_event {
+	struct memory_event_header hdr;
 	u64 kernel_stack[MAX_STACK_DEPTH];
 	u64 user_stack[MAX_STACK_DEPTH];
 #ifdef SYSTING_PYSTACKS
@@ -381,6 +391,7 @@ struct task_info _task_info = {0};
 struct probe_event _uprobe_event = {0};
 struct marker_event _marker_event = {0};
 struct memory_event _memory_event = {0};
+struct memory_event_header _memory_event_header = {0};
 enum memory_event_type _memory_event_type = MEMORY_RSS_STAT;
 enum memory_rss_member _memory_rss_member = MEMORY_MM_FILEPAGES;
 enum memory_alloc_op _memory_alloc_op = MEMORY_OP_MALLOC;
@@ -1193,7 +1204,7 @@ static struct packet_event *reserve_packet_event(long *flags)
 	return event;
 }
 
-static struct memory_event *reserve_memory_event(long *flags)
+static __always_inline void *reserve_memory_ringbuf(long *flags, u64 size)
 {
 	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
 	void *rb;
@@ -1202,19 +1213,35 @@ static struct memory_event *reserve_memory_event(long *flags)
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
-	struct memory_event *event = bpf_ringbuf_reserve(rb, sizeof(struct memory_event), 0);
+	return bpf_ringbuf_reserve(rb, size, 0);
+}
+
+static __always_inline void memory_header_init(struct memory_event_header *hdr)
+{
+	hdr->addr = 0;
+	hdr->size = 0;
+	hdr->member = 0;
+	hdr->flags = 0;
+	hdr->old_addr = 0;
+	hdr->kernel_stack_length = 0;
+	hdr->user_stack_length = 0;
+}
+
+static struct memory_event_header *reserve_memory_event_header(long *flags)
+{
+	struct memory_event_header *hdr =
+		reserve_memory_ringbuf(flags, sizeof(struct memory_event_header));
+	if (hdr)
+		memory_header_init(hdr);
+	return hdr;
+}
+
+static struct memory_event *reserve_memory_event(long *flags)
+{
+	struct memory_event *event =
+		reserve_memory_ringbuf(flags, sizeof(struct memory_event));
 	if (event) {
-		event->type = 0;
-		event->ts = 0;
-		event->cpu = 0;
-		__builtin_memset(&event->task, 0, sizeof(event->task));
-		event->addr = 0;
-		event->size = 0;
-		event->member = 0;
-		event->flags = 0;
-		event->old_addr = 0;
-		event->kernel_stack_length = 0;
-		event->user_stack_length = 0;
+		memory_header_init(&event->hdr);
 #ifdef SYSTING_PYSTACKS
 		event->py_msg_buffer.stack_len = 0;
 #endif
@@ -1941,14 +1968,14 @@ int systing_perf_event_clock(void *ctx)
 		struct mm_struct *mm = BPF_CORE_READ(task, mm);
 		if (mm) {
 			long mflags;
-			struct memory_event *mev = reserve_memory_event(&mflags);
+			struct memory_event_header *mev = reserve_memory_event_header(&mflags);
 			if (mev) {
 				mev->type = MEMORY_MM_SAMPLE;
 				mev->ts = ts;
 				mev->cpu = bpf_get_smp_processor_id();
 				record_task_info(&mev->task, task);
-				mev->addr = BPF_CORE_READ(mm, hiwater_rss) * 4096;
-				mev->size = BPF_CORE_READ(mm, total_vm) * 4096;
+				mev->addr = BPF_CORE_READ(mm, hiwater_rss) * (u64)tool_config.page_size;
+				mev->size = BPF_CORE_READ(mm, total_vm) * (u64)tool_config.page_size;
 				bpf_ringbuf_submit(mev, mflags);
 			} else {
 				handle_missed_event(MISSED_MEMORY_EVENT);
@@ -4529,14 +4556,14 @@ static __always_inline void memory_capture_stack(void *ctx, struct memory_event 
 		len = bpf_get_stack(ctx, &event->user_stack,
 				    sizeof(event->user_stack),
 				    BPF_F_USER_STACK);
-		event->user_stack_length = len > 0 ? len / sizeof(u64) : 0;
+		event->hdr.user_stack_length = len > 0 ? len / sizeof(u64) : 0;
 	} else {
-		event->user_stack_length = 0;
+		event->hdr.user_stack_length = 0;
 	}
 
 	len = bpf_get_stack(ctx, &event->kernel_stack,
 			    sizeof(event->kernel_stack), SKIP_STACK_DEPTH);
-	event->kernel_stack_length = len > 0 ? len / sizeof(u64) : 0;
+	event->hdr.kernel_stack_length = len > 0 ? len / sizeof(u64) : 0;
 
 #ifdef SYSTING_PYSTACKS
 	if (tool_config.collect_pystacks) {
@@ -4554,7 +4581,7 @@ int systing_rss_stat(struct trace_event_raw_rss_stat *ctx)
 		return 0;
 
 	long flags;
-	struct memory_event *event = reserve_memory_event(&flags);
+	struct memory_event_header *event = reserve_memory_event_header(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_MEMORY_EVENT);
 
@@ -4612,14 +4639,14 @@ int systing_mmap_exit(struct trace_event_raw_sys_exit *ctx)
 	if (!event)
 		return handle_missed_event(MISSED_MEMORY_EVENT);
 
-	event->type = MEMORY_MMAP;
-	event->ts = bpf_ktime_get_boot_ns();
-	event->cpu = bpf_get_smp_processor_id();
-	record_task_info(&event->task, task);
-	event->addr = (u64)ret;
-	event->size = args.size;
-	event->member = args.prot;
-	event->flags = args.flags;
+	event->hdr.type = MEMORY_MMAP;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = (u64)ret;
+	event->hdr.size = args.size;
+	event->hdr.member = args.prot;
+	event->hdr.flags = args.flags;
 	memory_capture_stack(ctx, event, task);
 
 	bpf_ringbuf_submit(event, flags);
@@ -4638,12 +4665,12 @@ int systing_munmap_enter(struct trace_event_raw_sys_enter *ctx)
 	if (!event)
 		return handle_missed_event(MISSED_MEMORY_EVENT);
 
-	event->type = MEMORY_MUNMAP;
-	event->ts = bpf_ktime_get_boot_ns();
-	event->cpu = bpf_get_smp_processor_id();
-	record_task_info(&event->task, task);
-	event->addr = (u64)ctx->args[0];
-	event->size = (u64)ctx->args[1];
+	event->hdr.type = MEMORY_MUNMAP;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = (u64)ctx->args[0];
+	event->hdr.size = (u64)ctx->args[1];
 	memory_capture_stack(ctx, event, task);
 
 	bpf_ringbuf_submit(event, flags);
@@ -4678,17 +4705,21 @@ int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
 	u64 old_brk = saved->addr;
 	bpf_map_delete_elem(&memory_syscall_scratch, &tgidpid);
 
+	/* brk(0) queries the current break and failed brk returns it unchanged. */
+	if ((u64)ctx->ret == old_brk)
+		return 0;
+
 	long flags;
 	struct memory_event *event = reserve_memory_event(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_MEMORY_EVENT);
 
-	event->type = MEMORY_BRK;
-	event->ts = bpf_ktime_get_boot_ns();
-	event->cpu = bpf_get_smp_processor_id();
-	record_task_info(&event->task, task);
-	event->addr = (u64)ctx->ret;
-	event->size = (u64)((s64)ctx->ret - (s64)old_brk);
+	event->hdr.type = MEMORY_BRK;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = (u64)ctx->ret;
+	event->hdr.size = (u64)((s64)ctx->ret - (s64)old_brk);
 	memory_capture_stack(ctx, event, task);
 
 	bpf_ringbuf_submit(event, flags);
@@ -4728,12 +4759,12 @@ int systing_page_fault_user(struct systing_pf_args *ctx)
 	if (!event)
 		return handle_missed_event(MISSED_MEMORY_EVENT);
 
-	event->type = MEMORY_PAGE_FAULT;
-	event->ts = bpf_ktime_get_boot_ns();
-	event->cpu = bpf_get_smp_processor_id();
-	record_task_info(&event->task, task);
-	event->addr = ctx->address;
-	event->flags = (u32)ctx->error_code;
+	event->hdr.type = MEMORY_PAGE_FAULT;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = ctx->address;
+	event->hdr.flags = (u32)ctx->error_code;
 	memory_capture_stack(ctx, event, task);
 
 	bpf_ringbuf_submit(event, flags);
@@ -4796,14 +4827,14 @@ static __always_inline int memory_alloc_exit(struct pt_regs *ctx, u64 addr,
 	if (!event)
 		return handle_missed_event(MISSED_MEMORY_EVENT);
 
-	event->type = MEMORY_ALLOC;
-	event->ts = bpf_ktime_get_boot_ns();
-	event->cpu = bpf_get_smp_processor_id();
-	record_task_info(&event->task, task);
-	event->addr = addr;
-	event->size = args.size;
-	event->old_addr = args.old_addr;
-	event->member = op;
+	event->hdr.type = MEMORY_ALLOC;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = addr;
+	event->hdr.size = args.size;
+	event->hdr.old_addr = args.old_addr;
+	event->hdr.member = op;
 	memory_capture_stack(ctx, event, task);
 
 	bpf_ringbuf_submit(event, flags);
@@ -4892,13 +4923,13 @@ int BPF_URETPROBE(systing_posix_memalign_exit, int ret)
 	if (!event)
 		return handle_missed_event(MISSED_MEMORY_EVENT);
 
-	event->type = MEMORY_ALLOC;
-	event->ts = bpf_ktime_get_boot_ns();
-	event->cpu = bpf_get_smp_processor_id();
-	record_task_info(&event->task, task);
-	event->addr = addr;
-	event->size = size;
-	event->member = MEMORY_OP_POSIX_MEMALIGN;
+	event->hdr.type = MEMORY_ALLOC;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = addr;
+	event->hdr.size = size;
+	event->hdr.member = MEMORY_OP_POSIX_MEMALIGN;
 	memory_capture_stack(ctx, event, task);
 
 	bpf_ringbuf_submit(event, flags);
@@ -4918,7 +4949,7 @@ int BPF_UPROBE(systing_free_enter, void *ptr)
 		return 0;
 
 	long flags;
-	struct memory_event *event = reserve_memory_event(&flags);
+	struct memory_event_header *event = reserve_memory_event_header(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_MEMORY_EVENT);
 
@@ -4928,7 +4959,6 @@ int BPF_UPROBE(systing_free_enter, void *ptr)
 	record_task_info(&event->task, task);
 	event->addr = (u64)ptr;
 	event->member = MEMORY_OP_FREE;
-	memory_capture_stack(ctx, event, task);
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;

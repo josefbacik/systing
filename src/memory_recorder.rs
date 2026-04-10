@@ -7,7 +7,9 @@ use crate::pystacks::stack_walker::StackWalkerRun;
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::stack_recorder::Stack;
-use crate::systing_core::types::{memory_alloc_op, memory_event, memory_event_type};
+use crate::systing_core::types::{
+    memory_alloc_op, memory_event, memory_event_type, memory_rss_member,
+};
 use crate::systing_core::SystingRecordEvent;
 use crate::trace::{MemoryAllocRecord, MemoryFaultRecord, MemoryMapRecord, MemoryRssRecord};
 
@@ -28,6 +30,7 @@ pub struct MemoryRecorder {
     next_stack_id: i64,
     next_map_id: i64,
     next_alloc_id: i64,
+    write_error_reported: bool,
 }
 
 impl Default for MemoryRecorder {
@@ -40,6 +43,7 @@ impl Default for MemoryRecorder {
             next_stack_id: MEMORY_STACK_ID_OFFSET,
             next_map_id: 1,
             next_alloc_id: 1,
+            write_error_reported: false,
         }
     }
 }
@@ -82,9 +86,18 @@ impl MemoryRecorder {
         Ok(collector)
     }
 
+    fn report_write_error(&mut self, r: Result<()>) {
+        if let Err(e) = r {
+            if !self.write_error_reported {
+                self.write_error_reported = true;
+                eprintln!("memory_recorder: write error (further errors suppressed): {e}");
+            }
+        }
+    }
+
     fn intern_stack(&mut self, event: &memory_event, tgid: i32) -> Option<i64> {
-        let klen = (event.kernel_stack_length as usize).min(event.kernel_stack.len());
-        let ulen = (event.user_stack_length as usize).min(event.user_stack.len());
+        let klen = (event.hdr.kernel_stack_length as usize).min(event.kernel_stack.len());
+        let ulen = (event.hdr.user_stack_length as usize).min(event.user_stack.len());
         let kstack = &event.kernel_stack[..klen];
         let ustack = &event.user_stack[..ulen];
         let py_stack = self
@@ -116,18 +129,19 @@ impl MemoryRecorder {
         let stack_id = self.intern_stack(event, tgid);
         let id = self.next_map_id;
         self.next_map_id += 1;
-        let _ = collector.add_memory_map(MemoryMapRecord {
+        let r = collector.add_memory_map(MemoryMapRecord {
             id,
-            ts: event.ts as i64,
+            ts: event.hdr.ts as i64,
             tid,
             pid: tgid,
             event_type: event_type.to_string(),
-            addr: event.addr as i64,
-            size: event.size as i64,
+            addr: event.hdr.addr as i64,
+            size: event.hdr.size as i64,
             prot,
             flags,
             stack_id,
         });
+        self.report_write_error(r);
     }
 }
 
@@ -142,18 +156,20 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
         let Some(mut collector) = self.streaming_collector.take() else {
             return;
         };
-        let tgid = (event.task.tgidpid >> 32) as i32;
-        let tid = (event.task.tgidpid & 0xFFFF_FFFF) as i32;
+        let hdr = &event.hdr;
+        let tgid = (hdr.task.tgidpid >> 32) as i32;
+        let tid = (hdr.task.tgidpid & 0xFFFF_FFFF) as i32;
 
-        match event.r#type {
+        match hdr.r#type {
             memory_event_type::MEMORY_RSS_STAT => {
-                let _ = collector.add_memory_rss(MemoryRssRecord {
-                    ts: event.ts as i64,
+                let r = collector.add_memory_rss(MemoryRssRecord {
+                    ts: hdr.ts as i64,
                     tid,
                     pid: tgid,
-                    member: event.member.min(i8::MAX as u32) as i8,
-                    size: event.size as i64,
+                    member: hdr.member.min(i8::MAX as u32) as i8,
+                    size: hdr.size as i64,
                 });
+                self.report_write_error(r);
             }
             memory_event_type::MEMORY_MMAP => {
                 self.emit_map(
@@ -162,8 +178,8 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
                     tgid,
                     tid,
                     "mmap",
-                    Some(event.member as i32),
-                    Some(event.flags as i32),
+                    Some(hdr.member as i32),
+                    Some(hdr.flags as i32),
                 );
             }
             memory_event_type::MEMORY_MUNMAP => {
@@ -174,52 +190,55 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
             }
             memory_event_type::MEMORY_PAGE_FAULT => {
                 let stack_id = self.intern_stack(&event, tgid);
-                let _ = collector.add_memory_fault(MemoryFaultRecord {
-                    ts: event.ts as i64,
+                let r = collector.add_memory_fault(MemoryFaultRecord {
+                    ts: hdr.ts as i64,
                     tid,
                     pid: tgid,
-                    addr: event.addr as i64,
-                    error_code: event.flags as i32,
+                    addr: hdr.addr as i64,
+                    error_code: hdr.flags as i32,
                     stack_id,
                 });
+                self.report_write_error(r);
             }
             memory_event_type::MEMORY_ALLOC | memory_event_type::MEMORY_FREE => {
                 let stack_id = self.intern_stack(&event, tgid);
                 let id = self.next_alloc_id;
                 self.next_alloc_id += 1;
-                let is_realloc =
-                    memory_alloc_op(event.member) == memory_alloc_op::MEMORY_OP_REALLOC;
-                let _ = collector.add_memory_alloc(MemoryAllocRecord {
+                let is_realloc = memory_alloc_op(hdr.member) == memory_alloc_op::MEMORY_OP_REALLOC;
+                let r = collector.add_memory_alloc(MemoryAllocRecord {
                     id,
-                    ts: event.ts as i64,
+                    ts: hdr.ts as i64,
                     tid,
                     pid: tgid,
-                    op: alloc_op_name(event.member).to_string(),
-                    addr: event.addr as i64,
-                    size: event.size as i64,
+                    op: alloc_op_name(hdr.member).to_string(),
+                    addr: hdr.addr as i64,
+                    size: hdr.size as i64,
                     old_addr: if is_realloc {
-                        Some(event.old_addr as i64)
+                        Some(hdr.old_addr as i64)
                     } else {
                         None
                     },
                     stack_id,
                 });
+                self.report_write_error(r);
             }
             memory_event_type::MEMORY_MM_SAMPLE => {
-                let _ = collector.add_memory_rss(MemoryRssRecord {
-                    ts: event.ts as i64,
+                let r = collector.add_memory_rss(MemoryRssRecord {
+                    ts: hdr.ts as i64,
                     tid,
                     pid: tgid,
                     member: MEMORY_MEMBER_HIWATER_RSS,
-                    size: event.addr as i64,
+                    size: hdr.addr as i64,
                 });
-                let _ = collector.add_memory_rss(MemoryRssRecord {
-                    ts: event.ts as i64,
+                self.report_write_error(r);
+                let r = collector.add_memory_rss(MemoryRssRecord {
+                    ts: hdr.ts as i64,
                     tid,
                     pid: tgid,
                     member: MEMORY_MEMBER_TOTAL_VM,
-                    size: event.size as i64,
+                    size: hdr.size as i64,
                 });
+                self.report_write_error(r);
             }
             _ => {}
         }
@@ -231,12 +250,15 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
 /// Human-readable label for the `memory_rss.member` column.
 pub fn memory_rss_member_name(member: i8) -> &'static str {
     match member {
-        0 => "file",
-        1 => "anon",
-        2 => "swap",
-        3 => "shmem",
         MEMORY_MEMBER_HIWATER_RSS => "hiwater_rss",
         MEMORY_MEMBER_TOTAL_VM => "total_vm",
+        m if m >= 0 => match memory_rss_member(m as u32) {
+            memory_rss_member::MEMORY_MM_FILEPAGES => "file",
+            memory_rss_member::MEMORY_MM_ANONPAGES => "anon",
+            memory_rss_member::MEMORY_MM_SWAPENTS => "swap",
+            memory_rss_member::MEMORY_MM_SHMEMPAGES => "shmem",
+            _ => "unknown",
+        },
         _ => "unknown",
     }
 }

@@ -639,6 +639,7 @@ pub use types::epoll_event_bpf;
 pub use types::event_type;
 pub use types::marker_event;
 pub use types::memory_event;
+pub use types::memory_event_header;
 pub use types::network_event;
 pub use types::packet_event;
 pub use types::perf_counter_event;
@@ -658,6 +659,7 @@ unsafe impl Plain for arg_desc {}
 unsafe impl Plain for arg_desc_array {}
 unsafe impl Plain for marker_event {}
 unsafe impl Plain for memory_event {}
+unsafe impl Plain for memory_event_header {}
 
 /// BPF exec event - delivered via dedicated ringbuf when a traced process execs.
 /// Used to dynamically discover Python PIDs for pystacks.
@@ -793,10 +795,10 @@ impl SystingEvent for epoll_event_bpf {
 
 impl SystingEvent for memory_event {
     fn ts(&self) -> u64 {
-        self.ts
+        self.hdr.ts
     }
     fn next_task_info(&self) -> Option<&task_info> {
-        Some(&self.task)
+        Some(&self.hdr.task)
     }
 }
 
@@ -826,6 +828,37 @@ where
         // unbounded userspace queue.
         if tx.send(event).is_err() {
             // Receiver has been dropped, we can silently ignore this
+            return -1;
+        }
+        0
+    })?;
+    builder.build()
+}
+
+/// Memory ringbuf carries variable-length records: stack-less types
+/// (RSS_STAT/MM_SAMPLE/FREE) emit only the header; stack-carrying types emit
+/// the full `memory_event`. The channel still delivers `memory_event` so the
+/// consumer is unchanged: header-only records zero-extend into a default full
+/// event (stack lengths are 0 in the header, so `intern_stack` returns None).
+fn create_memory_ring<'a>(
+    map: &dyn libbpf_rs::MapCore,
+    tx: SyncSender<memory_event>,
+) -> Result<libbpf_rs::RingBuffer<'a>, libbpf_rs::Error> {
+    let mut builder = RingBufferBuilder::new();
+    builder.add(map, move |data: &[u8]| {
+        let mut event = memory_event::default();
+        let len = data.len().min(std::mem::size_of::<memory_event>());
+        // SAFETY: memory_event is Plain (repr(C), no padding invariants) and
+        // default-initialized; we copy at most sizeof(memory_event) bytes from
+        // the BPF-produced ringbuf record into its leading bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                &mut event as *mut memory_event as *mut u8,
+                len,
+            );
+        }
+        if tx.send(event).is_err() {
             return -1;
         }
         0
@@ -1680,7 +1713,7 @@ fn setup_ringbuffers<'a>(
             let ring = create_ring::<epoll_event_bpf>(&map, epoll_tx.clone())?;
             rings.push((name.to_string(), ring));
         } else if name.starts_with("ringbuf_memory") && opts.memory {
-            let ring = create_ring::<memory_event>(&map, memory_tx.clone())?;
+            let ring = create_memory_ring(&map, memory_tx.clone())?;
             rings.push((name.to_string(), ring));
         }
     }
@@ -1886,6 +1919,7 @@ fn configure_bpf_skeleton(
         if opts.memory {
             rodata.tool_config.collect_memory = 1;
             rodata.tool_config.memory_fault_sample_rate = opts.memory_fault_sample_rate;
+            rodata.tool_config.page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
         }
         if opts.memory_alloc {
             rodata.tool_config.memory_alloc_sample_rate = opts.memory_alloc_sample_rate;
@@ -2190,6 +2224,8 @@ fn discover_libc_paths(pids: &[u32]) -> (Vec<String>, usize) {
     let mut unique = Vec::new();
     for p in raw_paths {
         match std::fs::metadata(&p) {
+            // insert() returns false if the (dev, ino) was already present:
+            // drop this path as a duplicate of one we kept.
             Ok(meta) if !seen_inodes.insert((meta.dev(), meta.ino())) => {}
             _ => unique.push(p),
         }
@@ -2220,88 +2256,55 @@ fn attach_memory_alloc_uprobes(
         return Ok(Vec::new());
     }
 
-    struct Probe<'a> {
-        prog: &'a libbpf_rs::ProgramMut<'a>,
-        func: &'static str,
-        ret: bool,
-    }
-    let probes = [
-        Probe {
-            prog: &skel.progs.systing_malloc_enter,
-            func: "malloc",
-            ret: false,
-        },
-        Probe {
-            prog: &skel.progs.systing_malloc_exit,
-            func: "malloc",
-            ret: true,
-        },
-        Probe {
-            prog: &skel.progs.systing_calloc_enter,
-            func: "calloc",
-            ret: false,
-        },
-        Probe {
-            prog: &skel.progs.systing_calloc_exit,
-            func: "calloc",
-            ret: true,
-        },
-        Probe {
-            prog: &skel.progs.systing_realloc_enter,
-            func: "realloc",
-            ret: false,
-        },
-        Probe {
-            prog: &skel.progs.systing_realloc_exit,
-            func: "realloc",
-            ret: true,
-        },
-        Probe {
-            prog: &skel.progs.systing_aligned_alloc_enter,
-            func: "aligned_alloc",
-            ret: false,
-        },
-        Probe {
-            prog: &skel.progs.systing_aligned_alloc_exit,
-            func: "aligned_alloc",
-            ret: true,
-        },
-        Probe {
-            prog: &skel.progs.systing_posix_memalign_enter,
-            func: "posix_memalign",
-            ret: false,
-        },
-        Probe {
-            prog: &skel.progs.systing_posix_memalign_exit,
-            func: "posix_memalign",
-            ret: true,
-        },
-        Probe {
-            prog: &skel.progs.systing_free_enter,
-            func: "free",
-            ret: false,
-        },
+    let probes: &[(&libbpf_rs::ProgramMut, &str, bool)] = &[
+        (&skel.progs.systing_malloc_enter, "malloc", false),
+        (&skel.progs.systing_malloc_exit, "malloc", true),
+        (&skel.progs.systing_calloc_enter, "calloc", false),
+        (&skel.progs.systing_calloc_exit, "calloc", true),
+        (&skel.progs.systing_realloc_enter, "realloc", false),
+        (&skel.progs.systing_realloc_exit, "realloc", true),
+        (
+            &skel.progs.systing_aligned_alloc_enter,
+            "aligned_alloc",
+            false,
+        ),
+        (
+            &skel.progs.systing_aligned_alloc_exit,
+            "aligned_alloc",
+            true,
+        ),
+        (
+            &skel.progs.systing_posix_memalign_enter,
+            "posix_memalign",
+            false,
+        ),
+        (
+            &skel.progs.systing_posix_memalign_exit,
+            "posix_memalign",
+            true,
+        ),
+        (&skel.progs.systing_free_enter, "free", false),
     ];
 
     let mut links = Vec::new();
     for path in &libc_paths {
-        for p in &probes {
-            match p.prog.attach_uprobe_with_opts(
+        for (prog, func, ret) in probes {
+            match prog.attach_uprobe_with_opts(
                 -1,
                 path,
                 0,
                 UprobeOpts {
-                    retprobe: p.ret,
-                    func_name: Some(p.func.to_string()),
+                    retprobe: *ret,
+                    func_name: Some(func.to_string()),
                     ..Default::default()
                 },
             ) {
                 Ok(link) => links.push(link),
                 Err(e) => eprintln!(
                     "Warning: failed to attach {}uprobe {}:{}: {}",
-                    if p.ret { "ret" } else { "" },
+                    if *ret { "ret" } else { "" },
                     path,
-                    p.func,
+                    func,
                     e
                 ),
             }
@@ -3007,6 +3010,10 @@ pub fn systing(
         // Attach any usdt's that we may have
         let _probe_links = attach_probes(&mut skel, &recorder, &opts, old_kernel)?;
 
+        // For a run-command trace this runs before the child execs, so
+        // /proc/<pid>/maps still reflects the forked parent's libc. That is
+        // normally the same file; a containerized/musl target that differs
+        // would need re-resolution after exec (not currently done).
         let _memory_alloc_links = if opts.memory_alloc {
             attach_memory_alloc_uprobes(&mut skel, &opts)?
         } else {
