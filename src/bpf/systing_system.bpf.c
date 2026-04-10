@@ -4500,9 +4500,8 @@ int systing_rss_stat(struct trace_event_raw_rss_stat *ctx)
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
 	event->member = ctx->member;
-	/* ctx->size is in pages; convert to bytes. Cast via s64 so negative
-	 * counters from partial updates propagate correctly. */
-	event->size = (u64)((s64)ctx->size * 4096);
+	/* rss_stat tracepoint already shifts by PAGE_SHIFT; size is bytes. */
+	event->size = (u64)(s64)ctx->size;
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
