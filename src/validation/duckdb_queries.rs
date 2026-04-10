@@ -50,6 +50,78 @@ impl DuckDbQueries {
             .unwrap_or(false)
     }
 
+    /// Find rows in `table` whose `utid` column is NULL on a non-CPU custom track.
+    ///
+    /// Joins the table against `track` and excludes tracks whose name matches
+    /// the ` CPU <digits>` suffix produced by `events::mod` for per-CPU tracks.
+    /// All other custom tracks (markers + thread-scoped event tracks) must
+    /// carry a non-NULL `utid`.
+    ///
+    /// The ` CPU [0-9]+$` regex must stay in sync with the Rust classifier
+    /// `is_cpu_track_name` in `parquet_queries.rs`.
+    ///
+    /// Returns `FieldCheck::ok(0)` if the table, `track` table, or required
+    /// columns are missing (e.g. a trace that did not collect any markers or
+    /// custom events).
+    fn find_utid_violations_table(&self, table: &str) -> Result<FieldCheck> {
+        if !self.table_exists(table)
+            || !self.column_exists(table, "utid")
+            || !self.column_exists(table, "track_id")
+            || !self.column_exists(table, "id")
+            || !self.table_exists("track")
+            || !self.column_exists("track", "id")
+            || !self.column_exists("track", "name")
+        {
+            return Ok(FieldCheck::ok(0));
+        }
+
+        let denom_sql = format!(
+            "SELECT COUNT(*) \
+             FROM {table} s \
+             JOIN track t ON s.track_id = t.id \
+             WHERE NOT regexp_matches(t.name, ' CPU [0-9]+$')"
+        );
+        let total_count: i64 = self
+            .conn
+            .query_row(&denom_sql, [], |row| row.get(0))
+            .with_context(|| format!("Failed to count non-CPU {table} rows"))?;
+
+        let viol_sql = format!(
+            "SELECT COUNT(*) \
+             FROM {table} s \
+             JOIN track t ON s.track_id = t.id \
+             WHERE s.utid IS NULL \
+               AND NOT regexp_matches(t.name, ' CPU [0-9]+$')"
+        );
+        let empty_count: i64 = self
+            .conn
+            .query_row(&viol_sql, [], |row| row.get(0))
+            .with_context(|| format!("Failed to count utid violations in {table}"))?;
+
+        let mut sample_ids = Vec::new();
+        if empty_count > 0 {
+            let sample_sql = format!(
+                "SELECT s.id \
+                 FROM {table} s \
+                 JOIN track t ON s.track_id = t.id \
+                 WHERE s.utid IS NULL \
+                   AND NOT regexp_matches(t.name, ' CPU [0-9]+$') \
+                 LIMIT 10"
+            );
+            let mut stmt = self.conn.prepare(&sample_sql)?;
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            for row in rows {
+                sample_ids.push(row?);
+            }
+        }
+
+        Ok(FieldCheck {
+            empty_count,
+            total_count,
+            sample_ids,
+        })
+    }
+
     /// Get the data type of a column.
     fn get_column_type(&self, table: &str, column: &str) -> Option<String> {
         self.conn
@@ -220,6 +292,14 @@ impl ValidationQueries for DuckDbQueries {
             total_count,
             sample_ids,
         })
+    }
+
+    fn find_slice_utid_violations(&mut self) -> Result<FieldCheck> {
+        self.find_utid_violations_table("slice")
+    }
+
+    fn find_instant_utid_violations(&mut self) -> Result<FieldCheck> {
+        self.find_utid_violations_table("instant")
     }
 
     fn get_cmdline_stats(&mut self) -> Result<CmdlineStats> {

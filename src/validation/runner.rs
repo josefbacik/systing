@@ -24,6 +24,59 @@ pub fn run_common_validations<Q: ValidationQueries>(
     validate_schema(queries, result);
     validate_stack_timing(queries, config, result);
     validate_tpu_metrics(queries, result);
+    validate_custom_track_utid_attribution(queries, result);
+}
+
+/// Validate per-thread attribution on custom (non-CPU) tracks.
+///
+/// Slices and instants on marker tracks and `events::mod` Thread tracks must
+/// carry a non-NULL `utid` so downstream joins against `thread` resolve the
+/// emitting thread. Per-CPU tracks — named `"<name> CPU <n>"` by `events::mod`
+/// — are excluded because their events are legitimately not thread-attributed.
+///
+/// Fires a hard `InvalidValue` error for every violating row found (capped by
+/// the sample list). This catches regressions like the pre-fix marker recorder
+/// path where `slice.utid` was left NULL even when sched/event rows in the
+/// same table were correctly attributed.
+fn validate_custom_track_utid_attribution<Q: ValidationQueries>(
+    queries: &mut Q,
+    result: &mut ValidationResult,
+) {
+    for (table, check_result) in [
+        ("slice", queries.find_slice_utid_violations()),
+        ("instant", queries.find_instant_utid_violations()),
+    ] {
+        match check_result {
+            Ok(check) => {
+                if check.empty_count > 0 {
+                    let message = if check.sample_ids.is_empty() {
+                        format!(
+                            "{} row(s) on non-CPU custom tracks have NULL utid \
+                             (of {} such rows)",
+                            check.empty_count, check.total_count,
+                        )
+                    } else {
+                        format!(
+                            "{} row(s) on non-CPU custom tracks have NULL utid \
+                             (of {} such rows); sample {}.id: {:?}",
+                            check.empty_count, check.total_count, table, check.sample_ids,
+                        )
+                    };
+                    result.add_error(ValidationError::InvalidValue {
+                        table: table.into(),
+                        column: "utid".into(),
+                        message,
+                    });
+                }
+            }
+            Err(e) => {
+                result.add_error(ValidationError::ReadError {
+                    table: table.into(),
+                    message: format!("Failed to check utid attribution: {e}"),
+                });
+            }
+        }
+    }
 }
 
 /// Validate reference integrity (foreign key relationships).
