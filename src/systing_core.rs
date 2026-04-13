@@ -159,6 +159,34 @@ const SYSCALL_BPF_PROGRAMS: &[&str] = &[
     "tracepoint__raw_syscalls__sys_exit",
 ];
 
+const MEMORY_BPF_PROGRAMS: &[&str] = &[
+    "systing_rss_stat",
+    "systing_mmap_enter",
+    "systing_mmap_exit",
+    "systing_munmap_enter",
+    "systing_brk_enter",
+    "systing_brk_exit",
+    #[cfg(target_arch = "x86_64")]
+    "systing_page_fault_user",
+];
+
+/// Allocator uprobe programs. Listed here only so `enable_programs` loads them
+/// when the `memory-alloc` recorder is on; actual attachment is manual via
+/// `attach_memory_alloc_uprobes` (libbpf cannot auto-attach a bare SEC("uprobe")).
+const MEMORY_ALLOC_BPF_PROGRAMS: &[&str] = &[
+    "systing_malloc_enter",
+    "systing_malloc_exit",
+    "systing_calloc_enter",
+    "systing_calloc_exit",
+    "systing_realloc_enter",
+    "systing_realloc_exit",
+    "systing_aligned_alloc_enter",
+    "systing_aligned_alloc_exit",
+    "systing_posix_memalign_enter",
+    "systing_posix_memalign_exit",
+    "systing_free_enter",
+];
+
 const NETWORK_BPF_PROGRAMS: &[&str] = &[
     "inet_sock_set_state",
     "tcp_time_wait_entry",
@@ -247,6 +275,18 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             bpf_programs: NETWORK_PACKETS_BPF_PROGRAMS,
         },
         RecorderInfo {
+            name: "memory",
+            description: "Memory usage tracking (RSS, mmap/munmap/brk, page faults)",
+            default_enabled: false,
+            bpf_programs: MEMORY_BPF_PROGRAMS,
+        },
+        RecorderInfo {
+            name: "memory-alloc",
+            description: "Heap allocator uprobes (malloc/calloc/realloc/free) with stacks",
+            default_enabled: false,
+            bpf_programs: MEMORY_ALLOC_BPF_PROGRAMS,
+        },
+        RecorderInfo {
             name: "pystacks",
             description: "Python stack tracing",
             default_enabled: false,
@@ -298,6 +338,8 @@ fn is_recorder_enabled(name: &str, opts: &Config) -> bool {
         "sleep-stacks" => !opts.no_sleep_stack_traces,
         "interruptible-stacks" => !opts.no_interruptible_stack_traces,
         "cpu-stacks" => !opts.no_cpu_stack_traces,
+        "memory" => opts.memory,
+        "memory-alloc" => opts.memory_alloc,
         "network" => opts.network,
         "network-packets" => opts.network_packets,
         "pystacks" => opts.collect_pystacks,
@@ -415,6 +457,14 @@ pub struct Config {
     pub marker_threshold: Option<u64>,
     /// Stop tracing when any marker range event exceeds this duration in milliseconds
     pub marker_duration_threshold: Option<u64>,
+    /// Enable memory recording (RSS, mmap/munmap/brk, page faults)
+    pub memory: bool,
+    /// Sample 1 in N user page faults (0 or 1 = record all)
+    pub memory_fault_sample_rate: u32,
+    /// Enable heap allocator uprobes (malloc/free/calloc/realloc/...)
+    pub memory_alloc: bool,
+    /// Sample 1 in N allocator calls (0 or 1 = record all)
+    pub memory_alloc_sample_rate: u32,
     /// Enable network recording
     pub network: bool,
     /// Enable network packet-level probes (sendmsg, recvmsg, transmit, qdisc, drops).
@@ -470,6 +520,10 @@ impl Default for Config {
             markers: false,
             marker_threshold: None,
             marker_duration_threshold: None,
+            memory: false,
+            memory_fault_sample_rate: 97,
+            memory_alloc: false,
+            memory_alloc_sample_rate: 1,
             network: false,
             network_packets: false,
             resolve_addresses: false,
@@ -584,6 +638,8 @@ pub use types::arg_type;
 pub use types::epoll_event_bpf;
 pub use types::event_type;
 pub use types::marker_event;
+pub use types::memory_event;
+pub use types::memory_event_header;
 pub use types::network_event;
 pub use types::packet_event;
 pub use types::perf_counter_event;
@@ -602,6 +658,8 @@ unsafe impl Plain for epoll_event_bpf {}
 unsafe impl Plain for arg_desc {}
 unsafe impl Plain for arg_desc_array {}
 unsafe impl Plain for marker_event {}
+unsafe impl Plain for memory_event {}
+unsafe impl Plain for memory_event_header {}
 
 /// BPF exec event - delivered via dedicated ringbuf when a traced process execs.
 /// Used to dynamically discover Python PIDs for pystacks.
@@ -735,6 +793,15 @@ impl SystingEvent for epoll_event_bpf {
     }
 }
 
+impl SystingEvent for memory_event {
+    fn ts(&self) -> u64 {
+        self.hdr.ts
+    }
+    fn next_task_info(&self) -> Option<&task_info> {
+        Some(&self.hdr.task)
+    }
+}
+
 impl SystingEvent for marker_event {
     fn ts(&self) -> u64 {
         self.ts
@@ -761,6 +828,37 @@ where
         // unbounded userspace queue.
         if tx.send(event).is_err() {
             // Receiver has been dropped, we can silently ignore this
+            return -1;
+        }
+        0
+    })?;
+    builder.build()
+}
+
+/// Memory ringbuf carries variable-length records: stack-less types
+/// (RSS_STAT/MM_SAMPLE/FREE) emit only the header; stack-carrying types emit
+/// the full `memory_event`. The channel still delivers `memory_event` so the
+/// consumer is unchanged: header-only records zero-extend into a default full
+/// event (stack lengths are 0 in the header, so `intern_stack` returns None).
+fn create_memory_ring<'a>(
+    map: &dyn libbpf_rs::MapCore,
+    tx: SyncSender<memory_event>,
+) -> Result<libbpf_rs::RingBuffer<'a>, libbpf_rs::Error> {
+    let mut builder = RingBufferBuilder::new();
+    builder.add(map, move |data: &[u8]| {
+        let mut event = memory_event::default();
+        let len = data.len().min(std::mem::size_of::<memory_event>());
+        // SAFETY: memory_event is Plain (repr(C), no padding invariants) and
+        // default-initialized; we copy at most sizeof(memory_event) bytes from
+        // the BPF-produced ringbuf record into its leading bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                &mut event as *mut memory_event as *mut u8,
+                len,
+            );
+        }
+        if tx.send(event).is_err() {
             return -1;
         }
         0
@@ -825,6 +923,7 @@ struct RecorderChannels {
     network_rx: Receiver<network_event>,
     packet_rx: Receiver<packet_event>,
     epoll_rx: Receiver<epoll_event_bpf>,
+    memory_rx: Receiver<memory_event>,
     marker_rx: Receiver<marker_event>,
     exec_event_rx: Option<Receiver<exec_event>>,
 }
@@ -846,6 +945,7 @@ fn spawn_recorder_threads(
         network_rx,
         packet_rx,
         epoll_rx,
+        memory_rx,
         marker_rx,
         ..
     } = channels;
@@ -1011,6 +1111,29 @@ fn spawn_recorder_threads(
         );
     }
 
+    // Conditionally spawn memory recorder
+    if opts.memory {
+        let session_recorder = recorder.clone();
+        let my_stop_tx = stop_tx.clone();
+        let my_task_tx = task_info_tx.clone();
+        threads.push(
+            thread::Builder::new()
+                .name("memory_recorder".to_string())
+                .spawn(move || {
+                    consume_loop::<crate::memory_recorder::MemoryRecorder, memory_event>(
+                        &session_recorder.memory_recorder,
+                        memory_rx,
+                        my_stop_tx,
+                        my_task_tx,
+                        None,
+                    );
+                    0
+                })?,
+        );
+    } else {
+        drop(memory_rx);
+    }
+
     // Conditionally spawn marker recorder
     if opts.markers {
         let session_recorder = recorder.clone();
@@ -1052,6 +1175,19 @@ fn dump_missed_events(skel: &SystingSystemSkel, index: u32) -> u64 {
         }
     }
     missed
+}
+
+fn sum_percpu_counter(map: &dyn libbpf_rs::MapCore) -> u64 {
+    let key = 0u32.to_ne_bytes();
+    let mut total = 0u64;
+    if let Ok(Some(results)) = map.lookup_percpu(&key, libbpf_rs::MapFlags::ANY) {
+        for cpu_data in results {
+            let mut v: u64 = 0;
+            plain::copy_from_bytes(&mut v, &cpu_data).unwrap();
+            total += v;
+        }
+    }
+    total
 }
 
 fn is_old_kernel() -> bool {
@@ -1352,19 +1488,44 @@ fn handle_exec_events(
         };
         let exe_str = exe.to_string_lossy();
 
-        if exe_str.contains("python") {
-            // Direct Python exec within a traced process — add to pystacks.
-            // No pids_map update needed here: the process is already in the
-            // BPF pids map (trace_task() passed in the BPF handler), so
-            // sched/stack events are already being generated for it.
-            if added_pids.insert(pid) {
+        // Try every traced exec: check_python_process() scans maps for
+        // libpython, so embedders (uwsgi, gunicorn, etc.) are covered and
+        // non-python processes are rejected there. Only mark the pid as
+        // handled on success so exec chains (e.g. bash -> `exec python3`)
+        // re-probe on the later exec.
+        //
+        // sched_process_exec fires before ld.so maps libpython, so for
+        // dynamically-linked python stubs the first maps scan often finds
+        // nothing. Retry a few times with a short backoff. This blocks the
+        // exec-handler thread for up to 100ms per miss, which is acceptable
+        // given the dedicated 100K-deep channel; a non-blocking retry queue
+        // is a follow-up if python fork-storms become an issue.
+        if !added_pids.contains(&pid) {
+            let looks_like_python = exe_str.contains("python");
+            let mut registered = psr.add_pid(pid as i32);
+            if !registered && looks_like_python {
+                for delay_ms in [10, 30, 60] {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    if psr.add_pid(pid as i32) {
+                        registered = true;
+                        break;
+                    }
+                }
+            }
+            if registered {
+                added_pids.insert(pid);
                 eprintln!(
                     "[pystacks] Dynamically added Python PID {} ({})",
                     pid, exe_str
                 );
-                psr.add_pid(pid as i32);
+            } else if looks_like_python && pystacks_debug {
+                eprintln!(
+                    "[pystacks debug] python-named exe PID {} ({}) but libpython/_PyRuntime not found after retries",
+                    pid, exe_str
+                );
             }
-        } else if !did_scan && exe_str.contains(".pyenv/") {
+        }
+        if !did_scan && exe_str.contains(".pyenv/") && !exe_str.contains("python") {
             // A pyenv binary but not Python itself (e.g., forkapple's `fa`).
             // The actual Python process may be outside our traced tree.
             // Scan /proc for all Python processes and add them.
@@ -1377,12 +1538,12 @@ fn handle_exec_events(
             did_scan = true;
             let discovered = discover_python_processes(pystacks_debug);
             for py_pid in discovered {
-                if added_pids.insert(py_pid) {
+                if !added_pids.contains(&py_pid) && psr.add_pid(py_pid as i32) {
+                    added_pids.insert(py_pid);
                     eprintln!(
                         "[pystacks] Dynamically added Python PID {} (discovered via pyenv exec)",
                         py_pid
                     );
-                    psr.add_pid(py_pid as i32);
                     // Also add to the BPF pids map so this process
                     // generates sched/stack events
                     let val = (1_u8).to_ne_bytes();
@@ -1396,11 +1557,6 @@ fn handle_exec_events(
                     }
                 }
             }
-        } else if pystacks_debug {
-            eprintln!(
-                "[pystacks debug] Exec event for PID {} ({}), not Python",
-                pid, exe_str
-            );
         }
     }
 }
@@ -1544,6 +1700,7 @@ fn setup_ringbuffers<'a>(
     let (network_tx, network_rx) = sync_channel(CHANNEL_CAPACITY);
     let (packet_tx, packet_rx) = sync_channel(CHANNEL_CAPACITY);
     let (epoll_tx, epoll_rx) = sync_channel(CHANNEL_CAPACITY);
+    let (memory_tx, memory_rx) = sync_channel(CHANNEL_CAPACITY);
     let (marker_tx, marker_rx) = sync_channel(CHANNEL_CAPACITY);
     let (exec_tx, exec_rx) = sync_channel(CHANNEL_CAPACITY);
     let mut has_exec_ringbuf = false;
@@ -1574,6 +1731,9 @@ fn setup_ringbuffers<'a>(
             rings.push((name.to_string(), ring));
         } else if name.starts_with("ringbuf_epoll") && opts.network {
             let ring = create_ring::<epoll_event_bpf>(&map, epoll_tx.clone())?;
+            rings.push((name.to_string(), ring));
+        } else if name.starts_with("ringbuf_memory") && opts.memory {
+            let ring = create_memory_ring(&map, memory_tx.clone())?;
             rings.push((name.to_string(), ring));
         }
     }
@@ -1615,6 +1775,7 @@ fn setup_ringbuffers<'a>(
         stack_rx,
         cache_rx,
         probe_rx,
+        memory_rx,
         network_rx,
         packet_rx,
         epoll_rx,
@@ -1775,6 +1936,14 @@ fn configure_bpf_skeleton(
             use syscalls::Sysno;
             rodata.tool_config.marker_syscall_nr = Sysno::faccessat2 as u32;
         }
+        if opts.memory {
+            rodata.tool_config.collect_memory = 1;
+            rodata.tool_config.memory_fault_sample_rate = opts.memory_fault_sample_rate;
+            rodata.tool_config.page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
+        }
+        if opts.memory_alloc {
+            rodata.tool_config.memory_alloc_sample_rate = opts.memory_alloc_sample_rate;
+        }
 
         // Set wakeup threshold to 50% of ringbuf size for batched wakeups
         // Default ringbuf size is 50 MiB if not specified
@@ -1833,6 +2002,17 @@ fn configure_bpf_skeleton(
                 || name.starts_with("ringbuf_packet_events_")
                 || name.starts_with("ringbuf_epoll_events_")
             {
+                map.set_max_entries(1).with_context(|| {
+                    format!("Failed to shrink unused ringbuf map '{name}' to 1 entry")
+                })?;
+            }
+        }
+    }
+
+    if !opts.memory {
+        for mut map in open_skel.open_object_mut().maps_mut() {
+            let name = map.name().to_str().unwrap().to_owned();
+            if name.starts_with("ringbuf_memory_events_") {
                 map.set_max_entries(1).with_context(|| {
                     format!("Failed to set network ringbuf map '{name}' to zero capacity")
                 })?;
@@ -2025,6 +2205,138 @@ fn resolve_pids_for_probe(
         }
         Ok((pid_map, false))
     }
+}
+
+/// Collect target PIDs for libc uprobe discovery (from `--pid` and each
+/// `--cgroup`'s `cgroup.procs`).
+fn collect_memory_alloc_target_pids(opts: &Config) -> Vec<u32> {
+    let mut pids: HashSet<u32> = opts.pid.iter().copied().collect();
+    for cgroup in &opts.cgroup {
+        let procs = std::path::Path::new(cgroup).join("cgroup.procs");
+        if let Ok(contents) = std::fs::read_to_string(&procs) {
+            for line in contents.lines() {
+                if let Ok(pid) = line.trim().parse::<u32>() {
+                    pids.insert(pid);
+                }
+            }
+        }
+    }
+    pids.into_iter().collect()
+}
+
+/// Resolve the set of distinct libc binaries mapped by the target processes.
+/// Matches `libc.so`, `libc.so.6`, `libc-2.xx.so`, and musl's `libc.so`/
+/// `ld-musl-*.so` via `resolve_library_path_for_pid`. Paths are deduplicated
+/// by `(st_dev, st_ino)` so containers that share an image get exactly one
+/// set of uprobes. Returns `(unique-inode paths, distinct path-string count)`.
+fn discover_libc_paths(pids: &[u32]) -> (Vec<String>, usize) {
+    let mut raw_paths = HashSet::new();
+    for pid in pids {
+        for name in ["libc.so.6", "libc.so", "ld-musl"] {
+            if let Some(p) = resolve_library_path_for_pid(*pid, name) {
+                raw_paths.insert(p);
+                break;
+            }
+        }
+    }
+    let raw_count = raw_paths.len();
+    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
+    let mut unique = Vec::new();
+    for p in raw_paths {
+        match std::fs::metadata(&p) {
+            // insert() returns false if the (dev, ino) was already present:
+            // drop this path as a duplicate of one we kept.
+            Ok(meta) if !seen_inodes.insert((meta.dev(), meta.ino())) => {}
+            _ => unique.push(p),
+        }
+    }
+    (unique, raw_count)
+}
+
+/// Attach malloc/free/... uprobes to each discovered libc. Probes are attached
+/// with pid=-1 so every process sharing that libc is covered; BPF-side
+/// `trace_task()` enforces the configured pid/cgroup filter.
+fn attach_memory_alloc_uprobes(
+    skel: &mut SystingSystemSkel,
+    opts: &Config,
+) -> Result<Vec<libbpf_rs::Link>> {
+    let pids = collect_memory_alloc_target_pids(opts);
+    if pids.is_empty() {
+        eprintln!(
+            "Warning: memory-alloc recorder requires --pid, --cgroup, or a run command; no uprobes attached"
+        );
+        return Ok(Vec::new());
+    }
+
+    let (libc_paths, raw_path_count) = discover_libc_paths(&pids);
+    if libc_paths.is_empty() {
+        eprintln!(
+            "Warning: memory-alloc recorder could not locate libc in /proc/<pid>/maps for any target; no uprobes attached"
+        );
+        return Ok(Vec::new());
+    }
+
+    let probes: &[(&libbpf_rs::ProgramMut, &str, bool)] = &[
+        (&skel.progs.systing_malloc_enter, "malloc", false),
+        (&skel.progs.systing_malloc_exit, "malloc", true),
+        (&skel.progs.systing_calloc_enter, "calloc", false),
+        (&skel.progs.systing_calloc_exit, "calloc", true),
+        (&skel.progs.systing_realloc_enter, "realloc", false),
+        (&skel.progs.systing_realloc_exit, "realloc", true),
+        (
+            &skel.progs.systing_aligned_alloc_enter,
+            "aligned_alloc",
+            false,
+        ),
+        (
+            &skel.progs.systing_aligned_alloc_exit,
+            "aligned_alloc",
+            true,
+        ),
+        (
+            &skel.progs.systing_posix_memalign_enter,
+            "posix_memalign",
+            false,
+        ),
+        (
+            &skel.progs.systing_posix_memalign_exit,
+            "posix_memalign",
+            true,
+        ),
+        (&skel.progs.systing_free_enter, "free", false),
+    ];
+
+    let mut links = Vec::new();
+    for path in &libc_paths {
+        for (prog, func, ret) in probes {
+            match prog.attach_uprobe_with_opts(
+                -1,
+                path,
+                0,
+                UprobeOpts {
+                    retprobe: *ret,
+                    func_name: Some(func.to_string()),
+                    ..Default::default()
+                },
+            ) {
+                Ok(link) => links.push(link),
+                Err(e) => eprintln!(
+                    "Warning: failed to attach {}uprobe {}:{}: {}",
+                    if *ret { "ret" } else { "" },
+                    path,
+                    func,
+                    e
+                ),
+            }
+        }
+    }
+    println!(
+        "memory-alloc: attached {} uprobe(s) across {} libc inode(s) (from {} path(s))",
+        links.len(),
+        libc_paths.len(),
+        raw_path_count
+    );
+    Ok(links)
 }
 
 fn attach_probes(
@@ -2441,6 +2753,19 @@ fn run_tracing_loop(
         println!("Missed packet events: {}", dump_missed_events(skel, 5));
         println!("Missed poll events: {}", dump_missed_events(skel, 6));
     }
+    if opts.memory {
+        println!("Missed memory events: {}", dump_missed_events(skel, 8));
+    }
+    if opts.memory_alloc {
+        let enters = sum_percpu_counter(&skel.maps.memory_alloc_enter_count);
+        let exits = sum_percpu_counter(&skel.maps.memory_alloc_exit_count);
+        println!(
+            "memory-alloc: lost {} allocation return probes ({} entries, {} exits)",
+            enters.saturating_sub(exits),
+            enters,
+            exits
+        );
+    }
     if opts.markers {
         println!(
             "Missed marker events (ringbuf full): {}",
@@ -2705,6 +3030,16 @@ pub fn systing(
         // Attach any usdt's that we may have
         let _probe_links = attach_probes(&mut skel, &recorder, &opts, old_kernel)?;
 
+        // For a run-command trace this runs before the child execs, so
+        // /proc/<pid>/maps still reflects the forked parent's libc. That is
+        // normally the same file; a containerized/musl target that differs
+        // would need re-resolution after exec (not currently done).
+        let _memory_alloc_links = if opts.memory_alloc {
+            attach_memory_alloc_uprobes(&mut skel, &opts)?
+        } else {
+            Vec::new()
+        };
+
         // Signal the traced child to exec now that BPF is fully attached.
         // All tracing is active, so we capture everything from exec onwards.
         if let Some(ref mut child) = traced_child {
@@ -2748,6 +3083,11 @@ pub fn systing(
         // access), which fails if the Arc has been cloned. Events queue in the
         // unbounded mpsc channel until this thread starts draining them.
         let psr = recorder.stack_recorder.lock().unwrap().psr.clone();
+        recorder
+            .memory_recorder
+            .lock()
+            .unwrap()
+            .set_pystacks_run(psr.clone());
 
         // Spawn exec event handler thread to dynamically add Python PIDs.
         // See handle_exec_events() for details.

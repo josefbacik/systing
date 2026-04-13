@@ -21,7 +21,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -54,6 +54,10 @@ pub const DATA_TABLES: &[&str] = &[
     "network_socket",
     "network_poll",
     "network_dns",
+    "memory_rss",
+    "memory_map",
+    "memory_fault",
+    "memory_alloc",
     "clock_snapshot",
     "sysinfo",
     "tpu_device",
@@ -407,6 +411,44 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             hostname VARCHAR
         );
 
+        CREATE TABLE IF NOT EXISTS memory_rss (
+            trace_id VARCHAR,
+            ts BIGINT,
+            utid BIGINT,
+            member TINYINT,
+            size BIGINT
+        );
+        CREATE TABLE IF NOT EXISTS memory_map (
+            trace_id VARCHAR,
+            id BIGINT,
+            ts BIGINT,
+            utid BIGINT,
+            event_type VARCHAR,
+            addr BIGINT,
+            size BIGINT,
+            prot INTEGER,
+            flags INTEGER,
+            stack_id BIGINT
+        );
+        CREATE TABLE IF NOT EXISTS memory_fault (
+            trace_id VARCHAR,
+            ts BIGINT,
+            utid BIGINT,
+            addr BIGINT,
+            error_code INTEGER,
+            stack_id BIGINT
+        );
+        CREATE TABLE IF NOT EXISTS memory_alloc (
+            trace_id VARCHAR,
+            id BIGINT,
+            ts BIGINT,
+            utid BIGINT,
+            op VARCHAR,
+            addr BIGINT,
+            size BIGINT,
+            old_addr BIGINT,
+            stack_id BIGINT
+        );
         CREATE TABLE IF NOT EXISTS clock_snapshot (
             trace_id VARCHAR,
             clock_id INTEGER,
@@ -604,6 +646,10 @@ fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Res
     import_table("network_socket", &paths.network_socket)?;
     import_table("network_poll", &paths.network_poll)?;
     import_table("network_dns", &paths.network_dns)?;
+    import_table("memory_rss", &paths.memory_rss)?;
+    import_table("memory_map", &paths.memory_map)?;
+    import_table("memory_fault", &paths.memory_fault)?;
+    import_table("memory_alloc", &paths.memory_alloc)?;
 
     // Clock snapshot
     import_table("clock_snapshot", &paths.clock_snapshot)?;
@@ -998,6 +1044,10 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
     export_table("network_socket", &paths.network_socket)?;
     export_table("network_poll", &paths.network_poll)?;
     export_table("network_dns", &paths.network_dns)?;
+    export_table("memory_rss", &paths.memory_rss)?;
+    export_table("memory_map", &paths.memory_map)?;
+    export_table("memory_fault", &paths.memory_fault)?;
+    export_table("memory_alloc", &paths.memory_alloc)?;
 
     // Clock snapshot
     export_table("clock_snapshot", &paths.clock_snapshot)?;

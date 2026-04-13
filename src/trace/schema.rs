@@ -401,6 +401,56 @@ pub fn network_dns_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Schema for memory_rss.parquet
+pub fn memory_rss_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("utid", DataType::Int64, false),
+        Field::new("member", DataType::Int8, false),
+        Field::new("size", DataType::Int64, false),
+    ]))
+}
+
+/// Schema for memory_map.parquet
+pub fn memory_map_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("utid", DataType::Int64, false),
+        Field::new("event_type", DataType::Utf8, false),
+        Field::new("addr", DataType::Int64, false),
+        Field::new("size", DataType::Int64, false),
+        Field::new("prot", DataType::Int32, true),
+        Field::new("flags", DataType::Int32, true),
+        Field::new("stack_id", DataType::Int64, true),
+    ]))
+}
+
+/// Schema for memory_fault.parquet
+pub fn memory_fault_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("utid", DataType::Int64, false),
+        Field::new("addr", DataType::Int64, false),
+        Field::new("error_code", DataType::Int32, false),
+        Field::new("stack_id", DataType::Int64, true),
+    ]))
+}
+
+/// Schema for memory_alloc.parquet
+pub fn memory_alloc_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("utid", DataType::Int64, false),
+        Field::new("op", DataType::Utf8, false),
+        Field::new("addr", DataType::Int64, false),
+        Field::new("size", DataType::Int64, false),
+        Field::new("old_addr", DataType::Int64, true),
+        Field::new("stack_id", DataType::Int64, true),
+    ]))
+}
+
 // TPU profiling schemas
 
 /// Schema for tpu_device.parquet

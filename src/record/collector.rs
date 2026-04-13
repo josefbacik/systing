@@ -8,7 +8,8 @@ use anyhow::Result;
 
 use crate::trace::{
     ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ExtractedData,
-    InstantArgRecord, InstantRecord, IrqSliceRecord, NetworkDnsRecord, NetworkInterfaceRecord,
+    InstantArgRecord, InstantRecord, IrqSliceRecord, MemoryAllocRecord, MemoryFaultRecord,
+    MemoryMapRecord, MemoryRssRecord, NetworkDnsRecord, NetworkInterfaceRecord,
     NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord,
     ProcessExitRecord, ProcessRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord,
     SoftirqSliceRecord, StackRecord, StackSampleRecord, SysInfoRecord, ThreadRecord,
@@ -105,6 +106,18 @@ pub trait RecordCollector {
 
     /// Add a network DNS record.
     fn add_network_dns(&mut self, record: NetworkDnsRecord) -> Result<()>;
+
+    /// Add a memory RSS counter record.
+    fn add_memory_rss(&mut self, record: MemoryRssRecord) -> Result<()>;
+
+    /// Add a memory map (mmap/munmap/brk) record.
+    fn add_memory_map(&mut self, record: MemoryMapRecord) -> Result<()>;
+
+    /// Add a sampled page fault record.
+    fn add_memory_fault(&mut self, record: MemoryFaultRecord) -> Result<()>;
+
+    /// Add a heap allocator (malloc/free/...) record.
+    fn add_memory_alloc(&mut self, record: MemoryAllocRecord) -> Result<()>;
 
     /// Set the system info record (only one per trace).
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()>;
@@ -283,6 +296,26 @@ impl RecordCollector for InMemoryCollector {
 
     fn add_network_dns(&mut self, record: NetworkDnsRecord) -> Result<()> {
         self.data.network_dns.push(record);
+        Ok(())
+    }
+
+    fn add_memory_rss(&mut self, record: MemoryRssRecord) -> Result<()> {
+        self.data.memory_rss.push(record);
+        Ok(())
+    }
+
+    fn add_memory_map(&mut self, record: MemoryMapRecord) -> Result<()> {
+        self.data.memory_maps.push(record);
+        Ok(())
+    }
+
+    fn add_memory_fault(&mut self, record: MemoryFaultRecord) -> Result<()> {
+        self.data.memory_faults.push(record);
+        Ok(())
+    }
+
+    fn add_memory_alloc(&mut self, record: MemoryAllocRecord) -> Result<()> {
+        self.data.memory_allocs.push(record);
         Ok(())
     }
 

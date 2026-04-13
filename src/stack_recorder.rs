@@ -30,10 +30,10 @@ use debuginfod::{BuildId, CachingClient, Client};
 
 // Stack structure representing kernel, user, and Python stacks
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
-struct Stack {
-    kernel_stack: Vec<u64>,
-    user_stack: Vec<u64>,
-    py_stack: Vec<PyAddr>,
+pub struct Stack {
+    pub(crate) kernel_stack: Vec<u64>,
+    pub(crate) user_stack: Vec<u64>,
+    pub(crate) py_stack: Vec<PyAddr>,
 }
 
 /// Maximum valid user-space address (48-bit virtual address space boundary).
@@ -63,7 +63,7 @@ fn filter_and_reverse_kernel_stack(addrs: &[u64]) -> Vec<u64> {
 }
 
 impl Stack {
-    fn new(kernel_stack: &[u64], user_stack: &[u64], py_stack: &[PyAddr]) -> Self {
+    pub fn new(kernel_stack: &[u64], user_stack: &[u64], py_stack: &[PyAddr]) -> Self {
         Self {
             kernel_stack: filter_and_reverse_kernel_stack(kernel_stack),
             user_stack: filter_and_reverse_user_stack(user_stack),
@@ -98,6 +98,10 @@ pub struct StackRecorder {
     /// The tgid is included in the key because the same addresses in different processes
     /// may resolve to different symbols (e.g., shared libraries at fixed addresses).
     unique_stacks: HashMap<(Stack, i32), i64>,
+    /// External stack_ids that collided with an existing unique_stacks key during
+    /// merge_external_stacks. Emitted as duplicate StackRecords in finish so every
+    /// id referenced by a streamed record resolves.
+    alias_stacks: Vec<(Stack, i32, i64)>,
     /// Next stack_id to assign for new unique stacks.
     next_stack_id: i64,
     /// Shared utid generator for consistent thread IDs across all recorders.
@@ -118,6 +122,7 @@ impl StackRecorder {
             process_dispatcher,
             streaming_collector: None,
             unique_stacks: HashMap::new(),
+            alias_stacks: Vec::new(),
             next_stack_id: 1,
             utid_generator,
         }
@@ -128,6 +133,22 @@ impl StackRecorder {
     /// entire trace. unique_stacks is still retained for end-of-trace symbolization.
     pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
         self.streaming_collector = Some(collector);
+    }
+
+    /// Merge externally-deduped stacks (from another recorder) so they are
+    /// symbolized and emitted alongside profiler stacks in `finish()`. When an
+    /// external key collides with an existing entry, the external id is kept as
+    /// an alias so both ids are emitted as StackRecords.
+    pub fn merge_external_stacks(&mut self, stacks: HashMap<(Stack, i32), i64>) {
+        for (key, id) in stacks {
+            if let Some(&existing) = self.unique_stacks.get(&key) {
+                if existing != id {
+                    self.alias_stacks.push((key.0, key.1, id));
+                }
+            } else {
+                self.unique_stacks.insert(key, id);
+            }
+        }
     }
 
     /// Create a symbolizer with the configured process dispatcher.
@@ -182,12 +203,12 @@ impl StackRecorder {
     }
 
     fn finish_inner(&mut self, collector: &mut dyn RecordCollector) -> Result<()> {
-        if self.unique_stacks.is_empty() {
+        if self.unique_stacks.is_empty() && self.alias_stacks.is_empty() {
             return Ok(());
         }
 
         // Symbolize all unique stacks and stream StackRecords
-        let pb = ProgressBar::new(self.unique_stacks.len() as u64);
+        let pb = ProgressBar::new((self.unique_stacks.len() + self.alias_stacks.len()) as u64);
         pb.set_style(
             ProgressStyle::default_bar()
                 .template(
@@ -211,6 +232,12 @@ impl StackRecorder {
         // Group stacks by tgid to reuse process sources efficiently
         let mut stacks_by_tgid: HashMap<i32, Vec<(&Stack, i64)>> = HashMap::new();
         for ((stack, tgid), stack_id) in self.unique_stacks.iter() {
+            stacks_by_tgid
+                .entry(*tgid)
+                .or_default()
+                .push((stack, *stack_id));
+        }
+        for (stack, tgid, stack_id) in self.alias_stacks.iter() {
             stacks_by_tgid
                 .entry(*tgid)
                 .or_default()

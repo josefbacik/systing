@@ -472,6 +472,64 @@ pub struct SysInfoRecord {
 }
 
 /// Container for all extracted trace data.
+/// Per-process RSS / VM counter sample.
+///
+/// `member` indexes the kernel `rss_stat` counter (0=file, 1=anon, 2=swap, 3=shmem).
+/// Negative members are synthetic: -1 = hiwater_rss, -2 = total_vm (from periodic mm snapshots).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryRssRecord {
+    pub ts: i64,
+    pub utid: i64,
+    pub member: i8,
+    pub size: i64,
+}
+
+/// Virtual address space change: mmap / munmap / brk.
+///
+/// `addr` and `size` describe the affected region (for brk, `addr` is the new
+/// break and `size` is the signed delta in bytes, negative on shrink).
+/// `stack_id` joins to the `stack` table for allocation-site attribution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryMapRecord {
+    pub id: i64,
+    pub ts: i64,
+    pub utid: i64,
+    pub event_type: String,
+    pub addr: i64,
+    pub size: i64,
+    pub prot: Option<i32>,
+    pub flags: Option<i32>,
+    pub stack_id: Option<i64>,
+}
+
+/// Sampled user page fault with the faulting stack.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryFaultRecord {
+    pub ts: i64,
+    pub utid: i64,
+    pub addr: i64,
+    pub error_code: i32,
+    pub stack_id: Option<i64>,
+}
+
+/// Heap allocator call (malloc/calloc/realloc/aligned_alloc/posix_memalign/free)
+/// captured via libc uprobes.
+///
+/// For `op == "free"`, `size` is 0. For `op == "realloc"`, `old_addr` is the
+/// pointer passed in (implicitly freed when `addr != old_addr`). `stack_id`
+/// joins to the `stack` table for allocation-site attribution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryAllocRecord {
+    pub id: i64,
+    pub ts: i64,
+    pub utid: i64,
+    pub op: String,
+    pub addr: i64,
+    pub size: i64,
+    pub old_addr: Option<i64>,
+    pub stack_id: Option<i64>,
+}
+
 #[derive(Debug, Default)]
 pub struct ExtractedData {
     pub processes: Vec<ProcessRecord>,
@@ -498,6 +556,10 @@ pub struct ExtractedData {
     pub network_sockets: Vec<NetworkSocketRecord>,
     pub network_polls: Vec<NetworkPollRecord>,
     pub network_dns: Vec<NetworkDnsRecord>,
+    pub memory_rss: Vec<MemoryRssRecord>,
+    pub memory_maps: Vec<MemoryMapRecord>,
+    pub memory_faults: Vec<MemoryFaultRecord>,
+    pub memory_allocs: Vec<MemoryAllocRecord>,
     pub clock_snapshots: Vec<ClockSnapshotRecord>,
     pub sysinfo: Option<SysInfoRecord>,
     pub tpu_devices: Vec<TpuDeviceRecord>,
