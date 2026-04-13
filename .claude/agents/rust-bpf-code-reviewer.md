@@ -78,6 +78,14 @@ When changes touch the database schema (`src/duckdb.rs` `create_schema()`, `src/
 
 Flag any schema change that is missing these updates as a **Critical Issue**.
 
+## Recorder Consistency Review Criteria
+
+When changes add or modify a recorder (any `*_recorder.rs`, or new tables in `src/trace/schema.rs` / `src/duckdb.rs`), verify:
+
+1. **Thread identity uses `utid`**: Per-event tables that attribute to a thread MUST use `utid` (Int64, joins `thread.utid`), not raw `tid`/`pid`. The recorder must hold an `Arc<UtidGenerator>` and call `get_or_create_utid(tid)` when emitting records. Precedent: `sched_slice`, `stack_sample`, `slice`, `instant`. Raw `tid`/`pid` columns are a **Critical Issue** — they break joins to the rest of the schema and cause cross-thread misattribution (see PR #99 for the marker recorder case).
+2. **Process attribution goes through `thread`**: Queries that need pid/process name should join `<table>.utid → thread.utid → thread.upid → process.upid`; tables should not duplicate `pid`.
+3. **utid FK integrity**: Integration tests for the recorder should assert that every emitted `utid` exists in `thread.utid` (zero orphans).
+
 ## Output Format
 
 Structure your review as follows:
