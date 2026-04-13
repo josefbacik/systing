@@ -19,6 +19,10 @@ const ALLOC_COUNT: i64 = 50;
 /// Upper bound for anon-RSS sanity (guards against unit bugs like bytes vs pages).
 const RSS_SANITY_CEILING_BYTES: i64 = 64 * 1024 * 1024 * 1024;
 
+/// SQL fragment that resolves the set of utids belonging to a given Linux pid.
+const UTIDS_FOR_PID: &str =
+    "(SELECT t.utid FROM thread t JOIN process p ON p.upid = t.upid WHERE p.pid = ?)";
+
 fn setup_bpf_environment() {
     bump_memlock_rlimit().expect("Failed to bump memlock rlimit");
 }
@@ -92,8 +96,10 @@ fn test_memory_recorder_e2e() {
     eprintln!("  memory_rss anon sanity...");
     let (anon_rows, max_anon): (i64, i64) = conn
         .query_row(
-            "SELECT COUNT(*), COALESCE(MAX(size), 0)
-             FROM memory_rss WHERE member = 1 AND pid = ?",
+            &format!(
+                "SELECT COUNT(*), COALESCE(MAX(size), 0)
+                 FROM memory_rss WHERE member = 1 AND utid IN {UTIDS_FOR_PID}"
+            ),
             [child_pid],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -118,8 +124,10 @@ fn test_memory_recorder_e2e() {
     eprintln!("  memory_map mmap events...");
     let (mmap_rows, big_mmap_rows): (i64, i64) = conn
         .query_row(
-            "SELECT COUNT(*), COUNT(*) FILTER (WHERE size >= ?)
-             FROM memory_map WHERE event_type = 'mmap' AND pid = ?",
+            &format!(
+                "SELECT COUNT(*), COUNT(*) FILTER (WHERE size >= ?)
+                 FROM memory_map WHERE event_type = 'mmap' AND utid IN {UTIDS_FOR_PID}"
+            ),
             [ALLOC_SIZE_BYTES, child_pid as i64],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -149,7 +157,10 @@ fn test_memory_recorder_e2e() {
     eprintln!("  memory_map munmap events...");
     let munmap_rows: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM memory_map WHERE event_type = 'munmap' AND pid = ?",
+            &format!(
+                "SELECT COUNT(*) FROM memory_map
+                 WHERE event_type = 'munmap' AND utid IN {UTIDS_FOR_PID}"
+            ),
             [child_pid],
             |row| row.get(0),
         )
@@ -164,11 +175,13 @@ fn test_memory_recorder_e2e() {
     eprintln!("  memory_map.stack_id -> stack.id join...");
     let (with_stack, joined): (i64, i64) = conn
         .query_row(
-            "SELECT
-                 (SELECT COUNT(*) FROM memory_map
-                  WHERE stack_id IS NOT NULL AND pid = ?),
-                 (SELECT COUNT(*) FROM memory_map mm JOIN stack s ON s.id = mm.stack_id
-                  WHERE mm.pid = ?)",
+            &format!(
+                "SELECT
+                     (SELECT COUNT(*) FROM memory_map
+                      WHERE stack_id IS NOT NULL AND utid IN {UTIDS_FOR_PID}),
+                     (SELECT COUNT(*) FROM memory_map mm JOIN stack s ON s.id = mm.stack_id
+                      WHERE mm.utid IN {UTIDS_FOR_PID})"
+            ),
             [child_pid, child_pid],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -190,7 +203,7 @@ fn test_memory_recorder_e2e() {
         eprintln!("  memory_fault events (x86_64)...");
         let fault_rows: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM memory_fault WHERE pid = ?",
+                &format!("SELECT COUNT(*) FROM memory_fault WHERE utid IN {UTIDS_FOR_PID}"),
                 [child_pid],
                 |row| row.get(0),
             )
@@ -203,6 +216,24 @@ fn test_memory_recorder_e2e() {
     }
     #[cfg(not(target_arch = "x86_64"))]
     eprintln!("  memory_fault: skipped (non-x86_64)");
+
+    // --- Check: every memory_* utid joins to thread.utid ---
+    eprintln!("  memory_*.utid -> thread.utid FK integrity...");
+    let orphaned_utids: i64 = conn
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM memory_rss   r WHERE NOT EXISTS (SELECT 1 FROM thread t WHERE t.utid = r.utid))
+               + (SELECT COUNT(*) FROM memory_map   m WHERE NOT EXISTS (SELECT 1 FROM thread t WHERE t.utid = m.utid))
+               + (SELECT COUNT(*) FROM memory_fault f WHERE NOT EXISTS (SELECT 1 FROM thread t WHERE t.utid = f.utid))",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Failed to query utid FK integrity");
+    assert_eq!(
+        orphaned_utids, 0,
+        "[memory_*] {} rows have utid that does not exist in thread table",
+        orphaned_utids
+    );
 
     eprintln!("\ntest_memory_recorder_e2e: all checks passed");
 }
@@ -265,10 +296,12 @@ fn test_memory_alloc_e2e() {
     eprintln!("  memory_alloc malloc events...");
     let (malloc_rows, free_rows): (i64, i64) = conn
         .query_row(
-            "SELECT
-                 COUNT(*) FILTER (WHERE op = 'malloc'),
-                 COUNT(*) FILTER (WHERE op = 'free')
-             FROM memory_alloc WHERE pid = ?",
+            &format!(
+                "SELECT
+                     COUNT(*) FILTER (WHERE op = 'malloc'),
+                     COUNT(*) FILTER (WHERE op = 'free')
+                 FROM memory_alloc WHERE utid IN {UTIDS_FOR_PID}"
+            ),
             [child_pid],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -290,8 +323,10 @@ fn test_memory_alloc_e2e() {
     // --- Check: malloc sizes look sane (non-zero, below 64GiB) ---
     let max_size: i64 = conn
         .query_row(
-            "SELECT COALESCE(MAX(size), 0) FROM memory_alloc
-             WHERE pid = ? AND op != 'free'",
+            &format!(
+                "SELECT COALESCE(MAX(size), 0) FROM memory_alloc
+                 WHERE op != 'free' AND utid IN {UTIDS_FOR_PID}"
+            ),
             [child_pid],
             |row| row.get(0),
         )
@@ -306,11 +341,13 @@ fn test_memory_alloc_e2e() {
     eprintln!("  memory_alloc.stack_id -> stack.id join...");
     let (with_stack, joined): (i64, i64) = conn
         .query_row(
-            "SELECT
-                 (SELECT COUNT(*) FROM memory_alloc
-                  WHERE stack_id IS NOT NULL AND pid = ?),
-                 (SELECT COUNT(*) FROM memory_alloc ma JOIN stack s ON s.id = ma.stack_id
-                  WHERE ma.pid = ?)",
+            &format!(
+                "SELECT
+                     (SELECT COUNT(*) FROM memory_alloc
+                      WHERE stack_id IS NOT NULL AND utid IN {UTIDS_FOR_PID}),
+                     (SELECT COUNT(*) FROM memory_alloc ma JOIN stack s ON s.id = ma.stack_id
+                      WHERE ma.utid IN {UTIDS_FOR_PID})"
+            ),
             [child_pid, child_pid],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -325,6 +362,21 @@ fn test_memory_alloc_e2e() {
         with_stack, joined
     );
     eprintln!("    {} memory_alloc rows join to stack table", joined);
+
+    // --- Check: every memory_alloc utid joins to thread.utid ---
+    let orphaned_utids: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_alloc a
+             WHERE NOT EXISTS (SELECT 1 FROM thread t WHERE t.utid = a.utid)",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Failed to query memory_alloc utid FK integrity");
+    assert_eq!(
+        orphaned_utids, 0,
+        "[memory_alloc] {} rows have utid that does not exist in thread table",
+        orphaned_utids
+    );
 
     eprintln!("\ntest_memory_alloc_e2e: all checks passed");
 }

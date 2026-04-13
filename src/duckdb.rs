@@ -414,8 +414,7 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS memory_rss (
             trace_id VARCHAR,
             ts BIGINT,
-            tid INTEGER,
-            pid INTEGER,
+            utid BIGINT,
             member TINYINT,
             size BIGINT
         );
@@ -423,8 +422,7 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             trace_id VARCHAR,
             id BIGINT,
             ts BIGINT,
-            tid INTEGER,
-            pid INTEGER,
+            utid BIGINT,
             event_type VARCHAR,
             addr BIGINT,
             size BIGINT,
@@ -435,8 +433,7 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS memory_fault (
             trace_id VARCHAR,
             ts BIGINT,
-            tid INTEGER,
-            pid INTEGER,
+            utid BIGINT,
             addr BIGINT,
             error_code INTEGER,
             stack_id BIGINT
@@ -445,8 +442,7 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             trace_id VARCHAR,
             id BIGINT,
             ts BIGINT,
-            tid INTEGER,
-            pid INTEGER,
+            utid BIGINT,
             op VARCHAR,
             addr BIGINT,
             size BIGINT,

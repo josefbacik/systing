@@ -479,8 +479,7 @@ pub struct SysInfoRecord {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryRssRecord {
     pub ts: i64,
-    pub tid: i32,
-    pub pid: i32,
+    pub utid: i64,
     pub member: i8,
     pub size: i64,
 }
@@ -494,8 +493,7 @@ pub struct MemoryRssRecord {
 pub struct MemoryMapRecord {
     pub id: i64,
     pub ts: i64,
-    pub tid: i32,
-    pub pid: i32,
+    pub utid: i64,
     pub event_type: String,
     pub addr: i64,
     pub size: i64,
@@ -508,8 +506,7 @@ pub struct MemoryMapRecord {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryFaultRecord {
     pub ts: i64,
-    pub tid: i32,
-    pub pid: i32,
+    pub utid: i64,
     pub addr: i64,
     pub error_code: i32,
     pub stack_id: Option<i64>,
@@ -525,8 +522,7 @@ pub struct MemoryFaultRecord {
 pub struct MemoryAllocRecord {
     pub id: i64,
     pub ts: i64,
-    pub tid: i32,
-    pub pid: i32,
+    pub utid: i64,
     pub op: String,
     pub addr: i64,
     pub size: i64,

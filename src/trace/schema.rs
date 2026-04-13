@@ -405,8 +405,7 @@ pub fn network_dns_schema() -> Arc<Schema> {
 pub fn memory_rss_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Int64, false),
-        Field::new("tid", DataType::Int32, false),
-        Field::new("pid", DataType::Int32, false),
+        Field::new("utid", DataType::Int64, false),
         Field::new("member", DataType::Int8, false),
         Field::new("size", DataType::Int64, false),
     ]))
@@ -417,8 +416,7 @@ pub fn memory_map_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("ts", DataType::Int64, false),
-        Field::new("tid", DataType::Int32, false),
-        Field::new("pid", DataType::Int32, false),
+        Field::new("utid", DataType::Int64, false),
         Field::new("event_type", DataType::Utf8, false),
         Field::new("addr", DataType::Int64, false),
         Field::new("size", DataType::Int64, false),
@@ -432,8 +430,7 @@ pub fn memory_map_schema() -> Arc<Schema> {
 pub fn memory_fault_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Int64, false),
-        Field::new("tid", DataType::Int32, false),
-        Field::new("pid", DataType::Int32, false),
+        Field::new("utid", DataType::Int64, false),
         Field::new("addr", DataType::Int64, false),
         Field::new("error_code", DataType::Int32, false),
         Field::new("stack_id", DataType::Int64, true),
@@ -445,8 +442,7 @@ pub fn memory_alloc_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("ts", DataType::Int64, false),
-        Field::new("tid", DataType::Int32, false),
-        Field::new("pid", DataType::Int32, false),
+        Field::new("utid", DataType::Int64, false),
         Field::new("op", DataType::Utf8, false),
         Field::new("addr", DataType::Int64, false),
         Field::new("size", DataType::Int64, false),

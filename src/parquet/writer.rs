@@ -2311,17 +2311,15 @@ fn build_memory_rss_batch(
     records: &[MemoryRssRecord],
     schema: &Arc<Schema>,
 ) -> Result<RecordBatch> {
-    use arrow::array::{Int32Builder, Int64Builder, Int8Builder};
+    use arrow::array::{Int64Builder, Int8Builder};
     let n = records.len();
     let mut ts = Int64Builder::with_capacity(n);
-    let mut tid = Int32Builder::with_capacity(n);
-    let mut pid = Int32Builder::with_capacity(n);
+    let mut utid = Int64Builder::with_capacity(n);
     let mut member = Int8Builder::with_capacity(n);
     let mut size = Int64Builder::with_capacity(n);
     for r in records {
         ts.append_value(r.ts);
-        tid.append_value(r.tid);
-        pid.append_value(r.pid);
+        utid.append_value(r.utid);
         member.append_value(r.member);
         size.append_value(r.size);
     }
@@ -2329,8 +2327,7 @@ fn build_memory_rss_batch(
         schema.clone(),
         vec![
             Arc::new(ts.finish()),
-            Arc::new(tid.finish()),
-            Arc::new(pid.finish()),
+            Arc::new(utid.finish()),
             Arc::new(member.finish()),
             Arc::new(size.finish()),
         ],
@@ -2341,12 +2338,11 @@ fn build_memory_alloc_batch(
     records: &[MemoryAllocRecord],
     schema: &Arc<Schema>,
 ) -> Result<RecordBatch> {
-    use arrow::array::{Int32Builder, Int64Builder};
+    use arrow::array::Int64Builder;
     let n = records.len();
     let mut id = Int64Builder::with_capacity(n);
     let mut ts = Int64Builder::with_capacity(n);
-    let mut tid = Int32Builder::with_capacity(n);
-    let mut pid = Int32Builder::with_capacity(n);
+    let mut utid = Int64Builder::with_capacity(n);
     let mut op = StringBuilder::with_capacity(n, n * 8);
     let mut addr = Int64Builder::with_capacity(n);
     let mut size = Int64Builder::with_capacity(n);
@@ -2355,8 +2351,7 @@ fn build_memory_alloc_batch(
     for r in records {
         id.append_value(r.id);
         ts.append_value(r.ts);
-        tid.append_value(r.tid);
-        pid.append_value(r.pid);
+        utid.append_value(r.utid);
         op.append_value(&r.op);
         addr.append_value(r.addr);
         size.append_value(r.size);
@@ -2368,8 +2363,7 @@ fn build_memory_alloc_batch(
         vec![
             Arc::new(id.finish()),
             Arc::new(ts.finish()),
-            Arc::new(tid.finish()),
-            Arc::new(pid.finish()),
+            Arc::new(utid.finish()),
             Arc::new(op.finish()),
             Arc::new(addr.finish()),
             Arc::new(size.finish()),
@@ -2387,8 +2381,7 @@ fn build_memory_map_batch(
     let n = records.len();
     let mut id = Int64Builder::with_capacity(n);
     let mut ts = Int64Builder::with_capacity(n);
-    let mut tid = Int32Builder::with_capacity(n);
-    let mut pid = Int32Builder::with_capacity(n);
+    let mut utid = Int64Builder::with_capacity(n);
     let mut event_type = StringBuilder::with_capacity(n, n * 8);
     let mut addr = Int64Builder::with_capacity(n);
     let mut size = Int64Builder::with_capacity(n);
@@ -2398,8 +2391,7 @@ fn build_memory_map_batch(
     for r in records {
         id.append_value(r.id);
         ts.append_value(r.ts);
-        tid.append_value(r.tid);
-        pid.append_value(r.pid);
+        utid.append_value(r.utid);
         event_type.append_value(&r.event_type);
         addr.append_value(r.addr);
         size.append_value(r.size);
@@ -2412,8 +2404,7 @@ fn build_memory_map_batch(
         vec![
             Arc::new(id.finish()),
             Arc::new(ts.finish()),
-            Arc::new(tid.finish()),
-            Arc::new(pid.finish()),
+            Arc::new(utid.finish()),
             Arc::new(event_type.finish()),
             Arc::new(addr.finish()),
             Arc::new(size.finish()),
@@ -2431,15 +2422,13 @@ fn build_memory_fault_batch(
     use arrow::array::{Int32Builder, Int64Builder};
     let n = records.len();
     let mut ts = Int64Builder::with_capacity(n);
-    let mut tid = Int32Builder::with_capacity(n);
-    let mut pid = Int32Builder::with_capacity(n);
+    let mut utid = Int64Builder::with_capacity(n);
     let mut addr = Int64Builder::with_capacity(n);
     let mut error_code = Int32Builder::with_capacity(n);
     let mut stack_id = Int64Builder::with_capacity(n);
     for r in records {
         ts.append_value(r.ts);
-        tid.append_value(r.tid);
-        pid.append_value(r.pid);
+        utid.append_value(r.utid);
         addr.append_value(r.addr);
         error_code.append_value(r.error_code);
         stack_id.append_option(r.stack_id);
@@ -2448,8 +2437,7 @@ fn build_memory_fault_batch(
         schema.clone(),
         vec![
             Arc::new(ts.finish()),
-            Arc::new(tid.finish()),
-            Arc::new(pid.finish()),
+            Arc::new(utid.finish()),
             Arc::new(addr.finish()),
             Arc::new(error_code.finish()),
             Arc::new(stack_id.finish()),

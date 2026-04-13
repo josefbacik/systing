@@ -12,6 +12,7 @@ use crate::systing_core::types::{
 };
 use crate::systing_core::SystingRecordEvent;
 use crate::trace::{MemoryAllocRecord, MemoryFaultRecord, MemoryMapRecord, MemoryRssRecord};
+use crate::utid::UtidGenerator;
 
 /// stack_id offset for stacks interned by the memory recorder, to keep them
 /// disjoint from `StackRecorder`'s own ids prior to the end-of-trace merge.
@@ -31,10 +32,11 @@ pub struct MemoryRecorder {
     next_map_id: i64,
     next_alloc_id: i64,
     write_error_reported: bool,
+    utid_generator: Arc<UtidGenerator>,
 }
 
-impl Default for MemoryRecorder {
-    fn default() -> Self {
+impl MemoryRecorder {
+    pub fn new(utid_generator: Arc<UtidGenerator>) -> Self {
         Self {
             ringbuf: RingBuffer::default(),
             psr: Arc::new(StackWalkerRun::default()),
@@ -44,6 +46,7 @@ impl Default for MemoryRecorder {
             next_map_id: 1,
             next_alloc_id: 1,
             write_error_reported: false,
+            utid_generator,
         }
     }
 }
@@ -115,25 +118,23 @@ impl MemoryRecorder {
         Some(id)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn emit_map(
         &mut self,
         collector: &mut (dyn RecordCollector + Send),
         event: &memory_event,
-        tgid: i32,
-        tid: i32,
+        utid: i64,
         event_type: &'static str,
         prot: Option<i32>,
         flags: Option<i32>,
     ) {
+        let tgid = (event.hdr.task.tgidpid >> 32) as i32;
         let stack_id = self.intern_stack(event, tgid);
         let id = self.next_map_id;
         self.next_map_id += 1;
         let r = collector.add_memory_map(MemoryMapRecord {
             id,
             ts: event.hdr.ts as i64,
-            tid,
-            pid: tgid,
+            utid,
             event_type: event_type.to_string(),
             addr: event.hdr.addr as i64,
             size: event.hdr.size as i64,
@@ -159,13 +160,13 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
         let hdr = &event.hdr;
         let tgid = (hdr.task.tgidpid >> 32) as i32;
         let tid = (hdr.task.tgidpid & 0xFFFF_FFFF) as i32;
+        let utid = self.utid_generator.get_or_create_utid(tid);
 
         match hdr.r#type {
             memory_event_type::MEMORY_RSS_STAT => {
                 let r = collector.add_memory_rss(MemoryRssRecord {
                     ts: hdr.ts as i64,
-                    tid,
-                    pid: tgid,
+                    utid,
                     member: hdr.member.min(i8::MAX as u32) as i8,
                     size: hdr.size as i64,
                 });
@@ -175,25 +176,23 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
                 self.emit_map(
                     collector.as_mut(),
                     &event,
-                    tgid,
-                    tid,
+                    utid,
                     "mmap",
                     Some(hdr.member as i32),
                     Some(hdr.flags as i32),
                 );
             }
             memory_event_type::MEMORY_MUNMAP => {
-                self.emit_map(collector.as_mut(), &event, tgid, tid, "munmap", None, None);
+                self.emit_map(collector.as_mut(), &event, utid, "munmap", None, None);
             }
             memory_event_type::MEMORY_BRK => {
-                self.emit_map(collector.as_mut(), &event, tgid, tid, "brk", None, None);
+                self.emit_map(collector.as_mut(), &event, utid, "brk", None, None);
             }
             memory_event_type::MEMORY_PAGE_FAULT => {
                 let stack_id = self.intern_stack(&event, tgid);
                 let r = collector.add_memory_fault(MemoryFaultRecord {
                     ts: hdr.ts as i64,
-                    tid,
-                    pid: tgid,
+                    utid,
                     addr: hdr.addr as i64,
                     error_code: hdr.flags as i32,
                     stack_id,
@@ -208,8 +207,7 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
                 let r = collector.add_memory_alloc(MemoryAllocRecord {
                     id,
                     ts: hdr.ts as i64,
-                    tid,
-                    pid: tgid,
+                    utid,
                     op: alloc_op_name(hdr.member).to_string(),
                     addr: hdr.addr as i64,
                     size: hdr.size as i64,
@@ -225,16 +223,14 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
             memory_event_type::MEMORY_MM_SAMPLE => {
                 let r = collector.add_memory_rss(MemoryRssRecord {
                     ts: hdr.ts as i64,
-                    tid,
-                    pid: tgid,
+                    utid,
                     member: MEMORY_MEMBER_HIWATER_RSS,
                     size: hdr.addr as i64,
                 });
                 self.report_write_error(r);
                 let r = collector.add_memory_rss(MemoryRssRecord {
                     ts: hdr.ts as i64,
-                    tid,
-                    pid: tgid,
+                    utid,
                     member: MEMORY_MEMBER_TOTAL_VM,
                     size: hdr.size as i64,
                 });

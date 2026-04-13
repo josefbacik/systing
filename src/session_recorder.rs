@@ -450,7 +450,7 @@ impl SessionRecorder {
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::new(Arc::clone(&utid_generator))),
             network_recorder: Mutex::new(NetworkRecorder::new(resolve_network_addresses)),
-            memory_recorder: Mutex::new(MemoryRecorder::default()),
+            memory_recorder: Mutex::new(MemoryRecorder::new(Arc::clone(&utid_generator))),
             marker_recorder: Mutex::new(
                 MarkerRecorder::new(Arc::clone(&utid_generator))
                     .with_threshold(marker_threshold)
@@ -1272,7 +1272,7 @@ mod tests {
             sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
             probe_recorder: Mutex::new(SystingProbeRecorder::new(Arc::clone(&utid_generator))),
             network_recorder: Mutex::new(NetworkRecorder::default()),
-            memory_recorder: Mutex::new(MemoryRecorder::default()),
+            memory_recorder: Mutex::new(MemoryRecorder::new(Arc::clone(&utid_generator))),
             marker_recorder: Mutex::new(MarkerRecorder::new(Arc::clone(&utid_generator))),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
