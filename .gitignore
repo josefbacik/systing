@@ -18,3 +18,4 @@ scratch/
 .claude/settings.local.json
 traces/
 trace.duckdb_.gstmp
+flake.lock
