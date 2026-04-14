@@ -900,6 +900,21 @@ fn test_e2e_network_suite() {
         );
         eprintln!("    {} interfaces in DuckDB", interface_count);
 
+        // --- Check: every network_syscall/network_poll utid joins to thread.utid ---
+        let orphaned_utids: i64 = conn
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM network_syscall s WHERE NOT EXISTS (SELECT 1 FROM thread t WHERE t.utid = s.utid))
+                 + (SELECT COUNT(*) FROM network_poll    p WHERE NOT EXISTS (SELECT 1 FROM thread t WHERE t.utid = p.utid))",
+                [],
+                |row| row.get(0),
+            )
+            .expect("Failed to query utid FK integrity");
+        assert_eq!(
+            orphaned_utids, 0,
+            "[network duckdb] {orphaned_utids} network_syscall/poll rows have utid not in thread"
+        );
+
         // Check for TCP state change events
         let state_change_count: i64 = conn
             .query_row(

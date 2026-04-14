@@ -184,6 +184,50 @@ impl ValidationQueries for ParquetQueries {
         })
     }
 
+    fn count_orphan_network_utids(&mut self) -> Result<OrphanCheck> {
+        let valid_utids = self.get_thread_utids()?.clone();
+        if valid_utids.is_empty() {
+            return Ok(OrphanCheck::ok(0));
+        }
+        let mut orphan_count = 0i64;
+        let mut total_count = 0i64;
+        let mut sample_orphan_ids = Vec::new();
+        for path in [&self.paths.network_syscall, &self.paths.network_poll] {
+            if !path.exists() {
+                continue;
+            }
+            let file = File::open(path)?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+            for batch_result in reader {
+                let batch = batch_result?;
+                let Some(utid_array) = batch
+                    .column_by_name("utid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                else {
+                    continue;
+                };
+                for i in 0..utid_array.len() {
+                    total_count += 1;
+                    if utid_array.is_null(i) {
+                        continue;
+                    }
+                    let utid = utid_array.value(i);
+                    if !valid_utids.contains(&utid) {
+                        orphan_count += 1;
+                        if sample_orphan_ids.len() < 10 {
+                            sample_orphan_ids.push(utid);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(OrphanCheck {
+            orphan_count,
+            total_count,
+            sample_orphan_ids,
+        })
+    }
+
     fn count_empty_process_names(&mut self) -> Result<FieldCheck> {
         count_empty_names(&self.paths.process, "upid", "pid", 0)
     }

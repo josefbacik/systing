@@ -14,7 +14,7 @@ use crate::trace::{
     NetworkDnsRecord, NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord,
     NetworkSyscallRecord,
 };
-use crate::utid::{ThreadAwareRecorder, UtidGenerator};
+use crate::utid::{ResolvedTask, ThreadAwareRecorder, UtidGenerator};
 use indicatif::{ProgressBar, ProgressStyle};
 
 /// Unique socket identifier assigned by BPF during tracing
@@ -444,8 +444,7 @@ impl NetworkRecorder {
     ) -> Result<()> {
         let socket_id = event.socket_id;
         let ts = event.start_ts as i64;
-        let tid = (event.task.tgidpid & 0xFFFFFFFF) as i32;
-        let pid = (event.task.tgidpid >> 32) as i32;
+        let ResolvedTask { utid, .. } = self.utid_generator.resolve_task(&event.task);
 
         // Emit NetworkSocketRecord if first time seeing this socket
         self.maybe_emit_socket_record(
@@ -478,8 +477,7 @@ impl NetworkRecorder {
             id,
             ts,
             dur,
-            tid,
-            pid,
+            utid,
             event_type,
             socket_id: socket_id as i64,
             bytes: event.bytes as i64,
@@ -740,8 +738,7 @@ impl NetworkRecorder {
     ) -> Result<()> {
         let socket_id = event.socket_id;
         let ts = event.ts as i64;
-        let tid = (event.task.tgidpid & 0xFFFFFFFF) as i32;
-        let pid = (event.task.tgidpid >> 32) as i32;
+        let ResolvedTask { utid, .. } = self.utid_generator.resolve_task(&event.task);
 
         // Note: Poll events don't have socket metadata (src/dest), so we can't emit NetworkSocketRecord here
 
@@ -759,8 +756,7 @@ impl NetworkRecorder {
         let record = NetworkPollRecord {
             id,
             ts,
-            tid,
-            pid,
+            utid,
             socket_id: socket_id as i64,
             requested_events: Self::poll_events_to_str(event.requested_events),
             returned_events: Self::poll_events_to_str(event.returned_events),

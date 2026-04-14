@@ -380,6 +380,10 @@ impl ValidationQueries for PerfettoQueries {
         Ok(OrphanCheck::ok(0))
     }
 
+    fn count_orphan_network_utids(&mut self) -> Result<OrphanCheck> {
+        Ok(OrphanCheck::ok(0))
+    }
+
     fn count_empty_process_names(&mut self) -> Result<FieldCheck> {
         Ok(FieldCheck {
             empty_count: self.context.empty_process_names,

@@ -46,6 +46,12 @@ pub trait ValidationQueries {
     /// Perfetto compact_sched uses pids directly, not utids.
     fn count_orphan_sched_utids(&mut self) -> Result<OrphanCheck>;
 
+    /// Count network_syscall/network_poll rows whose utid is not in `thread`.
+    ///
+    /// Perfetto returns `OrphanCheck::ok(0)` — network events are routed via
+    /// `track_uuid`, not a utid column.
+    fn count_orphan_network_utids(&mut self) -> Result<OrphanCheck>;
+
     // === Required Field Queries ===
 
     /// Count processes with empty/null names (excluding pid=0 kernel process).

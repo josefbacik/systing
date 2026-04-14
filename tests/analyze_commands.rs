@@ -1089,7 +1089,9 @@ fn test_network_connections_with_pid(db: &Path) {
         "-f",
         "csv",
         "-s",
-        "SELECT DISTINCT pid FROM network_syscall LIMIT 1",
+        "SELECT DISTINCT p.pid FROM network_syscall ns \
+         JOIN thread t ON ns.utid = t.utid \
+         JOIN process p ON t.upid = p.upid LIMIT 1",
     ]);
     assert!(
         output.status.success(),
@@ -1137,7 +1139,8 @@ fn test_network_connections_with_tid(db: &Path) {
         "-f",
         "csv",
         "-s",
-        "SELECT DISTINCT tid FROM network_syscall LIMIT 1",
+        "SELECT DISTINCT t.tid FROM network_syscall ns \
+         JOIN thread t ON ns.utid = t.utid LIMIT 1",
     ]);
     assert!(
         output.status.success(),

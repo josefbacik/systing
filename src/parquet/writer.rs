@@ -2020,8 +2020,7 @@ fn build_network_syscall_batch(
     let mut id_builder = Int64Builder::with_capacity(records.len());
     let mut ts_builder = Int64Builder::with_capacity(records.len());
     let mut dur_builder = Int64Builder::with_capacity(records.len());
-    let mut tid_builder = Int32Builder::with_capacity(records.len());
-    let mut pid_builder = Int32Builder::with_capacity(records.len());
+    let mut utid_builder = Int64Builder::with_capacity(records.len());
     let mut event_type_builder = StringBuilder::with_capacity(records.len(), records.len() * 16);
     let mut socket_id_builder = Int64Builder::with_capacity(records.len());
     let mut bytes_builder = Int64Builder::with_capacity(records.len());
@@ -2038,8 +2037,7 @@ fn build_network_syscall_batch(
         id_builder.append_value(record.id);
         ts_builder.append_value(record.ts);
         dur_builder.append_value(record.dur);
-        tid_builder.append_value(record.tid);
-        pid_builder.append_value(record.pid);
+        utid_builder.append_value(record.utid);
         event_type_builder.append_value(&record.event_type);
         socket_id_builder.append_value(record.socket_id);
         bytes_builder.append_value(record.bytes);
@@ -2059,8 +2057,7 @@ fn build_network_syscall_batch(
             Arc::new(id_builder.finish()),
             Arc::new(ts_builder.finish()),
             Arc::new(dur_builder.finish()),
-            Arc::new(tid_builder.finish()),
-            Arc::new(pid_builder.finish()),
+            Arc::new(utid_builder.finish()),
             Arc::new(event_type_builder.finish()),
             Arc::new(socket_id_builder.finish()),
             Arc::new(bytes_builder.finish()),
@@ -2275,8 +2272,7 @@ fn build_network_poll_batch(
 ) -> Result<RecordBatch> {
     let mut id_builder = Int64Builder::with_capacity(records.len());
     let mut ts_builder = Int64Builder::with_capacity(records.len());
-    let mut tid_builder = Int32Builder::with_capacity(records.len());
-    let mut pid_builder = Int32Builder::with_capacity(records.len());
+    let mut utid_builder = Int64Builder::with_capacity(records.len());
     let mut socket_id_builder = Int64Builder::with_capacity(records.len());
     let mut requested_events_builder =
         StringBuilder::with_capacity(records.len(), records.len() * 16);
@@ -2286,8 +2282,7 @@ fn build_network_poll_batch(
     for record in records {
         id_builder.append_value(record.id);
         ts_builder.append_value(record.ts);
-        tid_builder.append_value(record.tid);
-        pid_builder.append_value(record.pid);
+        utid_builder.append_value(record.utid);
         socket_id_builder.append_value(record.socket_id);
         requested_events_builder.append_value(&record.requested_events);
         returned_events_builder.append_value(&record.returned_events);
@@ -2298,8 +2293,7 @@ fn build_network_poll_batch(
         vec![
             Arc::new(id_builder.finish()),
             Arc::new(ts_builder.finish()),
-            Arc::new(tid_builder.finish()),
-            Arc::new(pid_builder.finish()),
+            Arc::new(utid_builder.finish()),
             Arc::new(socket_id_builder.finish()),
             Arc::new(requested_events_builder.finish()),
             Arc::new(returned_events_builder.finish()),
