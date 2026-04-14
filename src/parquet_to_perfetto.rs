@@ -84,7 +84,9 @@ struct ParquetToPerfettoConverter {
     utid_to_uuid: HashMap<i64, u64>,
     /// Map from upid to process track UUID
     upid_to_uuid: HashMap<i64, u64>,
-    /// Map from tid (thread ID) to thread track UUID for network events
+    /// Map from tgid to process-track UUID. Populated during the process pass
+    /// and consumed during the thread pass so main threads reuse the process
+    /// track. Not used by network events after schema v7.
     tid_to_uuid: HashMap<i32, u64>,
     /// Map from upid to pid (process ID) for thread descriptors
     upid_to_pid: HashMap<i64, i32>,

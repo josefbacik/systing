@@ -272,11 +272,12 @@ impl ValidationQueries for DuckDbQueries {
                 .context("Failed to count orphan network utids")?;
             total_count += t;
             orphan_count += o;
-            if o > 0 && sample_orphan_ids.len() < 10 {
+            let remaining = 10usize.saturating_sub(sample_orphan_ids.len());
+            if o > 0 && remaining > 0 {
                 let mut stmt = self.conn.prepare(&format!(
                     "SELECT DISTINCT n.utid FROM {tbl} n \
                      WHERE n.utid IS NOT NULL \
-                     AND NOT EXISTS (SELECT 1 FROM thread th WHERE th.utid = n.utid) LIMIT 10"
+                     AND NOT EXISTS (SELECT 1 FROM thread th WHERE th.utid = n.utid) LIMIT {remaining}"
                 ))?;
                 let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
                 for row in rows {

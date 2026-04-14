@@ -128,19 +128,18 @@ impl MemoryRecorder {
         &mut self,
         collector: &mut (dyn RecordCollector + Send),
         event: &memory_event,
-        utid: i64,
+        task: ResolvedTask,
         event_type: &'static str,
         prot: Option<i32>,
         flags: Option<i32>,
     ) {
-        let tgid = (event.hdr.task.tgidpid >> 32) as i32;
-        let stack_id = self.intern_stack(event, tgid);
+        let stack_id = self.intern_stack(event, task.tgid);
         let id = self.next_map_id;
         self.next_map_id += 1;
         let r = collector.add_memory_map(MemoryMapRecord {
             id,
             ts: event.hdr.ts as i64,
-            utid,
+            utid: task.utid,
             event_type: event_type.to_string(),
             addr: event.hdr.addr as i64,
             size: event.hdr.size as i64,
@@ -164,7 +163,8 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
             return;
         };
         let hdr = &event.hdr;
-        let ResolvedTask { utid, tgid } = self.utid_generator.resolve_task(&hdr.task);
+        let task = self.utid_generator.resolve_task(&hdr.task);
+        let ResolvedTask { utid, tgid } = task;
 
         match hdr.r#type {
             memory_event_type::MEMORY_RSS_STAT => {
@@ -180,17 +180,17 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
                 self.emit_map(
                     collector.as_mut(),
                     &event,
-                    utid,
+                    task,
                     "mmap",
                     Some(hdr.member as i32),
                     Some(hdr.flags as i32),
                 );
             }
             memory_event_type::MEMORY_MUNMAP => {
-                self.emit_map(collector.as_mut(), &event, utid, "munmap", None, None);
+                self.emit_map(collector.as_mut(), &event, task, "munmap", None, None);
             }
             memory_event_type::MEMORY_BRK => {
-                self.emit_map(collector.as_mut(), &event, utid, "brk", None, None);
+                self.emit_map(collector.as_mut(), &event, task, "brk", None, None);
             }
             memory_event_type::MEMORY_PAGE_FAULT => {
                 let stack_id = self.intern_stack(&event, tgid);
