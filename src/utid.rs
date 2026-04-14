@@ -22,6 +22,26 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use dashmap::DashMap;
 
+use crate::systing_core::types::task_info;
+
+/// Result of resolving a BPF `task_info` via the shared generator.
+///
+/// `tgid` is returned for callers that still need the raw Linux pid for
+/// /proc lookups or stack symbolization; emitted records should key on `utid`.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedTask {
+    pub utid: i64,
+    pub tgid: i32,
+}
+
+/// Every `SystingRecordEvent` implementor must expose the shared generator so
+/// per-thread records can key on `utid`. Recorders that emit no per-thread rows
+/// still hold the Arc (cheap) and simply never call `resolve_task`; losing
+/// `Default` on those recorders is the feature, not a cost.
+pub trait ThreadAwareRecorder {
+    fn utid_generator(&self) -> &UtidGenerator;
+}
+
 /// Thread-safe generator for utid (unique thread ID) and upid (unique process ID) values.
 ///
 /// This structure maintains mappings from OS thread/process IDs to unique internal IDs
@@ -92,6 +112,17 @@ impl UtidGenerator {
     /// Get upid for a pid if it exists, without creating a new one.
     pub fn get_upid(&self, pid: i32) -> Option<i64> {
         self.pid_to_upid.get(&pid).as_deref().copied()
+    }
+
+    /// Resolve a BPF `task_info` into `(utid, tgid)`, centralizing the
+    /// `tgidpid` bit-unpacking so recorders don't open-code it.
+    pub fn resolve_task(&self, task: &task_info) -> ResolvedTask {
+        let tgid = (task.tgidpid >> 32) as i32;
+        let tid = (task.tgidpid & 0xFFFF_FFFF) as i32;
+        ResolvedTask {
+            utid: self.get_or_create_utid(tid),
+            tgid,
+        }
     }
 
     /// Get the complete tid_to_utid mapping.

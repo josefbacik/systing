@@ -68,7 +68,7 @@ ORDER BY dur DESC LIMIT 20;
 ```
 
 ### Network
-- `network_syscall` — sendmsg/recvmsg calls: `ts`, `dur`, `tid`, `pid`, `event_type`, `socket_id`, `bytes`, buffer usage.
+- `network_syscall` — sendmsg/recvmsg calls: `ts`, `dur`, `utid`, `event_type`, `socket_id`, `bytes`, buffer usage.
 - `network_packet` — packet-level: `seq`, `length`, `is_retransmit`, `srtt_ms`, `drop_reason_str`, `tcp_flags`.
 - `network_socket` — socket metadata: `socket_id`, `protocol`, src/dest IP:port.
 - Join syscall/packet → socket on `socket_id`.

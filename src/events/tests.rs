@@ -5,10 +5,14 @@ use crate::utid::UtidGenerator;
 use rand::rngs::mock::StepRng;
 use std::sync::Arc;
 
+fn new_recorder() -> SystingProbeRecorder {
+    SystingProbeRecorder::new(Arc::new(UtidGenerator::new()))
+}
+
 /// Create a test recorder with a streaming collector already set,
 /// matching the production invariant that streaming is always initialized.
 fn create_test_recorder() -> SystingProbeRecorder {
-    let mut recorder = SystingProbeRecorder::new(Arc::new(UtidGenerator::new()));
+    let mut recorder = new_recorder();
     recorder.set_streaming_collector(Box::new(InMemoryCollector::new()));
     recorder
 }
@@ -16,7 +20,7 @@ fn create_test_recorder() -> SystingProbeRecorder {
 #[test]
 fn test_add_event() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     recorder
         .add_event_from_str("usdt:/path/to/file:provider:name", &mut rng)
         .unwrap();
@@ -28,7 +32,7 @@ fn test_add_event() {
 #[test]
 fn test_add_event_invalid() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     assert!(recorder
         .add_event_from_str("invalid:/path/to/file:provider:name", &mut rng)
         .is_err());
@@ -37,7 +41,7 @@ fn test_add_event_invalid() {
 #[test]
 fn test_add_event_json() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -58,7 +62,7 @@ fn test_add_event_json() {
 #[test]
 fn test_add_event_json_invalid() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -77,7 +81,7 @@ fn test_add_event_json_invalid() {
 #[test]
 fn test_add_event_json_duplicate() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -100,7 +104,7 @@ fn test_add_event_json_duplicate() {
 #[test]
 fn test_add_event_json_range() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -136,7 +140,7 @@ fn test_add_event_json_range() {
 #[test]
 fn test_add_event_json_range_invalid() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [],
@@ -161,7 +165,7 @@ fn test_add_event_json_range_invalid() {
 #[test]
 fn test_add_event_json_range_duplicate() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [],
@@ -191,7 +195,7 @@ fn test_add_event_json_range_duplicate() {
 #[test]
 fn test_add_event_json_instant() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -222,7 +226,7 @@ fn test_add_event_json_instant() {
 #[test]
 fn test_add_event_json_instant_invalid() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [],
@@ -247,7 +251,7 @@ fn test_add_event_json_instant_invalid() {
 #[test]
 fn test_add_event_json_instant_duplicate() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -286,7 +290,7 @@ fn test_add_event_json_instant_duplicate() {
 #[test]
 fn test_add_event_json_instant_range() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -326,7 +330,7 @@ fn test_add_event_json_instant_range() {
 #[test]
 fn test_add_event_json_instant_range_duplicate() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -370,7 +374,7 @@ fn test_add_event_json_instant_range_duplicate() {
 #[test]
 fn test_add_event_json_overlapping_events() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -835,7 +839,7 @@ fn test_uprobe_packet() {
 #[test]
 fn test_invalid_event_type() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let result = recorder.add_event_from_str("invalid:/path/to/file:provider:name", &mut rng);
     assert!(result.is_err());
     assert_eq!(
@@ -847,7 +851,7 @@ fn test_invalid_event_type() {
 #[test]
 fn test_uprobe_variants() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -904,7 +908,7 @@ fn test_uprobe_variants() {
 #[test]
 fn test_uprobe_variants_from_str() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let result = recorder.add_event_from_str("uprobe:/path/to/file:symbol", &mut rng);
     assert!(result.is_ok());
     let result = recorder.add_event_from_str("uretprobe:/path/to/file:symbol1", &mut rng);
@@ -940,7 +944,7 @@ fn test_uprobe_variants_from_str() {
 #[test]
 fn test_threshold_trigger() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -974,7 +978,7 @@ fn test_threshold_trigger() {
 #[test]
 fn test_threshold_trigger_invalid() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1006,7 +1010,7 @@ fn test_threshold_trigger_invalid() {
 #[test]
 fn test_threshold_trigger_invalid_end() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1038,7 +1042,7 @@ fn test_threshold_trigger_invalid_end() {
 #[test]
 fn test_instant_trigger() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1064,7 +1068,7 @@ fn test_instant_trigger() {
 #[test]
 fn test_trip_threshold() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1108,7 +1112,7 @@ fn test_trip_threshold() {
 #[test]
 fn test_no_trip_threshold() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1152,7 +1156,7 @@ fn test_no_trip_threshold() {
 #[test]
 fn test_trip_instant() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1304,7 +1308,7 @@ fn test_tracepoint_packet() {
 #[test]
 fn test_event_with_args() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1354,7 +1358,7 @@ fn test_event_with_args() {
 #[test]
 fn test_event_bad_arg_type() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1385,7 +1389,7 @@ fn test_event_bad_arg_type() {
 #[test]
 fn test_event_with_multiple_args() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1437,7 +1441,7 @@ fn test_event_with_multiple_args() {
 #[test]
 fn test_event_with_retval() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1481,7 +1485,7 @@ fn test_event_with_retval() {
 #[test]
 fn test_event_with_retval_no_arg_index() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1512,7 +1516,7 @@ fn test_event_with_retval_no_arg_index() {
 #[test]
 fn test_retval_with_nonzero_arg_index_rejected() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1543,7 +1547,7 @@ fn test_retval_with_nonzero_arg_index_rejected() {
 #[test]
 fn test_retval_invalid_on_uprobe() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1574,7 +1578,7 @@ fn test_retval_invalid_on_uprobe() {
 #[test]
 fn test_retval_invalid_on_kprobe() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1605,7 +1609,7 @@ fn test_retval_invalid_on_kprobe() {
 #[test]
 fn test_retval_invalid_on_usdt() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1636,7 +1640,7 @@ fn test_retval_invalid_on_usdt() {
 #[test]
 fn test_retval_invalid_on_tracepoint() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1667,7 +1671,7 @@ fn test_retval_invalid_on_tracepoint() {
 #[test]
 fn test_event_too_many_args() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1768,7 +1772,7 @@ fn test_event_cpu_scope() {
 #[test]
 fn test_stack_field_true() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1792,7 +1796,7 @@ fn test_stack_field_true() {
 #[test]
 fn test_stack_field_false() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1816,7 +1820,7 @@ fn test_stack_field_false() {
 #[test]
 fn test_stack_field_default() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -1839,7 +1843,7 @@ fn test_stack_field_default() {
 #[test]
 fn test_stack_field_with_args() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [
@@ -2109,7 +2113,7 @@ fn test_process_scope_cross_thread_match() {
 #[test]
 fn test_range_mismatched_scope_is_rejected() {
     let mut rng = StepRng::new(0, 1);
-    let mut recorder = SystingProbeRecorder::default();
+    let mut recorder = new_recorder();
     let json = r#"
     {
         "events": [

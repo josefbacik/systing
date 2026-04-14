@@ -247,6 +247,51 @@ impl ValidationQueries for DuckDbQueries {
         })
     }
 
+    fn count_orphan_network_utids(&mut self) -> Result<OrphanCheck> {
+        if !self.table_exists("thread") {
+            return Ok(OrphanCheck::ok(0));
+        }
+        let mut total_count = 0i64;
+        let mut orphan_count = 0i64;
+        let mut sample_orphan_ids = Vec::new();
+        for tbl in ["network_syscall", "network_poll"] {
+            if !self.table_exists(tbl) {
+                continue;
+            }
+            let (t, o): (i64, i64) = self
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*), COUNT(*) FILTER (WHERE utid IS NOT NULL \
+                         AND NOT EXISTS (SELECT 1 FROM thread th WHERE th.utid = {tbl}.utid)) \
+                         FROM {tbl}"
+                    ),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .context("Failed to count orphan network utids")?;
+            total_count += t;
+            orphan_count += o;
+            let remaining = 10usize.saturating_sub(sample_orphan_ids.len());
+            if o > 0 && remaining > 0 {
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT DISTINCT n.utid FROM {tbl} n \
+                     WHERE n.utid IS NOT NULL \
+                     AND NOT EXISTS (SELECT 1 FROM thread th WHERE th.utid = n.utid) LIMIT {remaining}"
+                ))?;
+                let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+                for row in rows {
+                    sample_orphan_ids.push(row?);
+                }
+            }
+        }
+        Ok(OrphanCheck {
+            orphan_count,
+            total_count,
+            sample_orphan_ids,
+        })
+    }
+
     fn count_empty_process_names(&mut self) -> Result<FieldCheck> {
         if !self.table_exists("process") {
             return Ok(FieldCheck::ok(0));

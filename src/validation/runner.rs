@@ -130,6 +130,28 @@ fn validate_reference_integrity<Q: ValidationQueries>(
             });
         }
     }
+
+    // Network → Thread
+    match queries.count_orphan_network_utids() {
+        Ok(orphans) => {
+            if orphans.has_orphans() {
+                if let Some(&utid) = orphans.sample_orphan_ids.first() {
+                    result.add_error(ValidationError::MissingReference {
+                        table: "network_syscall/network_poll".into(),
+                        column: "utid".into(),
+                        value: utid,
+                        referenced_table: "thread".into(),
+                    });
+                }
+            }
+        }
+        Err(e) => {
+            result.add_error(ValidationError::ReadError {
+                table: "network_syscall".into(),
+                message: format!("Failed to check utid references: {e}"),
+            });
+        }
+    }
 }
 
 /// Validate required fields are populated.

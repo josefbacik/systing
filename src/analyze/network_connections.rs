@@ -267,9 +267,12 @@ fn build_connections_query(
     // are returned. When not active, the LEFT JOIN is preserved and connections
     // with zero bytes still appear.
     let pid_tid_where = if let Some(pid_val) = pid {
-        format!(" AND nsc.pid = {pid_val}")
+        format!(
+            " AND nsc.utid IN (SELECT t.utid FROM thread t \
+             JOIN process p ON p.upid = t.upid WHERE p.pid = {pid_val})"
+        )
     } else if let Some(tid_val) = tid {
-        format!(" AND nsc.tid = {tid_val}")
+        format!(" AND nsc.utid IN (SELECT t.utid FROM thread t WHERE t.tid = {tid_val})")
     } else {
         String::new()
     };
@@ -356,8 +359,7 @@ mod tests {
         assert!(sql.contains("QUALIFY ROW_NUMBER()"));
         assert!(sql.contains("PARTITION BY ns.trace_id"));
         assert!(sql.contains("<= 50"));
-        assert!(!sql.contains("nsc.pid"));
-        assert!(!sql.contains("nsc.tid"));
+        assert!(!sql.contains("nsc.utid IN"));
         assert!(!sql.contains("ns.trace_id = '"));
     }
 
@@ -370,15 +372,17 @@ mod tests {
     #[test]
     fn test_build_connections_query_with_pid() {
         let sql = build_connections_query(None, Some(1234), None, Some(50), true, true);
-        assert!(sql.contains("nsc.pid = 1234"));
-        assert!(!sql.contains("nsc.tid"));
+        assert!(sql.contains("nsc.utid IN"));
+        assert!(sql.contains("p.pid = 1234"));
+        assert!(!sql.contains("t.tid ="));
     }
 
     #[test]
     fn test_build_connections_query_with_tid() {
         let sql = build_connections_query(None, None, Some(5678), Some(50), true, true);
-        assert!(sql.contains("nsc.tid = 5678"));
-        assert!(!sql.contains("nsc.pid"));
+        assert!(sql.contains("nsc.utid IN"));
+        assert!(sql.contains("t.tid = 5678"));
+        assert!(!sql.contains("p.pid ="));
     }
 
     #[test]

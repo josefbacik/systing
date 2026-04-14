@@ -30,8 +30,7 @@ Network syscall events (sendmsg/recvmsg) with duration.
 | id | BIGINT | No | Unique event ID |
 | ts | BIGINT | No | Start timestamp (nanoseconds) |
 | dur | BIGINT | No | Duration (nanoseconds) |
-| tid | INTEGER | No | Thread ID |
-| pid | INTEGER | No | Process ID |
+| utid | BIGINT | No | Unique thread ID (joins `thread.utid`) |
 | event_type | VARCHAR | No | "sendmsg" or "recvmsg" |
 | socket_id | BIGINT | No | Socket identifier (FK to network_socket) |
 | bytes | BIGINT | No | Bytes transferred |
@@ -120,8 +119,7 @@ Poll/epoll/select events.
 |--------|------|----------|-------------|
 | id | BIGINT | No | Unique event ID |
 | ts | BIGINT | No | Timestamp (nanoseconds) |
-| tid | INTEGER | No | Thread ID |
-| pid | INTEGER | No | Process ID |
+| utid | BIGINT | No | Unique thread ID (joins `thread.utid`) |
 | socket_id | BIGINT | No | Socket identifier |
 | requested_events | VARCHAR | No | Poll events requested ("IN\|OUT") |
 | returned_events | VARCHAR | No | Poll events returned ("IN") |
@@ -170,8 +168,8 @@ SELECT p.name as process, p.pid,
        COUNT(*) as syscalls,
        SUM(ns.bytes) / 1048576.0 as total_mb
 FROM network_syscall ns
-JOIN thread t ON ns.tid = t.tid
-JOIN process p ON ns.pid = p.pid
+JOIN thread t ON ns.utid = t.utid
+JOIN process p ON t.upid = p.upid
 GROUP BY p.name, p.pid
 ORDER BY total_mb DESC;
 ```
@@ -292,7 +290,7 @@ ORDER BY connection_count DESC;
 ```sql
 SELECT sock.dest_ip, sock.dest_port,
        COUNT(*) as poll_count,
-       COUNT(DISTINCT np.tid) as threads_polling
+       COUNT(DISTINCT np.utid) as threads_polling
 FROM network_poll np
 JOIN network_socket sock ON np.socket_id = sock.socket_id
 GROUP BY sock.dest_ip, sock.dest_port

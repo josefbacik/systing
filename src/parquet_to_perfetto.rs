@@ -84,7 +84,9 @@ struct ParquetToPerfettoConverter {
     utid_to_uuid: HashMap<i64, u64>,
     /// Map from upid to process track UUID
     upid_to_uuid: HashMap<i64, u64>,
-    /// Map from tid (thread ID) to thread track UUID for network events
+    /// Map from tgid to process-track UUID. Populated during the process pass
+    /// and consumed during the thread pass so main threads reuse the process
+    /// track. Not used by network events after schema v7.
     tid_to_uuid: HashMap<i32, u64>,
     /// Map from upid to pid (process ID) for thread descriptors
     upid_to_pid: HashMap<i64, i32>,
@@ -428,8 +430,6 @@ impl ParquetToPerfettoConverter {
 
                     let uuid = self.alloc_uuid();
                     self.utid_to_uuid.insert(utid, uuid);
-                    // Map tid to thread track UUID for network events
-                    self.tid_to_uuid.insert(tid, uuid);
 
                     // Create TrackDescriptor with ThreadDescriptor
                     // The pid field in ThreadDescriptor tells Perfetto the parent TGID
@@ -2013,22 +2013,21 @@ impl ParquetToPerfettoConverter {
         // =====================================================================
         // Create per-thread "Network" tracks for syscall/poll events
         // =====================================================================
-        // Read parquet files once and collect tids, then reuse the batches
-        let mut tids_with_network_events: HashSet<i32> = HashSet::new();
+        // Read parquet files once and collect utids, then reuse the batches
+        let mut utids_with_network_events: HashSet<i64> = HashSet::new();
 
         // Read syscall batches once
         let syscall_batches = if syscall_path.exists() {
             let batches = read_parquet_file(&syscall_path)?;
             for batch in &batches {
-                if let Some(tids) = batch
-                    .column_by_name("tid")
-                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                if let Some(utids) = batch
+                    .column_by_name("utid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
                 {
                     for i in 0..batch.num_rows() {
-                        let tid = tids.value(i);
-                        // Only include if we have a thread track for this tid
-                        if self.tid_to_uuid.contains_key(&tid) {
-                            tids_with_network_events.insert(tid);
+                        let utid = utids.value(i);
+                        if self.utid_to_uuid.contains_key(&utid) {
+                            utids_with_network_events.insert(utid);
                         }
                     }
                 }
@@ -2042,15 +2041,14 @@ impl ParquetToPerfettoConverter {
         let poll_batches = if poll_path.exists() {
             let batches = read_parquet_file(&poll_path)?;
             for batch in &batches {
-                if let Some(tids) = batch
-                    .column_by_name("tid")
-                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                if let Some(utids) = batch
+                    .column_by_name("utid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
                 {
                     for i in 0..batch.num_rows() {
-                        let tid = tids.value(i);
-                        // Only include if we have a thread track for this tid
-                        if self.tid_to_uuid.contains_key(&tid) {
-                            tids_with_network_events.insert(tid);
+                        let utid = utids.value(i);
+                        if self.utid_to_uuid.contains_key(&utid) {
+                            utids_with_network_events.insert(utid);
                         }
                     }
                 }
@@ -2060,22 +2058,22 @@ impl ParquetToPerfettoConverter {
             None
         };
 
-        // Create "Network" track for each tid, parented to the thread track
-        let mut tid_to_network_track: HashMap<i32, u64> = HashMap::new();
+        // Create "Network" track for each utid, parented to the thread track
+        let mut utid_to_network_track: HashMap<i64, u64> = HashMap::new();
 
-        for tid in &tids_with_network_events {
-            let thread_track_uuid = match self.tid_to_uuid.get(tid) {
+        for utid in &utids_with_network_events {
+            let thread_track_uuid = match self.utid_to_uuid.get(utid) {
                 Some(&uuid) => uuid,
                 None => continue, // Should not happen, but be safe
             };
 
             let network_track_uuid = self.alloc_uuid();
-            tid_to_network_track.insert(*tid, network_track_uuid);
+            utid_to_network_track.insert(*utid, network_track_uuid);
 
             // Create track descriptor for this per-thread Network track
             let mut desc = TrackDescriptor::default();
             desc.set_uuid(network_track_uuid);
-            desc.set_name(format!("Network (tid {tid})"));
+            desc.set_name("Network".to_string());
             desc.set_parent_uuid(thread_track_uuid);
 
             let mut packet = TracePacket::default();
@@ -2110,10 +2108,10 @@ impl ParquetToPerfettoConverter {
                     .column_by_name("bytes")
                     .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
                     .context("Missing bytes column in network_syscall")?;
-                let tids = batch
-                    .column_by_name("tid")
-                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-                    .context("Missing tid column in network_syscall")?;
+                let utids = batch
+                    .column_by_name("utid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing utid column in network_syscall")?;
 
                 for i in 0..batch.num_rows() {
                     let ts = timestamps.value(i);
@@ -2121,15 +2119,15 @@ impl ParquetToPerfettoConverter {
                     let socket_id = socket_ids.value(i);
                     let event_type = event_types.value(i);
                     let bytes = bytes_col.value(i);
-                    let tid = tids.value(i);
+                    let utid = utids.value(i);
 
                     // Get the per-thread Network track UUID
-                    let track_uuid = match tid_to_network_track.get(&tid) {
+                    let track_uuid = match utid_to_network_track.get(&utid) {
                         Some(&uuid) => uuid,
                         None => {
                             // Thread not found, skip this event
                             tracing::debug!(
-                                tid = tid,
+                                utid = utid,
                                 socket_id = socket_id,
                                 event_type = event_type,
                                 "Skipping network syscall event: no Network track"
@@ -2192,10 +2190,10 @@ impl ParquetToPerfettoConverter {
                     .column_by_name("socket_id")
                     .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
                     .context("Missing socket_id column in network_poll")?;
-                let tids = batch
-                    .column_by_name("tid")
-                    .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-                    .context("Missing tid column in network_poll")?;
+                let utids = batch
+                    .column_by_name("utid")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .context("Missing utid column in network_poll")?;
                 let requested = batch
                     .column_by_name("requested_events")
                     .and_then(|c| c.as_any().downcast_ref::<StringArray>())
@@ -2208,17 +2206,17 @@ impl ParquetToPerfettoConverter {
                 for i in 0..batch.num_rows() {
                     let ts = timestamps.value(i);
                     let socket_id = socket_ids.value(i);
-                    let tid = tids.value(i);
+                    let utid = utids.value(i);
                     let req_events = requested.value(i);
                     let ret_events = returned.value(i);
 
                     // Get the per-thread Network track UUID
-                    let track_uuid = match tid_to_network_track.get(&tid) {
+                    let track_uuid = match utid_to_network_track.get(&utid) {
                         Some(&uuid) => uuid,
                         None => {
                             // Thread not found, skip this event
                             tracing::debug!(
-                                tid = tid,
+                                utid = utid,
                                 socket_id = socket_id,
                                 "Skipping network poll event: no Network track"
                             );

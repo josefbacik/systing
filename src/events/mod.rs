@@ -21,7 +21,7 @@ use crate::ringbuf::RingBuffer;
 use crate::systing_core::types::probe_event;
 use crate::systing_core::SystingRecordEvent;
 use crate::trace::{ArgRecord, InstantArgRecord, InstantRecord, SliceRecord, TrackRecord};
-use crate::utid::UtidGenerator;
+use crate::utid::{ThreadAwareRecorder, UtidGenerator};
 
 use anyhow::Result;
 use plain::Plain;
@@ -66,7 +66,6 @@ enum TrackCacheKey {
 
 // This is the main recorder struct, we keep track of the configuration for the events, as well as
 // the events we've seen so far.
-#[derive(Default)]
 pub struct SystingProbeRecorder {
     pub ringbuf: RingBuffer<probe_event>,
 
@@ -248,12 +247,37 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
     }
 }
 
+impl ThreadAwareRecorder for SystingProbeRecorder {
+    fn utid_generator(&self) -> &UtidGenerator {
+        &self.utid_generator
+    }
+}
+
 impl SystingProbeRecorder {
     /// Create a new SystingProbeRecorder with the given utid generator.
     pub fn new(utid_generator: Arc<UtidGenerator>) -> Self {
         Self {
+            ringbuf: RingBuffer::default(),
+            cookies: HashMap::new(),
+            outstanding_ranges: HashMap::new(),
+            outstanding_cpu_ranges: HashMap::new(),
+            config_events: HashMap::new(),
+            start_events: HashMap::new(),
+            stop_events: HashMap::new(),
+            instant_events: HashMap::new(),
+            stop_triggers: Vec::new(),
+            start_triggers: HashSet::new(),
+            end_triggers: HashMap::new(),
+            instant_triggers: HashSet::new(),
+            outstanding_triggers: HashMap::new(),
+            ranges: HashMap::new(),
+            pending_syscalls: HashMap::new(),
+            streaming_collector: None,
+            track_id_counter: 0,
+            slice_id_counter: 0,
+            instant_id_counter: 0,
+            track_cache: HashMap::new(),
             utid_generator,
-            ..Default::default()
         }
     }
 

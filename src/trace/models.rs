@@ -294,8 +294,7 @@ pub struct SocketConnectionRecord {
 /// - `id`: Unique event ID
 /// - `ts`: Start timestamp in nanoseconds
 /// - `dur`: Duration in nanoseconds
-/// - `tid`: Thread ID (from tgidpid)
-/// - `pid`: Process ID (from tgidpid)
+/// - `utid`: Unique thread ID (joins `thread.utid`)
 /// - `event_type`: Type like "tcp_send", "tcp_recv", "udp_send"
 /// - `socket_id`: Socket identifier (FK to network_socket)
 /// - `bytes`: Bytes transferred
@@ -312,8 +311,7 @@ pub struct NetworkSyscallRecord {
     pub id: i64,
     pub ts: i64,
     pub dur: i64,
-    pub tid: i32,
-    pub pid: i32,
+    pub utid: i64,
     pub event_type: String,
     pub socket_id: i64,
     pub bytes: i64,
@@ -437,8 +435,7 @@ pub struct NetworkDnsRecord {
 /// # Fields
 /// - `id`: Unique event ID
 /// - `ts`: Timestamp in nanoseconds
-/// - `tid`: Thread ID
-/// - `pid`: Process ID
+/// - `utid`: Unique thread ID (joins `thread.utid`)
 /// - `socket_id`: Socket identifier
 /// - `requested_events`: Events requested (e.g., "IN|OUT|PRI")
 /// - `returned_events`: Events returned (e.g., "IN")
@@ -446,8 +443,7 @@ pub struct NetworkDnsRecord {
 pub struct NetworkPollRecord {
     pub id: i64,
     pub ts: i64,
-    pub tid: i32,
-    pub pid: i32,
+    pub utid: i64,
     pub socket_id: i64,
     pub requested_events: String,
     pub returned_events: String,

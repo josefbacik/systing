@@ -96,3 +96,13 @@ Added memory-usage tables for the new `memory` recorder (enable with `--add-reco
 - `memory_alloc` — Heap allocator calls via libc uprobes (id, ts, utid, op, addr, size, old_addr, stack_id). `op` is one of `malloc`, `calloc`, `realloc`, `aligned_alloc`, `posix_memalign`, `free`. For `free`, `size` is 0 and `stack_id` is NULL. When `--memory-alloc-sample-rate` > 1, alloc and free are sampled independently, so addr-based pairing is unreliable. For `realloc`, `old_addr` is the input pointer (implicitly freed when `addr != old_addr`). Enable with `--add-recorder memory-alloc`; sampling rate via `--memory-alloc-sample-rate`.
 
 All four memory tables key on `utid` (joins to `thread.utid`); for process attribution join through `thread.upid -> process.upid`.
+
+## Schema Version 7 (systing 1.6.0) — 2026-04-14
+
+Switched network per-thread tables to key on `utid`, matching `sched_slice`/`stack_sample`/`memory_*`.
+
+### Changed columns
+- `network_syscall`: dropped `tid INTEGER, pid INTEGER`; added `utid BIGINT` (joins `thread.utid`).
+- `network_poll`: dropped `tid INTEGER, pid INTEGER`; added `utid BIGINT` (joins `thread.utid`).
+
+For process attribution join through `network_*.utid -> thread.utid -> thread.upid -> process.upid`.

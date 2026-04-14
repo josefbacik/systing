@@ -12,7 +12,7 @@ use crate::systing_core::types::{
 };
 use crate::systing_core::SystingRecordEvent;
 use crate::trace::{MemoryAllocRecord, MemoryFaultRecord, MemoryMapRecord, MemoryRssRecord};
-use crate::utid::UtidGenerator;
+use crate::utid::{ResolvedTask, ThreadAwareRecorder, UtidGenerator};
 
 /// stack_id offset for stacks interned by the memory recorder, to keep them
 /// disjoint from `StackRecorder`'s own ids prior to the end-of-trace merge.
@@ -48,6 +48,12 @@ impl MemoryRecorder {
             write_error_reported: false,
             utid_generator,
         }
+    }
+}
+
+impl ThreadAwareRecorder for MemoryRecorder {
+    fn utid_generator(&self) -> &UtidGenerator {
+        &self.utid_generator
     }
 }
 
@@ -122,19 +128,18 @@ impl MemoryRecorder {
         &mut self,
         collector: &mut (dyn RecordCollector + Send),
         event: &memory_event,
-        utid: i64,
+        task: ResolvedTask,
         event_type: &'static str,
         prot: Option<i32>,
         flags: Option<i32>,
     ) {
-        let tgid = (event.hdr.task.tgidpid >> 32) as i32;
-        let stack_id = self.intern_stack(event, tgid);
+        let stack_id = self.intern_stack(event, task.tgid);
         let id = self.next_map_id;
         self.next_map_id += 1;
         let r = collector.add_memory_map(MemoryMapRecord {
             id,
             ts: event.hdr.ts as i64,
-            utid,
+            utid: task.utid,
             event_type: event_type.to_string(),
             addr: event.hdr.addr as i64,
             size: event.hdr.size as i64,
@@ -158,9 +163,8 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
             return;
         };
         let hdr = &event.hdr;
-        let tgid = (hdr.task.tgidpid >> 32) as i32;
-        let tid = (hdr.task.tgidpid & 0xFFFF_FFFF) as i32;
-        let utid = self.utid_generator.get_or_create_utid(tid);
+        let task = self.utid_generator.resolve_task(&hdr.task);
+        let ResolvedTask { utid, tgid } = task;
 
         match hdr.r#type {
             memory_event_type::MEMORY_RSS_STAT => {
@@ -176,17 +180,17 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
                 self.emit_map(
                     collector.as_mut(),
                     &event,
-                    utid,
+                    task,
                     "mmap",
                     Some(hdr.member as i32),
                     Some(hdr.flags as i32),
                 );
             }
             memory_event_type::MEMORY_MUNMAP => {
-                self.emit_map(collector.as_mut(), &event, utid, "munmap", None, None);
+                self.emit_map(collector.as_mut(), &event, task, "munmap", None, None);
             }
             memory_event_type::MEMORY_BRK => {
-                self.emit_map(collector.as_mut(), &event, utid, "brk", None, None);
+                self.emit_map(collector.as_mut(), &event, task, "brk", None, None);
             }
             memory_event_type::MEMORY_PAGE_FAULT => {
                 let stack_id = self.intern_stack(&event, tgid);

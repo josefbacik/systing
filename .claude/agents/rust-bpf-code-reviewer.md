@@ -36,6 +36,7 @@ You believe that excellent code is simple, readable, and does exactly what it ne
 ### Code Cleanliness
 - **No obvious comments**: Remove comments that merely restate what the code does (e.g., `// increment counter` before `counter += 1`)
 - **No excessive comments**: Comments should explain *why*, not *what*
+- **No source-line references in comments**: Comments must not reference specific line numbers (e.g., `see :423`, `handled at line 120`). These drift the moment surrounding code changes and mislead readers. Refer to the function, type, or field by name instead.
 - **Meaningful names**: Variables, functions, and types should be self-documenting
 - **Appropriate function length**: Functions should do one thing well
 

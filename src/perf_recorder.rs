@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -7,6 +8,7 @@ use crate::ringbuf::RingBuffer;
 use crate::systing_core::types::perf_counter_event;
 use crate::systing_core::SystingRecordEvent;
 use crate::trace::{CounterRecord, CounterTrackRecord};
+use crate::utid::{ThreadAwareRecorder, UtidGenerator};
 
 #[derive(Default, PartialEq, Eq, Hash)]
 struct PerfCounterKey {
@@ -21,16 +23,24 @@ pub struct PerfCounterRecorder {
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
     track_ids: HashMap<PerfCounterKey, i64>,
     next_track_id: i64,
+    utid_generator: Arc<UtidGenerator>,
 }
 
-impl Default for PerfCounterRecorder {
-    fn default() -> Self {
+impl ThreadAwareRecorder for PerfCounterRecorder {
+    fn utid_generator(&self) -> &UtidGenerator {
+        &self.utid_generator
+    }
+}
+
+impl PerfCounterRecorder {
+    pub fn new(utid_generator: Arc<UtidGenerator>) -> Self {
         Self {
             ringbuf: RingBuffer::default(),
             perf_counters: Vec::new(),
             streaming_collector: None,
             track_ids: HashMap::new(),
             next_track_id: 1,
+            utid_generator,
         }
     }
 }
@@ -144,7 +154,7 @@ mod tests {
     fn test_perf_counter_streaming() {
         use crate::record::collector::InMemoryCollector;
 
-        let mut recorder = PerfCounterRecorder::default();
+        let mut recorder = PerfCounterRecorder::new(Arc::new(UtidGenerator::new()));
         recorder.perf_counters.push("cycles".to_string());
 
         // Set up streaming with InMemoryCollector

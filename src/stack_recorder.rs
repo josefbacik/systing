@@ -9,7 +9,7 @@ use crate::ringbuf::RingBuffer;
 use crate::systing_core::types::stack_event;
 use crate::systing_core::SystingRecordEvent;
 use crate::trace::{StackRecord, StackSampleRecord};
-use crate::utid::UtidGenerator;
+use crate::utid::{ThreadAwareRecorder, UtidGenerator};
 
 use blazesym::helper::{read_elf_build_id, ElfResolver};
 use blazesym::symbolize::source::{Kernel, Process, Source};
@@ -106,6 +106,12 @@ pub struct StackRecorder {
     next_stack_id: i64,
     /// Shared utid generator for consistent thread IDs across all recorders.
     utid_generator: Arc<UtidGenerator>,
+}
+
+impl ThreadAwareRecorder for StackRecorder {
+    fn utid_generator(&self) -> &UtidGenerator {
+        &self.utid_generator
+    }
 }
 
 impl StackRecorder {

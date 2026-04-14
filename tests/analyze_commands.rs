@@ -9,9 +9,12 @@
 //! ./scripts/run-integration-tests.sh analyze_commands
 //! ```
 
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use systing::{bump_memlock_rlimit, systing, validate_duckdb, Config};
@@ -40,30 +43,42 @@ fn record_trace() -> (TempDir, std::path::PathBuf) {
     let config = Config {
         duration: 3,
         network: true,
+        // sendmsg/recvmsg kprobes (which populate network_syscall) are in the
+        // network-packets set, gated separately from `network`; without this
+        // the table stays empty regardless of traffic.
+        network_packets: true,
         output_dir: dir.path().to_path_buf(),
         output: duckdb_path.clone(),
         ..Config::default()
     };
 
-    // Generate TCP traffic in background so network_socket table has data
-    let traffic_thread = thread::spawn(|| {
-        thread::sleep(Duration::from_millis(500));
-
-        // Start a local TCP listener and connect to it to guarantee socket data
-        if let Ok(listener) = TcpListener::bind("127.0.0.1:0") {
-            let addr = listener.local_addr().unwrap();
-            for _ in 0..3 {
-                if let Ok(_stream) =
-                    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100))
-                {
-                    let _ = listener.accept();
+    // Generate TCP traffic continuously until recording completes. BPF attach
+    // with network probes can take several seconds, so a fixed-count loop that
+    // starts after a sleep races the attach and leaves network_syscall empty
+    // on slow hosts. Each iteration does an explicit send/recv round-trip so
+    // the test's own traffic guarantees network_syscall rows regardless of
+    // ambient system activity.
+    let stop_traffic = Arc::new(AtomicBool::new(false));
+    let stop_flag = stop_traffic.clone();
+    let traffic_thread = thread::spawn(move || {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind traffic listener");
+        let addr = listener.local_addr().unwrap();
+        while !stop_flag.load(Ordering::Relaxed) {
+            if let Ok(mut client) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+                if let Ok((mut server, _)) = listener.accept() {
+                    let _ = client.write_all(b"ping");
+                    let mut buf = [0u8; 4];
+                    let _ = server.read_exact(&mut buf);
+                    let _ = server.write_all(b"pong");
+                    let _ = client.read_exact(&mut buf);
                 }
-                thread::sleep(Duration::from_millis(200));
             }
+            thread::sleep(Duration::from_millis(200));
         }
     });
 
     systing(config, None).expect("systing recording failed");
+    stop_traffic.store(true, Ordering::Relaxed);
     traffic_thread.join().expect("Traffic thread panicked");
 
     assert!(
@@ -1089,7 +1104,9 @@ fn test_network_connections_with_pid(db: &Path) {
         "-f",
         "csv",
         "-s",
-        "SELECT DISTINCT pid FROM network_syscall LIMIT 1",
+        "SELECT DISTINCT p.pid FROM network_syscall ns \
+         JOIN thread t ON ns.utid = t.utid \
+         JOIN process p ON t.upid = p.upid LIMIT 1",
     ]);
     assert!(
         output.status.success(),
@@ -1137,7 +1154,8 @@ fn test_network_connections_with_tid(db: &Path) {
         "-f",
         "csv",
         "-s",
-        "SELECT DISTINCT tid FROM network_syscall LIMIT 1",
+        "SELECT DISTINCT t.tid FROM network_syscall ns \
+         JOIN thread t ON ns.utid = t.utid LIMIT 1",
     ]);
     assert!(
         output.status.success(),
