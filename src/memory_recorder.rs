@@ -12,7 +12,7 @@ use crate::systing_core::types::{
 };
 use crate::systing_core::SystingRecordEvent;
 use crate::trace::{MemoryAllocRecord, MemoryFaultRecord, MemoryMapRecord, MemoryRssRecord};
-use crate::utid::UtidGenerator;
+use crate::utid::{ResolvedTask, ThreadAwareRecorder, UtidGenerator};
 
 /// stack_id offset for stacks interned by the memory recorder, to keep them
 /// disjoint from `StackRecorder`'s own ids prior to the end-of-trace merge.
@@ -48,6 +48,12 @@ impl MemoryRecorder {
             write_error_reported: false,
             utid_generator,
         }
+    }
+}
+
+impl ThreadAwareRecorder for MemoryRecorder {
+    fn utid_generator(&self) -> &UtidGenerator {
+        &self.utid_generator
     }
 }
 
@@ -158,9 +164,7 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
             return;
         };
         let hdr = &event.hdr;
-        let tgid = (hdr.task.tgidpid >> 32) as i32;
-        let tid = (hdr.task.tgidpid & 0xFFFF_FFFF) as i32;
-        let utid = self.utid_generator.get_or_create_utid(tid);
+        let ResolvedTask { utid, tgid } = self.utid_generator.resolve_task(&hdr.task);
 
         match hdr.r#type {
             memory_event_type::MEMORY_RSS_STAT => {

@@ -13,7 +13,7 @@ use crate::trace::{
     IrqSliceRecord, ProcessExitRecord, SchedSliceRecord, SoftirqSliceRecord, ThreadStateRecord,
     WakeupNewRecord,
 };
-use crate::utid::UtidGenerator;
+use crate::utid::{ThreadAwareRecorder, UtidGenerator};
 
 /// Threshold for flushing streaming sched slices to the collector.
 /// Lower than Parquet batch size (200K) to reduce peak memory while maintaining I/O efficiency.
@@ -283,6 +283,12 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
 
             _ => {}
         }
+    }
+}
+
+impl ThreadAwareRecorder for SchedEventRecorder {
+    fn utid_generator(&self) -> &UtidGenerator {
+        &self.utid_generator
     }
 }
 

@@ -672,7 +672,7 @@ struct exec_event {
 unsafe impl Plain for exec_event {}
 
 /// Trait for events that can be recorded in a ring buffer.
-pub trait SystingRecordEvent<T> {
+pub trait SystingRecordEvent<T>: crate::utid::ThreadAwareRecorder {
     fn use_ringbuf(&self) -> bool {
         self.ringbuf().max_duration() > 0
     }

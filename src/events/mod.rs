@@ -21,7 +21,7 @@ use crate::ringbuf::RingBuffer;
 use crate::systing_core::types::probe_event;
 use crate::systing_core::SystingRecordEvent;
 use crate::trace::{ArgRecord, InstantArgRecord, InstantRecord, SliceRecord, TrackRecord};
-use crate::utid::UtidGenerator;
+use crate::utid::{ThreadAwareRecorder, UtidGenerator};
 
 use anyhow::Result;
 use plain::Plain;
@@ -245,6 +245,12 @@ impl SystingRecordEvent<probe_event> for SystingProbeRecorder {
         }
 
         false
+    }
+}
+
+impl ThreadAwareRecorder for SystingProbeRecorder {
+    fn utid_generator(&self) -> &UtidGenerator {
+        &self.utid_generator
     }
 }
 

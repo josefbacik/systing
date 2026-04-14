@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -13,6 +14,7 @@ use crate::trace::{
     NetworkDnsRecord, NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord,
     NetworkSyscallRecord,
 };
+use crate::utid::{ThreadAwareRecorder, UtidGenerator};
 use indicatif::{ProgressBar, ProgressStyle};
 
 /// Unique socket identifier assigned by BPF during tracing
@@ -317,30 +319,29 @@ pub struct NetworkRecorder {
     next_syscall_id: i64,
     next_packet_id: i64,
     next_poll_id: i64,
+    utid_generator: Arc<UtidGenerator>,
 }
 
-impl Default for NetworkRecorder {
-    fn default() -> Self {
+impl ThreadAwareRecorder for NetworkRecorder {
+    fn utid_generator(&self) -> &UtidGenerator {
+        &self.utid_generator
+    }
+}
+
+impl NetworkRecorder {
+    pub fn new(utid_generator: Arc<UtidGenerator>, resolve_addresses: bool) -> Self {
         Self {
             ringbuf: RingBuffer::default(),
             socket_metadata: HashMap::new(),
             hostname_cache: HashMap::new(),
-            resolve_addresses: true,
+            resolve_addresses,
             min_ts: None,
             seen_sockets: HashSet::new(),
             streaming_collector: None,
             next_syscall_id: 1,
             next_packet_id: 1,
             next_poll_id: 1,
-        }
-    }
-}
-
-impl NetworkRecorder {
-    pub fn new(resolve_addresses: bool) -> Self {
-        Self {
-            resolve_addresses,
-            ..Default::default()
+            utid_generator,
         }
     }
 

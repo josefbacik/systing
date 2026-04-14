@@ -22,7 +22,7 @@ use crate::tpu::metrics_recorder::TpuMetricsRecorder;
 use crate::trace::{
     ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ProcessRecord, ThreadRecord,
 };
-use crate::utid::UtidGenerator;
+use crate::utid::{ThreadAwareRecorder, UtidGenerator};
 
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
@@ -48,15 +48,23 @@ pub struct SysinfoRecorder {
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
     track_ids: HashMap<u32, i64>,
     next_track_id: i64,
+    utid_generator: Arc<UtidGenerator>,
 }
 
-impl Default for SysinfoRecorder {
-    fn default() -> Self {
+impl ThreadAwareRecorder for SysinfoRecorder {
+    fn utid_generator(&self) -> &UtidGenerator {
+        &self.utid_generator
+    }
+}
+
+impl SysinfoRecorder {
+    pub fn new(utid_generator: Arc<UtidGenerator>) -> Self {
         Self {
             ringbuf: RingBuffer::default(),
             streaming_collector: None,
             track_ids: HashMap::new(),
             next_track_id: 1,
+            utid_generator,
         }
     }
 }
@@ -446,10 +454,15 @@ impl SessionRecorder {
                 enable_debuginfod,
                 Arc::clone(&utid_generator),
             )),
-            perf_counter_recorder: Mutex::new(PerfCounterRecorder::default()),
-            sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
+            perf_counter_recorder: Mutex::new(PerfCounterRecorder::new(Arc::clone(
+                &utid_generator,
+            ))),
+            sysinfo_recorder: Mutex::new(SysinfoRecorder::new(Arc::clone(&utid_generator))),
             probe_recorder: Mutex::new(SystingProbeRecorder::new(Arc::clone(&utid_generator))),
-            network_recorder: Mutex::new(NetworkRecorder::new(resolve_network_addresses)),
+            network_recorder: Mutex::new(NetworkRecorder::new(
+                Arc::clone(&utid_generator),
+                resolve_network_addresses,
+            )),
             memory_recorder: Mutex::new(MemoryRecorder::new(Arc::clone(&utid_generator))),
             marker_recorder: Mutex::new(
                 MarkerRecorder::new(Arc::clone(&utid_generator))
@@ -1268,10 +1281,12 @@ mod tests {
             clock_snapshot: Mutex::new(ClockSnapshot::default()),
             event_recorder: Mutex::new(SchedEventRecorder::new(Arc::clone(&utid_generator))),
             stack_recorder: Mutex::new(StackRecorder::new(false, Arc::clone(&utid_generator))),
-            perf_counter_recorder: Mutex::new(PerfCounterRecorder::default()),
-            sysinfo_recorder: Mutex::new(SysinfoRecorder::default()),
+            perf_counter_recorder: Mutex::new(PerfCounterRecorder::new(Arc::clone(
+                &utid_generator,
+            ))),
+            sysinfo_recorder: Mutex::new(SysinfoRecorder::new(Arc::clone(&utid_generator))),
             probe_recorder: Mutex::new(SystingProbeRecorder::new(Arc::clone(&utid_generator))),
-            network_recorder: Mutex::new(NetworkRecorder::default()),
+            network_recorder: Mutex::new(NetworkRecorder::new(Arc::clone(&utid_generator), false)),
             memory_recorder: Mutex::new(MemoryRecorder::new(Arc::clone(&utid_generator))),
             marker_recorder: Mutex::new(MarkerRecorder::new(Arc::clone(&utid_generator))),
             process_descriptors: RwLock::new(HashMap::new()),

@@ -8,7 +8,7 @@ use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing_core::{marker_event, SystingRecordEvent};
 use crate::trace::{ArgRecord, InstantArgRecord, InstantRecord, SliceRecord, TrackRecord};
-use crate::utid::UtidGenerator;
+use crate::utid::{ThreadAwareRecorder, UtidGenerator};
 
 struct MarkerRange {
     track: String,
@@ -43,6 +43,12 @@ pub struct MarkerRecorder {
     // runs on the drain path. They observe events at different times.
     outstanding_triggers: HashMap<(u64, String, String), u64>,
     utid_generator: Arc<UtidGenerator>,
+}
+
+impl ThreadAwareRecorder for MarkerRecorder {
+    fn utid_generator(&self) -> &UtidGenerator {
+        &self.utid_generator
+    }
 }
 
 /// Marker type values passed in the `dirfd` argument of the `faccessat2` syscall.
