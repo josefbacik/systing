@@ -351,14 +351,16 @@ fn is_recorder_enabled(name: &str, opts: &Config) -> bool {
 }
 
 /// BPF programs that are always loaded regardless of recorder selection.
-/// These provide core infrastructure (clock sampling) and generic probe handlers
-/// that are needed for user-specified trace events.
-const CORE_BPF_PROGRAMS: &[&str] = &[
-    "systing_perf_event_clock",
-    "systing_usdt",
-    "systing_uprobe",
-    "systing_kprobe",
-];
+/// `systing_perf_event_clock` is the periodic sampler that drives cpu-stacks,
+/// perf-counters, and memory RSS; its perf-counter and memory paths are
+/// rodata-gated (`tool_config.num_perf_counters`, `tool_config.collect_memory`)
+/// so the verifier prunes them when those recorders are disabled.
+const CORE_BPF_PROGRAMS: &[&str] = &["systing_perf_event_clock"];
+
+/// Generic probe handlers for user-specified `--trace-event` / USDT / uprobe /
+/// kprobe. Loaded only when at least one trace event is configured so that
+/// `probe_ringbufs` can be `autocreate=false` otherwise.
+const PROBE_BPF_PROGRAMS: &[&str] = &["systing_usdt", "systing_uprobe", "systing_kprobe"];
 
 /// Collect the set of BPF programs required by all enabled recorders.
 ///
@@ -375,11 +377,16 @@ pub fn get_required_bpf_programs(
     // Core programs always loaded
     required.extend(CORE_BPF_PROGRAMS);
 
-    // Kernel version determines which generic tracepoint handler to use
-    if old_kernel {
-        required.insert("systing_tracepoint");
-    } else {
-        required.insert("systing_raw_tracepoint");
+    // Generic probe handlers are loaded-but-unattached until a trace event is
+    // configured; skip the load entirely when none are so probe_ringbufs can
+    // be autocreate=false (see configure_bpf_skeleton).
+    if !opts.trace_event.is_empty() || !opts.trace_event_config.is_empty() {
+        required.extend(PROBE_BPF_PROGRAMS);
+        if old_kernel {
+            required.insert("systing_tracepoint");
+        } else {
+            required.insert("systing_raw_tracepoint");
+        }
     }
 
     // PID filtering needs fork tracking to follow child processes
@@ -1707,9 +1714,14 @@ fn setup_ringbuffers<'a>(
 
     let object = skel.object();
 
+    // Ringbuf families for disabled recorders are autocreate=false
+    // (see configure_bpf_skeleton) and have no fd to mmap; gate each
+    // create_ring on the same condition that governed autocreate.
+    let want_events = !opts.no_sched || opts.syscalls;
+    let want_probe = !opts.trace_event.is_empty() || !opts.trace_event_config.is_empty();
     for (i, map) in object.maps().enumerate() {
         let name = map.name().to_str().unwrap();
-        if name.starts_with("ringbuf_events") {
+        if name.starts_with("ringbuf_events") && want_events {
             let ring = create_ring::<task_event>(&map, event_tx.clone())?;
             rings.push((format!("events_{i}").to_string(), ring));
         } else if name.starts_with("ringbuf_stack") {
@@ -1720,7 +1732,7 @@ fn setup_ringbuffers<'a>(
                 let ring = create_ring::<perf_counter_event>(&map, cache_tx.clone())?;
                 rings.push((name.to_string(), ring));
             }
-        } else if name.starts_with("ringbuf_probe") {
+        } else if name.starts_with("ringbuf_probe") && want_probe {
             let ring = create_ring::<probe_event>(&map, probe_tx.clone())?;
             rings.push((name.to_string(), ring));
         } else if name.starts_with("ringbuf_network") && opts.network {
@@ -1972,50 +1984,76 @@ fn configure_bpf_skeleton(
         }
     }
 
-    // BPF selects a per-CPU ringbuf via `cpu_id % NR_RINGBUFS` (NR_RINGBUFS = 8).
-    // On hosts with fewer than 8 possible CPUs, ringbufs whose index is >= num_cpus
-    // can never be selected, so shrink them to the minimum to avoid wasting up to
-    // hundreds of MiB of mlocked kernel memory per unused slot.
+    // Skip creating ringbuf ARRAY_OF_MAPS for disabled recorders. The cost
+    // isn't the inner-map vmalloc (shrinking those to PAGE_SIZE makes creates
+    // ~25 µs each) — it's `synchronize_rcu()` in the kernel's
+    // `maybe_wait_bpf_programs()` after every `BPF_MAP_UPDATE_ELEM` on a
+    // map-of-maps, which libbpf calls once per `.values` slot. On a busy
+    // many-core host a grace period is ~100 ms, so 8 families × 8 slots ≈
+    // 6.4 s of startup even with every inner shrunk. Setting
+    // `autocreate(false)` on the outer skips the whole family (template,
+    // inners, and the slot updates that trigger the RCU waits). All programs
+    // that reference a skipped outer are already `autoload=false` via
+    // `required_programs` below, so the verifier never sees the dangling
+    // reference.
+    //
+    // Inners for families that ARE enabled still get shrunk to PAGE_SIZE when
+    // their slot index >= num_cpus, to save mlocked memory on small hosts
+    // (the slot update still happens, so no time saving there).
+    //
+    // Must match NR_RINGBUFS in src/bpf/systing_system.bpf.c.
     const NR_RINGBUFS: u32 = 8;
-    if num_cpus < NR_RINGBUFS {
-        let object = open_skel.open_object_mut();
-        for mut map in object.maps_mut() {
-            let name = map.name().to_str().unwrap().to_string();
-            if let Some(idx) = name
-                .rfind("_node")
-                .and_then(|pos| name[pos + 5..].parse::<u32>().ok())
-            {
-                if idx >= num_cpus {
-                    map.set_max_entries(1)
-                        .with_context(|| format!("Failed to shrink unused ringbuf map '{name}'"))?;
-                }
-            }
-        }
+    // SAFETY: sysconf is always safe to call; _SC_PAGESIZE cannot fail.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
+    // (outer map name, inner-map prefix)
+    let mut unused: Vec<(&str, &str)> = Vec::new();
+    if opts.no_sched && !opts.syscalls {
+        unused.push(("ringbufs", "ringbuf_events_node"));
     }
-
-    // Set network ringbuffer maps to zero capacity if network recording is disabled
+    if opts.perf_counter.is_empty() && !opts.cpu_frequency {
+        unused.push(("perf_counter_ringbufs", "ringbuf_perf_counter_events_node"));
+    }
+    if opts.trace_event.is_empty() && opts.trace_event_config.is_empty() {
+        unused.push(("probe_ringbufs", "ringbuf_probe_events_node"));
+    }
     if !opts.network {
-        let object = open_skel.open_object_mut();
-        for mut map in object.maps_mut() {
-            let name = map.name().to_str().unwrap().to_string();
-            if name.starts_with("ringbuf_network_events_")
-                || name.starts_with("ringbuf_packet_events_")
-                || name.starts_with("ringbuf_epoll_events_")
-            {
-                map.set_max_entries(1).with_context(|| {
-                    format!("Failed to shrink unused ringbuf map '{name}' to 1 entry")
-                })?;
-            }
+        unused.push(("network_ringbufs", "ringbuf_network_events_node"));
+        unused.push(("packet_ringbufs", "ringbuf_packet_events_node"));
+        unused.push(("epoll_ringbufs", "ringbuf_epoll_events_node"));
+    }
+    if !opts.memory && !opts.memory_alloc {
+        unused.push(("memory_ringbufs", "ringbuf_memory_events_node"));
+    }
+    for mut map in open_skel.open_object_mut().maps_mut() {
+        let name = map.name().to_str().unwrap().to_owned();
+        if unused
+            .iter()
+            .any(|(outer, inner)| name == *outer || name.starts_with(inner))
+        {
+            map.set_autocreate(false)
+                .with_context(|| format!("Failed to disable autocreate for '{name}'"))?;
+            continue;
+        }
+        let unreachable_slot = name
+            .rfind("_node")
+            .and_then(|pos| name[pos + 5..].parse::<u32>().ok())
+            .is_some_and(|idx| idx >= num_cpus && num_cpus < NR_RINGBUFS);
+        if unreachable_slot {
+            map.set_max_entries(page_size)
+                .with_context(|| format!("Failed to shrink unreachable ringbuf slot '{name}'"))?;
         }
     }
 
-    if !opts.memory {
-        for mut map in open_skel.open_object_mut().maps_mut() {
-            let name = map.name().to_str().unwrap().to_owned();
-            if name.starts_with("ringbuf_memory_events_") {
-                map.set_max_entries(1).with_context(|| {
-                    format!("Failed to set network ringbuf map '{name}' to zero capacity")
-                })?;
+    if std::env::var_os("SYSTING_DIAG_RINGBUFS").is_some() {
+        for map in open_skel.open_object_mut().maps_mut() {
+            let name = map.name().to_str().unwrap();
+            if name.starts_with("ringbuf_") || name.ends_with("ringbufs") {
+                eprintln!(
+                    "[diag] map={} type={:?} max_entries={}",
+                    name,
+                    map.map_type(),
+                    map.max_entries()
+                );
             }
         }
     }
@@ -2893,9 +2931,14 @@ pub fn systing(
                 format!("Failed to set missed_events map size to {num_cpus} entries")
             })?;
 
+        let diag = std::env::var_os("SYSTING_DIAG_RINGBUFS").is_some();
+        let t_load = std::time::Instant::now();
         let mut skel = open_skel.load().with_context(|| {
             "Failed to load BPF skeleton into kernel. Check dmesg for BPF verifier errors."
         })?;
+        if diag {
+            eprintln!("[diag] open_skel.load() took {:?}", t_load.elapsed());
+        }
         for cgroup in opts.cgroup.iter() {
             let metadata = std::fs::metadata(cgroup)
                 .with_context(|| format!("Failed to access cgroup path: {cgroup}"))?;
