@@ -1844,7 +1844,7 @@ fn run_pystacks_version_test(full_ver: &str) {
     setup_bpf_environment();
 
     let script_content = r#"
-import time
+import sys
 
 def pystacks_version_test_function():
     """Function that does busy work to show up in profiling."""
@@ -1854,8 +1854,11 @@ def pystacks_version_test_function():
     return total
 
 def main():
-    start_time = time.time()
-    while time.time() - start_time < 10:
+    # Signal the harness that the interpreter is fully initialized and in the
+    # hot loop, so pystacks discovery can find _PyRuntime.
+    with open(sys.argv[1], "w") as f:
+        f.write("ready")
+    while True:
         pystacks_version_test_function()
 
 if __name__ == "__main__":
@@ -1864,6 +1867,7 @@ if __name__ == "__main__":
 
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
+    let ready_marker = dir.path().join("ready");
 
     let python_script = dir.path().join("test_version.py");
     {
@@ -1874,6 +1878,7 @@ if __name__ == "__main__":
 
     let mut python_proc = Command::new(&python_bin)
         .arg(&python_script)
+        .arg(&ready_marker)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1882,8 +1887,23 @@ if __name__ == "__main__":
     let python_pid = python_proc.id();
     eprintln!("Started Python {} with PID: {}", full_ver, python_pid);
 
-    // Give Python time to start and begin executing
-    thread::sleep(Duration::from_millis(1000));
+    // Wait for Python to reach its hot loop before attaching. A fixed sleep
+    // races pyenv shim exec + Py_Initialize under parallel-suite load.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !ready_marker.exists() {
+        if let Ok(Some(status)) = python_proc.try_wait() {
+            panic!(
+                "[Python {}] exited before signalling ready: {:?}",
+                full_ver, status
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "[Python {}] timed out waiting for ready marker",
+            full_ver
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 
     let config = Config {
         duration: 3,
@@ -1897,6 +1917,7 @@ if __name__ == "__main__":
 
     systing(config, None).expect("systing recording failed");
 
+    let _ = python_proc.kill();
     let _ = python_proc.wait();
 
     let stack_parquet = dir.path().join("stack.parquet");
