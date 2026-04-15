@@ -311,6 +311,10 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             description: "Userspace marker events (faccessat2 with mode=-975)",
             default_enabled: false,
             bpf_programs: MARKER_BPF_PROGRAMS,
+            // Markers write to the standalone ringbuf_marker map, not a family.
+            // MARKER_BPF_PROGRAMS (== SYSCALL_BPF_PROGRAMS) do reference
+            // probe_ringbufs in sys_enter/exit, but behind a
+            // tool_config.collect_syscalls rodata gate the verifier prunes.
             ringbuf_families: &[],
         },
         RecorderInfo {
@@ -1769,7 +1773,7 @@ fn setup_ringbuffers<'a>(
         let name = map.name().to_str().unwrap();
         if name.starts_with("ringbuf_events") && required.contains("ringbufs") {
             let ring = create_ring::<task_event>(&map, event_tx.clone())?;
-            rings.push((format!("events_{i}").to_string(), ring));
+            rings.push((format!("events_{i}"), ring));
         } else if name.starts_with("ringbuf_stack") {
             let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
             rings.push((name.to_string(), ring));

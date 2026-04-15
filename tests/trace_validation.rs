@@ -134,13 +134,13 @@ fn spawn_python_workload(
     );
     let script_path = dir.join(script_name);
     std::fs::write(&script_path, &script).expect("write python script");
-    let ready_marker = dir.join("ready");
+    let ready_marker = dir.join(format!("{script_name}.ready"));
     let _ = std::fs::remove_file(&ready_marker);
 
     let mut child = std::process::Command::new(python_bin)
         .arg(&script_path)
         .arg(&ready_marker)
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn python");
