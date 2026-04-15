@@ -362,6 +362,34 @@ const CORE_BPF_PROGRAMS: &[&str] = &["systing_perf_event_clock"];
 /// `probe_ringbufs` can be `autocreate=false` otherwise.
 const PROBE_BPF_PROGRAMS: &[&str] = &["systing_usdt", "systing_uprobe", "systing_kprobe"];
 
+/// Per-CPU ringbuf ARRAY_OF_MAPS families: (outer map name, inner-map name prefix).
+const RINGBUF_FAMILIES: &[(&str, &str)] = &[
+    ("ringbufs", "ringbuf_events_node"),
+    ("perf_counter_ringbufs", "ringbuf_perf_counter_events_node"),
+    ("probe_ringbufs", "ringbuf_probe_events_node"),
+    ("network_ringbufs", "ringbuf_network_events_node"),
+    ("packet_ringbufs", "ringbuf_packet_events_node"),
+    ("epoll_ringbufs", "ringbuf_epoll_events_node"),
+    ("memory_ringbufs", "ringbuf_memory_events_node"),
+];
+
+/// Whether any enabled recorder's BPF program writes to the given outer map.
+/// Single source of truth for both `configure_bpf_skeleton` (autocreate) and
+/// `setup_ringbuffers` (mmap/consume); keeping these in sync by hand is what
+/// broke `--syscalls` when this optimization first landed.
+fn want_ringbuf_family(opts: &Config, outer: &str) -> bool {
+    match outer {
+        "ringbufs" => !opts.no_sched,
+        "perf_counter_ringbufs" => !opts.perf_counter.is_empty(),
+        "probe_ringbufs" => {
+            !opts.trace_event.is_empty() || !opts.trace_event_config.is_empty() || opts.syscalls
+        }
+        "network_ringbufs" | "packet_ringbufs" | "epoll_ringbufs" => opts.network,
+        "memory_ringbufs" => opts.memory || opts.memory_alloc,
+        _ => true,
+    }
+}
+
 /// Collect the set of BPF programs required by all enabled recorders.
 ///
 /// This coalesces programs from each enabled recorder's `bpf_programs` list,
@@ -1689,7 +1717,6 @@ fn discover_processes_with_mapping(
 fn setup_ringbuffers<'a>(
     skel: &SystingSystemSkel,
     opts: &Config,
-    perf_counter_names: &[String],
     collect_pystacks: bool,
 ) -> Result<(Vec<(String, libbpf_rs::RingBuffer<'a>)>, RecorderChannels)> {
     // Per-event-type channel capacity. Bounded so that a slow recorder thread
@@ -1714,37 +1741,39 @@ fn setup_ringbuffers<'a>(
 
     let object = skel.object();
 
-    // Ringbuf families for disabled recorders are autocreate=false
-    // (see configure_bpf_skeleton) and have no fd to mmap; gate each
-    // create_ring on the same condition that governed autocreate.
-    let want_events = !opts.no_sched || opts.syscalls;
-    let want_probe = !opts.trace_event.is_empty() || !opts.trace_event_config.is_empty();
+    // Ringbuf families for disabled recorders are autocreate=false and have no
+    // fd to mmap; gate each create_ring on want_ringbuf_family so the two
+    // sites cannot drift.
     for (i, map) in object.maps().enumerate() {
         let name = map.name().to_str().unwrap();
-        if name.starts_with("ringbuf_events") && want_events {
+        if name.starts_with("ringbuf_events") && want_ringbuf_family(opts, "ringbufs") {
             let ring = create_ring::<task_event>(&map, event_tx.clone())?;
             rings.push((format!("events_{i}").to_string(), ring));
         } else if name.starts_with("ringbuf_stack") {
             let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
             rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_perf_counter") {
-            if !perf_counter_names.is_empty() {
-                let ring = create_ring::<perf_counter_event>(&map, cache_tx.clone())?;
-                rings.push((name.to_string(), ring));
-            }
-        } else if name.starts_with("ringbuf_probe") && want_probe {
+        } else if name.starts_with("ringbuf_perf_counter")
+            && want_ringbuf_family(opts, "perf_counter_ringbufs")
+        {
+            let ring = create_ring::<perf_counter_event>(&map, cache_tx.clone())?;
+            rings.push((name.to_string(), ring));
+        } else if name.starts_with("ringbuf_probe") && want_ringbuf_family(opts, "probe_ringbufs") {
             let ring = create_ring::<probe_event>(&map, probe_tx.clone())?;
             rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_network") && opts.network {
+        } else if name.starts_with("ringbuf_network")
+            && want_ringbuf_family(opts, "network_ringbufs")
+        {
             let ring = create_ring::<network_event>(&map, network_tx.clone())?;
             rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_packet") && opts.network {
+        } else if name.starts_with("ringbuf_packet") && want_ringbuf_family(opts, "packet_ringbufs")
+        {
             let ring = create_ring::<packet_event>(&map, packet_tx.clone())?;
             rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_epoll") && opts.network {
+        } else if name.starts_with("ringbuf_epoll") && want_ringbuf_family(opts, "epoll_ringbufs") {
             let ring = create_ring::<epoll_event_bpf>(&map, epoll_tx.clone())?;
             rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_memory") && opts.memory {
+        } else if name.starts_with("ringbuf_memory") && want_ringbuf_family(opts, "memory_ringbufs")
+        {
             let ring = create_memory_ring(&map, memory_tx.clone())?;
             rings.push((name.to_string(), ring));
         }
@@ -2005,25 +2034,11 @@ fn configure_bpf_skeleton(
     const NR_RINGBUFS: u32 = 8;
     // SAFETY: sysconf is always safe to call; _SC_PAGESIZE cannot fail.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
-    // (outer map name, inner-map prefix)
-    let mut unused: Vec<(&str, &str)> = Vec::new();
-    if opts.no_sched && !opts.syscalls {
-        unused.push(("ringbufs", "ringbuf_events_node"));
-    }
-    if opts.perf_counter.is_empty() && !opts.cpu_frequency {
-        unused.push(("perf_counter_ringbufs", "ringbuf_perf_counter_events_node"));
-    }
-    if opts.trace_event.is_empty() && opts.trace_event_config.is_empty() {
-        unused.push(("probe_ringbufs", "ringbuf_probe_events_node"));
-    }
-    if !opts.network {
-        unused.push(("network_ringbufs", "ringbuf_network_events_node"));
-        unused.push(("packet_ringbufs", "ringbuf_packet_events_node"));
-        unused.push(("epoll_ringbufs", "ringbuf_epoll_events_node"));
-    }
-    if !opts.memory && !opts.memory_alloc {
-        unused.push(("memory_ringbufs", "ringbuf_memory_events_node"));
-    }
+    let unused: Vec<(&str, &str)> = RINGBUF_FAMILIES
+        .iter()
+        .copied()
+        .filter(|(outer, _)| !want_ringbuf_family(opts, outer))
+        .collect();
     for mut map in open_skel.open_object_mut().maps_mut() {
         let name = map.name().to_str().unwrap().to_owned();
         if unused
@@ -3023,8 +3038,7 @@ pub fn systing(
             );
         }
 
-        let (rings, mut channels) =
-            setup_ringbuffers(&skel, &opts, &perf_counter_names, collect_pystacks)?;
+        let (rings, mut channels) = setup_ringbuffers(&skel, &opts, collect_pystacks)?;
         // Take exec_event_rx out before channels is moved into spawn_recorder_threads
         let exec_event_rx = channels.exec_event_rx.take();
 
