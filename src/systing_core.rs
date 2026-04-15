@@ -137,6 +137,10 @@ pub struct RecorderInfo {
     /// BPF programs required by this recorder. Empty for recorders that don't
     /// need BPF programs (e.g., tpu, tpu-metrics).
     pub bpf_programs: &'static [&'static str],
+    /// Ringbuf ARRAY_OF_MAPS families this recorder's programs write to.
+    /// Drives autocreate in `configure_bpf_skeleton` and consumption in
+    /// `setup_ringbuffers`.
+    pub ringbuf_families: &'static [&'static str],
 }
 
 // BPF program lists for each recorder.
@@ -237,78 +241,91 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             description: "Scheduler event tracing",
             default_enabled: true,
             bpf_programs: SCHED_BPF_PROGRAMS,
+            ringbuf_families: &["ringbufs"],
         },
         RecorderInfo {
             name: "syscalls",
             description: "Syscall tracing",
             default_enabled: false,
             bpf_programs: SYSCALL_BPF_PROGRAMS,
+            ringbuf_families: &["probe_ringbufs"],
         },
         RecorderInfo {
             name: "sleep-stacks",
             description: "Sleep stack traces",
             default_enabled: true,
             bpf_programs: &[],
+            ringbuf_families: &[],
         },
         RecorderInfo {
             name: "interruptible-stacks",
             description: "Interruptible sleep stack traces",
             default_enabled: true,
             bpf_programs: &[],
+            ringbuf_families: &[],
         },
         RecorderInfo {
             name: "cpu-stacks",
             description: "CPU perf stack traces",
             default_enabled: true,
             bpf_programs: &[],
+            ringbuf_families: &[],
         },
         RecorderInfo {
             name: "network",
             description: "Network connection state tracking",
             default_enabled: false,
             bpf_programs: NETWORK_BPF_PROGRAMS,
+            ringbuf_families: &["packet_ringbufs"],
         },
         RecorderInfo {
             name: "network-packets",
             description: "Network packet-level tracing (sendmsg, recvmsg, qdisc, drops)",
             default_enabled: false,
             bpf_programs: NETWORK_PACKETS_BPF_PROGRAMS,
+            ringbuf_families: &["network_ringbufs", "packet_ringbufs", "epoll_ringbufs"],
         },
         RecorderInfo {
             name: "memory",
             description: "Memory usage tracking (RSS, mmap/munmap/brk, page faults)",
             default_enabled: false,
             bpf_programs: MEMORY_BPF_PROGRAMS,
+            ringbuf_families: &["memory_ringbufs"],
         },
         RecorderInfo {
             name: "memory-alloc",
             description: "Heap allocator uprobes (malloc/calloc/realloc/free) with stacks",
             default_enabled: false,
             bpf_programs: MEMORY_ALLOC_BPF_PROGRAMS,
+            ringbuf_families: &["memory_ringbufs"],
         },
         RecorderInfo {
             name: "pystacks",
             description: "Python stack tracing",
             default_enabled: false,
             bpf_programs: &[],
+            ringbuf_families: &[],
         },
         RecorderInfo {
             name: "markers",
             description: "Userspace marker events (faccessat2 with mode=-975)",
             default_enabled: false,
             bpf_programs: MARKER_BPF_PROGRAMS,
+            ringbuf_families: &[],
         },
         RecorderInfo {
             name: "tpu",
             description: "TPU profiling (gRPC to XLA runtime profiler service)",
             default_enabled: false,
             bpf_programs: &[],
+            ringbuf_families: &[],
         },
         RecorderInfo {
             name: "tpu-metrics",
             description: "TPU runtime metrics polling (port 8431, always available)",
             default_enabled: false,
             bpf_programs: &[],
+            ringbuf_families: &[],
         },
     ]
 }
@@ -373,21 +390,24 @@ const RINGBUF_FAMILIES: &[(&str, &str)] = &[
     ("memory_ringbufs", "ringbuf_memory_events_node"),
 ];
 
-/// Whether any enabled recorder's BPF program writes to the given outer map.
-/// Single source of truth for both `configure_bpf_skeleton` (autocreate) and
-/// `setup_ringbuffers` (mmap/consume); keeping these in sync by hand is what
-/// broke `--syscalls` when this optimization first landed.
-fn want_ringbuf_family(opts: &Config, outer: &str) -> bool {
-    match outer {
-        "ringbufs" => !opts.no_sched,
-        "perf_counter_ringbufs" => !opts.perf_counter.is_empty(),
-        "probe_ringbufs" => {
-            !opts.trace_event.is_empty() || !opts.trace_event_config.is_empty() || opts.syscalls
+/// Collect ringbuf ARRAY_OF_MAPS families written by any enabled recorder or
+/// probe. Drives both autocreate in `configure_bpf_skeleton` and mmap/consume
+/// in `setup_ringbuffers`; derived from `RecorderInfo::ringbuf_families` so it
+/// cannot drift from `get_required_bpf_programs`.
+fn get_required_ringbuf_families(opts: &Config) -> HashSet<&'static str> {
+    let mut required = HashSet::new();
+    for recorder in get_available_recorders() {
+        if is_recorder_enabled(recorder.name, opts) {
+            required.extend(recorder.ringbuf_families);
         }
-        "network_ringbufs" | "packet_ringbufs" | "epoll_ringbufs" => opts.network,
-        "memory_ringbufs" => opts.memory || opts.memory_alloc,
-        _ => true,
     }
+    if !opts.trace_event.is_empty() || !opts.trace_event_config.is_empty() {
+        required.insert("probe_ringbufs");
+    }
+    if !opts.perf_counter.is_empty() {
+        required.insert("perf_counter_ringbufs");
+    }
+    required
 }
 
 /// Collect the set of BPF programs required by all enabled recorders.
@@ -1742,38 +1762,35 @@ fn setup_ringbuffers<'a>(
     let object = skel.object();
 
     // Ringbuf families for disabled recorders are autocreate=false and have no
-    // fd to mmap; gate each create_ring on want_ringbuf_family so the two
-    // sites cannot drift.
+    // fd to mmap; gate each create_ring on the same required-set that governed
+    // autocreate (see configure_bpf_skeleton).
+    let required = get_required_ringbuf_families(opts);
     for (i, map) in object.maps().enumerate() {
         let name = map.name().to_str().unwrap();
-        if name.starts_with("ringbuf_events") && want_ringbuf_family(opts, "ringbufs") {
+        if name.starts_with("ringbuf_events") && required.contains("ringbufs") {
             let ring = create_ring::<task_event>(&map, event_tx.clone())?;
             rings.push((format!("events_{i}").to_string(), ring));
         } else if name.starts_with("ringbuf_stack") {
             let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
             rings.push((name.to_string(), ring));
         } else if name.starts_with("ringbuf_perf_counter")
-            && want_ringbuf_family(opts, "perf_counter_ringbufs")
+            && required.contains("perf_counter_ringbufs")
         {
             let ring = create_ring::<perf_counter_event>(&map, cache_tx.clone())?;
             rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_probe") && want_ringbuf_family(opts, "probe_ringbufs") {
+        } else if name.starts_with("ringbuf_probe") && required.contains("probe_ringbufs") {
             let ring = create_ring::<probe_event>(&map, probe_tx.clone())?;
             rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_network")
-            && want_ringbuf_family(opts, "network_ringbufs")
-        {
+        } else if name.starts_with("ringbuf_network") && required.contains("network_ringbufs") {
             let ring = create_ring::<network_event>(&map, network_tx.clone())?;
             rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_packet") && want_ringbuf_family(opts, "packet_ringbufs")
-        {
+        } else if name.starts_with("ringbuf_packet") && required.contains("packet_ringbufs") {
             let ring = create_ring::<packet_event>(&map, packet_tx.clone())?;
             rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_epoll") && want_ringbuf_family(opts, "epoll_ringbufs") {
+        } else if name.starts_with("ringbuf_epoll") && required.contains("epoll_ringbufs") {
             let ring = create_ring::<epoll_event_bpf>(&map, epoll_tx.clone())?;
             rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_memory") && want_ringbuf_family(opts, "memory_ringbufs")
-        {
+        } else if name.starts_with("ringbuf_memory") && required.contains("memory_ringbufs") {
             let ring = create_memory_ring(&map, memory_tx.clone())?;
             rings.push((name.to_string(), ring));
         }
@@ -2034,10 +2051,11 @@ fn configure_bpf_skeleton(
     const NR_RINGBUFS: u32 = 8;
     // SAFETY: sysconf is always safe to call; _SC_PAGESIZE cannot fail.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
+    let required = get_required_ringbuf_families(opts);
     let unused: Vec<(&str, &str)> = RINGBUF_FAMILIES
         .iter()
         .copied()
-        .filter(|(outer, _)| !want_ringbuf_family(opts, outer))
+        .filter(|(outer, _)| !required.contains(outer))
         .collect();
     for mut map in open_skel.open_object_mut().maps_mut() {
         let name = map.name().to_str().unwrap().to_owned();
