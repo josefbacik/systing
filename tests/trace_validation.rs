@@ -25,18 +25,8 @@ use systing::{
 };
 use tempfile::TempDir;
 
-// Timing constants for network namespace tests.
-// BPF initialization (skeleton build, probe attachment) can take 5+ seconds on some systems.
-// These values provide buffer for initialization before traffic generation begins.
-//
-// TODO: Consider adding a proper synchronization mechanism to systing (e.g., a callback
-// or channel that signals when BPF probes are attached) rather than relying on fixed delays.
-
-/// Time to wait for BPF probe initialization before generating test traffic (seconds).
-const NETNS_BPF_INIT_WAIT_SECS: u64 = 7;
-
-/// Total recording duration for netns tests (seconds). Must be longer than
-/// NETNS_BPF_INIT_WAIT_SECS plus time for traffic generation.
+/// Total recording duration for netns tests (seconds). Workloads loop until
+/// teardown, so this only needs to exceed BPF attach latency.
 const NETNS_RECORDING_DURATION_SECS: u64 = 10;
 
 /// Recording duration for the basic validation suite (seconds).
@@ -92,6 +82,86 @@ fn pyenv_python(version: &str) -> PathBuf {
     try_pyenv_python(version).unwrap_or_else(|| {
         panic!("Python {version} not found. Install it with: ./scripts/setup-pystacks.sh")
     })
+}
+
+/// A Python process running `loop_body` forever. Killed on drop.
+struct PythonWorkload {
+    child: std::process::Child,
+    pid: u32,
+}
+
+impl Drop for PythonWorkload {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Spawn a Python process that runs `loop_body` in an infinite loop, blocking
+/// until the interpreter has fully initialized and executed one warm-up
+/// iteration. Replaces the flaky "spawn, sleep 1s, hope pyenv shim +
+/// Py_Initialize finished" pattern. The returned handle kills the child on
+/// drop.
+fn spawn_python_workload(
+    python_bin: impl AsRef<std::ffi::OsStr>,
+    dir: &std::path::Path,
+    script_name: &str,
+    defs: &str,
+    loop_body: &str,
+) -> PythonWorkload {
+    let indent = |s: &str, n| {
+        let pad = " ".repeat(n);
+        s.lines()
+            .map(|l| format!("{pad}{l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // One warm-up iteration before writing the ready marker: proves the
+    // workload is actually executing, not just that the interpreter finished
+    // init. Pystacks discovery and the recorder both start only once this
+    // fires, so every sample is known-good.
+    let script = format!(
+        "import sys, time\n\
+         {defs}\n\
+         if __name__ == \"__main__\":\n\
+         {warmup}\n    \
+             with open(sys.argv[1], \"w\") as f:\n        \
+                 f.write(\"ready\")\n    \
+             while True:\n\
+         {body}\n",
+        warmup = indent(loop_body, 4),
+        body = indent(loop_body, 8),
+    );
+    let script_path = dir.join(script_name);
+    std::fs::write(&script_path, &script).expect("write python script");
+    let ready_marker = dir.join("ready");
+    let _ = std::fs::remove_file(&ready_marker);
+
+    let mut child = std::process::Command::new(python_bin)
+        .arg(&script_path)
+        .arg(&ready_marker)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn python");
+    let pid = child.id();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ready_marker.exists() {
+        if let Ok(Some(status)) = child.try_wait() {
+            let mut stderr = String::new();
+            if let Some(mut e) = child.stderr.take() {
+                let _ = std::io::Read::read_to_string(&mut e, &mut stderr);
+            }
+            panic!("python exited before ready: {status:?}\nstderr:\n{stderr}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for python ready marker"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    PythonWorkload { child, pid }
 }
 
 /// Scan a stack.parquet file for Python symbols and a specific target function name.
@@ -289,27 +359,26 @@ fn test_e2e_validation_suite() {
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
-    // Spawn exit workload to generate EXIT_DEAD/EXIT_ZOMBIE states
-    // We run many short-lived processes to ensure we reliably capture exit states
-    // during the trace window. The 500ms initial delay gives BPF programs time to
-    // fully initialize before we start generating exit events.
-    let workload_handle = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(500));
-        // Run multiple rounds of short-lived processes. Each round spawns 50 subshells
-        // that immediately exit, which should generate EXIT_DEAD/EXIT_ZOMBIE states.
-        // We run continuously throughout the trace window.
-        for _ in 0..20 {
-            let mut child = Command::new("bash")
-                .arg("-c")
-                .arg("for i in $(seq 1 50); do (exit 0) & done; wait")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("Failed to spawn workload");
-            child.wait().expect("Failed to wait for workload");
-            thread::sleep(Duration::from_millis(50));
-        }
-    });
+    // Spawn exit workload to generate EXIT_DEAD/EXIT_ZOMBIE states. Loop until
+    // told to stop so the workload is guaranteed to overlap the full record
+    // window regardless of BPF attach latency.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let workload_handle = {
+        let stop = stop.clone();
+        thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut child = Command::new("bash")
+                    .arg("-c")
+                    .arg("for i in $(seq 1 50); do (exit 0) & done; wait")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("Failed to spawn workload");
+                child.wait().expect("Failed to wait for workload");
+                thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
 
     // Record a trace with both parquet and perfetto output
     eprintln!(
@@ -324,6 +393,7 @@ fn test_e2e_validation_suite() {
     };
 
     systing(config, None).expect("systing recording failed");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
     workload_handle.join().expect("Workload thread panicked");
     eprintln!("Recording complete.\n");
 
@@ -1037,12 +1107,13 @@ fn test_network_recording_with_netns() {
     let dest_ip = netns_env.config.ns_ip.to_string();
     let dest_port = netns_env.server_port;
 
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let traffic_handle = {
         let server_addr = netns_env.server_addr();
+        let stop = stop.clone();
         thread::spawn(move || {
-            thread::sleep(Duration::from_secs(NETNS_BPF_INIT_WAIT_SECS));
-
-            for i in 0..5 {
+            let mut i = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let message = format!("Hello from netns test round {i}");
                 if let Ok(mut stream) = std::net::TcpStream::connect(&server_addr) {
                     let _ = stream.write_all(message.as_bytes());
@@ -1051,11 +1122,13 @@ fn test_network_recording_with_netns() {
                     let _ = stream.read_to_end(&mut response);
                 }
                 thread::sleep(Duration::from_millis(200));
+                i += 1;
             }
         })
     };
 
     systing(config, None).expect("systing recording failed");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
     traffic_handle.join().expect("Traffic thread panicked");
     drop(netns_env);
 
@@ -1167,21 +1240,13 @@ fn test_network_recording_with_netns() {
 fn test_pystacks_symbol_resolution() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File;
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    use std::thread;
-    use std::time::Duration;
 
     setup_bpf_environment();
 
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
-    let python_script = dir.path().join("test_pystacks.py");
-    let script_content = r#"
-import time
-import sys
-
+    let defs = r#"
 def systing_test_leaf_function():
     """Leaf function that does busy work to show up in profiling."""
     total = 0
@@ -1199,53 +1264,29 @@ def systing_test_middle_function():
 def systing_test_outer_function():
     """Outer function that calls middle."""
     return systing_test_middle_function()
-
-def main():
-    """Main entry point."""
-    print("Python test script starting...", flush=True)
-    start_time = time.time()
-    while time.time() - start_time < 10:
-        systing_test_outer_function()
-    print("Python test script done.", flush=True)
-
-if __name__ == "__main__":
-    main()
 "#;
 
-    {
-        let mut file = File::create(&python_script).expect("Failed to create Python script");
-        file.write_all(script_content.as_bytes())
-            .expect("Failed to write Python script");
-    }
-
-    let mut python_proc = Command::new(pyenv_python(PYTHON_313_VERSION))
-        .arg(&python_script)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn Python process");
-
-    let python_pid = python_proc.id();
-    eprintln!("Started Python process with PID: {}", python_pid);
-
-    thread::sleep(Duration::from_millis(1000));
+    let workload = spawn_python_workload(
+        pyenv_python(PYTHON_313_VERSION),
+        dir.path(),
+        "test_pystacks.py",
+        defs,
+        "systing_test_outer_function()",
+    );
+    eprintln!("Started Python process with PID: {}", workload.pid);
 
     let config = Config {
         duration: 3,
         parquet_only: false,
         collect_pystacks: true,
-        pystacks_pids: vec![python_pid],
+        pystacks_pids: vec![workload.pid],
         output_dir: dir.path().to_path_buf(),
         output: trace_path.clone(),
         ..Config::default()
     };
 
     systing(config, None).expect("systing recording failed");
-
-    let python_status = python_proc
-        .wait()
-        .expect("Failed to wait for Python process");
-    eprintln!("Python process exited with status: {:?}", python_status);
+    drop(workload);
 
     // === VALIDATE PARQUET OUTPUT ===
 
@@ -1429,21 +1470,13 @@ fn test_pystacks_sleep_stacks() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::collections::HashMap;
     use std::fs::File;
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    use std::thread;
-    use std::time::Duration;
 
     setup_bpf_environment();
 
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
-    let python_script = dir.path().join("test_sleep_pystacks.py");
-    let script_content = r#"
-import time
-import sys
-
+    let defs = r#"
 def systing_sleep_leaf_function():
     """Leaf function that sleeps - should appear in STACK_SLEEP samples."""
     time.sleep(0.05)
@@ -1466,54 +1499,29 @@ def systing_cpu_middle_function():
     for _ in range(10):
         result += systing_cpu_leaf_function()
     return result
-
-def main():
-    """Main entry point - alternates between CPU work and sleeping."""
-    print("Python sleep/CPU test script starting...", flush=True)
-    start_time = time.time()
-    while time.time() - start_time < 10:
-        systing_cpu_middle_function()
-        systing_sleep_middle_function()
-    print("Python sleep/CPU test script done.", flush=True)
-
-if __name__ == "__main__":
-    main()
 "#;
 
-    {
-        let mut file = File::create(&python_script).expect("Failed to create Python script");
-        file.write_all(script_content.as_bytes())
-            .expect("Failed to write Python script");
-    }
-
-    let mut python_proc = Command::new(pyenv_python(PYTHON_313_VERSION))
-        .arg(&python_script)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn Python process");
-
-    let python_pid = python_proc.id();
-    eprintln!("Started Python process with PID: {}", python_pid);
-
-    thread::sleep(Duration::from_millis(1000));
+    let workload = spawn_python_workload(
+        pyenv_python(PYTHON_313_VERSION),
+        dir.path(),
+        "test_sleep_pystacks.py",
+        defs,
+        "systing_cpu_middle_function()\nsysting_sleep_middle_function()",
+    );
+    eprintln!("Started Python process with PID: {}", workload.pid);
 
     let config = Config {
         duration: 5,
         parquet_only: false,
         collect_pystacks: true,
-        pystacks_pids: vec![python_pid],
+        pystacks_pids: vec![workload.pid],
         output_dir: dir.path().to_path_buf(),
         output: trace_path.clone(),
         ..Config::default()
     };
 
     systing(config, None).expect("systing recording failed");
-
-    let python_status = python_proc
-        .wait()
-        .expect("Failed to wait for Python process");
-    eprintln!("Python process exited with status: {:?}", python_status);
+    drop(workload);
 
     // === LOAD STACK.PARQUET INTO A MAP ===
     let stack_parquet = dir.path().join("stack.parquet");
@@ -1657,10 +1665,6 @@ if __name__ == "__main__":
 fn test_pystacks_frame_error_rate() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File;
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    use std::thread;
-    use std::time::Duration;
 
     let python_bin = match try_pyenv_python(PYTHON_311_VERSION) {
         Some(p) => p,
@@ -1678,10 +1682,7 @@ fn test_pystacks_frame_error_rate() {
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
-    let python_script = dir.path().join("test_frame_error.py");
-    let script_content = r#"
-import time
-
+    let defs = r#"
 def level3():
     total = 0
     for i in range(100000):
@@ -1693,46 +1694,28 @@ def level2():
 
 def level1():
     return level2()
-
-def main():
-    start = time.time()
-    while time.time() - start < 10:
-        level1()
-
-if __name__ == "__main__":
-    main()
 "#;
 
-    {
-        let mut file = File::create(&python_script).expect("Failed to create Python script");
-        file.write_all(script_content.as_bytes())
-            .expect("Failed to write Python script");
-    }
-
-    let mut python_proc = Command::new(&python_bin)
-        .arg(&python_script)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn Python process");
-
-    let python_pid = python_proc.id();
-    thread::sleep(Duration::from_millis(1000));
+    let workload = spawn_python_workload(
+        &python_bin,
+        dir.path(),
+        "test_frame_error.py",
+        defs,
+        "level1()",
+    );
 
     let config = Config {
         duration: 3,
         parquet_only: false,
         collect_pystacks: true,
-        pystacks_pids: vec![python_pid],
+        pystacks_pids: vec![workload.pid],
         output_dir: dir.path().to_path_buf(),
         output: trace_path.clone(),
         ..Config::default()
     };
 
     systing(config, None).expect("systing recording failed");
-    python_proc
-        .wait()
-        .expect("Failed to wait for Python process");
+    drop(workload);
 
     let stack_parquet = dir.path().join("stack.parquet");
     assert!(stack_parquet.exists(), "stack.parquet not found");
@@ -1744,6 +1727,8 @@ if __name__ == "__main__":
     let mut total_python_stacks = 0;
     let mut frame_error_not_at_bottom = 0;
     let mut expected_functions_found = 0;
+    let mut total_rows = 0;
+    let mut sample_other: Option<Vec<String>> = None;
 
     for batch_result in reader {
         let batch = batch_result.expect("Failed to read batch");
@@ -1759,6 +1744,7 @@ if __name__ == "__main__":
             if frame_names_col.is_null(i) {
                 continue;
             }
+            total_rows += 1;
 
             let inner = frame_names_col.value(i);
             let string_array = inner
@@ -1778,6 +1764,9 @@ if __name__ == "__main__":
 
             let is_our_stack = frames.iter().any(|f| f.contains("test_frame_error.py"));
             if !is_our_stack {
+                if sample_other.is_none() && frames.iter().any(|f| f.contains("(python)")) {
+                    sample_other = Some(frames.clone());
+                }
                 continue;
             }
 
@@ -1808,7 +1797,11 @@ if __name__ == "__main__":
         }
     }
 
-    assert!(total_python_stacks > 0, "No Python stacks captured");
+    assert!(
+        total_python_stacks > 0,
+        "No Python stacks captured: {total_rows} total stack rows, sample (python) stack that \
+         didn't match test_frame_error.py: {sample_other:?}"
+    );
 
     assert!(
         expected_functions_found > 0,
@@ -1833,92 +1826,43 @@ if __name__ == "__main__":
 
 /// Helper: trace a Python script with pystacks and verify symbols appear.
 fn run_pystacks_version_test(full_ver: &str) {
-    use std::fs::File;
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    use std::thread;
-    use std::time::Duration;
-
     let python_bin = pyenv_python(full_ver);
 
     setup_bpf_environment();
 
-    let script_content = r#"
-import sys
-
+    let defs = r#"
 def pystacks_version_test_function():
     """Function that does busy work to show up in profiling."""
     total = 0
     for i in range(1000000):
         total += i * i
     return total
-
-def main():
-    # Signal the harness that the interpreter is fully initialized and in the
-    # hot loop, so pystacks discovery can find _PyRuntime.
-    with open(sys.argv[1], "w") as f:
-        f.write("ready")
-    while True:
-        pystacks_version_test_function()
-
-if __name__ == "__main__":
-    main()
 "#;
 
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
-    let ready_marker = dir.path().join("ready");
 
-    let python_script = dir.path().join("test_version.py");
-    {
-        let mut file = File::create(&python_script).expect("Failed to create Python script");
-        file.write_all(script_content.as_bytes())
-            .expect("Failed to write Python script");
-    }
-
-    let mut python_proc = Command::new(&python_bin)
-        .arg(&python_script)
-        .arg(&ready_marker)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("Failed to spawn Python {}: {}", full_ver, e));
-
-    let python_pid = python_proc.id();
-    eprintln!("Started Python {} with PID: {}", full_ver, python_pid);
-
-    // Wait for Python to reach its hot loop before attaching. A fixed sleep
-    // races pyenv shim exec + Py_Initialize under parallel-suite load.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !ready_marker.exists() {
-        if let Ok(Some(status)) = python_proc.try_wait() {
-            panic!(
-                "[Python {}] exited before signalling ready: {:?}",
-                full_ver, status
-            );
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "[Python {}] timed out waiting for ready marker",
-            full_ver
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+    let workload = spawn_python_workload(
+        &python_bin,
+        dir.path(),
+        "test_version.py",
+        defs,
+        "pystacks_version_test_function()",
+    );
+    eprintln!("Started Python {} with PID: {}", full_ver, workload.pid);
 
     let config = Config {
         duration: 3,
         parquet_only: true,
         collect_pystacks: true,
-        pystacks_pids: vec![python_pid],
+        pystacks_pids: vec![workload.pid],
         output_dir: dir.path().to_path_buf(),
         output: trace_path,
         ..Config::default()
     };
 
     systing(config, None).expect("systing recording failed");
-
-    let _ = python_proc.kill();
-    let _ = python_proc.wait();
+    drop(workload);
 
     let stack_parquet = dir.path().join("stack.parquet");
     assert!(
