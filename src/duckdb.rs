@@ -10,6 +10,101 @@ use std::path::Path;
 
 use crate::parquet_paths::ParquetPaths;
 
+/// Best-effort detection of the cgroup memory limit for the current process.
+///
+/// DuckDB sizes its buffer pool from physical RAM, which inside a container is
+/// the host's RAM, not the cgroup limit. On large hosts this makes the
+/// parquet→duckdb import OOM the container. We read the cgroup limit ourselves
+/// so we can cap DuckDB explicitly.
+fn detect_cgroup_memory_limit() -> Option<u64> {
+    // A limit at or above this is "effectively unlimited" (cgroup v1 reports a
+    // page-rounded i64::MAX; v2 reports the literal string "max").
+    const UNLIMITED_THRESHOLD: u64 = 1 << 55;
+
+    let parse = |s: &str| -> Option<u64> {
+        let s = s.trim();
+        if s == "max" {
+            return None;
+        }
+        let v = s.parse::<u64>().ok()?;
+        (v < UNLIMITED_THRESHOLD).then_some(v)
+    };
+
+    // cgroup v2: resolve our cgroup path and walk up toward the root, taking the
+    // tightest limit (a parent may be stricter than the leaf).
+    if let Ok(cg) = std::fs::read_to_string("/proc/self/cgroup") {
+        if let Some(rel) = cg.lines().find_map(|l| l.strip_prefix("0::")) {
+            let root = Path::new("/sys/fs/cgroup");
+            let mut dir = root.join(rel.trim().trim_start_matches('/'));
+            let mut best: Option<u64> = None;
+            loop {
+                if let Ok(s) = std::fs::read_to_string(dir.join("memory.max")) {
+                    if let Some(v) = parse(&s) {
+                        best = Some(best.map_or(v, |b| b.min(v)));
+                    }
+                }
+                if dir == root || !dir.pop() {
+                    break;
+                }
+            }
+            if best.is_some() {
+                return best;
+            }
+        }
+    }
+
+    // cgroup v1 fallback.
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        return parse(&s);
+    }
+
+    None
+}
+
+/// Configure a DuckDB connection for bulk parquet import/export under a memory
+/// budget.
+///
+/// Sets `memory_limit` from the cgroup limit (with headroom for the rest of the
+/// process), caps `threads` so per-thread buffer state cannot exceed that
+/// limit, disables `preserve_insertion_order` so INSERT…SELECT can stream
+/// without reorder buffering, and points `temp_directory` at `spill_dir` so
+/// DuckDB can spill instead of OOMing if it still hits the cap.
+fn configure_for_bulk_io(conn: &Connection, spill_dir: &Path) -> Result<()> {
+    const MIB: u64 = 1024 * 1024;
+
+    // Leave 25% of the container for everything that is not DuckDB's buffer
+    // pool (our own heap, resident BPF maps, kernel page cache pressure),
+    // clamped to at least 1 GiB so tiny containers still get a working import.
+    let mem_limit_mib = detect_cgroup_memory_limit().map(|bytes| (bytes * 3 / 4 / MIB).max(1024));
+
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get() as u64)
+        .unwrap_or(4);
+    // Parallel parquet scan + insert keeps roughly a row-group's worth of state
+    // live per thread; budget ~512 MiB/thread so a 24 GiB container tops out
+    // around 36 threads instead of 200+. Without a cgroup limit we still cap at
+    // 32 — unbounded thread counts were the observed OOM trigger.
+    let threads = match mem_limit_mib {
+        Some(m) => num_cpus.clamp(2, (m / 512).max(2)),
+        None => num_cpus.clamp(2, 32),
+    };
+
+    let escaped_spill = spill_dir.to_string_lossy().replace('\'', "''");
+    let mut pragmas = format!(
+        "SET threads TO {threads};\
+         SET preserve_insertion_order = false;\
+         SET temp_directory = '{escaped_spill}';"
+    );
+    if let Some(m) = mem_limit_mib {
+        pragmas.push_str(&format!("SET memory_limit = '{m}MiB';"));
+        eprintln!("  duckdb: memory_limit={m}MiB threads={threads}");
+    } else {
+        eprintln!("  duckdb: threads={threads} (no cgroup memory limit detected)");
+    }
+    conn.execute_batch(&pragmas)?;
+    Ok(())
+}
+
 /// Mapping for a single trace when importing from one DuckDB database to another.
 pub struct TraceImportMapping {
     /// The trace ID in the source database
@@ -546,12 +641,9 @@ pub fn parquet_to_duckdb(parquet_dir: &Path, db_path: &Path, trace_id: &str) -> 
     let conn = Connection::open(db_path)
         .with_context(|| format!("Failed to create DuckDB database: {}", db_path.display()))?;
 
-    // Configure DuckDB for parallel import.
-    // Use a conservative default of 4 threads if CPU count detection fails.
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    conn.execute_batch(&format!("SET threads TO {num_cpus};"))?;
+    // Spill to a sibling of the db file so it lands on the same filesystem.
+    let spill_dir = db_path.parent().unwrap_or(Path::new("."));
+    configure_for_bulk_io(&conn, spill_dir)?;
 
     create_schema(&conn)?;
 
@@ -959,11 +1051,7 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
         )
     })?;
 
-    // Configure DuckDB for parallel export
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    conn.execute_batch(&format!("SET threads TO {num_cpus};"))?;
+    configure_for_bulk_io(&conn, output_dir)?;
 
     let paths = ParquetPaths::new(output_dir);
     let escaped_trace_id = trace_id.replace('\'', "''");
@@ -1066,6 +1154,43 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_configure_for_bulk_io_applies_pragmas() {
+        let tmp = TempDir::new().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        configure_for_bulk_io(&conn, tmp.path()).unwrap();
+
+        let order: bool = conn
+            .query_row(
+                "SELECT current_setting('preserve_insertion_order')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!order);
+
+        let threads: i64 = conn
+            .query_row("SELECT current_setting('threads')", [], |r| r.get(0))
+            .unwrap();
+        assert!(threads >= 2, "threads clamped below floor: {threads}");
+        assert!(threads <= 32 || detect_cgroup_memory_limit().is_some());
+
+        let temp_dir: String = conn
+            .query_row("SELECT current_setting('temp_directory')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(temp_dir, tmp.path().to_string_lossy());
+    }
+
+    #[test]
+    fn test_detect_cgroup_memory_limit_sane() {
+        // Whatever the host reports, it must not be zero or the v1 "unlimited"
+        // sentinel — either would make configure_for_bulk_io pick bad pragmas.
+        if let Some(v) = detect_cgroup_memory_limit() {
+            assert!(v >= 64 * 1024 * 1024, "implausible cgroup limit: {v}");
+            assert!(v < (1u64 << 55));
+        }
+    }
 
     #[test]
     fn test_create_schema() {

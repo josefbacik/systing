@@ -320,7 +320,7 @@ impl PerfettoQueries {
         }
 
         if !invalid_comms.is_empty() {
-            invalid_comms.sort_by(|a, b| b.1.cmp(&a.1));
+            invalid_comms.sort_by_key(|c| std::cmp::Reverse(c.1));
             let invalid_count: u64 = invalid_comms.iter().map(|(_, c)| c).sum();
             let invalid_percent = if total_pid_zero_events > 0 {
                 (invalid_count as f64 / total_pid_zero_events as f64) * 100.0
