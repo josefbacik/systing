@@ -293,6 +293,12 @@ impl StackRecorder {
 
         pb.finish_with_message("Stack symbolization complete");
 
+        // Release the dedup tables now that they have been emitted. On busy
+        // many-core hosts these hold several GiB of Stack keys that would
+        // otherwise sit under the DuckDB import that follows.
+        self.unique_stacks = HashMap::new();
+        self.alias_stacks = Vec::new();
+
         Ok(())
     }
 

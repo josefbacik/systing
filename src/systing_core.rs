@@ -939,11 +939,7 @@ fn consume_loop<T, N>(
     // can cause threads to not be recorded if the filter incorrectly says "seen"
     let mut seen_tasks: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-    loop {
-        let Ok(event) = rx.recv() else {
-            break;
-        };
-
+    while let Ok(event) = rx.recv() {
         // Send task_info to process discovery thread only if not already seen
         if let Some(task_info) = event.next_task_info() {
             if seen_tasks.insert(task_info.tgidpid) {
@@ -3431,6 +3427,11 @@ pub fn systing(
     );
     recorder.generate_parquet_trace(&opts.output_dir, tpu_recorder)?;
     println!("Successfully wrote Parquet trace files");
+
+    // The recorder still holds process/thread maps, symbolizer caches, etc.
+    // Drop our reference before the DuckDB/Perfetto conversion so that memory
+    // is available to the importer rather than stacked underneath it.
+    drop(recorder);
 
     // Generate output trace (unless --parquet-only)
     // Format is auto-detected from the file extension

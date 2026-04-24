@@ -290,7 +290,7 @@ impl AnalyzeDb {
         }
 
         // Sort by total_bytes descending
-        pairs.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+        pairs.sort_by_key(|p| std::cmp::Reverse(p.total_bytes));
 
         // Apply top_n limit
         if let Some(n) = params.top_n {
