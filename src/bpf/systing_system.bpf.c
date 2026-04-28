@@ -2830,6 +2830,8 @@ int BPF_KRETPROBE(udp_recvmsg_exit, int ret)
 SEC("kprobe/udp_send_skb")
 int BPF_KPROBE(udp_send_skb_entry, struct sk_buff *skb, struct flowi4 *fl4, struct inet_cork *cork)
 {
+	if (!tracing_enabled)
+		return 0;
 	if (!skb || !fl4)
 		return 0;
 
@@ -2901,6 +2903,8 @@ int BPF_KPROBE(udp_send_skb_entry, struct sk_buff *skb, struct flowi4 *fl4, stru
 SEC("kprobe/udp_queue_rcv_one_skb")
 int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb)
 {
+	if (!tracing_enabled)
+		return 0;
 	if (!sk || !skb)
 		return 0;
 
@@ -2969,6 +2973,8 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 SEC("kprobe/__udp_enqueue_schedule_skb")
 int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *skb)
 {
+	if (!tracing_enabled)
+		return 0;
 	if (!sk || !skb)
 		return 0;
 
@@ -3037,6 +3043,8 @@ int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *
 SEC("kprobe/__tcp_transmit_skb")
 int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int clone_it, gfp_t gfp_mask, u32 rcv_nxt)
 {
+	if (!tracing_enabled)
+		return 0;
 	if (!sk || !skb)
 		return 0;
 
@@ -3209,6 +3217,8 @@ static __always_inline int emit_udp_packet_event(struct sock *sk, struct sk_buff
 SEC("tp_btf/net_dev_start_xmit")
 int BPF_PROG(net_dev_start_xmit, struct sk_buff *skb, struct net_device *dev)
 {
+	if (!tracing_enabled)
+		return 0;
 	if (!skb)
 		return 0;
 
@@ -3290,6 +3300,8 @@ static __always_inline int read_src_addr_from_skb(struct sk_buff *skb,
 SEC("kprobe/tcp_rcv_established")
 int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 {
+	if (!tracing_enabled)
+		return 0;
 	if (!sk || !skb)
 		return 0;
 
@@ -3348,6 +3360,8 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 SEC("kprobe/tcp_queue_rcv")
 int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *fragstolen)
 {
+	if (!tracing_enabled)
+		return 0;
 	if (!sk || !skb)
 		return 0;
 
@@ -3408,6 +3422,8 @@ int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *
 SEC("kprobe/tcp_data_queue")
 int BPF_KPROBE(tcp_data_queue_entry, struct sock *sk, struct sk_buff *skb)
 {
+	if (!tracing_enabled)
+		return 0;
 	if (!sk || !skb)
 		return 0;
 
@@ -3530,6 +3546,8 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 SEC("kprobe/tcp_send_probe0")
 int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 {
+	if (!tracing_enabled)
+		return 0;
 	if (!sk)
 		return 0;
 
@@ -3601,6 +3619,8 @@ int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 SEC("kprobe/tcp_send_ack")
 int BPF_KPROBE(tcp_send_ack_entry, struct sock *sk)
 {
+	if (!tracing_enabled)
+		return 0;
 	if (!sk)
 		return 0;
 
@@ -3718,6 +3738,8 @@ int BPF_KPROBE(tcp_send_ack_entry, struct sock *sk)
 SEC("kprobe/tcp_retransmit_timer")
 int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 {
+	if (!tracing_enabled)
+		return 0;
 	if (!sk)
 		return 0;
 
@@ -3974,6 +3996,8 @@ static __always_inline u64 get_socket_id_from_skb(struct sk_buff *skb)
 SEC("tracepoint/skb/kfree_skb")
 int tracepoint__skb__kfree_skb(struct trace_event_raw_kfree_skb *ctx)
 {
+	if (!tracing_enabled)
+		return 0;
 	// Get the SKB and check if it's associated with a tracked socket
 	struct sk_buff *skb = (struct sk_buff *)ctx->skbaddr;
 	u64 socket_id = get_socket_id_from_skb(skb);
@@ -4050,6 +4074,8 @@ struct {
 SEC("kprobe/enqueue_to_backlog")
 int BPF_KPROBE(enqueue_to_backlog_entry, struct sk_buff *skb, int cpu, unsigned int *qtail)
 {
+	if (!tracing_enabled)
+		return 0;
 	u64 socket_id = get_socket_id_from_skb(skb);
 	if (socket_id == 0)
 		return 0;
@@ -4068,6 +4094,8 @@ int BPF_KPROBE(enqueue_to_backlog_entry, struct sk_buff *skb, int cpu, unsigned 
 SEC("kretprobe/enqueue_to_backlog")
 int BPF_KRETPROBE(enqueue_to_backlog_exit, int ret)
 {
+	if (!tracing_enabled)
+		return 0;
 	u64 pid_tgid = bpf_get_current_pid_tgid();
 	struct backlog_entry *entry = bpf_map_lookup_elem(&pending_backlog, &pid_tgid);
 	if (!entry) {
@@ -4132,6 +4160,8 @@ int BPF_KRETPROBE(enqueue_to_backlog_exit, int ret)
 SEC("kprobe/sk_stream_wait_memory")
 int BPF_KPROBE(sk_stream_wait_memory_entry, struct sock *sk, long *timeo)
 {
+	if (!tracing_enabled)
+		return 0;
 	if (!sk)
 		return 0;
 
@@ -4231,6 +4261,8 @@ struct {
 SEC("tracepoint/qdisc/qdisc_enqueue")
 int tracepoint__qdisc__qdisc_enqueue(struct trace_event_raw_qdisc_enqueue *ctx)
 {
+	if (!tracing_enabled)
+		return 0;
 	struct sk_buff *skb = (struct sk_buff *)ctx->skbaddr;
 	if (!skb)
 		return 0;
@@ -4306,6 +4338,8 @@ int tracepoint__qdisc__qdisc_enqueue(struct trace_event_raw_qdisc_enqueue *ctx)
 SEC("tracepoint/qdisc/qdisc_dequeue")
 int tracepoint__qdisc__qdisc_dequeue(struct trace_event_raw_qdisc_dequeue *ctx)
 {
+	if (!tracing_enabled)
+		return 0;
 	// skb can be NULL if dequeue was attempted but queue was empty
 	struct sk_buff *skb = (struct sk_buff *)ctx->skbaddr;
 	if (!skb)
