@@ -925,6 +925,8 @@ fn create_memory_ring<'a>(
     builder.build()
 }
 
+const CONSUME_BATCH: usize = 4096;
+
 fn consume_loop<T, N>(
     recorder: &Mutex<T>,
     rx: Receiver<N>,
@@ -938,34 +940,44 @@ fn consume_loop<T, N>(
     // Use a HashSet for deduplication - bloom filters have false positives which
     // can cause threads to not be recorded if the filter incorrectly says "seen"
     let mut seen_tasks: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut batch: Vec<N> = Vec::with_capacity(CONSUME_BATCH);
 
-    while let Ok(event) = rx.recv() {
-        // Send task_info to process discovery thread only if not already seen
-        if let Some(task_info) = event.next_task_info() {
-            if seen_tasks.insert(task_info.tgidpid) {
-                let _ = task_info_tx.send(*task_info);
+    // Block for the first event so an idle recorder doesn't spin, then drain
+    // whatever else is immediately available so we take the recorder lock once
+    // per batch instead of once per event.
+    'outer: while let Ok(first) = rx.recv() {
+        batch.push(first);
+        batch.extend(rx.try_iter().take(CONSUME_BATCH - 1));
+
+        for event in &batch {
+            // Send task_info to process discovery thread only if not already seen
+            if let Some(task_info) = event.next_task_info() {
+                if seen_tasks.insert(task_info.tgidpid) {
+                    let _ = task_info_tx.send(*task_info);
+                }
+            }
+            if let Some(task_info) = event.prev_task_info() {
+                if seen_tasks.insert(task_info.tgidpid) {
+                    let _ = task_info_tx.send(*task_info);
+                }
+            }
+
+            // Send event to pystack symbol loading thread only if it has Python stack data
+            // This avoids waking up the symbol loader thread for events without Python stacks
+            if let Some(ref tx) = pystack_symbol_tx {
+                if event.has_pystack() {
+                    tx.send(*event)
+                        .expect("Failed to send event to pystack symbol loader thread");
+                }
             }
         }
-        if let Some(task_info) = event.prev_task_info() {
-            if seen_tasks.insert(task_info.tgidpid) {
-                let _ = task_info_tx.send(*task_info);
+
+        let mut rec = recorder.lock().unwrap();
+        for event in batch.drain(..) {
+            if rec.record_event(event) {
+                let _ = stop_tx.send(());
+                break 'outer;
             }
-        }
-
-        // Send event to pystack symbol loading thread only if it has Python stack data
-        // This avoids waking up the symbol loader thread for events without Python stacks
-        if let Some(ref tx) = pystack_symbol_tx {
-            if event.has_pystack() {
-                tx.send(event)
-                    .expect("Failed to send event to pystack symbol loader thread");
-            }
-        }
-
-        let ret = recorder.lock().unwrap().record_event(event);
-
-        if ret {
-            let _ = stop_tx.send(());
-            break;
         }
     }
 }
@@ -1100,17 +1112,21 @@ fn spawn_recorder_threads(
                     // Use HashSet for deduplication - bloom filters have false positives
                     let mut seen_tasks: std::collections::HashSet<u64> =
                         std::collections::HashSet::new();
-                    while let Ok(event) = packet_rx.recv() {
-                        if let Some(task_info) = event.next_task_info() {
-                            if seen_tasks.insert(task_info.tgidpid) {
-                                session_recorder.maybe_record_task(task_info);
+                    let mut batch: Vec<packet_event> = Vec::with_capacity(CONSUME_BATCH);
+                    while let Ok(first) = packet_rx.recv() {
+                        batch.push(first);
+                        batch.extend(packet_rx.try_iter().take(CONSUME_BATCH - 1));
+                        for event in &batch {
+                            if let Some(task_info) = event.next_task_info() {
+                                if seen_tasks.insert(task_info.tgidpid) {
+                                    session_recorder.maybe_record_task(task_info);
+                                }
                             }
                         }
-                        session_recorder
-                            .network_recorder
-                            .lock()
-                            .unwrap()
-                            .handle_packet_event(event);
+                        let mut rec = session_recorder.network_recorder.lock().unwrap();
+                        for event in batch.drain(..) {
+                            rec.handle_packet_event(event);
+                        }
                     }
                     0
                 })?,
@@ -1125,17 +1141,21 @@ fn spawn_recorder_threads(
                     // Use HashSet for deduplication
                     let mut seen_tasks: std::collections::HashSet<u64> =
                         std::collections::HashSet::new();
-                    while let Ok(event) = epoll_rx.recv() {
-                        if let Some(task_info) = event.next_task_info() {
-                            if seen_tasks.insert(task_info.tgidpid) {
-                                session_recorder.maybe_record_task(task_info);
+                    let mut batch: Vec<epoll_event_bpf> = Vec::with_capacity(CONSUME_BATCH);
+                    while let Ok(first) = epoll_rx.recv() {
+                        batch.push(first);
+                        batch.extend(epoll_rx.try_iter().take(CONSUME_BATCH - 1));
+                        for event in &batch {
+                            if let Some(task_info) = event.next_task_info() {
+                                if seen_tasks.insert(task_info.tgidpid) {
+                                    session_recorder.maybe_record_task(task_info);
+                                }
                             }
                         }
-                        session_recorder
-                            .network_recorder
-                            .lock()
-                            .unwrap()
-                            .handle_epoll_event(event);
+                        let mut rec = session_recorder.network_recorder.lock().unwrap();
+                        for event in batch.drain(..) {
+                            rec.handle_epoll_event(event);
+                        }
                     }
                     0
                 })?,
