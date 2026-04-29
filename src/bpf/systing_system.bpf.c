@@ -3077,8 +3077,8 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	event->length = end_seq - start_seq;
 	event->tcp_flags = tcp_flags;
 
-	// Check TCPCB_RETRANS flag (0x10) to detect retransmits
-	#define TCPCB_RETRANS 0x10
+	// TCPCB_RETRANS = TCPCB_SACKED_RETRANS | TCPCB_EVER_RETRANS | TCPCB_REPAIRED
+	#define TCPCB_RETRANS 0x92
 	event->is_retransmit = (sacked & TCPCB_RETRANS) ? 1 : 0;
 
 	// Look up socket ID for this socket with full 4-tuple
@@ -3147,7 +3147,10 @@ static __always_inline int emit_tcp_packet_event(struct sock *sk, struct sk_buff
 	u32 seq = 0;
 	read_tcp_seq_from_skb(skb, &seq);
 	event->seq = seq;
-	event->length = 0;  // Length not available at this probe point
+
+	u32 len = 0;
+	bpf_probe_read_kernel(&len, sizeof(len), &skb->len);
+	event->length = len;
 	event->tcp_flags = 0;  // tcp_skb_cb not available at this probe point
 	event->is_retransmit = 0;  // TCPCB_RETRANS not available at this probe point
 
@@ -3355,72 +3358,12 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 	return 0;
 }
 
-// Trace tcp_queue_rcv to capture when data enters socket buffer (fast path)
-// Emits instant PACKET_QUEUE_RCV event
+// Trace tcp_queue_rcv to capture when data enters socket buffer.
+// Covers both the header-prediction fast path in tcp_rcv_established and the
+// slow path via tcp_data_queue, which also calls tcp_queue_rcv for in-sequence
+// data. Emits instant PACKET_QUEUE_RCV event.
 SEC("kprobe/tcp_queue_rcv")
 int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *fragstolen)
-{
-	if (!tracing_enabled)
-		return 0;
-	if (!sk || !skb)
-		return 0;
-
-	long flags;
-	struct packet_event *event = reserve_packet_event(&flags);
-	if (!event)
-		return handle_missed_event(MISSED_PACKET_EVENT);
-
-	event->ts = bpf_ktime_get_boot_ns();
-	event->protocol = NETWORK_TCP;
-	event->event_type = PACKET_QUEUE_RCV;
-	event->cpu = bpf_get_smp_processor_id();
-
-	// Read source (peer) address from skb
-	if (read_src_addr_from_skb(skb, &event->af, event->dest_addr, &event->dest_port) != 0) {
-		bpf_ringbuf_discard(event, flags);
-		return 0;
-	}
-
-	// Read our local source address from the socket
-	read_socket_src_info(sk, &event->af, event->src_addr, &event->src_port);
-
-	// Read seq from TCP header
-	u32 seq = 0;
-	read_tcp_seq_from_skb(skb, &seq);
-	event->seq = seq;
-
-	// Read length from tcp_skb_cb
-	struct tcp_skb_cb *tcb = (struct tcp_skb_cb *)&skb->cb[0];
-	u32 start_seq = 0;
-	u32 end_seq = 0;
-	bpf_probe_read_kernel(&start_seq, sizeof(start_seq), &tcb->seq);
-	bpf_probe_read_kernel(&end_seq, sizeof(end_seq), &tcb->end_seq);
-	event->length = end_seq - start_seq;
-	event->tcp_flags = 0;
-
-	// Look up socket ID
-	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
-					     event->dest_addr, event->dest_port);
-
-	event->sndbuf_used = 0;
-	event->sndbuf_limit = 0;
-
-	// Initialize persist timer fields (receive events don't have this info)
-	event->icsk_pending = 0;
-	event->icsk_timeout = 0;
-	event->rto_jiffies = 0;
-	event->probe_count = 0;
-	event->backoff = 0;
-
-	bpf_ringbuf_submit(event, flags);
-	return 0;
-}
-
-// Trace tcp_data_queue to capture slow path packets (packets arriving when buffer has data)
-// This complements tcp_queue_rcv which only handles fast path
-// Emits instant PACKET_QUEUE_RCV event
-SEC("kprobe/tcp_data_queue")
-int BPF_KPROBE(tcp_data_queue_entry, struct sock *sk, struct sk_buff *skb)
 {
 	if (!tracing_enabled)
 		return 0;
