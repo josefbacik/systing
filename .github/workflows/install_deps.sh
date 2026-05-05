@@ -3,7 +3,7 @@
 export DEBIAN_FRONTEND=noninteractive
 
 sudo apt-get install -y rustup linux-tools-common libelf-dev linux-libc-dev \
-    clang libbpf-dev make pkg-config jq \
+    clang libbpf-dev make pkg-config jq libjemalloc2 \
     --no-install-recommends
 
 # make errno/asm.h available.

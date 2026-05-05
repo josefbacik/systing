@@ -15,7 +15,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq
+          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq libjemalloc2
       - uses: actions/checkout@v2
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -51,7 +51,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq
+          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq libjemalloc2
       - uses: actions/checkout@v2
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
