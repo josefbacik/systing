@@ -380,3 +380,183 @@ fn test_memory_alloc_e2e() {
 
     eprintln!("\ntest_memory_alloc_e2e: all checks passed");
 }
+
+/// Trace `run_cmd` with the memory-alloc recorder and return the number of
+/// `malloc` rows attributed to the workload pid. Returns 0 if no parquet was
+/// emitted (i.e., no uprobes attached / no events).
+fn count_malloc_rows(run_cmd: Vec<String>, memory_alloc_lib: Option<String>) -> i64 {
+    setup_bpf_environment();
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+    let child_pid = traced_child.pid as i32;
+    let config = Config {
+        memory_alloc: true,
+        memory_alloc_sample_rate: 1,
+        memory_alloc_lib,
+        parquet_only: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+    assert_eq!(exit_code, 0, "allocator workload should exit cleanly");
+    if !dir.path().join("memory_alloc.parquet").exists() {
+        return 0;
+    }
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "allotest")
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM memory_alloc WHERE op = 'malloc' AND utid IN {UTIDS_FOR_PID}"
+        ),
+        [child_pid],
+        |row| row.get(0),
+    )
+    .expect("Failed to query memory_alloc")
+}
+
+fn small_malloc_workload() -> Vec<String> {
+    vec![
+        "python3".to_string(),
+        "-c".to_string(),
+        "objs=[bytes(512) for _ in range(2000)]\ndel objs\nimport time; time.sleep(0.1)\n"
+            .to_string(),
+    ]
+}
+
+fn find_jemalloc() -> Option<String> {
+    let out = std::process::Command::new("ldconfig")
+        .arg("-p")
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find(|l| l.contains("libjemalloc.so"))
+        .and_then(|l| l.split("=> ").nth(1))
+        .map(|p| p.trim().to_string())
+}
+
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_alloc_jemalloc_preload() {
+    let Some(jemalloc) = find_jemalloc() else {
+        eprintln!("SKIP: libjemalloc not found via ldconfig -p");
+        return;
+    };
+    eprintln!("Using LD_PRELOAD={jemalloc}");
+    setup_bpf_environment();
+    let dir = TempDir::new().expect("Failed to create temp dir");
+
+    // Spawn the workload independently (not via spawn_traced_child) so that
+    // allocator discovery scans a process that has already exec'd and mapped
+    // jemalloc. Run-command mode attaches pre-exec and would only see the
+    // parent's libc.
+    let mut child = std::process::Command::new("python3")
+        .env("LD_PRELOAD", &jemalloc)
+        .arg("-c")
+        .arg(
+            "import time\n\
+             for _ in range(1000):\n\
+             \x20 objs=[bytes(512) for _ in range(200)]\n\
+             \x20 del objs\n\
+             \x20 time.sleep(0.005)\n",
+        )
+        .spawn()
+        .expect("Failed to spawn jemalloc workload");
+    let child_pid = child.id();
+    let mut mapped = false;
+    for _ in 0..50 {
+        mapped = std::fs::read_to_string(format!("/proc/{child_pid}/maps"))
+            .map(|m| m.contains("libjemalloc"))
+            .unwrap_or(false);
+        if mapped {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        mapped,
+        "libjemalloc never appeared in /proc/{child_pid}/maps; LD_PRELOAD ineffective?"
+    );
+
+    let config = Config {
+        memory_alloc: true,
+        memory_alloc_sample_rate: 1,
+        pid: vec![child_pid],
+        duration: 2,
+        parquet_only: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+    let exit_code = systing(config, None).expect("systing recording failed");
+    assert_eq!(exit_code, 0);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        dir.path().join("memory_alloc.parquet").exists(),
+        "memory_alloc.parquet not written (discovery missed jemalloc?)"
+    );
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "jetest")
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+    let rows: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM memory_alloc WHERE op = 'malloc' AND utid IN {UTIDS_FOR_PID}"
+            ),
+            [child_pid as i64],
+            |row| row.get(0),
+        )
+        .expect("Failed to query memory_alloc");
+    assert!(
+        rows > 0,
+        "[memory_alloc] expected malloc rows with jemalloc preloaded, got 0"
+    );
+    eprintln!("    {rows} malloc events recorded under jemalloc");
+}
+
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_alloc_lib_override_name() {
+    // spawn_traced_child resolves the override against the forked child's
+    // pre-exec maps (== this test binary's maps). That's fine here because the
+    // test binary and python3 share the system libc.so.6.
+    let rows = count_malloc_rows(small_malloc_workload(), Some("libc.so.6".to_string()));
+    assert!(
+        rows > 0,
+        "[memory_alloc] expected malloc rows with --memory-alloc-lib libc.so.6, got 0"
+    );
+    eprintln!("    {rows} malloc events via --memory-alloc-lib name override");
+}
+
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_alloc_lib_override_bad_path() {
+    let rows = count_malloc_rows(
+        small_malloc_workload(),
+        Some("/nonexistent/liballoc.so".to_string()),
+    );
+    assert_eq!(
+        rows, 0,
+        "[memory_alloc] expected 0 rows for nonexistent --memory-alloc-lib, got {rows}"
+    );
+}
+
+/// Regression guard: a dynamically-linked binary lists `malloc` as an
+/// *undefined* import in `.dynsym`; `exe_defines_malloc` must not treat that
+/// as a locally-defined allocator.
+#[test]
+fn test_exe_defines_malloc_negative() {
+    let self_pid = std::process::id();
+    assert_eq!(
+        systing::systing_core::exe_defines_malloc(self_pid),
+        None,
+        "test binary is glibc-linked; exe_defines_malloc should return None"
+    );
+}

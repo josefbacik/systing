@@ -523,6 +523,10 @@ pub struct Config {
     pub memory_alloc: bool,
     /// Sample 1 in N allocator calls (0 or 1 = record all)
     pub memory_alloc_sample_rate: u32,
+    /// Override allocator library for memory-alloc uprobes (path or bare name)
+    pub memory_alloc_lib: Option<String>,
+    /// Prefix prepended to malloc/free/... symbol names (e.g. "je_")
+    pub memory_alloc_symbol_prefix: Option<String>,
     /// Enable network recording
     pub network: bool,
     /// Enable network packet-level probes (sendmsg, recvmsg, transmit, qdisc, drops).
@@ -582,6 +586,8 @@ impl Default for Config {
             memory_fault_sample_rate: 97,
             memory_alloc: false,
             memory_alloc_sample_rate: 1,
+            memory_alloc_lib: None,
+            memory_alloc_symbol_prefix: None,
             network: false,
             network_packets: false,
             resolve_addresses: false,
@@ -1185,8 +1191,10 @@ fn spawn_recorder_threads(
         );
     }
 
-    // Conditionally spawn memory recorder
-    if opts.memory {
+    // Conditionally spawn memory recorder. The same ringbuf/consumer carries
+    // both `memory` (mmap/brk/fault/rss) and `memory-alloc` (malloc/free)
+    // events, so start it if either recorder is enabled.
+    if opts.memory || opts.memory_alloc {
         let session_recorder = recorder.clone();
         let my_stop_tx = stop_tx.clone();
         let my_task_tx = task_info_tx.clone();
@@ -2313,38 +2321,85 @@ fn collect_memory_alloc_target_pids(opts: &Config) -> Vec<u32> {
     pids.into_iter().collect()
 }
 
-/// Resolve the set of distinct libc binaries mapped by the target processes.
-/// Matches `libc.so`, `libc.so.6`, `libc-2.xx.so`, and musl's `libc.so`/
-/// `ld-musl-*.so` via `resolve_library_path_for_pid`. Paths are deduplicated
-/// by `(st_dev, st_ino)` so containers that share an image get exactly one
-/// set of uprobes. Returns `(unique-inode paths, distinct path-string count)`.
-fn discover_libc_paths(pids: &[u32]) -> (Vec<String>, usize) {
-    let mut raw_paths = HashSet::new();
-    for pid in pids {
-        for name in ["libc.so.6", "libc.so", "ld-musl"] {
-            if let Some(p) = resolve_library_path_for_pid(*pid, name) {
-                raw_paths.insert(p);
-                break;
-            }
-        }
-    }
-    let raw_count = raw_paths.len();
-    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
+/// Override allocator libraries, checked before libc. When one of these is
+/// LD_PRELOAD'd it interposes `malloc`/`free`/... and libc's copies never run,
+/// so uprobes on libc would silently miss. Bare substrings so the `.contains()`
+/// match in `resolve_library_path_for_pid` catches versioned sonames and
+/// variants (`.so.2`, `_minimal`, `_and_profiler`, `-secure`, `shim`).
+const OVERRIDE_ALLOCATORS: &[&str] = &["libjemalloc", "libtcmalloc", "libmimalloc", "libsnmalloc"];
+const LIBC_CANDIDATES: &[&str] = &["libc.so.6", "libc.so", "ld-musl"];
+
+/// Check whether the main executable of `pid` defines `malloc` itself (e.g.
+/// jemalloc/tcmalloc statically linked into the binary). Only a *defined*
+/// global text symbol counts — every glibc-linked binary has an *undefined*
+/// `malloc` import in `.dynsym`, which must not match. For dynamic exes only
+/// `.dynsym` governs interposition; `.symtab` is consulted only when the
+/// binary is fully static (no dynamic symbol table).
+pub fn exe_defines_malloc(pid: u32) -> Option<String> {
+    use object::{Object, ObjectSymbol, SymbolKind};
+    let exe = format!("/proc/{pid}/exe");
+    let data = std::fs::read(&exe).ok()?;
+    let file = object::File::parse(&*data).ok()?;
+    let defines = |s: object::Symbol| {
+        s.kind() == SymbolKind::Text
+            && s.is_global()
+            && !s.is_undefined()
+            && s.name() == Ok("malloc")
+    };
+    let hit = if file.dynamic_symbols().next().is_some() {
+        file.dynamic_symbols().any(defines)
+    } else {
+        file.symbols().any(defines)
+    };
+    hit.then_some(exe)
+}
+
+/// Collapse allocator paths that refer to the same on-disk inode so containers
+/// sharing an image get exactly one set of uprobes. Returns surviving
+/// `(path, match-reason)` pairs plus the pre-dedup path-string count.
+fn dedup_by_inode(raw: HashMap<String, &'static str>) -> (Vec<(String, &'static str)>, usize) {
+    let raw_count = raw.len();
+    let mut seen: HashSet<(u64, u64)> = HashSet::new();
     let mut unique = Vec::new();
-    for p in raw_paths {
-        match std::fs::metadata(&p) {
-            // insert() returns false if the (dev, ino) was already present:
-            // drop this path as a duplicate of one we kept.
-            Ok(meta) if !seen_inodes.insert((meta.dev(), meta.ino())) => {}
-            _ => unique.push(p),
+    for (path, reason) in raw {
+        match std::fs::metadata(&path) {
+            Ok(meta) if !seen.insert((meta.dev(), meta.ino())) => {}
+            _ => unique.push((path, reason)),
         }
     }
     (unique, raw_count)
 }
 
-/// Attach malloc/free/... uprobes to each discovered libc. Probes are attached
-/// with pid=-1 so every process sharing that libc is covered; BPF-side
-/// `trace_task()` enforces the configured pid/cgroup filter.
+/// Resolve the set of distinct allocator binaries for the target processes.
+/// Resolution order per pid, first match wins: LD_PRELOAD-style override
+/// (`OVERRIDE_ALLOCATORS`) → the main exe if it statically defines `malloc`
+/// → libc/musl. Paths are deduplicated by `(st_dev, st_ino)`.
+fn discover_allocator_paths(pids: &[u32]) -> (Vec<(String, &'static str)>, usize) {
+    let mut raw: HashMap<String, &'static str> = HashMap::new();
+    'pid: for pid in pids {
+        for name in OVERRIDE_ALLOCATORS {
+            if let Some(p) = resolve_library_path_for_pid(*pid, name) {
+                raw.entry(p).or_insert(name);
+                continue 'pid;
+            }
+        }
+        if let Some(p) = exe_defines_malloc(*pid) {
+            raw.entry(p).or_insert("static in exe");
+            continue 'pid;
+        }
+        for name in LIBC_CANDIDATES {
+            if let Some(p) = resolve_library_path_for_pid(*pid, name) {
+                raw.entry(p).or_insert(name);
+                continue 'pid;
+            }
+        }
+    }
+    dedup_by_inode(raw)
+}
+
+/// Attach malloc/free/... uprobes to each discovered allocator library. Probes
+/// are attached with pid=-1 so every process sharing that library is covered;
+/// BPF-side `trace_task()` enforces the configured pid/cgroup filter.
 fn attach_memory_alloc_uprobes(
     skel: &mut SystingSystemSkel,
     opts: &Config,
@@ -2357,14 +2412,50 @@ fn attach_memory_alloc_uprobes(
         return Ok(Vec::new());
     }
 
-    let (libc_paths, raw_path_count) = discover_libc_paths(&pids);
-    if libc_paths.is_empty() {
-        eprintln!(
-            "Warning: memory-alloc recorder could not locate libc in /proc/<pid>/maps for any target; no uprobes attached"
-        );
-        return Ok(Vec::new());
+    let (alloc_paths, raw_path_count) = match &opts.memory_alloc_lib {
+        Some(lib) if std::path::Path::new(lib).is_absolute() => {
+            if !std::path::Path::new(lib).exists() {
+                eprintln!(
+                    "Warning: --memory-alloc-lib '{lib}' does not exist; no uprobes attached"
+                );
+                return Ok(Vec::new());
+            }
+            dedup_by_inode(HashMap::from([(lib.clone(), "--memory-alloc-lib")]))
+        }
+        Some(lib) => {
+            let mut raw: HashMap<String, &'static str> = HashMap::new();
+            for pid in &pids {
+                if let Some(p) = resolve_library_path_for_pid(*pid, lib) {
+                    raw.entry(p).or_insert("--memory-alloc-lib");
+                }
+            }
+            if raw.is_empty() {
+                eprintln!(
+                    "Warning: --memory-alloc-lib '{lib}' not found in any target's /proc/<pid>/maps; no uprobes attached"
+                );
+                return Ok(Vec::new());
+            }
+            dedup_by_inode(raw)
+        }
+        None => {
+            let (paths, raw_count) = discover_allocator_paths(&pids);
+            if paths.is_empty() {
+                eprintln!(
+                    "Warning: memory-alloc recorder could not locate an allocator (tried {}, /proc/<pid>/exe, {}); no uprobes attached",
+                    OVERRIDE_ALLOCATORS.join("/"),
+                    LIBC_CANDIDATES.join("/"),
+                );
+                return Ok(Vec::new());
+            }
+            (paths, raw_count)
+        }
+    };
+
+    for (path, reason) in &alloc_paths {
+        println!("memory-alloc: attaching to {path} (matched: {reason})");
     }
 
+    let prefix = opts.memory_alloc_symbol_prefix.as_deref().unwrap_or("");
     let probes: &[(&libbpf_rs::ProgramMut, &str, bool)] = &[
         (&skel.progs.systing_malloc_enter, "malloc", false),
         (&skel.progs.systing_malloc_exit, "malloc", true),
@@ -2396,15 +2487,16 @@ fn attach_memory_alloc_uprobes(
     ];
 
     let mut links = Vec::new();
-    for path in &libc_paths {
+    for (path, _) in &alloc_paths {
         for (prog, func, ret) in probes {
+            let func_name = format!("{prefix}{func}");
             match prog.attach_uprobe_with_opts(
                 -1,
                 path,
                 0,
                 UprobeOpts {
                     retprobe: *ret,
-                    func_name: Some(func.to_string()),
+                    func_name: Some(func_name.clone()),
                     ..Default::default()
                 },
             ) {
@@ -2413,16 +2505,16 @@ fn attach_memory_alloc_uprobes(
                     "Warning: failed to attach {}uprobe {}:{}: {}",
                     if *ret { "ret" } else { "" },
                     path,
-                    func,
+                    func_name,
                     e
                 ),
             }
         }
     }
     println!(
-        "memory-alloc: attached {} uprobe(s) across {} libc inode(s) (from {} path(s))",
+        "memory-alloc: attached {} uprobe(s) across {} allocator inode(s) (from {} path(s))",
         links.len(),
-        libc_paths.len(),
+        alloc_paths.len(),
         raw_path_count
     );
     Ok(links)
@@ -2842,7 +2934,7 @@ fn run_tracing_loop(
         println!("Missed packet events: {}", dump_missed_events(skel, 5));
         println!("Missed poll events: {}", dump_missed_events(skel, 6));
     }
-    if opts.memory {
+    if opts.memory || opts.memory_alloc {
         println!("Missed memory events: {}", dump_missed_events(skel, 8));
     }
     if opts.memory_alloc {

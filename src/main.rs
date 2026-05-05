@@ -80,6 +80,12 @@ struct Command {
     /// Sample 1 in N allocator calls (malloc/free/...) when the memory-alloc recorder is enabled (0 or 1 = record all). Note: values > 1 sample alloc and free independently, so addr-based alloc/free pairing for leak detection is unreliable; use for hotspot profiling.
     #[arg(long, default_value = "1")]
     memory_alloc_sample_rate: u32,
+    /// Override allocator library for memory-alloc uprobes. Absolute path is used verbatim (host namespace); bare name is resolved per-pid via /proc/<pid>/maps (container-safe). An absolute path also works around the pre-exec limitation when tracing via `-- <cmd>`.
+    #[arg(long)]
+    memory_alloc_lib: Option<String>,
+    /// Prefix prepended to malloc/free/... symbol names when attaching memory-alloc uprobes (e.g. "je_" for jemalloc built with --with-jemalloc-prefix).
+    #[arg(long)]
+    memory_alloc_symbol_prefix: Option<String>,
     // Network recording enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     network: bool,
@@ -175,6 +181,8 @@ impl From<Command> for Config {
             memory_fault_sample_rate: cmd.memory_fault_sample_rate,
             memory_alloc: cmd.memory_alloc,
             memory_alloc_sample_rate: cmd.memory_alloc_sample_rate,
+            memory_alloc_lib: cmd.memory_alloc_lib,
+            memory_alloc_symbol_prefix: cmd.memory_alloc_symbol_prefix,
             network: cmd.network,
             network_packets: cmd.network_packets,
             resolve_addresses: cmd.resolve_addresses,
