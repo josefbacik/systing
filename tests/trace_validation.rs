@@ -3450,3 +3450,133 @@ fn test_network_dns_resolution() {
 
     eprintln!("  All DNS resolution checks passed");
 }
+
+/// Regression test: `--only-recorder cpu-stacks` must still emit STACK_RUNNING
+/// samples even though the scheduler recorder is disabled.
+///
+/// CPU stack samples are gated in BPF by `cpu_running_pid`, which is populated
+/// by `systing_sched_switch`. If the sched programs are not loaded when only
+/// cpu-stacks is requested, `cpu_running_pid` stays empty and every
+/// STACK_RUNNING sample from the perf clock is dropped. The fix is to load the
+/// sched_switch program when stack collection is enabled and to gate the
+/// scheduler `task_event` emission separately on the sched recorder.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_only_cpu_stacks_emits_samples() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+
+    // CPU-bound workload to give the perf clock something to sample.
+    let stop = Arc::new(AtomicBool::new(false));
+    let workload_handle = {
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut acc: u64 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                for i in 0..100_000u64 {
+                    acc = acc.wrapping_add(i.wrapping_mul(i));
+                }
+                std::hint::black_box(acc);
+            }
+        })
+    };
+
+    // Mirror what `--only-recorder cpu-stacks` produces in main.rs:
+    // every other recorder is off, including the scheduler.
+    let config = Config {
+        duration: 4,
+        output_dir: dir.path().to_path_buf(),
+        no_sched: true,
+        no_cpu_stack_traces: false,
+        no_sleep_stack_traces: true,
+        no_interruptible_stack_traces: true,
+        syscalls: false,
+        memory: false,
+        memory_alloc: false,
+        network: false,
+        network_packets: false,
+        markers: false,
+        collect_pystacks: false,
+        parquet_only: true,
+        ..Config::default()
+    };
+
+    systing(config, None).expect("systing recording failed");
+    stop.store(true, Ordering::Relaxed);
+    workload_handle.join().expect("Workload thread panicked");
+
+    let stack_sample_path = dir.path().join("stack_sample.parquet");
+    assert!(
+        stack_sample_path.exists(),
+        "stack_sample.parquet not produced by --only-recorder cpu-stacks"
+    );
+
+    let file = File::open(&stack_sample_path).expect("Failed to open stack_sample.parquet");
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create reader");
+    let reader = builder.build().expect("Failed to build reader");
+
+    let mut running_samples = 0u64;
+    let mut other_samples = 0u64;
+    for batch_result in reader {
+        let batch = batch_result.expect("Failed to read batch");
+        let event_type_col = batch
+            .column_by_name("stack_event_type")
+            .expect("stack_event_type column missing")
+            .as_any()
+            .downcast_ref::<arrow::array::Int8Array>()
+            .expect("stack_event_type should be Int8");
+        for i in 0..batch.num_rows() {
+            match event_type_col.value(i) {
+                1 => running_samples += 1,
+                _ => other_samples += 1,
+            }
+        }
+    }
+
+    eprintln!(
+        "  --only-recorder cpu-stacks produced running={running_samples}, other={other_samples}"
+    );
+    // The perf clock samples at ~1 kHz per CPU and the workload pegs a core
+    // for 4s, so we expect hundreds of samples. Setting a floor (rather than
+    // `> 0`) catches a "only one CPU's cpu_running_pid ever populated"
+    // regression that a single sample would mask.
+    assert!(
+        running_samples > 10,
+        "--only-recorder cpu-stacks produced too few STACK_RUNNING samples \
+         (running={running_samples}, other={other_samples}); \
+         sched_switch must load to populate cpu_running_pid on every CPU"
+    );
+
+    // Scheduler recorder is off, so no sleep stacks should sneak in.
+    assert_eq!(
+        other_samples, 0,
+        "Unexpected non-RUNNING stack samples emitted while --only-recorder cpu-stacks: \
+         got {other_samples}"
+    );
+
+    // Sanity: scheduler outputs must not be produced when sched is disabled.
+    let sched_slice = dir.path().join("sched_slice.parquet");
+    if sched_slice.exists() {
+        let file = File::open(&sched_slice).expect("Failed to open sched_slice.parquet");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("Failed to create sched_slice reader");
+        let reader = builder.build().expect("Failed to build sched_slice reader");
+        let mut sched_rows = 0u64;
+        for batch_result in reader {
+            let batch = batch_result.expect("Failed to read sched_slice batch");
+            sched_rows += batch.num_rows() as u64;
+        }
+        assert_eq!(
+            sched_rows, 0,
+            "--only-recorder cpu-stacks produced {sched_rows} sched_slice rows; \
+             scheduler events should not be emitted to userspace when sched is off"
+        );
+    }
+}

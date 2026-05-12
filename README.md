@@ -77,7 +77,8 @@ This will display all available recorders and their default states:
 - `interruptible-stacks` - Interruptible sleep stack traces (on by default, requires sleep-stacks)
 - `cpu-stacks` - CPU perf stack traces (on by default)
 - `network` - Network traffic recording (TCP/UDP send/receive and packet-level latency)
-- `pystacks` - Python stack tracing
+
+Python stack symbolization is not a recorder; enable it with `--collect-pystacks`, which resolves Python frames in whichever stacks the active recorders collect.
 
 Note: `sleep-stacks` acts as a master switch for all sleep stack collection. When enabled,
 both uninterruptible (D state) and interruptible (S state) sleep stacks are collected by

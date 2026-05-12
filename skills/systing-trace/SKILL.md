@@ -50,7 +50,6 @@ systing --list-recorders
 | `interruptible-stacks` | on | Interruptible sleep (S-state) stacks |
 | `syscalls` | off | All syscall entry/exit |
 | `network` | off | TCP/UDP packets, syscalls, retransmits, RTT |
-| `pystacks` | off | Python stack frames (CPython 3.8–3.13) |
 | `markers` | off | Userspace marker events (via `faccessat2`) |
 | `tpu` | off | TPU op-level profile via XLA runtime gRPC (port 8466) |
 | `tpu-metrics` | off | TPU runtime metrics polling (port 8431, lightweight) |
@@ -74,7 +73,7 @@ sudo systing --only-recorder sched --only-recorder network -d 10 --output trace.
 | `-d <SEC>` | Duration in seconds (0 = until Ctrl-C or command exits) |
 | `--output <PATH>` | Output file; `.duckdb` extension → DuckDB, `.pb`/`.perfetto` → Perfetto |
 | `--output-dir <DIR>` | Directory for intermediate parquet files (default `./traces`) |
-| `--collect-pystacks` | Enable Python stack tracing (shortcut for `--add-recorder pystacks`) |
+| `--collect-pystacks` | Enable Python stack symbolization (resolves Python frames in user stacks) |
 | `--enable-debuginfod` | Better symbol resolution (requires `DEBUGINFOD_URLS` env var) |
 | `--no-stack-traces` | Disable all stack trace collection |
 | `--marker-threshold <N>` | Stop after N marker instant events |

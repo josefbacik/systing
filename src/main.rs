@@ -235,7 +235,6 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
                 opts.memory = true;
             }
         }
-        "pystacks" => opts.collect_pystacks = enable,
         "markers" => opts.markers = enable,
         "tpu-metrics" => opts.tpu_metrics = enable,
         _ => unreachable!("validated recorder name not handled: {recorder_name}"),
@@ -257,7 +256,6 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         opts.memory_alloc = false;
         opts.network = false;
         opts.network_packets = false;
-        opts.collect_pystacks = false;
         opts.markers = false;
         opts.tpu_profile = false;
         opts.tpu_metrics = false;

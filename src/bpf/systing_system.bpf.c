@@ -73,6 +73,9 @@ const volatile struct {
 	u32 memory_fault_sample_rate; /* Sample 1 in N page faults (0 or 1 = all) */
 	u32 memory_alloc_sample_rate; /* Sample 1 in N malloc/free calls (0 or 1 = all) */
 	u32 page_size;         /* sysconf(_SC_PAGESIZE) for page-count -> byte conversion */
+	u32 no_sched;          /* Sched recorder off: sched_switch still runs for
+				* cpu_running_pid and sleep stacks, but task_event
+				* emission is suppressed. */
 } tool_config = {};
 
 enum event_type {
@@ -1691,26 +1694,45 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 	if (!trace_task(prev) && !trace_task(next))
 		return 0;
 
-	event = reserve_task_event(&flags);
-	if (!event)
-		return handle_missed_event(MISSED_SCHED_EVENT);
-
-	event->ts = ts;
-	event->type = SCHED_SWITCH;
-	event->cpu = bpf_get_smp_processor_id();
-	record_task_info(&event->next, next);
-	record_task_info(&event->prev, prev);
 	/*
-	 * Convert raw task state to ftrace format (mask to TASK_REPORT bits + preemption).
-	 * The kernel stores exit states (EXIT_ZOMBIE, EXIT_DEAD) in a separate exit_state
-	 * field, so we must OR the kernel-provided prev_state (captured at the right moment)
-	 * with exit_state to get the complete task state.
-	 * See kernel's __task_state_index() in include/linux/sched.h.
+	 * Scheduler recorder may be off while stack collection is on (e.g.
+	 * `--only-recorder cpu-stacks`). The sched_switch program still has
+	 * to run unconditionally to keep cpu_running_pid current for
+	 * STACK_RUNNING gating and to emit sleep stacks, but we must not
+	 * emit the scheduler task_event itself in that mode.
 	 */
-	event->prev_state = preempt ? TASK_REPORT_MAX : ((prev_state | prev->exit_state) & TASK_REPORT);
-	event->next_prio = next->prio;
-	event->prev_prio = prev->prio;
-	bpf_ringbuf_submit(event, flags);
+	if (!tool_config.no_sched) {
+		event = reserve_task_event(&flags);
+		if (!event) {
+			/*
+			 * Intentional fall-through: previously this returned
+			 * early on missed events, but the sleep-stack ringbuf
+			 * is independent of `ringbufs`, so a full sched ring
+			 * shouldn't cascade into dropping the sleep stack.
+			 */
+			handle_missed_event(MISSED_SCHED_EVENT);
+		} else {
+			event->ts = ts;
+			event->type = SCHED_SWITCH;
+			event->cpu = bpf_get_smp_processor_id();
+			record_task_info(&event->next, next);
+			record_task_info(&event->prev, prev);
+			/*
+			 * Convert raw task state to ftrace format (mask to
+			 * TASK_REPORT bits + preemption). The kernel stores
+			 * exit states (EXIT_ZOMBIE, EXIT_DEAD) in a separate
+			 * exit_state field, so we must OR the kernel-provided
+			 * prev_state (captured at the right moment) with
+			 * exit_state to get the complete task state. See
+			 * kernel's __task_state_index() in include/linux/sched.h.
+			 */
+			event->prev_state = preempt ? TASK_REPORT_MAX :
+				((prev_state | prev->exit_state) & TASK_REPORT);
+			event->next_prio = next->prio;
+			event->prev_prio = prev->prio;
+			bpf_ringbuf_submit(event, flags);
+		}
+	}
 
 	/*
 	 * Record the blocked stack trace for sleep states.
