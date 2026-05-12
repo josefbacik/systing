@@ -299,13 +299,6 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             ringbuf_families: &["memory_ringbufs"],
         },
         RecorderInfo {
-            name: "pystacks",
-            description: "Python stack tracing",
-            default_enabled: false,
-            bpf_programs: &[],
-            ringbuf_families: &[],
-        },
-        RecorderInfo {
             name: "markers",
             description: "Userspace marker events (faccessat2 with mode=-975)",
             default_enabled: false,
@@ -362,7 +355,6 @@ fn is_recorder_enabled(name: &str, opts: &Config) -> bool {
         "memory-alloc" => opts.memory_alloc,
         "network" => opts.network,
         "network-packets" => opts.network_packets,
-        "pystacks" => opts.collect_pystacks,
         "markers" => opts.markers,
         "tpu" => opts.tpu_profile,
         "tpu-metrics" => opts.tpu_metrics,
