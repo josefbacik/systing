@@ -158,6 +158,18 @@ const SCHED_BPF_PROGRAMS: &[&str] = &[
     "systing_softirq_exit",
 ];
 
+/// Stack-collection recorders (cpu-stacks, sleep-stacks, interruptible-stacks)
+/// depend on `systing_sched_switch` even when the scheduler recorder is off:
+/// it populates `cpu_running_pid` (the gate for STACK_RUNNING samples) and is
+/// where sleep/interruptible stacks are emitted. The `task_event` emission for
+/// the scheduler itself is gated separately in BPF by `tool_config.no_sched`,
+/// so loading the program here does not produce sched events.
+///
+/// Because the program references the `ringbufs` map, that family must also
+/// be autocreated whenever this program is loaded (see
+/// `get_required_ringbuf_families`).
+const SCHED_SWITCH_FOR_STACKS: &[&str] = &["systing_sched_switch"];
+
 const SYSCALL_BPF_PROGRAMS: &[&str] = &[
     "tracepoint__raw_syscalls__sys_enter",
     "tracepoint__raw_syscalls__sys_exit",
@@ -253,22 +265,22 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             name: "sleep-stacks",
             description: "Sleep stack traces",
             default_enabled: true,
-            bpf_programs: &[],
-            ringbuf_families: &[],
+            bpf_programs: SCHED_SWITCH_FOR_STACKS,
+            ringbuf_families: &["ringbufs"],
         },
         RecorderInfo {
             name: "interruptible-stacks",
             description: "Interruptible sleep stack traces",
             default_enabled: true,
-            bpf_programs: &[],
-            ringbuf_families: &[],
+            bpf_programs: SCHED_SWITCH_FOR_STACKS,
+            ringbuf_families: &["ringbufs"],
         },
         RecorderInfo {
             name: "cpu-stacks",
             description: "CPU perf stack traces",
             default_enabled: true,
-            bpf_programs: &[],
-            ringbuf_families: &[],
+            bpf_programs: SCHED_SWITCH_FOR_STACKS,
+            ringbuf_families: &["ringbufs"],
         },
         RecorderInfo {
             name: "network",
@@ -1991,6 +2003,7 @@ fn configure_bpf_skeleton(
         rodata.tool_config.no_sleep_stack_traces = opts.no_sleep_stack_traces as u32;
         rodata.tool_config.no_interruptible_stack_traces =
             opts.no_interruptible_stack_traces as u32;
+        rodata.tool_config.no_sched = opts.no_sched as u32;
         rodata.tool_config.confidentiality_mode = detect_confidentiality_mode();
         if !opts.cgroup.is_empty() {
             rodata.tool_config.filter_cgroup = 1;
