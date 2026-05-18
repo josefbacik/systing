@@ -1510,14 +1510,20 @@ static void emit_stack_event_with_ts(void *ctx, struct task_struct *task,
 	 * window between sched_switch (where we update cpu_running_pid) and
 	 * the actual context switch (where 'current' is updated).
 	 *
-	 * At startup (before any sched_switch on this CPU), expected_pid is 0
-	 * and samples are dropped. The userspace validation handles this by
-	 * skipping samples that occur before the first sched_slice.
+	 * At startup (before any sched_switch on this CPU), expected_pid is 0.
+	 * The race we're guarding against requires sched_switch to have set
+	 * the slot to a real PID, so a 0 slot cannot indicate a race — let the
+	 * sample through. This matters on idle many-core machines: a CPU-bound
+	 * task that was already running when the trace started can run for the
+	 * entire trace without a single sched_switch on its CPU, and dropping
+	 * those samples loses all CPU stacks for that task.
 	 */
 	if (type == STACK_RUNNING) {
 		u32 key = 0;
 		u32 *expected_pid = bpf_map_lookup_elem(&cpu_running_pid, &key);
-		if (!expected_pid || *expected_pid != task->pid)
+		if (!expected_pid)
+			return;
+		if (*expected_pid != 0 && *expected_pid != task->pid)
 			return;
 	}
 
