@@ -379,8 +379,20 @@ struct memory_event {
  * `struct task_event`
  */
 #ifdef SYSTING_PYSTACKS
+/*
+ * Notify userspace that a traced process exec'd or forked so it can update
+ * the pystacks discovery state. The handler in handle_exec_events() reads
+ * /proc/<pid>/{exe,maps}, so this only carries the pid and a flag describing
+ * what kernel event produced it (exec vs. fork) for logging/diagnostics.
+ */
 struct exec_event {
 	u32 pid;
+	/* 1 if produced by sched_process_fork (Python parent forked a new
+	 * process), 0 if produced by sched_process_exec. u32 (not u8/bool) so
+	 * the struct has no padding bytes -- bpf_ringbuf_reserve() does not
+	 * zero its allocation, so padding would leak uninitialized kernel
+	 * memory to userspace. */
+	u32 is_fork;
 };
 #endif
 
@@ -712,7 +724,15 @@ struct memory_ringbuf_map {
 #ifdef SYSTING_PYSTACKS
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 4096 /* 4KB - exec events are tiny and rare */);
+	/*
+	 * 16KB. Carries both exec events and Python-process-fork events, both
+	 * tiny (~16 bytes with ringbuf header). Pre-fork servers and
+	 * multiprocessing pools can fork in bursts; if a reservation does
+	 * fail, the BPF maps are already correct (fork propagation happens
+	 * before the ringbuf write) and only the userspace pid->version hint
+	 * is missed.
+	 */
+	__uint(max_entries, 16384);
 } ringbuf_exec_events SEC(".maps");
 #endif
 
@@ -1800,6 +1820,25 @@ static int handle_sched_process_exit(struct task_struct *task)
 	if (!trace_task(task))
 		return 0;
 
+#ifdef SYSTING_PYSTACKS
+	/*
+	 * Drop the pystacks config when the *last* thread of a process exits.
+	 * Forked Python children that exit without exec'ing (multiprocessing
+	 * workers, plain os.fork()) would otherwise leak entries in the
+	 * bounded targeted_pids/pystacks_pid_config maps and starve later
+	 * forks once those maps fill (1024 entries each).
+	 *
+	 * sched_process_exit fires per *thread*, but both maps are keyed by
+	 * tgid. do_exit() decrements signal->live before this tracepoint
+	 * fires, so 0 here means this thread is the last one in the group;
+	 * earlier-exiting threads see > 0 and leave the config alone (the
+	 * remaining threads still need it).
+	 */
+	if (tool_config.collect_pystacks &&
+	    BPF_CORE_READ(task, signal, live.counter) == 0)
+		pystacks_clear_pid(task->tgid);
+#endif
+
 	event = reserve_task_event(&flags);
 	if (!event)
 		return handle_missed_event(MISSED_SCHED_EVENT);
@@ -1830,6 +1869,36 @@ static int handle_sched_process_fork(struct task_struct *parent,
 	u8 val = 1;
 	bpf_map_update_elem(&pids, &child_pid, &val, BPF_ANY);
 
+#ifdef SYSTING_PYSTACKS
+	/*
+	 * If the parent is a registered Python process, the forked child shares
+	 * its address space (CoW) until it execs, so the parent's pystacks
+	 * config is valid for the child too. Propagate it immediately so the
+	 * child's very first samples have working pystacks (no userspace round
+	 * trip), then notify userspace so the symbol resolver learns the
+	 * child's Python version (used for line-table parsing).
+	 *
+	 * Threads (CLONE_THREAD) share the parent's tgid; pystacks_propagate_fork
+	 * detects that and returns false without touching the maps.
+	 */
+	if (tool_config.collect_pystacks &&
+	    pystacks_propagate_fork(parent->tgid, child->tgid)) {
+		struct exec_event *event = bpf_ringbuf_reserve(
+			&ringbuf_exec_events, sizeof(*event), 0);
+		if (event) {
+			event->pid = child->tgid;
+			event->is_fork = 1;
+			bpf_ringbuf_submit(event, 0);
+		}
+		/*
+		 * If the ringbuf reservation fails the BPF maps are still
+		 * correct (populated above); only the userspace pid->version
+		 * mapping is missed, which degrades line numbers but keeps
+		 * function-level symbolization working.
+		 */
+	}
+#endif
+
 	return 0;
 }
 
@@ -1850,11 +1919,34 @@ int BPF_PROG(systing_sched_process_exec, struct task_struct *task,
 	if (!trace_task(task))
 		return 0;
 
+	/*
+	 * Reserve the ringbuf slot *before* clearing the stale pystacks config.
+	 * If the reservation fails, userspace never learns about this exec, so
+	 * leaving the (now-stale) config in place is the lesser evil: stale
+	 * config produces unreadable garbage that walks to a 0-frame stack,
+	 * but no config means we'd silently never re-register if the new image
+	 * is still Python.
+	 */
 	struct exec_event *event =
 		bpf_ringbuf_reserve(&ringbuf_exec_events, sizeof(*event), 0);
 	if (!event)
 		return 0;
+
+	/*
+	 * Exec replaces the address space, so any pystacks config we have for
+	 * this pid (whether registered at startup, dynamically discovered, or
+	 * inherited from a parent at fork time) is now stale. Drop it; the
+	 * exec event triggers userspace re-discovery, which re-registers the
+	 * pid if the new image is still Python.
+	 *
+	 * This is what keeps subprocess.Popen() from a Python parent from
+	 * leaking a stale entry per call: fork propagates the parent's config
+	 * to the child, then exec into the subprocess binary clears it again.
+	 */
+	pystacks_clear_pid(task->tgid);
+
 	event->pid = task->tgid;
+	event->is_fork = 0;
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }

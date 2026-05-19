@@ -1127,3 +1127,57 @@ __hidden int pystacks_read_stacks(
 struct pystacks_message* pystacks_get_msg(void) {
   return bpf_map_lookup_elem(&pystacks_msg_heap, &zero);
 }
+
+/* See pystacks.bpf.h for the rationale.
+ *
+ * Note both maps are keyed by tgid, so this is a process-level operation.
+ * Threads (CLONE_THREAD) share their parent's tgid and need no propagation;
+ * they're handled here as a no-op (parent_pid == child_pid).
+ */
+__hidden bool pystacks_propagate_fork(pid_t parent_pid, pid_t child_pid) {
+  if (parent_pid == child_pid) {
+    /* Same tgid -> a new thread, not a forked process. The existing
+     * per-tgid entry already covers it. */
+    return false;
+  }
+
+  PyPidData* cfg = bpf_map_lookup_elem(&pystacks_pid_config, &parent_pid);
+  if (!cfg) {
+    /* Parent isn't a registered Python process — or it is, but its config
+     * was just cleared by pystacks_clear_pid() on exec and userspace hasn't
+     * re-registered it yet. The latter is a real (small) gap: a process that
+     * execs into Python and immediately forks workers before the userspace
+     * exec handler catches up will miss propagation for those early forks.
+     * Closing it would require waiting for userspace acks in the BPF fork
+     * path, which isn't worth the complexity given the window is sub-100ms. */
+    return false;
+  }
+
+  /* The forked child shares the parent's address space (CoW), so the
+   * parent's offsets / runtime addresses are valid for the child until it
+   * execs (at which point pystacks_clear_pid drops this entry).
+   *
+   * Both updates must succeed or neither: a child in targeted_pids without
+   * a pystacks_pid_config entry makes the sampler walk the binary-id
+   * fallback chain on every sample to no effect, and a config entry that
+   * isn't targeted is just a wasted slot. Either map can fill up under
+   * heavy fork churn (1024 entries each); when that happens, fail closed. */
+  if (bpf_map_update_elem(&pystacks_pid_config, &child_pid, cfg, BPF_ANY))
+    return false;
+
+  bool targeted = true;
+  if (bpf_map_update_elem(&targeted_pids, &child_pid, &targeted, BPF_ANY)) {
+    bpf_map_delete_elem(&pystacks_pid_config, &child_pid);
+    return false;
+  }
+
+  return true;
+}
+
+/* See pystacks.bpf.h for the rationale.
+ * bpf_map_delete_elem returns -ENOENT for missing keys; safe to call
+ * unconditionally on every exec from a traced task. */
+__hidden void pystacks_clear_pid(pid_t pid) {
+  bpf_map_delete_elem(&pystacks_pid_config, &pid);
+  bpf_map_delete_elem(&targeted_pids, &pid);
+}

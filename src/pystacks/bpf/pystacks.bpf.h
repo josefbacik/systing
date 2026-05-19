@@ -54,6 +54,29 @@ int pystacks_read_stacks(
     struct task_struct* task,
     struct pystacks_message* py_msg_buffer);
 
+/* Propagate the parent's pystacks pid configuration to a forked child.
+ *
+ * Forked children share the parent's address space (CoW) until they exec, so
+ * the parent's PyPidData (struct offsets, _PyRuntime address, TLS key, ...)
+ * is valid for the child too. Without this, every fork() of a Python process
+ * (multiprocessing workers, gunicorn pre-forks, plain os.fork()) gets a fresh
+ * tgid that fails the targeted_pids / pystacks_pid_config lookups and silently
+ * drops every Python stack for the child.
+ *
+ * Returns true if the parent was a registered Python process and the config
+ * was propagated. Threads (same tgid) are a no-op and return false.
+ */
+bool pystacks_propagate_fork(pid_t parent_pid, pid_t child_pid);
+
+/* Drop a pid from the pystacks targeting maps. Called on exec: the address
+ * space (and any inherited PyPidData) is replaced, so the cached config is
+ * stale. The exec event handler in userspace re-discovers the new binary and
+ * re-registers if it is still Python. Without this cleanup, fork+exec from a
+ * Python parent (subprocess.Popen) leaks a stale entry per call and steadily
+ * fills the bounded pid maps. Safe to call for pids that were never registered.
+ */
+void pystacks_clear_pid(pid_t pid);
+
 struct pystacks_msg_heap_map {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __uint(max_entries, 1);
