@@ -729,13 +729,21 @@ unsafe impl Plain for marker_event {}
 unsafe impl Plain for memory_event {}
 unsafe impl Plain for memory_event_header {}
 
-/// BPF exec event - delivered via dedicated ringbuf when a traced process execs.
-/// Used to dynamically discover Python PIDs for pystacks.
+/// BPF exec/fork event - delivered via the `ringbuf_exec_events` ringbuf when
+/// a traced process execs (any traced task) or forks (Python parents only).
+/// Used to dynamically keep pystacks discovery in sync with the process tree.
+/// Layout must match `struct exec_event` in `systing_system.bpf.c`.
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 #[allow(non_camel_case_types)]
 struct exec_event {
     pid: u32,
+    /// 1 if produced by sched_process_fork (the BPF side already copied the
+    /// parent's pystacks config to this pid), 0 if produced by
+    /// sched_process_exec (the BPF side cleared this pid's pystacks config
+    /// and we need to re-discover from scratch). u32 to match the BPF struct,
+    /// which uses u32 to keep the struct padding-free.
+    is_fork: u32,
 }
 unsafe impl Plain for exec_event {}
 
@@ -1544,18 +1552,31 @@ fn discover_python_processes(debug: bool) -> Vec<u32> {
     discovered
 }
 
-/// Handles exec events from the BPF ringbuf, dynamically adding Python PIDs to pystacks.
+/// Handles exec/fork events from the BPF ringbuf, keeping pystacks discovery
+/// in sync with the process tree.
 ///
-/// When a traced process execs into Python directly, adds it to pystacks immediately.
-/// When a traced process execs into a pyenv launcher (e.g., forkapple's `fa`), scans
-/// /proc for all Python processes since the actual Python workers may be outside the
-/// traced process tree (pre-forked by a server like forkapple).
+/// Exec events: a traced process replaced its image. The BPF side already
+/// dropped any stale pystacks config for the pid; if the new image is Python
+/// (or embeds libpython) we re-register it. When the exec'd binary is a pyenv
+/// launcher (e.g., forkapple's `fa`), we additionally scan /proc once for
+/// Python workers that may live outside the traced process tree.
+///
+/// Fork events: a registered Python process forked. The BPF side already
+/// copied the parent's pystacks config to the child (the address space is
+/// CoW-shared until exec, so the parent's config is valid); we only need to
+/// teach the symbol resolver the child's Python version for line-table
+/// parsing. `psr.add_pid()` does that as a side effect of re-discovering the
+/// child via /proc.
 fn handle_exec_events(
     exec_rx: Receiver<exec_event>,
     psr: Arc<crate::pystacks::stack_walker::StackWalkerRun>,
     pids_map: libbpf_rs::MapHandle,
     pystacks_debug: bool,
 ) {
+    // Pids we've successfully registered with pystacks. Used only to keep the
+    // logging quiet on repeat events; it does NOT short-circuit re-discovery,
+    // because exec invalidates the registration (BPF clears the maps and we
+    // must re-register the new image) and forks always carry a fresh pid.
     let mut added_pids = std::collections::HashSet::new();
     // Single scan flag: we only scan /proc once per trace session because
     // the forkapple server's Python workers are long-lived and pre-forked,
@@ -1563,22 +1584,24 @@ fn handle_exec_events(
     let mut did_scan = false;
     while let Ok(event) = exec_rx.recv() {
         let pid = event.pid;
+        let is_fork = event.is_fork != 0;
+        let kind = if is_fork { "Fork" } else { "Exec" };
         let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
             if pystacks_debug {
                 eprintln!(
-                    "[pystacks debug] Exec event for PID {} but readlink failed",
-                    pid
+                    "[pystacks debug] {} event for PID {} but readlink failed (process exited?)",
+                    kind, pid
                 );
             }
             continue;
         };
         let exe_str = exe.to_string_lossy();
+        let was_registered = added_pids.contains(&pid);
 
-        // Try every traced exec: check_python_process() scans maps for
-        // libpython, so embedders (uwsgi, gunicorn, etc.) are covered and
-        // non-python processes are rejected there. Only mark the pid as
-        // handled on success so exec chains (e.g. bash -> `exec python3`)
-        // re-probe on the later exec.
+        // Try discovery on every event. check_python_process() scans
+        // /proc/pid/exe and /proc/pid/maps for libpython, so embedders
+        // (uwsgi, gunicorn, ...) are covered and non-python processes are
+        // rejected cheaply.
         //
         // sched_process_exec fires before ld.so maps libpython, so for
         // dynamically-linked python stubs the first maps scan often finds
@@ -1586,32 +1609,57 @@ fn handle_exec_events(
         // exec-handler thread for up to 100ms per miss, which is acceptable
         // given the dedicated 100K-deep channel; a non-blocking retry queue
         // is a follow-up if python fork-storms become an issue.
-        if !added_pids.contains(&pid) {
-            let looks_like_python = exe_str.contains("python");
-            let mut registered = psr.add_pid(pid as i32);
-            if !registered && looks_like_python {
-                for delay_ms in [10, 30, 60] {
-                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                    if psr.add_pid(pid as i32) {
-                        registered = true;
-                        break;
-                    }
+        //
+        // Forks don't need the retry: the child's address space is fully set
+        // up at fork time (CoW from the parent), and the BPF maps are already
+        // populated regardless of whether this userspace pass succeeds.
+        let looks_like_python = exe_str.contains("python");
+        let mut registered = psr.add_pid(pid as i32);
+        if !registered && looks_like_python && !is_fork {
+            for delay_ms in [10, 30, 60] {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                if psr.add_pid(pid as i32) {
+                    registered = true;
+                    break;
                 }
             }
-            if registered {
+        }
+        if registered {
+            if !was_registered {
                 added_pids.insert(pid);
                 eprintln!(
-                    "[pystacks] Dynamically added Python PID {} ({})",
-                    pid, exe_str
-                );
-            } else if looks_like_python && pystacks_debug {
-                eprintln!(
-                    "[pystacks debug] python-named exe PID {} ({}) but libpython/_PyRuntime not found after retries",
-                    pid, exe_str
+                    "[pystacks] Dynamically added Python PID {} ({}{})",
+                    pid,
+                    exe_str,
+                    if is_fork { ", forked" } else { "" }
                 );
             }
+        } else if was_registered && !is_fork {
+            // Was a Python process; the new image isn't (or its libpython
+            // hasn't been mapped yet). BPF already dropped its pystacks
+            // config; drop our tracking too so a later exec back into Python
+            // re-logs the add.
+            added_pids.remove(&pid);
+            if pystacks_debug {
+                if looks_like_python {
+                    eprintln!(
+                        "[pystacks debug] PID {} re-exec'd ({}) but libpython/_PyRuntime not found; dropped",
+                        pid, exe_str
+                    );
+                } else {
+                    eprintln!(
+                        "[pystacks debug] PID {} exec'd from Python into non-Python ({}); dropped",
+                        pid, exe_str
+                    );
+                }
+            }
+        } else if looks_like_python && pystacks_debug {
+            eprintln!(
+                "[pystacks debug] python-named exe PID {} ({}, {}) but libpython/_PyRuntime not found",
+                pid, exe_str, kind
+            );
         }
-        if !did_scan && exe_str.contains(".pyenv/") && !exe_str.contains("python") {
+        if !did_scan && !is_fork && exe_str.contains(".pyenv/") && !exe_str.contains("python") {
             // A pyenv binary but not Python itself (e.g., forkapple's `fa`).
             // The actual Python process may be outside our traced tree.
             // Scan /proc for all Python processes and add them.

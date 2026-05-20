@@ -1928,6 +1928,379 @@ fn test_pystacks_python313() {
 }
 
 // =============================================================================
+// Pystacks dynamic process discovery
+//
+// These tests exercise the paths where Python work runs in a process that did
+// NOT exist (or was not yet a Python process) when systing started. The
+// recorder must keep the BPF `targeted_pids` / `pystacks_pid_config` maps in
+// sync as the process tree changes:
+//
+//   - new threads share the parent's tgid, so they "just work" once the
+//     process is registered (test_pystacks_threads validates this stays true)
+//   - forked children get a new tgid, so the BPF fork tracepoint must
+//     propagate the parent's pystacks config to the child
+//     (test_pystacks_fork, test_pystacks_multiprocessing)
+//   - fork+exec into a different python (subprocess re-exec) must re-discover
+//     via the exec event handler (test_pystacks_fork_exec)
+// =============================================================================
+
+/// Run a pystacks workload, record a trace, and assert that `target_function`
+/// shows up as a Python frame in `stack.parquet`.
+///
+/// `defs` and `loop_body` are passed straight to `spawn_python_workload`.
+fn run_pystacks_workload_and_check(
+    test_label: &str,
+    defs: &str,
+    loop_body: &str,
+    target_function: &str,
+    duration: u64,
+) {
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+
+    let workload = spawn_python_workload(
+        pyenv_python(PYTHON_313_VERSION),
+        dir.path(),
+        &format!("{test_label}.py"),
+        defs,
+        loop_body,
+    );
+    eprintln!("[{test_label}] Started Python parent PID: {}", workload.pid);
+
+    let config = Config {
+        duration,
+        parquet_only: true,
+        collect_pystacks: true,
+        // Filter to the workload pid so the trace stays small. Forked
+        // descendants are added to the BPF `pids` map automatically by the
+        // sched_process_fork tracepoint, so they remain in scope. We do NOT
+        // pass `pystacks_pids` so the `--pid` filter path is exercised
+        // (the more common usage and the one that drives auto-discovery).
+        pid: vec![workload.pid],
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path,
+        ..Config::default()
+    };
+
+    systing(config, None).expect("systing recording failed");
+    drop(workload);
+
+    let stack_parquet = dir.path().join("stack.parquet");
+    assert!(
+        stack_parquet.exists(),
+        "[{test_label}] stack.parquet not found"
+    );
+
+    let (found_python_symbols, found_target) =
+        find_python_symbols_in_parquet(&stack_parquet, target_function);
+
+    assert!(
+        found_python_symbols,
+        "[{test_label}] No Python symbols found in stack.parquet at all"
+    );
+    assert!(
+        found_target,
+        "[{test_label}] Expected python function '{target_function}' not found in stack.parquet. \
+         Python stacks for the spawned worker were not captured."
+    );
+
+    eprintln!("[{test_label}] passed");
+}
+
+/// New threads share the parent's tgid, so the `targeted_pids` /
+/// `pystacks_pid_config` lookups (keyed by tgid) cover them automatically.
+/// This is a regression guard so that future changes don't accidentally key
+/// on the per-thread pid.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_pystacks_threads() {
+    let defs = r#"
+import threading
+
+state = {"calls": 0}
+
+def systing_thread_worker_function():
+    """Runs only on the spawned thread; must show up in pystacks samples."""
+    while True:
+        total = 0
+        for i in range(1000000):
+            total += i * i
+
+def systing_thread_step():
+    state["calls"] += 1
+    if state["calls"] == 1:
+        # Warm-up iteration runs before the ready marker is written -- just
+        # busy spin so the parent looks like a real python process.
+        total = 0
+        for i in range(1000000):
+            total += i * i
+        return
+    if state["calls"] == 2:
+        # Spawn the worker thread on the first post-ready iteration so it's
+        # born after systing has started (and possibly after BPF attach).
+        # Either way the tgid lookup covers it -- that's what the test
+        # asserts -- but spawning here exercises the "thread born during
+        # the trace" case rather than only "thread already alive at attach."
+        t = threading.Thread(target=systing_thread_worker_function, daemon=True)
+        t.start()
+        return
+    # Steady state: parent stays mostly idle so the worker thread gets the GIL.
+    time.sleep(0.1)
+"#;
+
+    run_pystacks_workload_and_check(
+        "test_pystacks_threads",
+        defs,
+        "systing_thread_step()",
+        "systing_thread_worker_function",
+        5,
+    );
+}
+
+/// `os.fork()` children get a new tgid. The BPF sched_process_fork tracepoint
+/// must propagate the parent's pystacks config to the child or all of the
+/// child's Python stacks are dropped.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_pystacks_fork() {
+    let defs = r#"
+import os
+
+state = {"calls": 0, "worker": None}
+PARENT_PID = os.getpid()
+
+def systing_fork_worker_function():
+    """Runs only in the forked child; must show up in pystacks samples."""
+    total = 0
+    for i in range(1000000):
+        total += i * i
+    return total
+
+def systing_fork_step():
+    state["calls"] += 1
+    if state["calls"] == 1:
+        # Warm-up iteration runs before the ready marker is written -- just
+        # busy spin so the parent looks like a real python process.
+        total = 0
+        for i in range(1000000):
+            total += i * i
+        return
+    # Kill the previous worker (if any) and fork a fresh one. systing's BPF
+    # setup time is variable (skel.load() alone can take 2-3s on a debug
+    # build), so a single fork at a fixed delay races against the
+    # sched_process_fork tracepoint attaching. Re-forking once a second is
+    # robust: at least one fork lands after the tracepoint is live, and
+    # that fork's pystacks config gets propagated.
+    if state["worker"] is not None:
+        try:
+            os.kill(state["worker"], 9)
+            os.waitpid(state["worker"], 0)
+        except (OSError, ChildProcessError):
+            pass
+    pid = os.fork()
+    if pid == 0:
+        # Exit when the parent disappears (drop() SIGKILLs it) so we
+        # don't leave an orphan spinning forever after the test ends.
+        while os.getppid() == PARENT_PID:
+            systing_fork_worker_function()
+        os._exit(0)
+    state["worker"] = pid
+    time.sleep(1.0)
+"#;
+
+    run_pystacks_workload_and_check(
+        "test_pystacks_fork",
+        defs,
+        "systing_fork_step()",
+        "systing_fork_worker_function",
+        6,
+    );
+}
+
+/// `multiprocessing.Process` with the (Linux default) `fork` start method
+/// is the most common way Python apps fan out CPU work. It's the same
+/// kernel-level fork as `os.fork()`, but goes through the multiprocessing
+/// bootstrap, so it exercises a deeper Python stack and a longer setup
+/// window before the worker reaches its target function.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_pystacks_multiprocessing() {
+    let defs = r#"
+import multiprocessing, os
+
+state = {"calls": 0, "worker": None}
+PARENT_PID = os.getpid()
+
+def systing_mp_worker_function():
+    """multiprocessing target; must show up in pystacks samples."""
+    # Exit when the parent disappears (drop() SIGKILLs it -- bypasses
+    # multiprocessing's own daemon cleanup, which uses atexit).
+    while os.getppid() == PARENT_PID:
+        total = 0
+        for i in range(1000000):
+            total += i * i
+
+def systing_mp_step():
+    state["calls"] += 1
+    if state["calls"] == 1:
+        # Warm-up iteration: just busy spin (see test_pystacks_fork).
+        total = 0
+        for i in range(1000000):
+            total += i * i
+        return
+    # Re-fork once a second so at least one fork lands after BPF attach
+    # (see test_pystacks_fork for why a fixed delay is racy).
+    if state["worker"] is not None:
+        try:
+            state["worker"].kill()
+            state["worker"].join(timeout=2)
+        except Exception:
+            pass
+    ctx = multiprocessing.get_context("fork")
+    p = ctx.Process(target=systing_mp_worker_function, daemon=True)
+    p.start()
+    state["worker"] = p
+    time.sleep(1.0)
+"#;
+
+    run_pystacks_workload_and_check(
+        "test_pystacks_multiprocessing",
+        defs,
+        "systing_mp_step()",
+        "systing_mp_worker_function",
+        6,
+    );
+}
+
+/// fork + exec into a fresh python (`subprocess.Popen([sys.executable, ...])`)
+/// — the most common subprocess pattern for Python services. The forked child
+/// inherits the parent's pystacks config (from the fork tracepoint) but then
+/// execs into a brand new address space, so the inherited config is stale and
+/// must be cleared. The exec event handler should then re-discover the new
+/// python and re-register it.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_pystacks_fork_exec() {
+    setup_bpf_environment();
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+
+    // The subprocess script: a busy loop with a unique function name so we
+    // can find it in stack.parquet.
+    let child_script = dir.path().join("test_pystacks_fork_exec_child.py");
+    std::fs::write(
+        &child_script,
+        r#"
+import os
+_initial_ppid = os.getppid()
+
+def systing_fork_exec_child_function():
+    total = 0
+    for i in range(1000000):
+        total += i * i
+    return total
+
+# Exit when the parent disappears so we don't leave an orphan spinning forever.
+while os.getppid() == _initial_ppid:
+    systing_fork_exec_child_function()
+"#,
+    )
+    .expect("write child script");
+    let child_script_str = child_script.to_string_lossy();
+
+    let defs = format!(
+        r#"
+import os, subprocess
+
+state = {{"calls": 0, "worker": None}}
+CHILD_SCRIPT = "{child_script_str}"
+
+def systing_fork_exec_step():
+    state["calls"] += 1
+    if state["calls"] == 1:
+        total = 0
+        for i in range(1000000):
+            total += i * i
+        return
+    # Re-fork+exec once a second so at least one lands after BPF attach
+    # (see test_pystacks_fork for why a fixed delay is racy).
+    if state["worker"] is not None:
+        try:
+            state["worker"].kill()
+            state["worker"].wait(timeout=2)
+        except Exception:
+            pass
+    # subprocess.Popen forks then execs into a fresh python. The forked
+    # child briefly inherits the parent's pystacks config (correct, since
+    # the address space is shared CoW until exec) and then execs into a
+    # brand new address space (the inherited config must be cleared).
+    p = subprocess.Popen([sys.executable, CHILD_SCRIPT])
+    state["worker"] = p
+    time.sleep(1.0)
+"#
+    );
+
+    let workload = spawn_python_workload(
+        pyenv_python(PYTHON_313_VERSION),
+        dir.path(),
+        "test_pystacks_fork_exec.py",
+        &defs,
+        "systing_fork_exec_step()",
+    );
+    eprintln!(
+        "[test_pystacks_fork_exec] Started Python parent PID: {}",
+        workload.pid
+    );
+
+    let config = Config {
+        // Longer duration: the exec re-discovery path goes through userspace
+        // (read /proc/<pid>/maps, parse ELF, ...) and may need the retry
+        // backoff (~100ms). Give it plenty of room.
+        duration: 8,
+        parquet_only: true,
+        collect_pystacks: true,
+        pid: vec![workload.pid],
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path,
+        ..Config::default()
+    };
+
+    systing(config, None).expect("systing recording failed");
+    drop(workload);
+
+    // subprocess child can outlive the workload's drop; clean it up so it
+    // doesn't keep burning CPU after the test.
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", &child_script_str])
+        .status();
+
+    let stack_parquet = dir.path().join("stack.parquet");
+    assert!(
+        stack_parquet.exists(),
+        "[test_pystacks_fork_exec] stack.parquet not found"
+    );
+
+    let (found_python_symbols, found_target) =
+        find_python_symbols_in_parquet(&stack_parquet, "systing_fork_exec_child_function");
+
+    assert!(
+        found_python_symbols,
+        "[test_pystacks_fork_exec] No Python symbols found in stack.parquet at all"
+    );
+    assert!(
+        found_target,
+        "[test_pystacks_fork_exec] Expected python function 'systing_fork_exec_child_function' \
+         not found in stack.parquet. The exec-event re-discovery path is not registering the \
+         re-exec'd python."
+    );
+
+    eprintln!("[test_pystacks_fork_exec] passed");
+}
+
+// =============================================================================
 // Consolidated run command suite
 //
 // Tests the `systing -- <command>` mode. Each sub-test needs its own systing
