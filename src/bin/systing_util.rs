@@ -6,7 +6,7 @@
 use anyhow::{bail, Context, Result};
 use arrow::array::{
     BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, ListBuilder, RecordBatch,
-    StringBuilder,
+    StringBuilder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use clap::{Parser, Subcommand};
@@ -2097,6 +2097,8 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
                 false,
             ),
             Field::new("is_kernel_thread", DataType::Boolean, false),
+            Field::new("cgroup_id", DataType::UInt64, false),
+            Field::new("cgroup_path", DataType::Utf8, true),
         ]));
 
         let mut trace_id_builder = StringBuilder::new();
@@ -2106,6 +2108,8 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
         let mut parent_upid_builder = Int64Builder::new();
         let mut cmdline_builder = ListBuilder::new(StringBuilder::new());
         let mut is_kernel_thread_builder = BooleanBuilder::new();
+        let mut cgroup_id_builder = UInt64Builder::new();
+        let mut cgroup_path_builder = StringBuilder::new();
 
         for proc in &data.processes {
             trace_id_builder.append_value(trace_id);
@@ -2119,6 +2123,9 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
             }
             cmdline_builder.append(true);
             is_kernel_thread_builder.append_value(proc.is_kernel_thread);
+            // Perfetto traces do not carry cgroup info, so default to unknown.
+            cgroup_id_builder.append_value(0);
+            cgroup_path_builder.append_null();
         }
 
         let batch = RecordBatch::try_new(
@@ -2131,6 +2138,8 @@ fn write_data_to_parquet(trace_id: &str, data: &ExtractedData, paths: &ParquetPa
                 Arc::new(parent_upid_builder.finish()),
                 Arc::new(cmdline_builder.finish()),
                 Arc::new(is_kernel_thread_builder.finish()),
+                Arc::new(cgroup_id_builder.finish()),
+                Arc::new(cgroup_path_builder.finish()),
             ],
         )?;
 

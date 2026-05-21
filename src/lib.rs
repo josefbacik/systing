@@ -32,6 +32,7 @@ pub mod analyze;
 pub mod mcp;
 
 // Core library modules
+pub mod cgroup;
 pub mod duckdb;
 pub mod parquet_paths;
 pub mod validation;

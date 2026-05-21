@@ -1,6 +1,6 @@
 [package]
 name = "systing"
-version = "1.6.6"
+version = "1.7.0"
 edition = "2021"
 authors = ["Josef Bacik <josef@toxicpanda.com>"]
 license = "MIT"

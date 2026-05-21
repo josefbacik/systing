@@ -43,6 +43,16 @@ fn setup_bpf_environment() {
     bump_memlock_rlimit().expect("Failed to bump memlock rlimit");
 }
 
+/// Read the current process's cgroup v2 path (relative to the cgroup root, e.g.
+/// "/system.slice/foo.service") from `/proc/self/cgroup`. Returns `None` on a
+/// system without a cgroup v2 unified hierarchy (no `0::` line).
+fn current_cgroup_v2_path() -> Option<String> {
+    let contents = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("0::").map(|p| p.to_string()))
+}
+
 /// Python versions used by pystacks integration tests.
 /// Install these via: ./scripts/setup-pystacks.sh
 ///
@@ -599,6 +609,126 @@ fn test_e2e_validation_suite() {
         duckdb_result.errors,
         duckdb_result.warnings
     );
+
+    // --- Check: cgroup ids recorded and resolved to paths (test_e2e_cgroup_resolution) ---
+    eprintln!("  cgroup id resolution (duckdb)...");
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+        if systing::cgroup::cgroup2_root().is_none() {
+            eprintln!("    skipping: no cgroup v2 unified hierarchy on this system");
+        } else {
+            // cgroup_id is captured in-kernel for every task; cgroup_path is resolved
+            // by walking the live cgroup hierarchy when the trace is written. At least
+            // some processes must therefore end up with a resolved cgroup_path.
+            let resolved: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM process \
+                     WHERE cgroup_id != 0 AND cgroup_path IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("Failed to query process cgroup columns");
+            assert!(
+                resolved > 0,
+                "[cgroup resolution] no processes had a resolved cgroup_path"
+            );
+            eprintln!("    {resolved} processes have a resolved cgroup_path");
+
+            // Correctness: every distinct (cgroup_id, cgroup_path) stored in the trace
+            // must match what the live cgroup hierarchy resolves that id to. cgroups
+            // that have since been removed simply won't be in the live map, so we skip
+            // those and require at least one positive match.
+            let live_map = systing::cgroup::build_cgroup_id_map();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT cgroup_id, cgroup_path FROM process \
+                     WHERE cgroup_path IS NOT NULL",
+                )
+                .expect("Failed to prepare distinct cgroup query");
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+                })
+                .expect("Failed to query distinct cgroups");
+
+            let mut matched = 0usize;
+            for row in rows {
+                let (id, path) = row.expect("Failed to read cgroup row");
+                if let Some(live_path) = live_map.get(&id) {
+                    assert_eq!(
+                        &path, live_path,
+                        "[cgroup resolution] cgroup_id {id} resolved to {path:?} in the trace \
+                         but {live_path:?} in the live hierarchy"
+                    );
+                    matched += 1;
+                }
+            }
+            assert!(
+                matched > 0,
+                "[cgroup resolution] no recorded cgroup id could be cross-checked against \
+                 the live cgroup hierarchy"
+            );
+            eprintln!("    cross-checked {matched} cgroup id(s) against the live hierarchy");
+
+            // Strongest check: the test harness drives the recording in-process, so its
+            // own pid is captured. Verify the recorded id/path exactly match the cgroup
+            // the test is running in, derived independently from /proc/self/cgroup.
+            //
+            // Assumption: the cgroup2 mount root equals this process's cgroup-namespace
+            // root, so mount-relative paths (what build_cgroup_id_map produces) agree
+            // with the namespace-relative `0::` path from /proc/self/cgroup. This holds
+            // for the normal/container cases but can diverge if the host hierarchy is
+            // bind-mounted in without a cgroup namespace; the broader `matched > 0`
+            // cross-check above does not depend on it.
+            if let Some(expected_path) = current_cgroup_v2_path() {
+                let cgroup_root = systing::cgroup::cgroup2_root()
+                    .expect("cgroup v2 path present but no cgroup2 mount found");
+                let abs = if expected_path == "/" {
+                    cgroup_root
+                } else {
+                    cgroup_root.join(expected_path.trim_start_matches('/'))
+                };
+                let expected_id = std::fs::metadata(&abs)
+                    .unwrap_or_else(|e| panic!("Failed to stat cgroup dir {}: {e}", abs.display()))
+                    .ino();
+
+                let my_pid = std::process::id() as i32;
+                let present: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM process WHERE pid = ?",
+                        [my_pid],
+                        |row| row.get(0),
+                    )
+                    .expect("Failed to count current pid in process table");
+                if present > 0 {
+                    let (db_id, db_path): (u64, Option<String>) = conn
+                        .query_row(
+                            "SELECT cgroup_id, cgroup_path FROM process WHERE pid = ?",
+                            [my_pid],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .expect("Failed to query current process row");
+                    assert_eq!(
+                        db_id, expected_id,
+                        "[cgroup resolution] cgroup_id mismatch for the current process"
+                    );
+                    assert_eq!(
+                        db_path.as_deref(),
+                        Some(expected_path.as_str()),
+                        "[cgroup resolution] cgroup_path mismatch for the current process"
+                    );
+                    eprintln!(
+                        "    current process cgroup resolved: id={db_id} path={expected_path}"
+                    );
+                } else {
+                    eprintln!("    current pid {my_pid} not captured; skipping self check");
+                }
+            }
+        }
+    }
 
     // --- Check: exit states in duckdb (test_e2e_task_exit_states) ---
     eprintln!("  exit states (duckdb)...");

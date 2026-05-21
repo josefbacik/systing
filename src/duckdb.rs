@@ -116,7 +116,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -192,7 +192,9 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             name VARCHAR,
             parent_upid BIGINT,
             cmdline VARCHAR[],
-            is_kernel_thread BOOLEAN NOT NULL DEFAULT FALSE
+            is_kernel_thread BOOLEAN NOT NULL DEFAULT FALSE,
+            cgroup_id UBIGINT NOT NULL DEFAULT 0,
+            cgroup_path VARCHAR
         );
 
         CREATE TABLE IF NOT EXISTS thread (

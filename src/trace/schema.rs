@@ -32,6 +32,8 @@ pub fn process_schema() -> Arc<Schema> {
             false,
         ),
         Field::new("is_kernel_thread", DataType::Boolean, false),
+        Field::new("cgroup_id", DataType::UInt64, false),
+        Field::new("cgroup_path", DataType::Utf8, true),
     ]))
 }
 

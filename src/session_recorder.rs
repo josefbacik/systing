@@ -83,6 +83,11 @@ pub struct SessionRecorder {
     pub process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
     pub processes: RwLock<HashMap<u64, ProtoProcess>>,
     pub threads: RwLock<HashMap<u64, ThreadDescriptor>>,
+    /// Maps process tgidpid -> cgroup id (the cgroup directory's kernfs node id,
+    /// i.e. its inode) as observed in-kernel at event time. This lets us attribute
+    /// even short-lived processes to a cgroup, since the id rides in on the event
+    /// and does not depend on /proc still existing when userspace runs discovery.
+    pub process_cgroups: RwLock<HashMap<u64, u64>>,
     /// Set of pids for processes detected as kernel threads.
     kernel_threads: RwLock<HashSet<u32>>,
     /// Shared utid generator for consistent thread IDs across all recorders.
@@ -477,6 +482,7 @@ impl SessionRecorder {
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
+            process_cgroups: RwLock::new(HashMap::new()),
             kernel_threads: RwLock::new(HashSet::new()),
             utid_generator,
         }
@@ -589,6 +595,17 @@ impl SessionRecorder {
             .write()
             .unwrap()
             .insert(info.tgidpid, proto_process);
+
+        // Record the cgroup id observed for this process. `info` may be a synthetic
+        // parent built from a thread we saw (when the main thread was never observed),
+        // in which case this carries that thread's cgroup id. We attribute the whole
+        // process to the first-observed task's cgroup; in a cgroup v2 threaded
+        // subtree (or cgroup v1) sibling threads can live in different cgroups, so
+        // this is the representative cgroup rather than a guaranteed per-thread one.
+        self.process_cgroups
+            .write()
+            .unwrap()
+            .insert(info.tgidpid, info.cgid);
     }
 
     fn record_new_thread(&self, info: &task_info) {
@@ -942,6 +959,11 @@ impl SessionRecorder {
         // Write process records using the shared upid generator
         let processes = self.processes.read().unwrap();
         let kernel_threads = self.kernel_threads.read().unwrap();
+        let process_cgroups = self.process_cgroups.read().unwrap();
+        // Snapshot the live cgroup hierarchy once so we can resolve the numeric
+        // cgroup id recorded for each process into a human-readable path. This is
+        // best-effort: cgroups removed before this point simply will not resolve.
+        let cgroup_id_map = crate::cgroup::build_cgroup_id_map();
         for (tgidpid, process) in self.process_descriptors.read().unwrap().iter() {
             let pid = process.pid();
             let upid = self.utid_generator.get_or_create_upid(pid);
@@ -960,6 +982,9 @@ impl SessionRecorder {
 
             let is_kernel_thread = kernel_threads.contains(&((*tgidpid >> 32) as u32));
 
+            let cgroup_id = process_cgroups.get(tgidpid).copied().unwrap_or(0);
+            let cgroup_path = cgroup_id_map.get(&cgroup_id).cloned();
+
             writer.add_process(ProcessRecord {
                 upid,
                 pid,
@@ -967,9 +992,12 @@ impl SessionRecorder {
                 parent_upid: None, // Could be set from parent_pid if needed
                 cmdline,
                 is_kernel_thread,
+                cgroup_id,
+                cgroup_path,
             })?;
         }
         drop(processes);
+        drop(process_cgroups);
 
         // Write thread records using the shared utid generator
         // Threads seen during streaming already have utids assigned; new threads get new utids
@@ -1263,6 +1291,7 @@ mod tests {
     fn create_test_task_info(tgid: u32, pid: u32, comm: &str) -> task_info {
         let mut task = task_info {
             tgidpid: ((tgid as u64) << 32) | (pid as u64),
+            cgid: 0,
             comm: [0; 16],
         };
 
@@ -1292,6 +1321,7 @@ mod tests {
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),
+            process_cgroups: RwLock::new(HashMap::new()),
             kernel_threads: RwLock::new(HashSet::new()),
             utid_generator,
             tpu_metrics_recorder: None,

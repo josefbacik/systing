@@ -106,3 +106,25 @@ Switched network per-thread tables to key on `utid`, matching `sched_slice`/`sta
 - `network_poll`: dropped `tid INTEGER, pid INTEGER`; added `utid BIGINT` (joins `thread.utid`).
 
 For process attribution join through `network_*.utid -> thread.utid -> thread.upid -> process.upid`.
+
+---
+
+## Schema Version 8 (systing 1.7.0) — 2026-05-21
+
+Record each process's cgroup so short-lived processes can still be attributed to a
+cgroup even when they exit before their `/proc` entry can be read. The numeric
+cgroup id is captured in-kernel at event time (BPF `task_info`), and resolved to a
+path by walking the live cgroup v2 hierarchy when the trace is written.
+
+### Added columns
+- `process`: added `cgroup_id UBIGINT NOT NULL DEFAULT 0` — the cgroup directory's
+  kernfs node id (its inode) in the v2 unified hierarchy. `0` means unknown.
+- `process`: added `cgroup_path VARCHAR` — best-effort path of that cgroup relative
+  to the cgroup root (e.g. `/system.slice/foo.service`); `NULL` if it could not be
+  resolved (e.g. the cgroup was removed before the trace was written). Resolution is
+  racy and reflects the hierarchy at write time; because kernfs inode numbers can be
+  reused, a removed-and-replaced id may resolve to a different cgroup's path. Trust
+  `cgroup_id`; treat `cgroup_path` as a hint.
+
+Older databases without these columns import cleanly: `cgroup_id` falls back to its
+`0` default and `cgroup_path` to `NULL`.
