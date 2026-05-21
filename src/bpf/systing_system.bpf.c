@@ -96,8 +96,21 @@ enum stack_event_type {
 	STACK_SLEEP_INTERRUPTIBLE,
 };
 
+/*
+ * Per-task identity shipped inline with every event that references a task.
+ *
+ * cgid (the task's cgroup id) is constant per task and is ultimately consumed
+ * only once, when userspace first creates the process record. It is nonetheless
+ * carried inline here - rather than via a separate BPF-populated map read at
+ * finalize - to stay consistent with comm, which is already shipped inline the
+ * same way. The cost is 8 bytes per task_info (so +16 bytes on sched_switch's
+ * task_event, which embeds prev+next). If event size ever becomes a concern,
+ * comm and cgid should move to a per-task metadata map together rather than
+ * splitting the two.
+ */
 struct task_info {
 	u64 tgidpid;
+	u64 cgid;
 	u8 comm[TASK_COMM_LEN];
 };
 
@@ -1491,6 +1504,13 @@ static __always_inline long safe_probe_read_user_str(void *dst, u32 size, const 
 static void record_task_info(struct task_info *info, struct task_struct *task)
 {
 	info->tgidpid = task_key(task);
+	// Record the cgroup id so that short-lived tasks (which may exit before
+	// userspace can read /proc) can still be attributed to a cgroup. This uses
+	// direct BTF field reads (not a restricted probe-read helper), so it is safe
+	// under kernel lockdown confidentiality mode too - the same way the cgroup
+	// filter already reads task_cg_id() unconditionally. Done before the comm
+	// read below, which IS skipped under lockdown.
+	info->cgid = task_cg_id(task);
 
 	// In confidentiality mode, use NULL comm (all zeros)
 	if (tool_config.confidentiality_mode) {

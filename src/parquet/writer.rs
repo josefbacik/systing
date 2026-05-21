@@ -15,7 +15,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow::array::{
     BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, Int8Builder, ListBuilder,
-    RecordBatch, StringBuilder,
+    RecordBatch, StringBuilder, UInt64Builder,
 };
 use arrow::datatypes::Schema;
 use parquet::arrow::ArrowWriter;
@@ -1418,6 +1418,8 @@ fn build_process_batch(records: &[ProcessRecord], schema: &Arc<Schema>) -> Resul
     let mut parent_upid_builder = Int64Builder::with_capacity(records.len());
     let mut cmdline_builder = ListBuilder::new(StringBuilder::new());
     let mut is_kernel_thread_builder = BooleanBuilder::with_capacity(records.len());
+    let mut cgroup_id_builder = UInt64Builder::with_capacity(records.len());
+    let mut cgroup_path_builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
 
     for record in records {
         upid_builder.append_value(record.upid);
@@ -1432,6 +1434,8 @@ fn build_process_batch(records: &[ProcessRecord], schema: &Arc<Schema>) -> Resul
         cmdline_builder.append(true);
 
         is_kernel_thread_builder.append_value(record.is_kernel_thread);
+        cgroup_id_builder.append_value(record.cgroup_id);
+        cgroup_path_builder.append_option(record.cgroup_path.as_deref());
     }
 
     Ok(RecordBatch::try_new(
@@ -1443,6 +1447,8 @@ fn build_process_batch(records: &[ProcessRecord], schema: &Arc<Schema>) -> Resul
             Arc::new(parent_upid_builder.finish()),
             Arc::new(cmdline_builder.finish()),
             Arc::new(is_kernel_thread_builder.finish()),
+            Arc::new(cgroup_id_builder.finish()),
+            Arc::new(cgroup_path_builder.finish()),
         ],
     )?)
 }

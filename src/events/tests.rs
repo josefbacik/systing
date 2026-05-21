@@ -1878,6 +1878,7 @@ fn test_stack_field_with_args() {
 fn create_test_task_info(tgid: u32, pid: u32) -> task_info {
     task_info {
         tgidpid: ((tgid as u64) << 32) | (pid as u64),
+        cgid: 0,
         comm: [0; 16],
     }
 }

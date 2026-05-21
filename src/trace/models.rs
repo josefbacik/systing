@@ -15,6 +15,17 @@
 ///   or for kernel threads which have no cmdline (see `is_kernel_thread`).
 /// - `is_kernel_thread`: Whether this process is a kernel thread (e.g., kworker,
 ///   migration, ksoftirqd). Kernel threads have no executable or cmdline.
+/// - `cgroup_id`: Numeric id of the process's cgroup in the v2 unified hierarchy
+///   (the cgroup directory's kernfs node id / inode). Captured in-kernel at event
+///   time, so it is available even for short-lived processes that exit before their
+///   `/proc` entry can be read. `0` means unknown.
+/// - `cgroup_path`: Best-effort path of that cgroup relative to the cgroup root
+///   (e.g. `/system.slice/foo.service`), resolved by walking the live cgroup
+///   hierarchy when the trace is written. `None` if the cgroup could not be
+///   resolved (e.g. it was removed before the trace was written). Resolution is
+///   racy: because kernfs inode numbers can be reused, an id whose cgroup was
+///   removed and replaced before the walk may resolve to a *different* cgroup's
+///   path. `cgroup_id` is always faithful; treat the path as a hint.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ProcessRecord {
     pub upid: i64,
@@ -23,6 +34,8 @@ pub struct ProcessRecord {
     pub parent_upid: Option<i64>,
     pub cmdline: Vec<String>,
     pub is_kernel_thread: bool,
+    pub cgroup_id: u64,
+    pub cgroup_path: Option<String>,
 }
 
 /// Thread information extracted from trace.
