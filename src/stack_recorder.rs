@@ -370,8 +370,8 @@ impl StackRecorder {
 }
 
 /// Formats code location information as a string suffix (e.g., "[file.rs:123]")
-fn format_location_info(code_info: &Option<blazesym::symbolize::CodeInfo>) -> String {
-    code_info.as_ref().map_or(String::new(), |info| {
+fn format_location_info(code_info: Option<&blazesym::symbolize::CodeInfo>) -> String {
+    code_info.map_or(String::new(), |info| {
         let file_name = info.file.to_str().unwrap_or("unknown");
         if let Some(line) = info.line {
             format!(" [{file_name}:{line}]")
@@ -391,7 +391,7 @@ fn format_symbolized_frame(sym: &Sym, addr: u64, default_module: &str) -> String
         .and_then(|m| std::path::Path::new(m).file_name())
         .and_then(|f| f.to_str())
         .unwrap_or(default_module);
-    let location_info = format_location_info(&sym.code_info);
+    let location_info = format_location_info(sym.code_info.as_deref());
     format!(
         "{} ({}{}) <{:#x}>",
         sym.name, module_name, location_info, addr

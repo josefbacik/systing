@@ -17,6 +17,13 @@ cargo build
 sudo ./target/debug/systing --duration 60
 ```
 
+Alternatively, install directly with cargo. Use `--locked` so the build uses
+the dependency versions from `Cargo.lock`:
+
+```bash
+cargo install --locked --git https://github.com/josefbacik/systing.git
+```
+
 This will generate a `trace.pb` file which can be uploaded to a
 [Perfetto](https://perfetto.dev/) instance for further analysis.
 
