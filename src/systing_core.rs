@@ -2362,16 +2362,37 @@ fn resolve_pids_for_probe(
 fn collect_memory_alloc_target_pids(opts: &Config) -> Vec<u32> {
     let mut pids: HashSet<u32> = opts.pid.iter().copied().collect();
     for cgroup in &opts.cgroup {
-        let procs = std::path::Path::new(cgroup).join("cgroup.procs");
-        if let Ok(contents) = std::fs::read_to_string(&procs) {
-            for line in contents.lines() {
-                if let Ok(pid) = line.trim().parse::<u32>() {
-                    pids.insert(pid);
-                }
+        // Descend into descendant cgroups: a --cgroup target is often an interior
+        // node (e.g. a k8s pod cgroup) whose own cgroup.procs is empty because the
+        // tasks live in child container/slice cgroups.
+        crate::cgroup::collect_cgroup_procs(std::path::Path::new(cgroup), &mut pids);
+    }
+    pids.into_iter().collect()
+}
+
+/// Resolve every cgroup id the BPF filter must match for the configured
+/// `--cgroup` targets: each target plus all of its descendant cgroups,
+/// deduplicated across targets.
+///
+/// A target is frequently an interior node (e.g. a k8s pod cgroup) whose tasks
+/// live in descendant container/slice cgroups, and the BPF filter matches a
+/// task's leaf cgroup id exactly — so the whole subtree must be included. The
+/// result drives both the size of the `cgroups` BPF map and its contents, which
+/// is why it is resolved before the skeleton is loaded.
+fn collect_cgroup_filter_ids(opts: &Config) -> Result<Vec<u64>> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    for cgroup in opts.cgroup.iter() {
+        let descendants =
+            crate::cgroup::collect_descendant_cgroup_ids(std::path::Path::new(cgroup))
+                .with_context(|| format!("Failed to access cgroup path: {cgroup}"))?;
+        for id in descendants {
+            if seen.insert(id) {
+                ids.push(id);
             }
         }
     }
-    pids.into_iter().collect()
+    Ok(ids)
 }
 
 /// Override allocator libraries, checked before libc. When one of these is
@@ -3127,6 +3148,25 @@ pub fn systing(
                 format!("Failed to set missed_events map size to {num_cpus} entries")
             })?;
 
+        // Resolve the full cgroup filter set (each --cgroup target plus its whole
+        // subtree) before load so the cgroups map can be sized to fit. Pointing
+        // --cgroup at a high-level node (a systemd slice, kubepods.slice, the root)
+        // can enumerate far more than the static default, so size the map to the
+        // actual count rather than risk an E2BIG failure when populating it.
+        let cgroup_filter_ids = collect_cgroup_filter_ids(&opts)?;
+        if !cgroup_filter_ids.is_empty() {
+            open_skel
+                .maps
+                .cgroups
+                .set_max_entries(cgroup_filter_ids.len() as u32)
+                .with_context(|| {
+                    format!(
+                        "Failed to set cgroups map size to {} entries",
+                        cgroup_filter_ids.len()
+                    )
+                })?;
+        }
+
         let diag = std::env::var_os("SYSTING_DIAG_RINGBUFS").is_some();
         let t_load = std::time::Instant::now();
         let mut skel = open_skel.load().with_context(|| {
@@ -3135,15 +3175,18 @@ pub fn systing(
         if diag {
             eprintln!("[diag] open_skel.load() took {:?}", t_load.elapsed());
         }
-        for cgroup in opts.cgroup.iter() {
-            let metadata = std::fs::metadata(cgroup)
-                .with_context(|| format!("Failed to access cgroup path: {cgroup}"))?;
-            let cgroupid = metadata.ino().to_ne_bytes();
-            let val = (1_u8).to_ne_bytes();
+        // The map was sized to hold exactly these ids above, so populating it now
+        // cannot overflow.
+        let cgroup_filter_val = (1_u8).to_ne_bytes();
+        for id in &cgroup_filter_ids {
             skel.maps
                 .cgroups
-                .update(&cgroupid, &val, libbpf_rs::MapFlags::ANY)
-                .with_context(|| format!("Failed to add cgroup {cgroup} to BPF map"))?;
+                .update(
+                    &id.to_ne_bytes(),
+                    &cgroup_filter_val,
+                    libbpf_rs::MapFlags::ANY,
+                )
+                .with_context(|| format!("Failed to add cgroup id {id} to BPF map"))?;
         }
 
         for pid in opts.pid.iter() {
