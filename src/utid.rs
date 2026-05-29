@@ -148,9 +148,50 @@ impl Default for UtidGenerator {
     }
 }
 
+/// Thread-safe generator for `counter_track` IDs.
+///
+/// More than one recorder emits counter tracks (the perf-counter recorder and
+/// the sysinfo/CPU-frequency recorder), and all of their rows land in the same
+/// `counter_track` table, so the IDs must come from a single shared sequence to
+/// stay unique. Every recorder that creates counter tracks should hold a clone
+/// of the same `Arc<CounterTrackIdGenerator>`.
+#[derive(Debug)]
+pub struct CounterTrackIdGenerator {
+    next_id: AtomicI64,
+}
+
+impl CounterTrackIdGenerator {
+    /// Create a new generator with IDs starting at 1.
+    pub fn new() -> Self {
+        Self {
+            next_id: AtomicI64::new(1),
+        }
+    }
+
+    /// Allocate the next unique counter-track ID.
+    pub fn next_id(&self) -> i64 {
+        // Relaxed ordering is sufficient - we only need uniqueness, not synchronization.
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+impl Default for CounterTrackIdGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_counter_track_id_generator_sequential() {
+        let gen = CounterTrackIdGenerator::new();
+        assert_eq!(gen.next_id(), 1);
+        assert_eq!(gen.next_id(), 2);
+        assert_eq!(gen.next_id(), 3);
+    }
 
     #[test]
     fn test_utid_generator_handles_tid_zero() {

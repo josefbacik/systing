@@ -12,7 +12,7 @@ use crate::memory_recorder::MemoryRecorder;
 use crate::network_recorder::NetworkRecorder;
 use crate::parquet::StreamingParquetWriter;
 use crate::perf_recorder::PerfCounterRecorder;
-use crate::record::RecordCollector;
+use crate::record::{RecordCollector, SharedCollector};
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::stack_recorder::StackRecorder;
@@ -22,7 +22,7 @@ use crate::tpu::metrics_recorder::TpuMetricsRecorder;
 use crate::trace::{
     ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ProcessRecord, ThreadRecord,
 };
-use crate::utid::{ThreadAwareRecorder, UtidGenerator};
+use crate::utid::{CounterTrackIdGenerator, ThreadAwareRecorder, UtidGenerator};
 
 use perfetto_protos::builtin_clock::BuiltinClock;
 use perfetto_protos::clock_snapshot::clock_snapshot::Clock;
@@ -47,7 +47,9 @@ pub struct SysinfoRecorder {
     // Streaming support
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
     track_ids: HashMap<u32, i64>,
-    next_track_id: i64,
+    /// Shared with every other recorder that emits counter tracks (e.g. the
+    /// perf-counter recorder) so track IDs stay unique across them.
+    counter_track_ids: Arc<CounterTrackIdGenerator>,
     utid_generator: Arc<UtidGenerator>,
 }
 
@@ -58,12 +60,15 @@ impl ThreadAwareRecorder for SysinfoRecorder {
 }
 
 impl SysinfoRecorder {
-    pub fn new(utid_generator: Arc<UtidGenerator>) -> Self {
+    pub fn new(
+        utid_generator: Arc<UtidGenerator>,
+        counter_track_ids: Arc<CounterTrackIdGenerator>,
+    ) -> Self {
         Self {
             ringbuf: RingBuffer::default(),
             streaming_collector: None,
             track_ids: HashMap::new(),
-            next_track_id: 1,
+            counter_track_ids,
             utid_generator,
         }
     }
@@ -388,8 +393,8 @@ impl SystingRecordEvent<SysInfoEvent> for SysinfoRecorder {
         let track_id = if let Some(&id) = self.track_ids.get(&cpu) {
             id
         } else {
-            let track_id = self.next_track_id;
-            self.next_track_id += 1;
+            // First event for this CPU - create the track
+            let track_id = self.counter_track_ids.next_id();
 
             if let Err(e) = collector.add_counter_track(CounterTrackRecord {
                 id: track_id,
@@ -419,8 +424,9 @@ impl SysinfoRecorder {
     /// When set, events will be streamed directly to the collector during
     /// handle_event() instead of being accumulated in memory.
     ///
-    /// Note: Each streaming recorder gets its own StreamingParquetWriter instance,
-    /// so local track IDs (starting at 1) are safe - they write to separate files.
+    /// Note: This recorder writes counter / counter_track rows, the same tables
+    /// the perf-counter recorder writes to, so the collector passed here must
+    /// share its underlying writer with that recorder (see `SharedCollector`).
     pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
         self.streaming_collector = Some(collector);
     }
@@ -433,9 +439,8 @@ impl SysinfoRecorder {
         if let Some(mut collector) = self.streaming_collector.take() {
             // Data already streamed during handle_event, just flush
             collector.flush()?;
-            // Clear track_ids cache and reset counter
+            // Clear track_ids cache
             self.track_ids.clear();
-            self.next_track_id = 1;
             Ok(Some(collector))
         } else {
             Ok(None)
@@ -452,6 +457,10 @@ impl SessionRecorder {
         tpu_metrics_enabled: bool,
     ) -> Self {
         let utid_generator = Arc::new(UtidGenerator::new());
+        // Counter tracks are written by both the perf-counter and the sysinfo
+        // (CPU frequency) recorders into the same counter_track table, so they
+        // share one ID generator to keep track IDs unique.
+        let counter_track_ids = Arc::new(CounterTrackIdGenerator::new());
         Self {
             clock_snapshot: Mutex::new(ClockSnapshot::default()),
             event_recorder: Mutex::new(SchedEventRecorder::new(Arc::clone(&utid_generator))),
@@ -459,10 +468,14 @@ impl SessionRecorder {
                 enable_debuginfod,
                 Arc::clone(&utid_generator),
             )),
-            perf_counter_recorder: Mutex::new(PerfCounterRecorder::new(Arc::clone(
-                &utid_generator,
-            ))),
-            sysinfo_recorder: Mutex::new(SysinfoRecorder::new(Arc::clone(&utid_generator))),
+            perf_counter_recorder: Mutex::new(PerfCounterRecorder::new(
+                Arc::clone(&utid_generator),
+                Arc::clone(&counter_track_ids),
+            )),
+            sysinfo_recorder: Mutex::new(SysinfoRecorder::new(
+                Arc::clone(&utid_generator),
+                Arc::clone(&counter_track_ids),
+            )),
             probe_recorder: Mutex::new(SystingProbeRecorder::new(Arc::clone(&utid_generator))),
             network_recorder: Mutex::new(NetworkRecorder::new(
                 Arc::clone(&utid_generator),
@@ -850,23 +863,22 @@ impl SessionRecorder {
             .unwrap()
             .set_streaming_collector(Box::new(probe_writer));
 
-        // Set up streaming collector for perf counter recorder (events emitted immediately).
-        // Perf counters get their own writer because counter tracks are self-contained and
-        // the local track_id counter (starting at 1) is safe since each writer outputs to
-        // separate parquet files (counter.parquet, counter_track.parquet).
-        let perf_writer = StreamingParquetWriter::new(output_dir)?;
+        // The perf-counter and sysinfo (CPU frequency) recorders both emit
+        // counter / counter_track rows, which map to the same counter.parquet /
+        // counter_track.parquet files. They must share a single writer: with
+        // separate writers both would create the same files and the last one to
+        // finish would clobber the other's data. Track IDs come from the shared
+        // CounterTrackIdGenerator so they never collide either.
+        let counter_writer =
+            SharedCollector::new(Box::new(StreamingParquetWriter::new(output_dir)?));
         self.perf_counter_recorder
             .lock()
             .unwrap()
-            .set_streaming_collector(Box::new(perf_writer));
-
-        // Set up streaming collector for sysinfo recorder (CPU frequency events).
-        // Like perf counters, sysinfo gets its own writer for counter tracks.
-        let sysinfo_writer = StreamingParquetWriter::new(output_dir)?;
+            .set_streaming_collector(Box::new(counter_writer.clone()));
         self.sysinfo_recorder
             .lock()
             .unwrap()
-            .set_streaming_collector(Box::new(sysinfo_writer));
+            .set_streaming_collector(Box::new(counter_writer));
 
         // Set up streaming collector for TPU metrics recorder (if enabled).
         if let Some(ref tpu_metrics) = self.tpu_metrics_recorder {
@@ -1306,14 +1318,19 @@ mod tests {
 
     fn create_test_session_recorder() -> SessionRecorder {
         let utid_generator = Arc::new(UtidGenerator::new());
+        let counter_track_ids = Arc::new(CounterTrackIdGenerator::new());
         SessionRecorder {
             clock_snapshot: Mutex::new(ClockSnapshot::default()),
             event_recorder: Mutex::new(SchedEventRecorder::new(Arc::clone(&utid_generator))),
             stack_recorder: Mutex::new(StackRecorder::new(false, Arc::clone(&utid_generator))),
-            perf_counter_recorder: Mutex::new(PerfCounterRecorder::new(Arc::clone(
-                &utid_generator,
-            ))),
-            sysinfo_recorder: Mutex::new(SysinfoRecorder::new(Arc::clone(&utid_generator))),
+            perf_counter_recorder: Mutex::new(PerfCounterRecorder::new(
+                Arc::clone(&utid_generator),
+                Arc::clone(&counter_track_ids),
+            )),
+            sysinfo_recorder: Mutex::new(SysinfoRecorder::new(
+                Arc::clone(&utid_generator),
+                Arc::clone(&counter_track_ids),
+            )),
             probe_recorder: Mutex::new(SystingProbeRecorder::new(Arc::clone(&utid_generator))),
             network_recorder: Mutex::new(NetworkRecorder::new(Arc::clone(&utid_generator), false)),
             memory_recorder: Mutex::new(MemoryRecorder::new(Arc::clone(&utid_generator))),
