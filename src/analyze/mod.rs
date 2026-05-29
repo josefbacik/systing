@@ -143,12 +143,17 @@ impl AnalyzeDb {
             bail!("Database not found: {}", path.display());
         }
 
-        let conn = if read_only {
-            let config = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
-            Connection::open_with_flags(path, config)?
-        } else {
-            Connection::open(path)?
-        };
+        // Disable external access (reading/writing files, ATTACH, loading
+        // extensions) so SQL run against an untrusted trace database -- e.g.
+        // queries an AI assistant was prompt-injected into running via the MCP
+        // server -- cannot touch anything outside the trace database. DuckDB
+        // refuses to re-enable this setting while the database is running, so
+        // it cannot be undone with a SET statement.
+        let mut config = duckdb::Config::default().enable_external_access(false)?;
+        if read_only {
+            config = config.access_mode(duckdb::AccessMode::ReadOnly)?;
+        }
+        let conn = Connection::open_with_flags(path, config)?;
 
         Ok(Self {
             conn,
@@ -542,5 +547,85 @@ mod tests {
     fn test_to_u64_negative() {
         assert_eq!(to_u64(-1), 0);
         assert_eq!(to_u64(i64::MIN), 0);
+    }
+
+    /// Assert that an error is DuckDB refusing an operation because external
+    /// access is disabled. DuckDB 1.4 phrases this "disabled by configuration"
+    /// for file access and "disabled through configuration" for extension
+    /// loading (older releases used the latter for both).
+    fn assert_external_access_blocked(err: &anyhow::Error) {
+        let msg = err.to_string();
+        assert!(
+            msg.contains("disabled by configuration")
+                || msg.contains("disabled through configuration"),
+            "expected external-access error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_open_blocks_external_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.duckdb");
+
+        // Create a small database to analyze.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+
+        // An external file that queries must not be able to read.
+        let csv_path = dir.path().join("external.csv");
+        std::fs::write(&csv_path, "a,b\n1,2\n").unwrap();
+
+        for read_only in [true, false] {
+            let db = AnalyzeDb::open(&db_path, read_only).unwrap();
+
+            // Queries against the trace database itself still work.
+            let result = db.query("SELECT x FROM t").unwrap();
+            assert_eq!(result.row_count, 1);
+
+            // Reading external files is blocked.
+            let read_err = db
+                .query(&format!(
+                    "SELECT * FROM read_csv_auto('{}')",
+                    csv_path.display()
+                ))
+                .unwrap_err();
+            assert_external_access_blocked(&read_err);
+
+            // Writing external files is blocked.
+            let copy_err = db
+                .query(&format!(
+                    "COPY (SELECT 1) TO '{}'",
+                    dir.path().join("out.csv").display()
+                ))
+                .unwrap_err();
+            assert_external_access_blocked(&copy_err);
+
+            // Attaching other database files is blocked.
+            let attach_err = db
+                .query(&format!(
+                    "ATTACH '{}' AS other",
+                    dir.path().join("other.duckdb").display()
+                ))
+                .unwrap_err();
+            assert_external_access_blocked(&attach_err);
+
+            // Installing or loading external extensions (e.g. httpfs for
+            // network egress) is blocked.
+            assert!(db.query("INSTALL httpfs").is_err());
+            let load_err = db.query("LOAD httpfs").unwrap_err();
+            assert_external_access_blocked(&load_err);
+
+            // The setting cannot be re-enabled at runtime.
+            let set_err = db.query("SET enable_external_access = true").unwrap_err();
+            assert!(
+                set_err
+                    .to_string()
+                    .contains("Cannot change enable_external_access"),
+                "unexpected error: {set_err}"
+            );
+        }
     }
 }
