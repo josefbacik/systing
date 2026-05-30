@@ -8,7 +8,7 @@ use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::systing_core::{marker_event, SystingRecordEvent};
 use crate::trace::{ArgRecord, InstantArgRecord, InstantRecord, SliceRecord, TrackRecord};
-use crate::utid::{ThreadAwareRecorder, UtidGenerator};
+use crate::utid::{ThreadAwareRecorder, TrackEventIdGenerator, UtidGenerator};
 
 struct MarkerRange {
     track: String,
@@ -42,6 +42,9 @@ pub struct MarkerRecorder {
     // ingestion path (before events enter the ring buffer), while `handle_event`
     // runs on the drain path. They observe events at different times.
     outstanding_triggers: HashMap<(u64, String, String), u64>,
+    /// Shared with every other recorder that emits track/slice/instant rows
+    /// (e.g. the probe recorder) so IDs stay unique across them.
+    track_event_ids: Arc<TrackEventIdGenerator>,
     utid_generator: Arc<UtidGenerator>,
 }
 
@@ -169,7 +172,10 @@ impl SystingRecordEvent<marker_event> for MarkerRecorder {
 }
 
 impl MarkerRecorder {
-    pub fn new(utid_generator: Arc<UtidGenerator>) -> Self {
+    pub fn new(
+        utid_generator: Arc<UtidGenerator>,
+        track_event_ids: Arc<TrackEventIdGenerator>,
+    ) -> Self {
         Self {
             ringbuf: RingBuffer::default(),
             outstanding_ranges: HashMap::new(),
@@ -179,6 +185,7 @@ impl MarkerRecorder {
             threshold: None,
             duration_threshold_ns: None,
             outstanding_triggers: HashMap::new(),
+            track_event_ids,
             utid_generator,
         }
     }
@@ -203,13 +210,7 @@ impl MarkerRecorder {
         [range_min, instant_min].into_iter().flatten().min()
     }
 
-    pub fn write_records(
-        &self,
-        collector: &mut dyn RecordCollector,
-        track_id_counter: &mut i64,
-        slice_id_counter: &mut i64,
-        instant_id_counter: &mut i64,
-    ) -> Result<()> {
+    pub fn write_records(&self, collector: &mut dyn RecordCollector) -> Result<()> {
         if !self.outstanding_ranges.is_empty() {
             eprintln!(
                 "Warning: {} marker range(s) had START but no END and will be dropped",
@@ -233,11 +234,7 @@ impl MarkerRecorder {
                 .entry(tid)
                 .or_default()
                 .entry(&r.track)
-                .or_insert_with(|| {
-                    let id = *track_id_counter;
-                    *track_id_counter += 1;
-                    id
-                });
+                .or_insert_with(|| self.track_event_ids.next_track_id());
             range_track_ids.push(id);
         }
         for i in &self.instants {
@@ -246,16 +243,12 @@ impl MarkerRecorder {
                 .entry(tid)
                 .or_default()
                 .entry(&i.track)
-                .or_insert_with(|| {
-                    let id = *track_id_counter;
-                    *track_id_counter += 1;
-                    id
-                });
+                .or_insert_with(|| self.track_event_ids.next_track_id());
             instant_track_ids.push(id);
         }
 
         // Emit track descriptors in stable id order (HashMap iteration is
-        // non-deterministic; ids are monotonic from track_id_counter).
+        // non-deterministic; ids are monotonic from the shared generator).
         let mut ordered_tracks: Vec<(&str, i64)> = track_ids
             .values()
             .flat_map(|inner| inner.iter().map(|(&name, &id)| (name, id)))
@@ -273,8 +266,7 @@ impl MarkerRecorder {
         for (r, &track_id) in self.recorded_ranges.iter().zip(range_track_ids.iter()) {
             let tid = r.tgidpid as i32;
             let utid = Some(self.utid_generator.get_or_create_utid(tid));
-            let slice_id = *slice_id_counter;
-            *slice_id_counter += 1;
+            let slice_id = self.track_event_ids.next_slice_id();
 
             collector.add_slice(SliceRecord {
                 id: slice_id,
@@ -300,8 +292,7 @@ impl MarkerRecorder {
         for (i, &track_id) in self.instants.iter().zip(instant_track_ids.iter()) {
             let tid = i.tgidpid as i32;
             let utid = Some(self.utid_generator.get_or_create_utid(tid));
-            let instant_id = *instant_id_counter;
-            *instant_id_counter += 1;
+            let instant_id = self.track_event_ids.next_instant_id();
 
             collector.add_instant(InstantRecord {
                 id: instant_id,
@@ -331,7 +322,10 @@ mod tests {
     use crate::systing_core::task_info;
 
     fn new_recorder() -> MarkerRecorder {
-        MarkerRecorder::new(Arc::new(UtidGenerator::new()))
+        MarkerRecorder::new(
+            Arc::new(UtidGenerator::new()),
+            Arc::new(TrackEventIdGenerator::new()),
+        )
     }
 
     fn make_event(marker_type: u32, name: &str, tgidpid: u64, ts: u64) -> marker_event {
@@ -438,9 +432,7 @@ mod tests {
         recorder.handle_event(make_event(2, "T:instant", 1, 150));
 
         let mut collector = crate::record::collector::InMemoryCollector::new();
-        recorder
-            .write_records(&mut collector, &mut 0, &mut 0, &mut 0)
-            .unwrap();
+        recorder.write_records(&mut collector).unwrap();
 
         let data = collector.into_data();
         // Only one track "T" should be created
@@ -586,9 +578,7 @@ mod tests {
         recorder.handle_event(make_event_with_info(2, "T:instant", 1, 150, 77));
 
         let mut collector = crate::record::collector::InMemoryCollector::new();
-        recorder
-            .write_records(&mut collector, &mut 0, &mut 0, &mut 0)
-            .unwrap();
+        recorder.write_records(&mut collector).unwrap();
 
         let data = collector.into_data();
         // Should have one arg for the slice
@@ -611,15 +601,14 @@ mod tests {
         let gen = Arc::new(UtidGenerator::new());
         let tid: i32 = 4242;
         let tgidpid = ((tid as u64) << 32) | (tid as u64);
-        let mut recorder = MarkerRecorder::new(Arc::clone(&gen));
+        let mut recorder =
+            MarkerRecorder::new(Arc::clone(&gen), Arc::new(TrackEventIdGenerator::new()));
         recorder.handle_event(make_event(0, "T:evt", tgidpid, 1000));
         recorder.handle_event(make_event(1, "T:evt", tgidpid, 2000));
         recorder.handle_event(make_event(2, "T:inst", tgidpid, 1500));
 
         let mut collector = crate::record::collector::InMemoryCollector::new();
-        recorder
-            .write_records(&mut collector, &mut 0, &mut 0, &mut 0)
-            .unwrap();
+        recorder.write_records(&mut collector).unwrap();
         let data = collector.into_data();
 
         let expected_utid = gen.get_utid(tid).expect("utid should exist after write");
@@ -639,16 +628,15 @@ mod tests {
         let tid_b: i32 = 1002;
         let tgidpid_a = ((tid_a as u64) << 32) | (tid_a as u64);
         let tgidpid_b = ((tid_b as u64) << 32) | (tid_b as u64);
-        let mut recorder = MarkerRecorder::new(Arc::clone(&gen));
+        let mut recorder =
+            MarkerRecorder::new(Arc::clone(&gen), Arc::new(TrackEventIdGenerator::new()));
         recorder.handle_event(make_event(0, "T:evt", tgidpid_a, 100));
         recorder.handle_event(make_event(1, "T:evt", tgidpid_a, 200));
         recorder.handle_event(make_event(0, "T:evt", tgidpid_b, 150));
         recorder.handle_event(make_event(1, "T:evt", tgidpid_b, 250));
 
         let mut collector = crate::record::collector::InMemoryCollector::new();
-        recorder
-            .write_records(&mut collector, &mut 0, &mut 0, &mut 0)
-            .unwrap();
+        recorder.write_records(&mut collector).unwrap();
         let data = collector.into_data();
 
         assert_eq!(data.tracks.len(), 2, "expected one track per thread");
@@ -683,15 +671,14 @@ mod tests {
         let gen = Arc::new(UtidGenerator::new());
         let tid: i32 = 77;
         let tgidpid = ((tid as u64) << 32) | (tid as u64);
-        let mut recorder = MarkerRecorder::new(Arc::clone(&gen));
+        let mut recorder =
+            MarkerRecorder::new(Arc::clone(&gen), Arc::new(TrackEventIdGenerator::new()));
         recorder.handle_event(make_event(0, "T:range", tgidpid, 100));
         recorder.handle_event(make_event(1, "T:range", tgidpid, 200));
         recorder.handle_event(make_event(2, "T:inst", tgidpid, 150));
 
         let mut collector = crate::record::collector::InMemoryCollector::new();
-        recorder
-            .write_records(&mut collector, &mut 0, &mut 0, &mut 0)
-            .unwrap();
+        recorder.write_records(&mut collector).unwrap();
         let data = collector.into_data();
 
         let expected_utid = gen.get_utid(tid).unwrap();
@@ -710,15 +697,14 @@ mod tests {
         let tgid: i32 = 99;
         let tid: i32 = 42;
         let tgidpid = ((tgid as u64) << 32) | (tid as u32 as u64);
-        let mut recorder = MarkerRecorder::new(Arc::clone(&gen));
+        let mut recorder =
+            MarkerRecorder::new(Arc::clone(&gen), Arc::new(TrackEventIdGenerator::new()));
         recorder.handle_event(make_event(0, "T:evt", tgidpid, 100));
         recorder.handle_event(make_event(1, "T:evt", tgidpid, 200));
         recorder.handle_event(make_event(2, "T:inst", tgidpid, 150));
 
         let mut collector = crate::record::collector::InMemoryCollector::new();
-        recorder
-            .write_records(&mut collector, &mut 0, &mut 0, &mut 0)
-            .unwrap();
+        recorder.write_records(&mut collector).unwrap();
         let data = collector.into_data();
 
         let utid = gen.get_utid(tid).expect("utid should exist for tid");

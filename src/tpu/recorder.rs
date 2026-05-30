@@ -15,8 +15,8 @@ use crate::tpu::xspace::{self, TpuRecordData};
 ///
 /// Created with a target service address (discovered or user-specified) and
 /// the desired profiling duration. Runs `capture()` in a dedicated thread,
-/// then `write_records()` is called during `generate_parquet_trace` with the
-/// shared ID counters.
+/// then `write_records()` is called during `generate_parquet_trace`
+/// finalization.
 pub struct TpuRecorder {
     service_addr: String,
     duration_ms: u64,
@@ -72,13 +72,10 @@ impl TpuRecorder {
 
     /// Write TPU records to the collector during `generate_parquet_trace`.
     ///
-    /// Uses the shared ID counter to assign globally unique IDs.
+    /// TPU device/op IDs are only referenced within the tpu_* tables, which
+    /// nothing else writes, so they are assigned from a local counter here.
     /// Returns `Ok(())` even if no TPU data was captured.
-    pub fn write_records(
-        self,
-        collector: &mut dyn RecordCollector,
-        id_counter: &mut i64,
-    ) -> Result<()> {
+    pub fn write_records(self, collector: &mut dyn RecordCollector) -> Result<()> {
         let records = match self.records {
             Some(r) => r,
             None => return Ok(()),
@@ -88,13 +85,14 @@ impl TpuRecorder {
             return Ok(());
         }
 
-        // Assign globally unique IDs and remap device references.
+        // Assign unique IDs and remap device references.
+        let mut id_counter: i64 = 1;
         let mut device_id_map: std::collections::HashMap<i64, i64> =
             std::collections::HashMap::new();
 
         for device in &records.devices {
-            let final_id = *id_counter;
-            *id_counter += 1;
+            let final_id = id_counter;
+            id_counter += 1;
             device_id_map.insert(device.id, final_id);
         }
 
@@ -105,8 +103,8 @@ impl TpuRecorder {
         }
 
         for mut op in records.ops {
-            let final_id = *id_counter;
-            *id_counter += 1;
+            let final_id = id_counter;
+            id_counter += 1;
             op.id = final_id;
             op.tpu_device_id = match device_id_map.get(&op.tpu_device_id) {
                 Some(&id) => id,

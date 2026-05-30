@@ -15,7 +15,7 @@ use crate::trace::{TpuDeviceRecord, TpuOpRecord};
 /// Parsed TPU record data ready for writing to Parquet.
 ///
 /// All timestamps have been converted from CLOCK_REALTIME to CLOCK_BOOTTIME.
-/// IDs are placeholders — final globally-unique IDs are assigned during
+/// IDs are placeholders — final unique IDs are assigned during
 /// `TpuRecorder::write_records()`.
 #[derive(Debug, Default)]
 pub struct TpuRecordData {
