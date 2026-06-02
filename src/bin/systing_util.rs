@@ -3410,7 +3410,9 @@ fn run_convert(
             }
         }
 
-        // Import files that already have trace_id
+        // Import files that already have trace_id. BY NAME so parquet files
+        // written by older systing versions (with fewer columns) import
+        // cleanly - missing columns become NULL.
         if !with_trace_id.is_empty() {
             let paths_list = with_trace_id
                 .iter()
@@ -3418,7 +3420,7 @@ fn run_convert(
                 .collect::<Vec<_>>()
                 .join(", ");
             conn.execute_batch(&format!(
-                "INSERT INTO {table_name} SELECT * FROM read_parquet([{paths_list}])"
+                "INSERT INTO {table_name} BY NAME SELECT * FROM read_parquet([{paths_list}])"
             ))?;
         }
 
@@ -3427,7 +3429,7 @@ fn run_convert(
             let escaped_path = path.replace('\'', "''");
             let escaped_trace_id = trace_id.replace('\'', "''");
             conn.execute_batch(&format!(
-                "INSERT INTO {table_name} SELECT '{escaped_trace_id}' as trace_id, * FROM read_parquet('{escaped_path}')"
+                "INSERT INTO {table_name} BY NAME SELECT '{escaped_trace_id}' as trace_id, * FROM read_parquet('{escaped_path}')"
             ))?;
         }
 

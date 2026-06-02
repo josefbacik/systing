@@ -471,13 +471,26 @@ pub struct ClockSnapshotRecord {
     pub is_primary: bool,
 }
 
-/// System info record - kernel version and machine information.
+/// System info record - kernel version, machine, and platform information.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SysInfoRecord {
     pub sysname: String,
     pub release: String,
     pub version: String,
     pub machine: String,
+    /// cpufreq scaling driver name (e.g. "intel_pstate"); `None` when the
+    /// kernel has no cpufreq support (typical for VM guests), in which case
+    /// CPU-frequency counter data is absent or meaningless.
+    pub cpufreq_driver: Option<String>,
+    /// Hypervisor the trace was captured under (e.g. "kvm"). `None` means no
+    /// hypervisor was detected; on x86_64 (CPUID-based) that reliably means
+    /// bare metal, on other architectures the check is best-effort and `None`
+    /// may just mean detection was unavailable.
+    pub hypervisor: Option<String>,
+    /// DMI system vendor (e.g. "Amazon EC2"), if exposed.
+    pub sys_vendor: Option<String>,
+    /// DMI product name (e.g. "m7i.16xlarge"), if exposed.
+    pub product_name: Option<String>,
 }
 
 /// Container for all extracted trace data.

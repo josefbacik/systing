@@ -3433,43 +3433,54 @@ pub fn systing(
             })?);
         }
 
-        // Start the sysinfo recorder if it's enabled
+        // Start the sysinfo recorder if it's enabled. Skip it when the kernel
+        // has no cpufreq driver (typical for VM guests): there is no real
+        // frequency to read, so polling would only record a constant nominal
+        // value - and the sysinfo crate's fallback path re-parses the whole
+        // /proc/cpuinfo per CPU per poll, which is expensive on large machines.
         let mut sysinfo_thread = None;
         if opts.cpu_frequency {
-            let shutdown_clone = shutdown_signal.clone();
-            let sysinfo_recorder = recorder.clone();
-            sysinfo_thread = Some(
-                thread::Builder::new()
-                    .name("sysinfo_recorder".to_string())
-                    .spawn(move || {
-                        let mut sys = sysinfo::System::new_with_specifics(
-                            sysinfo::RefreshKind::nothing()
-                                .with_cpu(sysinfo::CpuRefreshKind::nothing().with_frequency()),
-                        );
+            if crate::session_recorder::cpufreq_scaling_driver().is_none() {
+                eprintln!(
+                    "Warning: --cpu-frequency requested but this system has no cpufreq \
+                     scaling driver (common in VMs); skipping CPU frequency collection"
+                );
+            } else {
+                let shutdown_clone = shutdown_signal.clone();
+                let sysinfo_recorder = recorder.clone();
+                sysinfo_thread = Some(
+                    thread::Builder::new()
+                        .name("sysinfo_recorder".to_string())
+                        .spawn(move || {
+                            let mut sys = sysinfo::System::new_with_specifics(
+                                sysinfo::RefreshKind::nothing()
+                                    .with_cpu(sysinfo::CpuRefreshKind::nothing().with_frequency()),
+                            );
 
-                        loop {
-                            if shutdown_clone.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            sys.refresh_cpu_frequency();
-                            let ts = get_clock_value(libc::CLOCK_BOOTTIME);
-                            {
-                                let mut recorder =
-                                    sysinfo_recorder.sysinfo_recorder.lock().unwrap();
-                                for (i, cpu) in sys.cpus().iter().enumerate() {
-                                    let event = SysInfoEvent {
-                                        ts,
-                                        cpu: i as u32,
-                                        frequency: cpu.frequency() as i64,
-                                    };
-                                    recorder.record_event(event);
+                            loop {
+                                if shutdown_clone.load(Ordering::Relaxed) {
+                                    break;
                                 }
+                                sys.refresh_cpu_frequency();
+                                let ts = get_clock_value(libc::CLOCK_BOOTTIME);
+                                {
+                                    let mut recorder =
+                                        sysinfo_recorder.sysinfo_recorder.lock().unwrap();
+                                    for (i, cpu) in sys.cpus().iter().enumerate() {
+                                        let event = SysInfoEvent {
+                                            ts,
+                                            cpu: i as u32,
+                                            frequency: cpu.frequency() as i64,
+                                        };
+                                        recorder.record_event(event);
+                                    }
+                                }
+                                thread::sleep(Duration::from_millis(SYSINFO_REFRESH_INTERVAL_MS));
                             }
-                            thread::sleep(Duration::from_millis(SYSINFO_REFRESH_INTERVAL_MS));
-                        }
-                        0
-                    })?,
-            );
+                            0
+                        })?,
+                );
+            }
         }
 
         // Start TPU profiling thread if enabled.

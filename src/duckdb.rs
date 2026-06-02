@@ -116,7 +116,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -557,7 +557,11 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             sysname VARCHAR,
             release VARCHAR,
             version VARCHAR,
-            machine VARCHAR
+            machine VARCHAR,
+            cpufreq_driver VARCHAR,
+            hypervisor VARCHAR,
+            sys_vendor VARCHAR,
+            product_name VARCHAR
         );
 
         -- TPU profiling tables

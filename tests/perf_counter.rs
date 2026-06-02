@@ -144,8 +144,14 @@ fn test_perf_counter_with_cpu_frequency() {
         eprintln!("    {tracks} tracks, {samples} samples, max delta {max_value}");
     }
 
-    // --- Check: CPU-frequency tracks are also present ---
+    // --- Check: CPU-frequency tracks match cpufreq availability ---
+    // Frequency polling is skipped when the kernel has no cpufreq scaling
+    // driver (typical for VM guests), so frequency tracks must exist exactly
+    // when the driver does. On hosts without one, the rest of this test still
+    // validates that requesting --cpu-frequency does not clobber the
+    // perf-counter data.
     eprintln!("  cpu-frequency tracks...");
+    let cpufreq_available = systing::session_recorder::cpufreq_scaling_driver().is_some();
     let (freq_tracks, freq_samples): (i64, i64) = conn
         .query_row(
             "SELECT COUNT(DISTINCT ct.id), COUNT(c.ts)
@@ -156,15 +162,23 @@ fn test_perf_counter_with_cpu_frequency() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("Failed to query frequency tracks");
-    assert!(
-        freq_tracks > 0,
-        "[cpu-frequency] no 'CPU <n> frequency' tracks in counter_track"
-    );
-    assert!(
-        freq_samples > 0,
-        "[cpu-frequency] no frequency samples recorded"
-    );
-    eprintln!("    {freq_tracks} tracks, {freq_samples} samples");
+    if cpufreq_available {
+        assert!(
+            freq_tracks > 0,
+            "[cpu-frequency] cpufreq driver present but no 'CPU <n> frequency' tracks"
+        );
+        assert!(
+            freq_samples > 0,
+            "[cpu-frequency] no frequency samples recorded"
+        );
+        eprintln!("    {freq_tracks} tracks, {freq_samples} samples");
+    } else {
+        assert_eq!(
+            freq_tracks, 0,
+            "[cpu-frequency] no cpufreq driver, yet frequency tracks were recorded"
+        );
+        eprintln!("    no cpufreq driver on this host; frequency collection skipped");
+    }
 
     // --- Check: counter_track IDs are unique across both recorders ---
     eprintln!("  counter_track id uniqueness...");

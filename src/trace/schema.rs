@@ -236,6 +236,10 @@ pub fn sysinfo_schema() -> Arc<Schema> {
         Field::new("release", DataType::Utf8, false),
         Field::new("version", DataType::Utf8, false),
         Field::new("machine", DataType::Utf8, false),
+        Field::new("cpufreq_driver", DataType::Utf8, true),
+        Field::new("hypervisor", DataType::Utf8, true),
+        Field::new("sys_vendor", DataType::Utf8, true),
+        Field::new("product_name", DataType::Utf8, true),
     ]))
 }
 

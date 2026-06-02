@@ -2000,11 +2000,19 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     let mut release_builder = StringBuilder::with_capacity(1, record.release.len());
     let mut version_builder = StringBuilder::with_capacity(1, record.version.len());
     let mut machine_builder = StringBuilder::with_capacity(1, record.machine.len());
+    let mut cpufreq_driver_builder = StringBuilder::with_capacity(1, 16);
+    let mut hypervisor_builder = StringBuilder::with_capacity(1, 16);
+    let mut sys_vendor_builder = StringBuilder::with_capacity(1, 16);
+    let mut product_name_builder = StringBuilder::with_capacity(1, 16);
 
     sysname_builder.append_value(&record.sysname);
     release_builder.append_value(&record.release);
     version_builder.append_value(&record.version);
     machine_builder.append_value(&record.machine);
+    cpufreq_driver_builder.append_option(record.cpufreq_driver.as_deref());
+    hypervisor_builder.append_option(record.hypervisor.as_deref());
+    sys_vendor_builder.append_option(record.sys_vendor.as_deref());
+    product_name_builder.append_option(record.product_name.as_deref());
 
     Ok(RecordBatch::try_new(
         schema.clone(),
@@ -2013,6 +2021,10 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
             Arc::new(release_builder.finish()),
             Arc::new(version_builder.finish()),
             Arc::new(machine_builder.finish()),
+            Arc::new(cpufreq_driver_builder.finish()),
+            Arc::new(hypervisor_builder.finish()),
+            Arc::new(sys_vendor_builder.finish()),
+            Arc::new(product_name_builder.finish()),
         ],
     )?)
 }
@@ -2761,6 +2773,66 @@ mod tests {
         assert_eq!(device_id, 0);
         assert_eq!(metric_name, "test.metric");
         assert!((value - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_sysinfo_duckdb_round_trip() {
+        use crate::duckdb::parquet_to_duckdb;
+        use duckdb::Connection;
+
+        let dir = TempDir::new().unwrap();
+        let mut writer = StreamingParquetWriter::new(dir.path()).unwrap();
+
+        writer
+            .set_sysinfo(SysInfoRecord {
+                sysname: "Linux".to_string(),
+                release: "6.12.0".to_string(),
+                version: "#1 SMP".to_string(),
+                machine: "x86_64".to_string(),
+                cpufreq_driver: Some("intel_pstate".to_string()),
+                hypervisor: Some("kvm".to_string()),
+                sys_vendor: Some("Amazon EC2".to_string()),
+                product_name: None,
+            })
+            .unwrap();
+        writer.finish().unwrap();
+
+        let db_path = dir.path().join("test.duckdb");
+        parquet_to_duckdb(dir.path(), &db_path, "test-trace")
+            .expect("DuckDB import should succeed");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let row: (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT sysname, machine, cpufreq_driver, hypervisor, sys_vendor, product_name \
+                 FROM sysinfo",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(row.0, "Linux");
+        assert_eq!(row.1, "x86_64");
+        assert_eq!(row.2, Some("intel_pstate".to_string()));
+        assert_eq!(row.3, Some("kvm".to_string()));
+        assert_eq!(row.4, Some("Amazon EC2".to_string()));
+        assert_eq!(row.5, None, "absent product_name should round-trip as NULL");
     }
 
     #[test]
