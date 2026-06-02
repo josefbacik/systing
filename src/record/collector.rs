@@ -4,6 +4,8 @@
 //! Implementations can buffer records and flush them to storage (e.g., Parquet files)
 //! when thresholds are reached.
 
+use std::sync::{Arc, Mutex, MutexGuard};
+
 use anyhow::Result;
 
 use crate::trace::{
@@ -143,6 +145,131 @@ pub trait RecordCollector {
     /// Finish writing and close all files (boxed version for trait objects).
     /// This is the same as finish() but takes a Box to work with trait objects.
     fn finish_boxed(self: Box<Self>) -> Result<()>;
+}
+
+/// A cloneable, thread-safe handle that lets several recorders stream into one
+/// shared underlying collector.
+///
+/// Some recorders emit rows for the same logical tables: the perf-counter
+/// recorder and the sysinfo (CPU frequency) recorder both emit `counter` /
+/// `counter_track` rows. If each held its own `StreamingParquetWriter`, both
+/// writers would target the same `counter.parquet` / `counter_track.parquet`
+/// paths and the last one to finish would silently clobber the other's data.
+/// Wrapping a single writer in a `SharedCollector` and handing a clone to each
+/// recorder makes them append to the same writer instead.
+///
+/// `finish()` / `finish_boxed()` only finalize the inner collector when called
+/// on the last live handle; earlier handles just flush. This keeps the existing
+/// per-recorder "finish your collector when you're done" flow unchanged.
+///
+/// Usage requirements:
+/// - Every handle must eventually be finished (or dropped) during trace
+///   generation; a handle whose finish is skipped keeps the inner collector
+///   open and the data only gets closed by the writer's `Drop` fallback.
+/// - Handles must not be finished concurrently from different threads: the
+///   "last live handle" check is not atomic across racing finishes, so two
+///   concurrent finishes could both see another live handle and neither would
+///   finalize the writer. `SessionRecorder::generate_parquet_trace` finishes
+///   all recorders sequentially on one thread, which satisfies this.
+pub struct SharedCollector {
+    inner: Arc<Mutex<Box<dyn RecordCollector + Send>>>,
+}
+
+impl SharedCollector {
+    /// Wrap a collector so it can be shared by multiple recorders.
+    pub fn new(inner: Box<dyn RecordCollector + Send>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Box<dyn RecordCollector + Send>> {
+        // A poisoned mutex means another recorder panicked mid-write; trace
+        // generation is already broken at that point, so propagate the panic.
+        self.inner.lock().unwrap()
+    }
+
+    /// Finish this handle. The inner collector is only finalized once the last
+    /// handle finishes (i.e. this handle holds the only remaining reference);
+    /// earlier handles just flush what they have written. Handles are expected
+    /// to be finished sequentially - see the type-level docs.
+    fn finish_shared(self) -> Result<()> {
+        match Arc::try_unwrap(self.inner) {
+            Ok(mutex) => mutex.into_inner().unwrap().finish_boxed(),
+            Err(arc) => arc.lock().unwrap().flush(),
+        }
+    }
+}
+
+impl Clone for SharedCollector {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+/// Generates the record-forwarding methods of [`RecordCollector`] for
+/// [`SharedCollector`]: each method locks the shared inner collector and
+/// delegates to it.
+macro_rules! shared_delegate {
+    ($($method:ident($record:ty)),* $(,)?) => {
+        $(
+            fn $method(&mut self, record: $record) -> Result<()> {
+                self.lock().$method(record)
+            }
+        )*
+    };
+}
+
+impl RecordCollector for SharedCollector {
+    shared_delegate! {
+        add_process(ProcessRecord),
+        add_thread(ThreadRecord),
+        add_sched_slice(SchedSliceRecord),
+        add_thread_state(ThreadStateRecord),
+        add_irq_slice(IrqSliceRecord),
+        add_softirq_slice(SoftirqSliceRecord),
+        add_wakeup_new(WakeupNewRecord),
+        add_process_exit(ProcessExitRecord),
+        add_counter(CounterRecord),
+        add_counter_track(CounterTrackRecord),
+        add_slice(SliceRecord),
+        add_track(TrackRecord),
+        add_instant(InstantRecord),
+        add_arg(ArgRecord),
+        add_instant_arg(InstantArgRecord),
+        add_network_interface(NetworkInterfaceRecord),
+        add_socket_connection(SocketConnectionRecord),
+        add_clock_snapshot(ClockSnapshotRecord),
+        add_stack(StackRecord),
+        add_stack_sample(StackSampleRecord),
+        add_network_syscall(NetworkSyscallRecord),
+        add_network_packet(NetworkPacketRecord),
+        add_network_socket(NetworkSocketRecord),
+        add_network_poll(NetworkPollRecord),
+        add_network_dns(NetworkDnsRecord),
+        add_memory_rss(MemoryRssRecord),
+        add_memory_map(MemoryMapRecord),
+        add_memory_fault(MemoryFaultRecord),
+        add_memory_alloc(MemoryAllocRecord),
+        set_sysinfo(SysInfoRecord),
+        add_tpu_device(TpuDeviceRecord),
+        add_tpu_op(TpuOpRecord),
+        add_tpu_metric(TpuMetricRecord),
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.lock().flush()
+    }
+
+    fn finish(self) -> Result<()> {
+        self.finish_shared()
+    }
+
+    fn finish_boxed(self: Box<Self>) -> Result<()> {
+        (*self).finish_shared()
+    }
 }
 
 /// A simple in-memory collector that stores all records in `ExtractedData`.

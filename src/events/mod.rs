@@ -21,7 +21,7 @@ use crate::ringbuf::RingBuffer;
 use crate::systing_core::types::probe_event;
 use crate::systing_core::SystingRecordEvent;
 use crate::trace::{ArgRecord, InstantArgRecord, InstantRecord, SliceRecord, TrackRecord};
-use crate::utid::{ThreadAwareRecorder, UtidGenerator};
+use crate::utid::{ThreadAwareRecorder, TrackEventIdGenerator, UtidGenerator};
 
 use anyhow::Result;
 use plain::Plain;
@@ -116,9 +116,9 @@ pub struct SystingProbeRecorder {
 
     // Streaming support
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
-    track_id_counter: i64,
-    slice_id_counter: i64,
-    instant_id_counter: i64,
+    /// Shared with every other recorder that emits track/slice/instant rows
+    /// (e.g. the marker recorder) so IDs stay unique across them.
+    track_event_ids: Arc<TrackEventIdGenerator>,
     track_cache: HashMap<TrackCacheKey, i64>,
 
     // Shared utid generator for consistent thread IDs across all recorders
@@ -254,8 +254,12 @@ impl ThreadAwareRecorder for SystingProbeRecorder {
 }
 
 impl SystingProbeRecorder {
-    /// Create a new SystingProbeRecorder with the given utid generator.
-    pub fn new(utid_generator: Arc<UtidGenerator>) -> Self {
+    /// Create a new SystingProbeRecorder with the given utid generator and
+    /// shared track-event ID generator.
+    pub fn new(
+        utid_generator: Arc<UtidGenerator>,
+        track_event_ids: Arc<TrackEventIdGenerator>,
+    ) -> Self {
         Self {
             ringbuf: RingBuffer::default(),
             cookies: HashMap::new(),
@@ -273,9 +277,7 @@ impl SystingProbeRecorder {
             ranges: HashMap::new(),
             pending_syscalls: HashMap::new(),
             streaming_collector: None,
-            track_id_counter: 0,
-            slice_id_counter: 0,
-            instant_id_counter: 0,
+            track_event_ids,
             track_cache: HashMap::new(),
             utid_generator,
         }
@@ -296,8 +298,7 @@ impl SystingProbeRecorder {
             return Ok(id);
         }
 
-        self.track_id_counter += 1;
-        let track_id = self.track_id_counter;
+        let track_id = self.track_event_ids.next_track_id();
 
         let name = match &key {
             TrackCacheKey::Thread { track_name, .. } => track_name.clone(),
@@ -366,8 +367,7 @@ impl SystingProbeRecorder {
                         track_name: SYSCALLS_TRACK_NAME.to_string(),
                     };
                     if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
-                        self.slice_id_counter += 1;
-                        let slice_id = self.slice_id_counter;
+                        let slice_id = self.track_event_ids.next_slice_id();
 
                         let tid = tgidpid as i32;
                         let utid = Some(self.utid_generator.get_or_create_utid(tid));
@@ -421,8 +421,7 @@ impl SystingProbeRecorder {
                     track_name: instant_track,
                 };
                 if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
-                    self.instant_id_counter += 1;
-                    let instant_id = self.instant_id_counter;
+                    let instant_id = self.track_event_ids.next_instant_id();
 
                     if let Err(e) = collector.add_instant(InstantRecord {
                         id: instant_id,
@@ -470,8 +469,7 @@ impl SystingProbeRecorder {
                                 track_name: track_name.clone(),
                             };
                             if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
-                                self.slice_id_counter += 1;
-                                let slice_id = self.slice_id_counter;
+                                let slice_id = self.track_event_ids.next_slice_id();
 
                                 if let Err(e) = collector.add_slice(SliceRecord {
                                     id: slice_id,
@@ -560,8 +558,7 @@ impl SystingProbeRecorder {
                     track_name: instant_track,
                 };
                 if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
-                    self.instant_id_counter += 1;
-                    let instant_id = self.instant_id_counter;
+                    let instant_id = self.track_event_ids.next_instant_id();
                     let tid = event.task.tgidpid as i32;
                     let utid = Some(self.utid_generator.get_or_create_utid(tid));
 
@@ -620,8 +617,7 @@ impl SystingProbeRecorder {
                                 track_name: track_name.clone(),
                             };
                             if let Ok(track_id) = self.get_or_create_track(key, &mut *collector) {
-                                self.slice_id_counter += 1;
-                                let slice_id = self.slice_id_counter;
+                                let slice_id = self.track_event_ids.next_slice_id();
                                 let tid = event.task.tgidpid as i32;
                                 let utid = Some(self.utid_generator.get_or_create_utid(tid));
 

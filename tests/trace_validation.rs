@@ -3013,6 +3013,9 @@ struct MarkerWorkloadConfig {
     range_info: i64,
     /// Info value passed as arg 3 (flags) for INSTANT events.
     instant_info: i64,
+    /// Also enable syscall tracing (`--syscalls`). The probe recorder then streams
+    /// syscall slices into the same track/slice tables the markers are written to.
+    syscalls: bool,
 }
 
 /// Run a marker-only systing recording while a workload thread emits faccessat2 marker events.
@@ -3073,6 +3076,7 @@ fn run_marker_recording(cfg: MarkerWorkloadConfig) -> TempDir {
         network: false,
         collect_pystacks: false,
         markers: true,
+        syscalls: cfg.syscalls,
         parquet_only: true,
         ..Config::default()
     };
@@ -3099,6 +3103,7 @@ fn test_e2e_marker_recording() {
         instant_name: "checkpoint",
         range_info: 42,
         instant_info: 77,
+        syscalls: false,
     });
 
     // --- Validate slice.parquet contains the range event ---
@@ -3202,6 +3207,7 @@ fn test_e2e_marker_recording_zero_extended() {
         instant_name: "ze_instant",
         range_info: 0,
         instant_info: 0,
+        syscalls: false,
     });
 
     eprintln!("  zero-extended marker: validating slice.parquet...");
@@ -3235,6 +3241,167 @@ fn test_e2e_marker_recording_zero_extended() {
     );
 
     eprintln!("  All zero-extended marker recording checks passed");
+}
+
+/// Regression test: markers and syscall tracing (probe recorder) enabled together.
+///
+/// Both the probe recorder (which streams syscall slices during recording) and the
+/// marker recorder (which writes buffered markers at trace-generation time) emit rows
+/// into the same track/slice/instant/args tables. They used to write through two
+/// separate parquet writers targeting the same files, so whichever writer closed last
+/// silently clobbered the other's data (markers won; all syscall slices were lost).
+/// They also allocated track/slice/instant IDs from independent counters starting at
+/// 1, so even without the clobber the merged tables would have had colliding IDs.
+///
+/// This test records with both enabled and verifies both data sets survive with
+/// unique, mutually-consistent IDs.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_marker_syscall_no_clobber() {
+    setup_bpf_environment();
+
+    // The marker workload's own syscalls (faccessat2 + nanosleep) provide the
+    // syscall activity, so no extra workload is needed.
+    let dir = run_marker_recording(MarkerWorkloadConfig {
+        mode: -975i64,
+        range_name: "ClobberTrack:clobber_range",
+        instant_name: "clobber_checkpoint",
+        range_info: 42,
+        instant_info: 77,
+        syscalls: true,
+    });
+
+    // --- Convert to DuckDB for SQL assertions ---
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "marker_syscall")
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    // --- Check: syscall slices (probe recorder) survived ---
+    eprintln!("  syscall slices...");
+    let syscall_slices: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM slice WHERE category = 'syscall'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Failed to query syscall slices");
+    assert!(
+        syscall_slices > 0,
+        "no syscall slices in the trace - the marker writer clobbered the probe \
+         recorder's slice data"
+    );
+    eprintln!("    {syscall_slices} syscall slices");
+
+    // --- Check: marker slices and instants (marker recorder) survived ---
+    eprintln!("  marker slices and instants...");
+    let marker_slices: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM slice WHERE name = 'clobber_range'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Failed to query marker slices");
+    assert!(
+        marker_slices > 0,
+        "no marker range slices in the trace - the probe writer clobbered the marker data"
+    );
+    let marker_instants: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM instant WHERE name = 'clobber_checkpoint'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Failed to query marker instants");
+    assert!(marker_instants > 0, "no marker instants in the trace");
+    eprintln!("    {marker_slices} marker slices, {marker_instants} marker instants");
+
+    // --- Check: tracks from both recorders coexist ---
+    eprintln!("  tracks from both recorders...");
+    for track in ["syscalls", "ClobberTrack"] {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM track WHERE name = ?",
+                [track],
+                |row| row.get(0),
+            )
+            .expect("Failed to query track");
+        assert!(count > 0, "track '{track}' missing from track table");
+    }
+
+    // --- Check: IDs are unique across both recorders ---
+    eprintln!("  id uniqueness...");
+    for table in ["track", "slice", "instant"] {
+        let duplicates: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM (SELECT id FROM {table} GROUP BY id HAVING COUNT(*) > 1)"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .expect("Failed to query duplicate ids");
+        assert_eq!(
+            duplicates, 0,
+            "{table} table has duplicate ids (probe and marker recorders must allocate \
+             from a shared id sequence)"
+        );
+    }
+
+    // --- Check: referential integrity across the merged tables ---
+    eprintln!("  referential integrity...");
+    let orphan_slices: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM slice s LEFT JOIN track t ON s.track_id = t.id \
+             WHERE t.id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Failed to query orphan slices");
+    assert_eq!(orphan_slices, 0, "slice rows reference missing track ids");
+    let orphan_args: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM args a LEFT JOIN slice s ON a.slice_id = s.id \
+             WHERE s.id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Failed to query orphan args");
+    assert_eq!(orphan_args, 0, "args rows reference missing slice ids");
+    let orphan_instant_args: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM instant_args ia LEFT JOIN instant i \
+             ON ia.instant_id = i.id WHERE i.id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Failed to query orphan instant_args");
+    assert_eq!(
+        orphan_instant_args, 0,
+        "instant_args rows reference missing instant ids"
+    );
+
+    // --- Check: thread attribution survives for both recorders' rows ---
+    // Both syscall slices and marker slices/instants carry a utid; every non-null
+    // utid must resolve to a thread row.
+    eprintln!("  utid attribution...");
+    let orphan_utids: i64 = conn
+        .query_row(
+            "SELECT \
+               (SELECT COUNT(*) FROM slice s LEFT JOIN thread t ON s.utid = t.utid \
+                WHERE s.utid IS NOT NULL AND t.utid IS NULL) + \
+               (SELECT COUNT(*) FROM instant i LEFT JOIN thread t ON i.utid = t.utid \
+                WHERE i.utid IS NOT NULL AND t.utid IS NULL)",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Failed to query orphan utids");
+    assert_eq!(
+        orphan_utids, 0,
+        "slice/instant rows reference utids missing from the thread table"
+    );
+
+    eprintln!("  All marker+syscall coexistence checks passed");
 }
 
 /// Count rows in a parquet file.

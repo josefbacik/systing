@@ -2762,4 +2762,122 @@ mod tests {
         assert_eq!(metric_name, "test.metric");
         assert!((value - 42.0).abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn test_shared_collector_counter_round_trip() {
+        use crate::record::SharedCollector;
+
+        let dir = TempDir::new().unwrap();
+
+        // Two recorders sharing one writer (the perf-counter and CPU-frequency
+        // recorders do this in production): both write counter tracks and
+        // counter samples, and every row must survive in the single
+        // counter.parquet / counter_track.parquet pair.
+        let shared =
+            SharedCollector::new(Box::new(StreamingParquetWriter::new(dir.path()).unwrap()));
+        let mut perf_handle = shared.clone();
+        let mut freq_handle = shared;
+
+        perf_handle
+            .add_counter_track(CounterTrackRecord {
+                id: 1,
+                name: "instructions CPU 0".to_string(),
+                unit: Some("count".to_string()),
+            })
+            .unwrap();
+        perf_handle
+            .add_counter(CounterRecord {
+                ts: 1_000,
+                track_id: 1,
+                value: 42.0,
+            })
+            .unwrap();
+        freq_handle
+            .add_counter_track(CounterTrackRecord {
+                id: 2,
+                name: "CPU 0 frequency".to_string(),
+                unit: Some("Hz".to_string()),
+            })
+            .unwrap();
+        freq_handle
+            .add_counter(CounterRecord {
+                ts: 2_000,
+                track_id: 2,
+                value: 2_400.0,
+            })
+            .unwrap();
+
+        // Finishing the first handle must not finalize the shared writer ...
+        perf_handle.finish().unwrap();
+        // ... the surviving handle can still write ...
+        freq_handle
+            .add_counter(CounterRecord {
+                ts: 3_000,
+                track_id: 2,
+                value: 2_500.0,
+            })
+            .unwrap();
+        // ... and only the last handle's finish closes the files.
+        freq_handle.finish().unwrap();
+
+        // Read back counter_track.parquet: both recorders' tracks are present.
+        let file = File::open(dir.path().join("counter_track.parquet")).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        let mut track_names = Vec::new();
+        for batch in &batches {
+            let names: &arrow::array::StringArray = batch.column(1).as_string();
+            for i in 0..batch.num_rows() {
+                track_names.push(names.value(i).to_string());
+            }
+        }
+        track_names.sort();
+        assert_eq!(
+            track_names,
+            vec![
+                "CPU 0 frequency".to_string(),
+                "instructions CPU 0".to_string()
+            ],
+            "tracks from both handles should survive in counter_track.parquet"
+        );
+
+        // Read back counter.parquet: all samples from both recorders are present.
+        let file = File::open(dir.path().join("counter.parquet")).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        let mut samples = Vec::new();
+        for batch in &batches {
+            let track_ids = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let values = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                samples.push((track_ids.value(i), values.value(i)));
+            }
+        }
+        samples.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        assert_eq!(
+            samples.len(),
+            3,
+            "samples from both handles should survive in counter.parquet"
+        );
+        assert_eq!(samples[0].0, 1);
+        assert!((samples[0].1 - 42.0).abs() < f64::EPSILON);
+        assert_eq!(samples[1].0, 2);
+        assert!((samples[1].1 - 2_400.0).abs() < f64::EPSILON);
+        assert_eq!(samples[2].0, 2);
+        assert!((samples[2].1 - 2_500.0).abs() < f64::EPSILON);
+    }
 }
