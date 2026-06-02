@@ -1,7 +1,9 @@
 [package]
 name = "systing"
-version = "1.7.5"
+version = "1.8.0"
 edition = "2021"
+# Floor set by safe (no-unsafe) std::arch::x86_64::__cpuid in detect_hypervisor.
+rust-version = "1.89"
 authors = ["Josef Bacik <josef@toxicpanda.com>"]
 license = "MIT"
 description = "A libbpf based tracer to figure out what an application is doing"
@@ -45,7 +47,11 @@ schemars = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.140"
 syscalls = "0.6"
-sysinfo = "0.33.1"
+# Only the "system" feature is used (CPU frequency polling, kernel version).
+# Default features pull in rayon (via "multithread", which parallelizes the
+# slow /proc/cpuinfo fallback) plus disk/network/component/user code we never
+# call.
+sysinfo = { version = "0.33.1", default-features = false, features = ["system"] }
 tempfile = "3.13"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "io-std"] }
 object = { version = "0.36", default-features = false, features = ["read", "elf"] }

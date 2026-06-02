@@ -128,3 +128,28 @@ path by walking the live cgroup v2 hierarchy when the trace is written.
 
 Older databases without these columns import cleanly: `cgroup_id` falls back to its
 `0` default and `cgroup_path` to `NULL`.
+
+## Schema Version 9 (systing 1.8.0) — 2026-06-02
+
+Record platform provenance in the `sysinfo` table so a trace identifies what kind
+of machine it was captured on — in particular whether CPU-frequency data could
+exist at all (VM guests have no cpufreq driver, so `--cpu-frequency` is now
+skipped there) and whether the host was virtualized.
+
+### Added columns
+- `sysinfo`: added `cpufreq_driver VARCHAR` — the kernel's cpufreq scaling driver
+  (e.g. `intel_pstate`, `acpi-cpufreq`); `NULL` when the system has no cpufreq
+  support, in which case CPU-frequency counter tracks are absent.
+- `sysinfo`: added `hypervisor VARCHAR` — the hypervisor the trace was captured
+  under, detected via the CPUID hypervisor bit and vendor signature on x86_64
+  (e.g. `kvm`, `xen`, `hyper-v`, `vmware`); `NULL` on bare metal.
+- `sysinfo`: added `sys_vendor VARCHAR` — DMI system vendor (e.g. `Amazon EC2`),
+  `NULL` if DMI is not exposed.
+- `sysinfo`: added `product_name VARCHAR` — DMI product name (e.g.
+  `m7i.16xlarge`), `NULL` if DMI is not exposed.
+
+Older parquet directories without these columns import cleanly: both the
+record-time import (`src/duckdb.rs`) and `systing-util convert` (which
+previously used positional inserts and would have failed on any added column,
+including v8's `process` columns) now use `INSERT ... BY NAME`, which fills
+missing columns with `NULL`.

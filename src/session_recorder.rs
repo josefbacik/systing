@@ -144,6 +144,121 @@ pub fn get_system_utsname() -> Option<Utsname> {
     Some(utsname)
 }
 
+/// Read a small sysfs/procfs file into a trimmed string. Returns `None` if the
+/// file is missing, unreadable, or empty. Trims NUL bytes as well as
+/// whitespace, since device-tree properties are NUL-terminated.
+fn read_sysfs_string(path: &str) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Returns the kernel's cpufreq scaling driver name (e.g. "intel_pstate",
+/// "acpi-cpufreq"), or `None` if the system has no cpufreq support at all.
+///
+/// VM guests typically have no cpufreq driver: the guest has no real frequency
+/// to report, so `--cpu-frequency` polling there only yields a constant nominal
+/// value (and the sysinfo crate's fallback path - a full /proc/cpuinfo parse
+/// per CPU per poll - is expensive). Callers use this both to gate the poller
+/// and to record frequency-data provenance in the trace.
+///
+/// Probes the policy directories rather than a per-CPU path: per-CPU `cpufreq`
+/// symlinks disappear when a CPU is offlined (possible for any CPU on arm64),
+/// while `policyN` directories track the driver itself. Note the `cpufreq`
+/// directory can exist and be empty on systems with no driver.
+pub fn cpufreq_scaling_driver() -> Option<String> {
+    fs::read_dir("/sys/devices/system/cpu/cpufreq")
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("policy"))
+        .find_map(|e| read_sysfs_string(e.path().join("scaling_driver").to_str()?))
+}
+
+/// Detect whether we are running under a hypervisor and, if so, identify it.
+///
+/// On x86_64 this checks the CPUID hypervisor-present bit (leaf 1, ECX bit 31)
+/// and reads the vendor signature from leaf 0x40000000 - the canonical,
+/// unforgeable-by-DMI way to tell a VM from bare metal (cloud "metal" instances
+/// report a vendor like "Amazon EC2" in DMI but do not set the hypervisor bit).
+/// Returns a normalized name ("kvm", "xen", ...) or the raw signature for
+/// unrecognized hypervisors. Returns `None` on bare metal.
+///
+/// Caveats: this records the hypervisor *interface* the guest sees - a KVM
+/// guest with Hyper-V enlightenments advertises "Microsoft Hv" at leaf
+/// 0x40000000 (the KVM signature moves to 0x40000100) and is reported as
+/// "hyper-v" here. On non-x86_64 the check is device-tree based and
+/// best-effort: ACPI-booted guests (most cloud aarch64) have no
+/// /proc/device-tree, so `None` there does not reliably mean bare metal.
+pub fn detect_hypervisor() -> Option<String> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // CPUID is unprivileged and always available on x86_64.
+        let leaf1 = std::arch::x86_64::__cpuid(1);
+        if leaf1.ecx & (1 << 31) == 0 {
+            return None;
+        }
+        // Leaf 0x40000000 is defined whenever the hypervisor bit is set, and
+        // returns the vendor signature in EBX/ECX/EDX.
+        let hv = std::arch::x86_64::__cpuid(0x4000_0000);
+        let mut sig_bytes = [0u8; 12];
+        sig_bytes[0..4].copy_from_slice(&hv.ebx.to_le_bytes());
+        sig_bytes[4..8].copy_from_slice(&hv.ecx.to_le_bytes());
+        sig_bytes[8..12].copy_from_slice(&hv.edx.to_le_bytes());
+        let sig = String::from_utf8_lossy(&sig_bytes)
+            .trim_matches(['\0', ' '])
+            .to_string();
+        let name = match sig.as_str() {
+            s if s.starts_with("KVM") => "kvm",
+            s if s.starts_with("VMware") => "vmware",
+            s if s.starts_with("XenVMM") => "xen",
+            "Microsoft Hv" => "hyper-v",
+            s if s.starts_with("TCG") => "qemu-tcg",
+            s if s.starts_with("bhyve") => "bhyve",
+            s if s.starts_with("VBox") => "virtualbox",
+            s if s.starts_with("ACRN") => "acrn",
+            // Pass unrecognized signatures through so they stay identifiable,
+            // but only if they are printable - garbage CPUID output (or the
+            // U+FFFD characters from_utf8_lossy substitutes for invalid bytes)
+            // should not land in the database verbatim.
+            other
+                if !other.is_empty() && other.chars().all(|c| c.is_ascii_graphic() || c == ' ') =>
+            {
+                other
+            }
+            _ => "unknown",
+        };
+        Some(name.to_string())
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // Best effort on other architectures: device-tree-booted ARM guests
+        // under KVM/Xen expose a hypervisor node whose `compatible` property
+        // names the hypervisor (e.g. "linux,kvm", "xen,xen").
+        if Path::new("/proc/device-tree/hypervisor").exists() {
+            Some(
+                read_sysfs_string("/proc/device-tree/hypervisor/compatible")
+                    .unwrap_or_else(|| "unknown".to_string()),
+            )
+        } else {
+            None
+        }
+    }
+}
+
+/// DMI system vendor (e.g. "Amazon EC2", "Dell Inc."), if exposed.
+pub fn dmi_sys_vendor() -> Option<String> {
+    read_sysfs_string("/sys/class/dmi/id/sys_vendor")
+}
+
+/// DMI product name (e.g. "m7i.16xlarge", "PowerEdge R750"), if exposed.
+pub fn dmi_product_name() -> Option<String> {
+    read_sysfs_string("/sys/class/dmi/id/product_name")
+}
+
 /// Track name for network interface metadata in Perfetto traces.
 pub const NETWORK_INTERFACES_TRACK_NAME: &str = "Network Interfaces";
 
@@ -961,13 +1076,17 @@ impl SessionRecorder {
         }
         drop(clock_snapshot);
 
-        // Write system info (utsname)
+        // Write system info (utsname + platform provenance)
         if let Some(utsname) = get_system_utsname() {
             writer.set_sysinfo(crate::trace::SysInfoRecord {
                 sysname: utsname.sysname().to_string(),
                 release: utsname.release().to_string(),
                 version: utsname.version().to_string(),
                 machine: utsname.machine().to_string(),
+                cpufreq_driver: cpufreq_scaling_driver(),
+                hypervisor: detect_hypervisor(),
+                sys_vendor: dmi_sys_vendor(),
+                product_name: dmi_product_name(),
             })?;
         }
 
@@ -1692,6 +1811,59 @@ mod tests {
 
         // On Linux, sysname should be "Linux"
         assert_eq!(utsname.sysname(), "Linux");
+    }
+
+    #[test]
+    fn test_cpufreq_scaling_driver_matches_sysfs() {
+        // The helper must agree with the sysfs layout it probes: Some(non-empty)
+        // exactly when at least one policy directory has a scaling_driver file.
+        // (The cpufreq directory itself can exist and be empty on systems with
+        // no driver, so directory existence alone is not the oracle.)
+        let any_policy_driver = std::fs::read_dir("/sys/devices/system/cpu/cpufreq")
+            .map(|entries| {
+                entries.flatten().any(|e| {
+                    e.file_name().to_string_lossy().starts_with("policy")
+                        && e.path().join("scaling_driver").exists()
+                })
+            })
+            .unwrap_or(false);
+        let driver = cpufreq_scaling_driver();
+        assert_eq!(driver.is_some(), any_policy_driver);
+        if let Some(d) = driver {
+            assert!(!d.is_empty());
+            assert!(!d.contains('\n'));
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_detect_hypervisor_matches_cpuinfo_flag() {
+        // /proc/cpuinfo's "hypervisor" flag mirrors CPUID.1:ECX bit 31, the
+        // same bit detect_hypervisor() checks - the two must agree.
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap();
+        let flag_set = cpuinfo
+            .lines()
+            .find(|l| l.starts_with("flags"))
+            .is_some_and(|l| l.split_whitespace().any(|f| f == "hypervisor"));
+        assert_eq!(detect_hypervisor().is_some(), flag_set);
+    }
+
+    #[test]
+    fn test_dmi_helpers_match_sysfs() {
+        // Compare against a direct read of the sysfs files (an independent
+        // oracle) rather than re-calling the helper's own code path.
+        for (helper, path) in [
+            (
+                dmi_sys_vendor as fn() -> Option<String>,
+                "/sys/class/dmi/id/sys_vendor",
+            ),
+            (dmi_product_name, "/sys/class/dmi/id/product_name"),
+        ] {
+            let expected = std::fs::read_to_string(path)
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            assert_eq!(helper().is_some(), expected, "{path}");
+        }
     }
 
     #[test]
