@@ -34,6 +34,7 @@ pub use sched_stats::{
 use anyhow::{bail, Result};
 use duckdb::Connection;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use query::{duckdb_value_to_json, duckdb_value_to_string};
@@ -98,6 +99,33 @@ pub struct TraceVersionInfo {
     pub systing_version: String,
 }
 
+/// Per-trace system/platform information (from the `sysinfo` table): what kind
+/// of machine the trace was captured on. The platform columns were added in
+/// schema v9 and read as `None` from older databases.
+#[derive(Debug, Serialize)]
+pub struct TraceSystemInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_release: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// Hypervisor the trace was captured under (e.g. "kvm"); `None` on bare
+    /// metal (reliable on x86_64, best-effort elsewhere).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hypervisor: Option<String>,
+    /// DMI system vendor (e.g. "Amazon EC2").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sys_vendor: Option<String>,
+    /// DMI product name (e.g. "m7i.16xlarge").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_name: Option<String>,
+    /// cpufreq scaling driver; `None` means the host had no cpufreq support,
+    /// so CPU-frequency counter tracks are absent from the trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpufreq_driver: Option<String>,
+}
+
 /// Trace metadata.
 #[derive(Debug, Serialize)]
 pub struct TraceInfo {
@@ -106,6 +134,8 @@ pub struct TraceInfo {
     pub trace_versions: Vec<TraceVersionInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub system: Vec<TraceSystemInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_range: Option<TimeRange>,
     pub tables: Vec<TableInfo>,
@@ -273,6 +303,7 @@ impl AnalyzeDb {
         let traces = self.get_trace_ids()?;
         let trace_versions = self.get_trace_versions();
         let schema_version = self.get_schema_version();
+        let system = self.get_system_info();
 
         let time_range =
             if self.table_exists("stack_sample")? && self.table_has_rows("stack_sample")? {
@@ -296,6 +327,7 @@ impl AnalyzeDb {
             traces,
             trace_versions,
             schema_version,
+            system,
             time_range,
             tables,
             total_process_count,
@@ -405,6 +437,66 @@ impl AnalyzeDb {
         let mut rows = stmt.query([]).ok()?;
         let row = rows.next().ok()??;
         row.get(0).ok()
+    }
+
+    /// Per-trace system/platform info from the `sysinfo` table. Best-effort:
+    /// the table may be missing entirely, and the platform columns
+    /// (hypervisor, sys_vendor, product_name, cpufreq_driver) only exist from
+    /// schema v9 on - missing columns are read as NULL so older databases
+    /// still report kernel/machine.
+    fn get_system_info(&self) -> Vec<TraceSystemInfo> {
+        let existing: HashSet<String> = match self
+            .conn
+            .prepare(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'sysinfo'",
+            )
+            .and_then(|mut s| {
+                s.query_map([], |r| r.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            }) {
+            Ok(cols) => cols,
+            Err(_) => return Vec::new(),
+        };
+        if existing.is_empty() {
+            return Vec::new();
+        }
+
+        // Substitute NULL for any column this database predates.
+        let col = |name: &str| -> String {
+            if existing.contains(name) {
+                format!("\"{name}\"")
+            } else {
+                "NULL".to_string()
+            }
+        };
+        let sql = format!(
+            "SELECT {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
+            col("trace_id"),
+            col("release"),
+            col("machine"),
+            col("hypervisor"),
+            col("sys_vendor"),
+            col("product_name"),
+            col("cpufreq_driver"),
+        );
+
+        let Ok(mut stmt) = self.conn.prepare(&sql) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok(TraceSystemInfo {
+                trace_id: row.get(0)?,
+                kernel_release: row.get(1)?,
+                machine: row.get(2)?,
+                hypervisor: row.get(3)?,
+                sys_vendor: row.get(4)?,
+                product_name: row.get(5)?,
+                cpufreq_driver: row.get(6)?,
+            })
+        }) else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| r.ok()).collect()
     }
 
     fn get_process_count(&self) -> Result<u64> {
@@ -627,5 +719,92 @@ mod tests {
                 "unexpected error: {set_err}"
             );
         }
+    }
+
+    #[test]
+    fn test_trace_info_system_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.duckdb");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            crate::duckdb::create_schema(&conn).unwrap();
+            conn.execute_batch(
+                "INSERT INTO sysinfo (trace_id, sysname, release, version, machine, \
+                 cpufreq_driver, hypervisor, sys_vendor, product_name) \
+                 VALUES ('t1', 'Linux', '6.12.0', '#1 SMP', 'x86_64', \
+                 NULL, 'kvm', 'Amazon EC2', 'm7i.16xlarge')",
+            )
+            .unwrap();
+        }
+
+        let db = AnalyzeDb::open(&db_path, true).unwrap();
+        let info = db.trace_info().unwrap();
+
+        assert_eq!(info.system.len(), 1);
+        let sys = &info.system[0];
+        assert_eq!(sys.trace_id.as_deref(), Some("t1"));
+        assert_eq!(sys.kernel_release.as_deref(), Some("6.12.0"));
+        assert_eq!(sys.machine.as_deref(), Some("x86_64"));
+        assert_eq!(sys.hypervisor.as_deref(), Some("kvm"));
+        assert_eq!(sys.sys_vendor.as_deref(), Some("Amazon EC2"));
+        assert_eq!(sys.product_name.as_deref(), Some("m7i.16xlarge"));
+        assert_eq!(
+            sys.cpufreq_driver, None,
+            "NULL cpufreq_driver must come back as None"
+        );
+    }
+
+    #[test]
+    fn test_trace_info_system_info_pre_v9_schema() {
+        // Databases produced before schema v9 have a sysinfo table without the
+        // platform columns; trace_info must still report kernel/machine and
+        // read the missing columns as None.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("old.duckdb");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            crate::duckdb::create_schema(&conn).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE sysinfo DROP COLUMN cpufreq_driver; \
+                 ALTER TABLE sysinfo DROP COLUMN hypervisor; \
+                 ALTER TABLE sysinfo DROP COLUMN sys_vendor; \
+                 ALTER TABLE sysinfo DROP COLUMN product_name; \
+                 INSERT INTO sysinfo (trace_id, sysname, release, version, machine) \
+                 VALUES ('t1', 'Linux', '5.10.0', '#1 SMP', 'aarch64')",
+            )
+            .unwrap();
+        }
+
+        let db = AnalyzeDb::open(&db_path, true).unwrap();
+        let info = db.trace_info().unwrap();
+
+        assert_eq!(info.system.len(), 1);
+        let sys = &info.system[0];
+        assert_eq!(sys.kernel_release.as_deref(), Some("5.10.0"));
+        assert_eq!(sys.machine.as_deref(), Some("aarch64"));
+        assert_eq!(sys.hypervisor, None);
+        assert_eq!(sys.sys_vendor, None);
+        assert_eq!(sys.product_name, None);
+        assert_eq!(sys.cpufreq_driver, None);
+    }
+
+    #[test]
+    fn test_trace_info_system_info_no_sysinfo_table() {
+        // A database without a sysinfo table at all must yield an empty
+        // system list, not an error.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bare.duckdb");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            crate::duckdb::create_schema(&conn).unwrap();
+            conn.execute_batch("DROP TABLE sysinfo").unwrap();
+        }
+
+        let db = AnalyzeDb::open(&db_path, true).unwrap();
+        let info = db.trace_info().unwrap();
+        assert!(info.system.is_empty());
     }
 }
