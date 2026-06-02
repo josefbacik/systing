@@ -576,7 +576,7 @@ impl SystingMcpServer {
 
     #[tool(
         name = "trace_info",
-        description = "Get metadata about a trace database: database path, trace IDs, time range (in nanoseconds and seconds), non-empty tables with row counts, total process count, and the top 25 processes by thread count. Use the query tool to explore the full process list if needed."
+        description = "Get metadata about a trace database: database path, trace IDs, time range (in nanoseconds and seconds), per-trace system/platform info (kernel, architecture, hypervisor, DMI vendor/product, cpufreq driver), non-empty tables with row counts, total process count, and the top 25 processes by thread count. Platform fields are omitted when unset: an absent hypervisor means bare metal, and an absent cpufreq_driver means CPU-frequency tracks are absent from the trace - except for traces recorded by systing < 1.8, which omit all four platform fields (meaning unknown, not bare metal). The whole system field is absent when the database has no sysinfo data. Use the query tool to explore the full process list if needed."
     )]
     async fn trace_info(
         &self,
@@ -755,7 +755,8 @@ network activity, and performance counters. Traces are stored in DuckDB database
 All tools accept an optional `path` parameter pointing to a .duckdb trace database file. \
 The database is opened automatically on first use and cached for subsequent calls. \
 If `path` is omitted, the most recently accessed database is used.
-1. trace_info \u{2014} Get overview: traces, time range, tables, processes. \
+1. trace_info \u{2014} Get overview: traces, time range, system/platform \
+   (kernel, hypervisor, machine type, cpufreq driver), tables, processes. \
    Good first call with a new database path.
 2. list_tables \u{2014} See all tables and row counts.
 3. describe_table \u{2014} Get column names and types for a table of interest.
