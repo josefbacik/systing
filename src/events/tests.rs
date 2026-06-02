@@ -1,12 +1,15 @@
 use super::*;
 use crate::record::collector::InMemoryCollector;
 use crate::systing_core::types::task_info;
-use crate::utid::UtidGenerator;
+use crate::utid::{TrackEventIdGenerator, UtidGenerator};
 use rand::rngs::mock::StepRng;
 use std::sync::Arc;
 
 fn new_recorder() -> SystingProbeRecorder {
-    SystingProbeRecorder::new(Arc::new(UtidGenerator::new()))
+    SystingProbeRecorder::new(
+        Arc::new(UtidGenerator::new()),
+        Arc::new(TrackEventIdGenerator::new()),
+    )
 }
 
 /// Create a test recorder with a streaming collector already set,
@@ -2130,4 +2133,96 @@ fn test_range_mismatched_scope_is_rejected() {
     let result = recorder.load_config_from_json(json, &mut rng);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("scope"));
+}
+
+#[test]
+fn test_track_event_ids_shared_with_marker_recorder() {
+    // The probe recorder and the marker recorder both emit track/slice/instant
+    // rows into the same tables, so they share a TrackEventIdGenerator. IDs
+    // allocated by one recorder must never be reused by the other.
+    use crate::marker_recorder::{
+        MarkerRecorder, MARKER_TYPE_END, MARKER_TYPE_INSTANT, MARKER_TYPE_START,
+    };
+    use crate::systing_core::marker_event;
+
+    let utid_gen = Arc::new(UtidGenerator::new());
+    let track_event_ids = Arc::new(TrackEventIdGenerator::new());
+
+    // Probe recorder streams a syscall slice (track + slice + arg) and a
+    // trace-event instant (track + instant).
+    let mut rng = StepRng::new(0, 1);
+    let mut probe_recorder =
+        SystingProbeRecorder::new(Arc::clone(&utid_gen), Arc::clone(&track_event_ids));
+    probe_recorder.set_streaming_collector(Box::new(InMemoryCollector::new()));
+    probe_recorder
+        .add_event_from_str("tracepoint:category:tp_name", &mut rng)
+        .unwrap();
+    probe_recorder.handle_event(create_syscall_enter_event(100, 101, 1000, 1));
+    probe_recorder.handle_event(create_syscall_exit_event(100, 101, 2000, 1, 42));
+    probe_recorder.handle_event(probe_event {
+        task: task_info {
+            tgidpid: (100u64 << 32) | 101u64,
+            ..Default::default()
+        },
+        ts: 1200,
+        cookie: 0, // matches the StepRng-generated cookie for the tracepoint event
+        ..Default::default()
+    });
+    let probe_data = probe_recorder.finish_in_memory();
+
+    // Marker recorder writes a range slice and an instant on its own track.
+    let marker_event_for = |marker_type: u32, name: &str, ts: u64| -> marker_event {
+        let mut event = marker_event {
+            marker_type,
+            ts,
+            ..Default::default()
+        };
+        event.task.tgidpid = (100u64 << 32) | 101u64;
+        event.name[..name.len()].copy_from_slice(name.as_bytes());
+        event
+    };
+    let mut marker_recorder =
+        MarkerRecorder::new(Arc::clone(&utid_gen), Arc::clone(&track_event_ids));
+    marker_recorder.handle_event(marker_event_for(MARKER_TYPE_START, "MyTrack:range", 1100));
+    marker_recorder.handle_event(marker_event_for(MARKER_TYPE_END, "MyTrack:range", 1900));
+    marker_recorder.handle_event(marker_event_for(MARKER_TYPE_INSTANT, "checkpoint", 1500));
+    let mut marker_collector = InMemoryCollector::new();
+    marker_recorder
+        .write_records(&mut marker_collector)
+        .unwrap();
+    let marker_data = marker_collector.into_data();
+
+    // Both recorders produced rows...
+    assert!(!probe_data.tracks.is_empty());
+    assert!(!probe_data.slices.is_empty());
+    assert!(!probe_data.instants.is_empty());
+    assert!(!marker_data.tracks.is_empty());
+    assert!(!marker_data.slices.is_empty());
+    assert!(!marker_data.instants.is_empty());
+
+    // ...and no track, slice, or instant ID is shared between them.
+    for probe_track in &probe_data.tracks {
+        assert!(
+            marker_data.tracks.iter().all(|t| t.id != probe_track.id),
+            "track id {} allocated by both recorders",
+            probe_track.id
+        );
+    }
+    for probe_slice in &probe_data.slices {
+        assert!(
+            marker_data.slices.iter().all(|s| s.id != probe_slice.id),
+            "slice id {} allocated by both recorders",
+            probe_slice.id
+        );
+    }
+    for probe_instant in &probe_data.instants {
+        assert!(
+            marker_data
+                .instants
+                .iter()
+                .all(|i| i.id != probe_instant.id),
+            "instant id {} allocated by both recorders",
+            probe_instant.id
+        );
+    }
 }

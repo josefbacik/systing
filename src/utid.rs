@@ -181,6 +181,54 @@ impl Default for CounterTrackIdGenerator {
     }
 }
 
+/// Thread-safe generator for `track`, `slice`, and `instant` IDs.
+///
+/// More than one recorder emits rows for these tables (the probe recorder for
+/// trace-events/syscalls and the marker recorder for userspace markers), and
+/// `args` / `instant_args` rows reference slice and instant IDs, so all IDs
+/// must come from a single shared sequence to stay unique. Every recorder that
+/// emits track/slice/instant rows should hold a clone of the same
+/// `Arc<TrackEventIdGenerator>`.
+#[derive(Debug)]
+pub struct TrackEventIdGenerator {
+    next_track_id: AtomicI64,
+    next_slice_id: AtomicI64,
+    next_instant_id: AtomicI64,
+}
+
+impl TrackEventIdGenerator {
+    /// Create a new generator with all ID sequences starting at 1.
+    pub fn new() -> Self {
+        Self {
+            next_track_id: AtomicI64::new(1),
+            next_slice_id: AtomicI64::new(1),
+            next_instant_id: AtomicI64::new(1),
+        }
+    }
+
+    /// Allocate the next unique track ID.
+    pub fn next_track_id(&self) -> i64 {
+        // Relaxed ordering is sufficient - we only need uniqueness, not synchronization.
+        self.next_track_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Allocate the next unique slice ID.
+    pub fn next_slice_id(&self) -> i64 {
+        self.next_slice_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Allocate the next unique instant ID.
+    pub fn next_instant_id(&self) -> i64 {
+        self.next_instant_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+impl Default for TrackEventIdGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +239,19 @@ mod tests {
         assert_eq!(gen.next_id(), 1);
         assert_eq!(gen.next_id(), 2);
         assert_eq!(gen.next_id(), 3);
+    }
+
+    #[test]
+    fn test_track_event_id_generator_independent_sequences() {
+        let gen = TrackEventIdGenerator::new();
+        // Each ID kind has its own sequence...
+        assert_eq!(gen.next_track_id(), 1);
+        assert_eq!(gen.next_track_id(), 2);
+        assert_eq!(gen.next_slice_id(), 1);
+        assert_eq!(gen.next_instant_id(), 1);
+        // ...and they advance independently.
+        assert_eq!(gen.next_slice_id(), 2);
+        assert_eq!(gen.next_track_id(), 3);
     }
 
     #[test]
