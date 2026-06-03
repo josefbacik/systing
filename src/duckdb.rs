@@ -15,8 +15,9 @@ use crate::parquet_paths::ParquetPaths;
 /// DuckDB sizes its buffer pool from physical RAM, which inside a container is
 /// the host's RAM, not the cgroup limit. On large hosts this makes the
 /// parquet→duckdb import OOM the container. We read the cgroup limit ourselves
-/// so we can cap DuckDB explicitly.
-fn detect_cgroup_memory_limit() -> Option<u64> {
+/// so we can cap DuckDB explicitly. Also used by the stack symbolizer to size
+/// its memory valve.
+pub(crate) fn detect_cgroup_memory_limit() -> Option<u64> {
     // A limit at or above this is "effectively unlimited" (cgroup v1 reports a
     // page-rounded i64::MAX; v2 reports the literal string "max").
     const UNLIMITED_THRESHOLD: u64 = 1 << 55;

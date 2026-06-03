@@ -1,7 +1,11 @@
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::record::RecordCollector;
@@ -72,6 +76,303 @@ impl Stack {
     }
 }
 
+/// 128-bit content hash of a (stack, tgid) dedup key. Used so the recorder
+/// only has to keep a 16-byte digest per unique stack in memory instead of the
+/// full address vectors; the actual contents are spilled to disk until
+/// end-of-trace symbolization. Two SipHash passes with independently random
+/// per-run keys give 128 bits, making collisions (which would alias two
+/// different stacks to one id) vanishingly unlikely — and, because the keys
+/// are not known to traced processes, not constructible offline either.
+fn stack_dedup_hash(hashers: &(RandomState, RandomState), stack: &Stack, tgid: i32) -> u128 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+
+    let mut h1 = hashers.0.build_hasher();
+    tgid.hash(&mut h1);
+    stack.hash(&mut h1);
+    let mut h2 = hashers.1.build_hasher();
+    tgid.hash(&mut h2);
+    stack.hash(&mut h2);
+    ((h1.finish() as u128) << 64) | h2.finish() as u128
+}
+
+/// Disk-backed store for unique stack contents. During recording each unique
+/// (stack, tgid) is appended once; at end of trace the records are streamed
+/// back for symbolization. This keeps per-unique-stack memory at ~16 bytes
+/// (the dedup hash) instead of the full address vectors, which on hosts with
+/// heavy short-lived-process churn (CI) otherwise grow to multiple GiB.
+///
+/// The backing file is created unlinked (tempfile) in the trace output
+/// directory. If no directory was configured (unit tests) or a write fails,
+/// records are kept in memory instead.
+struct StackSpill {
+    writer: Option<BufWriter<File>>,
+    /// In-memory fallback used when no spill dir is set or after an IO error.
+    fallback: Vec<(Stack, i32, i64)>,
+    /// Records handed to the writer (not in `fallback` or `pending`).
+    written: u64,
+    /// Records known durable: count at the last successful flush. Only records
+    /// up to this point are replayed from the file if a later flush fails.
+    flushed: u64,
+    /// Copies of records written since the last successful flush. Moved to
+    /// `fallback` on an IO error so no record is ever lost or duplicated;
+    /// bounded by `SPILL_FLUSH_INTERVAL`.
+    pending: Vec<(Stack, i32, i64)>,
+    /// Reusable serialization buffer.
+    buf: Vec<u8>,
+}
+
+/// Explicitly flush the spill BufWriter every this many records. Bounds both
+/// the size of `pending` (records that fall back to memory on an IO error) and
+/// the cost of the extra page-cache writes.
+const SPILL_FLUSH_INTERVAL: u64 = 256;
+
+impl StackSpill {
+    fn new() -> Self {
+        Self {
+            writer: None,
+            fallback: Vec::new(),
+            written: 0,
+            flushed: 0,
+            pending: Vec::new(),
+            buf: Vec::new(),
+        }
+    }
+
+    fn set_dir(&mut self, dir: &Path) {
+        match tempfile::tempfile_in(dir) {
+            Ok(f) => self.writer = Some(BufWriter::new(f)),
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to create stack spill file in {}: {e}; \
+                     keeping stacks in memory",
+                    dir.display()
+                );
+            }
+        }
+    }
+
+    fn total(&self) -> u64 {
+        self.written + self.fallback.len() as u64
+    }
+
+    /// Record format (little-endian):
+    /// id: i64, tgid: i32, klen: u16, ulen: u16, pylen: u16,
+    /// then klen+ulen u64 addresses and pylen (u32 symbol_id, i32 inst_idx).
+    ///
+    /// Called from the ringbuf consumer path, but only once per *unique* stack
+    /// and buffered through page cache, so it does not normally block event
+    /// consumption. A stalled filesystem on the output directory could.
+    fn push(&mut self, stack: Stack, tgid: i32, id: i64) {
+        if self.writer.is_none() {
+            self.fallback.push((stack, tgid, id));
+            return;
+        }
+
+        // The depth fields are u16; BPF caps kernel/user stacks at
+        // MAX_STACK_DEPTH (36) and Python stacks at 127 frames, so these can
+        // only fire if those limits grow past 65535.
+        debug_assert!(stack.kernel_stack.len() <= u16::MAX as usize);
+        debug_assert!(stack.user_stack.len() <= u16::MAX as usize);
+        debug_assert!(stack.py_stack.len() <= u16::MAX as usize);
+
+        self.buf.clear();
+        self.buf.extend_from_slice(&id.to_le_bytes());
+        self.buf.extend_from_slice(&tgid.to_le_bytes());
+        self.buf
+            .extend_from_slice(&(stack.kernel_stack.len() as u16).to_le_bytes());
+        self.buf
+            .extend_from_slice(&(stack.user_stack.len() as u16).to_le_bytes());
+        self.buf
+            .extend_from_slice(&(stack.py_stack.len() as u16).to_le_bytes());
+        for addr in &stack.kernel_stack {
+            self.buf.extend_from_slice(&addr.to_le_bytes());
+        }
+        for addr in &stack.user_stack {
+            self.buf.extend_from_slice(&addr.to_le_bytes());
+        }
+        for py in &stack.py_stack {
+            self.buf.extend_from_slice(&py.addr.symbol_id.to_le_bytes());
+            self.buf.extend_from_slice(&py.addr.inst_idx.to_le_bytes());
+        }
+
+        let writer = self.writer.as_mut().expect("writer checked above");
+        if let Err(e) = writer.write_all(&self.buf) {
+            // Anything since the last successful flush (including this record)
+            // moves to the in-memory fallback; the reader only replays up to
+            // `flushed`, so nothing is lost or duplicated.
+            eprintln!(
+                "Warning: stack spill write failed ({e}); keeping {} affected stacks \
+                 (and all further ones) in memory",
+                self.pending.len() + 1
+            );
+            self.writer = None;
+            self.written = self.flushed;
+            self.fallback.append(&mut self.pending);
+            self.fallback.push((stack, tgid, id));
+            return;
+        }
+        self.written += 1;
+        self.pending.push((stack, tgid, id));
+
+        if self.written - self.flushed >= SPILL_FLUSH_INTERVAL {
+            match writer.flush() {
+                Ok(()) => {
+                    self.flushed = self.written;
+                    self.pending.clear();
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: stack spill flush failed ({e}); keeping {} affected \
+                         stacks (and all further ones) in memory",
+                        self.pending.len()
+                    );
+                    self.writer = None;
+                    self.written = self.flushed;
+                    self.fallback.append(&mut self.pending);
+                }
+            }
+        }
+    }
+
+    /// Flush and rewind the spill file for reading. Returns the reader plus
+    /// the number of durable records to replay; `None` if nothing was spilled
+    /// to disk. On a final-flush failure the file prefix written so far is
+    /// still replayed and the unflushed tail is recovered from `pending`.
+    fn take_reader(&mut self) -> Option<(BufReader<File>, u64)> {
+        let mut writer = self.writer.take()?;
+        match writer.flush() {
+            Ok(()) => {
+                self.flushed = self.written;
+                self.pending.clear();
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to flush stack spill file ({e}); recovering {} \
+                     buffered stacks from memory",
+                    self.pending.len()
+                );
+                self.written = self.flushed;
+                self.fallback.append(&mut self.pending);
+            }
+        }
+        // into_parts (rather than into_inner) so a flush failure above cannot
+        // cost us the file: the already-flushed prefix is always readable.
+        let (mut f, _) = writer.into_parts();
+        match f.seek(SeekFrom::Start(0)) {
+            Ok(_) => Some((BufReader::new(f), self.flushed)),
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to rewind stack spill file: {e}; {} stacks will \
+                     be missing from the trace",
+                    self.flushed
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Approximate anonymous RSS of this process in bytes (resident minus
+/// file-backed shared pages, from /proc/self/statm).
+fn current_anon_rss_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let mut it = s.split_whitespace();
+    let _size = it.next()?;
+    let resident: u64 = it.next()?.parse().ok()?;
+    let shared: u64 = it.next()?.parse().ok()?;
+    // SAFETY: sysconf is always safe to call; _SC_PAGESIZE cannot fail.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    Some(resident.saturating_sub(shared) * page_size)
+}
+
+/// Memory budget for the symbolization phase. blazesym retains parsed debug
+/// info for every live binary it symbolizes (with code-info and inlined-fn
+/// resolution this can be GiBs for large debug-heavy binaries), so the
+/// symbolization loop periodically checks anon RSS against this budget and
+/// rebuilds the symbolizer when it is exceeded.
+fn symbolizer_memory_budget() -> u64 {
+    const DEFAULT_BUDGET: u64 = 2 << 30; // 2 GiB
+    crate::duckdb::detect_cgroup_memory_limit()
+        .map(|limit| limit / 2)
+        .unwrap_or(DEFAULT_BUDGET)
+        .clamp(256 << 20, 16 << 30)
+}
+
+/// Emit a symbolized stack as a StackRecord (skipping empty stacks).
+fn emit_stack_record(
+    collector: &mut dyn RecordCollector,
+    stack_id: i64,
+    frame_names: Vec<String>,
+) -> Result<()> {
+    if frame_names.is_empty() {
+        return Ok(());
+    }
+    let leaf_name = frame_names.first().cloned().unwrap_or_default();
+    let depth = frame_names.len().min(i32::MAX as usize) as i32;
+    collector.add_stack(StackRecord {
+        id: stack_id,
+        frame_names,
+        depth,
+        leaf_name,
+    })
+}
+
+/// Read one spill record. Returns `Ok(None)` on clean EOF, `Err` on a torn
+/// record (which terminates reading; the writer warned when it happened).
+fn read_spill_record(reader: &mut BufReader<File>) -> Result<Option<(Stack, i32, i64)>> {
+    let mut hdr = [0u8; 18];
+    match reader.read_exact(&mut hdr[..1]) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e).context("reading stack spill record header"),
+    }
+    reader
+        .read_exact(&mut hdr[1..])
+        .context("reading stack spill record header")?;
+
+    let id = i64::from_le_bytes(hdr[0..8].try_into().unwrap());
+    let tgid = i32::from_le_bytes(hdr[8..12].try_into().unwrap());
+    let klen = u16::from_le_bytes(hdr[12..14].try_into().unwrap()) as usize;
+    let ulen = u16::from_le_bytes(hdr[14..16].try_into().unwrap()) as usize;
+    let pylen = u16::from_le_bytes(hdr[16..18].try_into().unwrap()) as usize;
+
+    let mut addrs = vec![0u8; (klen + ulen) * 8 + pylen * 8];
+    reader
+        .read_exact(&mut addrs)
+        .context("reading stack spill record body")?;
+
+    let mut off = 0;
+    let read_u64s = |n: usize, off: &mut usize| -> Vec<u64> {
+        let v = addrs[*off..*off + n * 8]
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        *off += n * 8;
+        v
+    };
+    let kernel_stack = read_u64s(klen, &mut off);
+    let user_stack = read_u64s(ulen, &mut off);
+    let py_stack = addrs[off..off + pylen * 8]
+        .chunks_exact(8)
+        .map(|c| PyAddr {
+            addr: crate::pystacks::types::StackWalkerFrame {
+                symbol_id: u32::from_le_bytes(c[0..4].try_into().unwrap()),
+                inst_idx: i32::from_le_bytes(c[4..8].try_into().unwrap()),
+            },
+        })
+        .collect();
+
+    Ok(Some((
+        Stack {
+            kernel_stack,
+            user_stack,
+            py_stack,
+        },
+        tgid,
+        id,
+    )))
+}
+
 /// Convert BPF stack_event_type (u32) to i8, clamping to valid range.
 /// Valid values are 0 (STACK_SLEEP_UNINTERRUPTIBLE), 1 (STACK_RUNNING), 2 (STACK_SLEEP_INTERRUPTIBLE).
 /// Unknown values are preserved but clamped to i8::MAX to avoid truncation issues.
@@ -94,14 +395,18 @@ pub struct StackRecorder {
     /// are written immediately in handle_event() and stacks are deduplicated during
     /// recording for end-of-trace symbolization via finish().
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
-    /// Maps (Stack, tgid) to stack_id for deduplication during streaming.
-    /// The tgid is included in the key because the same addresses in different processes
-    /// may resolve to different symbols (e.g., shared libraries at fixed addresses).
-    unique_stacks: HashMap<(Stack, i32), i64>,
-    /// External stack_ids that collided with an existing unique_stacks key during
-    /// merge_external_stacks. Emitted as duplicate StackRecords in finish so every
-    /// id referenced by a streamed record resolves.
-    alias_stacks: Vec<(Stack, i32, i64)>,
+    /// Maps the 128-bit hash of (stack, tgid) to stack_id for deduplication
+    /// during streaming. The tgid is part of the key because the same addresses
+    /// in different processes may resolve to different symbols (e.g., shared
+    /// libraries at fixed addresses). Only the digest is kept in memory; the
+    /// stack contents live in `spill` until end-of-trace symbolization.
+    stack_ids: HashMap<u128, i64>,
+    /// Per-run random keys for the dedup hash, so collisions cannot be
+    /// precomputed by traced processes.
+    dedup_hashers: (RandomState, RandomState),
+    /// Disk-backed contents of every unique (stack, tgid), including external
+    /// (memory recorder) stacks and their id aliases.
+    spill: StackSpill,
     /// Next stack_id to assign for new unique stacks.
     next_stack_id: i64,
     /// Shared utid generator for consistent thread IDs across all recorders.
@@ -127,8 +432,9 @@ impl StackRecorder {
             psr: Arc::new(StackWalkerRun::default()),
             process_dispatcher,
             streaming_collector: None,
-            unique_stacks: HashMap::new(),
-            alias_stacks: Vec::new(),
+            stack_ids: HashMap::new(),
+            dedup_hashers: (RandomState::new(), RandomState::new()),
+            spill: StackSpill::new(),
             next_stack_id: 1,
             utid_generator,
         }
@@ -136,9 +442,16 @@ impl StackRecorder {
 
     /// Enable streaming mode and attach a collector so that StackSampleRecords
     /// are emitted immediately in handle_event() rather than accumulated for the
-    /// entire trace. unique_stacks is still retained for end-of-trace symbolization.
+    /// entire trace. Unique stack contents are spilled (see `set_spill_dir`)
+    /// for end-of-trace symbolization.
     pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
         self.streaming_collector = Some(collector);
+    }
+
+    /// Configure the directory for the unique-stack spill file. Must be called
+    /// before recording starts; without it, stack contents are kept in memory.
+    pub fn set_spill_dir(&mut self, dir: &Path) {
+        self.spill.set_dir(dir);
     }
 
     /// Merge externally-deduped stacks (from another recorder) so they are
@@ -146,13 +459,19 @@ impl StackRecorder {
     /// external key collides with an existing entry, the external id is kept as
     /// an alias so both ids are emitted as StackRecords.
     pub fn merge_external_stacks(&mut self, stacks: HashMap<(Stack, i32), i64>) {
-        for (key, id) in stacks {
-            if let Some(&existing) = self.unique_stacks.get(&key) {
-                if existing != id {
-                    self.alias_stacks.push((key.0, key.1, id));
+        for ((stack, tgid), id) in stacks {
+            let hash = stack_dedup_hash(&self.dedup_hashers, &stack, tgid);
+            match self.stack_ids.get(&hash) {
+                Some(&existing) if existing == id => {}
+                Some(_) => {
+                    // Alias: same contents already recorded under another id.
+                    // Persist again under the external id so both ids resolve.
+                    self.spill.push(stack, tgid, id);
                 }
-            } else {
-                self.unique_stacks.insert(key, id);
+                None => {
+                    self.stack_ids.insert(hash, id);
+                    self.spill.push(stack, tgid, id);
+                }
             }
         }
     }
@@ -209,12 +528,13 @@ impl StackRecorder {
     }
 
     fn finish_inner(&mut self, collector: &mut dyn RecordCollector) -> Result<()> {
-        if self.unique_stacks.is_empty() && self.alias_stacks.is_empty() {
+        let total = self.spill.total();
+        if total == 0 {
             return Ok(());
         }
 
         // Symbolize all unique stacks and stream StackRecords
-        let pb = ProgressBar::new((self.unique_stacks.len() + self.alias_stacks.len()) as u64);
+        let pb = ProgressBar::new(total);
         pb.set_style(
             ProgressStyle::default_bar()
                 .template(
@@ -230,90 +550,170 @@ impl StackRecorder {
         // Create kernel source once - it's shared across all processes
         let kernel_src = Source::Kernel(Kernel::default());
 
-        // Address cache: blazesym caches metadata (KASLR, ELF parsing) but not individual
-        // symbolization results. We cache (addr, tgid) -> frame_name to avoid re-symbolizing
-        // the same address across different stacks.
-        let mut addr_cache: HashMap<(u64, i32), String> = HashMap::new();
+        // Kernel address cache: blazesym caches metadata (KASLR, kallsyms
+        // parsing) but not individual symbolization results, and the KASLR
+        // offset is system-wide so the same kernel address resolves identically
+        // for all processes.
+        let mut kernel_cache: HashMap<u64, String> = HashMap::new();
 
-        // Group stacks by tgid to reuse process sources efficiently
-        let mut stacks_by_tgid: HashMap<i32, Vec<(&Stack, i64)>> = HashMap::new();
-        for ((stack, tgid), stack_id) in self.unique_stacks.iter() {
-            stacks_by_tgid
-                .entry(*tgid)
-                .or_default()
-                .push((stack, *stack_id));
-        }
-        for (stack, tgid, stack_id) in self.alias_stacks.iter() {
-            stacks_by_tgid
-                .entry(*tgid)
-                .or_default()
-                .push((stack, *stack_id));
-        }
+        // Pass 1: stream spilled stacks back from disk one record at a time
+        // (then any kept in memory). Stacks of exited processes are emitted
+        // immediately: their user addresses cannot be symbolized at all
+        // (blazesym needs /proc/<pid>/maps), so they only need the kernel cache
+        // and a hex rendering, and their address vectors are freed right away.
+        // Stacks of live processes are grouped per tgid for pass 2.
+        //
+        // Under heavy short-lived-process churn (CI) nearly everything is dead
+        // by now, so this pass keeps peak memory flat where the old
+        // hold-everything approach grew to multiple GiB.
+        let mut live_groups: HashMap<i32, Vec<(Stack, i64)>> = HashMap::new();
+        let mut tgid_alive: HashMap<i32, bool> = HashMap::new();
 
-        // Process each tgid group with a single Source per process
-        for (tgid, stacks) in stacks_by_tgid.iter() {
-            // Create process source once per tgid
-            let proc_src = Source::Process(Process::new(Pid::from(*tgid as u32)));
-
-            // Pre-cache process metadata for this tgid (best-effort optimization;
-            // result is ignored as caching failure doesn't affect correctness)
-            let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(
-                (*tgid as u32).into(),
-            )));
-
-            for (stack, stack_id) in stacks {
-                // Symbolize this stack using the shared sources and address cache
-                let frame_names = self.symbolize_stack_with_sources_cached(
-                    &mut symbolizer,
-                    stack,
-                    &proc_src,
-                    &kernel_src,
-                    *tgid,
-                    &mut addr_cache,
-                );
-
-                pb.inc(1);
-
-                // Skip empty stacks
-                if frame_names.is_empty() {
-                    continue;
-                }
-
-                let leaf_name = frame_names.first().cloned().unwrap_or_default();
-                let depth = frame_names.len().min(i32::MAX as usize) as i32;
-
-                collector.add_stack(StackRecord {
-                    id: *stack_id,
-                    frame_names,
-                    depth,
-                    leaf_name,
-                })?;
+        let mut handle_record = |this: &Self,
+                                 symbolizer: &mut Symbolizer,
+                                 kernel_cache: &mut HashMap<u64, String>,
+                                 live_groups: &mut HashMap<i32, Vec<(Stack, i64)>>,
+                                 stack: Stack,
+                                 tgid: i32,
+                                 stack_id: i64|
+         -> Result<()> {
+            let alive = *tgid_alive
+                .entry(tgid)
+                .or_insert_with(|| Path::new("/proc").join(tgid.to_string()).exists());
+            if alive {
+                live_groups.entry(tgid).or_default().push((stack, stack_id));
+                return Ok(());
             }
+
+            let frame_names =
+                this.symbolize_stack_frames(symbolizer, &stack, None, &kernel_src, kernel_cache);
+            pb.inc(1);
+            emit_stack_record(collector, stack_id, frame_names)
+        };
+
+        if let Some((mut reader, durable_records)) = self.spill.take_reader() {
+            for _ in 0..durable_records {
+                match read_spill_record(&mut reader) {
+                    Ok(Some((stack, tgid, stack_id))) => {
+                        handle_record(
+                            self,
+                            &mut symbolizer,
+                            &mut kernel_cache,
+                            &mut live_groups,
+                            stack,
+                            tgid,
+                            stack_id,
+                        )?;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("Warning: stopping stack spill replay early: {e:#}");
+                        break;
+                    }
+                }
+            }
+        }
+        for (stack, tgid, stack_id) in std::mem::take(&mut self.spill.fallback) {
+            handle_record(
+                self,
+                &mut symbolizer,
+                &mut kernel_cache,
+                &mut live_groups,
+                stack,
+                tgid,
+                stack_id,
+            )?;
+        }
+
+        // Release the dedup table before the symbolization pass; it is no
+        // longer needed and live-group symbolization can be memory-hungry.
+        self.stack_ids = HashMap::new();
+
+        // Pass 2: symbolize live processes one tgid at a time. blazesym
+        // accumulates parsed debug info for every binary it touches with no
+        // eviction (with code-info and inlined-fn resolution this can reach
+        // GiBs for debug-heavy binaries), so anon RSS is checked against a
+        // budget after each group and periodically within large groups, and
+        // the symbolizer is rebuilt when it is exceeded. Grouping per tgid
+        // means each process's binaries are normally parsed once; a rebuild
+        // costs re-parsing for addresses not already in the string caches.
+        //
+        // `rebuild_floor` is the RSS right after the last rebuild: if a rebuild
+        // doesn't actually free memory (the budget is exceeded by things a
+        // rebuild can't touch, or one binary's debug info alone exceeds it),
+        // further rebuilds would only thrash re-parsing, so the valve waits for
+        // real growth above the floor before firing again.
+        let memory_budget = symbolizer_memory_budget();
+        const VALVE_CHECK_INTERVAL: usize = 8192;
+        const REBUILD_GROWTH_MARGIN: u64 = 256 << 20;
+        let mut rebuild_floor: u64 = 0;
+        let mut maybe_rebuild = |this: &Self, symbolizer: &mut Symbolizer| {
+            let Some(anon) = current_anon_rss_bytes() else {
+                return;
+            };
+            if anon <= memory_budget || anon <= rebuild_floor.saturating_add(REBUILD_GROWTH_MARGIN)
+            {
+                return;
+            }
+            *symbolizer = this.create_symbolizer();
+            // SAFETY: malloc_trim is always safe to call on glibc.
+            unsafe {
+                libc::malloc_trim(0);
+            }
+            rebuild_floor = current_anon_rss_bytes().unwrap_or(anon);
+            eprintln!(
+                "Note: symbolizer caches rebuilt to stay under memory budget ({} MiB)",
+                memory_budget >> 20
+            );
+        };
+
+        for (tgid, stacks) in live_groups {
+            // Pre-cache process metadata for this tgid (best-effort
+            // optimization; failure doesn't affect correctness).
+            let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(
+                (tgid as u32).into(),
+            )));
+            let proc_src = Source::Process(Process::new(Pid::from(tgid as u32)));
+            // Per-process user-address cache, freed with the group. Survives a
+            // mid-group rebuild, so already-resolved addresses are not re-done.
+            let mut user_cache: HashMap<u64, String> = HashMap::new();
+
+            for (i, (stack, stack_id)) in stacks.into_iter().enumerate() {
+                if i > 0 && i % VALVE_CHECK_INTERVAL == 0 {
+                    maybe_rebuild(self, &mut symbolizer);
+                }
+                let frame_names = self.symbolize_stack_frames(
+                    &mut symbolizer,
+                    &stack,
+                    Some((&proc_src, &mut user_cache)),
+                    &kernel_src,
+                    &mut kernel_cache,
+                );
+                pb.inc(1);
+                emit_stack_record(collector, stack_id, frame_names)?;
+            }
+
+            maybe_rebuild(self, &mut symbolizer);
         }
 
         pb.finish_with_message("Stack symbolization complete");
-
-        // Release the dedup tables now that they have been emitted. On busy
-        // many-core hosts these hold several GiB of Stack keys that would
-        // otherwise sit under the DuckDB import that follows.
-        self.unique_stacks = HashMap::new();
-        self.alias_stacks = Vec::new();
 
         Ok(())
     }
 
     /// Symbolize a single stack and return frame names.
-    /// Takes pre-created Source objects and an address cache for efficiency.
-    /// Blazesym caches metadata (KASLR, ELF parsing) but not symbolization results,
-    /// so we maintain our own cache for individual addresses.
-    fn symbolize_stack_with_sources_cached(
+    ///
+    /// `user` carries the process source and per-process address cache for a
+    /// live process; `None` means the process has exited, in which case user
+    /// addresses are rendered as raw hex (symbolization cannot succeed without
+    /// /proc/<pid>/maps). Kernel addresses go through the shared `kernel_cache`.
+    fn symbolize_stack_frames(
         &self,
         symbolizer: &mut Symbolizer,
         stack: &Stack,
-        proc_src: &Source<'_>,
+        user: Option<(&Source<'_>, &mut HashMap<u64, String>)>,
         kernel_src: &Source<'_>,
-        tgid: i32,
-        addr_cache: &mut HashMap<(u64, i32), String>,
+        kernel_cache: &mut HashMap<u64, String>,
     ) -> Vec<String> {
         let mut frame_names = Vec::with_capacity(
             stack.user_stack.len() + stack.kernel_stack.len() + stack.py_stack.len(),
@@ -323,28 +723,35 @@ impl StackRecorder {
         let python_frames = self.psr.get_python_frame_names(&stack.py_stack);
         frame_names.extend(python_frames);
 
-        // Symbolize user addresses (leaf) - use tgid for cache key
-        for &addr in &stack.user_stack {
-            let frame_name = addr_cache
-                .entry((addr, tgid))
-                .or_insert_with(|| {
-                    symbolizer
-                        .symbolize_single(proc_src, Input::AbsAddr(addr))
-                        .ok()
-                        .and_then(|s| s.into_sym())
-                        .map(|s| format_symbolized_frame(&s, addr, "unknown"))
-                        .unwrap_or_else(|| format!("0x{addr:x}"))
-                })
-                .clone();
-            frame_names.push(frame_name);
+        // Symbolize user addresses (leaf)
+        match user {
+            Some((proc_src, user_cache)) => {
+                for &addr in &stack.user_stack {
+                    let frame_name = user_cache
+                        .entry(addr)
+                        .or_insert_with(|| {
+                            symbolizer
+                                .symbolize_single(proc_src, Input::AbsAddr(addr))
+                                .ok()
+                                .and_then(|s| s.into_sym())
+                                .map(|s| format_symbolized_frame(&s, addr, "unknown"))
+                                .unwrap_or_else(|| format!("0x{addr:x}"))
+                        })
+                        .clone();
+                    frame_names.push(frame_name);
+                }
+            }
+            None => {
+                for &addr in &stack.user_stack {
+                    frame_names.push(format!("0x{addr:x}"));
+                }
+            }
         }
 
         // Symbolize kernel addresses (root).
-        // Use tgid=0 since KASLR offset is system-wide; the same kernel address
-        // resolves identically for all processes.
         for &addr in &stack.kernel_stack {
-            let frame_name = addr_cache
-                .entry((addr, 0))
+            let frame_name = kernel_cache
+                .entry(addr)
                 .or_insert_with(|| {
                     symbolizer
                         .symbolize_single(kernel_src, Input::AbsAddr(addr))
@@ -498,15 +905,18 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
 
             // Streaming mode: dedupe stacks and emit samples directly to the collector
             if let Some(collector) = &mut self.streaming_collector {
-                // Get or assign stack_id for this (stack, tgid) pair
-                // Include tgid in key since same addresses may resolve differently per-process
-                let key = (stack, tgid);
-                let stack_id = if let Some(&id) = self.unique_stacks.get(&key) {
+                // Get or assign stack_id for this (stack, tgid) pair.
+                // Include tgid in key since same addresses may resolve differently
+                // per-process. Only the content hash is kept in memory; new stacks
+                // are spilled to disk for end-of-trace symbolization.
+                let hash = stack_dedup_hash(&self.dedup_hashers, &stack, tgid);
+                let stack_id = if let Some(&id) = self.stack_ids.get(&hash) {
                     id
                 } else {
                     let id = self.next_stack_id;
                     self.next_stack_id += 1;
-                    self.unique_stacks.insert(key, id);
+                    self.stack_ids.insert(hash, id);
+                    self.spill.push(stack, tgid, id);
                     id
                 };
 
@@ -588,6 +998,139 @@ mod tests {
 
         // Empty stack
         assert_eq!(filter_and_reverse_kernel_stack(&[]), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn test_stack_spill_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spill = StackSpill::new();
+        spill.set_dir(dir.path());
+        assert!(spill.writer.is_some(), "spill file should be created");
+
+        let py = vec![PyAddr {
+            addr: crate::pystacks::types::StackWalkerFrame {
+                symbol_id: 7,
+                inst_idx: -1,
+            },
+        }];
+        let stacks = [
+            (
+                Stack {
+                    kernel_stack: vec![0xffffffff81000000, 0xffffffff82000000],
+                    user_stack: vec![0x7f0000001000],
+                    py_stack: py.clone(),
+                },
+                42,
+                1,
+            ),
+            (
+                Stack {
+                    kernel_stack: vec![],
+                    user_stack: vec![0x1000, 0x2000, 0x3000],
+                    py_stack: vec![],
+                },
+                -1,
+                1_000_000_007,
+            ),
+            (
+                Stack {
+                    kernel_stack: vec![],
+                    user_stack: vec![],
+                    py_stack: py,
+                },
+                i32::MAX,
+                i64::MAX,
+            ),
+        ];
+        for (stack, tgid, id) in &stacks {
+            spill.push(stack.clone(), *tgid, *id);
+        }
+        assert_eq!(spill.total(), 3);
+        assert!(spill.fallback.is_empty());
+
+        let (mut reader, durable) = spill.take_reader().expect("reader");
+        assert_eq!(durable, 3);
+        for (stack, tgid, id) in &stacks {
+            let (rstack, rtgid, rid) = read_spill_record(&mut reader).unwrap().unwrap();
+            assert_eq!(&rstack, stack);
+            assert_eq!(rtgid, *tgid);
+            assert_eq!(rid, *id);
+        }
+        assert!(read_spill_record(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_stack_spill_periodic_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spill = StackSpill::new();
+        spill.set_dir(dir.path());
+
+        let n = SPILL_FLUSH_INTERVAL * 2 + 7;
+        for i in 0..n {
+            let stack = Stack {
+                kernel_stack: vec![i],
+                user_stack: vec![i + 1],
+                py_stack: vec![],
+            };
+            spill.push(stack, i as i32, i as i64);
+        }
+        // Two full flush intervals are durable; the remainder is pending.
+        assert_eq!(spill.flushed, SPILL_FLUSH_INTERVAL * 2);
+        assert_eq!(spill.pending.len(), 7);
+        assert_eq!(spill.total(), n);
+
+        let (mut reader, durable) = spill.take_reader().expect("reader");
+        assert_eq!(durable, n, "final flush makes everything durable");
+        assert!(spill.pending.is_empty());
+        for i in 0..n {
+            let (rstack, rtgid, rid) = read_spill_record(&mut reader).unwrap().unwrap();
+            assert_eq!(rstack.kernel_stack, vec![i]);
+            assert_eq!(rtgid, i as i32);
+            assert_eq!(rid, i as i64);
+        }
+        assert!(read_spill_record(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_stack_spill_fallback_without_dir() {
+        let mut spill = StackSpill::new();
+        let stack = Stack {
+            kernel_stack: vec![1],
+            user_stack: vec![2],
+            py_stack: vec![],
+        };
+        spill.push(stack.clone(), 5, 9);
+        assert_eq!(spill.total(), 1);
+        assert_eq!(spill.fallback, vec![(stack, 5, 9)]);
+        assert!(spill.take_reader().is_none());
+    }
+
+    #[test]
+    fn test_stack_dedup_hash() {
+        let h = (RandomState::new(), RandomState::new());
+        let a = Stack {
+            kernel_stack: vec![0xffffffff81000000],
+            user_stack: vec![0x1000],
+            py_stack: vec![],
+        };
+        let b = a.clone();
+        assert_eq!(stack_dedup_hash(&h, &a, 1), stack_dedup_hash(&h, &b, 1));
+        // Different tgid must produce a different key
+        assert_ne!(stack_dedup_hash(&h, &a, 1), stack_dedup_hash(&h, &a, 2));
+        // Different contents must produce a different key
+        let c = Stack {
+            kernel_stack: vec![0xffffffff81000000],
+            user_stack: vec![0x1001],
+            py_stack: vec![],
+        };
+        assert_ne!(stack_dedup_hash(&h, &a, 1), stack_dedup_hash(&h, &c, 1));
+        // Moving an address between kernel and user stacks must change the key
+        let d = Stack {
+            kernel_stack: vec![],
+            user_stack: vec![0xffffffff81000000, 0x1000],
+            py_stack: vec![],
+        };
+        assert_ne!(stack_dedup_hash(&h, &a, 1), stack_dedup_hash(&h, &d, 1));
     }
 
     #[test]

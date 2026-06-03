@@ -959,12 +959,15 @@ impl SessionRecorder {
             .set_streaming_collector(Box::new(writer));
 
         // Set up streaming collector for stack recorder so samples are written
-        // incrementally instead of buffered for the entire trace.
+        // incrementally instead of buffered for the entire trace. Unique stack
+        // contents are spilled to a tempfile in the output directory so they
+        // don't accumulate in memory until end-of-trace symbolization.
         let stack_writer = StreamingParquetWriter::new(output_dir)?;
-        self.stack_recorder
-            .lock()
-            .unwrap()
-            .set_streaming_collector(Box::new(stack_writer));
+        {
+            let mut stack_recorder = self.stack_recorder.lock().unwrap();
+            stack_recorder.set_streaming_collector(Box::new(stack_writer));
+            stack_recorder.set_spill_dir(output_dir);
+        }
 
         // Set up streaming collector for network recorder (events emitted immediately)
         let network_writer = StreamingParquetWriter::new(output_dir)?;
