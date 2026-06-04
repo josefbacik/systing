@@ -959,12 +959,15 @@ impl SessionRecorder {
             .set_streaming_collector(Box::new(writer));
 
         // Set up streaming collector for stack recorder so samples are written
-        // incrementally instead of buffered for the entire trace.
+        // incrementally instead of buffered for the entire trace. Unique stack
+        // contents are spilled to a tempfile in the output directory so they
+        // don't accumulate in memory until end-of-trace symbolization.
         let stack_writer = StreamingParquetWriter::new(output_dir)?;
-        self.stack_recorder
-            .lock()
-            .unwrap()
-            .set_streaming_collector(Box::new(stack_writer));
+        {
+            let mut stack_recorder = self.stack_recorder.lock().unwrap();
+            stack_recorder.set_streaming_collector(Box::new(stack_writer));
+            stack_recorder.set_spill_dir(output_dir);
+        }
 
         // Set up streaming collector for network recorder (events emitted immediately)
         let network_writer = StreamingParquetWriter::new(output_dir)?;
@@ -973,12 +976,15 @@ impl SessionRecorder {
             .unwrap()
             .set_streaming_collector(Box::new(network_writer));
 
-        // Set up streaming collector for memory recorder (events emitted immediately)
+        // Set up streaming collector for memory recorder (events emitted
+        // immediately). Its unique alloc/fault stacks spill to disk like the
+        // stack recorder's.
         let memory_writer = StreamingParquetWriter::new(output_dir)?;
-        self.memory_recorder
-            .lock()
-            .unwrap()
-            .set_streaming_collector(Box::new(memory_writer));
+        {
+            let mut memory_recorder = self.memory_recorder.lock().unwrap();
+            memory_recorder.set_streaming_collector(Box::new(memory_writer));
+            memory_recorder.set_spill_dir(output_dir);
+        }
 
         // Set up streaming collector for probe recorder (events emitted on completion).
         // Note: marker records are also written through this collector during
@@ -1176,12 +1182,12 @@ impl SessionRecorder {
         eprintln!("Flushing memory trace records...");
         {
             let mut memory = self.memory_recorder.lock().unwrap();
-            let memory_stacks = memory.take_unique_stacks();
-            if !memory_stacks.is_empty() {
+            let memory_interner = memory.take_interner();
+            if memory_interner.total() > 0 {
                 self.stack_recorder
                     .lock()
                     .unwrap()
-                    .merge_external_stacks(memory_stacks);
+                    .merge_external_interner(memory_interner);
             }
             writer = memory.finish(writer)?;
         }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -6,7 +6,7 @@ use anyhow::Result;
 use crate::pystacks::stack_walker::StackWalkerRun;
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
-use crate::stack_recorder::Stack;
+use crate::stack_recorder::{Stack, StackInterner};
 use crate::systing_core::types::{
     memory_alloc_op, memory_event, memory_event_type, memory_rss_member,
 };
@@ -14,9 +14,11 @@ use crate::systing_core::SystingRecordEvent;
 use crate::trace::{MemoryAllocRecord, MemoryFaultRecord, MemoryMapRecord, MemoryRssRecord};
 use crate::utid::{ResolvedTask, ThreadAwareRecorder, UtidGenerator};
 
-/// stack_id offset for stacks interned by the memory recorder, to keep them
-/// disjoint from `StackRecorder`'s own ids prior to the end-of-trace merge.
-const MEMORY_STACK_ID_OFFSET: i64 = 1_000_000_000;
+/// stack_id offset for stacks interned by the memory recorder. Each
+/// recorder's interner owns a disjoint id range for the whole trace: the
+/// stack recorder assigns ids below this value (and warns if it ever runs
+/// out), the memory recorder from here up.
+pub(crate) const MEMORY_STACK_ID_OFFSET: i64 = 1_000_000_000;
 
 /// Synthetic `member` values for periodic mm_struct samples (distinguish from
 /// the kernel rss_stat member indices 0..=3).
@@ -27,8 +29,11 @@ pub struct MemoryRecorder {
     pub(crate) ringbuf: RingBuffer<memory_event>,
     pub(crate) psr: Arc<StackWalkerRun>,
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
-    unique_stacks: HashMap<(Stack, i32), i64>,
-    next_stack_id: i64,
+    /// Dedup + disk spill of unique (stack, tgid) contents, handed to the
+    /// StackRecorder at trace end for symbolization. Memory-alloc tracing
+    /// interns a stack per malloc site per process, so under short-lived-
+    /// process churn this would otherwise grow to GiBs in memory.
+    interner: StackInterner,
     next_map_id: i64,
     next_alloc_id: i64,
     write_error_reported: bool,
@@ -41,8 +46,7 @@ impl MemoryRecorder {
             ringbuf: RingBuffer::default(),
             psr: Arc::new(StackWalkerRun::default()),
             streaming_collector: None,
-            unique_stacks: HashMap::new(),
-            next_stack_id: MEMORY_STACK_ID_OFFSET,
+            interner: StackInterner::new(MEMORY_STACK_ID_OFFSET),
             next_map_id: 1,
             next_alloc_id: 1,
             write_error_reported: false,
@@ -78,10 +82,19 @@ impl MemoryRecorder {
         self.psr = psr;
     }
 
-    /// Drain the deduplicated stacks for hand-off to `StackRecorder` so they are
-    /// symbolized in the shared `stack` table during finish.
-    pub fn take_unique_stacks(&mut self) -> HashMap<(Stack, i32), i64> {
-        std::mem::take(&mut self.unique_stacks)
+    /// Configure the directory for the unique-stack spill file. Must be called
+    /// before recording starts; without it, stack contents are kept in memory.
+    pub fn set_spill_dir(&mut self, dir: &Path) {
+        self.interner.set_spill_dir(dir);
+    }
+
+    /// Drain the stack interner for hand-off to `StackRecorder` so its stacks
+    /// are symbolized in the shared `stack` table during finish.
+    pub(crate) fn take_interner(&mut self) -> StackInterner {
+        std::mem::replace(
+            &mut self.interner,
+            StackInterner::new(MEMORY_STACK_ID_OFFSET),
+        )
     }
 
     pub fn finish(
@@ -116,12 +129,7 @@ impl MemoryRecorder {
             return None;
         }
         let stack = Stack::new(kstack, ustack, &py_stack);
-        let id = *self.unique_stacks.entry((stack, tgid)).or_insert_with(|| {
-            let id = self.next_stack_id;
-            self.next_stack_id += 1;
-            id
-        });
-        Some(id)
+        Some(self.interner.intern(stack, tgid))
     }
 
     fn emit_map(

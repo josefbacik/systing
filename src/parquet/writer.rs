@@ -38,6 +38,12 @@ use crate::trace::{
 /// Default batch size for streaming writes.
 const DEFAULT_BATCH_SIZE: usize = 200_000;
 
+/// Batch size for stack records. Stack rows are far heavier than other record
+/// types (a Vec of ~20-30 frame-name Strings each), so buffering 200k of them
+/// costs hundreds of MiB during end-of-trace symbolization. Flush in smaller
+/// row groups to keep that bounded.
+const STACK_BATCH_SIZE: usize = 20_000;
+
 /// A streaming Parquet writer that implements `RecordCollector`.
 ///
 /// Records are buffered in memory and flushed to Parquet files when the
@@ -1193,7 +1199,7 @@ impl RecordCollector for StreamingParquetWriter {
     fn add_stack(&mut self, record: StackRecord) -> Result<()> {
         self.stacks.push(record);
         self.total_records += 1;
-        if Self::should_flush(&self.stacks, self.batch_size) {
+        if Self::should_flush(&self.stacks, self.batch_size.min(STACK_BATCH_SIZE)) {
             self.flush_stacks()?;
         }
         Ok(())
