@@ -14,9 +14,11 @@ use crate::systing_core::SystingRecordEvent;
 use crate::trace::{MemoryAllocRecord, MemoryFaultRecord, MemoryMapRecord, MemoryRssRecord};
 use crate::utid::{ResolvedTask, ThreadAwareRecorder, UtidGenerator};
 
-/// stack_id offset for stacks interned by the memory recorder, to keep them
-/// disjoint from `StackRecorder`'s own ids prior to the end-of-trace merge.
-const MEMORY_STACK_ID_OFFSET: i64 = 1_000_000_000;
+/// stack_id offset for stacks interned by the memory recorder. Each
+/// recorder's interner owns a disjoint id range for the whole trace: the
+/// stack recorder assigns ids below this value (and warns if it ever runs
+/// out), the memory recorder from here up.
+pub(crate) const MEMORY_STACK_ID_OFFSET: i64 = 1_000_000_000;
 
 /// Synthetic `member` values for periodic mm_struct samples (distinguish from
 /// the kernel rss_stat member indices 0..=3).

@@ -312,6 +312,12 @@ pub(crate) struct StackInterner {
     /// Next stack id to assign. Each interner owns a disjoint id range
     /// (the memory recorder's starts at MEMORY_STACK_ID_OFFSET).
     next_id: i64,
+    /// Ids at or beyond this value belong to another interner's range.
+    /// Crossing it would silently corrupt stack joins, so `intern` warns.
+    /// Practically unreachable: ~40-50 bytes of dedup map per unique stack
+    /// means the process runs out of memory orders of magnitude earlier.
+    id_limit: Option<i64>,
+    id_limit_warned: bool,
 }
 
 impl StackInterner {
@@ -321,7 +327,14 @@ impl StackInterner {
             hashers: (RandomState::new(), RandomState::new()),
             spill: StackSpill::new(),
             next_id: first_id,
+            id_limit: None,
+            id_limit_warned: false,
         }
+    }
+
+    pub(crate) fn with_id_limit(mut self, limit: i64) -> Self {
+        self.id_limit = Some(limit);
+        self
     }
 
     /// Configure the directory for the spill file. Must be called before
@@ -339,6 +352,14 @@ impl StackInterner {
         }
         let id = self.next_id;
         self.next_id += 1;
+        if !self.id_limit_warned && self.id_limit.is_some_and(|limit| id >= limit) {
+            self.id_limit_warned = true;
+            eprintln!(
+                "Warning: stack id {id} crossed into another interner's range (>= {}); \
+                 stack table joins may be ambiguous",
+                self.id_limit.unwrap_or(0)
+            );
+        }
         self.stack_ids.insert(hash, id);
         self.spill.push(stack, tgid, id);
         id
@@ -480,7 +501,8 @@ impl StackRecorder {
             psr: Arc::new(StackWalkerRun::default()),
             process_dispatcher,
             streaming_collector: None,
-            interner: StackInterner::new(1),
+            interner: StackInterner::new(1)
+                .with_id_limit(crate::memory_recorder::MEMORY_STACK_ID_OFFSET),
             external_interners: Vec::new(),
             utid_generator,
         }
