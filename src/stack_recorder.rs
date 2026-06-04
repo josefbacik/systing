@@ -298,6 +298,58 @@ fn symbolizer_memory_budget() -> u64 {
         .clamp(256 << 20, 16 << 30)
 }
 
+/// Memory-bounded interner for unique (stack, tgid) pairs, shared by the
+/// stack and memory recorders. Keeps only a 16-byte content hash per unique
+/// stack in memory and spills the address vectors to disk (see [`StackSpill`]);
+/// `StackRecorder::finish` replays the contents for symbolization.
+pub(crate) struct StackInterner {
+    /// 128-bit content hash of (stack, tgid) -> assigned stack id.
+    stack_ids: HashMap<u128, i64>,
+    /// Per-run random keys for the dedup hash, so collisions cannot be
+    /// precomputed by traced processes.
+    hashers: (RandomState, RandomState),
+    spill: StackSpill,
+    /// Next stack id to assign. Each interner owns a disjoint id range
+    /// (the memory recorder's starts at MEMORY_STACK_ID_OFFSET).
+    next_id: i64,
+}
+
+impl StackInterner {
+    pub(crate) fn new(first_id: i64) -> Self {
+        Self {
+            stack_ids: HashMap::new(),
+            hashers: (RandomState::new(), RandomState::new()),
+            spill: StackSpill::new(),
+            next_id: first_id,
+        }
+    }
+
+    /// Configure the directory for the spill file. Must be called before
+    /// recording starts; without it, stack contents are kept in memory.
+    pub(crate) fn set_spill_dir(&mut self, dir: &Path) {
+        self.spill.set_dir(dir);
+    }
+
+    /// Get or assign the stack id for this (stack, tgid) pair, persisting the
+    /// contents on first sight.
+    pub(crate) fn intern(&mut self, stack: Stack, tgid: i32) -> i64 {
+        let hash = stack_dedup_hash(&self.hashers, &stack, tgid);
+        if let Some(&id) = self.stack_ids.get(&hash) {
+            return id;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.stack_ids.insert(hash, id);
+        self.spill.push(stack, tgid, id);
+        id
+    }
+
+    /// Number of unique stacks interned.
+    pub(crate) fn total(&self) -> u64 {
+        self.spill.total()
+    }
+}
+
 /// Emit a symbolized stack as a StackRecord (skipping empty stacks).
 fn emit_stack_record(
     collector: &mut dyn RecordCollector,
@@ -395,20 +447,16 @@ pub struct StackRecorder {
     /// are written immediately in handle_event() and stacks are deduplicated during
     /// recording for end-of-trace symbolization via finish().
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
-    /// Maps the 128-bit hash of (stack, tgid) to stack_id for deduplication
-    /// during streaming. The tgid is part of the key because the same addresses
+    /// Dedup + disk spill of unique (stack, tgid) contents seen by this
+    /// recorder. The tgid is part of the dedup key because the same addresses
     /// in different processes may resolve to different symbols (e.g., shared
-    /// libraries at fixed addresses). Only the digest is kept in memory; the
-    /// stack contents live in `spill` until end-of-trace symbolization.
-    stack_ids: HashMap<u128, i64>,
-    /// Per-run random keys for the dedup hash, so collisions cannot be
-    /// precomputed by traced processes.
-    dedup_hashers: (RandomState, RandomState),
-    /// Disk-backed contents of every unique (stack, tgid), including external
-    /// (memory recorder) stacks and their id aliases.
-    spill: StackSpill,
-    /// Next stack_id to assign for new unique stacks.
-    next_stack_id: i64,
+    /// libraries at fixed addresses).
+    interner: StackInterner,
+    /// Interners handed over by other recorders (the memory recorder) at
+    /// trace end; their stacks are symbolized alongside this recorder's in
+    /// `finish()`. Id ranges are disjoint per interner, so identical contents
+    /// interned by two recorders simply emit one StackRecord per id.
+    external_interners: Vec<StackInterner>,
     /// Shared utid generator for consistent thread IDs across all recorders.
     utid_generator: Arc<UtidGenerator>,
 }
@@ -432,10 +480,8 @@ impl StackRecorder {
             psr: Arc::new(StackWalkerRun::default()),
             process_dispatcher,
             streaming_collector: None,
-            stack_ids: HashMap::new(),
-            dedup_hashers: (RandomState::new(), RandomState::new()),
-            spill: StackSpill::new(),
-            next_stack_id: 1,
+            interner: StackInterner::new(1),
+            external_interners: Vec::new(),
             utid_generator,
         }
     }
@@ -451,29 +497,15 @@ impl StackRecorder {
     /// Configure the directory for the unique-stack spill file. Must be called
     /// before recording starts; without it, stack contents are kept in memory.
     pub fn set_spill_dir(&mut self, dir: &Path) {
-        self.spill.set_dir(dir);
+        self.interner.set_spill_dir(dir);
     }
 
-    /// Merge externally-deduped stacks (from another recorder) so they are
-    /// symbolized and emitted alongside profiler stacks in `finish()`. When an
-    /// external key collides with an existing entry, the external id is kept as
-    /// an alias so both ids are emitted as StackRecords.
-    pub fn merge_external_stacks(&mut self, stacks: HashMap<(Stack, i32), i64>) {
-        for ((stack, tgid), id) in stacks {
-            let hash = stack_dedup_hash(&self.dedup_hashers, &stack, tgid);
-            match self.stack_ids.get(&hash) {
-                Some(&existing) if existing == id => {}
-                Some(_) => {
-                    // Alias: same contents already recorded under another id.
-                    // Persist again under the external id so both ids resolve.
-                    self.spill.push(stack, tgid, id);
-                }
-                None => {
-                    self.stack_ids.insert(hash, id);
-                    self.spill.push(stack, tgid, id);
-                }
-            }
-        }
+    /// Take ownership of another recorder's interner so its stacks are
+    /// symbolized and emitted alongside profiler stacks in `finish()`.
+    /// Interners use disjoint id ranges, so ids never collide; identical
+    /// contents interned by both recorders emit one StackRecord per id.
+    pub(crate) fn merge_external_interner(&mut self, interner: StackInterner) {
+        self.external_interners.push(interner);
     }
 
     /// Create a symbolizer with the configured process dispatcher.
@@ -528,7 +560,14 @@ impl StackRecorder {
     }
 
     fn finish_inner(&mut self, collector: &mut dyn RecordCollector) -> Result<()> {
-        let total = self.spill.total();
+        // Move all interners (own + external) out of self so their spills can
+        // be replayed while `self` stays borrowable for symbolization, and so
+        // each interner's dedup table and fallback storage are freed as soon as
+        // it has been drained.
+        let mut interners = vec![std::mem::replace(&mut self.interner, StackInterner::new(1))];
+        interners.append(&mut self.external_interners);
+
+        let total: u64 = interners.iter().map(|i| i.total()).sum();
         if total == 0 {
             return Ok(());
         }
@@ -591,43 +630,43 @@ impl StackRecorder {
             emit_stack_record(collector, stack_id, frame_names)
         };
 
-        if let Some((mut reader, durable_records)) = self.spill.take_reader() {
-            for _ in 0..durable_records {
-                match read_spill_record(&mut reader) {
-                    Ok(Some((stack, tgid, stack_id))) => {
-                        handle_record(
-                            self,
-                            &mut symbolizer,
-                            &mut kernel_cache,
-                            &mut live_groups,
-                            stack,
-                            tgid,
-                            stack_id,
-                        )?;
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        eprintln!("Warning: stopping stack spill replay early: {e:#}");
-                        break;
+        // Each interner is dropped at the end of its loop iteration, releasing
+        // its dedup table before the (memory-hungry) live-group pass below.
+        for mut interner in interners {
+            if let Some((mut reader, durable_records)) = interner.spill.take_reader() {
+                for _ in 0..durable_records {
+                    match read_spill_record(&mut reader) {
+                        Ok(Some((stack, tgid, stack_id))) => {
+                            handle_record(
+                                self,
+                                &mut symbolizer,
+                                &mut kernel_cache,
+                                &mut live_groups,
+                                stack,
+                                tgid,
+                                stack_id,
+                            )?;
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            eprintln!("Warning: stopping stack spill replay early: {e:#}");
+                            break;
+                        }
                     }
                 }
             }
+            for (stack, tgid, stack_id) in std::mem::take(&mut interner.spill.fallback) {
+                handle_record(
+                    self,
+                    &mut symbolizer,
+                    &mut kernel_cache,
+                    &mut live_groups,
+                    stack,
+                    tgid,
+                    stack_id,
+                )?;
+            }
         }
-        for (stack, tgid, stack_id) in std::mem::take(&mut self.spill.fallback) {
-            handle_record(
-                self,
-                &mut symbolizer,
-                &mut kernel_cache,
-                &mut live_groups,
-                stack,
-                tgid,
-                stack_id,
-            )?;
-        }
-
-        // Release the dedup table before the symbolization pass; it is no
-        // longer needed and live-group symbolization can be memory-hungry.
-        self.stack_ids = HashMap::new();
 
         // Pass 2: symbolize live processes one tgid at a time. blazesym
         // accumulates parsed debug info for every binary it touches with no
@@ -909,16 +948,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
                 // Include tgid in key since same addresses may resolve differently
                 // per-process. Only the content hash is kept in memory; new stacks
                 // are spilled to disk for end-of-trace symbolization.
-                let hash = stack_dedup_hash(&self.dedup_hashers, &stack, tgid);
-                let stack_id = if let Some(&id) = self.stack_ids.get(&hash) {
-                    id
-                } else {
-                    let id = self.next_stack_id;
-                    self.next_stack_id += 1;
-                    self.stack_ids.insert(hash, id);
-                    self.spill.push(stack, tgid, id);
-                    id
-                };
+                let stack_id = self.interner.intern(stack, tgid);
 
                 let sample = StackSampleRecord {
                     ts: event.ts as i64,
@@ -1103,6 +1133,46 @@ mod tests {
         assert_eq!(spill.total(), 1);
         assert_eq!(spill.fallback, vec![(stack, 5, 9)]);
         assert!(spill.take_reader().is_none());
+    }
+
+    #[test]
+    fn test_stack_interner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut interner = StackInterner::new(1_000_000_000);
+        interner.set_spill_dir(dir.path());
+
+        let a = Stack {
+            kernel_stack: vec![0xffffffff81000000],
+            user_stack: vec![0x1000],
+            py_stack: vec![],
+        };
+        let b = Stack {
+            kernel_stack: vec![0xffffffff81000000],
+            user_stack: vec![0x2000],
+            py_stack: vec![],
+        };
+
+        // Ids start at the configured offset and dedup by content + tgid.
+        let id_a = interner.intern(a.clone(), 1);
+        assert_eq!(id_a, 1_000_000_000);
+        assert_eq!(interner.intern(a.clone(), 1), id_a);
+        let id_b = interner.intern(b.clone(), 1);
+        assert_eq!(id_b, 1_000_000_001);
+        let id_a2 = interner.intern(a.clone(), 2);
+        assert_eq!(id_a2, 1_000_000_002);
+        assert_eq!(interner.total(), 3);
+
+        // Contents are persisted once per unique (stack, tgid).
+        let (mut reader, durable) = interner.spill.take_reader().expect("reader");
+        assert_eq!(durable, 3);
+        let expected = [(a.clone(), 1, id_a), (b, 1, id_b), (a, 2, id_a2)];
+        for (stack, tgid, id) in &expected {
+            let (rstack, rtgid, rid) = read_spill_record(&mut reader).unwrap().unwrap();
+            assert_eq!(&rstack, stack);
+            assert_eq!(rtgid, *tgid);
+            assert_eq!(rid, *id);
+        }
+        assert!(read_spill_record(&mut reader).unwrap().is_none());
     }
 
     #[test]

@@ -976,12 +976,15 @@ impl SessionRecorder {
             .unwrap()
             .set_streaming_collector(Box::new(network_writer));
 
-        // Set up streaming collector for memory recorder (events emitted immediately)
+        // Set up streaming collector for memory recorder (events emitted
+        // immediately). Its unique alloc/fault stacks spill to disk like the
+        // stack recorder's.
         let memory_writer = StreamingParquetWriter::new(output_dir)?;
-        self.memory_recorder
-            .lock()
-            .unwrap()
-            .set_streaming_collector(Box::new(memory_writer));
+        {
+            let mut memory_recorder = self.memory_recorder.lock().unwrap();
+            memory_recorder.set_streaming_collector(Box::new(memory_writer));
+            memory_recorder.set_spill_dir(output_dir);
+        }
 
         // Set up streaming collector for probe recorder (events emitted on completion).
         // Note: marker records are also written through this collector during
@@ -1179,12 +1182,12 @@ impl SessionRecorder {
         eprintln!("Flushing memory trace records...");
         {
             let mut memory = self.memory_recorder.lock().unwrap();
-            let memory_stacks = memory.take_unique_stacks();
-            if !memory_stacks.is_empty() {
+            let memory_interner = memory.take_interner();
+            if memory_interner.total() > 0 {
                 self.stack_recorder
                     .lock()
                     .unwrap()
-                    .merge_external_stacks(memory_stacks);
+                    .merge_external_interner(memory_interner);
             }
             writer = memory.finish(writer)?;
         }
