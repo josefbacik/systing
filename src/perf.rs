@@ -228,10 +228,16 @@ impl PerfOpenEvents {
         self.events.values()
     }
 
+    /// Open the configured events. A non-zero `sample_period` makes the events
+    /// sample every `sample_period` occurrences of the event (cycles for
+    /// cpu-cycles, nanoseconds for cpu-clock). Period mode is used instead of
+    /// the kernel's adaptive frequency mode because the frequency estimator
+    /// misbehaves on mostly-idle CPUs: it shrinks the period toward its floor
+    /// while the CPU idles, then floods samples the moment the CPU wakes up.
     pub fn open_events(
         &mut self,
         slots_files: Option<&PerfOpenEvents>,
-        freq: u64,
+        sample_period: u64,
     ) -> Result<(), Error> {
         if !self.events.is_empty() {
             return Ok(());
@@ -244,9 +250,8 @@ impl PerfOpenEvents {
             attr._type = hwevent.event_type;
             attr.size = mem::size_of::<perf_event_attr>() as u32;
             attr.config = hwevent.event_config;
-            if freq > 0 {
-                attr.sample.sample_freq = freq;
-                attr.flags.set_freq(1);
+            if sample_period > 0 {
+                attr.sample.sample_period = sample_period;
             }
             if hwevent.disabled {
                 attr.flags.set_disabled(1);

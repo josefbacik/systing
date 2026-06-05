@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::io::AsRawFd;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::Result;
 
@@ -42,6 +42,64 @@ pub struct SysInfoEvent {
     pub cpu: u32,
     pub ts: u64,
     pub frequency: i64,
+}
+
+/// The perf event configuration driving CPU stack sampling. Recorded into the
+/// trace's sysinfo row so analysis knows what one stack sample represents:
+/// `period` cycles for "cpu-cycles", `period` nanoseconds for "cpu-clock".
+#[derive(Clone, Debug)]
+pub struct ClockSamplingConfig {
+    /// Perf event name: "cpu-cycles" (hardware) or "cpu-clock" (software
+    /// fallback, used with --sw-event or when the PMU is unavailable).
+    pub event: &'static str,
+    /// Sampling period in event units (cycles or nanoseconds).
+    pub period: u64,
+}
+
+/// Static per-CPU frequency limits from sysfs cpufreq, in kHz (sysfs's native
+/// unit). `base_freq_khz` is the sustained (non-turbo) frequency and is only
+/// exposed by some drivers (e.g. intel_pstate).
+pub struct CpuFreqInfo {
+    pub cpu: u32,
+    pub min_freq_khz: Option<i64>,
+    pub max_freq_khz: Option<i64>,
+    pub base_freq_khz: Option<i64>,
+}
+
+/// Read each CPU's cpufreq limits from sysfs. CPUs without a cpufreq directory
+/// (VM guests, offlined CPUs) are omitted, so the result is empty on systems
+/// with no cpufreq support. Used both to pick the cpu-cycles sample period at
+/// startup and to record per-CPU frequency provenance in the trace, which is
+/// what lets analysis convert cycle-denominated samples into approximate time.
+pub fn cpu_freq_limits() -> Vec<CpuFreqInfo> {
+    let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") else {
+        return Vec::new();
+    };
+    let mut cpus: Vec<CpuFreqInfo> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let cpu: u32 = name.to_str()?.strip_prefix("cpu")?.parse().ok()?;
+            let cpufreq = entry.path().join("cpufreq");
+            let read_khz = |file: &str| -> Option<i64> {
+                read_sysfs_string(cpufreq.join(file).to_str()?)?
+                    .parse()
+                    .ok()
+            };
+            let info = CpuFreqInfo {
+                cpu,
+                min_freq_khz: read_khz("cpuinfo_min_freq"),
+                max_freq_khz: read_khz("cpuinfo_max_freq"),
+                base_freq_khz: read_khz("base_frequency"),
+            };
+            let has_data = info.min_freq_khz.is_some()
+                || info.max_freq_khz.is_some()
+                || info.base_freq_khz.is_some();
+            has_data.then_some(info)
+        })
+        .collect();
+    cpus.sort_by_key(|c| c.cpu);
+    cpus
 }
 
 pub struct SysinfoRecorder {
@@ -99,6 +157,9 @@ pub struct SessionRecorder {
     kernel_threads: RwLock<HashSet<u32>>,
     /// Shared utid generator for consistent thread IDs across all recorders.
     utid_generator: Arc<UtidGenerator>,
+    /// The perf event/period driving CPU stack sampling, set once perf events
+    /// are opened. Unset until then (or in unit tests that never open them).
+    pub clock_sampling: OnceLock<ClockSamplingConfig>,
 }
 
 pub fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -622,6 +683,7 @@ impl SessionRecorder {
             process_cgroups: RwLock::new(HashMap::new()),
             kernel_threads: RwLock::new(HashSet::new()),
             utid_generator,
+            clock_sampling: OnceLock::new(),
         }
     }
 
@@ -1084,6 +1146,7 @@ impl SessionRecorder {
 
         // Write system info (utsname + platform provenance)
         if let Some(utsname) = get_system_utsname() {
+            let clock_sampling = self.clock_sampling.get();
             writer.set_sysinfo(crate::trace::SysInfoRecord {
                 sysname: utsname.sysname().to_string(),
                 release: utsname.release().to_string(),
@@ -1093,6 +1156,20 @@ impl SessionRecorder {
                 hypervisor: detect_hypervisor(),
                 sys_vendor: dmi_sys_vendor(),
                 product_name: dmi_product_name(),
+                sample_event: clock_sampling.map(|c| c.event.to_string()),
+                sample_period: clock_sampling.map(|c| c.period as i64),
+            })?;
+        }
+
+        // Write per-CPU frequency limits so cycle-denominated stack samples
+        // can be converted to approximate time during analysis. Empty (no
+        // rows) on systems without cpufreq support.
+        for cpu in cpu_freq_limits() {
+            writer.add_cpu_info(crate::trace::CpuInfoRecord {
+                cpu: cpu.cpu as i32,
+                min_freq_khz: cpu.min_freq_khz,
+                max_freq_khz: cpu.max_freq_khz,
+                base_freq_khz: cpu.base_freq_khz,
             })?;
         }
 
@@ -1494,6 +1571,7 @@ mod tests {
             kernel_threads: RwLock::new(HashSet::new()),
             utid_generator,
             tpu_metrics_recorder: None,
+            clock_sampling: OnceLock::new(),
         }
     }
 

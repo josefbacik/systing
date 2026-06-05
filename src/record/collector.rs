@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use anyhow::Result;
 
 use crate::trace::{
-    ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ExtractedData,
-    InstantArgRecord, InstantRecord, IrqSliceRecord, MemoryAllocRecord, MemoryFaultRecord,
-    MemoryMapRecord, MemoryRssRecord, NetworkDnsRecord, NetworkInterfaceRecord,
+    ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, CpuInfoRecord,
+    ExtractedData, InstantArgRecord, InstantRecord, IrqSliceRecord, MemoryAllocRecord,
+    MemoryFaultRecord, MemoryMapRecord, MemoryRssRecord, NetworkDnsRecord, NetworkInterfaceRecord,
     NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord,
     ProcessExitRecord, ProcessRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord,
     SoftirqSliceRecord, StackRecord, StackSampleRecord, SysInfoRecord, ThreadRecord,
@@ -123,6 +123,9 @@ pub trait RecordCollector {
 
     /// Set the system info record (only one per trace).
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()>;
+
+    /// Add a per-CPU frequency-limit record (one per CPU with cpufreq data).
+    fn add_cpu_info(&mut self, record: CpuInfoRecord) -> Result<()>;
 
     // TPU profiling records
 
@@ -254,6 +257,7 @@ impl RecordCollector for SharedCollector {
         add_memory_fault(MemoryFaultRecord),
         add_memory_alloc(MemoryAllocRecord),
         set_sysinfo(SysInfoRecord),
+        add_cpu_info(CpuInfoRecord),
         add_tpu_device(TpuDeviceRecord),
         add_tpu_op(TpuOpRecord),
         add_tpu_metric(TpuMetricRecord),
@@ -448,6 +452,11 @@ impl RecordCollector for InMemoryCollector {
 
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()> {
         self.data.sysinfo = Some(record);
+        Ok(())
+    }
+
+    fn add_cpu_info(&mut self, record: CpuInfoRecord) -> Result<()> {
+        self.data.cpu_infos.push(record);
         Ok(())
     }
 

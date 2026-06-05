@@ -124,6 +124,16 @@ pub struct TraceSystemInfo {
     /// so CPU-frequency counter tracks are absent from the trace.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpufreq_driver: Option<String>,
+    /// Perf event that drove CPU stack sampling: "cpu-cycles" (hardware) or
+    /// "cpu-clock" (software fallback). `None` for traces from systing < 1.9,
+    /// which sampled cpu-cycles in adaptive frequency mode at a nominal 1kHz.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_event: Option<String>,
+    /// Stack sampling period in event units: one CPU stack sample
+    /// (stack_event_type = 1) represents this many cycles ("cpu-cycles") or
+    /// nanoseconds ("cpu-clock") of execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_period: Option<i64>,
 }
 
 /// Trace metadata.
@@ -470,7 +480,7 @@ impl AnalyzeDb {
             }
         };
         let sql = format!(
-            "SELECT {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
+            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
             col("trace_id"),
             col("release"),
             col("machine"),
@@ -478,6 +488,8 @@ impl AnalyzeDb {
             col("sys_vendor"),
             col("product_name"),
             col("cpufreq_driver"),
+            col("sample_event"),
+            col("sample_period"),
         );
 
         let Ok(mut stmt) = self.conn.prepare(&sql) else {
@@ -492,6 +504,8 @@ impl AnalyzeDb {
                 sys_vendor: row.get(4)?,
                 product_name: row.get(5)?,
                 cpufreq_driver: row.get(6)?,
+                sample_event: row.get(7)?,
+                sample_period: row.get(8)?,
             })
         }) else {
             return Vec::new();
@@ -731,9 +745,10 @@ mod tests {
             crate::duckdb::create_schema(&conn).unwrap();
             conn.execute_batch(
                 "INSERT INTO sysinfo (trace_id, sysname, release, version, machine, \
-                 cpufreq_driver, hypervisor, sys_vendor, product_name) \
+                 cpufreq_driver, hypervisor, sys_vendor, product_name, \
+                 sample_event, sample_period) \
                  VALUES ('t1', 'Linux', '6.12.0', '#1 SMP', 'x86_64', \
-                 NULL, 'kvm', 'Amazon EC2', 'm7i.16xlarge')",
+                 NULL, 'kvm', 'Amazon EC2', 'm7i.16xlarge', 'cpu-clock', 1000000)",
             )
             .unwrap();
         }
@@ -753,6 +768,8 @@ mod tests {
             sys.cpufreq_driver, None,
             "NULL cpufreq_driver must come back as None"
         );
+        assert_eq!(sys.sample_event.as_deref(), Some("cpu-clock"));
+        assert_eq!(sys.sample_period, Some(1_000_000));
     }
 
     #[test]
@@ -771,6 +788,8 @@ mod tests {
                  ALTER TABLE sysinfo DROP COLUMN hypervisor; \
                  ALTER TABLE sysinfo DROP COLUMN sys_vendor; \
                  ALTER TABLE sysinfo DROP COLUMN product_name; \
+                 ALTER TABLE sysinfo DROP COLUMN sample_event; \
+                 ALTER TABLE sysinfo DROP COLUMN sample_period; \
                  INSERT INTO sysinfo (trace_id, sysname, release, version, machine) \
                  VALUES ('t1', 'Linux', '5.10.0', '#1 SMP', 'aarch64')",
             )
@@ -788,6 +807,8 @@ mod tests {
         assert_eq!(sys.sys_vendor, None);
         assert_eq!(sys.product_name, None);
         assert_eq!(sys.cpufreq_driver, None);
+        assert_eq!(sys.sample_event, None);
+        assert_eq!(sys.sample_period, None);
     }
 
     #[test]

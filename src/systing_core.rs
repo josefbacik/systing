@@ -26,7 +26,9 @@ use crate::perf::{PerfCounters, PerfHwEvent, PerfOpenEvents};
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
-use crate::session_recorder::{get_clock_value, SessionRecorder, SysInfoEvent};
+use crate::session_recorder::{
+    get_clock_value, ClockSamplingConfig, SessionRecorder, SysInfoEvent,
+};
 use crate::stack_recorder::StackRecorder;
 
 // Library imports for shared functionality
@@ -42,8 +44,20 @@ use libbpf_rs::{
 
 use plain::Plain;
 
-/// Sample period for perf clock events (1ms = 1000 samples/sec)
-const PERF_CLOCK_SAMPLE_PERIOD: u64 = 1000;
+/// Target stack-sampling rate for the perf clock event, in samples per second
+/// per CPU. The clock event runs in period mode (see `PerfOpenEvents::
+/// open_events`), so this target is hit exactly for the cpu-clock software
+/// event and at max CPU frequency for the cpu-cycles hardware event; a
+/// throttled CPU samples proportionally slower.
+const PERF_CLOCK_TARGET_FREQ_HZ: u64 = 1000;
+
+/// Sample period for the cpu-clock software clock event, which counts
+/// nanoseconds: 1ms between samples = PERF_CLOCK_TARGET_FREQ_HZ.
+const SW_CLOCK_SAMPLE_PERIOD_NS: u64 = 1_000_000_000 / PERF_CLOCK_TARGET_FREQ_HZ;
+
+/// Fallback cpu-cycles sample period when no CPU frequency information is
+/// available from sysfs: assume a 3 GHz part, sampling at ~1kHz.
+const DEFAULT_CYCLES_SAMPLE_PERIOD: u64 = 3_000_000_000 / PERF_CLOCK_TARGET_FREQ_HZ;
 
 /// Memory lock limit for BPF programs (128 MiB)
 const MEMLOCK_RLIMIT_BYTES: u64 = 128 << 20;
@@ -2187,20 +2201,45 @@ fn configure_bpf_skeleton(
     Ok(())
 }
 
+/// Pick the cpu-cycles sample period that yields PERF_CLOCK_TARGET_FREQ_HZ
+/// samples/sec at the fastest CPU's maximum frequency. Using the max across
+/// CPUs (rather than per-CPU periods) keeps the period uniform so every sample
+/// in the trace represents the same number of cycles; slower or throttled CPUs
+/// simply sample at a proportionally lower rate.
+fn cycles_sample_period() -> u64 {
+    let max_khz = crate::session_recorder::cpu_freq_limits()
+        .into_iter()
+        .filter_map(|c| c.max_freq_khz)
+        .max();
+    match max_khz {
+        Some(khz) if khz > 0 => (khz as u64 * 1000) / PERF_CLOCK_TARGET_FREQ_HZ,
+        _ => DEFAULT_CYCLES_SAMPLE_PERIOD,
+    }
+}
+
 fn setup_perf_events(
     skel: &mut SystingSystemSkel,
     opts: &Config,
     counters: &PerfCounters,
     perf_counter_names: &[String],
     num_cpus: u32,
-) -> Result<(Vec<libbpf_rs::Link>, Vec<PerfOpenEvents>)> {
+) -> Result<(
+    Vec<libbpf_rs::Link>,
+    Vec<PerfOpenEvents>,
+    ClockSamplingConfig,
+)> {
     use crate::perf;
 
     let mut perf_links = Vec::new();
     let mut event_files_vec = Vec::new();
 
+    let sw_clock_sampling = ClockSamplingConfig {
+        event: "cpu-clock",
+        period: SW_CLOCK_SAMPLE_PERIOD_NS,
+    };
+
     // Set up clock perf events with automatic VM detection and fallback
-    let clock_files = {
+    let (clock_files, clock_sampling) = {
         let mut clock_files = PerfOpenEvents::default();
         let mut clock_event = PerfHwEvent {
             name: "clock".to_string(),
@@ -2218,11 +2257,19 @@ fn setup_perf_events(
             need_slots: false,
             cpus: (0..num_cpus).collect(),
         };
+        let mut clock_sampling = if opts.sw_event {
+            sw_clock_sampling.clone()
+        } else {
+            ClockSamplingConfig {
+                event: "cpu-cycles",
+                period: cycles_sample_period(),
+            }
+        };
 
         clock_files.add_hw_event(clock_event.clone())?;
 
         // Try to open the events, handle VM detection
-        if let Err(e) = clock_files.open_events(None, PERF_CLOCK_SAMPLE_PERIOD) {
+        if let Err(e) = clock_files.open_events(None, clock_sampling.period) {
             // Check if this is a VM-related error (ErrorKind::NotFound)
             if e.kind() == std::io::ErrorKind::NotFound && !opts.sw_event {
                 // Detected VM environment, automatically retry with software events
@@ -2231,18 +2278,19 @@ fn setup_perf_events(
                 // Modify the event to use software events
                 clock_event.event_type = perf::PERF_TYPE_SOFTWARE;
                 clock_event.event_config = perf::PERF_COUNT_SW_CPU_CLOCK;
+                clock_sampling = sw_clock_sampling;
 
                 // Recreate clock_files with the modified event
                 clock_files = PerfOpenEvents::default();
                 clock_files.add_hw_event(clock_event)?;
-                clock_files.open_events(None, PERF_CLOCK_SAMPLE_PERIOD)?;
+                clock_files.open_events(None, clock_sampling.period)?;
             } else {
                 // Not a VM error or already using software events, propagate the error
                 return Err(e.into());
             }
         }
 
-        clock_files
+        (clock_files, clock_sampling)
     };
 
     // Attach clock events to BPF program
@@ -2315,7 +2363,7 @@ fn setup_perf_events(
         event_files_vec.push(slots_files);
     }
 
-    Ok((perf_links, event_files_vec))
+    Ok((perf_links, event_files_vec, clock_sampling))
 }
 
 /// Returns PIDs to attach probes to with their resolved library paths.
@@ -3298,8 +3346,14 @@ pub fn systing(
         )?;
 
         // Set up perf events (clock events and counter events)
-        let (_perf_links, _events_files) =
+        let (_perf_links, _events_files, clock_sampling) =
             setup_perf_events(&mut skel, &opts, &counters, &perf_counter_names, num_cpus)?;
+
+        // Record which event/period drives stack sampling so the trace's
+        // sysinfo row documents what each stack sample represents. Perf
+        // events are opened once per recording session, so the set cannot
+        // race or repeat.
+        let _ = recorder.clock_sampling.set(clock_sampling);
 
         skel.attach().with_context(|| {
             "Failed to attach BPF programs to tracepoints. Check if tracepoints are enabled."
