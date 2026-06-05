@@ -3481,6 +3481,8 @@ fn run_convert(
     import_table("clock_snapshot", |p| &p.clock_snapshot)?;
     // System info
     import_table("sysinfo", |p| &p.sysinfo)?;
+    // Per-CPU frequency limits
+    import_table("cpu_info", |p| &p.cpu_info)?;
 
     conn.execute_batch("COMMIT")?;
 

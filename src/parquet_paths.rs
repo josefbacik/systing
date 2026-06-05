@@ -52,6 +52,8 @@ pub struct ParquetPaths {
     pub clock_snapshot: PathBuf,
     // System info table
     pub sysinfo: PathBuf,
+    // Per-CPU frequency limits table
+    pub cpu_info: PathBuf,
     // TPU tables
     pub tpu_device: PathBuf,
     pub tpu_op: PathBuf,
@@ -112,6 +114,8 @@ impl ParquetPaths {
             clock_snapshot: dir.join("clock_snapshot.parquet"),
             // System info table
             sysinfo: dir.join("sysinfo.parquet"),
+            // Per-CPU frequency limits table
+            cpu_info: dir.join("cpu_info.parquet"),
             // TPU tables
             tpu_device: dir.join("tpu_device.parquet"),
             tpu_op: dir.join("tpu_op.parquet"),
@@ -159,6 +163,7 @@ impl ParquetPaths {
             memory_alloc: dir.join(format!("{trace_id}_memory_alloc.parquet")),
             clock_snapshot: dir.join(format!("{trace_id}_clock_snapshot.parquet")),
             sysinfo: dir.join(format!("{trace_id}_sysinfo.parquet")),
+            cpu_info: dir.join(format!("{trace_id}_cpu_info.parquet")),
             // TPU tables
             tpu_device: dir.join(format!("{trace_id}_tpu_device.parquet")),
             tpu_op: dir.join(format!("{trace_id}_tpu_op.parquet")),
@@ -167,7 +172,7 @@ impl ParquetPaths {
     }
 
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 38] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 39] {
         [
             PathEntry {
                 path: &self.process,
@@ -309,6 +314,10 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.sysinfo,
                 name: "sysinfo",
+            },
+            PathEntry {
+                path: &self.cpu_info,
+                name: "cpu_info",
             },
             PathEntry {
                 path: &self.tpu_device,

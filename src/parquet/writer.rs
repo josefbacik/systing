@@ -26,13 +26,13 @@ use crate::network_recorder::{drop_reason_str, format_tcp_flags, tcp_state_name}
 use crate::parquet::ParquetPaths;
 use crate::record::RecordCollector;
 use crate::trace::{
-    self, ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, InstantArgRecord,
-    InstantRecord, IrqSliceRecord, MemoryAllocRecord, MemoryFaultRecord, MemoryMapRecord,
-    MemoryRssRecord, NetworkDnsRecord, NetworkInterfaceRecord, NetworkPacketRecord,
-    NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord,
-    SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord, StackRecord,
-    StackSampleRecord, SysInfoRecord, ThreadRecord, ThreadStateRecord, TpuDeviceRecord,
-    TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
+    self, ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, CpuInfoRecord,
+    InstantArgRecord, InstantRecord, IrqSliceRecord, MemoryAllocRecord, MemoryFaultRecord,
+    MemoryMapRecord, MemoryRssRecord, NetworkDnsRecord, NetworkInterfaceRecord,
+    NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord,
+    ProcessExitRecord, ProcessRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord,
+    SoftirqSliceRecord, StackRecord, StackSampleRecord, SysInfoRecord, ThreadRecord,
+    ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -90,6 +90,7 @@ pub struct StreamingParquetWriter {
     memory_allocs: Vec<MemoryAllocRecord>,
     clock_snapshots: Vec<ClockSnapshotRecord>,
     sysinfo: Option<SysInfoRecord>,
+    cpu_infos: Vec<CpuInfoRecord>,
     tpu_devices: Vec<TpuDeviceRecord>,
     tpu_ops: Vec<TpuOpRecord>,
     tpu_metrics: Vec<TpuMetricRecord>,
@@ -125,6 +126,7 @@ pub struct StreamingParquetWriter {
     memory_alloc_writer: Option<ArrowWriter<File>>,
     clock_snapshot_writer: Option<ArrowWriter<File>>,
     sysinfo_writer: Option<ArrowWriter<File>>,
+    cpu_info_writer: Option<ArrowWriter<File>>,
     tpu_device_writer: Option<ArrowWriter<File>>,
     tpu_op_writer: Option<ArrowWriter<File>>,
     tpu_metric_writer: Option<ArrowWriter<File>>,
@@ -205,6 +207,7 @@ impl StreamingParquetWriter {
             memory_allocs: Vec::new(),
             clock_snapshots: Vec::new(),
             sysinfo: None,
+            cpu_infos: Vec::new(),
             tpu_devices: Vec::new(),
             tpu_ops: Vec::new(),
             tpu_metrics: Vec::new(),
@@ -239,6 +242,7 @@ impl StreamingParquetWriter {
             memory_alloc_writer: None,
             clock_snapshot_writer: None,
             sysinfo_writer: None,
+            cpu_info_writer: None,
             tpu_device_writer: None,
             tpu_op_writer: None,
             tpu_metric_writer: None,
@@ -718,6 +722,26 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    // Flush cpu_infos buffer
+    fn flush_cpu_infos(&mut self) -> Result<()> {
+        if self.cpu_infos.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::cpu_info_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.cpu_info_writer,
+            &self.paths.cpu_info,
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_cpu_info_batch(&self.cpu_infos, &schema)?;
+        writer.write(&batch)?;
+        self.cpu_infos.clear();
+        Ok(())
+    }
+
     // Flush network_syscalls buffer
     fn flush_network_syscalls(&mut self) -> Result<()> {
         if self.network_syscalls.is_empty() {
@@ -993,6 +1017,7 @@ impl StreamingParquetWriter {
         close_writer!(self.memory_alloc_writer);
         close_writer!(self.clock_snapshot_writer);
         close_writer!(self.sysinfo_writer);
+        close_writer!(self.cpu_info_writer);
         close_writer!(self.tpu_device_writer);
         close_writer!(self.tpu_op_writer);
         close_writer!(self.tpu_metric_writer);
@@ -1033,6 +1058,7 @@ impl Drop for StreamingParquetWriter {
             || self.network_dns_writer.is_some()
             || self.clock_snapshot_writer.is_some()
             || self.sysinfo_writer.is_some()
+            || self.cpu_info_writer.is_some()
             || self.tpu_device_writer.is_some()
             || self.tpu_op_writer.is_some()
             || self.tpu_metric_writer.is_some();
@@ -1362,6 +1388,15 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn add_cpu_info(&mut self, record: CpuInfoRecord) -> Result<()> {
+        self.cpu_infos.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.cpu_infos, self.batch_size) {
+            self.flush_cpu_infos()?;
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<()> {
         self.flush_processes()?;
         self.flush_threads()?;
@@ -1393,6 +1428,7 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_memory_allocs()?;
         self.flush_clock_snapshots()?;
         self.flush_sysinfo()?;
+        self.flush_cpu_infos()?;
         self.flush_tpu_devices()?;
         self.flush_tpu_ops()?;
         self.flush_tpu_metrics()?;
@@ -2010,6 +2046,8 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     let mut hypervisor_builder = StringBuilder::with_capacity(1, 16);
     let mut sys_vendor_builder = StringBuilder::with_capacity(1, 16);
     let mut product_name_builder = StringBuilder::with_capacity(1, 16);
+    let mut sample_event_builder = StringBuilder::with_capacity(1, 16);
+    let mut sample_period_builder = Int64Builder::with_capacity(1);
 
     sysname_builder.append_value(&record.sysname);
     release_builder.append_value(&record.release);
@@ -2019,6 +2057,8 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     hypervisor_builder.append_option(record.hypervisor.as_deref());
     sys_vendor_builder.append_option(record.sys_vendor.as_deref());
     product_name_builder.append_option(record.product_name.as_deref());
+    sample_event_builder.append_option(record.sample_event.as_deref());
+    sample_period_builder.append_option(record.sample_period);
 
     Ok(RecordBatch::try_new(
         schema.clone(),
@@ -2031,6 +2071,32 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
             Arc::new(hypervisor_builder.finish()),
             Arc::new(sys_vendor_builder.finish()),
             Arc::new(product_name_builder.finish()),
+            Arc::new(sample_event_builder.finish()),
+            Arc::new(sample_period_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_cpu_info_batch(records: &[CpuInfoRecord], schema: &Arc<Schema>) -> Result<RecordBatch> {
+    let mut cpu_builder = Int32Builder::with_capacity(records.len());
+    let mut min_freq_builder = Int64Builder::with_capacity(records.len());
+    let mut max_freq_builder = Int64Builder::with_capacity(records.len());
+    let mut base_freq_builder = Int64Builder::with_capacity(records.len());
+
+    for record in records {
+        cpu_builder.append_value(record.cpu);
+        min_freq_builder.append_option(record.min_freq_khz);
+        max_freq_builder.append_option(record.max_freq_khz);
+        base_freq_builder.append_option(record.base_freq_khz);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(cpu_builder.finish()),
+            Arc::new(min_freq_builder.finish()),
+            Arc::new(max_freq_builder.finish()),
+            Arc::new(base_freq_builder.finish()),
         ],
     )?)
 }
@@ -2799,6 +2865,8 @@ mod tests {
                 hypervisor: Some("kvm".to_string()),
                 sys_vendor: Some("Amazon EC2".to_string()),
                 product_name: None,
+                sample_event: Some("cpu-cycles".to_string()),
+                sample_period: Some(3_500_000),
             })
             .unwrap();
         writer.finish().unwrap();
@@ -2807,18 +2875,22 @@ mod tests {
         parquet_to_duckdb(dir.path(), &db_path, "test-trace")
             .expect("DuckDB import should succeed");
 
+        type SysInfoRow = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        );
+
         let conn = Connection::open(&db_path).unwrap();
-        let row: (
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = conn
+        let row: SysInfoRow = conn
             .query_row(
-                "SELECT sysname, machine, cpufreq_driver, hypervisor, sys_vendor, product_name \
-                 FROM sysinfo",
+                "SELECT sysname, machine, cpufreq_driver, hypervisor, sys_vendor, product_name, \
+                 sample_event, sample_period FROM sysinfo",
                 [],
                 |row| {
                     Ok((
@@ -2828,6 +2900,8 @@ mod tests {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
@@ -2839,6 +2913,84 @@ mod tests {
         assert_eq!(row.3, Some("kvm".to_string()));
         assert_eq!(row.4, Some("Amazon EC2".to_string()));
         assert_eq!(row.5, None, "absent product_name should round-trip as NULL");
+        assert_eq!(row.6, Some("cpu-cycles".to_string()));
+        assert_eq!(row.7, Some(3_500_000));
+    }
+
+    #[test]
+    fn test_cpu_info_duckdb_round_trip() {
+        use crate::duckdb::parquet_to_duckdb;
+        use duckdb::Connection;
+
+        let dir = TempDir::new().unwrap();
+        let mut writer = StreamingParquetWriter::new(dir.path()).unwrap();
+
+        // A heterogeneous part: cpu 0 is a P-core with a base frequency, cpu 1
+        // is an E-core whose driver exposes no base_frequency.
+        writer
+            .add_cpu_info(CpuInfoRecord {
+                cpu: 0,
+                min_freq_khz: Some(400_000),
+                max_freq_khz: Some(5_000_000),
+                base_freq_khz: Some(3_200_000),
+            })
+            .unwrap();
+        writer
+            .add_cpu_info(CpuInfoRecord {
+                cpu: 1,
+                min_freq_khz: Some(400_000),
+                max_freq_khz: Some(3_800_000),
+                base_freq_khz: None,
+            })
+            .unwrap();
+        writer.finish().unwrap();
+
+        let db_path = dir.path().join("test.duckdb");
+        parquet_to_duckdb(dir.path(), &db_path, "test-trace")
+            .expect("DuckDB import should succeed");
+
+        type CpuInfoRow = (String, i32, Option<i64>, Option<i64>, Option<i64>);
+
+        let conn = Connection::open(&db_path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT trace_id, cpu, min_freq_khz, max_freq_khz, base_freq_khz \
+                 FROM cpu_info ORDER BY cpu",
+            )
+            .unwrap();
+        let rows: Vec<CpuInfoRow> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "test-trace".to_string(),
+                    0,
+                    Some(400_000),
+                    Some(5_000_000),
+                    Some(3_200_000)
+                ),
+                (
+                    "test-trace".to_string(),
+                    1,
+                    Some(400_000),
+                    Some(3_800_000),
+                    None
+                ),
+            ]
+        );
     }
 
     #[test]

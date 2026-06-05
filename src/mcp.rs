@@ -576,7 +576,7 @@ impl SystingMcpServer {
 
     #[tool(
         name = "trace_info",
-        description = "Get metadata about a trace database: database path, trace IDs, time range (in nanoseconds and seconds), per-trace system/platform info (kernel, architecture, hypervisor, DMI vendor/product, cpufreq driver), non-empty tables with row counts, total process count, and the top 25 processes by thread count. Platform fields are omitted when unset: an absent hypervisor means bare metal, and an absent cpufreq_driver means CPU-frequency tracks are absent from the trace - except for traces recorded by systing < 1.8, which omit all four platform fields (meaning unknown, not bare metal). The whole system field is absent when the database has no sysinfo data. Use the query tool to explore the full process list if needed."
+        description = "Get metadata about a trace database: database path, trace IDs, time range (in nanoseconds and seconds), per-trace system/platform info (kernel, architecture, hypervisor, DMI vendor/product, cpufreq driver, stack-sampling event/period), non-empty tables with row counts, total process count, and the top 25 processes by thread count. Platform fields are omitted when unset: an absent hypervisor means bare metal, and an absent cpufreq_driver means CPU-frequency tracks are absent from the trace - except for traces recorded by systing < 1.8, which omit all four platform fields (meaning unknown, not bare metal). sample_event/sample_period (systing >= 1.9) say what one CPU stack sample represents: sample_period cycles for 'cpu-cycles' (so sample density tracks cycles consumed, not wall time; the cpu_info table holds per-CPU min/max/base frequency in kHz for cycles-to-time conversion) or sample_period nanoseconds for 'cpu-clock'; absent means an older trace sampled with the kernel's adaptive frequency mode at a nominal 1000 Hz. The whole system field is absent when the database has no sysinfo data. Use the query tool to explore the full process list if needed."
     )]
     async fn trace_info(
         &self,
@@ -738,6 +738,8 @@ network activity, and performance counters. Traces are stored in DuckDB database
 - process: Process metadata (upid=internal unique ID, pid=Linux PID, name).
 - sched_slice: Scheduling events with durations.
 - counter: Performance counter values over time.
+- cpu_info: Per-CPU static frequency limits in kHz (min/max/base) from sysfs \
+  cpufreq; empty on systems without cpufreq support (typical VMs).
 - network_syscall: Network send/recv syscalls with bytes and buffer metrics.
 - network_packet: Packet-level events (TCP/UDP) with sequence numbers, \
   retransmits, RTT, drops.
@@ -748,6 +750,12 @@ network activity, and performance counters. Traces are stored in DuckDB database
 - utid/upid are internal unique thread/process IDs (not Linux TID/PID). \
   Use thread.tid / process.pid for the Linux IDs.
 - stack_sample.stack_event_type: 0 = uninterruptible-sleep, 1 = CPU sample, 2 = interruptible-sleep.
+- CPU samples are taken in fixed-period mode (systing >= 1.9): each represents \
+  sysinfo.sample_period cycles (sample_event 'cpu-cycles') or nanoseconds \
+  ('cpu-clock'). With cycles, sample density tracks cycles consumed, not wall \
+  time - use sched_slice for time, and cpu_info frequencies (or \
+  sample_period / delta-ts between consecutive samples on a busy CPU) to \
+  convert cycles to approximate time.
 - sched_slice.end_state: 1 = interruptible sleep (S), 2 = uninterruptible sleep (D).
 - Tables are linked by trace_id (for multi-trace databases).
 
@@ -756,8 +764,8 @@ All tools accept an optional `path` parameter pointing to a .duckdb trace databa
 The database is opened automatically on first use and cached for subsequent calls. \
 If `path` is omitted, the most recently accessed database is used.
 1. trace_info \u{2014} Get overview: traces, time range, system/platform \
-   (kernel, hypervisor, machine type, cpufreq driver), tables, processes. \
-   Good first call with a new database path.
+   (kernel, hypervisor, machine type, cpufreq driver, stack-sampling \
+   event/period), tables, processes. Good first call with a new database path.
 2. list_tables \u{2014} See all tables and row counts.
 3. describe_table \u{2014} Get column names and types for a table of interest.
 4. query \u{2014} Run SQL queries. Results are capped at 10,000 rows; \

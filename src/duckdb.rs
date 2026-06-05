@@ -117,7 +117,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -156,6 +156,7 @@ pub const DATA_TABLES: &[&str] = &[
     "memory_alloc",
     "clock_snapshot",
     "sysinfo",
+    "cpu_info",
     "tpu_device",
     "tpu_op",
     "tpu_metric",
@@ -562,7 +563,26 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             cpufreq_driver VARCHAR,
             hypervisor VARCHAR,
             sys_vendor VARCHAR,
-            product_name VARCHAR
+            product_name VARCHAR,
+            -- Perf event driving stack sampling ('cpu-cycles' or 'cpu-clock')
+            -- and its period in event units (cycles or nanoseconds): one
+            -- stack_sample row with stack_event_type = 1 represents
+            -- sample_period cycles/ns of execution. NULL in traces recorded
+            -- by systing < 1.9.
+            sample_event VARCHAR,
+            sample_period BIGINT
+        );
+
+        -- Per-CPU static frequency limits (kHz) from sysfs cpufreq. Empty on
+        -- systems without cpufreq support (typical for VM guests). With
+        -- cycles-based sampling these convert cycle counts to approximate
+        -- time; per-CPU rows matter on heterogeneous parts (P/E cores).
+        CREATE TABLE IF NOT EXISTS cpu_info (
+            trace_id VARCHAR,
+            cpu INTEGER,
+            min_freq_khz BIGINT,
+            max_freq_khz BIGINT,
+            base_freq_khz BIGINT
         );
 
         -- TPU profiling tables
@@ -753,6 +773,7 @@ fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Res
 
     // System info
     import_table("sysinfo", &paths.sysinfo)?;
+    import_table("cpu_info", &paths.cpu_info)?;
 
     // TPU tables
     import_table("tpu_device", &paths.tpu_device)?;
@@ -1147,6 +1168,7 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
 
     // System info
     export_table("sysinfo", &paths.sysinfo)?;
+    export_table("cpu_info", &paths.cpu_info)?;
 
     // TPU tables
     export_table("tpu_device", &paths.tpu_device)?;

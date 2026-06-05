@@ -491,6 +491,32 @@ pub struct SysInfoRecord {
     pub sys_vendor: Option<String>,
     /// DMI product name (e.g. "m7i.16xlarge"), if exposed.
     pub product_name: Option<String>,
+    /// Perf event driving CPU stack sampling: "cpu-cycles" (hardware) or
+    /// "cpu-clock" (software fallback). `None` in traces from systing < 1.9
+    /// (which sampled cycles in adaptive frequency mode at a nominal 1000 Hz).
+    pub sample_event: Option<String>,
+    /// Stack sampling period in event units: each `stack_sample` row with
+    /// `stack_event_type` = 1 represents this many cycles ("cpu-cycles") or
+    /// nanoseconds ("cpu-clock") of execution. `None` in traces from
+    /// systing < 1.9.
+    pub sample_period: Option<i64>,
+}
+
+/// Per-CPU static frequency limits from sysfs cpufreq, in kHz.
+///
+/// One row per CPU that exposes cpufreq data; the table is empty on systems
+/// without cpufreq support (typical for VM guests). With cycles-based stack
+/// sampling (`sysinfo.sample_event` = "cpu-cycles") these bound the
+/// cycles-to-time conversion for each CPU; per-CPU rows matter on
+/// heterogeneous parts (P/E cores) where limits differ between CPUs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpuInfoRecord {
+    pub cpu: i32,
+    pub min_freq_khz: Option<i64>,
+    pub max_freq_khz: Option<i64>,
+    /// Sustained (non-turbo) frequency; only exposed by some drivers
+    /// (e.g. intel_pstate's `base_frequency`).
+    pub base_freq_khz: Option<i64>,
 }
 
 /// Container for all extracted trace data.
@@ -584,6 +610,7 @@ pub struct ExtractedData {
     pub memory_allocs: Vec<MemoryAllocRecord>,
     pub clock_snapshots: Vec<ClockSnapshotRecord>,
     pub sysinfo: Option<SysInfoRecord>,
+    pub cpu_infos: Vec<CpuInfoRecord>,
     pub tpu_devices: Vec<TpuDeviceRecord>,
     pub tpu_ops: Vec<TpuOpRecord>,
     pub tpu_metrics: Vec<TpuMetricRecord>,

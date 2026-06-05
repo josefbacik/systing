@@ -240,6 +240,21 @@ pub fn sysinfo_schema() -> Arc<Schema> {
         Field::new("hypervisor", DataType::Utf8, true),
         Field::new("sys_vendor", DataType::Utf8, true),
         Field::new("product_name", DataType::Utf8, true),
+        Field::new("sample_event", DataType::Utf8, true),
+        Field::new("sample_period", DataType::Int64, true),
+    ]))
+}
+
+/// Schema for cpu_info.parquet
+///
+/// Per-CPU static frequency limits (kHz) from sysfs cpufreq. Empty on systems
+/// without cpufreq support.
+pub fn cpu_info_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("cpu", DataType::Int32, false),
+        Field::new("min_freq_khz", DataType::Int64, true),
+        Field::new("max_freq_khz", DataType::Int64, true),
+        Field::new("base_freq_khz", DataType::Int64, true),
     ]))
 }
 

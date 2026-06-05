@@ -153,3 +153,36 @@ record-time import (`src/duckdb.rs`) and `systing-util convert` (which
 previously used positional inserts and would have failed on any added column,
 including v8's `process` columns) now use `INSERT ... BY NAME`, which fills
 missing columns with `NULL`.
+
+---
+
+## Schema Version 10 (systing 1.9.0) — 2026-06-04
+
+Stack sampling moved from the kernel's adaptive frequency mode (nominal 1000 Hz
+on cpu-cycles) to fixed-period mode: the frequency estimator shrinks the period
+toward its floor while a CPU idles, then floods samples the moment the CPU
+wakes, oversampling wakeup paths on mostly-idle CPUs. With a fixed period each
+CPU stack sample represents an exact, constant amount of execution — but
+interpreting it requires knowing the period, and converting cycles to time
+requires CPU frequency data, so both are now recorded.
+
+### Added columns
+- `sysinfo`: added `sample_event VARCHAR` — the perf event that drove CPU stack
+  sampling: `cpu-cycles` (hardware) or `cpu-clock` (software fallback, used
+  with `--sw-event` or when the PMU is unavailable, e.g. most VMs). `NULL` in
+  traces recorded by systing < 1.9.
+- `sysinfo`: added `sample_period BIGINT` — the sampling period in event units:
+  each `stack_sample` row with `stack_event_type = 1` represents
+  `sample_period` cycles (`cpu-cycles`) or nanoseconds (`cpu-clock`) of
+  execution. The period is chosen at startup so sampling runs at ~1000 Hz at
+  the fastest CPU's maximum frequency. `NULL` in traces from systing < 1.9.
+
+### Added tables
+- `cpu_info` — per-CPU static frequency limits from sysfs cpufreq, in kHz:
+  `cpu INTEGER`, `min_freq_khz BIGINT`, `max_freq_khz BIGINT`,
+  `base_freq_khz BIGINT` (sustained non-turbo frequency; only exposed by some
+  drivers, e.g. intel_pstate). One row per CPU with cpufreq data; empty on
+  systems without cpufreq support (typical for VM guests). With cycles-based
+  sampling these bound the cycles-to-time conversion per CPU; with a fixed
+  period, effective frequency is also derivable directly from the trace as
+  `sample_period / Δts` between consecutive samples on a continuously-busy CPU.
