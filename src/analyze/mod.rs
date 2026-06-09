@@ -90,11 +90,11 @@ fn create_spill_dir(tmp: &Path) -> Option<PathBuf> {
         SPILL_DIR_SEQ.fetch_add(1, Ordering::Relaxed),
     ));
     use std::os::unix::fs::DirBuilderExt;
-    match std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&spill_dir)
-    {
+    // Non-recursive create: the directory name is predictable, so in a shared
+    // temp dir it could be pre-created by another user with open permissions
+    // (or as a symlink to a directory they control). AlreadyExists then lands
+    // in the spilling-disabled fallback instead of adopting their directory.
+    match std::fs::DirBuilder::new().mode(0o700).create(&spill_dir) {
         Ok(()) => Some(spill_dir),
         Err(e) => {
             eprintln!(
