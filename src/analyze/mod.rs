@@ -36,8 +36,75 @@ use duckdb::Connection;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use query::{duckdb_value_to_json, duckdb_value_to_string};
+
+/// Distinguishes the spill directories of databases opened by one process:
+/// DuckDB names temp files by block id, which is only unique per instance, so
+/// instances sharing a temp_directory could clobber each other's spills.
+static SPILL_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Best-effort removal of spill directories left behind by dead processes.
+/// DuckDB only cleans its temp files up on graceful shutdown, so an OOM-killed
+/// or SIGKILLed process leaves its whole spill directory behind; reclaim it
+/// once the owning pid is gone. Directories whose embedded pid is alive (or
+/// reused) are skipped — a stale dir then just waits for a later sweep.
+fn sweep_stale_spill_dirs(tmp: &Path) {
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("systing-analyze-spill-"))
+        else {
+            continue;
+        };
+        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Create a per-instance spill directory under `tmp`, owner-only (0700): left
+/// to DuckDB it would be created lazily with umask-default permissions, and
+/// spill files contain trace contents (stack frames, process names, network
+/// endpoints) that should not be world-readable on multi-user hosts.
+///
+/// Returns `None` if the directory cannot be created — some container
+/// environments have no writable temp dir at all. The caller then disables
+/// spilling entirely rather than inheriting DuckDB's default location (a
+/// lazily-created, umask-permission `.tmp` directory next to the database),
+/// which would quietly drop the owner-only protection. Without spilling, an
+/// oversized aggregation gets a query error at the memory limit, which still
+/// beats the OOM killer.
+fn create_spill_dir(tmp: &Path) -> Option<PathBuf> {
+    let spill_dir = tmp.join(format!(
+        "systing-analyze-spill-{}-{}",
+        std::process::id(),
+        SPILL_DIR_SEQ.fetch_add(1, Ordering::Relaxed),
+    ));
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&spill_dir)
+    {
+        Ok(()) => Some(spill_dir),
+        Err(e) => {
+            eprintln!(
+                "duckdb: cannot create spill dir {}: {e}; spilling disabled",
+                spill_dir.display()
+            );
+            None
+        }
+    }
+}
 
 /// Maximum number of rows returned by a query.
 pub const MAX_QUERY_ROWS: usize = 10_000;
@@ -183,16 +250,48 @@ impl AnalyzeDb {
             bail!("Database not found: {}", path.display());
         }
 
+        // DuckDB sizes its buffer pool and thread pool from the host (80% of
+        // physical RAM, one thread per CPU), not the cgroup, so analyzing a
+        // large trace from a small container on a big node gets the whole
+        // container OOM-killed mid-aggregation. Bound both from the cgroup
+        // limit — 50% rather than the import path's 75%, because an analysis
+        // container typically also hosts whatever is driving the MCP server —
+        // and point spills at the system temp dir so oversized aggregations
+        // hit disk instead of the OOM killer. Note temp_dir() honors TMPDIR;
+        // if /tmp is a tmpfs (whose pages are charged to the same cgroup,
+        // defeating the spill), point TMPDIR at a disk-backed directory.
+        let (mem_limit_mib, threads) = crate::duckdb::duckdb_resource_limits(50, 512);
+        let tmp = std::env::temp_dir();
+        sweep_stale_spill_dirs(&tmp);
+        let mut config = duckdb::Config::default().threads(threads as i64)?;
+        // temp_directory must be set before enable_external_access(false):
+        // DuckDB refuses to modify it once external access is disabled, even
+        // on a Config that has not opened a database yet. An empty value
+        // disables spilling, so the unwritable-temp-dir fallback never lands
+        // spill files in DuckDB's umask-permission default location.
+        config = match create_spill_dir(&tmp) {
+            Some(spill_dir) => config.with("temp_directory", spill_dir.to_string_lossy())?,
+            None => config.with("temp_directory", "")?,
+        };
+        if let Some(m) = mem_limit_mib {
+            config = config.max_memory(&format!("{m}MiB"))?;
+            eprintln!("duckdb: memory_limit={m}MiB threads={threads}");
+        } else {
+            eprintln!("duckdb: threads={threads} (no cgroup memory limit detected)");
+        }
+
         // Disable external access (reading/writing files, ATTACH, loading
         // extensions) so SQL run against an untrusted trace database -- e.g.
         // queries an AI assistant was prompt-injected into running via the MCP
         // server -- cannot touch anything outside the trace database. DuckDB
         // refuses to re-enable this setting while the database is running, so
-        // it cannot be undone with a SET statement.
-        let mut config = duckdb::Config::default().enable_external_access(false)?;
+        // it cannot be undone with a SET statement; it also locks
+        // temp_directory, so injected SQL cannot redirect spills either.
+        config = config.enable_external_access(false)?;
         if read_only {
             config = config.access_mode(duckdb::AccessMode::ReadOnly)?;
         }
+
         let conn = Connection::open_with_flags(path, config)?;
 
         Ok(Self {
@@ -732,6 +831,104 @@ mod tests {
                     .contains("Cannot change enable_external_access"),
                 "unexpected error: {set_err}"
             );
+        }
+    }
+
+    #[test]
+    fn test_create_spill_dir_unwritable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let ro = base.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        // Root ignores directory write bits, so the failure path can only be
+        // exercised as an unprivileged user; probe instead of checking uid.
+        if std::fs::write(ro.join("probe"), b"").is_err() {
+            assert!(create_spill_dir(&ro).is_none());
+        }
+
+        // Restore write permission so TempDir cleanup succeeds.
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // The fallback feeds '' to DuckDB to disable spilling; make sure that
+        // is accepted at config time and sticks.
+        let conn = Connection::open_in_memory_with_flags(
+            duckdb::Config::default()
+                .with("temp_directory", "")
+                .unwrap(),
+        )
+        .unwrap();
+        let temp_directory: String = conn
+            .query_row("SELECT current_setting('temp_directory')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(temp_directory, "");
+    }
+
+    #[test]
+    fn test_open_bounds_duckdb_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.duckdb");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+
+        let setting = |db: &AnalyzeDb, name: &str| -> String {
+            let result = db
+                .query(&format!("SELECT current_setting('{name}')"))
+                .unwrap();
+            match &result.rows[0][0] {
+                serde_json::Value::String(s) => s.clone(),
+                v => v.to_string(),
+            }
+        };
+
+        // A spill dir left behind by a dead process (this pid is above the
+        // kernel's PID_MAX_LIMIT, so it cannot be alive) is swept on open.
+        let stale = std::env::temp_dir().join("systing-analyze-spill-4294967294-0");
+        std::fs::create_dir_all(&stale).unwrap();
+
+        for read_only in [true, false] {
+            let db = AnalyzeDb::open(&db_path, read_only).unwrap();
+
+            // Spills are redirected away from the database's directory into a
+            // per-instance directory under the system temp dir, pre-created
+            // owner-only since spill files contain trace contents.
+            let temp_directory = setting(&db, "temp_directory");
+            assert!(
+                temp_directory.contains("systing-analyze-spill-"),
+                "unexpected temp_directory: {temp_directory}"
+            );
+            let mode = std::fs::metadata(&temp_directory).unwrap().permissions();
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(mode.mode() & 0o777, 0o700);
+
+            assert!(!stale.exists(), "stale spill dir not swept");
+
+            // Threads are capped, not one per host CPU.
+            let threads: u64 = setting(&db, "threads").parse().unwrap();
+            assert!(threads >= 2, "threads clamped below floor: {threads}");
+            assert!(threads <= 32 || crate::duckdb::detect_cgroup_memory_limit().is_some());
+
+            // Inside a cgroup the memory limit comes from the cgroup, not
+            // from 80% of host RAM. Compare against a reference connection
+            // configured with the same value so the test doesn't depend on
+            // how DuckDB formats the setting for display.
+            if let Some(cgroup_bytes) = crate::duckdb::detect_cgroup_memory_limit() {
+                let expected_mib = (cgroup_bytes / 2 / (1024 * 1024)).max(512);
+                let reference = Connection::open_in_memory_with_flags(
+                    duckdb::Config::default()
+                        .max_memory(&format!("{expected_mib}MiB"))
+                        .unwrap(),
+                )
+                .unwrap();
+                let expected: String = reference
+                    .query_row("SELECT current_setting('memory_limit')", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(setting(&db, "memory_limit"), expected);
+            }
         }
     }
 

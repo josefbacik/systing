@@ -62,6 +62,36 @@ pub(crate) fn detect_cgroup_memory_limit() -> Option<u64> {
     None
 }
 
+/// Compute a `(memory_limit in MiB, threads)` budget for a DuckDB instance
+/// from the cgroup memory limit.
+///
+/// `mem_fraction_pct` is the share of the cgroup granted to DuckDB's buffer
+/// pool — the remainder is headroom for everything else in the container.
+/// `min_mib` is a floor so tiny containers still get a working instance.
+/// Returns `None` for the memory limit when no cgroup limit is detected.
+///
+/// Threads are capped at one per ~512 MiB of memory budget: a parallel scan
+/// keeps roughly a row-group's worth of state live per thread, so an 18 GiB
+/// budget (a 24 GiB container at 75%) tops out around 36 threads instead of
+/// one per host CPU. Without a
+/// cgroup limit we still cap at 32 — unbounded thread counts were the
+/// observed OOM trigger.
+pub(crate) fn duckdb_resource_limits(mem_fraction_pct: u64, min_mib: u64) -> (Option<u64>, u64) {
+    const MIB: u64 = 1024 * 1024;
+
+    let mem_limit_mib = detect_cgroup_memory_limit()
+        .map(|bytes| (bytes * mem_fraction_pct / 100 / MIB).max(min_mib));
+
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get() as u64)
+        .unwrap_or(4);
+    let threads = match mem_limit_mib {
+        Some(m) => num_cpus.clamp(2, (m / 512).max(2)),
+        None => num_cpus.clamp(2, 32),
+    };
+    (mem_limit_mib, threads)
+}
+
 /// Configure a DuckDB connection for bulk parquet import/export under a memory
 /// budget.
 ///
@@ -71,24 +101,10 @@ pub(crate) fn detect_cgroup_memory_limit() -> Option<u64> {
 /// without reorder buffering, and points `temp_directory` at `spill_dir` so
 /// DuckDB can spill instead of OOMing if it still hits the cap.
 fn configure_for_bulk_io(conn: &Connection, spill_dir: &Path) -> Result<()> {
-    const MIB: u64 = 1024 * 1024;
-
     // Leave 25% of the container for everything that is not DuckDB's buffer
     // pool (our own heap, resident BPF maps, kernel page cache pressure),
     // clamped to at least 1 GiB so tiny containers still get a working import.
-    let mem_limit_mib = detect_cgroup_memory_limit().map(|bytes| (bytes * 3 / 4 / MIB).max(1024));
-
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get() as u64)
-        .unwrap_or(4);
-    // Parallel parquet scan + insert keeps roughly a row-group's worth of state
-    // live per thread; budget ~512 MiB/thread so a 24 GiB container tops out
-    // around 36 threads instead of 200+. Without a cgroup limit we still cap at
-    // 32 — unbounded thread counts were the observed OOM trigger.
-    let threads = match mem_limit_mib {
-        Some(m) => num_cpus.clamp(2, (m / 512).max(2)),
-        None => num_cpus.clamp(2, 32),
-    };
+    let (mem_limit_mib, threads) = duckdb_resource_limits(75, 1024);
 
     let escaped_spill = spill_dir.to_string_lossy().replace('\'', "''");
     let mut pragmas = format!(
