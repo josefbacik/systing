@@ -157,7 +157,7 @@ impl StackSpill {
 
     /// Record format (little-endian):
     /// id: i64, tgid: i32, klen: u16, ulen: u16, pylen: u16,
-    /// then klen+ulen u64 addresses and pylen (u32 symbol_id, i32 inst_idx).
+    /// then klen+ulen u64 addresses and pylen (u64 symbol_id, i32 inst_idx).
     ///
     /// Called from the ringbuf consumer path, but only once per *unique* stack
     /// and buffered through page cache, so it does not normally block event
@@ -409,7 +409,9 @@ fn read_spill_record(reader: &mut BufReader<File>) -> Result<Option<(Stack, i32,
     let ulen = u16::from_le_bytes(hdr[14..16].try_into().unwrap()) as usize;
     let pylen = u16::from_le_bytes(hdr[16..18].try_into().unwrap()) as usize;
 
-    let mut addrs = vec![0u8; (klen + ulen) * 8 + pylen * 8];
+    // Python frames serialize as 12 bytes: u64 symbol_id + i32 inst_idx.
+    const PY_FRAME_BYTES: usize = 12;
+    let mut addrs = vec![0u8; (klen + ulen) * 8 + pylen * PY_FRAME_BYTES];
     reader
         .read_exact(&mut addrs)
         .context("reading stack spill record body")?;
@@ -425,12 +427,13 @@ fn read_spill_record(reader: &mut BufReader<File>) -> Result<Option<(Stack, i32,
     };
     let kernel_stack = read_u64s(klen, &mut off);
     let user_stack = read_u64s(ulen, &mut off);
-    let py_stack = addrs[off..off + pylen * 8]
-        .chunks_exact(8)
+    let py_stack = addrs[off..off + pylen * PY_FRAME_BYTES]
+        .chunks_exact(PY_FRAME_BYTES)
         .map(|c| PyAddr {
             addr: crate::pystacks::types::StackWalkerFrame {
-                symbol_id: u32::from_le_bytes(c[0..4].try_into().unwrap()),
-                inst_idx: i32::from_le_bytes(c[4..8].try_into().unwrap()),
+                symbol_id: u64::from_le_bytes(c[0..8].try_into().unwrap()),
+                inst_idx: i32::from_le_bytes(c[8..12].try_into().unwrap()),
+                pad_: 0,
             },
         })
         .collect();
@@ -1061,8 +1064,9 @@ mod tests {
 
         let py = vec![PyAddr {
             addr: crate::pystacks::types::StackWalkerFrame {
-                symbol_id: 7,
+                symbol_id: 0xdeadbeef_cafef00d,
                 inst_idx: -1,
+                pad_: 0,
             },
         }];
         let stacks = [

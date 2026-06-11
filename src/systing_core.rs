@@ -801,11 +801,6 @@ pub trait SystingEvent {
     fn prev_task_info(&self) -> Option<&task_info> {
         None
     }
-    /// Returns true if this event contains Python stack data that needs symbol loading.
-    /// Default is false; only stack_event overrides this.
-    fn has_pystack(&self) -> bool {
-        false
-    }
 }
 
 impl SystingEvent for task_event {
@@ -832,9 +827,6 @@ impl SystingEvent for stack_event {
     }
     fn next_task_info(&self) -> Option<&task_info> {
         Some(&self.task)
-    }
-    fn has_pystack(&self) -> bool {
-        self.py_msg_buffer.stack_len > 0
     }
 }
 
@@ -963,7 +955,6 @@ fn consume_loop<T, N>(
     rx: Receiver<N>,
     stop_tx: Sender<()>,
     task_info_tx: Sender<task_info>,
-    pystack_symbol_tx: Option<Sender<N>>,
 ) where
     T: SystingRecordEvent<N>,
     N: Plain + SystingEvent + Copy,
@@ -992,15 +983,6 @@ fn consume_loop<T, N>(
                     let _ = task_info_tx.send(*task_info);
                 }
             }
-
-            // Send event to pystack symbol loading thread only if it has Python stack data
-            // This avoids waking up the symbol loader thread for events without Python stacks
-            if let Some(ref tx) = pystack_symbol_tx {
-                if event.has_pystack() {
-                    tx.send(*event)
-                        .expect("Failed to send event to pystack symbol loader thread");
-                }
-            }
         }
 
         let mut rec = recorder.lock().unwrap();
@@ -1024,6 +1006,10 @@ struct RecorderChannels {
     memory_rx: Receiver<memory_event>,
     marker_rx: Receiver<marker_event>,
     exec_event_rx: Option<Receiver<exec_event>>,
+    /// Python symbol records emitted by BPF on first sight of a symbol;
+    /// consumed by the pystack_symbol_loader thread, which interns them and
+    /// updates the BPF gate map. Present only when pystacks is enabled.
+    pysym_rx: Option<Receiver<crate::pystacks::types::PystacksSymbolRecord>>,
 }
 
 fn spawn_recorder_threads(
@@ -1033,7 +1019,6 @@ fn spawn_recorder_threads(
     stop_tx: &Sender<()>,
     perf_counter_names: &[String],
     task_info_tx: &Sender<task_info>,
-    pystack_symbol_tx: &Option<Sender<stack_event>>,
 ) -> Result<Vec<thread::JoinHandle<i32>>> {
     let RecorderChannels {
         event_rx,
@@ -1064,7 +1049,6 @@ fn spawn_recorder_threads(
                         event_rx,
                         my_stop_tx,
                         my_task_tx,
-                        None,
                     );
                     0
                 })?,
@@ -1076,7 +1060,6 @@ fn spawn_recorder_threads(
         let session_recorder = recorder.clone();
         let my_stop_tx = stop_tx.clone();
         let my_task_tx = task_info_tx.clone();
-        let my_pystack_tx = pystack_symbol_tx.clone();
         threads.push(
             thread::Builder::new()
                 .name("stack_recorder".to_string())
@@ -1086,7 +1069,6 @@ fn spawn_recorder_threads(
                         stack_rx,
                         my_stop_tx,
                         my_task_tx,
-                        my_pystack_tx,
                     );
                     0
                 })?,
@@ -1107,7 +1089,6 @@ fn spawn_recorder_threads(
                         probe_rx,
                         my_stop_tx,
                         my_task_tx,
-                        None,
                     );
                     0
                 })?,
@@ -1128,7 +1109,6 @@ fn spawn_recorder_threads(
                         network_rx,
                         my_stop_tx,
                         my_task_tx,
-                        None,
                     );
                     0
                 })?,
@@ -1210,7 +1190,6 @@ fn spawn_recorder_threads(
                         cache_rx,
                         my_stop_tx,
                         my_task_tx,
-                        None,
                     );
                     0
                 })?,
@@ -1233,7 +1212,6 @@ fn spawn_recorder_threads(
                         memory_rx,
                         my_stop_tx,
                         my_task_tx,
-                        None,
                     );
                     0
                 })?,
@@ -1256,7 +1234,6 @@ fn spawn_recorder_threads(
                         marker_rx,
                         my_stop_tx,
                         my_task_tx,
-                        None,
                     );
                     0
                 })?,
@@ -1889,12 +1866,24 @@ fn setup_ringbuffers<'a>(
         }
     }
 
+    let mut pysym_rx = None;
     if collect_pystacks {
         for map in object.maps() {
             if map.name().to_str().unwrap() == "ringbuf_exec_events" {
                 let ring = create_ring::<exec_event>(&map, exec_tx.clone())?;
                 rings.push(("ringbuf_exec_events".to_string(), ring));
                 has_exec_ringbuf = true;
+                break;
+            }
+        }
+
+        for map in object.maps() {
+            if map.name().to_str().unwrap() == "ringbuf_pysym_events" {
+                let (pysym_tx, rx) = sync_channel(CHANNEL_CAPACITY);
+                let ring =
+                    create_ring::<crate::pystacks::types::PystacksSymbolRecord>(&map, pysym_tx)?;
+                rings.push(("ringbuf_pysym_events".to_string(), ring));
+                pysym_rx = Some(rx);
                 break;
             }
         }
@@ -1932,6 +1921,7 @@ fn setup_ringbuffers<'a>(
         epoll_rx,
         marker_rx,
         exec_event_rx,
+        pysym_rx,
     };
 
     Ok((rings, channels))
@@ -2167,6 +2157,19 @@ fn configure_bpf_skeleton(
         if unreachable_slot {
             map.set_max_entries(page_size)
                 .with_context(|| format!("Failed to shrink unreachable ringbuf slot '{name}'"))?;
+        }
+        // The pysym maps are referenced by always-loaded programs (the
+        // sched_switch pystacks path is rodata-gated via
+        // tool_config.collect_pystacks, not autoload-gated), so they can't be
+        // autocreate=false; shrink them when pystacks is off instead.
+        if !collect_pystacks {
+            if name == "ringbuf_pysym_events" {
+                map.set_max_entries(page_size)
+                    .with_context(|| format!("Failed to shrink '{name}'"))?;
+            } else if name == "pystacks_symbols" || name == "pystacks_emitted_cache" {
+                map.set_max_entries(1)
+                    .with_context(|| format!("Failed to shrink '{name}'"))?;
+            }
         }
     }
 
@@ -2918,7 +2921,6 @@ struct ThreadHandles {
     exec_handler_thread: Option<thread::JoinHandle<()>>,
     tpu_metrics_thread: Option<thread::JoinHandle<i32>>,
     task_info_tx: Sender<task_info>,
-    pystack_symbol_tx: Sender<stack_event>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3037,7 +3039,6 @@ fn run_tracing_loop(
     }
     // Drop senders to allow background threads to exit
     drop(handles.task_info_tx);
-    drop(handles.pystack_symbol_tx);
     handles
         .discovery_thread
         .join()
@@ -3311,8 +3312,10 @@ pub fn systing(
         }
 
         let (rings, mut channels) = setup_ringbuffers(&skel, &opts, collect_pystacks)?;
-        // Take exec_event_rx out before channels is moved into spawn_recorder_threads
+        // Take exec_event_rx/pysym_rx out before channels is moved into
+        // spawn_recorder_threads
         let exec_event_rx = channels.exec_event_rx.take();
+        let pysym_rx = channels.pysym_rx.take();
 
         // Create shutdown signal for receiver threads
         let shutdown_signal = Arc::new(AtomicBool::new(false));
@@ -3331,9 +3334,6 @@ pub fn systing(
                 0
             })?;
 
-        // Create channel for Python symbol loading
-        let (pystack_symbol_tx, pystack_symbol_rx) = channel();
-
         // Spawn all recorder threads
         let recv_threads = spawn_recorder_threads(
             &recorder,
@@ -3342,7 +3342,6 @@ pub fn systing(
             &stop_tx,
             &perf_counter_names,
             &task_info_tx,
-            &Some(pystack_symbol_tx.clone()),
         )?;
 
         // Set up perf events (clock events and counter events)
@@ -3441,11 +3440,21 @@ pub fn systing(
             );
         }
 
+        // Consume symbol records emitted by BPF the first time it sees a
+        // Python symbol: resolve + cache the symbol, then insert it into the
+        // BPF gate map from this (process-context) thread. BPF itself never
+        // inserts into the gate map because its probes run with IRQs off,
+        // where a contended hash-map bucket lock can permanently halt the
+        // vCPU on hypervisors that drop PV spinlock kicks (AWS Nitro).
+        // The channel senders live in the ringbuf callbacks, so this thread
+        // exits once the ringbuf threads are joined and the rings dropped.
         let symbol_thread = thread::Builder::new()
             .name("pystack_symbol_loader".to_string())
             .spawn(move || {
-                while let Ok(event) = pystack_symbol_rx.recv() {
-                    psr.load_pystack_symbols(&event);
+                if let Some(rx) = pysym_rx {
+                    while let Ok(record) = rx.recv() {
+                        psr.ingest_symbol_record(&record);
+                    }
                 }
                 0
             })?;
@@ -3639,7 +3648,6 @@ pub fn systing(
             symbol_loader_thread: symbol_thread,
             exec_handler_thread,
             task_info_tx,
-            pystack_symbol_tx,
             tpu_metrics_thread,
         };
 

@@ -36,9 +36,10 @@ struct read_file_name {
   uintptr_t fault_addr; // != 0 if fault
 };
 
-// IMPORTANT: pystacks_symbol struct is used as the key to the 'symbols' bpf
-// map. Be careful about adding fields as any increase cardinality can degrade
-// symbol quality.
+// IMPORTANT: pystacks_symbol is the input to the 64-bit content hash that
+// becomes the symbol ID (see get_py_symbol_id). Be careful about adding
+// fields as any increased cardinality can degrade symbol quality, and the
+// struct size must stay a multiple of 8 bytes for the word-at-a-time hash.
 //
 // pystacks_symbol file names and qualified names are normally read directly
 // from bpf_py_probe.bpf.c in get_names(). If a page fault occurs when trying to
@@ -49,6 +50,7 @@ struct pystacks_symbol {
   struct read_file_name filename;
   struct read_qualified_name qualname;
   pid_t fault_pid; // != 0 if fault
+  int32_t pad_; // explicit padding: hashed, so it must be deterministic
 };
 
 struct pystacks_message {
@@ -75,6 +77,19 @@ struct pystacks_line_table {
   uint32_t length;
   uintptr_t addr;
   pid_t pid;
+  int32_t pad_; // explicit padding so the ringbuf record has no uninit bytes
+};
+
+/*
+ * Sent BPF -> userspace through the pysym ringbuf the first time a symbol
+ * hash misses the pystacks_symbols gate map. Userspace resolves it (page
+ * fault recovery, line table read) and then inserts symbol_id into
+ * pystacks_symbols, which stops further emission of this symbol.
+ */
+struct pystacks_symbol_record {
+  symbol_id_t symbol_id;
+  struct pystacks_symbol sym;
+  struct pystacks_line_table linetable;
 };
 
 #endif

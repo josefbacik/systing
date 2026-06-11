@@ -38,11 +38,18 @@ struct stack_walker_opts {
 };
 
 // @lint-ignore-every CLANGTIDY modernize-use-using
-typedef uint32_t symbol_id_t;
+//
+// Symbol IDs are 64-bit content hashes (FNV-style, over struct pystacks_symbol)
+// computed in BPF. A content-derived ID means every CPU independently arrives
+// at the same ID for the same symbol, so the probe never needs a shared
+// counter or a BPF-map insert to allocate one (see get_py_symbol_id in
+// pystacks.bpf.c for why probe-context map updates are forbidden).
+typedef uint64_t symbol_id_t;
 
 struct stack_walker_frame {
   symbol_id_t symbol_id;
   int32_t inst_idx;
+  int32_t pad_;
 };
 
 #ifdef __cplusplus

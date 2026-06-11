@@ -1,11 +1,11 @@
 use crate::systing_core::types::{pystacks_message, stack_event};
 use libbpf_rs::Object;
 use std::hash::{Hash, Hasher};
-use std::time::Instant;
 
 use {
     crate::pystacks::bpf_maps::PystacksMaps, crate::pystacks::discovery,
-    crate::pystacks::symbols::SymbolResolver, crate::pystacks::types::StackWalkerFrame, std::fmt,
+    crate::pystacks::symbols::SymbolResolver, crate::pystacks::types::PystacksSymbolRecord,
+    crate::pystacks::types::StackWalkerFrame, std::fmt,
 };
 
 #[derive(Debug, Clone)]
@@ -32,6 +32,7 @@ impl From<&crate::systing_core::types::stack_walker_frame> for StackWalkerFrame 
         StackWalkerFrame {
             symbol_id: frame.symbol_id,
             inst_idx: frame.inst_idx,
+            pad_: 0,
         }
     }
 }
@@ -62,9 +63,6 @@ const DEBUG_SAMPLE_LOG_LIMIT: u64 = 10;
 pub struct StackWalkerRun {
     resolver: Option<SymbolResolver>,
     maps: Option<PystacksMaps>,
-    // Symbol loading rate limiting
-    last_symbol_load: std::cell::Cell<Option<Instant>>,
-    symbol_load_interval: std::time::Duration,
     // Debug mode flag (atomic for thread safety with Sync impl)
     debug: std::sync::atomic::AtomicBool,
     // Counters for debug statistics (atomic for thread safety with Sync impl)
@@ -73,6 +71,9 @@ pub struct StackWalkerRun {
     symbols_loaded_count: std::sync::atomic::AtomicU64,
     frames_symbolized: std::sync::atomic::AtomicU64,
     frames_unknown: std::sync::atomic::AtomicU64,
+    /// Failed inserts into the BPF gate map (warned once, see
+    /// `ingest_symbol_record`).
+    gate_insert_failures: std::sync::atomic::AtomicU64,
 }
 
 impl StackWalkerRun {
@@ -83,16 +84,13 @@ impl StackWalkerRun {
         StackWalkerRun {
             resolver: None,
             maps: None,
-            last_symbol_load: std::cell::Cell::new(None),
-            // Load symbols at most once per 500ms (2 Hz) to catch dying processes
-            // while minimizing overhead on long traces
-            symbol_load_interval: std::time::Duration::from_millis(500),
             debug: AtomicBool::new(false),
             events_with_pystack: AtomicU64::new(0),
             events_without_pystack: AtomicU64::new(0),
             symbols_loaded_count: AtomicU64::new(0),
             frames_symbolized: AtomicU64::new(0),
             frames_unknown: AtomicU64::new(0),
+            gate_insert_failures: AtomicU64::new(0),
         }
     }
 
@@ -153,11 +151,7 @@ impl StackWalkerRun {
         }
 
         // Create symbol resolver
-        self.resolver = Some(SymbolResolver::new(
-            maps.symbols_fd,
-            maps.linetables_fd,
-            &process_info,
-        ));
+        self.resolver = Some(SymbolResolver::new(&process_info));
 
         self.maps = Some(maps);
 
@@ -189,6 +183,10 @@ impl StackWalkerRun {
                 self.frames_unknown.load(Ordering::Relaxed),
                 self.initialized()
             );
+            let gate_failures = self.gate_insert_failures.load(Ordering::Relaxed);
+            if gate_failures > 0 {
+                eprintln!("[pystacks debug] gate map insert failures: {gate_failures}");
+            }
         }
     }
 
@@ -206,9 +204,49 @@ impl StackWalkerRun {
         }
     }
 
-    fn load_symbols(&self) {
-        if let Some(resolver) = &self.resolver {
-            resolver.load_symbols();
+    /// Ingest a symbol record emitted by BPF through the pysym ringbuf.
+    ///
+    /// Resolves and caches the symbol, then marks its ID as interned in the
+    /// BPF gate map so BPF stops re-emitting it. The gate update happens
+    /// here, from process context — BPF must never insert into the gate map
+    /// from its probes (IRQs-off hash-map updates can wedge the CPU on
+    /// hypervisors that drop PV spinlock kicks; see pystacks.bpf.c).
+    pub fn ingest_symbol_record(&self, record: &PystacksSymbolRecord) {
+        use std::sync::atomic::Ordering;
+
+        let Some(resolver) = &self.resolver else {
+            return;
+        };
+
+        if resolver.ingest_record(record) {
+            if let Some(maps) = &self.maps {
+                if !maps.mark_symbol_interned(record.symbol_id) {
+                    // Likely the gate map is full. Symbolization stays
+                    // correct (the userspace cache above is authoritative),
+                    // but BPF will keep re-emitting this symbol at the
+                    // rate-limited cadence for the rest of the trace.
+                    let count = self.gate_insert_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count == 1 {
+                        eprintln!(
+                            "[pystacks] Warning: failed to mark symbol {:#x} as interned \
+                             (gate map full?); BPF will keep re-emitting un-interned symbols",
+                            record.symbol_id
+                        );
+                    }
+                }
+            }
+
+            if self.is_debug() {
+                let count = self.symbols_loaded_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if count <= DEBUG_SAMPLE_LOG_LIMIT {
+                    eprintln!(
+                        "[pystacks debug] Interned symbol #{} (id {:#x}, {} total)",
+                        count,
+                        record.symbol_id,
+                        resolver.symbol_count()
+                    );
+                }
+            }
         }
     }
 
@@ -270,39 +308,6 @@ impl StackWalkerRun {
             .iter()
             .map(|frame| PyAddr { addr: frame.into() })
             .collect()
-    }
-
-    pub fn load_pystack_symbols(&self, event: &stack_event) {
-        use std::sync::atomic::Ordering;
-
-        if !self.initialized() {
-            if self.is_debug() && self.events_with_pystack.load(Ordering::Relaxed) == 1 {
-                eprintln!("[pystacks debug] load_pystack_symbols: not initialized!");
-            }
-            return;
-        }
-
-        if event.py_msg_buffer.stack_len == 0 {
-            return;
-        }
-
-        let now = Instant::now();
-        let should_load = match self.last_symbol_load.get() {
-            None => true,
-            Some(last_load) => now.duration_since(last_load) >= self.symbol_load_interval,
-        };
-
-        if should_load {
-            if self.is_debug() {
-                let count = self.symbols_loaded_count.fetch_add(1, Ordering::Relaxed) + 1;
-                if count <= DEBUG_SAMPLE_LOG_LIMIT {
-                    eprintln!("[pystacks debug] Loading symbols (load #{})", count);
-                }
-            }
-
-            self.load_symbols();
-            self.last_symbol_load.set(Some(now));
-        }
     }
 
     pub fn init_pystacks(&mut self, pids: &[u32], bpf_object: &Object, debug: bool) {

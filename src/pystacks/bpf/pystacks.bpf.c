@@ -64,19 +64,80 @@ struct {
 #define BPF_LIB_CO_ITERABLE_COROUTINE 0x0100
 #define BPF_LIB_CO_STATICALLY_COMPILED 0x4000000
 
+/*
+ * LOCKING RULE FOR THIS FILE: pystacks runs from probe contexts where IRQs
+ * are hard-off (sched_switch fires under the runqueue lock; the perf-event
+ * sampler runs in NMI context). bpf_map_update_elem on a HASH map takes a
+ * per-bucket raw spinlock; on a large guest under contention those waiters
+ * fall into the paravirt qspinlock slow path, where kvm_wait executes HLT
+ * with IF=0 and depends on the hypervisor's PV kick to ever wake up. AWS
+ * Nitro does not deliver that kick to an IF=0 halt, so a contended map
+ * update from these probes permanently halts the vCPU and wedges the node
+ * (rq lock never released). Therefore BPF code here may only do lock-free
+ * map *lookups* on shared hash maps; all inserts are done by userspace from
+ * process context (IF=1 waiters fall back to safe_halt and are woken by the
+ * timer tick even without a kick). Per-CPU array maps and ringbuf
+ * reserve/submit (short, low-duty-cycle critical section, NMI-safe trylock)
+ * are the only other map operations allowed on the probe paths.
+ */
+
+#define PYSYM_GATE_MAP_SIZE 65536
+#define PYSYM_CACHE_SLOTS 1024
+/* Minimum interval between re-emissions of the same un-interned symbol from
+ * one CPU. Bounds duplicate ringbuf traffic during warm-up while still
+ * guaranteeing eventual interning if a record is dropped. */
+#define PYSYM_REEMIT_NS (1ULL * 1000 * 1000 * 1000)
+
+/*
+ * Interned-symbol gate. Key is the 64-bit content hash of the symbol
+ * (== symbol_id), value is unused. BPF only ever does lock-free lookups
+ * here; userspace inserts an entry once it has consumed and resolved the
+ * corresponding pystacks_symbol_record, which stops further emission of
+ * that symbol. See the locking rule above for why BPF must never update it.
+ */
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, BPF_LIB_DEFAULT_MAP_SIZE);
-  __type(key, struct pystacks_symbol);
-  __type(value, symbol_id_t);
+  __uint(max_entries, PYSYM_GATE_MAP_SIZE);
+  __type(key, symbol_id_t);
+  __type(value, uint8_t);
 } pystacks_symbols SEC(".maps");
 
+/*
+ * Carries pystacks_symbol_record from probe context to userspace. A single
+ * (un-sharded) ringbuf is fine here: emission is rate-limited to at most one
+ * record per CPU per un-interned symbol per PYSYM_REEMIT_NS, so the reserve
+ * spinlock's duty cycle is far too low to push waiters into the paravirt
+ * halt path even on very wide machines. ~470-byte records; 4MiB buffers ~8k
+ * in-flight symbols, and drops are recovered via PYSYM_REEMIT_NS.
+ * Shrunk to one page at open time when pystacks is disabled.
+ */
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, BPF_LIB_DEFAULT_MAP_SIZE);
-  __type(key, symbol_id_t);
-  __type(value, struct pystacks_line_table);
-} pystacks_linetables SEC(".maps");
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 4 * 1024 * 1024 /* 4MiB */);
+} ringbuf_pysym_events SEC(".maps");
+
+/*
+ * Per-CPU emission rate limiter, direct-mapped by the low bits of the
+ * symbol id; each slot holds the timestamp of the last emission attempt
+ * that claimed it. A slot in cooldown suppresses emission for *any* symbol
+ * mapping to it, which hard-caps each CPU at PYSYM_CACHE_SLOTS ringbuf
+ * reserve attempts per PYSYM_REEMIT_NS no matter how many distinct
+ * un-interned symbols are in flight (deliberately slot-based, not id-based:
+ * an id-based check would let two aliasing symbols evict each other's claim
+ * and degenerate to per-frame reserve attempts on the shared ringbuf lock).
+ * A suppressed symbol is retried on its next *sighting*: another CPU with a
+ * free slot emits it, or this slot's cooldown expires and a later miss
+ * re-emits. Symbols that recur are therefore eventually interned; a one-shot
+ * frame (e.g. module-level import code seen exactly once) that loses the
+ * slot race on every CPU that saw it, or whose record is dropped by a full
+ * ringbuf, stays unresolved — an accepted trade for the hard cap.
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, PYSYM_CACHE_SLOTS);
+  __type(key, u32);
+  __type(value, uint64_t);
+} pystacks_emitted_cache SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -120,8 +181,6 @@ static __always_inline struct sample_state_t* get_state() {
     return 0; /* should never happen */       \
   }
 
-static symbol_id_t next_symbol_id = 1;
-
 static __always_inline void read_shadow_frame_data(
     void* shadow_frame,
     const OffsetConfig* const offsets,
@@ -153,30 +212,77 @@ static __always_inline void read_shadow_frame_data(
                       (uintptr_t)offsets->PyShadowFrame_PtrMask);
 }
 
-static symbol_id_t get_py_symbol_id(struct pystacks_symbol* const sym) {
-  symbol_id_t* id = bpf_map_lookup_elem(&pystacks_symbols, sym);
-  if (id) {
-    return *id;
-  } else {
-    symbol_id_t new_id = next_symbol_id;
-    __sync_fetch_and_add(&next_symbol_id, 1);
-    int error =
-        bpf_map_update_elem(&pystacks_symbols, sym, &new_id, BPF_NOEXIST);
-    if (!error) {
-      return new_id;
-    }
-    if (error == -EEXIST) {
-      // Another thread updated the map already with the same stack.
-      // It should exist now.
-      id = bpf_map_lookup_elem(&pystacks_symbols, sym);
-      if (!id) {
-        // This shouldn't happen (fingers crossed).
-        return 0;
-      }
-      return *id;
-    }
-    return 0;
+/*
+ * 64-bit FNV-style hash over the whole pystacks_symbol, folding 8 bytes per
+ * round (NOT byte-wise FNV-1a — mixing is coarser, but collision odds at
+ * realistic symbol counts are still negligible, ~1e-8 at 100k symbols).
+ * get_names() zeroes the struct before filling it, so unused bytes
+ * (including the explicit padding) hash deterministically. The result is
+ * the symbol ID: content-derived, so every CPU computes the same ID
+ * independently and no shared counter or map insert is needed from probe
+ * context.
+ */
+static symbol_id_t hash_symbol(const struct pystacks_symbol* const sym) {
+  _Static_assert(
+      sizeof(struct pystacks_symbol) % sizeof(uint64_t) == 0,
+      "pystacks_symbol must be a multiple of 8 bytes for the word hash");
+  const uint64_t* words = (const uint64_t*)sym;
+  uint64_t hash = 0xcbf29ce484222325ULL;
+  for (uint32_t i = 0; i < sizeof(struct pystacks_symbol) / sizeof(uint64_t);
+       i++) {
+    hash ^= words[i];
+    hash *= 0x100000001b3ULL;
   }
+  /* 0 is reserved as "no symbol" by userspace consumers. */
+  return hash ? hash : 1;
+}
+
+/*
+ * Send {id, symbol, line table} to userspace for interning, rate-limited by
+ * the per-CPU emitted cache. The cache slot is claimed *before* the reserve
+ * so that a full ringbuf backs us off for PYSYM_REEMIT_NS instead of
+ * hammering the shared reserve spinlock on every frame.
+ */
+static __noinline void emit_symbol_record(
+    symbol_id_t id,
+    const struct pystacks_symbol* const sym,
+    const struct pystacks_line_table* const linetable) {
+  u32 slot = (u32)(id & (PYSYM_CACHE_SLOTS - 1));
+  uint64_t* last_emit = bpf_map_lookup_elem(&pystacks_emitted_cache, &slot);
+  u64 now = bpf_ktime_get_ns();
+
+  /* Fail closed: emitting without rate limiting is the failure class this
+   * file exists to prevent. The lookup can only miss if the cache map was
+   * shrunk (pystacks disabled), where this path should be dead code anyway. */
+  if (!last_emit)
+    return;
+  if (now - *last_emit < PYSYM_REEMIT_NS)
+    return;
+  *last_emit = now;
+
+  /* In NMI context (perf-event sampler) reserve degrades to a trylock and
+   * may fail; the record is re-emitted after PYSYM_REEMIT_NS. */
+  struct pystacks_symbol_record* rec =
+      bpf_ringbuf_reserve(&ringbuf_pysym_events, sizeof(*rec), 0);
+  if (!rec)
+    return;
+
+  rec->symbol_id = id;
+  rec->sym = *sym;
+  rec->linetable = *linetable;
+  bpf_ringbuf_submit(rec, 0);
+}
+
+static symbol_id_t get_py_symbol_id(struct sample_state_t* const state) {
+  symbol_id_t id = hash_symbol(&state->sym);
+
+  /* Lock-free lookup; see the locking rule above the map definitions for
+   * why this path must never bpf_map_update_elem a shared hash map. */
+  if (bpf_map_lookup_elem(&pystacks_symbols, &id))
+    return id;
+
+  emit_symbol_record(id, &state->sym, &state->linetable);
+  return id;
 }
 
 static __always_inline void* get_gen_ptr(
@@ -603,7 +709,7 @@ add_symbol_to_buffer(struct pystacks_message* const py_msg) {
     return 0; /* should never happen */
   }
 
-  const symbol_id_t symbol_id = get_py_symbol_id(&state->sym);
+  const symbol_id_t symbol_id = get_py_symbol_id(state);
 
   uint64_t max_len = pystacks_prog_cfg.stack_max_len;
   uint64_t max_offset = BPF_LIB_MAX_STACK_DEPTH;
@@ -612,14 +718,14 @@ add_symbol_to_buffer(struct pystacks_message* const py_msg) {
   if (st_len >= 0 && st_len < max_len && st_len < max_offset) {
     py_msg->buffer[st_len].symbol_id = symbol_id;
     py_msg->buffer[st_len].inst_idx = state->lasti;
+    py_msg->buffer[st_len].pad_ = 0;
     py_msg->header.len += sizeof(struct stack_walker_frame);
     ++st_len;
   }
 
-  if (pystacks_prog_cfg.enable_py_src_lines) {
-    bpf_map_update_elem(
-        &pystacks_linetables, &symbol_id, &state->linetable, BPF_NOEXIST);
-  }
+  /* Line tables ride in the pystacks_symbol_record emitted by
+   * get_py_symbol_id; updating a shared hash map from here is forbidden
+   * (see the locking rule above the map definitions). */
   py_msg->stack_len = st_len;
   return st_len;
 }
