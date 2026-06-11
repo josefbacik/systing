@@ -1,8 +1,13 @@
 /// Symbol resolution for Python stack frames.
 ///
-/// Replaces the core symbol lookup logic from pystacks.cpp.
-/// Reads symbols from BPF maps, constructs function names, and resolves
-/// source file/line information using line tables.
+/// Symbols arrive as `PystacksSymbolRecord`s through the pysym ringbuf: BPF
+/// emits a record the first time a symbol's content hash misses the
+/// `pystacks_symbols` gate map, and `ingest_record` resolves it here (page
+/// fault recovery, line table read) and caches it by symbol ID. The caller
+/// then inserts the ID into the gate map (from process context) so BPF stops
+/// emitting that symbol. BPF never inserts into shared hash maps itself
+/// because its probes run with IRQs off, where a contended map bucket lock
+/// can permanently halt the vCPU on hypervisors that drop PV spinlock kicks.
 use super::discovery::PyProcessInfo;
 use super::linetable::PyLineTable;
 use super::process;
@@ -17,23 +22,15 @@ struct PySymbol {
     linetable: Option<PyLineTable>,
 }
 
-/// Manages symbol resolution from BPF maps.
+/// Manages symbol resolution from BPF symbol records.
 pub struct SymbolResolver {
     symbols: RwLock<HashMap<SymbolIdT, PySymbol>>,
     /// Map of PID -> version info for line table construction.
     pid_versions: RwLock<HashMap<i32, (i32, i32)>>,
-    /// FD for the pystacks_symbols BPF map.
-    symbols_fd: i32,
-    /// FD for the pystacks_linetables BPF map.
-    linetables_fd: i32,
 }
 
 impl SymbolResolver {
-    pub fn new(
-        symbols_fd: i32,
-        linetables_fd: i32,
-        process_info: &HashMap<i32, PyProcessInfo>,
-    ) -> Self {
+    pub fn new(process_info: &HashMap<i32, PyProcessInfo>) -> Self {
         let pid_versions = process_info
             .iter()
             .map(|(&pid, info)| (pid, (info.version_major, info.version_minor)))
@@ -42,8 +39,6 @@ impl SymbolResolver {
         Self {
             symbols: RwLock::new(HashMap::new()),
             pid_versions: RwLock::new(pid_versions),
-            symbols_fd,
-            linetables_fd,
         }
     }
 
@@ -54,131 +49,72 @@ impl SymbolResolver {
             .insert(pid, (major, minor));
     }
 
-    /// Load symbols from BPF maps.
-    /// Iterates the pystacks_symbols BPF hash map and caches resolved symbols.
-    pub fn load_symbols(&self) {
-        let mut new_symbols = 0usize;
-        let mut missing_linetables = 0usize;
+    /// Number of symbols currently cached.
+    pub fn symbol_count(&self) -> usize {
+        self.symbols.read().unwrap().len()
+    }
 
-        // Iterate over all elements in the symbols BPF hash map.
-        // bpf_map_get_next_key with NULL key returns the first key.
-        let mut prev_key: Option<PystacksSymbol> = None;
-        let mut next_key = PystacksSymbol::default();
+    /// Ingest one symbol record emitted by BPF.
+    ///
+    /// Returns true if the symbol is cached after this call (newly resolved
+    /// or already known); the caller should then mark the ID as interned in
+    /// the BPF gate map. Returns false if resolution failed (e.g. the
+    /// faulted qualname could not be read back); the ID is left out of the
+    /// gate map so BPF re-emits it (rate-limited) and we retry — the page
+    /// may be resident on a later attempt.
+    pub fn ingest_record(&self, record: &PystacksSymbolRecord) -> bool {
+        let id = record.symbol_id;
+        if id == 0 {
+            // 0 is reserved as "no symbol".
+            return false;
+        }
 
-        loop {
-            let prev_ptr = match &prev_key {
-                Some(k) => k as *const PystacksSymbol as *const std::ffi::c_void,
-                None => std::ptr::null(),
-            };
+        if self.symbols.read().unwrap().contains_key(&id) {
+            return true;
+        }
 
-            let ret = unsafe {
-                libbpf_rs::libbpf_sys::bpf_map_get_next_key(
-                    self.symbols_fd,
-                    prev_ptr,
-                    &mut next_key as *mut PystacksSymbol as *mut std::ffi::c_void,
-                )
-            };
+        let mut sym = record.sym.clone();
 
-            if ret != 0 {
-                break; // No more keys
-            }
-
-            // Look up the symbol_id value for this key
-            let mut id: SymbolIdT = 0;
-            let ret = unsafe {
-                libbpf_rs::libbpf_sys::bpf_map_lookup_elem(
-                    self.symbols_fd,
-                    &next_key as *const PystacksSymbol as *const std::ffi::c_void,
-                    &mut id as *mut SymbolIdT as *mut std::ffi::c_void,
-                )
-            };
-
-            if ret != 0 {
-                prev_key = Some(next_key.clone());
-                continue;
-            }
-
-            // Skip if already cached
+        // Handle page fault recovery for qualname
+        if sym.qualname.fault_addr != 0 && sym.fault_pid != 0 {
+            let mut buf = [0u8; BPF_LIB_PYSTACKS_QUAL_NAME_LEN];
+            if process::read_process_memory(sym.fault_pid, sym.qualname.fault_addr, &mut buf)
+                .is_ok()
             {
-                let symbols = self.symbols.read().unwrap();
-                if symbols.contains_key(&id) {
-                    prev_key = Some(next_key.clone());
-                    continue;
-                }
+                sym.qualname.value = buf;
+            } else {
+                return false; // Can't recover qualname yet; retry on re-emit
             }
+        }
 
-            // Handle page fault recovery for qualname
-            let mut sym = next_key.clone();
-            if sym.qualname.fault_addr != 0 && sym.fault_pid != 0 {
-                let mut buf = [0u8; BPF_LIB_PYSTACKS_QUAL_NAME_LEN];
-                if process::read_process_memory(sym.fault_pid, sym.qualname.fault_addr, &mut buf)
-                    .is_ok()
-                {
-                    sym.qualname.value = buf;
-                } else {
-                    prev_key = Some(next_key.clone());
-                    continue; // Can't recover qualname
-                }
-            }
+        // Handle page fault recovery for filename
+        if sym.filename.fault_addr != 0 && sym.fault_pid != 0 {
+            let mut buf = [0u8; BPF_LIB_PYSTACKS_FILE_NAME_LEN];
+            let _ = process::read_process_memory(sym.fault_pid, sym.filename.fault_addr, &mut buf)
+                .map(|_| {
+                    sym.filename.value = buf;
+                });
+            // Continue even if filename recovery fails - qualname is more important
+        }
 
-            // Handle page fault recovery for filename
-            if sym.filename.fault_addr != 0 && sym.fault_pid != 0 {
-                let mut buf = [0u8; BPF_LIB_PYSTACKS_FILE_NAME_LEN];
-                let _ =
-                    process::read_process_memory(sym.fault_pid, sym.filename.fault_addr, &mut buf)
-                        .map(|_| {
-                            sym.filename.value = buf;
-                        });
-                // Continue even if filename recovery fails - qualname is more important
-            }
+        let funcname = get_symbol_name(&sym);
+        let filename = cstring_from_bytes(&sym.filename.value);
+        let linetable = self.load_line_table(&record.linetable);
 
-            // Build the symbol
-            let funcname = get_symbol_name(&sym);
-            let filename = cstring_from_bytes(&sym.filename.value);
-
-            // Try to load line table
-            let linetable = self.load_line_table(id);
-            if linetable.is_none() {
-                missing_linetables += 1;
-            }
-
-            let py_symbol = PySymbol {
+        self.symbols.write().unwrap().insert(
+            id,
+            PySymbol {
                 funcname,
                 filename,
                 linetable,
-            };
-
-            {
-                let mut symbols = self.symbols.write().unwrap();
-                symbols.insert(id, py_symbol);
-            }
-            new_symbols += 1;
-
-            prev_key = Some(next_key.clone());
-        }
-
-        if new_symbols > 0 {
-            let total = self.symbols.read().unwrap().len();
-            eprintln!(
-                "[pystacks] Added {} Python symbols ({} total, {} missing linetables)",
-                new_symbols, total, missing_linetables
-            );
-        }
+            },
+        );
+        true
     }
 
-    /// Load a line table from BPF map for a given symbol ID.
-    fn load_line_table(&self, id: SymbolIdT) -> Option<PyLineTable> {
-        let mut lt = PystacksLineTable::default();
-
-        let ret = unsafe {
-            libbpf_rs::libbpf_sys::bpf_map_lookup_elem(
-                self.linetables_fd,
-                &id as *const SymbolIdT as *const std::ffi::c_void,
-                &mut lt as *mut PystacksLineTable as *mut std::ffi::c_void,
-            )
-        };
-
-        if ret != 0 || lt.addr == 0 || lt.length == 0 || lt.first_line == 0 || lt.pid == 0 {
+    /// Build a line table from the data carried in a symbol record.
+    fn load_line_table(&self, lt: &PystacksLineTable) -> Option<PyLineTable> {
+        if lt.addr == 0 || lt.length == 0 || lt.first_line == 0 || lt.pid == 0 {
             return None;
         }
 
@@ -403,5 +339,37 @@ mod tests {
         sym.qualname.value[128..128 + func_name.len()].copy_from_slice(func_name);
 
         assert_eq!(get_symbol_name(&sym), "MyClass.my_method");
+    }
+
+    #[test]
+    fn test_ingest_record_caches_symbol() {
+        let resolver = SymbolResolver::new(&HashMap::new());
+        let mut record = PystacksSymbolRecord {
+            symbol_id: 0xdeadbeefcafef00d,
+            ..Default::default()
+        };
+        let name = b"my_func";
+        record.sym.qualname.value[..name.len()].copy_from_slice(name);
+
+        assert!(resolver.ingest_record(&record));
+        assert_eq!(resolver.symbol_count(), 1);
+        // Duplicate ingestion is a no-op but still reports cached.
+        assert!(resolver.ingest_record(&record));
+        assert_eq!(resolver.symbol_count(), 1);
+
+        let frame = StackWalkerFrame {
+            symbol_id: 0xdeadbeefcafef00d,
+            inst_idx: -1,
+            pad_: 0,
+        };
+        assert_eq!(resolver.symbolize_function(&frame), "my_func");
+    }
+
+    #[test]
+    fn test_ingest_record_rejects_zero_id() {
+        let resolver = SymbolResolver::new(&HashMap::new());
+        let record = PystacksSymbolRecord::default();
+        assert!(!resolver.ingest_record(&record));
+        assert_eq!(resolver.symbol_count(), 0);
     }
 }

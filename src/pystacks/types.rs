@@ -12,15 +12,19 @@ pub const BPF_LIB_PYSTACKS_QUAL_NAME_LEN: usize =
 pub const BPF_LIB_MAX_STACK_DEPTH: usize = 127;
 pub const BPF_LIB_DEFAULT_MAP_SIZE: usize = 1024;
 
-pub type SymbolIdT = u32;
+/// Symbol IDs are 64-bit content hashes computed in BPF (FNV-style, over the
+/// `pystacks_symbol` struct), so the same symbol gets the same ID on every
+/// CPU without any shared counter or probe-context map insert.
+pub type SymbolIdT = u64;
 
 /// Matches `struct stack_walker_frame` from stack_walker.h.
-/// 8 bytes: symbol_id (u32) + inst_idx (i32).
+/// 16 bytes: symbol_id (u64) + inst_idx (i32) + explicit padding.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash)]
 pub struct StackWalkerFrame {
     pub symbol_id: SymbolIdT,
     pub inst_idx: i32,
+    pub pad_: i32,
 }
 
 /// Matches `struct read_file_name` from python/include/structs.h.
@@ -60,13 +64,15 @@ impl Default for ReadQualifiedName {
 }
 
 /// Matches `struct pystacks_symbol` from python/include/structs.h.
-/// Used as the key in the `pystacks_symbols` BPF map.
+/// Hashed in BPF to produce the symbol ID and shipped to userspace inside
+/// `PystacksSymbolRecord`.
 #[repr(C)]
 #[derive(Clone, Default)]
 pub struct PystacksSymbol {
     pub filename: ReadFileName,
     pub qualname: ReadQualifiedName,
     pub fault_pid: i32,
+    pub pad_: i32,
 }
 
 /// Matches `struct pystacks_line_table` from python/include/structs.h.
@@ -77,7 +83,24 @@ pub struct PystacksLineTable {
     pub length: u32,
     pub addr: usize,
     pub pid: i32,
+    pub pad_: i32,
 }
+
+/// Matches `struct pystacks_symbol_record` from python/include/py_structs.h.
+/// Emitted by BPF through the pysym ringbuf the first time a symbol hash
+/// misses the `pystacks_symbols` gate map.
+#[repr(C)]
+#[derive(Clone, Default)]
+pub struct PystacksSymbolRecord {
+    pub symbol_id: SymbolIdT,
+    pub sym: PystacksSymbol,
+    pub linetable: PystacksLineTable,
+}
+
+// SAFETY: repr(C) with explicit padding fields; any byte pattern is a valid
+// value (raw byte buffers and integers only). Required so the ringbuf
+// consumer can deserialize records with plain::copy_from_bytes.
+unsafe impl plain::Plain for PystacksSymbolRecord {}
 
 /// Matches `OffsetConfig` from python/include/OffsetConfig.h.
 /// Contains field offsets for Python runtime structures.
@@ -231,8 +254,8 @@ pub struct BpfLibBinaryId {
 // Size assertions to validate struct layout matches C definitions.
 // These are compile-time checks - any mismatch is a build error.
 const _: () = {
-    assert!(std::mem::size_of::<StackWalkerFrame>() == 8);
-    assert!(std::mem::align_of::<StackWalkerFrame>() == 4);
+    assert!(std::mem::size_of::<StackWalkerFrame>() == 16);
+    assert!(std::mem::align_of::<StackWalkerFrame>() == 8);
 
     // ReadFileName: 192 bytes + padding + usize
     assert!(std::mem::size_of::<ReadFileName>() == BPF_LIB_PYSTACKS_FILE_NAME_LEN + 8);
@@ -240,16 +263,19 @@ const _: () = {
     // ReadQualifiedName: 224 bytes + usize
     assert!(std::mem::size_of::<ReadQualifiedName>() == BPF_LIB_PYSTACKS_QUAL_NAME_LEN + 8);
 
-    // PystacksLineTable: u32 + u32 + usize + i32 + padding
-    // On 64-bit: 4 + 4 + 8 + 4 + 4(pad) = 24
+    // PystacksLineTable: u32 + u32 + usize + i32 + explicit pad
+    // On 64-bit: 4 + 4 + 8 + 4 + 4 = 24
     assert!(std::mem::size_of::<PystacksLineTable>() == 24);
 
     // OffsetConfig: 51 usize fields + 3 i32 fields
     // On 64-bit: 51*8 + 3*4 + 4(pad) = 408 + 12 + 4 = 424
     assert!(std::mem::size_of::<OffsetConfig>() == 424);
 
-    // PystacksSymbol: ReadFileName(200) + ReadQualifiedName(232) + i32(4) + padding(4) = 440
+    // PystacksSymbol: ReadFileName(200) + ReadQualifiedName(232) + i32(4) + explicit pad(4) = 440
     assert!(std::mem::size_of::<PystacksSymbol>() == 440);
+
+    // PystacksSymbolRecord: u64(8) + PystacksSymbol(440) + PystacksLineTable(24) = 472
+    assert!(std::mem::size_of::<PystacksSymbolRecord>() == 472);
 
     // PyPidData: OffsetConfig(424) + bool(1) + padding(7) + 5*usize(40) = 472
     assert!(std::mem::size_of::<PyPidData>() == 472);
@@ -264,8 +290,13 @@ mod tests {
 
     #[test]
     fn test_stack_walker_frame_size() {
-        assert_eq!(std::mem::size_of::<StackWalkerFrame>(), 8);
-        assert_eq!(std::mem::align_of::<StackWalkerFrame>(), 4);
+        assert_eq!(std::mem::size_of::<StackWalkerFrame>(), 16);
+        assert_eq!(std::mem::align_of::<StackWalkerFrame>(), 8);
+    }
+
+    #[test]
+    fn test_pystacks_symbol_record_size() {
+        assert_eq!(std::mem::size_of::<PystacksSymbolRecord>(), 472);
     }
 
     #[test]

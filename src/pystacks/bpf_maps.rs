@@ -21,8 +21,13 @@ use std::os::fd::{AsFd, AsRawFd};
 
 /// Holds BPF map file descriptors and BSS access for pystacks.
 pub struct PystacksMaps {
+    /// The interned-symbol gate map (key: u64 symbol id, value: u8).
+    /// BPF only does lock-free lookups on it; userspace inserts entries
+    /// here once a symbol record has been resolved, which stops BPF from
+    /// re-emitting that symbol. This split exists because a hash-map
+    /// update from the sched_switch/perf probes (IRQs off) can deadlock
+    /// the CPU on hypervisors that drop PV spinlock kicks (AWS Nitro).
     pub symbols_fd: i32,
-    pub linetables_fd: i32,
     pub pid_config_fd: i32,
     pub targeted_pids_fd: i32,
     bss_fd: i32,
@@ -33,7 +38,6 @@ impl PystacksMaps {
     /// Initialize map FDs from the loaded BPF object.
     pub fn new(bpf_object: &Object) -> Option<Self> {
         let symbols_fd = get_map_fd(bpf_object, "pystacks_symbols")?;
-        let linetables_fd = get_map_fd(bpf_object, "pystacks_linetables")?;
         let pid_config_fd = get_map_fd(bpf_object, "pystacks_pid_config")?;
         let targeted_pids_fd = get_map_fd(bpf_object, "targeted_pids")?;
 
@@ -42,12 +46,27 @@ impl PystacksMaps {
 
         Some(Self {
             symbols_fd,
-            linetables_fd,
             pid_config_fd,
             targeted_pids_fd,
             bss_fd,
             bss_size,
         })
+    }
+
+    /// Mark a symbol ID as interned in the BPF gate map so BPF stops
+    /// emitting records for it. Runs in process context (IRQs on), which is
+    /// the only context where contended hash-map bucket locks are safe on
+    /// all hypervisors.
+    pub fn mark_symbol_interned(&self, symbol_id: u64) -> bool {
+        let val: u8 = 1;
+        unsafe {
+            libbpf_rs::libbpf_sys::bpf_map_update_elem(
+                self.symbols_fd,
+                &symbol_id as *const u64 as *const std::ffi::c_void,
+                &val as *const u8 as *const std::ffi::c_void,
+                0, // BPF_ANY
+            ) == 0
+        }
     }
 
     /// Add a PID to the targeted_pids BPF map.
