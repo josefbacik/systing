@@ -1098,6 +1098,14 @@ impl SessionRecorder {
         output_dir: &Path,
         tpu_recorder: Option<crate::tpu::recorder::TpuRecorder>,
     ) -> Result<()> {
+        // Per-stage elapsed lines below let fleet log pipelines attribute
+        // stop-phase cost without relying on collector timestamp granularity.
+        let gen_start = std::time::Instant::now();
+        let mut stage_start = gen_start;
+        let stage_done = |label: &str, start: &mut std::time::Instant| {
+            eprintln!("{} in {:.2}s", label, start.elapsed().as_secs_f64());
+            *start = std::time::Instant::now();
+        };
         eprintln!("Generating Parquet trace to {output_dir:?}...");
 
         // Get the end timestamp for flushing streaming data
@@ -1114,6 +1122,7 @@ impl SessionRecorder {
         let mut writer: Box<dyn RecordCollector + Send> = collector_opt.ok_or_else(|| {
             anyhow::anyhow!("streaming collector must be initialized before generating trace")
         })?;
+        stage_done("Flushed scheduler trace records", &mut stage_start);
 
         // Step 2: Generate clock snapshot records
         eprintln!("Writing clock snapshot...");
@@ -1252,6 +1261,7 @@ impl SessionRecorder {
         // Step 4: Generate network interface metadata
         eprintln!("Writing network interface metadata...");
         self.write_network_interface_records(&mut *writer)?;
+        stage_done("Wrote metadata records", &mut stage_start);
 
         // Step 5: Flush streaming records from all recorders
         // Scheduler trace records were already written via streaming above.
@@ -1268,24 +1278,29 @@ impl SessionRecorder {
             }
             writer = memory.finish(writer)?;
         }
+        stage_done("Flushed memory trace records", &mut stage_start);
 
         eprintln!("Flushing stack samples and symbolizing stacks...");
         writer = self.stack_recorder.lock().unwrap().finish(writer)?;
+        stage_done("Flushed and symbolized stack samples", &mut stage_start);
 
         eprintln!("Flushing network trace records...");
         if let Some(network_collector) = self.network_recorder.lock().unwrap().finish()? {
             network_collector.finish_boxed()?;
         }
+        stage_done("Flushed network trace records", &mut stage_start);
 
         eprintln!("Flushing perf counter records from streaming...");
         if let Some(perf_collector) = self.perf_counter_recorder.lock().unwrap().finish()? {
             perf_collector.finish_boxed()?;
         }
+        stage_done("Flushed perf counter records", &mut stage_start);
 
         eprintln!("Flushing sysinfo records from streaming...");
         if let Some(sysinfo_collector) = self.sysinfo_recorder.lock().unwrap().finish()? {
             sysinfo_collector.finish_boxed()?;
         }
+        stage_done("Flushed sysinfo records", &mut stage_start);
 
         // The probe recorder (trace-events/syscalls) and the marker recorder both
         // emit track/slice/instant/args rows, which map to the same parquet files.
@@ -1315,10 +1330,12 @@ impl SessionRecorder {
             }
         }
         track_writer.finish_boxed()?;
+        stage_done("Flushed probe trace records", &mut stage_start);
 
         // Write TPU profiling records (if any were captured). TPU device/op IDs are
         // only referenced within the tpu_* tables, which nothing else writes, so
         // write_records assigns them internally.
+        let has_tpu = tpu_recorder.is_some() || self.tpu_metrics_recorder.is_some();
         if let Some(tpu) = tpu_recorder {
             eprintln!("Writing TPU profiling records...");
             tpu.write_records(&mut *writer)?;
@@ -1330,13 +1347,20 @@ impl SessionRecorder {
                 collector.finish_boxed()?;
             }
         }
+        if has_tpu {
+            stage_done("Wrote TPU records", &mut stage_start);
+        }
 
         // Step 6: Finish writing and close all files
         eprintln!("Finishing Parquet trace...");
         // Flush and properly close all Parquet writers
         writer.finish_boxed()?;
+        stage_done("Finished Parquet writers", &mut stage_start);
 
-        eprintln!("Parquet trace generation complete.");
+        eprintln!(
+            "Parquet trace generation complete in {:.2}s.",
+            gen_start.elapsed().as_secs_f64()
+        );
         Ok(())
     }
 }

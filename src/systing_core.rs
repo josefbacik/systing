@@ -3727,8 +3727,13 @@ pub fn systing(
                     "Converting to Perfetto format: {}...",
                     opts.output.display()
                 );
+                let convert_start = std::time::Instant::now();
                 parquet_to_perfetto::convert(&opts.output_dir, &opts.output)?;
-                println!("Successfully wrote {}", opts.output.display());
+                println!(
+                    "Successfully wrote {} in {:.2}s",
+                    opts.output.display(),
+                    convert_start.elapsed().as_secs_f64()
+                );
             }
             Some("duckdb") => {
                 // Generate trace_id from output directory name
@@ -3739,8 +3744,13 @@ pub fn systing(
                     .unwrap_or_else(|| "trace".to_string());
 
                 println!("Generating DuckDB database: {}...", opts.output.display());
+                let convert_start = std::time::Instant::now();
                 systing_duckdb::parquet_to_duckdb(&opts.output_dir, &opts.output, &trace_id)?;
-                println!("Successfully wrote {}", opts.output.display());
+                println!(
+                    "Successfully wrote {} in {:.2}s",
+                    opts.output.display(),
+                    convert_start.elapsed().as_secs_f64()
+                );
             }
             Some(ext) => {
                 bail!(
