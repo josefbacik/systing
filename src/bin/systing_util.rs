@@ -3410,17 +3410,25 @@ fn run_convert(
             }
         }
 
+        let order = systing::duckdb::import_order_by(table_name)
+            .map(|o| format!(" ORDER BY {o}"))
+            .unwrap_or_default();
+
         // Import files that already have trace_id. BY NAME so parquet files
         // written by older systing versions (with fewer columns) import
-        // cleanly - missing columns become NULL.
+        // cleanly - missing columns become NULL. Prefix the sort with trace_id
+        // so rows from different traces stay contiguous (better BitPacking).
         if !with_trace_id.is_empty() {
+            let multi_order = systing::duckdb::import_order_by(table_name)
+                .map(|o| format!(" ORDER BY trace_id, {o}"))
+                .unwrap_or_default();
             let paths_list = with_trace_id
                 .iter()
                 .map(|p| format!("'{}'", p.replace('\'', "''")))
                 .collect::<Vec<_>>()
                 .join(", ");
             conn.execute_batch(&format!(
-                "INSERT INTO {table_name} BY NAME SELECT * FROM read_parquet([{paths_list}])"
+                "INSERT INTO {table_name} BY NAME SELECT * FROM read_parquet([{paths_list}]){multi_order}"
             ))?;
         }
 
@@ -3429,7 +3437,7 @@ fn run_convert(
             let escaped_path = path.replace('\'', "''");
             let escaped_trace_id = trace_id.replace('\'', "''");
             conn.execute_batch(&format!(
-                "INSERT INTO {table_name} BY NAME SELECT '{escaped_trace_id}' as trace_id, * FROM read_parquet('{escaped_path}')"
+                "INSERT INTO {table_name} BY NAME SELECT '{escaped_trace_id}' as trace_id, * FROM read_parquet('{escaped_path}'){order}"
             ))?;
         }
 
@@ -3465,8 +3473,22 @@ fn run_convert(
     import_table("stack_profile_frame", |p| &p.frame)?;
     import_table("stack_profile_callsite", |p| &p.callsite)?;
     import_table("perf_sample", |p| &p.perf_sample)?;
-    // New query-friendly stack tables
-    import_table("stack", |p| &p.stack)?;
+    // New query-friendly stack tables. stack.parquet carries frame_names
+    // (denormalized) which is interned into frame + stack.frame_ids on import.
+    // Only the parquet-directory inputs (needs_trace_id_injection) produce a
+    // stack.parquet; .pb extraction uses the legacy stack_profile_* tables.
+    {
+        let start = Instant::now();
+        for result in successful_results.iter() {
+            let path = &result.parquet_paths.stack;
+            if path.exists() {
+                systing::duckdb::import_stack_from_parquet(&conn, path, &result.trace_id)?;
+            }
+        }
+        if verbose {
+            eprintln!("  stack import: {:.2}s", start.elapsed().as_secs_f64());
+        }
+    }
     import_table("stack_sample", |p| &p.stack_sample)?;
     // Network interface metadata
     import_table("network_interface", |p| &p.network_interface)?;

@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -103,8 +104,18 @@ pub struct FlamegraphResult {
     pub folded: String,
 }
 
+/// Per-trace frame interning table: trace_id → Vec indexed by frame id.
+/// Frame ids are dense and zero-based per trace, so a Vec is the natural
+/// (and allocation-free to look up) container.
+type FrameTable = HashMap<String, Vec<String>>;
+
 impl AnalyzeDb {
     /// Run flamegraph analysis and return structured results.
+    ///
+    /// On a multi-trace database with no `trace_id` filter, stacks are grouped
+    /// per trace (frame ids are scoped per `trace_id`), so the same call chain
+    /// in two traces appears as two output rows rather than one merged count.
+    /// Filter to a single trace if a merged view is needed.
     pub fn flamegraph(&self, params: &FlamegraphParams) -> Result<FlamegraphResult> {
         if !self.table_exists("stack_sample")? || !self.table_exists("stack")? {
             bail!(
@@ -118,6 +129,12 @@ impl AnalyzeDb {
 
         let abs_start = params.start_time.map(|t| min_ts + (t * 1e9) as i64);
         let abs_end = params.end_time.map(|t| min_ts + (t * 1e9) as i64);
+
+        // Load the frame interning table once. The fold query groups by
+        // `frame_ids` (cheap BIGINT[] hashing) and we resolve to names here,
+        // which is as fast as the pre-v11 frame_names column but lets DuckDB
+        // store stacks ~5x smaller.
+        let frame_names = self.load_frame_names(params.trace_id.as_deref())?;
 
         let sql = build_flamegraph_query(
             params.stack_type,
@@ -137,11 +154,12 @@ impl AnalyzeDb {
         let mut unique_stacks: u64 = 0;
 
         while let Some(row) = rows.next()? {
-            let frames_str: String = row.get(0)?;
-            let count: i64 = row.get(1)?;
+            let trace_id: String = row.get(0)?;
+            let frames_str: String = row.get(1)?;
+            let count: i64 = row.get(2)?;
             let count = count as u64;
 
-            let folded = format_folded_stack(&frames_str);
+            let folded = format_folded_stack(&trace_id, &frames_str, &frame_names);
             if folded.is_empty() {
                 continue;
             }
@@ -167,6 +185,32 @@ impl AnalyzeDb {
             },
             folded: folded_lines.join("\n"),
         })
+    }
+
+    /// Load the frame interning table into a [`FrameTable`].
+    fn load_frame_names(&self, trace_id: Option<&str>) -> Result<FrameTable> {
+        let sql = match trace_id {
+            Some(t) => {
+                let escaped = t.replace('\'', "''");
+                format!("SELECT trace_id, id, name FROM frame WHERE trace_id = '{escaped}'")
+            }
+            None => "SELECT trace_id, id, name FROM frame".to_string(),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        let mut map: FrameTable = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let tid: String = row.get(0)?;
+            let id: i64 = row.get(1)?;
+            let name: String = row.get(2)?;
+            let v = map.entry(tid).or_default();
+            let idx = id as usize;
+            if v.len() <= idx {
+                v.resize(idx + 1, String::new());
+            }
+            v[idx] = name;
+        }
+        Ok(map)
     }
 }
 
@@ -225,8 +269,8 @@ fn build_flamegraph_query(
         conditions.push(format!("ss.trace_id = '{escaped}'"));
     }
 
-    conditions.push("s.frame_names IS NOT NULL".to_string());
-    conditions.push("len(s.frame_names) > 0".to_string());
+    conditions.push("s.frame_ids IS NOT NULL".to_string());
+    conditions.push("len(s.frame_ids) > 0".to_string());
 
     let where_clause = if conditions.is_empty() {
         String::new()
@@ -240,30 +284,47 @@ fn build_flamegraph_query(
         String::new()
     };
 
+    // duckdb-rs has no FromSql for Vec<i64>, so flatten frame_ids to a
+    // chr(31)-separated string and parse it Rust-side. Grouping happens on the
+    // raw BIGINT[] so the string conversion only runs once per output row.
+    // trace_id is carried through because frame ids are scoped per trace.
     format!(
-        "SELECT array_to_string(s.frame_names, chr(31)) as frames, \
-         COUNT(*) as count \
+        "SELECT s.trace_id, \
+                array_to_string([x::VARCHAR for x in s.frame_ids], chr(31)) as frames, \
+                COUNT(*) as count \
          FROM stack_sample ss \
          JOIN stack s ON ss.stack_id = s.id AND ss.trace_id = s.trace_id\
          {joins}{where_clause} \
-         GROUP BY s.frame_names{having_clause} \
+         GROUP BY s.trace_id, s.frame_ids{having_clause} \
          ORDER BY count DESC"
     )
 }
 
-/// Format a DuckDB frame_names array (as chr(31)-separated string) into folded stack format.
+/// Format a chr(31)-separated string of frame ids into folded stack format.
 ///
-/// Frame names are stored leaf-to-root in the database, so they are reversed
+/// Frame ids are stored leaf-to-root in the database, so they are reversed
 /// to root-to-leaf order for flamegraph convention (root;child;...;leaf).
-fn format_folded_stack(frames_str: &str) -> String {
+fn format_folded_stack(trace_id: &str, frames_str: &str, frames: &FrameTable) -> String {
     if frames_str.is_empty() {
         return String::new();
     }
 
-    let frames: Vec<&str> = frames_str.split('\x1F').collect();
+    let trace_frames = frames.get(trace_id);
 
     // Reverse from leaf-to-root (storage order) to root-to-leaf (flamegraph convention)
-    let formatted: Vec<String> = frames.iter().rev().map(|f| format_frame(f)).collect();
+    let formatted: Vec<String> = frames_str
+        .split('\x1F')
+        .rev()
+        .map(|id_str| {
+            let name = id_str
+                .parse::<usize>()
+                .ok()
+                .and_then(|id| trace_frames.and_then(|v| v.get(id)))
+                .map(String::as_str)
+                .unwrap_or(id_str);
+            format_frame(name)
+        })
+        .collect();
 
     formatted.join(";")
 }
@@ -342,24 +403,33 @@ mod tests {
         assert_eq!(format_frame(""), "[unknown]");
     }
 
+    fn frame_map(names: &[&str]) -> FrameTable {
+        let mut m = HashMap::new();
+        m.insert(
+            "t".to_string(),
+            names.iter().map(|s| s.to_string()).collect(),
+        );
+        m
+    }
+
     #[test]
     fn test_format_folded_stack_reversal() {
-        // frame_names stored leaf-to-root: "leaf\x1Fmid\x1Froot"
+        // frame_ids stored leaf-to-root: "0\x1F1\x1F2"
         // Should output root-to-leaf: "root;mid;leaf"
-        let input = "leaf (app) <0x1>\x1Fmid (app) <0x2>\x1Froot (app) <0x3>";
-        let result = format_folded_stack(input);
+        let frames = frame_map(&["leaf (app) <0x1>", "mid (app) <0x2>", "root (app) <0x3>"]);
+        let result = format_folded_stack("t", "0\x1F1\x1F2", &frames);
         assert_eq!(result, "root [app];mid [app];leaf [app]");
     }
 
     #[test]
     fn test_format_folded_stack_empty() {
-        assert_eq!(format_folded_stack(""), "");
+        assert_eq!(format_folded_stack("t", "", &HashMap::new()), "");
     }
 
     #[test]
     fn test_format_folded_stack_single_frame() {
-        let input = "main (myapp) <0x401234>";
-        assert_eq!(format_folded_stack(input), "main [myapp]");
+        let frames = frame_map(&["main (myapp) <0x401234>"]);
+        assert_eq!(format_folded_stack("t", "0", &frames), "main [myapp]");
     }
 
     #[test]

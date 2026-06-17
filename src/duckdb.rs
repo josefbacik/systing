@@ -133,7 +133,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -157,6 +157,7 @@ pub const DATA_TABLES: &[&str] = &[
     "stack_profile_frame",
     "stack_profile_callsite",
     "perf_sample",
+    "frame",
     "stack",
     "stack_sample",
     "network_interface",
@@ -377,14 +378,34 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             cpu INTEGER
         );
 
-        -- Query-friendly stack tables (new schema)
+        -- Query-friendly stack tables.
+        -- frame_ids are dense per-trace integers into the frame table; this is
+        -- normalized because DuckDB does not compress strings inside list
+        -- columns, so a VARCHAR[] of frame names blows up to tens of MB. The
+        -- stack_frames view reconstructs the legacy frame_names column for
+        -- ad-hoc queries (slower than joining frame directly).
+        CREATE TABLE IF NOT EXISTS frame (
+            trace_id VARCHAR,
+            id BIGINT,
+            name VARCHAR
+        );
+
         CREATE TABLE IF NOT EXISTS stack (
             trace_id VARCHAR,
             id BIGINT,
-            frame_names VARCHAR[],
+            frame_ids BIGINT[],
             depth INTEGER,
             leaf_name VARCHAR
         );
+
+        CREATE VIEW IF NOT EXISTS stack_frames AS
+            SELECT s.trace_id, s.id,
+                   list(f.name ORDER BY u.idx) AS frame_names,
+                   any_value(s.depth) AS depth,
+                   any_value(s.leaf_name) AS leaf_name
+            FROM stack s, unnest(s.frame_ids) WITH ORDINALITY AS u(fid, idx)
+            JOIN frame f ON f.trace_id = s.trace_id AND f.id = u.fid
+            GROUP BY s.trace_id, s.id;
 
         CREATE TABLE IF NOT EXISTS stack_sample (
             trace_id VARCHAR,
@@ -713,8 +734,64 @@ pub fn parquet_to_duckdb(parquet_dir: &Path, db_path: &Path, trace_id: &str) -> 
     Ok(())
 }
 
+/// Import a `stack.parquet` (which stores `frame_names VARCHAR[]`) into the
+/// normalized `frame` + `stack` DuckDB tables for the given trace.
+///
+/// Parquet keeps the denormalized `frame_names` array because ZSTD compresses
+/// the repeated strings well there; DuckDB does not compress strings inside
+/// list columns, so storing them verbatim costs ~5x more than this interned
+/// form. The `stack_frames` view reconstructs the legacy column for ad-hoc SQL.
+///
+/// Assumes every `frame_names` entry is non-empty and contains no NULL
+/// elements; the unnest+join would silently drop such rows. The streaming
+/// writer guarantees this (`stack_recorder` skips empty stacks before emit).
+pub fn import_stack_from_parquet(conn: &Connection, path: &Path, trace_id: &str) -> Result<()> {
+    let escaped_path = path.to_string_lossy().replace('\'', "''");
+    let escaped_trace_id = trace_id.replace('\'', "''");
+    conn.execute_batch(&format!(
+        "INSERT INTO frame \
+           SELECT '{escaped_trace_id}', row_number() OVER () - 1, f \
+           FROM (SELECT DISTINCT unnest(frame_names) AS f \
+                 FROM read_parquet('{escaped_path}')); \
+         INSERT INTO stack \
+           SELECT '{escaped_trace_id}', s.id, \
+                  list(fr.id ORDER BY u.idx), s.depth, s.leaf_name \
+           FROM read_parquet('{escaped_path}') s, \
+                unnest(s.frame_names) WITH ORDINALITY AS u(fname, idx) \
+           JOIN frame fr ON fr.trace_id = '{escaped_trace_id}' AND fr.name = u.fname \
+           GROUP BY s.id, s.depth, s.leaf_name \
+           ORDER BY s.id;"
+    ))
+    .with_context(|| {
+        format!(
+            "Failed to import stack/frame tables from '{}'",
+            path.display()
+        )
+    })
+}
+
+/// Per-table sort keys applied at parquet→duckdb import time.
+///
+/// DuckDB's lightweight compression (BitPacking with delta + frame-of-reference)
+/// works best when adjacent values are close. The streaming parquet writer
+/// already sorts each batch, but batches interleave across the trace; a final
+/// global sort here gives DuckDB the best shot at packing the wide `ts`/`dur`
+/// columns tightly.
+pub fn import_order_by(table_name: &str) -> Option<&'static str> {
+    match table_name {
+        "sched_slice" => Some("cpu, ts"),
+        "thread_state" => Some("utid, ts"),
+        "stack_sample" => Some("utid, ts"),
+        "softirq_slice" | "irq_slice" => Some("cpu, ts"),
+        "counter" => Some("track_id, ts"),
+        _ => None,
+    }
+}
+
 /// Import all tables from Parquet files.
 fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Result<()> {
+    let escaped_trace_id = trace_id.replace('\'', "''");
+
     // Helper to import a single table with trace_id injection.
     //
     // Note on SQL safety: We use string interpolation here because DuckDB's execute_batch
@@ -727,14 +804,31 @@ fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Res
         }
 
         let escaped_path = path.to_string_lossy().replace('\'', "''");
-        let escaped_trace_id = trace_id.replace('\'', "''");
+        let order = import_order_by(table_name)
+            .map(|o| format!(" ORDER BY {o}"))
+            .unwrap_or_default();
 
         conn.execute_batch(&format!(
-            "INSERT INTO {table_name} BY NAME SELECT '{escaped_trace_id}' as trace_id, * FROM read_parquet('{escaped_path}')"
+            "INSERT INTO {table_name} BY NAME \
+             SELECT '{escaped_trace_id}' as trace_id, * \
+             FROM read_parquet('{escaped_path}'){order}"
         ))
-        .with_context(|| format!("Failed to import table '{}' from '{}'", table_name, path.display()))?;
+        .with_context(|| {
+            format!(
+                "Failed to import table '{}' from '{}'",
+                table_name,
+                path.display()
+            )
+        })?;
 
         Ok(())
+    };
+
+    let import_stack = |path: &Path| -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        import_stack_from_parquet(conn, path, trace_id)
     };
 
     // Import core tables
@@ -761,7 +855,7 @@ fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Res
     import_table("instant_args", &paths.instant_args)?;
 
     // Stack tables (query-friendly format)
-    import_table("stack", &paths.stack)?;
+    import_stack(&paths.stack)?;
     import_table("stack_sample", &paths.stack_sample)?;
 
     // Legacy stack profile tables (for Perfetto .pb extraction compatibility)
@@ -984,9 +1078,50 @@ fn import_duckdb_traces_inner(conn: &Connection, mappings: &[TraceImportMapping]
         format!("WHERE trace_id IN ({})", ids.join(", "))
     };
 
+    // The `stack` table changed shape in schema v11 (frame_names → frame_ids).
+    // If the source still has the old VARCHAR[] column, normalize it on the fly
+    // so older databases continue to merge cleanly. New-schema sources fall
+    // through to the generic column-intersection path below (frame ids are
+    // scoped per trace_id, so the remap keeps them unique).
+    let mut migrated_legacy_stack = false;
+    if input_tables.contains("stack") {
+        let has_frame_names: bool = {
+            let mut stmt = conn.prepare(
+                "SELECT COUNT(*) FROM duckdb_columns() \
+                 WHERE database_name = 'input_db' AND schema_name = 'main' \
+                 AND table_name = 'stack' AND column_name = 'frame_names'",
+            )?;
+            let count: u32 = stmt.query_row([], |row| row.get(0))?;
+            count > 0
+        };
+        if has_frame_names {
+            conn.execute_batch(&format!(
+                "INSERT INTO main.frame \
+                   SELECT {case_expr}, row_number() OVER (PARTITION BY trace_id) - 1, f \
+                   FROM (SELECT DISTINCT trace_id, f \
+                         FROM (SELECT trace_id, unnest(frame_names) AS f \
+                               FROM input_db.stack {where_clause})); \
+                 INSERT INTO main.stack \
+                   SELECT s.new_tid, s.id, \
+                          list(fr.id ORDER BY u.idx), s.depth, s.leaf_name \
+                   FROM (SELECT ({case_expr}) AS new_tid, id, frame_names, depth, leaf_name \
+                         FROM input_db.stack {where_clause}) s, \
+                        unnest(s.frame_names) WITH ORDINALITY AS u(fname, idx) \
+                   JOIN main.frame fr ON fr.trace_id = s.new_tid AND fr.name = u.fname \
+                   GROUP BY s.new_tid, s.id, s.depth, s.leaf_name;"
+            ))
+            .context("Failed to migrate legacy stack.frame_names during DuckDB merge")?;
+            migrated_legacy_stack = true;
+        }
+    }
+
     // Import each table
     for table_name in DATA_TABLES {
         if !input_tables.contains(*table_name) {
+            continue;
+        }
+        // Already handled above for pre-v11 sources.
+        if migrated_legacy_stack && (*table_name == "stack" || *table_name == "frame") {
             continue;
         }
 
@@ -1155,8 +1290,31 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
     export_table("instant", &paths.instant)?;
     export_table("instant_args", &paths.instant_args)?;
 
-    // Stack tables (query-friendly format)
-    export_table("stack", &paths.stack)?;
+    // Stack tables: denormalize frame_ids back to frame_names so the parquet
+    // matches what the streaming writer would have produced.
+    {
+        let stack_count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM stack WHERE trace_id = '{escaped_trace_id}'"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if stack_count > 0 {
+            let escaped_path = paths.stack.to_string_lossy().replace('\'', "''");
+            conn.execute_batch(&format!(
+                "COPY (SELECT id, frame_names, depth, leaf_name \
+                       FROM stack_frames WHERE trace_id = '{escaped_trace_id}') \
+                 TO '{escaped_path}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+            ))
+            .with_context(|| {
+                format!(
+                    "Failed to export stack table to '{}'",
+                    paths.stack.display()
+                )
+            })?;
+        }
+    }
     export_table("stack_sample", &paths.stack_sample)?;
 
     // Legacy stack profile tables (for Perfetto .pb extraction compatibility)
@@ -1258,6 +1416,138 @@ mod tests {
         assert!(tables.contains(&"thread".to_string()));
         assert!(tables.contains(&"sched_slice".to_string()));
         assert!(tables.contains(&"stack".to_string()));
+        assert!(tables.contains(&"frame".to_string()));
+        assert!(tables.contains(&"stack_frames".to_string()));
+    }
+
+    #[test]
+    fn test_stack_normalization_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.duckdb");
+        let conn = Connection::open(&db_path).unwrap();
+        create_schema(&conn).unwrap();
+
+        // Hand-build a stack.parquet with overlapping frame names.
+        let pq = temp_dir.path().join("stack.parquet");
+        conn.execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES \
+                (1::BIGINT, ['a','b','c'], 3, 'a'), \
+                (2::BIGINT, ['b','c'],     2, 'b'), \
+                (3::BIGINT, ['d'],         1, 'd'), \
+                (4::BIGINT, ['a','b','a'], 3, 'a')  \
+             ) t(id, frame_names, depth, leaf_name)) \
+             TO '{}' (FORMAT PARQUET)",
+            pq.to_string_lossy().replace('\'', "''")
+        ))
+        .unwrap();
+
+        import_stack_from_parquet(&conn, &pq, "t").unwrap();
+
+        // 4 distinct frames interned once each.
+        let frame_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM frame", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(frame_count, 4);
+
+        // stack_frames view reconstructs the original arrays.
+        let rows: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT id, array_to_string(frame_names, ',') \
+                 FROM stack_frames ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "a,b,c".to_string()),
+                (2, "b,c".to_string()),
+                (3, "d".to_string()),
+                (4, "a,b,a".to_string()),
+            ]
+        );
+
+        // duckdb_to_parquet denormalizes back to frame_names.
+        conn.execute(
+            "INSERT INTO _traces (trace_id, source_path) VALUES ('t', 'test')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let out_dir = temp_dir.path().join("out");
+        duckdb_to_parquet(&db_path, &out_dir, "t").unwrap();
+        let out_stack = out_dir.join("stack.parquet");
+        assert!(out_stack.exists());
+        let conn = Connection::open_in_memory().unwrap();
+        let cols: String = conn
+            .query_row(
+                &format!(
+                    "SELECT string_agg(name, ',') FROM parquet_schema('{}') WHERE name != 'schema'",
+                    out_stack.to_string_lossy().replace('\'', "''")
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(cols.contains("frame_names"), "got columns: {cols}");
+    }
+
+    #[test]
+    fn test_import_duckdb_traces_migrates_legacy_stack() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Build a pre-v11 source db: stack table with frame_names VARCHAR[].
+        let src = temp_dir.path().join("legacy.duckdb");
+        {
+            let c = Connection::open(&src).unwrap();
+            c.execute_batch(
+                "CREATE TABLE _traces(trace_id VARCHAR, source_path VARCHAR, \
+                                      systing_version VARCHAR); \
+                 INSERT INTO _traces VALUES ('old', 'x', '1.9.0'); \
+                 CREATE TABLE stack(trace_id VARCHAR, id BIGINT, \
+                                    frame_names VARCHAR[], depth INT, leaf_name VARCHAR); \
+                 INSERT INTO stack VALUES \
+                   ('old', 1, ['a','b'], 2, 'a'), \
+                   ('old', 2, ['b','c'], 2, 'b');",
+            )
+            .unwrap();
+        }
+
+        let dst = temp_dir.path().join("new.duckdb");
+        let conn = Connection::open(&dst).unwrap();
+        create_schema(&conn).unwrap();
+        import_duckdb_traces(
+            &conn,
+            &src,
+            &[TraceImportMapping {
+                old_id: "old".into(),
+                new_id: "new".into(),
+                source_path: "/test".into(),
+            }],
+        )
+        .unwrap();
+
+        let frames: i64 = conn
+            .query_row("SELECT COUNT(*) FROM frame WHERE trace_id='new'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(frames, 3, "a/b/c interned once each");
+
+        let rows: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT id, array_to_string(frame_names, ',') \
+                 FROM stack_frames WHERE trace_id='new' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows, vec![(1, "a,b".into()), (2, "b,c".into())]);
     }
 
     #[test]
@@ -1985,11 +2275,13 @@ mod tests {
         let conn = Connection::open(&db_path).unwrap();
         create_schema(&conn).unwrap();
 
-        // Get all tables from schema
+        // Get all tables from schema (base tables only; views like stack_frames
+        // are derived and intentionally absent from DATA_TABLES)
         let schema_tables: HashSet<String> = conn
             .prepare(
                 "SELECT table_name FROM information_schema.tables \
-                 WHERE table_schema = 'main' AND table_name NOT IN ('_traces', '_schema_version')",
+                 WHERE table_schema = 'main' AND table_type = 'BASE TABLE' \
+                 AND table_name NOT IN ('_traces', '_schema_version')",
             )
             .unwrap()
             .query_map([], |row| row.get(0))

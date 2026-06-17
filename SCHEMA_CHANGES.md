@@ -186,3 +186,28 @@ requires CPU frequency data, so both are now recorded.
   sampling these bound the cycles-to-time conversion per CPU; with a fixed
   period, effective frequency is also derivable directly from the trace as
   `sample_period / Δts` between consecutive samples on a continuously-busy CPU.
+
+## Schema Version 11 (systing 1.10.0) — 2026-06-17
+
+Stack frame strings are now interned. DuckDB cannot compress strings inside
+list columns, so the previous `stack.frame_names VARCHAR[]` column was stored
+raw and routinely accounted for over half the database. Frames are now stored
+once each in a new `frame` table and referenced by integer id, cutting the
+stack-table footprint by roughly 5–6x. Parquet output is unchanged
+(`stack.parquet` still carries `frame_names`; ZSTD already deduplicates the
+strings there) — the normalization happens at DuckDB import time.
+
+### Added tables
+- `frame` — interned stack-frame strings: `id BIGINT`, `name VARCHAR`. Ids are
+  dense, zero-based, and scoped per `trace_id`.
+
+### Changed columns
+- `stack`: `frame_names VARCHAR[]` is replaced by `frame_ids BIGINT[]`, indexing
+  into `frame` on `(trace_id, id)`. `depth`, `leaf_name`, and the leaf-to-root
+  ordering are unchanged.
+
+### Added views
+- `stack_frames` — backward-compat view exposing the pre-v11 `stack` columns
+  (`trace_id, id, frame_names, depth, leaf_name`). Ad-hoc queries can use it as
+  a drop-in replacement; for hot paths join `frame` directly, since the view
+  re-aggregates names per row.
