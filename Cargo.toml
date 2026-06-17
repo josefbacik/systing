@@ -29,7 +29,7 @@ ctrlc = "3.4"
 dashmap = "6"
 debuginfod = { version = "0.2.1", features = ["fs-cache", "tracing"] }
 dns-lookup = "2.0"
-duckdb = "1.1.1"
+duckdb = "1.10504"
 parquet = "54"
 arrow = "54"
 flate2 = "1.0"

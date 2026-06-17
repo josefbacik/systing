@@ -56,17 +56,21 @@ const STACK_BATCH_SIZE: usize = 20_000;
 /// Low-cardinality columns (`cpu`, `utid`, `end_state`, ...) keep the default
 /// dictionary encoding.
 ///
-/// BYTE_STREAM_SPLIT compresses ~7% smaller still, but the bundled libduckdb's
-/// parquet reader rejects it for integer columns, and we read these files back
-/// via `read_parquet()`. Page-level statistics are disabled — systing reads
-/// these files back wholesale, so per-page min/max is dead weight.
+/// BYTE_STREAM_SPLIT would compress ~7% smaller still, but DuckDB cannot
+/// decode it for integer columns (only FLOAT/DOUBLE — upstream
+/// duckdb/duckdb#17114) and we read these files back via `read_parquet()`.
+/// The f64 `value` column does use it. Page-level statistics are disabled —
+/// systing reads these files back wholesale, so per-page min/max is dead
+/// weight.
 fn build_writer_properties() -> WriterProperties {
     const DELTA_COLUMNS: &[&str] = &["ts", "dur", "id", "addr", "size", "seq", "ack", "bytes"];
 
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
         .set_max_row_group_size(1_000_000)
-        .set_statistics_enabled(EnabledStatistics::Chunk);
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_column_dictionary_enabled(ColumnPath::from("value"), false)
+        .set_column_encoding(ColumnPath::from("value"), Encoding::BYTE_STREAM_SPLIT);
 
     for col in DELTA_COLUMNS {
         let path = ColumnPath::from(*col);
