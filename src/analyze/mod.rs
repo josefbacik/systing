@@ -824,11 +824,12 @@ mod tests {
             assert_external_access_blocked(&load_err);
 
             // The setting cannot be re-enabled at runtime. The exact wording
-            // varies across libduckdb versions; match the stable substrings.
+            // varies across libduckdb builds, so assert only on the setting
+            // name — what matters is that the SET is refused.
             let set_err = db.query("SET enable_external_access = true").unwrap_err();
             let msg = set_err.to_string();
             assert!(
-                msg.contains("external access") && msg.contains("Cannot"),
+                msg.contains("external_access") || msg.contains("external access"),
                 "unexpected error: {set_err}"
             );
         }
