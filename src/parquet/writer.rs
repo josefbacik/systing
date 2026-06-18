@@ -19,8 +19,9 @@ use arrow::array::{
 };
 use arrow::datatypes::Schema;
 use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
+use parquet::basic::{Compression, Encoding, ZstdLevel};
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::schema::types::ColumnPath;
 
 use crate::network_recorder::{drop_reason_str, format_tcp_flags, tcp_state_name};
 use crate::parquet::ParquetPaths;
@@ -43,6 +44,43 @@ const DEFAULT_BATCH_SIZE: usize = 200_000;
 /// costs hundreds of MiB during end-of-trace symbolization. Flush in smaller
 /// row groups to keep that bounded.
 const STACK_BATCH_SIZE: usize = 20_000;
+
+/// Build the shared `WriterProperties` used for all parquet files.
+///
+/// Tuned for size: ZSTD level 3 plus DELTA_BINARY_PACKED on the high-cardinality
+/// integer columns (`ts`, `dur`, ...). These columns are wide and effectively
+/// unique per row, so dictionary encoding is useless and PLAIN wastes 8
+/// bytes/row. With the per-batch sort applied at flush time, adjacent
+/// timestamps differ by microseconds rather than the full nanosecond width,
+/// and DELTA_BINARY_PACKED stores those small diffs in a couple of bits each.
+/// Low-cardinality columns (`cpu`, `utid`, `end_state`, ...) keep the default
+/// dictionary encoding.
+///
+/// BYTE_STREAM_SPLIT would compress ~7% smaller still, but DuckDB cannot
+/// decode it for integer columns (only FLOAT/DOUBLE — upstream
+/// duckdb/duckdb#17114) and we read these files back via `read_parquet()`.
+/// The f64 `value` column does use it. Page-level statistics are disabled —
+/// systing reads these files back wholesale, so per-page min/max is dead
+/// weight.
+fn build_writer_properties() -> WriterProperties {
+    const DELTA_COLUMNS: &[&str] = &["ts", "dur", "id", "addr", "size", "seq", "ack", "bytes"];
+
+    let mut builder = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
+        .set_max_row_group_size(1_000_000)
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_column_dictionary_enabled(ColumnPath::from("value"), false)
+        .set_column_encoding(ColumnPath::from("value"), Encoding::BYTE_STREAM_SPLIT);
+
+    for col in DELTA_COLUMNS {
+        let path = ColumnPath::from(*col);
+        builder = builder
+            .set_column_dictionary_enabled(path.clone(), false)
+            .set_column_encoding(path, Encoding::DELTA_BINARY_PACKED);
+    }
+
+    builder.build()
+}
 
 /// A streaming Parquet writer that implements `RecordCollector`.
 ///
@@ -161,10 +199,7 @@ impl StreamingParquetWriter {
         }
 
         let paths = ParquetPaths::new(output_dir);
-        let writer_props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(Default::default()))
-            .set_max_row_group_size(1_000_000)
-            .build();
+        let writer_props = build_writer_properties();
 
         Ok(Self {
             output_dir: output_dir.to_path_buf(),
@@ -356,6 +391,11 @@ impl StreamingParquetWriter {
             &self.writer_props,
         )?;
 
+        // Sorting each batch by (cpu, ts) groups runs of nearby timestamps so
+        // delta encoding + ZSTD can exploit the locality. Per-batch sort is
+        // nearly as effective as a global sort because each 200k-row batch
+        // already covers a narrow time window.
+        self.sched_slices.sort_unstable_by_key(|r| (r.cpu, r.ts));
         let batch = build_sched_slice_batch(&self.sched_slices, &schema)?;
         writer.write(&batch)?;
         self.sched_slices.clear();
@@ -376,6 +416,7 @@ impl StreamingParquetWriter {
             &self.writer_props,
         )?;
 
+        self.thread_states.sort_unstable_by_key(|r| (r.utid, r.ts));
         let batch = build_thread_state_batch(&self.thread_states, &schema)?;
         writer.write(&batch)?;
         self.thread_states.clear();
@@ -396,6 +437,7 @@ impl StreamingParquetWriter {
             &self.writer_props,
         )?;
 
+        self.irq_slices.sort_unstable_by_key(|r| (r.cpu, r.ts));
         let batch = build_irq_slice_batch(&self.irq_slices, &schema)?;
         writer.write(&batch)?;
         self.irq_slices.clear();
@@ -416,6 +458,7 @@ impl StreamingParquetWriter {
             &self.writer_props,
         )?;
 
+        self.softirq_slices.sort_unstable_by_key(|r| (r.cpu, r.ts));
         let batch = build_softirq_slice_batch(&self.softirq_slices, &schema)?;
         writer.write(&batch)?;
         self.softirq_slices.clear();
@@ -476,6 +519,7 @@ impl StreamingParquetWriter {
             &self.writer_props,
         )?;
 
+        self.counters.sort_unstable_by_key(|r| (r.track_id, r.ts));
         let batch = build_counter_batch(&self.counters, &schema)?;
         writer.write(&batch)?;
         self.counters.clear();
@@ -636,6 +680,7 @@ impl StreamingParquetWriter {
             &self.writer_props,
         )?;
 
+        self.stack_samples.sort_unstable_by_key(|r| (r.utid, r.ts));
         let batch = build_stack_sample_batch(&self.stack_samples, &schema)?;
         writer.write(&batch)?;
         self.stack_samples.clear();
