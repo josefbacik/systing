@@ -8,8 +8,8 @@
 //! `StreamingParquetWriter` is NOT thread-safe. Use from a single thread or wrap
 //! in appropriate synchronization primitives.
 
-use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -24,7 +24,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 
 use crate::network_recorder::{drop_reason_str, format_tcp_flags, tcp_state_name};
-use crate::parquet::ParquetPaths;
+use crate::parquet::ParquetSink;
 use crate::record::RecordCollector;
 use crate::trace::{
     self, ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, CpuInfoRecord,
@@ -82,6 +82,11 @@ fn build_writer_properties() -> WriterProperties {
     builder.build()
 }
 
+/// Per-table parquet writer. `ArrowWriter` only needs `Write + Send` (no
+/// `Seek`), so the underlying sink can be a `File` or a socket — see
+/// [`ParquetSink`].
+type TableWriter = ArrowWriter<Box<dyn Write + Send>>;
+
 /// A streaming Parquet writer that implements `RecordCollector`.
 ///
 /// Records are buffered in memory and flushed to Parquet files when the
@@ -92,8 +97,7 @@ fn build_writer_properties() -> WriterProperties {
 ///
 /// This type is NOT thread-safe. Use from a single thread.
 pub struct StreamingParquetWriter {
-    output_dir: PathBuf,
-    paths: ParquetPaths,
+    sink: ParquetSink,
     batch_size: usize,
     writer_props: WriterProperties,
 
@@ -134,76 +138,76 @@ pub struct StreamingParquetWriter {
     tpu_metrics: Vec<TpuMetricRecord>,
 
     // Persistent writers (created lazily on first flush, kept alive until finish)
-    process_writer: Option<ArrowWriter<File>>,
-    thread_writer: Option<ArrowWriter<File>>,
-    sched_slice_writer: Option<ArrowWriter<File>>,
-    thread_state_writer: Option<ArrowWriter<File>>,
-    irq_slice_writer: Option<ArrowWriter<File>>,
-    softirq_slice_writer: Option<ArrowWriter<File>>,
-    wakeup_new_writer: Option<ArrowWriter<File>>,
-    process_exit_writer: Option<ArrowWriter<File>>,
-    counter_writer: Option<ArrowWriter<File>>,
-    counter_track_writer: Option<ArrowWriter<File>>,
-    slice_writer: Option<ArrowWriter<File>>,
-    track_writer: Option<ArrowWriter<File>>,
-    instant_writer: Option<ArrowWriter<File>>,
-    args_writer: Option<ArrowWriter<File>>,
-    instant_args_writer: Option<ArrowWriter<File>>,
-    stack_writer: Option<ArrowWriter<File>>,
-    stack_sample_writer: Option<ArrowWriter<File>>,
-    network_interface_writer: Option<ArrowWriter<File>>,
-    socket_connection_writer: Option<ArrowWriter<File>>,
-    network_syscall_writer: Option<ArrowWriter<File>>,
-    network_packet_writer: Option<ArrowWriter<File>>,
-    network_socket_writer: Option<ArrowWriter<File>>,
-    network_poll_writer: Option<ArrowWriter<File>>,
-    network_dns_writer: Option<ArrowWriter<File>>,
-    memory_rss_writer: Option<ArrowWriter<File>>,
-    memory_map_writer: Option<ArrowWriter<File>>,
-    memory_fault_writer: Option<ArrowWriter<File>>,
-    memory_alloc_writer: Option<ArrowWriter<File>>,
-    clock_snapshot_writer: Option<ArrowWriter<File>>,
-    sysinfo_writer: Option<ArrowWriter<File>>,
-    cpu_info_writer: Option<ArrowWriter<File>>,
-    tpu_device_writer: Option<ArrowWriter<File>>,
-    tpu_op_writer: Option<ArrowWriter<File>>,
-    tpu_metric_writer: Option<ArrowWriter<File>>,
+    process_writer: Option<TableWriter>,
+    thread_writer: Option<TableWriter>,
+    sched_slice_writer: Option<TableWriter>,
+    thread_state_writer: Option<TableWriter>,
+    irq_slice_writer: Option<TableWriter>,
+    softirq_slice_writer: Option<TableWriter>,
+    wakeup_new_writer: Option<TableWriter>,
+    process_exit_writer: Option<TableWriter>,
+    counter_writer: Option<TableWriter>,
+    counter_track_writer: Option<TableWriter>,
+    slice_writer: Option<TableWriter>,
+    track_writer: Option<TableWriter>,
+    instant_writer: Option<TableWriter>,
+    args_writer: Option<TableWriter>,
+    instant_args_writer: Option<TableWriter>,
+    stack_writer: Option<TableWriter>,
+    stack_sample_writer: Option<TableWriter>,
+    network_interface_writer: Option<TableWriter>,
+    socket_connection_writer: Option<TableWriter>,
+    network_syscall_writer: Option<TableWriter>,
+    network_packet_writer: Option<TableWriter>,
+    network_socket_writer: Option<TableWriter>,
+    network_poll_writer: Option<TableWriter>,
+    network_dns_writer: Option<TableWriter>,
+    memory_rss_writer: Option<TableWriter>,
+    memory_map_writer: Option<TableWriter>,
+    memory_fault_writer: Option<TableWriter>,
+    memory_alloc_writer: Option<TableWriter>,
+    clock_snapshot_writer: Option<TableWriter>,
+    sysinfo_writer: Option<TableWriter>,
+    cpu_info_writer: Option<TableWriter>,
+    tpu_device_writer: Option<TableWriter>,
+    tpu_op_writer: Option<TableWriter>,
+    tpu_metric_writer: Option<TableWriter>,
 
     // Track counts for statistics
     total_records: usize,
 }
 
 impl StreamingParquetWriter {
-    /// Create a new streaming Parquet writer.
+    /// Create a new streaming Parquet writer that writes to a directory.
     ///
     /// The output directory will be created if it doesn't exist.
     pub fn new(output_dir: &Path) -> Result<Self> {
-        Self::with_batch_size(output_dir, DEFAULT_BATCH_SIZE)
+        Ok(Self::with_sink(
+            ParquetSink::directory(output_dir)?,
+            DEFAULT_BATCH_SIZE,
+        ))
     }
 
     /// Create a new streaming Parquet writer with a custom batch size.
     pub fn with_batch_size(output_dir: &Path, batch_size: usize) -> Result<Self> {
-        // Create the output directory if it doesn't exist
-        if !output_dir.exists() {
-            fs::create_dir_all(output_dir).with_context(|| {
-                format!(
-                    "Failed to create output directory: {}",
-                    output_dir.display()
-                )
-            })?;
-        } else if !output_dir.is_dir() {
-            anyhow::bail!(
-                "Output path exists but is not a directory: {}",
-                output_dir.display()
-            );
-        }
+        Ok(Self::with_sink(
+            ParquetSink::directory(output_dir)?,
+            batch_size,
+        ))
+    }
 
-        let paths = ParquetPaths::new(output_dir);
+    /// Create a new streaming Parquet writer over an arbitrary sink, with the
+    /// default batch size.
+    pub fn for_sink(sink: ParquetSink) -> Self {
+        Self::with_sink(sink, DEFAULT_BATCH_SIZE)
+    }
+
+    /// Create a new streaming Parquet writer over an arbitrary sink.
+    pub fn with_sink(sink: ParquetSink, batch_size: usize) -> Self {
         let writer_props = build_writer_properties();
 
-        Ok(Self {
-            output_dir: output_dir.to_path_buf(),
-            paths,
+        Self {
+            sink,
             batch_size,
             writer_props,
             // Buffers use lazy allocation - they grow as needed to minimize
@@ -282,19 +286,7 @@ impl StreamingParquetWriter {
             tpu_op_writer: None,
             tpu_metric_writer: None,
             total_records: 0,
-        })
-    }
-
-    /// Get the output directory.
-    #[allow(dead_code)]
-    pub fn output_dir(&self) -> &Path {
-        &self.output_dir
-    }
-
-    /// Get the paths to all Parquet files.
-    #[allow(dead_code)]
-    pub fn paths(&self) -> &ParquetPaths {
-        &self.paths
+        }
     }
 
     /// Get the total number of records written.
@@ -320,18 +312,18 @@ impl StreamingParquetWriter {
 
     // Helper to create or get a writer
     fn get_or_create_writer<'a>(
-        writer_opt: &'a mut Option<ArrowWriter<File>>,
-        path: &Path,
+        writer_opt: &'a mut Option<TableWriter>,
+        sink: &ParquetSink,
+        table: &str,
         schema: Arc<Schema>,
         props: &WriterProperties,
-    ) -> Result<&'a mut ArrowWriter<File>> {
+    ) -> Result<&'a mut TableWriter> {
         if writer_opt.is_none() {
-            let file = File::create(path)
-                .with_context(|| format!("Failed to create file: {}", path.display()))?;
-            let writer =
-                ArrowWriter::try_new(file, schema, Some(props.clone())).with_context(|| {
-                    format!("Failed to create Parquet writer for: {}", path.display())
-                })?;
+            let out = sink
+                .open(table)
+                .with_context(|| format!("Failed to open parquet sink for table {table}"))?;
+            let writer = ArrowWriter::try_new(out, schema, Some(props.clone()))
+                .with_context(|| format!("Failed to create Parquet writer for table {table}"))?;
             *writer_opt = Some(writer);
         }
         Ok(writer_opt.as_mut().unwrap())
@@ -346,7 +338,8 @@ impl StreamingParquetWriter {
         let schema = trace::process_schema();
         let writer = Self::get_or_create_writer(
             &mut self.process_writer,
-            &self.paths.process,
+            &self.sink,
+            "process",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -366,7 +359,8 @@ impl StreamingParquetWriter {
         let schema = trace::thread_schema();
         let writer = Self::get_or_create_writer(
             &mut self.thread_writer,
-            &self.paths.thread,
+            &self.sink,
+            "thread",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -386,7 +380,8 @@ impl StreamingParquetWriter {
         let schema = trace::sched_slice_schema();
         let writer = Self::get_or_create_writer(
             &mut self.sched_slice_writer,
-            &self.paths.sched_slice,
+            &self.sink,
+            "sched_slice",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -411,7 +406,8 @@ impl StreamingParquetWriter {
         let schema = trace::thread_state_schema();
         let writer = Self::get_or_create_writer(
             &mut self.thread_state_writer,
-            &self.paths.thread_state,
+            &self.sink,
+            "thread_state",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -432,7 +428,8 @@ impl StreamingParquetWriter {
         let schema = trace::irq_slice_schema();
         let writer = Self::get_or_create_writer(
             &mut self.irq_slice_writer,
-            &self.paths.irq_slice,
+            &self.sink,
+            "irq_slice",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -453,7 +450,8 @@ impl StreamingParquetWriter {
         let schema = trace::softirq_slice_schema();
         let writer = Self::get_or_create_writer(
             &mut self.softirq_slice_writer,
-            &self.paths.softirq_slice,
+            &self.sink,
+            "softirq_slice",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -474,7 +472,8 @@ impl StreamingParquetWriter {
         let schema = trace::wakeup_new_schema();
         let writer = Self::get_or_create_writer(
             &mut self.wakeup_new_writer,
-            &self.paths.wakeup_new,
+            &self.sink,
+            "wakeup_new",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -494,7 +493,8 @@ impl StreamingParquetWriter {
         let schema = trace::process_exit_schema();
         let writer = Self::get_or_create_writer(
             &mut self.process_exit_writer,
-            &self.paths.process_exit,
+            &self.sink,
+            "process_exit",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -514,7 +514,8 @@ impl StreamingParquetWriter {
         let schema = trace::counter_schema();
         let writer = Self::get_or_create_writer(
             &mut self.counter_writer,
-            &self.paths.counter,
+            &self.sink,
+            "counter",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -535,7 +536,8 @@ impl StreamingParquetWriter {
         let schema = trace::counter_track_schema();
         let writer = Self::get_or_create_writer(
             &mut self.counter_track_writer,
-            &self.paths.counter_track,
+            &self.sink,
+            "counter_track",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -555,7 +557,8 @@ impl StreamingParquetWriter {
         let schema = trace::slice_schema();
         let writer = Self::get_or_create_writer(
             &mut self.slice_writer,
-            &self.paths.slice,
+            &self.sink,
+            "slice",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -575,7 +578,8 @@ impl StreamingParquetWriter {
         let schema = trace::track_schema();
         let writer = Self::get_or_create_writer(
             &mut self.track_writer,
-            &self.paths.track,
+            &self.sink,
+            "track",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -595,7 +599,8 @@ impl StreamingParquetWriter {
         let schema = trace::instant_schema();
         let writer = Self::get_or_create_writer(
             &mut self.instant_writer,
-            &self.paths.instant,
+            &self.sink,
+            "instant",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -615,7 +620,8 @@ impl StreamingParquetWriter {
         let schema = trace::args_schema();
         let writer = Self::get_or_create_writer(
             &mut self.args_writer,
-            &self.paths.args,
+            &self.sink,
+            "args",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -635,7 +641,8 @@ impl StreamingParquetWriter {
         let schema = trace::instant_args_schema();
         let writer = Self::get_or_create_writer(
             &mut self.instant_args_writer,
-            &self.paths.instant_args,
+            &self.sink,
+            "instant_args",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -655,7 +662,8 @@ impl StreamingParquetWriter {
         let schema = trace::stack_schema();
         let writer = Self::get_or_create_writer(
             &mut self.stack_writer,
-            &self.paths.stack,
+            &self.sink,
+            "stack",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -675,7 +683,8 @@ impl StreamingParquetWriter {
         let schema = trace::stack_sample_schema();
         let writer = Self::get_or_create_writer(
             &mut self.stack_sample_writer,
-            &self.paths.stack_sample,
+            &self.sink,
+            "stack_sample",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -696,7 +705,8 @@ impl StreamingParquetWriter {
         let schema = trace::network_interface_schema();
         let writer = Self::get_or_create_writer(
             &mut self.network_interface_writer,
-            &self.paths.network_interface,
+            &self.sink,
+            "network_interface",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -716,7 +726,8 @@ impl StreamingParquetWriter {
         let schema = trace::socket_connection_schema();
         let writer = Self::get_or_create_writer(
             &mut self.socket_connection_writer,
-            &self.paths.socket_connection,
+            &self.sink,
+            "socket_connection",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -736,7 +747,8 @@ impl StreamingParquetWriter {
         let schema = trace::clock_snapshot_schema();
         let writer = Self::get_or_create_writer(
             &mut self.clock_snapshot_writer,
-            &self.paths.clock_snapshot,
+            &self.sink,
+            "clock_snapshot",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -757,7 +769,8 @@ impl StreamingParquetWriter {
         let schema = trace::sysinfo_schema();
         let writer = Self::get_or_create_writer(
             &mut self.sysinfo_writer,
-            &self.paths.sysinfo,
+            &self.sink,
+            "sysinfo",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -776,7 +789,8 @@ impl StreamingParquetWriter {
         let schema = trace::cpu_info_schema();
         let writer = Self::get_or_create_writer(
             &mut self.cpu_info_writer,
-            &self.paths.cpu_info,
+            &self.sink,
+            "cpu_info",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -796,7 +810,8 @@ impl StreamingParquetWriter {
         let schema = trace::network_syscall_schema();
         let writer = Self::get_or_create_writer(
             &mut self.network_syscall_writer,
-            &self.paths.network_syscall,
+            &self.sink,
+            "network_syscall",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -816,7 +831,8 @@ impl StreamingParquetWriter {
         let schema = trace::network_packet_schema();
         let writer = Self::get_or_create_writer(
             &mut self.network_packet_writer,
-            &self.paths.network_packet,
+            &self.sink,
+            "network_packet",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -836,7 +852,8 @@ impl StreamingParquetWriter {
         let schema = trace::network_socket_schema();
         let writer = Self::get_or_create_writer(
             &mut self.network_socket_writer,
-            &self.paths.network_socket,
+            &self.sink,
+            "network_socket",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -856,7 +873,8 @@ impl StreamingParquetWriter {
         let schema = trace::network_poll_schema();
         let writer = Self::get_or_create_writer(
             &mut self.network_poll_writer,
-            &self.paths.network_poll,
+            &self.sink,
+            "network_poll",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -876,7 +894,8 @@ impl StreamingParquetWriter {
         let schema = trace::network_dns_schema();
         let writer = Self::get_or_create_writer(
             &mut self.network_dns_writer,
-            &self.paths.network_dns,
+            &self.sink,
+            "network_dns",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -894,7 +913,8 @@ impl StreamingParquetWriter {
         let schema = trace::memory_rss_schema();
         let writer = Self::get_or_create_writer(
             &mut self.memory_rss_writer,
-            &self.paths.memory_rss,
+            &self.sink,
+            "memory_rss",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -911,7 +931,8 @@ impl StreamingParquetWriter {
         let schema = trace::memory_map_schema();
         let writer = Self::get_or_create_writer(
             &mut self.memory_map_writer,
-            &self.paths.memory_map,
+            &self.sink,
+            "memory_map",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -928,7 +949,8 @@ impl StreamingParquetWriter {
         let schema = trace::memory_fault_schema();
         let writer = Self::get_or_create_writer(
             &mut self.memory_fault_writer,
-            &self.paths.memory_fault,
+            &self.sink,
+            "memory_fault",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -945,7 +967,8 @@ impl StreamingParquetWriter {
         let schema = trace::memory_alloc_schema();
         let writer = Self::get_or_create_writer(
             &mut self.memory_alloc_writer,
-            &self.paths.memory_alloc,
+            &self.sink,
+            "memory_alloc",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -964,7 +987,8 @@ impl StreamingParquetWriter {
         let schema = trace::tpu_device_schema();
         let writer = Self::get_or_create_writer(
             &mut self.tpu_device_writer,
-            &self.paths.tpu_device,
+            &self.sink,
+            "tpu_device",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -984,7 +1008,8 @@ impl StreamingParquetWriter {
         let schema = trace::tpu_op_schema();
         let writer = Self::get_or_create_writer(
             &mut self.tpu_op_writer,
-            &self.paths.tpu_op,
+            &self.sink,
+            "tpu_op",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -1004,7 +1029,8 @@ impl StreamingParquetWriter {
         let schema = trace::tpu_metric_schema();
         let writer = Self::get_or_create_writer(
             &mut self.tpu_metric_writer,
-            &self.paths.tpu_metric,
+            &self.sink,
+            "tpu_metric",
             schema.clone(),
             &self.writer_props,
         )?;
@@ -1111,8 +1137,8 @@ impl Drop for StreamingParquetWriter {
         if has_open_writers {
             eprintln!(
                 "Warning: StreamingParquetWriter dropped without calling finish(). \
-                 Parquet files in {:?} may be incomplete or corrupted.",
-                self.output_dir
+                 Parquet output at {} may be incomplete or corrupted.",
+                self.sink
             );
             // Attempt to close writers to at least flush pending data
             if let Err(e) = self.close_writers() {
@@ -2733,6 +2759,7 @@ mod tests {
     use arrow::array::AsArray;
     use arrow::array::{Float64Array, Int32Array, Int64Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
     use tempfile::TempDir;
 
     #[test]

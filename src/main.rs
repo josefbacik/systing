@@ -12,6 +12,7 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::time::SystemTime;
 use tracing_subscriber::FmtSubscriber;
 
+use systing::stream::StreamTarget;
 use systing::traced_command;
 use systing::{get_available_recorders, systing, Config};
 
@@ -142,6 +143,12 @@ struct Command {
     #[arg(long)]
     parquet_only: bool,
 
+    /// Stream parquet over a socket instead of writing to disk.
+    /// URI: vsock://CID:PORT | unix:///path/to.sock | tcp://host:port
+    /// (tcp is unauthenticated; trusted networks only).
+    #[arg(long, value_name = "URI", conflicts_with_all = ["output", "parquet_only"])]
+    stream: Option<StreamTarget>,
+
     /// Command to run and trace. Everything after -- is treated as the command.
     /// Only the command and its children/threads will be traced.
     /// Example: systing -- python3 myscript.py
@@ -194,6 +201,7 @@ impl From<Command> for Config {
             output_dir: cmd.output_dir,
             output: cmd.output,
             parquet_only: cmd.parquet_only,
+            stream: cmd.stream,
             run_command: if cmd.run_command.is_empty() {
                 None
             } else {
