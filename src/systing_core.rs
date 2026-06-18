@@ -568,6 +568,8 @@ pub struct Config {
     pub output: PathBuf,
     /// Skip trace generation, keep only parquet
     pub parquet_only: bool,
+    /// Stream parquet over a socket instead of writing to disk
+    pub stream: Option<crate::stream::StreamTarget>,
     /// Command to run and trace (everything after --)
     pub run_command: Option<Vec<String>>,
 }
@@ -617,6 +619,7 @@ impl Default for Config {
             output_dir: PathBuf::from("./traces"),
             output: PathBuf::from("trace.pb"),
             parquet_only: false,
+            stream: None,
             run_command: None,
         }
     }
@@ -3115,12 +3118,15 @@ pub fn systing(
     recorder.snapshot_clocks();
 
     // Initialize streaming parquet output BEFORE recording starts
-    prepare_output_dir(&opts.output_dir)?;
-    recorder.init_streaming_parquet(&opts.output_dir)?;
-    eprintln!(
-        "Initialized streaming parquet output to {:?}",
-        opts.output_dir
-    );
+    let sink = match &opts.stream {
+        Some(target) => crate::parquet::ParquetSink::stream(target.clone())?,
+        None => {
+            prepare_output_dir(&opts.output_dir)?;
+            crate::parquet::ParquetSink::Directory(opts.output_dir.clone())
+        }
+    };
+    recorder.init_streaming_output(&sink)?;
+    eprintln!("Initialized streaming parquet output to {sink}");
 
     // TPU profiling thread handle - declared outside skel scope so it can be
     // joined after skel is dropped.
@@ -3700,17 +3706,25 @@ pub fn systing(
     };
 
     // Write trace files directly to Parquet
-    println!(
-        "Writing Parquet trace files to {}...",
-        opts.output_dir.display()
-    );
-    recorder.generate_parquet_trace(&opts.output_dir, tpu_recorder)?;
+    println!("Writing Parquet trace files to {sink}...");
+    recorder.generate_parquet_trace(tpu_recorder)?;
     println!("Successfully wrote Parquet trace files");
 
     // The recorder still holds process/thread maps, symbolizer caches, etc.
     // Drop our reference before the DuckDB/Perfetto conversion so that memory
     // is available to the importer rather than stacked underneath it.
     drop(recorder);
+
+    // In stream mode there's nothing on local disk to convert; the receiver
+    // owns assembly into duckdb. The private spill tempdir is removed when the
+    // last `Arc<TempDir>` clone drops — `drop(recorder)` above released the
+    // ones held inside the boxed writers, and `drop(sink)` releases the
+    // final one here.
+    if let Some(target) = &opts.stream {
+        drop(sink);
+        println!("Streamed trace to {target}");
+        return Ok(0);
+    }
 
     // Generate output trace (unless --parquet-only)
     // Format is auto-detected from the file extension

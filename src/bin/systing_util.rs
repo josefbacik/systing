@@ -108,6 +108,27 @@ enum Commands {
         #[arg(long)]
         addr: Option<String>,
     },
+    /// Receive a streamed trace from `systing --stream` and write parquet files.
+    ///
+    /// Listens on a vsock/unix/tcp socket. Each accepted connection carries one
+    /// table: an ASCII header line `systing/<ver> <table>` followed by raw
+    /// parquet bytes. Streams are written to `<output_dir>/<table>.parquet`
+    /// (or `<table>.<n>.parquet` if multiple writer instances emit the same
+    /// table) and can then be imported with `systing-util convert`.
+    Receive {
+        /// Listen URI: vsock://CID:PORT | unix:///path/to.sock | tcp://host:port.
+        /// tcp is unauthenticated; for trusted networks only.
+        #[arg(value_name = "URI")]
+        listen: systing::stream::StreamTarget,
+
+        /// Directory to write received parquet files into.
+        #[arg(short, long)]
+        output_dir: PathBuf,
+
+        /// Allow binding a TCP listener on 0.0.0.0 / [::].
+        #[arg(long)]
+        insecure_tcp_bind_any: bool,
+    },
 }
 
 /// Information about a trace being processed
@@ -3753,6 +3774,11 @@ fn main() -> Result<()> {
             json,
         } => run_validate(path, verbose, json),
         Commands::DumpTpuProto { addr } => run_dump_tpu_proto(addr),
+        Commands::Receive {
+            listen,
+            output_dir,
+            insecure_tcp_bind_any,
+        } => systing::stream::receive::run(listen, output_dir, insecure_tcp_bind_any),
     }
 }
 

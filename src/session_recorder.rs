@@ -10,7 +10,7 @@ use crate::events::SystingProbeRecorder;
 use crate::marker_recorder::MarkerRecorder;
 use crate::memory_recorder::MemoryRecorder;
 use crate::network_recorder::NetworkRecorder;
-use crate::parquet::StreamingParquetWriter;
+use crate::parquet::{ParquetSink, StreamingParquetWriter};
 use crate::perf_recorder::PerfCounterRecorder;
 use crate::record::{RecordCollector, SharedCollector};
 use crate::ringbuf::RingBuffer;
@@ -1008,44 +1008,41 @@ impl SessionRecorder {
 
     /// Initialize streaming parquet output for the scheduler, stack, and network recorders.
     /// This must be called BEFORE recording starts to enable streaming of events
-    /// directly to parquet files.
-    ///
-    /// # Arguments
-    /// * `output_dir` - Directory to write Parquet files to
-    pub fn init_streaming_parquet(&self, output_dir: &Path) -> Result<()> {
+    /// directly to the configured `sink` (a local directory or a socket
+    /// endpoint; see [`ParquetSink`]).
+    pub fn init_streaming_output(&self, sink: &ParquetSink) -> Result<()> {
+        let make_writer = || StreamingParquetWriter::for_sink(sink.clone());
+        let spill_dir = sink.spill_dir();
+
         // Set up streaming collector for scheduler events
-        let writer = StreamingParquetWriter::new(output_dir)?;
         self.event_recorder
             .lock()
             .unwrap()
-            .set_streaming_collector(Box::new(writer));
+            .set_streaming_collector(Box::new(make_writer()));
 
         // Set up streaming collector for stack recorder so samples are written
         // incrementally instead of buffered for the entire trace. Unique stack
-        // contents are spilled to a tempfile in the output directory so they
-        // don't accumulate in memory until end-of-trace symbolization.
-        let stack_writer = StreamingParquetWriter::new(output_dir)?;
+        // contents are spilled to a tempfile under the sink's spill directory so
+        // they don't accumulate in memory until end-of-trace symbolization.
         {
             let mut stack_recorder = self.stack_recorder.lock().unwrap();
-            stack_recorder.set_streaming_collector(Box::new(stack_writer));
-            stack_recorder.set_spill_dir(output_dir);
+            stack_recorder.set_streaming_collector(Box::new(make_writer()));
+            stack_recorder.set_spill_dir(spill_dir);
         }
 
         // Set up streaming collector for network recorder (events emitted immediately)
-        let network_writer = StreamingParquetWriter::new(output_dir)?;
         self.network_recorder
             .lock()
             .unwrap()
-            .set_streaming_collector(Box::new(network_writer));
+            .set_streaming_collector(Box::new(make_writer()));
 
         // Set up streaming collector for memory recorder (events emitted
         // immediately). Its unique alloc/fault stacks spill to disk like the
         // stack recorder's.
-        let memory_writer = StreamingParquetWriter::new(output_dir)?;
         {
             let mut memory_recorder = self.memory_recorder.lock().unwrap();
-            memory_recorder.set_streaming_collector(Box::new(memory_writer));
-            memory_recorder.set_spill_dir(output_dir);
+            memory_recorder.set_streaming_collector(Box::new(make_writer()));
+            memory_recorder.set_spill_dir(spill_dir);
         }
 
         // Set up streaming collector for probe recorder (events emitted on completion).
@@ -1053,11 +1050,10 @@ impl SessionRecorder {
         // generate_parquet_trace - markers share the track/slice/instant tables with
         // probe events, so writing them through a separate writer would clobber the
         // probe data (see the marker-write step in generate_parquet_trace).
-        let probe_writer = StreamingParquetWriter::new(output_dir)?;
         self.probe_recorder
             .lock()
             .unwrap()
-            .set_streaming_collector(Box::new(probe_writer));
+            .set_streaming_collector(Box::new(make_writer()));
 
         // The perf-counter and sysinfo (CPU frequency) recorders both emit
         // counter / counter_track rows, which map to the same counter.parquet /
@@ -1065,8 +1061,7 @@ impl SessionRecorder {
         // separate writers both would create the same files and the last one to
         // finish would clobber the other's data. Track IDs come from the shared
         // CounterTrackIdGenerator so they never collide either.
-        let counter_writer =
-            SharedCollector::new(Box::new(StreamingParquetWriter::new(output_dir)?));
+        let counter_writer = SharedCollector::new(Box::new(make_writer()));
         self.perf_counter_recorder
             .lock()
             .unwrap()
@@ -1078,11 +1073,10 @@ impl SessionRecorder {
 
         // Set up streaming collector for TPU metrics recorder (if enabled).
         if let Some(ref tpu_metrics) = self.tpu_metrics_recorder {
-            let tpu_metrics_writer = StreamingParquetWriter::new(output_dir)?;
             tpu_metrics
                 .lock()
                 .unwrap()
-                .set_streaming_collector(Box::new(tpu_metrics_writer));
+                .set_streaming_collector(Box::new(make_writer()));
         }
 
         Ok(())
@@ -1090,12 +1084,11 @@ impl SessionRecorder {
 
     /// Finalize the streaming parquet trace.
     ///
-    /// Flushes all streaming recorders and writes process/thread metadata to the
-    /// parquet output directory. Streaming must have been initialized via
-    /// `init_streaming_parquet` before calling this method.
+    /// Flushes all streaming recorders and writes process/thread metadata to
+    /// the configured sink. Streaming must have been initialized via
+    /// `init_streaming_output` before calling this method.
     pub fn generate_parquet_trace(
         &self,
-        output_dir: &Path,
         tpu_recorder: Option<crate::tpu::recorder::TpuRecorder>,
     ) -> Result<()> {
         // Per-stage elapsed lines below let fleet log pipelines attribute
@@ -1106,7 +1099,7 @@ impl SessionRecorder {
             eprintln!("{} in {:.2}s", label, start.elapsed().as_secs_f64());
             *start = std::time::Instant::now();
         };
-        eprintln!("Generating Parquet trace to {output_dir:?}...");
+        eprintln!("Generating Parquet trace...");
 
         // Get the end timestamp for flushing streaming data
         let end_ts = get_clock_value(libc::CLOCK_BOOTTIME) as i64;
