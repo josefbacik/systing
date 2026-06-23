@@ -3430,7 +3430,7 @@ dependencies = [
 
 [[package]]
 name = "systing"
-version = "1.10.1"
+version = "1.10.2"
 dependencies = [
  "anyhow",
  "arrow 54.3.1",

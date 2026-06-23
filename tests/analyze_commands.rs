@@ -17,13 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use systing::{bump_memlock_rlimit, systing, validate_duckdb, Config};
+use systing::{systing, validate_duckdb, Config};
 use tempfile::TempDir;
-
-/// Helper to set up the environment for BPF tests.
-fn setup_bpf_environment() {
-    bump_memlock_rlimit().expect("Failed to bump memlock rlimit");
-}
 
 /// Run systing-analyze with the given arguments, returning the full Output.
 fn run_analyze(args: &[&str]) -> Output {
@@ -35,8 +30,6 @@ fn run_analyze(args: &[&str]) -> Output {
 
 /// Record a trace to DuckDB and return the temp dir (kept alive by caller).
 fn record_trace() -> (TempDir, std::path::PathBuf) {
-    setup_bpf_environment();
-
     let dir = TempDir::new().expect("Failed to create temp dir");
     let duckdb_path = dir.path().join("trace.duckdb");
 

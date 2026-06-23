@@ -59,9 +59,6 @@ const SW_CLOCK_SAMPLE_PERIOD_NS: u64 = 1_000_000_000 / PERF_CLOCK_TARGET_FREQ_HZ
 /// available from sysfs: assume a 3 GHz part, sampling at ~1kHz.
 const DEFAULT_CYCLES_SAMPLE_PERIOD: u64 = 3_000_000_000 / PERF_CLOCK_TARGET_FREQ_HZ;
 
-/// Memory lock limit for BPF programs (128 MiB)
-const MEMLOCK_RLIMIT_BYTES: u64 = 128 << 20;
-
 /// Sleep duration before stopping in continuous mode (1 second)
 const CONTINUOUS_MODE_STOP_DELAY_SECS: u64 = 1;
 
@@ -623,24 +620,6 @@ impl Default for Config {
             run_command: None,
         }
     }
-}
-
-/// Bump the memory lock rlimit for BPF programs.
-pub fn bump_memlock_rlimit() -> Result<()> {
-    let rlimit = libc::rlimit {
-        rlim_cur: MEMLOCK_RLIMIT_BYTES,
-        rlim_max: MEMLOCK_RLIMIT_BYTES,
-    };
-
-    if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlimit) } != 0 {
-        bail!(
-            "Failed to increase RLIMIT_MEMLOCK to {} bytes ({} MiB). This is required for BPF programs.",
-            MEMLOCK_RLIMIT_BYTES,
-            MEMLOCK_RLIMIT_BYTES >> 20
-        );
-    }
-
-    Ok(())
 }
 
 /// Prepare the output directory for parquet files.
@@ -3092,8 +3071,6 @@ pub fn systing(
     mut opts: Config,
     mut traced_child: Option<crate::traced_command::TracedChild>,
 ) -> Result<i32> {
-    bump_memlock_rlimit()?;
-
     // Add the traced child's PID to the PID filter list
     if let Some(ref child) = traced_child {
         opts.pid.push(child.pid);

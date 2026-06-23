@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use systing::stream::{receive, StreamTarget};
-use systing::{bump_memlock_rlimit, systing, Config};
+use systing::{systing, Config};
 use tempfile::TempDir;
 
 /// Tables that the default recorder set always emits.
@@ -31,8 +31,6 @@ fn parquet_rows(path: &Path) -> anyhow::Result<i64> {
 #[test]
 #[ignore = "requires root/BPF; run via ./scripts/run-integration-tests.sh"]
 fn test_stream_unix_roundtrip() {
-    bump_memlock_rlimit().expect("memlock rlimit");
-
     let recv_dir = TempDir::new().unwrap();
     let sock_path = recv_dir.path().join("systing.sock");
     let target = StreamTarget::Unix(sock_path.clone());

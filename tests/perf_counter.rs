@@ -12,7 +12,7 @@
 //! ./scripts/run-integration-tests.sh perf_counter
 //! ```
 
-use systing::{bump_memlock_rlimit, systing, Config};
+use systing::{systing, Config};
 use tempfile::TempDir;
 
 /// Counters used by the test. `instructions` and `cpu-cycles` are backed by
@@ -24,10 +24,6 @@ const TEST_COUNTERS: [&str; 2] = ["instructions", "cpu-cycles"];
 /// Long enough for the sampling clock to read the counters many times and for
 /// the CPU-frequency poller (100ms interval) to record plenty of samples.
 const RECORDING_SECS: u64 = 3;
-
-fn setup_bpf_environment() {
-    bump_memlock_rlimit().expect("Failed to bump memlock rlimit");
-}
 
 /// Returns true if the host can actually open the hardware perf counters used
 /// by the test. Virtualized/CI hosts frequently expose no PMU at all; in that
@@ -75,8 +71,6 @@ fn perf_counters_available() -> bool {
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_perf_counter_with_cpu_frequency() {
-    setup_bpf_environment();
-
     if !perf_counters_available() {
         eprintln!("skipping: hardware perf counters are not available on this host");
         return;

@@ -19,10 +19,7 @@ use common::{
 };
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use systing::{
-    bump_memlock_rlimit, systing, validate_duckdb, validate_parquet_dir, validate_perfetto_trace,
-    Config,
-};
+use systing::{systing, validate_duckdb, validate_parquet_dir, validate_perfetto_trace, Config};
 use tempfile::TempDir;
 
 /// Total recording duration for netns tests (seconds). Workloads loop until
@@ -37,11 +34,6 @@ const VALIDATION_SUITE_DURATION_SECS: u64 = 4;
 
 /// Recording duration for the network suite (seconds).
 const NETWORK_SUITE_DURATION_SECS: u64 = 3;
-
-/// Helper to set up the environment for BPF tests.
-fn setup_bpf_environment() {
-    bump_memlock_rlimit().expect("Failed to bump memlock rlimit");
-}
 
 /// Read the current process's cgroup v2 path (relative to the cgroup root, e.g.
 /// "/system.slice/foo.service") from `/proc/self/cgroup`. Returns `None` on a
@@ -363,8 +355,6 @@ fn test_e2e_validation_suite() {
 
     const EXIT_DEAD: i32 = 16;
     const EXIT_ZOMBIE: i32 = 32;
-
-    setup_bpf_environment();
 
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
@@ -927,8 +917,6 @@ fn test_e2e_network_suite() {
     use std::thread;
     use std::time::Duration;
 
-    setup_bpf_environment();
-
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
@@ -1217,8 +1205,6 @@ fn test_network_recording_with_netns() {
     use std::thread;
     use std::time::Duration;
 
-    setup_bpf_environment();
-
     let netns_env = NetnsTestEnv::new(NetworkTestConfig::default())
         .expect("Failed to create network namespace test environment");
 
@@ -1370,8 +1356,6 @@ fn test_network_recording_with_netns() {
 fn test_pystacks_symbol_resolution() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File;
-
-    setup_bpf_environment();
 
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
@@ -1601,8 +1585,6 @@ fn test_pystacks_sleep_stacks() {
     use std::collections::HashMap;
     use std::fs::File;
 
-    setup_bpf_environment();
-
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
@@ -1807,8 +1789,6 @@ fn test_pystacks_frame_error_rate() {
         }
     };
 
-    setup_bpf_environment();
-
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
@@ -1958,8 +1938,6 @@ def level1():
 fn run_pystacks_version_test(full_ver: &str) {
     let python_bin = pyenv_python(full_ver);
 
-    setup_bpf_environment();
-
     let defs = r#"
 def pystacks_version_test_function():
     """Function that does busy work to show up in profiling."""
@@ -2085,8 +2063,6 @@ fn run_pystacks_workload_and_check(
     target_function: &str,
     duration: u64,
 ) {
-    setup_bpf_environment();
-
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
@@ -2313,8 +2289,6 @@ def systing_mp_step():
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_pystacks_fork_exec() {
-    setup_bpf_environment();
-
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
@@ -2444,8 +2418,6 @@ fn test_run_command_suite() {
     use arrow::array::{Int32Array, StringArray};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File;
-
-    setup_bpf_environment();
 
     // --- Sub-test: basic command with perfetto output (combines basic + perfetto_output) ---
     eprintln!("\n  run command: basic (sleep 0.5, with perfetto)...");
@@ -2706,8 +2678,6 @@ fn test_pystacks_run_and_trace() {
     use std::fs::File;
     use std::io::Write;
 
-    setup_bpf_environment();
-
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
@@ -2810,8 +2780,6 @@ fn test_pystacks_exec_discovery() {
     use std::fs::File;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
-
-    setup_bpf_environment();
 
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
@@ -3095,7 +3063,6 @@ fn test_e2e_marker_recording() {
     // value of 0xFFFFFFFFFFFFFC31 (sign-extended). This exercises the sign-extended
     // calling convention. See test_e2e_marker_recording_zero_extended for the
     // zero-extended path (e.g. Python ctypes, some JVM runtimes).
-    setup_bpf_environment();
 
     let dir = run_marker_recording(MarkerWorkloadConfig {
         mode: -975i64,
@@ -3199,8 +3166,6 @@ fn test_e2e_marker_recording_zero_extended() {
         "zero-extended and sign-extended representations must differ for this test to be meaningful"
     );
 
-    setup_bpf_environment();
-
     let dir = run_marker_recording(MarkerWorkloadConfig {
         mode: mode_zero_extended,
         range_name: "ZETrack:ze_range",
@@ -3258,8 +3223,6 @@ fn test_e2e_marker_recording_zero_extended() {
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_marker_syscall_no_clobber() {
-    setup_bpf_environment();
-
     // The marker workload's own syscalls (faccessat2 + nanosleep) provide the
     // syscall activity, so no extra workload is needed.
     let dir = run_marker_recording(MarkerWorkloadConfig {
@@ -3438,8 +3401,6 @@ fn test_e2e_marker_threshold() {
     use std::time::{Duration, Instant};
     use syscalls::Sysno;
 
-    setup_bpf_environment();
-
     let dir = TempDir::new().expect("Failed to create temp dir");
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
@@ -3541,8 +3502,6 @@ fn test_e2e_marker_duration_threshold() {
 
     use arrow::array::Int64Array;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    setup_bpf_environment();
 
     let dir = TempDir::new().expect("Failed to create temp dir");
     let stop = Arc::new(AtomicBool::new(false));
@@ -3777,8 +3736,6 @@ fn run_events_recording(config_json: &str, workload: EventsWorkload) -> TempDir 
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_tracepoint_instant() {
-    setup_bpf_environment();
-
     let config_json = r#"
     {
         "events": [
@@ -3824,8 +3781,6 @@ fn test_e2e_tracepoint_instant() {
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_tracepoint_range() {
-    setup_bpf_environment();
-
     let config_json = r#"
     {
         "events": [
@@ -3874,8 +3829,6 @@ fn test_e2e_tracepoint_range() {
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_kprobe_range() {
-    setup_bpf_environment();
-
     let config_json = r#"
     {
         "events": [
@@ -3924,8 +3877,6 @@ fn test_e2e_kprobe_range() {
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_syscall_tracking() {
-    setup_bpf_environment();
-
     let dir = run_events_recording_with(EventsWorkload::FileOpen, |config| {
         config.syscalls = true;
     });
@@ -3961,8 +3912,6 @@ fn test_e2e_syscall_tracking() {
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_event_scope_cpu() {
-    setup_bpf_environment();
-
     let config_json = r#"
     {
         "events": [
@@ -4016,8 +3965,6 @@ fn test_network_dns_resolution() {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
-
-    setup_bpf_environment();
 
     let dir = TempDir::new().expect("Failed to create temp dir");
 
@@ -4138,8 +4085,6 @@ fn test_e2e_only_cpu_stacks_emits_samples() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread;
-
-    setup_bpf_environment();
 
     let dir = TempDir::new().expect("Failed to create temp dir");
 
