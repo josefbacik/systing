@@ -16,10 +16,6 @@ use systing::stream::StreamTarget;
 use systing::traced_command;
 use systing::{get_available_recorders, systing, Config};
 
-/// Memory lock limit used for capability probing (128 MiB).
-/// This value should match the limit in systing_core::MEMLOCK_RLIMIT_BYTES.
-const CAPABILITY_PROBE_MEMLOCK_BYTES: u64 = 128 << 20;
-
 #[derive(Debug, Parser)]
 struct Command {
     /// Increase verbosity (can be supplied multiple times).
@@ -283,30 +279,52 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
     Ok(())
 }
 
-/// Check if we have the necessary capabilities to run BPF programs
-/// We need CAP_BPF, CAP_PERFMON, or at a minimum CAP_SYS_ADMIN
+/// Check if we have the necessary capabilities to run BPF programs.
+///
+/// systing needs to load BPF programs and open tracing perf events, which on
+/// modern kernels requires CAP_BPF + CAP_PERFMON (split out in 5.8), or
+/// CAP_SYS_ADMIN as the legacy catch-all. Checks the effective set via
+/// capget(2) so file capabilities / ambient caps are honored even when
+/// euid != 0.
 fn has_bpf_capabilities() -> bool {
-    // If we're root, we have all capabilities
-    if unsafe { libc::getuid() } == 0 {
-        return true;
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+    const CAP_SYS_ADMIN: u32 = 21;
+    const CAP_PERFMON: u32 = 38;
+    const CAP_BPF: u32 = 39;
+
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
     }
 
-    // Try to load a simple BPF program to check if we have the necessary capabilities
-    // This is the most reliable way to check since capability APIs may not accurately
-    // reflect the effective capabilities needed for BPF
-
-    // For now, we'll do a simple check: if we can bump memlock rlimit,
-    // we likely have capabilities. Otherwise, we need systemd-run.
-    // A better approach would be to actually try loading a minimal BPF program,
-    // but that's more complex.
-
-    // Check if we can set rlimit - this is a good proxy for having needed capabilities
-    let rlimit = libc::rlimit {
-        rlim_cur: CAPABILITY_PROBE_MEMLOCK_BYTES,
-        rlim_max: CAPABILITY_PROBE_MEMLOCK_BYTES,
+    let mut hdr = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
     };
+    let mut data = [CapData::default(); 2];
+    // SAFETY: hdr/data are #[repr(C)] with the kernel ABI layout for capget(2);
+    // version 3 always writes exactly two cap_data structs.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut hdr as *mut CapHeader,
+            data.as_mut_ptr(),
+        )
+    };
+    if ret != 0 {
+        return false;
+    }
 
-    unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlimit) == 0 }
+    let has = |cap: u32| data[(cap >> 5) as usize].effective & (1u32 << (cap & 31)) != 0;
+    has(CAP_SYS_ADMIN) || (has(CAP_BPF) && has(CAP_PERFMON))
 }
 
 /// Re-execute the current program using systemd-run to get elevated privileges

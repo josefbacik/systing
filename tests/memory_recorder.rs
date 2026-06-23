@@ -8,7 +8,7 @@
 //! ./scripts/run-integration-tests.sh memory_recorder
 //! ```
 
-use systing::{bump_memlock_rlimit, systing, Config};
+use systing::{systing, Config};
 use tempfile::TempDir;
 
 /// Size of each allocation in the workload. Must be well above the glibc
@@ -23,15 +23,9 @@ const RSS_SANITY_CEILING_BYTES: i64 = 64 * 1024 * 1024 * 1024;
 const UTIDS_FOR_PID: &str =
     "(SELECT t.utid FROM thread t JOIN process p ON p.upid = t.upid WHERE p.pid = ?)";
 
-fn setup_bpf_environment() {
-    bump_memlock_rlimit().expect("Failed to bump memlock rlimit");
-}
-
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_memory_recorder_e2e() {
-    setup_bpf_environment();
-
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
@@ -241,8 +235,6 @@ fn test_memory_recorder_e2e() {
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_memory_alloc_e2e() {
-    setup_bpf_environment();
-
     let dir = TempDir::new().expect("Failed to create temp dir");
     let trace_path = dir.path().join("trace.pb");
 
@@ -385,7 +377,6 @@ fn test_memory_alloc_e2e() {
 /// `malloc` rows attributed to the workload pid. Returns 0 if no parquet was
 /// emitted (i.e., no uprobes attached / no events).
 fn count_malloc_rows(run_cmd: Vec<String>, memory_alloc_lib: Option<String>) -> i64 {
-    setup_bpf_environment();
     let dir = TempDir::new().expect("Failed to create temp dir");
     let traced_child =
         systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
@@ -447,7 +438,6 @@ fn test_memory_alloc_jemalloc_preload() {
         return;
     };
     eprintln!("Using LD_PRELOAD={jemalloc}");
-    setup_bpf_environment();
     let dir = TempDir::new().expect("Failed to create temp dir");
 
     // Spawn the workload independently (not via spawn_traced_child) so that
