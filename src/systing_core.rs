@@ -44,20 +44,16 @@ use libbpf_rs::{
 
 use plain::Plain;
 
-/// Target stack-sampling rate for the perf clock event, in samples per second
-/// per CPU. The clock event runs in period mode (see `PerfOpenEvents::
-/// open_events`), so this target is hit exactly for the cpu-clock software
-/// event and at max CPU frequency for the cpu-cycles hardware event; a
-/// throttled CPU samples proportionally slower.
-const PERF_CLOCK_TARGET_FREQ_HZ: u64 = 1000;
+/// Default target stack-sampling rate for the perf clock event, in samples per
+/// second per CPU. Overridable via `--sample-freq`. The clock event runs in
+/// period mode (see `PerfOpenEvents::open_events`), so this target is hit
+/// exactly for the cpu-clock software event and at max CPU frequency for the
+/// cpu-cycles hardware event; a throttled CPU samples proportionally slower.
+pub const DEFAULT_SAMPLE_FREQ_HZ: u64 = 1000;
 
-/// Sample period for the cpu-clock software clock event, which counts
-/// nanoseconds: 1ms between samples = PERF_CLOCK_TARGET_FREQ_HZ.
-const SW_CLOCK_SAMPLE_PERIOD_NS: u64 = 1_000_000_000 / PERF_CLOCK_TARGET_FREQ_HZ;
-
-/// Fallback cpu-cycles sample period when no CPU frequency information is
-/// available from sysfs: assume a 3 GHz part, sampling at ~1kHz.
-const DEFAULT_CYCLES_SAMPLE_PERIOD: u64 = 3_000_000_000 / PERF_CLOCK_TARGET_FREQ_HZ;
+/// Assumed CPU clock rate for picking a cpu-cycles sample period when no
+/// cpufreq data is available from sysfs.
+const FALLBACK_CPU_FREQ_HZ: u64 = 3_000_000_000;
 
 /// Sleep duration before stopping in continuous mode (1 second)
 const CONTINUOUS_MODE_STOP_DELAY_SECS: u64 = 1;
@@ -498,6 +494,8 @@ pub struct Config {
     pub trace_event_pid: Vec<u32>,
     /// Use software events instead of hardware
     pub sw_event: bool,
+    /// Target CPU stack-sampling rate in Hz (samples/sec/CPU)
+    pub sample_freq: u64,
     /// Record CPU frequency
     pub cpu_frequency: bool,
     /// Perf counters to collect
@@ -583,6 +581,7 @@ impl Default for Config {
             trace_event: Vec::new(),
             trace_event_pid: Vec::new(),
             sw_event: false,
+            sample_freq: DEFAULT_SAMPLE_FREQ_HZ,
             cpu_frequency: false,
             perf_counter: Vec::new(),
             no_cpu_stack_traces: false,
@@ -2186,20 +2185,20 @@ fn configure_bpf_skeleton(
     Ok(())
 }
 
-/// Pick the cpu-cycles sample period that yields PERF_CLOCK_TARGET_FREQ_HZ
-/// samples/sec at the fastest CPU's maximum frequency. Using the max across
-/// CPUs (rather than per-CPU periods) keeps the period uniform so every sample
-/// in the trace represents the same number of cycles; slower or throttled CPUs
-/// simply sample at a proportionally lower rate.
-fn cycles_sample_period() -> u64 {
-    let max_khz = crate::session_recorder::cpu_freq_limits()
+/// Pick the cpu-cycles sample period that yields `target_freq_hz` samples/sec
+/// at the fastest CPU's maximum frequency. Using the max across CPUs (rather
+/// than per-CPU periods) keeps the period uniform so every sample in the trace
+/// represents the same number of cycles; slower or throttled CPUs simply
+/// sample at a proportionally lower rate.
+fn cycles_sample_period(target_freq_hz: u64) -> u64 {
+    let max_hz = crate::session_recorder::cpu_freq_limits()
         .into_iter()
         .filter_map(|c| c.max_freq_khz)
-        .max();
-    match max_khz {
-        Some(khz) if khz > 0 => (khz as u64 * 1000) / PERF_CLOCK_TARGET_FREQ_HZ,
-        _ => DEFAULT_CYCLES_SAMPLE_PERIOD,
-    }
+        .max()
+        .filter(|&khz| khz > 0)
+        .map(|khz| khz as u64 * 1000)
+        .unwrap_or(FALLBACK_CPU_FREQ_HZ);
+    (max_hz / target_freq_hz).max(1)
 }
 
 fn setup_perf_events(
@@ -2218,9 +2217,12 @@ fn setup_perf_events(
     let mut perf_links = Vec::new();
     let mut event_files_vec = Vec::new();
 
+    // Clamp to avoid divide-by-zero for library callers that bypass the
+    // clap range(1..) validator on --sample-freq.
+    let target_hz = opts.sample_freq.max(1);
     let sw_clock_sampling = ClockSamplingConfig {
         event: "cpu-clock",
-        period: SW_CLOCK_SAMPLE_PERIOD_NS,
+        period: (1_000_000_000 / target_hz).max(1),
     };
 
     // Set up clock perf events with automatic VM detection and fallback
@@ -2247,7 +2249,7 @@ fn setup_perf_events(
         } else {
             ClockSamplingConfig {
                 event: "cpu-cycles",
-                period: cycles_sample_period(),
+                period: cycles_sample_period(target_hz),
             }
         };
 

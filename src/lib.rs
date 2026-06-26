@@ -62,7 +62,7 @@ pub mod utid;
 
 // Re-export for convenience
 pub use parquet_paths::ParquetPaths;
-pub use systing_core::{get_available_recorders, systing, Config};
+pub use systing_core::{get_available_recorders, systing, Config, DEFAULT_SAMPLE_FREQ_HZ};
 pub use validation::{
     cross_validate_parquet_perfetto, validate_duckdb, validate_parquet_dir,
     validate_perfetto_trace, ValidationError, ValidationResult, ValidationWarning,
