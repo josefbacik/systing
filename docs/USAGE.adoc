@@ -216,6 +216,14 @@ If you are having too many missed events you can increase this size.
 NOTE: You will always have missed events for perf events, this is normal.
 Only increase this if you are having misseed sched events, as that affects the trace quality.
 
+=== *--sample-freq* _HZ_
+
+Sets the target CPU stack-sampling rate in samples per second per CPU.
+The default is 1000.
+Sampling runs in fixed-period mode: with `--sw-event` (cpu-clock) the rate is exact; with the cpu-cycles hardware event it is the rate at the CPU's maximum frequency, so a throttled CPU samples proportionally slower.
+The chosen period is recorded in the trace's `sysinfo.sample_period` column.
+Higher values give finer-grained profiles at the cost of more overhead and larger traces; very high rates may be throttled by the kernel's perf interrupt-rate limit and can increase ringbuf drops (raise `--ringbuf-size-mib` if needed).
+
 === *--sw-event*
 
 If recording inside of a VM, this can be specified to enable the software events necessary to record stack traces.

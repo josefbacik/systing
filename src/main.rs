@@ -37,6 +37,12 @@ struct Command {
     trace_event_pid: Vec<u32>,
     #[arg(short, long)]
     sw_event: bool,
+    /// Target CPU stack-sampling rate in Hz (samples per second per CPU). The
+    /// perf clock event runs in fixed-period mode, so this is exact for
+    /// --sw-event and the rate at max CPU frequency for cpu-cycles.
+    #[arg(long, default_value_t = systing::DEFAULT_SAMPLE_FREQ_HZ,
+          value_parser = clap::value_parser!(u64).range(1..))]
+    sample_freq: u64,
     #[arg(long)]
     cpu_frequency: bool,
     #[arg(long)]
@@ -164,6 +170,7 @@ impl From<Command> for Config {
             trace_event: cmd.trace_event,
             trace_event_pid: cmd.trace_event_pid,
             sw_event: cmd.sw_event,
+            sample_freq: cmd.sample_freq,
             cpu_frequency: cmd.cpu_frequency,
             perf_counter: cmd.perf_counter,
             no_cpu_stack_traces: cmd.no_cpu_stack_traces,
