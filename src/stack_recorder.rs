@@ -2,7 +2,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -234,6 +234,29 @@ impl StackSpill {
         }
     }
 
+    /// Drain all records (durable file contents then in-memory fallback) into
+    /// `f`, consuming the spill. Convenience wrapper around `take_reader` +
+    /// `read_spill_record` so callers replay the full record set without
+    /// repeating that loop.
+    fn drain(&mut self, mut f: impl FnMut(Stack, i32, i64) -> Result<()>) -> Result<()> {
+        if let Some((mut reader, durable)) = self.take_reader() {
+            for _ in 0..durable {
+                match read_spill_record(&mut reader) {
+                    Ok(Some((stack, tgid, id))) => f(stack, tgid, id)?,
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("Warning: stopping stack spill replay early: {e:#}");
+                        break;
+                    }
+                }
+            }
+        }
+        for (stack, tgid, id) in std::mem::take(&mut self.fallback) {
+            f(stack, tgid, id)?;
+        }
+        Ok(())
+    }
+
     /// Flush and rewind the spill file for reading. Returns the reader plus
     /// the number of durable records to replay; `None` if nothing was spilled
     /// to disk. On a final-flush failure the file prefix written so far is
@@ -284,6 +307,16 @@ fn current_anon_rss_bytes() -> Option<u64> {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
     Some(resident.saturating_sub(shared) * page_size)
 }
+
+/// Number of second-tier spill files alive-process stacks are hashed into
+/// during `finish()`. The recording-phase spill is a single file (one fd, one
+/// sequential write stream on the hot path); at symbolization time stacks of
+/// still-live processes are re-spilled into `tgid % RESPILL_BUCKETS` files
+/// and replayed one bucket at a time, so peak memory is roughly
+/// `total_live_stacks / RESPILL_BUCKETS` instead of all of them at once. 64
+/// keeps the fd cost trivial while bringing the per-bucket fraction well
+/// under the symbolizer budget on 192-core hosts.
+const RESPILL_BUCKETS: usize = 64;
 
 /// Memory budget for the symbolization phase. blazesym retains parsed debug
 /// info for every live binary it symbolizes (with code-info and inlined-fn
@@ -481,6 +514,9 @@ pub struct StackRecorder {
     /// `finish()`. Id ranges are disjoint per interner, so identical contents
     /// interned by two recorders simply emit one StackRecord per id.
     external_interners: Vec<StackInterner>,
+    /// Directory for spill tempfiles. Retained so `finish()` can re-spill
+    /// alive-process stacks into per-bucket files (see [`RESPILL_BUCKETS`]).
+    spill_dir: Option<PathBuf>,
     /// Shared utid generator for consistent thread IDs across all recorders.
     utid_generator: Arc<UtidGenerator>,
 }
@@ -507,6 +543,7 @@ impl StackRecorder {
             interner: StackInterner::new(1)
                 .with_id_limit(crate::memory_recorder::MEMORY_STACK_ID_OFFSET),
             external_interners: Vec::new(),
+            spill_dir: None,
             utid_generator,
         }
     }
@@ -523,6 +560,7 @@ impl StackRecorder {
     /// before recording starts; without it, stack contents are kept in memory.
     pub fn set_spill_dir(&mut self, dir: &Path) {
         self.interner.set_spill_dir(dir);
+        self.spill_dir = Some(dir.to_path_buf());
     }
 
     /// Take ownership of another recorder's interner so its stacks are
@@ -625,82 +663,59 @@ impl StackRecorder {
         // immediately: their user addresses cannot be symbolized at all
         // (blazesym needs /proc/<pid>/maps), so they only need the kernel cache
         // and a hex rendering, and their address vectors are freed right away.
-        // Stacks of live processes are grouped per tgid for pass 2.
+        // Stacks of live processes are re-spilled into RESPILL_BUCKETS
+        // tgid-hashed second-tier files for pass 2, so they stay on disk
+        // instead of accumulating in memory.
         //
         // Under heavy short-lived-process churn (CI) nearly everything is dead
-        // by now, so this pass keeps peak memory flat where the old
-        // hold-everything approach grew to multiple GiB.
-        let mut live_groups: HashMap<i32, Vec<(Stack, i64)>> = HashMap::new();
+        // by now and this pass keeps peak memory flat. On long-lived-process
+        // hosts (training, inference) nearly everything is alive, and the
+        // re-spill is what keeps the address vectors out of RAM until pass 2
+        // touches one bucket at a time.
+        let mut respill: Vec<StackSpill> = (0..RESPILL_BUCKETS)
+            .map(|_| {
+                let mut s = StackSpill::new();
+                if let Some(dir) = &self.spill_dir {
+                    s.set_dir(dir);
+                }
+                s
+            })
+            .collect();
         let mut tgid_alive: HashMap<i32, bool> = HashMap::new();
 
-        let mut handle_record = |this: &Self,
-                                 symbolizer: &mut Symbolizer,
-                                 kernel_cache: &mut HashMap<u64, String>,
-                                 live_groups: &mut HashMap<i32, Vec<(Stack, i64)>>,
-                                 stack: Stack,
-                                 tgid: i32,
-                                 stack_id: i64|
-         -> Result<()> {
-            let alive = *tgid_alive
-                .entry(tgid)
-                .or_insert_with(|| Path::new("/proc").join(tgid.to_string()).exists());
-            if alive {
-                live_groups.entry(tgid).or_default().push((stack, stack_id));
-                return Ok(());
-            }
-
-            let frame_names =
-                this.symbolize_stack_frames(symbolizer, &stack, None, &kernel_src, kernel_cache);
-            pb.inc(1);
-            emit_stack_record(collector, stack_id, frame_names)
-        };
-
         // Each interner is dropped at the end of its loop iteration, releasing
-        // its dedup table before the (memory-hungry) live-group pass below.
+        // its dedup table before the (memory-hungry) live-process pass below.
         for mut interner in interners {
-            if let Some((mut reader, durable_records)) = interner.spill.take_reader() {
-                for _ in 0..durable_records {
-                    match read_spill_record(&mut reader) {
-                        Ok(Some((stack, tgid, stack_id))) => {
-                            handle_record(
-                                self,
-                                &mut symbolizer,
-                                &mut kernel_cache,
-                                &mut live_groups,
-                                stack,
-                                tgid,
-                                stack_id,
-                            )?;
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            eprintln!("Warning: stopping stack spill replay early: {e:#}");
-                            break;
-                        }
-                    }
+            interner.spill.drain(|stack, tgid, stack_id| {
+                let alive = *tgid_alive
+                    .entry(tgid)
+                    .or_insert_with(|| Path::new("/proc").join(tgid.to_string()).exists());
+                if alive {
+                    respill[(tgid as u32 as usize) % RESPILL_BUCKETS].push(stack, tgid, stack_id);
+                    return Ok(());
                 }
-            }
-            for (stack, tgid, stack_id) in std::mem::take(&mut interner.spill.fallback) {
-                handle_record(
-                    self,
+                let frame_names = self.symbolize_stack_frames(
                     &mut symbolizer,
+                    &stack,
+                    None,
+                    &kernel_src,
                     &mut kernel_cache,
-                    &mut live_groups,
-                    stack,
-                    tgid,
-                    stack_id,
-                )?;
-            }
+                );
+                pb.inc(1);
+                emit_stack_record(collector, stack_id, frame_names)
+            })?;
         }
+        drop(tgid_alive);
 
-        // Pass 2: symbolize live processes one tgid at a time. blazesym
-        // accumulates parsed debug info for every binary it touches with no
-        // eviction (with code-info and inlined-fn resolution this can reach
-        // GiBs for debug-heavy binaries), so anon RSS is checked against a
-        // budget after each group and periodically within large groups, and
-        // the symbolizer is rebuilt when it is exceeded. Grouping per tgid
-        // means each process's binaries are normally parsed once; a rebuild
-        // costs re-parsing for addresses not already in the string caches.
+        // Pass 2: symbolize live processes one re-spill bucket at a time, and
+        // within each bucket one tgid at a time. blazesym accumulates parsed
+        // debug info for every binary it touches with no eviction (with
+        // code-info and inlined-fn resolution this can reach GiBs for
+        // debug-heavy binaries), so anon RSS is checked against a budget after
+        // each group and periodically within large groups, and the symbolizer
+        // is rebuilt when it is exceeded. Grouping per tgid means each
+        // process's binaries are normally parsed once; a rebuild costs
+        // re-parsing for addresses not already in the string caches.
         //
         // `rebuild_floor` is the RSS right after the last rebuild: if a rebuild
         // doesn't actually free memory (the budget is exceeded by things a
@@ -731,33 +746,50 @@ impl StackRecorder {
             );
         };
 
-        for (tgid, stacks) in live_groups {
-            // Pre-cache process metadata for this tgid (best-effort
-            // optimization; failure doesn't affect correctness).
-            let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(
-                (tgid as u32).into(),
-            )));
-            let proc_src = Source::Process(Process::new(Pid::from(tgid as u32)));
-            // Per-process user-address cache, freed with the group. Survives a
-            // mid-group rebuild, so already-resolved addresses are not re-done.
-            let mut user_cache: HashMap<u64, String> = HashMap::new();
+        for mut bucket in respill {
+            // Load this bucket's records and group by tgid so each process's
+            // user addresses go through one Process source and one cache.
+            // Only ~1/RESPILL_BUCKETS of the total live-stack volume is
+            // resident at a time; it is freed when `bucket_groups` drops at
+            // the end of the iteration.
+            let mut bucket_groups: HashMap<i32, Vec<(Stack, i64)>> = HashMap::new();
+            bucket.drain(|stack, tgid, stack_id| {
+                bucket_groups
+                    .entry(tgid)
+                    .or_default()
+                    .push((stack, stack_id));
+                Ok(())
+            })?;
 
-            for (i, (stack, stack_id)) in stacks.into_iter().enumerate() {
-                if i > 0 && i % VALVE_CHECK_INTERVAL == 0 {
-                    maybe_rebuild(self, &mut symbolizer);
+            for (tgid, stacks) in bucket_groups {
+                // Pre-cache process metadata for this tgid (best-effort
+                // optimization; failure doesn't affect correctness).
+                let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(
+                    (tgid as u32).into(),
+                )));
+                let proc_src = Source::Process(Process::new(Pid::from(tgid as u32)));
+                // Per-process user-address cache, freed with the group. Survives
+                // a mid-group rebuild, so already-resolved addresses are not
+                // re-done.
+                let mut user_cache: HashMap<u64, String> = HashMap::new();
+
+                for (i, (stack, stack_id)) in stacks.into_iter().enumerate() {
+                    if i > 0 && i % VALVE_CHECK_INTERVAL == 0 {
+                        maybe_rebuild(self, &mut symbolizer);
+                    }
+                    let frame_names = self.symbolize_stack_frames(
+                        &mut symbolizer,
+                        &stack,
+                        Some((&proc_src, &mut user_cache)),
+                        &kernel_src,
+                        &mut kernel_cache,
+                    );
+                    pb.inc(1);
+                    emit_stack_record(collector, stack_id, frame_names)?;
                 }
-                let frame_names = self.symbolize_stack_frames(
-                    &mut symbolizer,
-                    &stack,
-                    Some((&proc_src, &mut user_cache)),
-                    &kernel_src,
-                    &mut kernel_cache,
-                );
-                pb.inc(1);
-                emit_stack_record(collector, stack_id, frame_names)?;
-            }
 
-            maybe_rebuild(self, &mut symbolizer);
+                maybe_rebuild(self, &mut symbolizer);
+            }
         }
 
         pb.finish_with_message("Stack symbolization complete");
@@ -1145,6 +1177,73 @@ mod tests {
             assert_eq!(rid, i as i64);
         }
         assert!(read_spill_record(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_stack_spill_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spill = StackSpill::new();
+        spill.set_dir(dir.path());
+
+        // First few go to the file; then drop the writer and push to fallback.
+        for i in 0..3 {
+            spill.push(
+                Stack {
+                    kernel_stack: vec![i],
+                    user_stack: vec![],
+                    py_stack: vec![],
+                },
+                i as i32,
+                i as i64,
+            );
+        }
+        spill.take_reader(); // flush + consume the writer
+        spill.push(
+            Stack {
+                kernel_stack: vec![99],
+                user_stack: vec![],
+                py_stack: vec![],
+            },
+            99,
+            99,
+        );
+        assert_eq!(spill.fallback.len(), 1);
+
+        // Re-seed a writer and re-push the file records so drain() sees both
+        // file and fallback paths in one call.
+        let mut spill = StackSpill::new();
+        spill.set_dir(dir.path());
+        for i in 0..3 {
+            spill.push(
+                Stack {
+                    kernel_stack: vec![i],
+                    user_stack: vec![],
+                    py_stack: vec![],
+                },
+                i as i32,
+                i as i64,
+            );
+        }
+        spill.fallback.push((
+            Stack {
+                kernel_stack: vec![99],
+                user_stack: vec![],
+                py_stack: vec![],
+            },
+            99,
+            99,
+        ));
+
+        let mut got = Vec::new();
+        spill
+            .drain(|stack, tgid, id| {
+                got.push((stack.kernel_stack[0], tgid, id));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(got, vec![(0, 0, 0), (1, 1, 1), (2, 2, 2), (99, 99, 99)]);
+        assert!(spill.fallback.is_empty());
+        assert!(spill.take_reader().is_none());
     }
 
     #[test]
