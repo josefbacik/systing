@@ -126,8 +126,10 @@ impl NetnsTestEnv {
     /// Default port for the echo server
     const DEFAULT_SERVER_PORT: u16 = 8765;
 
-    /// Maximum time to wait for server readiness (5 seconds total)
-    const SERVER_READY_TIMEOUT_MS: u64 = 5000;
+    /// Maximum time to wait for server readiness. Shares the suite-wide
+    /// slow-machine budget: this is a backstop against a server that never
+    /// comes up, not an estimate (the poll exits as soon as the port opens).
+    const SERVER_READY_TIMEOUT_MS: u64 = super::workload::SLOW_MACHINE_BUDGET.as_millis() as u64;
 
     /// Interval between readiness checks
     const SERVER_READY_POLL_MS: u64 = 100;

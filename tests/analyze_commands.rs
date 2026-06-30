@@ -9,12 +9,14 @@
 //! ./scripts/run-integration-tests.sh analyze_commands
 //! ```
 
+mod common;
+
+use common::workload::stoppable_workload;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 use systing::{systing, validate_duckdb, Config};
@@ -51,12 +53,10 @@ fn record_trace() -> (TempDir, std::path::PathBuf) {
     // on slow hosts. Each iteration does an explicit send/recv round-trip so
     // the test's own traffic guarantees network_syscall rows regardless of
     // ambient system activity.
-    let stop_traffic = Arc::new(AtomicBool::new(false));
-    let stop_flag = stop_traffic.clone();
-    let traffic_thread = thread::spawn(move || {
+    let traffic = stoppable_workload(|stop| {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind traffic listener");
         let addr = listener.local_addr().unwrap();
-        while !stop_flag.load(Ordering::Relaxed) {
+        while !stop.load(Ordering::Relaxed) {
             if let Ok(mut client) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
                 if let Ok((mut server, _)) = listener.accept() {
                     let _ = client.write_all(b"ping");
@@ -71,8 +71,7 @@ fn record_trace() -> (TempDir, std::path::PathBuf) {
     });
 
     systing(config, None).expect("systing recording failed");
-    stop_traffic.store(true, Ordering::Relaxed);
-    traffic_thread.join().expect("Traffic thread panicked");
+    traffic.stop();
 
     assert!(
         duckdb_path.exists(),
