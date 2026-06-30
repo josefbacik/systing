@@ -2486,6 +2486,15 @@ fn dedup_by_inode(raw: HashMap<String, &'static str>) -> (Vec<(String, &'static 
 fn discover_allocator_paths(pids: &[u32]) -> (Vec<(String, &'static str)>, usize) {
     let mut raw: HashMap<String, &'static str> = HashMap::new();
     'pid: for pid in pids {
+        // A dead pid fails every lookup below the same way a live one with no
+        // matching maps entry does; name the actual problem. Common when the
+        // target is short-lived and BPF load (which precedes attach) is slow.
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            eprintln!(
+                "Warning: memory-alloc: target pid {pid} exited before uprobe attach; skipping"
+            );
+            continue 'pid;
+        }
         for name in OVERRIDE_ALLOCATORS {
             if let Some(p) = resolve_library_path_for_pid(*pid, name) {
                 raw.entry(p).or_insert(name);

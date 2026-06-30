@@ -444,16 +444,25 @@ fn test_memory_alloc_jemalloc_preload() {
     // allocator discovery scans a process that has already exec'd and mapped
     // jemalloc. Run-command mode attaches pre-exec and would only see the
     // parent's libc.
+    //
+    // The workload must stay alive until uprobe attach, which happens after
+    // BPF skeleton load — tens of seconds on slow/emulated machines (e.g.
+    // QEMU TCG). A fixed iteration count races that, so it runs until the
+    // test drops a stop file (with a deadline as the orphan backstop should
+    // the test die before cleanup).
+    let stop_file = dir.path().join("stop-workload");
     let mut child = std::process::Command::new("python3")
         .env("LD_PRELOAD", &jemalloc)
         .arg("-c")
         .arg(
-            "import time\n\
-             for _ in range(1000):\n\
+            "import os, sys, time\n\
+             deadline = time.time() + 600\n\
+             while time.time() < deadline and not os.path.exists(sys.argv[1]):\n\
              \x20 objs=[bytes(512) for _ in range(200)]\n\
              \x20 del objs\n\
              \x20 time.sleep(0.005)\n",
         )
+        .arg(&stop_file)
         .spawn()
         .expect("Failed to spawn jemalloc workload");
     let child_pid = child.id();
@@ -484,8 +493,15 @@ fn test_memory_alloc_jemalloc_preload() {
     };
     let exit_code = systing(config, None).expect("systing recording failed");
     assert_eq!(exit_code, 0);
+    let exited_early = child.try_wait().expect("try_wait failed");
+    let _ = std::fs::write(&stop_file, b"");
     let _ = child.kill();
     let _ = child.wait();
+    assert!(
+        exited_early.is_none(),
+        "workload exited before the trace completed (status {exited_early:?}); \
+         it must outlive BPF load + attach + the 2s trace window"
+    );
 
     assert!(
         dir.path().join("memory_alloc.parquet").exists(),
