@@ -8,6 +8,9 @@
 //! ./scripts/run-integration-tests.sh memory_recorder
 //! ```
 
+mod common;
+
+use common::workload::{wait_until, SLOW_MACHINE_BUDGET};
 use systing::{systing, Config};
 use tempfile::TempDir;
 
@@ -451,34 +454,34 @@ fn test_memory_alloc_jemalloc_preload() {
     // test drops a stop file (with a deadline as the orphan backstop should
     // the test die before cleanup).
     let stop_file = dir.path().join("stop-workload");
+    // The in-workload deadline is the orphan backstop should the test die
+    // before writing the stop file; it must comfortably exceed the test's own
+    // wait budget so it can never fire first.
+    let orphan_backstop_secs = 2 * SLOW_MACHINE_BUDGET.as_secs();
     let mut child = std::process::Command::new("python3")
         .env("LD_PRELOAD", &jemalloc)
         .arg("-c")
-        .arg(
+        .arg(format!(
             "import os, sys, time\n\
-             deadline = time.time() + 600\n\
+             deadline = time.time() + {orphan_backstop_secs}\n\
              while time.time() < deadline and not os.path.exists(sys.argv[1]):\n\
              \x20 objs=[bytes(512) for _ in range(200)]\n\
              \x20 del objs\n\
-             \x20 time.sleep(0.005)\n",
-        )
+             \x20 time.sleep(0.005)\n"
+        ))
         .arg(&stop_file)
         .spawn()
         .expect("Failed to spawn jemalloc workload");
     let child_pid = child.id();
-    let mut mapped = false;
-    for _ in 0..50 {
-        mapped = std::fs::read_to_string(format!("/proc/{child_pid}/maps"))
-            .map(|m| m.contains("libjemalloc"))
-            .unwrap_or(false);
-        if mapped {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(
-        mapped,
-        "libjemalloc never appeared in /proc/{child_pid}/maps; LD_PRELOAD ineffective?"
+    // python exec + dynamic linking can take seconds on slow machines; poll
+    // for the actual postcondition instead of a hardcoded settle time.
+    wait_until(
+        &format!("libjemalloc in /proc/{child_pid}/maps (LD_PRELOAD ineffective?)"),
+        || {
+            std::fs::read_to_string(format!("/proc/{child_pid}/maps"))
+                .map(|m| m.contains("libjemalloc"))
+                .unwrap_or(false)
+        },
     );
 
     let config = Config {

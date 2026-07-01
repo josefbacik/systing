@@ -14,6 +14,7 @@
 mod common;
 
 use arrow::array::Array;
+use common::workload::{stoppable_workload, wait_until, SLOW_MACHINE_BUDGET};
 use common::{
     assert_poll_events_recorded, validate_network_trace, NetnsTestEnv, NetworkTestConfig,
 };
@@ -28,8 +29,8 @@ const NETNS_RECORDING_DURATION_SECS: u64 = 10;
 
 /// Recording duration for the basic validation suite (seconds).
 /// Set to 4s to give the exit workload time to generate EXIT_DEAD/EXIT_ZOMBIE
-/// states during the trace. The workload starts 500ms after trace begins (to
-/// allow BPF initialization) and runs 20 rounds of 50 processes.
+/// states during the trace; the workload loops until told to stop, so it
+/// overlaps the window regardless of BPF attach latency.
 const VALIDATION_SUITE_DURATION_SECS: u64 = 4;
 
 /// Recording duration for the network suite (seconds).
@@ -148,8 +149,9 @@ fn spawn_python_workload(
         .expect("spawn python");
     let pid = child.id();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !ready_marker.exists() {
+    // No fixed estimate here: the warm-up iteration is real work (some tests
+    // burn tens of millions of bytecodes) and scales with machine speed.
+    wait_until("python ready marker", || {
         if let Ok(Some(status)) = child.try_wait() {
             let mut stderr = String::new();
             if let Some(mut e) = child.stderr.take() {
@@ -157,12 +159,8 @@ fn spawn_python_workload(
             }
             panic!("python exited before ready: {status:?}\nstderr:\n{stderr}");
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for python ready marker"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+        ready_marker.exists()
+    });
     PythonWorkload { child, pid }
 }
 
@@ -362,23 +360,19 @@ fn test_e2e_validation_suite() {
     // Spawn exit workload to generate EXIT_DEAD/EXIT_ZOMBIE states. Loop until
     // told to stop so the workload is guaranteed to overlap the full record
     // window regardless of BPF attach latency.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let workload_handle = {
-        let stop = stop.clone();
-        thread::spawn(move || {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let mut child = Command::new("bash")
-                    .arg("-c")
-                    .arg("for i in $(seq 1 50); do (exit 0) & done; wait")
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .expect("Failed to spawn workload");
-                child.wait().expect("Failed to wait for workload");
-                thread::sleep(Duration::from_millis(50));
-            }
-        })
-    };
+    let workload = stoppable_workload(move |stop| {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut child = Command::new("bash")
+                .arg("-c")
+                .arg("for i in $(seq 1 50); do (exit 0) & done; wait")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("Failed to spawn workload");
+            child.wait().expect("Failed to wait for workload");
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
 
     // Record a trace with both parquet and perfetto output
     eprintln!(
@@ -393,8 +387,7 @@ fn test_e2e_validation_suite() {
     };
 
     systing(config, None).expect("systing recording failed");
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    workload_handle.join().expect("Workload thread panicked");
+    workload.stop();
     eprintln!("Recording complete.\n");
 
     // --- Check: parquet files exist (test_e2e_parquet_validation, test_e2e_with_perfetto) ---
@@ -937,16 +930,13 @@ fn test_e2e_network_suite() {
     // BPF setup with network probes can take several seconds, so the thread must
     // keep generating connections throughout the entire recording window.
     // We sleep 200ms between rounds to keep traffic volume reasonable.
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    let stop_traffic = Arc::new(AtomicBool::new(false));
-    let stop_flag = stop_traffic.clone();
-    let traffic_thread = thread::spawn(move || {
+    use std::sync::atomic::Ordering;
+    let traffic = stoppable_workload(move |stop| {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind traffic listener");
         let addr = listener.local_addr().unwrap();
 
-        while !stop_flag.load(Ordering::Relaxed) {
+        while !stop.load(Ordering::Relaxed) {
             // Make a single TCP connection per iteration
             if let Ok(_stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
                 let _ = listener.accept();
@@ -960,8 +950,7 @@ fn test_e2e_network_suite() {
         NETWORK_SUITE_DURATION_SECS
     );
     systing(config, None).expect("systing recording failed");
-    stop_traffic.store(true, Ordering::Relaxed);
-    traffic_thread.join().expect("Traffic thread panicked");
+    traffic.stop();
     eprintln!("Recording complete.\n");
 
     // --- Check: basic parquet files exist ---
@@ -1223,29 +1212,24 @@ fn test_network_recording_with_netns() {
     let dest_ip = netns_env.config.ns_ip.to_string();
     let dest_port = netns_env.server_port;
 
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let traffic_handle = {
-        let server_addr = netns_env.server_addr();
-        let stop = stop.clone();
-        thread::spawn(move || {
-            let mut i = 0u64;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let message = format!("Hello from netns test round {i}");
-                if let Ok(mut stream) = std::net::TcpStream::connect(&server_addr) {
-                    let _ = stream.write_all(message.as_bytes());
-                    let _ = stream.shutdown(std::net::Shutdown::Write);
-                    let mut response = Vec::new();
-                    let _ = stream.read_to_end(&mut response);
-                }
-                thread::sleep(Duration::from_millis(200));
-                i += 1;
+    let server_addr = netns_env.server_addr();
+    let traffic = stoppable_workload(move |stop| {
+        let mut i = 0u64;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let message = format!("Hello from netns test round {i}");
+            if let Ok(mut stream) = std::net::TcpStream::connect(&server_addr) {
+                let _ = stream.write_all(message.as_bytes());
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                let mut response = Vec::new();
+                let _ = stream.read_to_end(&mut response);
             }
-        })
-    };
+            thread::sleep(Duration::from_millis(200));
+            i += 1;
+        }
+    });
 
     systing(config, None).expect("systing recording failed");
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    traffic_handle.join().expect("Traffic thread panicked");
+    traffic.stop();
     drop(netns_env);
 
     // === STRICT ASSERTIONS ===
@@ -1595,24 +1579,26 @@ def systing_sleep_leaf_function():
 
 def systing_sleep_middle_function():
     """Middle function that calls the sleep leaf."""
-    for _ in range(20):
+    for _ in range(2):
         systing_sleep_leaf_function()
 
 def systing_cpu_leaf_function():
     """Leaf function that does CPU work - should appear in STACK_RUNNING samples."""
     total = 0
-    for i in range(500000):
+    for i in range(100000):
         total += i * i
     return total
 
 def systing_cpu_middle_function():
     """Middle function that calls the CPU leaf."""
-    result = 0
-    for _ in range(10):
-        result += systing_cpu_leaf_function()
-    return result
+    return systing_cpu_leaf_function()
 "#;
 
+    // The assertions need samples of BOTH phases inside the trace window, so
+    // each loop iteration keeps both phases short: a long CPU phase (CPU work
+    // runs 10-20x slower under emulation) can otherwise swallow the whole
+    // window and leave zero sleep samples, depending on where the window
+    // lands relative to the alternation.
     let workload = spawn_python_workload(
         pyenv_python(PYTHON_313_VERSION),
         dir.path(),
@@ -2988,22 +2974,19 @@ struct MarkerWorkloadConfig {
 
 /// Run a marker-only systing recording while a workload thread emits faccessat2 marker events.
 ///
-/// Spawns a thread that loops: START range → sleep 50 ms → END range → INSTANT → sleep 200 ms.
-/// The thread waits 500 ms first to allow BPF probe attachment.
+/// Spawns a thread that loops: START range → sleep 50 ms → END range → INSTANT → sleep 200 ms,
+/// running until the recording completes so the events span BPF attach.
 ///
 /// Returns the [`TempDir`] holding the output Parquet files. The caller is responsible
 /// for asserting the expected contents.
 fn run_marker_recording(cfg: MarkerWorkloadConfig) -> TempDir {
     use std::ffi::CString;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::Duration;
     use syscalls::Sysno;
 
     let dir = TempDir::new().expect("Failed to create temp dir");
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_clone = stop.clone();
 
     let mode = cfg.mode;
     let range_info = cfg.range_info;
@@ -3012,11 +2995,12 @@ fn run_marker_recording(cfg: MarkerWorkloadConfig) -> TempDir {
     let instant_name = CString::new(cfg.instant_name).unwrap();
     let sysno = Sysno::faccessat2 as i64;
 
-    let workload_handle = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(500));
+    // The loop spans BPF attach (markers emitted before the probes are live
+    // are simply not recorded), so no head-start delay is needed.
+    let workload = stoppable_workload(move |stop| {
         // SAFETY: CString pointers remain valid for the duration of each syscall.
         // faccessat2 reads the pathname argument but does not store the pointer.
-        while !stop_clone.load(Ordering::Relaxed) {
+        while !stop.load(Ordering::Relaxed) {
             unsafe {
                 libc::syscall(sysno, 0i64, range_name.as_ptr(), mode, range_info);
                 // START
@@ -3050,8 +3034,7 @@ fn run_marker_recording(cfg: MarkerWorkloadConfig) -> TempDir {
     };
 
     systing(config, None).expect("systing recording failed");
-    stop.store(true, Ordering::Relaxed);
-    workload_handle.join().expect("Workload thread panicked");
+    workload.stop();
 
     dir
 }
@@ -3395,25 +3378,22 @@ fn parquet_row_count(path: &std::path::Path) -> usize {
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_marker_threshold() {
     use std::ffi::CString;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::{Duration, Instant};
     use syscalls::Sysno;
 
     let dir = TempDir::new().expect("Failed to create temp dir");
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_clone = stop.clone();
 
     let mode = -975i64;
     let instant_name = CString::new("Threshold:ping").unwrap();
     let sysno = Sysno::faccessat2 as i64;
 
     // Workload: emit INSTANT events in a loop with 500ms pauses.
-    // With marker_threshold=3 the third instant triggers shutdown.
-    let workload_handle = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(500)); // Wait for BPF init
-        while !stop_clone.load(Ordering::Relaxed) {
+    // With marker_threshold=3 the third instant after BPF attach triggers
+    // shutdown; the loop spans attach, so no head-start delay is needed.
+    let workload = stoppable_workload(move |stop| {
+        while !stop.load(Ordering::Relaxed) {
             unsafe {
                 libc::syscall(sysno, 2i64, instant_name.as_ptr(), mode, 0i64); // INSTANT
             }
@@ -3440,15 +3420,14 @@ fn test_e2e_marker_threshold() {
 
     systing(config, None).expect("systing recording failed");
     let elapsed = start.elapsed();
-    stop.store(true, Ordering::Relaxed);
-    workload_handle.join().expect("Workload thread panicked");
+    workload.stop();
 
     eprintln!(
         "  marker threshold: recording took {:.1}s",
         elapsed.as_secs_f64()
     );
     assert!(
-        elapsed < Duration::from_secs(30),
+        elapsed < SLOW_MACHINE_BUDGET,
         "Threshold should have triggered well before timeout; took {:.1}s",
         elapsed.as_secs_f64()
     );
@@ -3494,8 +3473,7 @@ fn test_e2e_marker_threshold() {
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_marker_duration_threshold() {
     use std::ffi::CString;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::{Duration, Instant};
     use syscalls::Sysno;
@@ -3504,8 +3482,6 @@ fn test_e2e_marker_duration_threshold() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let dir = TempDir::new().expect("Failed to create temp dir");
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_clone = stop.clone();
 
     let mode = -975i64;
     let range_name = CString::new("DurTest:slow_op").unwrap();
@@ -3513,10 +3489,9 @@ fn test_e2e_marker_duration_threshold() {
 
     // Workload: continuously emit a short range (200ms) then a long range (1000ms).
     // The long range exceeds the 800ms threshold and triggers shutdown.
-    // Loop repeats until stopped, so BPF probes have time to attach.
-    let workload_handle = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(500)); // Wait for BPF init
-        while !stop_clone.load(Ordering::Relaxed) {
+    // The loop repeats until stopped and spans BPF attach.
+    let workload = stoppable_workload(move |stop| {
+        while !stop.load(Ordering::Relaxed) {
             // Short range (below threshold)
             unsafe {
                 libc::syscall(sysno, 0i64, range_name.as_ptr(), mode, 0i64); // START
@@ -3527,7 +3502,7 @@ fn test_e2e_marker_duration_threshold() {
             }
             thread::sleep(Duration::from_millis(50));
 
-            if stop_clone.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) {
                 break;
             }
 
@@ -3562,8 +3537,7 @@ fn test_e2e_marker_duration_threshold() {
 
     systing(config, None).expect("systing recording failed");
     let elapsed = start.elapsed();
-    stop.store(true, Ordering::Relaxed);
-    workload_handle.join().expect("Workload thread panicked");
+    workload.stop();
 
     // The duration threshold should trigger once BPF captures a 1000ms range.
     eprintln!(
@@ -3571,7 +3545,7 @@ fn test_e2e_marker_duration_threshold() {
         elapsed.as_secs_f64()
     );
     assert!(
-        elapsed < Duration::from_secs(30),
+        elapsed < SLOW_MACHINE_BUDGET,
         "Duration threshold should have triggered well before timeout; took {:.1}s",
         elapsed.as_secs_f64()
     );
@@ -3662,19 +3636,15 @@ fn run_events_recording_with(
     workload: EventsWorkload,
     customize: impl FnOnce(&mut Config),
 ) -> TempDir {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::Duration;
 
     let dir = TempDir::new().expect("Failed to create temp dir");
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_clone = stop.clone();
-
-    let workload_handle = thread::spawn(move || match workload {
+    let workload = stoppable_workload(move |stop| match workload {
         EventsWorkload::FileOpen => {
-            while !stop_clone.load(Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed) {
                 let _ = std::fs::File::open("/dev/null");
                 thread::sleep(Duration::from_millis(10));
             }
@@ -3682,7 +3652,7 @@ fn run_events_recording_with(
         EventsWorkload::Signal => {
             let pid = unsafe { libc::getpid() };
             let prev = unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
-            while !stop_clone.load(Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed) {
                 unsafe {
                     libc::kill(pid, libc::SIGUSR1);
                 }
@@ -3709,8 +3679,7 @@ fn run_events_recording_with(
     customize(&mut config);
 
     systing(config, None).expect("systing recording failed");
-    stop.store(true, Ordering::Relaxed);
-    workload_handle.join().expect("Workload thread panicked");
+    workload.stop();
 
     dir
 }
@@ -3961,10 +3930,21 @@ fn test_e2e_event_scope_cpu() {
 #[ignore]
 fn test_network_dns_resolution() {
     use std::net::TcpStream;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::net::ToSocketAddrs;
+    use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::Duration;
+
+    // Skip (rather than fail) when the environment has no DNS/network —
+    // common in CI sandboxes and hermetic test VMs. Everything below needs
+    // a resolvable, reachable google.com.
+    let Ok(mut addrs) = "google.com:80".to_socket_addrs() else {
+        eprintln!("SKIPPED: DNS resolution unavailable (no network access)");
+        return;
+    };
+    let addr = addrs
+        .next()
+        .expect("resolved google.com but got no addresses");
 
     let dir = TempDir::new().expect("Failed to create temp dir");
 
@@ -3980,18 +3960,8 @@ fn test_network_dns_resolution() {
 
     // Spawn traffic thread that connects to google.com:80 repeatedly.
     // This ensures we have at least one socket with a publicly-resolvable IP.
-    // Note: This test requires network access to resolve and connect to google.com.
-    let stop_traffic = Arc::new(AtomicBool::new(false));
-    let stop_flag = stop_traffic.clone();
-    let traffic_thread = thread::spawn(move || {
-        use std::net::ToSocketAddrs;
-        let addr = "google.com:80"
-            .to_socket_addrs()
-            .expect("Failed to resolve google.com")
-            .next()
-            .expect("No addresses for google.com");
-
-        while !stop_flag.load(Ordering::Relaxed) {
+    let traffic = stoppable_workload(move |stop| {
+        while !stop.load(Ordering::Relaxed) {
             // Connect to google.com on HTTP port - we just need the TCP handshake
             // to create a socket with a resolvable IP address.
             if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
@@ -4006,8 +3976,7 @@ fn test_network_dns_resolution() {
         NETWORK_SUITE_DURATION_SECS
     );
     systing(config, None).expect("systing recording failed");
-    stop_traffic.store(true, Ordering::Relaxed);
-    traffic_thread.join().expect("Traffic thread panicked");
+    traffic.stop();
 
     // Validate network_dns.parquet exists
     let dns_parquet = dir.path().join("network_dns.parquet");
@@ -4082,26 +4051,20 @@ fn test_network_dns_resolution() {
 fn test_e2e_only_cpu_stacks_emits_samples() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::thread;
+    use std::sync::atomic::Ordering;
 
     let dir = TempDir::new().expect("Failed to create temp dir");
 
     // CPU-bound workload to give the perf clock something to sample.
-    let stop = Arc::new(AtomicBool::new(false));
-    let workload_handle = {
-        let stop = stop.clone();
-        thread::spawn(move || {
-            let mut acc: u64 = 0;
-            while !stop.load(Ordering::Relaxed) {
-                for i in 0..100_000u64 {
-                    acc = acc.wrapping_add(i.wrapping_mul(i));
-                }
-                std::hint::black_box(acc);
+    let workload = stoppable_workload(|stop| {
+        let mut acc: u64 = 0;
+        while !stop.load(Ordering::Relaxed) {
+            for i in 0..100_000u64 {
+                acc = acc.wrapping_add(i.wrapping_mul(i));
             }
-        })
-    };
+            std::hint::black_box(acc);
+        }
+    });
 
     // Mirror what `--only-recorder cpu-stacks` produces in main.rs:
     // every other recorder is off, including the scheduler.
@@ -4124,8 +4087,7 @@ fn test_e2e_only_cpu_stacks_emits_samples() {
     };
 
     systing(config, None).expect("systing recording failed");
-    stop.store(true, Ordering::Relaxed);
-    workload_handle.join().expect("Workload thread panicked");
+    workload.stop();
 
     let stack_sample_path = dir.path().join("stack_sample.parquet");
     assert!(

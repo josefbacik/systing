@@ -6,6 +6,9 @@
 //!
 //! Run with: ./scripts/run-integration-tests.sh stream_unix
 
+mod common;
+
+use common::workload::SLOW_MACHINE_BUDGET;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -69,7 +72,7 @@ fn test_stream_unix_roundtrip() {
     // sender is done; we only need to wait for the receiver-side io::copy
     // threads to drain. Poll the actual postcondition — every expected file
     // is a complete parquet with rows — rather than guessing a settle time.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + SLOW_MACHINE_BUDGET;
     loop {
         let ready = EXPECTED_TABLES.iter().all(|t| {
             let p = recv_dir.path().join(format!("{t}.parquet"));
