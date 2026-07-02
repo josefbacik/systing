@@ -1425,7 +1425,7 @@ mod tests {
         rec.set_spill_dir(dir.path());
 
         let self_tgid = std::process::id() as i32;
-        let live_addr = marker_fn as usize as u64;
+        let live_addr = marker_fn as fn() -> u64 as usize as u64;
         let live_id = rec.interner.intern(
             Stack {
                 kernel_stack: vec![],
