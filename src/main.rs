@@ -65,6 +65,10 @@ struct Command {
     /// Enable debuginfod for enhanced symbol resolution (requires DEBUGINFOD_URLS environment variable)
     #[arg(long)]
     enable_debuginfod: bool,
+    /// Render frames that fail symbolization as bare hex instead of contextual
+    /// labels like "unknown ([gvisor:runtime]) <0x...>" or "unknown ([jit:node]) <0x...>"
+    #[arg(long)]
+    no_frame_labels: bool,
     /// Disable scheduler event tracing (sched_* tracepoints and scheduler event recorder)
     #[arg(long)]
     no_sched: bool,
@@ -182,6 +186,7 @@ impl From<Command> for Config {
             pystacks_pids: Vec::new(), // CLI doesn't expose this yet, uses discovery
             pystacks_debug: cmd.pystacks_debug,
             enable_debuginfod: cmd.enable_debuginfod,
+            no_frame_labels: cmd.no_frame_labels,
             no_sched: cmd.no_sched,
             syscalls: cmd.syscalls,
             markers: cmd.markers,

@@ -518,6 +518,9 @@ pub struct Config {
     pub pystacks_debug: bool,
     /// Enable debuginfod for symbol resolution
     pub enable_debuginfod: bool,
+    /// Render frames that fail symbolization as bare hex instead of
+    /// contextual labels (`unknown ([gvisor:runtime]) <addr>`, ...)
+    pub no_frame_labels: bool,
     /// Disable scheduler tracing
     pub no_sched: bool,
     /// Enable syscall tracing
@@ -593,6 +596,7 @@ impl Default for Config {
             pystacks_pids: Vec::new(),
             pystacks_debug: false,
             enable_debuginfod: false,
+            no_frame_labels: false,
             no_sched: false,
             syscalls: false,
             markers: false,
@@ -1347,6 +1351,13 @@ fn configure_recorder(opts: &Config, recorder: &Arc<SessionRecorder>) {
     if opts.continuous > 0 {
         let duration_nanos = Duration::from_secs(opts.continuous).as_nanos() as u64;
         set_ringbuf_duration(recorder, duration_nanos);
+    }
+    if opts.no_frame_labels {
+        recorder
+            .stack_recorder
+            .lock()
+            .unwrap()
+            .set_frame_labels(false);
     }
 }
 
