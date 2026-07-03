@@ -10,13 +10,14 @@ use anyhow::{Context, Result};
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
+use crate::sandbox_maps::ProcessMaps;
 use crate::systing_core::types::stack_event;
 use crate::systing_core::SystingRecordEvent;
 use crate::trace::{StackRecord, StackSampleRecord};
 use crate::utid::{ThreadAwareRecorder, UtidGenerator};
 
 use blazesym::helper::{read_elf_build_id, ElfResolver};
-use blazesym::symbolize::source::{Kernel, Process, Source};
+use blazesym::symbolize::source::{Elf, Kernel, Process, Source};
 use blazesym::symbolize::{
     cache, Input, ProcessMemberInfo, ProcessMemberType, Resolve, Sym, Symbolizer,
 };
@@ -519,6 +520,12 @@ pub struct StackRecorder {
     spill_dir: Option<PathBuf>,
     /// Shared utid generator for consistent thread IDs across all recorders.
     utid_generator: Arc<UtidGenerator>,
+    /// When set (default), frames that fail symbolization are rendered with
+    /// the most specific context known — `unknown ([gvisor:runtime]) <addr>`,
+    /// `unknown ([jit:node]) <addr>`, `unknown (<module>) <addr>`,
+    /// `unknown ([exited]) <addr>` — instead of bare hex. See
+    /// [`crate::sandbox_maps`].
+    frame_labels: bool,
 }
 
 impl ThreadAwareRecorder for StackRecorder {
@@ -545,7 +552,13 @@ impl StackRecorder {
             external_interners: Vec::new(),
             spill_dir: None,
             utid_generator,
+            frame_labels: true,
         }
+    }
+
+    /// Disable contextual labels on unresolvable frames (revert to bare hex).
+    pub fn set_frame_labels(&mut self, enabled: bool) {
+        self.frame_labels = enabled;
     }
 
     /// Enable streaming mode and attach a collector so that StackSampleRecords
@@ -768,6 +781,10 @@ impl StackRecorder {
                     (tgid as u32).into(),
                 )));
                 let proc_src = Source::Process(Process::new(Pid::from(tgid as u32)));
+                // One maps analysis per process, powering island bridging and
+                // frame labels for its whole group. `None` (process raced to
+                // exit, unreadable maps) degrades to plain symbolization.
+                let maps_info = ProcessMaps::load(tgid);
                 // Per-process user-address cache, freed with the group. Survives
                 // a mid-group rebuild, so already-resolved addresses are not
                 // re-done.
@@ -780,7 +797,7 @@ impl StackRecorder {
                     let frame_names = self.symbolize_stack_frames(
                         &mut symbolizer,
                         &stack,
-                        Some((&proc_src, &mut user_cache)),
+                        Some((&proc_src, &mut user_cache, maps_info.as_ref())),
                         &kernel_src,
                         &mut kernel_cache,
                     );
@@ -797,17 +814,58 @@ impl StackRecorder {
         Ok(())
     }
 
+    /// Symbolize one user-space address of a live process: regular process
+    /// symbolization, then — for sandboxed processes — bridging of
+    /// pool-memfd islands back to their original file (see
+    /// [`crate::sandbox_maps`]), then the most specific label available.
+    fn symbolize_user_addr(
+        &self,
+        symbolizer: &mut Symbolizer,
+        proc_src: &Source<'_>,
+        maps_info: Option<&ProcessMaps>,
+        addr: u64,
+    ) -> String {
+        if let Some(sym) = symbolizer
+            .symbolize_single(proc_src, Input::AbsAddr(addr))
+            .ok()
+            .and_then(|s| s.into_sym())
+        {
+            return format_symbolized_frame(&sym, addr, "unknown");
+        }
+
+        if let Some(bridge) = maps_info.and_then(|m| m.bridge_for(addr)) {
+            let elf_src = Source::Elf(Elf::new(&bridge.map_files_path));
+            if let Some(sym) = symbolizer
+                .symbolize_single(&elf_src, Input::FileOffset(bridge.file_offset))
+                .ok()
+                .and_then(|s| s.into_sym())
+            {
+                // sym.module would render the map_files link; report the
+                // original binary the island belongs to instead.
+                return format_symbolized_frame_forced_module(&sym, addr, &bridge.module_name);
+            }
+        }
+
+        if self.frame_labels {
+            crate::sandbox_maps::format_unresolved(addr, maps_info)
+        } else {
+            format!("0x{addr:x}")
+        }
+    }
+
     /// Symbolize a single stack and return frame names.
     ///
-    /// `user` carries the process source and per-process address cache for a
-    /// live process; `None` means the process has exited, in which case user
-    /// addresses are rendered as raw hex (symbolization cannot succeed without
-    /// /proc/<pid>/maps). Kernel addresses go through the shared `kernel_cache`.
+    /// `user` carries the process source, per-process address cache, and
+    /// optional maps analysis for a live process; `None` means the process
+    /// has exited, in which case user addresses cannot be symbolized (no
+    /// /proc/<pid>/maps) and are rendered as `unknown ([exited]) <addr>` (or
+    /// raw hex with labels disabled). Kernel addresses go through the shared
+    /// `kernel_cache`.
     fn symbolize_stack_frames(
         &self,
         symbolizer: &mut Symbolizer,
         stack: &Stack,
-        user: Option<(&Source<'_>, &mut HashMap<u64, String>)>,
+        user: Option<(&Source<'_>, &mut HashMap<u64, String>, Option<&ProcessMaps>)>,
         kernel_src: &Source<'_>,
         kernel_cache: &mut HashMap<u64, String>,
     ) -> Vec<String> {
@@ -821,25 +879,27 @@ impl StackRecorder {
 
         // Symbolize user addresses (leaf)
         match user {
-            Some((proc_src, user_cache)) => {
+            Some((proc_src, user_cache, maps_info)) => {
                 for &addr in &stack.user_stack {
-                    let frame_name = user_cache
-                        .entry(addr)
-                        .or_insert_with(|| {
-                            symbolizer
-                                .symbolize_single(proc_src, Input::AbsAddr(addr))
-                                .ok()
-                                .and_then(|s| s.into_sym())
-                                .map(|s| format_symbolized_frame(&s, addr, "unknown"))
-                                .unwrap_or_else(|| format!("0x{addr:x}"))
-                        })
-                        .clone();
+                    let frame_name = match user_cache.get(&addr) {
+                        Some(name) => name.clone(),
+                        None => {
+                            let name =
+                                self.symbolize_user_addr(symbolizer, proc_src, maps_info, addr);
+                            user_cache.insert(addr, name.clone());
+                            name
+                        }
+                    };
                     frame_names.push(frame_name);
                 }
             }
             None => {
                 for &addr in &stack.user_stack {
-                    frame_names.push(format!("0x{addr:x}"));
+                    if self.frame_labels {
+                        frame_names.push(format!("unknown ([exited]) <{addr:#x}>"));
+                    } else {
+                        frame_names.push(format!("0x{addr:x}"));
+                    }
                 }
             }
         }
@@ -894,6 +954,14 @@ fn format_symbolized_frame(sym: &Sym, addr: u64, default_module: &str) -> String
         .and_then(|m| std::path::Path::new(m).file_name())
         .and_then(|f| f.to_str())
         .unwrap_or(default_module);
+    format_symbolized_frame_forced_module(sym, addr, module_name)
+}
+
+/// Same as [`format_symbolized_frame`] but with a caller-supplied module
+/// name. Used when symbolization went through an indirect source (e.g. a
+/// `map_files` link for a bridged island) whose path would be meaningless to
+/// report.
+fn format_symbolized_frame_forced_module(sym: &Sym, addr: u64, module_name: &str) -> String {
     let location_info = format_location_info(sym.code_info.as_deref());
     format!(
         "{} ({}{}) <{:#x}>",
@@ -1336,5 +1404,87 @@ mod tests {
         assert_eq!(convert_stack_event_type(127), 127);
         assert_eq!(convert_stack_event_type(128), i8::MAX);
         assert_eq!(convert_stack_event_type(u32::MAX), i8::MAX);
+    }
+
+    /// An address inside this test binary's text, guaranteed to be backed by
+    /// a symbolizable mapping of our own executable.
+    #[inline(never)]
+    fn marker_fn() -> u64 {
+        42
+    }
+
+    /// End-to-end run of the finish()-time symbolization over the real
+    /// /proc: a stack from our own live process must not degrade to hex
+    /// (either the symbol resolves or the module label kicks in), and a
+    /// stack from an impossible tgid must take the dead-process path and be
+    /// labeled [exited].
+    #[test]
+    fn test_finish_inner_symbolizes_live_and_labels_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
+        rec.set_spill_dir(dir.path());
+
+        let self_tgid = std::process::id() as i32;
+        let live_addr = marker_fn as fn() -> u64 as usize as u64;
+        let live_id = rec.interner.intern(
+            Stack {
+                kernel_stack: vec![],
+                user_stack: vec![live_addr],
+                py_stack: vec![],
+            },
+            self_tgid,
+        );
+
+        // Far above pid_max: /proc/<tgid> cannot exist.
+        let dead_tgid = i32::MAX - 1;
+        let dead_addr = 0x1234_5678u64;
+        let dead_id = rec.interner.intern(
+            Stack {
+                kernel_stack: vec![],
+                user_stack: vec![dead_addr],
+                py_stack: vec![],
+            },
+            dead_tgid,
+        );
+
+        let mut collector = crate::record::InMemoryCollector::new();
+        rec.finish_inner(&mut collector).unwrap();
+        let stacks = &collector.data().stacks;
+
+        let dead = stacks.iter().find(|s| s.id == dead_id).expect("dead stack");
+        assert_eq!(
+            dead.frame_names[0],
+            format!("unknown ([exited]) <{dead_addr:#x}>")
+        );
+
+        let live = stacks.iter().find(|s| s.id == live_id).expect("live stack");
+        let frame = &live.frame_names[0];
+        assert!(
+            !frame.starts_with("0x") && frame.contains('('),
+            "live self-process frame should symbolize or at least carry a \
+             module label, got: {frame}"
+        );
+
+        // With labels disabled the dead path reverts to historical bare hex.
+        let mut rec_plain = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
+        rec_plain.set_frame_labels(false);
+        rec_plain.set_spill_dir(dir.path());
+        let plain_id = rec_plain.interner.intern(
+            Stack {
+                kernel_stack: vec![],
+                user_stack: vec![dead_addr],
+                py_stack: vec![],
+            },
+            dead_tgid,
+        );
+        let mut plain_collector = crate::record::InMemoryCollector::new();
+        rec_plain.finish_inner(&mut plain_collector).unwrap();
+        let plain = plain_collector
+            .data()
+            .stacks
+            .iter()
+            .find(|s| s.id == plain_id)
+            .expect("plain stack");
+        assert_eq!(plain.frame_names[0], format!("0x{dead_addr:x}"));
     }
 }

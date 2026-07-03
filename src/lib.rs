@@ -50,6 +50,7 @@ pub mod perfetto;
 pub mod pystacks;
 pub mod record;
 pub mod ringbuf;
+pub mod sandbox_maps;
 pub mod sched;
 pub mod session_recorder;
 pub mod stack_recorder;
