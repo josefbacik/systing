@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+use crate::gvisor_guest::{GuestAddr, GuestProcess, SandboxIndex};
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
@@ -483,6 +484,15 @@ fn read_spill_record(reader: &mut BufReader<File>) -> Result<Option<(Stack, i32,
     )))
 }
 
+/// Everything known about one live process while symbolizing its user
+/// frames: the blazesym process source, the host-side maps analysis, and —
+/// for sandbox stubs — the guest process they mirror.
+struct UserSymbolizeCtx<'a> {
+    proc_src: &'a Source<'a>,
+    maps: Option<&'a ProcessMaps>,
+    guest: Option<&'a GuestProcess>,
+}
+
 /// Convert BPF stack_event_type (u32) to i8, clamping to valid range.
 /// Valid values are 0 (STACK_SLEEP_UNINTERRUPTIBLE), 1 (STACK_RUNNING), 2 (STACK_SLEEP_INTERRUPTIBLE).
 /// Unknown values are preserved but clamped to i8::MAX to avoid truncation issues.
@@ -526,6 +536,11 @@ pub struct StackRecorder {
     /// `unknown ([exited]) <addr>` — instead of bare hex. See
     /// [`crate::sandbox_maps`].
     frame_labels: bool,
+    /// When set (default), gVisor sandboxes on the host are queried over
+    /// their control sockets so guest processes' own maps refine the
+    /// classification of otherwise-unresolvable frames. See
+    /// [`crate::gvisor_guest`].
+    gvisor_guest_maps: bool,
 }
 
 impl ThreadAwareRecorder for StackRecorder {
@@ -553,12 +568,18 @@ impl StackRecorder {
             spill_dir: None,
             utid_generator,
             frame_labels: true,
+            gvisor_guest_maps: true,
         }
     }
 
     /// Disable contextual labels on unresolvable frames (revert to bare hex).
     pub fn set_frame_labels(&mut self, enabled: bool) {
         self.frame_labels = enabled;
+    }
+
+    /// Disable querying gVisor control sockets for guest maps.
+    pub fn set_gvisor_guest_maps(&mut self, enabled: bool) {
+        self.gvisor_guest_maps = enabled;
     }
 
     /// Enable streaming mode and attach a collector so that StackSampleRecords
@@ -759,6 +780,10 @@ impl StackRecorder {
             );
         };
 
+        // Guest-side sandbox snapshot, taken lazily on the first gVisor
+        // process encountered and shared by every group after it.
+        let mut sandbox_index: Option<SandboxIndex> = None;
+
         for mut bucket in respill {
             // Load this bucket's records and group by tgid so each process's
             // user addresses go through one Process source and one cache.
@@ -785,6 +810,25 @@ impl StackRecorder {
                 // frame labels for its whole group. `None` (process raced to
                 // exit, unreadable maps) degrades to plain symbolization.
                 let maps_info = ProcessMaps::load(tgid);
+                // For sandbox processes, the guest process this stub mirrors
+                // (if any). The sandbox snapshot is taken once, on first
+                // contact with a gVisor process.
+                let mut guest: Option<&GuestProcess> = None;
+                if self.gvisor_guest_maps {
+                    if let Some(m) = maps_info.as_ref().filter(|m| m.is_gvisor()) {
+                        if sandbox_index.is_none() {
+                            sandbox_index = Some(SandboxIndex::load());
+                        }
+                        guest = sandbox_index
+                            .as_ref()
+                            .and_then(|idx| idx.correlate(&m.exec_file_ranges()));
+                    }
+                }
+                let ctx = UserSymbolizeCtx {
+                    proc_src: &proc_src,
+                    maps: maps_info.as_ref(),
+                    guest,
+                };
                 // Per-process user-address cache, freed with the group. Survives
                 // a mid-group rebuild, so already-resolved addresses are not
                 // re-done.
@@ -797,7 +841,7 @@ impl StackRecorder {
                     let frame_names = self.symbolize_stack_frames(
                         &mut symbolizer,
                         &stack,
-                        Some((&proc_src, &mut user_cache, maps_info.as_ref())),
+                        Some((&ctx, &mut user_cache)),
                         &kernel_src,
                         &mut kernel_cache,
                     );
@@ -817,23 +861,24 @@ impl StackRecorder {
     /// Symbolize one user-space address of a live process: regular process
     /// symbolization, then — for sandboxed processes — bridging of
     /// pool-memfd islands back to their original file (see
-    /// [`crate::sandbox_maps`]), then the most specific label available.
+    /// [`crate::sandbox_maps`]), then the guest's own view of the address
+    /// (see [`crate::gvisor_guest`]), then the most specific label
+    /// available from the host side.
     fn symbolize_user_addr(
         &self,
         symbolizer: &mut Symbolizer,
-        proc_src: &Source<'_>,
-        maps_info: Option<&ProcessMaps>,
+        ctx: &UserSymbolizeCtx<'_>,
         addr: u64,
     ) -> String {
         if let Some(sym) = symbolizer
-            .symbolize_single(proc_src, Input::AbsAddr(addr))
+            .symbolize_single(ctx.proc_src, Input::AbsAddr(addr))
             .ok()
             .and_then(|s| s.into_sym())
         {
             return format_symbolized_frame(&sym, addr, "unknown");
         }
 
-        if let Some(bridge) = maps_info.and_then(|m| m.bridge_for(addr)) {
+        if let Some(bridge) = ctx.maps.and_then(|m| m.bridge_for(addr)) {
             let elf_src = Source::Elf(Elf::new(&bridge.map_files_path));
             if let Some(sym) = symbolizer
                 .symbolize_single(&elf_src, Input::FileOffset(bridge.file_offset))
@@ -846,26 +891,44 @@ impl StackRecorder {
             }
         }
 
-        if self.frame_labels {
-            crate::sandbox_maps::format_unresolved(addr, maps_info)
-        } else {
-            format!("0x{addr:x}")
+        if !self.frame_labels {
+            return format!("0x{addr:x}");
         }
+
+        // The guest's own maps are authoritative where the host view is a
+        // pool memfd: they name the file a pool-backed range belongs to and
+        // bound the runtime-injected regions exactly.
+        if let Some(guest) = ctx.guest {
+            match guest.lookup(addr) {
+                GuestAddr::File { module, .. } => {
+                    return format!("unknown ({module}) <{addr:#x}>");
+                }
+                GuestAddr::Runtime => {
+                    return format!("unknown ([gvisor:runtime]) <{addr:#x}>");
+                }
+                GuestAddr::Anon => {
+                    return format!("unknown ([gvisor:guest]) <{addr:#x}>");
+                }
+                GuestAddr::Unmapped => {}
+            }
+        }
+
+        crate::sandbox_maps::format_unresolved(addr, ctx.maps)
     }
 
     /// Symbolize a single stack and return frame names.
     ///
-    /// `user` carries the process source, per-process address cache, and
-    /// optional maps analysis for a live process; `None` means the process
-    /// has exited, in which case user addresses cannot be symbolized (no
-    /// /proc/<pid>/maps) and are rendered as `unknown ([exited]) <addr>` (or
-    /// raw hex with labels disabled). Kernel addresses go through the shared
+    /// `user` carries the symbolization context and per-process address
+    /// cache for a live process; `None` means the process has exited, in
+    /// which case user addresses cannot be symbolized (no /proc/<pid>/maps)
+    /// and are rendered as `unknown ([exited]) <addr>` (or raw hex with
+    /// labels disabled). Kernel addresses go through the shared
     /// `kernel_cache`.
     fn symbolize_stack_frames(
         &self,
         symbolizer: &mut Symbolizer,
         stack: &Stack,
-        user: Option<(&Source<'_>, &mut HashMap<u64, String>, Option<&ProcessMaps>)>,
+        user: Option<(&UserSymbolizeCtx<'_>, &mut HashMap<u64, String>)>,
         kernel_src: &Source<'_>,
         kernel_cache: &mut HashMap<u64, String>,
     ) -> Vec<String> {
@@ -879,13 +942,12 @@ impl StackRecorder {
 
         // Symbolize user addresses (leaf)
         match user {
-            Some((proc_src, user_cache, maps_info)) => {
+            Some((ctx, user_cache)) => {
                 for &addr in &stack.user_stack {
                     let frame_name = match user_cache.get(&addr) {
                         Some(name) => name.clone(),
                         None => {
-                            let name =
-                                self.symbolize_user_addr(symbolizer, proc_src, maps_info, addr);
+                            let name = self.symbolize_user_addr(symbolizer, ctx, addr);
                             user_cache.insert(addr, name.clone());
                             name
                         }

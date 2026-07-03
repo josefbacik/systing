@@ -311,6 +311,34 @@ fn test_gvisor_record() {
         runsc_tids.len()
     );
 
+    // Guest-side truth over the control socket: point discovery at our
+    // private state root (also picked up by the recording below), dump the
+    // live sandbox, and correlate a real stub's address space to the guest
+    // shell — end to end against the running runsc.
+    std::env::set_var("SYSTING_RUNSC_ROOTS", state_root.path());
+    let sandbox_index = systing::gvisor_guest::SandboxIndex::load();
+    assert!(
+        !sandbox_index.is_empty(),
+        "[gvisor guest maps] control socket in {} not reachable",
+        state_root.path().display()
+    );
+    let correlated = runsc_tids.iter().find_map(|tid| {
+        let maps = systing::sandbox_maps::ProcessMaps::load(*tid)?;
+        if !maps.is_gvisor() {
+            return None;
+        }
+        let ranges = maps.exec_file_ranges();
+        sandbox_index
+            .correlate(&ranges)
+            .map(|g| g.comm().to_string())
+    });
+    eprintln!("stub correlation result: {correlated:?}");
+    assert_eq!(
+        correlated.as_deref(),
+        Some("sh"),
+        "[gvisor guest maps] no stub correlated to the guest shell"
+    );
+
     eprintln!("Recording trace ({GVISOR_RECORDING_DURATION_SECS}s, sandboxed exec loop)...");
     let config = Config {
         duration: GVISOR_RECORDING_DURATION_SECS,

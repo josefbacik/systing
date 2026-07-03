@@ -69,6 +69,10 @@ struct Command {
     /// labels like "unknown ([gvisor:runtime]) <0x...>" or "unknown ([jit:node]) <0x...>"
     #[arg(long)]
     no_frame_labels: bool,
+    /// Do not query gVisor sandboxes' control sockets for guest maps during
+    /// symbolization
+    #[arg(long)]
+    no_gvisor_guest_maps: bool,
     /// Disable scheduler event tracing (sched_* tracepoints and scheduler event recorder)
     #[arg(long)]
     no_sched: bool,
@@ -187,6 +191,7 @@ impl From<Command> for Config {
             pystacks_debug: cmd.pystacks_debug,
             enable_debuginfod: cmd.enable_debuginfod,
             no_frame_labels: cmd.no_frame_labels,
+            no_gvisor_guest_maps: cmd.no_gvisor_guest_maps,
             no_sched: cmd.no_sched,
             syscalls: cmd.syscalls,
             markers: cmd.markers,

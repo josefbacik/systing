@@ -521,6 +521,8 @@ pub struct Config {
     /// Render frames that fail symbolization as bare hex instead of
     /// contextual labels (`unknown ([gvisor:runtime]) <addr>`, ...)
     pub no_frame_labels: bool,
+    /// Do not query gVisor sandboxes' control sockets for guest maps
+    pub no_gvisor_guest_maps: bool,
     /// Disable scheduler tracing
     pub no_sched: bool,
     /// Enable syscall tracing
@@ -597,6 +599,7 @@ impl Default for Config {
             pystacks_debug: false,
             enable_debuginfod: false,
             no_frame_labels: false,
+            no_gvisor_guest_maps: false,
             no_sched: false,
             syscalls: false,
             markers: false,
@@ -1358,6 +1361,13 @@ fn configure_recorder(opts: &Config, recorder: &Arc<SessionRecorder>) {
             .lock()
             .unwrap()
             .set_frame_labels(false);
+    }
+    if opts.no_gvisor_guest_maps {
+        recorder
+            .stack_recorder
+            .lock()
+            .unwrap()
+            .set_gvisor_guest_maps(false);
     }
 }
 
