@@ -154,7 +154,6 @@ pub struct RecorderInfo {
 // These are the program names as they appear in the BPF skeleton.
 
 const SCHED_BPF_PROGRAMS: &[&str] = &[
-    "systing_sched_wakeup",
     "systing_sched_wakeup_new",
     "systing_sched_switch",
     "systing_sched_waking",
@@ -2004,7 +2003,6 @@ fn warn_failed_probe_attachments(skel: &SystingSystemSkel) {
         // are skipped since they're attached manually
         let link_is_none = match name.as_ref() {
             // Scheduler probes
-            "systing_sched_wakeup" => skel.links.systing_sched_wakeup.is_none(),
             "systing_sched_wakeup_new" => skel.links.systing_sched_wakeup_new.is_none(),
             "systing_sched_switch" => skel.links.systing_sched_switch.is_none(),
             "systing_sched_waking" => skel.links.systing_sched_waking.is_none(),

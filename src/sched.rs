@@ -272,7 +272,9 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                 }
             }
 
-            // Skip SCHED_WAKEUP (redundant with SCHED_WAKING)
+            // SCHED_WAKEUP is no longer emitted (redundant with SCHED_WAKING;
+            // the sched_wakeup program isn't attached). The arm stays so a
+            // stray event is ignored rather than hitting the catch-all.
             event_type::SCHED_WAKEUP => {}
 
             _ => {}

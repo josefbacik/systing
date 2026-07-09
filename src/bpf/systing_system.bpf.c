@@ -1702,21 +1702,6 @@ static int handle_wakeup(struct task_struct *waker, struct task_struct *wakee,
 	return 0;
 }
 
-static int handle_sched_wakeup(struct task_struct *task, int success)
-{
-	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
-
-	if (!trace_task(cur) && !trace_task(task))
-		return 0;
-	return handle_wakeup(cur, task, SCHED_WAKEUP);
-}
-
-SEC("tp_btf/sched_wakeup")
-int BPF_PROG(systing_sched_wakeup, struct task_struct *task, int success)
-{
-	return handle_sched_wakeup(task, success);
-}
-
 static int handle_sched_wakeup_new(struct task_struct *task)
 {
 	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
