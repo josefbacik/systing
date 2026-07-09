@@ -49,6 +49,7 @@ pub mod parquet_to_perfetto;
 pub mod perf;
 pub mod perf_recorder;
 pub mod perfetto;
+pub mod profile_export;
 pub mod pystacks;
 pub mod record;
 pub mod ringbuf;
