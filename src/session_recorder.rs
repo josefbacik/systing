@@ -145,6 +145,7 @@ pub struct SessionRecorder {
     pub stack_recorder: Mutex<StackRecorder>,
     pub perf_counter_recorder: Mutex<PerfCounterRecorder>,
     pub sysinfo_recorder: Mutex<SysinfoRecorder>,
+    pub missed_events_recorder: Mutex<MissedEventsRecorder>,
     pub probe_recorder: Mutex<SystingProbeRecorder>,
     pub network_recorder: Mutex<NetworkRecorder>,
     pub memory_recorder: Mutex<MemoryRecorder>,
@@ -631,6 +632,149 @@ impl SysinfoRecorder {
     }
 }
 
+/// Labels for the BPF `missed_events` map classes, index-matched to the
+/// MISSED_*_EVENT defines in systing_system.bpf.c. Wording matches the exit
+/// summary lines so the in-trace tracks and the final printout name the same
+/// things.
+pub const MISSED_EVENT_CLASS_LABELS: &[(u32, &str)] = &[
+    (0, "sched/IRQ"),
+    (1, "stack"),
+    (2, "probe"),
+    (3, "cache"),
+    (4, "network"),
+    (5, "packet"),
+    (6, "poll"),
+    (7, "marker"),
+    (8, "memory"),
+];
+
+/// One sample of one missed-event class: the cumulative (per-CPU-summed)
+/// counter for `class` as read from the BPF `missed_events` map at `ts`.
+#[derive(Default, Clone, Copy)]
+pub struct MissedEvent {
+    pub ts: u64,
+    pub class: u32,
+    pub count: u64,
+}
+
+/// Records per-class missed-event counts as counter tracks, so event loss is
+/// visible and time-localized in the trace instead of only in the exit
+/// summary. Same streaming shape as `SysinfoRecorder`: one counter track per
+/// class, created lazily on the first sample; values are the map's cumulative
+/// totals, so a loss burst shows up as a step at the second it happened.
+pub struct MissedEventsRecorder {
+    pub ringbuf: RingBuffer<MissedEvent>,
+    streaming_collector: Option<Box<dyn RecordCollector + Send>>,
+    track_ids: HashMap<u32, i64>,
+    /// Shared with every other recorder that emits counter tracks so track
+    /// IDs stay unique across them.
+    counter_track_ids: Arc<CounterTrackIdGenerator>,
+    utid_generator: Arc<UtidGenerator>,
+}
+
+impl ThreadAwareRecorder for MissedEventsRecorder {
+    fn utid_generator(&self) -> &UtidGenerator {
+        &self.utid_generator
+    }
+}
+
+impl MissedEventsRecorder {
+    pub fn new(
+        utid_generator: Arc<UtidGenerator>,
+        counter_track_ids: Arc<CounterTrackIdGenerator>,
+    ) -> Self {
+        Self {
+            ringbuf: RingBuffer::default(),
+            streaming_collector: None,
+            track_ids: HashMap::new(),
+            counter_track_ids,
+            utid_generator,
+        }
+    }
+
+    fn class_label(class: u32) -> &'static str {
+        MISSED_EVENT_CLASS_LABELS
+            .iter()
+            .find(|(idx, _)| *idx == class)
+            .map(|(_, label)| *label)
+            .unwrap_or("unknown")
+    }
+
+    /// Note: this recorder writes counter / counter_track rows, the same
+    /// tables the perf-counter and sysinfo recorders write to, so the
+    /// collector passed here must share its underlying writer with those
+    /// recorders (see `SharedCollector`).
+    pub fn set_streaming_collector(&mut self, collector: Box<dyn RecordCollector + Send>) {
+        self.streaming_collector = Some(collector);
+    }
+
+    /// Finish streaming and return the collector for finalization.
+    pub fn finish(&mut self) -> Result<Option<Box<dyn RecordCollector + Send>>> {
+        if let Some(mut collector) = self.streaming_collector.take() {
+            collector.flush()?;
+            self.track_ids.clear();
+            Ok(Some(collector))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl SystingRecordEvent<MissedEvent> for MissedEventsRecorder {
+    fn ringbuf(&self) -> &RingBuffer<MissedEvent> {
+        &self.ringbuf
+    }
+    fn ringbuf_mut(&mut self) -> &mut RingBuffer<MissedEvent> {
+        &mut self.ringbuf
+    }
+    fn handle_event(&mut self, event: MissedEvent) {
+        debug_assert!(
+            self.streaming_collector.is_some(),
+            "streaming collector must be set before handling events"
+        );
+
+        let Some(ref mut collector) = self.streaming_collector else {
+            return;
+        };
+
+        let class = event.class;
+        let track_id = if let Some(&id) = self.track_ids.get(&class) {
+            id
+        } else {
+            // First sample for this class - create the track
+            let track_id = self.counter_track_ids.next_id();
+
+            // "count" is the validated counter-unit vocabulary's term for
+            // event counts (see VALID_COUNTER_UNITS) and maps to perfetto's
+            // UNIT_COUNT; the track name already says what is being counted.
+            if let Err(e) = collector.add_counter_track(CounterTrackRecord {
+                id: track_id,
+                name: format!("Missed {} events", Self::class_label(class)),
+                unit: Some("count".to_string()),
+            }) {
+                eprintln!("Warning: Failed to create missed-events track: {e}");
+            }
+
+            self.track_ids.insert(class, track_id);
+            track_id
+        };
+
+        if let Err(e) = collector.add_counter(CounterRecord {
+            ts: event.ts as i64,
+            track_id,
+            value: event.count as f64,
+        }) {
+            eprintln!("Warning: Failed to stream missed-events record: {e}");
+        }
+    }
+}
+
+impl crate::systing_core::SystingEvent for MissedEvent {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+}
+
 impl SessionRecorder {
     pub fn new(
         enable_debuginfod: bool,
@@ -662,6 +806,10 @@ impl SessionRecorder {
                 Arc::clone(&counter_track_ids),
             )),
             sysinfo_recorder: Mutex::new(SysinfoRecorder::new(
+                Arc::clone(&utid_generator),
+                Arc::clone(&counter_track_ids),
+            )),
+            missed_events_recorder: Mutex::new(MissedEventsRecorder::new(
                 Arc::clone(&utid_generator),
                 Arc::clone(&counter_track_ids),
             )),
@@ -883,6 +1031,7 @@ impl SessionRecorder {
         self.stack_recorder.lock().unwrap().drain_ringbuf();
         self.perf_counter_recorder.lock().unwrap().drain_ringbuf();
         self.sysinfo_recorder.lock().unwrap().drain_ringbuf();
+        self.missed_events_recorder.lock().unwrap().drain_ringbuf();
         self.probe_recorder.lock().unwrap().drain_ringbuf();
         self.network_recorder.lock().unwrap().drain_ringbuf();
         self.marker_recorder.lock().unwrap().drain_ringbuf();
@@ -1077,18 +1226,23 @@ impl SessionRecorder {
             .unwrap()
             .set_streaming_collector(Box::new(make_writer()));
 
-        // The perf-counter and sysinfo (CPU frequency) recorders both emit
-        // counter / counter_track rows, which map to the same counter.parquet /
-        // counter_track.parquet files. They must share a single writer: with
-        // separate writers both would create the same files and the last one to
-        // finish would clobber the other's data. Track IDs come from the shared
-        // CounterTrackIdGenerator so they never collide either.
+        // The perf-counter, sysinfo (CPU frequency), and missed-events
+        // recorders all emit counter / counter_track rows, which map to the
+        // same counter.parquet / counter_track.parquet files. They must share
+        // a single writer: with separate writers each would create the same
+        // files and the last one to finish would clobber the others' data.
+        // Track IDs come from the shared CounterTrackIdGenerator so they
+        // never collide either.
         let counter_writer = SharedCollector::new(Box::new(make_writer()));
         self.perf_counter_recorder
             .lock()
             .unwrap()
             .set_streaming_collector(Box::new(counter_writer.clone()));
         self.sysinfo_recorder
+            .lock()
+            .unwrap()
+            .set_streaming_collector(Box::new(counter_writer.clone()));
+        self.missed_events_recorder
             .lock()
             .unwrap()
             .set_streaming_collector(Box::new(counter_writer));
@@ -1325,6 +1479,12 @@ impl SessionRecorder {
             sysinfo_collector.finish_boxed()?;
         }
         stage_done("Flushed sysinfo records", &mut stage_start);
+
+        eprintln!("Flushing missed-event records from streaming...");
+        if let Some(missed_collector) = self.missed_events_recorder.lock().unwrap().finish()? {
+            missed_collector.finish_boxed()?;
+        }
+        stage_done("Flushed missed-event records", &mut stage_start);
 
         // The probe recorder (trace-events/syscalls) and the marker recorder both
         // emit track/slice/instant/args rows, which map to the same parquet files.
@@ -1601,6 +1761,10 @@ mod tests {
                 Arc::clone(&counter_track_ids),
             )),
             sysinfo_recorder: Mutex::new(SysinfoRecorder::new(
+                Arc::clone(&utid_generator),
+                Arc::clone(&counter_track_ids),
+            )),
+            missed_events_recorder: Mutex::new(MissedEventsRecorder::new(
                 Arc::clone(&utid_generator),
                 Arc::clone(&counter_track_ids),
             )),
@@ -2225,5 +2389,197 @@ mod tests {
             ts > 0,
             "Should return current BOOTTIME when no events recorded"
         );
+    }
+
+    // =========================================================================
+    // MissedEventsRecorder
+    // =========================================================================
+
+    /// Streams two classes of missed-event samples through a real parquet
+    /// writer and reads them back: one track per class with exit-summary
+    /// naming, samples in order with cumulative values intact.
+    #[test]
+    fn test_missed_events_recorder_streams_counter_tracks() {
+        use crate::parquet::StreamingParquetWriter;
+        use crate::systing_core::SystingRecordEvent;
+        use arrow::array::{Float64Array, Int64Array, StringArray};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let mut rec = MissedEventsRecorder::new(
+            Arc::new(UtidGenerator::new()),
+            Arc::new(CounterTrackIdGenerator::new()),
+        );
+        rec.set_streaming_collector(Box::new(StreamingParquetWriter::new(dir.path()).unwrap()));
+
+        // Non-continuous mode streams straight through handle_event. Two
+        // classes, two samples each; class 0 steps 0 -> 7 at the second
+        // sample (a loss burst must appear as a step, not a fresh track).
+        rec.record_event(MissedEvent {
+            ts: 1_000,
+            class: 0,
+            count: 0,
+        });
+        rec.record_event(MissedEvent {
+            ts: 1_000,
+            class: 1,
+            count: 0,
+        });
+        rec.record_event(MissedEvent {
+            ts: 2_000,
+            class: 0,
+            count: 7,
+        });
+        rec.record_event(MissedEvent {
+            ts: 2_000,
+            class: 1,
+            count: 0,
+        });
+
+        let collector = rec.finish().unwrap().expect("collector was set");
+        collector.finish_boxed().unwrap();
+
+        // counter_track.parquet: exactly one track per class, named like the
+        // exit summary lines.
+        let file = File::open(dir.path().join("counter_track.parquet")).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut tracks = Vec::new(); // (id, name)
+        for batch in reader.collect::<Result<Vec<_>, _>>().unwrap() {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let units = batch
+                .column_by_name("unit")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                assert_eq!(
+                    units.value(i),
+                    "count",
+                    "unit must stay in the validated counter-unit vocabulary"
+                );
+                tracks.push((ids.value(i), names.value(i).to_string()));
+            }
+        }
+        let mut names: Vec<_> = tracks.iter().map(|(_, n)| n.clone()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "Missed sched/IRQ events".to_string(),
+                "Missed stack events".to_string()
+            ],
+            "one track per class, exit-summary naming, no duplicates"
+        );
+        let sched_track_id = tracks
+            .iter()
+            .find(|(_, n)| n == "Missed sched/IRQ events")
+            .unwrap()
+            .0;
+
+        // counter.parquet: the sched track carries [0, 7] in ts order.
+        let file = File::open(dir.path().join("counter.parquet")).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut sched_samples = Vec::new(); // (ts, value)
+        let mut total_samples = 0;
+        for batch in reader.collect::<Result<Vec<_>, _>>().unwrap() {
+            let ts = batch
+                .column_by_name("ts")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let track_ids = batch
+                .column_by_name("track_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let values = batch
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                total_samples += 1;
+                if track_ids.value(i) == sched_track_id {
+                    sched_samples.push((ts.value(i), values.value(i)));
+                }
+            }
+        }
+        assert_eq!(total_samples, 4, "all four samples survive");
+        sched_samples.sort_by_key(|(ts, _)| *ts);
+        assert_eq!(
+            sched_samples,
+            vec![(1_000, 0.0), (2_000, 7.0)],
+            "cumulative values ride the same track in ts order"
+        );
+    }
+
+    /// In continuous mode samples buffer in the ring and only reach the
+    /// collector on drain, so the flight-recorder window rotation applies to
+    /// loss counters like any other event.
+    #[test]
+    fn test_missed_events_recorder_continuous_drains_through_ringbuf() {
+        use crate::parquet::StreamingParquetWriter;
+        use crate::systing_core::SystingRecordEvent;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let mut rec = MissedEventsRecorder::new(
+            Arc::new(UtidGenerator::new()),
+            Arc::new(CounterTrackIdGenerator::new()),
+        );
+        rec.set_streaming_collector(Box::new(StreamingParquetWriter::new(dir.path()).unwrap()));
+        rec.ringbuf.set_max_duration(1_000_000_000);
+
+        rec.record_event(MissedEvent {
+            ts: 1_000,
+            class: 0,
+            count: 3,
+        });
+        assert_eq!(
+            rec.track_ids.len(),
+            0,
+            "continuous-mode samples must buffer in the ring, not stream"
+        );
+
+        rec.drain_ringbuf();
+        let collector = rec.finish().unwrap().expect("collector was set");
+        collector.finish_boxed().unwrap();
+
+        let file = File::open(dir.path().join("counter.parquet")).unwrap();
+        let rows: usize = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 1, "drained sample reaches the collector");
     }
 }
