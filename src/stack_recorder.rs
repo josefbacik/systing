@@ -1085,7 +1085,7 @@ fn dispatch_process_with_client(
                 return Ok(None);
             };
 
-            println!("Fetching debug info for build ID: {}", &build_id);
+            println!("Fetching debug info for build ID: {build_id}");
             let path = if let Some(path) = client.fetch_debug_info(&build_id).map_err(Box::from)? {
                 path
             } else {

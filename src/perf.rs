@@ -303,7 +303,7 @@ impl PerfOpenEvents {
     }
 
     pub fn enable(&mut self) -> Result<(), Error> {
-        for (_, file) in self.events.iter_mut() {
+        for file in self.events.values_mut() {
             file.enable()?;
         }
         Ok(())
