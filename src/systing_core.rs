@@ -547,6 +547,8 @@ pub struct Config {
     pub no_frame_labels: bool,
     /// Do not query gVisor sandboxes' control sockets for guest maps
     pub no_gvisor_guest_maps: bool,
+    /// Do not symbolize stripped Go binaries from their `.gopclntab`
+    pub no_gopclntab: bool,
     /// Disable scheduler tracing
     pub no_sched: bool,
     /// Disable IRQ/softirq tracing
@@ -626,6 +628,7 @@ impl Default for Config {
             enable_debuginfod: false,
             no_frame_labels: false,
             no_gvisor_guest_maps: false,
+            no_gopclntab: false,
             no_sched: false,
             no_irq: false,
             syscalls: false,
@@ -1412,6 +1415,13 @@ fn configure_recorder(opts: &Config, recorder: &Arc<SessionRecorder>) {
             .lock()
             .unwrap()
             .set_gvisor_guest_maps(false);
+    }
+    if opts.no_gopclntab {
+        recorder
+            .stack_recorder
+            .lock()
+            .unwrap()
+            .set_gopclntab(false);
     }
 }
 

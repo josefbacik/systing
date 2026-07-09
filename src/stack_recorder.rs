@@ -541,6 +541,11 @@ pub struct StackRecorder {
     /// classification of otherwise-unresolvable frames. See
     /// [`crate::gvisor_guest`].
     gvisor_guest_maps: bool,
+    /// When set (default), process members that have no ELF symbol table
+    /// but carry a `.gopclntab` — stripped Go binaries — are symbolized
+    /// from the Go runtime's function table instead of rendering as hex.
+    /// See [`crate::gopclntab`].
+    gopclntab: bool,
 }
 
 impl ThreadAwareRecorder for StackRecorder {
@@ -569,12 +574,18 @@ impl StackRecorder {
             utid_generator,
             frame_labels: true,
             gvisor_guest_maps: true,
+            gopclntab: true,
         }
     }
 
     /// Disable contextual labels on unresolvable frames (revert to bare hex).
     pub fn set_frame_labels(&mut self, enabled: bool) {
         self.frame_labels = enabled;
+    }
+
+    /// Disable `.gopclntab`-based symbolization of stripped Go binaries.
+    pub fn set_gopclntab(&mut self, enabled: bool) {
+        self.gopclntab = enabled;
     }
 
     /// Disable querying gVisor control sockets for guest maps.
@@ -607,19 +618,39 @@ impl StackRecorder {
 
     /// Create a symbolizer with the configured process dispatcher.
     fn create_symbolizer(&self) -> Symbolizer {
-        if let Some(dispatcher) = &self.process_dispatcher {
-            let dispatcher = dispatcher.clone();
-            Symbolizer::builder()
+        let debuginfod = self.process_dispatcher.clone();
+        let gopclntab = self.gopclntab;
+        if debuginfod.is_none() && !gopclntab {
+            return Symbolizer::builder()
                 .enable_code_info(true)
                 .enable_inlined_fns(true)
-                .set_process_dispatcher(move |info| dispatcher(info))
-                .build()
-        } else {
-            Symbolizer::builder()
-                .enable_code_info(true)
-                .enable_inlined_fns(true)
-                .build()
+                .build();
         }
+        // Dispatch order: debuginfod first (fetched debug info beats
+        // everything), then the stripped-Go probe, then blazesym's default
+        // ELF handling for members neither claims.
+        let dispatcher = move |info: ProcessMemberInfo<'_>| -> Result<Option<Box<dyn Resolve>>, BlazeErr> {
+            if let Some(debuginfod) = &debuginfod {
+                if let Some(resolver) = debuginfod(info.clone())? {
+                    return Ok(Some(resolver));
+                }
+            }
+            if gopclntab {
+                if let ProcessMemberType::Path(path) = info.member_entry {
+                    if let Some(resolver) =
+                        crate::gopclntab::try_gopclntab_resolver(&path.maps_file, &path.symbolic_path)
+                    {
+                        return Ok(Some(resolver));
+                    }
+                }
+            }
+            Ok(None)
+        };
+        Symbolizer::builder()
+            .enable_code_info(true)
+            .enable_inlined_fns(true)
+            .set_process_dispatcher(dispatcher)
+            .build()
     }
 
     /// Finish streaming and symbolize all unique stacks.
