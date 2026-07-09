@@ -50,6 +50,7 @@ Use *--list-recorders* to see available recorders and their default states.
 Available recorders:
 
 * `sched` - Scheduler event tracing (enabled by default)
+* `irq` - IRQ and softirq event tracing (enabled by default)
 * `syscalls` - Syscall tracing (disabled by default)
 * `sleep-stacks` - Sleep stack traces (enabled by default)
 * `cpu-stacks` - CPU perf stack traces (enabled by default)
@@ -131,6 +132,7 @@ Example:
 # systing --list-recorders
 Available recorders:
   sched          - Scheduler event tracing (on by default)
+  irq            - IRQ and softirq event tracing (on by default)
   syscalls       - Syscall tracing
   sleep-stacks   - Sleep stack traces (on by default)
   cpu-stacks     - CPU perf stack traces (on by default)
@@ -141,6 +143,15 @@ Available recorders:
 === *--no-cpu-stack-traces*
 
 Do not record the `perf` style stack traces for tasks while they're running.
+
+=== *--no-irq*
+
+Disable IRQ and softirq event tracing (the `irq_handler_entry`/`irq_handler_exit` and `softirq_entry`/`softirq_exit` tracepoints).
+IRQ events cannot meaningfully be narrowed by *-p* (nearly every IRQ interrupts _some_ traced task on a busy host), so on large machines they can dominate a pid-scoped trace; this flag sheds that load independently of the scheduler recorder.
+Equivalent to leaving `irq` out of an *--only-recorder* list.
+
+Note: before the `irq` recorder was split out, these tracepoints were part of the `sched` recorder and *--no-sched* disabled them too.
+*--no-sched* no longer affects IRQ tracing; use *--no-irq* (or recorder selection) for that.
 
 === *--no-sched*
 

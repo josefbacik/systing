@@ -159,6 +159,16 @@ const SCHED_BPF_PROGRAMS: &[&str] = &[
     "systing_sched_switch",
     "systing_sched_waking",
     "systing_sched_process_exit",
+];
+
+/// IRQ/softirq tracing programs. Historically bundled with the scheduler
+/// recorder, but split out so IRQ pressure can be shed independently: IRQ
+/// events cannot meaningfully be filtered by `-p` (nearly every IRQ
+/// interrupts *some* traced task on a busy host), so on many-CPU machines
+/// they can drown a pid-scoped sched trace. When the `irq` recorder is off
+/// these programs are simply not loaded, so they cost nothing; the
+/// `tool_config.no_irq` rodata gate in BPF is belt-and-braces on top.
+const IRQ_BPF_PROGRAMS: &[&str] = &[
     "systing_irq_handler_entry",
     "systing_irq_handler_exit",
     "systing_softirq_entry",
@@ -259,6 +269,15 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             description: "Scheduler event tracing",
             default_enabled: true,
             bpf_programs: SCHED_BPF_PROGRAMS,
+            ringbuf_families: &["ringbufs"],
+        },
+        RecorderInfo {
+            name: "irq",
+            description: "IRQ and softirq event tracing",
+            default_enabled: true,
+            bpf_programs: IRQ_BPF_PROGRAMS,
+            // IRQ events share the sched rings (and consumers); the events
+            // are task_events with IRQ-specific types, schema unchanged.
             ringbuf_families: &["ringbufs"],
         },
         RecorderInfo {
@@ -366,6 +385,7 @@ pub fn validate_recorder_names(names: &[String]) -> Result<()> {
 fn is_recorder_enabled(name: &str, opts: &Config) -> bool {
     match name {
         "sched" => !opts.no_sched,
+        "irq" => !opts.no_irq,
         "syscalls" => opts.syscalls,
         "sleep-stacks" => !opts.no_sleep_stack_traces,
         "interruptible-stacks" => !opts.no_interruptible_stack_traces,
@@ -530,6 +550,8 @@ pub struct Config {
     pub no_gvisor_guest_maps: bool,
     /// Disable scheduler tracing
     pub no_sched: bool,
+    /// Disable IRQ/softirq tracing
+    pub no_irq: bool,
     /// Enable syscall tracing
     pub syscalls: bool,
     /// Enable marker recording (faccessat2-based userspace markers)
@@ -606,6 +628,7 @@ impl Default for Config {
             no_frame_labels: false,
             no_gvisor_guest_maps: false,
             no_sched: false,
+            no_irq: false,
             syscalls: false,
             markers: false,
             marker_threshold: None,
@@ -2088,6 +2111,7 @@ fn configure_bpf_skeleton(
         rodata.tool_config.no_interruptible_stack_traces =
             opts.no_interruptible_stack_traces as u32;
         rodata.tool_config.no_sched = opts.no_sched as u32;
+        rodata.tool_config.no_irq = opts.no_irq as u32;
         rodata.tool_config.confidentiality_mode = detect_confidentiality_mode();
         if !opts.cgroup.is_empty() {
             rodata.tool_config.filter_cgroup = 1;

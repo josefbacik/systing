@@ -76,6 +76,11 @@ const volatile struct {
 	u32 no_sched;          /* Sched recorder off: sched_switch still runs for
 				* cpu_running_pid and sleep stacks, but task_event
 				* emission is suppressed. */
+	u32 no_irq;            /* IRQ recorder off: the irq/softirq programs are
+				* not loaded at all in that case, so this rodata
+				* gate is belt-and-braces (and lets the verifier
+				* prune the bodies if the programs ever get loaded
+				* for another reason). */
 } tool_config = {};
 
 enum event_type {
@@ -1617,8 +1622,12 @@ static void emit_stack_event(void *ctx, struct task_struct *task,
 
 static int trace_irq_event(struct irqaction *action, int irq, int ret, bool enter)
 {
-	struct task_struct *tsk = (struct task_struct *)bpf_get_current_task_btf();
+	struct task_struct *tsk;
 
+	if (tool_config.no_irq)
+		return 0;
+
+	tsk = (struct task_struct *)bpf_get_current_task_btf();
 	if (!trace_task(tsk))
 		return 0;
 
@@ -1649,8 +1658,12 @@ static int trace_irq_event(struct irqaction *action, int irq, int ret, bool ente
 
 static int trace_softirq_event(unsigned int vec_nr, bool enter)
 {
-	struct task_struct *tsk = (struct task_struct *)bpf_get_current_task_btf();
+	struct task_struct *tsk;
 
+	if (tool_config.no_irq)
+		return 0;
+
+	tsk = (struct task_struct *)bpf_get_current_task_btf();
 	if (!trace_task(tsk))
 		return 0;
 
