@@ -15,8 +15,13 @@ use crate::trace::{
 };
 use crate::utid::{ThreadAwareRecorder, UtidGenerator};
 
-/// Threshold for flushing streaming sched slices to the collector.
+/// Threshold for flushing locally buffered streaming records to the collector.
 /// Lower than Parquet batch size (200K) to reduce peak memory while maintaining I/O efficiency.
+/// Also bounds how often a recorder touches the collector: with per-ring
+/// consumers all sharing one underlying parquet writer (see
+/// `SharedCollector`), per-record adds would serialize the consumers on the
+/// writer lock, so every record type is buffered locally and handed over in
+/// batches.
 const STREAMING_SCHED_FLUSH_THRESHOLD: usize = 10_000;
 
 /// Convert a kernel prev_state value to an Option<i32> for storage.
@@ -71,7 +76,15 @@ pub struct SchedEventRecorder {
     pending_softirqs: HashMap<(u32, i32), PendingSoftirq>,
     // Per-CPU state for building sched slices
     cpu_states: HashMap<u32, CpuRunningState>,
+    // Locally buffered records, flushed to the collector in batches (see
+    // STREAMING_SCHED_FLUSH_THRESHOLD). The collector may be shared with the
+    // other per-ring recorder shards, so nothing writes to it per-event.
     pending_slices: Vec<SchedSliceRecord>,
+    pending_thread_states: Vec<ThreadStateRecord>,
+    pending_irq_slices: Vec<IrqSliceRecord>,
+    pending_softirq_slices: Vec<SoftirqSliceRecord>,
+    pending_wakeup_news: Vec<WakeupNewRecord>,
+    pending_process_exits: Vec<ProcessExitRecord>,
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
     // Shared utid generator for consistent thread IDs across all recorders
     utid_generator: Arc<UtidGenerator>,
@@ -118,31 +131,17 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                         // Emit sleep state record when task leaves CPU with non-zero state
                         // This is critical for Perfetto to show correct off-CPU thread states
                         if let Some(state) = end_state {
-                            // Get utid before borrowing collector mutably
                             let utid = self.utid_generator.get_or_create_utid(prev_state.tid);
-                            if let Some(collector) = &mut self.streaming_collector {
-                                if let Err(e) = collector.add_thread_state(ThreadStateRecord {
-                                    ts: event.ts as i64,
-                                    dur: 0,
-                                    utid,
-                                    state,
-                                    cpu: None, // CPU not relevant for sleep state
-                                }) {
-                                    eprintln!("Warning: Failed to stream thread sleep state: {e}");
-                                }
-                            }
+                            self.pending_thread_states.push(ThreadStateRecord {
+                                ts: event.ts as i64,
+                                dur: 0,
+                                utid,
+                                state,
+                                cpu: None, // CPU not relevant for sleep state
+                            });
                         }
 
-                        // Flush if we have accumulated enough slices
-                        if self.pending_slices.len() >= STREAMING_SCHED_FLUSH_THRESHOLD {
-                            if let Some(collector) = &mut self.streaming_collector {
-                                for slice in self.pending_slices.drain(..) {
-                                    if let Err(e) = collector.add_sched_slice(slice) {
-                                        eprintln!("Warning: Failed to stream sched slice: {e}");
-                                    }
-                                }
-                            }
-                        }
+                        self.maybe_flush_pending();
                     }
 
                     // Update state for next task
@@ -163,16 +162,15 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                     let tid = event.next.tgidpid as i32;
                     let utid = self.utid_generator.get_or_create_utid(tid);
 
-                    if let Some(collector) = &mut self.streaming_collector {
-                        if let Err(e) = collector.add_thread_state(ThreadStateRecord {
+                    if self.streaming_collector.is_some() {
+                        self.pending_thread_states.push(ThreadStateRecord {
                             ts: event.ts as i64,
                             dur: 0,
                             utid,
                             state: 0, // TASK_RUNNING (runnable)
                             cpu: Some(event.target_cpu as i32),
-                        }) {
-                            eprintln!("Warning: Failed to stream thread state: {e}");
-                        }
+                        });
+                        self.maybe_flush_pending();
                     }
                 }
             }
@@ -200,17 +198,16 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                 if let Some(pending) = self.pending_irqs.remove(&(event.cpu, irq)) {
                     let dur = event.ts.saturating_sub(pending.ts) as i64;
 
-                    if let Some(collector) = &mut self.streaming_collector {
-                        if let Err(e) = collector.add_irq_slice(IrqSliceRecord {
+                    if self.streaming_collector.is_some() {
+                        self.pending_irq_slices.push(IrqSliceRecord {
                             ts: pending.ts as i64,
                             dur,
                             cpu: event.cpu as i32,
                             irq: pending.irq,
                             name: pending.name_option(),
                             ret: Some(ret),
-                        }) {
-                            eprintln!("Warning: Failed to stream IRQ slice: {e}");
-                        }
+                        });
+                        self.maybe_flush_pending();
                     }
                 }
             }
@@ -228,15 +225,14 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                 if let Some(pending) = self.pending_softirqs.remove(&(event.cpu, vec)) {
                     let dur = event.ts.saturating_sub(pending.ts) as i64;
 
-                    if let Some(collector) = &mut self.streaming_collector {
-                        if let Err(e) = collector.add_softirq_slice(SoftirqSliceRecord {
+                    if self.streaming_collector.is_some() {
+                        self.pending_softirq_slices.push(SoftirqSliceRecord {
                             ts: pending.ts as i64,
                             dur,
                             cpu: event.cpu as i32,
                             vec: pending.vec,
-                        }) {
-                            eprintln!("Warning: Failed to stream softirq slice: {e}");
-                        }
+                        });
+                        self.maybe_flush_pending();
                     }
                 }
             }
@@ -248,15 +244,14 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                 let tid = event.next.tgidpid as i32;
                 let utid = self.utid_generator.get_or_create_utid(tid);
 
-                if let Some(collector) = &mut self.streaming_collector {
-                    if let Err(e) = collector.add_wakeup_new(WakeupNewRecord {
+                if self.streaming_collector.is_some() {
+                    self.pending_wakeup_news.push(WakeupNewRecord {
                         ts: event.ts as i64,
                         cpu: event.cpu as i32,
                         utid,
                         target_cpu: event.target_cpu as i32,
-                    }) {
-                        eprintln!("Warning: Failed to stream wakeup_new: {e}");
-                    }
+                    });
+                    self.maybe_flush_pending();
                 }
             }
 
@@ -267,14 +262,13 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                 let tid = event.prev.tgidpid as i32;
                 let utid = self.utid_generator.get_or_create_utid(tid);
 
-                if let Some(collector) = &mut self.streaming_collector {
-                    if let Err(e) = collector.add_process_exit(ProcessExitRecord {
+                if self.streaming_collector.is_some() {
+                    self.pending_process_exits.push(ProcessExitRecord {
                         ts: event.ts as i64,
                         cpu: event.cpu as i32,
                         utid,
-                    }) {
-                        eprintln!("Warning: Failed to stream process_exit: {e}");
-                    }
+                    });
+                    self.maybe_flush_pending();
                 }
             }
 
@@ -301,6 +295,11 @@ impl SchedEventRecorder {
             pending_softirqs: HashMap::new(),
             cpu_states: HashMap::new(),
             pending_slices: Vec::new(),
+            pending_thread_states: Vec::new(),
+            pending_irq_slices: Vec::new(),
+            pending_softirq_slices: Vec::new(),
+            pending_wakeup_news: Vec::new(),
+            pending_process_exits: Vec::new(),
             streaming_collector: None,
             utid_generator,
         }
@@ -311,18 +310,93 @@ impl SchedEventRecorder {
         self.streaming_collector = Some(collector);
     }
 
+    /// Total number of locally buffered records awaiting a batched handover
+    /// to the collector.
+    fn pending_len(&self) -> usize {
+        self.pending_slices.len()
+            + self.pending_thread_states.len()
+            + self.pending_irq_slices.len()
+            + self.pending_softirq_slices.len()
+            + self.pending_wakeup_news.len()
+            + self.pending_process_exits.len()
+    }
+
+    /// Hand all locally buffered records to the collector. The collector may
+    /// be shared with the other per-ring recorder shards, so this is the only
+    /// place that writes records to it: batching keeps the shards from
+    /// serializing on the shared writer's lock.
+    ///
+    /// Every buffer is fully drained even when individual adds fail: a failed
+    /// record is warned about and dropped (matching the previous per-record
+    /// behaviour) rather than aborting the batch, so one bad write can't
+    /// silently discard the rest of a buffer. Returns an error summarizing
+    /// the failure count so finish() can surface it; mid-recording callers
+    /// ignore it (the per-record warnings have already been printed).
+    fn flush_pending(&mut self) -> Result<()> {
+        let Some(collector) = &mut self.streaming_collector else {
+            return Ok(());
+        };
+        let mut failed = 0usize;
+        let warn = |what: &str, e: anyhow::Error, failed: &mut usize| {
+            eprintln!("Warning: Failed to stream {what}: {e}");
+            *failed += 1;
+        };
+        for record in self.pending_slices.drain(..) {
+            if let Err(e) = collector.add_sched_slice(record) {
+                warn("sched slice", e, &mut failed);
+            }
+        }
+        for record in self.pending_thread_states.drain(..) {
+            if let Err(e) = collector.add_thread_state(record) {
+                warn("thread state", e, &mut failed);
+            }
+        }
+        for record in self.pending_irq_slices.drain(..) {
+            if let Err(e) = collector.add_irq_slice(record) {
+                warn("IRQ slice", e, &mut failed);
+            }
+        }
+        for record in self.pending_softirq_slices.drain(..) {
+            if let Err(e) = collector.add_softirq_slice(record) {
+                warn("softirq slice", e, &mut failed);
+            }
+        }
+        for record in self.pending_wakeup_news.drain(..) {
+            if let Err(e) = collector.add_wakeup_new(record) {
+                warn("wakeup_new", e, &mut failed);
+            }
+        }
+        for record in self.pending_process_exits.drain(..) {
+            if let Err(e) = collector.add_process_exit(record) {
+                warn("process_exit", e, &mut failed);
+            }
+        }
+        if failed > 0 {
+            anyhow::bail!("failed to stream {failed} sched/IRQ records");
+        }
+        Ok(())
+    }
+
+    /// Flush the local buffers once enough records have accumulated.
+    /// Failures were already warned about per record inside flush_pending,
+    /// and event consumption keeps going regardless.
+    fn maybe_flush_pending(&mut self) {
+        if self.pending_len() >= STREAMING_SCHED_FLUSH_THRESHOLD {
+            let _ = self.flush_pending();
+        }
+    }
+
     /// Finish streaming and emit final records for incomplete events.
     ///
     /// This method should be called at the end of recording to:
     /// 1. Emit final slices for still-running tasks on each CPU
     /// 2. Emit unpaired IRQs/softirqs with dur=0
-    /// 3. Flush any remaining pending_slices to collector
+    /// 3. Drain every locally buffered record type to the collector
     ///
     /// Returns the streaming collector so the caller can call finish() on it.
     pub fn finish(&mut self, end_ts: i64) -> Result<Option<Box<dyn RecordCollector + Send>>> {
-        if let Some(collector) = &mut self.streaming_collector {
+        if self.streaming_collector.is_some() {
             // Emit final slices for still-running tasks on each CPU
-            // Pre-compute utids before borrowing collector mutably
             let final_slices: Vec<_> = self
                 .cpu_states
                 .iter()
@@ -338,40 +412,42 @@ impl SchedEventRecorder {
                     }
                 })
                 .collect();
-
-            for slice in final_slices {
-                collector.add_sched_slice(slice)?;
-            }
-
-            // Flush any remaining pending slices
-            for slice in self.pending_slices.drain(..) {
-                collector.add_sched_slice(slice)?;
-            }
+            self.pending_slices.extend(final_slices);
 
             // Emit unpaired IRQs with dur=0 to indicate incomplete
-            for ((cpu, _irq), pending) in &self.pending_irqs {
-                collector.add_irq_slice(IrqSliceRecord {
+            let unpaired_irqs: Vec<_> = self
+                .pending_irqs
+                .iter()
+                .map(|((cpu, _irq), pending)| IrqSliceRecord {
                     ts: pending.ts as i64,
                     dur: 0, // Incomplete - no exit event received
                     cpu: *cpu as i32,
                     irq: pending.irq,
                     name: pending.name_option(),
                     ret: None, // No return value without exit
-                })?;
-            }
+                })
+                .collect();
+            self.pending_irq_slices.extend(unpaired_irqs);
 
             // Emit unpaired softirqs with dur=0
-            for ((cpu, _vec), pending) in &self.pending_softirqs {
-                collector.add_softirq_slice(SoftirqSliceRecord {
+            let unpaired_softirqs: Vec<_> = self
+                .pending_softirqs
+                .iter()
+                .map(|((cpu, _vec), pending)| SoftirqSliceRecord {
                     ts: pending.ts as i64,
                     dur: 0, // Incomplete - no exit event received
                     cpu: *cpu as i32,
                     vec: pending.vec,
-                })?;
-            }
+                })
+                .collect();
+            self.pending_softirq_slices.extend(unpaired_softirqs);
 
-            // Flush buffers before returning collector
-            collector.flush()?;
+            // Hand everything buffered locally to the collector, then flush
+            // the collector's own buffers before returning it.
+            self.flush_pending()?;
+            if let Some(collector) = &mut self.streaming_collector {
+                collector.flush()?;
+            }
         }
 
         // Take ownership of the collector and return it
@@ -382,6 +458,7 @@ impl SchedEventRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::collector::InMemoryCollector;
     use crate::systing_core::types::event_type;
     use crate::systing_core::types::task_info;
     use crate::utid::UtidGenerator;
@@ -393,6 +470,153 @@ mod tests {
 
     fn create_test_recorder() -> SchedEventRecorder {
         SchedEventRecorder::new(Arc::new(UtidGenerator::new()))
+    }
+
+    /// A RecordCollector that delegates to a shared InMemoryCollector, so a
+    /// test can keep a handle to the data after handing the collector to the
+    /// recorder (SchedEventRecorder::finish returns an opaque trait object).
+    #[derive(Clone)]
+    struct SharedInMemoryCollector(std::sync::Arc<std::sync::Mutex<InMemoryCollector>>);
+
+    impl SharedInMemoryCollector {
+        fn new() -> Self {
+            Self(std::sync::Arc::new(std::sync::Mutex::new(
+                InMemoryCollector::new(),
+            )))
+        }
+    }
+
+    macro_rules! delegate_to_inner {
+        ($($method:ident($record:ty)),* $(,)?) => {
+            $(
+                fn $method(&mut self, record: $record) -> Result<()> {
+                    self.0.lock().unwrap().$method(record)
+                }
+            )*
+        };
+    }
+
+    impl RecordCollector for SharedInMemoryCollector {
+        delegate_to_inner! {
+            add_process(crate::trace::ProcessRecord),
+            add_thread(crate::trace::ThreadRecord),
+            add_sched_slice(SchedSliceRecord),
+            add_thread_state(ThreadStateRecord),
+            add_irq_slice(IrqSliceRecord),
+            add_softirq_slice(SoftirqSliceRecord),
+            add_wakeup_new(WakeupNewRecord),
+            add_process_exit(ProcessExitRecord),
+            add_counter(crate::trace::CounterRecord),
+            add_counter_track(crate::trace::CounterTrackRecord),
+            add_slice(crate::trace::SliceRecord),
+            add_track(crate::trace::TrackRecord),
+            add_instant(crate::trace::InstantRecord),
+            add_arg(crate::trace::ArgRecord),
+            add_instant_arg(crate::trace::InstantArgRecord),
+            add_network_interface(crate::trace::NetworkInterfaceRecord),
+            add_socket_connection(crate::trace::SocketConnectionRecord),
+            add_clock_snapshot(crate::trace::ClockSnapshotRecord),
+            add_stack(crate::trace::StackRecord),
+            add_stack_sample(crate::trace::StackSampleRecord),
+            add_network_syscall(crate::trace::NetworkSyscallRecord),
+            add_network_packet(crate::trace::NetworkPacketRecord),
+            add_network_socket(crate::trace::NetworkSocketRecord),
+            add_network_poll(crate::trace::NetworkPollRecord),
+            add_network_dns(crate::trace::NetworkDnsRecord),
+            add_memory_rss(crate::trace::MemoryRssRecord),
+            add_memory_map(crate::trace::MemoryMapRecord),
+            add_memory_fault(crate::trace::MemoryFaultRecord),
+            add_memory_alloc(crate::trace::MemoryAllocRecord),
+            set_sysinfo(crate::trace::SysInfoRecord),
+            add_cpu_info(crate::trace::CpuInfoRecord),
+            add_tpu_device(crate::trace::TpuDeviceRecord),
+            add_tpu_op(crate::trace::TpuOpRecord),
+            add_tpu_metric(crate::trace::TpuMetricRecord),
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            self.0.lock().unwrap().flush()
+        }
+
+        fn finish(self) -> Result<()> {
+            Ok(())
+        }
+
+        fn finish_boxed(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Every record type the recorder buffers locally must actually reach the
+    /// collector: mid-recording the buffers hold records below the flush
+    /// threshold, and finish() must drain all of them (not just sched slices).
+    #[test]
+    fn test_finish_drains_all_buffered_record_types() {
+        let mut recorder = create_test_recorder();
+        let handle = SharedInMemoryCollector::new();
+        recorder.set_streaming_collector(Box::new(handle.clone()));
+
+        let mk = |r#type, ts: u64, cpu: u32, target_cpu: u32, tgidpid: u64| task_event {
+            r#type,
+            ts,
+            cpu,
+            target_cpu,
+            next: task_info {
+                tgidpid,
+                ..Default::default()
+            },
+            prev: task_info {
+                tgidpid,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Two switches on one CPU complete one sched slice; the second has
+        // prev_state != 0, which also emits a sleep thread_state.
+        let mut switch1 = mk(event_type::SCHED_SWITCH, 1000, 0, 0, 100);
+        switch1.prev_state = 0;
+        recorder.handle_event(switch1);
+        let mut switch2 = mk(event_type::SCHED_SWITCH, 2000, 0, 0, 200);
+        switch2.prev_state = 2; // TASK_UNINTERRUPTIBLE
+        recorder.handle_event(switch2);
+
+        // Waking emits a runnable thread_state.
+        recorder.handle_event(mk(event_type::SCHED_WAKING, 2500, 1, 3, 300));
+
+        // Paired IRQ and softirq entry/exit emit one slice each.
+        recorder.handle_event(mk(event_type::SCHED_IRQ_ENTER, 3000, 2, 42, 400));
+        recorder.handle_event(mk(event_type::SCHED_IRQ_EXIT, 3100, 2, 42, 400));
+        recorder.handle_event(mk(event_type::SCHED_SOFTIRQ_ENTER, 4000, 3, 6, 500));
+        recorder.handle_event(mk(event_type::SCHED_SOFTIRQ_EXIT, 4200, 3, 6, 500));
+
+        recorder.handle_event(mk(event_type::SCHED_WAKEUP_NEW, 5000, 4, 5, 600));
+        recorder.handle_event(mk(event_type::SCHED_PROCESS_EXIT, 6000, 5, 0, 700));
+
+        // Below the flush threshold, everything is still buffered locally.
+        {
+            let inner = handle.0.lock().unwrap();
+            assert!(inner.data().sched_slices.is_empty());
+            assert!(inner.data().thread_states.is_empty());
+            assert!(inner.data().irq_slices.is_empty());
+            assert!(inner.data().softirq_slices.is_empty());
+            assert!(inner.data().wakeup_news.is_empty());
+            assert!(inner.data().process_exits.is_empty());
+        }
+
+        // finish() must hand every buffered record type to the collector.
+        recorder.finish(10_000).unwrap();
+        let inner = handle.0.lock().unwrap();
+        let data = inner.data();
+        // One completed slice (switch1 -> switch2) plus one final slice for
+        // the still-running task on CPU 0.
+        assert_eq!(data.sched_slices.len(), 2);
+        // One sleep state (switch2, prev_state != 0) + one runnable (waking).
+        assert_eq!(data.thread_states.len(), 2);
+        assert_eq!(data.irq_slices.len(), 1);
+        assert_eq!(data.softirq_slices.len(), 1);
+        assert_eq!(data.wakeup_news.len(), 1);
+        assert_eq!(data.process_exits.len(), 1);
     }
 
     #[test]
