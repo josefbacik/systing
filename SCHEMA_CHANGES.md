@@ -211,3 +211,47 @@ strings there) — the normalization happens at DuckDB import time.
   (`trace_id, id, frame_names, depth, leaf_name`). Ad-hoc queries can use it as
   a drop-in replacement; for hot paths join `frame` directly, since the view
   re-aggregates names per row.
+
+## Schema Version 12 (systing 1.11.0) — 2026-07-09
+
+Stack frame ordering is now uniform. Recorded stacks are a concatenation of
+three segments — python, user, kernel — and through v11 the segments disagreed
+on direction: the BPF unwinder's user and kernel segments were reversed to
+root-to-leaf at capture, while the python segment kept pystacks' leaf-first
+buffer order. `leaf_name` took the first entry of the combined array, which is
+the python leaf when python frames are present but the ROOT frame for
+native-only stacks. (The v11 entry's claim that ordering was "leaf-to-root"
+described the reader's assumption, not the data: native segments have been
+root-to-leaf since capture-time reversal was introduced.)
+
+No table shapes change. The version bump marks the data-semantics change so
+tools can distinguish uniformly-ordered databases.
+
+### Changed semantics
+- `stack.frame_ids` (and `frame_names` in parquet / the `stack_frames` view):
+  the python segment is now stored root-to-leaf like the user and kernel
+  segments, making the whole array one coherent root-to-leaf sequence
+  (outermost caller first, innermost executing frame last). Segment layout is
+  unchanged: python (outermost), then user, then kernel. v11 and older
+  databases keep the mixed order they were written with — the python segment
+  cannot be re-ordered after the fact without classifying frames by name
+  (note for anyone attempting that: root-side markers — `<module>`, threading
+  bootstraps, and on CPython 3.12+ an `<interpreter trampoline>` frame that
+  sits beyond `<module>` — fall in the run's root-side half, not necessarily
+  at its literal end); native-only stacks are identical either way. Importing an older trace into
+  a v12 database does not re-order it either. `_traces.systing_version` is
+  the per-trace discriminator, with one caveat: it is stamped at
+  parquet-to-DuckDB conversion time with the converting binary's version
+  (then preserved across database-to-database imports), so it names the
+  recorder only when recording and conversion happen in the same run — true
+  for the normal pipeline, not for a retained parquet directory converted
+  later by a newer binary. Embedding the recorder's version in the parquet
+  directory itself is planned follow-up.
+- `stack.leaf_name` now holds the name of the innermost executing frame (the
+  last array entry). Through v11 it held the first entry — the root frame for
+  native-only stacks, despite the column name.
+- `systing analyze flamegraph` (and the MCP flamegraph tool) previously
+  reversed the array on output under the leaf-to-root assumption, emitting
+  inverted folded stacks for native frames. It now emits storage order, which
+  is correct for all schema versions' native segments; python segments in
+  pre-v12 databases remain leaf-first within the blend.

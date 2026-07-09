@@ -133,7 +133,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -379,6 +379,9 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
         );
 
         -- Query-friendly stack tables.
+        -- frame_ids are ordered root-to-leaf (outermost caller first; schema
+        -- v12 — earlier traces stored the python segment leaf-first, see
+        -- SCHEMA_CHANGES.md) and leaf_name names the last (innermost) frame.
         -- frame_ids are dense per-trace integers into the frame table; this is
         -- normalized because DuckDB does not compress strings inside list
         -- columns, so a VARCHAR[] of frame names blows up to tens of MB. The

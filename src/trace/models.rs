@@ -242,9 +242,10 @@ pub struct InstantArgRecord {
 ///
 /// # Fields
 /// - `id`: Unique stack ID
-/// - `frame_names`: Function names from leaf to root (with embedded module/location info)
+/// - `frame_names`: Function names from root to leaf (with embedded module/location info)
 /// - `depth`: Number of frames in the stack
-/// - `leaf_name`: Leaf function name (redundant but enables fast filtering)
+/// - `leaf_name`: Innermost (executing) frame's name — the last entry of
+///   `frame_names` (redundant but enables fast filtering)
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StackRecord {
     pub id: i64,

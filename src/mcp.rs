@@ -733,7 +733,9 @@ network activity, and performance counters. Traces are stored in DuckDB database
 # Key tables and their contents
 - stack_sample: Stack trace samples with timestamps (ts in nanoseconds). \
   stack_event_type: 0=uninterruptible-sleep, 1=cpu, 2=interruptible-sleep.
-- stack: Flattened stack frames (frame_ids BIGINT[], leaf-to-root order). \
+- stack: Flattened stack frames (frame_ids BIGINT[], root-to-leaf order: \
+  outermost caller first, innermost executing frame last; leaf_name is the \
+  last frame's name). \
   Join to frame on (trace_id, id) for names, or use the stack_frames view \
   which exposes a frame_names VARCHAR[] column directly.
 - frame: Interned frame strings (id, name) referenced by stack.frame_ids.

@@ -34,7 +34,13 @@ type ProcessDispatcher = Box<
 >;
 use debuginfod::{BuildId, CachingClient, Client};
 
-// Stack structure representing kernel, user, and Python stacks
+// Stack structure representing kernel, user, and Python stacks.
+//
+// Direction invariant: every segment is stored ROOT-TO-LEAF (outermost
+// caller first, innermost/executing frame last). The BPF unwinder and
+// pystacks both deliver frames leaf-first; `Stack::new` reverses each
+// segment so `frame_ids`, folded output, and exports all read one
+// coherent direction.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Stack {
     pub(crate) kernel_stack: Vec<u64>,
@@ -68,12 +74,19 @@ fn filter_and_reverse_kernel_stack(addrs: &[u64]) -> Vec<u64> {
         .collect()
 }
 
+/// Reverses the python stack to get root-to-leaf order. pystacks fills its
+/// buffer leaf-first (the executing frame is read first, then the walk
+/// follows the frame chain outward), mirroring the BPF unwinder direction.
+fn reverse_py_stack(frames: &[PyAddr]) -> Vec<PyAddr> {
+    frames.iter().rev().cloned().collect()
+}
+
 impl Stack {
     pub fn new(kernel_stack: &[u64], user_stack: &[u64], py_stack: &[PyAddr]) -> Self {
         Self {
             kernel_stack: filter_and_reverse_kernel_stack(kernel_stack),
             user_stack: filter_and_reverse_user_stack(user_stack),
-            py_stack: py_stack.to_vec(),
+            py_stack: reverse_py_stack(py_stack),
         }
     }
 }
@@ -415,7 +428,9 @@ fn emit_stack_record(
     if frame_names.is_empty() {
         return Ok(());
     }
-    let leaf_name = frame_names.first().cloned().unwrap_or_default();
+    // Frames are stored root-to-leaf; the leaf (innermost executing frame)
+    // is the last entry.
+    let leaf_name = frame_names.last().cloned().unwrap_or_default();
     let depth = frame_names.len().min(i32::MAX as usize) as i32;
     collector.add_stack(StackRecord {
         id: stack_id,
@@ -1297,6 +1312,43 @@ mod tests {
 
         // Empty stack
         assert_eq!(filter_and_reverse_kernel_stack(&[]), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn test_stack_new_reverses_py_stack() {
+        use crate::pystacks::types::StackWalkerFrame;
+        // pystacks delivers frames leaf-first; Stack stores every segment
+        // root-to-leaf, so construction must reverse the python segment too.
+        let py = |symbol_id: u64| PyAddr {
+            addr: StackWalkerFrame {
+                symbol_id,
+                inst_idx: 0,
+                pad_: 0,
+            },
+        };
+        let stack = Stack::new(&[], &[], &[py(1), py(2), py(3)]);
+        assert_eq!(stack.py_stack, vec![py(3), py(2), py(1)]);
+
+        // Empty python stack stays empty.
+        assert!(Stack::new(&[], &[], &[]).py_stack.is_empty());
+    }
+
+    #[test]
+    fn test_emit_stack_record_leaf_name_is_last_frame() {
+        use crate::record::collector::InMemoryCollector;
+        // Frames arrive root-to-leaf; leaf_name must be the innermost
+        // (executing) frame — the LAST entry, not the first.
+        let mut collector = InMemoryCollector::new();
+        emit_stack_record(
+            &mut collector,
+            7,
+            vec!["root".to_string(), "mid".to_string(), "leaf".to_string()],
+        )
+        .unwrap();
+        let stacks = &collector.data().stacks;
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].leaf_name, "leaf");
+        assert_eq!(stacks[0].depth, 3);
     }
 
     #[test]
