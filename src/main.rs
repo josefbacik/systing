@@ -76,6 +76,9 @@ struct Command {
     /// Disable scheduler event tracing (sched_* tracepoints and scheduler event recorder)
     #[arg(long)]
     no_sched: bool,
+    /// Disable IRQ and softirq event tracing (irq_handler_* and softirq_* tracepoints)
+    #[arg(long)]
+    no_irq: bool,
     /// Enable syscall tracing (raw_syscalls:sys_enter and sys_exit tracepoints)
     #[arg(long)]
     syscalls: bool,
@@ -193,6 +196,7 @@ impl From<Command> for Config {
             no_frame_labels: cmd.no_frame_labels,
             no_gvisor_guest_maps: cmd.no_gvisor_guest_maps,
             no_sched: cmd.no_sched,
+            no_irq: cmd.no_irq,
             syscalls: cmd.syscalls,
             markers: cmd.markers,
             marker_threshold: cmd.marker_threshold,
@@ -228,6 +232,7 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
     match recorder_name {
         "syscalls" => opts.syscalls = enable,
         "sched" => opts.no_sched = !enable,
+        "irq" => opts.no_irq = !enable,
         "sleep-stacks" => opts.no_sleep_stack_traces = !enable,
         "interruptible-stacks" => opts.no_interruptible_stack_traces = !enable,
         "tpu" => opts.tpu_profile = enable,
@@ -269,6 +274,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
     // If --only-recorder is specified, disable all recorders first
     if !opts.only_recorder.is_empty() {
         opts.no_sched = true;
+        opts.no_irq = true;
         opts.syscalls = false;
         opts.no_sleep_stack_traces = true;
         opts.no_interruptible_stack_traces = true;

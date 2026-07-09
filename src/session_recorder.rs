@@ -136,7 +136,12 @@ impl SysinfoRecorder {
 
 pub struct SessionRecorder {
     pub clock_snapshot: Mutex<ClockSnapshot>,
-    pub event_recorder: Mutex<SchedEventRecorder>,
+    /// Scheduler/IRQ event recorder shards, one per `ringbufs`-family ring.
+    /// Shard i is fed only by ring i's consumer thread; all recorder state is
+    /// keyed by CPU and cpu -> ring is static (cpu % NR_RINGBUFS), so shards
+    /// never see each other's CPUs. They stream into one shared parquet
+    /// writer (see `init_streaming_output`).
+    pub event_recorders: Vec<Mutex<SchedEventRecorder>>,
     pub stack_recorder: Mutex<StackRecorder>,
     pub perf_counter_recorder: Mutex<PerfCounterRecorder>,
     pub sysinfo_recorder: Mutex<SysinfoRecorder>,
@@ -645,7 +650,9 @@ impl SessionRecorder {
         let track_event_ids = Arc::new(TrackEventIdGenerator::new());
         Self {
             clock_snapshot: Mutex::new(ClockSnapshot::default()),
-            event_recorder: Mutex::new(SchedEventRecorder::new(Arc::clone(&utid_generator))),
+            event_recorders: (0..crate::systing_core::NR_RINGBUFS)
+                .map(|_| Mutex::new(SchedEventRecorder::new(Arc::clone(&utid_generator))))
+                .collect(),
             stack_recorder: Mutex::new(StackRecorder::new(
                 enable_debuginfod,
                 Arc::clone(&utid_generator),
@@ -870,7 +877,9 @@ impl SessionRecorder {
     }
 
     pub fn drain_all_ringbufs(&self) {
-        self.event_recorder.lock().unwrap().drain_ringbuf();
+        for event_recorder in &self.event_recorders {
+            event_recorder.lock().unwrap().drain_ringbuf();
+        }
         self.stack_recorder.lock().unwrap().drain_ringbuf();
         self.perf_counter_recorder.lock().unwrap().drain_ringbuf();
         self.sysinfo_recorder.lock().unwrap().drain_ringbuf();
@@ -1014,11 +1023,24 @@ impl SessionRecorder {
         let make_writer = || StreamingParquetWriter::for_sink(sink.clone());
         let spill_dir = sink.spill_dir();
 
-        // Set up streaming collector for scheduler events
-        self.event_recorder
-            .lock()
-            .unwrap()
-            .set_streaming_collector(Box::new(make_writer()));
+        // Set up streaming collectors for the scheduler event recorder shards.
+        // All shards write rows for the same logical tables (sched_slice,
+        // thread_state, ...), which map to the same parquet files, so they
+        // must share one underlying writer: separate writers would create the
+        // same files and the last one to finish would clobber the others'
+        // data (same reasoning as the perf-counter/sysinfo SharedCollector
+        // below). Rows from different shards interleave in the files; readers
+        // sort by timestamp where order matters. Each shard buffers records
+        // locally and hands them over in batches, so the shared writer's lock
+        // is not a per-event serialization point.
+        let sched_writer = SharedCollector::new(Box::new(make_writer()));
+        for event_recorder in &self.event_recorders {
+            event_recorder
+                .lock()
+                .unwrap()
+                .set_streaming_collector(Box::new(sched_writer.clone()));
+        }
+        drop(sched_writer);
 
         // Set up streaming collector for stack recorder so samples are written
         // incrementally instead of buffered for the entire trace. Unique stack
@@ -1104,17 +1126,26 @@ impl SessionRecorder {
         // Get the end timestamp for flushing streaming data
         let end_ts = get_clock_value(libc::CLOCK_BOOTTIME) as i64;
 
-        // Step 1: Finish streaming collection in the event recorder and retrieve the collector
+        // Step 1: Finish streaming collection in every event recorder shard
+        // and retrieve the collector. The shards share one underlying writer
+        // through SharedCollector handles; keep the last handle as the main
+        // writer (the records are all in the shared inner writer, so the
+        // other handles can simply be dropped) and finalize it in step 6,
+        // by which point it is the only live handle.
         eprintln!("Flushing scheduler trace records from streaming...");
-        let collector_opt = {
-            let mut event_recorder = self.event_recorder.lock().unwrap();
-            event_recorder.finish(end_ts)?
-        };
+        let mut sched_collectors = Vec::new();
+        for event_recorder in &self.event_recorders {
+            if let Some(collector) = event_recorder.lock().unwrap().finish(end_ts)? {
+                sched_collectors.push(collector);
+            }
+        }
 
         // The streaming collector has scheduler data already written
-        let mut writer: Box<dyn RecordCollector + Send> = collector_opt.ok_or_else(|| {
-            anyhow::anyhow!("streaming collector must be initialized before generating trace")
-        })?;
+        let mut writer: Box<dyn RecordCollector + Send> =
+            sched_collectors.pop().ok_or_else(|| {
+                anyhow::anyhow!("streaming collector must be initialized before generating trace")
+            })?;
+        drop(sched_collectors);
         stage_done("Flushed scheduler trace records", &mut stage_start);
 
         // Step 2: Generate clock snapshot records
@@ -1561,7 +1592,9 @@ mod tests {
         let track_event_ids = Arc::new(TrackEventIdGenerator::new());
         SessionRecorder {
             clock_snapshot: Mutex::new(ClockSnapshot::default()),
-            event_recorder: Mutex::new(SchedEventRecorder::new(Arc::clone(&utid_generator))),
+            event_recorders: (0..crate::systing_core::NR_RINGBUFS)
+                .map(|_| Mutex::new(SchedEventRecorder::new(Arc::clone(&utid_generator))))
+                .collect(),
             stack_recorder: Mutex::new(StackRecorder::new(false, Arc::clone(&utid_generator))),
             perf_counter_recorder: Mutex::new(PerfCounterRecorder::new(
                 Arc::clone(&utid_generator),

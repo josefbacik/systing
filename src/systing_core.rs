@@ -154,11 +154,20 @@ pub struct RecorderInfo {
 // These are the program names as they appear in the BPF skeleton.
 
 const SCHED_BPF_PROGRAMS: &[&str] = &[
-    "systing_sched_wakeup",
     "systing_sched_wakeup_new",
     "systing_sched_switch",
     "systing_sched_waking",
     "systing_sched_process_exit",
+];
+
+/// IRQ/softirq tracing programs. Historically bundled with the scheduler
+/// recorder, but split out so IRQ pressure can be shed independently: IRQ
+/// events cannot meaningfully be filtered by `-p` (nearly every IRQ
+/// interrupts *some* traced task on a busy host), so on many-CPU machines
+/// they can drown a pid-scoped sched trace. When the `irq` recorder is off
+/// these programs are simply not loaded, so they cost nothing; the
+/// `tool_config.no_irq` rodata gate in BPF is belt-and-braces on top.
+const IRQ_BPF_PROGRAMS: &[&str] = &[
     "systing_irq_handler_entry",
     "systing_irq_handler_exit",
     "systing_softirq_entry",
@@ -259,6 +268,15 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             description: "Scheduler event tracing",
             default_enabled: true,
             bpf_programs: SCHED_BPF_PROGRAMS,
+            ringbuf_families: &["ringbufs"],
+        },
+        RecorderInfo {
+            name: "irq",
+            description: "IRQ and softirq event tracing",
+            default_enabled: true,
+            bpf_programs: IRQ_BPF_PROGRAMS,
+            // IRQ events share the sched rings (and consumers); the events
+            // are task_events with IRQ-specific types, schema unchanged.
             ringbuf_families: &["ringbufs"],
         },
         RecorderInfo {
@@ -366,6 +384,7 @@ pub fn validate_recorder_names(names: &[String]) -> Result<()> {
 fn is_recorder_enabled(name: &str, opts: &Config) -> bool {
     match name {
         "sched" => !opts.no_sched,
+        "irq" => !opts.no_irq,
         "syscalls" => opts.syscalls,
         "sleep-stacks" => !opts.no_sleep_stack_traces,
         "interruptible-stacks" => !opts.no_interruptible_stack_traces,
@@ -392,6 +411,11 @@ const CORE_BPF_PROGRAMS: &[&str] = &["systing_perf_event_clock"];
 /// kprobe. Loaded only when at least one trace event is configured so that
 /// `probe_ringbufs` can be `autocreate=false` otherwise.
 const PROBE_BPF_PROGRAMS: &[&str] = &["systing_usdt", "systing_uprobe", "systing_kprobe"];
+
+/// Number of per-CPU-sharded ring buffers in each ringbuf ARRAY_OF_MAPS
+/// family (events land in ring `cpu % NR_RINGBUFS`).
+/// Must match NR_RINGBUFS in src/bpf/systing_system.bpf.c.
+pub(crate) const NR_RINGBUFS: usize = 8;
 
 /// Per-CPU ringbuf ARRAY_OF_MAPS families: (outer map name, inner-map name prefix).
 const RINGBUF_FAMILIES: &[(&str, &str)] = &[
@@ -525,6 +549,8 @@ pub struct Config {
     pub no_gvisor_guest_maps: bool,
     /// Disable scheduler tracing
     pub no_sched: bool,
+    /// Disable IRQ/softirq tracing
+    pub no_irq: bool,
     /// Enable syscall tracing
     pub syscalls: bool,
     /// Enable marker recording (faccessat2-based userspace markers)
@@ -601,6 +627,7 @@ impl Default for Config {
             no_frame_labels: false,
             no_gvisor_guest_maps: false,
             no_sched: false,
+            no_irq: false,
             syscalls: false,
             markers: false,
             marker_threshold: None,
@@ -984,7 +1011,10 @@ fn consume_loop<T, N>(
 }
 
 struct RecorderChannels {
-    event_rx: Receiver<task_event>,
+    /// One receiver per `ringbufs`-family ring. Each ring has exactly one
+    /// producer (its poller thread) and gets exactly one consumer thread, so
+    /// every channel is used SPSC and consumers never contend with each other.
+    event_rxs: Vec<Receiver<task_event>>,
     stack_rx: Receiver<stack_event>,
     cache_rx: Receiver<perf_counter_event>,
     probe_rx: Receiver<probe_event>,
@@ -1009,7 +1039,7 @@ fn spawn_recorder_threads(
     task_info_tx: &Sender<task_info>,
 ) -> Result<Vec<thread::JoinHandle<i32>>> {
     let RecorderChannels {
-        event_rx,
+        event_rxs,
         stack_rx,
         cache_rx,
         probe_rx,
@@ -1023,17 +1053,30 @@ fn spawn_recorder_threads(
 
     let mut threads = Vec::new();
 
-    // Always spawn sched recorder
-    {
+    // Spawn one sched consumer per ring. Each consumer owns its recorder
+    // shard: cpu -> ring is static (cpu % NR_RINGBUFS) and all
+    // SchedEventRecorder state is keyed by CPU, so shards share nothing and
+    // the per-shard mutex is effectively uncontended (the shard's consumer
+    // is the only per-event lock holder; trace finalization locks it once
+    // after consumers exit).
+    anyhow::ensure!(
+        event_rxs.len() <= recorder.event_recorders.len(),
+        "{} sched/IRQ rings but only {} recorder shards (NR_RINGBUFS out of sync?)",
+        event_rxs.len(),
+        recorder.event_recorders.len()
+    );
+    for (i, event_rx) in event_rxs.into_iter().enumerate() {
         let session_recorder = recorder.clone();
         let my_stop_tx = stop_tx.clone();
         let my_task_tx = task_info_tx.clone();
         threads.push(
             thread::Builder::new()
-                .name("sched_recorder".to_string())
+                // Kernel comm is 15 chars; keep the ring index visible in
+                // ps//proc/<pid>/task/*/comm (and in systing's own traces).
+                .name(format!("sched_rec_{i}"))
                 .spawn(move || {
                     consume_loop::<SchedEventRecorder, task_event>(
-                        &session_recorder.event_recorder,
+                        &session_recorder.event_recorders[i],
                         event_rx,
                         my_stop_tx,
                         my_task_tx,
@@ -1312,12 +1355,13 @@ fn setup_perf_counters(
 }
 
 fn set_ringbuf_duration(recorder: &Arc<SessionRecorder>, duration_nanos: u64) {
-    recorder
-        .event_recorder
-        .lock()
-        .unwrap()
-        .ringbuf
-        .set_max_duration(duration_nanos);
+    for event_recorder in &recorder.event_recorders {
+        event_recorder
+            .lock()
+            .unwrap()
+            .ringbuf
+            .set_max_duration(duration_nanos);
+    }
     recorder
         .stack_recorder
         .lock()
@@ -1811,15 +1855,21 @@ fn setup_ringbuffers<'a>(
     opts: &Config,
     collect_pystacks: bool,
 ) -> Result<(Vec<(String, libbpf_rs::RingBuffer<'a>)>, RecorderChannels)> {
-    // Per-event-type channel capacity. Bounded so that a slow recorder thread
-    // applies backpressure to the ringbuf reader instead of letting an unbounded
+    // Per-channel capacity. Bounded so that a slow recorder thread applies
+    // backpressure to the ringbuf reader instead of letting an unbounded
     // queue grow until OOM. If the kernel ringbuf fills as a result, BPF drops
     // events and increments the missed-events counter, which is the intended
     // behaviour under sustained overload.
     const CHANNEL_CAPACITY: usize = 100_000;
 
     let mut rings = Vec::new();
-    let (event_tx, event_rx) = sync_channel(CHANNEL_CAPACITY);
+    // The sched/IRQ event stream gets one SPSC channel per ring instead of a
+    // shared channel: on many-CPU hosts a single consumer thread is the
+    // throughput ceiling that makes BPF drop events even with large rings,
+    // so each ring's poller feeds its own consumer. (Possible because all
+    // SchedEventRecorder state is keyed by CPU and cpu -> ring is a static
+    // `cpu % NR_RINGBUFS`, so no state is shared across rings.)
+    let mut event_rxs = Vec::new();
     let (stack_tx, stack_rx) = sync_channel(CHANNEL_CAPACITY);
     let (cache_tx, cache_rx) = sync_channel(CHANNEL_CAPACITY);
     let (probe_tx, probe_rx) = sync_channel(CHANNEL_CAPACITY);
@@ -1840,7 +1890,9 @@ fn setup_ringbuffers<'a>(
     for (i, map) in object.maps().enumerate() {
         let name = map.name().to_str().unwrap();
         if name.starts_with("ringbuf_events") && required.contains("ringbufs") {
-            let ring = create_ring::<task_event>(&map, event_tx.clone())?;
+            let (event_tx, event_rx) = sync_channel(CHANNEL_CAPACITY);
+            let ring = create_ring::<task_event>(&map, event_tx)?;
+            event_rxs.push(event_rx);
             rings.push((format!("events_{i}"), ring));
         } else if name.starts_with("ringbuf_stack") {
             let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
@@ -1913,7 +1965,7 @@ fn setup_ringbuffers<'a>(
     };
 
     let channels = RecorderChannels {
-        event_rx,
+        event_rxs,
         stack_rx,
         cache_rx,
         probe_rx,
@@ -1951,7 +2003,6 @@ fn warn_failed_probe_attachments(skel: &SystingSystemSkel) {
         // are skipped since they're attached manually
         let link_is_none = match name.as_ref() {
             // Scheduler probes
-            "systing_sched_wakeup" => skel.links.systing_sched_wakeup.is_none(),
             "systing_sched_wakeup_new" => skel.links.systing_sched_wakeup_new.is_none(),
             "systing_sched_switch" => skel.links.systing_sched_switch.is_none(),
             "systing_sched_waking" => skel.links.systing_sched_waking.is_none(),
@@ -2058,6 +2109,7 @@ fn configure_bpf_skeleton(
         rodata.tool_config.no_interruptible_stack_traces =
             opts.no_interruptible_stack_traces as u32;
         rodata.tool_config.no_sched = opts.no_sched as u32;
+        rodata.tool_config.no_irq = opts.no_irq as u32;
         rodata.tool_config.confidentiality_mode = detect_confidentiality_mode();
         if !opts.cgroup.is_empty() {
             rodata.tool_config.filter_cgroup = 1;
@@ -2132,8 +2184,6 @@ fn configure_bpf_skeleton(
     // their slot index >= num_cpus, to save mlocked memory on small hosts
     // (the slot update still happens, so no time saving there).
     //
-    // Must match NR_RINGBUFS in src/bpf/systing_system.bpf.c.
-    const NR_RINGBUFS: u32 = 8;
     // SAFETY: sysconf is always safe to call; _SC_PAGESIZE cannot fail.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
     let required = get_required_ringbuf_families(opts);
@@ -2155,7 +2205,7 @@ fn configure_bpf_skeleton(
         let unreachable_slot = name
             .rfind("_node")
             .and_then(|pos| name[pos + 5..].parse::<u32>().ok())
-            .is_some_and(|idx| idx >= num_cpus && num_cpus < NR_RINGBUFS);
+            .is_some_and(|idx| idx >= num_cpus && num_cpus < NR_RINGBUFS as u32);
         if unreachable_slot {
             map.set_max_entries(page_size)
                 .with_context(|| format!("Failed to shrink unreachable ringbuf slot '{name}'"))?;
