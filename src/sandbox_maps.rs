@@ -160,6 +160,18 @@ impl ProcessMaps {
         self.gvisor_exe || self.gvisor_memfd
     }
 
+    /// Executable file-backed ranges of this process — for a systrap stub,
+    /// the fragments of guest text it maps directly. Used as the
+    /// fingerprint for correlating a stub to the guest process it mirrors
+    /// (stub VAs are guest VAs).
+    pub fn exec_file_ranges(&self) -> Vec<(u64, u64)> {
+        self.entries
+            .iter()
+            .filter(|e| e.exec && matches!(e.backing, Backing::File(_)))
+            .map(|e| (e.start, e.end))
+            .collect()
+    }
+
     fn entry_for(&self, addr: u64) -> Option<&MapEntry> {
         // Entries are in address order as read from /proc.
         self.entries
