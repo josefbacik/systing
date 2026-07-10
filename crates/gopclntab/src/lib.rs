@@ -1,56 +1,53 @@
-//! Fallback symbolization for stripped Go binaries via `.gopclntab`.
+//! Parse the Go runtime's function table (pclntab) and resolve program
+//! counters to function names.
 //!
-//! Stripped Go binaries carry no ELF symbol table, but the Go runtime needs
-//! its function table (pclntab) at run time for tracebacks and GC, so
-//! `strip` and `-ldflags="-s -w"` always leave `.gopclntab` behind. blazesym
-//! only reads `.symtab`/`.dynsym`, which has two failure modes on such
-//! binaries:
+//! Stripped Go binaries carry no ELF symbol table, but the Go runtime
+//! needs its pclntab at run time for tracebacks and garbage collection, so
+//! `strip` and `-ldflags="-s -w"` always leave the `.gopclntab` section
+//! behind. Symbolizers that only read `.symtab`/`.dynsym` render such
+//! binaries as hex (or worse, misattribute addresses to the few surviving
+//! dynamic symbols of a cgo build); the pclntab has the real answer.
 //!
-//! * fully stripped (e.g. upstream kube-state-metrics, etcd, cilium-agent
-//!   release builds): every user frame renders as bare hex;
-//! * stripped cgo builds that retain a handful of dynamic symbols (e.g.
-//!   COS/boringcrypto kubelet builds): blazesym's nearest-symbol match
-//!   attributes whole Go text ranges to whichever C/asm symbol happens to
-//!   precede them, producing confidently *wrong* names.
+//! # Scope
 //!
-//! [`try_gopclntab_resolver`] probes a process member for exactly that
-//! shape — no `.symtab`, `.gopclntab` present — and returns a resolver that
-//! answers name lookups from the pclntab instead. Binaries with a real
-//! symbol table never take this path, so the richer symtab+DWARF resolution
-//! (source locations, inlined functions) is unaffected.
+//! Name-only resolution: given a virtual address, find the covering Go
+//! function's name, entry address, and size. Source locations and inline
+//! expansion (which the pclntab also encodes) are not read yet.
 //!
-//! Only function names are resolved here (no file/line, no inline
-//! expansion): that is the difference between an unreadable profile and a
-//! readable one, and pclntab line tables can be layered on later if wanted.
+//! Layouts for Go 1.16/1.17 (`ver116`) and Go 1.18+ (`ver118`; the Go
+//! 1.20 magic shares the layout) are supported, little-endian. The Go
+//! 1.2–1.15 layout and big-endian tables are rejected with
+//! [`Error::Unsupported`].
+//!
+//! Robustness is a design requirement: the input is untrusted (arbitrary
+//! binaries found on a system), so every offset is bounds-checked and
+//! malformed tables produce an [`Error`] or a lookup miss, never a panic.
+//!
+//! # Example
+//!
+//! ```no_run
+//! let elf = gopclntab::ElfPclntab::from_path("/usr/bin/some-go-binary")?
+//!     .expect("not a Go binary");
+//! // Symbol-table-less binary: the pclntab is the only symbolization
+//! // source. (Binaries with a symbol table have richer options.)
+//! assert!(!elf.has_symtab);
+//! if let Some(func) = elf.table.find_func(0x4a6e40) {
+//!     println!("{} ({:#x}, {} bytes)", func.name, func.entry, func.size);
+//! }
+//! # Ok::<(), gopclntab::Error>(())
+//! ```
 //!
 //! Format reference: `go/src/debug/gosym/pclntab.go` and
-//! `go/src/internal/abi/symtab.go`. Layouts for Go 1.16/1.17 (`ver116`) and
-//! Go 1.18+ (`ver118`; the Go 1.20 magic shares the layout) are supported.
-//! The Go 1.2–1.15 layout and big-endian tables are rejected, in which case
-//! symbolization behaves exactly as before this module existed.
+//! `go/src/internal/abi/symtab.go`.
 
-use std::ffi::OsString;
-use std::fmt;
-use std::fs::File;
-use std::os::unix::fs::FileExt as _;
-use std::path::Path;
+mod elf;
+mod error;
 
-use anyhow::bail;
-use anyhow::Context;
-use anyhow::Result;
+pub use elf::ElfPclntab;
+pub use error::Error;
 
-use blazesym::helper::ElfResolver;
-use blazesym::symbolize::FindSymOpts;
-use blazesym::symbolize::Reason;
-use blazesym::symbolize::Resolve;
-use blazesym::symbolize::ResolvedSym;
-use blazesym::symbolize::SrcLang;
-use blazesym::symbolize::Symbolize;
-use blazesym::symbolize::TranslateFileOffset;
-use blazesym::Addr;
-
-/// Go 1.2 through 1.15. Predates every Go release still in support; not
-/// worth carrying the layout. Recognized only to be rejected explicitly.
+/// Go 1.2 through 1.15. Predates every Go release still in support;
+/// recognized only to be rejected explicitly.
 const GO12_MAGIC: u32 = 0xFFFF_FFFB;
 /// Go 1.16 and 1.17.
 const GO116_MAGIC: u32 = 0xFFFF_FFFA;
@@ -71,9 +68,9 @@ enum PclnVersion {
     V118,
 }
 
-/// A parsed `.gopclntab` section, exposing pc -> function-name lookups.
+/// A parsed pclntab, exposing pc -> function-name lookups.
 ///
-/// Owns the raw section bytes; the functab within them is already sorted by
+/// Owns the raw table bytes; the functab within them is already sorted by
 /// entry address, so lookups binary-search the raw table directly and
 /// parsing amounts to header validation.
 pub struct GoPclntab {
@@ -82,14 +79,14 @@ pub struct GoPclntab {
     ptrsize: usize,
     nfunctab: usize,
     /// Virtual address of the start of text, the base for V118 entry
-    /// offsets. Taken from the `.text` section header (matching what the Go
-    /// runtime relocates against) with the pclntab header value as
-    /// fallback. Unused for V116.
+    /// offsets. Callers should prefer the `.text` section address
+    /// (matching what the Go runtime relocates against); the pclntab
+    /// header value is the fallback. Unused for V116.
     text_start: u64,
     /// Offset of the function-name string table within `data`.
     funcnametab: usize,
-    /// Offset of the funcdata region within `data`; `funcoff` values in the
-    /// functab are relative to this.
+    /// Offset of the funcdata region within `data`; `funcoff` values in
+    /// the functab are relative to this.
     funcdata: usize,
     /// Offset of the functab (pairs of entry/funcoff) within `data`.
     functab: usize,
@@ -97,8 +94,8 @@ pub struct GoPclntab {
     functab_field: usize,
 }
 
-impl fmt::Debug for GoPclntab {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Debug for GoPclntab {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GoPclntab")
             .field("version", &self.version)
             .field("nfunctab", &self.nfunctab)
@@ -120,42 +117,46 @@ pub struct GoFunc<'tab> {
 }
 
 impl GoPclntab {
-    /// Parse a `.gopclntab` section.
+    /// Parse a pclntab from its raw bytes (e.g. the contents of the
+    /// `.gopclntab` ELF section).
     ///
     /// `text_vaddr` is the virtual address of the binary's `.text` section
     /// when known; Go's own tooling prefers it over the header's stored
-    /// value (which may be unrelocated in edge cases) and so do we.
-    ///
-    /// Every offset is bounds-checked here or read via checked accessors:
-    /// malformed input must produce an error, never a panic, because this
-    /// runs against arbitrary binaries found on the system.
-    pub fn parse(data: Vec<u8>, text_vaddr: Option<u64>) -> Result<Self> {
+    /// value (which may be unrelocated in edge cases) and so does this
+    /// crate. [`ElfPclntab`] supplies it automatically.
+    pub fn parse(data: Vec<u8>, text_vaddr: Option<u64>) -> Result<Self, Error> {
         if data.len() < HEADER_PREFIX_LEN {
-            bail!("pclntab too short for header: {} bytes", data.len());
+            return Err(Error::Malformed(format!(
+                "too short for header: {} bytes",
+                data.len()
+            )));
         }
         let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
         let version = match magic {
             GO118_MAGIC | GO120_MAGIC => PclnVersion::V118,
             GO116_MAGIC => PclnVersion::V116,
-            GO12_MAGIC => bail!("Go <= 1.15 pclntab layout is not supported"),
+            GO12_MAGIC => return Err(Error::Unsupported("Go <= 1.15 pclntab layout".to_string())),
             // The magics are chosen so a byte-swapped read never matches:
-            // an unknown value covers both corruption and big-endian tables.
-            other => bail!("unrecognized pclntab magic {other:#x}"),
+            // an unknown value covers both corruption and big-endian
+            // tables.
+            other => return Err(Error::Unsupported(format!("magic {other:#x}"))),
         };
         let ptrsize = data[7] as usize;
         if ptrsize != 4 && ptrsize != 8 {
-            bail!("unsupported pclntab ptrsize {ptrsize}");
+            return Err(Error::Unsupported(format!("ptrsize {ptrsize}")));
         }
 
-        let word = |idx: usize| -> Result<u64> {
+        let word = |idx: usize| -> Result<u64, Error> {
             let off = HEADER_PREFIX_LEN + idx * ptrsize;
             read_uint(&data, off, ptrsize)
-                .with_context(|| format!("pclntab header word {idx} out of bounds"))
+                .ok_or_else(|| Error::Malformed(format!("header word {idx} out of bounds")))
         };
-        let tab_offset = |idx: usize, what: &str| -> Result<usize> {
+        let tab_offset = |idx: usize, what: &str| -> Result<usize, Error> {
             let off = word(idx)?;
-            let off = usize::try_from(off).ok().filter(|o| *o <= data.len());
-            off.with_context(|| format!("pclntab {what} offset out of bounds"))
+            usize::try_from(off)
+                .ok()
+                .filter(|off| *off <= data.len())
+                .ok_or_else(|| Error::Malformed(format!("{what} offset out of bounds")))
         };
 
         let (nfunctab, text_start, funcnametab, funcdata) = match version {
@@ -172,7 +173,8 @@ impl GoPclntab {
                 tab_offset(6, "funcdata")?,
             ),
         };
-        let nfunctab = usize::try_from(nfunctab).context("pclntab nfunc overflows usize")?;
+        let nfunctab = usize::try_from(nfunctab)
+            .map_err(|_| Error::Malformed("nfunc overflows usize".to_string()))?;
         let functab = funcdata;
         let functab_field = match version {
             PclnVersion::V118 => 4,
@@ -185,15 +187,15 @@ impl GoPclntab {
             .checked_mul(2)
             .and_then(|n| n.checked_add(1))
             .and_then(|n| n.checked_mul(functab_field))
-            .context("pclntab functab size overflows")?;
+            .ok_or_else(|| Error::Malformed("functab size overflows".to_string()))?;
         if functab
             .checked_add(functab_size)
             .is_none_or(|end| end > data.len())
         {
-            bail!(
-                "pclntab functab ({nfunctab} functions) exceeds section size {}",
+            return Err(Error::Malformed(format!(
+                "functab ({nfunctab} functions) exceeds table size {}",
                 data.len()
-            );
+            )));
         }
 
         Ok(Self {
@@ -214,16 +216,26 @@ impl GoPclntab {
         self.nfunctab
     }
 
+    /// The virtual entry address of functab slot `i`, `i < func_count()`.
+    /// Useful for enumerating the table; [`GoPclntab::find_func`] on the
+    /// returned address resolves the same slot.
+    pub fn func_entry(&self, i: usize) -> Option<u64> {
+        if i >= self.nfunctab {
+            return None;
+        }
+        self.entry_vaddr(i)
+    }
+
     /// Read functab word `idx` (words are laid out as
     /// `entry0, funcoff0, entry1, funcoff1, ..., entryN` with the trailing
     /// sentinel entry). Bounds were validated at parse time, but a miss is
     /// still an honest `None` rather than a panic: this data ultimately
-    /// comes from arbitrary binaries found on the system.
+    /// comes from untrusted binaries.
     fn functab_word(&self, idx: usize) -> Option<u64> {
         let off = self
             .functab
             .checked_add(idx.checked_mul(self.functab_field)?)?;
-        read_uint(&self.data, off, self.functab_field).ok()
+        read_uint(&self.data, off, self.functab_field)
     }
 
     /// The entry value (offset for V118, absolute address for V116) of
@@ -245,8 +257,7 @@ impl GoPclntab {
     ///
     /// Returns `None` for addresses outside the table's text range — which
     /// for cgo binaries legitimately includes the C/asm portions of text:
-    /// those are not Go functions and the caller's fallback rendering
-    /// (contextual `unknown` labels) is the honest answer there.
+    /// those are not Go functions and have no entry here.
     pub fn find_func(&self, pc: u64) -> Option<GoFunc<'_>> {
         if self.nfunctab == 0 {
             return None;
@@ -263,11 +274,11 @@ impl GoPclntab {
         if key >= self.entry_value(self.nfunctab)? {
             return None;
         }
-        // partition_point returns the first slot whose entry exceeds `key`;
-        // the covering function is the slot before it. Entries are sorted
-        // by construction (the linker emits them in address order); a
-        // corrupt out-of-bounds read partitions as "exceeds" and can only
-        // shift the search toward a miss.
+        // partition_point returns the first slot whose entry exceeds
+        // `key`; the covering function is the slot before it. Entries are
+        // sorted by construction (the linker emits them in address order);
+        // a corrupt out-of-bounds read partitions as "exceeds" and can
+        // only shift the search toward a miss.
         let upper = partition_point(self.nfunctab + 1, |i| {
             self.entry_value(i).is_some_and(|entry| entry <= key)
         });
@@ -293,7 +304,7 @@ impl GoPclntab {
             .funcdata
             .checked_add(funcoff)?
             .checked_add(entry_width)?;
-        let nameoff = usize::try_from(read_uint(&self.data, nameoff_pos, 4).ok()?).ok()?;
+        let nameoff = usize::try_from(read_uint(&self.data, nameoff_pos, 4)?).ok()?;
         let name_start = self.funcnametab.checked_add(nameoff)?;
         let rest = self.data.get(name_start..)?;
         let len = rest.iter().position(|b| *b == 0)?;
@@ -302,15 +313,12 @@ impl GoPclntab {
 }
 
 /// Little-endian unsigned read of `width` (4 or 8) bytes at `off`.
-fn read_uint(data: &[u8], off: usize, width: usize) -> Result<u64> {
-    let bytes = off
-        .checked_add(width)
-        .and_then(|end| data.get(off..end))
-        .with_context(|| format!("read of {width} bytes at {off} out of bounds"))?;
-    Ok(match width {
+fn read_uint(data: &[u8], off: usize, width: usize) -> Option<u64> {
+    let bytes = off.checked_add(width).and_then(|end| data.get(off..end))?;
+    Some(match width {
         4 => u64::from(u32::from_le_bytes(bytes.try_into().unwrap())),
         8 => u64::from_le_bytes(bytes.try_into().unwrap()),
-        _ => bail!("unsupported read width {width}"),
+        _ => return None,
     })
 }
 
@@ -329,178 +337,6 @@ fn partition_point(n: usize, pred: impl Fn(usize) -> bool) -> usize {
         }
     }
     lo
-}
-
-/// A [`Resolve`] implementation answering symbol lookups from a Go
-/// binary's pclntab.
-///
-/// File-offset translation (needed by the process symbolization flow to
-/// map memory offsets into ELF virtual addresses before calling
-/// [`Symbolize::find_sym`]) is delegated to a regular [`ElfResolver`] over
-/// the same file, which reads it from the program headers.
-#[derive(Debug)]
-pub struct GoPclntabResolver {
-    pclntab: GoPclntab,
-    elf: ElfResolver,
-    /// Reporting name for the module, from the mapping's symbolic path.
-    module: OsString,
-}
-
-impl Symbolize for GoPclntabResolver {
-    fn find_sym(
-        &self,
-        addr: Addr,
-        _opts: &FindSymOpts,
-    ) -> blazesym::Result<std::result::Result<ResolvedSym<'_>, Reason>> {
-        match self.pclntab.find_func(addr) {
-            Some(func) => Ok(Ok(ResolvedSym {
-                name: func.name,
-                module: Some(self.module.as_os_str()),
-                addr: func.entry,
-                size: usize::try_from(func.size).ok(),
-                // Go is not a variant blazesym knows; Unknown also keeps
-                // the demangler away from names that are not mangled.
-                lang: SrcLang::Unknown,
-                code_info: None,
-                inlined: Box::new([]),
-                _non_exhaustive: (),
-            })),
-            None => Ok(Err(Reason::UnknownAddr)),
-        }
-    }
-}
-
-impl TranslateFileOffset for GoPclntabResolver {
-    fn file_offset_to_virt_offset(&self, file_offset: u64) -> blazesym::Result<Option<Addr>> {
-        self.elf.file_offset_to_virt_offset(file_offset)
-    }
-}
-
-/// Probe a process member for the stripped-Go shape and build a resolver
-/// for it.
-///
-/// Returns `Some` only when the ELF at `maps_file` has *no* `.symtab` but
-/// does have a parseable `.gopclntab` — the case the default ELF resolver
-/// renders as hex or misattributes from stray dynamic symbols. Binaries
-/// with a symbol table keep the default (richer) path. Any error along the
-/// way returns `None`, deliberately: this probe must never make
-/// symbolization worse than it was without it.
-pub fn try_gopclntab_resolver(maps_file: &Path, symbolic_path: &Path) -> Option<Box<dyn Resolve>> {
-    let pclntab = match read_pclntab_from_stripped_elf(maps_file) {
-        Ok(Some(tab)) => tab,
-        Ok(None) => return None,
-        Err(err) => {
-            tracing::debug!(
-                "ignoring unusable .gopclntab in {}: {err:#}",
-                symbolic_path.display()
-            );
-            return None;
-        }
-    };
-    let elf = ElfResolver::open(maps_file).ok()?;
-    let module = symbolic_path
-        .file_name()
-        .unwrap_or(symbolic_path.as_os_str())
-        .to_os_string();
-    tracing::debug!(
-        "using .gopclntab symbolization for stripped Go binary {} ({} functions)",
-        symbolic_path.display(),
-        pclntab.func_count()
-    );
-    Some(Box::new(GoPclntabResolver {
-        pclntab,
-        elf,
-        module,
-    }))
-}
-
-/// Section-header size caps. Every symbol-table-less member of every
-/// profiled process gets probed, so reads must stay bounded and targeted:
-/// ELF + section headers + shstrtab first (a few KiB), then exactly the
-/// pclntab byte range for the binaries that have one. A binary whose
-/// metadata exceeds these caps is skipped, not mis-parsed.
-const MAX_SECTION_HEADERS: u64 = 4096;
-const MAX_SHSTRTAB_SIZE: u64 = 1 << 20;
-const MAX_PCLNTAB_SIZE: u64 = 1 << 30;
-
-/// Read and parse `.gopclntab` from the ELF at `path`, returning
-/// `Ok(None)` when the binary is not the stripped-Go shape this module
-/// exists for: not a little-endian ELF64, has a `.symtab` (the default
-/// symtab+DWARF path is strictly better), or has no `.gopclntab`.
-fn read_pclntab_from_stripped_elf(path: &Path) -> Result<Option<GoPclntab>> {
-    let file = File::open(path)?;
-
-    let mut ehdr = [0u8; 64];
-    if file.read_exact_at(&mut ehdr, 0).is_err() {
-        return Ok(None);
-    }
-    // \x7fELF, 64-bit (class 2), little-endian (data 1). Anything else is
-    // simply not a candidate.
-    if ehdr[..4] != [0x7f, b'E', b'L', b'F'] || ehdr[4] != 2 || ehdr[5] != 1 {
-        return Ok(None);
-    }
-    let e_shoff = u64::from_le_bytes(ehdr[0x28..0x30].try_into().unwrap());
-    let e_shentsize = u64::from(u16::from_le_bytes(ehdr[0x3a..0x3c].try_into().unwrap()));
-    let e_shnum = u64::from(u16::from_le_bytes(ehdr[0x3c..0x3e].try_into().unwrap()));
-    let e_shstrndx = usize::from(u16::from_le_bytes(ehdr[0x3e..0x40].try_into().unwrap()));
-    // e_shnum == 0 covers both section-header-stripped binaries and the
-    // >= SHN_LORESERVE escape hatch; neither occurs for the Go release
-    // builds this targets, so skipping is the fail-safe answer.
-    if e_shentsize != 64 || e_shnum == 0 || e_shnum > MAX_SECTION_HEADERS {
-        return Ok(None);
-    }
-
-    let mut shdrs = vec![0u8; (e_shnum * 64) as usize];
-    if file.read_exact_at(&mut shdrs, e_shoff).is_err() {
-        return Ok(None);
-    }
-    // Elf64_Shdr field offsets: sh_name +0 (u32), sh_type +4 (u32),
-    // sh_addr +16, sh_offset +24, sh_size +32 (u64s).
-    let shdr = |i: usize| shdrs.get(i * 64..(i + 1) * 64);
-    let shdr_u32 = |s: &[u8], off: usize| u32::from_le_bytes(s[off..off + 4].try_into().unwrap());
-    let shdr_u64 = |s: &[u8], off: usize| u64::from_le_bytes(s[off..off + 8].try_into().unwrap());
-
-    let shstr = shdr(e_shstrndx).context("shstrndx out of range")?;
-    let shstr_off = shdr_u64(shstr, 24);
-    let shstr_size = shdr_u64(shstr, 32);
-    if shstr_size > MAX_SHSTRTAB_SIZE {
-        return Ok(None);
-    }
-    let mut shstrtab = vec![0u8; shstr_size as usize];
-    if file.read_exact_at(&mut shstrtab, shstr_off).is_err() {
-        return Ok(None);
-    }
-    let section_name = |s: &[u8]| -> &[u8] {
-        let name_off = shdr_u32(s, 0) as usize;
-        let rest = shstrtab.get(name_off..).unwrap_or(&[]);
-        &rest[..rest.iter().position(|b| *b == 0).unwrap_or(rest.len())]
-    };
-
-    const SHT_SYMTAB: u32 = 2;
-    let mut pclntab_range = None;
-    let mut text_vaddr = None;
-    for i in 0..e_shnum as usize {
-        let s = shdr(i).context("section header out of range")?;
-        if shdr_u32(s, 4) == SHT_SYMTAB {
-            return Ok(None);
-        }
-        match section_name(s) {
-            b".gopclntab" => pclntab_range = Some((shdr_u64(s, 24), shdr_u64(s, 32))),
-            b".text" => text_vaddr = Some(shdr_u64(s, 16)),
-            _ => {}
-        }
-    }
-    let Some((offset, size)) = pclntab_range else {
-        return Ok(None);
-    };
-    if size > MAX_PCLNTAB_SIZE {
-        bail!(".gopclntab implausibly large ({size} bytes)");
-    }
-
-    let mut data = vec![0u8; size as usize];
-    file.read_exact_at(&mut data, offset)
-        .context("short read of .gopclntab")?;
-    GoPclntab::parse(data, text_vaddr).map(Some)
 }
 
 #[cfg(test)]
@@ -628,7 +464,7 @@ mod tests {
             out
         }
 
-        fn parse(&self) -> Result<GoPclntab> {
+        fn parse(&self) -> Result<GoPclntab, Error> {
             GoPclntab::parse(self.build(), Some(self.text_start))
         }
     }
@@ -677,6 +513,16 @@ mod tests {
     }
 
     #[test]
+    fn func_entry_enumeration_round_trips() {
+        let tab = sample_v118();
+        for i in 0..tab.func_count() {
+            let entry = tab.func_entry(i).unwrap();
+            assert_eq!(tab.find_func(entry).unwrap().entry, entry);
+        }
+        assert_eq!(tab.func_entry(tab.func_count()), None);
+    }
+
+    #[test]
     fn v116_absolute_entries() {
         let tab = TabBuilder::v116()
             .func(0x40_1000, "runtime.gcBgMarkWorker")
@@ -721,29 +567,38 @@ mod tests {
             .func(0x0, "main.main")
             .end(0x100);
         builder.magic = GO12_MAGIC;
-        assert!(builder.parse().is_err());
+        assert!(matches!(builder.parse(), Err(Error::Unsupported(_))));
         builder.magic = 0xDEAD_BEEF;
-        assert!(builder.parse().is_err());
+        assert!(matches!(builder.parse(), Err(Error::Unsupported(_))));
         // Big-endian table: the LE read of a BE magic matches nothing.
         builder.magic = GO120_MAGIC.swap_bytes();
-        assert!(builder.parse().is_err());
+        assert!(matches!(builder.parse(), Err(Error::Unsupported(_))));
     }
 
     #[test]
     fn rejects_malformed_input_without_panicking() {
         // Too short for the header prefix.
-        assert!(GoPclntab::parse(vec![0xF1, 0xFF, 0xFF], None).is_err());
+        assert!(matches!(
+            GoPclntab::parse(vec![0xF1, 0xFF, 0xFF], None),
+            Err(Error::Malformed(_))
+        ));
         // Valid prefix, missing header words.
         let mut short = GO120_MAGIC.to_le_bytes().to_vec();
         short.extend_from_slice(&[0, 0, 1, 8]);
-        assert!(GoPclntab::parse(short, None).is_err());
+        assert!(matches!(
+            GoPclntab::parse(short, None),
+            Err(Error::Malformed(_))
+        ));
         // Bad ptrsize.
         let mut bad_ptr = GO120_MAGIC.to_le_bytes().to_vec();
         bad_ptr.extend_from_slice(&[0, 0, 1, 3]);
         bad_ptr.extend_from_slice(&[0u8; 64]);
-        assert!(GoPclntab::parse(bad_ptr, None).is_err());
+        assert!(matches!(
+            GoPclntab::parse(bad_ptr, None),
+            Err(Error::Unsupported(_))
+        ));
         // nfunc so large the functab cannot fit in the section.
-        let mut builder = TabBuilder::v118(0x40_0000)
+        let builder = TabBuilder::v118(0x40_0000)
             .func(0x0, "main.main")
             .end(0x100);
         let mut bytes = builder.build();
@@ -751,7 +606,6 @@ mod tests {
         assert!(GoPclntab::parse(bytes, None).is_err());
         // Truncations at every length must error or lose the function, but
         // never panic.
-        builder.magic = GO120_MAGIC;
         let full = builder.build();
         for len in 0..full.len() {
             let tab = GoPclntab::parse(full[..len].to_vec(), Some(0x40_0000));
@@ -773,111 +627,6 @@ mod tests {
         bytes[len - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
         let tab = GoPclntab::parse(bytes, Some(0x40_0000)).unwrap();
         assert_eq!(tab.find_func(0x40_0000), None);
-    }
-
-    /// Parse the pclntab of a binary produced by the real Go toolchain,
-    /// stripped the way release images are, and resolve its functions.
-    /// Skips (with a notice) when no `go` binary is on PATH, mirroring how
-    /// the pystacks tests skip without a usable Python.
-    #[test]
-    fn resolves_real_stripped_go_binary() {
-        use std::io::Write as _;
-        use std::process::Command;
-
-        if Command::new("go").arg("version").output().is_err() {
-            eprintln!("skipping: no go toolchain on PATH");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("main.go");
-        let mut f = File::create(&src).unwrap();
-        f.write_all(
-            b"package main\n\nfunc main() {\n\tprintln(helper())\n}\n\n//go:noinline\nfunc helper() int {\n\treturn 42\n}\n",
-        )
-        .unwrap();
-        drop(f);
-        // File-mode build (no module) with -trimpath: the embedded module
-        // path is the synthetic "command-line-arguments" and no local
-        // filesystem paths land in the binary's metadata.
-        let bin = dir.path().join("fixture");
-        let out = Command::new("go")
-            .args(["build", "-trimpath", "-ldflags=-s -w", "-o"])
-            .arg(&bin)
-            .arg(&src)
-            .env("GOCACHE", dir.path().join("gocache"))
-            .env("CGO_ENABLED", "0")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "go build failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-
-        // The production probe must classify the fixture as stripped-Go.
-        let tab = read_pclntab_from_stripped_elf(&bin)
-            .unwrap()
-            .expect("fixture not detected as a stripped Go binary");
-        assert!(tab.func_count() > 100, "implausibly small function table");
-
-        // Sweep every function entry: each must resolve back to itself,
-        // and main.main / main.helper must both be present by name.
-        let mut seen_main = false;
-        let mut seen_helper = false;
-        for i in 0..tab.func_count() {
-            let entry = tab.entry_vaddr(i).unwrap();
-            let func = tab
-                .find_func(entry)
-                .unwrap_or_else(|| panic!("entry {entry:#x} (functab slot {i}) failed to resolve"));
-            assert_eq!(func.entry, entry);
-            seen_main |= func.name == "main.main";
-            seen_helper |= func.name == "main.helper";
-        }
-        assert!(seen_main, "main.main not found in pclntab");
-        assert!(seen_helper, "main.helper not found in pclntab");
-
-        // An unstripped build of the same source must be declined: the
-        // symtab+DWARF path is richer and the probe must not shadow it.
-        let unstripped = dir.path().join("fixture-unstripped");
-        let out = Command::new("go")
-            .args(["build", "-trimpath", "-o"])
-            .arg(&unstripped)
-            .arg(&src)
-            .env("GOCACHE", dir.path().join("gocache"))
-            .env("CGO_ENABLED", "0")
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        assert!(read_pclntab_from_stripped_elf(&unstripped)
-            .unwrap()
-            .is_none());
-    }
-
-    /// Parse the pclntab of an arbitrary Go ELF supplied via
-    /// `GOPCLNTAB_TEST_BINARY` — handy for vetting against real release
-    /// binaries (kubelet, etcd, kube-state-metrics). Skips when unset.
-    #[test]
-    fn resolves_binary_from_env() {
-        let Some(path) = std::env::var_os("GOPCLNTAB_TEST_BINARY") else {
-            return;
-        };
-        let tab = read_pclntab_from_stripped_elf(Path::new(&path))
-            .unwrap()
-            .expect("binary not detected as stripped Go");
-        assert!(tab.func_count() > 0);
-        let mut named = 0usize;
-        for i in 0..tab.func_count() {
-            if let Some(func) = tab.find_func(tab.entry_vaddr(i).unwrap()) {
-                assert!(!func.name.is_empty());
-                named += 1;
-            }
-        }
-        eprintln!(
-            "resolved {named}/{} functions from {}",
-            tab.func_count(),
-            Path::new(&path).display()
-        );
-        assert_eq!(named, tab.func_count());
     }
 
     #[test]

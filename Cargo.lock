@@ -1430,6 +1430,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gopclntab"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3430,7 +3437,7 @@ dependencies = [
 
 [[package]]
 name = "systing"
-version = "1.10.7"
+version = "1.10.9"
 dependencies = [
  "anyhow",
  "arrow 54.3.1",
@@ -3443,6 +3450,7 @@ dependencies = [
  "dns-lookup",
  "duckdb",
  "flate2",
+ "gopclntab",
  "indicatif",
  "libbpf-cargo",
  "libbpf-rs",
