@@ -1597,17 +1597,19 @@ impl TraceExtractor {
         Ok(())
     }
 
-    /// Convert flat frame_ids to parent-child callsite tree. Returns leaf callsite ID.
+    /// Convert flat frame_ids to a parent-child callsite tree. frame_ids
+    /// follow the perfetto Callstack convention: ROOT first (frame_ids[0]),
+    /// leaf last — the order perfetto's own tooling produces and systing's
+    /// exporter emits (storage-order pass-through, uniform since schema
+    /// v12). Depth is root=0 increasing toward the leaf, matching trace
+    /// processor's stack_profile_callsite. Returns the LEAF callsite ID.
     fn get_or_create_callsite(&mut self, frame_ids: &[u64]) -> i64 {
         if frame_ids.is_empty() {
             return 0;
         }
 
-        let num_frames = frame_ids.len();
-
-        // Check if full stack already exists (reversed for root-to-leaf prefix matching)
-        let reversed_key: Vec<u64> = frame_ids.iter().rev().copied().collect();
-        if let Some(&id) = self.callsite_map.get(&reversed_key) {
+        // Fast path: the whole stack is itself a root-first prefix key.
+        if let Some(&id) = self.callsite_map.get(frame_ids) {
             return id;
         }
 
@@ -1615,7 +1617,7 @@ impl TraceExtractor {
         let mut current_prefix: Vec<u64> = Vec::new();
         let mut leaf_callsite_id: i64 = 0;
 
-        for (i, &frame_iid) in frame_ids.iter().rev().enumerate() {
+        for (i, &frame_iid) in frame_ids.iter().enumerate() {
             current_prefix.push(frame_iid);
 
             if let Some(&existing_id) = self.callsite_map.get(&current_prefix) {
@@ -1631,7 +1633,7 @@ impl TraceExtractor {
                 id: callsite_id,
                 parent_id,
                 frame_id: frame_iid as i64,
-                depth: (num_frames - 1 - i) as i32,
+                depth: i as i32,
             });
 
             self.callsite_map
@@ -3930,7 +3932,7 @@ mod tests {
     fn test_get_or_create_callsite_single_frame() {
         let mut extractor = TraceExtractor::new();
 
-        // Single frame: frame_ids[0] is the leaf (and root)
+        // Single frame: frame_ids[0] is the root (and leaf)
         let frame_ids = vec![100u64];
         let callsite_id = extractor.get_or_create_callsite(&frame_ids);
 
@@ -3941,14 +3943,14 @@ mod tests {
         assert_eq!(callsite.id, 1);
         assert_eq!(callsite.parent_id, None); // Single frame has no parent
         assert_eq!(callsite.frame_id, 100);
-        assert_eq!(callsite.depth, 0); // Leaf is depth 0
+        assert_eq!(callsite.depth, 0); // Root is depth 0
     }
 
     #[test]
     fn test_get_or_create_callsite_multiple_frames() {
         let mut extractor = TraceExtractor::new();
 
-        // frame_ids[0]=10 is leaf, frame_ids[2]=30 is root
+        // Perfetto Callstack order: frame_ids[0]=10 is ROOT, frame_ids[2]=30 is leaf
         let frame_ids = vec![10u64, 20, 30];
         let callsite_id = extractor.get_or_create_callsite(&frame_ids);
 
@@ -3958,10 +3960,10 @@ mod tests {
             .data
             .callsites
             .iter()
-            .find(|c| c.frame_id == 30)
+            .find(|c| c.frame_id == 10)
             .unwrap();
         assert_eq!(root.parent_id, None);
-        assert_eq!(root.depth, 2);
+        assert_eq!(root.depth, 0);
 
         let middle = extractor
             .data
@@ -3976,10 +3978,10 @@ mod tests {
             .data
             .callsites
             .iter()
-            .find(|c| c.frame_id == 10)
+            .find(|c| c.frame_id == 30)
             .unwrap();
         assert_eq!(leaf.parent_id, Some(middle.id));
-        assert_eq!(leaf.depth, 0);
+        assert_eq!(leaf.depth, 2);
 
         assert_eq!(callsite_id, leaf.id);
     }
@@ -3988,7 +3990,7 @@ mod tests {
     fn test_get_or_create_callsite_deduplication() {
         let mut extractor = TraceExtractor::new();
 
-        // First stack: [A, B, C] where C is root
+        // First stack: [A, B, C] where A is root (perfetto order)
         let stack1 = vec![1u64, 2, 3];
         let id1 = extractor.get_or_create_callsite(&stack1);
 
@@ -4002,11 +4004,11 @@ mod tests {
     fn test_get_or_create_callsite_shared_prefix() {
         let mut extractor = TraceExtractor::new();
 
-        let stack1 = vec![1u64, 2, 3]; // [leaf=1, 2, root=3]
+        let stack1 = vec![1u64, 2, 3]; // [root=1, 2, leaf=3]
         let id1 = extractor.get_or_create_callsite(&stack1);
         assert_eq!(extractor.data.callsites.len(), 3);
 
-        let stack2 = vec![4u64, 2, 3]; // [leaf=4, 2, root=3] shares [2, 3] suffix
+        let stack2 = vec![1u64, 2, 4]; // [root=1, 2, leaf=4] shares the [1, 2] prefix
         let id2 = extractor.get_or_create_callsite(&stack2);
 
         assert_eq!(extractor.data.callsites.len(), 4); // Only 1 new callsite for frame 4
@@ -4018,7 +4020,7 @@ mod tests {
             .iter()
             .find(|c| c.frame_id == 4)
             .unwrap();
-        assert_eq!(new_callsite.depth, 0);
+        assert_eq!(new_callsite.depth, 2);
 
         let parent = extractor
             .data
@@ -4069,7 +4071,124 @@ mod tests {
             }
         }
 
+        // Walking leaf -> root visits the root-first input in reverse.
+        visited_frames.reverse();
         assert_eq!(visited_frames, frame_ids);
+    }
+
+    #[test]
+    fn test_callsite_frame_ids_are_root_first_per_perfetto_spec() {
+        // Regression for the import-order bug: Callstack.frame_ids in
+        // perfetto traces are ROOT-first (so are systing's own exports,
+        // storage-order pass-through). A main -> foo -> bar sample must
+        // produce a tree rooted at main with bar as the returned leaf —
+        // the pre-fix code reversed the input and built the tree upside
+        // down (bar as parentless root, main returned as "leaf").
+        let mut extractor = TraceExtractor::new();
+        let (main_f, foo_f, bar_f) = (1u64, 2u64, 3u64);
+
+        let returned = extractor.get_or_create_callsite(&[main_f, foo_f, bar_f]);
+
+        let by_frame = |f: u64| {
+            extractor
+                .data
+                .callsites
+                .iter()
+                .find(|c| c.frame_id == f as i64)
+                .unwrap()
+        };
+        let (main_c, foo_c, bar_c) = (by_frame(main_f), by_frame(foo_f), by_frame(bar_f));
+
+        assert_eq!(main_c.parent_id, None, "main is the tree root");
+        assert_eq!(foo_c.parent_id, Some(main_c.id), "foo called by main");
+        assert_eq!(bar_c.parent_id, Some(foo_c.id), "bar called by foo");
+        assert_eq!(
+            (main_c.depth, foo_c.depth, bar_c.depth),
+            (0, 1, 2),
+            "depth grows root -> leaf, trace_processor convention"
+        );
+        assert_eq!(returned, bar_c.id, "returned id is the LEAF callsite");
+    }
+
+    #[test]
+    fn test_perfetto_wire_round_trip_preserves_tree_direction() {
+        // Wire-level round trip: the packets below carry exactly what
+        // systing's exporter emits — InternedData whose Callstack.frame_ids
+        // pass through storage order, root-first (uniform since schema
+        // v12) — and the full packet import path must reconstruct the
+        // same tree: rooted at main, with the perf sample's callsite_id
+        // pointing at the true leaf. Locks the export/import convention
+        // end-to-end at the .pb boundary, not just inside the tree
+        // builder.
+        use perfetto_protos::interned_data::InternedData;
+        use perfetto_protos::profile_common::{Callstack, Frame, InternedString};
+        use perfetto_protos::profile_packet::PerfSample;
+
+        let mut extractor = TraceExtractor::new();
+
+        let mut interned_packet = TracePacket::default();
+        let mut interned_data = InternedData::default();
+
+        let names = [(1u64, "main"), (2, "foo"), (3, "bar")];
+        for &(iid, name) in &names {
+            let mut fname = InternedString::default();
+            fname.set_iid(iid);
+            fname.set_str(name.as_bytes().to_vec());
+            interned_data.function_names.push(fname);
+
+            let mut frame = Frame::default();
+            frame.set_iid(iid);
+            frame.set_function_name_id(iid);
+            interned_data.frames.push(frame);
+        }
+
+        let mut callstack = Callstack::default();
+        callstack.set_iid(7);
+        callstack.frame_ids = vec![1, 2, 3]; // root-first: main, foo, bar
+        interned_data.callstacks.push(callstack);
+
+        interned_packet.interned_data = Some(interned_data).into();
+        extractor.process_packet(&interned_packet).unwrap();
+
+        let mut sample_packet = TracePacket::default();
+        sample_packet.set_timestamp(42);
+        let mut perf_sample = PerfSample::default();
+        perf_sample.set_pid(1000);
+        perf_sample.set_tid(1000);
+        perf_sample.set_callstack_iid(7);
+        sample_packet.set_perf_sample(perf_sample);
+        extractor.process_packet(&sample_packet).unwrap();
+
+        let by_frame = |f: i64| {
+            extractor
+                .data
+                .callsites
+                .iter()
+                .find(|c| c.frame_id == f)
+                .unwrap()
+        };
+        let (main_c, foo_c, bar_c) = (by_frame(1), by_frame(2), by_frame(3));
+        assert_eq!(main_c.parent_id, None, "main roots the imported tree");
+        assert_eq!(foo_c.parent_id, Some(main_c.id));
+        assert_eq!(bar_c.parent_id, Some(foo_c.id));
+
+        let sample = &extractor.data.perf_samples[0];
+        assert_eq!(
+            sample.callsite_id,
+            Some(bar_c.id),
+            "sample's callsite is the LEAF (bar), not the root"
+        );
+
+        // The interned function names must resolve to the frames so the
+        // reconstructed tree is symbolizable end-to-end.
+        extractor.finalize_stack_data();
+        for &(iid, name) in &names {
+            assert!(extractor
+                .data
+                .symbols
+                .iter()
+                .any(|s| s.id == iid as i64 && s.name == name));
+        }
     }
 
     #[test]
@@ -4198,7 +4317,7 @@ mod tests {
     fn test_callsite_depth_correctness() {
         let mut extractor = TraceExtractor::new();
 
-        let frame_ids: Vec<u64> = vec![100, 101, 102, 103, 104]; // leaf=100, root=104
+        let frame_ids: Vec<u64> = vec![100, 101, 102, 103, 104]; // root=100, leaf=104
         extractor.get_or_create_callsite(&frame_ids);
 
         for (i, &frame_id) in frame_ids.iter().enumerate() {
