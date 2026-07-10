@@ -21,7 +21,7 @@ otherwise be unreadable.
   are on the roadmap, not implemented.
 - **Layouts**: Go 1.16/1.17 and Go 1.18+ (through current), little-endian.
   Go ≤ 1.15 tables and big-endian are rejected as unsupported.
-- **Zero dependencies**, `std` only.
+- **One dependency**: the [`object`](https://crates.io/crates/object) crate (read core + ELF format only) for ELF section access.
 - **Untrusted input is the design point**: every offset is bounds-checked;
   malformed tables produce errors or lookup misses, never panics. The test
   suite includes truncation sweeps and corrupted-field cases, and the

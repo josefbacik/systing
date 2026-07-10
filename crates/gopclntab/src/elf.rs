@@ -1,33 +1,32 @@
 //! Locate and extract `.gopclntab` from ELF binaries.
 //!
-//! Reads are targeted and bounded — ELF header, section headers, and the
-//! section-name string table first (a few KiB, explicitly capped), then
-//! exactly the pclntab byte range — so probing large binaries (Go binaries
-//! run to hundreds of MiB) never reads whole files.
+//! ELF parsing is delegated to the [`object`] crate; reads are targeted —
+//! headers and the sections consulted, then exactly the pclntab byte
+//! range — so probing large binaries (Go binaries run to hundreds of MiB)
+//! never reads whole files.
 //!
-//! Only little-endian ELF64 is supported; anything else reports "not a
-//! candidate" (`Ok(None)`) rather than an error, as do binaries without a
-//! `.gopclntab` section. Policy is deliberately left to the caller: this
-//! module reports whether a symbol table is present ([`ElfPclntab::
-//! has_symtab`]) but does not decide whether the pclntab *should* be used
-//! — a profiler may only want it for stripped binaries, while other tools
-//! may always want it.
+//! Binaries that are not ELF, or have no `.gopclntab` section, report
+//! "not a candidate" (`Ok(None)`) rather than an error. Section metadata
+//! is validated against the input's actual size, so the only inputs
+//! rejected as malformed are ones whose headers are inconsistent with the
+//! bytes on disk — there is no size threshold a large-but-valid binary
+//! could trip over.
+//!
+//! Policy is deliberately left to the caller: this module reports whether
+//! a symbol table is present ([`ElfPclntab::has_symtab`]) but does not
+//! decide whether the pclntab *should* be used — a profiler may only want
+//! it for stripped binaries, while other tools may always want it.
 
 use std::fs::File;
 use std::path::Path;
 
+use object::read::ReadCache;
+use object::read::ReadRef;
+use object::Object;
+use object::ObjectSection;
+
 use crate::Error;
 use crate::GoPclntab;
-
-/// Caps on metadata reads. A binary whose metadata exceeds these is
-/// skipped (`Ok(None)`), not mis-parsed; a `.gopclntab` larger than the
-/// cap is reported as malformed (real tables in very large binaries run
-/// to tens of MiB).
-const MAX_SECTION_HEADERS: u64 = 4096;
-const MAX_SHSTRTAB_SIZE: u64 = 1 << 20;
-const MAX_PCLNTAB_SIZE: u64 = 1 << 30;
-
-const SHT_SYMTAB: u32 = 2;
 
 /// A `.gopclntab` extracted from an ELF binary, with the context a caller
 /// needs to decide how to use it.
@@ -42,133 +41,67 @@ pub struct ElfPclntab {
     pub has_symtab: bool,
 }
 
-/// A bounded random-access byte source: implemented for files (pread) and
-/// in-memory slices.
-trait ReadAt {
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()>;
-}
-
-impl ReadAt for File {
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-        std::os::unix::fs::FileExt::read_exact_at(self, buf, offset)
-    }
-}
-
-impl ReadAt for &[u8] {
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-        let start = usize::try_from(offset).ok().filter(|start| {
-            start
-                .checked_add(buf.len())
-                .is_some_and(|end| end <= self.len())
-        });
-        match start {
-            Some(start) => {
-                buf.copy_from_slice(&self[start..start + buf.len()]);
-                Ok(())
-            }
-            None => Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
-        }
-    }
-}
-
 impl ElfPclntab {
     /// Extract and parse `.gopclntab` from the ELF file at `path`.
     ///
-    /// Returns `Ok(None)` when the file is not a candidate: not a
-    /// little-endian ELF64, no section headers, or no `.gopclntab`
-    /// section. Returns an error for I/O failures and for tables that
-    /// exist but do not parse.
+    /// Returns `Ok(None)` when the file is not a candidate: not an ELF, or
+    /// no `.gopclntab` section. Returns an error for I/O failures and for
+    /// tables that exist but do not parse.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Option<Self>, Error> {
         let file = File::open(path)?;
-        Self::from_read_at(&file)
+        // ReadCache reads the byte ranges object asks for, not the whole
+        // file.
+        let cache = ReadCache::new(file);
+        Self::from_read_ref(&cache)
     }
 
     /// Extract and parse `.gopclntab` from an in-memory ELF image.
     ///
     /// Same semantics as [`ElfPclntab::from_path`].
     pub fn from_bytes(data: &[u8]) -> Result<Option<Self>, Error> {
-        Self::from_read_at(&data)
+        Self::from_read_ref(data)
     }
 
-    fn from_read_at<R: ReadAt>(source: &R) -> Result<Option<Self>, Error> {
-        let mut ehdr = [0u8; 64];
-        if source.read_exact_at(&mut ehdr, 0).is_err() {
-            return Ok(None);
-        }
-        // \x7fELF, 64-bit (class 2), little-endian (data 1).
-        if ehdr[..4] != [0x7f, b'E', b'L', b'F'] || ehdr[4] != 2 || ehdr[5] != 1 {
-            return Ok(None);
-        }
-        let e_shoff = u64::from_le_bytes(ehdr[0x28..0x30].try_into().unwrap());
-        let e_shentsize = u64::from(u16::from_le_bytes(ehdr[0x3a..0x3c].try_into().unwrap()));
-        let e_shnum = u64::from(u16::from_le_bytes(ehdr[0x3c..0x3e].try_into().unwrap()));
-        let e_shstrndx = usize::from(u16::from_le_bytes(ehdr[0x3e..0x40].try_into().unwrap()));
-        // e_shnum == 0 covers both section-header-stripped binaries and
-        // the >= SHN_LORESERVE escape hatch; neither occurs for Go
-        // release builds, so skipping is the fail-safe answer.
-        if e_shentsize != 64 || e_shnum == 0 || e_shnum > MAX_SECTION_HEADERS {
-            return Ok(None);
-        }
-
-        let mut shdrs = vec![0u8; (e_shnum * 64) as usize];
-        if source.read_exact_at(&mut shdrs, e_shoff).is_err() {
-            return Ok(None);
-        }
-        // Elf64_Shdr field offsets: sh_name +0 (u32), sh_type +4 (u32),
-        // sh_addr +16, sh_offset +24, sh_size +32 (u64s).
-        let shdr = |i: usize| shdrs.get(i * 64..(i + 1) * 64);
-        let shdr_u32 =
-            |s: &[u8], off: usize| u32::from_le_bytes(s[off..off + 4].try_into().unwrap());
-        let shdr_u64 =
-            |s: &[u8], off: usize| u64::from_le_bytes(s[off..off + 8].try_into().unwrap());
-
-        let Some(shstr) = shdr(e_shstrndx) else {
+    fn from_read_ref<'data, R: ReadRef<'data>>(source: R) -> Result<Option<Self>, Error> {
+        let Ok(elf) = object::File::parse(source) else {
+            // Not an object file this build recognizes (only the ELF
+            // format is compiled in): not a candidate.
             return Ok(None);
         };
-        let shstr_off = shdr_u64(shstr, 24);
-        let shstr_size = shdr_u64(shstr, 32);
-        if shstr_size > MAX_SHSTRTAB_SIZE {
-            return Ok(None);
-        }
-        let mut shstrtab = vec![0u8; shstr_size as usize];
-        if source.read_exact_at(&mut shstrtab, shstr_off).is_err() {
-            return Ok(None);
-        }
-        let section_name = |s: &[u8]| -> &[u8] {
-            let name_off = shdr_u32(s, 0) as usize;
-            let rest = shstrtab.get(name_off..).unwrap_or(&[]);
-            &rest[..rest.iter().position(|b| *b == 0).unwrap_or(rest.len())]
-        };
 
-        let mut has_symtab = false;
-        let mut pclntab_range = None;
-        let mut text_vaddr = None;
-        for i in 0..e_shnum as usize {
-            let Some(s) = shdr(i) else {
-                return Ok(None);
-            };
-            if shdr_u32(s, 4) == SHT_SYMTAB {
-                has_symtab = true;
-            }
-            match section_name(s) {
-                b".gopclntab" => pclntab_range = Some((shdr_u64(s, 24), shdr_u64(s, 32))),
-                b".text" => text_vaddr = Some(shdr_u64(s, 16)),
-                _ => {}
-            }
-        }
-        let Some((offset, size)) = pclntab_range else {
+        let Some(section) = elf.section_by_name(".gopclntab") else {
             return Ok(None);
         };
-        if size > MAX_PCLNTAB_SIZE {
+        // Resolving the section's (offset, size) before reading lets the
+        // metadata be validated against the input's real length: a section
+        // header claiming bytes past end-of-input is inconsistent with the
+        // file itself, which is the only "too large" this module rejects.
+        let range = section
+            .compressed_file_range()
+            .map_err(|_| Error::Malformed(".gopclntab has no file range".to_string()))?;
+        if range.format != object::CompressionFormat::None {
+            return Err(Error::Unsupported(
+                "compressed .gopclntab section".to_string(),
+            ));
+        }
+        let input_len = source.len().unwrap_or(u64::MAX);
+        if range
+            .offset
+            .checked_add(range.uncompressed_size)
+            .is_none_or(|end| end > input_len)
+        {
             return Err(Error::Malformed(format!(
-                ".gopclntab implausibly large ({size} bytes)"
+                ".gopclntab claims {} bytes at offset {} but the input is {} bytes",
+                range.uncompressed_size, range.offset, input_len
             )));
         }
+        let data = section
+            .uncompressed_data()
+            .map_err(|_| Error::Malformed("short read of .gopclntab".to_string()))?
+            .into_owned();
 
-        let mut data = vec![0u8; size as usize];
-        source
-            .read_exact_at(&mut data, offset)
-            .map_err(|_| Error::Malformed("short read of .gopclntab".to_string()))?;
+        let has_symtab = elf.symbol_table().is_some();
+        let text_vaddr = elf.section_by_name(".text").map(|text| text.address());
         let table = GoPclntab::parse(data, text_vaddr)?;
         Ok(Some(Self { table, has_symtab }))
     }
@@ -263,6 +196,33 @@ mod tests {
         let elf = ElfPclntab::from_bytes(&bytes).unwrap().unwrap();
         assert!(!elf.has_symtab);
         assert_eq!(elf.table.func_count(), tab.func_count());
+
+        // Corrupt the section header so .gopclntab claims to extend past
+        // end-of-file: the only "too large" that gets rejected is metadata
+        // inconsistent with the input itself.
+        let corrupt = corrupt_gopclntab_size(&bytes);
+        assert!(matches!(
+            ElfPclntab::from_bytes(&corrupt),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    /// Flip the `sh_size` of `.gopclntab` to a value larger than the file.
+    /// object's read API is read-only, so the edit pokes the ELF64
+    /// section-header layout directly (stable ABI; fine for a test).
+    fn corrupt_gopclntab_size(elf: &[u8]) -> Vec<u8> {
+        use object::read::elf::ElfFile64;
+        let parsed: ElfFile64 = ElfFile64::parse(elf).unwrap();
+        let section = parsed.section_by_name(".gopclntab").unwrap();
+        let index = section.index().0;
+
+        let mut out = elf.to_vec();
+        let e_shoff = u64::from_le_bytes(elf[0x28..0x30].try_into().unwrap()) as usize;
+        let e_shentsize = u16::from_le_bytes(elf[0x3a..0x3c].try_into().unwrap()) as usize;
+        // sh_size lives at +0x20 within an Elf64_Shdr.
+        let sh_size_at = e_shoff + index * e_shentsize + 0x20;
+        out[sh_size_at..sh_size_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        out
     }
 
     /// Parse the pclntab of an arbitrary Go ELF supplied via
@@ -300,14 +260,12 @@ mod tests {
         assert!(ElfPclntab::from_bytes(b"not an elf at all")
             .unwrap()
             .is_none());
-        // Valid magic, wrong class (32-bit).
+        // A bare ELF header with nothing behind it must not become a
+        // candidate (and must not panic).
         let mut ehdr = vec![0u8; 64];
         ehdr[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
-        ehdr[4] = 1;
-        ehdr[5] = 1;
-        assert!(ElfPclntab::from_bytes(&ehdr).unwrap().is_none());
-        // 64-bit LE but no section headers.
         ehdr[4] = 2;
-        assert!(ElfPclntab::from_bytes(&ehdr).unwrap().is_none());
+        ehdr[5] = 1;
+        assert!(matches!(ElfPclntab::from_bytes(&ehdr), Ok(None)));
     }
 }

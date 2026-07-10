@@ -12,6 +12,9 @@ keywords = ["go", "golang", "pclntab", "symbolication", "profiling"]
 categories = ["development-tools::debugging", "parser-implementations"]
 
 [dependencies]
+# ELF access only: the read core plus the ELF format, nothing else
+# compiled in.
+object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }
 
 [dev-dependencies]
 tempfile = "3"

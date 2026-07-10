@@ -1433,6 +1433,7 @@ dependencies = [
 name = "gopclntab"
 version = "0.1.0"
 dependencies = [
+ "object",
  "tempfile",
 ]
 
