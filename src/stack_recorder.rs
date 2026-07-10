@@ -544,7 +544,7 @@ pub struct StackRecorder {
     /// When set (default), process members that have no ELF symbol table
     /// but carry a `.gopclntab` — stripped Go binaries — are symbolized
     /// from the Go runtime's function table instead of rendering as hex.
-    /// See [`crate::gopclntab`].
+    /// See [`crate::gopclntab_resolver`].
     gopclntab: bool,
 }
 
@@ -638,7 +638,7 @@ impl StackRecorder {
                 }
                 if gopclntab {
                     if let ProcessMemberType::Path(path) = info.member_entry {
-                        if let Some(resolver) = crate::gopclntab::try_gopclntab_resolver(
+                        if let Some(resolver) = crate::gopclntab_resolver::try_gopclntab_resolver(
                             &path.maps_file,
                             &path.symbolic_path,
                         ) {

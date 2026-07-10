@@ -1,0 +1,20 @@
+[package]
+name = "gopclntab"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+authors = ["Josef Bacik <josef@toxicpanda.com>"]
+license = "MIT"
+description = "Parse the Go runtime's pclntab (.gopclntab) and resolve program counters to function names, including in fully stripped Go binaries"
+repository = "https://github.com/josefbacik/systing"
+readme = "README.md"
+keywords = ["go", "golang", "pclntab", "symbolication", "profiling"]
+categories = ["development-tools::debugging", "parser-implementations"]
+
+[dependencies]
+# ELF access only: the read core plus the ELF format, nothing else
+# compiled in.
+object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }
+
+[dev-dependencies]
+tempfile = "3"
