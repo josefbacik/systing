@@ -73,6 +73,10 @@ struct Command {
     /// symbolization
     #[arg(long)]
     no_gvisor_guest_maps: bool,
+    /// Do not symbolize stripped Go binaries from their .gopclntab (revert
+    /// to symbol-table-only resolution, which renders them as hex)
+    #[arg(long)]
+    no_gopclntab: bool,
     /// Disable scheduler event tracing (sched_* tracepoints and scheduler event recorder)
     #[arg(long)]
     no_sched: bool,
@@ -195,6 +199,7 @@ impl From<Command> for Config {
             enable_debuginfod: cmd.enable_debuginfod,
             no_frame_labels: cmd.no_frame_labels,
             no_gvisor_guest_maps: cmd.no_gvisor_guest_maps,
+            no_gopclntab: cmd.no_gopclntab,
             no_sched: cmd.no_sched,
             no_irq: cmd.no_irq,
             syscalls: cmd.syscalls,
