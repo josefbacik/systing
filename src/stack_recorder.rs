@@ -546,6 +546,18 @@ pub struct StackRecorder {
     /// from the Go runtime's function table instead of rendering as hex.
     /// See [`crate::gopclntab_resolver`].
     gopclntab: bool,
+    /// When set, resolve user-space symbols from ELF symbol tables only:
+    /// no DWARF debug info, source line info, inlined-function resolution,
+    /// or debuginfod fetches. Function names are unchanged for binaries
+    /// that carry a symbol table (and `.gopclntab` handling for stripped
+    /// Go binaries is unaffected); frames lose their "[file:line]" suffix
+    /// and inlined frames collapse into their caller. This bounds
+    /// symbolization memory: blazesym retains parsed debug info per binary
+    /// with no eviction, and one freshly-built `-g` binary can hold
+    /// hundreds of MiB resident, so a host running many of them (a CI node
+    /// mid-build) accumulates past any fixed budget — while the
+    /// symbol-table path costs a few MiB per binary for identical names.
+    names_only: bool,
 }
 
 impl ThreadAwareRecorder for StackRecorder {
@@ -575,6 +587,7 @@ impl StackRecorder {
             frame_labels: true,
             gvisor_guest_maps: true,
             gopclntab: true,
+            names_only: false,
         }
     }
 
@@ -586,6 +599,12 @@ impl StackRecorder {
     /// Disable `.gopclntab`-based symbolization of stripped Go binaries.
     pub fn set_gopclntab(&mut self, enabled: bool) {
         self.gopclntab = enabled;
+    }
+
+    /// Restrict user-space symbolization to ELF symbol tables (see the
+    /// `names_only` field docs for what is kept and what is lost).
+    pub fn set_names_only(&mut self, enabled: bool) {
+        self.names_only = enabled;
     }
 
     /// Disable querying gVisor control sockets for guest maps.
@@ -618,12 +637,21 @@ impl StackRecorder {
 
     /// Create a symbolizer with the configured process dispatcher.
     fn create_symbolizer(&self) -> Symbolizer {
-        let debuginfod = self.process_dispatcher.clone();
+        // names_only drops debuginfod: its purpose is fetching debug info,
+        // which names-only symbolization would then ignore. gopclntab stays —
+        // it provides function names for stripped Go binaries at
+        // symbol-table-like cost.
+        let debuginfod = if self.names_only {
+            None
+        } else {
+            self.process_dispatcher.clone()
+        };
         let gopclntab = self.gopclntab;
+        let code_info = !self.names_only;
         if debuginfod.is_none() && !gopclntab {
             return Symbolizer::builder()
-                .enable_code_info(true)
-                .enable_inlined_fns(true)
+                .enable_code_info(code_info)
+                .enable_inlined_fns(code_info)
                 .build();
         }
         // Dispatch order: debuginfod first (fetched debug info beats
@@ -649,8 +677,8 @@ impl StackRecorder {
                 Ok(None)
             };
         Symbolizer::builder()
-            .enable_code_info(true)
-            .enable_inlined_fns(true)
+            .enable_code_info(code_info)
+            .enable_inlined_fns(code_info)
             .set_process_dispatcher(dispatcher)
             .build()
     }
@@ -714,6 +742,20 @@ impl StackRecorder {
         );
         pb.set_message("Symbolizing stacks");
 
+        // Phase-boundary RSS notes: together with the rebuild note below,
+        // these attribute a memory blowup (or an OOM kill's last words) to
+        // the exited-process pass vs. the live-process symbolization pass
+        // without any tooling on the host.
+        let phase_rss = |phase: &str| {
+            if let Some(anon) = current_anon_rss_bytes() {
+                eprintln!(
+                    "Note: symbolization {phase}: anon RSS {} MiB ({total} unique stacks)",
+                    anon >> 20
+                );
+            }
+        };
+        phase_rss("start");
+
         let mut symbolizer = self.create_symbolizer();
 
         // Create kernel source once - it's shared across all processes
@@ -773,6 +815,7 @@ impl StackRecorder {
             })?;
         }
         drop(tgid_alive);
+        phase_rss("exited-process pass done");
 
         // Pass 2: symbolize live processes one re-spill bucket at a time, and
         // within each bucket one tgid at a time. blazesym accumulates parsed
@@ -838,7 +881,10 @@ impl StackRecorder {
                 let _ = symbolizer.cache(&cache::Cache::from(cache::Process::new(
                     (tgid as u32).into(),
                 )));
-                let proc_src = Source::Process(Process::new(Pid::from(tgid as u32)));
+                let mut proc_source = Process::new(Pid::from(tgid as u32));
+                // See the `names_only` field for the tradeoff.
+                proc_source.debug_syms = !self.names_only;
+                let proc_src = Source::Process(proc_source);
                 // One maps analysis per process, powering island bridging and
                 // frame labels for its whole group. `None` (process raced to
                 // exit, unreadable maps) degrades to plain symbolization.
@@ -887,6 +933,7 @@ impl StackRecorder {
         }
 
         pb.finish_with_message("Stack symbolization complete");
+        phase_rss("done");
 
         Ok(())
     }
@@ -912,7 +959,9 @@ impl StackRecorder {
         }
 
         if let Some(bridge) = ctx.maps.and_then(|m| m.bridge_for(addr)) {
-            let elf_src = Source::Elf(Elf::new(&bridge.map_files_path));
+            let mut bridge_elf = Elf::new(&bridge.map_files_path);
+            bridge_elf.debug_syms = !self.names_only;
+            let elf_src = Source::Elf(bridge_elf);
             if let Some(sym) = symbolizer
                 .symbolize_single(&elf_src, Input::FileOffset(bridge.file_offset))
                 .ok()
@@ -1581,5 +1630,61 @@ mod tests {
             .find(|s| s.id == plain_id)
             .expect("plain stack");
         assert_eq!(plain.frame_names[0], format!("0x{dead_addr:x}"));
+    }
+
+    /// Names-only mode must still resolve live-process symbols — the ELF
+    /// symbol table carries the same function names DWARF does — while the
+    /// dead-process path is unchanged.
+    #[test]
+    fn test_finish_inner_names_only_still_resolves_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
+        rec.set_names_only(true);
+        rec.set_spill_dir(dir.path());
+
+        let self_tgid = std::process::id() as i32;
+        let live_addr = marker_fn as fn() -> u64 as usize as u64;
+        let live_id = rec.interner.intern(
+            Stack {
+                kernel_stack: vec![],
+                user_stack: vec![live_addr],
+                py_stack: vec![],
+            },
+            self_tgid,
+        );
+        let dead_tgid = i32::MAX - 1;
+        let dead_addr = 0x1234_5678u64;
+        let dead_id = rec.interner.intern(
+            Stack {
+                kernel_stack: vec![],
+                user_stack: vec![dead_addr],
+                py_stack: vec![],
+            },
+            dead_tgid,
+        );
+
+        let mut collector = crate::record::InMemoryCollector::new();
+        rec.finish_inner(&mut collector).unwrap();
+        let stacks = &collector.data().stacks;
+
+        let live = stacks.iter().find(|s| s.id == live_id).expect("live stack");
+        let frame = &live.frame_names[0];
+        assert!(
+            !frame.starts_with("0x") && frame.contains('('),
+            "names-only live frame should still resolve from the symbol \
+             table (or carry a module label), got: {frame}"
+        );
+        // The test binary carries full DWARF, so a "[file:line]" suffix
+        // here would mean names-only silently stopped disabling code info.
+        assert!(
+            !frame.contains(".rs:"),
+            "names-only frame must not carry source location info, got: {frame}"
+        );
+
+        let dead = stacks.iter().find(|s| s.id == dead_id).expect("dead stack");
+        assert_eq!(
+            dead.frame_names[0],
+            format!("unknown ([exited]) <{dead_addr:#x}>")
+        );
     }
 }

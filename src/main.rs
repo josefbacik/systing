@@ -77,6 +77,16 @@ struct Command {
     /// to symbol-table-only resolution, which renders them as hex)
     #[arg(long)]
     no_gopclntab: bool,
+    /// Resolve user-space symbols from ELF symbol tables only: skips DWARF
+    /// debug info, source line info, inlined-function resolution, and
+    /// debuginfod. Function names are unchanged for binaries that carry a
+    /// symbol table; frames lose their "[file:line]" suffix and inlined
+    /// frames collapse into their caller. Bounds symbolization memory on
+    /// hosts running many freshly-built debug binaries (CI), where parsed
+    /// debug info — cached per binary with no eviction — otherwise reaches
+    /// GiBs.
+    #[arg(long)]
+    symbolize_names_only: bool,
     /// Disable scheduler event tracing (sched_* tracepoints and scheduler event recorder)
     #[arg(long)]
     no_sched: bool,
@@ -200,6 +210,7 @@ impl From<Command> for Config {
             no_frame_labels: cmd.no_frame_labels,
             no_gvisor_guest_maps: cmd.no_gvisor_guest_maps,
             no_gopclntab: cmd.no_gopclntab,
+            symbolize_names_only: cmd.symbolize_names_only,
             no_sched: cmd.no_sched,
             no_irq: cmd.no_irq,
             syscalls: cmd.syscalls,
