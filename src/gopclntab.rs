@@ -186,7 +186,10 @@ impl GoPclntab {
             .and_then(|n| n.checked_add(1))
             .and_then(|n| n.checked_mul(functab_field))
             .context("pclntab functab size overflows")?;
-        if functab.checked_add(functab_size).is_none_or(|end| end > data.len()) {
+        if functab
+            .checked_add(functab_size)
+            .is_none_or(|end| end > data.len())
+        {
             bail!(
                 "pclntab functab ({nfunctab} functions) exceeds section size {}",
                 data.len()
@@ -217,7 +220,9 @@ impl GoPclntab {
     /// still an honest `None` rather than a panic: this data ultimately
     /// comes from arbitrary binaries found on the system.
     fn functab_word(&self, idx: usize) -> Option<u64> {
-        let off = self.functab.checked_add(idx.checked_mul(self.functab_field)?)?;
+        let off = self
+            .functab
+            .checked_add(idx.checked_mul(self.functab_field)?)?;
         read_uint(&self.data, off, self.functab_field).ok()
     }
 
@@ -284,7 +289,10 @@ impl GoPclntab {
             PclnVersion::V118 => 4,
             PclnVersion::V116 => self.ptrsize,
         };
-        let nameoff_pos = self.funcdata.checked_add(funcoff)?.checked_add(entry_width)?;
+        let nameoff_pos = self
+            .funcdata
+            .checked_add(funcoff)?
+            .checked_add(entry_width)?;
         let nameoff = usize::try_from(read_uint(&self.data, nameoff_pos, 4).ok()?).ok()?;
         let name_start = self.funcnametab.checked_add(nameoff)?;
         let rest = self.data.get(name_start..)?;
@@ -676,7 +684,10 @@ mod tests {
             .end(0x40_2000)
             .parse()
             .unwrap();
-        assert_eq!(tab.find_func(0x40_1234).unwrap().name, "runtime.gcBgMarkWorker");
+        assert_eq!(
+            tab.find_func(0x40_1234).unwrap().name,
+            "runtime.gcBgMarkWorker"
+        );
         let f = tab.find_func(0x40_1fff).unwrap();
         assert_eq!(f.name, "main.main");
         assert_eq!(f.entry, 0x40_1800);
@@ -687,9 +698,14 @@ mod tests {
 
     #[test]
     fn go118_magic_accepted() {
-        let mut builder = TabBuilder::v118(0x40_0000).func(0x0, "main.main").end(0x100);
+        let mut builder = TabBuilder::v118(0x40_0000)
+            .func(0x0, "main.main")
+            .end(0x100);
         builder.magic = GO118_MAGIC;
-        assert_eq!(builder.parse().unwrap().find_func(0x40_0000).unwrap().name, "main.main");
+        assert_eq!(
+            builder.parse().unwrap().find_func(0x40_0000).unwrap().name,
+            "main.main"
+        );
     }
 
     #[test]
@@ -701,7 +717,9 @@ mod tests {
 
     #[test]
     fn rejects_go12_and_unknown_magics() {
-        let mut builder = TabBuilder::v118(0x40_0000).func(0x0, "main.main").end(0x100);
+        let mut builder = TabBuilder::v118(0x40_0000)
+            .func(0x0, "main.main")
+            .end(0x100);
         builder.magic = GO12_MAGIC;
         assert!(builder.parse().is_err());
         builder.magic = 0xDEAD_BEEF;
@@ -725,7 +743,9 @@ mod tests {
         bad_ptr.extend_from_slice(&[0u8; 64]);
         assert!(GoPclntab::parse(bad_ptr, None).is_err());
         // nfunc so large the functab cannot fit in the section.
-        let mut builder = TabBuilder::v118(0x40_0000).func(0x0, "main.main").end(0x100);
+        let mut builder = TabBuilder::v118(0x40_0000)
+            .func(0x0, "main.main")
+            .end(0x100);
         let mut bytes = builder.build();
         bytes[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(GoPclntab::parse(bytes, None).is_err());
@@ -806,9 +826,9 @@ mod tests {
         let mut seen_helper = false;
         for i in 0..tab.func_count() {
             let entry = tab.entry_vaddr(i).unwrap();
-            let func = tab.find_func(entry).unwrap_or_else(|| {
-                panic!("entry {entry:#x} (functab slot {i}) failed to resolve")
-            });
+            let func = tab
+                .find_func(entry)
+                .unwrap_or_else(|| panic!("entry {entry:#x} (functab slot {i}) failed to resolve"));
             assert_eq!(func.entry, entry);
             seen_main |= func.name == "main.main";
             seen_helper |= func.name == "main.helper";
@@ -869,7 +889,10 @@ mod tests {
             if let Some(f) = tab.find_func(pc) {
                 assert!(f.entry <= pc && pc < f.entry + f.size, "pc {pc:#x}");
             } else {
-                assert!(!(0x40_0000..0x40_0400).contains(&pc), "pc {pc:#x} should resolve");
+                assert!(
+                    !(0x40_0000..0x40_0400).contains(&pc),
+                    "pc {pc:#x} should resolve"
+                );
             }
         }
     }

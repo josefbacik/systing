@@ -629,23 +629,25 @@ impl StackRecorder {
         // Dispatch order: debuginfod first (fetched debug info beats
         // everything), then the stripped-Go probe, then blazesym's default
         // ELF handling for members neither claims.
-        let dispatcher = move |info: ProcessMemberInfo<'_>| -> Result<Option<Box<dyn Resolve>>, BlazeErr> {
-            if let Some(debuginfod) = &debuginfod {
-                if let Some(resolver) = debuginfod(info.clone())? {
-                    return Ok(Some(resolver));
-                }
-            }
-            if gopclntab {
-                if let ProcessMemberType::Path(path) = info.member_entry {
-                    if let Some(resolver) =
-                        crate::gopclntab::try_gopclntab_resolver(&path.maps_file, &path.symbolic_path)
-                    {
+        let dispatcher =
+            move |info: ProcessMemberInfo<'_>| -> Result<Option<Box<dyn Resolve>>, BlazeErr> {
+                if let Some(debuginfod) = &debuginfod {
+                    if let Some(resolver) = debuginfod(info.clone())? {
                         return Ok(Some(resolver));
                     }
                 }
-            }
-            Ok(None)
-        };
+                if gopclntab {
+                    if let ProcessMemberType::Path(path) = info.member_entry {
+                        if let Some(resolver) = crate::gopclntab::try_gopclntab_resolver(
+                            &path.maps_file,
+                            &path.symbolic_path,
+                        ) {
+                            return Ok(Some(resolver));
+                        }
+                    }
+                }
+                Ok(None)
+            };
         Symbolizer::builder()
             .enable_code_info(true)
             .enable_inlined_fns(true)

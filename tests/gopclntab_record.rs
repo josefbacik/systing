@@ -156,7 +156,9 @@ fn test_gopclntab_record() {
     let mut workload_tids = std::collections::HashSet::new();
     collect_tids(&mut workload_tids);
 
-    eprintln!("Recording trace ({RECORDING_DURATION_SECS}s, stripped Go spinner pid {workload_pid})...");
+    eprintln!(
+        "Recording trace ({RECORDING_DURATION_SECS}s, stripped Go spinner pid {workload_pid})..."
+    );
     let out_dir = TempDir::new().expect("failed to create output dir");
     let config = Config {
         duration: RECORDING_DURATION_SECS,

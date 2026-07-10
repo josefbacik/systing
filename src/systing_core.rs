@@ -1417,11 +1417,7 @@ fn configure_recorder(opts: &Config, recorder: &Arc<SessionRecorder>) {
             .set_gvisor_guest_maps(false);
     }
     if opts.no_gopclntab {
-        recorder
-            .stack_recorder
-            .lock()
-            .unwrap()
-            .set_gopclntab(false);
+        recorder.stack_recorder.lock().unwrap().set_gopclntab(false);
     }
 }
 
