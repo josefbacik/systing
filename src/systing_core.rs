@@ -558,6 +558,9 @@ pub struct Config {
     pub no_gvisor_guest_maps: bool,
     /// Do not symbolize stripped Go binaries from their `.gopclntab`
     pub no_gopclntab: bool,
+    /// Resolve user-space symbols from ELF symbol tables only (no DWARF
+    /// debug info, line info, inlined functions, or debuginfod)
+    pub symbolize_names_only: bool,
     /// Disable scheduler tracing
     pub no_sched: bool,
     /// Disable IRQ/softirq tracing
@@ -638,6 +641,7 @@ impl Default for Config {
             no_frame_labels: false,
             no_gvisor_guest_maps: false,
             no_gopclntab: false,
+            symbolize_names_only: false,
             no_sched: false,
             no_irq: false,
             syscalls: false,
@@ -1430,6 +1434,15 @@ fn configure_recorder(opts: &Config, recorder: &Arc<SessionRecorder>) {
     }
     if opts.no_gopclntab {
         recorder.stack_recorder.lock().unwrap().set_gopclntab(false);
+    }
+    if opts.symbolize_names_only {
+        recorder.stack_recorder.lock().unwrap().set_names_only(true);
+        if opts.enable_debuginfod {
+            eprintln!(
+                "Note: --symbolize-names-only ignores debuginfod (it exists \
+                 to fetch the debug info names-only symbolization skips)"
+            );
+        }
     }
 }
 
