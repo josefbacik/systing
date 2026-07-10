@@ -302,8 +302,9 @@ fn build_flamegraph_query(
 
 /// Format a chr(31)-separated string of frame ids into folded stack format.
 ///
-/// Frame ids are stored leaf-to-root in the database, so they are reversed
-/// to root-to-leaf order for flamegraph convention (root;child;...;leaf).
+/// Frame ids are stored root-to-leaf in the database (see `Stack` in
+/// stack_recorder.rs), which is already the flamegraph folded convention
+/// (root;child;...;leaf) — emit in storage order.
 fn format_folded_stack(trace_id: &str, frames_str: &str, frames: &FrameTable) -> String {
     if frames_str.is_empty() {
         return String::new();
@@ -311,10 +312,8 @@ fn format_folded_stack(trace_id: &str, frames_str: &str, frames: &FrameTable) ->
 
     let trace_frames = frames.get(trace_id);
 
-    // Reverse from leaf-to-root (storage order) to root-to-leaf (flamegraph convention)
     let formatted: Vec<String> = frames_str
         .split('\x1F')
-        .rev()
         .map(|id_str| {
             let name = id_str
                 .parse::<usize>()
@@ -413,10 +412,10 @@ mod tests {
     }
 
     #[test]
-    fn test_format_folded_stack_reversal() {
-        // frame_ids stored leaf-to-root: "0\x1F1\x1F2"
-        // Should output root-to-leaf: "root;mid;leaf"
-        let frames = frame_map(&["leaf (app) <0x1>", "mid (app) <0x2>", "root (app) <0x3>"]);
+    fn test_format_folded_stack_storage_order() {
+        // frame_ids stored root-to-leaf: "0\x1F1\x1F2" emits in storage
+        // order, which is already the folded convention root;mid;leaf.
+        let frames = frame_map(&["root (app) <0x1>", "mid (app) <0x2>", "leaf (app) <0x3>"]);
         let result = format_folded_stack("t", "0\x1F1\x1F2", &frames);
         assert_eq!(result, "root [app];mid [app];leaf [app]");
     }

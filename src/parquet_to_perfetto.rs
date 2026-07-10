@@ -2546,7 +2546,9 @@ fn get_trace_start_timestamp(input_dir: &Path) -> u64 {
 
 /// Helper struct for stack records from stack.parquet
 struct StackData {
-    /// Frame names in leaf-to-root order.
+    /// Frame names in root-to-leaf order (storage order), which matches
+    /// perfetto's `Callstack.frame_ids` convention ("bottom frame first") —
+    /// pass through without reversing.
     /// Each name contains embedded module and location info in format:
     /// `function_name (module_name [file:line]) <0xaddr>`
     frame_names: Vec<String>,
