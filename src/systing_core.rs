@@ -27,7 +27,7 @@ use crate::perf_recorder::PerfCounterRecorder;
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::session_recorder::{
-    get_clock_value, ClockSamplingConfig, SessionRecorder, SysInfoEvent,
+    get_clock_value, ClockSamplingConfig, MissedEvent, SessionRecorder, SysInfoEvent,
 };
 use crate::stack_recorder::StackRecorder;
 
@@ -60,6 +60,15 @@ const CONTINUOUS_MODE_STOP_DELAY_SECS: u64 = 1;
 
 /// Interval for refreshing system info like CPU frequency (100ms)
 const SYSINFO_REFRESH_INTERVAL_MS: u64 = 100;
+/// How often the missed-events poller samples the per-class BPF counters
+/// into counter tracks. Coarser than sysinfo: the value is a cumulative
+/// total, so one-second steps localize a loss burst well enough while
+/// keeping the added trace volume negligible.
+const MISSED_EVENTS_POLL_INTERVAL_MS: u64 = 1000;
+/// While waiting out the poll interval the missed-events poller re-checks the
+/// shutdown flag at this granularity, so stopping doesn't have to wait out a
+/// full poll interval.
+const MISSED_EVENTS_SHUTDOWN_CHECK_MS: u64 = 100;
 
 struct ShutdownSignal {
     eventfd: OwnedFd,
@@ -1279,12 +1288,9 @@ fn spawn_recorder_threads(
     Ok(threads)
 }
 
-fn dump_missed_events(skel: &SystingSystemSkel, index: u32) -> u64 {
+fn dump_missed_events(map: &dyn libbpf_rs::MapCore, index: u32) -> u64 {
     let index = index.to_ne_bytes();
-    let result = skel
-        .maps
-        .missed_events
-        .lookup_percpu(&index, libbpf_rs::MapFlags::ANY);
+    let result = map.lookup_percpu(&index, libbpf_rs::MapFlags::ANY);
     let mut missed = 0;
     if let Ok(Some(results)) = result {
         for cpu_data in results {
@@ -1379,6 +1385,12 @@ fn set_ringbuf_duration(recorder: &Arc<SessionRecorder>, duration_nanos: u64) {
         .set_max_duration(duration_nanos);
     recorder
         .sysinfo_recorder
+        .lock()
+        .unwrap()
+        .ringbuf
+        .set_max_duration(duration_nanos);
+    recorder
+        .missed_events_recorder
         .lock()
         .unwrap()
         .ringbuf
@@ -2985,6 +2997,7 @@ fn attach_probes(
 struct ThreadHandles {
     ringbuf_threads: Vec<thread::JoinHandle<i32>>,
     sysinfo_thread: Option<thread::JoinHandle<i32>>,
+    missed_poller_thread: thread::JoinHandle<i32>,
     recorder_threads: Vec<thread::JoinHandle<i32>>,
     discovery_thread: thread::JoinHandle<i32>,
     symbol_loader_thread: thread::JoinHandle<i32>,
@@ -3099,6 +3112,13 @@ fn run_tracing_loop(
     if let Some(thread) = handles.sysinfo_thread {
         thread.join().expect("Failed to join sysinfo thread");
     }
+    // The missed-events poller takes one final sample after it observes the
+    // shutdown flag; the ringbuf threads are already joined by then, so that
+    // sample carries the settled totals.
+    handles
+        .missed_poller_thread
+        .join()
+        .expect("Failed to join missed-events poller thread");
     if let Some(thread) = handles.tpu_metrics_thread {
         if let Err(e) = thread.join() {
             eprintln!("TPU metrics thread panicked: {:?}", e);
@@ -3118,17 +3138,41 @@ fn run_tracing_loop(
         .join()
         .expect("Failed to join symbol thread");
 
-    println!("Missed sched/IRQ events: {}", dump_missed_events(skel, 0));
-    println!("Missed stack events: {}", dump_missed_events(skel, 1));
-    println!("Missed probe events: {}", dump_missed_events(skel, 2));
-    println!("Missed cache events: {}", dump_missed_events(skel, 3));
+    println!(
+        "Missed sched/IRQ events: {}",
+        dump_missed_events(&skel.maps.missed_events, 0)
+    );
+    println!(
+        "Missed stack events: {}",
+        dump_missed_events(&skel.maps.missed_events, 1)
+    );
+    println!(
+        "Missed probe events: {}",
+        dump_missed_events(&skel.maps.missed_events, 2)
+    );
+    println!(
+        "Missed cache events: {}",
+        dump_missed_events(&skel.maps.missed_events, 3)
+    );
     if opts.network {
-        println!("Missed network events: {}", dump_missed_events(skel, 4));
-        println!("Missed packet events: {}", dump_missed_events(skel, 5));
-        println!("Missed poll events: {}", dump_missed_events(skel, 6));
+        println!(
+            "Missed network events: {}",
+            dump_missed_events(&skel.maps.missed_events, 4)
+        );
+        println!(
+            "Missed packet events: {}",
+            dump_missed_events(&skel.maps.missed_events, 5)
+        );
+        println!(
+            "Missed poll events: {}",
+            dump_missed_events(&skel.maps.missed_events, 6)
+        );
     }
     if opts.memory || opts.memory_alloc {
-        println!("Missed memory events: {}", dump_missed_events(skel, 8));
+        println!(
+            "Missed memory events: {}",
+            dump_missed_events(&skel.maps.missed_events, 8)
+        );
     }
     if opts.memory_alloc {
         let enters = sum_percpu_counter(&skel.maps.memory_alloc_enter_count);
@@ -3143,7 +3187,7 @@ fn run_tracing_loop(
     if opts.markers {
         println!(
             "Missed marker events (ringbuf full): {}",
-            dump_missed_events(skel, 7)
+            dump_missed_events(&skel.maps.missed_events, 7)
         );
     }
 
@@ -3617,6 +3661,62 @@ pub fn systing(
             }
         }
 
+        // Poll the per-class missed-event counters into counter tracks so
+        // event loss is visible and time-localized in the trace instead of
+        // only in the exit summary. Always on: it's a handful of map lookups
+        // per second, and "loss was zero the whole run" is itself useful
+        // signal. Only the classes whose subsystems are active this run are
+        // polled - same conditions as the exit summary. The map handle is
+        // duplicated so the thread doesn't borrow the skeleton.
+        let missed_poller_thread = {
+            let missed_map = libbpf_rs::MapHandle::try_from(&skel.maps.missed_events)?;
+            let mut classes: Vec<u32> = vec![0, 1, 2, 3];
+            if opts.network {
+                classes.extend([4, 5, 6]);
+            }
+            if opts.markers {
+                classes.push(7);
+            }
+            if opts.memory || opts.memory_alloc {
+                classes.push(8);
+            }
+            let shutdown_clone = shutdown_signal.clone();
+            let missed_recorder = recorder.clone();
+            thread::Builder::new()
+                .name("missed_poller".to_string())
+                .spawn(move || {
+                    loop {
+                        let stopping = shutdown_clone.load(Ordering::Relaxed);
+                        let ts = get_clock_value(libc::CLOCK_BOOTTIME);
+                        {
+                            let mut rec = missed_recorder.missed_events_recorder.lock().unwrap();
+                            for &class in &classes {
+                                let count = dump_missed_events(&missed_map, class);
+                                rec.record_event(MissedEvent { ts, class, count });
+                            }
+                        }
+                        if stopping {
+                            // This sample ran with the flag already observed:
+                            // the rings are quiesced by the time the flag is
+                            // set, so it carries the settled totals.
+                            break;
+                        }
+                        // Wait out the poll interval in slices, re-checking
+                        // the shutdown flag, so the final sample (and the
+                        // join behind it) isn't delayed by up to a full
+                        // interval after stop.
+                        let mut slept = 0;
+                        while slept < MISSED_EVENTS_POLL_INTERVAL_MS
+                            && !shutdown_clone.load(Ordering::Relaxed)
+                        {
+                            thread::sleep(Duration::from_millis(MISSED_EVENTS_SHUTDOWN_CHECK_MS));
+                            slept += MISSED_EVENTS_SHUTDOWN_CHECK_MS;
+                        }
+                    }
+                    0
+                })?
+        };
+
         // Start TPU profiling thread if enabled.
         // The XLA ProfilerService requires a fixed capture duration upfront, so
         // --tpu-profile is incompatible with indefinite tracing (duration == 0).
@@ -3714,6 +3814,7 @@ pub fn systing(
         let handles = ThreadHandles {
             ringbuf_threads,
             sysinfo_thread,
+            missed_poller_thread,
             recorder_threads: recv_threads,
             discovery_thread,
             symbol_loader_thread: symbol_thread,
