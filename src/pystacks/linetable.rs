@@ -176,7 +176,7 @@ impl PyLineTable {
                 0
             };
 
-            line_number += line_delta;
+            line_number = line_number.saturating_add(line_delta);
             let end_addr = addr + delta * 2;
 
             if !callback(addr as usize, end_addr as usize, line_number) {
@@ -188,6 +188,16 @@ impl PyLineTable {
 }
 
 /// Read a varint from the location table data.
+///
+/// The bytes come from traced process memory, which can be torn or
+/// replaced mid-read (fork/exec churn), so this must tolerate arbitrary
+/// input. A well-formed CPython location-table varint fits u32 in at
+/// most six 6-bit groups; the accumulator is u64 so the sixth group
+/// (shift 30, reaching bit 35) cannot lose bits, and a sixth
+/// continuation byte stops the read — the shift would reach 36, the
+/// table is not well-formed, and no amount of further decoding
+/// recovers it. (`x << 36` on u32 is the debug-build panic this
+/// replaces; release builds shifted into oblivion silently.)
 fn read_varint(data: &[u8], pos: &mut usize) -> u32 {
     let len = data.len();
     if *pos >= len {
@@ -195,18 +205,18 @@ fn read_varint(data: &[u8], pos: &mut usize) -> u32 {
     }
     let mut b = data[*pos];
     *pos += 1;
-    let mut val = (b & 63) as u32;
+    let mut val = (b & 63) as u64;
     let mut shift = 0u32;
     while b & 64 != 0 {
-        if *pos >= len {
+        if *pos >= len || shift >= 30 {
             break;
         }
         b = data[*pos];
         *pos += 1;
         shift += 6;
-        val += ((b & 63) as u32) << shift;
+        val += ((b & 63) as u64) << shift;
     }
-    val
+    val.min(u32::MAX as u64) as u32
 }
 
 /// Read a signed varint from the location table data.
@@ -285,5 +295,70 @@ mod tests {
     fn test_empty_data() {
         let lt = PyLineTable::from_data(Vec::new(), 10, 3, 11);
         assert_eq!(lt.get_line_for_inst_index(0), 0);
+    }
+
+    #[test]
+    fn test_varint_multibyte_decodes() {
+        // Two groups: 0x41 = continuation + low bits 1, then 2 ->
+        // 1 + (2 << 6) = 129. Position ends past both bytes.
+        let data = vec![0x41, 0x02, 0x05];
+        let mut pos = 0;
+        assert_eq!(read_varint(&data, &mut pos), 129);
+        assert_eq!(pos, 2);
+        assert_eq!(read_varint(&data, &mut pos), 5);
+    }
+
+    #[test]
+    fn test_varint_six_group_saturation() {
+        // Five continuation bytes: all six groups accumulate (u64 keeps
+        // bit 35), and a value past u32 saturates instead of wrapping.
+        let data = vec![0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x3F];
+        let mut pos = 0;
+        assert_eq!(read_varint(&data, &mut pos), u32::MAX);
+        assert_eq!(pos, 6);
+    }
+
+    #[test]
+    fn test_varint_overflow_reproducer_does_not_panic() {
+        // SIX continuation bytes drive the old code's shift to 36 —
+        // `<< 36` on u32 is the exact "attempt to shift left with
+        // overflow" debug panic that torn fork/exec memory triggered in
+        // the field (a fake continuation run). The fixed read stops at
+        // the sixth continuation byte, saturates, and leaves the
+        // remaining garbage unconsumed.
+        let data = vec![0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x3F];
+        let mut pos = 0;
+        assert_eq!(read_varint(&data, &mut pos), u32::MAX);
+        assert_eq!(pos, 6);
+    }
+
+    #[test]
+    fn test_line_accumulator_saturates_on_torn_deltas() {
+        // Same torn-memory door, one level up: two code-13 entries whose
+        // signed varints saturate to -i32::MAX overflow the i32 line
+        // accumulator in parse_location_table — the walk must saturate,
+        // not panic the capture. (The addr accumulator and the 3.10
+        // lnotab path are bounded by MAX_LINE_TABLE_SIZE and need no cap.)
+        let entry = [0x68, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x3F];
+        let mut data = Vec::new();
+        data.extend_from_slice(&entry);
+        data.extend_from_slice(&entry);
+        let lt = PyLineTable::from_data(data, 0, 3, 11);
+        assert_eq!(lt.get_line_for_inst_index(1000), 0);
+    }
+
+    #[test]
+    fn test_varint_endless_continuation_run_terminates() {
+        // All-continuation garbage (torn table): the read must stop
+        // after six groups instead of shifting past the accumulator,
+        // and must not consume the whole buffer.
+        let data = vec![0x7F; 64];
+        let mut pos = 0;
+        let _ = read_varint(&data, &mut pos);
+        assert_eq!(pos, 6, "read stops after six groups");
+        // Signed wrapper over the same garbage is equally safe.
+        let mut pos2 = 0;
+        let _ = read_signed_varint(&data, &mut pos2);
+        assert_eq!(pos2, 6);
     }
 }
