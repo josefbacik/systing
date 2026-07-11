@@ -255,3 +255,19 @@ tools can distinguish uniformly-ordered databases.
   inverted folded stacks for native frames. It now emits storage order, which
   is correct for all schema versions' native segments; python segments in
   pre-v12 databases remain leaf-first within the blend.
+
+## Perfetto import callsite order (no schema version change)
+
+`systing-util`'s perfetto-trace importer previously read `Callstack.frame_ids`
+as leaf-first and built the callsite tree from the reversed array. Perfetto's
+convention is root-first (and systing's own exporter emits storage order,
+uniformly root-first since v12), so importing any spec-compliant trace —
+including systing's own exports — produced an inverted tree: the real leaf
+became the parentless root, the returned "leaf" id pointed at the real root,
+and `depth` counted leaf=0. The importer now reads frame_ids root-first and
+writes `depth` root=0 increasing toward the leaf, matching perfetto trace
+processor's `stack_profile_callsite`. Table shapes are unchanged (no
+SCHEMA_VERSION bump); `callsites` tables written by older systing-util
+binaries from spec-compliant inputs carry the inverted parent/depth shape and
+cannot be distinguished in-band — re-import with a fixed binary if the tree
+direction matters.

@@ -1037,7 +1037,7 @@ impl StackRecorder {
         let python_frames = self.psr.get_python_frame_names(&stack.py_stack);
         frame_names.extend(python_frames);
 
-        // Symbolize user addresses (leaf)
+        // Symbolize user addresses (middle segment of the root-to-leaf array)
         match user {
             Some((ctx, user_cache)) => {
                 for &addr in &stack.user_stack {
@@ -1063,7 +1063,7 @@ impl StackRecorder {
             }
         }
 
-        // Symbolize kernel addresses (root).
+        // Symbolize kernel addresses (leaf end).
         for &addr in &stack.kernel_stack {
             let frame_name = kernel_cache
                 .entry(addr)
