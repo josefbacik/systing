@@ -593,6 +593,115 @@ fn test_e2e_validation_suite() {
         duckdb_result.warnings
     );
 
+    // --- Check: profile export from both producers agrees (test_e2e_profile_export) ---
+    // The parquet reader and the DuckDB reader must serialize the same
+    // recording to the same profile: identical header semantics and identical
+    // sample tallies once stacks are resolved to frame-name sequences (frame
+    // ids are producer-internal).
+    eprintln!("  profile export (parquet + duckdb producers)...");
+    {
+        use std::collections::HashMap;
+
+        let from_parquet = dir.path().join("from_parquet.systing");
+        systing::profile_export::parquet_to_profile_export(dir.path(), &from_parquet, "test_trace")
+            .expect("parquet -> profile export failed");
+        let from_duckdb = dir.path().join("from_duckdb.systing");
+        systing::profile_export::duckdb_to_profile_export(&duckdb_path, &from_duckdb, None)
+            .expect("duckdb -> profile export failed");
+
+        // Canonical view of one export: (utid, leaf-first frame names, event
+        // type) -> summed count, plus the header for field checks.
+        type Tallies = HashMap<(i64, Vec<String>, i64), i64>;
+        fn canonicalize(path: &Path) -> (serde_json::Value, Tallies) {
+            let text = std::fs::read_to_string(path).expect("Failed to read profile export");
+            let mut lines = text.lines();
+            let header: serde_json::Value =
+                serde_json::from_str(lines.next().expect("[profile export] empty file"))
+                    .expect("[profile export] header is not JSON");
+
+            let mut frames: HashMap<i64, String> = HashMap::new();
+            let mut stacks: HashMap<i64, Vec<String>> = HashMap::new();
+            let mut tallies: Tallies = HashMap::new();
+            for line in lines {
+                let record: serde_json::Value =
+                    serde_json::from_str(line).expect("[profile export] record is not JSON");
+                let tag = record[0].as_str().expect("[profile export] tagless record");
+                match tag {
+                    "f" => {
+                        frames.insert(
+                            record[1].as_i64().unwrap(),
+                            record[2].as_str().unwrap().to_string(),
+                        );
+                    }
+                    "s" => {
+                        // Define-before-use: every frame id must already be
+                        // interned.
+                        let names = record[2]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|id| {
+                                frames
+                                    .get(&id.as_i64().unwrap())
+                                    .expect("[profile export] stack references undefined frame")
+                                    .clone()
+                            })
+                            .collect();
+                        stacks.insert(record[1].as_i64().unwrap(), names);
+                    }
+                    "x" => {
+                        let names = stacks
+                            .get(&record[2].as_i64().unwrap())
+                            .expect("[profile export] sample references undefined stack")
+                            .clone();
+                        let event_type = record[3].as_i64().unwrap();
+                        assert!(
+                            (0..=2).contains(&event_type),
+                            "[profile export] unknown event type {event_type}"
+                        );
+                        *tallies
+                            .entry((record[1].as_i64().unwrap(), names, event_type))
+                            .or_insert(0) += record[4].as_i64().unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            (header, tallies)
+        }
+
+        let (parquet_header, parquet_tallies) = canonicalize(&from_parquet);
+        let (duckdb_header, duckdb_tallies) = canonicalize(&from_duckdb);
+
+        assert_eq!(
+            parquet_header["systing_profile_export"], 1,
+            "[profile export] unexpected format version"
+        );
+        assert_eq!(
+            parquet_header["stack_order"], "leaf_first",
+            "[profile export] unexpected stack order"
+        );
+        for key in [
+            "source_schema_version",
+            "sample_event",
+            "sample_period",
+            "start_ts",
+            "end_ts",
+        ] {
+            assert_eq!(
+                parquet_header[key], duckdb_header[key],
+                "[profile export] producers disagree on header {key}"
+            );
+        }
+        assert!(
+            !parquet_tallies.is_empty(),
+            "[profile export] no sample tallies exported"
+        );
+        assert_eq!(
+            parquet_tallies, duckdb_tallies,
+            "[profile export] parquet and duckdb producers disagree on tallies"
+        );
+    }
+
     // --- Check: cgroup ids recorded and resolved to paths (test_e2e_cgroup_resolution) ---
     eprintln!("  cgroup id resolution (duckdb)...");
     {
