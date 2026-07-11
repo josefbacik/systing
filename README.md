@@ -25,7 +25,11 @@ cargo install --locked --git https://github.com/josefbacik/systing.git
 ```
 
 This will generate a `trace.pb` file which can be uploaded to a
-[Perfetto](https://perfetto.dev/) instance for further analysis.
+[Perfetto](https://perfetto.dev/) instance for further analysis. Other
+`--output` extensions select other formats: `.duckdb` writes a queryable
+[DuckDB](https://duckdb.org/) trace database, and `.systing` (or
+`.systing.gz`) writes a lightweight profile export any tool can parse without
+DuckDB — see [docs/PROFILE_EXPORT_FORMAT.md](docs/PROFILE_EXPORT_FORMAT.md).
 
 ## Development Setup
 

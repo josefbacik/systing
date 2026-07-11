@@ -3908,55 +3908,78 @@ pub fn systing(
     // Generate output trace (unless --parquet-only)
     // Format is auto-detected from the file extension
     if !opts.parquet_only {
-        let extension = opts
-            .output
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
+        // Checked before the extension match: `.systing.gz` outputs have a
+        // `gz` extension, so a suffix check is needed rather than a match arm.
+        if crate::profile_export::is_profile_export_output(&opts.output) {
+            let trace_id = opts
+                .output_dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "trace".to_string());
 
-        match extension.as_deref() {
-            Some("pb") | Some("perfetto") => {
-                println!(
-                    "Converting to Perfetto format: {}...",
-                    opts.output.display()
-                );
-                let convert_start = std::time::Instant::now();
-                parquet_to_perfetto::convert(&opts.output_dir, &opts.output)?;
-                println!(
-                    "Successfully wrote {} in {:.2}s",
-                    opts.output.display(),
-                    convert_start.elapsed().as_secs_f64()
-                );
-            }
-            Some("duckdb") => {
-                // Generate trace_id from output directory name
-                let trace_id = opts
-                    .output_dir
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "trace".to_string());
+            println!("Generating profile export: {}...", opts.output.display());
+            let convert_start = std::time::Instant::now();
+            crate::profile_export::parquet_to_profile_export(
+                &opts.output_dir,
+                &opts.output,
+                &trace_id,
+            )?;
+            println!(
+                "Successfully wrote {} in {:.2}s",
+                opts.output.display(),
+                convert_start.elapsed().as_secs_f64()
+            );
+        } else {
+            let extension = opts
+                .output
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
 
-                println!("Generating DuckDB database: {}...", opts.output.display());
-                let convert_start = std::time::Instant::now();
-                systing_duckdb::parquet_to_duckdb(&opts.output_dir, &opts.output, &trace_id)?;
-                println!(
-                    "Successfully wrote {} in {:.2}s",
-                    opts.output.display(),
-                    convert_start.elapsed().as_secs_f64()
-                );
-            }
-            Some(ext) => {
-                bail!(
-                    "Unknown file extension '.{}' for '{}'. Use .pb for Perfetto or .duckdb for DuckDB.",
+            match extension.as_deref() {
+                Some("pb") | Some("perfetto") => {
+                    println!(
+                        "Converting to Perfetto format: {}...",
+                        opts.output.display()
+                    );
+                    let convert_start = std::time::Instant::now();
+                    parquet_to_perfetto::convert(&opts.output_dir, &opts.output)?;
+                    println!(
+                        "Successfully wrote {} in {:.2}s",
+                        opts.output.display(),
+                        convert_start.elapsed().as_secs_f64()
+                    );
+                }
+                Some("duckdb") => {
+                    // Generate trace_id from output directory name
+                    let trace_id = opts
+                        .output_dir
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "trace".to_string());
+
+                    println!("Generating DuckDB database: {}...", opts.output.display());
+                    let convert_start = std::time::Instant::now();
+                    systing_duckdb::parquet_to_duckdb(&opts.output_dir, &opts.output, &trace_id)?;
+                    println!(
+                        "Successfully wrote {} in {:.2}s",
+                        opts.output.display(),
+                        convert_start.elapsed().as_secs_f64()
+                    );
+                }
+                Some(ext) => {
+                    bail!(
+                    "Unknown file extension '.{}' for '{}'. Use .pb for Perfetto, .duckdb for DuckDB, or .systing for a profile export.",
                     ext,
                     opts.output.display()
                 );
-            }
-            None => {
-                bail!(
-                    "Missing file extension for '{}'. Use .pb for Perfetto or .duckdb for DuckDB.",
+                }
+                None => {
+                    bail!(
+                    "Missing file extension for '{}'. Use .pb for Perfetto, .duckdb for DuckDB, or .systing for a profile export.",
                     opts.output.display()
                 );
+                }
             }
         }
     }

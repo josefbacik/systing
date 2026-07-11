@@ -163,6 +163,7 @@ struct Command {
     /// Output file path. Format is auto-detected from extension:
     /// - .pb or .perfetto: Perfetto trace
     /// - .duckdb: DuckDB database
+    /// - .systing or .systing.gz: profile export (docs/PROFILE_EXPORT_FORMAT.md)
     #[arg(long, default_value = "trace.pb")]
     output: PathBuf,
 

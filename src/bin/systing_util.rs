@@ -65,7 +65,8 @@ enum Commands {
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
 
-        /// Output path (DuckDB .duckdb or Perfetto .pb/.pftrace/.perfetto-trace)
+        /// Output path (DuckDB .duckdb, Perfetto .pb/.pftrace/.perfetto-trace,
+        /// or profile export .systing/.systing.gz)
         #[arg(short, long)]
         output: PathBuf,
 
@@ -3112,6 +3113,34 @@ fn run_convert(
             TraceInput::ParquetDir(p) => parquet_dirs.push(p),
             TraceInput::DuckDbFile(p) => duckdb_files.push(p),
         }
+    }
+
+    // Check for profile export (.systing) conversion paths
+    if systing::profile_export::is_profile_export_output(&output) {
+        if pb_files.is_empty() && parquet_dirs.is_empty() && duckdb_files.len() == 1 {
+            return systing::profile_export::duckdb_to_profile_export(
+                &duckdb_files[0],
+                &output,
+                trace_id.as_deref(),
+            );
+        }
+        if pb_files.is_empty() && duckdb_files.is_empty() && parquet_dirs.len() == 1 {
+            let dir = &parquet_dirs[0];
+            let derived_id = generate_trace_id(dir);
+            return systing::profile_export::parquet_to_profile_export(
+                dir,
+                &output,
+                trace_id.as_deref().unwrap_or(&derived_id),
+            );
+        }
+        bail!(
+            "Profile export conversion takes exactly one DuckDB file or one \
+             Parquet directory as input. Found {} Perfetto file(s), {} Parquet \
+             director(y/ies), {} DuckDB file(s).",
+            pb_files.len(),
+            parquet_dirs.len(),
+            duckdb_files.len()
+        );
     }
 
     // Check for DuckDB → Perfetto conversion path
