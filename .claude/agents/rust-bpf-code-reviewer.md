@@ -74,8 +74,8 @@ When changes touch the database schema (`src/duckdb.rs` `create_schema()`, `src/
 
 1. **SCHEMA_CHANGES.md updated**: Every schema change must have a corresponding entry in `SCHEMA_CHANGES.md` describing what changed
 2. **SCHEMA_VERSION incremented**: The `SCHEMA_VERSION` constant in `src/duckdb.rs` must be incremented for any schema change
-3. **Minor version bump**: Schema changes require a **minor** version bump in `Cargo.toml` (e.g., 1.0.0 → 1.1.0)
-4. **Patch version bump**: Non-schema changes require a **patch** version bump in `Cargo.toml` (e.g., 1.0.0 → 1.0.1)
+3. **No version edits in PRs**: `version` in `Cargo.toml` (and the matching `Cargo.lock` entry) must NOT be modified by a PR — the version-bump workflow bumps and tags on every merge to main. Flag any PR that touches it as a **Critical Issue**.
+4. **Minor-bump signal for schema changes**: a schema change must carry `[bump minor]` in the PR title so the merge workflow performs a minor (not patch) bump. A schema change without the token is a **Critical Issue**.
 
 Flag any schema change that is missing these updates as a **Critical Issue**.
 
