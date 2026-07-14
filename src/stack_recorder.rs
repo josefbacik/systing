@@ -1003,6 +1003,9 @@ impl StackRecorder {
                 GuestAddr::Runtime => {
                     return format!("unknown ([gvisor:runtime]) <{addr:#x}>");
                 }
+                GuestAddr::Jit(rt) => {
+                    return format!("unknown ([jit:{rt}]) <{addr:#x}>");
+                }
                 GuestAddr::Anon => {
                     return format!("unknown ([gvisor:guest]) <{addr:#x}>");
                 }

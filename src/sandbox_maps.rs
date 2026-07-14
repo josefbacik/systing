@@ -24,8 +24,9 @@
 //! not, "what is the most specific label we can attach instead of raw hex?".
 //! The labels reuse systing's existing miss format (`unknown (<module>)
 //! <0xADDR>`), so downstream consumers see a module-shaped string:
-//! `[gvisor:runtime]`, `[jit:<runtime>]`, or the real module basename when
-//! only the symbol lookup failed.
+//! `[gvisor:runtime]`, `[jit:<runtime>]`, `[anon:exec]`, `[anon]`,
+//! `[unmapped]`, or the real module basename when only the symbol lookup
+//! failed.
 
 use std::fs;
 use std::path::PathBuf;
@@ -90,15 +91,52 @@ pub struct ProcessMaps {
 const GVISOR_MEMFDS: &[&str] = &["runsc-memory", "systrap-memory"];
 
 /// Module basenames whose presence marks a process as running a JIT runtime;
-/// anonymous executable guest pages in such a process are labeled
-/// `[jit:<tag>]`. Deliberately short and conservative.
+/// anonymous executable pages in such a process are labeled `[jit:<tag>]`,
+/// and so are sampled addresses that are no longer mapped by the time maps
+/// are read (JIT runtimes recycle code pages faster than a recording tick).
+/// Deliberately short and conservative; matching requires a version or
+/// extension boundary after the prefix (see [`runtime_matches`]).
 const JIT_RUNTIMES: &[(&str, &str)] = &[
-    ("node", "node"),
-    ("libnode", "node"),
+    ("beam.smp", "beam"),
+    ("bun", "bun"),
+    ("deno", "deno"),
+    ("libcoreclr", "dotnet"),
+    ("libjulia", "julia"),
     ("libjvm", "jvm"),
+    ("libluajit", "lua"),
+    ("libnode", "node"),
+    ("libpypy", "pypy"),
     ("libpython3", "python"),
+    ("libruby", "ruby"),
     ("libv8", "v8"),
+    ("node", "node"),
+    ("nodejs", "node"),
+    ("pypy", "pypy"),
+    ("python3", "python"),
+    ("ruby", "ruby"),
 ];
+
+/// Whether a module basename belongs to a runtime prefix: exact match, or
+/// the prefix followed by a version/extension boundary — "node" matches
+/// "node" and "node22", "libnode.so.115", but not "node_exporter".
+fn runtime_matches(base: &str, prefix: &str) -> bool {
+    match base.strip_prefix(prefix) {
+        Some("") => true,
+        Some(rest) => {
+            let c = rest.as_bytes()[0];
+            c == b'.' || c == b'-' || c.is_ascii_digit()
+        }
+        None => false,
+    }
+}
+
+/// The JIT runtime tag for a mapped-module basename, if any.
+pub(crate) fn detect_jit_runtime(base: &str) -> Option<&'static str> {
+    JIT_RUNTIMES
+        .iter()
+        .find(|(prefix, _)| runtime_matches(base, prefix))
+        .map(|(_, tag)| *tag)
+}
 
 impl ProcessMaps {
     /// Read and analyze `/proc/<tgid>/maps`. Returns `None` when the process
@@ -138,10 +176,8 @@ impl ProcessMaps {
                 }
                 Backing::File(path) => {
                     if let Some(base) = path.file_name().and_then(|f| f.to_str()) {
-                        for (prefix, tag) in JIT_RUNTIMES {
-                            if base.starts_with(prefix) {
-                                pm.jit_runtime = Some(tag);
-                            }
+                        if let Some(tag) = detect_jit_runtime(base) {
+                            pm.jit_runtime = Some(tag);
                         }
                     }
                     let (lo, hi) = pm.file_span.unwrap_or((u64::MAX, 0));
@@ -231,9 +267,10 @@ impl ProcessMaps {
     }
 
     /// Most specific module-slot label for an address that did not
-    /// symbolize. Returns `None` when nothing better than raw hex is known
-    /// (non-sandbox process with a plain unreadable mapping, unmapped
-    /// address, ...).
+    /// symbolize. Returns `None` only for bracketed pseudo-entries
+    /// (`[vdso]`, `[stack]`, ...) — those are the symbolizer's business;
+    /// everything else gets at least a class name, so raw hex from a live
+    /// process means the maps themselves were unreadable.
     ///
     /// gVisor classification leans on which backing object a mapping uses:
     /// ALL guest-created memory is served from the `runsc-memory` pool, the
@@ -276,11 +313,32 @@ impl ProcessMaps {
                 Some("[gvisor:runtime]".to_string())
             }
             // Non-gVisor JIT runtimes: anonymous executable pages are JIT
-            // output with the same confidence as in the sandboxed case.
+            // output with the same confidence as in the sandboxed case;
+            // without a recognized runtime the page is still nameable as
+            // what it observably is.
             Some((Backing::Memfd(_), true)) | Some((Backing::Anon, true)) => {
-                self.jit_runtime.map(|rt| format!("[jit:{rt}]"))
+                Some(match self.jit_runtime {
+                    Some(rt) => format!("[jit:{rt}]"),
+                    None => "[anon:exec]".to_string(),
+                })
             }
-            _ => None,
+            // Non-executable anonymous memory: heap, arenas, or a W^X
+            // code page caught in its writable phase. A PC here is either
+            // recycled code or unwind garbage — name the class without
+            // claiming a runtime.
+            Some((Backing::Memfd(_), false)) | Some((Backing::Anon, false)) => {
+                Some("[anon]".to_string())
+            }
+            // Bracketed pseudo-entries stay with the symbolizer.
+            Some((Backing::Special(_), _)) => None,
+            // In no current mapping at all. JIT runtimes allocate and free
+            // code pages faster than a recording tick, so in a process
+            // running one this is almost always reclaimed JIT code; the
+            // maps snapshot postdates the sample. Otherwise unknowable.
+            None => Some(match self.jit_runtime {
+                Some(rt) => format!("[jit:{rt}]"),
+                None => "[unmapped]".to_string(),
+            }),
         }
     }
 }
@@ -436,8 +494,8 @@ mod tests {
         );
         // Known module, failed symbol lookup: module basename.
         assert_eq!(pm.label_for(0x400100).as_deref(), Some("guestbox"));
-        // Unmapped address: nothing better than hex.
-        assert_eq!(pm.label_for(0xdead0000), None);
+        // Unmapped address in a non-JIT process: named as such.
+        assert_eq!(pm.label_for(0xdead0000).as_deref(), Some("[unmapped]"));
 
         // Guest-anon exec page inside the image span of a JIT-runtime
         // process labels as JIT output.
@@ -467,14 +525,52 @@ mod tests {
 7f0000000000-7f0000100000 rwxp 00000000 00:00 0 ";
         let pmp = ProcessMaps::parse(2, plain_jit, "java");
         assert_eq!(pmp.label_for(0x7f0000000100).as_deref(), Some("[jit:jvm]"));
-        // ...but a plain anon page in a non-JIT, non-gVisor process stays
-        // unlabeled (hex), preserving historical output.
+        // An unmapped address in the same process: reclaimed JIT code —
+        // pages are recycled between the sample and the maps read.
+        assert_eq!(pmp.label_for(0xdead0000).as_deref(), Some("[jit:jvm]"));
+
+        // Non-JIT, non-gVisor process: anon pages are named by observable
+        // class instead of falling back to hex.
         let pm_none = ProcessMaps::parse(
             3,
-            "400000-500000 r-xp 00000000 08:01 42 /usr/bin/foo\n7f0000000000-7f0000001000 rw-p 00000000 00:00 0 ",
+            "400000-500000 r-xp 00000000 08:01 42 /usr/bin/foo\n\
+             7f0000000000-7f0000001000 rw-p 00000000 00:00 0 \n\
+             7f0000100000-7f0000101000 rwxp 00000000 00:00 0 ",
             "foo",
         );
-        assert_eq!(pm_none.label_for(0x7f0000000100), None);
+        assert_eq!(pm_none.label_for(0x7f0000000100).as_deref(), Some("[anon]"));
+        assert_eq!(
+            pm_none.label_for(0x7f0000100100).as_deref(),
+            Some("[anon:exec]")
+        );
+    }
+
+    #[test]
+    fn test_runtime_matching() {
+        // Exact names and versioned/suffixed forms match.
+        assert_eq!(detect_jit_runtime("node"), Some("node"));
+        assert_eq!(detect_jit_runtime("node22"), Some("node"));
+        assert_eq!(detect_jit_runtime("nodejs"), Some("node"));
+        assert_eq!(detect_jit_runtime("libnode.so.115"), Some("node"));
+        assert_eq!(detect_jit_runtime("libjvm.so"), Some("jvm"));
+        assert_eq!(detect_jit_runtime("libpython3.14.so.1.0"), Some("python"));
+        // Statically linked interpreters carry the runtime in the exe name.
+        assert_eq!(detect_jit_runtime("python3.14"), Some("python"));
+        assert_eq!(detect_jit_runtime("ruby3.2"), Some("ruby"));
+        assert_eq!(detect_jit_runtime("libruby.so.3.2"), Some("ruby"));
+        assert_eq!(detect_jit_runtime("libcoreclr.so"), Some("dotnet"));
+        assert_eq!(detect_jit_runtime("beam.smp"), Some("beam"));
+        assert_eq!(detect_jit_runtime("libluajit-5.1.so.2"), Some("lua"));
+        assert_eq!(detect_jit_runtime("libjulia.so.1"), Some("julia"));
+        assert_eq!(detect_jit_runtime("deno"), Some("deno"));
+        assert_eq!(detect_jit_runtime("bun"), Some("bun"));
+        assert_eq!(detect_jit_runtime("libpypy3.9-c.so"), Some("pypy"));
+        // The boundary requirement rejects lookalike module names.
+        assert_eq!(detect_jit_runtime("node_exporter"), None);
+        assert_eq!(detect_jit_runtime("bundler"), None);
+        assert_eq!(detect_jit_runtime("denoise"), None);
+        assert_eq!(detect_jit_runtime("rubyfmt"), None);
+        assert_eq!(detect_jit_runtime("libfoo.so"), None);
     }
 
     #[test]
@@ -484,7 +580,11 @@ mod tests {
             format_unresolved(0x64100, Some(&pm)),
             "unknown ([gvisor:runtime]) <0x64100>"
         );
-        assert_eq!(format_unresolved(0xdead0000, Some(&pm)), "0xdead0000");
+        assert_eq!(
+            format_unresolved(0xdead0000, Some(&pm)),
+            "unknown ([unmapped]) <0xdead0000>"
+        );
+        // No maps at all (unreadable /proc): hex is all that is left.
         assert_eq!(format_unresolved(0x1234, None), "0x1234");
     }
 
