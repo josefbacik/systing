@@ -120,6 +120,9 @@ struct Command {
     // Network packet-level probes (set by recorder management, not a CLI flag)
     #[arg(skip)]
     network_packets: bool,
+    // Network syscall-level probes (set by recorder management, not a CLI flag)
+    #[arg(skip)]
+    network_syscalls: bool,
     // Marker recording enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     markers: bool,
@@ -226,6 +229,7 @@ impl From<Command> for Config {
             memory_alloc_symbol_prefix: cmd.memory_alloc_symbol_prefix,
             network: cmd.network,
             network_packets: cmd.network_packets,
+            network_syscalls: cmd.network_syscalls,
             resolve_addresses: cmd.resolve_addresses,
             tpu_profile: cmd.tpu_profile,
             tpu_service_addr: cmd.tpu_service_addr,
@@ -274,11 +278,25 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool, select
             if selection == Selection::WithCompanions || !enable {
                 opts.network_packets = enable;
             }
+            // The syscalls tier also cannot run without the base recorder,
+            // but it is never a companion default — only the disable cascades.
+            if !enable {
+                opts.network_syscalls = false;
+            }
         }
         "network-packets" => {
             opts.network_packets = enable;
             // Packet probes require the network infrastructure (ringbufs, consumers),
             // so enabling network-packets also enables the base network recorder.
+            if enable {
+                opts.network = true;
+            }
+        }
+        "network-syscalls" => {
+            opts.network_syscalls = enable;
+            // Syscall probes require the network infrastructure (ringbufs,
+            // consumers), so enabling network-syscalls also enables the base
+            // network recorder.
             if enable {
                 opts.network = true;
             }
@@ -314,6 +332,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         opts.memory_alloc = false;
         opts.network = false;
         opts.network_packets = false;
+        opts.network_syscalls = false;
         opts.markers = false;
         opts.tpu_profile = false;
         opts.tpu_metrics = false;
@@ -612,5 +631,50 @@ mod tests {
         );
         assert!(opts.memory_alloc);
         assert!(!opts.network);
+    }
+
+    #[test]
+    fn only_recorder_network_syscalls_omits_packets() {
+        let opts = opts_from(&["--only-recorder", "network-syscalls"]);
+        assert!(
+            opts.network,
+            "syscall probes require the base network recorder"
+        );
+        assert!(opts.network_syscalls);
+        assert!(
+            !opts.network_packets,
+            "network-syscalls must not enable per-packet tracing"
+        );
+    }
+
+    #[test]
+    fn add_recorder_network_syscalls_omits_packets() {
+        let opts = opts_from(&["--add-recorder", "network-syscalls"]);
+        assert!(opts.network);
+        assert!(opts.network_syscalls);
+        assert!(!opts.network_packets);
+    }
+
+    #[test]
+    fn add_recorder_network_does_not_imply_syscalls_tier() {
+        let opts = opts_from(&["--add-recorder", "network"]);
+        assert!(opts.network_packets, "packets stay the add-mode companion");
+        assert!(
+            !opts.network_syscalls,
+            "the syscalls tier is never implied; name it"
+        );
+    }
+
+    #[test]
+    fn only_recorder_syscalls_and_packets_tiers_union() {
+        let opts = opts_from(&[
+            "--only-recorder",
+            "network-syscalls",
+            "--only-recorder",
+            "network-packets",
+        ]);
+        assert!(opts.network);
+        assert!(opts.network_syscalls);
+        assert!(opts.network_packets);
     }
 }

@@ -137,14 +137,20 @@ The network recorder captures detailed network traffic information including:
 
 **Note:** Network recording is disabled by default to minimize overhead. Enable it explicitly when you need to analyze network performance.
 
-Network tracing is split across two recorders: `network` tracks TCP
-connection state (socket lifecycle and state transitions via
-`inet_sock_set_state`), and `network-packets` adds the per-packet and
-per-syscall probes listed below. `--add-recorder network` enables both,
-which is the usual shape for an investigation. `--only-recorder` enables
-exactly what you name, so `--only-recorder network` records connection
-state alone — useful when the packet-level event volume would be
-prohibitive, e.g. continuous or fleet-wide profiling.
+Network tracing is split across three recorders, ordered by event volume:
+`network` tracks TCP connection state (socket lifecycle and state
+transitions via `inet_sock_set_state`); `network-syscalls` adds per-syscall
+send/receive accounting plus the low-frequency diagnostics (retransmit
+timer, zero-window probes, sndbuf stalls, packet drops) — bytes, stalls and
+drops per connection at syscall-rate cost; and `network-packets` adds the
+per-packet and per-poll probes (transmit/receive path, qdisc, epoll), whose
+event volume is bounded by traffic rather than by anything you control.
+`--add-recorder network` enables state + packets, the usual shape for an
+investigation. `--only-recorder` enables exactly what you name (each tier
+pulls in the base `network` recorder it requires), so `--only-recorder
+network` is state-only and `--only-recorder network-syscalls` is the shape
+for continuous or fleet-wide profiling, where per-packet volume is
+prohibitive but per-connection throughput still matters.
 
 ```bash
 # Enable network recording (connection state + packet-level)
@@ -152,6 +158,9 @@ sudo ./target/debug/systing --add-recorder network --duration 60
 
 # Connection state only — no packet-level probes
 sudo ./target/debug/systing --only-recorder network --duration 60
+
+# Connection state + syscall accounting + retransmit/drop/stall diagnostics
+sudo ./target/debug/systing --only-recorder network-syscalls --duration 60
 
 # Full network tracing and nothing else
 sudo ./target/debug/systing --only-recorder network-packets --duration 60
