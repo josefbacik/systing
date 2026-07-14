@@ -54,7 +54,9 @@ Available recorders:
 * `syscalls` - Syscall tracing (disabled by default)
 * `sleep-stacks` - Sleep stack traces (enabled by default)
 * `cpu-stacks` - CPU perf stack traces (enabled by default)
-* `network` - Network traffic recording (disabled by default) - Captures TCP/UDP send/receive operations, packet-level latency tracking, and queue management through multiple kernel instrumentation points
+* `network` - Network connection state tracking (disabled by default) - Socket lifecycle and TCP state transitions
+* `network-syscalls` - Network syscall-level tracing (disabled by default) - Per-syscall send/receive accounting plus retransmit/drop/stall diagnostics, without the per-packet probes
+* `network-packets` - Network packet-level tracing (disabled by default) - Per-packet and per-poll probes: transmit/receive path, qdisc latency, epoll
 * `pystacks` - Python stack tracing (disabled by default)
 
 Examples:
@@ -196,6 +198,10 @@ Examples:
 # (the network-packets companion is not implied here; name it to get
 # packet-level tracing)
 # systing --only-recorder network --duration 60
+
+# Network syscall accounting + retransmit/drop/stall diagnostics without
+# the per-packet probes (pulls in the base network recorder)
+# systing --only-recorder network-syscalls --duration 60
 
 # Only record syscalls and cpu-stacks
 # systing --only-recorder syscalls --only-recorder cpu-stacks --duration 60

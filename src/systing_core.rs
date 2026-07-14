@@ -266,6 +266,28 @@ const NETWORK_PACKETS_BPF_PROGRAMS: &[&str] = &[
     "tracepoint__qdisc__qdisc_dequeue",
 ];
 
+/// The syscall-level subset of network tracing: per-syscall send/recv
+/// accounting plus the low-frequency diagnostics (retransmit timer,
+/// zero-window probes, sndbuf stalls, drops) — without the per-packet and
+/// per-poll probes, whose event volume is traffic-bound. `skb_recv_udp_exit`
+/// emits no events itself: it fills the pending UDP recv entry with the peer
+/// address, without which `handle_recvmsg_exit` drops every UDP recv record.
+const NETWORK_SYSCALLS_BPF_PROGRAMS: &[&str] = &[
+    "tcp_sendmsg_entry",
+    "tcp_sendmsg_exit",
+    "udp_sendmsg_entry",
+    "udp_sendmsg_exit",
+    "tcp_recvmsg_entry",
+    "tcp_recvmsg_exit",
+    "udp_recvmsg_entry",
+    "udp_recvmsg_exit",
+    "skb_recv_udp_exit",
+    "tcp_send_probe0_entry",
+    "tcp_retransmit_timer_entry",
+    "sk_stream_wait_memory_entry",
+    "tracepoint__skb__kfree_skb",
+];
+
 // Marker recording reuses the syscall tracepoints.
 const MARKER_BPF_PROGRAMS: &[&str] = SYSCALL_BPF_PROGRAMS;
 
@@ -322,6 +344,15 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             default_enabled: false,
             bpf_programs: NETWORK_BPF_PROGRAMS,
             ringbuf_families: &["packet_ringbufs"],
+        },
+        RecorderInfo {
+            name: "network-syscalls",
+            description: "Network syscall-level tracing (send/recv bytes, retransmits, drops, stalls) without per-packet probes",
+            default_enabled: false,
+            bpf_programs: NETWORK_SYSCALLS_BPF_PROGRAMS,
+            // Syscall records land in network_ringbufs; the diagnostics
+            // (retransmits, probe0, stalls, drops) are packet_events.
+            ringbuf_families: &["network_ringbufs", "packet_ringbufs"],
         },
         RecorderInfo {
             name: "network-packets",
@@ -401,6 +432,7 @@ fn is_recorder_enabled(name: &str, opts: &Config) -> bool {
         "memory" => opts.memory,
         "memory-alloc" => opts.memory_alloc,
         "network" => opts.network,
+        "network-syscalls" => opts.network_syscalls,
         "network-packets" => opts.network_packets,
         "markers" => opts.markers,
         "tpu" => opts.tpu_profile,
@@ -590,6 +622,10 @@ pub struct Config {
     /// Enable network packet-level probes (sendmsg, recvmsg, transmit, qdisc, drops).
     /// Automatically enabled when "network" is enabled via `--add-recorder`.
     pub network_packets: bool,
+    /// Enable network syscall-level probes: per-syscall send/recv accounting
+    /// plus retransmit/drop/stall diagnostics, without the per-packet probes.
+    /// Never enabled implicitly; name it.
+    pub network_syscalls: bool,
     /// Resolve network IP addresses to hostnames via DNS
     pub resolve_addresses: bool,
     /// Enable TPU profiling
@@ -656,6 +692,7 @@ impl Default for Config {
             memory_alloc_symbol_prefix: None,
             network: false,
             network_packets: false,
+            network_syscalls: false,
             resolve_addresses: false,
             tpu_profile: false,
             tpu_service_addr: None,
