@@ -60,6 +60,24 @@ const GO120_MAGIC: u32 = 0xFFFF_FFF1;
 /// Header prefix: magic u32, two pad bytes, minLC u8, ptrsize u8.
 const HEADER_PREFIX_LEN: usize = 8;
 
+/// Whether `b` starts with a plausible pclntab header: a supported magic,
+/// the two mandatory zero pad bytes, an instruction-size quantum Go
+/// actually emits (1 on x86, 2 on arm, 4 on arm64/riscv), and a sane
+/// pointer size. Eight constrained bytes — cheap enough to test at every
+/// aligned offset of a scan, selective enough that full parse validation
+/// only runs on real candidates.
+fn header_signature(b: &[u8]) -> bool {
+    if b.len() < HEADER_PREFIX_LEN {
+        return false;
+    }
+    let magic = u32::from_le_bytes(b[0..4].try_into().unwrap());
+    matches!(magic, GO116_MAGIC | GO118_MAGIC | GO120_MAGIC)
+        && b[4] == 0
+        && b[5] == 0
+        && matches!(b[6], 1 | 2 | 4)
+        && matches!(b[7], 4 | 8)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PclnVersion {
     /// Go 1.16/1.17: functab holds ptrsize-wide absolute entry addresses.
@@ -209,6 +227,35 @@ impl GoPclntab {
             functab,
             functab_field,
         })
+    }
+
+    /// Locate and parse a pclntab embedded at an unknown offset inside a
+    /// larger byte region.
+    ///
+    /// Some links emit no dedicated `.gopclntab` section — distro
+    /// external-linking PIE builds merge the table anonymously into
+    /// `.data.rel.ro` — leaving its header as the only identification.
+    /// The scan matches the 8-byte header signature (a known magic, two
+    /// zero pad bytes, a plausible instruction quantum and pointer size)
+    /// at 8-byte alignment, then validates each candidate by fully
+    /// parsing it: the header's offset words must all land inside the
+    /// region, which rejects signature lookalikes. The first candidate
+    /// that parses wins; `None` means the region holds no parseable
+    /// table.
+    pub fn scan(region: &[u8], text_vaddr: Option<u64>) -> Option<Self> {
+        let mut off = 0;
+        while off + HEADER_PREFIX_LEN <= region.len() {
+            if header_signature(&region[off..]) {
+                match Self::parse(region[off..].to_vec(), text_vaddr) {
+                    // An empty table parses but resolves nothing; keep
+                    // scanning rather than let it shadow a real one.
+                    Ok(table) if table.func_count() > 0 => return Some(table),
+                    _ => {}
+                }
+            }
+            off += 8;
+        }
+        None
     }
 
     /// The number of functions in the table.
@@ -477,6 +524,44 @@ mod tests {
             .end(0x400)
             .parse()
             .unwrap()
+    }
+
+    #[test]
+    fn scan_finds_embedded_table() {
+        let table = TabBuilder::v118(0x40_0000)
+            .func(0x0, "runtime.main")
+            .func(0x100, "main.main")
+            .end(0x400)
+            .build();
+
+        // Embed the table at an aligned offset in a larger region, with a
+        // decoy earlier: a valid 8-byte signature whose header words are
+        // garbage. The decoy must be rejected by full parse validation and
+        // the scan must carry on to the real table.
+        let mut region = vec![0u8; 64 * 1024];
+        region[0..4].copy_from_slice(&GO120_MAGIC.to_le_bytes());
+        region[6] = 1;
+        region[7] = 8;
+        for b in &mut region[8..72] {
+            *b = 0xFF;
+        }
+        let off = 4096;
+        region[off..off + table.len()].copy_from_slice(&table);
+
+        let tab = GoPclntab::scan(&region, Some(0x40_0000)).expect("scan missed embedded table");
+        assert_eq!(tab.func_count(), 2);
+        assert_eq!(tab.find_func(0x40_0100).unwrap().name, "main.main");
+    }
+
+    #[test]
+    fn scan_rejects_empty_and_garbage() {
+        assert!(GoPclntab::scan(&[], None).is_none());
+        assert!(GoPclntab::scan(&[0u8; 4096], None).is_none());
+        // Signature at an UNALIGNED offset is not considered.
+        let mut region = vec![0u8; 4096];
+        let table = TabBuilder::v118(0).end(0).build();
+        region[100..100 + table.len()].copy_from_slice(&table);
+        assert!(GoPclntab::scan(&region, None).is_none());
     }
 
     #[test]
