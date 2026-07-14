@@ -245,7 +245,17 @@ impl From<Command> for Config {
     }
 }
 
-fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
+/// How a recorder name was selected on the command line. `--add-recorder`
+/// also enables the companion recorders a name defaults to (network brings
+/// in packet-level tracing); `--only-recorder` enables exactly the named
+/// recorders.
+#[derive(Clone, Copy, PartialEq)]
+enum Selection {
+    WithCompanions,
+    Exact,
+}
+
+fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool, selection: Selection) {
     match recorder_name {
         "syscalls" => opts.syscalls = enable,
         "sched" => opts.no_sched = !enable,
@@ -256,10 +266,14 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool) {
         "cpu-stacks" => opts.no_cpu_stack_traces = !enable,
         "network" => {
             opts.network = enable;
-            // Network and packet-level tracing are coupled: enabling network also
-            // enables packets by default, disabling network also disables packets.
-            // Users can override with --only-recorder network to get state-only.
-            opts.network_packets = enable;
+            // --add-recorder network also enables packet-level tracing (the
+            // common investigation shape), while --only-recorder network is
+            // state-only: TCP connection/state tracking without the
+            // per-packet kprobes. Disabling network always disables packets,
+            // which cannot run without it.
+            if selection == Selection::WithCompanions || !enable {
+                opts.network_packets = enable;
+            }
         }
         "network-packets" => {
             opts.network_packets = enable;
@@ -304,17 +318,19 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         opts.tpu_profile = false;
         opts.tpu_metrics = false;
 
-        // Then enable only the specified recorders
+        // Then enable exactly the specified recorders — no companion
+        // defaults, so `--only-recorder network` yields state-only tracing.
         let recorders = opts.only_recorder.clone();
         for recorder_name in &recorders {
-            enable_recorder(opts, recorder_name, true);
+            enable_recorder(opts, recorder_name, true, Selection::Exact);
         }
     }
 
-    // Process --add-recorder to enable additional recorders
+    // Process --add-recorder to enable additional recorders, with their
+    // companion defaults (network brings in network-packets).
     let recorders = opts.add_recorder.clone();
     for recorder_name in &recorders {
-        enable_recorder(opts, recorder_name, true);
+        enable_recorder(opts, recorder_name, true, Selection::WithCompanions);
     }
     Ok(())
 }
@@ -502,4 +518,99 @@ fn main() -> Result<()> {
         process::exit(exit_code);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts_from(args: &[&str]) -> Command {
+        let mut opts = Command::parse_from(std::iter::once("systing").chain(args.iter().copied()));
+        process_recorder_options(&mut opts).expect("valid recorder names");
+        opts
+    }
+
+    #[test]
+    fn only_recorder_network_is_state_only() {
+        let opts = opts_from(&["--only-recorder", "network"]);
+        assert!(opts.network);
+        assert!(
+            !opts.network_packets,
+            "--only-recorder network must not enable packet-level tracing"
+        );
+        // Everything outside the named recorder stays off.
+        assert!(opts.no_sched);
+        assert!(opts.no_cpu_stack_traces);
+        assert!(!opts.memory);
+    }
+
+    #[test]
+    fn only_recorder_network_packets_enables_base_network() {
+        let opts = opts_from(&["--only-recorder", "network-packets"]);
+        assert!(
+            opts.network,
+            "packet probes require the base network recorder"
+        );
+        assert!(opts.network_packets);
+    }
+
+    #[test]
+    fn only_recorder_network_order_independent() {
+        for args in [
+            [
+                "--only-recorder",
+                "network",
+                "--only-recorder",
+                "network-packets",
+            ],
+            [
+                "--only-recorder",
+                "network-packets",
+                "--only-recorder",
+                "network",
+            ],
+        ] {
+            let opts = opts_from(&args);
+            assert!(opts.network);
+            assert!(opts.network_packets);
+        }
+    }
+
+    #[test]
+    fn add_recorder_network_keeps_packet_companion() {
+        let opts = opts_from(&["--add-recorder", "network"]);
+        assert!(opts.network);
+        assert!(
+            opts.network_packets,
+            "--add-recorder network keeps enabling packet tracing by default"
+        );
+        // Default recorders stay on in add mode.
+        assert!(!opts.no_sched);
+        assert!(!opts.no_cpu_stack_traces);
+    }
+
+    #[test]
+    fn add_recorder_network_packets_enables_base_network() {
+        let opts = opts_from(&["--add-recorder", "network-packets"]);
+        assert!(opts.network);
+        assert!(opts.network_packets);
+    }
+
+    #[test]
+    fn no_recorder_flags_leave_network_off() {
+        let opts = opts_from(&[]);
+        assert!(!opts.network);
+        assert!(!opts.network_packets);
+    }
+
+    #[test]
+    fn only_recorder_memory_alloc_enables_base_memory() {
+        let opts = opts_from(&["--only-recorder", "memory-alloc"]);
+        assert!(
+            opts.memory,
+            "memory-alloc shares the memory ringbuf/consumer"
+        );
+        assert!(opts.memory_alloc);
+        assert!(!opts.network);
+    }
 }

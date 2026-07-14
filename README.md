@@ -119,7 +119,8 @@ Use `--only-recorder` to disable all recorders and enable only the ones you spec
 # Only record syscalls (disable everything else)
 sudo ./target/debug/systing --only-recorder syscalls --duration 60
 
-# Only record network traffic (disable everything else)
+# Only record network connection state (disable everything else,
+# including the packet-level probes — see Network Traffic Recording)
 sudo ./target/debug/systing --only-recorder network --duration 60
 
 # Only record syscalls and cpu-stacks
@@ -136,12 +137,24 @@ The network recorder captures detailed network traffic information including:
 
 **Note:** Network recording is disabled by default to minimize overhead. Enable it explicitly when you need to analyze network performance.
 
+Network tracing is split across two recorders: `network` tracks TCP
+connection state (socket lifecycle and state transitions via
+`inet_sock_set_state`), and `network-packets` adds the per-packet and
+per-syscall probes listed below. `--add-recorder network` enables both,
+which is the usual shape for an investigation. `--only-recorder` enables
+exactly what you name, so `--only-recorder network` records connection
+state alone — useful when the packet-level event volume would be
+prohibitive, e.g. continuous or fleet-wide profiling.
+
 ```bash
-# Enable network recording
+# Enable network recording (connection state + packet-level)
 sudo ./target/debug/systing --add-recorder network --duration 60
 
-# Only record network traffic (disable everything else)
+# Connection state only — no packet-level probes
 sudo ./target/debug/systing --only-recorder network --duration 60
+
+# Full network tracing and nothing else
+sudo ./target/debug/systing --only-recorder network-packets --duration 60
 ```
 
 The network recorder instruments multiple points in the Linux network stack:
