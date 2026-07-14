@@ -1,0 +1,49 @@
+name: version-bump
+
+on:
+  push:
+    branches: [main]
+
+# Serialize bump jobs so merge bursts can't race each other's push.
+concurrency:
+  group: version-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    # Loop guard: our own bump commits start with "release:" and are
+    # skipped, so the workflow cannot trigger itself.
+    if: ${{ !startsWith(github.event.head_commit.message, 'release:') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+      - name: bump version and tag
+        run: |
+          set -euo pipefail
+          # A queued run may start after a newer bump already landed;
+          # rebase onto the live tip before computing the next version.
+          git pull --rebase origin main
+          cur=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          IFS=. read -r maj min pat <<<"$cur"
+          # Schema changes request a minor bump with "[bump minor]" in
+          # the PR title; the squash/merge commit message carries it.
+          # Read the TRIGGERING commit (pinned sha), not HEAD — after the
+          # rebase above, HEAD may be a newer run's release commit.
+          if git log -1 --format=%B '${{ github.event.head_commit.id }}' | grep -q '\[bump minor\]'; then
+            new="$maj.$((min+1)).0"
+          else
+            new="$maj.$min.$((pat+1))"
+          fi
+          sed -i "0,/^version = \"$cur\"$/s//version = \"$new\"/" Cargo.toml
+          cargo update --workspace --offline 2>/dev/null || cargo update --workspace
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "release: v$new"
+          # Annotated tag: --follow-tags only pushes annotated tags.
+          git tag -a "v$new" -m "v$new"
+          git push origin main --follow-tags
