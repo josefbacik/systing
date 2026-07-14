@@ -22,6 +22,10 @@ jobs:
         with:
           fetch-depth: 0
           ref: main
+          # Push via a write deploy key: the main ruleset blocks direct
+          # pushes from the workflow token, and deploy keys carry the
+          # ruleset's bypass entry for this repo.
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
       - name: bump version and tag
         run: |
           set -euo pipefail
