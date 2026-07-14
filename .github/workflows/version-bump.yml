@@ -39,6 +39,14 @@ jobs:
           else
             new="$maj.$min.$((pat+1))"
           fi
+          # Skip any version whose tag already exists — failed runs can
+          # leave stray tags (git pushes refs non-atomically, so a tag can
+          # land while the branch push is rejected). This makes retries
+          # and collisions self-healing without tag surgery.
+          while git rev-parse -q --verify "refs/tags/v$new" >/dev/null; do
+            IFS=. read -r maj min pat <<<"$new"
+            new="$maj.$min.$((pat+1))"
+          done
           sed -i "0,/^version = \"$cur\"$/s//version = \"$new\"/" Cargo.toml
           cargo update --workspace --offline 2>/dev/null || cargo update --workspace
           git config user.name "github-actions[bot]"
