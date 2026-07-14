@@ -12,8 +12,53 @@ const SRC: [&str; 1] = ["src/bpf/systing_system.bpf.c"];
 /// under `/usr/include/<triplet>/` (e.g. `/usr/include/x86_64-linux-gnu/`).
 /// On Fedora/RHEL they're directly in `/usr/include/asm/`.
 ///
-/// Returns a `-I/usr/include/<triplet>` string if needed, or None.
+/// When cross-compiling, the triplet must be the TARGET's, not the build
+/// host's: the BPF objects are compiled with the target's `-D__<arch>__`
+/// define, and host libc headers plus a foreign arch define fall over in
+/// arch-conditional glibc internals. Concretely, compiling for aarch64 on
+/// an x86_64 host, x86's `gnu/stubs.h` hits `#include <gnu/stubs-32.h>`
+/// (absent on a 64-bit-only install) because under `-target bpf` neither
+/// `__x86_64__` nor `__i386__` is defined.
+///
+/// Returns a `-I<dir>` string if needed, or None.
 fn detect_multiarch_include() -> Option<String> {
+    // Cross build: prefer the target's header locations. On Debian/Ubuntu
+    // these are /usr/include/<triplet> (multiarch, from libc6-dev:<arch>)
+    // or /usr/<triplet>/include (cross-toolchain sysroot, shipped alongside
+    // gcc-<triplet>). If neither exists, warn and return None rather than
+    // silently offering the HOST's headers — setups with a real sysroot
+    // pass their own include flags.
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH not set");
+    if target_arch != env::consts::ARCH {
+        // get_arch_config() already restricts supported targets to these two.
+        let triplet = match target_arch.as_str() {
+            "x86_64" => "x86_64-linux-gnu",
+            "aarch64" => "aarch64-linux-gnu",
+            _ => return None,
+        };
+        let candidates = [
+            format!("/usr/include/{triplet}"),
+            format!("/usr/{triplet}/include"),
+        ];
+        for dir in &candidates {
+            if Path::new(dir).exists() {
+                return Some(format!("-I{dir}"));
+            }
+        }
+        let deb_arch = if target_arch == "aarch64" {
+            "arm64"
+        } else {
+            "amd64"
+        };
+        println!(
+            "cargo:warning=cross-compiling for {target_arch} but neither {} nor {} exists; \
+             BPF compilation may fail or pick up host libc headers \
+             (on Debian/Ubuntu: apt install libc6-dev:{deb_arch} or the {triplet} cross toolchain)",
+            candidates[0], candidates[1],
+        );
+        return None;
+    }
+
     // Check that both asm/ and bits/ headers are available directly.
     // On some CI environments (GitHub Actions), /usr/include/asm is symlinked
     // to asm-generic but bits/wordsize.h still lives under the multiarch path.
