@@ -151,7 +151,7 @@ impl ExportWriter {
 /// but swallows any I/O error, silently truncating the output.
 enum ExportSink {
     Plain(BufWriter<File>),
-    Gz(GzEncoder<BufWriter<File>>),
+    Gz(Box<GzEncoder<BufWriter<File>>>),
 }
 
 impl Write for ExportSink {
@@ -301,10 +301,10 @@ fn open_output(path: &Path) -> Result<ExportSink> {
         .and_then(|f| f.to_str())
         .is_some_and(|f| f.to_ascii_lowercase().ends_with(".gz"));
     if is_gz {
-        Ok(ExportSink::Gz(GzEncoder::new(
+        Ok(ExportSink::Gz(Box::new(GzEncoder::new(
             buffered,
             Compression::default(),
-        )))
+        ))))
     } else {
         Ok(ExportSink::Plain(buffered))
     }
