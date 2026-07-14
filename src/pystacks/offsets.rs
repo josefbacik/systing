@@ -9,7 +9,7 @@ use super::types::BPF_LIB_DEFAULT_FIELD_OFFSET;
 
 /// Returns the OffsetConfig for a given Python (major, minor) version.
 /// Returns None if the version is not supported.
-/// Falls back to Python 3.13 for unknown versions >= 3.13.
+/// Falls back to Python 3.14 for unknown versions >= 3.14.
 pub fn for_version(major: i32, minor: i32) -> Option<OffsetConfig> {
     if major != 3 {
         return None;
@@ -21,7 +21,8 @@ pub fn for_version(major: i32, minor: i32) -> Option<OffsetConfig> {
         11 => Some(py311()),
         12 => Some(py312()),
         13 => Some(py313()),
-        m if m > 13 => Some(py313()), // fallback to latest known
+        14 => Some(py314()),
+        m if m > 14 => Some(py314()), // fallback to latest known
         _ => None,
     }
 }
@@ -308,6 +309,60 @@ pub fn py313() -> OffsetConfig {
     c
 }
 
+#[allow(clippy::field_reassign_with_default)]
+pub fn py314() -> OffsetConfig {
+    use bindings::v3_14_0::*;
+    let mut c = OffsetConfig::default();
+
+    // Common offsets
+    c.py_object_type = PY_OBJECT_OB_TYPE;
+    c.py_type_object_name = PY_TYPE_OBJECT_TP_NAME;
+    c.py_var_object_size = PY_VAR_OBJECT_OB_SIZE;
+    c.py_tuple_object_item = PY_TUPLE_OBJECT_OB_ITEM;
+    c.py_bytes_object_data = PY_BYTES_OBJECT_OB_SVAL;
+    c.string_data = PY_ASCII_OBJECT_SIZE;
+
+    // Thread state (like 3.13: current_frame directly on _ts, no _PyCFrame)
+    c.py_thread_state_cframe = PY_THREAD_STATE_CURRENT_FRAME;
+    c.py_thread_state_thread = PY_THREAD_STATE_THREAD;
+    c.py_thread_state_interp = PY_THREAD_STATE_INTERP;
+
+    // No _PyCFrame indirection - sentinel means "no second dereference"
+    c.py_cframe_current_frame = BPF_LIB_DEFAULT_FIELD_OFFSET;
+
+    // Interpreter frame (same shape as 3.13; offsets shifted)
+    c.py_interpreter_frame_code = PY_INTERP_FRAME_CODE;
+    c.py_interpreter_frame_previous = PY_INTERP_FRAME_PREVIOUS;
+    c.py_interpreter_frame_localsplus = PY_INTERP_FRAME_LOCALSPLUS;
+    c.py_interpreter_frame_prev_instr = PY_INTERP_FRAME_PREV_INSTR;
+
+    // Code object
+    c.py_code_object_co_flags = PY_CODE_OBJECT_CO_FLAGS;
+    c.py_code_object_filename = PY_CODE_OBJECT_CO_FILENAME;
+    c.py_code_object_name = PY_CODE_OBJECT_CO_NAME;
+    c.py_code_object_qualname = PY_CODE_OBJECT_CO_QUALNAME;
+    c.py_code_object_linetable = PY_CODE_OBJECT_CO_LINETABLE;
+    c.py_code_object_firstlineno = PY_CODE_OBJECT_CO_FIRSTLINENO;
+    c.py_code_object_code_adaptive = PY_CODE_OBJECT_CO_CODE_ADAPTIVE;
+
+    // 3.12+ generator/coroutine offsets
+    c.py_coro_object_cr_awaiter = PY_CORO_OBJECT_CR_ORIGIN_OR_FINALIZER;
+    c.py_gen_object_iframe = PY_GEN_OBJECT_GI_IFRAME;
+    c.py_frame_object_owner = PY_INTERP_FRAME_OWNER;
+
+    // Compound offsets (from C program)
+    c.tls_key_offset = PYRUNTIME_TLS_KEY_OFFSET;
+    c.py_runtime_state_interpreters_head = PYRUNTIME_INTERPRETERS_HEAD_OFFSET;
+    c.py_interpreter_state_modules = PYINTERP_MODULES_OFFSET;
+    c.py_interpreter_state_gil_locked = PYINTERP_GIL_LOCKED_OFFSET;
+    c.py_interpreter_state_gil_last_holder = PYINTERP_GIL_LAST_HOLDER_OFFSET;
+
+    c.py_version_major = 3;
+    c.py_version_minor = 14;
+    c.py_version_micro = 0;
+    c
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +371,7 @@ mod tests {
     fn test_for_version_known() {
         assert!(for_version(3, 8).is_some());
         assert!(for_version(3, 13).is_some());
+        assert!(for_version(3, 14).is_some());
     }
 
     #[test]
@@ -326,8 +382,8 @@ mod tests {
 
     #[test]
     fn test_for_version_future_fallback() {
-        let future = for_version(3, 14).unwrap();
-        assert_eq!(future.py_version_minor, 13); // falls back to 3.13
+        let future = for_version(3, 15).unwrap();
+        assert_eq!(future.py_version_minor, 14); // falls back to 3.14
     }
 
     #[test]
@@ -371,6 +427,20 @@ mod tests {
         assert_eq!(c.py_cframe_current_frame, 0);
         assert_eq!(c.py_interpreter_frame_code, 0);
         assert_eq!(c.py_code_object_code_adaptive, 192);
+    }
+
+    #[test]
+    fn test_py314_offsets() {
+        let c = py314();
+        assert_eq!(c.py_version_minor, 14);
+        assert_eq!(c.py_thread_state_cframe, 72);
+        assert_eq!(c.py_cframe_current_frame, BPF_LIB_DEFAULT_FIELD_OFFSET);
+        assert_eq!(c.tls_key_offset, 2340);
+        assert_eq!(c.py_runtime_state_interpreters_head, 808);
+        assert_eq!(c.py_interpreter_frame_localsplus, 80);
+        assert_eq!(c.py_frame_object_owner, 74);
+        assert_eq!(c.py_tuple_object_item, 32);
+        assert_eq!(c.py_interpreter_state_gil_locked, 7776);
     }
 
     #[test]

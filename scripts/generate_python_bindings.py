@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSIONS = ["v3.8.0", "v3.9.0", "v3.10.0", "v3.11.0", "v3.12.0", "v3.13.0"]
+VERSIONS = ["v3.8.0", "v3.9.0", "v3.10.0", "v3.11.0", "v3.12.0", "v3.13.0", "v3.14.0"]
 
 
 def version_tuple(version_str):
