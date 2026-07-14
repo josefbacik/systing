@@ -49,7 +49,7 @@ fn current_cgroup_v2_path() -> Option<String> {
 /// Python versions used by pystacks integration tests.
 /// Install these via: ./scripts/setup-pystacks.sh
 ///
-/// Per-version tests (test_pystacks_python38 .. test_pystacks_python313)
+/// Per-version tests (test_pystacks_python38 .. test_pystacks_python314)
 /// exercise each version individually so failures can be narrowed down.
 const PYTHON_38_VERSION: &str = "3.8.20";
 const PYTHON_39_VERSION: &str = "3.9.25";
@@ -57,6 +57,7 @@ const PYTHON_310_VERSION: &str = "3.10.19";
 const PYTHON_311_VERSION: &str = "3.11.14";
 const PYTHON_312_VERSION: &str = "3.12.12";
 const PYTHON_313_VERSION: &str = "3.13.11";
+const PYTHON_314_VERSION: &str = "3.14.6";
 
 /// Get the path to a pyenv-installed Python binary.
 ///
@@ -2128,6 +2129,12 @@ fn test_pystacks_python312() {
 #[ignore]
 fn test_pystacks_python313() {
     run_pystacks_version_test(PYTHON_313_VERSION);
+}
+
+#[test]
+#[ignore]
+fn test_pystacks_python314() {
+    run_pystacks_version_test(PYTHON_314_VERSION);
 }
 
 // =============================================================================

@@ -87,6 +87,17 @@ When changes add or modify a recorder (any `*_recorder.rs`, or new tables in `sr
 2. **Process attribution goes through `thread`**: Queries that need pid/process name should join `<table>.utid → thread.utid → thread.upid → process.upid`; tables should not duplicate `pid`.
 3. **utid FK integrity**: Integration tests for the recorder should assert that every emitted `utid` exists in `thread.utid` (zero orphans).
 
+## Python Version Support Review Criteria
+
+When changes add support for a new Python version (a new `src/pystacks/bindings/v3_*_0.rs` bindings module, a new `py3xx()` config or match arm in `src/pystacks/offsets.rs`, or a new entry in the version list in `scripts/generate_python_bindings.py`), verify the same change also includes:
+
+1. **Interpreter setup**: the `PYTHON_VERSIONS` array in `scripts/setup-pystacks.sh` gains a representative interpreter release for the new minor version, so the test harness can install it
+2. **Integration-test matrix**: `tests/trace_validation.rs` gains the matching `PYTHON_3XX_VERSION` constant and a `test_pystacks_python3xx` per-version test, so the frame walker is exercised against a real interpreter of the new version — unit tests over generated offsets alone do not catch discovery or walking breakage
+3. **Version agreement**: the release added to `setup-pystacks.sh` and the new constant in `tests/trace_validation.rs` are identical (the two lists are documented to match)
+4. **Fallback arm advanced**: the future-version fallback arm in `for_version()` in `src/pystacks/offsets.rs` points at the newest known version, and the fallback unit test is updated to match
+
+Missing item 1 or item 2 is a **Critical Issue**: version support without interpreter setup and matrix coverage is exactly how a silent offset fallback ships — a new version appears supported while discovery reads garbage and produces no frames.
+
 ## Output Format
 
 Structure your review as follows:
