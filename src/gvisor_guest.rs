@@ -97,6 +97,12 @@ pub struct GuestProcess {
     status: GuestStatus,
     #[serde(default)]
     maps: Vec<GuestMapping>,
+    /// JIT runtime detected among the guest's file mappings. The guest
+    /// view carries real paths, making it the authoritative signal for
+    /// classifying the guest's anonymous executable pages. Computed after
+    /// deserialization in [`parse_dump_response`].
+    #[serde(skip)]
+    jit_runtime: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -119,7 +125,11 @@ pub enum GuestAddr {
     },
     /// Runtime-injected region (`[usertrap]`): sandbox overhead.
     Runtime,
-    /// Guest-anonymous memory (JIT output, heap made executable, ...).
+    /// Guest-anonymous executable memory in a process running the tagged
+    /// JIT runtime: compiled output.
+    Jit(&'static str),
+    /// Guest-anonymous memory (heap, copied-up pages, executable pages of
+    /// an unrecognized runtime).
     Anon,
     /// Not mapped in the guest at all.
     Unmapped,
@@ -153,6 +163,12 @@ impl GuestProcess {
                 }
             }
             "[usertrap]" => GuestAddr::Runtime,
+            // Executable anonymous guest memory; bracketed pseudo-regions
+            // ([vdso], [vvar], ...) are runtime-provided, never JIT output.
+            path if m.perms.execute && !path.starts_with('[') => match self.jit_runtime {
+                Some(rt) => GuestAddr::Jit(rt),
+                None => GuestAddr::Anon,
+            },
             _ => GuestAddr::Anon,
         }
     }
@@ -337,7 +353,16 @@ fn parse_dump_response(buf: &[u8]) -> std::io::Result<Vec<GuestProcess>> {
     if !resp.success {
         return Err(std::io::Error::other(format!("urpc error: {}", resp.err)));
     }
-    Ok(resp.result)
+    let mut procs = resp.result;
+    for p in &mut procs {
+        p.jit_runtime = p
+            .maps
+            .iter()
+            .filter(|m| m.is_file())
+            .filter_map(|m| Path::new(&m.pathname).file_name().and_then(|f| f.to_str()))
+            .find_map(crate::sandbox_maps::detect_jit_runtime);
+    }
+    Ok(procs)
 }
 
 #[cfg(test)]
@@ -414,6 +439,71 @@ mod tests {
         assert_eq!(p.lookup(405504 + 0x100), GuestAddr::Runtime);
         assert_eq!(p.lookup(7426048 + 0x10), GuestAddr::Anon);
         assert_eq!(p.lookup(0xdead_0000_0000), GuestAddr::Unmapped);
+    }
+
+    /// Synthetic dump: one guest running a JIT runtime (node, detected via
+    /// its shared library), one plain guest with an anonymous executable
+    /// page but no recognized runtime.
+    const JIT_DUMP: &str = r#"{"success":true,"err":"","result":[{
+        "exe":"/usr/bin/node",
+        "clone_ts":1,
+        "status":{"comm":"node","pid":10},
+        "maps":[
+            {"address":{"Start":4194304,"End":8388608},
+             "permissions":{"Read":true,"Write":false,"Execute":true},
+             "offset":0,"pathname":"/usr/bin/node"},
+            {"address":{"Start":139264000000,"End":139264100000},
+             "permissions":{"Read":true,"Write":false,"Execute":true},
+             "offset":0,"pathname":"/usr/lib/libnode.so.115"},
+            {"address":{"Start":34359738368,"End":34359771136},
+             "permissions":{"Read":true,"Write":false,"Execute":true},
+             "offset":0,"pathname":""},
+            {"address":{"Start":68719476736,"End":68719509504},
+             "permissions":{"Read":true,"Write":true,"Execute":false},
+             "offset":0,"pathname":""},
+            {"address":{"Start":103079215104,"End":103079219200},
+             "permissions":{"Read":true,"Write":false,"Execute":true},
+             "offset":0,"pathname":"[vdso]"}
+        ]},{
+        "exe":"/usr/bin/plain",
+        "clone_ts":2,
+        "status":{"comm":"plain","pid":11},
+        "maps":[
+            {"address":{"Start":4194304,"End":8388608},
+             "permissions":{"Read":true,"Write":false,"Execute":true},
+             "offset":0,"pathname":"/usr/bin/plain"},
+            {"address":{"Start":34359738368,"End":34359771136},
+             "permissions":{"Read":true,"Write":false,"Execute":true},
+             "offset":0,"pathname":""}
+        ]}]}"#;
+
+    #[test]
+    fn test_guest_jit_classification() {
+        let procs = parse_dump_response(JIT_DUMP.as_bytes()).unwrap();
+        let node = &procs[0];
+        let plain = &procs[1];
+
+        // Anonymous executable pages of a JIT-runtime guest are its
+        // compiled output; non-executable anonymous stays guest memory.
+        assert_eq!(node.lookup(34359738368 + 0x100), GuestAddr::Jit("node"));
+        assert_eq!(node.lookup(68719476736 + 0x100), GuestAddr::Anon);
+        // File-backed text is unaffected by the runtime flag.
+        assert!(matches!(
+            node.lookup(4194304 + 0x100),
+            GuestAddr::File { .. }
+        ));
+
+        // Bracketed pseudo-regions are executable but never JIT output,
+        // even in a JIT-runtime guest.
+        assert_eq!(node.lookup(103079215104 + 0x100), GuestAddr::Anon);
+
+        // Without a recognized runtime an executable anonymous page stays
+        // unidentifiable guest memory.
+        assert_eq!(plain.lookup(34359738368 + 0x100), GuestAddr::Anon);
+
+        // The verbatim fixture's guest maps no runtime: nothing regresses.
+        let fixture = parse_dump_response(DUMP_FIXTURE.as_bytes()).unwrap();
+        assert_eq!(fixture[0].jit_runtime, None);
     }
 
     #[test]
