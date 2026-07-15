@@ -30,10 +30,11 @@ fn detect_multiarch_include() -> Option<String> {
     // pass their own include flags.
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH not set");
     if target_arch != env::consts::ARCH {
-        // get_arch_config() already restricts supported targets to these two.
+        // get_arch_config() already restricts supported targets.
         let triplet = match target_arch.as_str() {
             "x86_64" => "x86_64-linux-gnu",
             "aarch64" => "aarch64-linux-gnu",
+            "riscv64" => "riscv64-linux-gnu",
             _ => return None,
         };
         let candidates = [
@@ -45,10 +46,11 @@ fn detect_multiarch_include() -> Option<String> {
                 return Some(format!("-I{dir}"));
             }
         }
-        let deb_arch = if target_arch == "aarch64" {
-            "arm64"
-        } else {
-            "amd64"
+        let deb_arch = match target_arch.as_str() {
+            "aarch64" => "arm64",
+            "riscv64" => "riscv64",
+            "x86_64" => "amd64",
+            other => panic!("Unsupported architecture: {other}"),
         };
         println!(
             "cargo:warning=cross-compiling for {target_arch} but neither {} nor {} exists; \
@@ -177,7 +179,10 @@ fn get_arch_config() -> (&'static str, &'static str) {
     match arch.as_str() {
         "x86_64" => ("-D__x86_64__", "vmlinux_x86_64.h"),
         "aarch64" => ("-D__aarch64__", "vmlinux_aarch64.h"),
-        _ => panic!("Unsupported architecture: {arch}. Only x86_64 and aarch64 are supported."),
+        "riscv64" => ("-D__riscv64__", "vmlinux_riscv64.h"),
+        _ => panic!(
+            "Unsupported architecture: {arch}. Only x86_64, aarch64 and riscv64 are supported."
+        ),
     }
 }
 

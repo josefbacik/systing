@@ -21,6 +21,9 @@
 #elif defined(__aarch64__)
 // https://www.kernel.org/doc/Documentation/arm64/memory.txt
 #define BPF_LIB_MAX_USER_SPACE_ADDRESS ((uintptr_t)0x0000007fffffffff)
+#elif defined(__riscv64__)
+// https://www.kernel.org/doc/Documentation/riscv/vm-layout.rst
+#define BPF_LIB_MAX_USER_SPACE_ADDRESS ((uintptr_t)0x00ffffffffffffff)
 #else
 #error Unsupported architecture
 #endif
