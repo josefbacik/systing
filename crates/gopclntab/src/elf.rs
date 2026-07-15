@@ -93,13 +93,28 @@ impl ElfPclntab {
             return Ok(Some(Self { table, has_symtab }));
         }
 
-        // No dedicated section: scan non-executable data sections for a
-        // validating header, likeliest homes first. Failures here are
-        // "not a candidate", not errors — this path is discovery, and
-        // sections that cannot be read or hold no table are simply
-        // skipped. The budget bounds total work on adversarial inputs;
-        // real binaries put the table within the first few dozen MiB of
-        // `.data.rel.ro` or `.rodata`.
+        // No dedicated section. The scan below reads whole data sections,
+        // which every stripped ELF that reaches this point would pay —
+        // so first require evidence the binary is Go at all. Both marker
+        // sections survive external linking and stripping (they are
+        // present on the sectionless distro builds this fallback exists
+        // for), unlike `.gopclntab` itself. This also narrows foreign-
+        // table adoption: a non-Go binary embedding a complete Go ELF in
+        // its data is no longer scanned at all.
+        if elf.section_by_name(".go.buildinfo").is_none()
+            && elf.section_by_name(".note.go.buildid").is_none()
+        {
+            return Ok(None);
+        }
+
+        // Scan non-executable data sections for a validating header,
+        // likeliest homes first. Failures here are "not a candidate",
+        // not errors — this path is discovery, and sections that cannot
+        // be read or hold no table are simply skipped. The budget bounds
+        // total bytes read on adversarial inputs (candidate rejection
+        // within a region is constant-time per candidate — see
+        // [`GoPclntab::scan`]); real binaries put the table within the
+        // first few dozen MiB of `.data.rel.ro` or `.rodata`.
         const SCAN_BUDGET: u64 = 1 << 30;
         let mut budget = SCAN_BUDGET;
         let mut sections: Vec<_> = elf
@@ -261,7 +276,7 @@ mod tests {
         // and only its header identifies it. Simulated by renaming the
         // section — the bytes stay exactly where they were — the scan
         // fallback must find the table and agree with the named path.
-        let renamed = rename_gopclntab(&bytes);
+        let renamed = rename_section(&bytes, ".gopclntab", ".mystery00");
         let elf = ElfPclntab::from_bytes(&renamed)
             .unwrap()
             .expect("scan fallback missed the renamed pclntab");
@@ -271,6 +286,29 @@ mod tests {
         assert_eq!(
             f.name,
             tab.find_func(tab.func_entry(0).unwrap()).unwrap().name
+        );
+        // ...and it proves the Go-ness gate passes real Go binaries: the
+        // marker sections were still present for that scan.
+
+        // With the marker sections renamed away as well, nothing
+        // identifies the binary as Go and the scan tier is skipped —
+        // not-a-candidate, though the (renamed) table bytes are all
+        // still in the file.
+        let mut gateless = renamed.clone();
+        let mut markers = 0;
+        for (from, to) in [
+            (".note.go.buildid", ".note.no.buildid"),
+            (".go.buildinfo", ".no.buildinfo"),
+        ] {
+            if section_exists(&gateless, from) {
+                gateless = rename_section(&gateless, from, to);
+                markers += 1;
+            }
+        }
+        assert!(markers > 0, "fixture carries no Go marker sections at all");
+        assert!(
+            ElfPclntab::from_bytes(&gateless).unwrap().is_none(),
+            "gate failed: scan ran on a binary with no Go evidence"
         );
 
         // Corrupt the section header so .gopclntab claims to extend past
@@ -283,15 +321,23 @@ mod tests {
         ));
     }
 
-    /// Overwrite the `.gopclntab` name in `.shstrtab` with an unknown
-    /// same-length name, so name-based lookups fail while the section's
-    /// bytes and headers otherwise stay intact — the closest simulation
-    /// of a link that never emitted the dedicated name. Pokes the ELF64
-    /// layout directly, like [`corrupt_gopclntab_size`].
-    fn rename_gopclntab(elf: &[u8]) -> Vec<u8> {
+    /// Whether the ELF has a section with this exact name.
+    fn section_exists(elf: &[u8], name: &str) -> bool {
         use object::read::elf::ElfFile64;
         let parsed: ElfFile64 = ElfFile64::parse(elf).unwrap();
-        let section = parsed.section_by_name(".gopclntab").unwrap();
+        parsed.section_by_name(name).is_some()
+    }
+
+    /// Overwrite a section's name in `.shstrtab` with an unknown
+    /// same-length name, so name-based lookups fail while the section's
+    /// bytes and headers otherwise stay intact — the closest simulation
+    /// of a link that never emitted that name. Pokes the ELF64 layout
+    /// directly, like [`corrupt_gopclntab_size`].
+    fn rename_section(elf: &[u8], from: &str, to: &str) -> Vec<u8> {
+        use object::read::elf::ElfFile64;
+        assert_eq!(from.len(), to.len(), "rename must preserve name length");
+        let parsed: ElfFile64 = ElfFile64::parse(elf).unwrap();
+        let section = parsed.section_by_name(from).unwrap();
         let index = section.index().0;
 
         let e_shoff = u64::from_le_bytes(elf[0x28..0x30].try_into().unwrap()) as usize;
@@ -314,8 +360,8 @@ mod tests {
 
         let mut out = elf.to_vec();
         let name_at = strtab_off + sh_name;
-        assert_eq!(&out[name_at..name_at + 10], b".gopclntab");
-        out[name_at..name_at + 10].copy_from_slice(b".mystery00");
+        assert_eq!(&out[name_at..name_at + from.len()], from.as_bytes());
+        out[name_at..name_at + to.len()].copy_from_slice(to.as_bytes());
         out
     }
 

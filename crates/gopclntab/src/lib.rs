@@ -134,6 +134,20 @@ pub struct GoFunc<'tab> {
     pub size: u64,
 }
 
+/// Header fields validated by a borrowed parse: every offset has been
+/// bounds-checked against the input it was parsed from, including the
+/// full functab extent.
+struct Header {
+    version: PclnVersion,
+    ptrsize: usize,
+    nfunctab: usize,
+    text_start: u64,
+    funcnametab: usize,
+    funcdata: usize,
+    functab: usize,
+    functab_field: usize,
+}
+
 impl GoPclntab {
     /// Parse a pclntab from its raw bytes (e.g. the contents of the
     /// `.gopclntab` ELF section).
@@ -143,6 +157,24 @@ impl GoPclntab {
     /// value (which may be unrelocated in edge cases) and so does this
     /// crate. [`ElfPclntab`] supplies it automatically.
     pub fn parse(data: Vec<u8>, text_vaddr: Option<u64>) -> Result<Self, Error> {
+        let h = Self::parse_header(&data, text_vaddr)?;
+        Ok(Self {
+            data,
+            version: h.version,
+            ptrsize: h.ptrsize,
+            nfunctab: h.nfunctab,
+            text_start: h.text_start,
+            funcnametab: h.funcnametab,
+            funcdata: h.funcdata,
+            functab: h.functab,
+            functab_field: h.functab_field,
+        })
+    }
+
+    /// All of [`GoPclntab::parse`]'s validation on a borrowed slice,
+    /// without taking ownership of the bytes — the scan path uses this to
+    /// vet candidates before paying for a copy.
+    fn parse_header(data: &[u8], text_vaddr: Option<u64>) -> Result<Header, Error> {
         if data.len() < HEADER_PREFIX_LEN {
             return Err(Error::Malformed(format!(
                 "too short for header: {} bytes",
@@ -166,7 +198,7 @@ impl GoPclntab {
 
         let word = |idx: usize| -> Result<u64, Error> {
             let off = HEADER_PREFIX_LEN + idx * ptrsize;
-            read_uint(&data, off, ptrsize)
+            read_uint(data, off, ptrsize)
                 .ok_or_else(|| Error::Malformed(format!("header word {idx} out of bounds")))
         };
         let tab_offset = |idx: usize, what: &str| -> Result<usize, Error> {
@@ -216,8 +248,7 @@ impl GoPclntab {
             )));
         }
 
-        Ok(Self {
-            data,
+        Ok(Header {
             version,
             ptrsize,
             nfunctab,
@@ -237,19 +268,26 @@ impl GoPclntab {
     /// `.data.rel.ro` — leaving its header as the only identification.
     /// The scan matches the 8-byte header signature (a known magic, two
     /// zero pad bytes, a plausible instruction quantum and pointer size)
-    /// at 8-byte alignment, then validates each candidate by fully
-    /// parsing it: the header's offset words must all land inside the
-    /// region, which rejects signature lookalikes. The first candidate
-    /// that parses wins; `None` means the region holds no parseable
-    /// table.
+    /// at 8-byte alignment, then validates each candidate on the borrowed
+    /// slice: the header's offset words and the full functab extent must
+    /// all land inside the region, which rejects signature lookalikes.
+    /// Bytes are copied exactly once, for the adopted table — candidate
+    /// validation allocates nothing, so a region tiled with fake
+    /// signatures costs a constant-time rejection each, not a copy each.
+    /// The first non-empty candidate that validates wins; `None` means
+    /// the region holds no parseable table.
     pub fn scan(region: &[u8], text_vaddr: Option<u64>) -> Option<Self> {
         let mut off = 0;
         while off + HEADER_PREFIX_LEN <= region.len() {
             if header_signature(&region[off..]) {
-                match Self::parse(region[off..].to_vec(), text_vaddr) {
+                match Self::parse_header(&region[off..], text_vaddr) {
                     // An empty table parses but resolves nothing; keep
                     // scanning rather than let it shadow a real one.
-                    Ok(table) if table.func_count() > 0 => return Some(table),
+                    Ok(h) if h.nfunctab > 0 => {
+                        // The borrowed validation just passed over these
+                        // exact bytes, so this parse cannot fail.
+                        return Self::parse(region[off..].to_vec(), text_vaddr).ok();
+                    }
                     _ => {}
                 }
             }
@@ -551,6 +589,32 @@ mod tests {
         let tab = GoPclntab::scan(&region, Some(0x40_0000)).expect("scan missed embedded table");
         assert_eq!(tab.func_count(), 2);
         assert_eq!(tab.find_func(0x40_0100).unwrap().name, "main.main");
+    }
+
+    #[test]
+    fn scan_rejects_tiled_signatures_in_linear_time() {
+        // A region tiled with valid 8-byte signatures at every aligned
+        // offset: each candidate's "header words" are the following
+        // tiles' bytes, which read as out-of-bounds offsets, so all of
+        // them must be rejected — on the borrowed slice, without copying
+        // the tail. (The pre-fix behavior copied per candidate and went
+        // quadratic: ~1.6 s per MiB, ×4 per doubling; the borrowed
+        // validation does the whole region in milliseconds.)
+        let mut region = vec![0u8; 2 << 20];
+        let mut off = 0;
+        while off + HEADER_PREFIX_LEN <= region.len() {
+            region[off..off + 4].copy_from_slice(&GO120_MAGIC.to_le_bytes());
+            region[off + 6] = 1;
+            region[off + 7] = 8;
+            off += 8;
+        }
+        let start = std::time::Instant::now();
+        assert!(GoPclntab::scan(&region, None).is_none());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "tiled-signature scan took {:?} — per-candidate cost regressed",
+            start.elapsed()
+        );
     }
 
     #[test]
