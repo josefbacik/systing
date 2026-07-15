@@ -45,6 +45,13 @@ enum Commands {
         /// Path to DuckDB database to open on startup (optional)
         #[arg(short, long)]
         database: Option<PathBuf>,
+        /// Bound DuckDB's on-disk spill usage, e.g. "8GiB" (any DuckDB size
+        /// string). DuckDB sizes the default from the filesystem's free
+        /// space, which quota-limited scratch (e.g. a Kubernetes emptyDir
+        /// sizeLimit) misreports -- pass the real budget so an oversized
+        /// query fails instead of the process being evicted.
+        #[arg(long, value_name = "SIZE")]
+        max_temp_directory_size: Option<String>,
     },
 }
 
@@ -1049,9 +1056,15 @@ fn main() -> Result<()> {
             NetworkCommands::Interfaces(iface_args) => run_network_interfaces(iface_args),
             NetworkCommands::SocketPairs(pairs_args) => run_network_socket_pairs(pairs_args),
         },
-        Commands::Mcp { database } => {
+        Commands::Mcp {
+            database,
+            max_temp_directory_size,
+        } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(systing::mcp::run_mcp_server(database))
+            rt.block_on(systing::mcp::run_mcp_server(
+                database,
+                max_temp_directory_size,
+            ))
         }
     }
 }

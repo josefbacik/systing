@@ -246,6 +246,30 @@ pub struct AnalyzeDb {
 impl AnalyzeDb {
     /// Open a trace database.
     pub fn open(path: &Path, read_only: bool) -> Result<Self> {
+        Self::open_with_spill_cap(path, read_only, None)
+    }
+
+    /// Open a trace database, optionally bounding DuckDB's on-disk spill.
+    ///
+    /// DuckDB derives its default `max_temp_directory_size` from the
+    /// filesystem's free space, which quota-limited environments misreport:
+    /// a Kubernetes emptyDir `sizeLimit` is enforced by a periodic kubelet
+    /// scan, not by the filesystem, so `statvfs` reports the whole node's
+    /// free disk and a single spilling query can blow past the quota and get
+    /// the pod evicted mid-run. A caller that knows its real scratch budget
+    /// passes it here (any DuckDB size string, e.g. "8GiB") so an oversized
+    /// aggregation fails that one query instead of killing the process.
+    ///
+    /// This is a structural default, not a jail: unlike `temp_directory`,
+    /// DuckDB does not lock this setting when external access is disabled,
+    /// so in-session SQL can still raise it (covered by a test). That is the
+    /// right trade for the intended failure mode — queries that never think
+    /// about spill — and it keeps deliberate in-session tuning possible.
+    pub fn open_with_spill_cap(
+        path: &Path,
+        read_only: bool,
+        spill_cap: Option<&str>,
+    ) -> Result<Self> {
         if !path.exists() {
             bail!("Database not found: {}", path.display());
         }
@@ -273,6 +297,14 @@ impl AnalyzeDb {
             Some(spill_dir) => config.with("temp_directory", spill_dir.to_string_lossy())?,
             None => config.with("temp_directory", "")?,
         };
+        if let Some(cap) = spill_cap {
+            // Set on the Config, like temp_directory above, so the bound is
+            // in force from the first query. DuckDB validates the size string
+            // at open, so a malformed cap fails loudly here rather than being
+            // silently ignored.
+            config = config.with("max_temp_directory_size", cap)?;
+            eprintln!("duckdb: max_temp_directory_size={cap}");
+        }
         if let Some(m) = mem_limit_mib {
             config = config.max_memory(&format!("{m}MiB"))?;
             eprintln!("duckdb: memory_limit={m}MiB threads={threads}");
@@ -833,6 +865,79 @@ mod tests {
                 "unexpected error: {set_err}"
             );
         }
+    }
+
+    #[test]
+    fn test_open_with_spill_cap_applies_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.duckdb");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+
+        let read_setting = |db: &AnalyzeDb| -> String {
+            let result = db
+                .query("SELECT current_setting('max_temp_directory_size')")
+                .unwrap();
+            result.rows[0][0].as_str().unwrap().to_string()
+        };
+
+        // Capped open reports the requested bound.
+        let capped = AnalyzeDb::open_with_spill_cap(&db_path, true, Some("100MiB")).unwrap();
+        let capped_value = read_setting(&capped);
+        assert!(
+            capped_value.starts_with("100") && capped_value.contains("MiB"),
+            "expected the 100MiB cap to be in force, got '{capped_value}'"
+        );
+
+        // Uncapped open differs — proves the assertion above is not vacuous.
+        let uncapped = AnalyzeDb::open(&db_path, true).unwrap();
+        assert_ne!(
+            read_setting(&uncapped),
+            capped_value,
+            "uncapped open unexpectedly reports the capped value"
+        );
+    }
+
+    #[test]
+    fn test_open_with_invalid_spill_cap_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.duckdb");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+        }
+
+        // A malformed size string must fail the open loudly, not be ignored.
+        let err = AnalyzeDb::open_with_spill_cap(&db_path, true, Some("not-a-size"));
+        assert!(err.is_err(), "malformed spill cap was silently accepted");
+    }
+
+    /// Documents the cap's trust boundary: `enable_external_access(false)`
+    /// locks `temp_directory` but NOT `max_temp_directory_size`, so SQL run
+    /// in-session can still raise the bound. The flag is a structural
+    /// default protecting against queries that never think about spill (the
+    /// real-world failure mode), not a jail against adversarial SQL — an
+    /// adversary with query access could raise it back. If DuckDB ever
+    /// starts locking this setting alongside temp_directory, this test
+    /// fails and the doc-comments should be updated to promise more.
+    #[test]
+    fn test_spill_cap_is_session_overridable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.duckdb");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+        }
+        let db = AnalyzeDb::open_with_spill_cap(&db_path, true, Some("100MiB")).unwrap();
+        db.query("SET max_temp_directory_size = '999GiB'")
+            .expect("session SET is currently allowed for this setting");
+        let v = db
+            .query("SELECT current_setting('max_temp_directory_size')")
+            .unwrap();
+        assert_eq!(v.rows[0][0].as_str().unwrap(), "999.0 GiB");
     }
 
     #[test]

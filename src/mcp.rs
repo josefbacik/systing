@@ -46,28 +46,35 @@ struct DbHandle {
 
 impl DbHandle {
     /// Spawn the database thread, optionally opening an initial database.
-    fn new(initial_db: Option<PathBuf>) -> Result<Self> {
+    ///
+    /// `spill_cap` bounds DuckDB's on-disk spill for every database this
+    /// server opens, initial and lazily-opened alike — see
+    /// [`AnalyzeDb::open_with_spill_cap`].
+    fn new(initial_db: Option<PathBuf>, spill_cap: Option<String>) -> Result<Self> {
         let (sender, mut receiver) = mpsc::channel::<(DbRequest, oneshot::Sender<DbResponse>)>(32);
 
         std::thread::spawn(move || {
             let mut dbs: HashMap<PathBuf, AnalyzeDb> = HashMap::new();
             let mut last_used: Option<PathBuf> = None;
+            let spill_cap = spill_cap.as_deref();
 
             if let Some(path) = initial_db {
                 match std::fs::canonicalize(&path) {
-                    Ok(canonical) => match AnalyzeDb::open(&canonical, true) {
-                        Ok(db) => {
-                            dbs.insert(canonical.clone(), db);
-                            last_used = Some(canonical);
+                    Ok(canonical) => {
+                        match AnalyzeDb::open_with_spill_cap(&canonical, true, spill_cap) {
+                            Ok(db) => {
+                                dbs.insert(canonical.clone(), db);
+                                last_used = Some(canonical);
+                            }
+                            Err(e) => eprintln!("Warning: failed to open initial database: {e}"),
                         }
-                        Err(e) => eprintln!("Warning: failed to open initial database: {e}"),
-                    },
+                    }
                     Err(e) => eprintln!("Warning: cannot resolve path '{}': {e}", path.display()),
                 }
             }
 
             while let Some((request, reply)) = receiver.blocking_recv() {
-                let result = handle_db_request(&mut dbs, &mut last_used, request);
+                let result = handle_db_request(&mut dbs, &mut last_used, spill_cap, request);
                 let _ = reply.send(result);
             }
         });
@@ -93,6 +100,7 @@ const MAX_CACHED_DBS: usize = 8;
 fn get_or_open<'a>(
     dbs: &'a mut HashMap<PathBuf, AnalyzeDb>,
     last_used: &mut Option<PathBuf>,
+    spill_cap: Option<&str>,
     path: Option<PathBuf>,
 ) -> Result<&'a AnalyzeDb, String> {
     let raw_path = match path {
@@ -119,7 +127,7 @@ fn get_or_open<'a>(
                 dbs.insert(k, db);
             }
         }
-        let db = AnalyzeDb::open(&canonical, true)
+        let db = AnalyzeDb::open_with_spill_cap(&canonical, true, spill_cap)
             .map_err(|e| format!("Failed to open database '{}': {e}", canonical.display()))?;
         dbs.insert(canonical.clone(), db);
     }
@@ -133,11 +141,12 @@ fn get_or_open<'a>(
 fn handle_db_request(
     dbs: &mut HashMap<PathBuf, AnalyzeDb>,
     last_used: &mut Option<PathBuf>,
+    spill_cap: Option<&str>,
     request: DbRequest,
 ) -> DbResponse {
     match request {
         DbRequest::Query(path, sql) => {
-            let db = get_or_open(dbs, last_used, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, path)?;
             db.query(&sql)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -145,7 +154,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Query error: {e}"))
         }
         DbRequest::ListTables(path) => {
-            let db = get_or_open(dbs, last_used, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, path)?;
             db.list_tables()
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -153,7 +162,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Error listing tables: {e}"))
         }
         DbRequest::DescribeTable(path, name) => {
-            let db = get_or_open(dbs, last_used, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, path)?;
             db.describe_table(&name)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -161,7 +170,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Error describing table: {e}"))
         }
         DbRequest::Flamegraph(path, params) => {
-            let db = get_or_open(dbs, last_used, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, path)?;
             db.flamegraph(&params)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -169,7 +178,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Flamegraph error: {e}"))
         }
         DbRequest::SchedStats(path, params) => {
-            let db = get_or_open(dbs, last_used, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, path)?;
             db.sched_stats(&params)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -177,7 +186,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Sched stats error: {e}"))
         }
         DbRequest::CpuStats(path, params) => {
-            let db = get_or_open(dbs, last_used, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, path)?;
             db.cpu_stats(&params)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -185,7 +194,7 @@ fn handle_db_request(
                 .map_err(|e| format!("CPU stats error: {e}"))
         }
         DbRequest::TraceInfo(path) => {
-            let db = get_or_open(dbs, last_used, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, path)?;
             db.trace_info()
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -193,7 +202,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Error getting trace info: {e}"))
         }
         DbRequest::NetworkConnections(path, params) => {
-            let db = get_or_open(dbs, last_used, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, path)?;
             db.network_connections(&params)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -201,7 +210,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Network connections error: {e}"))
         }
         DbRequest::NetworkInterfaces(path, params) => {
-            let db = get_or_open(dbs, last_used, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, path)?;
             db.network_interfaces(&params)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -209,7 +218,7 @@ fn handle_db_request(
                 .map_err(|e| format!("Network interfaces error: {e}"))
         }
         DbRequest::NetworkSocketPairs(path, params) => {
-            let db = get_or_open(dbs, last_used, path)?;
+            let db = get_or_open(dbs, last_used, spill_cap, path)?;
             db.network_socket_pairs(&params)
                 .and_then(|r| {
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
@@ -808,8 +817,14 @@ impl ServerHandler for SystingMcpServer {
 }
 
 /// Run the MCP server over stdio transport.
-pub async fn run_mcp_server(database: Option<PathBuf>) -> Result<()> {
-    let db_handle = DbHandle::new(database)?;
+///
+/// `max_temp_directory_size` bounds DuckDB's on-disk spill for every
+/// database the server opens — see [`AnalyzeDb::open_with_spill_cap`].
+pub async fn run_mcp_server(
+    database: Option<PathBuf>,
+    max_temp_directory_size: Option<String>,
+) -> Result<()> {
+    let db_handle = DbHandle::new(database, max_temp_directory_size)?;
     let server = SystingMcpServer::new(db_handle);
 
     let service = server.serve(stdio()).await?;
