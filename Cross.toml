@@ -1,2 +1,7 @@
 [target.aarch64-unknown-linux-gnu]
 dockerfile = { file = "cross/aarch64.Dockerfile" }
+
+[target.riscv64gc-unknown-linux-gnu]
+dockerfile = { file = "cross/riscv64.Dockerfile" }
+# Fix libatomic linking for libduckdb-sys
+env = { passthrough = ["CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-Wl,--no-as-needed -C link-arg=-latomic -C link-arg=-Wl,--as-needed"] }
