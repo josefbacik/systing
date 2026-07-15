@@ -3,7 +3,7 @@ members = [".", "crates/gopclntab"]
 
 [package]
 name = "systing"
-version = "1.11.20"
+version = "1.11.21"
 edition = "2021"
 # Floor set by safe (no-unsafe) std::arch::x86_64::__cpuid in detect_hypervisor.
 rust-version = "1.89"
