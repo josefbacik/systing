@@ -27,21 +27,27 @@ if [[ ! -f /sys/kernel/btf/vmlinux ]]; then
 fi
 
 # VFIO modules we need BTF from (sysfs uses underscores)
-VFIO_MODULES=(vfio vfio_pci vfio_pci_core vfio_iommu_type1)
+VFIO_MODULES=(vfio vfio_pci vfio_pci_core)
+
+if [[ "${ARCH}" == "x86_64" || "${ARCH}" == "arm64" || "${ARCH}" == "aarch64" ]]; then
+    # https://github.com/torvalds/linux/blob/58717b2a1365d06c8c64b72aa948541b53fe31eb/drivers/vfio/Kconfig#L42
+    VFIO_MODULES+=(vfio_iommu_type1)
+fi
+
+BTF_ARGS=(file /sys/kernel/btf/vmlinux)
 
 for mod in "${VFIO_MODULES[@]}"; do
-    if [[ ! -f /sys/kernel/btf/${mod} ]]; then
-        echo "ERROR: /sys/kernel/btf/${mod} not found"
+    btf_path="/sys/kernel/btf/${mod}"
+
+    if [[ ! -f "${btf_path}" ]]; then
+        echo "ERROR: ${btf_path} not found"
         echo "Is the ${mod//_/-} module loaded? Try: modprobe ${mod//_/-}"
         exit 1
     fi
+
+    BTF_ARGS+=(file "${btf_path}")
 done
 
 echo "Generating ${OUTPUT} from running kernel BTF (including vfio module types)..."
-"${BPFTOOL}" btf dump file /sys/kernel/btf/vmlinux \
-    file /sys/kernel/btf/vfio \
-    file /sys/kernel/btf/vfio_pci \
-    file /sys/kernel/btf/vfio_pci_core \
-    file /sys/kernel/btf/vfio_iommu_type1 \
-    format c > "${OUTPUT}"
+"${BPFTOOL}" btf dump "${BTF_ARGS[@]}" format c > "${OUTPUT}"
 echo "Done. Commit ${OUTPUT} to the repository."
