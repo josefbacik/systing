@@ -1,16 +1,26 @@
-//! Locate and extract `.gopclntab` from ELF binaries.
+//! Locate and extract the pclntab from ELF binaries.
 //!
 //! ELF parsing is delegated to the [`object`] crate; reads are targeted —
 //! headers and the sections consulted, then exactly the pclntab byte
 //! range — so probing large binaries (Go binaries run to hundreds of MiB)
-//! never reads whole files.
+//! never reads whole files. The exception is the sectionless fallback
+//! below, which must read the data sections it scans.
 //!
-//! Binaries that are not ELF, or have no `.gopclntab` section, report
-//! "not a candidate" (`Ok(None)`) rather than an error. Section metadata
-//! is validated against the input's actual size, so the only inputs
-//! rejected as malformed are ones whose headers are inconsistent with the
-//! bytes on disk — there is no size threshold a large-but-valid binary
-//! could trip over.
+//! The table is located by section name first — `.gopclntab`, then the
+//! `.data.rel.ro.gopclntab` name some PIE links use. When neither
+//! exists, non-executable data sections are scanned for a validating
+//! pclntab header: distro external-linking PIE builds (observed on
+//! Amazon Linux 2023's containerd packages across go1.20–go1.23) merge
+//! the table anonymously into `.data.rel.ro`, and the header is its only
+//! remaining identification. See [`GoPclntab::scan`].
+//!
+//! Binaries that are not ELF, or in which no table can be located,
+//! report "not a candidate" (`Ok(None)`) rather than an error. Section
+//! metadata is validated against the input's actual size, so the only
+//! inputs rejected as malformed are ones whose headers are inconsistent
+//! with the bytes on disk — there is no size threshold a large-but-valid
+//! binary could trip over (the scan's own budget caps work done, not
+//! input size).
 //!
 //! Policy is deliberately left to the caller: this module reports whether
 //! a symbol table is present ([`ElfPclntab::has_symtab`]) but does not
@@ -69,42 +79,90 @@ impl ElfPclntab {
             return Ok(None);
         };
 
-        let Some(section) = elf.section_by_name(".gopclntab") else {
-            return Ok(None);
-        };
-        // Resolving the section's (offset, size) before reading lets the
-        // metadata be validated against the input's real length: a section
-        // header claiming bytes past end-of-input is inconsistent with the
-        // file itself, which is the only "too large" this module rejects.
-        let range = section
-            .compressed_file_range()
-            .map_err(|_| Error::Malformed(".gopclntab has no file range".to_string()))?;
-        if range.format != object::CompressionFormat::None {
-            return Err(Error::Unsupported(
-                "compressed .gopclntab section".to_string(),
-            ));
-        }
-        let input_len = source.len().unwrap_or(u64::MAX);
-        if range
-            .offset
-            .checked_add(range.uncompressed_size)
-            .is_none_or(|end| end > input_len)
-        {
-            return Err(Error::Malformed(format!(
-                ".gopclntab claims {} bytes at offset {} but the input is {} bytes",
-                range.uncompressed_size, range.offset, input_len
-            )));
-        }
-        let data = section
-            .uncompressed_data()
-            .map_err(|_| Error::Malformed("short read of .gopclntab".to_string()))?
-            .into_owned();
-
         let has_symtab = elf.symbol_table().is_some();
         let text_vaddr = elf.section_by_name(".text").map(|text| text.address());
-        let table = GoPclntab::parse(data, text_vaddr)?;
-        Ok(Some(Self { table, has_symtab }))
+        let input_len = source.len().unwrap_or(u64::MAX);
+
+        // The dedicated section, under both names Go links emit.
+        for name in [".gopclntab", ".data.rel.ro.gopclntab"] {
+            let Some(section) = elf.section_by_name(name) else {
+                continue;
+            };
+            let data = read_named_section(&section, input_len, name)?;
+            let table = GoPclntab::parse(data, text_vaddr)?;
+            return Ok(Some(Self { table, has_symtab }));
+        }
+
+        // No dedicated section: scan non-executable data sections for a
+        // validating header, likeliest homes first. Failures here are
+        // "not a candidate", not errors — this path is discovery, and
+        // sections that cannot be read or hold no table are simply
+        // skipped. The budget bounds total work on adversarial inputs;
+        // real binaries put the table within the first few dozen MiB of
+        // `.data.rel.ro` or `.rodata`.
+        const SCAN_BUDGET: u64 = 1 << 30;
+        let mut budget = SCAN_BUDGET;
+        let mut sections: Vec<_> = elf
+            .sections()
+            .filter(|s| {
+                matches!(
+                    s.kind(),
+                    object::SectionKind::Data | object::SectionKind::ReadOnlyData
+                )
+            })
+            .collect();
+        sections.sort_by_key(|s| match s.name() {
+            Ok(".data.rel.ro") => 0,
+            Ok(".rodata") => 1,
+            _ => 2,
+        });
+        for section in sections {
+            if section.size() == 0 || section.size() > budget {
+                continue;
+            }
+            // A section claiming bytes past end-of-input cannot be read;
+            // uncompressed_data fails and the section is skipped.
+            let Ok(data) = section.uncompressed_data() else {
+                continue;
+            };
+            budget = budget.saturating_sub(data.len() as u64);
+            if let Some(table) = GoPclntab::scan(&data, text_vaddr) {
+                return Ok(Some(Self { table, has_symtab }));
+            }
+        }
+        Ok(None)
     }
+}
+
+/// Read a named pclntab section's bytes, validating its metadata against
+/// the input's real length first: a section header claiming bytes past
+/// end-of-input is inconsistent with the file itself, which is the only
+/// "too large" this module rejects.
+fn read_named_section<'data>(
+    section: &object::Section<'data, '_, impl ReadRef<'data>>,
+    input_len: u64,
+    name: &str,
+) -> Result<Vec<u8>, Error> {
+    let range = section
+        .compressed_file_range()
+        .map_err(|_| Error::Malformed(format!("{name} has no file range")))?;
+    if range.format != object::CompressionFormat::None {
+        return Err(Error::Unsupported(format!("compressed {name} section")));
+    }
+    if range
+        .offset
+        .checked_add(range.uncompressed_size)
+        .is_none_or(|end| end > input_len)
+    {
+        return Err(Error::Malformed(format!(
+            "{name} claims {} bytes at offset {} but the input is {} bytes",
+            range.uncompressed_size, range.offset, input_len
+        )));
+    }
+    Ok(section
+        .uncompressed_data()
+        .map_err(|_| Error::Malformed(format!("short read of {name}")))?
+        .into_owned())
 }
 
 #[cfg(test)]
@@ -197,6 +255,24 @@ mod tests {
         assert!(!elf.has_symtab);
         assert_eq!(elf.table.func_count(), tab.func_count());
 
+        // The sectionless shape (distro external-linking PIE builds, e.g.
+        // Amazon Linux 2023 containerd): no section is named
+        // ".gopclntab", the table sits anonymously inside a data section
+        // and only its header identifies it. Simulated by renaming the
+        // section — the bytes stay exactly where they were — the scan
+        // fallback must find the table and agree with the named path.
+        let renamed = rename_gopclntab(&bytes);
+        let elf = ElfPclntab::from_bytes(&renamed)
+            .unwrap()
+            .expect("scan fallback missed the renamed pclntab");
+        assert!(!elf.has_symtab);
+        assert_eq!(elf.table.func_count(), tab.func_count());
+        let f = elf.table.find_func(tab.func_entry(0).unwrap()).unwrap();
+        assert_eq!(
+            f.name,
+            tab.find_func(tab.func_entry(0).unwrap()).unwrap().name
+        );
+
         // Corrupt the section header so .gopclntab claims to extend past
         // end-of-file: the only "too large" that gets rejected is metadata
         // inconsistent with the input itself.
@@ -205,6 +281,42 @@ mod tests {
             ElfPclntab::from_bytes(&corrupt),
             Err(Error::Malformed(_))
         ));
+    }
+
+    /// Overwrite the `.gopclntab` name in `.shstrtab` with an unknown
+    /// same-length name, so name-based lookups fail while the section's
+    /// bytes and headers otherwise stay intact — the closest simulation
+    /// of a link that never emitted the dedicated name. Pokes the ELF64
+    /// layout directly, like [`corrupt_gopclntab_size`].
+    fn rename_gopclntab(elf: &[u8]) -> Vec<u8> {
+        use object::read::elf::ElfFile64;
+        let parsed: ElfFile64 = ElfFile64::parse(elf).unwrap();
+        let section = parsed.section_by_name(".gopclntab").unwrap();
+        let index = section.index().0;
+
+        let e_shoff = u64::from_le_bytes(elf[0x28..0x30].try_into().unwrap()) as usize;
+        let e_shentsize = u16::from_le_bytes(elf[0x3a..0x3c].try_into().unwrap()) as usize;
+        let e_shstrndx = u16::from_le_bytes(elf[0x3e..0x40].try_into().unwrap()) as usize;
+
+        // The section's name offset within .shstrtab (sh_name, u32 at +0
+        // of its Elf64_Shdr), and .shstrtab's own file offset (sh_offset,
+        // u64 at +0x18 of its header).
+        let sh_name = u32::from_le_bytes(
+            elf[e_shoff + index * e_shentsize..][..4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let strtab_off = u64::from_le_bytes(
+            elf[e_shoff + e_shstrndx * e_shentsize + 0x18..][..8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+
+        let mut out = elf.to_vec();
+        let name_at = strtab_off + sh_name;
+        assert_eq!(&out[name_at..name_at + 10], b".gopclntab");
+        out[name_at..name_at + 10].copy_from_slice(b".mystery00");
+        out
     }
 
     /// Flip the `sh_size` of `.gopclntab` to a value larger than the file.
