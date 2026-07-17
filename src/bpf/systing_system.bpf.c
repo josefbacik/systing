@@ -73,6 +73,16 @@ const volatile struct {
 	u32 memory_fault_sample_rate; /* Sample 1 in N page faults (0 or 1 = all) */
 	u32 memory_alloc_sample_rate; /* Sample 1 in N malloc/free calls (0 or 1 = all) */
 	u32 page_size;         /* sysconf(_SC_PAGESIZE) for page-count -> byte conversion */
+	/* Minimum absolute byte-drift before an rss_stat event is emitted.
+	 * Computed by userspace as max(16 MiB, 64 * nr_cpus * page_size). On the
+	 * tp_btf path (>=6.2), the emitted value is an approximate percpu_counter
+	 * read whose worst-case error is percpu_counter_batch * nr_cpus pages
+	 * (batch = max(32, 2*nr_cpus), so quadratic on many-core hosts). In
+	 * typical operation only a few CPUs hold unflushed drift for a given mm
+	 * and the error is far below threshold; in the pathological case a
+	 * spurious emit is harmless (absolute value, just noisier cadence).
+	 * 0 disables the threshold (emit every event, the pre-change behavior). */
+	u64 memory_rss_threshold_bytes;
 	u32 no_sched;          /* Sched recorder off: sched_switch still runs for
 				* cpu_running_pid and sleep stacks, but task_event
 				* emission is suppressed. */
@@ -925,6 +935,30 @@ struct {
 	__type(key, u32);
 	__type(value, u64);
 } memory_fault_counter SEC(".maps");
+
+/* Per-process rss_stat emission state. Keyed by tgid (not tgidpid): the
+ * kernel's mm->rss_stat counters are per-mm, shared across all threads in a
+ * thread group, so a per-thread key would redundantly track the same value
+ * from every thread that happens to fault. last_emitted/latest_seen are
+ * absolute byte values per member (MM_FILEPAGES..MM_SHMEMPAGES); -1 marks
+ * "never seen". */
+struct rss_stat_state {
+	s64 last_emitted[NR_MM_COUNTERS];
+	s64 latest_seen[NR_MM_COUNTERS];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	/* Bounds concurrent TRACED processes (tgids), not threads or events.
+	 * 65536 matches memory_syscall_scratch and is comfortably above the
+	 * ~20k-task ceiling observed on the busiest CI clusters; on overflow
+	 * the rss_stat progs fall through to direct-submit so no sample is
+	 * ever dropped, only the threshold-batching optimization is lost for
+	 * the overflow tgids. */
+	__uint(max_entries, 65536);
+	__type(key, u32);   // tgid
+	__type(value, struct rss_stat_state);
+} rss_stat_last SEC(".maps");
 
 /* Per-thread scratch for pairing allocator uprobe enter→uretprobe exit.
  * Separate from memory_syscall_scratch so a malloc that internally calls
@@ -4703,13 +4737,78 @@ static __always_inline void memory_capture_stack(void *ctx, struct memory_event 
 #endif
 }
 
-SEC("tracepoint/kmem/rss_stat")
-int systing_rss_stat(struct trace_event_raw_rss_stat *ctx)
-{
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
-	if (!trace_task(task))
-		return 0;
+/* ---- rss_stat: CO-RE read + per-tgid threshold-batched emission ----
+ *
+ * Attach path: tp_btf/rss_stat (BPF_PROG_TYPE_TRACING) is preferred. The
+ * classic tracepoint/kmem/rss_stat path routes every firing through the
+ * kernel's perf_trace_rss_stat glue, whose TP_fast_assign on >=6.2 calls
+ * percpu_counter_sum_positive() — an O(nr_cpus) cache-line walk per event.
+ * On fault-heavy nodes that glue alone has been measured at ~1% of on-CPU
+ * time during a capture window. tp_btf bypasses the glue entirely and reads
+ * the counter from mm directly. The classic prog is kept as a fallback
+ * (selected at load time; see systing_core.rs select_rss_stat_prog()) for
+ * kernels whose BTF lacks btf_trace_rss_stat.
+ *
+ * Threshold batching: the kernel fires rss_stat on every per-page counter
+ * update, so a fault storm produces one event per page. We emit only when
+ * the absolute value drifts >= tool_config.memory_rss_threshold_bytes from
+ * the last emitted value for (tgid, member), and flush any sub-threshold
+ * residual at last-thread-exit. memory_rss.size stays an absolute
+ * byte-valued counter sample; only the emission cadence changes.
+ */
 
+/* CO-RE flavor for <6.2 kernels where mm->rss_stat was still
+ * struct mm_rss_stat { atomic_long_t count[NR_MM_COUNTERS]; } rather than
+ * struct percpu_counter rss_stat[NR_MM_COUNTERS]. The ___pre62 suffix is
+ * stripped by CO-RE matching. */
+struct mm_rss_stat___pre62 {
+	atomic_long_t count[NR_MM_COUNTERS];
+};
+struct mm_struct___pre62 {
+	struct mm_rss_stat___pre62 rss_stat;
+};
+
+/* Read mm->rss_stat[member] as an absolute page count. On <6.2 (atomic
+ * array) this is exact. On >=6.2 (percpu_counter) this reads only .count,
+ * missing the per-CPU batch slots — error bounded by
+ * +-(percpu_counter_batch * nr_online_cpus) pages where the kernel sets
+ * batch = max(32, 2*nr_online_cpus) (lib/percpu_counter.c), so worst-case
+ * is quadratic in nr_cpus. In practice only the CPUs a given mm is actively
+ * faulting on carry unflushed drift, so typical error is a small multiple
+ * of batch.
+ *
+ * An exact sum would need bpf_per_cpu_ptr() over rss_stat[member].counters,
+ * but that helper requires ARG_PTR_TO_PERCPU_BTF_ID and a value read via
+ * BPF_CORE_READ arrives as SCALAR_VALUE; direct BTF-walk access preserves
+ * percpu-ness only on clang-built kernels with btf_type_tag("percpu") in
+ * vmlinux BTF — not portable across the fleet. The approximate read is the
+ * portable choice; the threshold absorbs the noise, and the classic
+ * fallback still emits exact values (from ctx->size) where tp_btf is
+ * unavailable. */
+static __always_inline s64 read_mm_rss_pages(struct mm_struct *mm, u32 member)
+{
+	struct mm_struct___pre62 *old = (void *)mm;
+	if (bpf_core_field_exists(old->rss_stat.count)) {
+		switch (member) {
+		case MM_FILEPAGES:  return BPF_CORE_READ(old, rss_stat.count[MM_FILEPAGES].counter);
+		case MM_ANONPAGES:  return BPF_CORE_READ(old, rss_stat.count[MM_ANONPAGES].counter);
+		case MM_SWAPENTS:   return BPF_CORE_READ(old, rss_stat.count[MM_SWAPENTS].counter);
+		case MM_SHMEMPAGES: return BPF_CORE_READ(old, rss_stat.count[MM_SHMEMPAGES].counter);
+		}
+		return 0;
+	}
+	switch (member) {
+	case MM_FILEPAGES:  return BPF_CORE_READ(mm, rss_stat[MM_FILEPAGES].count);
+	case MM_ANONPAGES:  return BPF_CORE_READ(mm, rss_stat[MM_ANONPAGES].count);
+	case MM_SWAPENTS:   return BPF_CORE_READ(mm, rss_stat[MM_SWAPENTS].count);
+	case MM_SHMEMPAGES: return BPF_CORE_READ(mm, rss_stat[MM_SHMEMPAGES].count);
+	}
+	return 0;
+}
+
+static __always_inline int emit_rss_stat_event(struct task_struct *task,
+					       u32 member, s64 size_bytes)
+{
 	long flags;
 	struct memory_event_header *event = reserve_memory_event_header(&flags);
 	if (!event)
@@ -4719,11 +4818,119 @@ int systing_rss_stat(struct trace_event_raw_rss_stat *ctx)
 	event->ts = bpf_ktime_get_boot_ns();
 	event->cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->task, task);
-	event->member = ctx->member;
-	/* rss_stat tracepoint already shifts by PAGE_SHIFT; size is bytes. */
-	event->size = (u64)(s64)ctx->size;
+	event->member = member;
+	event->size = (u64)size_bytes;
 
 	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+/* Threshold gate shared by both attach paths. */
+static __always_inline int handle_rss_stat(struct task_struct *task,
+					   u32 member, s64 size_bytes)
+{
+	if (!trace_task(task))
+		return 0;
+	if (member >= NR_MM_COUNTERS)
+		return 0;
+
+	/* Threshold disabled (0): preserve pre-change behavior exactly. */
+	if (tool_config.memory_rss_threshold_bytes == 0)
+		return emit_rss_stat_event(task, member, size_bytes);
+
+	u32 tgid = BPF_CORE_READ(task, tgid);
+	struct rss_stat_state *st = bpf_map_lookup_elem(&rss_stat_last, &tgid);
+	if (!st) {
+		struct rss_stat_state init;
+		__builtin_memset(&init, 0xff, sizeof(init)); /* all members = -1 (never seen) */
+		/* Map full, or lost the insert race to another thread of this
+		 * tgid: fall through to direct-submit so no sample is dropped.
+		 * BPF_NOEXIST (not BPF_ANY) so the race-loser doesn't clobber
+		 * the winner's populated state. */
+		if (bpf_map_update_elem(&rss_stat_last, &tgid, &init, BPF_NOEXIST) != 0)
+			return emit_rss_stat_event(task, member, size_bytes);
+		st = bpf_map_lookup_elem(&rss_stat_last, &tgid);
+		if (!st)
+			return emit_rss_stat_event(task, member, size_bytes);
+	}
+
+	/* Unsynchronized per-member s64 stores — multiple threads of a tgid
+	 * may race here. Benign: worst case is a duplicate emit or one stale
+	 * last_emitted (one extra emit); never a lost sample. */
+	st->latest_seen[member] = size_bytes;
+	s64 last = st->last_emitted[member];
+	/* First sighting for this member: always emit so consumers have a
+	 * baseline (last == -1 from the 0xff memset). */
+	s64 drift = last < 0 ? (s64)tool_config.memory_rss_threshold_bytes
+			     : size_bytes - last;
+	if (drift < 0)
+		drift = -drift;
+	if ((u64)drift < tool_config.memory_rss_threshold_bytes)
+		return 0;
+
+	st->last_emitted[member] = size_bytes;
+	return emit_rss_stat_event(task, member, size_bytes);
+}
+
+SEC("tp_btf/rss_stat")
+int BPF_PROG(systing_rss_stat_btf, struct mm_struct *mm, int member)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	s64 pages = read_mm_rss_pages(mm, (u32)member);
+	if (pages < 0)
+		pages = 0;
+	return handle_rss_stat(task, (u32)member, pages * (s64)tool_config.page_size);
+}
+
+SEC("tracepoint/kmem/rss_stat")
+int systing_rss_stat(struct trace_event_raw_rss_stat *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	/* ctx->size is the kernel's exact percpu_counter_sum_positive() already
+	 * shifted to bytes; this path pays that O(nr_cpus) cost per event but
+	 * is only selected when tp_btf is unavailable. Clamp transient
+	 * negatives (possible on <6.2 SPLIT_RSS_COUNTING kernels near zero) so
+	 * the threshold gate's last<0 sentinel stays unambiguous. */
+	s64 size = (s64)ctx->size;
+	if (size < 0)
+		size = 0;
+	return handle_rss_stat(task, (u32)ctx->member, size);
+}
+
+/* Flush sub-threshold residual rss_stat state at last-thread-exit so a
+ * process that exits between thresholds still records its final counter
+ * values, then release the map entry. Separate program (not inlined into
+ * systing_sched_process_exit) so the memory_ringbufs reference stays
+ * confined to memory-recorder programs and the sched program can load when
+ * memory_ringbufs is autocreate=false. Multiple tp_btf progs on one
+ * tracepoint is fine. */
+SEC("tp_btf/sched_process_exit")
+int BPF_PROG(systing_rss_stat_exit_flush, struct task_struct *task)
+{
+	if (tool_config.memory_rss_threshold_bytes == 0)
+		return 0;
+	/* Delete even for untraced tasks (no map-entry leak if trace_task's
+	 * answer changed between insert and exit); emit only for traced. */
+	u32 tgid = BPF_CORE_READ(task, tgid);
+	if (BPF_CORE_READ(task, signal, live.counter) != 0)
+		return 0;
+	struct rss_stat_state *st = bpf_map_lookup_elem(&rss_stat_last, &tgid);
+	if (!st)
+		return 0;
+
+	if (trace_task(task)) {
+		/* task->mm is NULL here (exit_mm() precedes this tracepoint),
+		 * so flush latest_seen[] captured on the rss_stat path rather
+		 * than re-reading mm. */
+		for (u32 m = 0; m < NR_MM_COUNTERS; m++) {
+			s64 latest = st->latest_seen[m];
+			if (latest < 0)
+				continue; /* never seen */
+			if (latest != st->last_emitted[m])
+				emit_rss_stat_event(task, m, latest);
+		}
+	}
+	bpf_map_delete_elem(&rss_stat_last, &tgid);
 	return 0;
 }
 

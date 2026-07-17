@@ -569,3 +569,134 @@ fn test_exe_defines_malloc_negative() {
         "test binary is glibc-linked; exe_defines_malloc should return None"
     );
 }
+
+/// Threshold-batching correctness test: with a known threshold, a workload
+/// that touches N * threshold bytes of anon memory should produce on the
+/// order of N rss_stat events — not one per 4 KiB page — and the peak
+/// emitted value should match the workload's ground-truth RSS.
+///
+/// Exercised on BOTH attach paths: the default (tp_btf/rss_stat where the
+/// kernel supports it) and the forced classic tracepoint fallback.
+fn run_rss_threshold_test(force_classic: bool) {
+    const THRESHOLD: u64 = 4 << 20; // 4 MiB: small and kernel-independent
+    const STEPS: i64 = 32; // ~128 MiB total anon growth
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+
+    // Workload: grow a single bytearray in THRESHOLD-sized steps, touching
+    // every page so each step produces ~THRESHOLD of anon-RSS growth. Using
+    // one resized buffer (not many) keeps the kernel's rss_stat firings on a
+    // single monotonic ramp, which is what the threshold gate sees.
+    let py_prog = format!(
+        "import time\n\
+         buf = bytearray()\n\
+         step = {step}\n\
+         for _ in range({steps}):\n\
+         \x20 buf.extend(b'\\x00' * step)\n\
+         \x20 for i in range(len(buf)-step, len(buf), 4096):\n\
+         \x20\x20 buf[i] = 1\n\
+         \x20 time.sleep(0.01)\n\
+         time.sleep(0.2)\n",
+        step = THRESHOLD,
+        steps = STEPS,
+    );
+    let run_cmd = vec!["python3".to_string(), "-c".to_string(), py_prog];
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+    let child_pid = traced_child.pid as i32;
+
+    eprintln!(
+        "Recording rss_stat threshold test (pid {}, {}x{} MiB, force_classic={})...",
+        child_pid,
+        STEPS,
+        THRESHOLD >> 20,
+        force_classic,
+    );
+
+    let config = Config {
+        memory: true,
+        memory_rss_threshold_bytes: Some(THRESHOLD),
+        memory_rss_force_classic: force_classic,
+        parquet_only: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+    assert_eq!(exit_code, 0, "workload should exit 0");
+
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "rsstest")
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    let (anon_rows, max_anon): (i64, i64) = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(MAX(size), 0)
+                 FROM memory_rss WHERE member = 1 AND utid IN {UTIDS_FOR_PID}"
+            ),
+            [child_pid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Failed to query memory_rss");
+
+    let target_bytes = STEPS * THRESHOLD as i64;
+    eprintln!(
+        "    anon rss_stat events: {} (target ~{}); max size: {} MiB (target ~{} MiB)",
+        anon_rows,
+        STEPS,
+        max_anon >> 20,
+        target_bytes >> 20,
+    );
+
+    // Event count: without thresholding, ~THRESHOLD/4096 * STEPS = ~32768
+    // events. With a THRESHOLD gate, expect on the order of STEPS emits on
+    // the ramp plus interpreter startup/teardown — bound generously, but
+    // tight enough to fail if the gate is broken (which would give >=1000).
+    assert!(
+        (STEPS / 2..STEPS * 8).contains(&anon_rows),
+        "[rss_stat threshold] anon event count {} outside [{}..{}) \
+         (force_classic={}, target ~{}) — threshold gate broken?",
+        anon_rows,
+        STEPS / 2,
+        STEPS * 8,
+        force_classic,
+        STEPS,
+    );
+
+    // Peak value: max emitted anon size should be within [target - threshold,
+    // target + python-overhead]. The lower bound checks that threshold
+    // batching didn't drop the peak; the upper is a loose sanity ceiling.
+    assert!(
+        (target_bytes - THRESHOLD as i64..target_bytes + (128 << 20)).contains(&max_anon),
+        "[rss_stat threshold] max anon {} bytes outside [{}, {}) \
+         (force_classic={}) — peak value wrong?",
+        max_anon,
+        target_bytes - THRESHOLD as i64,
+        target_bytes + (128 << 20),
+        force_classic,
+    );
+
+    // Byte semantics guard: fails if the tp_btf path emitted pages instead
+    // of bytes (off by 4096x).
+    assert!(
+        max_anon > target_bytes / 16,
+        "[rss_stat threshold] max anon {} suspiciously small vs target {} \
+         — page/byte unit bug on tp_btf path?",
+        max_anon,
+        target_bytes,
+    );
+}
+
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_rss_threshold_tp_btf() {
+    run_rss_threshold_test(false);
+}
+
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_rss_threshold_classic_fallback() {
+    run_rss_threshold_test(true);
+}

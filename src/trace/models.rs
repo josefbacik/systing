@@ -525,6 +525,16 @@ pub struct CpuInfoRecord {
 ///
 /// `member` indexes the kernel `rss_stat` counter (0=file, 1=anon, 2=swap, 3=shmem).
 /// Negative members are synthetic: -1 = hiwater_rss, -2 = total_vm (from periodic mm snapshots).
+///
+/// Emission cadence: rss_stat samples are threshold-batched in BPF (one event
+/// per ≥ `memory_rss_threshold_bytes` of drift per (tgid, member), default
+/// max(16 MiB, 64·nr_cpus·page_size)), not one per kernel tracepoint firing.
+/// On the `tp_btf/rss_stat` attach path (kernels ≥6.2 with BTF), `size` is
+/// an approximate `percpu_counter_read()` of `mm->rss_stat[member]` — it
+/// misses the per-CPU batch slots, so its worst-case error is
+/// ±(percpu_counter_batch · nr_online_cpus) pages where the kernel sets
+/// batch = max(32, 2·nr_online_cpus). On the classic `tracepoint/kmem/rss_stat`
+/// fallback the kernel's own exact sum is used.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryRssRecord {
     pub ts: i64,
