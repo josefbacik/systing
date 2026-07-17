@@ -889,6 +889,65 @@ impl SessionRecorder {
         }
     }
 
+    /// Whether an executable basename is an ELF dynamic loader. Matches the
+    /// common glibc and musl loader names (`ld-linux-x86-64.so.2`,
+    /// `ld-linux-aarch64.so.1`, `ld-musl-x86_64.so.1`), the versioned real
+    /// files the loader symlink can resolve to (`ld-2.31.so`), and the
+    /// generic `ld.so`/`ld64.so.*` forms. Deliberately does not match `ld`
+    /// (the linker) or `ldconfig`.
+    fn is_loader_basename(name: &str) -> bool {
+        name == "ld.so"
+            || name.starts_with("ld64.so")
+            || (name.starts_with("ld-") && name.contains(".so"))
+    }
+
+    /// For a process launched by invoking the dynamic loader directly
+    /// (`ld-linux-x86-64.so.2 [options] /path/to/prog args...`), extract the
+    /// real program's basename from cmdline: skip the loader (argv[0]) and
+    /// its options. An `--argv0 VALUE` option wins since that is what the
+    /// program itself sees as argv[0]. Returns None when the invocation isn't
+    /// parseable (unknown option, missing option value, no program argument)
+    /// so the caller falls back to the exe basename rather than guess.
+    fn loader_target_name(cmdline: &[String]) -> Option<String> {
+        // glibc rtld options that consume the following argument (elf/rtld.c).
+        const VALUE_OPTS: [&str; 7] = [
+            "--library-path",
+            "--inhibit-rpath",
+            "--audit",
+            "--preload",
+            "--argv0",
+            "--glibc-hwcaps-prepend",
+            "--glibc-hwcaps-mask",
+        ];
+        // glibc rtld options that stand alone. (musl's loader takes no
+        // options at all, so its invocations parse via the fallthrough arm.)
+        const FLAG_OPTS: [&str; 3] = ["--list", "--verify", "--inhibit-cache"];
+
+        let mut argv0_override: Option<&String> = None;
+        let mut iter = cmdline.iter().skip(1);
+        while let Some(arg) = iter.next() {
+            if VALUE_OPTS.contains(&arg.as_str()) {
+                let value = iter.next()?;
+                if arg == "--argv0" {
+                    argv0_override = Some(value);
+                }
+            } else if FLAG_OPTS.contains(&arg.as_str()) {
+                continue;
+            } else if arg.starts_with("--") {
+                // Unknown loader option: it might consume a value, so any
+                // guess about where the program argument starts could be
+                // wrong. Let the caller keep the exe-derived name.
+                return None;
+            } else {
+                let prog = argv0_override.unwrap_or(arg);
+                return Path::new(prog.as_str())
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string());
+            }
+        }
+        None
+    }
+
     fn record_new_process(&self, info: &task_info) {
         let comm = Self::extract_comm(info);
         let pid = (info.tgidpid >> 32) as u32;
@@ -901,15 +960,22 @@ impl SessionRecorder {
         // because thread names set via pthread_setname_np (e.g., "gc-worker-3")
         // are more informative than the binary filename.
         let name_from_proc = Self::fetch_name_from_proc(pid);
-        let process_name = if !name_from_proc.is_empty() {
+        let cmdline = Self::fetch_cmdline_from_proc(pid);
+
+        // Processes launched by invoking the dynamic loader directly keep the
+        // loader as /proc/PID/exe for their whole lifetime, which would name
+        // every such process after the loader (a common pattern in hermetic
+        // build/CI environments). Recover the real program from cmdline in
+        // that case.
+        let process_name = if Self::is_loader_basename(&name_from_proc) {
+            Self::loader_target_name(&cmdline).unwrap_or_else(|| name_from_proc.clone())
+        } else if !name_from_proc.is_empty() {
             name_from_proc.clone()
         } else if !comm.is_empty() {
             comm
         } else {
             format!("<pid:{pid}>")
         };
-
-        let cmdline = Self::fetch_cmdline_from_proc(pid);
 
         // Detect kernel threads: no executable AND no cmdline AND /proc/pid exists.
         // Kernel threads have no /proc/pid/exe (readlink fails) and no cmdline.
@@ -990,13 +1056,72 @@ impl SessionRecorder {
             .insert(info.tgidpid, thread_descriptor);
     }
 
+    /// Apply a rename decided under the read lock in maybe_record_task.
+    ///
+    /// Process names are deliberately not updated on comm changes: they are
+    /// exe-derived by preference (see record_new_process), and overwriting
+    /// them from a thread's comm would reintroduce the child-name-leak
+    /// problem that exe-preference exists to avoid.
+    fn rename_thread(&self, tgidpid: u64, fresh: String) {
+        let mut threads = self.threads.write().unwrap();
+        if let Some(descriptor) = threads.get_mut(&tgidpid) {
+            // Re-check under the write lock: another consumer may have
+            // renamed concurrently since the read-lock decision.
+            if Self::rename_improves(descriptor.thread_name(), &fresh) {
+                descriptor.set_thread_name(fresh);
+            }
+        }
+    }
+
+    /// Whether replacing `current` with a freshly observed comm is an
+    /// improvement. The kernel comm is capped at TASK_COMM_LEN - 1 = 15
+    /// bytes, so a fresh comm that is exactly the 15-byte prefix of the
+    /// current name is the truncation of what we already have (typically an
+    /// exe-derived name) and must not downgrade it.
+    fn rename_improves(current: &str, fresh: &str) -> bool {
+        if fresh == current {
+            return false;
+        }
+        if fresh.len() == 15 && current.len() > 15 && current.starts_with(fresh) {
+            return false;
+        }
+        true
+    }
+
     pub fn maybe_record_task(&self, info: &task_info) {
+        enum ThreadAction {
+            Record,
+            Rename(String),
+            Nothing,
+        }
+
         // Always record ALL tasks as threads - this ensures every tid that appears
         // in sched events has a corresponding thread record in parquet files.
         // For Perfetto output, write_thread_packets filters out main threads (tid == pid)
         // since those are represented by ProcessDescriptor instead of ThreadDescriptor.
-        if !self.threads.read().unwrap().contains_key(&info.tgidpid) {
-            self.record_new_thread(info);
+        //
+        // One read lock decides everything: record a new thread, or rename an
+        // existing one (event consumers re-forward a task whenever its comm
+        // changes - exec, pthread_setname_np - so a task that renames after
+        // first sighting doesn't stay frozen at its old name).
+        let action = {
+            let threads = self.threads.read().unwrap();
+            match threads.get(&info.tgidpid) {
+                None => ThreadAction::Record,
+                Some(existing) => {
+                    let fresh = Self::extract_comm(info);
+                    if !fresh.is_empty() && Self::rename_improves(existing.thread_name(), &fresh) {
+                        ThreadAction::Rename(fresh)
+                    } else {
+                        ThreadAction::Nothing
+                    }
+                }
+            }
+        };
+        match action {
+            ThreadAction::Record => self.record_new_thread(info),
+            ThreadAction::Rename(fresh) => self.rename_thread(info.tgidpid, fresh),
+            ThreadAction::Nothing => {}
         }
 
         // Also maintain process metadata for Perfetto generation.
@@ -1802,6 +1927,216 @@ mod tests {
         // A PID above pid_max should not exist
         let name = SessionRecorder::fetch_name_from_proc(u32::MAX);
         assert!(name.is_empty(), "should return empty for nonexistent PID");
+    }
+
+    #[test]
+    fn test_is_loader_basename() {
+        for loader in [
+            "ld-linux-x86-64.so.2",
+            "ld-linux-aarch64.so.1",
+            "ld-musl-x86_64.so.1",
+            "ld-2.31.so",
+            "ld.so",
+            "ld64.so.2",
+        ] {
+            assert!(
+                SessionRecorder::is_loader_basename(loader),
+                "{loader} should match"
+            );
+        }
+        for not_loader in ["ld", "ldconfig", "ld-tool", "python3.13", "", "sold.so"] {
+            assert!(
+                !SessionRecorder::is_loader_basename(not_loader),
+                "{not_loader} should not match"
+            );
+        }
+    }
+
+    fn cmdline(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_loader_target_name_simple() {
+        assert_eq!(
+            SessionRecorder::loader_target_name(&cmdline(&[
+                "/usr/lib64/ld-linux-x86-64.so.2",
+                "/usr/bin/python3.13",
+                "app.py",
+            ])),
+            Some("python3.13".to_string())
+        );
+    }
+
+    #[test]
+    fn test_loader_target_name_with_options() {
+        assert_eq!(
+            SessionRecorder::loader_target_name(&cmdline(&[
+                "ld-linux-x86-64.so.2",
+                "--library-path",
+                "/nix/store/xyz/lib:/usr/lib",
+                "--inhibit-cache",
+                "--preload",
+                "libhook.so",
+                "/opt/worker/bin/mycro-worker",
+                "--worker-arg",
+            ])),
+            Some("mycro-worker".to_string())
+        );
+    }
+
+    #[test]
+    fn test_loader_target_name_argv0_wins() {
+        assert_eq!(
+            SessionRecorder::loader_target_name(&cmdline(&[
+                "ld.so",
+                "--argv0",
+                "/renamed/fancy-name",
+                "/usr/bin/python3.13",
+            ])),
+            Some("fancy-name".to_string())
+        );
+    }
+
+    #[test]
+    fn test_loader_target_name_unknown_option_bails() {
+        assert_eq!(
+            SessionRecorder::loader_target_name(&cmdline(&[
+                "ld-linux-x86-64.so.2",
+                "--frobnicate",
+                "maybe-a-value",
+                "/usr/bin/prog",
+            ])),
+            None
+        );
+    }
+
+    #[test]
+    fn test_loader_target_name_missing_value_bails() {
+        assert_eq!(
+            SessionRecorder::loader_target_name(&cmdline(&["ld-linux-x86-64.so.2", "--preload",])),
+            None
+        );
+    }
+
+    #[test]
+    fn test_loader_target_name_no_program() {
+        assert_eq!(
+            SessionRecorder::loader_target_name(&cmdline(&["ld.so", "--list"])),
+            None
+        );
+        assert_eq!(
+            SessionRecorder::loader_target_name(&cmdline(&["ld.so"])),
+            None
+        );
+        assert_eq!(SessionRecorder::loader_target_name(&cmdline(&[])), None);
+    }
+
+    #[test]
+    fn test_maybe_record_task_renames_thread_on_comm_change() {
+        let recorder = create_test_session_recorder();
+        let first = create_test_task_info(TEST_PID_A, TEST_PID_A, "loader");
+        recorder.maybe_record_task(&first);
+        assert_eq!(
+            recorder
+                .threads
+                .read()
+                .unwrap()
+                .get(&first.tgidpid)
+                .unwrap()
+                .thread_name(),
+            "loader"
+        );
+
+        let renamed = create_test_task_info(TEST_PID_A, TEST_PID_A, "worker-1");
+        recorder.maybe_record_task(&renamed);
+        assert_eq!(
+            recorder
+                .threads
+                .read()
+                .unwrap()
+                .get(&renamed.tgidpid)
+                .unwrap()
+                .thread_name(),
+            "worker-1",
+            "fresh comm should rename the thread record"
+        );
+    }
+
+    #[test]
+    fn test_maybe_record_task_zero_comm_does_not_rename() {
+        let recorder = create_test_session_recorder();
+        let first = create_test_task_info(TEST_PID_A, TEST_PID_A, "real-name");
+        recorder.maybe_record_task(&first);
+
+        let zeroed = create_test_task_info(TEST_PID_A, TEST_PID_A, "");
+        recorder.maybe_record_task(&zeroed);
+        assert_eq!(
+            recorder
+                .threads
+                .read()
+                .unwrap()
+                .get(&first.tgidpid)
+                .unwrap()
+                .thread_name(),
+            "real-name",
+            "zeroed comm must not clobber a real name"
+        );
+    }
+
+    #[test]
+    fn test_maybe_record_task_comm_change_keeps_process_name() {
+        let recorder = create_test_session_recorder();
+        let first = create_test_task_info(TEST_PID_A, TEST_PID_A, "main-proc");
+        recorder.maybe_record_task(&first);
+
+        let renamed = create_test_task_info(TEST_PID_A, TEST_PID_A, "retitled");
+        recorder.maybe_record_task(&renamed);
+
+        let process_descriptors = recorder.process_descriptors.read().unwrap();
+        assert_eq!(
+            process_descriptors
+                .get(&first.tgidpid)
+                .unwrap()
+                .process_name(),
+            "main-proc",
+            "process names are not comm-renamed (exe-preference fence)"
+        );
+        drop(process_descriptors);
+        assert_eq!(
+            recorder
+                .threads
+                .read()
+                .unwrap()
+                .get(&first.tgidpid)
+                .unwrap()
+                .thread_name(),
+            "retitled",
+            "the thread record does rename"
+        );
+    }
+
+    #[test]
+    fn test_rename_improves_truncation_guard() {
+        // A 15-byte fresh comm that is the prefix of a longer stored name is
+        // the TASK_COMM_LEN truncation of what we already have.
+        assert!(!SessionRecorder::rename_improves(
+            "ld-linux-x86-64.so.2",
+            "ld-linux-x86-64"
+        ));
+        // A genuinely different name still wins.
+        assert!(SessionRecorder::rename_improves(
+            "ld-linux-x86-64.so.2",
+            "python3.13"
+        ));
+        assert!(!SessionRecorder::rename_improves("same", "same"));
+        assert!(SessionRecorder::rename_improves("<tid:1234>", "worker"));
+        // A 15-char fresh comm that is NOT a prefix of the stored name is a
+        // real rename.
+        assert!(SessionRecorder::rename_improves(
+            "something-else-long",
+            "fifteen-chars-x"
+        ));
     }
 
     #[test]
