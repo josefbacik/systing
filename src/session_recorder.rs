@@ -1056,6 +1056,49 @@ impl SessionRecorder {
             .insert(info.tgidpid, thread_descriptor);
     }
 
+    /// Update a known thread's name from a freshly observed BPF comm.
+    ///
+    /// Process names are deliberately not updated here: they are exe-derived
+    /// by preference (see record_new_process), and overwriting them from a
+    /// thread's comm would reintroduce the child-name-leak problem that
+    /// exe-preference exists to avoid.
+    fn maybe_rename_thread(&self, info: &task_info) {
+        let fresh = Self::extract_comm(info);
+        if fresh.is_empty() {
+            return;
+        }
+        {
+            let threads = self.threads.read().unwrap();
+            match threads.get(&info.tgidpid) {
+                Some(existing) if Self::rename_improves(existing.thread_name(), &fresh) => {}
+                _ => return,
+            }
+        }
+        let mut threads = self.threads.write().unwrap();
+        if let Some(descriptor) = threads.get_mut(&info.tgidpid) {
+            // Re-check under the write lock: another consumer may have
+            // renamed concurrently between our read and write.
+            if Self::rename_improves(descriptor.thread_name(), &fresh) {
+                descriptor.set_thread_name(fresh);
+            }
+        }
+    }
+
+    /// Whether replacing `current` with a freshly observed comm is an
+    /// improvement. The kernel comm is capped at TASK_COMM_LEN - 1 = 15
+    /// bytes, so a fresh comm that is exactly the 15-byte prefix of the
+    /// current name is the truncation of what we already have (typically an
+    /// exe-derived name) and must not downgrade it.
+    fn rename_improves(current: &str, fresh: &str) -> bool {
+        if fresh == current {
+            return false;
+        }
+        if fresh.len() == 15 && current.len() > 15 && current.starts_with(fresh) {
+            return false;
+        }
+        true
+    }
+
     pub fn maybe_record_task(&self, info: &task_info) {
         // Always record ALL tasks as threads - this ensures every tid that appears
         // in sched events has a corresponding thread record in parquet files.
@@ -1063,6 +1106,11 @@ impl SessionRecorder {
         // since those are represented by ProcessDescriptor instead of ThreadDescriptor.
         if !self.threads.read().unwrap().contains_key(&info.tgidpid) {
             self.record_new_thread(info);
+        } else {
+            // Event consumers re-forward a task whenever its comm changes
+            // (exec, pthread_setname_np), so a task that renames after first
+            // sighting doesn't stay frozen at its old name.
+            self.maybe_rename_thread(info);
         }
 
         // Also maintain process metadata for Perfetto generation.
@@ -1971,6 +2019,113 @@ mod tests {
             None
         );
         assert_eq!(SessionRecorder::loader_target_name(&cmdline(&[])), None);
+    }
+
+    #[test]
+    fn test_maybe_record_task_renames_thread_on_comm_change() {
+        let recorder = create_test_session_recorder();
+        let first = create_test_task_info(TEST_PID_A, TEST_PID_A, "loader");
+        recorder.maybe_record_task(&first);
+        assert_eq!(
+            recorder
+                .threads
+                .read()
+                .unwrap()
+                .get(&first.tgidpid)
+                .unwrap()
+                .thread_name(),
+            "loader"
+        );
+
+        let renamed = create_test_task_info(TEST_PID_A, TEST_PID_A, "worker-1");
+        recorder.maybe_record_task(&renamed);
+        assert_eq!(
+            recorder
+                .threads
+                .read()
+                .unwrap()
+                .get(&renamed.tgidpid)
+                .unwrap()
+                .thread_name(),
+            "worker-1",
+            "fresh comm should rename the thread record"
+        );
+    }
+
+    #[test]
+    fn test_maybe_record_task_zero_comm_does_not_rename() {
+        let recorder = create_test_session_recorder();
+        let first = create_test_task_info(TEST_PID_A, TEST_PID_A, "real-name");
+        recorder.maybe_record_task(&first);
+
+        let zeroed = create_test_task_info(TEST_PID_A, TEST_PID_A, "");
+        recorder.maybe_record_task(&zeroed);
+        assert_eq!(
+            recorder
+                .threads
+                .read()
+                .unwrap()
+                .get(&first.tgidpid)
+                .unwrap()
+                .thread_name(),
+            "real-name",
+            "zeroed comm must not clobber a real name"
+        );
+    }
+
+    #[test]
+    fn test_maybe_record_task_comm_change_keeps_process_name() {
+        let recorder = create_test_session_recorder();
+        let first = create_test_task_info(TEST_PID_A, TEST_PID_A, "main-proc");
+        recorder.maybe_record_task(&first);
+
+        let renamed = create_test_task_info(TEST_PID_A, TEST_PID_A, "retitled");
+        recorder.maybe_record_task(&renamed);
+
+        let process_descriptors = recorder.process_descriptors.read().unwrap();
+        assert_eq!(
+            process_descriptors
+                .get(&first.tgidpid)
+                .unwrap()
+                .process_name(),
+            "main-proc",
+            "process names are not comm-renamed (exe-preference fence)"
+        );
+        drop(process_descriptors);
+        assert_eq!(
+            recorder
+                .threads
+                .read()
+                .unwrap()
+                .get(&first.tgidpid)
+                .unwrap()
+                .thread_name(),
+            "retitled",
+            "the thread record does rename"
+        );
+    }
+
+    #[test]
+    fn test_rename_improves_truncation_guard() {
+        // A 15-byte fresh comm that is the prefix of a longer stored name is
+        // the TASK_COMM_LEN truncation of what we already have.
+        assert!(!SessionRecorder::rename_improves(
+            "ld-linux-x86-64.so.2",
+            "ld-linux-x86-64"
+        ));
+        // A genuinely different name still wins.
+        assert!(SessionRecorder::rename_improves(
+            "ld-linux-x86-64.so.2",
+            "python3.13"
+        ));
+        assert!(!SessionRecorder::rename_improves("same", "same"));
+        assert!(SessionRecorder::rename_improves("<tid:1234>", "worker"));
+        // A 15-char fresh comm that is NOT a prefix of the stored name is a
+        // real rename.
+        assert!(SessionRecorder::rename_improves(
+            "something-else-long",
+            "fifteen-chars-x"
+        ));
     }
 
     #[test]

@@ -1018,6 +1018,46 @@ fn create_memory_ring<'a>(
 
 const CONSUME_BATCH: usize = 4096;
 
+/// Per-consumer tracker deciding which task_info sightings are worth
+/// forwarding to process discovery. Forwards the first sighting of a tgidpid
+/// and any later sighting whose comm changed to a new non-empty value, so
+/// tasks that rename after first sighting (exec, pthread_setname_np) get
+/// their thread records refreshed instead of staying frozen at the
+/// first-seen name. An exact map is used rather than a bloom filter because
+/// false positives would permanently suppress a task's record; zeroed comms
+/// never count as a change since smaller BPF events leave task_info fields
+/// uninitialized.
+struct TaskSightings {
+    seen: std::collections::HashMap<u64, [u8; 16]>,
+}
+
+impl TaskSightings {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Returns true when this sighting should be forwarded downstream.
+    fn observe(&mut self, info: &task_info) -> bool {
+        use std::collections::hash_map::Entry;
+        match self.seen.entry(info.tgidpid) {
+            Entry::Vacant(entry) => {
+                entry.insert(info.comm);
+                true
+            }
+            Entry::Occupied(mut entry) => {
+                if info.comm[0] != 0 && entry.get() != &info.comm {
+                    entry.insert(info.comm);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
 fn consume_loop<T, N>(
     recorder: &Mutex<T>,
     rx: Receiver<N>,
@@ -1027,9 +1067,7 @@ fn consume_loop<T, N>(
     T: SystingRecordEvent<N>,
     N: Plain + SystingEvent + Copy,
 {
-    // Use a HashSet for deduplication - bloom filters have false positives which
-    // can cause threads to not be recorded if the filter incorrectly says "seen"
-    let mut seen_tasks: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut seen_tasks = TaskSightings::new();
     let mut batch: Vec<N> = Vec::with_capacity(CONSUME_BATCH);
 
     // Block for the first event so an idle recorder doesn't spin, then drain
@@ -1040,14 +1078,15 @@ fn consume_loop<T, N>(
         batch.extend(rx.try_iter().take(CONSUME_BATCH - 1));
 
         for event in &batch {
-            // Send task_info to process discovery thread only if not already seen
+            // Send task_info to process discovery on first sighting or
+            // comm change
             if let Some(task_info) = event.next_task_info() {
-                if seen_tasks.insert(task_info.tgidpid) {
+                if seen_tasks.observe(task_info) {
                     let _ = task_info_tx.send(*task_info);
                 }
             }
             if let Some(task_info) = event.prev_task_info() {
-                if seen_tasks.insert(task_info.tgidpid) {
+                if seen_tasks.observe(task_info) {
                     let _ = task_info_tx.send(*task_info);
                 }
             }
@@ -1204,16 +1243,14 @@ fn spawn_recorder_threads(
             thread::Builder::new()
                 .name("packet_recorder".to_string())
                 .spawn(move || {
-                    // Use HashSet for deduplication - bloom filters have false positives
-                    let mut seen_tasks: std::collections::HashSet<u64> =
-                        std::collections::HashSet::new();
+                    let mut seen_tasks = TaskSightings::new();
                     let mut batch: Vec<packet_event> = Vec::with_capacity(CONSUME_BATCH);
                     while let Ok(first) = packet_rx.recv() {
                         batch.push(first);
                         batch.extend(packet_rx.try_iter().take(CONSUME_BATCH - 1));
                         for event in &batch {
                             if let Some(task_info) = event.next_task_info() {
-                                if seen_tasks.insert(task_info.tgidpid) {
+                                if seen_tasks.observe(task_info) {
                                     session_recorder.maybe_record_task(task_info);
                                 }
                             }
@@ -1233,16 +1270,14 @@ fn spawn_recorder_threads(
             thread::Builder::new()
                 .name("epoll_recorder".to_string())
                 .spawn(move || {
-                    // Use HashSet for deduplication
-                    let mut seen_tasks: std::collections::HashSet<u64> =
-                        std::collections::HashSet::new();
+                    let mut seen_tasks = TaskSightings::new();
                     let mut batch: Vec<epoll_event_bpf> = Vec::with_capacity(CONSUME_BATCH);
                     while let Ok(first) = epoll_rx.recv() {
                         batch.push(first);
                         batch.extend(epoll_rx.try_iter().take(CONSUME_BATCH - 1));
                         for event in &batch {
                             if let Some(task_info) = event.next_task_info() {
-                                if seen_tasks.insert(task_info.tgidpid) {
+                                if seen_tasks.observe(task_info) {
                                     session_recorder.maybe_record_task(task_info);
                                 }
                             }
@@ -4063,4 +4098,64 @@ pub fn systing(
     };
 
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(tgidpid: u64, comm: &str) -> task_info {
+        let mut task = task_info {
+            tgidpid,
+            cgid: 0,
+            comm: [0; 16],
+        };
+        let bytes = comm.as_bytes();
+        let len = bytes.len().min(15);
+        task.comm[..len].copy_from_slice(&bytes[..len]);
+        task
+    }
+
+    #[test]
+    fn task_sightings_forwards_first_and_comm_changes() {
+        let mut sightings = TaskSightings::new();
+        assert!(sightings.observe(&info(42, "loader")));
+        assert!(
+            !sightings.observe(&info(42, "loader")),
+            "same comm suppressed"
+        );
+        assert!(
+            sightings.observe(&info(42, "worker")),
+            "comm change forwards"
+        );
+        assert!(
+            !sightings.observe(&info(42, "worker")),
+            "steady state suppressed"
+        );
+        assert!(sightings.observe(&info(43, "worker")), "new task forwards");
+    }
+
+    #[test]
+    fn task_sightings_ignores_zeroed_comm() {
+        let mut sightings = TaskSightings::new();
+        assert!(sightings.observe(&info(42, "real-name")));
+        assert!(
+            !sightings.observe(&info(42, "")),
+            "zeroed comm is not a change"
+        );
+        assert!(sightings.observe(&info(42, "renamed")));
+    }
+
+    #[test]
+    fn task_sightings_zero_comm_first_sight_then_real() {
+        let mut sightings = TaskSightings::new();
+        assert!(
+            sightings.observe(&info(7, "")),
+            "first sighting always forwards"
+        );
+        assert!(
+            sightings.observe(&info(7, "late-name")),
+            "real comm after zeroed first sight forwards"
+        );
+    }
 }
