@@ -4825,12 +4825,13 @@ static __always_inline int emit_rss_stat_event(struct task_struct *task,
 	return 0;
 }
 
-/* Threshold gate shared by both attach paths. */
+/* Threshold gate shared by both attach paths. Callers have already
+ * gated with trace_task() — the filter runs before any per-event work
+ * (counter reads, size math) so untraced tasks pay as close to zero as
+ * possible on this very hot tracepoint. */
 static __always_inline int handle_rss_stat(struct task_struct *task,
 					   u32 member, s64 size_bytes)
 {
-	if (!trace_task(task))
-		return 0;
 	if (member >= NR_MM_COUNTERS)
 		return 0;
 
@@ -4876,6 +4877,8 @@ SEC("tp_btf/rss_stat")
 int BPF_PROG(systing_rss_stat_btf, struct mm_struct *mm, int member)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
 	s64 pages = read_mm_rss_pages(mm, (u32)member);
 	if (pages < 0)
 		pages = 0;
@@ -4886,6 +4889,8 @@ SEC("tracepoint/kmem/rss_stat")
 int systing_rss_stat(struct trace_event_raw_rss_stat *ctx)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
 	/* ctx->size is the kernel's exact percpu_counter_sum_positive() already
 	 * shifted to bytes; this path pays that O(nr_cpus) cost per event but
 	 * is only selected when tp_btf is unavailable. Clamp transient
