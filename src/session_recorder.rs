@@ -1056,28 +1056,17 @@ impl SessionRecorder {
             .insert(info.tgidpid, thread_descriptor);
     }
 
-    /// Update a known thread's name from a freshly observed BPF comm.
+    /// Apply a rename decided under the read lock in maybe_record_task.
     ///
-    /// Process names are deliberately not updated here: they are exe-derived
-    /// by preference (see record_new_process), and overwriting them from a
-    /// thread's comm would reintroduce the child-name-leak problem that
-    /// exe-preference exists to avoid.
-    fn maybe_rename_thread(&self, info: &task_info) {
-        let fresh = Self::extract_comm(info);
-        if fresh.is_empty() {
-            return;
-        }
-        {
-            let threads = self.threads.read().unwrap();
-            match threads.get(&info.tgidpid) {
-                Some(existing) if Self::rename_improves(existing.thread_name(), &fresh) => {}
-                _ => return,
-            }
-        }
+    /// Process names are deliberately not updated on comm changes: they are
+    /// exe-derived by preference (see record_new_process), and overwriting
+    /// them from a thread's comm would reintroduce the child-name-leak
+    /// problem that exe-preference exists to avoid.
+    fn rename_thread(&self, tgidpid: u64, fresh: String) {
         let mut threads = self.threads.write().unwrap();
-        if let Some(descriptor) = threads.get_mut(&info.tgidpid) {
+        if let Some(descriptor) = threads.get_mut(&tgidpid) {
             // Re-check under the write lock: another consumer may have
-            // renamed concurrently between our read and write.
+            // renamed concurrently since the read-lock decision.
             if Self::rename_improves(descriptor.thread_name(), &fresh) {
                 descriptor.set_thread_name(fresh);
             }
@@ -1100,17 +1089,39 @@ impl SessionRecorder {
     }
 
     pub fn maybe_record_task(&self, info: &task_info) {
+        enum ThreadAction {
+            Record,
+            Rename(String),
+            Nothing,
+        }
+
         // Always record ALL tasks as threads - this ensures every tid that appears
         // in sched events has a corresponding thread record in parquet files.
         // For Perfetto output, write_thread_packets filters out main threads (tid == pid)
         // since those are represented by ProcessDescriptor instead of ThreadDescriptor.
-        if !self.threads.read().unwrap().contains_key(&info.tgidpid) {
-            self.record_new_thread(info);
-        } else {
-            // Event consumers re-forward a task whenever its comm changes
-            // (exec, pthread_setname_np), so a task that renames after first
-            // sighting doesn't stay frozen at its old name.
-            self.maybe_rename_thread(info);
+        //
+        // One read lock decides everything: record a new thread, or rename an
+        // existing one (event consumers re-forward a task whenever its comm
+        // changes - exec, pthread_setname_np - so a task that renames after
+        // first sighting doesn't stay frozen at its old name).
+        let action = {
+            let threads = self.threads.read().unwrap();
+            match threads.get(&info.tgidpid) {
+                None => ThreadAction::Record,
+                Some(existing) => {
+                    let fresh = Self::extract_comm(info);
+                    if !fresh.is_empty() && Self::rename_improves(existing.thread_name(), &fresh) {
+                        ThreadAction::Rename(fresh)
+                    } else {
+                        ThreadAction::Nothing
+                    }
+                }
+            }
+        };
+        match action {
+            ThreadAction::Record => self.record_new_thread(info),
+            ThreadAction::Rename(fresh) => self.rename_thread(info.tgidpid, fresh),
+            ThreadAction::Nothing => {}
         }
 
         // Also maintain process metadata for Perfetto generation.
