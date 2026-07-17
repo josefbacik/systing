@@ -889,6 +889,65 @@ impl SessionRecorder {
         }
     }
 
+    /// Whether an executable basename is an ELF dynamic loader. Matches the
+    /// common glibc and musl loader names (`ld-linux-x86-64.so.2`,
+    /// `ld-linux-aarch64.so.1`, `ld-musl-x86_64.so.1`), the versioned real
+    /// files the loader symlink can resolve to (`ld-2.31.so`), and the
+    /// generic `ld.so`/`ld64.so.*` forms. Deliberately does not match `ld`
+    /// (the linker) or `ldconfig`.
+    fn is_loader_basename(name: &str) -> bool {
+        name == "ld.so"
+            || name.starts_with("ld64.so")
+            || (name.starts_with("ld-") && name.contains(".so"))
+    }
+
+    /// For a process launched by invoking the dynamic loader directly
+    /// (`ld-linux-x86-64.so.2 [options] /path/to/prog args...`), extract the
+    /// real program's basename from cmdline: skip the loader (argv[0]) and
+    /// its options. An `--argv0 VALUE` option wins since that is what the
+    /// program itself sees as argv[0]. Returns None when the invocation isn't
+    /// parseable (unknown option, missing option value, no program argument)
+    /// so the caller falls back to the exe basename rather than guess.
+    fn loader_target_name(cmdline: &[String]) -> Option<String> {
+        // glibc rtld options that consume the following argument (elf/rtld.c).
+        const VALUE_OPTS: [&str; 7] = [
+            "--library-path",
+            "--inhibit-rpath",
+            "--audit",
+            "--preload",
+            "--argv0",
+            "--glibc-hwcaps-prepend",
+            "--glibc-hwcaps-mask",
+        ];
+        // glibc rtld options that stand alone. (musl's loader takes no
+        // options at all, so its invocations parse via the fallthrough arm.)
+        const FLAG_OPTS: [&str; 3] = ["--list", "--verify", "--inhibit-cache"];
+
+        let mut argv0_override: Option<&String> = None;
+        let mut iter = cmdline.iter().skip(1);
+        while let Some(arg) = iter.next() {
+            if VALUE_OPTS.contains(&arg.as_str()) {
+                let value = iter.next()?;
+                if arg == "--argv0" {
+                    argv0_override = Some(value);
+                }
+            } else if FLAG_OPTS.contains(&arg.as_str()) {
+                continue;
+            } else if arg.starts_with("--") {
+                // Unknown loader option: it might consume a value, so any
+                // guess about where the program argument starts could be
+                // wrong. Let the caller keep the exe-derived name.
+                return None;
+            } else {
+                let prog = argv0_override.unwrap_or(arg);
+                return Path::new(prog.as_str())
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string());
+            }
+        }
+        None
+    }
+
     fn record_new_process(&self, info: &task_info) {
         let comm = Self::extract_comm(info);
         let pid = (info.tgidpid >> 32) as u32;
@@ -901,15 +960,22 @@ impl SessionRecorder {
         // because thread names set via pthread_setname_np (e.g., "gc-worker-3")
         // are more informative than the binary filename.
         let name_from_proc = Self::fetch_name_from_proc(pid);
-        let process_name = if !name_from_proc.is_empty() {
+        let cmdline = Self::fetch_cmdline_from_proc(pid);
+
+        // Processes launched by invoking the dynamic loader directly keep the
+        // loader as /proc/PID/exe for their whole lifetime, which would name
+        // every such process after the loader (a common pattern in hermetic
+        // build/CI environments). Recover the real program from cmdline in
+        // that case.
+        let process_name = if Self::is_loader_basename(&name_from_proc) {
+            Self::loader_target_name(&cmdline).unwrap_or_else(|| name_from_proc.clone())
+        } else if !name_from_proc.is_empty() {
             name_from_proc.clone()
         } else if !comm.is_empty() {
             comm
         } else {
             format!("<pid:{pid}>")
         };
-
-        let cmdline = Self::fetch_cmdline_from_proc(pid);
 
         // Detect kernel threads: no executable AND no cmdline AND /proc/pid exists.
         // Kernel threads have no /proc/pid/exe (readlink fails) and no cmdline.
@@ -1802,6 +1868,109 @@ mod tests {
         // A PID above pid_max should not exist
         let name = SessionRecorder::fetch_name_from_proc(u32::MAX);
         assert!(name.is_empty(), "should return empty for nonexistent PID");
+    }
+
+    #[test]
+    fn test_is_loader_basename() {
+        for loader in [
+            "ld-linux-x86-64.so.2",
+            "ld-linux-aarch64.so.1",
+            "ld-musl-x86_64.so.1",
+            "ld-2.31.so",
+            "ld.so",
+            "ld64.so.2",
+        ] {
+            assert!(
+                SessionRecorder::is_loader_basename(loader),
+                "{loader} should match"
+            );
+        }
+        for not_loader in ["ld", "ldconfig", "ld-tool", "python3.13", "", "sold.so"] {
+            assert!(
+                !SessionRecorder::is_loader_basename(not_loader),
+                "{not_loader} should not match"
+            );
+        }
+    }
+
+    fn cmdline(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_loader_target_name_simple() {
+        assert_eq!(
+            SessionRecorder::loader_target_name(&cmdline(&[
+                "/usr/lib64/ld-linux-x86-64.so.2",
+                "/usr/bin/python3.13",
+                "app.py",
+            ])),
+            Some("python3.13".to_string())
+        );
+    }
+
+    #[test]
+    fn test_loader_target_name_with_options() {
+        assert_eq!(
+            SessionRecorder::loader_target_name(&cmdline(&[
+                "ld-linux-x86-64.so.2",
+                "--library-path",
+                "/nix/store/xyz/lib:/usr/lib",
+                "--inhibit-cache",
+                "--preload",
+                "libhook.so",
+                "/opt/worker/bin/mycro-worker",
+                "--worker-arg",
+            ])),
+            Some("mycro-worker".to_string())
+        );
+    }
+
+    #[test]
+    fn test_loader_target_name_argv0_wins() {
+        assert_eq!(
+            SessionRecorder::loader_target_name(&cmdline(&[
+                "ld.so",
+                "--argv0",
+                "/renamed/fancy-name",
+                "/usr/bin/python3.13",
+            ])),
+            Some("fancy-name".to_string())
+        );
+    }
+
+    #[test]
+    fn test_loader_target_name_unknown_option_bails() {
+        assert_eq!(
+            SessionRecorder::loader_target_name(&cmdline(&[
+                "ld-linux-x86-64.so.2",
+                "--frobnicate",
+                "maybe-a-value",
+                "/usr/bin/prog",
+            ])),
+            None
+        );
+    }
+
+    #[test]
+    fn test_loader_target_name_missing_value_bails() {
+        assert_eq!(
+            SessionRecorder::loader_target_name(&cmdline(&["ld-linux-x86-64.so.2", "--preload",])),
+            None
+        );
+    }
+
+    #[test]
+    fn test_loader_target_name_no_program() {
+        assert_eq!(
+            SessionRecorder::loader_target_name(&cmdline(&["ld.so", "--list"])),
+            None
+        );
+        assert_eq!(
+            SessionRecorder::loader_target_name(&cmdline(&["ld.so"])),
+            None
+        );
+        assert_eq!(SessionRecorder::loader_target_name(&cmdline(&[])), None);
     }
 
     #[test]
