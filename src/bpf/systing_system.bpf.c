@@ -4914,26 +4914,32 @@ int BPF_PROG(systing_rss_stat_exit_flush, struct task_struct *task)
 {
 	if (tool_config.memory_rss_threshold_bytes == 0)
 		return 0;
-	/* Delete even for untraced tasks (no map-entry leak if trace_task's
-	 * answer changed between insert and exit); emit only for traced. */
-	u32 tgid = BPF_CORE_READ(task, tgid);
+	/* Filter first: this hook fires for every task exit on the host, so
+	 * untraced exits pay only the tool check and this. Trade: an entry
+	 * inserted while its task was traced is no longer deleted if the
+	 * task's filter answer changed before exit (e.g. cgroup migration in
+	 * cgroup-targeted mode) — bounded by the map's fall-through-on-full
+	 * semantics (batching degrades to direct-submit, correctness
+	 * unaffected) and impossible in whole-system mode where the filter
+	 * answer is constant. */
+	if (!trace_task(task))
+		return 0;
 	if (BPF_CORE_READ(task, signal, live.counter) != 0)
 		return 0;
+	u32 tgid = BPF_CORE_READ(task, tgid);
 	struct rss_stat_state *st = bpf_map_lookup_elem(&rss_stat_last, &tgid);
 	if (!st)
 		return 0;
 
-	if (trace_task(task)) {
-		/* task->mm is NULL here (exit_mm() precedes this tracepoint),
-		 * so flush latest_seen[] captured on the rss_stat path rather
-		 * than re-reading mm. */
-		for (u32 m = 0; m < NR_MM_COUNTERS; m++) {
-			s64 latest = st->latest_seen[m];
-			if (latest < 0)
-				continue; /* never seen */
-			if (latest != st->last_emitted[m])
-				emit_rss_stat_event(task, m, latest);
-		}
+	/* task->mm is NULL here (exit_mm() precedes this tracepoint), so
+	 * flush latest_seen[] captured on the rss_stat path rather than
+	 * re-reading mm. */
+	for (u32 m = 0; m < NR_MM_COUNTERS; m++) {
+		s64 latest = st->latest_seen[m];
+		if (latest < 0)
+			continue; /* never seen */
+		if (latest != st->last_emitted[m])
+			emit_rss_stat_event(task, m, latest);
 	}
 	bpf_map_delete_elem(&rss_stat_last, &tgid);
 	return 0;
