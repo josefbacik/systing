@@ -102,6 +102,12 @@ struct Command {
     /// Sample 1 in N user page faults when the memory recorder is enabled (0 or 1 = record all)
     #[arg(long, default_value = "97")]
     memory_fault_sample_rate: u32,
+    /// Override the minimum byte-drift between emitted rss_stat events (default: max(16 MiB, 64*nr_cpus*page_size); 0 = emit every event)
+    #[arg(long)]
+    memory_rss_threshold_bytes: Option<u64>,
+    /// Force the classic tracepoint/kmem/rss_stat attach path even when tp_btf/rss_stat is available (testing only)
+    #[arg(long, hide = true)]
+    memory_rss_force_classic: bool,
     // Heap-allocator tracing enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     memory_alloc: bool,
@@ -223,6 +229,8 @@ impl From<Command> for Config {
             marker_duration_threshold: cmd.marker_duration_threshold,
             memory: cmd.memory,
             memory_fault_sample_rate: cmd.memory_fault_sample_rate,
+            memory_rss_threshold_bytes: cmd.memory_rss_threshold_bytes,
+            memory_rss_force_classic: cmd.memory_rss_force_classic,
             memory_alloc: cmd.memory_alloc,
             memory_alloc_sample_rate: cmd.memory_alloc_sample_rate,
             memory_alloc_lib: cmd.memory_alloc_lib,

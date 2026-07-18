@@ -201,7 +201,12 @@ const SYSCALL_BPF_PROGRAMS: &[&str] = &[
 ];
 
 const MEMORY_BPF_PROGRAMS: &[&str] = &[
-    "systing_rss_stat",
+    // rss_stat has two implementations (tp_btf and classic tracepoint);
+    // exactly one is selected at load time — see get_required_bpf_programs.
+    // The exit-flush prog is a separate tp_btf/sched_process_exit attach so
+    // the memory_ringbufs map reference stays out of the sched recorder's
+    // program and each recorder's ringbuf families stay independent.
+    "systing_rss_stat_exit_flush",
     "systing_mmap_enter",
     "systing_mmap_exit",
     "systing_munmap_enter",
@@ -533,6 +538,12 @@ pub fn get_required_bpf_programs(
         }
     }
 
+    // rss_stat attach-path selection: exactly one of the two progs is loaded.
+    // MEMORY_BPF_PROGRAMS deliberately lists neither.
+    if opts.memory {
+        required.insert(select_rss_stat_prog(opts.memory_rss_force_classic));
+    }
+
     required
 }
 
@@ -609,6 +620,13 @@ pub struct Config {
     pub memory: bool,
     /// Sample 1 in N user page faults (0 or 1 = record all)
     pub memory_fault_sample_rate: u32,
+    /// Minimum absolute byte-drift between emitted rss_stat events (0 = emit
+    /// every event). Default is max(16 MiB, 64 * nr_cpus * page_size); see
+    /// `memory_rss_threshold_bytes` in `tool_config` for the derivation.
+    pub memory_rss_threshold_bytes: Option<u64>,
+    /// Force the classic `tracepoint/kmem/rss_stat` attach path even when
+    /// `tp_btf/rss_stat` is available. Testing-only (exercises the fallback).
+    pub memory_rss_force_classic: bool,
     /// Enable heap allocator uprobes (malloc/free/calloc/realloc/...)
     pub memory_alloc: bool,
     /// Sample 1 in N allocator calls (0 or 1 = record all)
@@ -686,6 +704,8 @@ impl Default for Config {
             marker_duration_threshold: None,
             memory: false,
             memory_fault_sample_rate: 97,
+            memory_rss_threshold_bytes: None,
+            memory_rss_force_classic: false,
             memory_alloc: false,
             memory_alloc_sample_rate: 1,
             memory_alloc_lib: None,
@@ -1389,6 +1409,39 @@ fn sum_percpu_counter(map: &dyn libbpf_rs::MapCore) -> u64 {
         }
     }
     total
+}
+
+/// Probe whether the running kernel's vmlinux BTF exposes the
+/// `btf_trace_rss_stat` typedef that `SEC("tp_btf/rss_stat")` attaches to.
+/// When absent (or when the caller forces the classic path for testing), fall
+/// back to the classic `tracepoint/kmem/rss_stat` prog. See the block
+/// comment above `systing_rss_stat_btf` in `systing_system.bpf.c` for why
+/// tp_btf is preferred (it skips the perf_trace glue and its O(nr_cpus)
+/// percpu_counter_sum on every event).
+fn kernel_has_rss_stat_btf() -> bool {
+    match libbpf_rs::btf::Btf::from_vmlinux() {
+        Ok(btf) => btf
+            .type_by_name::<libbpf_rs::btf::types::Typedef<'_>>("btf_trace_rss_stat")
+            .is_some(),
+        Err(e) => {
+            eprintln!(
+                "Warning: failed to open vmlinux BTF ({e}); \
+                 falling back to classic rss_stat tracepoint attach"
+            );
+            false
+        }
+    }
+}
+
+/// Pick the rss_stat BPF program name to load: `systing_rss_stat_btf` when
+/// the kernel supports tp_btf attach for rss_stat and the user hasn't forced
+/// the classic fallback (for test coverage), otherwise `systing_rss_stat`.
+fn select_rss_stat_prog(force_classic: bool) -> &'static str {
+    if !force_classic && kernel_has_rss_stat_btf() {
+        "systing_rss_stat_btf"
+    } else {
+        "systing_rss_stat"
+    }
 }
 
 fn is_old_kernel() -> bool {
@@ -2112,6 +2165,10 @@ fn warn_failed_probe_attachments(skel: &SystingSystemSkel) {
             "systing_sched_process_exit" => skel.links.systing_sched_process_exit.is_none(),
             "systing_sched_process_fork" => skel.links.systing_sched_process_fork.is_none(),
             "systing_sched_process_exec" => skel.links.systing_sched_process_exec.is_none(),
+            // Memory recorder
+            "systing_rss_stat_btf" => skel.links.systing_rss_stat_btf.is_none(),
+            "systing_rss_stat" => skel.links.systing_rss_stat.is_none(),
+            "systing_rss_stat_exit_flush" => skel.links.systing_rss_stat_exit_flush.is_none(),
             // IRQ probes
             "systing_irq_handler_entry" => skel.links.systing_irq_handler_entry.is_none(),
             "systing_irq_handler_exit" => skel.links.systing_irq_handler_exit.is_none(),
@@ -2237,7 +2294,17 @@ fn configure_bpf_skeleton(
         if opts.memory {
             rodata.tool_config.collect_memory = 1;
             rodata.tool_config.memory_fault_sample_rate = opts.memory_fault_sample_rate;
-            rodata.tool_config.page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
+            rodata.tool_config.page_size = page_size;
+            // Default threshold: max(16 MiB, 64 * nr_cpus * page_size). The
+            // 64*nr_cpus term keeps the threshold above typical
+            // percpu_counter read noise on many-core hosts; see the
+            // tool_config comment in systing_system.bpf.c for the full
+            // error-bound story and why worst-case noise can still exceed
+            // this on very large hosts (harmless — spurious emits only).
+            rodata.tool_config.memory_rss_threshold_bytes = opts
+                .memory_rss_threshold_bytes
+                .unwrap_or_else(|| (16u64 << 20).max(64 * num_cpus as u64 * page_size as u64));
         }
         if opts.memory_alloc {
             rodata.tool_config.memory_alloc_sample_rate = opts.memory_alloc_sample_rate;
