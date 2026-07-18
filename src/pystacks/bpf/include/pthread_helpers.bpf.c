@@ -5,6 +5,31 @@
 #include "bpf_read_helpers.bpf.h"
 #include "task_helpers.bpf.h"
 
+#if __riscv64__
+/* glibc registers &pthread->tid as the kernel clear-child-tid pointer. */
+static __always_inline void* get_riscv_pthread_descriptor(
+    const struct task_struct* cur_task) {
+  const uint32_t offsetof_tid = 0xd0;
+  void* clear_child_tid = (void*)BPF_PROBE_READ(cur_task, clear_child_tid);
+  if (!IS_VALID_USER_SPACE_ADDRESS(clear_child_tid))
+      return NULL;
+  return (char*)clear_child_tid - offsetof_tid;
+}
+
+/*
+ * glibc registers &pthread->robust_head as the kernel robust-list pointer.
+ * specific_1stblock is 0x30 bytes after robust_head in both of glibc's
+ * robust-mutex layouts.
+ */
+static __always_inline void* get_riscv_specific1stblock(
+    const struct task_struct* cur_task) {
+  void* robust_list = (void*)BPF_PROBE_READ(cur_task, robust_list);
+  return IS_VALID_USER_SPACE_ADDRESS(robust_list)
+      ? (char*)robust_list + 0x30
+      : NULL;
+}
+#endif
+
 // Read the current value of the pthread tls slot, mirroring the logic
 // in pthread_getspecific().
 //
@@ -18,8 +43,16 @@ __hidden int probe_read_pthread_tls_slot(
   struct task_struct* cur_task = get_current_task(task);
 #if __x86_64__
   void* tls_base = (void*)BPF_PROBE_READ(cur_task, thread.fsbase);
+  void* specific1stblock = (char*)tls_base + 0x310;
 #elif __aarch64__
   void* tls_base = (void*)BPF_PROBE_READ(cur_task, thread.uw.tp_value);
+  void* specific1stblock = (char*)tls_base + 0x310;
+#elif __riscv64__
+  void* specific1stblock = get_riscv_specific1stblock(cur_task);
+  if (!specific1stblock) {
+    *value = 0;
+    return -1;
+  }
 #else
 #error "Unsupported platform"
 #endif
@@ -36,14 +69,14 @@ __hidden int probe_read_pthread_tls_slot(
   // level data-structure that is an array of pointers to 32-entry blocks.
   //   pthread->specific[key / 32][key % 32].data
   //
-  // 'struct pthread' is not in the public API so we have to hardcode
-  // the offsets here.
-
-  const uint32_t offsetof_specific1stblock = 0x310;
+  // 'struct pthread' is not in the public API.
+  // - x86-64 and AArch64 use fixed offset above.
+  // - RISC-V derives the block from the kernel's glibc robust-list pointer.
+  //   (https://codebrowser.dev/glibc/glibc/sysdeps/nptl/dl-tls_init_tp.c.html#92)
   const uint32_t specific1stblock_count = 32;
   const uint32_t sizeof_pthread_key_data = 16;
   const uint32_t sizeof_pointer = 8;
-  const uint32_t offsetof_specific = offsetof_specific1stblock +
+  const uint32_t sizeof_specific1stblock =
       specific1stblock_count * sizeof_pthread_key_data;
   const uint32_t offsetof_data_member = 8;
 
@@ -51,7 +84,7 @@ __hidden int probe_read_pthread_tls_slot(
 
   void* tlsSlotDataAddress;
   if (key < 32) {
-    tlsSlotDataAddress = tls_base + offsetof_specific1stblock +
+    tlsSlotDataAddress = (char*)specific1stblock +
         key * sizeof_pthread_key_data + offsetof_data_member;
 
     error = bpf_probe_read_user_task(
@@ -67,8 +100,8 @@ __hidden int probe_read_pthread_tls_slot(
     uint32_t idx1st = key / 32;
     uint32_t idx2nd = key % 32;
 
-    void* secondLevelPtrAddress =
-        tls_base + offsetof_specific + idx1st * sizeof_pointer;
+    void* secondLevelPtrAddress = (char*)specific1stblock +
+        sizeof_specific1stblock + idx1st * sizeof_pointer;
     void* secondLevelAddress;
     error = bpf_probe_read_user_task(
         &secondLevelAddress,

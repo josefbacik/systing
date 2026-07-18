@@ -9,6 +9,12 @@ typedef __s8 int8_t;
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+
+#if __riscv64__
+// errno.h indirectly includes bits/wordsize.h. Define __riscv_xlen to avoid assertion failure.
+# define __riscv_xlen 64
+#endif
+
 #include <errno.h>
 
 #include "bpf_read_helpers.bpf.h"
@@ -984,12 +990,17 @@ get_pthread_id_match(void* thread_state, void* tls_base, PyPidData* pid_data) {
     return PYSTACKS_PTHREAD_ID_NULL;
   }
 
+#if __riscv64__
+  /* tls_base is the pthread descriptor derived from clear_child_tid. */
+  pthread_self = (uint64_t)tls_base;
+#else
   // 0x10 = offsetof(struct pthread, header.self)
   result = bpf_probe_read_kernel(
       &pthread_self, sizeof(pthread_self), tls_base + 0x10);
   if (result != 0) {
     return PYSTACKS_PTHREAD_ID_ERROR;
   }
+#endif
   if (pthread_self == 0) {
     return PYSTACKS_PTHREAD_ID_ERROR;
   }
@@ -1110,6 +1121,8 @@ __hidden int pystacks_read_stacks_task(
   void* tls_base = (void*)BPF_PROBE_READ(cur_task, thread.fsbase);
 #elif __aarch64__
   void* tls_base = (void*)BPF_PROBE_READ(cur_task, thread.uw.tp_value);
+#elif __riscv64__
+  void* tls_base = get_riscv_pthread_descriptor(cur_task);
 #else
 #error "Unsupported platform"
 #endif

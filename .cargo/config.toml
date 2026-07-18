@@ -5,3 +5,7 @@ linker = "clang"
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "linker=clang", "-C", "link-arg=--target=aarch64-linux-gnu"]
 linker = "clang"
+
+[target.riscv64gc-unknown-linux-gnu]
+rustflags = ["-C", "linker=clang", "-C", "link-arg=--target=riscv64-linux-gnu"]
+linker = "clang"
