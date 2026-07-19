@@ -4273,3 +4273,160 @@ fn test_e2e_only_cpu_stacks_emits_samples() {
         );
     }
 }
+
+/// Not a real test: a busy-loop child process for
+/// test_exited_process_recovery, run as systing's traced command via
+/// `<test-binary> --exact burner_helper_busy_loop`. Deliberately NOT
+/// `#[ignore]`: the VM integration runner selects ignored tests
+/// (`--ignored`), and this helper must be excluded there while staying
+/// spawnable by exact name. The loop is wall-clock bound (not iteration
+/// bound) so TCG slowdown cannot shrink its lifetime, and two seconds is
+/// enough on-CPU time for the sampler and the first-sample snapshot even
+/// when the consumer side lags. The test binary carries a full symbol
+/// table, so samples landing here are name-resolvable if (and only if)
+/// symbolization has something to resolve against.
+#[test]
+fn burner_helper_busy_loop() {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut counter: u64 = 0;
+    while Instant::now() < deadline {
+        counter = std::hint::black_box(counter.wrapping_add(1));
+    }
+    assert!(counter > 0);
+}
+
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_exited_process_recovery() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+    use std::time::Instant;
+    use systing::traced_command::spawn_traced_child;
+
+    // Record one trace of a single short-lived burner child and count how
+    // its frames rendered. Returns (burner_named_frames, exited_frames).
+    //
+    // The burner runs as systing's traced command, which pins the whole
+    // lifecycle to events instead of machine-speed guesses (QEMU TCG
+    // stretches BPF setup to tens of seconds): the forked child blocks
+    // until tracing is attached before it execs, so the burner cannot burn
+    // out before the window opens, and the recording stops because the
+    // child exited and was reaped (waitpid plus a drain delay), so the
+    // burner is gone from /proc before end-of-trace symbolization runs.
+    // Any name-resolved burner frame can therefore only come from the
+    // first-sample mapping snapshot, on any machine speed. This is also
+    // the population the feature exists for:
+    // `systing record -- short_lived_command`.
+    fn record_and_count(no_exited_recovery: bool) -> (usize, usize) {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+        let trace_path = dir.path().join("trace.pb");
+        let own_binary = std::env::current_exe().expect("current_exe");
+
+        let child = spawn_traced_child(&[
+            own_binary
+                .to_str()
+                .expect("test binary path not utf-8")
+                .to_string(),
+            "--exact".to_string(),
+            "burner_helper_busy_loop".to_string(),
+        ])
+        .expect("failed to fork burner child");
+
+        let start = Instant::now();
+        let config = Config {
+            duration: 300, // backstop only: the child's exit stops the trace
+            no_exited_recovery,
+            output_dir: dir.path().to_path_buf(),
+            output: trace_path,
+            ..Config::default()
+        };
+        systing(config, Some(child)).expect("systing recording failed");
+        let elapsed = start.elapsed();
+        eprintln!("  recording stopped after {:.1}s", elapsed.as_secs_f64());
+        assert!(
+            elapsed < SLOW_MACHINE_BUDGET,
+            "recording should stop when the burner exits; took {:.1}s \
+             (duration backstop reached - child-exit stop broken?)",
+            elapsed.as_secs_f64()
+        );
+
+        let stack_parquet = dir.path().join("stack.parquet");
+        assert!(
+            stack_parquet.exists(),
+            "[exited recovery] stack.parquet not found"
+        );
+        let file = File::open(&stack_parquet).expect("Failed to open stack.parquet");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("Failed to create reader")
+            .build()
+            .expect("Failed to build reader");
+
+        let mut burner_named = 0usize;
+        let mut exited = 0usize;
+        for batch_result in reader {
+            let batch = batch_result.expect("Failed to read batch");
+            let Some(frame_names_col) = batch.column_by_name("frame_names") else {
+                continue;
+            };
+            use arrow::array::{ListArray, StringArray};
+            let list_array = frame_names_col
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("frame_names should be a ListArray");
+            for i in 0..list_array.len() {
+                if list_array.is_null(i) {
+                    continue;
+                }
+                let inner = list_array.value(i);
+                let string_array = inner
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("frame_names inner should be StringArray");
+                for j in 0..string_array.len() {
+                    if string_array.is_null(j) {
+                        continue;
+                    }
+                    let frame = string_array.value(j);
+                    if frame.contains("burner_helper_busy_loop") {
+                        burner_named += 1;
+                    }
+                    if frame.contains("[exited]") {
+                        exited += 1;
+                    }
+                }
+            }
+        }
+        (burner_named, exited)
+    }
+
+    // Negative control first: with recovery disabled, the burner must have
+    // been sampled (its pid renders [exited] frames) and none of its frames
+    // may carry a resolved name - this proves both that the traced child
+    // gets sampled and that it is reliably gone by symbolization time,
+    // which run 2 inherits.
+    eprintln!("Recording with --no-exited-recovery (negative control)...");
+    let (named_off, exited_off) = record_and_count(true);
+    eprintln!("  control: burner_named={named_off} exited_frames={exited_off}");
+    assert!(
+        exited_off > 0,
+        "[exited recovery control] expected [exited] frames from the dead burner, got none \
+         (burner not sampled? sampling misconfigured?)"
+    );
+    assert_eq!(
+        named_off, 0,
+        "[exited recovery control] burner frames resolved with recovery disabled - \
+         the burner survived to the live pass, control is invalid"
+    );
+
+    // With recovery enabled (default), the same dead burner resolves by name
+    // from its first-sample mapping snapshot.
+    eprintln!("Recording with exited recovery enabled...");
+    let (named_on, exited_on) = record_and_count(false);
+    eprintln!("  recovery: burner_named={named_on} exited_frames={exited_on}");
+    assert!(
+        named_on > 0,
+        "[exited recovery] no burner frames resolved by name; first-sample \
+         snapshot recovery is not working ({exited_on} [exited] frames present)"
+    );
+}

@@ -91,6 +91,10 @@ const volatile struct {
 				* gate is belt-and-braces (and lets the verifier
 				* prune the bodies if the programs ever get loaded
 				* for another reason). */
+	u32 collect_exited_recovery; /* First-sample mapping snapshots for
+				      * exited-process symbolization: gates the
+				      * snapshot-hint sidecar ringbuf and the
+				      * exec-invalidation path. */
 } tool_config = {};
 
 enum event_type {
@@ -406,12 +410,13 @@ struct memory_event {
  * Dummy instance to get skeleton to generate definition for
  * `struct task_event`
  */
-#ifdef SYSTING_PYSTACKS
 /*
- * Notify userspace that a traced process exec'd or forked so it can update
- * the pystacks discovery state. The handler in handle_exec_events() reads
- * /proc/<pid>/{exe,maps}, so this only carries the pid and a flag describing
- * what kernel event produced it (exec vs. fork) for logging/diagnostics.
+ * Notify userspace that a traced process exec'd or forked. Two consumers:
+ * pystacks discovery state updates, and exited-recovery mapping-snapshot
+ * invalidation (exec replaces the address space, so a snapshot captured
+ * for the old image must be dropped). The handler in handle_exec_events()
+ * reads /proc/<pid>/{exe,maps}, so this only carries the pid and a flag
+ * describing what kernel event produced it (exec vs. fork).
  */
 struct exec_event {
 	u32 pid;
@@ -422,7 +427,22 @@ struct exec_event {
 	 * memory to userspace. */
 	u32 is_fork;
 };
-#endif
+
+/*
+ * Sidecar notification that a stack sample with a user stack was taken for
+ * a tgid. A dedicated userspace thread drains these and captures the
+ * process's executable mappings on first sight: the main stack ringbuf can
+ * queue seconds behind under load, and a short-lived process is gone
+ * before its first sample is consumed from it — a snapshot captured then
+ * comes too late. Hints are advisory; if one is dropped the stack-event
+ * consumer makes the same observation later, just slower.
+ */
+struct snapshot_hint {
+	u32 tgid;
+	/* Explicit, zeroed padding: bpf_ringbuf_reserve() does not zero its
+	 * allocation, and implicit padding would leak kernel memory. */
+	u32 reserved;
+};
 
 struct task_event _event = {0};
 struct stack_event _stack_event = {0};
@@ -438,9 +458,8 @@ struct memory_event_header _memory_event_header = {0};
 enum memory_event_type _memory_event_type = MEMORY_RSS_STAT;
 enum memory_rss_member _memory_rss_member = MEMORY_MM_FILEPAGES;
 enum memory_alloc_op _memory_alloc_op = MEMORY_OP_MALLOC;
-#ifdef SYSTING_PYSTACKS
 struct exec_event _exec_event = {0};
-#endif
+struct snapshot_hint _snapshot_hint = {0};
 struct arg_desc _arg_desc = {0};
 enum event_type _type = SCHED_SWITCH;
 enum arg_type _arg_type = ARG_NONE;
@@ -749,7 +768,6 @@ struct memory_ringbuf_map {
 	ringbuf_memory_events_node6 SEC(".maps"),
 	ringbuf_memory_events_node7 SEC(".maps");
 
-#ifdef SYSTING_PYSTACKS
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	/*
@@ -762,7 +780,36 @@ struct {
 	 */
 	__uint(max_entries, 16384);
 } ringbuf_exec_events SEC(".maps");
-#endif
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	/*
+	 * 64KB of ~16-byte snapshot hints. Overflow is harmless by design:
+	 * the stack-event consumer performs the same first-sample
+	 * observation when it gets there — a dropped hint costs capture
+	 * latency, never correctness.
+	 */
+	__uint(max_entries, 65536);
+} ringbuf_snapshot_hints SEC(".maps");
+
+/*
+ * Once-per-tgid gate for snapshot hints. The consumer only acts on the
+ * first hint it sees for a tgid (one capture attempt per tgid), so
+ * emitting a hint per user-stack sample is pure waste past the first:
+ * gating emission here keeps the hint ringbuf and its consumer thread
+ * out of the per-sample picture entirely. Sized for 8192
+ * concurrently-live tgids before benign eviction: an
+ * evicted-then-resampled tgid re-hints, and the consumer's one-attempt
+ * rule absorbs the duplicate — the same advisory semantics as a
+ * dropped hint, in the other direction. Exec deletes the entry (see
+ * systing_sched_process_exec) so a replaced address space re-hints.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, u32);
+	__type(value, u8);
+} recovery_hinted_tgids SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -1645,7 +1692,41 @@ static void emit_stack_event_with_ts(void *ctx, struct task_struct *task,
 		event->kernel_stack_length = len / sizeof(u64);
 	else
 		event->kernel_stack_length = 0;
+
+	u32 user_stack_length = event->user_stack_length;
 	bpf_ringbuf_submit(event, flags);
+
+	/*
+	 * Exited-recovery snapshot hint, after the main submit so the stack
+	 * event's latency is unaffected. Only samples with a user stack need
+	 * a mapping snapshot; kernel-only samples symbolize without one, and
+	 * only the FIRST hint per tgid does any work downstream — the LRU
+	 * lookup keeps the hot path to one hash probe per sample.
+	 */
+	if (tool_config.collect_exited_recovery && user_stack_length > 0) {
+		u32 tgid = task->tgid;
+
+		if (!bpf_map_lookup_elem(&recovery_hinted_tgids, &tgid)) {
+			struct snapshot_hint *hint = bpf_ringbuf_reserve(
+				&ringbuf_snapshot_hints, sizeof(*hint), 0);
+			if (hint) {
+				u8 seen = 1;
+
+				hint->tgid = tgid;
+				hint->reserved = 0;
+				bpf_ringbuf_submit(hint, 0);
+				/*
+				 * Mark only after a successful emit: a failed
+				 * reserve retries on the next sample, keeping
+				 * hints advisory. Two CPUs racing the lookup
+				 * emit a duplicate, which the consumer's
+				 * one-attempt rule absorbs.
+				 */
+				bpf_map_update_elem(&recovery_hinted_tgids,
+						    &tgid, &seen, BPF_ANY);
+			}
+		}
+	}
 }
 
 static void emit_stack_event(void *ctx, struct task_struct *task,
@@ -1961,15 +2042,28 @@ int BPF_PROG(systing_sched_process_fork, struct task_struct *parent,
 	return handle_sched_process_fork(parent, child);
 }
 
-#ifdef SYSTING_PYSTACKS
 SEC("tp_btf/sched_process_exec")
 int BPF_PROG(systing_sched_process_exec, struct task_struct *task,
 	     pid_t old_pid, struct linux_binprm *bprm)
 {
-	if (!tool_config.collect_pystacks)
+	if (!tool_config.collect_pystacks && !tool_config.collect_exited_recovery)
 		return 0;
 	if (!trace_task(task))
 		return 0;
+
+	/*
+	 * Exec replaced the address space, so the once-per-tgid hint gate
+	 * must reopen regardless of what happens to the exec event below: if
+	 * the event is dropped (ringbuf full), the stale userspace snapshot
+	 * survives until the consumer notices, but the re-hint on the next
+	 * sample gives it that chance — deleting after a failed reserve
+	 * would close both doors.
+	 */
+	if (tool_config.collect_exited_recovery) {
+		u32 exec_tgid = task->tgid;
+
+		bpf_map_delete_elem(&recovery_hinted_tgids, &exec_tgid);
+	}
 
 	/*
 	 * Reserve the ringbuf slot *before* clearing the stale pystacks config.
@@ -1984,6 +2078,7 @@ int BPF_PROG(systing_sched_process_exec, struct task_struct *task,
 	if (!event)
 		return 0;
 
+#ifdef SYSTING_PYSTACKS
 	/*
 	 * Exec replaces the address space, so any pystacks config we have for
 	 * this pid (whether registered at startup, dynamically discovered, or
@@ -1994,15 +2089,21 @@ int BPF_PROG(systing_sched_process_exec, struct task_struct *task,
 	 * This is what keeps subprocess.Popen() from a Python parent from
 	 * leaking a stale entry per call: fork propagates the parent's config
 	 * to the child, then exec into the subprocess binary clears it again.
+	 *
+	 * The same exec event separately invalidates any exited-recovery
+	 * mapping snapshot in userspace (see handle_exec_events()), which is
+	 * why this program runs — and the event is submitted — even when
+	 * pystacks is off.
 	 */
-	pystacks_clear_pid(task->tgid);
+	if (tool_config.collect_pystacks)
+		pystacks_clear_pid(task->tgid);
+#endif
 
 	event->pid = task->tgid;
 	event->is_fork = 0;
 	bpf_ringbuf_submit(event, 0);
 	return 0;
 }
-#endif
 
 SEC("tp_btf/irq_handler_entry")
 int BPF_PROG(systing_irq_handler_entry, int irq, struct irqaction *action)

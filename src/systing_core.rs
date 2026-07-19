@@ -526,8 +526,10 @@ pub fn get_required_bpf_programs(
         required.insert("systing_sched_process_fork");
     }
 
-    // Pystacks with PID filtering needs exec tracking to discover new Python processes
-    if collect_pystacks && !opts.pid.is_empty() {
+    // Pystacks with PID filtering needs exec tracking to discover new Python
+    // processes; exited recovery needs it unconditionally, to invalidate
+    // mapping snapshots when exec replaces a process's address space.
+    if (collect_pystacks && !opts.pid.is_empty()) || exited_recovery_enabled(opts) {
         required.insert("systing_sched_process_exec");
     }
 
@@ -601,6 +603,10 @@ pub struct Config {
     pub no_gvisor_guest_maps: bool,
     /// Do not symbolize stripped Go binaries from their `.gopclntab`
     pub no_gopclntab: bool,
+    /// Do not capture first-sample mapping snapshots for post-mortem
+    /// symbolization of processes that exit before end-of-trace
+    /// symbolization
+    pub no_exited_recovery: bool,
     /// Resolve user-space symbols from ELF symbol tables only (no DWARF
     /// debug info, line info, inlined functions, or debuginfod)
     pub symbolize_names_only: bool,
@@ -695,6 +701,7 @@ impl Default for Config {
             no_frame_labels: false,
             no_gvisor_guest_maps: false,
             no_gopclntab: false,
+            no_exited_recovery: false,
             symbolize_names_only: false,
             no_sched: false,
             no_irq: false,
@@ -833,7 +840,9 @@ unsafe impl Plain for memory_event_header {}
 
 /// BPF exec/fork event - delivered via the `ringbuf_exec_events` ringbuf when
 /// a traced process execs (any traced task) or forks (Python parents only).
-/// Used to dynamically keep pystacks discovery in sync with the process tree.
+/// Two consumers in handle_exec_events(): pystacks discovery updates, and
+/// exited-recovery mapping-snapshot invalidation (exec replaces the address
+/// space, so a snapshot of the old image must be dropped).
 /// Layout must match `struct exec_event` in `systing_system.bpf.c`.
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -848,6 +857,19 @@ struct exec_event {
     is_fork: u32,
 }
 unsafe impl Plain for exec_event {}
+
+/// Snapshot hint - delivered via the `ringbuf_snapshot_hints` ringbuf for
+/// every stack sample with a user stack (rodata-gated on exited recovery).
+/// Layout must match `struct snapshot_hint` in `systing_system.bpf.c`.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+#[allow(non_camel_case_types)]
+struct snapshot_hint {
+    tgid: u32,
+    /// Explicit padding, zeroed by the BPF side.
+    reserved: u32,
+}
+unsafe impl Plain for snapshot_hint {}
 
 /// Trait for events that can be recorded in a ring buffer.
 pub trait SystingRecordEvent<T>: crate::utid::ThreadAwareRecorder {
@@ -1136,6 +1158,13 @@ struct RecorderChannels {
     memory_rx: Receiver<memory_event>,
     marker_rx: Receiver<marker_event>,
     exec_event_rx: Option<Receiver<exec_event>>,
+    /// Snapshot hints: one tiny event per stack sample with a user stack,
+    /// drained by a dedicated thread that captures exited-recovery mapping
+    /// snapshots on first sight of a tgid. Dedicated because the stack_rx
+    /// consumer can run seconds behind under load, and a short-lived process
+    /// is gone before its first sample is consumed from there. Present only
+    /// when exited recovery is enabled.
+    snapshot_hint_rx: Option<Receiver<snapshot_hint>>,
     /// Python symbol records emitted by BPF on first sight of a symbol;
     /// consumed by the pystack_symbol_loader thread, which interns them and
     /// updates the BPF gate map. Present only when pystacks is enabled.
@@ -1560,6 +1589,13 @@ fn configure_recorder(opts: &Config, recorder: &Arc<SessionRecorder>) {
     if opts.no_gopclntab {
         recorder.stack_recorder.lock().unwrap().set_gopclntab(false);
     }
+    if opts.no_exited_recovery {
+        recorder
+            .stack_recorder
+            .lock()
+            .unwrap()
+            .set_exited_recovery(false);
+    }
     if opts.symbolize_names_only {
         recorder.stack_recorder.lock().unwrap().set_names_only(true);
         if opts.enable_debuginfod {
@@ -1765,6 +1801,7 @@ fn handle_exec_events(
     psr: Arc<crate::pystacks::stack_walker::StackWalkerRun>,
     pids_map: libbpf_rs::MapHandle,
     pystacks_debug: bool,
+    exit_snapshots: Arc<Mutex<crate::exit_snapshot::ExitSnapshots>>,
 ) {
     // Pids we've successfully registered with pystacks. Used only to keep the
     // logging quiet on repeat events; it does NOT short-circuit re-discovery,
@@ -1778,6 +1815,14 @@ fn handle_exec_events(
     while let Ok(event) = exec_rx.recv() {
         let pid = event.pid;
         let is_fork = event.is_fork != 0;
+        // Exec replaced the address space: drop any first-sample mapping
+        // snapshot BEFORE anything that can bail on this event — the process
+        // may already be gone (readlink below fails), but its stale snapshot
+        // must still die, or dead post-exec addresses resolve against the
+        // wrong image. Forks are new tgids with no snapshot to drop.
+        if !is_fork {
+            exit_snapshots.lock().unwrap().forget_on_exec(pid as i32);
+        }
         let kind = if is_fork { "Fork" } else { "Exec" };
         let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
             if pystacks_debug {
@@ -2036,6 +2081,8 @@ fn setup_ringbuffers<'a>(
     let (marker_tx, marker_rx) = sync_channel(CHANNEL_CAPACITY);
     let (exec_tx, exec_rx) = sync_channel(CHANNEL_CAPACITY);
     let mut has_exec_ringbuf = false;
+    let (snapshot_hint_tx, snapshot_hint_rx) = sync_channel(CHANNEL_CAPACITY);
+    let mut has_snapshot_hint_ringbuf = false;
 
     let object = skel.object();
 
@@ -2076,8 +2123,10 @@ fn setup_ringbuffers<'a>(
         }
     }
 
-    let mut pysym_rx = None;
-    if collect_pystacks {
+    // The exec ringbuf feeds two consumers via one handler: pystacks
+    // re-discovery and exited-recovery snapshot invalidation. Drain it when
+    // either is on.
+    if collect_pystacks || exited_recovery_enabled(opts) {
         for map in object.maps() {
             if map.name().to_str().unwrap() == "ringbuf_exec_events" {
                 let ring = create_ring::<exec_event>(&map, exec_tx.clone())?;
@@ -2086,7 +2135,21 @@ fn setup_ringbuffers<'a>(
                 break;
             }
         }
+    }
 
+    if exited_recovery_enabled(opts) {
+        for map in object.maps() {
+            if map.name().to_str().unwrap() == "ringbuf_snapshot_hints" {
+                let ring = create_ring::<snapshot_hint>(&map, snapshot_hint_tx.clone())?;
+                rings.push(("ringbuf_snapshot_hints".to_string(), ring));
+                has_snapshot_hint_ringbuf = true;
+                break;
+            }
+        }
+    }
+
+    let mut pysym_rx = None;
+    if collect_pystacks {
         for map in object.maps() {
             if map.name().to_str().unwrap() == "ringbuf_pysym_events" {
                 let (pysym_tx, rx) = sync_channel(CHANNEL_CAPACITY);
@@ -2119,6 +2182,11 @@ fn setup_ringbuffers<'a>(
     } else {
         None
     };
+    let snapshot_hint_rx = if has_snapshot_hint_ringbuf {
+        Some(snapshot_hint_rx)
+    } else {
+        None
+    };
 
     let channels = RecorderChannels {
         event_rxs,
@@ -2131,6 +2199,7 @@ fn setup_ringbuffers<'a>(
         epoll_rx,
         marker_rx,
         exec_event_rx,
+        snapshot_hint_rx,
         pysym_rx,
     };
 
@@ -2226,6 +2295,14 @@ fn warn_failed_probe_attachments(skel: &SystingSystemSkel) {
     }
 }
 
+/// Whether exited-process recovery is active: first-sample mapping snapshots
+/// are captured (snapshot-hint lane plus the stack consumer as fallback) and
+/// invalidated on exec. Off when stack traces are off entirely — with no
+/// user stacks recorded there is nothing to symbolize post-mortem.
+fn exited_recovery_enabled(opts: &Config) -> bool {
+    !opts.no_exited_recovery && !opts.no_stack_traces
+}
+
 fn configure_bpf_skeleton(
     open_skel: &mut OpenSystingSystemSkel,
     opts: &Config,
@@ -2282,6 +2359,9 @@ fn configure_bpf_skeleton(
         }
         if collect_pystacks {
             rodata.tool_config.collect_pystacks = 1;
+        }
+        if exited_recovery_enabled(opts) {
+            rodata.tool_config.collect_exited_recovery = 1;
         }
         if opts.syscalls {
             rodata.tool_config.collect_syscalls = 1;
@@ -2392,6 +2472,23 @@ fn configure_bpf_skeleton(
                 map.set_max_entries(1)
                     .with_context(|| format!("Failed to shrink '{name}'"))?;
             }
+        }
+        // Same constraint family: the snapshot-hint ringbuf is referenced by
+        // the always-loaded stack programs (rodata-gated via
+        // tool_config.collect_exited_recovery) and the exec ringbuf by the
+        // pid-filter-loaded fork program, so neither can be autocreate=false;
+        // shrink them when their consumers are off.
+        if !exited_recovery_enabled(opts) && name == "ringbuf_snapshot_hints" {
+            map.set_max_entries(page_size)
+                .with_context(|| format!("Failed to shrink '{name}'"))?;
+        }
+        if !exited_recovery_enabled(opts) && name == "recovery_hinted_tgids" {
+            map.set_max_entries(1)
+                .with_context(|| format!("Failed to shrink '{name}'"))?;
+        }
+        if !collect_pystacks && !exited_recovery_enabled(opts) && name == "ringbuf_exec_events" {
+            map.set_max_entries(page_size)
+                .with_context(|| format!("Failed to shrink '{name}'"))?;
         }
     }
 
@@ -3154,6 +3251,7 @@ struct ThreadHandles {
     discovery_thread: thread::JoinHandle<i32>,
     symbol_loader_thread: thread::JoinHandle<i32>,
     exec_handler_thread: Option<thread::JoinHandle<()>>,
+    snapshot_hint_thread: Option<thread::JoinHandle<()>>,
     tpu_metrics_thread: Option<thread::JoinHandle<i32>>,
     task_info_tx: Sender<task_info>,
 }
@@ -3255,10 +3353,14 @@ fn run_tracing_loop(
     for thread in handles.ringbuf_threads {
         thread.join().expect("Failed to join thread");
     }
-    // The exec handler thread reads from a channel fed by ringbuf callbacks,
-    // so it terminates after ringbuf threads exit and senders are dropped.
+    // The exec handler and snapshot-hint threads read from channels fed by
+    // ringbuf callbacks, so they terminate after ringbuf threads exit and
+    // senders are dropped.
     if let Some(thread) = handles.exec_handler_thread {
         thread.join().expect("Failed to join exec handler thread");
+    }
+    if let Some(thread) = handles.snapshot_hint_thread {
+        thread.join().expect("Failed to join snapshot hint thread");
     }
     shutdown_signal.store(true, Ordering::Relaxed);
     if let Some(thread) = handles.sysinfo_thread {
@@ -3582,6 +3684,7 @@ pub fn systing(
         // Take exec_event_rx/pysym_rx out before channels is moved into
         // spawn_recorder_threads
         let exec_event_rx = channels.exec_event_rx.take();
+        let snapshot_hint_rx = channels.snapshot_hint_rx.take();
         let pysym_rx = channels.pysym_rx.take();
 
         // Create shutdown signal for receiver threads
@@ -3698,11 +3801,50 @@ pub fn systing(
             let pystacks_debug = opts.pystacks_debug;
             let pids_map = libbpf_rs::MapHandle::try_from(&skel.maps.pids)
                 .context("Failed to get handle to BPF pids map")?;
+            let exec_exit_snapshots = recorder
+                .stack_recorder
+                .lock()
+                .unwrap()
+                .exit_snapshots_handle();
             exec_handler_thread = Some(
                 thread::Builder::new()
                     .name("pystacks_exec_handler".to_string())
                     .spawn(move || {
-                        handle_exec_events(exec_rx, exec_psr, pids_map, pystacks_debug);
+                        handle_exec_events(
+                            exec_rx,
+                            exec_psr,
+                            pids_map,
+                            pystacks_debug,
+                            exec_exit_snapshots,
+                        );
+                    })?,
+            );
+        }
+
+        // Drain snapshot hints on a dedicated thread: capture latency must
+        // not depend on the stack consumer's queue depth — under load that
+        // queue runs seconds behind, and a short-lived process is gone
+        // before its first sample is consumed from it. This thread does one
+        // hash lookup per hint (and one /proc read per NEW tgid), so it
+        // stays caught up. Like the exec handler, it exits when the ringbuf
+        // threads are joined and the channel senders drop.
+        let mut snapshot_hint_thread: Option<thread::JoinHandle<()>> = None;
+        if let Some(hint_rx) = snapshot_hint_rx {
+            let hint_exit_snapshots = recorder
+                .stack_recorder
+                .lock()
+                .unwrap()
+                .exit_snapshots_handle();
+            snapshot_hint_thread = Some(
+                thread::Builder::new()
+                    .name("exit_snapshot_hint".to_string())
+                    .spawn(move || {
+                        while let Ok(hint) = hint_rx.recv() {
+                            hint_exit_snapshots
+                                .lock()
+                                .unwrap()
+                                .observe_tgid(hint.tgid as i32);
+                        }
                     })?,
             );
         }
@@ -3971,6 +4113,7 @@ pub fn systing(
             discovery_thread,
             symbol_loader_thread: symbol_thread,
             exec_handler_thread,
+            snapshot_hint_thread,
             task_info_tx,
             tpu_metrics_thread,
         };
