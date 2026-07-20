@@ -5,9 +5,23 @@
 #include "bpf_read_helpers.bpf.h"
 #include "task_helpers.bpf.h"
 
-#if __riscv64__
-/* glibc registers &pthread->tid as the kernel clear-child-tid pointer. */
-static __always_inline void* get_riscv_pthread_descriptor(
+#if __aarch64__ || __riscv64__
+/*
+ * On TLS-variant-1 architectures (aarch64, riscv64) the thread pointer
+ * addresses the 16-byte TCB, not struct pthread: the descriptor sits at
+ * tp - sizeof(struct pthread), and that distance is tail-anchored — it
+ * changes when glibc grows or shrinks struct pthread (e.g. 1856 bytes in
+ * glibc 2.36 vs 1824 in 2.41 on aarch64). Head-anchored offsets are
+ * stable across those same versions, so instead of the thread pointer we
+ * derive the descriptor from pointers glibc registers with the kernel,
+ * which point into the descriptor head.
+ *
+ * glibc registers &pthread->tid as the kernel clear-child-tid pointer
+ * (set_tid_address is called for the main thread too). 0xd0 is
+ * offsetof(struct pthread, tid) for the generic-nptl layout both
+ * architectures share: 24-pointer header padding (192) + list_head (16).
+ */
+static __always_inline void* get_glibc_pthread_descriptor(
     const struct task_struct* cur_task) {
   const uint32_t offsetof_tid = 0xd0;
   void* clear_child_tid = (void*)BPF_PROBE_READ(cur_task, clear_child_tid);
@@ -21,7 +35,7 @@ static __always_inline void* get_riscv_pthread_descriptor(
  * specific_1stblock is 0x30 bytes after robust_head in both of glibc's
  * robust-mutex layouts.
  */
-static __always_inline void* get_riscv_specific1stblock(
+static __always_inline void* get_glibc_specific1stblock(
     const struct task_struct* cur_task) {
   void* robust_list = (void*)BPF_PROBE_READ(cur_task, robust_list);
   return IS_VALID_USER_SPACE_ADDRESS(robust_list)
@@ -44,11 +58,8 @@ __hidden int probe_read_pthread_tls_slot(
 #if __x86_64__
   void* tls_base = (void*)BPF_PROBE_READ(cur_task, thread.fsbase);
   void* specific1stblock = (char*)tls_base + 0x310;
-#elif __aarch64__
-  void* tls_base = (void*)BPF_PROBE_READ(cur_task, thread.uw.tp_value);
-  void* specific1stblock = (char*)tls_base + 0x310;
-#elif __riscv64__
-  void* specific1stblock = get_riscv_specific1stblock(cur_task);
+#elif __aarch64__ || __riscv64__
+  void* specific1stblock = get_glibc_specific1stblock(cur_task);
   if (!specific1stblock) {
     *value = 0;
     return -1;
@@ -70,8 +81,9 @@ __hidden int probe_read_pthread_tls_slot(
   //   pthread->specific[key / 32][key % 32].data
   //
   // 'struct pthread' is not in the public API.
-  // - x86-64 and AArch64 use fixed offset above.
-  // - RISC-V derives the block from the kernel's glibc robust-list pointer.
+  // - x86-64 uses the fixed offset above (fsbase is the descriptor itself).
+  // - AArch64 and RISC-V derive the block from the kernel's glibc
+  //   robust-list pointer.
   //   (https://codebrowser.dev/glibc/glibc/sysdeps/nptl/dl-tls_init_tp.c.html#92)
   const uint32_t specific1stblock_count = 32;
   const uint32_t sizeof_pthread_key_data = 16;
