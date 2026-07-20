@@ -610,6 +610,10 @@ pub struct Config {
     /// Resolve user-space symbols from ELF symbol tables only (no DWARF
     /// debug info, line info, inlined functions, or debuginfod)
     pub symbolize_names_only: bool,
+    /// Collapse generic/template argument groups in symbol names longer
+    /// than 256 bytes (`path::func<...>`), bounding the cost of deeply
+    /// monomorphized Rust/C++ names; shorter names are unchanged
+    pub symbolize_elide_generics: bool,
     /// Disable scheduler tracing
     pub no_sched: bool,
     /// Disable IRQ/softirq tracing
@@ -703,6 +707,7 @@ impl Default for Config {
             no_gopclntab: false,
             no_exited_recovery: false,
             symbolize_names_only: false,
+            symbolize_elide_generics: false,
             no_sched: false,
             no_irq: false,
             syscalls: false,
@@ -1604,6 +1609,13 @@ fn configure_recorder(opts: &Config, recorder: &Arc<SessionRecorder>) {
                  to fetch the debug info names-only symbolization skips)"
             );
         }
+    }
+    if opts.symbolize_elide_generics {
+        recorder
+            .stack_recorder
+            .lock()
+            .unwrap()
+            .set_elide_generics(true);
     }
 }
 

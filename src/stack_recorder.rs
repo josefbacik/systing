@@ -574,6 +574,16 @@ pub struct StackRecorder {
     /// mid-build) accumulates past any fixed budget — while the
     /// symbol-table path costs a few MiB per binary for identical names.
     names_only: bool,
+    /// When set, symbol names longer than
+    /// [`crate::symbol_shorten::ELIDE_GATE`] bytes have their generic /
+    /// template argument groups collapsed (`a::b<X<Y>, Z>::c(P)` renders
+    /// as `a::b<...>::c(...)`). Deeply monomorphized Rust and C++ names
+    /// legitimately demangle to multi-KiB strings; with stacks
+    /// materialized as per-frame strings, one hot kilobyte-scale name
+    /// repeated across millions of frames dominates recorder memory and
+    /// trace size. Shorter names are unchanged; longer names keep their
+    /// path head and function segment. See [`crate::symbol_shorten`].
+    elide_generics: bool,
     /// Executable-mapping snapshots and pinned backing files, captured at
     /// each process's first stack sample so processes that exit before
     /// end-of-trace symbolization can still be symbolized. Shared: the
@@ -612,6 +622,7 @@ impl StackRecorder {
             gvisor_guest_maps: true,
             gopclntab: true,
             names_only: false,
+            elide_generics: false,
             exit_snapshots: Arc::new(Mutex::new(ExitSnapshots::new())),
         }
     }
@@ -643,6 +654,12 @@ impl StackRecorder {
     /// `names_only` field docs for what is kept and what is lost).
     pub fn set_names_only(&mut self, enabled: bool) {
         self.names_only = enabled;
+    }
+
+    /// Collapse generic/template argument groups in over-long symbol
+    /// names (see the `elide_generics` field docs).
+    pub fn set_elide_generics(&mut self, enabled: bool) {
+        self.elide_generics = enabled;
     }
 
     /// Disable querying gVisor control sockets for guest maps.
@@ -1000,7 +1017,7 @@ impl StackRecorder {
             .ok()
             .and_then(|s| s.into_sym())
         {
-            return format_symbolized_frame(&sym, addr, "unknown");
+            return format_symbolized_frame(&sym, addr, "unknown", self.elide_generics);
         }
 
         if let Some(bridge) = ctx.maps.and_then(|m| m.bridge_for(addr)) {
@@ -1014,7 +1031,12 @@ impl StackRecorder {
             {
                 // sym.module would render the map_files link; report the
                 // original binary the island belongs to instead.
-                return format_symbolized_frame_forced_module(&sym, addr, &bridge.module_name);
+                return format_symbolized_frame_forced_module(
+                    &sym,
+                    addr,
+                    &bridge.module_name,
+                    self.elide_generics,
+                );
             }
         }
 
@@ -1107,6 +1129,7 @@ impl StackRecorder {
                                 &sym,
                                 addr,
                                 &resolved.module,
+                                self.elide_generics,
                             ));
                             continue;
                         }
@@ -1129,7 +1152,7 @@ impl StackRecorder {
                         .symbolize_single(kernel_src, Input::AbsAddr(addr))
                         .ok()
                         .and_then(|s| s.into_sym())
-                        .map(|s| format_symbolized_frame(&s, addr, "[kernel]"))
+                        .map(|s| format_symbolized_frame(&s, addr, "[kernel]", self.elide_generics))
                         .unwrap_or_else(|| format!("unknown ([kernel]) <{addr:#x}>"))
                 })
                 .clone();
@@ -1162,7 +1185,16 @@ fn format_location_info(code_info: Option<&blazesym::symbolize::CodeInfo>) -> St
 
 /// Formats a symbolized frame as a string with module and location info.
 /// Format: "function_name (module_name [file:line]) <0xaddr>"
-fn format_symbolized_frame(sym: &Sym, addr: u64, default_module: &str) -> String {
+///
+/// With `elide_generics` set, over-long function names have their
+/// generic/template argument groups collapsed first (see
+/// [`crate::symbol_shorten`]).
+fn format_symbolized_frame(
+    sym: &Sym,
+    addr: u64,
+    default_module: &str,
+    elide_generics: bool,
+) -> String {
     let module_name = sym
         .module
         .as_ref()
@@ -1170,19 +1202,27 @@ fn format_symbolized_frame(sym: &Sym, addr: u64, default_module: &str) -> String
         .and_then(|m| std::path::Path::new(m).file_name())
         .and_then(|f| f.to_str())
         .unwrap_or(default_module);
-    format_symbolized_frame_forced_module(sym, addr, module_name)
+    format_symbolized_frame_forced_module(sym, addr, module_name, elide_generics)
 }
 
 /// Same as [`format_symbolized_frame`] but with a caller-supplied module
 /// name. Used when symbolization went through an indirect source (e.g. a
 /// `map_files` link for a bridged island) whose path would be meaningless to
 /// report.
-fn format_symbolized_frame_forced_module(sym: &Sym, addr: u64, module_name: &str) -> String {
+fn format_symbolized_frame_forced_module(
+    sym: &Sym,
+    addr: u64,
+    module_name: &str,
+    elide_generics: bool,
+) -> String {
     let location_info = format_location_info(sym.code_info.as_deref());
-    format!(
-        "{} ({}{}) <{:#x}>",
-        sym.name, module_name, location_info, addr
-    )
+    let name: &str = &sym.name;
+    let name = if elide_generics {
+        crate::symbol_shorten::shorten_name(name)
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    };
+    format!("{name} ({module_name}{location_info}) <{addr:#x}>")
 }
 
 /// Create a debuginfod dispatcher if debuginfod is available in the environment
