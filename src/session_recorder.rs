@@ -392,6 +392,46 @@ fn get_host_netns_inode() -> Option<u64> {
     get_netns_inode(1)
 }
 
+/// Extends `netns_map` with the network namespaces of `pids`. Existing
+/// entries win: a namespace already present keeps its representative (the
+/// host entry and recorded processes are seeded before any wider walk).
+/// Pids that disappear between enumeration and the /proc reads are skipped
+/// — `get_netns_inode` returns None for them.
+fn extend_netns_map(
+    netns_map: &mut HashMap<u64, NetnsInfo>,
+    host_netns_inode: Option<u64>,
+    pids: impl Iterator<Item = u32>,
+) {
+    for pid in pids {
+        if let Some(inode) = get_netns_inode(pid) {
+            netns_map.entry(inode).or_insert_with(|| {
+                let is_host = host_netns_inode == Some(inode);
+                NetnsInfo {
+                    inode,
+                    representative_pid: pid,
+                    container_id: if is_host { None } else { get_container_id(pid) },
+                    comm: get_comm(pid),
+                    is_host,
+                }
+            });
+        }
+    }
+}
+
+/// Every pid currently visible in /proc (numeric entries only).
+fn all_proc_pids() -> impl Iterator<Item = u32> {
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+        })
+}
+
 /// Attempts to extract a container ID from a process's cgroup information.
 /// Looks for Docker/containerd container IDs in the cgroup path.
 fn get_container_id(pid: u32) -> Option<String> {
@@ -1225,21 +1265,30 @@ impl SessionRecorder {
         }
 
         // Iterate through all recorded processes to find unique network namespaces
-        for tgidpid in self.process_descriptors.read().unwrap().keys() {
-            let pid = (*tgidpid >> 32) as u32;
+        {
+            let descriptors = self.process_descriptors.read().unwrap();
+            let recorded_pids = descriptors.keys().map(|tgidpid| (*tgidpid >> 32) as u32);
+            extend_netns_map(&mut netns_map, host_netns_inode, recorded_pids);
+        }
 
-            if let Some(inode) = get_netns_inode(pid) {
-                netns_map.entry(inode).or_insert_with(|| {
-                    let is_host = host_netns_inode == Some(inode);
-                    NetnsInfo {
-                        inode,
-                        representative_pid: pid,
-                        container_id: if is_host { None } else { get_container_id(pid) },
-                        comm: get_comm(pid),
-                        is_host,
-                    }
-                });
-            }
+        // When the network recorder captured events this session, extend the
+        // walk to every pid on the node. State-only network recording
+        // (--only-recorder network) records no tasks, so the recorded-process
+        // walk above typically sees only the host namespace — leaving every
+        // pod/container-sourced socket in network_socket with no netns/IP row
+        // to attribute against. Deduplication by netns inode keeps the added
+        // cost to one /proc/<pid>/ns/net stat per process plus one
+        // cgroup+comm read per NEW namespace. Gated on network activity so
+        // traces without network events pay neither the walk nor the
+        // per-namespace setns interface enumeration below.
+        if self
+            .network_recorder
+            .lock()
+            .unwrap()
+            .min_timestamp()
+            .is_some()
+        {
+            extend_netns_map(&mut netns_map, host_netns_inode, all_proc_pids());
         }
 
         // Sort namespaces: host first, then by inode for consistent ordering
@@ -2916,5 +2965,71 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(rows, 1, "drained sample reaches the collector");
+    }
+
+    /// The netns inode of this test process, read the same way
+    /// `get_netns_inode` reads it for arbitrary pids.
+    fn self_netns_inode() -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self/ns/net").unwrap().ino()
+    }
+
+    #[test]
+    fn extend_netns_map_skips_dead_pids() {
+        let mut map: HashMap<u64, NetnsInfo> = HashMap::new();
+        extend_netns_map(&mut map, None, [TEST_PID_A, TEST_PID_B].into_iter());
+        assert!(
+            map.is_empty(),
+            "pids with no /proc entry must be skipped, not inserted"
+        );
+    }
+
+    #[test]
+    fn extend_netns_map_adds_self_and_dedups() {
+        let self_pid = std::process::id();
+        let mut map: HashMap<u64, NetnsInfo> = HashMap::new();
+
+        extend_netns_map(&mut map, None, std::iter::once(self_pid));
+        assert_eq!(map.len(), 1, "own netns discovered via /proc");
+        let inode = self_netns_inode();
+        assert_eq!(map[&inode].representative_pid, self_pid);
+
+        // A second walk over the same pid must not duplicate or replace.
+        extend_netns_map(&mut map, None, std::iter::once(self_pid));
+        assert_eq!(map.len(), 1, "same netns inode deduplicates");
+    }
+
+    #[test]
+    fn extend_netns_map_existing_entry_wins() {
+        let self_pid = std::process::id();
+        let inode = self_netns_inode();
+        let mut map: HashMap<u64, NetnsInfo> = HashMap::new();
+        map.insert(
+            inode,
+            NetnsInfo {
+                inode,
+                representative_pid: TEST_PID_A,
+                container_id: None,
+                comm: "seeded".to_string(),
+                is_host: false,
+            },
+        );
+
+        extend_netns_map(&mut map, None, std::iter::once(self_pid));
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map[&inode].representative_pid, TEST_PID_A,
+            "a seeded representative (host entry / recorded process) must not \
+             be replaced by the wider walk"
+        );
+    }
+
+    #[test]
+    fn all_proc_pids_sees_self() {
+        let self_pid = std::process::id();
+        assert!(
+            all_proc_pids().any(|pid| pid == self_pid),
+            "the /proc walk must include the current process"
+        );
     }
 }
