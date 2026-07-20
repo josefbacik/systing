@@ -59,6 +59,7 @@ pub mod sched;
 pub mod session_recorder;
 pub mod stack_recorder;
 pub mod stream;
+pub mod symbol_shorten;
 pub mod systing_core;
 pub mod tpu;
 pub mod trace;

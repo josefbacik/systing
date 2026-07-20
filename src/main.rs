@@ -92,6 +92,15 @@ struct Command {
     /// GiBs.
     #[arg(long)]
     symbolize_names_only: bool,
+    /// Collapse generic/template argument groups in over-long symbol names:
+    /// names longer than 256 bytes render as `path::func<...>` instead of
+    /// carrying the full monomorphized argument list, keeping their path
+    /// head and function segment. Deeply generic Rust and C++ names
+    /// legitimately demangle to multi-kilobyte strings; one hot name
+    /// repeated across millions of recorded frames dominates recorder
+    /// memory and trace size. Names of 256 bytes or less are unchanged.
+    #[arg(long)]
+    symbolize_elide_generics: bool,
     /// Disable scheduler event tracing (sched_* tracepoints and scheduler event recorder)
     #[arg(long)]
     no_sched: bool,
@@ -227,6 +236,7 @@ impl From<Command> for Config {
             no_gopclntab: cmd.no_gopclntab,
             no_exited_recovery: cmd.no_exited_recovery,
             symbolize_names_only: cmd.symbolize_names_only,
+            symbolize_elide_generics: cmd.symbolize_elide_generics,
             no_sched: cmd.no_sched,
             no_irq: cmd.no_irq,
             syscalls: cmd.syscalls,
