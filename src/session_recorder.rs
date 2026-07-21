@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::Result;
@@ -33,7 +32,7 @@ use perfetto_protos::process_descriptor::ProcessDescriptor;
 use perfetto_protos::process_tree::process_tree::Process as ProtoProcess;
 use perfetto_protos::system_info::Utsname;
 use perfetto_protos::thread_descriptor::ThreadDescriptor;
-use std::fs::{self, File};
+use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -492,39 +491,111 @@ fn get_comm(pid: u32) -> String {
         .unwrap_or_default()
 }
 
-/// Retrieves network interfaces from within a specific network namespace.
-/// This function temporarily enters the target namespace, enumerates interfaces,
-/// and then returns to the original namespace.
+/// Retrieves network interface addresses for `pid`'s network namespace by
+/// reading `/proc/<pid>/net/` — which reflects that pid's namespace — without
+/// entering it.
+///
+/// The previous implementation entered the namespace with
+/// `setns(CLONE_NEWNET)`, which requires `CAP_SYS_ADMIN`. Deployments that
+/// run the recorder under a restricted capability set (ptrace/BPF only, no
+/// SYS_ADMIN) had every non-host enumeration fail — and fail silently, since
+/// `setns`'s error path returned an empty list indistinguishable from a
+/// namespace with no addresses. Reading the proc files needs only ordinary
+/// file access, so this works under the same permissions that make the rest
+/// of the walk possible.
+///
+/// IPv6 addresses come from `if_inet6`, which names the owning interface.
+/// IPv4 local addresses come from the `fib_trie` local-table dump, which
+/// does not name interfaces — those are grouped under an empty interface
+/// name rather than guessed.
 fn get_interfaces_in_netns(pid: u32) -> Vec<NetworkInterface> {
-    let self_netns = match File::open("/proc/self/ns/net") {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
+    let mut interfaces: HashMap<String, NetworkInterface> = HashMap::new();
 
-    let target_netns_path = format!("/proc/{pid}/ns/net");
-    let target_netns = match File::open(&target_netns_path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-
-    // SAFETY: target_netns is a valid file descriptor obtained from File::open() on a
-    // namespace pseudo-file. CLONE_NEWNET is a valid namespace type. The setns syscall
-    // is safe to call with these arguments - it only changes the calling thread's namespace.
-    if unsafe { libc::setns(target_netns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
-        return Vec::new();
+    if let Ok(content) = fs::read_to_string(format!("/proc/{pid}/net/if_inet6")) {
+        for (name, addr) in parse_if_inet6(&content) {
+            interfaces
+                .entry(name.clone())
+                .or_insert_with(|| NetworkInterface {
+                    name,
+                    ipv4_addrs: Vec::new(),
+                    ipv6_addrs: Vec::new(),
+                })
+                .ipv6_addrs
+                .push(addr);
+        }
     }
 
-    let interfaces = get_network_interfaces();
-
-    // SAFETY: self_netns is a valid file descriptor for our original namespace, obtained
-    // before switching. This restores the thread to its original network namespace.
-    if unsafe { libc::setns(self_netns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
-        eprintln!(
-            "WARNING: Failed to restore original network namespace after enumerating interfaces for pid {pid}"
-        );
+    if let Ok(content) = fs::read_to_string(format!("/proc/{pid}/net/fib_trie")) {
+        let v4 = parse_fib_trie_local(&content);
+        if !v4.is_empty() {
+            let entry = interfaces
+                .entry(String::new())
+                .or_insert_with(|| NetworkInterface {
+                    name: String::new(),
+                    ipv4_addrs: Vec::new(),
+                    ipv6_addrs: Vec::new(),
+                });
+            entry.ipv4_addrs.extend(v4);
+        }
     }
 
-    interfaces
+    interfaces.into_values().collect()
+}
+
+/// Parses `/proc/<pid>/net/if_inet6` into `(interface_name, address)` pairs.
+///
+/// Each line is `<32 hex chars> <ifindex> <prefixlen> <scope> <flags> <name>`;
+/// malformed lines are skipped rather than failing the enumeration.
+fn parse_if_inet6(content: &str) -> Vec<(String, Ipv6Addr)> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(hex), Some(name)) = (fields.next(), fields.nth(4)) else {
+            continue;
+        };
+        if hex.len() != 32 {
+            continue;
+        }
+        let mut segments = [0u16; 8];
+        let mut valid = true;
+        for (i, segment) in segments.iter_mut().enumerate() {
+            match u16::from_str_radix(&hex[i * 4..i * 4 + 4], 16) {
+                Ok(v) => *segment = v,
+                Err(_) => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if valid {
+            out.push((name.to_string(), Ipv6Addr::from(segments)));
+        }
+    }
+    out
+}
+
+/// Parses the local addresses out of a `/proc/<pid>/net/fib_trie` dump.
+///
+/// The dump prints trie leaves as `|-- <address>` lines followed by one
+/// attribute line per prefix; a local (host-assigned) address carries
+/// `/32 host LOCAL`. The same leaf appears in both the `Local:` and `Main:`
+/// table sections, so results are deduplicated. Addresses only ever ROUTED
+/// through the namespace carry other attribute strings (`link UNICAST`,
+/// `unicast`, `/32 link BROADCAST`, …) and are not local addresses.
+fn parse_fib_trie_local(content: &str) -> Vec<Ipv4Addr> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut current: Option<Ipv4Addr> = None;
+    for line in content.lines() {
+        let trimmed = line.trim_start_matches([' ', '|', '+', '-']);
+        if let Some(addr_str) = line.split("|--").nth(1) {
+            current = addr_str.trim().parse::<Ipv4Addr>().ok();
+        } else if trimmed.starts_with("/32 host LOCAL") {
+            if let Some(addr) = current {
+                seen.insert(addr);
+            }
+        }
+    }
+    seen.into_iter().collect()
 }
 
 /// Retrieves all network interfaces and their IP addresses using getifaddrs.
@@ -1310,6 +1381,21 @@ impl SessionRecorder {
             } else {
                 get_interfaces_in_netns(netns_info.representative_pid)
             };
+
+            // An empty result for a real (non-host) namespace means its
+            // sockets cannot be attributed downstream. That was previously
+            // indistinguishable from a namespace with no addresses — the
+            // failed-enumeration case returned the same empty list with no
+            // diagnostic, which is how a permissions regression here stayed
+            // invisible. One line per affected namespace per trace, bounded
+            // by the namespace count.
+            if interfaces.is_empty() && !netns_info.is_host {
+                eprintln!(
+                    "WARNING: no addresses enumerated for network namespace {netns_name} \
+                     (representative pid {}); its sockets will be unattributable",
+                    netns_info.representative_pid
+                );
+            }
 
             // Write a record for each interface and IP address
             for iface in interfaces {
@@ -3030,6 +3116,71 @@ mod tests {
         assert!(
             all_proc_pids().any(|pid| pid == self_pid),
             "the /proc walk must include the current process"
+        );
+    }
+
+    #[test]
+    fn parse_if_inet6_real_format() {
+        let content = "\
+00000000000000000000000000000001 01 80 10 80       lo
+fe800000000000000042aafffe000001 02 40 20 80     eth0
+this line is not an if_inet6 entry
+00000000000000000000000000000001 01 80 10 80\n";
+        let parsed = parse_if_inet6(content);
+        assert_eq!(
+            parsed,
+            vec![
+                ("lo".to_string(), "::1".parse().unwrap()),
+                ("eth0".to_string(), "fe80::42:aaff:fe00:1".parse().unwrap()),
+            ],
+            "well-formed lines parse; malformed and truncated lines are skipped"
+        );
+    }
+
+    #[test]
+    fn parse_fib_trie_local_dedupes_and_filters() {
+        let content = "\
+Local:
+  +-- 0.0.0.0/0 3 0 5
+     |-- 10.0.0.5
+        /32 host LOCAL
+     +-- 127.0.0.0/8 2 0 2
+        |-- 127.0.0.1
+           /32 host LOCAL
+        |-- 127.255.255.255
+           /32 link BROADCAST
+Main:
+  +-- 0.0.0.0/0 3 0 5
+     |-- 10.0.0.5
+        /32 host LOCAL
+     |-- 10.0.0.0
+        /24 unicast\n";
+        let parsed = parse_fib_trie_local(content);
+        assert_eq!(
+            parsed,
+            vec![
+                "10.0.0.5".parse::<Ipv4Addr>().unwrap(),
+                "127.0.0.1".parse().unwrap(),
+            ],
+            "host LOCAL entries collected once each; broadcast and routed \
+             prefixes excluded"
+        );
+    }
+
+    #[test]
+    fn proc_enumeration_sees_own_loopback() {
+        // /proc/<self>/net reflects our own namespace, and loopback is
+        // always assigned — so the enumeration must find 127.0.0.1 without
+        // any namespace-entry privileges. This is the regression test for
+        // the capability-free property itself.
+        let interfaces = get_interfaces_in_netns(std::process::id());
+        let v4: Vec<_> = interfaces
+            .iter()
+            .flat_map(|i| i.ipv4_addrs.iter())
+            .collect();
+        assert!(
+            v4.contains(&&"127.0.0.1".parse().unwrap()),
+            "own-namespace enumeration must include loopback, got: {v4:?}"
         );
     }
 }
