@@ -1,5 +1,6 @@
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ use crate::utid::{ThreadAwareRecorder, UtidGenerator};
 use blazesym::helper::{read_elf_build_id, ElfResolver};
 use blazesym::symbolize::source::{Elf, Kernel, Process, Source};
 use blazesym::symbolize::{
-    cache, Input, ProcessMemberInfo, ProcessMemberType, Resolve, Sym, Symbolizer,
+    cache, evict, Input, ProcessMemberInfo, ProcessMemberType, Resolve, Sym, Symbolizer,
 };
 use blazesym::Error as BlazeErr;
 use blazesym::Pid;
@@ -441,6 +442,30 @@ fn emit_stack_record(
     })
 }
 
+/// Maximum number of distinct exit-snapshot ELF paths the symbolizer may
+/// hold cached before the exited-process pass evicts them. blazesym keeps
+/// one open descriptor per distinct binary it touches and never drops it on
+/// its own, so without eviction the pass would duplicate up to the snapshot
+/// layer's whole pinned-file cap on top of the pins themselves. A small
+/// batch keeps the duplicate descriptors well below that cap while still
+/// amortizing re-parses across many stacks.
+const EXITED_ELF_EVICT_BATCH: usize = 64;
+
+/// Evict the symbolizer's cached state for each touched exit-snapshot ELF
+/// path, closing the descriptor blazesym holds for it. A failed eviction
+/// only means that descriptor lives until the symbolizer is dropped, so it
+/// is not worth failing symbolization over.
+fn evict_exited_elf_paths(symbolizer: &mut Symbolizer, paths: &mut HashSet<PathBuf>) {
+    for path in paths.drain() {
+        if let Err(e) = symbolizer.evict(&evict::Evict::from(evict::Elf::new(path.clone()))) {
+            eprintln!(
+                "Warning: failed to evict symbolizer cache entry for {}: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
 /// Read one spill record. Returns `Ok(None)` on clean EOF, `Err` on a torn
 /// record (which terminates reading; the writer warned when it happened).
 fn read_spill_record(reader: &mut BufReader<File>) -> Result<Option<(Stack, i32, i64)>> {
@@ -829,9 +854,10 @@ impl StackRecorder {
 
         // Pass 1: stream spilled stacks back from disk one record at a time
         // (then any kept in memory). Stacks of exited processes are emitted
-        // immediately: their user addresses cannot be symbolized at all
-        // (blazesym needs /proc/<pid>/maps), so they only need the kernel cache
-        // and a hex rendering, and their address vectors are freed right away.
+        // immediately: their user addresses resolve through the first-sample
+        // mapping snapshots where one was captured (see
+        // [`crate::exit_snapshot`]) and render as unknown otherwise, so
+        // their address vectors are freed right away.
         // Stacks of live processes are re-spilled into RESPILL_BUCKETS
         // tgid-hashed second-tier files for pass 2, so they stay on disk
         // instead of accumulating in memory.
@@ -852,10 +878,24 @@ impl StackRecorder {
             .collect();
         let mut tgid_alive: HashMap<i32, bool> = HashMap::new();
 
+        // Exit-snapshot ELF paths the symbolizer has touched and not yet
+        // evicted. The exited pass symbolizes through /proc/self/fd/<n>
+        // paths of files the snapshot layer holds open; blazesym opens its
+        // own duplicate descriptor per distinct binary and never drops it,
+        // so the pass evicts them in bounded batches (and once more when
+        // the pass ends).
+        let mut touched_exit_elf_paths: HashSet<PathBuf> = HashSet::new();
+
         // Each interner is dropped at the end of its loop iteration, releasing
         // its dedup table before the (memory-hungry) live-process pass below.
+        //
+        // A drain failure is captured rather than propagated on the spot so
+        // the eviction sweep below also covers the bail-out path (a
+        // propagated error would drop the symbolizer anyway; sweeping first
+        // keeps the pass's descriptor accounting uniform on every exit).
+        let mut exited_pass_result: Result<()> = Ok(());
         for mut interner in interners {
-            interner.spill.drain(|stack, tgid, stack_id| {
+            let result = interner.spill.drain(|stack, tgid, stack_id| {
                 let alive = *tgid_alive
                     .entry(tgid)
                     .or_insert_with(|| Path::new("/proc").join(tgid.to_string()).exists());
@@ -868,14 +908,21 @@ impl StackRecorder {
                     &stack,
                     tgid,
                     None,
+                    Some(&mut touched_exit_elf_paths),
                     &kernel_src,
                     &mut kernel_cache,
                 );
                 pb.inc(1);
                 emit_stack_record(collector, stack_id, frame_names)
-            })?;
+            });
+            if let Err(e) = result {
+                exited_pass_result = Err(e);
+                break;
+            }
         }
         drop(tgid_alive);
+        evict_exited_elf_paths(&mut symbolizer, &mut touched_exit_elf_paths);
+        exited_pass_result?;
         phase_rss("exited-process pass done");
 
         // Pass 2: symbolize live processes one re-spill bucket at a time, and
@@ -983,6 +1030,7 @@ impl StackRecorder {
                         &stack,
                         tgid,
                         Some((&ctx, &mut user_cache)),
+                        None,
                         &kernel_src,
                         &mut kernel_cache,
                     );
@@ -1077,12 +1125,19 @@ impl StackRecorder {
     /// [`crate::exit_snapshot`]) and otherwise rendered as
     /// `unknown ([exited]) <addr>` (or raw hex with labels disabled).
     /// Kernel addresses go through the shared `kernel_cache`.
+    ///
+    /// `touched_exit_elf_paths`, when provided by the exited pass, collects
+    /// the snapshot ELF paths this stack symbolized through; once enough
+    /// distinct paths accumulate they are evicted from the symbolizer so
+    /// its open descriptors cannot pile up across the pass.
+    #[allow(clippy::too_many_arguments)]
     fn symbolize_stack_frames(
         &self,
         symbolizer: &mut Symbolizer,
         stack: &Stack,
         tgid: i32,
         user: Option<(&UserSymbolizeCtx<'_>, &mut HashMap<u64, String>)>,
+        mut touched_exit_elf_paths: Option<&mut HashSet<PathBuf>>,
         kernel_src: &Source<'_>,
         kernel_cache: &mut HashMap<u64, String>,
     ) -> Vec<String> {
@@ -1110,34 +1165,59 @@ impl StackRecorder {
                 }
             }
             None => {
-                // One lock per dead-process stack rather than per frame; the
-                // hint drain thread only contends while this pass runs.
-                let exit_snapshots = self.exit_snapshots.lock().unwrap();
+                // One lock per dead-process stack rather than per frame
+                // (re-acquired if a batch eviction fires mid-stack, so the
+                // hint drain thread is never blocked behind eviction work);
+                // the drain thread only contends while this pass runs.
+                let mut exit_snapshots = self.exit_snapshots.lock().unwrap();
                 for &addr in &stack.user_stack {
-                    if let Some(resolved) = exit_snapshots.resolve(tgid, addr) {
+                    let resolved_frame = if let Some(resolved) = exit_snapshots.resolve(tgid, addr)
+                    {
                         let mut elf = Elf::new(&resolved.elf_path);
                         elf.debug_syms = !self.names_only;
                         let elf_src = Source::Elf(elf);
-                        if let Some(sym) = symbolizer
+                        let frame = symbolizer
                             .symbolize_single(&elf_src, Input::FileOffset(resolved.file_offset))
                             .ok()
                             .and_then(|s| s.into_sym())
-                        {
-                            // sym.module would render the /proc/self/fd link;
-                            // report the binary the mapping belonged to.
-                            frame_names.push(format_symbolized_frame_forced_module(
-                                &sym,
-                                addr,
-                                &resolved.module,
-                                self.elide_generics,
-                            ));
-                            continue;
+                            .map(|sym| {
+                                // sym.module would render the /proc/self/fd
+                                // link; report the binary the mapping
+                                // belonged to.
+                                format_symbolized_frame_forced_module(
+                                    &sym,
+                                    addr,
+                                    &resolved.module,
+                                    self.elide_generics,
+                                )
+                            });
+                        // Even a failed attempt leaves a descriptor-holding
+                        // cache entry behind, so the path is recorded — and
+                        // the batch bound enforced — per attempt: one deep
+                        // stack crossing many binaries must not exceed the
+                        // cap either.
+                        if let Some(touched) = touched_exit_elf_paths.as_deref_mut() {
+                            touched.insert(resolved.elf_path);
+                            if touched.len() >= EXITED_ELF_EVICT_BATCH {
+                                // If the drain thread re-pins a descriptor
+                                // number to a new file while the lock is
+                                // dropped, evicting the old path only drops
+                                // the new file's entry: a harmless re-parse.
+                                drop(exit_snapshots);
+                                evict_exited_elf_paths(symbolizer, touched);
+                                exit_snapshots = self.exit_snapshots.lock().unwrap();
+                            }
                         }
-                    }
-                    if self.frame_labels {
-                        frame_names.push(format!("unknown ([exited]) <{addr:#x}>"));
+                        frame
                     } else {
-                        frame_names.push(format!("0x{addr:x}"));
+                        None
+                    };
+                    match resolved_frame {
+                        Some(frame) => frame_names.push(frame),
+                        None if self.frame_labels => {
+                            frame_names.push(format!("unknown ([exited]) <{addr:#x}>"))
+                        }
+                        None => frame_names.push(format!("0x{addr:x}")),
                     }
                 }
             }
@@ -1842,6 +1922,122 @@ mod tests {
         assert_eq!(
             dead.frame_names[0],
             format!("unknown ([exited]) <{dead_addr:#x}>")
+        );
+    }
+
+    /// Number of open descriptors in this process that resolve to `path`.
+    fn fd_count_for(path: &Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.unwrap().path()).ok())
+            .filter(|target| target == path)
+            .count()
+    }
+
+    /// Evicting an exit-snapshot ELF path must close the descriptor the
+    /// symbolizer's cache holds for it; bounding descriptors in the exited
+    /// pass rests on exactly this property.
+    #[test]
+    fn test_evict_exited_elf_paths_closes_descriptors() {
+        use std::os::fd::AsRawFd as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        // A uniquely named copy of this test binary: descriptor counts for
+        // its path cannot be perturbed by concurrently running tests.
+        let elf_path = dir.path().join("evict-fd-target");
+        std::fs::copy(std::env::current_exe().unwrap(), &elf_path).unwrap();
+        let canonical = elf_path.canonicalize().unwrap();
+
+        // Stands in for an exit-snapshot pin: the descriptor whose
+        // /proc/self/fd path the exited pass symbolizes through.
+        let pin = File::open(&elf_path).unwrap();
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", pin.as_raw_fd()));
+
+        let rec = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
+        let mut symbolizer = rec.create_symbolizer();
+        let mut elf = Elf::new(&fd_path);
+        elf.debug_syms = false;
+        let elf_src = Source::Elf(elf);
+        // The offset need not resolve to a symbol: the attempt alone
+        // creates the descriptor-holding cache entry.
+        let _ = symbolizer.symbolize_single(&elf_src, Input::FileOffset(0x1000));
+        assert!(
+            fd_count_for(&canonical) >= 2,
+            "the symbolizer should hold its own descriptor besides the pin"
+        );
+
+        let mut touched: HashSet<PathBuf> = HashSet::from([fd_path]);
+        evict_exited_elf_paths(&mut symbolizer, &mut touched);
+        assert!(touched.is_empty(), "eviction should drain the touched set");
+        assert_eq!(
+            fd_count_for(&canonical),
+            1,
+            "only the pinned descriptor should survive eviction"
+        );
+    }
+
+    /// Pins that eviction leaves nothing behind for a recycled
+    /// /proc/self/fd/<n> path: after the descriptor number is re-pointed at
+    /// a different file, symbolization must read the new file and no
+    /// descriptor for the old one may survive.
+    ///
+    /// This cannot be hit in production today: each tick symbolizes with a
+    /// fresh symbolizer, and the snapshot layer's pins normally live for
+    /// the whole pass (cap eviction aside), so a descriptor number does not
+    /// change identity within a symbolizer's lifetime — and blazesym
+    /// re-stats unpinned paths, which self-heals plain reuse. The test pins
+    /// the behavior for a future longer-lived symbolizer, where a stale
+    /// entry could serve the wrong binary after a file-metadata collision.
+    #[test]
+    fn test_evict_exited_elf_paths_guards_fd_path_reuse() {
+        use std::os::fd::AsRawFd as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let not_elf = dir.path().join("reuse-not-elf");
+        std::fs::write(&not_elf, b"not an ELF at all").unwrap();
+        let not_elf_canonical = not_elf.canonicalize().unwrap();
+        let elf_path = dir.path().join("reuse-elf");
+        std::fs::copy(std::env::current_exe().unwrap(), &elf_path).unwrap();
+        let elf_canonical = elf_path.canonicalize().unwrap();
+
+        let pin = File::open(&not_elf).unwrap();
+        let fd = pin.as_raw_fd();
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{fd}"));
+
+        let rec = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
+        let mut symbolizer = rec.create_symbolizer();
+        let mut elf = Elf::new(&fd_path);
+        elf.debug_syms = false;
+        let elf_src = Source::Elf(elf);
+        // Parsing fails, but the cache entry (and its descriptor) exists.
+        let _ = symbolizer.symbolize_single(&elf_src, Input::FileOffset(0x1000));
+        assert_eq!(fd_count_for(&not_elf_canonical), 2);
+
+        let mut touched: HashSet<PathBuf> = HashSet::from([fd_path]);
+        evict_exited_elf_paths(&mut symbolizer, &mut touched);
+        assert_eq!(
+            fd_count_for(&not_elf_canonical),
+            1,
+            "eviction must also drop entries whose parse failed"
+        );
+
+        // Re-point the same descriptor number at the ELF, as descriptor
+        // recycling between snapshot generations would.
+        let replacement = File::open(&elf_path).unwrap();
+        // SAFETY: dup2 on descriptors this test owns; it atomically closes
+        // the old descriptor and reuses its number.
+        let rc = unsafe { libc::dup2(replacement.as_raw_fd(), fd) };
+        assert_eq!(rc, fd);
+
+        let _ = symbolizer.symbolize_single(&elf_src, Input::FileOffset(0x1000));
+        assert_eq!(
+            fd_count_for(&not_elf_canonical),
+            0,
+            "no descriptor for the replaced file may survive"
+        );
+        assert!(
+            fd_count_for(&elf_canonical) >= 3,
+            "the recycled path must be re-read from the new file"
         );
     }
 }
