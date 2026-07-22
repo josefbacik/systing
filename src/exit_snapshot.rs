@@ -213,8 +213,8 @@ impl ExitSnapshots {
     }
 
     /// Ensure the backing file of a parsed mapping is pinned. Returns false
-    /// when the file cannot be opened (the segment is then not recorded and
-    /// its addresses keep the [exited] rendering).
+    /// when the file cannot be opened or is not an ELF object (the segment
+    /// is then not recorded and its addresses keep the [exited] rendering).
     fn pin_file(&mut self, tgid: i32, parsed: &ParsedMapsLine) -> bool {
         if self.files.contains_key(&parsed.file) {
             return true;
@@ -253,10 +253,16 @@ impl ExitSnapshots {
 /// path through the process's root, then the plain path — each verified
 /// against the mapping's (device, inode) so a recycled or namespace-mismatched
 /// path can never pin the wrong file.
+///
+/// Whatever path opened it, the file must pass the ELF-magic screen: a
+/// non-ELF backing file can never symbolize, so pinning it is pure cost
+/// (see [`is_elf`]). A file that fails the screen fails it on every path
+/// (they all reach the same inode), so there is no point trying the next
+/// candidate.
 fn open_mapping_file(tgid: i32, parsed: &ParsedMapsLine) -> Option<File> {
     let link = format!("/proc/{tgid}/map_files/{:x}-{:x}", parsed.start, parsed.end);
     if let Ok(file) = File::open(link) {
-        return Some(file);
+        return is_elf(&file).then_some(file);
     }
     for candidate in [
         format!("/proc/{tgid}/root{}", parsed.path),
@@ -264,11 +270,32 @@ fn open_mapping_file(tgid: i32, parsed: &ParsedMapsLine) -> Option<File> {
     ] {
         if let Ok(file) = File::open(candidate) {
             if file_key(&file) == Some(parsed.file) {
-                return Some(file);
+                return is_elf(&file).then_some(file);
             }
         }
     }
     None
+}
+
+/// Whether the file starts with the ELF magic.
+///
+/// Executable file-backed mappings are not always ELF objects: runtimes
+/// that manage code or memory through memfd — sandbox runtimes mapping
+/// guest memory arenas, JITs mapping code files — produce maps entries
+/// that look file-backed and executable but hold raw bytes symbolization
+/// can never resolve. Pinning those files costs a descriptor per unique
+/// file with zero chance of a name, and because a held descriptor keeps
+/// an unlinked file alive, it can extend a dead process's memory arena
+/// until the next reset. On hosts dense with such processes the pinned
+/// set is dominated by these files; screening at pin time keeps the
+/// descriptor footprint proportional to real binaries.
+fn is_elf(file: &File) -> bool {
+    use std::os::unix::fs::FileExt;
+    let mut magic = [0u8; 4];
+    match file.read_exact_at(&mut magic, 0) {
+        Ok(()) => magic == [0x7f, b'E', b'L', b'F'],
+        Err(_) => false,
+    }
 }
 
 /// (device, inode) of an open file, encoded like the maps-line key.
@@ -476,5 +503,65 @@ mod tests {
             .filter(|segment| snapshots.files.contains_key(&segment.file))
             .count();
         assert!(resolvable <= 1);
+    }
+
+    #[test]
+    fn is_elf_screens_magic() {
+        use std::io::Write;
+        let exe = File::open("/proc/self/exe").expect("open own exe");
+        assert!(is_elf(&exe));
+        let mut junk = tempfile::tempfile().expect("tempfile");
+        junk.write_all(b"raw bytes, not an object").expect("write");
+        assert!(!is_elf(&junk));
+        // Shorter than the magic: the read fails, the screen rejects.
+        let empty = tempfile::tempfile().expect("tempfile");
+        assert!(!is_elf(&empty));
+    }
+
+    #[test]
+    fn capture_skips_non_elf_backing_files() {
+        // An exec-mapped memfd full of raw bytes: its maps line is
+        // executable and file-backed (leading '/', nonzero inode), which is
+        // exactly how runtime-managed memory arenas present. The screen must
+        // keep it out of the pinned set while real ELF mappings still pin.
+        let page = 4096usize;
+        let fd = unsafe { libc::memfd_create(b"junk\0".as_ptr().cast(), 0) };
+        assert!(fd >= 0, "memfd_create failed");
+        let junk = vec![0xAAu8; page];
+        let written = unsafe { libc::write(fd, junk.as_ptr().cast(), page) };
+        assert_eq!(written, page as isize, "memfd write failed");
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ | libc::PROT_EXEC,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED, "mmap failed");
+
+        let mut snapshots = ExitSnapshots::new();
+        let me = std::process::id() as i32;
+        snapshots.observe_tgid(me);
+        let snapshot = snapshots.snapshots.get(&me).expect("snapshot exists");
+        let mapped_start = mapped as u64;
+        assert!(
+            !snapshot
+                .segments
+                .iter()
+                .any(|segment| segment.start == mapped_start),
+            "non-ELF memfd mapping must not be recorded"
+        );
+        assert!(
+            !snapshot.segments.is_empty(),
+            "real ELF mappings must still be recorded"
+        );
+
+        unsafe {
+            libc::munmap(mapped, page);
+            libc::close(fd);
+        }
     }
 }
