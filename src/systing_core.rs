@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::events::{EventKeyType, EventProbe, SystingProbeRecorder};
 use crate::network_recorder;
@@ -3170,6 +3170,36 @@ struct ThreadHandles {
     task_info_tx: Sender<task_info>,
 }
 
+/// Wall-clock bracket around one step of the capture-stop transition.
+///
+/// Prints the begin line BEFORE the step runs and the elapsed line when the
+/// step completes, so shipped host logs localize a stall to the exact
+/// operation in flight: a host that wedges mid-step leaves the unclosed
+/// begin line as its last word. Plain stdout on purpose — these lines ride
+/// the same journald path operators already read the stop sequence from.
+struct StopPhase {
+    name: &'static str,
+    start: Instant,
+}
+
+fn stop_phase(name: &'static str) -> StopPhase {
+    println!("stop-phase: {name}...");
+    StopPhase {
+        name,
+        start: Instant::now(),
+    }
+}
+
+impl Drop for StopPhase {
+    fn drop(&mut self) {
+        println!(
+            "stop-phase: {} done in {}ms",
+            self.name,
+            self.start.elapsed().as_millis()
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_tracing_loop(
     handles: ThreadHandles,
@@ -3262,45 +3292,66 @@ fn run_tracing_loop(
         thread::sleep(Duration::from_secs(CONTINUOUS_MODE_STOP_DELAY_SECS));
     }
     println!("Stopping...");
-    skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
-    ringbuf_shutdown.signal();
-    for thread in handles.ringbuf_threads {
-        thread.join().expect("Failed to join thread");
+    {
+        let _p = stop_phase("disable tracing gate");
+        skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
+        ringbuf_shutdown.signal();
+    }
+    {
+        let _p = stop_phase("join ring buffer consumers");
+        for thread in handles.ringbuf_threads {
+            thread.join().expect("Failed to join thread");
+        }
     }
     // The exec handler thread reads from a channel fed by ringbuf callbacks,
     // so it terminates after ringbuf threads exit and senders are dropped.
     if let Some(thread) = handles.exec_handler_thread {
+        let _p = stop_phase("join exec handler");
         thread.join().expect("Failed to join exec handler thread");
     }
     shutdown_signal.store(true, Ordering::Relaxed);
     if let Some(thread) = handles.sysinfo_thread {
+        let _p = stop_phase("join sysinfo poller");
         thread.join().expect("Failed to join sysinfo thread");
     }
     // The missed-events poller takes one final sample after it observes the
     // shutdown flag; the ringbuf threads are already joined by then, so that
     // sample carries the settled totals.
-    handles
-        .missed_poller_thread
-        .join()
-        .expect("Failed to join missed-events poller thread");
+    {
+        let _p = stop_phase("join missed-events poller");
+        handles
+            .missed_poller_thread
+            .join()
+            .expect("Failed to join missed-events poller thread");
+    }
     if let Some(thread) = handles.tpu_metrics_thread {
+        let _p = stop_phase("join tpu metrics poller");
         if let Err(e) = thread.join() {
             eprintln!("TPU metrics thread panicked: {:?}", e);
         }
     }
-    for thread in handles.recorder_threads {
-        thread.join().expect("Failed to join receiver thread");
+    {
+        let _p = stop_phase("join recorder threads");
+        for thread in handles.recorder_threads {
+            thread.join().expect("Failed to join receiver thread");
+        }
     }
     // Drop senders to allow background threads to exit
-    drop(handles.task_info_tx);
-    handles
-        .discovery_thread
-        .join()
-        .expect("Failed to join discovery thread");
-    handles
-        .symbol_loader_thread
-        .join()
-        .expect("Failed to join symbol thread");
+    {
+        let _p = stop_phase("join discovery thread");
+        drop(handles.task_info_tx);
+        handles
+            .discovery_thread
+            .join()
+            .expect("Failed to join discovery thread");
+    }
+    {
+        let _p = stop_phase("join symbol loader");
+        handles
+            .symbol_loader_thread
+            .join()
+            .expect("Failed to join symbol thread");
+    }
 
     println!(
         "Missed sched/IRQ events: {}",
@@ -4001,15 +4052,26 @@ pub fn systing(
         // Load socket metadata from BPF map after tracing completes
         // This must be done while skel is still alive
         if opts.network {
+            let _p = stop_phase("load socket metadata");
             recorder
                 .network_recorder
                 .lock()
                 .unwrap()
                 .load_socket_metadata(&skel.maps.socket_metadata_map);
         }
+
+        // Make the implicit end-of-scope teardown an explicit, bracketed
+        // step: detaching the programs (probe links, then the skeleton's own
+        // links and maps) is the part of the stop transition that talks to
+        // the kernel on every CPU.
+        let _p = stop_phase("detach bpf programs");
+        drop(_memory_alloc_links);
+        drop(_probe_links);
+        drop(skel);
     }
 
     if opts.continuous > 0 {
+        let _p = stop_phase("drain recorder ringbuffers");
         println!("Draining recorder ringbuffers...");
         recorder.drain_all_ringbufs();
     }
@@ -4037,7 +4099,10 @@ pub fn systing(
 
     // Write trace files directly to Parquet
     println!("Writing Parquet trace files to {sink}...");
-    recorder.generate_parquet_trace(tpu_recorder)?;
+    {
+        let _p = stop_phase("symbolize and write parquet");
+        recorder.generate_parquet_trace(tpu_recorder)?;
+    }
     println!("Successfully wrote Parquet trace files");
 
     // The recorder still holds process/thread maps, symbolizer caches, etc.
