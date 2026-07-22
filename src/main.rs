@@ -77,11 +77,6 @@ struct Command {
     /// to symbol-table-only resolution, which renders them as hex)
     #[arg(long)]
     no_gopclntab: bool,
-    /// Do not capture mapping snapshots at each process's first stack
-    /// sample (revert to rendering processes that exit before end-of-trace
-    /// symbolization as "[exited]")
-    #[arg(long)]
-    no_exited_recovery: bool,
     /// Resolve user-space symbols from ELF symbol tables only: skips DWARF
     /// debug info, source line info, inlined-function resolution, and
     /// debuginfod. Function names are unchanged for binaries that carry a
@@ -234,7 +229,6 @@ impl From<Command> for Config {
             no_frame_labels: cmd.no_frame_labels,
             no_gvisor_guest_maps: cmd.no_gvisor_guest_maps,
             no_gopclntab: cmd.no_gopclntab,
-            no_exited_recovery: cmd.no_exited_recovery,
             symbolize_names_only: cmd.symbolize_names_only,
             symbolize_elide_generics: cmd.symbolize_elide_generics,
             no_sched: cmd.no_sched,

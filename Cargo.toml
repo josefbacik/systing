@@ -26,7 +26,7 @@ bitfield = "0.19.0"
 # 0.2.x releases (where Sym::code_info became Option<Box<CodeInfo>>), so
 # `cargo install` without --locked picked an incompatible version. An exact pin
 # keeps fresh resolutions reproducible.
-blazesym = { git = "https://github.com/libbpf/blazesym.git", rev = "8705da0a8cec2bb27f897ac732e27121f9be7936" }
+blazesym = { git = "https://github.com/libbpf/blazesym.git", rev = "862c2cf5d424307456322d2c68fe86c591baece2" }
 clap = { version = "4.5.20", features = ["derive"] }
 ctrlc = "3.4"
 dashmap = "6"
