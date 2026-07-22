@@ -677,8 +677,8 @@ dependencies = [
 
 [[package]]
 name = "blazesym"
-version = "0.2.6"
-source = "git+https://github.com/libbpf/blazesym.git?rev=8705da0a8cec2bb27f897ac732e27121f9be7936#8705da0a8cec2bb27f897ac732e27121f9be7936"
+version = "0.2.5"
+source = "git+https://github.com/libbpf/blazesym.git?rev=862c2cf5d424307456322d2c68fe86c591baece2#862c2cf5d424307456322d2c68fe86c591baece2"
 dependencies = [
  "cpp_demangle",
  "crc32fast",
