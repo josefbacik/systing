@@ -3,11 +3,10 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::exit_snapshot::ExitSnapshots;
 use crate::gvisor_guest::{GuestAddr, GuestProcess, SandboxIndex};
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::record::RecordCollector;
@@ -584,14 +583,6 @@ pub struct StackRecorder {
     /// trace size. Shorter names are unchanged; longer names keep their
     /// path head and function segment. See [`crate::symbol_shorten`].
     elide_generics: bool,
-    /// Executable-mapping snapshots and pinned backing files, captured at
-    /// each process's first stack sample so processes that exit before
-    /// end-of-trace symbolization can still be symbolized. Shared: the
-    /// snapshot-hint drain thread observes (captures) and the exec-event
-    /// handler invalidates through [`StackRecorder::exit_snapshots_handle`];
-    /// this recorder observes as a fallback, resolves, and resets. See
-    /// [`crate::exit_snapshot`].
-    exit_snapshots: Arc<Mutex<ExitSnapshots>>,
 }
 
 impl ThreadAwareRecorder for StackRecorder {
@@ -623,26 +614,12 @@ impl StackRecorder {
             gopclntab: true,
             names_only: false,
             elide_generics: false,
-            exit_snapshots: Arc::new(Mutex::new(ExitSnapshots::new())),
         }
-    }
-
-    /// Shared handle to the exited-process snapshot state, for the
-    /// snapshot-hint drain thread (timely capture) and the exec-event
-    /// handler (invalidation on exec).
-    pub fn exit_snapshots_handle(&self) -> Arc<Mutex<ExitSnapshots>> {
-        Arc::clone(&self.exit_snapshots)
     }
 
     /// Disable contextual labels on unresolvable frames (revert to bare hex).
     pub fn set_frame_labels(&mut self, enabled: bool) {
         self.frame_labels = enabled;
-    }
-
-    /// Disable first-sample mapping snapshots for post-mortem symbolization
-    /// of processes that exit before end-of-trace symbolization.
-    pub fn set_exited_recovery(&mut self, enabled: bool) {
-        self.exit_snapshots.lock().unwrap().set_enabled(enabled);
     }
 
     /// Disable `.gopclntab`-based symbolization of stripped Go binaries.
@@ -766,12 +743,7 @@ impl StackRecorder {
             .streaming_collector
             .take()
             .expect("streaming collector must be set");
-        let result = self.finish_inner(own.as_mut());
-        // Release pinned mapping descriptors whether or not symbolization
-        // succeeded: in continuous mode finish() runs every tick, and the
-        // next tick's processes get fresh snapshots.
-        self.exit_snapshots.lock().unwrap().reset();
-        result?;
+        self.finish_inner(own.as_mut())?;
         own.flush()?;
         own.finish_boxed()?;
         Ok(collector)
@@ -866,7 +838,6 @@ impl StackRecorder {
                 let frame_names = self.symbolize_stack_frames(
                     &mut symbolizer,
                     &stack,
-                    tgid,
                     None,
                     &kernel_src,
                     &mut kernel_cache,
@@ -981,7 +952,6 @@ impl StackRecorder {
                     let frame_names = self.symbolize_stack_frames(
                         &mut symbolizer,
                         &stack,
-                        tgid,
                         Some((&ctx, &mut user_cache)),
                         &kernel_src,
                         &mut kernel_cache,
@@ -1072,16 +1042,14 @@ impl StackRecorder {
     ///
     /// `user` carries the symbolization context and per-process address
     /// cache for a live process; `None` means the process has exited, in
-    /// which case user addresses are resolved from the process's
-    /// first-sample mapping snapshot where one was captured (see
-    /// [`crate::exit_snapshot`]) and otherwise rendered as
-    /// `unknown ([exited]) <addr>` (or raw hex with labels disabled).
-    /// Kernel addresses go through the shared `kernel_cache`.
+    /// which case user addresses cannot be symbolized (no /proc/<pid>/maps)
+    /// and are rendered as `unknown ([exited]) <addr>` (or raw hex with
+    /// labels disabled). Kernel addresses go through the shared
+    /// `kernel_cache`.
     fn symbolize_stack_frames(
         &self,
         symbolizer: &mut Symbolizer,
         stack: &Stack,
-        tgid: i32,
         user: Option<(&UserSymbolizeCtx<'_>, &mut HashMap<u64, String>)>,
         kernel_src: &Source<'_>,
         kernel_cache: &mut HashMap<u64, String>,
@@ -1110,30 +1078,7 @@ impl StackRecorder {
                 }
             }
             None => {
-                // One lock per dead-process stack rather than per frame; the
-                // hint drain thread only contends while this pass runs.
-                let exit_snapshots = self.exit_snapshots.lock().unwrap();
                 for &addr in &stack.user_stack {
-                    if let Some(resolved) = exit_snapshots.resolve(tgid, addr) {
-                        let mut elf = Elf::new(&resolved.elf_path);
-                        elf.debug_syms = !self.names_only;
-                        let elf_src = Source::Elf(elf);
-                        if let Some(sym) = symbolizer
-                            .symbolize_single(&elf_src, Input::FileOffset(resolved.file_offset))
-                            .ok()
-                            .and_then(|s| s.into_sym())
-                        {
-                            // sym.module would render the /proc/self/fd link;
-                            // report the binary the mapping belonged to.
-                            frame_names.push(format_symbolized_frame_forced_module(
-                                &sym,
-                                addr,
-                                &resolved.module,
-                                self.elide_generics,
-                            ));
-                            continue;
-                        }
-                    }
                     if self.frame_labels {
                         frame_names.push(format!("unknown ([exited]) <{addr:#x}>"));
                     } else {
@@ -1313,14 +1258,6 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
             let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
             let stack_key = (event.task.tgidpid >> 32) as i32;
             let py_stack = self.psr.get_pystack_from_event(&event);
-
-            // First sample from a process: it is on-CPU right now, so this
-            // is the earliest (and often only) chance to capture its
-            // mappings before it exits. Steady-state cost is one hash
-            // lookup per event.
-            if event.user_stack_length > 0 {
-                self.exit_snapshots.lock().unwrap().observe_tgid(stack_key);
-            }
 
             let stack = Stack::new(&kstack_vec, &ustack_vec, &py_stack);
             let tid = event.task.tgidpid as i32;
