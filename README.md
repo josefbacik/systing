@@ -91,6 +91,15 @@ This will display all available recorders and their default states:
 
 Python stack symbolization is not a recorder; enable it with `--collect-pystacks`, which resolves Python frames in whichever stacks the active recorders collect.
 
+`--collect-build-id` captures user stacks as (build-id, file offset) pairs
+instead of raw addresses, so frames of processes that exit before end-of-trace
+symbolization still resolve — through a build-id-keyed store filled from
+`/usr/lib/debug/.build-id`, debuginfod (with `--enable-debuginfod`), and the
+binaries of still-running processes. Frames whose build-id no source knows
+render as `unknown ([buildid:<hex>]) <0x<offset>>`, a stable identity that can
+be resolved offline later. Costs ~40% larger stack-ring reservations while
+enabled; off by default and free when off.
+
 Note: `sleep-stacks` acts as a master switch for all sleep stack collection. When enabled,
 both uninterruptible (D state) and interruptible (S state) sleep stacks are collected by
 default. Use `--no-interruptible-stack-traces` or disable the `interruptible-stacks`
