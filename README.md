@@ -83,11 +83,22 @@ sudo ./target/debug/systing --list-recorders
 
 This will display all available recorders and their default states:
 - `sched` - Scheduler event tracing (on by default)
+- `irq` - IRQ and softirq event tracing (on by default)
 - `syscalls` - Syscall tracing
 - `sleep-stacks` - Sleep stack traces for all sleep states (on by default)
 - `interruptible-stacks` - Interruptible sleep stack traces (on by default, requires sleep-stacks)
 - `cpu-stacks` - CPU perf stack traces (on by default)
-- `network` - Network traffic recording (TCP/UDP send/receive and packet-level latency)
+- `network` - Network connection state tracking
+- `network-syscalls` - Network syscall-level tracing (send/recv bytes, retransmits, drops, stalls) without per-packet probes
+- `network-packets` - Network packet-level tracing (sendmsg, recvmsg, qdisc, drops)
+- `memory` - Memory usage tracking (RSS, mmap/munmap/brk, page faults)
+- `memory-alloc` - Heap allocator uprobes (malloc/calloc/realloc/free) with stacks
+- `markers` - Userspace marker events (faccessat2 with mode=-975)
+- `tpu` - TPU profiling (gRPC to XLA runtime profiler service)
+- `tpu-metrics` - TPU runtime metrics polling (port 8431, always available)
+
+The three `network*` recorders are tiers of the same subsystem, ordered by event
+volume — see Network Traffic Recording below for when to use each.
 
 Python stack symbolization is not a recorder; enable it with `--collect-pystacks`, which resolves Python frames in whichever stacks the active recorders collect.
 
