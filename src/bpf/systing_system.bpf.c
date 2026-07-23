@@ -49,6 +49,22 @@
 #define SKIP_STACK_DEPTH 3
 #define NR_RINGBUFS 8
 
+/* Mirror of the kernel's struct bpf_stack_build_id (filled by bpf_get_stack
+ * under BPF_F_USER_BUILD_ID), with the offset/ip union flattened to one u64
+ * so the generated Rust type has no union member. status says which meaning
+ * the u64 carries: BPF_STACK_BUILD_ID_VALID = file offset (build_id is set),
+ * BPF_STACK_BUILD_ID_IP = raw instruction pointer (the kernel could not
+ * resolve the frame's VMA to a file with a build-id note, or could not walk
+ * safely in this context). */
+struct systing_stack_build_id {
+	s32 status;
+	u8 build_id[20];
+	u64 offset_or_ip;
+};
+_Static_assert(sizeof(struct systing_stack_build_id) ==
+		       sizeof(struct bpf_stack_build_id),
+	       "layout must match the kernel struct bpf_get_stack fills");
+
 #define SYS_ENTER_COOKIE 0xFFFFFFFFFFFFFFFEULL
 #define SYS_EXIT_COOKIE 0xFFFFFFFFFFFFFFFFULL
 
@@ -86,6 +102,14 @@ const volatile struct {
 	u32 no_sched;          /* Sched recorder off: sched_switch still runs for
 				* cpu_running_pid and sleep stacks, but task_event
 				* emission is suppressed. */
+	u32 collect_build_id;  /* User stacks carry (build_id, file offset) pairs
+				* instead of raw IPs (BPF_F_USER_BUILD_ID), and
+				* stack_event reservations include the
+				* user_stack_bid tail. rodata: with the knob off
+				* the verifier prunes the build-id arms entirely,
+				* so the off configuration is instruction- and
+				* reservation-identical to before the knob
+				* existed. */
 	u32 no_irq;            /* IRQ recorder off: the irq/softirq programs are
 				* not loaded at all in that case, so this rodata
 				* gate is belt-and-braces (and lets the verifier
@@ -196,18 +220,34 @@ struct marker_event {
 	u64 info;          // from args[3] (flags param of faccessat2)
 };
 
+/* user_stack_format values: which entry format the user_stack region
+ * carries. The capture mode is fixed for a whole run (rodata), so the
+ * per-event flag is belt-and-braces — it makes every record
+ * self-describing for downstream readers. */
+#define USER_STACK_FORMAT_IP 0
+#define USER_STACK_FORMAT_BUILD_ID 1
+
 struct stack_event {
 	enum stack_event_type stack_event_type;
 	u64 ts;
 	u32 cpu;
+	u32 user_stack_format;
 	struct task_info task;
 	u64 kernel_stack_length;
 	u64 user_stack_length;
 	u64 kernel_stack[MAX_STACK_DEPTH];
-	u64 user_stack[MAX_STACK_DEPTH];
 #ifdef SYSTING_PYSTACKS
 	struct pystacks_message py_msg_buffer;
 #endif
+	/* One region, tail by contract, sized for the larger (build-id) entry
+	 * format. Raw-IP mode packs u64 addresses from the region start and
+	 * uses less of it: reservations stop at
+	 * offsetof(user_stack) + MAX_STACK_DEPTH * sizeof(u64) — byte-for-byte
+	 * what the pre-build-id layout reserved — and userspace zero-extends
+	 * short records (the memory ring's variable-length pattern).
+	 * user_stack_format says how to parse; user_stack_length counts
+	 * entries of that format. */
+	struct systing_stack_build_id user_stack[MAX_STACK_DEPTH];
 };
 
 struct perf_counter_event {
@@ -1216,19 +1256,37 @@ static struct stack_event *reserve_stack_event(long *flags)
 	if (!rb)
 		return NULL;
 	*flags = get_ringbuf_flags(rb);
-	struct stack_event *event = bpf_ringbuf_reserve(rb, sizeof(struct stack_event), 0);
+	/*
+	 * Two reservation sizes over ONE user_stack region: raw-IP mode packs
+	 * u64s and reserves only the bytes it uses — byte-for-byte what the
+	 * pre-build-id layout reserved — while build-id mode reserves the full
+	 * region for the 32-byte entries. collect_build_id is rodata, so the
+	 * verifier prunes the dead branch at load time. Userspace zero-extends
+	 * short records (see create_ring_zero_extend), the same contract as
+	 * the memory ring.
+	 */
+	struct stack_event *event;
+	if (tool_config.collect_build_id)
+		event = bpf_ringbuf_reserve(rb, sizeof(struct stack_event), 0);
+	else
+		event = bpf_ringbuf_reserve(
+			rb,
+			offsetof(struct stack_event, user_stack) +
+				MAX_STACK_DEPTH * sizeof(u64),
+			0);
 	if (event) {
 		/*
 		 * When SYSTING_PYSTACKS is enabled, stack_event includes a large
 		 * pystacks_message buffer (~1KB). Zero only the base fields to avoid
 		 * emitting a memset call that BPF doesn't support for large sizes.
 		 * The py_msg_buffer is populated by pystacks_read_stacks() and doesn't
-		 * need pre-zeroing.
+		 * need pre-zeroing. The user_stack region is bounded by
+		 * user_stack_length, so it needs no pre-zeroing either.
 		 */
 #ifdef SYSTING_PYSTACKS
 		__builtin_memset(event, 0, offsetof(struct stack_event, py_msg_buffer));
 #else
-		__builtin_memset(event, 0, sizeof(*event));
+		__builtin_memset(event, 0, offsetof(struct stack_event, user_stack));
 #endif
 	}
 	return event;
@@ -1628,13 +1686,39 @@ static void emit_stack_event_with_ts(void *ctx, struct task_struct *task,
 	event->stack_event_type = type;
 
 	if (!(task->flags & PF_KTHREAD)) {
-		len = bpf_get_stack(ctx, &event->user_stack,
-				    sizeof(event->user_stack),
-				    BPF_F_USER_STACK);
-		if (len > 0)
-			event->user_stack_length = len / sizeof(u64);
-		else
-			event->user_stack_length = 0;
+		/*
+		 * Both modes walk into the same user_stack region; the entry
+		 * format (and how much of the region was reserved) differs.
+		 * Build-id mode: the kernel emits (build_id, file offset) per
+		 * frame where it can resolve the VMA's file (falling back to
+		 * the raw IP with status BPF_STACK_BUILD_ID_IP where it
+		 * cannot), so frames stay symbolizable after the process
+		 * exits. The extraction is the kernel's own bounded,
+		 * trylock-guarded walk (perf's build-id mechanism) — no code
+		 * of ours runs per frame, and with the rodata knob off this
+		 * arm is pruned at load time.
+		 */
+		if (tool_config.collect_build_id) {
+			event->user_stack_format = USER_STACK_FORMAT_BUILD_ID;
+			len = bpf_get_stack(ctx, &event->user_stack,
+					    sizeof(event->user_stack),
+					    BPF_F_USER_STACK |
+						    BPF_F_USER_BUILD_ID);
+			if (len > 0)
+				event->user_stack_length =
+					len / sizeof(struct systing_stack_build_id);
+			else
+				event->user_stack_length = 0;
+		} else {
+			event->user_stack_format = USER_STACK_FORMAT_IP;
+			len = bpf_get_stack(ctx, &event->user_stack,
+					    MAX_STACK_DEPTH * sizeof(u64),
+					    BPF_F_USER_STACK);
+			if (len > 0)
+				event->user_stack_length = len / sizeof(u64);
+			else
+				event->user_stack_length = 0;
+		}
 	} else {
 		event->user_stack_length = 0;
 	}

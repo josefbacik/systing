@@ -588,6 +588,11 @@ pub struct Config {
     pub continuous: u64,
     /// Collect Python stack traces
     pub collect_pystacks: bool,
+    /// Capture user stacks as (build-id, file offset) pairs instead of raw
+    /// IPs (BPF_F_USER_BUILD_ID), so frames of exited processes remain
+    /// symbolizable from a build-id-keyed store and unresolved frames keep a
+    /// durable identity (`unknown ([buildid:<hex>]) <0x<offset>>`)
+    pub collect_build_id: bool,
     /// Explicit PIDs for pystacks (bypasses auto-discovery)
     pub pystacks_pids: Vec<u32>,
     /// Enable debug output for pystacks
@@ -693,6 +698,7 @@ impl Default for Config {
             trace_event_config: Vec::new(),
             continuous: 0,
             collect_pystacks: false,
+            collect_build_id: false,
             pystacks_pids: Vec::new(),
             pystacks_debug: false,
             enable_debuginfod: false,
@@ -1003,6 +1009,35 @@ where
         // unbounded userspace queue.
         if tx.send(event).is_err() {
             // Receiver has been dropped, we can silently ignore this
+            return -1;
+        }
+        0
+    })?;
+    builder.build()
+}
+
+/// Like [`create_ring`] but tolerant of records shorter than `T`: the record
+/// zero-extends into a default `T`. The stack ring needs this because classic
+/// (non-build-id) reservations stop at `offsetof(stack_event, user_stack_bid)`
+/// — the same variable-length contract the memory ring has always used.
+fn create_ring_zero_extend<'a, T>(
+    map: &dyn libbpf_rs::MapCore,
+    tx: SyncSender<T>,
+) -> Result<libbpf_rs::RingBuffer<'a>, libbpf_rs::Error>
+where
+    T: Default + Plain + 'a,
+{
+    let mut builder = RingBufferBuilder::new();
+    builder.add(map, move |data: &[u8]| {
+        let mut event = T::default();
+        let len = data.len().min(std::mem::size_of::<T>());
+        // SAFETY: T is Plain (repr(C), no padding invariants) and
+        // default-initialized; we copy at most sizeof(T) bytes from the
+        // BPF-produced ringbuf record into its leading bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), &mut event as *mut T as *mut u8, len);
+        }
+        if tx.send(event).is_err() {
             return -1;
         }
         0
@@ -1548,6 +1583,13 @@ fn configure_recorder(opts: &Config, recorder: &Arc<SessionRecorder>) {
         let duration_nanos = Duration::from_secs(opts.continuous).as_nanos() as u64;
         set_ringbuf_duration(recorder, duration_nanos);
     }
+    if opts.collect_build_id {
+        recorder
+            .stack_recorder
+            .lock()
+            .unwrap()
+            .set_build_id_mode(true);
+    }
     if opts.no_frame_labels {
         recorder
             .stack_recorder
@@ -2063,7 +2105,7 @@ fn setup_ringbuffers<'a>(
             event_rxs.push(event_rx);
             rings.push((format!("events_{i}"), ring));
         } else if name.starts_with("ringbuf_stack") {
-            let ring = create_ring::<stack_event>(&map, stack_tx.clone())?;
+            let ring = create_ring_zero_extend::<stack_event>(&map, stack_tx.clone())?;
             rings.push((name.to_string(), ring));
         } else if name.starts_with("ringbuf_perf_counter")
             && required.contains("perf_counter_ringbufs")
@@ -2294,6 +2336,9 @@ fn configure_bpf_skeleton(
         }
         if collect_pystacks {
             rodata.tool_config.collect_pystacks = 1;
+        }
+        if opts.collect_build_id {
+            rodata.tool_config.collect_build_id = 1;
         }
         if opts.syscalls {
             rodata.tool_config.collect_syscalls = 1;

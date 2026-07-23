@@ -59,6 +59,12 @@ struct Command {
     continuous: u64,
     #[arg(long)]
     collect_pystacks: bool,
+    /// Capture user stacks as (build-id, file offset) pairs instead of raw
+    /// IPs, so frames of exited processes remain symbolizable from a
+    /// build-id-keyed store; unresolved frames render as
+    /// "unknown ([buildid:<hex>]) <0x<offset>>" and stay resolvable offline
+    #[arg(long)]
+    collect_build_id: bool,
     /// Enable debug output for pystacks (Python stack tracing)
     #[arg(long)]
     pystacks_debug: bool,
@@ -223,6 +229,7 @@ impl From<Command> for Config {
             trace_event_config: cmd.trace_event_config,
             continuous: cmd.continuous,
             collect_pystacks: cmd.collect_pystacks,
+            collect_build_id: cmd.collect_build_id,
             pystacks_pids: Vec::new(), // CLI doesn't expose this yet, uses discovery
             pystacks_debug: cmd.pystacks_debug,
             enable_debuginfod: cmd.enable_debuginfod,

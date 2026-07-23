@@ -208,6 +208,29 @@ impl ProcessMaps {
             .collect()
     }
 
+    /// Executable file-backed mappings as (namespace-immune `map_files`
+    /// link, display path) pairs, one per distinct file path. The link
+    /// opens the exact mapped file regardless of mount namespace (the maps
+    /// path may not resolve from the host); the display path names the
+    /// binary for humans. Feed for the build-id store's live-binary fills.
+    pub fn exec_file_links(&self) -> Vec<(PathBuf, PathBuf)> {
+        let mut seen = std::collections::HashSet::new();
+        self.entries
+            .iter()
+            .filter(|e| e.exec)
+            .filter_map(|e| match &e.backing {
+                Backing::File(p) if seen.insert(p.clone()) => Some((
+                    PathBuf::from(format!(
+                        "/proc/{}/map_files/{:x}-{:x}",
+                        self.tgid, e.start, e.end
+                    )),
+                    p.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn entry_for(&self, addr: u64) -> Option<&MapEntry> {
         // Entries are in address order as read from /proc.
         self.entries

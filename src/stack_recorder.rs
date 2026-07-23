@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+use crate::build_id_store::{build_id_hex, BuildIdStore};
 use crate::gvisor_guest::{GuestAddr, GuestProcess, SandboxIndex};
 use crate::pystacks::stack_walker::{PyAddr, StackWalkerRun};
 use crate::record::RecordCollector;
@@ -34,17 +35,35 @@ type ProcessDispatcher = Box<
 >;
 use debuginfod::{BuildId, CachingClient, Client};
 
+/// One user-space frame as delivered by the BPF walker.
+///
+/// Classic capture yields raw virtual addresses. Build-id capture
+/// (`--collect-build-id`) yields `(build_id, file offset)` pairs for frames
+/// the kernel could resolve to a mapped file carrying an ELF build-id note —
+/// a process-independent identity that stays symbolizable after the process
+/// exits — and falls back to the raw IP (`BPF_STACK_BUILD_ID_IP`) where it
+/// could not.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+pub enum UserFrame {
+    /// Raw virtual address; symbolized through the live process (or labeled
+    /// `[exited]`/`[gvisor:*]`/... when that is impossible).
+    Ip(u64),
+    /// ELF build-id plus file offset; symbolized through the build-id store
+    /// regardless of whether the process still exists.
+    BuildId { id: [u8; 20], offset: u64 },
+}
+
 // Stack structure representing kernel, user, and Python stacks.
 //
 // Direction invariant: every segment is stored ROOT-TO-LEAF (outermost
 // caller first, innermost/executing frame last). The BPF unwinder and
-// pystacks both deliver frames leaf-first; `Stack::new` reverses each
+// pystacks both deliver frames leaf-first; the constructors reverse each
 // segment so `frame_ids`, folded output, and exports all read one
 // coherent direction.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Stack {
     pub(crate) kernel_stack: Vec<u64>,
-    pub(crate) user_stack: Vec<u64>,
+    pub(crate) user_stack: Vec<UserFrame>,
     pub(crate) py_stack: Vec<PyAddr>,
 }
 
@@ -55,11 +74,26 @@ pub struct Stack {
 const MAX_USER_ADDR: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 /// Filters out zero and garbage addresses from user stack and reverses to get root-to-leaf order.
-fn filter_and_reverse_user_stack(addrs: &[u64]) -> Vec<u64> {
+fn filter_and_reverse_user_stack(addrs: &[u64]) -> Vec<UserFrame> {
     addrs
         .iter()
         .copied()
         .filter(|&addr| addr != 0 && addr <= MAX_USER_ADDR)
+        .map(UserFrame::Ip)
+        .rev()
+        .collect()
+}
+
+/// Same for pre-parsed frames (build-id mode): the garbage-address filter
+/// applies to raw-IP fallback frames only — build-id frames carry a file
+/// offset, for which the virtual-address bound is meaningless.
+fn filter_and_reverse_user_frames(frames: Vec<UserFrame>) -> Vec<UserFrame> {
+    frames
+        .into_iter()
+        .filter(|f| match f {
+            UserFrame::Ip(addr) => *addr != 0 && *addr <= MAX_USER_ADDR,
+            UserFrame::BuildId { .. } => true,
+        })
         .rev()
         .collect()
 }
@@ -86,6 +120,19 @@ impl Stack {
         Self {
             kernel_stack: filter_and_reverse_kernel_stack(kernel_stack),
             user_stack: filter_and_reverse_user_stack(user_stack),
+            py_stack: reverse_py_stack(py_stack),
+        }
+    }
+
+    /// Like [`Stack::new`] but with pre-parsed user frames (build-id mode).
+    pub fn from_frames(
+        kernel_stack: &[u64],
+        user_frames: Vec<UserFrame>,
+        py_stack: &[PyAddr],
+    ) -> Self {
+        Self {
+            kernel_stack: filter_and_reverse_kernel_stack(kernel_stack),
+            user_stack: filter_and_reverse_user_frames(user_frames),
             py_stack: reverse_py_stack(py_stack),
         }
     }
@@ -172,7 +219,11 @@ impl StackSpill {
 
     /// Record format (little-endian):
     /// id: i64, tgid: i32, klen: u16, ulen: u16, pylen: u16,
-    /// then klen+ulen u64 addresses and pylen (u64 symbol_id, i32 inst_idx).
+    /// then klen u64 kernel addresses, ulen self-describing user frames
+    /// (tag u8: 0 = raw IP, u64 follows; 1 = build-id, 20 id bytes + u64
+    /// offset follow), and pylen (u64 symbol_id, i32 inst_idx) entries.
+    /// The file never outlives the run, so there is no cross-version
+    /// compatibility to keep.
     ///
     /// Called from the ringbuf consumer path, but only once per *unique* stack
     /// and buffered through page cache, so it does not normally block event
@@ -202,8 +253,18 @@ impl StackSpill {
         for addr in &stack.kernel_stack {
             self.buf.extend_from_slice(&addr.to_le_bytes());
         }
-        for addr in &stack.user_stack {
-            self.buf.extend_from_slice(&addr.to_le_bytes());
+        for frame in &stack.user_stack {
+            match frame {
+                UserFrame::Ip(addr) => {
+                    self.buf.push(0);
+                    self.buf.extend_from_slice(&addr.to_le_bytes());
+                }
+                UserFrame::BuildId { id, offset } => {
+                    self.buf.push(1);
+                    self.buf.extend_from_slice(id);
+                    self.buf.extend_from_slice(&offset.to_le_bytes());
+                }
+            }
         }
         for py in &stack.py_stack {
             self.buf.extend_from_slice(&py.addr.symbol_id.to_le_bytes());
@@ -459,25 +520,54 @@ fn read_spill_record(reader: &mut BufReader<File>) -> Result<Option<(Stack, i32,
     let ulen = u16::from_le_bytes(hdr[14..16].try_into().unwrap()) as usize;
     let pylen = u16::from_le_bytes(hdr[16..18].try_into().unwrap()) as usize;
 
+    let mut kernel_stack = Vec::with_capacity(klen);
+    let mut buf8 = [0u8; 8];
+    for _ in 0..klen {
+        reader
+            .read_exact(&mut buf8)
+            .context("reading stack spill kernel frame")?;
+        kernel_stack.push(u64::from_le_bytes(buf8));
+    }
+
+    // User frames are self-describing (see `push`): tag 0 = raw IP (u64),
+    // tag 1 = build-id (20 id bytes + u64 file offset).
+    let mut user_stack = Vec::with_capacity(ulen);
+    for _ in 0..ulen {
+        let mut tag = [0u8; 1];
+        reader
+            .read_exact(&mut tag)
+            .context("reading stack spill user frame tag")?;
+        match tag[0] {
+            0 => {
+                reader
+                    .read_exact(&mut buf8)
+                    .context("reading stack spill user frame")?;
+                user_stack.push(UserFrame::Ip(u64::from_le_bytes(buf8)));
+            }
+            1 => {
+                let mut bid = [0u8; 20];
+                reader
+                    .read_exact(&mut bid)
+                    .context("reading stack spill build-id")?;
+                reader
+                    .read_exact(&mut buf8)
+                    .context("reading stack spill build-id offset")?;
+                user_stack.push(UserFrame::BuildId {
+                    id: bid,
+                    offset: u64::from_le_bytes(buf8),
+                });
+            }
+            t => anyhow::bail!("corrupt stack spill record: unknown user frame tag {t}"),
+        }
+    }
+
     // Python frames serialize as 12 bytes: u64 symbol_id + i32 inst_idx.
     const PY_FRAME_BYTES: usize = 12;
-    let mut addrs = vec![0u8; (klen + ulen) * 8 + pylen * PY_FRAME_BYTES];
+    let mut py_bytes = vec![0u8; pylen * PY_FRAME_BYTES];
     reader
-        .read_exact(&mut addrs)
+        .read_exact(&mut py_bytes)
         .context("reading stack spill record body")?;
-
-    let mut off = 0;
-    let read_u64s = |n: usize, off: &mut usize| -> Vec<u64> {
-        let v = addrs[*off..*off + n * 8]
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        *off += n * 8;
-        v
-    };
-    let kernel_stack = read_u64s(klen, &mut off);
-    let user_stack = read_u64s(ulen, &mut off);
-    let py_stack = addrs[off..off + pylen * PY_FRAME_BYTES]
+    let py_stack = py_bytes
         .chunks_exact(PY_FRAME_BYTES)
         .map(|c| PyAddr {
             addr: crate::pystacks::types::StackWalkerFrame {
@@ -508,6 +598,51 @@ struct UserSymbolizeCtx<'a> {
     guest: Option<&'a GuestProcess>,
 }
 
+/// Kernel `enum bpf_stack_build_id_status` values, as delivered in
+/// `systing_stack_build_id.status` (EMPTY = 0 produces no frame at all).
+const BUILD_ID_STATUS_VALID: i32 = 1;
+const BUILD_ID_STATUS_IP: i32 = 2;
+
+/// `stack_event.user_stack_format` values (mirrors the BPF-side
+/// USER_STACK_FORMAT_* defines): which entry format the event's user_stack
+/// region carries.
+const USER_STACK_FORMAT_BUILD_ID: u32 = 1;
+
+/// Index one live process's executable mappings into the build-id store
+/// (the opportunistic fill source). Returns how many mappings were read.
+///
+/// Each mapping is read through its `map_files` link first — namespace-
+/// immune, so containerized processes' binaries index correctly under the
+/// privileges systing runs with in production — falling back to the maps
+/// path, which works unprivileged for same-namespace processes. A process
+/// racing to exit mid-read is just a miss.
+fn fill_store_from_maps(store: &mut BuildIdStore, maps: &ProcessMaps) -> usize {
+    let mut mappings = 0usize;
+    for (link, display) in maps.exec_file_links() {
+        let (bid, resolve_path) = match read_elf_build_id(&link) {
+            Ok(Some(b)) => (b, link),
+            _ => match read_elf_build_id(&display) {
+                Ok(Some(b)) => (b, display.clone()),
+                _ => continue,
+            },
+        };
+        let mut id = [0u8; 20];
+        let bytes: &[u8] = &bid;
+        let n = bytes.len().min(20);
+        // Shorter note payloads zero-extend, matching the kernel's fixed
+        // 20-byte field.
+        id[..n].copy_from_slice(&bytes[..n]);
+        let module = display
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("[buildid]")
+            .to_string();
+        store.fill_live(id, resolve_path, module);
+        mappings += 1;
+    }
+    mappings
+}
+
 /// Convert BPF stack_event_type (u32) to i8, clamping to valid range.
 /// Valid values are 0 (STACK_SLEEP_UNINTERRUPTIBLE), 1 (STACK_RUNNING), 2 (STACK_SLEEP_INTERRUPTIBLE).
 /// Unknown values are preserved but clamped to i8::MAX to avoid truncation issues.
@@ -525,6 +660,14 @@ pub struct StackRecorder {
     pub(crate) ringbuf: RingBuffer<stack_event>,
     pub(crate) psr: Arc<StackWalkerRun>,
     process_dispatcher: Option<Arc<ProcessDispatcher>>,
+    /// Shared debuginfod client (when enabled): backs both the process
+    /// dispatcher above and the build-id store's by-id fetches.
+    debuginfod_client: Option<Arc<CachingClient>>,
+    /// When set, BPF delivered user frames as (build-id, file offset) pairs
+    /// (`--collect-build-id`): handle_event parses the `user_stack_bid`
+    /// tail, and symbolization resolves those frames through the
+    /// build-id store instead of the process.
+    build_id_mode: bool,
     // Streaming support
     /// Collector for emitting StackSampleRecords as they arrive. When set, samples
     /// are written immediately in handle_event() and stacks are deduplicated during
@@ -593,16 +736,19 @@ impl ThreadAwareRecorder for StackRecorder {
 
 impl StackRecorder {
     pub fn new(enable_debuginfod: bool, utid_generator: Arc<UtidGenerator>) -> Self {
-        let process_dispatcher = if enable_debuginfod {
-            create_debuginfod_dispatcher()
+        let debuginfod_client = if enable_debuginfod {
+            create_debuginfod_client()
         } else {
             None
         };
+        let process_dispatcher = debuginfod_client.clone().map(create_debuginfod_dispatcher);
 
         Self {
             ringbuf: RingBuffer::default(),
             psr: Arc::new(StackWalkerRun::default()),
             process_dispatcher,
+            debuginfod_client,
+            build_id_mode: false,
             streaming_collector: None,
             interner: StackInterner::new(1)
                 .with_id_limit(crate::memory_recorder::MEMORY_STACK_ID_OFFSET),
@@ -615,6 +761,14 @@ impl StackRecorder {
             names_only: false,
             elide_generics: false,
         }
+    }
+
+    /// Enable build-id mode: user frames arrive as (build-id, file offset)
+    /// pairs in the event's `user_stack_bid` tail and symbolize through the
+    /// build-id store. Must match the BPF-side `collect_build_id` rodata
+    /// setting.
+    pub fn set_build_id_mode(&mut self, enabled: bool) {
+        self.build_id_mode = enabled;
     }
 
     /// Disable contextual labels on unresolvable frames (revert to bare hex).
@@ -799,6 +953,46 @@ impl StackRecorder {
         // for all processes.
         let mut kernel_cache: HashMap<u64, String> = HashMap::new();
 
+        // Build-id store and result cache (build-id mode; both stay empty
+        // otherwise). Unlike the per-process user caches below, these are
+        // global: (build-id, offset) identifies a frame independently of
+        // any process, so one resolution serves every process — dead or
+        // alive — that ever mapped that binary.
+        let mut bid_store = BuildIdStore::new(self.debuginfod_client.clone());
+        let mut bid_cache: HashMap<([u8; 20], u64), String> = HashMap::new();
+
+        // Index every live process's executable mappings by build-id note —
+        // the store's opportunistic source. Host-wide rather than
+        // sampled-tgids-only because the binaries a dead process mapped are
+        // often held open by processes that were never sampled (the
+        // `systing record -- short_cmd` shape: the traced command dies, its
+        // binary lives on in unsampled processes). One bounded pass at
+        // symbolization time; nothing here runs during capture.
+        if self.build_id_mode {
+            let t0 = std::time::Instant::now();
+            let mut mappings = 0usize;
+            if let Ok(entries) = std::fs::read_dir("/proc") {
+                for entry in entries.flatten() {
+                    let Some(tgid) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|s| s.parse::<i32>().ok())
+                    else {
+                        continue;
+                    };
+                    let Some(maps) = ProcessMaps::load(tgid) else {
+                        continue;
+                    };
+                    mappings += fill_store_from_maps(&mut bid_store, &maps);
+                }
+            }
+            eprintln!(
+                "Note: build-id store: indexed {mappings} executable mappings \
+                 from live processes in {:.0?}",
+                t0.elapsed()
+            );
+        }
+
         // Pass 1: stream spilled stacks back from disk one record at a time
         // (then any kept in memory). Stacks of exited processes are emitted
         // immediately: their user addresses cannot be symbolized at all
@@ -826,6 +1020,8 @@ impl StackRecorder {
 
         // Each interner is dropped at the end of its loop iteration, releasing
         // its dedup table before the (memory-hungry) live-process pass below.
+        // Build-id frames of exited processes resolve right here: the store
+        // was populated from all live processes above, before any pass ran.
         for mut interner in interners {
             interner.spill.drain(|stack, tgid, stack_id| {
                 let alive = *tgid_alive
@@ -841,6 +1037,8 @@ impl StackRecorder {
                     None,
                     &kernel_src,
                     &mut kernel_cache,
+                    &mut bid_store,
+                    &mut bid_cache,
                 );
                 pb.inc(1);
                 emit_stack_record(collector, stack_id, frame_names)
@@ -955,6 +1153,8 @@ impl StackRecorder {
                         Some((&ctx, &mut user_cache)),
                         &kernel_src,
                         &mut kernel_cache,
+                        &mut bid_store,
+                        &mut bid_cache,
                     );
                     pb.inc(1);
                     emit_stack_record(collector, stack_id, frame_names)?;
@@ -1038,14 +1238,74 @@ impl StackRecorder {
         crate::sandbox_maps::format_unresolved(addr, ctx.maps)
     }
 
+    /// Symbolize one (build-id, file offset) frame through the build-id
+    /// store, with the global result cache in front. Process-independent:
+    /// works identically whether the producing process is alive or gone.
+    /// Store misses render the deferred form — the full build-id and offset
+    /// travel in the frame string, so anything downstream can resolve it
+    /// once some store learns the id.
+    fn symbolize_build_id_frame(
+        &self,
+        symbolizer: &mut Symbolizer,
+        store: &mut BuildIdStore,
+        cache: &mut HashMap<([u8; 20], u64), String>,
+        id: [u8; 20],
+        offset: u64,
+    ) -> String {
+        if let Some(name) = cache.get(&(id, offset)) {
+            return name.clone();
+        }
+        let name = self.resolve_build_id_frame(symbolizer, store, id, offset);
+        cache.insert((id, offset), name.clone());
+        name
+    }
+
+    fn resolve_build_id_frame(
+        &self,
+        symbolizer: &mut Symbolizer,
+        store: &mut BuildIdStore,
+        id: [u8; 20],
+        offset: u64,
+    ) -> String {
+        if let Some(bin) = store.lookup(&id) {
+            let mut elf = Elf::new(&bin.path);
+            elf.debug_syms = !self.names_only;
+            let elf_src = Source::Elf(elf);
+            if let Some(sym) = symbolizer
+                .symbolize_single(&elf_src, Input::FileOffset(offset))
+                .ok()
+                .and_then(|s| s.into_sym())
+            {
+                // The trailing <...> slot carries the file offset (the
+                // frame's identity within the module), not a virtual
+                // address — build-id frames don't have one.
+                return format_symbolized_frame_forced_module(
+                    &sym,
+                    offset,
+                    &bin.display_module,
+                    self.elide_generics,
+                );
+            }
+        }
+        if self.frame_labels {
+            format!("unknown ([buildid:{}]) <{offset:#x}>", build_id_hex(&id))
+        } else {
+            // Even with labels off the identity must survive: a bare offset
+            // would masquerade as a virtual address.
+            format!("buildid:{}+{offset:#x}", build_id_hex(&id))
+        }
+    }
+
     /// Symbolize a single stack and return frame names.
     ///
     /// `user` carries the symbolization context and per-process address
     /// cache for a live process; `None` means the process has exited, in
-    /// which case user addresses cannot be symbolized (no /proc/<pid>/maps)
-    /// and are rendered as `unknown ([exited]) <addr>` (or raw hex with
-    /// labels disabled). Kernel addresses go through the shared
-    /// `kernel_cache`.
+    /// which case raw user addresses cannot be symbolized (no
+    /// /proc/<pid>/maps) and are rendered as `unknown ([exited]) <addr>`
+    /// (or raw hex with labels disabled). Build-id frames don't need the
+    /// process at all: they resolve through the store either way. Kernel
+    /// addresses go through the shared `kernel_cache`.
+    #[allow(clippy::too_many_arguments)]
     fn symbolize_stack_frames(
         &self,
         symbolizer: &mut Symbolizer,
@@ -1053,6 +1313,8 @@ impl StackRecorder {
         user: Option<(&UserSymbolizeCtx<'_>, &mut HashMap<u64, String>)>,
         kernel_src: &Source<'_>,
         kernel_cache: &mut HashMap<u64, String>,
+        bid_store: &mut BuildIdStore,
+        bid_cache: &mut HashMap<([u8; 20], u64), String>,
     ) -> Vec<String> {
         let mut frame_names = Vec::with_capacity(
             stack.user_stack.len() + stack.kernel_stack.len() + stack.py_stack.len(),
@@ -1065,25 +1327,38 @@ impl StackRecorder {
         // Symbolize user addresses (middle segment of the root-to-leaf array)
         match user {
             Some((ctx, user_cache)) => {
-                for &addr in &stack.user_stack {
-                    let frame_name = match user_cache.get(&addr) {
-                        Some(name) => name.clone(),
-                        None => {
-                            let name = self.symbolize_user_addr(symbolizer, ctx, addr);
-                            user_cache.insert(addr, name.clone());
-                            name
-                        }
+                for frame in &stack.user_stack {
+                    let frame_name = match frame {
+                        UserFrame::Ip(addr) => match user_cache.get(addr) {
+                            Some(name) => name.clone(),
+                            None => {
+                                let name = self.symbolize_user_addr(symbolizer, ctx, *addr);
+                                user_cache.insert(*addr, name.clone());
+                                name
+                            }
+                        },
+                        UserFrame::BuildId { id, offset } => self.symbolize_build_id_frame(
+                            symbolizer, bid_store, bid_cache, *id, *offset,
+                        ),
                     };
                     frame_names.push(frame_name);
                 }
             }
             None => {
-                for &addr in &stack.user_stack {
-                    if self.frame_labels {
-                        frame_names.push(format!("unknown ([exited]) <{addr:#x}>"));
-                    } else {
-                        frame_names.push(format!("0x{addr:x}"));
-                    }
+                for frame in &stack.user_stack {
+                    let frame_name = match frame {
+                        UserFrame::Ip(addr) => {
+                            if self.frame_labels {
+                                format!("unknown ([exited]) <{addr:#x}>")
+                            } else {
+                                format!("0x{addr:x}")
+                            }
+                        }
+                        UserFrame::BuildId { id, offset } => self.symbolize_build_id_frame(
+                            symbolizer, bid_store, bid_cache, *id, *offset,
+                        ),
+                    };
+                    frame_names.push(frame_name);
                 }
             }
         }
@@ -1170,25 +1445,16 @@ fn format_symbolized_frame_forced_module(
     format!("{name} ({module_name}{location_info}) <{addr:#x}>")
 }
 
-/// Create a debuginfod dispatcher if debuginfod is available in the environment
-fn create_debuginfod_dispatcher() -> Option<Arc<ProcessDispatcher>> {
+/// Create a shared debuginfod client if debuginfod is available in the
+/// environment. Backs both the process dispatcher (path-keyed fetches for
+/// live processes) and the build-id store (id-keyed fetches, which need no
+/// process at all).
+fn create_debuginfod_client() -> Option<Arc<CachingClient>> {
     match Client::from_env() {
         Ok(Some(client)) => match CachingClient::from_env(client) {
             Ok(caching_client) => {
                 println!("Debuginfod enabled: using debuginfod for symbol resolution");
-
-                // Wrap the CachingClient in an Arc so it can be shared across threads.
-                // The closure below will take ownership of this Arc (via the `move` keyword),
-                // storing it as part of the closure's captured state. When the closure is
-                // called during symbolization, it will clone the Arc to pass to
-                // dispatch_process_with_client. The CachingClient itself remains shared
-                // across all threads (only the Arc reference is cloned, not the client).
-                // The closure and its captured Arc<CachingClient> will live as long as the
-                // StackRecorder that owns the process_dispatcher field.
-                let client = Arc::new(caching_client);
-                Some(Arc::new(Box::new(move |info: ProcessMemberInfo<'_>| -> Result<Option<Box<dyn Resolve>>, BlazeErr> {
-                    dispatch_process_with_client(info, client.clone())
-                }) as ProcessDispatcher))
+                Some(Arc::new(caching_client))
             }
             Err(e) => {
                 println!("Failed to create caching debuginfod client: {e}, using default resolver");
@@ -1204,6 +1470,20 @@ fn create_debuginfod_dispatcher() -> Option<Arc<ProcessDispatcher>> {
             None
         }
     }
+}
+
+/// Wrap the shared debuginfod client as a blazesym process dispatcher.
+///
+/// The closure takes ownership of one Arc clone; each dispatch clones the
+/// Arc again (the client itself is shared, not copied). The closure and its
+/// captured Arc live as long as the StackRecorder that owns the
+/// process_dispatcher field.
+fn create_debuginfod_dispatcher(client: Arc<CachingClient>) -> Arc<ProcessDispatcher> {
+    Arc::new(Box::new(
+        move |info: ProcessMemberInfo<'_>| -> Result<Option<Box<dyn Resolve>>, BlazeErr> {
+            dispatch_process_with_client(info, client.clone())
+        },
+    ) as ProcessDispatcher)
 }
 
 /// Callback function for process dispatcher that fetches debug info using debuginfod
@@ -1255,11 +1535,51 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
 
         if has_stack {
             let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
-            let ustack_vec = Vec::from(&event.user_stack[..event.user_stack_length as usize]);
+            // One user_stack region, two entry formats; the per-event
+            // user_stack_format flag says which one this record carries
+            // (self-describing — the parse never depends on recorder-side
+            // configuration). user_stack_length counts entries of that
+            // format; it is BPF-computed from the walker's return value,
+            // but clamp anyway — a short (zero-extended) record must never
+            // index past the region.
+            let ulen = event.user_stack_length as usize;
+            let user_frames: Vec<UserFrame> =
+                if event.user_stack_format == USER_STACK_FORMAT_BUILD_ID {
+                    event.user_stack[..ulen.min(event.user_stack.len())]
+                        .iter()
+                        .filter_map(|e| match e.status {
+                            BUILD_ID_STATUS_VALID => Some(UserFrame::BuildId {
+                                id: e.build_id,
+                                offset: e.offset_or_ip,
+                            }),
+                            BUILD_ID_STATUS_IP => Some(UserFrame::Ip(e.offset_or_ip)),
+                            // EMPTY (or anything unknown): no frame.
+                            _ => None,
+                        })
+                        .collect()
+                } else {
+                    // Raw-IP format: the region holds packed u64 addresses from
+                    // its start (the reservation covered only those bytes).
+                    // SAFETY: stack_event is Plain (repr(C)); the region starts
+                    // u64-aligned (it follows u64-aligned fields in a struct of
+                    // alignment 8), MAX_STACK_DEPTH u64s (288B) fit inside the
+                    // MAX_STACK_DEPTH 32-byte entries (1152B), and the record
+                    // was zero-extended to the full struct size on copy.
+                    let ips: &[u64] = unsafe {
+                        std::slice::from_raw_parts(
+                            event.user_stack.as_ptr() as *const u64,
+                            event.user_stack.len(),
+                        )
+                    };
+                    ips[..ulen.min(ips.len())]
+                        .iter()
+                        .map(|&addr| UserFrame::Ip(addr))
+                        .collect()
+                };
             let stack_key = (event.task.tgidpid >> 32) as i32;
             let py_stack = self.psr.get_pystack_from_event(&event);
 
-            let stack = Stack::new(&kstack_vec, &ustack_vec, &py_stack);
+            let stack = Stack::from_frames(&kstack_vec, user_frames, &py_stack);
             let tid = event.task.tgidpid as i32;
             let tgid = stack_key; // tgid for process-specific symbolization
 
@@ -1296,40 +1616,80 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
 mod tests {
     use super::*;
 
+    /// Raw addresses as Ip frames (the classic-capture shape).
+    fn ips(addrs: &[u64]) -> Vec<UserFrame> {
+        addrs.iter().map(|&a| UserFrame::Ip(a)).collect()
+    }
+
+    fn bid_frame(seed: u8, offset: u64) -> UserFrame {
+        UserFrame::BuildId {
+            id: [seed; 20],
+            offset,
+        }
+    }
+
     #[test]
     fn test_filter_and_reverse_user_stack() {
         // Test zero filtering
-        assert_eq!(filter_and_reverse_user_stack(&[0, 0x1000, 0]), vec![0x1000]);
+        assert_eq!(
+            filter_and_reverse_user_stack(&[0, 0x1000, 0]),
+            ips(&[0x1000])
+        );
 
         // Test reversal
         assert_eq!(
             filter_and_reverse_user_stack(&[0x1000, 0x2000]),
-            vec![0x2000, 0x1000]
+            ips(&[0x2000, 0x1000])
         );
 
         // Test MAX_USER_ADDR boundary - address at boundary should be kept
         assert_eq!(
             filter_and_reverse_user_stack(&[0x1000, MAX_USER_ADDR]),
-            vec![MAX_USER_ADDR, 0x1000]
+            ips(&[MAX_USER_ADDR, 0x1000])
         );
 
         // Test garbage addresses above MAX_USER_ADDR are filtered
         assert_eq!(
             filter_and_reverse_user_stack(&[0x1000, MAX_USER_ADDR + 1]),
-            vec![0x1000]
+            ips(&[0x1000])
         );
 
         // Test typical garbage from bad frame pointer unwinding (instruction bytes)
         assert_eq!(
             filter_and_reverse_user_stack(&[0x7f0000001000, 0xc48348d88948ff31]),
-            vec![0x7f0000001000]
+            ips(&[0x7f0000001000])
         );
 
         // Empty stack
-        assert_eq!(filter_and_reverse_user_stack(&[]), Vec::<u64>::new());
+        assert_eq!(filter_and_reverse_user_stack(&[]), Vec::<UserFrame>::new());
 
         // All zeros
-        assert_eq!(filter_and_reverse_user_stack(&[0, 0, 0]), Vec::<u64>::new());
+        assert_eq!(
+            filter_and_reverse_user_stack(&[0, 0, 0]),
+            Vec::<UserFrame>::new()
+        );
+    }
+
+    #[test]
+    fn test_filter_and_reverse_user_frames() {
+        // The garbage filter applies to Ip fallback frames only; build-id
+        // frames carry file offsets, for which the virtual-address bound is
+        // meaningless (offset 0 is a legitimate file offset).
+        let frames = vec![
+            UserFrame::Ip(0),                 // filtered: zero addr
+            bid_frame(1, 0),                  // kept: offset 0 is valid
+            UserFrame::Ip(MAX_USER_ADDR + 1), // filtered: garbage addr
+            bid_frame(2, u64::MAX),           // kept: any offset
+            UserFrame::Ip(0x1000),            // kept
+        ];
+        assert_eq!(
+            filter_and_reverse_user_frames(frames),
+            vec![
+                UserFrame::Ip(0x1000),
+                bid_frame(2, u64::MAX),
+                bid_frame(1, 0)
+            ]
+        );
     }
 
     #[test]
@@ -1411,7 +1771,7 @@ mod tests {
             (
                 Stack {
                     kernel_stack: vec![0xffffffff81000000, 0xffffffff82000000],
-                    user_stack: vec![0x7f0000001000],
+                    user_stack: ips(&[0x7f0000001000]),
                     py_stack: py.clone(),
                 },
                 42,
@@ -1420,7 +1780,7 @@ mod tests {
             (
                 Stack {
                     kernel_stack: vec![],
-                    user_stack: vec![0x1000, 0x2000, 0x3000],
+                    user_stack: ips(&[0x1000, 0x2000, 0x3000]),
                     py_stack: vec![],
                 },
                 -1,
@@ -1429,21 +1789,36 @@ mod tests {
             (
                 Stack {
                     kernel_stack: vec![],
-                    user_stack: vec![],
+                    user_stack: ips(&[]),
                     py_stack: py,
                 },
                 i32::MAX,
                 i64::MAX,
             ),
+            // Build-id mode stacks interleave BuildId and Ip-fallback
+            // frames; both tags must round-trip.
+            (
+                Stack {
+                    kernel_stack: vec![0xffffffff81000000],
+                    user_stack: vec![
+                        bid_frame(0xab, 0x1234),
+                        UserFrame::Ip(0x7f0000002000),
+                        bid_frame(0x01, u64::MAX),
+                    ],
+                    py_stack: vec![],
+                },
+                7,
+                8,
+            ),
         ];
         for (stack, tgid, id) in &stacks {
             spill.push(stack.clone(), *tgid, *id);
         }
-        assert_eq!(spill.total(), 3);
+        assert_eq!(spill.total(), 4);
         assert!(spill.fallback.is_empty());
 
         let (mut reader, durable) = spill.take_reader().expect("reader");
-        assert_eq!(durable, 3);
+        assert_eq!(durable, 4);
         for (stack, tgid, id) in &stacks {
             let (rstack, rtgid, rid) = read_spill_record(&mut reader).unwrap().unwrap();
             assert_eq!(&rstack, stack);
@@ -1463,7 +1838,7 @@ mod tests {
         for i in 0..n {
             let stack = Stack {
                 kernel_stack: vec![i],
-                user_stack: vec![i + 1],
+                user_stack: ips(&[i + 1]),
                 py_stack: vec![],
             };
             spill.push(stack, i as i32, i as i64);
@@ -1496,7 +1871,7 @@ mod tests {
             spill.push(
                 Stack {
                     kernel_stack: vec![i],
-                    user_stack: vec![],
+                    user_stack: ips(&[]),
                     py_stack: vec![],
                 },
                 i as i32,
@@ -1507,7 +1882,7 @@ mod tests {
         spill.push(
             Stack {
                 kernel_stack: vec![99],
-                user_stack: vec![],
+                user_stack: ips(&[]),
                 py_stack: vec![],
             },
             99,
@@ -1523,7 +1898,7 @@ mod tests {
             spill.push(
                 Stack {
                     kernel_stack: vec![i],
-                    user_stack: vec![],
+                    user_stack: ips(&[]),
                     py_stack: vec![],
                 },
                 i as i32,
@@ -1533,7 +1908,7 @@ mod tests {
         spill.fallback.push((
             Stack {
                 kernel_stack: vec![99],
-                user_stack: vec![],
+                user_stack: ips(&[]),
                 py_stack: vec![],
             },
             99,
@@ -1557,7 +1932,7 @@ mod tests {
         let mut spill = StackSpill::new();
         let stack = Stack {
             kernel_stack: vec![1],
-            user_stack: vec![2],
+            user_stack: ips(&[2]),
             py_stack: vec![],
         };
         spill.push(stack.clone(), 5, 9);
@@ -1574,12 +1949,12 @@ mod tests {
 
         let a = Stack {
             kernel_stack: vec![0xffffffff81000000],
-            user_stack: vec![0x1000],
+            user_stack: ips(&[0x1000]),
             py_stack: vec![],
         };
         let b = Stack {
             kernel_stack: vec![0xffffffff81000000],
-            user_stack: vec![0x2000],
+            user_stack: ips(&[0x2000]),
             py_stack: vec![],
         };
 
@@ -1611,7 +1986,7 @@ mod tests {
         let h = (RandomState::new(), RandomState::new());
         let a = Stack {
             kernel_stack: vec![0xffffffff81000000],
-            user_stack: vec![0x1000],
+            user_stack: ips(&[0x1000]),
             py_stack: vec![],
         };
         let b = a.clone();
@@ -1621,17 +1996,66 @@ mod tests {
         // Different contents must produce a different key
         let c = Stack {
             kernel_stack: vec![0xffffffff81000000],
-            user_stack: vec![0x1001],
+            user_stack: ips(&[0x1001]),
             py_stack: vec![],
         };
         assert_ne!(stack_dedup_hash(&h, &a, 1), stack_dedup_hash(&h, &c, 1));
         // Moving an address between kernel and user stacks must change the key
         let d = Stack {
             kernel_stack: vec![],
-            user_stack: vec![0xffffffff81000000, 0x1000],
+            user_stack: ips(&[0xffffffff81000000, 0x1000]),
             py_stack: vec![],
         };
         assert_ne!(stack_dedup_hash(&h, &a, 1), stack_dedup_hash(&h, &d, 1));
+        // An Ip frame and a BuildId frame whose offset equals the address
+        // must not alias — the variant (and the id bytes) are part of the key.
+        let e = Stack {
+            kernel_stack: vec![0xffffffff81000000],
+            user_stack: vec![bid_frame(0, 0x1000)],
+            py_stack: vec![],
+        };
+        assert_ne!(stack_dedup_hash(&h, &a, 1), stack_dedup_hash(&h, &e, 1));
+        // Same offset, different build-id: different key.
+        let f = Stack {
+            kernel_stack: vec![0xffffffff81000000],
+            user_stack: vec![bid_frame(1, 0x1000)],
+            py_stack: vec![],
+        };
+        assert_ne!(stack_dedup_hash(&h, &e, 1), stack_dedup_hash(&h, &f, 1));
+    }
+
+    /// The user_stack region is ONE tail-positioned array sized for the
+    /// build-id entry format; raw-IP mode packs u64s from its start and the
+    /// BPF side reserves only `offsetof(user_stack) + 36 * 8` bytes for it.
+    /// The region must therefore be the LAST field (a shorter raw-IP
+    /// reservation would truncate anything after it), and the raw-IP u64
+    /// view requires the region to start u64-aligned. Also pins the mirror
+    /// struct's layout to the kernel's bpf_stack_build_id (s32 + 20 bytes +
+    /// u64 at offset 24 = 32 bytes).
+    #[test]
+    fn test_stack_event_user_stack_region_layout() {
+        use crate::systing_core::types::systing_stack_build_id;
+        use std::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<systing_stack_build_id>(), 32);
+        let region = offset_of!(stack_event, user_stack);
+        let full = size_of::<stack_event>();
+        assert_eq!(
+            full - region,
+            36 * size_of::<systing_stack_build_id>(),
+            "user_stack must be the final field of stack_event \
+             (raw-IP reservations stop partway into it)"
+        );
+        assert_eq!(
+            region % align_of::<u64>(),
+            0,
+            "the region must start u64-aligned for the raw-IP packed view"
+        );
+        let ip_reserve = region + 36 * size_of::<u64>();
+        eprintln!(
+            "stack_event reservation: raw-ip={ip_reserve}B build-id={full}B \
+             ratio={:.2}",
+            full as f64 / ip_reserve as f64
+        );
     }
 
     #[test]
@@ -1667,7 +2091,7 @@ mod tests {
         let live_id = rec.interner.intern(
             Stack {
                 kernel_stack: vec![],
-                user_stack: vec![live_addr],
+                user_stack: ips(&[live_addr]),
                 py_stack: vec![],
             },
             self_tgid,
@@ -1679,7 +2103,7 @@ mod tests {
         let dead_id = rec.interner.intern(
             Stack {
                 kernel_stack: vec![],
-                user_stack: vec![dead_addr],
+                user_stack: ips(&[dead_addr]),
                 py_stack: vec![],
             },
             dead_tgid,
@@ -1710,7 +2134,7 @@ mod tests {
         let plain_id = rec_plain.interner.intern(
             Stack {
                 kernel_stack: vec![],
-                user_stack: vec![dead_addr],
+                user_stack: ips(&[dead_addr]),
                 py_stack: vec![],
             },
             dead_tgid,
@@ -1741,7 +2165,7 @@ mod tests {
         let live_id = rec.interner.intern(
             Stack {
                 kernel_stack: vec![],
-                user_stack: vec![live_addr],
+                user_stack: ips(&[live_addr]),
                 py_stack: vec![],
             },
             self_tgid,
@@ -1751,7 +2175,7 @@ mod tests {
         let dead_id = rec.interner.intern(
             Stack {
                 kernel_stack: vec![],
-                user_stack: vec![dead_addr],
+                user_stack: ips(&[dead_addr]),
                 py_stack: vec![],
             },
             dead_tgid,
@@ -1780,5 +2204,126 @@ mod tests {
             dead.frame_names[0],
             format!("unknown ([exited]) <{dead_addr:#x}>")
         );
+    }
+
+    /// Build-id mode, the deferred path: a dead-process frame whose
+    /// build-id no source knows must render the full id and offset (that
+    /// identity is what makes it resolvable offline), not `[exited]` hex.
+    #[test]
+    fn test_finish_inner_build_id_deferred_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
+        rec.set_build_id_mode(true);
+        rec.set_spill_dir(dir.path());
+
+        let dead_tgid = i32::MAX - 1;
+        let id_bytes = [0x5au8; 20];
+        let dead_id = rec.interner.intern(
+            Stack {
+                kernel_stack: vec![],
+                user_stack: vec![UserFrame::BuildId {
+                    id: id_bytes,
+                    offset: 0x1234,
+                }],
+                py_stack: vec![],
+            },
+            dead_tgid,
+        );
+
+        let mut collector = crate::record::InMemoryCollector::new();
+        rec.finish_inner(&mut collector).unwrap();
+        let stacks = &collector.data().stacks;
+        let dead = stacks.iter().find(|s| s.id == dead_id).expect("dead stack");
+        assert_eq!(
+            dead.frame_names[0],
+            format!("unknown ([buildid:{}]) <0x1234>", "5a".repeat(20))
+        );
+    }
+
+    /// Build-id mode, the resolution path this design exists for: a frame
+    /// of a DEAD process symbolizes because a LIVE process (here: the test
+    /// binary itself) still maps the binary, whose build-id the store
+    /// indexes during the live pass. Skips (with a note) when the test
+    /// binary carries no GNU build-id note — linker-dependent.
+    #[test]
+    fn test_finish_inner_build_id_dead_frame_resolves_via_live_fill() {
+        let exe = std::fs::read_link("/proc/self/exe").unwrap();
+        let Ok(Some(own_bid)) = read_elf_build_id(&exe) else {
+            eprintln!("skipping: test binary has no GNU build-id note");
+            return;
+        };
+        let mut id = [0u8; 20];
+        let bytes: &[u8] = &own_bid;
+        let n = bytes.len().min(20);
+        id[..n].copy_from_slice(&bytes[..n]);
+
+        // File offset of marker_fn inside our own executable, derived from
+        // /proc/self/maps (addr - segment start + segment file offset).
+        let addr = marker_fn as fn() -> u64 as usize as u64;
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let mut offset = None;
+        for line in maps.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(range), Some(_perms), Some(off)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let Some((lo, hi)) = range.split_once('-') else {
+                continue;
+            };
+            let (Ok(lo), Ok(hi), Ok(off)) = (
+                u64::from_str_radix(lo, 16),
+                u64::from_str_radix(hi, 16),
+                u64::from_str_radix(off, 16),
+            ) else {
+                continue;
+            };
+            if lo <= addr && addr < hi {
+                offset = Some(addr - lo + off);
+                break;
+            }
+        }
+        let offset = offset.expect("marker_fn must be inside a mapping of our own exe");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
+        rec.set_build_id_mode(true);
+        rec.set_spill_dir(dir.path());
+
+        // The live stack makes pass 2 visit our own tgid and index our
+        // executable mappings by build-id; the dead stack then resolves
+        // against that fill even though its tgid has no /proc entry.
+        let self_tgid = std::process::id() as i32;
+        let live_id = rec.interner.intern(
+            Stack {
+                kernel_stack: vec![],
+                user_stack: vec![UserFrame::BuildId { id, offset }],
+                py_stack: vec![],
+            },
+            self_tgid,
+        );
+        let dead_tgid = i32::MAX - 1;
+        let dead_id = rec.interner.intern(
+            Stack {
+                kernel_stack: vec![],
+                user_stack: vec![UserFrame::BuildId { id, offset }],
+                py_stack: vec![],
+            },
+            dead_tgid,
+        );
+
+        let mut collector = crate::record::InMemoryCollector::new();
+        rec.finish_inner(&mut collector).unwrap();
+        let stacks = &collector.data().stacks;
+
+        for (which, sid) in [("live", live_id), ("dead", dead_id)] {
+            let s = stacks.iter().find(|s| s.id == sid).expect(which);
+            let frame = &s.frame_names[0];
+            assert!(
+                frame.contains("marker_fn"),
+                "{which} build-id frame should resolve to marker_fn via the \
+                 live-fill store, got: {frame}"
+            );
+        }
     }
 }
