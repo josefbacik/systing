@@ -437,7 +437,18 @@ fn all_proc_pids() -> impl Iterator<Item = u32> {
 fn get_container_id(pid: u32) -> Option<String> {
     let cgroup_path = format!("/proc/{pid}/cgroup");
     let content = fs::read_to_string(&cgroup_path).ok()?;
+    parse_container_id(&content)
+}
 
+/// Extracts a container ID from `/proc/<pid>/cgroup` content.
+///
+/// Returns the ID exactly as the runtime wrote it (the full 64-hex digest
+/// on containerd/CRI-O/Docker) — no truncation. Consumers that join these
+/// IDs against other runtime state (cgroup trees, CRI APIs) need the full
+/// digest; anything display-oriented can shorten at the display layer.
+/// The `>= 12` length floor only guards against matching stray short hex
+/// fragments in unrelated path components.
+fn parse_container_id(content: &str) -> Option<String> {
     for line in content.lines() {
         // Docker format: 0::/docker/<container_id>
         // containerd format: 0::/system.slice/containerd.service/kubepods-.../<container_id>
@@ -450,7 +461,7 @@ fn get_container_id(pid: u32) -> Option<String> {
                 let id = &line[id_start..];
                 let id = id.split('/').next().unwrap_or(id);
                 if id.len() >= 12 && id.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Some(id[..12].to_string());
+                    return Some(id.to_string());
                 }
             }
         }
@@ -462,7 +473,7 @@ fn get_container_id(pid: u32) -> Option<String> {
                 let id = &line[id_start..];
                 let id = id.split('.').next().unwrap_or(id);
                 if id.len() >= 12 && id.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Some(id[..12].to_string());
+                    return Some(id.to_string());
                 }
             }
         }
@@ -474,7 +485,7 @@ fn get_container_id(pid: u32) -> Option<String> {
                 let id = &line[id_start..];
                 let id = id.split('.').next().unwrap_or(id);
                 if id.len() >= 12 && id.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Some(id[..12].to_string());
+                    return Some(id.to_string());
                 }
             }
         }
@@ -1739,6 +1750,36 @@ mod tests {
     use perfetto_protos::track_descriptor::TrackDescriptor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, RwLock};
+
+    #[test]
+    fn parse_container_id_returns_full_id() {
+        let id = "a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1c2d3e4f5a0b1";
+        // containerd under kubernetes (systemd cgroup driver).
+        let content = format!(
+            "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123.slice/cri-containerd-{id}.scope\n"
+        );
+        assert_eq!(parse_container_id(&content).as_deref(), Some(id));
+        // Docker.
+        let content = format!("0::/docker/{id}\n");
+        assert_eq!(parse_container_id(&content).as_deref(), Some(id));
+        // CRI-O.
+        let content = format!("0::/machine.slice/crio-{id}.scope\n");
+        assert_eq!(parse_container_id(&content).as_deref(), Some(id));
+    }
+
+    #[test]
+    fn parse_container_id_rejects_non_ids() {
+        // Too short to be a container id.
+        assert_eq!(parse_container_id("0::/docker/abcdef\n"), None);
+        // Non-hex.
+        assert_eq!(
+            parse_container_id("0::/docker/not-a-container-id-just-words\n"),
+            None
+        );
+        // No recognized runtime prefix.
+        assert_eq!(parse_container_id("0::/system.slice/sshd.service\n"), None);
+        assert_eq!(parse_container_id(""), None);
+    }
 
     // PIDs above Linux's pid_max (4194304) to ensure /proc lookups never
     // resolve to real processes, keeping test assertions deterministic.
