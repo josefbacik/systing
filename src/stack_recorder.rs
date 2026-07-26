@@ -1286,14 +1286,16 @@ impl StackRecorder {
                     self.elide_generics,
                 );
             }
+            // Store hit, symbol unresolved: the module is still known.
+            return render_unresolved_build_id(
+                self.frame_labels,
+                Some(&bin.display_module),
+                &id,
+                offset,
+            );
         }
-        if self.frame_labels {
-            format!("unknown ([buildid:{}]) <{offset:#x}>", build_id_hex(&id))
-        } else {
-            // Even with labels off the identity must survive: a bare offset
-            // would masquerade as a virtual address.
-            format!("buildid:{}+{offset:#x}", build_id_hex(&id))
-        }
+        // Full store miss: only the build-id identity is available.
+        render_unresolved_build_id(self.frame_labels, None, &id, offset)
     }
 
     /// Symbolize a single stack and return frame names.
@@ -1401,6 +1403,35 @@ fn format_location_info(code_info: Option<&blazesym::symbolize::CodeInfo>) -> St
             format!(" [{file_name}]")
         }
     })
+}
+
+/// Render a build-id frame that did not resolve to a symbol name.
+///
+/// `module` is the store's `display_module` when the id resolved to a mapped
+/// binary, or `None` on a full store miss. Opportunistic-fill entries carry a
+/// real module name (e.g. `libc.so.6`); trusted-source entries carry only the
+/// id, so their `display_module` is itself a `[buildid:...]` placeholder.
+///
+/// With frame labels on, a known real module is named (`<module>:unknown`
+/// once tideline stamps the leaf), matching the live-process path's
+/// module-level fallback rather than emitting a bare build-id hash the module
+/// name would have covered. When only the id is known (store miss, or a
+/// trusted id-only entry) the deferred `[buildid:...]` form carries the
+/// identity forward. With labels off the machine form always carries the id,
+/// since a bare offset would masquerade as a virtual address.
+fn render_unresolved_build_id(
+    frame_labels: bool,
+    module: Option<&str>,
+    id: &[u8; 20],
+    offset: u64,
+) -> String {
+    if !frame_labels {
+        return format!("buildid:{}+{offset:#x}", build_id_hex(id));
+    }
+    match module {
+        Some(m) if !m.starts_with("[buildid:") => format!("unknown ({m}) <{offset:#x}>"),
+        _ => format!("unknown ([buildid:{}]) <{offset:#x}>", build_id_hex(id)),
+    }
 }
 
 /// Formats a symbolized frame as a string with module and location info.
@@ -1626,6 +1657,44 @@ mod tests {
             id: [seed; 20],
             offset,
         }
+    }
+
+    #[test]
+    fn test_render_unresolved_build_id() {
+        let id = [0xabu8; 20];
+        let full = build_id_hex(&id);
+
+        // Store hit with a real module name (opportunistic-fill entry) and an
+        // unresolved symbol: name the module so the leaf stamps as
+        // `libc.so.6:unknown`, not a bare build-id hash.
+        assert_eq!(
+            render_unresolved_build_id(true, Some("libc.so.6"), &id, 0x1234),
+            "unknown (libc.so.6) <0x1234>"
+        );
+
+        // Trusted id-only entry (its display_module is itself a placeholder):
+        // the id is the only identity, so keep the deferred form.
+        assert_eq!(
+            render_unresolved_build_id(true, Some("[buildid:abababab]"), &id, 0x1234),
+            format!("unknown ([buildid:{full}]) <0x1234>")
+        );
+
+        // Full store miss: same deferred form, driven by `None`.
+        assert_eq!(
+            render_unresolved_build_id(true, None, &id, 0x1234),
+            format!("unknown ([buildid:{full}]) <0x1234>")
+        );
+
+        // Labels off: the machine form always carries the id, regardless of
+        // whether the module name was known.
+        assert_eq!(
+            render_unresolved_build_id(false, Some("libc.so.6"), &id, 0x1234),
+            format!("buildid:{full}+0x1234")
+        );
+        assert_eq!(
+            render_unresolved_build_id(false, None, &id, 0x1234),
+            format!("buildid:{full}+0x1234")
+        );
     }
 
     #[test]
