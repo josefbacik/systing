@@ -202,6 +202,7 @@ pub fn network_interface_schema() -> Arc<Schema> {
         Field::new("interface_name", DataType::Utf8, false),
         Field::new("ip_address", DataType::Utf8, false),
         Field::new("address_type", DataType::Utf8, false),
+        Field::new("netns_inum", DataType::Int64, false),
     ]))
 }
 
@@ -385,6 +386,7 @@ pub fn network_packet_schema() -> Arc<Schema> {
 pub fn network_socket_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("socket_id", DataType::Int64, false),
+        Field::new("netns_inum", DataType::Int64, false),
         Field::new("protocol", DataType::Utf8, false),
         Field::new("address_family", DataType::Utf8, false),
         Field::new("src_ip", DataType::Utf8, false),

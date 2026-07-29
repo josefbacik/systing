@@ -293,6 +293,11 @@ struct network_event {
 	u32 recv_seq_start;    // TCP copied_seq at recvmsg entry (TCP recv only)
 	u32 recv_seq_end;      // TCP copied_seq at recvmsg exit (TCP recv only)
 	u32 rcv_nxt_at_entry;  // TCP rcv_nxt at entry - kernel's next expected seq (TCP recv only)
+	u64 netns_inum;    // Inode of the socket's network namespace (sk->__sk_common.skc_net).
+	                   // Lets the fold attribute a flow to its owning netns (hence pod)
+	                   // directly, instead of inferring it from src_ip against the
+	                   // interface map — which cannot disambiguate loopback (every netns
+	                   // has 127.0.0.1). 0 when the sock pointer was unavailable.
 };
 
 enum packet_event_type {
@@ -335,6 +340,7 @@ struct packet_event {
 	u32 sndbuf_used;   // Bytes in send buffer (sk_wmem_queued) - shows buffer drain on ACK
 	u32 sndbuf_limit;  // Max send buffer size (sk_sndbuf)
 	u64 socket_id;     // Unique socket ID for correlation with network events
+	u64 netns_inum;    // Inode of the socket's network namespace (see network_event.netns_inum).
 	u8 is_retransmit;  // 1 if this packet is a TCP retransmit, 0 otherwise
 	u8 is_zero_window_probe;  // 1 if this is a zero window probe (sender-side)
 	u8 probe_count;           // Number of probes sent (icsk_probes_out)
@@ -2752,6 +2758,19 @@ static int handle_sendmsg_entry(struct sock *sk, struct msghdr *msg, enum networ
 	return 0;
 }
 
+// Read the inode of a socket's network namespace from a struct sock pointer.
+// The netns is stable over the socket's lifetime, so reading it at event-emit
+// time is equivalent to reading it at socket creation. Returns 0 if sk_ptr is
+// null. The inode matches what userspace reads via /proc/<pid>/ns/net, so the
+// fold can join a flow's netns_inum to the interface map's per-netns inode.
+static __always_inline u64 read_sk_netns_inum(u64 sk_ptr)
+{
+	if (!sk_ptr)
+		return 0;
+	struct sock *sk = (struct sock *)sk_ptr;
+	return BPF_CORE_READ(sk, __sk_common.skc_net.net, ns.inum);
+}
+
 static int handle_sendmsg_exit(void *ctx, int ret)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
@@ -2805,6 +2824,7 @@ static int handle_sendmsg_exit(void *ctx, int ret)
 
 	// Copy socket_id for correlation
 	event->socket_id = info->socket_id;
+	event->netns_inum = read_sk_netns_inum(info->sk_ptr);
 
 	bpf_ringbuf_submit(event, flags);
 	bpf_map_delete_elem(&pending_network_sends, &tgidpid);
@@ -2931,6 +2951,7 @@ static int handle_recvmsg_exit(void *ctx, int ret)
 
 	// Copy socket_id for correlation
 	event->socket_id = info->socket_id;
+	event->netns_inum = read_sk_netns_inum(info->sk_ptr);
 
 	// Copy TCP receive sequence tracking fields (TCP only)
 	if (info->protocol == NETWORK_TCP) {
@@ -3139,6 +3160,7 @@ int BPF_KPROBE(udp_send_skb_entry, struct sk_buff *skb, struct flowi4 *fl4, stru
 	// Look up socket ID for this socket with full 4-tuple
 	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
 					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
@@ -3209,6 +3231,7 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 	// Look up socket ID
 	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
 					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
@@ -3279,6 +3302,7 @@ int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *
 	// Look up socket ID
 	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
 					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
@@ -3340,6 +3364,7 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	// Look up socket ID for this socket with full 4-tuple
 	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
 					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	// Read send buffer state from socket
 	int wmem_queued = 0;
@@ -3413,6 +3438,7 @@ static __always_inline int emit_tcp_packet_event(struct sock *sk, struct sk_buff
 	// Look up socket ID for this socket with full 4-tuple
 	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
 					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	// Read send buffer state from socket
 	int wmem_queued = 0;
@@ -3456,6 +3482,7 @@ static __always_inline int emit_udp_packet_event(struct sock *sk, struct sk_buff
 	// Look up socket ID for this socket with full 4-tuple
 	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
 					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
@@ -3599,6 +3626,7 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 	// Look up socket ID for this socket with full 4-tuple
 	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
 					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
@@ -3662,6 +3690,7 @@ int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *
 	// Look up socket ID
 	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
 					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	event->sndbuf_used = 0;
 	event->sndbuf_limit = 0;
@@ -3724,6 +3753,7 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 	// Look up socket ID
 	pkt_event->socket_id = lookup_socket_id(sk, pkt_event->src_addr, pkt_event->src_port,
 						 pkt_event->dest_addr, pkt_event->dest_port);
+	pkt_event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	pkt_event->sndbuf_used = 0;
 	pkt_event->sndbuf_limit = 0;
@@ -3807,6 +3837,7 @@ int BPF_KPROBE(tcp_send_probe0_entry, struct sock *sk)
 	// Get socket ID for correlation
 	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
 					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
@@ -3909,6 +3940,7 @@ int BPF_KPROBE(tcp_send_ack_entry, struct sock *sk)
 	// Get socket ID for correlation
 	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
 					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	// Initialize persist timer fields (receiver-side ACK events don't have this info)
 	event->icsk_pending = 0;
@@ -4026,6 +4058,7 @@ int BPF_KPROBE(tcp_retransmit_timer_entry, struct sock *sk)
 	// Get socket ID for correlation
 	event->socket_id = lookup_socket_id(sk, event->src_addr, event->src_port,
 					     event->dest_addr, event->dest_port);
+	event->netns_inum = read_sk_netns_inum((u64)sk);
 
 	// Read persist timer state
 	bpf_probe_read_kernel(&event->icsk_pending, sizeof(event->icsk_pending), &icsk->icsk_pending);
@@ -4385,6 +4418,7 @@ int BPF_KPROBE(sk_stream_wait_memory_entry, struct sock *sk, long *timeo)
 	event->event_type = PACKET_MEM_PRESSURE;
 	event->cpu = bpf_get_smp_processor_id();
 	event->socket_id = *socket_id_ptr;
+	event->netns_inum = read_sk_netns_inum(sk_ptr);
 	event->protocol = NETWORK_TCP;
 
 	// Read socket addresses
@@ -4666,6 +4700,7 @@ int BPF_PROG(inet_sock_set_state, const struct sock *sk, int oldstate, int newst
 	__builtin_memcpy(event->dest_addr, dest_addr, 16);
 	event->dest_port = dest_port;
 	event->socket_id = socket_id;
+	event->netns_inum = read_sk_netns_inum((u64)sk);
 	event->old_state = (u8)oldstate;
 	event->new_state = (u8)newstate;
 

@@ -271,3 +271,28 @@ SCHEMA_VERSION bump); `callsites` tables written by older systing-util
 binaries from spec-compliant inputs carry the inverted parent/depth shape and
 cannot be distinguished in-band — re-import with a fixed binary if the tree
 direction matters.
+
+## Schema Version 13 (systing 1.12.0) — 2026-07-29
+
+`network_socket` and `network_interface` each gain a `netns_inum BIGINT` column:
+the inode of the network namespace that owns the socket (for a flow row) or the
+interface/IP (for an interface row). It lets a reader attribute a flow to its
+owning netns — and therefore its pod — by joining
+`network_socket.netns_inum = network_interface.netns_inum`, instead of matching
+the socket's `src_ip` against the interface map. The IP match cannot
+disambiguate loopback (every netns has `127.0.0.1`/`::1` on `lo`), so
+intra-pod-localhost flows were unattributable before; the netns inode is
+unambiguous. It also attributes inbound flows (whose `src_ip` is the remote
+peer, not a local interface) and IPv4-mapped-IPv6 sockets correctly.
+
+### New columns
+- `network_socket.netns_inum` (BIGINT): read in BPF from the socket's
+  `struct sock` (`sk->__sk_common.skc_net.net->ns.inum`) at send/recv event
+  emission; the netns is stable over the socket's lifetime. `0` when the sock
+  pointer was unavailable.
+- `network_interface.netns_inum` (BIGINT): the inode of the enumerated netns
+  (the same value userspace reads from `/proc/<pid>/ns/net`), emitted alongside
+  the existing `namespace` display string by the per-namespace interface walk.
+
+Pre-v13 databases and traces have neither column; readers join on `netns_inum`
+where present and fall back to the `src_ip`→interface heuristic otherwise.
