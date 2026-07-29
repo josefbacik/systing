@@ -282,6 +282,10 @@ pub struct NetworkInterfaceRecord {
     pub interface_name: String,
     pub ip_address: String,
     pub address_type: String,
+    /// Inode of the network namespace this interface/IP belongs to. Lets the
+    /// fold join a flow's `network_socket.netns_inum` to its owning netns
+    /// without going through the IP (unambiguous for loopback). 0 if unknown.
+    pub netns_inum: i64,
 }
 
 /// Socket connection record.
@@ -421,6 +425,10 @@ pub struct NetworkPacketRecord {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NetworkSocketRecord {
     pub socket_id: i64,
+    /// Inode of the socket's network namespace. Joins `network_interface.netns_inum`
+    /// to attribute the flow to its owning netns (hence pod) directly, without
+    /// inferring from src_ip (which cannot disambiguate loopback). 0 if unknown.
+    pub netns_inum: i64,
     pub protocol: String,
     pub address_family: String,
     pub src_ip: String,

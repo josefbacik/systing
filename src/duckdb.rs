@@ -133,7 +133,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -425,7 +425,8 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             namespace VARCHAR,
             interface_name VARCHAR,
             ip_address VARCHAR,
-            address_type VARCHAR
+            address_type VARCHAR,
+            netns_inum BIGINT
         );
 
         -- Socket connection metadata (extracted from socket track names)
@@ -522,6 +523,7 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS network_socket (
             trace_id VARCHAR,
             socket_id BIGINT,
+            netns_inum BIGINT,
             protocol VARCHAR,
             address_family VARCHAR,
             src_ip VARCHAR,

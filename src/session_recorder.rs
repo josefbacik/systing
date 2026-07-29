@@ -1331,6 +1331,7 @@ impl SessionRecorder {
                         interface_name: iface.name.clone(),
                         ip_address: ipv4.to_string(),
                         address_type: "ipv4".to_string(),
+                        netns_inum: netns_info.inode as i64,
                     })?;
                 }
 
@@ -1341,6 +1342,7 @@ impl SessionRecorder {
                         interface_name: iface.name.clone(),
                         ip_address: ipv6.to_string(),
                         address_type: "ipv6".to_string(),
+                        netns_inum: netns_info.inode as i64,
                     })?;
                 }
             }

@@ -2023,12 +2023,14 @@ fn build_network_interface_batch(
         StringBuilder::with_capacity(records.len(), records.len() * 16);
     let mut ip_address_builder = StringBuilder::with_capacity(records.len(), records.len() * 45);
     let mut address_type_builder = StringBuilder::with_capacity(records.len(), records.len() * 4);
+    let mut netns_inum_builder = Int64Builder::with_capacity(records.len());
 
     for record in records {
         namespace_builder.append_value(&record.namespace);
         interface_name_builder.append_value(&record.interface_name);
         ip_address_builder.append_value(&record.ip_address);
         address_type_builder.append_value(&record.address_type);
+        netns_inum_builder.append_value(record.netns_inum);
     }
 
     Ok(RecordBatch::try_new(
@@ -2038,6 +2040,7 @@ fn build_network_interface_batch(
             Arc::new(interface_name_builder.finish()),
             Arc::new(ip_address_builder.finish()),
             Arc::new(address_type_builder.finish()),
+            Arc::new(netns_inum_builder.finish()),
         ],
     )?)
 }
@@ -2390,6 +2393,7 @@ fn build_network_socket_batch(
     schema: &Arc<Schema>,
 ) -> Result<RecordBatch> {
     let mut socket_id_builder = Int64Builder::with_capacity(records.len());
+    let mut netns_inum_builder = Int64Builder::with_capacity(records.len());
     let mut protocol_builder = StringBuilder::with_capacity(records.len(), records.len() * 3);
     let mut address_family_builder = StringBuilder::with_capacity(records.len(), records.len() * 4);
     let mut src_ip_builder = StringBuilder::with_capacity(records.len(), records.len() * 45);
@@ -2401,6 +2405,7 @@ fn build_network_socket_batch(
 
     for record in records {
         socket_id_builder.append_value(record.socket_id);
+        netns_inum_builder.append_value(record.netns_inum);
         protocol_builder.append_value(&record.protocol);
         address_family_builder.append_value(&record.address_family);
         src_ip_builder.append_value(&record.src_ip);
@@ -2415,6 +2420,7 @@ fn build_network_socket_batch(
         schema.clone(),
         vec![
             Arc::new(socket_id_builder.finish()),
+            Arc::new(netns_inum_builder.finish()),
             Arc::new(protocol_builder.finish()),
             Arc::new(address_family_builder.finish()),
             Arc::new(src_ip_builder.finish()),

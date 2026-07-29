@@ -367,6 +367,7 @@ impl NetworkRecorder {
         src_port: u16,
         dest_addr: &[u8; 16],
         dest_port: u16,
+        netns_inum: u64,
         ts: i64,
     ) -> Result<bool> {
         use crate::systing_core::types::{network_address_family, network_protocol};
@@ -411,6 +412,7 @@ impl NetworkRecorder {
         // Emit NetworkSocketRecord
         collector.add_network_socket(NetworkSocketRecord {
             socket_id: socket_id as i64,
+            netns_inum: netns_inum as i64,
             protocol: protocol_str,
             address_family: af_str,
             src_ip,
@@ -455,6 +457,7 @@ impl NetworkRecorder {
             event.src_port,
             &event.dest_addr,
             event.dest_port,
+            event.netns_inum,
             ts,
         )?;
 
@@ -542,6 +545,7 @@ impl NetworkRecorder {
             event.src_port,
             &event.dest_addr,
             event.dest_port,
+            event.netns_inum,
             ts,
         )?;
 
