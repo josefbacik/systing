@@ -598,6 +598,18 @@ struct UserSymbolizeCtx<'a> {
     guest: Option<&'a GuestProcess>,
 }
 
+/// Key of a kernel-tagged build-id frame: the fixed 20-byte note field plus
+/// the file offset the kernel computed for the ip.
+type BuildIdFrameKey = ([u8; 20], u64);
+
+/// A live process's symbolization input: the context plus the two
+/// per-process caches (raw user addresses; live-path build-id frames).
+type LiveUserState<'a, 'b> = (
+    &'a UserSymbolizeCtx<'b>,
+    &'a mut HashMap<u64, String>,
+    &'a mut HashMap<BuildIdFrameKey, String>,
+);
+
 /// Kernel `enum bpf_stack_build_id_status` values, as delivered in
 /// `systing_stack_build_id.status` (EMPTY = 0 produces no frame at all).
 const BUILD_ID_STATUS_VALID: i32 = 1;
@@ -626,12 +638,7 @@ fn fill_store_from_maps(store: &mut BuildIdStore, maps: &ProcessMaps) -> usize {
                 _ => continue,
             },
         };
-        let mut id = [0u8; 20];
-        let bytes: &[u8] = &bid;
-        let n = bytes.len().min(20);
-        // Shorter note payloads zero-extend, matching the kernel's fixed
-        // 20-byte field.
-        id[..n].copy_from_slice(&bytes[..n]);
+        let id = note_to_id(&bid);
         let module = display
             .file_name()
             .and_then(|f| f.to_str())
@@ -641,6 +648,37 @@ fn fill_store_from_maps(store: &mut BuildIdStore, maps: &ProcessMaps) -> usize {
         mappings += 1;
     }
     mappings
+}
+
+/// A build-id note payload as the kernel's fixed 20-byte stack-frame field:
+/// shorter notes zero-extend, longer ones truncate (the kernel does both).
+fn note_to_id(bytes: &[u8]) -> [u8; 20] {
+    let mut id = [0u8; 20];
+    let n = bytes.len().min(20);
+    id[..n].copy_from_slice(&bytes[..n]);
+    id
+}
+
+/// Locate a (build-id, file offset) frame in a live process's own address
+/// space: find the file-backed executable mapping that both contains the
+/// file offset and carries the frame's build-id note, and return the
+/// virtual address the offset is mapped at there. `None` — no containing
+/// mapping, note unreadable, or note mismatch (including island-relative
+/// offsets, whose pool ranges never match a file mapping) — sends the
+/// frame down the store path unchanged.
+fn reconstruct_build_id_addr(
+    maps: Option<&ProcessMaps>,
+    id: &[u8; 20],
+    file_offset: u64,
+) -> Option<u64> {
+    for (addr, link) in maps?.virt_candidates_for_file_offset(file_offset) {
+        if let Ok(Some(bid)) = read_elf_build_id(&link) {
+            if note_to_id(&bid) == *id {
+                return Some(addr);
+            }
+        }
+    }
+    None
 }
 
 /// Convert BPF stack_event_type (u32) to i8, clamping to valid range.
@@ -953,13 +991,16 @@ impl StackRecorder {
         // for all processes.
         let mut kernel_cache: HashMap<u64, String> = HashMap::new();
 
-        // Build-id store and result cache (build-id mode; both stay empty
-        // otherwise). Unlike the per-process user caches below, these are
-        // global: (build-id, offset) identifies a frame independently of
-        // any process, so one resolution serves every process — dead or
-        // alive — that ever mapped that binary.
+        // Build-id store and store-path result cache (build-id mode; both
+        // stay empty otherwise). Unlike the per-process user caches below,
+        // these are global: a STORE-path resolution of (build-id, offset)
+        // is process-independent, so one serves every process — dead or
+        // alive — that ever mapped that binary. Live-path build-id results
+        // (frames re-located in a live process's own maps and symbolized
+        // through the full cascade) are process-scoped — bridge and guest
+        // labels depend on the process — and cache per group below.
         let mut bid_store = BuildIdStore::new(self.debuginfod_client.clone());
-        let mut bid_cache: HashMap<([u8; 20], u64), String> = HashMap::new();
+        let mut bid_cache: HashMap<BuildIdFrameKey, String> = HashMap::new();
 
         // Index every live process's executable mappings by build-id note —
         // the store's opportunistic source. Host-wide rather than
@@ -1138,10 +1179,13 @@ impl StackRecorder {
                     maps: maps_info.as_ref(),
                     guest,
                 };
-                // Per-process user-address cache, freed with the group. Survives
-                // a mid-group rebuild, so already-resolved addresses are not
-                // re-done.
+                // Per-process caches, freed with the group: raw user
+                // addresses, and live-path build-id frames (whose rendering
+                // is process-scoped — see the bid_cache comment above).
+                // Both survive a mid-group rebuild, so already-resolved
+                // frames are not re-done.
                 let mut user_cache: HashMap<u64, String> = HashMap::new();
+                let mut live_bid_cache: HashMap<BuildIdFrameKey, String> = HashMap::new();
 
                 for (i, (stack, stack_id)) in stacks.into_iter().enumerate() {
                     if i > 0 && i % VALVE_CHECK_INTERVAL == 0 {
@@ -1150,7 +1194,7 @@ impl StackRecorder {
                     let frame_names = self.symbolize_stack_frames(
                         &mut symbolizer,
                         &stack,
-                        Some((&ctx, &mut user_cache)),
+                        Some((&ctx, &mut user_cache, &mut live_bid_cache)),
                         &kernel_src,
                         &mut kernel_cache,
                         &mut bid_store,
@@ -1248,7 +1292,7 @@ impl StackRecorder {
         &self,
         symbolizer: &mut Symbolizer,
         store: &mut BuildIdStore,
-        cache: &mut HashMap<([u8; 20], u64), String>,
+        cache: &mut HashMap<BuildIdFrameKey, String>,
         id: [u8; 20],
         offset: u64,
     ) -> String {
@@ -1300,23 +1344,27 @@ impl StackRecorder {
 
     /// Symbolize a single stack and return frame names.
     ///
-    /// `user` carries the symbolization context and per-process address
-    /// cache for a live process; `None` means the process has exited, in
-    /// which case raw user addresses cannot be symbolized (no
-    /// /proc/<pid>/maps) and are rendered as `unknown ([exited]) <addr>`
-    /// (or raw hex with labels disabled). Build-id frames don't need the
-    /// process at all: they resolve through the store either way. Kernel
+    /// `user` carries the symbolization context and the two per-process
+    /// caches (raw addresses; live build-id frames) for a live process;
+    /// `None` means the process has exited, in which case raw user
+    /// addresses cannot be symbolized (no /proc/<pid>/maps) and are
+    /// rendered as `unknown ([exited]) <addr>` (or raw hex with labels
+    /// disabled). Build-id frames of a LIVE process are first located in
+    /// the process's own maps and symbolized through the full live cascade
+    /// (memory view, island bridging, guest labels — everything the store
+    /// path lacks); the store path serves them only as fallback, and is
+    /// the sole path once the process is gone (its design case). Kernel
     /// addresses go through the shared `kernel_cache`.
     #[allow(clippy::too_many_arguments)]
     fn symbolize_stack_frames(
         &self,
         symbolizer: &mut Symbolizer,
         stack: &Stack,
-        user: Option<(&UserSymbolizeCtx<'_>, &mut HashMap<u64, String>)>,
+        user: Option<LiveUserState<'_, '_>>,
         kernel_src: &Source<'_>,
         kernel_cache: &mut HashMap<u64, String>,
         bid_store: &mut BuildIdStore,
-        bid_cache: &mut HashMap<([u8; 20], u64), String>,
+        bid_cache: &mut HashMap<BuildIdFrameKey, String>,
     ) -> Vec<String> {
         let mut frame_names = Vec::with_capacity(
             stack.user_stack.len() + stack.kernel_stack.len() + stack.py_stack.len(),
@@ -1328,7 +1376,7 @@ impl StackRecorder {
 
         // Symbolize user addresses (middle segment of the root-to-leaf array)
         match user {
-            Some((ctx, user_cache)) => {
+            Some((ctx, user_cache, live_bid_cache)) => {
                 for frame in &stack.user_stack {
                     let frame_name = match frame {
                         UserFrame::Ip(addr) => match user_cache.get(addr) {
@@ -1339,9 +1387,24 @@ impl StackRecorder {
                                 name
                             }
                         },
-                        UserFrame::BuildId { id, offset } => self.symbolize_build_id_frame(
-                            symbolizer, bid_store, bid_cache, *id, *offset,
-                        ),
+                        UserFrame::BuildId { id, offset } => {
+                            match live_bid_cache.get(&(*id, *offset)) {
+                                Some(name) => name.clone(),
+                                None => {
+                                    let name =
+                                        match reconstruct_build_id_addr(ctx.maps, id, *offset) {
+                                            Some(addr) => {
+                                                self.symbolize_user_addr(symbolizer, ctx, addr)
+                                            }
+                                            None => self.symbolize_build_id_frame(
+                                                symbolizer, bid_store, bid_cache, *id, *offset,
+                                            ),
+                                        };
+                                    live_bid_cache.insert((*id, *offset), name.clone());
+                                    name
+                                }
+                            }
+                        }
                     };
                     frame_names.push(frame_name);
                 }
@@ -1657,6 +1720,37 @@ mod tests {
             id: [seed; 20],
             offset,
         }
+    }
+
+    #[test]
+    fn test_note_to_id_zero_extend_and_truncate() {
+        assert_eq!(note_to_id(&[0xab; 20]), [0xab; 20]);
+        let mut short = [0u8; 20];
+        short[..4].copy_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(
+            note_to_id(&[1, 2, 3, 4]),
+            short,
+            "short notes zero-extend like the kernel's fixed field"
+        );
+        assert_eq!(note_to_id(&[0x7; 24]), [0x7; 20], "long notes truncate");
+    }
+
+    #[test]
+    fn test_reconstruct_build_id_addr_falls_back_to_store_path() {
+        // Exited shape: no maps at all.
+        assert_eq!(reconstruct_build_id_addr(None, &[1; 20], 0x1000), None);
+
+        // A containing candidate whose map_files link is unreadable (the
+        // fixture tgid doesn't exist): the note check cannot confirm it, so
+        // reconstruction declines — the frame takes the store path rather
+        // than guessing among offset-overlapping mappings.
+        let pm = crate::sandbox_maps::ProcessMaps::parse(
+            -42,
+            "400000-500000 r-xp 00000000 08:01 7 /usr/bin/x",
+            "x",
+        );
+        assert_eq!(pm.virt_candidates_for_file_offset(0x1000).len(), 1);
+        assert_eq!(reconstruct_build_id_addr(Some(&pm), &[1; 20], 0x1000), None);
     }
 
     #[test]

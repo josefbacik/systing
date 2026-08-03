@@ -231,6 +231,31 @@ impl ProcessMaps {
             .collect()
     }
 
+    /// File-backed executable mappings whose file-offset range contains
+    /// `file_offset`, as (candidate virtual address, namespace-immune
+    /// `map_files` link) pairs. The candidate address is where the file
+    /// offset is mapped in this process: `start + (file_offset - offset)`.
+    /// Memfd and anonymous entries never match — their offset fields are
+    /// pool offsets, meaningless as ELF file offsets (see [`MapEntry`]).
+    /// Offset ranges of unrelated files overlap freely, so callers must
+    /// disambiguate candidates (by build-id note).
+    pub fn virt_candidates_for_file_offset(&self, file_offset: u64) -> Vec<(u64, PathBuf)> {
+        self.entries
+            .iter()
+            .filter(|e| e.exec && matches!(e.backing, Backing::File(_)))
+            .filter(|e| e.offset <= file_offset && file_offset - e.offset < e.end - e.start)
+            .map(|e| {
+                (
+                    e.start + (file_offset - e.offset),
+                    PathBuf::from(format!(
+                        "/proc/{}/map_files/{:x}-{:x}",
+                        self.tgid, e.start, e.end
+                    )),
+                )
+            })
+            .collect()
+    }
+
     fn entry_for(&self, addr: u64) -> Option<&MapEntry> {
         // Entries are in address order as read from /proc.
         self.entries
@@ -446,6 +471,51 @@ mod tests {
             "foo",
         );
         assert!(!pm_plain.is_gvisor());
+    }
+
+    #[test]
+    fn test_virt_candidates_containment_and_exclusions() {
+        let pm = ProcessMaps::parse(510, STUB_MAPS, "");
+
+        // 0x1000 falls in guestbox fragment 1 (foff 0x0, len 0xc2000) and in
+        // the anonymous r-xp entry's offset range — but anon never matches,
+        // so exactly one candidate comes back, at start + delta.
+        let c = pm.virt_candidates_for_file_offset(0x1000);
+        assert_eq!(c.len(), 1, "file-backed exec only (anon excluded)");
+        assert_eq!(c[0].0, 0x401000);
+        assert_eq!(
+            c[0].1,
+            PathBuf::from("/proc/510/map_files/400000-4c2000"),
+            "candidate must carry the namespace-immune link"
+        );
+
+        // 0xc3500 is only inside fragment 2 (foff 0xc3000, len 0xa000).
+        let c = pm.virt_candidates_for_file_offset(0xc3500);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].0, 0x4c3500);
+
+        // 0xc2800 sits in the file-offset gap the pool island covers in
+        // address space — no file fragment contains it (the island-relative
+        // offset shape; callers fall back to the store path).
+        assert!(pm.virt_candidates_for_file_offset(0xc2800).is_empty());
+
+        // A pool offset inside an island's own offset field must never
+        // match: memfd offsets are not ELF file offsets.
+        assert!(pm.virt_candidates_for_file_offset(0x3ff26800).is_empty());
+    }
+
+    #[test]
+    fn test_virt_candidates_multiple_files_both_returned() {
+        // Two unrelated files whose offset ranges overlap: both are
+        // candidates, disambiguation is the caller's job (build-id note).
+        let maps = "\
+400000-410000 r-xp 00001000 08:01 42 /usr/bin/a
+7f0000000000-7f0000020000 r-xp 00000000 08:01 43 /usr/lib/b.so";
+        let pm = ProcessMaps::parse(7, maps, "a");
+        let c = pm.virt_candidates_for_file_offset(0x2000);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].0, 0x401000, "a: 0x400000 + (0x2000 - 0x1000)");
+        assert_eq!(c[1].0, 0x7f0000002000, "b: base + 0x2000");
     }
 
     #[test]
