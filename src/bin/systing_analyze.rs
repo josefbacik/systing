@@ -5,7 +5,8 @@
 //! MCP server mode for AI assistant integration.
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use std::path::PathBuf;
 use systing::analyze::{self, AnalyzeDb};
 
@@ -52,6 +53,12 @@ enum Commands {
         /// query fails instead of the process being evicted.
         #[arg(long, value_name = "SIZE")]
         max_temp_directory_size: Option<String>,
+    },
+    /// Print a shell completion script to stdout
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_name = "SHELL")]
+        shell: Shell,
     },
 }
 
@@ -1065,6 +1072,12 @@ fn main() -> Result<()> {
                 database,
                 max_temp_directory_size,
             ))
+        }
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            generate(shell, &mut cmd, name, &mut std::io::stdout());
+            Ok(())
         }
     }
 }

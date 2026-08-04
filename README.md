@@ -31,6 +31,39 @@ This will generate a `trace.pb` file which can be uploaded to a
 `.systing.gz`) writes a lightweight profile export any tool can parse without
 DuckDB — see [docs/PROFILE_EXPORT_FORMAT.md](docs/PROFILE_EXPORT_FORMAT.md).
 
+## Shell completions
+
+All three binaries can print their own completion script. `systing` uses a
+flag, the subcommand-based tools use a `completions` subcommand:
+
+```bash
+systing --completions bash
+systing-analyze completions zsh
+systing-util completions fish
+```
+
+Supported shells: `bash`, `zsh`, `fish`, `elvish`, `powershell`.
+
+To install them for your user (bash and zsh shown):
+
+```bash
+# bash
+mkdir -p ~/.local/share/bash-completion/completions
+systing --completions bash > ~/.local/share/bash-completion/completions/systing
+systing-analyze completions bash > ~/.local/share/bash-completion/completions/systing-analyze
+systing-util completions bash > ~/.local/share/bash-completion/completions/systing-util
+
+# zsh (any directory on your $fpath)
+mkdir -p ~/.local/share/zsh/site-functions
+systing --completions zsh > ~/.local/share/zsh/site-functions/_systing
+```
+
+Packagers can generate all files at once into a directory:
+
+```bash
+./scripts/generate-completions.sh completions/
+```
+
 ## Development Setup
 
 **IMPORTANT**: If you're contributing code, enable the git hooks to enforce code formatting:

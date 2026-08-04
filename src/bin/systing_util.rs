@@ -9,7 +9,8 @@ use arrow::array::{
     StringBuilder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use duckdb::{params, Connection};
 
 // Import shared modules from library
@@ -129,6 +130,12 @@ enum Commands {
         /// Allow binding a TCP listener on 0.0.0.0 / [::].
         #[arg(long)]
         insecure_tcp_bind_any: bool,
+    },
+    /// Print a shell completion script to stdout
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_name = "SHELL")]
+        shell: Shell,
     },
 }
 
@@ -3810,6 +3817,12 @@ fn main() -> Result<()> {
             output_dir,
             insecure_tcp_bind_any,
         } => systing::stream::receive::run(listen, output_dir, insecure_tcp_bind_any),
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            generate(shell, &mut cmd, name, &mut std::io::stdout());
+            Ok(())
+        }
     }
 }
 
