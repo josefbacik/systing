@@ -1103,8 +1103,22 @@ static __always_inline u64 get_or_create_socket_id(
 
 	// Check if we already have metadata for this socket
 	existing = bpf_map_lookup_elem(&socket_metadata_map, &identity_key);
-	if (existing)
+	if (existing) {
+		// Seed the sk-keyed map on the hit path too: a socket that
+		// merges into a persistent tuple entry (client port reuse
+		// within the capture) must still resolve sk-first at its
+		// terminal transitions, or its close falls back to the
+		// anonymous degraded-tuple identity. Guarded on a bound
+		// src_port — seeding from a port-less connect-start hit
+		// would pin the socket to a shared per-destination port-0
+		// entry for its whole lifecycle.
+		if (src_port != 0) {
+			u64 sk_ptr = (u64)sk;
+			bpf_map_update_elem(&sk_socket_id_map, &sk_ptr,
+					    &existing->socket_id, BPF_ANY);
+		}
 		return existing->socket_id;
+	}
 
 	// Create new socket metadata
 	metadata.socket_id = generate_socket_id();
@@ -4673,15 +4687,32 @@ int BPF_PROG(inet_sock_set_state, const struct sock *sk, int oldstate, int newst
 			      dest_addr, &dest_port) < 0)
 		return 0;
 
-	// Get or create socket ID - use get_or_create_socket_id so that
-	// early transitions (SYN_SENT, SYN_RECV -> ESTABLISHED) create
-	// socket entries even before any sendmsg/recvmsg occurs.
-	// Note: tgidpid may not be the socket owner in softirq/timer context,
-	// but get_or_create_socket_id does not use it for identification.
+	// Socket identity: reuse the socket's EXISTING id first (sk-keyed
+	// lookup). State transitions fire with degraded tuples at both ends
+	// of the lifecycle — the connect-start transition (CLOSE ->
+	// SYN_SENT) fires in tcp_v4_connect() before the ephemeral port is
+	// assigned, and transitions to CLOSE observably arrive with the
+	// bound port already zeroed (every anonymous close row reads
+	// src_port=0 in production traces) — so the tuple-keyed
+	// get_or_create minted a SECOND, anonymous src_port=0 identity for
+	// terminal transitions and a socket's opens and closes landed on
+	// different flow rows. The sk-first lookup pins the whole
+	// lifecycle to one identity. get_or_create remains the fallback
+	// for a socket whose first-ever observed event is a state change
+	// (it also seeds sk_socket_id_map for the next event).
+	// Note: tgidpid may not be the socket owner in softirq/timer
+	// context, but get_or_create_socket_id does not use it for
+	// identification.
 	u64 tgidpid = bpf_get_current_pid_tgid();
-	u64 socket_id = get_or_create_socket_id(
-		(struct sock *)sk, NETWORK_TCP, af,
-		src_addr, src_port, dest_addr, dest_port, tgidpid);
+	u64 sk_key = (u64)sk;
+	u64 socket_id = 0;
+	u64 *sid = bpf_map_lookup_elem(&sk_socket_id_map, &sk_key);
+	if (sid && *sid)
+		socket_id = *sid;
+	else
+		socket_id = get_or_create_socket_id(
+			(struct sock *)sk, NETWORK_TCP, af,
+			src_addr, src_port, dest_addr, dest_port, tgidpid);
 	if (socket_id == 0)
 		return 0;
 
@@ -4721,6 +4752,14 @@ int BPF_PROG(inet_sock_set_state, const struct sock *sk, int oldstate, int newst
 			struct tw_pending_info empty = {};
 			bpf_map_update_elem(&pending_tw, &tw_key, &empty, BPF_ANY);
 		}
+		// This sk is being destroyed on BOTH paths that reach here
+		// with a raw CLOSE — a real close, and the TIME_WAIT rewrite
+		// (tcp_time_wait() frees this sk via tcp_done(); the
+		// timewait sock carries on under its own pointer, tracked by
+		// the tw kprobes, which captured the id before this fires).
+		// Drop the sk-keyed identity so a recycled sk allocation
+		// mints a fresh id instead of inheriting this lifecycle's.
+		bpf_map_delete_elem(&sk_socket_id_map, &sk_key);
 	}
 
 	bpf_ringbuf_submit(event, flags);
