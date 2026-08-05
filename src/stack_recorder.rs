@@ -660,19 +660,40 @@ fn note_to_id(bytes: &[u8]) -> [u8; 20] {
 }
 
 /// Locate a (build-id, file offset) frame in a live process's own address
-/// space: find the file-backed executable mapping that both contains the
-/// file offset and carries the frame's build-id note, and return the
-/// virtual address the offset is mapped at there. `None` — no containing
-/// mapping, note unreadable, or note mismatch (including island-relative
-/// offsets, whose pool ranges never match a file mapping) — sends the
-/// frame down the store path unchanged.
+/// space and return the virtual address to symbolize, or `None` to send the
+/// frame down the store path unchanged. Two cases:
+///
+/// 1. Ordinary file-backed text: the offset is a real ELF file offset; find
+///    the file-backed executable mapping that both contains it and carries
+///    the frame's build-id note, and return where that offset is mapped.
+///
+/// 2. gVisor guest islands: under systrap the kernel reports a guest frame's
+///    offset relative to the `runsc-memory` pool memfd, so no file mapping
+///    matches. Reconstruct the island address from the pool mapping and keep
+///    it only if it bridges to a real file — [`ProcessMaps::bridge_for`]'s
+///    neighbour-congruence is the disambiguator, and the bridged neighbour's
+///    own ELF note must match the frame's build-id (the pool memfd's note is
+///    unreliable, but the neighbour file's is authoritative). A coincidental
+///    pool-offset match that does not bridge, or bridges to a different
+///    binary, falls through to the store path unchanged.
 fn reconstruct_build_id_addr(
     maps: Option<&ProcessMaps>,
     id: &[u8; 20],
     file_offset: u64,
 ) -> Option<u64> {
-    for (addr, link) in maps?.virt_candidates_for_file_offset(file_offset) {
+    let maps = maps?;
+    for (addr, link) in maps.virt_candidates_for_file_offset(file_offset) {
         if let Ok(Some(bid)) = read_elf_build_id(&link) {
+            if note_to_id(&bid) == *id {
+                return Some(addr);
+            }
+        }
+    }
+    for addr in maps.pool_candidates_for_offset(file_offset) {
+        let Some(bridge) = maps.bridge_for(addr) else {
+            continue;
+        };
+        if let Ok(Some(bid)) = read_elf_build_id(&bridge.map_files_path) {
             if note_to_id(&bid) == *id {
                 return Some(addr);
             }
@@ -1751,6 +1772,26 @@ mod tests {
         );
         assert_eq!(pm.virt_candidates_for_file_offset(0x1000).len(), 1);
         assert_eq!(reconstruct_build_id_addr(Some(&pm), &[1; 20], 0x1000), None);
+
+        // gVisor island shape: a pool-relative offset finds no file candidate
+        // but reconstructs to an island address that bridges to its congruent
+        // file neighbours. With the neighbour's note unreadable (fixture tgid
+        // doesn't exist) the pool path declines too, sending the frame to the
+        // store path rather than resolving against an unconfirmed binary.
+        let guest = crate::sandbox_maps::ProcessMaps::parse(
+            -42,
+            "400000-4c2000 r-xs 00000000 00:13 426 /root/bin/guestbox\n\
+             4c2000-4c3000 r-xs 3ff1f000 00:01 4   /memfd:runsc-memory (deleted)\n\
+             4c3000-4cd000 r-xs 000c3000 00:13 426 /root/bin/guestbox",
+            "guestbox",
+        );
+        assert!(guest.virt_candidates_for_file_offset(0x3ff1f500).is_empty());
+        assert_eq!(guest.pool_candidates_for_offset(0x3ff1f500), vec![0x4c2500]);
+        assert!(guest.bridge_for(0x4c2500).is_some());
+        assert_eq!(
+            reconstruct_build_id_addr(Some(&guest), &[1; 20], 0x3ff1f500),
+            None
+        );
     }
 
     #[test]

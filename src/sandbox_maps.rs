@@ -256,6 +256,29 @@ impl ProcessMaps {
             .collect()
     }
 
+    /// Virtual addresses of executable memfd mappings whose offset range
+    /// contains `offset`. Exists for gVisor's `runsc-memory` pool: under
+    /// systrap the kernel's build-id walker reports a guest island frame's
+    /// offset relative to the pool memfd (not the original ELF), so the
+    /// `virt_candidates` lookup finds nothing; the address
+    /// `start + (offset - e.offset)` is where that pool offset is mapped,
+    /// which is an island inside the guest image. Deliberately name-agnostic
+    /// (any memfd, matching [`Self::bridge_for`]'s scope, not
+    /// `GVISOR_MEMFDS`): correctness comes from the caller bridging each
+    /// candidate and verifying the bridged neighbor's build-id note, which
+    /// makes a coincidental match on some other runtime's exec memfd
+    /// harmless. Returns addresses to bridge, never (offset, link) pairs —
+    /// the pool offset itself is meaningless as an ELF file offset, and only
+    /// the island's file-backed neighbors identify the real binary.
+    pub fn pool_candidates_for_offset(&self, offset: u64) -> Vec<u64> {
+        self.entries
+            .iter()
+            .filter(|e| e.exec && matches!(e.backing, Backing::Memfd(_)))
+            .filter(|e| e.offset <= offset && offset - e.offset < e.end - e.start)
+            .map(|e| e.start + (offset - e.offset))
+            .collect()
+    }
+
     fn entry_for(&self, addr: u64) -> Option<&MapEntry> {
         // Entries are in address order as read from /proc.
         self.entries
@@ -516,6 +539,29 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].0, 0x401000, "a: 0x400000 + (0x2000 - 0x1000)");
         assert_eq!(c[1].0, 0x7f0000002000, "b: base + 0x2000");
+    }
+
+    #[test]
+    fn test_pool_candidates_containment_and_exclusions() {
+        let pm = ProcessMaps::parse(510, STUB_MAPS, "");
+
+        // A pool offset inside the exec island 4c2000-4c3000 (memfd pgoff
+        // 0x3ff1f000) reconstructs to its island address — the kernel reports
+        // guest island frames at this pool offset, and this is where it maps.
+        let c = pm.pool_candidates_for_offset(0x3ff1f500);
+        assert_eq!(c, vec![0x4c2500], "island start + (offset - pgoff)");
+
+        // The exec island 64000-69000 (memfd pgoff 0x3ff26000).
+        assert_eq!(pm.pool_candidates_for_offset(0x3ff26800), vec![0x64800]);
+
+        // A real ELF file offset (0x1000) belongs to no pool mapping's
+        // offset range — the pool path must not spuriously claim it.
+        assert!(pm.pool_candidates_for_offset(0x1000).is_empty());
+
+        // The rw-s memfd 711000-714000 (pgoff 0x3fe00000) is NOT executable,
+        // so an offset in its range yields no candidate — only exec pool
+        // mappings carry code frames.
+        assert!(pm.pool_candidates_for_offset(0x3fe00800).is_empty());
     }
 
     #[test]
