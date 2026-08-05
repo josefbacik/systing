@@ -412,6 +412,13 @@ pub struct NetworkPacketRecord {
 /// Replaces socket_connection with a cleaner schema (no track_id needed).
 /// Socket info extracted directly from BPF events for true streaming.
 ///
+/// Normally one record per socket per capture. A socket whose identity
+/// was created by a pre-bind state transition (connect-start fires
+/// before the ephemeral port is assigned) emits its first record with
+/// `src_port` 0 and ONE upgraded record with the bound tuple when a
+/// later event carries it — readers keeping one row per `socket_id`
+/// should prefer the row whose `src_port` is nonzero.
+///
 /// # Fields
 /// - `socket_id`: Unique socket ID (primary key)
 /// - `protocol`: "TCP" or "UDP"

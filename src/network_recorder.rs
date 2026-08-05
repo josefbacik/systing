@@ -311,8 +311,16 @@ pub struct NetworkRecorder {
     min_ts: Option<u64>,
 
     // Streaming support fields
-    /// Track which sockets have had their NetworkSocketRecord emitted
-    seen_sockets: HashSet<SocketId>,
+    /// Track which sockets have had their NetworkSocketRecord emitted,
+    /// and whether that record carried a bound (nonzero) src_port. A
+    /// socket whose identity is created by a pre-bind state transition
+    /// (connect-start fires before the ephemeral port is assigned)
+    /// emits its first record with src_port=0; when a later event
+    /// arrives carrying the bound tuple, ONE upgraded record is
+    /// emitted for the same socket_id so the trace carries the real
+    /// tuple. Readers keep one row per socket by preferring the
+    /// bound-port row.
+    seen_sockets: HashMap<SocketId, bool>,
     /// Collector for streaming records during recording
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
     /// Next record ID counters for streaming
@@ -328,6 +336,27 @@ impl ThreadAwareRecorder for NetworkRecorder {
     }
 }
 
+/// Decide whether a NetworkSocketRecord should be emitted for this
+/// sighting of `socket_id`, updating the seen-map. True on first sight,
+/// and ONCE more as an upgrade when the first record was emitted from a
+/// pre-bind event (src_port=0) and this sighting carries the bound port
+/// — after the upgrade the id is marked bound and never re-emits. A
+/// port-less sighting never downgrades a bound mark.
+fn should_emit_socket_record(
+    seen_sockets: &mut HashMap<SocketId, bool>,
+    socket_id: SocketId,
+    src_port: u16,
+) -> bool {
+    match seen_sockets.get(&socket_id) {
+        Some(true) => false,
+        Some(false) if src_port == 0 => false,
+        _ => {
+            seen_sockets.insert(socket_id, src_port != 0);
+            true
+        }
+    }
+}
+
 impl NetworkRecorder {
     pub fn new(utid_generator: Arc<UtidGenerator>, resolve_addresses: bool) -> Self {
         Self {
@@ -336,7 +365,7 @@ impl NetworkRecorder {
             hostname_cache: HashMap::new(),
             resolve_addresses,
             min_ts: None,
-            seen_sockets: HashSet::new(),
+            seen_sockets: HashMap::new(),
             streaming_collector: None,
             next_syscall_id: 1,
             next_packet_id: 1,
@@ -355,8 +384,10 @@ impl NetworkRecorder {
         self.streaming_collector = Some(collector);
     }
 
-    /// Helper to emit NetworkSocketRecord if not yet seen for this socket.
-    /// Returns true if a new socket record was emitted.
+    /// Helper to emit NetworkSocketRecord if not yet seen for this socket,
+    /// or ONCE more as an upgrade when the first record was emitted from a
+    /// pre-bind event (src_port=0) and this event carries the bound tuple.
+    /// Returns true if a record was emitted.
     #[allow(clippy::too_many_arguments)]
     fn maybe_emit_socket_record(
         &mut self,
@@ -372,13 +403,9 @@ impl NetworkRecorder {
     ) -> Result<bool> {
         use crate::systing_core::types::{network_address_family, network_protocol};
 
-        // Check if we've already emitted a record for this socket
-        if self.seen_sockets.contains(&socket_id) {
+        if !should_emit_socket_record(&mut self.seen_sockets, socket_id, src_port) {
             return Ok(false);
         }
-
-        // Mark as seen
-        self.seen_sockets.insert(socket_id);
 
         // Get collector (must be present in streaming mode)
         let collector = self.streaming_collector.as_mut().ok_or_else(|| {
@@ -1112,5 +1139,51 @@ mod tests {
         assert_eq!(tcp_state_name(12), "NEW_SYN_RECV");
         assert_eq!(tcp_state_name(13), "UNKNOWN");
         assert_eq!(tcp_state_name(255), "UNKNOWN");
+    }
+}
+
+#[cfg(test)]
+mod socket_record_emission_tests {
+    use super::*;
+
+    /// The upgrade lifecycle (the close-storm RCA's recorder half): a
+    /// socket first seen via a pre-bind event emits a port-less record,
+    /// the first bound-tuple sighting emits exactly one upgrade, and
+    /// nothing after that re-emits.
+    #[test]
+    fn upgrade_emits_once_after_portless_first_sight() {
+        let mut seen = HashMap::new();
+        // First sight, pre-bind (connect-start): emit the port-less record.
+        assert!(should_emit_socket_record(&mut seen, 42, 0));
+        // More pre-bind sightings: no re-emit.
+        assert!(!should_emit_socket_record(&mut seen, 42, 0));
+        // Bound tuple arrives: the ONE upgrade.
+        assert!(should_emit_socket_record(&mut seen, 42, 33000));
+        // Nothing re-emits afterwards — bound, port-less, or otherwise.
+        assert!(!should_emit_socket_record(&mut seen, 42, 33000));
+        assert!(!should_emit_socket_record(&mut seen, 42, 0));
+        assert!(!should_emit_socket_record(&mut seen, 42, 44000));
+    }
+
+    /// A socket first seen with its bound tuple behaves exactly as
+    /// before this change: one record, no upgrades, and a later
+    /// port-less sighting (a terminal transition) never re-emits.
+    #[test]
+    fn bound_first_sight_is_single_emission() {
+        let mut seen = HashMap::new();
+        assert!(should_emit_socket_record(&mut seen, 7, 443));
+        assert!(!should_emit_socket_record(&mut seen, 7, 443));
+        assert!(!should_emit_socket_record(&mut seen, 7, 0));
+        assert!(!should_emit_socket_record(&mut seen, 7, 443));
+    }
+
+    /// Distinct sockets track independently.
+    #[test]
+    fn sockets_are_independent() {
+        let mut seen = HashMap::new();
+        assert!(should_emit_socket_record(&mut seen, 1, 0));
+        assert!(should_emit_socket_record(&mut seen, 2, 80));
+        assert!(should_emit_socket_record(&mut seen, 1, 1024));
+        assert!(!should_emit_socket_record(&mut seen, 2, 0));
     }
 }
