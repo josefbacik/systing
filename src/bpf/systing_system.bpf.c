@@ -4869,8 +4869,19 @@ int BPF_KPROBE(inet_twsk_deschedule_put_entry, struct inet_timewait_sock *tw)
 
 /* ===== Memory recorder ===== */
 
+/* `with_kernel` selects whether the kernel half is captured at all. The
+ * page-fault leg passes false: at the exceptions/page_fault_user tracepoint
+ * the kernel stack is only the exception-entry glue above the faulting user
+ * frame — how much of it survives SKIP_STACK_DEPTH varies by kernel version
+ * (6.12.55 leaves asm_exc_page_fault; 6.12.68+ leaves nothing), so the
+ * capture carries no analytical signal and made `leaf` grouping split by
+ * kernel. The mmap/munmap/brk legs still pass true: their captures sit at
+ * syscall enter/exit tracepoints, so the kernel half there is the same
+ * plumbing class (the syscall body is not on the stack at either point) —
+ * they are kept for now only to hold this change to the measured hot
+ * path, and dropping them the same way is a candidate follow-up. */
 static __always_inline void memory_capture_stack(void *ctx, struct memory_event *event,
-						 struct task_struct *task)
+						 struct task_struct *task, bool with_kernel)
 {
 	long len;
 
@@ -4883,9 +4894,13 @@ static __always_inline void memory_capture_stack(void *ctx, struct memory_event 
 		event->hdr.user_stack_length = 0;
 	}
 
-	len = bpf_get_stack(ctx, &event->kernel_stack,
-			    sizeof(event->kernel_stack), SKIP_STACK_DEPTH);
-	event->hdr.kernel_stack_length = len > 0 ? len / sizeof(u64) : 0;
+	if (with_kernel) {
+		len = bpf_get_stack(ctx, &event->kernel_stack,
+				    sizeof(event->kernel_stack), SKIP_STACK_DEPTH);
+		event->hdr.kernel_stack_length = len > 0 ? len / sizeof(u64) : 0;
+	} else {
+		event->hdr.kernel_stack_length = 0;
+	}
 
 #ifdef SYSTING_PYSTACKS
 	if (tool_config.collect_pystacks) {
@@ -5153,7 +5168,7 @@ int systing_mmap_exit(struct trace_event_raw_sys_exit *ctx)
 	event->hdr.size = args.size;
 	event->hdr.member = args.prot;
 	event->hdr.flags = args.flags;
-	memory_capture_stack(ctx, event, task);
+	memory_capture_stack(ctx, event, task, true);
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
@@ -5177,7 +5192,7 @@ int systing_munmap_enter(struct trace_event_raw_sys_enter *ctx)
 	record_task_info(&event->hdr.task, task);
 	event->hdr.addr = (u64)ctx->args[0];
 	event->hdr.size = (u64)ctx->args[1];
-	memory_capture_stack(ctx, event, task);
+	memory_capture_stack(ctx, event, task, true);
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
@@ -5226,7 +5241,7 @@ int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
 	record_task_info(&event->hdr.task, task);
 	event->hdr.addr = (u64)ctx->ret;
 	event->hdr.size = (u64)((s64)ctx->ret - (s64)old_brk);
-	memory_capture_stack(ctx, event, task);
+	memory_capture_stack(ctx, event, task, true);
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
@@ -5271,7 +5286,7 @@ int systing_page_fault_user(struct systing_pf_args *ctx)
 	record_task_info(&event->hdr.task, task);
 	event->hdr.addr = ctx->address;
 	event->hdr.flags = (u32)ctx->error_code;
-	memory_capture_stack(ctx, event, task);
+	memory_capture_stack(ctx, event, task, false);
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
