@@ -210,6 +210,7 @@ const MEMORY_BPF_PROGRAMS: &[&str] = &[
     "systing_mmap_enter",
     "systing_mmap_exit",
     "systing_munmap_enter",
+    "systing_munmap_exit",
     "systing_brk_enter",
     "systing_brk_exit",
     #[cfg(target_arch = "x86_64")]
