@@ -394,7 +394,7 @@ struct epoll_event_bpf {
 enum memory_event_type {
 	MEMORY_RSS_STAT,      // kmem:rss_stat - per-mm RSS counter change
 	MEMORY_MMAP,          // sys_exit_mmap - new VM area
-	MEMORY_MUNMAP,        // sys_enter_munmap - VM area removed
+	MEMORY_MUNMAP,        // sys_exit_munmap (success-gated) - VM area removed
 	MEMORY_BRK,           // sys_exit_brk - heap boundary change
 	MEMORY_PAGE_FAULT,    // exceptions:page_fault_user - demand fault (sampled)
 	MEMORY_MM_SAMPLE,     // periodic mm_struct snapshot (from perf_event_clock)
@@ -959,7 +959,7 @@ struct {
 	},
 };
 
-/* Per-thread scratch map for pairing mmap/brk enter→exit. */
+/* Per-thread scratch map for pairing mmap/munmap/brk enter→exit. */
 struct memory_syscall_args {
 	u64 addr;
 	u64 size;
@@ -5181,6 +5181,46 @@ int systing_munmap_enter(struct trace_event_raw_sys_enter *ctx)
 	if (!trace_task(task))
 		return 0;
 
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_syscall_args args = {
+		.addr = (u64)ctx->args[0],
+		.size = (u64)ctx->args[1],
+	};
+	bpf_map_update_elem(&memory_syscall_scratch, &tgidpid, &args, BPF_ANY);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_munmap")
+int systing_munmap_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_syscall_args *saved = bpf_map_lookup_elem(&memory_syscall_scratch, &tgidpid);
+	if (!saved)
+		return 0;
+	struct memory_syscall_args args = *saved;
+	bpf_map_delete_elem(&memory_syscall_scratch, &tgidpid);
+
+	/* munmap returns 0 on success, -errno on failure. A failed call
+	 * unmaps nothing and its arguments are unvalidated caller input:
+	 * emitting at enter recorded address-magnitude garbage as the
+	 * unmap size (production callers pass pointer-scale values in the
+	 * length position, which the kernel EINVALs but the recorder
+	 * published as real unmaps). Gate on success like mmap and brk.
+	 *
+	 * Known capture limitation: a thread that unmaps its OWN stack
+	 * (musl's thread-exit path) reaches this exit with those pages
+	 * gone, so the user stack reads empty for that row class where
+	 * the old enter-time capture had frames. Accepted: the size field
+	 * (what aggregations consume) comes from the stash and stays
+	 * correct, and stashing full stacks per thread would multiply the
+	 * scratch map's footprint by the stack-buffer size. */
+	if (ctx->ret != 0)
+		return 0;
+
 	long flags;
 	struct memory_event *event = reserve_memory_event(&flags);
 	if (!event)
@@ -5190,8 +5230,8 @@ int systing_munmap_enter(struct trace_event_raw_sys_enter *ctx)
 	event->hdr.ts = bpf_ktime_get_boot_ns();
 	event->hdr.cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->hdr.task, task);
-	event->hdr.addr = (u64)ctx->args[0];
-	event->hdr.size = (u64)ctx->args[1];
+	event->hdr.addr = args.addr;
+	event->hdr.size = args.size;
 	memory_capture_stack(ctx, event, task, true);
 
 	bpf_ringbuf_submit(event, flags);
