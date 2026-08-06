@@ -977,6 +977,17 @@ struct memory_syscall_args {
 	u64 size;
 	u32 prot;
 	u32 flags;
+	/* munmap only: the process's total mapped size in bytes at enter,
+	 * used to bound the recorded unmap size. munmap's length argument is
+	 * the REQUESTED range, not the amount actually unmapped -- the kernel
+	 * removes whatever is mapped in [addr, addr+len) and returns 0 even
+	 * where nothing is mapped -- so callers that request oversized ranges
+	 * of a sparse address space (gVisor sentries were observed requesting
+	 * far more than the whole process has mapped) recorded impossible
+	 * sizes. No single munmap can remove more than the process has mapped
+	 * in total; this is that upper bound (looser than the exact in-range
+	 * mapped bytes, but enough to drop the impossible values). */
+	u64 vm_limit;
 };
 
 struct {
@@ -5265,6 +5276,8 @@ int systing_munmap_enter(struct trace_event_raw_sys_enter *ctx)
 	struct memory_syscall_args args = {
 		.addr = (u64)ctx->args[0],
 		.size = (u64)ctx->args[1],
+		.vm_limit = (u64)BPF_CORE_READ(task, mm, total_vm) *
+			    tool_config.page_size,
 	};
 	bpf_map_update_elem(&memory_syscall_scratch, &tgidpid, &args, BPF_ANY);
 	return 0;
@@ -5318,7 +5331,14 @@ int systing_munmap_exit(struct trace_event_raw_sys_exit *ctx)
 	event->hdr.cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->hdr.task, task);
 	event->hdr.addr = args.addr;
-	event->hdr.size = args.size;
+	/* No munmap can remove more than the process has mapped in total;
+	 * bound the requested length by the enter-time mapped size. An upper
+	 * bound (the exact freed amount is the in-range mapped bytes), enough
+	 * to drop the physically-impossible values. Skip the bound if
+	 * total_vm read as 0 (kernel-thread edge) to avoid zeroing the size. */
+	event->hdr.size = (args.vm_limit && args.size > args.vm_limit)
+				  ? args.vm_limit
+				  : args.size;
 	memory_capture_stack(ctx, event, task, true);
 
 	bpf_ringbuf_submit(event, flags);
