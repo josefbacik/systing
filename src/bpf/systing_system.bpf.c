@@ -99,6 +99,7 @@ const volatile struct {
 	u32 collect_memory;    /* Memory recorder enabled */
 	u32 memory_fault_sample_rate; /* Sample 1 in N page faults (0 or 1 = all) */
 	u32 memory_alloc_sample_rate; /* Sample 1 in N malloc/free calls (0 or 1 = all) */
+	u32 memory_map_sample_rate; /* Sample 1 in N mmap/munmap/brk events (0 or 1 = all) */
 	u32 page_size;         /* sysconf(_SC_PAGESIZE) for page-count -> byte conversion */
 	/* Minimum absolute byte-drift before an rss_stat event is emitted.
 	 * Computed by userspace as max(16 MiB, 64 * nr_cpus * page_size). On the
@@ -992,6 +993,32 @@ struct {
 	__type(key, u32);
 	__type(value, u64);
 } memory_fault_counter SEC(".maps");
+
+/* Per-CPU sampling counters for mmap/munmap/brk. One per syscall type:
+ * a shared counter would correlate the three event streams, so a
+ * workload with a periodic mmap/munmap pair could alias the modulo and
+ * sample one type near-exclusively while starving the other. Per-type
+ * counters make each stream an independent 1:N sample. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_mmap_sample_counter SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_munmap_sample_counter SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_brk_sample_counter SEC(".maps");
 
 /* Per-process rss_stat emission state. Keyed by tgid (not tgidpid): the
  * kernel's mm->rss_stat counters are per-mm, shared across all threads in a
@@ -5141,6 +5168,29 @@ int BPF_PROG(systing_rss_stat_exit_flush, struct task_struct *task)
 	return 0;
 }
 
+/* Sample 1:N mmap/munmap/brk events. The map legs were originally
+ * unsampled on the assumption that map-call rates are low; allocator
+ * churn breaks that (workloads unmapping ~100/s sustained), and on such
+ * hosts unsampled map events dominate the memory lane end to end:
+ * per-event stack capture, ringbuf traffic, trace size, and the
+ * post-capture processing whose memory footprint scales with row
+ * volume. The decision is made at EXIT, on the successful-event stream,
+ * for two reasons: the enter/exit scratch pairing stays intact (every
+ * enter stashes, every exit consumes and deletes -- no sampled-out
+ * enter can leave a stash for a later exit to misread), and the count
+ * advances once per real event rather than per attempt. The expensive
+ * work (stack capture + emit) is what gets gated. `cnt` is the
+ * per-type counter, already looked up under a rate > 1 guard at the
+ * call site so the default path touches no map (the fault-sampling
+ * pattern). Returns true to keep this event. */
+static __always_inline bool memory_map_sample_hit(u64 *cnt)
+{
+	if (!cnt)
+		return true;
+	*cnt += 1;
+	return (*cnt % tool_config.memory_map_sample_rate) == 0;
+}
+
 SEC("tracepoint/syscalls/sys_enter_mmap")
 int systing_mmap_enter(struct trace_event_raw_sys_enter *ctx)
 {
@@ -5177,6 +5227,13 @@ int systing_mmap_exit(struct trace_event_raw_sys_exit *ctx)
 	long ret = ctx->ret;
 	if (ret < 0 && ret > -4096)
 		return 0;
+
+	if (tool_config.memory_map_sample_rate > 1) {
+		u32 zero = 0;
+		if (!memory_map_sample_hit(bpf_map_lookup_elem(
+			    &memory_mmap_sample_counter, &zero)))
+			return 0;
+	}
 
 	long flags;
 	struct memory_event *event = reserve_memory_event(&flags);
@@ -5244,6 +5301,13 @@ int systing_munmap_exit(struct trace_event_raw_sys_exit *ctx)
 	if (ctx->ret != 0)
 		return 0;
 
+	if (tool_config.memory_map_sample_rate > 1) {
+		u32 zero = 0;
+		if (!memory_map_sample_hit(bpf_map_lookup_elem(
+			    &memory_munmap_sample_counter, &zero)))
+			return 0;
+	}
+
 	long flags;
 	struct memory_event *event = reserve_memory_event(&flags);
 	if (!event)
@@ -5292,6 +5356,13 @@ int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
 	/* brk(0) queries the current break and failed brk returns it unchanged. */
 	if ((u64)ctx->ret == old_brk)
 		return 0;
+
+	if (tool_config.memory_map_sample_rate > 1) {
+		u32 zero = 0;
+		if (!memory_map_sample_hit(bpf_map_lookup_elem(
+			    &memory_brk_sample_counter, &zero)))
+			return 0;
+	}
 
 	long flags;
 	struct memory_event *event = reserve_memory_event(&flags);
