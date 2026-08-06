@@ -68,6 +68,7 @@ tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
 tokio-stream = "0.1"
 tonic-reflection = { version = "0.14", default-features = false }
+clap_complete = "4.5"
 
 [lib]
 name = "systing"

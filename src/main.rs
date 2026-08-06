@@ -5,7 +5,8 @@ use std::process::{Command as ProcessCommand, Stdio};
 
 use anyhow::Context;
 use anyhow::Result;
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, CommandFactory, Parser};
+use clap_complete::{generate, Shell};
 
 use tracing::subscriber::set_global_default as set_global_subscriber;
 use tracing_subscriber::filter::LevelFilter;
@@ -203,6 +204,11 @@ struct Command {
     /// (tcp is unauthenticated; trusted networks only).
     #[arg(long, value_name = "URI", conflicts_with_all = ["output", "parquet_only"])]
     stream: Option<StreamTarget>,
+
+    /// Print a shell completion script for the given shell to stdout and exit.
+    /// Example: systing --completions bash > /usr/share/bash-completion/completions/systing
+    #[arg(long, value_name = "SHELL")]
+    completions: Option<Shell>,
 
     /// Command to run and trace. Everything after -- is treated as the command.
     /// Only the command and its children/threads will be traced.
@@ -484,6 +490,15 @@ fn reexec_with_systemd_run() -> Result<i32> {
 
 fn main() -> Result<()> {
     let mut opts = Command::parse();
+
+    // Completions must be handled before the capability check below, which
+    // re-execs us under systemd-run.
+    if let Some(shell) = opts.completions {
+        let mut cmd = Command::command();
+        let name = cmd.get_name().to_string();
+        generate(shell, &mut cmd, name, &mut std::io::stdout());
+        return Ok(());
+    }
 
     if opts.list_recorders {
         println!("Available recorders:");
