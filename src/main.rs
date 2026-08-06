@@ -117,6 +117,9 @@ struct Command {
     /// Sample 1 in N user page faults when the memory recorder is enabled (0 or 1 = record all)
     #[arg(long, default_value = "97")]
     memory_fault_sample_rate: u32,
+    /// Sample 1 in N mmap/munmap/brk events when the memory recorder is enabled (0 or 1 = record all). Byte aggregates over sampled map events scale by the rate; per-event address pairing (an mmap with its munmap) is unreliable at rates > 1.
+    #[arg(long, default_value = "1")]
+    memory_map_sample_rate: u32,
     /// Override the minimum byte-drift between emitted rss_stat events (default: max(16 MiB, 64*nr_cpus*page_size); 0 = emit every event)
     #[arg(long)]
     memory_rss_threshold_bytes: Option<u64>,
@@ -246,6 +249,7 @@ impl From<Command> for Config {
             marker_duration_threshold: cmd.marker_duration_threshold,
             memory: cmd.memory,
             memory_fault_sample_rate: cmd.memory_fault_sample_rate,
+            memory_map_sample_rate: cmd.memory_map_sample_rate,
             memory_rss_threshold_bytes: cmd.memory_rss_threshold_bytes,
             memory_rss_force_classic: cmd.memory_rss_force_classic,
             memory_alloc: cmd.memory_alloc,

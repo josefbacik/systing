@@ -630,6 +630,8 @@ pub struct Config {
     pub memory: bool,
     /// Sample 1 in N user page faults (0 or 1 = record all)
     pub memory_fault_sample_rate: u32,
+    /// Sample 1 in N mmap/munmap/brk events (0 or 1 = record all)
+    pub memory_map_sample_rate: u32,
     /// Minimum absolute byte-drift between emitted rss_stat events (0 = emit
     /// every event). Default is max(16 MiB, 64 * nr_cpus * page_size); see
     /// `memory_rss_threshold_bytes` in `tool_config` for the derivation.
@@ -716,6 +718,7 @@ impl Default for Config {
             marker_duration_threshold: None,
             memory: false,
             memory_fault_sample_rate: 97,
+            memory_map_sample_rate: 1,
             memory_rss_threshold_bytes: None,
             memory_rss_force_classic: false,
             memory_alloc: false,
@@ -2352,6 +2355,7 @@ fn configure_bpf_skeleton(
         if opts.memory {
             rodata.tool_config.collect_memory = 1;
             rodata.tool_config.memory_fault_sample_rate = opts.memory_fault_sample_rate;
+            rodata.tool_config.memory_map_sample_rate = opts.memory_map_sample_rate;
             let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
             rodata.tool_config.page_size = page_size;
             // Default threshold: max(16 MiB, 64 * nr_cpus * page_size). The
