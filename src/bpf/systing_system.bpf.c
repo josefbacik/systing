@@ -46,7 +46,18 @@
 #define PF_KTHREAD 0x00200000
 
 #define MAX_STACK_DEPTH 36
+/* Kernel-stack frames to skip on TRACEPOINT-attached captures, covering
+ * the BPF/tracing entry glue between the traced site and the program
+ * (bpf_trace_run*, __traceiter_*). The exact glue depth varies by
+ * kernel version, so some kernels leak residual glue frames past this
+ * skip; fold-side leaf handling owns that remainder. Perf-event
+ * sampling captures must NOT use this: there the walk starts at the
+ * sample's interrupted registers -- no glue exists, and a nonzero skip
+ * discards the interrupted IP plus real return addresses (every kernel
+ * "leaf" becomes its third-level caller).
+ */
 #define SKIP_STACK_DEPTH 3
+#define PERF_EVENT_SKIP_STACK_DEPTH 0
 #define NR_RINGBUFS 8
 
 /* Mirror of the kernel's struct bpf_stack_build_id (filled by bpf_get_stack
@@ -1649,7 +1660,8 @@ static void record_task_info(struct task_info *info, struct task_struct *task)
 }
 
 static void emit_stack_event_with_ts(void *ctx, struct task_struct *task,
-				     enum stack_event_type type, u64 ts)
+				     enum stack_event_type type, u64 ts,
+				     u64 kernel_skip)
 {
 	struct stack_event *event;
 	long len = 0;
@@ -1744,7 +1756,7 @@ static void emit_stack_event_with_ts(void *ctx, struct task_struct *task,
 	}
 
 	len = bpf_get_stack(ctx, &event->kernel_stack,
-			    sizeof(event->kernel_stack), SKIP_STACK_DEPTH);
+			    sizeof(event->kernel_stack), kernel_skip);
 	if (len > 0)
 		event->kernel_stack_length = len / sizeof(u64);
 	else
@@ -1755,7 +1767,7 @@ static void emit_stack_event_with_ts(void *ctx, struct task_struct *task,
 static void emit_stack_event(void *ctx, struct task_struct *task,
 			     enum stack_event_type type)
 {
-	emit_stack_event_with_ts(ctx, task, type, 0);
+	emit_stack_event_with_ts(ctx, task, type, 0, SKIP_STACK_DEPTH);
 }
 
 static int trace_irq_event(struct irqaction *action, int irq, int ret, bool enter)
@@ -1931,10 +1943,12 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 	 */
 	if (!tool_config.no_sleep_stack_traces) {
 		if (prev_state & TASK_UNINTERRUPTIBLE)
-			emit_stack_event_with_ts(ctx, prev, STACK_SLEEP_UNINTERRUPTIBLE, ts);
+			emit_stack_event_with_ts(ctx, prev, STACK_SLEEP_UNINTERRUPTIBLE, ts,
+						 SKIP_STACK_DEPTH);
 		else if (!tool_config.no_interruptible_stack_traces &&
 			 prev_state & TASK_INTERRUPTIBLE)
-			emit_stack_event_with_ts(ctx, prev, STACK_SLEEP_INTERRUPTIBLE, ts);
+			emit_stack_event_with_ts(ctx, prev, STACK_SLEEP_INTERRUPTIBLE, ts,
+						 SKIP_STACK_DEPTH);
 	}
 	return 0;
 }
@@ -2251,8 +2265,17 @@ int systing_perf_event_clock(void *ctx)
 	 */
 	u64 ts = bpf_ktime_get_boot_ns();
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	/*
+	 * No stack skip on this path: a perf-event program's
+	 * bpf_get_stack() walks from the sample's interrupted registers,
+	 * not through tracepoint glue. The shared skip here discarded the
+	 * interrupted IP plus the first two real return addresses, so
+	 * every kernel leaf in sampled profiles rendered as its
+	 * third-level caller.
+	 */
 	if (!tool_config.no_cpu_stack_traces)
-		emit_stack_event_with_ts(ctx, task, STACK_RUNNING, ts);
+		emit_stack_event_with_ts(ctx, task, STACK_RUNNING, ts,
+					 PERF_EVENT_SKIP_STACK_DEPTH);
 	read_counters(ctx, task);
 
 	if (tool_config.collect_memory && trace_task(task)) {
