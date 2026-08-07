@@ -561,7 +561,10 @@ pub struct MemoryRssRecord {
 /// Virtual address space change: mmap / munmap / brk.
 ///
 /// `addr` and `size` describe the affected region (for brk, `addr` is the new
-/// break and `size` is the signed delta in bytes, negative on shrink).
+/// break and `size` is the signed delta in bytes, negative on shrink). For
+/// munmap, `size` is the requested length bounded by the process's total
+/// mapped size at call time -- an upper bound on what the call could free,
+/// not necessarily a region of that size at `addr`.
 /// `stack_id` joins to the `stack` table for allocation-site attribution.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryMapRecord {
