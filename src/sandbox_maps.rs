@@ -286,6 +286,30 @@ impl ProcessMaps {
             .find(|e| e.start <= addr && addr < e.end)
     }
 
+    /// The tgid these maps were read from — needed to read the process's own
+    /// memory when authenticating a pool-backed image with no file neighbor.
+    pub fn tgid(&self) -> i32 {
+        self.tgid
+    }
+
+    /// For an address in an executable pool-memfd mapping, the virtual
+    /// address at which the image's ELF header (file offset 0) is mapped.
+    ///
+    /// The pool pgoff tracks the file offset affinely across an image's
+    /// mappings — `pool_offset = vaddr - image_base + K`, so `start - offset`
+    /// is a constant equal to `image_base` over the whole image — which means
+    /// the ELF header sits at `start - offset`. Used to read the image's own
+    /// build-id note from process memory when [`Self::bridge_for`] finds no
+    /// file-backed neighbor (fully pool-backed guest text). Returns `None`
+    /// for non-pool or non-executable addresses.
+    pub fn pool_image_base(&self, addr: u64) -> Option<u64> {
+        let e = self.entry_for(addr)?;
+        if !e.exec || !matches!(e.backing, Backing::Memfd(_)) {
+            return None;
+        }
+        e.start.checked_sub(e.offset)
+    }
+
     /// If `addr` falls in a pool-memfd island whose file-backed neighbors
     /// agree on the original file, return where to symbolize it instead.
     ///

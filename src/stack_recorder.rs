@@ -673,9 +673,101 @@ fn note_to_id(bytes: &[u8]) -> [u8; 20] {
 ///    it only if it bridges to a real file — [`ProcessMaps::bridge_for`]'s
 ///    neighbour-congruence is the disambiguator, and the bridged neighbour's
 ///    own ELF note must match the frame's build-id (the pool memfd's note is
-///    unreliable, but the neighbour file's is authoritative). A coincidental
-///    pool-offset match that does not bridge, or bridges to a different
-///    binary, falls through to the store path unchanged.
+///    unreliable, but the neighbour file's is authoritative).
+///
+/// 3. Fully pool-backed guest text: on a memory-backed overlay (the container
+///    writable layer, or tmpfs) the whole image lives in the pool memfd with
+///    no file-backed neighbour, so case 2 finds nothing to bridge. Here the
+///    image's own ELF note IS authoritative — the bytes are the real binary,
+///    not a syscall-patch copy — so read it from the process's live memory at
+///    the image base and, on a build-id match, return the reconstructed
+///    address for the caller to symbolize through the live cascade. A
+///    coincidental pool-offset match in an unrelated image fails the note
+///    match and falls through to the store path unchanged.
+///
+/// Every non-match falls through to the store path, so this only ever adds a
+/// live-process resolution ahead of the unchanged fallback.
+fn read_build_id_from_process_mem(tgid: i32, image_base: u64) -> Option<[u8; 20]> {
+    use std::os::unix::fs::FileExt;
+    let mem = std::fs::File::open(format!("/proc/{tgid}/mem")).ok()?;
+    parse_build_id_from_elf(image_base, |addr, len| {
+        let mut buf = vec![0u8; len];
+        mem.read_exact_at(&mut buf, addr).ok()?;
+        Some(buf)
+    })
+}
+
+/// The ELF-parsing core of [`read_build_id_from_process_mem`], split from the
+/// `/proc/<tgid>/mem` read so it is testable with synthetic bytes. `read`
+/// returns `len` bytes at an absolute virtual address, or `None`.
+///
+/// Parses the guest's own Elf64 image at `image_base` with the `object` crate
+/// and returns the first `NT_GNU_BUILD_ID` note descriptor, or `None` on any
+/// malformed or short input. The image is read through object's bounds-checked
+/// parsers segment by segment rather than loaded whole: a running image keeps
+/// no section-header table in memory (sections are not `SHF_ALLOC`), so the
+/// high-level `Object::build_id` — which needs it — cannot be used here; the
+/// program headers, which do live in memory, reach the note on their own. Each
+/// read is size-capped because the bytes are another process's (semi-trusted)
+/// memory.
+fn parse_build_id_from_elf(
+    image_base: u64,
+    read: impl Fn(u64, usize) -> Option<Vec<u8>>,
+) -> Option<[u8; 20]> {
+    use object::elf::{FileHeader64, NT_GNU_BUILD_ID, PT_NOTE};
+    use object::read::elf::{FileHeader, NoteIterator, ProgramHeader};
+    use object::Endianness;
+    use std::mem::size_of;
+
+    type Ehdr = FileHeader64<Endianness>;
+
+    // A malformed header must not drive a huge read of another process's
+    // memory: real images carry a few program headers and a tiny build-id note.
+    const MAX_PHNUM: u64 = 256;
+    const MAX_NOTE_BYTES: u64 = 64 * 1024;
+
+    // Header first — object validates the magic, class, version and endianness
+    // and declines on anything malformed; `parse` reads only the fixed header.
+    let ehdr_bytes = read(image_base, size_of::<Ehdr>())?;
+    let header = Ehdr::parse(&*ehdr_bytes).ok()?;
+    let endian = header.endian().ok()?;
+
+    // Read the header plus the program-header table (which sits just past the
+    // header, at e_phoff) in one span so object can index the table.
+    let phnum = header.e_phnum(endian) as u64;
+    if phnum > MAX_PHNUM {
+        return None;
+    }
+    let table_end = header
+        .e_phoff(endian)
+        .checked_add(phnum.checked_mul(header.e_phentsize(endian) as u64)?)?;
+    let front = read(image_base, usize::try_from(table_end).ok()?)?;
+
+    for ph in header.program_headers(endian, &*front).ok()? {
+        if ph.p_type(endian) != PT_NOTE {
+            continue;
+        }
+        // A PT_NOTE segment maps at image_base + p_offset; read exactly its
+        // bytes and let object walk the notes (it handles the note alignment
+        // and every bound).
+        let filesz = ph.p_filesz(endian);
+        if filesz == 0 || filesz > MAX_NOTE_BYTES {
+            continue;
+        }
+        let seg = read(
+            image_base.checked_add(ph.p_offset(endian))?,
+            usize::try_from(filesz).ok()?,
+        )?;
+        let mut notes = NoteIterator::<Ehdr>::new(endian, ph.p_align(endian), &seg).ok()?;
+        while let Some(note) = notes.next().ok()? {
+            if note.n_type(endian) == NT_GNU_BUILD_ID && note.name() == b"GNU" {
+                return Some(note_to_id(note.desc()));
+            }
+        }
+    }
+    None
+}
+
 fn reconstruct_build_id_addr(
     maps: Option<&ProcessMaps>,
     id: &[u8; 20],
@@ -690,12 +782,25 @@ fn reconstruct_build_id_addr(
         }
     }
     for addr in maps.pool_candidates_for_offset(file_offset) {
-        let Some(bridge) = maps.bridge_for(addr) else {
-            continue;
-        };
-        if let Ok(Some(bid)) = read_elf_build_id(&bridge.map_files_path) {
-            if note_to_id(&bid) == *id {
-                return Some(addr);
+        match maps.bridge_for(addr) {
+            // Case 2: syscall-patch island — a file-backed neighbour carries
+            // the authoritative note.
+            Some(bridge) => {
+                if let Ok(Some(bid)) = read_elf_build_id(&bridge.map_files_path) {
+                    if note_to_id(&bid) == *id {
+                        return Some(addr);
+                    }
+                }
+            }
+            // Case 3: fully pool-backed guest text — no file neighbour, so the
+            // image's own note (read from live process memory at its base) is
+            // authoritative.
+            None => {
+                if let Some(image_base) = maps.pool_image_base(addr) {
+                    if read_build_id_from_process_mem(maps.tgid(), image_base) == Some(*id) {
+                        return Some(addr);
+                    }
+                }
             }
         }
     }
@@ -1792,6 +1897,107 @@ mod tests {
             reconstruct_build_id_addr(Some(&guest), &[1; 20], 0x3ff1f500),
             None
         );
+    }
+
+    /// Assemble a minimal Elf64 (header + one PT_NOTE segment carrying an
+    /// NT_GNU_BUILD_ID note with `id`) so the note walker can be exercised
+    /// without a real process. Uses the same layout constants as the parser.
+    fn synth_elf_with_build_id(id: &[u8; 20]) -> Vec<u8> {
+        use core::mem::{offset_of, size_of};
+        use object::elf::{
+            FileHeader64, Ident, NoteHeader64, ProgramHeader64, ELFCLASS64, ELFDATA2LSB, ELFMAG,
+            EV_CURRENT, NT_GNU_BUILD_ID, PT_NOTE,
+        };
+        use object::Endianness;
+
+        type Eh = FileHeader64<Endianness>;
+        type Ph = ProgramHeader64<Endianness>;
+
+        // One program header directly after the header, the note after it. All
+        // offsets and widths come from object's own struct layout, so the
+        // fixture and the parser agree on the format by construction.
+        let phdr_at = size_of::<Eh>();
+        let note_at = phdr_at + size_of::<Ph>();
+        let name = b"GNU\0"; // n_namesz counts the trailing NUL
+        let note_len = size_of::<NoteHeader64<Endianness>>() + name.len() + id.len();
+
+        let mut b = vec![0u8; note_at];
+        let ident = offset_of!(Eh, e_ident);
+        b[ident..ident + ELFMAG.len()].copy_from_slice(&ELFMAG);
+        b[ident + offset_of!(Ident, class)] = ELFCLASS64;
+        b[ident + offset_of!(Ident, data)] = ELFDATA2LSB;
+        b[ident + offset_of!(Ident, version)] = EV_CURRENT;
+        b[offset_of!(Eh, e_phoff)..][..size_of::<u64>()]
+            .copy_from_slice(&(phdr_at as u64).to_le_bytes());
+        b[offset_of!(Eh, e_phentsize)..][..size_of::<u16>()]
+            .copy_from_slice(&(size_of::<Ph>() as u16).to_le_bytes());
+        b[offset_of!(Eh, e_phnum)..][..size_of::<u16>()].copy_from_slice(&1u16.to_le_bytes());
+
+        b[phdr_at + offset_of!(Ph, p_type)..][..size_of::<u32>()]
+            .copy_from_slice(&PT_NOTE.to_le_bytes());
+        b[phdr_at + offset_of!(Ph, p_offset)..][..size_of::<u64>()]
+            .copy_from_slice(&(note_at as u64).to_le_bytes());
+        b[phdr_at + offset_of!(Ph, p_filesz)..][..size_of::<u64>()]
+            .copy_from_slice(&(note_len as u64).to_le_bytes());
+        b[phdr_at + offset_of!(Ph, p_align)..][..size_of::<u64>()]
+            .copy_from_slice(&4u64.to_le_bytes());
+
+        // Elf64_Nhdr { n_namesz, n_descsz, n_type }, then the name and the id.
+        b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        b.extend_from_slice(&(id.len() as u32).to_le_bytes());
+        b.extend_from_slice(&NT_GNU_BUILD_ID.to_le_bytes());
+        b.extend_from_slice(name);
+        b.extend_from_slice(id);
+        b
+    }
+
+    #[test]
+    fn test_parse_build_id_from_elf() {
+        let id = [0x5au8; 20];
+        let blob = synth_elf_with_build_id(&id);
+        let reader = |addr: u64, len: usize| {
+            let a = addr as usize;
+            blob.get(a..a + len).map(<[u8]>::to_vec)
+        };
+        // The note walker recovers the build-id from the synthetic image.
+        assert_eq!(parse_build_id_from_elf(0, reader), Some(id));
+
+        // Bad magic → None (never mistakes arbitrary memory for an ELF).
+        let junk = [0u8; 200];
+        let junk_reader = |addr: u64, len: usize| {
+            let a = addr as usize;
+            junk.get(a..a + len).map(<[u8]>::to_vec)
+        };
+        assert_eq!(parse_build_id_from_elf(0, junk_reader), None);
+
+        // A short read anywhere on the path declines rather than panicking.
+        let short = synth_elf_with_build_id(&id)[..100].to_vec();
+        let short_reader = |addr: u64, len: usize| {
+            let a = addr as usize;
+            short.get(a..a + len).map(<[u8]>::to_vec)
+        };
+        assert_eq!(parse_build_id_from_elf(0, short_reader), None);
+    }
+
+    #[test]
+    fn test_pool_image_base_and_full_pool_declines() {
+        // Fully pool-backed guest text: a lone runsc-memory exec mapping with
+        // no file-backed neighbour (the memory-overlay case). image_base is
+        // start - pool_pgoff = 0x400000 - 0x6000.
+        let pm = crate::sandbox_maps::ProcessMaps::parse(
+            -42,
+            "400000-413000 r-xs 00006000 00:01 2 /memfd:runsc-memory (deleted)",
+            "guestbox",
+        );
+        assert_eq!(pm.pool_candidates_for_offset(0x6500), vec![0x400500]);
+        // No file neighbour to bridge — this is the case-3 (full-pool) shape.
+        assert!(pm.bridge_for(0x400500).is_none());
+        assert_eq!(pm.pool_image_base(0x400500), Some(0x3fa000));
+        // A real ELF file offset (non-pool) has no pool image base.
+        assert_eq!(pm.pool_image_base(0x800000), None);
+        // With the fixture tgid unreadable, the live-memory note auth cannot
+        // confirm the image, so reconstruction declines to the store path.
+        assert_eq!(reconstruct_build_id_addr(Some(&pm), &[1; 20], 0x6500), None);
     }
 
     #[test]
