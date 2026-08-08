@@ -21,7 +21,7 @@ use crate::utid::{ThreadAwareRecorder, UtidGenerator};
 use blazesym::helper::{read_elf_build_id, ElfResolver};
 use blazesym::symbolize::source::{Elf, Kernel, Process, Source};
 use blazesym::symbolize::{
-    cache, Input, ProcessMemberInfo, ProcessMemberType, Resolve, Sym, Symbolizer,
+    cache, evict, Input, ProcessMemberInfo, ProcessMemberType, Resolve, Sym, Symbolizer,
 };
 use blazesym::Error as BlazeErr;
 use blazesym::Pid;
@@ -384,6 +384,25 @@ fn current_anon_rss_bytes() -> Option<u64> {
     Some(resident.saturating_sub(shared) * page_size)
 }
 
+/// Approximate file-backed RSS of this process in bytes — the resident
+/// *shared* pages from /proc/self/statm, which is exactly the term
+/// [`current_anon_rss_bytes`] subtracts. During symbolization this is
+/// dominated by blazesym's `FileCache`, which mmaps every ELF/`.so` it
+/// touches and never evicts; that cache grows with the count of distinct
+/// binaries symbolized and is file-backed, not heap, so the anon budget
+/// above is blind to it. Watching this axis is what lets the evict valve
+/// fire on the symbol-file cache rather than only on parse-time heap.
+fn current_file_rss_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let mut it = s.split_whitespace();
+    let _size = it.next()?;
+    let _resident = it.next()?;
+    let shared: u64 = it.next()?.parse().ok()?;
+    // SAFETY: sysconf is always safe to call; _SC_PAGESIZE cannot fail.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    Some(shared * page_size)
+}
+
 /// Number of second-tier spill files alive-process stacks are hashed into
 /// during `finish()`. The recording-phase spill is a single file (one fd, one
 /// sequential write stream on the hot path); at symbolization time stacks of
@@ -405,6 +424,48 @@ fn symbolizer_memory_budget() -> u64 {
         .map(|limit| limit / 2)
         .unwrap_or(DEFAULT_BUDGET)
         .clamp(256 << 20, 16 << 30)
+}
+
+/// Budget for the file-backed symbol cache — blazesym's mmap'd ELF/`.so`
+/// `FileCache`, measured by [`current_file_rss_bytes`]. Distinct from the
+/// anon [`symbolizer_memory_budget`] above, and the reason this fix exists:
+/// the file cache runs ~3 GiB and deterministic on the fleet (every capture
+/// symbolizes the same common-binary set), dominates the tracer's ~3.9 GiB
+/// peak, and is invisible to the anon watch — so it needs its own, tighter
+/// bound. Kept well under the anon budget so the symbolization footprint
+/// leaves headroom in the cgroup for the later DuckDB build phase, which is
+/// where large captures OOM. cgroup/8 targets ~1 GiB on an 8Gi slice.
+fn symbolizer_file_budget() -> u64 {
+    const DEFAULT_BUDGET: u64 = 1 << 30; // 1 GiB
+    crate::duckdb::detect_cgroup_memory_limit()
+        .map(|limit| limit / 8)
+        .unwrap_or(DEFAULT_BUDGET)
+        .clamp(256 << 20, 4 << 30)
+}
+
+/// Plan which touched ELF files to evict, fattest-first, so that the estimated
+/// file-backed RSS after eviction falls to `budget` or below. Returns the paths
+/// in eviction order; empty when already at or under budget. The on-disk `size`
+/// is an upper bound on the resident drop a single evict yields, so the plan is
+/// conservative — if a pass under-sheds, the valve re-fires on the next check
+/// interval. Kept pure and deterministic (size descending, ties broken by path)
+/// so the eviction policy is unit-testable without a live symbolizer.
+fn plan_evictions(touched_elf: &HashMap<PathBuf, u64>, file_rss: u64, budget: u64) -> Vec<PathBuf> {
+    if file_rss <= budget {
+        return Vec::new();
+    }
+    let mut by_size: Vec<(&PathBuf, u64)> = touched_elf.iter().map(|(p, &s)| (p, s)).collect();
+    by_size.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let mut est = file_rss;
+    let mut plan = Vec::new();
+    for (path, size) in by_size {
+        if est <= budget {
+            break;
+        }
+        plan.push(path.clone());
+        est = est.saturating_sub(size);
+    }
+    plan
 }
 
 /// Memory-bounded interner for unique (stack, tgid) pairs, shared by the
@@ -1230,28 +1291,80 @@ impl StackRecorder {
         // further rebuilds would only thrash re-parsing, so the valve waits for
         // real growth above the floor before firing again.
         let memory_budget = symbolizer_memory_budget();
+        let file_budget = symbolizer_file_budget();
         const VALVE_CHECK_INTERVAL: usize = 8192;
         const REBUILD_GROWTH_MARGIN: u64 = 256 << 20;
         let mut rebuild_floor: u64 = 0;
-        let mut maybe_rebuild = |this: &Self, symbolizer: &mut Symbolizer| {
-            let Some(anon) = current_anon_rss_bytes() else {
-                return;
+        // The valve watches BOTH memory axes. The file-backed symbol cache
+        // (blazesym's mmap'd ELFs — see [`current_file_rss_bytes`]) is the
+        // dominant, deterministic term of the tracer's footprint and is
+        // invisible to `current_anon_rss_bytes`, so when it exceeds its
+        // budget we surgically `evict(Elf)` the fattest touched binaries —
+        // releasing their mmaps drops rss_file while keeping the rest of the
+        // warm cache — and fall back to a full rebuild only for anon growth
+        // (parse-time heap) a targeted evict can't reach. `touched_elf` (ELF
+        // path → on-disk size, the fattest-first key) is a parameter so the
+        // Pass-2 loop can keep populating it between valve calls.
+        let mut maybe_evict_or_rebuild =
+            |this: &Self, symbolizer: &mut Symbolizer, touched_elf: &mut HashMap<PathBuf, u64>| {
+                if let Some(file_rss) = current_file_rss_bytes() {
+                    let mut evicted = 0usize;
+                    for path in plan_evictions(touched_elf, file_rss, file_budget) {
+                        // A failed eviction only means blazesym holds that entry
+                        // until the symbolizer is dropped; not worth failing
+                        // symbolization over. `path` is the map_files link, which
+                        // is blazesym's elf_cache key (its EntryPath maps_file /
+                        // actual_path) for a live Process source, so this releases
+                        // the mmap and its fd; the VM gate confirms the rss_file
+                        // drop empirically.
+                        if symbolizer
+                            .evict(&evict::Evict::from(evict::Elf::new(path.clone())))
+                            .is_ok()
+                        {
+                            touched_elf.remove(&path);
+                            evicted += 1;
+                        }
+                    }
+                    if evicted > 0 {
+                        // SAFETY: malloc_trim is always safe to call on glibc.
+                        unsafe {
+                            libc::malloc_trim(0);
+                        }
+                        eprintln!(
+                            "Note: evicted {evicted} symbol-file cache entries to \
+                             stay under file budget ({} MiB)",
+                            file_budget >> 20
+                        );
+                    }
+                }
+
+                let Some(anon) = current_anon_rss_bytes() else {
+                    return;
+                };
+                if anon <= memory_budget
+                    || anon <= rebuild_floor.saturating_add(REBUILD_GROWTH_MARGIN)
+                {
+                    return;
+                }
+                *symbolizer = this.create_symbolizer();
+                // A full rebuild drops the whole cache, so the touched-ELF set
+                // no longer reflects what blazesym holds.
+                touched_elf.clear();
+                // SAFETY: malloc_trim is always safe to call on glibc.
+                unsafe {
+                    libc::malloc_trim(0);
+                }
+                rebuild_floor = current_anon_rss_bytes().unwrap_or(anon);
+                eprintln!(
+                    "Note: symbolizer caches rebuilt to stay under memory budget ({} MiB)",
+                    memory_budget >> 20
+                );
             };
-            if anon <= memory_budget || anon <= rebuild_floor.saturating_add(REBUILD_GROWTH_MARGIN)
-            {
-                return;
-            }
-            *symbolizer = this.create_symbolizer();
-            // SAFETY: malloc_trim is always safe to call on glibc.
-            unsafe {
-                libc::malloc_trim(0);
-            }
-            rebuild_floor = current_anon_rss_bytes().unwrap_or(anon);
-            eprintln!(
-                "Note: symbolizer caches rebuilt to stay under memory budget ({} MiB)",
-                memory_budget >> 20
-            );
-        };
+
+        // ELF paths symbolized this pass → on-disk size, the fattest-first
+        // key for `maybe_evict_or_rebuild`. Populated per-tgid from each
+        // process's exec-file maps as Pass 2 walks the buckets.
+        let mut touched_elf: HashMap<PathBuf, u64> = HashMap::new();
 
         // Guest-side sandbox snapshot, taken lazily on the first gVisor
         // process encountered and shared by every group after it.
@@ -1286,6 +1399,23 @@ impl StackRecorder {
                 // frame labels for its whole group. `None` (process raced to
                 // exit, unreadable maps) degrades to plain symbolization.
                 let maps_info = ProcessMaps::load(tgid);
+                // Record this process's mapped ELF files so the valve can evict
+                // the fattest ones when the symbol-file cache exceeds its budget.
+                // exec_file_links yields (map_files link, display path). We key
+                // by the map_files link — `/proc/<pid>/map_files/<start>-<end>` —
+                // because that is byte-for-byte blazesym's elf_cache key for a
+                // live Process source (its `EntryPath::maps_file`, the cache
+                // `actual_path`; the display/maps-text path is only the module
+                // name and evicts nothing). The link is also namespace-immune:
+                // `metadata` follows it to the backing file for the size even
+                // when the process's maps-text path does not resolve from here.
+                if let Some(maps) = maps_info.as_ref() {
+                    for (link, _display) in maps.exec_file_links() {
+                        touched_elf.entry(link).or_insert_with_key(|p| {
+                            std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+                        });
+                    }
+                }
                 // For sandbox processes, the guest process this stub mirrors
                 // (if any). The sandbox snapshot is taken once, on first
                 // contact with a gVisor process.
@@ -1315,7 +1445,7 @@ impl StackRecorder {
 
                 for (i, (stack, stack_id)) in stacks.into_iter().enumerate() {
                     if i > 0 && i % VALVE_CHECK_INTERVAL == 0 {
-                        maybe_rebuild(self, &mut symbolizer);
+                        maybe_evict_or_rebuild(self, &mut symbolizer, &mut touched_elf);
                     }
                     let frame_names = self.symbolize_stack_frames(
                         &mut symbolizer,
@@ -1330,7 +1460,7 @@ impl StackRecorder {
                     emit_stack_record(collector, stack_id, frame_names)?;
                 }
 
-                maybe_rebuild(self, &mut symbolizer);
+                maybe_evict_or_rebuild(self, &mut symbolizer, &mut touched_elf);
             }
         }
 
@@ -2735,5 +2865,74 @@ mod tests {
                  live-fill store, got: {frame}"
             );
         }
+    }
+
+    /// Build a touched-ELF map (path -> on-disk size) for eviction-plan tests.
+    fn touched(entries: &[(&str, u64)]) -> HashMap<PathBuf, u64> {
+        entries
+            .iter()
+            .map(|&(p, s)| (PathBuf::from(p), s))
+            .collect()
+    }
+
+    #[test]
+    fn plan_evictions_empty_when_at_or_under_budget() {
+        let t = touched(&[("/a", 100), ("/b", 200)]);
+        assert!(
+            plan_evictions(&t, 500, 1000).is_empty(),
+            "under budget evicts nothing"
+        );
+        assert!(
+            plan_evictions(&t, 1000, 1000).is_empty(),
+            "exactly at budget evicts nothing"
+        );
+    }
+
+    #[test]
+    fn plan_evictions_fattest_first_stops_once_under() {
+        let t = touched(&[("/small", 100), ("/big", 800), ("/mid", 400)]);
+        // rss 1500, budget 1000: shed >=500. Fattest first, /big (800) alone
+        // brings the estimate to 700 <= 1000, so the plan stops after it.
+        assert_eq!(plan_evictions(&t, 1500, 1000), vec![PathBuf::from("/big")]);
+    }
+
+    #[test]
+    fn plan_evictions_continues_until_enough_shed() {
+        let t = touched(&[("/a", 100), ("/b", 120), ("/c", 90)]);
+        // rss 1000, budget 700: shed >=300. Fattest first: b(120)->880,
+        // a(100)->780, c(90)->690 <= 700.
+        assert_eq!(
+            plan_evictions(&t, 1000, 700),
+            vec![
+                PathBuf::from("/b"),
+                PathBuf::from("/a"),
+                PathBuf::from("/c")
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_evictions_deterministic_on_size_ties() {
+        let t = touched(&[("/z", 500), ("/a", 500)]);
+        // Equal sizes: tie broken by path ascending, so /a is chosen first and
+        // alone (500 -> 700 <= 800) — deterministic regardless of map order.
+        assert_eq!(plan_evictions(&t, 1200, 800), vec![PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn symbolizer_file_budget_within_clamp() {
+        let b = symbolizer_file_budget();
+        assert!(
+            ((256u64 << 20)..=(4u64 << 30)).contains(&b),
+            "file budget {b} must stay within the [256 MiB, 4 GiB] clamp"
+        );
+    }
+
+    #[test]
+    fn current_file_rss_bytes_reads_own_statm() {
+        // A running process always has resident shared pages (libc and friends),
+        // so the file-backed axis reads as a positive value from our own statm.
+        let v = current_file_rss_bytes().expect("statm is readable for self");
+        assert!(v > 0, "file-backed RSS should be > 0 for a running process");
     }
 }
