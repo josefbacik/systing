@@ -429,6 +429,7 @@ pub fn memory_rss_schema() -> Arc<Schema> {
         Field::new("utid", DataType::Int64, false),
         Field::new("member", DataType::Int8, false),
         Field::new("size", DataType::Int64, false),
+        Field::new("external", DataType::Boolean, false),
     ]))
 }
 

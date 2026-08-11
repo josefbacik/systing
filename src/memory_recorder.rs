@@ -24,6 +24,27 @@ pub(crate) const MEMORY_STACK_ID_OFFSET: i64 = 1_000_000_000;
 /// the kernel rss_stat member indices 0..=3).
 pub const MEMORY_MEMBER_HIWATER_RSS: i8 = -1;
 pub const MEMORY_MEMBER_TOTAL_VM: i8 = -2;
+/// Synthetic `member` values for the passive per-task thrash counters sampled
+/// at the same periodic mm snapshot. maj_flt is a fault COUNT (not bytes);
+/// thrashing_count is delayacct's thrash stall count and thrashing_delay its
+/// cumulative stall time in NANOSECONDS — all cumulative per sampled thread.
+/// The thrashing pair is emitted whenever delayacct was readable on the host,
+/// zero values included — so zero-valued rows mean "delayacct on, no thrash",
+/// and their complete absence while -3 rows are present means delayacct is
+/// not enabled (kernel config or the `delayacct` boot / `kernel.task_delayacct`
+/// sysctl setting).
+pub const MEMORY_MEMBER_MAJ_FLT: i8 = -3;
+pub const MEMORY_MEMBER_THRASHING_COUNT: i8 = -4;
+pub const MEMORY_MEMBER_THRASHING_DELAY: i8 = -5;
+
+/// Mirror of `MEMORY_RSS_FLAG_EXTERNAL` in systing_system.bpf.c: the rss_stat
+/// counter update came from outside the process's thread group (external
+/// reclaim) rather than the process's own fault/map/unmap/exit path.
+const MEMORY_RSS_FLAG_EXTERNAL: u32 = 1 << 0;
+
+/// Mirror of `MEMORY_THRASH_FLAG_DELAYACCT` in systing_system.bpf.c: delayacct
+/// was enabled and the thrash counters were actually read for this sample.
+const MEMORY_THRASH_FLAG_DELAYACCT: u32 = 1 << 0;
 
 pub struct MemoryRecorder {
     pub(crate) ringbuf: RingBuffer<memory_event>,
@@ -181,6 +202,7 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
                     utid,
                     member: hdr.member.min(i8::MAX as u32) as i8,
                     size: hdr.size as i64,
+                    external: hdr.flags & MEMORY_RSS_FLAG_EXTERNAL != 0,
                 });
                 self.report_write_error(r);
             }
@@ -238,6 +260,7 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
                     utid,
                     member: MEMORY_MEMBER_HIWATER_RSS,
                     size: hdr.addr as i64,
+                    external: false,
                 });
                 self.report_write_error(r);
                 let r = collector.add_memory_rss(MemoryRssRecord {
@@ -245,8 +268,45 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
                     utid,
                     member: MEMORY_MEMBER_TOTAL_VM,
                     size: hdr.size as i64,
+                    external: false,
                 });
                 self.report_write_error(r);
+            }
+            memory_event_type::MEMORY_THRASH_SAMPLE => {
+                // Per-type field reuse: addr = maj_flt, size = delayacct
+                // thrashing_count, old_addr = thrashing_delay ns.
+                let (maj_flt, thrash_count, thrash_delay_ns) = (hdr.addr, hdr.size, hdr.old_addr);
+                // maj_flt is emitted unconditionally (a 0 row distinguishes
+                // "no major faults yet" from "no data"); the delayacct pair
+                // only when the flag says the counters were readable, so
+                // zero-valued pair rows mean "no thrash" and pair absence
+                // means delayacct is off on the host.
+                let r = collector.add_memory_rss(MemoryRssRecord {
+                    ts: hdr.ts as i64,
+                    utid,
+                    member: MEMORY_MEMBER_MAJ_FLT,
+                    size: maj_flt as i64,
+                    external: false,
+                });
+                self.report_write_error(r);
+                if hdr.flags & MEMORY_THRASH_FLAG_DELAYACCT != 0 {
+                    let r = collector.add_memory_rss(MemoryRssRecord {
+                        ts: hdr.ts as i64,
+                        utid,
+                        member: MEMORY_MEMBER_THRASHING_COUNT,
+                        size: thrash_count as i64,
+                        external: false,
+                    });
+                    self.report_write_error(r);
+                    let r = collector.add_memory_rss(MemoryRssRecord {
+                        ts: hdr.ts as i64,
+                        utid,
+                        member: MEMORY_MEMBER_THRASHING_DELAY,
+                        size: thrash_delay_ns as i64,
+                        external: false,
+                    });
+                    self.report_write_error(r);
+                }
             }
             _ => {}
         }
@@ -260,6 +320,9 @@ pub fn memory_rss_member_name(member: i8) -> &'static str {
     match member {
         MEMORY_MEMBER_HIWATER_RSS => "hiwater_rss",
         MEMORY_MEMBER_TOTAL_VM => "total_vm",
+        MEMORY_MEMBER_MAJ_FLT => "maj_flt",
+        MEMORY_MEMBER_THRASHING_COUNT => "thrashing_count",
+        MEMORY_MEMBER_THRASHING_DELAY => "thrashing_delay_ns",
         m if m >= 0 => match memory_rss_member(m as u32) {
             memory_rss_member::MEMORY_MM_FILEPAGES => "file",
             memory_rss_member::MEMORY_MM_ANONPAGES => "anon",
@@ -280,6 +343,10 @@ mod tests {
         assert_eq!(memory_rss_member_name(1), "anon");
         assert_eq!(memory_rss_member_name(-1), "hiwater_rss");
         assert_eq!(memory_rss_member_name(-2), "total_vm");
+        assert_eq!(memory_rss_member_name(-3), "maj_flt");
+        assert_eq!(memory_rss_member_name(-4), "thrashing_count");
+        assert_eq!(memory_rss_member_name(-5), "thrashing_delay_ns");
+        assert_eq!(memory_rss_member_name(-6), "unknown");
         assert_eq!(memory_rss_member_name(99), "unknown");
     }
 }

@@ -296,3 +296,51 @@ peer, not a local interface) and IPv4-mapped-IPv6 sockets correctly.
 
 Pre-v13 databases and traces have neither column; readers join on `netns_inum`
 where present and fall back to the `src_ip`→interface heuristic otherwise.
+
+## Schema Version 14 (unreleased) — 2026-08-11
+
+`memory_rss` gains an `external BOOLEAN` column and three synthetic members
+(-3/-4/-5), fixing rss_stat attribution in reclaim context and adding passive
+per-task thrash signals.
+
+### Attribution fix (no column)
+rss_stat events are now attributed to the mm's owner rather than to the task
+that happened to be running. Reclaim (`try_to_unmap_one`) decrements the
+victim's counters from the reclaimer's context, so reclaim-driven RSS drops of
+a traced process were previously dropped in cgroup-targeted mode (kswapd fails
+the filter) and misattributed to the reclaimer in whole-system mode (with the
+threshold batching state keyed by the wrong tgid). The common self-update case
+is unchanged, and a process's own exit teardown stays self-attributed — even
+when `mm_update_next_owner()` has already cleared `mm->owner` — so per-process
+RSS still falls to zero at exit. On the classic (non-BTF) fallback attach path
+the raw tracepoint carries no mm pointer, so remote updates are dropped there
+instead of misattributed.
+
+### New columns
+- `memory_rss.external` (BOOLEAN): true when the counter update was performed
+  from outside the process's own thread group — an external reclaimer (kswapd,
+  khugepaged, another process's direct reclaim, a `memory.reclaim` /
+  `process_madvise` writer) evicted or migrated the process's pages. False for
+  the process's own faults/maps/unmaps/exit teardown, for synthetic members,
+  and for exit-flush residuals (mixed provenance). Splitting cumulative member
+  deltas by this flag yields a per-process evicted-bytes timeline (under
+  threshold batching the flag reflects the update that crossed the threshold).
+
+### New synthetic members (periodic mm snapshots, `utid` = sampled thread)
+- `-3` maj_flt: cumulative major fault count for the sampled thread — a page
+  the process needed came back from disk/swap. Count, not bytes.
+- `-4` thrashing_count / `-5` thrashing_delay_ns: delayacct's thrash metrics
+  (stalls on `PG_workingset` pages — pages that refaulted soon after reclaim).
+  Emitted (zero values included) whenever delayacct was readable for the
+  sampled task, so zero-valued rows mean "delayacct on, no thrash", and their
+  complete absence while -3 rows are present means delayacct is not enabled
+  on the host (`CONFIG_TASK_DELAY_ACCT` plus the `delayacct` boot parameter
+  or the `kernel.task_delayacct` sysctl — runtime-enableable, but only tasks
+  forked after enablement carry the counters).
+
+"RSS flat while maj_flt and thrashing_delay climb" is a direct per-process
+thrash signature; `external` tells you whose pages reclaim is taking. Pre-v14
+databases and traces have neither the column nor the members: merging a
+pre-v14 DuckDB into a v14 database (`systing-util convert`) NULL-fills
+`external` via the column-intersection import, and readers of raw pre-v14
+parquet must treat the column as absent.

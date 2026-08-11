@@ -133,7 +133,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -555,7 +555,8 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             ts BIGINT,
             utid BIGINT,
             member TINYINT,
-            size BIGINT
+            size BIGINT,
+            external BOOLEAN
         );
         CREATE TABLE IF NOT EXISTS memory_map (
             trace_id VARCHAR,

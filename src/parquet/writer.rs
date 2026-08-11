@@ -2472,17 +2472,19 @@ fn build_memory_rss_batch(
     records: &[MemoryRssRecord],
     schema: &Arc<Schema>,
 ) -> Result<RecordBatch> {
-    use arrow::array::{Int64Builder, Int8Builder};
+    use arrow::array::{BooleanBuilder, Int64Builder, Int8Builder};
     let n = records.len();
     let mut ts = Int64Builder::with_capacity(n);
     let mut utid = Int64Builder::with_capacity(n);
     let mut member = Int8Builder::with_capacity(n);
     let mut size = Int64Builder::with_capacity(n);
+    let mut external = BooleanBuilder::with_capacity(n);
     for r in records {
         ts.append_value(r.ts);
         utid.append_value(r.utid);
         member.append_value(r.member);
         size.append_value(r.size);
+        external.append_value(r.external);
     }
     Ok(RecordBatch::try_new(
         schema.clone(),
@@ -2491,6 +2493,7 @@ fn build_memory_rss_batch(
             Arc::new(utid.finish()),
             Arc::new(member.finish()),
             Arc::new(size.finish()),
+            Arc::new(external.finish()),
         ],
     )?)
 }
