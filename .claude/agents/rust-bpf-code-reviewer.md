@@ -98,6 +98,22 @@ When changes add support for a new Python version (a new `src/pystacks/bindings/
 
 Missing item 1 or item 2 is a **Critical Issue**: version support without interpreter setup and matrix coverage is exactly how a silent offset fallback ships — a new version appears supported while discovery reads garbage and produces no frames.
 
+## Binary / ELF Parsing Review Criteria
+
+When changes parse ELF (or other binary object) files or in-memory images — magic-byte checks, ELF/program-header/section-header field offsets, or note-segment walking — verify the code uses the **`object` crate** (already a direct dependency, with the `read`/`elf` features) rather than hand-rolled byte offsets and magic constants. `object::File::parse` is the established idiom in this tree (`systing_core.rs`, `pystacks/discovery.rs`); its low-level `object::elf::FileHeader64` + `program_headers()` + `NoteIterator` cover the cases the high-level `File` API does not.
+
+Flag as a **Critical Issue** any hand-rolled ELF parsing where `object` covers the need:
+
+1. **Magic-byte checks**: a literal ELF magic compare such as `magic == [0x7f, b'E', b'L', b'F']` or `bytes.starts_with(b"\x7fELF")`. Use `object::FileKind::parse` (which returns `Elf32`/`Elf64`) or `object::elf::FileHeader64::parse`, which validates the magic, class, and endianness for you.
+2. **Header / program-header field arithmetic**: hand-indexed offsets like `ehdr[32..40]` for `e_phoff`, manual `e_phentsize`/`e_phnum` decoding, or a hand-written program-header stride loop. Use `object::elf::FileHeader64` with its `.e_phoff()`/`.e_phnum()` accessors and `.program_headers()`.
+3. **Note / build-id walking**: a hand `n_namesz`/`n_descsz`/`n_type` walk with manual 4-byte alignment. Use `object`'s `NoteIterator`, or `Object::build_id()` when a whole file is in hand.
+
+The only acceptable hand-roll is one that carries an **explicit written justification** — in a code comment and in the PR description — for why `object` cannot serve the specific case. Even then the fix is still `object`: when the high-level `File`/`build_id()` genuinely does not fit (for example, parsing a *loaded* image in another process's memory, which has no section-header table because sections are not `SHF_ALLOC`), use `object`'s low-level `FileHeader` / `ProgramHeader` / `NoteIterator` structs — not a fresh set of magic constants.
+
+This pattern has reached review twice and had to be caught by hand both times; flag it so it never surprises a human reviewer:
+- **`is_elf`** (the exit-snapshot ELF screen): a raw four-byte `[0x7f, b'E', b'L', b'F']` compare, where `object::FileKind::parse` answers "is this an ELF" directly.
+- **`parse_build_id_from_elf`** (build-id note extraction from process memory): a hand-walked Elf64 header → program-header table → `PT_NOTE` segment with a local module of offset and type constants, rewritten onto `object`'s `FileHeader64` + `program_headers()` + `NoteIterator` — behaviour-identical, ~30 fewer lines, and the low-level-not-high-level choice documented in the code.
+
 ## Output Format
 
 Structure your review as follows:
