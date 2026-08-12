@@ -412,6 +412,7 @@ enum memory_event_type {
 	MEMORY_MM_SAMPLE,     // periodic mm_struct snapshot (from perf_event_clock)
 	MEMORY_ALLOC,         // uretprobe malloc/calloc/realloc/... - heap object allocated
 	MEMORY_FREE,          // uprobe free - heap object released
+	MEMORY_THRASH_SAMPLE, // periodic per-task thrash counters (from perf_event_clock)
 };
 
 /* RSS stat member indices (mirrors include/linux/mm_types_task.h) */
@@ -421,6 +422,22 @@ enum memory_rss_member {
 	MEMORY_MM_SWAPENTS,
 	MEMORY_MM_SHMEMPAGES,
 };
+
+/* memory_event_header.flags bits for MEMORY_RSS_STAT events. */
+/* The counter update was performed by a task outside the mm's thread
+ * group -- an external reclaimer (kswapd, khugepaged, another process in
+ * direct reclaim, a memory.reclaim / process_madvise writer) evicted or
+ * migrated this process's pages, rather than the process itself
+ * faulting, mapping, or unmapping. Never set on exit-flush residuals
+ * (those aggregate updates from both classes). */
+#define MEMORY_RSS_FLAG_EXTERNAL (1U << 0)
+
+/* memory_event_header.flags bit for MEMORY_THRASH_SAMPLE events: delayacct
+ * was enabled and task->delays was read, so zero-valued thrash counters mean
+ * "no thrash". Events without this bit mean the counters were unavailable
+ * (CONFIG_TASK_DELAY_ACCT off, delayacct not enabled, or delays not
+ * allocated for this task). */
+#define MEMORY_THRASH_FLAG_DELAYACCT (1U << 0)
 
 /* Allocator operation, stored in memory_event.member for MEMORY_ALLOC/FREE. */
 enum memory_alloc_op {
@@ -434,19 +451,19 @@ enum memory_alloc_op {
 
 /*
  * memory_event is split so the high-frequency stack-less types
- * (RSS_STAT, MM_SAMPLE, FREE) reserve only the ~80-byte header instead of the
- * full struct with stack arrays and pystacks buffer.
+ * (RSS_STAT, MM_SAMPLE, THRASH_SAMPLE, FREE) reserve only the ~80-byte header
+ * instead of the full struct with stack arrays and pystacks buffer.
  */
 struct memory_event_header {
 	enum memory_event_type type;
 	u64 ts;
 	u32 cpu;
 	struct task_info task;
-	u64 addr;          // mmap ret / munmap addr / fault addr / brk new / hiwater_rss / alloc ret
-	u64 size;          // mmap len / munmap len / rss size (bytes) / total_vm (bytes) / alloc bytes
+	u64 addr;          // mmap ret / munmap addr / fault addr / brk new / hiwater_rss / alloc ret / thrash maj_flt
+	u64 size;          // mmap len / munmap len / rss size (bytes) / total_vm (bytes) / alloc bytes / thrash stall count
 	u32 member;        // rss_stat: enum memory_rss_member; mmap: prot; alloc: enum memory_alloc_op
-	u32 flags;         // mmap: MAP_* flags; page_fault: error_code
-	u64 old_addr;      // realloc: previous pointer (else 0)
+	u32 flags;         // mmap: MAP_* flags; page_fault: error_code; rss_stat: MEMORY_RSS_FLAG_*
+	u64 old_addr;      // realloc: previous pointer / thrash stall delay ns (else 0)
 	u64 kernel_stack_length;
 	u64 user_stack_length;
 };
@@ -2329,6 +2346,32 @@ int systing_perf_event_clock(void *ctx)
 				mev->addr = BPF_CORE_READ(mm, hiwater_rss) * (u64)tool_config.page_size;
 				mev->size = BPF_CORE_READ(mm, total_vm) * (u64)tool_config.page_size;
 				bpf_ringbuf_submit(mev, mflags);
+			} else {
+				handle_missed_event(MISSED_MEMORY_EVENT);
+			}
+			/* Companion thrash sample: a separate event type so
+			 * the shared header doesn't grow for fields only this
+			 * low-rate path fills. task->delays is only present
+			 * with CONFIG_TASK_DELAY_ACCT and only allocated when
+			 * delayacct is enabled; absent or NULL leaves the
+			 * init-zeroed values. */
+			struct memory_event_header *tev = reserve_memory_event_header(&mflags);
+			if (tev) {
+				tev->type = MEMORY_THRASH_SAMPLE;
+				tev->ts = ts;
+				tev->cpu = bpf_get_smp_processor_id();
+				record_task_info(&tev->task, task);
+				tev->addr = BPF_CORE_READ(task, maj_flt);
+				if (bpf_core_field_exists(task->delays)) {
+					struct task_delay_info *d =
+						BPF_CORE_READ(task, delays);
+					if (d) {
+						tev->flags = MEMORY_THRASH_FLAG_DELAYACCT;
+						tev->size = BPF_CORE_READ(d, thrashing_count);
+						tev->old_addr = BPF_CORE_READ(d, thrashing_delay);
+					}
+				}
+				bpf_ringbuf_submit(tev, mflags);
 			} else {
 				handle_missed_event(MISSED_MEMORY_EVENT);
 			}
@@ -5041,7 +5084,8 @@ static __always_inline s64 read_mm_rss_pages(struct mm_struct *mm, u32 member)
 }
 
 static __always_inline int emit_rss_stat_event(struct task_struct *task,
-					       u32 member, s64 size_bytes)
+					       u32 member, s64 size_bytes,
+					       u32 rss_flags)
 {
 	long flags;
 	struct memory_event_header *event = reserve_memory_event_header(&flags);
@@ -5054,6 +5098,7 @@ static __always_inline int emit_rss_stat_event(struct task_struct *task,
 	record_task_info(&event->task, task);
 	event->member = member;
 	event->size = (u64)size_bytes;
+	event->flags = rss_flags;
 
 	bpf_ringbuf_submit(event, flags);
 	return 0;
@@ -5064,14 +5109,15 @@ static __always_inline int emit_rss_stat_event(struct task_struct *task,
  * (counter reads, size math) so untraced tasks pay as close to zero as
  * possible on this very hot tracepoint. */
 static __always_inline int handle_rss_stat(struct task_struct *task,
-					   u32 member, s64 size_bytes)
+					   u32 member, s64 size_bytes,
+					   u32 rss_flags)
 {
 	if (member >= NR_MM_COUNTERS)
 		return 0;
 
 	/* Threshold disabled (0): preserve pre-change behavior exactly. */
 	if (tool_config.memory_rss_threshold_bytes == 0)
-		return emit_rss_stat_event(task, member, size_bytes);
+		return emit_rss_stat_event(task, member, size_bytes, rss_flags);
 
 	u32 tgid = BPF_CORE_READ(task, tgid);
 	struct rss_stat_state *st = bpf_map_lookup_elem(&rss_stat_last, &tgid);
@@ -5083,10 +5129,10 @@ static __always_inline int handle_rss_stat(struct task_struct *task,
 		 * BPF_NOEXIST (not BPF_ANY) so the race-loser doesn't clobber
 		 * the winner's populated state. */
 		if (bpf_map_update_elem(&rss_stat_last, &tgid, &init, BPF_NOEXIST) != 0)
-			return emit_rss_stat_event(task, member, size_bytes);
+			return emit_rss_stat_event(task, member, size_bytes, rss_flags);
 		st = bpf_map_lookup_elem(&rss_stat_last, &tgid);
 		if (!st)
-			return emit_rss_stat_event(task, member, size_bytes);
+			return emit_rss_stat_event(task, member, size_bytes, rss_flags);
 	}
 
 	/* Unsynchronized per-member s64 stores — multiple threads of a tgid
@@ -5104,25 +5150,79 @@ static __always_inline int handle_rss_stat(struct task_struct *task,
 		return 0;
 
 	st->last_emitted[member] = size_bytes;
-	return emit_rss_stat_event(task, member, size_bytes);
+	return emit_rss_stat_event(task, member, size_bytes, rss_flags);
 }
 
 SEC("tp_btf/rss_stat")
 int BPF_PROG(systing_rss_stat_btf, struct mm_struct *mm, int member)
 {
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	struct task_struct *current = (struct task_struct *)bpf_get_current_task_btf();
+	struct task_struct *task = current;
+	u32 rss_flags = 0;
+
+	/* Attribute by the tracepoint's mm, not by current. Reclaim fires
+	 * this tracepoint from a context whose current is the RECLAIMER --
+	 * kswapd, khugepaged, another process in direct reclaim, a
+	 * memory.reclaim / process_madvise writer -- while the counters
+	 * that moved belong to the mm's owner. Attributing by current
+	 * dropped those events in cgroup-targeted mode (the reclaimer
+	 * fails the filter) and misattributed them to the reclaimer in
+	 * whole-system mode (with the threshold state batched under the
+	 * wrong tgid). The common self-update case (fault, mmap, munmap)
+	 * keeps current: it is a thread of the mm's own thread group, so
+	 * attribution is identical and no mm->owner walk is paid. */
+	if (current->mm != mm) {
+		struct task_struct *owner = NULL;
+
+		if (bpf_core_field_exists(mm->owner))
+			owner = mm->owner;
+		if (owner) {
+			task = owner;
+			/* Same-tgid updates with current->mm detached are
+			 * the task's own exit teardown (exit_mm() nulls
+			 * current->mm before exit_mmap() drops the
+			 * counters): the process releasing its own memory,
+			 * not external reclaim. */
+			if (current->tgid != owner->tgid)
+				rss_flags |= MEMORY_RSS_FLAG_EXTERNAL;
+		} else if (!(current->flags & PF_KTHREAD) &&
+			   current->active_mm == mm) {
+			/* Last-user exit teardown: mm_update_next_owner()
+			 * NULLs mm->owner before exit_mmap() drops the
+			 * counters (and CONFIG_MEMCG=n kernels have no
+			 * owner field at all), but the exiting task still
+			 * carries the mm as active_mm. Keep the final
+			 * RSS fall self-attributed so per-process RSS
+			 * reaches zero at exit. */
+			task = current;
+		} else {
+			/* Unattributable: a reclaimer hit an mm whose
+			 * owner is gone. */
+			return 0;
+		}
+	}
 	if (!trace_task(task))
 		return 0;
 	s64 pages = read_mm_rss_pages(mm, (u32)member);
 	if (pages < 0)
 		pages = 0;
-	return handle_rss_stat(task, (u32)member, pages * (s64)tool_config.page_size);
+	return handle_rss_stat(task, (u32)member,
+			       pages * (s64)tool_config.page_size, rss_flags);
 }
 
 SEC("tracepoint/kmem/rss_stat")
 int systing_rss_stat(struct trace_event_raw_rss_stat *ctx)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	/* The raw tracepoint carries a hashed mm id (ctx->mm_id) plus a
+	 * curr flag -- no mm pointer -- so on this fallback path the victim
+	 * of a remote update (reclaim) cannot be resolved. curr==0 events
+	 * would be attributed to the reclaimer; drop them instead. Bounded
+	 * loss: this path is only selected on kernels whose BTF lacks
+	 * btf_trace_rss_stat, and such events were never correctly
+	 * attributed here anyway. */
+	if (!ctx->curr)
+		return 0;
 	if (!trace_task(task))
 		return 0;
 	/* ctx->size is the kernel's exact percpu_counter_sum_positive() already
@@ -5133,7 +5233,7 @@ int systing_rss_stat(struct trace_event_raw_rss_stat *ctx)
 	s64 size = (s64)ctx->size;
 	if (size < 0)
 		size = 0;
-	return handle_rss_stat(task, (u32)ctx->member, size);
+	return handle_rss_stat(task, (u32)ctx->member, size, 0);
 }
 
 /* Flush sub-threshold residual rss_stat state at last-thread-exit so a
@@ -5167,13 +5267,14 @@ int BPF_PROG(systing_rss_stat_exit_flush, struct task_struct *task)
 
 	/* task->mm is NULL here (exit_mm() precedes this tracepoint), so
 	 * flush latest_seen[] captured on the rss_stat path rather than
-	 * re-reading mm. */
+	 * re-reading mm. Flushed residuals aggregate updates from both the
+	 * process itself and any external reclaimer, so no external flag. */
 	for (u32 m = 0; m < NR_MM_COUNTERS; m++) {
 		s64 latest = st->latest_seen[m];
 		if (latest < 0)
 			continue; /* never seen */
 		if (latest != st->last_emitted[m])
-			emit_rss_stat_event(task, m, latest);
+			emit_rss_stat_event(task, m, latest, 0);
 	}
 	bpf_map_delete_elem(&rss_stat_last, &tgid);
 	return 0;

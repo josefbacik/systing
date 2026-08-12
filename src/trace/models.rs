@@ -539,7 +539,14 @@ pub struct CpuInfoRecord {
 /// Per-process RSS / VM counter sample.
 ///
 /// `member` indexes the kernel `rss_stat` counter (0=file, 1=anon, 2=swap, 3=shmem).
-/// Negative members are synthetic: -1 = hiwater_rss, -2 = total_vm (from periodic mm snapshots).
+/// Negative members are synthetic, from periodic mm snapshots: -1 = hiwater_rss
+/// bytes, -2 = total_vm bytes, -3 = maj_flt (major fault count for the sampled
+/// thread), -4 = delayacct thrashing stall count, -5 = delayacct thrashing
+/// stall delay in ns. -4/-5 rows are emitted (zero values included) whenever
+/// delayacct was readable on the host, so zero-valued rows mean "delayacct
+/// on, no thrash", and their complete absence while -3 rows are present means
+/// delayacct is not enabled (`CONFIG_TASK_DELAY_ACCT` plus the `delayacct`
+/// boot parameter or `kernel.task_delayacct` sysctl).
 ///
 /// Emission cadence: rss_stat samples are threshold-batched in BPF (one event
 /// per ≥ `memory_rss_threshold_bytes` of drift per (tgid, member), default
@@ -550,12 +557,24 @@ pub struct CpuInfoRecord {
 /// ±(percpu_counter_batch · nr_online_cpus) pages where the kernel sets
 /// batch = max(32, 2·nr_online_cpus). On the classic `tracepoint/kmem/rss_stat`
 /// fallback the kernel's own exact sum is used.
+///
+/// `external` is true when the sampled counter update was performed from
+/// outside the process's own thread group — an external reclaimer (kswapd,
+/// khugepaged, another process's direct reclaim, a memory.reclaim or
+/// process_madvise writer) evicted or migrated the process's pages. False for
+/// the process's own faults/maps/unmaps/exit teardown, for all synthetic
+/// members, for exit-flush residuals (mixed provenance), and always on the
+/// classic fallback attach path (which cannot resolve remote updates and
+/// drops them instead). Under threshold batching the flag carries the
+/// provenance of the update that crossed the threshold; the sub-threshold
+/// drift folded into that emission may mix self and external updates.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryRssRecord {
     pub ts: i64,
     pub utid: i64,
     pub member: i8,
     pub size: i64,
+    pub external: bool,
 }
 
 /// Virtual address space change: mmap / munmap / brk.

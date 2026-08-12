@@ -113,7 +113,7 @@ ORDER BY retransmits DESC;
 ### Memory
 From the `memory` / `memory-alloc` recorders. `stack_id` columns join to `stack.id` like sample stacks.
 
-- `memory_rss(ts, utid, member, size)` — RSS tracking. `member`: `0`=file, `1`=anon, `2`=swap, `3`=shmem, `-1`=hiwater_rss, `-2`=total_vm (the negatives are synthetic periodic `mm_struct` samples).
+- `memory_rss(ts, utid, member, size, external)` — RSS tracking. `member`: `0`=file, `1`=anon, `2`=swap, `3`=shmem, `-1`=hiwater_rss, `-2`=total_vm, `-3`=maj_flt, `-4`=thrashing_count, `-5`=thrashing_delay_ns (negatives are synthetic periodic samples). Units vary by member: `size` is bytes for `0..3`/`-1`/`-2`, a cumulative fault count for `-3`, a stall count for `-4`, and nanoseconds for `-5` — never aggregate across members. `external` is true when the update came from an external reclaimer (kswapd, direct reclaim by another process) rather than the process itself; `-4`/`-5` rows appear only on delayacct-enabled hosts (zero-valued rows there mean "no thrash").
 - `memory_map(ts, utid, event_type, addr, size, prot, flags, stack_id)` — mmap/munmap/brk.
 - `memory_fault(ts, utid, addr, error_code, stack_id)` — user page faults (sampled 1-in-N, default 97).
 - `memory_alloc(ts, utid, op, addr, size, old_addr, stack_id)` — malloc/calloc/realloc/free uprobes.
