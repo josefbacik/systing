@@ -2549,6 +2549,7 @@ fn build_memory_map_batch(
     let mut event_type = StringBuilder::with_capacity(n, n * 8);
     let mut addr = Int64Builder::with_capacity(n);
     let mut size = Int64Builder::with_capacity(n);
+    let mut rss_delta_bytes = Int64Builder::with_capacity(n);
     let mut prot = Int32Builder::with_capacity(n);
     let mut flags = Int32Builder::with_capacity(n);
     let mut stack_id = Int64Builder::with_capacity(n);
@@ -2559,6 +2560,7 @@ fn build_memory_map_batch(
         event_type.append_value(&r.event_type);
         addr.append_value(r.addr);
         size.append_value(r.size);
+        rss_delta_bytes.append_option(r.rss_delta_bytes);
         prot.append_option(r.prot);
         flags.append_option(r.flags);
         stack_id.append_option(r.stack_id);
@@ -2572,6 +2574,7 @@ fn build_memory_map_batch(
             Arc::new(event_type.finish()),
             Arc::new(addr.finish()),
             Arc::new(size.finish()),
+            Arc::new(rss_delta_bytes.finish()),
             Arc::new(prot.finish()),
             Arc::new(flags.finish()),
             Arc::new(stack_id.finish()),

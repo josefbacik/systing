@@ -165,6 +165,13 @@ impl MemoryRecorder {
         let stack_id = self.intern_stack(event, task.tgid);
         let id = self.next_map_id;
         self.next_map_id += 1;
+        // Per-type field reuse: map legs carry the signed RSS delta in
+        // old_addr (see the BPF header comment); the sentinel marks rows
+        // where either resident read was unavailable.
+        let rss_delta_bytes = match event.hdr.old_addr as i64 {
+            i64::MIN => None,
+            d => Some(d),
+        };
         let r = collector.add_memory_map(MemoryMapRecord {
             id,
             ts: event.hdr.ts as i64,
@@ -172,6 +179,7 @@ impl MemoryRecorder {
             event_type: event_type.to_string(),
             addr: event.hdr.addr as i64,
             size: event.hdr.size as i64,
+            rss_delta_bytes,
             prot,
             flags,
             stack_id,

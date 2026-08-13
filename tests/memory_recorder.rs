@@ -168,6 +168,48 @@ fn test_memory_recorder_e2e() {
     );
     eprintln!("    {} munmap events", munmap_rows);
 
+    // --- Check: memory_map.rss_delta_bytes captures the munmap RSS drop ---
+    // The workload's bytearray(size) memsets the full buffer, so each large
+    // munmap releases ~ALLOC_SIZE_BYTES of resident anon. First make sure the
+    // column is populated at all (if the BPF-side mm read failed, every row
+    // would carry the absent sentinel and decode to NULL — a vacuous pass),
+    // then require the signed drop on at least half the large frees. The
+    // negative bound also catches an enter/exit sign inversion, which would
+    // render frees as +2 MiB gains.
+    eprintln!("  memory_map.rss_delta_bytes munmap drop...");
+    let (delta_rows, drop_rows): (i64, i64) = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FILTER (WHERE rss_delta_bytes IS NOT NULL),
+                        COUNT(*) FILTER (WHERE rss_delta_bytes <= -?)
+                 FROM memory_map WHERE event_type = 'munmap' AND utid IN {UTIDS_FOR_PID}"
+            ),
+            [ALLOC_SIZE_BYTES / 2, child_pid as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Failed to query memory_map rss_delta_bytes");
+    assert!(
+        delta_rows > 0,
+        "[memory_map] rss_delta_bytes is NULL on all {munmap_rows} munmap rows \
+         (BPF mm read never succeeded?)"
+    );
+    assert!(
+        drop_rows >= ALLOC_COUNT / 2,
+        "[memory_map] expected >= {} munmap events with rss_delta_bytes <= -{} bytes, \
+         got {} ({} non-NULL of {} munmaps)",
+        ALLOC_COUNT / 2,
+        ALLOC_SIZE_BYTES / 2,
+        drop_rows,
+        delta_rows,
+        munmap_rows
+    );
+    eprintln!(
+        "    {} munmap drops <= -{} MiB ({} non-NULL)",
+        drop_rows,
+        (ALLOC_SIZE_BYTES / 2) >> 20,
+        delta_rows
+    );
+
     // --- Check: memory_map.stack_id joins to stack.id ---
     eprintln!("  memory_map.stack_id -> stack.id join...");
     let (with_stack, joined): (i64, i64) = conn

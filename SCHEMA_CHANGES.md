@@ -344,3 +344,38 @@ databases and traces have neither the column nor the members: merging a
 pre-v14 DuckDB into a v14 database (`systing-util convert`) NULL-fills
 `external` via the column-intersection import, and readers of raw pre-v14
 parquet must treat the column as absent.
+
+## Schema Version 15 (unreleased) — 2026-08-13
+
+`memory_map` gains `rss_delta_bytes BIGINT` (nullable): the SIGNED change in
+the process's resident set across each mmap/munmap/brk call — pages actually
+committed or freed, where `size` only names the virtual-address range the
+arguments described.
+
+Why: the VA number misrepresents reality on both sides. mmap commits nothing
+(page faults do), so huge mmaps of sparse reservations recorded as if memory
+appeared; munmap frees only what was resident in the range, so sparse unmaps
+recorded far more than the machine gave back. `rss_delta_bytes` is measured
+from the mm's resident counters at syscall enter and success-gated exit:
+munmap rows are typically negative (the real release), mmap rows typically
+~0, brk either sign.
+
+Read rules, stated once here and in the record docs:
+- NULL means the resident read was unavailable on either side of the call —
+  and every pre-v15 row. Never treat NULL as zero.
+- Three approximations, all bounded and deliberate: concurrent faults or
+  reclaim on the process's other threads inside the syscall window land in
+  the delta (microsecond window); the resident reads carry the rss_stat
+  sampling's worst-case ±(percpu batch x nr_cpus pages) error (the kernel's
+  counter caching — the same slop rss_stat rows already document); and under
+  `--memory-map-sample-rate` 1:N sampling only sampled events carry a delta.
+- Sampling composition: a sampled-in row carries the FULL delta of its own
+  call — the rate scales aggregate event mass (multiply sums by N), never
+  divides a row's delta. At rates above 1 the scaled estimate is unbiased
+  but heavy-tail-noisy: one huge munmap missed by sampling is invisible,
+  the same property the VA sums always had. Zero-delta events are NOT
+  suppressed — every sampled successful call emits a row, so event-rate
+  reads on this stream stay valid.
+- Churn built from this column: freed = sum(-rss_delta_bytes) over negative
+  rows; committed-at-map = sum over positive rows. The old `size` sums remain
+  VA-range churn and keep their v13/v14 meaning for historical continuity.
