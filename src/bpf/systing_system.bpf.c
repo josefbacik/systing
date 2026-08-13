@@ -439,6 +439,12 @@ enum memory_rss_member {
  * allocated for this task). */
 #define MEMORY_THRASH_FLAG_DELAYACCT (1U << 0)
 
+/* Sentinel for "no RSS read" in the map legs' old_addr rss-delta encoding
+ * (see the header field comments): S64_MIN can never be a real signed
+ * byte delta, so it marks rows where the enter- or exit-side resident-set
+ * read was unavailable and the recorder should emit NULL. */
+#define MEMORY_RSS_DELTA_ABSENT ((s64)0x8000000000000000)
+
 /* Allocator operation, stored in memory_event.member for MEMORY_ALLOC/FREE. */
 enum memory_alloc_op {
 	MEMORY_OP_MALLOC,
@@ -463,7 +469,7 @@ struct memory_event_header {
 	u64 size;          // mmap len / munmap len / rss size (bytes) / total_vm (bytes) / alloc bytes / thrash stall count
 	u32 member;        // rss_stat: enum memory_rss_member; mmap: prot; alloc: enum memory_alloc_op
 	u32 flags;         // mmap: MAP_* flags; page_fault: error_code; rss_stat: MEMORY_RSS_FLAG_*
-	u64 old_addr;      // realloc: previous pointer / thrash stall delay ns (else 0)
+	u64 old_addr;      // realloc: previous pointer / thrash stall delay ns / map legs: signed rss-delta bytes as two's-complement (MEMORY_RSS_DELTA_ABSENT = no read); else 0
 	u64 kernel_stack_length;
 	u64 user_stack_length;
 };
@@ -1005,6 +1011,15 @@ struct memory_syscall_args {
 	 * in total; this is that upper bound (looser than the exact in-range
 	 * mapped bytes, but enough to drop the impossible values). */
 	u64 vm_limit;
+	/* All map legs: the mm's resident-set bytes at syscall enter
+	 * (file + anon + shmem, the same approximate percpu-counter read
+	 * the rss_stat handler uses), so the success-gated exit can emit
+	 * the signed RSS delta the call actually caused -- pages committed
+	 * or freed, not the VA range the arguments named. The VA number
+	 * misrepresents reality on both sides: mmap commits nothing (faults
+	 * do), and munmap frees only what was resident in range. -1 = read
+	 * unavailable at enter; the exit then emits the delta as absent. */
+	s64 enter_rss;
 };
 
 struct {
@@ -5303,6 +5318,40 @@ static __always_inline bool memory_map_sample_hit(u64 *cnt)
 	return (*cnt % tool_config.memory_map_sample_rate) == 0;
 }
 
+/* Resident-set bytes of the task's mm (file + anon + shmem pages), the
+ * same approximate percpu_counter read the rss_stat handler uses, so the
+ * two share one error model (worst case ±(percpu batch x nr_cpus) pages).
+ * Returns -1 when the mm is unreadable so callers can mark the read
+ * absent rather than emitting a fake zero. */
+static __always_inline s64 current_task_rss_bytes(struct task_struct *task)
+{
+	struct mm_struct *mm = BPF_CORE_READ(task, mm);
+	if (!mm)
+		return -1;
+	s64 pages = read_mm_rss_pages(mm, MEMORY_MM_FILEPAGES) +
+		    read_mm_rss_pages(mm, MEMORY_MM_ANONPAGES) +
+		    read_mm_rss_pages(mm, MEMORY_MM_SHMEMPAGES);
+	if (pages < 0)
+		pages = 0;
+	return pages * (s64)tool_config.page_size;
+}
+
+/* Compute the map legs' signed rss-delta encoding for old_addr: the exit-
+ * side resident read minus the stashed enter-side read, or ABSENT when
+ * either side was unavailable. Concurrent faults or reclaim on other
+ * threads inside the syscall window land in the delta -- the window is
+ * microseconds, the drift is small, and the schema doc says so. */
+static __always_inline u64 map_rss_delta_enc(struct task_struct *task,
+					     s64 enter_rss)
+{
+	if (enter_rss < 0)
+		return (u64)MEMORY_RSS_DELTA_ABSENT;
+	s64 exit_rss = current_task_rss_bytes(task);
+	if (exit_rss < 0)
+		return (u64)MEMORY_RSS_DELTA_ABSENT;
+	return (u64)(exit_rss - enter_rss);
+}
+
 SEC("tracepoint/syscalls/sys_enter_mmap")
 int systing_mmap_enter(struct trace_event_raw_sys_enter *ctx)
 {
@@ -5316,6 +5365,7 @@ int systing_mmap_enter(struct trace_event_raw_sys_enter *ctx)
 		.size = (u64)ctx->args[1],
 		.prot = (u32)ctx->args[2],
 		.flags = (u32)ctx->args[3],
+		.enter_rss = current_task_rss_bytes(task),
 	};
 	bpf_map_update_elem(&memory_syscall_scratch, &tgidpid, &args, BPF_ANY);
 	return 0;
@@ -5360,6 +5410,7 @@ int systing_mmap_exit(struct trace_event_raw_sys_exit *ctx)
 	event->hdr.size = args.size;
 	event->hdr.member = args.prot;
 	event->hdr.flags = args.flags;
+	event->hdr.old_addr = map_rss_delta_enc(task, args.enter_rss);
 	memory_capture_stack(ctx, event, task, true);
 
 	bpf_ringbuf_submit(event, flags);
@@ -5379,6 +5430,7 @@ int systing_munmap_enter(struct trace_event_raw_sys_enter *ctx)
 		.size = (u64)ctx->args[1],
 		.vm_limit = (u64)BPF_CORE_READ(task, mm, total_vm) *
 			    tool_config.page_size,
+		.enter_rss = current_task_rss_bytes(task),
 	};
 	bpf_map_update_elem(&memory_syscall_scratch, &tgidpid, &args, BPF_ANY);
 	return 0;
@@ -5440,6 +5492,7 @@ int systing_munmap_exit(struct trace_event_raw_sys_exit *ctx)
 	event->hdr.size = (args.vm_limit && args.size > args.vm_limit)
 				  ? args.vm_limit
 				  : args.size;
+	event->hdr.old_addr = map_rss_delta_enc(task, args.enter_rss);
 	memory_capture_stack(ctx, event, task, true);
 
 	bpf_ringbuf_submit(event, flags);
@@ -5455,7 +5508,10 @@ int systing_brk_enter(struct trace_event_raw_sys_enter *ctx)
 
 	u64 tgidpid = bpf_get_current_pid_tgid();
 	/* Stash the current brk so exit can compute the delta. */
-	struct memory_syscall_args args = { .addr = BPF_CORE_READ(task, mm, brk) };
+	struct memory_syscall_args args = {
+		.addr = BPF_CORE_READ(task, mm, brk),
+		.enter_rss = current_task_rss_bytes(task),
+	};
 	bpf_map_update_elem(&memory_syscall_scratch, &tgidpid, &args, BPF_ANY);
 	return 0;
 }
@@ -5472,6 +5528,7 @@ int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
 	if (!saved)
 		return 0;
 	u64 old_brk = saved->addr;
+	s64 enter_rss = saved->enter_rss;
 	bpf_map_delete_elem(&memory_syscall_scratch, &tgidpid);
 
 	/* brk(0) queries the current break and failed brk returns it unchanged. */
@@ -5496,6 +5553,7 @@ int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
 	record_task_info(&event->hdr.task, task);
 	event->hdr.addr = (u64)ctx->ret;
 	event->hdr.size = (u64)((s64)ctx->ret - (s64)old_brk);
+	event->hdr.old_addr = map_rss_delta_enc(task, enter_rss);
 	memory_capture_stack(ctx, event, task, true);
 
 	bpf_ringbuf_submit(event, flags);

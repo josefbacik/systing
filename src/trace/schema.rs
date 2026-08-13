@@ -442,6 +442,7 @@ pub fn memory_map_schema() -> Arc<Schema> {
         Field::new("event_type", DataType::Utf8, false),
         Field::new("addr", DataType::Int64, false),
         Field::new("size", DataType::Int64, false),
+        Field::new("rss_delta_bytes", DataType::Int64, true),
         Field::new("prot", DataType::Int32, true),
         Field::new("flags", DataType::Int32, true),
         Field::new("stack_id", DataType::Int64, true),

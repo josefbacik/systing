@@ -584,6 +584,19 @@ pub struct MemoryRssRecord {
 /// munmap, `size` is the requested length bounded by the process's total
 /// mapped size at call time -- an upper bound on what the call could free,
 /// not necessarily a region of that size at `addr`.
+///
+/// `rss_delta_bytes` is the SIGNED change in the process's resident set across the
+/// syscall, in bytes -- pages actually committed or freed, where `size` is
+/// only the virtual-address range the arguments named. munmap is typically
+/// negative (what the call really freed), mmap typically ~0 (mapping commits
+/// nothing; faults do), brk either sign. `None` when either resident read was
+/// unavailable, and on all pre-v15 rows. Three documented approximations:
+/// concurrent faults/reclaim on other threads inside the syscall window land
+/// in the delta (microsecond window, small drift); the resident reads carry
+/// the same worst-case ±(percpu batch x nr_cpus pages) error as rss_stat
+/// samples; and under `--memory-map-sample-rate` 1:N sampling, per-event
+/// deltas exist only for sampled events -- aggregates scale by the stamped
+/// rate like the byte sums.
 /// `stack_id` joins to the `stack` table for allocation-site attribution.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryMapRecord {
@@ -593,6 +606,7 @@ pub struct MemoryMapRecord {
     pub event_type: String,
     pub addr: i64,
     pub size: i64,
+    pub rss_delta_bytes: Option<i64>,
     pub prot: Option<i32>,
     pub flags: Option<i32>,
     pub stack_id: Option<i64>,
