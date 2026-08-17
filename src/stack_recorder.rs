@@ -51,7 +51,23 @@ pub enum UserFrame {
     /// ELF build-id plus file offset; symbolized through the build-id store
     /// regardless of whether the process still exists.
     BuildId { id: [u8; 20], offset: u64 },
+    /// Synthetic: the sample interrupted a hypervisor vCPU thread while it
+    /// was executing guest code (`PF_VCPU`, the flag the kernel's cputime
+    /// accounting bills as guest time). There is no host address to
+    /// symbolize — the kernel returns empty callchains for guest-mode
+    /// samples by design, on x86 and arm64 alike — so the frame renders as
+    /// the `[guest]` label. It exists so that CPU time spent inside virtual
+    /// machines is *counted*, attributed to the VMM thread that ran it,
+    /// rather than silently dropped as an unwind failure.
+    Guest,
 }
+
+/// Rendered name of [`UserFrame::Guest`]: the standard `symbol (module)`
+/// frame shape with the label in the module slot, like `[exited]` and the
+/// `[gvisor:*]` family, so existing frame parsers classify it without
+/// changes. No `<0x…>` suffix — there is no address, and inventing one
+/// would be worse than its honest absence.
+const GUEST_FRAME_NAME: &str = "unknown ([guest])";
 
 // Stack structure representing kernel, user, and Python stacks.
 //
@@ -92,7 +108,7 @@ fn filter_and_reverse_user_frames(frames: Vec<UserFrame>) -> Vec<UserFrame> {
         .into_iter()
         .filter(|f| match f {
             UserFrame::Ip(addr) => *addr != 0 && *addr <= MAX_USER_ADDR,
-            UserFrame::BuildId { .. } => true,
+            UserFrame::BuildId { .. } | UserFrame::Guest => true,
         })
         .rev()
         .collect()
@@ -263,6 +279,10 @@ impl StackSpill {
                     self.buf.push(1);
                     self.buf.extend_from_slice(id);
                     self.buf.extend_from_slice(&offset.to_le_bytes());
+                }
+                UserFrame::Guest => {
+                    // Tag only: a guest frame carries no payload.
+                    self.buf.push(2);
                 }
             }
         }
@@ -591,7 +611,8 @@ fn read_spill_record(reader: &mut BufReader<File>) -> Result<Option<(Stack, i32,
     }
 
     // User frames are self-describing (see `push`): tag 0 = raw IP (u64),
-    // tag 1 = build-id (20 id bytes + u64 file offset).
+    // tag 1 = build-id (20 id bytes + u64 file offset), tag 2 = guest
+    // (no payload).
     let mut user_stack = Vec::with_capacity(ulen);
     for _ in 0..ulen {
         let mut tag = [0u8; 1];
@@ -618,6 +639,7 @@ fn read_spill_record(reader: &mut BufReader<File>) -> Result<Option<(Stack, i32,
                     offset: u64::from_le_bytes(buf8),
                 });
             }
+            2 => user_stack.push(UserFrame::Guest),
             t => anyhow::bail!("corrupt stack spill record: unknown user frame tag {t}"),
         }
     }
@@ -680,6 +702,13 @@ const BUILD_ID_STATUS_IP: i32 = 2;
 /// USER_STACK_FORMAT_* defines): which entry format the event's user_stack
 /// region carries.
 const USER_STACK_FORMAT_BUILD_ID: u32 = 1;
+
+/// `stack_event.sample_flags` bit (mirrors the BPF-side SAMPLE_FLAG_IN_GUEST
+/// define): the sampled task was a vCPU thread executing its guest
+/// (`PF_VCPU`). Such events carry no frames — the kernel does not walk
+/// callchains for guest-mode samples — and are accounted as one
+/// [`UserFrame::Guest`] frame instead of being dropped.
+const SAMPLE_FLAG_IN_GUEST: u32 = 1;
 
 /// Index one live process's executable mappings into the build-id store
 /// (the opportunistic fill source). Returns how many mappings were read.
@@ -951,6 +980,15 @@ pub struct StackRecorder {
     /// trace size. Shorter names are unchanged; longer names keep their
     /// path head and function segment. See [`crate::symbol_shorten`].
     elide_generics: bool,
+    /// Samples accounted as guest execution: a vCPU thread interrupted
+    /// while its guest was running (see [`UserFrame::Guest`]). Reported at
+    /// trace end — this is CPU time that used to be invisible.
+    guest_samples: u64,
+    /// Stack events that arrived with no kernel, user, or Python frames and
+    /// no guest mark, and were therefore dropped. Both unwinds failing for
+    /// an ordinary task is rare; counting it keeps the recorder from ever
+    /// discarding samples without a trace.
+    dropped_frameless: u64,
 }
 
 impl ThreadAwareRecorder for StackRecorder {
@@ -985,6 +1023,8 @@ impl StackRecorder {
             gopclntab: true,
             names_only: false,
             elide_generics: false,
+            guest_samples: 0,
+            dropped_frameless: 0,
         }
     }
 
@@ -1135,6 +1175,23 @@ impl StackRecorder {
         // it has been drained.
         let mut interners = vec![std::mem::replace(&mut self.interner, StackInterner::new(1))];
         interners.append(&mut self.external_interners);
+
+        // Sample-accounting notes. Guest samples are CPU time inside virtual
+        // machines that carries no host frames (rendered as [guest]); the
+        // frameless count is the residual class that still cannot be
+        // attributed to anything — surfaced so it is never silently zero.
+        if self.guest_samples > 0 {
+            eprintln!(
+                "Note: {} CPU samples landed in guest execution (vCPU threads) and were recorded as [guest]",
+                self.guest_samples
+            );
+        }
+        if self.dropped_frameless > 0 {
+            eprintln!(
+                "Note: dropped {} stack samples that carried no frames (kernel and user unwind both empty)",
+                self.dropped_frameless
+            );
+        }
 
         let total: u64 = interners.iter().map(|i| i.total()).sum();
         if total == 0 {
@@ -1661,6 +1718,9 @@ impl StackRecorder {
                                 }
                             }
                         }
+                        // Not an address: guest execution is opaque to the
+                        // host, live process or not.
+                        UserFrame::Guest => GUEST_FRAME_NAME.to_string(),
                     };
                     frame_names.push(frame_name);
                 }
@@ -1678,6 +1738,7 @@ impl StackRecorder {
                         UserFrame::BuildId { id, offset } => self.symbolize_build_id_frame(
                             symbolizer, bid_store, bid_cache, *id, *offset,
                         ),
+                        UserFrame::Guest => GUEST_FRAME_NAME.to_string(),
                     };
                     frame_names.push(frame_name);
                 }
@@ -1880,10 +1941,17 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
     fn handle_event(&mut self, event: stack_event) {
         let py_stack_len = event.py_msg_buffer.stack_len;
 
-        let has_stack =
+        // A vCPU thread sampled while its guest was executing arrives with
+        // no frames at all (the kernel does not walk callchains for
+        // guest-mode samples). That is CPU time all the same — a busy
+        // virtual machine — so it is accounted below as one synthetic
+        // [guest] frame under the VMM thread rather than dropped.
+        let in_guest = event.sample_flags & SAMPLE_FLAG_IN_GUEST != 0;
+
+        let has_frames =
             event.user_stack_length > 0 || event.kernel_stack_length > 0 || py_stack_len > 0;
 
-        if has_stack {
+        if has_frames || in_guest {
             let kstack_vec = Vec::from(&event.kernel_stack[..event.kernel_stack_length as usize]);
             // One user_stack region, two entry formats; the per-event
             // user_stack_format flag says which one this record carries
@@ -1893,7 +1961,7 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
             // but clamp anyway — a short (zero-extended) record must never
             // index past the region.
             let ulen = event.user_stack_length as usize;
-            let user_frames: Vec<UserFrame> =
+            let mut user_frames: Vec<UserFrame> =
                 if event.user_stack_format == USER_STACK_FORMAT_BUILD_ID {
                     event.user_stack[..ulen.min(event.user_stack.len())]
                         .iter()
@@ -1926,6 +1994,14 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
                         .map(|&addr| UserFrame::Ip(addr))
                         .collect()
                 };
+            // Guest-mode sample with (as expected) no host frames: the
+            // synthetic frame makes it a countable stack. If a guest-marked
+            // sample does carry frames — a sampling NMI landing in the
+            // host's VM-entry/exit glue — the real frames are kept as-is.
+            if in_guest && !has_frames {
+                user_frames.push(UserFrame::Guest);
+                self.guest_samples += 1;
+            }
             let stack_key = (event.task.tgidpid >> 32) as i32;
             let py_stack = self.psr.get_pystack_from_event(&event);
 
@@ -1958,6 +2034,10 @@ impl SystingRecordEvent<stack_event> for StackRecorder {
                     eprintln!("Warning: Failed to stream stack sample: {e}");
                 }
             }
+        } else {
+            // Neither unwind produced a frame and the task was not running a
+            // guest: nothing to attribute the sample to. Counted, not silent.
+            self.dropped_frameless += 1;
         }
     }
 }
@@ -2220,12 +2300,14 @@ mod tests {
             bid_frame(1, 0),                  // kept: offset 0 is valid
             UserFrame::Ip(MAX_USER_ADDR + 1), // filtered: garbage addr
             bid_frame(2, u64::MAX),           // kept: any offset
+            UserFrame::Guest,                 // kept: no address to judge
             UserFrame::Ip(0x1000),            // kept
         ];
         assert_eq!(
             filter_and_reverse_user_frames(frames),
             vec![
                 UserFrame::Ip(0x1000),
+                UserFrame::Guest,
                 bid_frame(2, u64::MAX),
                 bid_frame(1, 0)
             ]
@@ -2350,15 +2432,26 @@ mod tests {
                 7,
                 8,
             ),
+            // The payload-free guest tag must round-trip and must not
+            // desynchronize the frames that follow it in the record.
+            (
+                Stack {
+                    kernel_stack: vec![0xffffffff81000000],
+                    user_stack: vec![UserFrame::Guest],
+                    py_stack: vec![],
+                },
+                9,
+                10,
+            ),
         ];
         for (stack, tgid, id) in &stacks {
             spill.push(stack.clone(), *tgid, *id);
         }
-        assert_eq!(spill.total(), 4);
+        assert_eq!(spill.total(), 5);
         assert!(spill.fallback.is_empty());
 
         let (mut reader, durable) = spill.take_reader().expect("reader");
-        assert_eq!(durable, 4);
+        assert_eq!(durable, 5);
         for (stack, tgid, id) in &stacks {
             let (rstack, rtgid, rid) = read_spill_record(&mut reader).unwrap().unwrap();
             assert_eq!(&rstack, stack);
@@ -2613,6 +2706,82 @@ mod tests {
     #[inline(never)]
     fn marker_fn() -> u64 {
         42
+    }
+
+    /// A BPF-shaped stack event for `handle_event` tests: zeroed (as the
+    /// ring delivers short records), then given a task identity, a RUNNING
+    /// type, and the requested sample flags. No frames.
+    fn frameless_event(tgid: i32, tid: i32, sample_flags: u32) -> stack_event {
+        use crate::systing_core::types::{stack_event_type, task_info};
+        stack_event {
+            stack_event_type: stack_event_type::STACK_RUNNING,
+            sample_flags,
+            task: task_info {
+                tgidpid: ((tgid as u32 as u64) << 32) | (tid as u32 as u64),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The fix for invisible virtual-machine CPU time, end to end through
+    /// the recorder: a frameless sample marked as guest execution must be
+    /// COUNTED — interned as a one-frame stack and streamed as a sample —
+    /// and must symbolize to the `[guest]` label whether or not the VMM
+    /// process is still alive at trace end. Before this, such events were
+    /// discarded in `handle_event` and a busy VM host profiled as idle.
+    #[test]
+    fn test_guest_sample_is_counted_and_labeled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
+        rec.set_spill_dir(dir.path());
+        rec.set_streaming_collector(Box::new(crate::record::InMemoryCollector::new()));
+
+        // One guest sample from our own (live) process, one from a VMM that
+        // has since exited (tgid far above pid_max).
+        let self_tgid = std::process::id() as i32;
+        let dead_tgid = i32::MAX - 1;
+        rec.handle_event(frameless_event(self_tgid, self_tgid, SAMPLE_FLAG_IN_GUEST));
+        rec.handle_event(frameless_event(dead_tgid, dead_tgid, SAMPLE_FLAG_IN_GUEST));
+
+        assert_eq!(rec.guest_samples, 2);
+        assert_eq!(rec.dropped_frameless, 0);
+        // Same synthetic content, two tgids: two dedup keys.
+        assert_eq!(rec.interner.total(), 2);
+
+        let mut collector = crate::record::InMemoryCollector::new();
+        rec.finish_inner(&mut collector).unwrap();
+        let stacks = &collector.data().stacks;
+        assert_eq!(stacks.len(), 2);
+        for s in stacks {
+            assert_eq!(s.frame_names, vec![GUEST_FRAME_NAME.to_string()]);
+        }
+    }
+
+    /// The residual class — no frames and no guest mark (both unwinds
+    /// failed for an ordinary task) — is still dropped, but now counted;
+    /// and a guest mark never turns a sample that HAS frames into `[guest]`.
+    #[test]
+    fn test_frameless_unmarked_sample_is_dropped_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
+        rec.set_spill_dir(dir.path());
+        rec.set_streaming_collector(Box::new(crate::record::InMemoryCollector::new()));
+
+        rec.handle_event(frameless_event(1234, 1234, 0));
+        assert_eq!(rec.dropped_frameless, 1);
+        assert_eq!(rec.guest_samples, 0);
+        assert_eq!(rec.interner.total(), 0);
+
+        // Guest-marked but WITH a kernel frame (an NMI in the host's
+        // VM-entry/exit glue): kept as the real stack, no synthetic frame.
+        let mut ev = frameless_event(1234, 1234, SAMPLE_FLAG_IN_GUEST);
+        ev.kernel_stack[0] = 0xffffffff81000000;
+        ev.kernel_stack_length = 1;
+        rec.handle_event(ev);
+        assert_eq!(rec.guest_samples, 0);
+        assert_eq!(rec.dropped_frameless, 1);
+        assert_eq!(rec.interner.total(), 1);
     }
 
     /// End-to-end run of the finish()-time symbolization over the real

@@ -125,6 +125,12 @@ Frame strings are exactly systing's symbolized frame names:
   may be a label rather than a binary basename: `[kernel]`,
   `[gvisor:runtime]`, `[gvisor:guest]`, `[jit:<runtime>]`, `[exited]`,
   `[vdso]` and similar. Unresolvable frames use the function name `unknown`.
+- Guest execution: `unknown ([guest])` — a CPU sample that interrupted a
+  hypervisor vCPU thread while it was running its virtual machine. There is
+  no host address (the kernel does not walk callchains for guest-mode
+  samples), so there is never an `<0xaddr>` suffix; the frame exists so that
+  CPU time spent inside VMs is counted and attributed to the VMM process
+  rather than dropped. It is emitted regardless of `--no-frame-labels`.
 - Python (pystacks): `name (python) [file.py:line]` — no address suffix.
 - With `--no-frame-labels`: bare hex addresses (`0x7f95bfdb6e12`).
 
