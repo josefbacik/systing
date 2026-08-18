@@ -1,8 +1,10 @@
 use anyhow::{bail, Result};
+use regex::Regex;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use super::AnalyzeDb;
 
@@ -328,78 +330,277 @@ fn format_folded_stack(trace_id: &str, frames_str: &str, frames: &FrameTable) ->
     formatted.join(";")
 }
 
-/// Simplify a frame name for folded output.
+/// The recorder writes frame names in one of three shapes, in order of
+/// completeness:
 ///
-/// Input format: `function_name (module_name [file:line]) <0xaddr>`
-/// Output format: `function_name [module_name]`
+/// ```text
+/// func (mapping [file:line]) <0xpc>
+/// func (mapping) <0xpc>
+/// 0xpc
+/// ```
 ///
-/// Unsymbolized frames (bare hex addresses like `0x5dbfa1`) become `0x5dbfa1 [unknown]`.
+/// Function names can contain unbalanced angle brackets and parens (Rust
+/// generics, C++ templates), so the parse anchors on the trailing pc and
+/// mapping rather than reading left to right. `mapping` is a real object
+/// name (`vmlinux`, `myapp`) or one of the recorder's bracketed pseudo-mapping
+/// labels (`[kernel]`, `[guest]`, `[exited]`, `[gvisor:*]`, `[jit:*]`,
+/// `[anon]`, `[buildid:…]`); the label's own brackets are the only ones it
+/// ever gets.
+static MAPPING_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r" \(([^()]+?)(?: \[([^\[\]:]+)(?::(\d+))?\])?\)$").unwrap());
+
+/// One recorder frame split into the parts the folded output is built from.
+/// Fields borrow from the frame text; a missing part is empty (or `0`).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Frame<'a> {
+    func: &'a str,
+    file: &'a str,
+    line: i32,
+    mapping: &'a str,
+    pc: u64,
+}
+
+fn parse_frame(raw: &str) -> Frame<'_> {
+    if let Some(pc) = raw
+        .strip_prefix("0x")
+        .and_then(|h| u64::from_str_radix(h, 16).ok())
+    {
+        return Frame {
+            pc,
+            ..Frame::default()
+        };
+    }
+    let (head, pc) = raw
+        .strip_suffix('>')
+        .and_then(|s| s.rsplit_once(" <0x"))
+        .and_then(|(head, hex)| Some((head, u64::from_str_radix(hex, 16).ok()?)))
+        .unwrap_or((raw, 0));
+    let Some(c) = MAPPING_RE.captures(head) else {
+        return Frame {
+            func: head,
+            pc,
+            ..Frame::default()
+        };
+    };
+    // The pattern is anchored at the end of `head`, so everything before the
+    // match is the function name.
+    Frame {
+        func: &head[..head.len() - c[0].len()],
+        file: c.get(2).map_or("", |m| m.as_str()),
+        line: c.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0),
+        mapping: c.get(1).map_or("", |m| m.as_str()),
+        pc,
+    }
+}
+
+/// Render one recorder frame for folded output as `file:function:line`.
+///
+/// This is the same grammar systing's continuous-profiling frames use, so a
+/// frame reads identically whichever mode produced it: `file` falls back to
+/// the mapping when the source location is unknown, `function` falls back to
+/// `0x{pc}` when unsymbolized, and `:line` is omitted when it is zero.
+///
+/// ```text
+/// tcp_sendmsg (vmlinux [net/ipv4/tcp.c:1234]) <0xffffffff8ec7559e>  →  net/ipv4/tcp.c:tcp_sendmsg:1234
+/// main (myapp) <0x401234>                                            →  myapp:main
+/// do_syscall_64 ([kernel]) <0xffffffff96f461b1>                      →  [kernel]:do_syscall_64
+/// unknown ([guest])                                                  →  [guest]:unknown
+/// 0x5dbfa1                                                           →  :0x5dbfa1
+/// ```
 fn format_frame(frame: &str) -> String {
-    let frame = frame.trim();
-    if frame.is_empty() {
-        return "[unknown]".to_string();
-    }
-
-    // Try to parse: "function_name (module_name [file:line]) <0xaddr>"
-    // or: "function_name (module_name) <0xaddr>"
-    if let Some(paren_pos) = frame.find(" (") {
-        let func_name = &frame[..paren_pos];
-        let rest = &frame[paren_pos + 2..];
-
-        // Extract module name (up to ' [' for source location or ')' for end)
-        let module_end = rest
-            .find(" [")
-            .or_else(|| rest.find(')'))
-            .unwrap_or(rest.len());
-        let module_name = &rest[..module_end];
-
-        if module_name.is_empty() {
-            func_name.to_string()
-        } else {
-            format!("{func_name} [{module_name}]")
-        }
-    } else if frame.starts_with("0x") {
-        // Bare hex address (unsymbolized)
-        format!("{frame} [unknown]")
+    let f = parse_frame(frame);
+    let file = if f.file.is_empty() { f.mapping } else { f.file };
+    let mut out = String::with_capacity(frame.len());
+    out.push_str(file);
+    out.push(':');
+    if f.func.is_empty() {
+        let _ = write!(out, "{:#x}", f.pc);
     } else {
-        // Unknown format, return as-is
-        frame.to_string()
+        out.push_str(f.func);
     }
+    if f.line > 0 {
+        let _ = write!(out, ":{}", f.line);
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // --- parse_frame: the recorder's three frame shapes ---
+
     #[test]
-    fn test_format_frame_symbolized() {
+    fn parse_frame_full() {
+        let f = parse_frame(
+            "<rayon_core::registry::WorkerThread>::wait_until_cold (myserver [registry.rs:806]) <0x57ee0e3679c4>",
+        );
+        assert_eq!(
+            f,
+            Frame {
+                func: "<rayon_core::registry::WorkerThread>::wait_until_cold",
+                file: "registry.rs",
+                line: 806,
+                mapping: "myserver",
+                pc: 0x57ee0e3679c4,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_frame_no_source() {
+        let f = parse_frame("syscall (libc.so.6) <0x7b9c5b3c390d>");
+        assert_eq!(
+            f,
+            Frame {
+                func: "syscall",
+                file: "",
+                line: 0,
+                mapping: "libc.so.6",
+                pc: 0x7b9c5b3c390d,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_frame_kernel_label() {
+        let f = parse_frame("do_syscall_64 ([kernel]) <0xffffffff96f461b1>");
+        assert_eq!(f.func, "do_syscall_64");
+        assert_eq!(f.mapping, "[kernel]");
+        assert_eq!(f.pc, 0xffffffff96f461b1);
+    }
+
+    #[test]
+    fn parse_frame_bare_hex() {
+        assert_eq!(
+            parse_frame("0x7b9c5b339ac3"),
+            Frame {
+                pc: 0x7b9c5b339ac3,
+                ..Frame::default()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_frame_file_no_line() {
+        let f = parse_frame(
+            "<rayon_core::registry::WorkerThread>::wait_until_cold (myserver [registry.rs]) <0x57ee0e367975>",
+        );
+        assert_eq!(
+            f.func,
+            "<rayon_core::registry::WorkerThread>::wait_until_cold"
+        );
+        assert_eq!(f.mapping, "myserver");
+        assert_eq!(f.file, "registry.rs");
+        assert_eq!(f.line, 0);
+    }
+
+    #[test]
+    fn parse_frame_go_autogenerated_source() {
+        let f =
+            parse_frame("net.(*UnixConn).Read (containerd [<autogenerated>:1]) <0x56ef7dec7645>");
+        assert_eq!(f.func, "net.(*UnixConn).Read");
+        assert_eq!(f.mapping, "containerd");
+        assert_eq!(f.file, "<autogenerated>");
+        assert_eq!(f.line, 1);
+    }
+
+    #[test]
+    fn parse_frame_label_without_address() {
+        // The recorder's synthetic guest frame carries no `<0xpc>` suffix.
+        let f = parse_frame("unknown ([guest])");
+        assert_eq!(f.func, "unknown");
+        assert_eq!(f.mapping, "[guest]");
+        assert_eq!(f.pc, 0);
+    }
+
+    #[test]
+    fn parse_frame_unparseable_is_func() {
+        let f = parse_frame("something weird with no structure");
+        assert_eq!(f.func, "something weird with no structure");
+        assert_eq!(f.mapping, "");
+        assert_eq!(f.pc, 0);
+    }
+
+    // --- format_frame: `file:function:line`, one grammar for every mode ---
+
+    #[test]
+    fn test_format_frame_symbolized_with_source() {
         assert_eq!(
             format_frame("tcp_sendmsg (vmlinux [net/ipv4/tcp.c:1234]) <0xffffffff8ec7559e>"),
-            "tcp_sendmsg [vmlinux]"
+            "net/ipv4/tcp.c:tcp_sendmsg:1234"
+        );
+    }
+
+    #[test]
+    fn test_format_frame_symbolized_file_without_line() {
+        assert_eq!(
+            format_frame("wait_until_cold (myserver [registry.rs]) <0x57ee0e367975>"),
+            "registry.rs:wait_until_cold"
         );
     }
 
     #[test]
     fn test_format_frame_with_module_only() {
-        assert_eq!(format_frame("main (myapp) <0x401234>"), "main [myapp]");
-    }
-
-    #[test]
-    fn test_format_frame_kernel_unknown() {
+        assert_eq!(format_frame("main (myapp) <0x401234>"), "myapp:main");
         assert_eq!(
-            format_frame("unknown ([kernel]) <0xffffffff8e000000>"),
-            "unknown [[kernel]]"
+            format_frame("syscall (libc.so.6) <0x7b9c5b3c390d>"),
+            "libc.so.6:syscall"
         );
     }
 
     #[test]
-    fn test_format_frame_bare_hex() {
-        assert_eq!(format_frame("0x5dbfa1"), "0x5dbfa1 [unknown]");
+    fn test_format_frame_kernel_symbolized() {
+        assert_eq!(
+            format_frame("do_syscall_64 ([kernel]) <0xffffffff96f461b1>"),
+            "[kernel]:do_syscall_64"
+        );
     }
 
     #[test]
-    fn test_format_frame_empty() {
-        assert_eq!(format_frame(""), "[unknown]");
+    fn test_format_frame_kernel_unknown() {
+        // The label's own brackets are the only ones it gets: never `[[kernel]]`.
+        assert_eq!(
+            format_frame("unknown ([kernel]) <0xffffffff8e000000>"),
+            "[kernel]:unknown"
+        );
+    }
+
+    #[test]
+    fn test_format_frame_pseudo_mapping_labels() {
+        // Every bracketed label the recorder can put in the mapping slot.
+        for label in [
+            "[guest]",
+            "[exited]",
+            "[gvisor:runtime]",
+            "[gvisor:guest]",
+            "[jit:python]",
+            "[anon]",
+            "[anon:exec]",
+            "[buildid:5a5a5a5a]",
+        ] {
+            assert_eq!(
+                format_frame(&format!("unknown ({label}) <0x7f0000000100>")),
+                format!("{label}:unknown"),
+                "label {label}"
+            );
+        }
+        assert_eq!(format_frame("unknown ([guest])"), "[guest]:unknown");
+    }
+
+    #[test]
+    fn test_format_frame_bare_hex() {
+        // No mapping and no name: an empty file slot, then the address.
+        assert_eq!(format_frame("0x5dbfa1"), ":0x5dbfa1");
+    }
+
+    #[test]
+    fn test_format_frame_unparseable() {
+        assert_eq!(
+            format_frame("something weird with no structure"),
+            ":something weird with no structure"
+        );
+        assert_eq!(format_frame(""), ":0x0");
     }
 
     fn frame_map(names: &[&str]) -> FrameTable {
@@ -417,7 +618,7 @@ mod tests {
         // order, which is already the folded convention root;mid;leaf.
         let frames = frame_map(&["root (app) <0x1>", "mid (app) <0x2>", "leaf (app) <0x3>"]);
         let result = format_folded_stack("t", "0\x1F1\x1F2", &frames);
-        assert_eq!(result, "root [app];mid [app];leaf [app]");
+        assert_eq!(result, "app:root;app:mid;app:leaf");
     }
 
     #[test]
@@ -428,7 +629,29 @@ mod tests {
     #[test]
     fn test_format_folded_stack_single_frame() {
         let frames = frame_map(&["main (myapp) <0x401234>"]);
-        assert_eq!(format_folded_stack("t", "0", &frames), "main [myapp]");
+        assert_eq!(format_folded_stack("t", "0", &frames), "myapp:main");
+    }
+
+    #[test]
+    fn test_format_folded_stack_mixed_frames() {
+        let frames = frame_map(&[
+            "entry_SYSCALL_64_after_hwframe ([kernel]) <0xffffffff8e000000>",
+            "tcp_sendmsg (vmlinux [net/ipv4/tcp.c:1234]) <0xffffffff8ec7559e>",
+            "main (myapp) <0x401234>",
+            "unknown ([guest])",
+            "0x5dbfa1",
+        ]);
+        assert_eq!(
+            format_folded_stack("t", "0\x1F1\x1F2\x1F3\x1F4", &frames),
+            "[kernel]:entry_SYSCALL_64_after_hwframe;net/ipv4/tcp.c:tcp_sendmsg:1234;myapp:main;[guest]:unknown;:0x5dbfa1"
+        );
+    }
+
+    #[test]
+    fn test_format_folded_stack_unknown_frame_id() {
+        // A frame id with no table entry falls back to the id text itself.
+        let frames = frame_map(&["main (myapp) <0x401234>"]);
+        assert_eq!(format_folded_stack("t", "0\x1F7", &frames), "myapp:main;:7");
     }
 
     #[test]
