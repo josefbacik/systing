@@ -42,6 +42,13 @@
 
 #define TASK_COMM_LEN 16
 
+/* PF_VCPU: the task is a hypervisor vCPU thread currently accounted as
+ * running its guest (set from guest_timing_enter_irqoff() until
+ * guest_timing_exit_irqoff(), which KVM deliberately runs only after the
+ * host has serviced the interrupt that forced the VM-exit). A sampling
+ * interrupt that lands while a CPU is executing guest code is handled in
+ * exactly that window. */
+#define PF_VCPU 0x00000001
 #define PF_WQ_WORKER 0x00000020
 #define PF_KTHREAD 0x00200000
 
@@ -239,8 +246,21 @@ struct marker_event {
 #define USER_STACK_FORMAT_IP 0
 #define USER_STACK_FORMAT_BUILD_ID 1
 
+/* stack_event.sample_flags bits. */
+/* The sample interrupted a vCPU thread while it was running its guest
+ * (task->flags & PF_VCPU — the same test the kernel's own cputime code uses
+ * to bill a tick as guest time). The kernel returns EMPTY callchains for
+ * such samples by design (perf_callchain_kernel()/perf_callchain_user()
+ * bail out under perf_guest_state(), on x86 and arm64 alike), so the event
+ * arrives with no frames; the flag lets userspace account the sample as
+ * guest execution instead of discarding it. */
+#define SAMPLE_FLAG_IN_GUEST (1U << 0)
+
 struct stack_event {
 	enum stack_event_type stack_event_type;
+	/* Occupies what was alignment padding before `ts`: no other field
+	 * moves and the record does not grow. */
+	u32 sample_flags;
 	u64 ts;
 	u32 cpu;
 	u32 user_stack_format;
@@ -1787,7 +1807,17 @@ static void emit_stack_event_with_ts(void *ctx, struct task_struct *task,
 
 	event->stack_event_type = type;
 
-	if (!(task->flags & PF_KTHREAD)) {
+	unsigned int task_flags = task->flags;
+	/*
+	 * A vCPU thread sampled while its guest was executing: the callchain
+	 * walks below come back empty for it (see SAMPLE_FLAG_IN_GUEST), and
+	 * without this mark userspace could not tell "CPU busy running guest
+	 * code" from an unwind failure — it would drop the sample and the
+	 * guest's CPU time would vanish from the profile entirely.
+	 */
+	event->sample_flags = (task_flags & PF_VCPU) ? SAMPLE_FLAG_IN_GUEST : 0;
+
+	if (!(task_flags & PF_KTHREAD)) {
 		/*
 		 * Both modes walk into the same user_stack region; the entry
 		 * format (and how much of the region was reserved) differs.
