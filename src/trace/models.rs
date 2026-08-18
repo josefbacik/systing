@@ -413,11 +413,19 @@ pub struct NetworkPacketRecord {
 /// Socket info extracted directly from BPF events for true streaming.
 ///
 /// Normally one record per socket per capture. A socket whose identity
-/// was created by a pre-bind state transition (connect-start fires
-/// before the ephemeral port is assigned) emits its first record with
-/// `src_port` 0 and ONE upgraded record with the bound tuple when a
-/// later event carries it — readers keeping one row per `socket_id`
-/// should prefer the row whose `src_port` is nonzero.
+/// was created by an event that fires before the kernel has filled in
+/// the tuple emits its first record with the degraded tuple and ONE
+/// upgraded record with the complete tuple when a later event carries
+/// it. Two events do this: a pre-bind state transition (connect-start
+/// fires before the ephemeral port is assigned — `src_port` 0), and on
+/// kernels before 6.15 the LISTEN→SYN_RECV transition of a passive open
+/// (fires before the peer is copied into the child socket — `dest_ip`
+/// the wildcard `0.0.0.0` / `::` and `dest_port` 0; Linux a3a128f611a9
+/// reordered it in 6.15). Readers keeping one row per `socket_id`
+/// should prefer the row whose `src_port` is nonzero AND whose peer is
+/// not the wildcard-with-port-0 shape; a socket that only ever shows a
+/// degraded tuple (a real listener, an unconnected UDP socket) has one
+/// record.
 ///
 /// # Fields
 /// - `socket_id`: Unique socket ID (primary key)

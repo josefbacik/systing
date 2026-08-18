@@ -312,14 +312,19 @@ pub struct NetworkRecorder {
 
     // Streaming support fields
     /// Track which sockets have had their NetworkSocketRecord emitted,
-    /// and whether that record carried a bound (nonzero) src_port. A
-    /// socket whose identity is created by a pre-bind state transition
-    /// (connect-start fires before the ephemeral port is assigned)
-    /// emits its first record with src_port=0; when a later event
-    /// arrives carrying the bound tuple, ONE upgraded record is
-    /// emitted for the same socket_id so the trace carries the real
-    /// tuple. Readers keep one row per socket by preferring the
-    /// bound-port row.
+    /// and whether that record carried a COMPLETE tuple (see
+    /// [`socket_tuple_is_complete`]). Two event shapes create a socket's
+    /// identity with a degraded tuple: a pre-bind state transition
+    /// (connect-start fires before the ephemeral port is assigned, so
+    /// src_port=0) and — on kernels before 6.15 — the LISTEN→SYN_RECV
+    /// transition of a passive open, which fires before the kernel has
+    /// copied the peer into the child socket (dest = the listener's
+    /// wildcard `0.0.0.0:0` / `[::]:0`; Linux commit a3a128f611a9
+    /// reordered it in 6.15). Either way the first record carries the
+    /// degraded tuple; when a later event on the same socket_id
+    /// arrives with the complete tuple, ONE upgraded record is emitted
+    /// so the trace carries the real endpoints. Readers keep one row
+    /// per socket by preferring the complete row.
     seen_sockets: HashMap<SocketId, bool>,
     /// Collector for streaming records during recording
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
@@ -336,22 +341,39 @@ impl ThreadAwareRecorder for NetworkRecorder {
     }
 }
 
+/// Whether a sighting's tuple names both endpoints: a bound (nonzero)
+/// src_port AND a real peer. The peer is missing when dest_port is 0 and
+/// dest_addr is the family's unspecified address (`0.0.0.0` / `::`, the
+/// shape a listener's clone carries before the kernel fills in the
+/// peer). Both halves of the peer test are required: a UDP socket can
+/// legitimately report dest_port 0 with a real dest_addr, and an
+/// unspecified dest_addr with a nonzero dest_port would be a recorder
+/// bug, not a listener. Decoded through [`parse_ip_addr`] so the test
+/// agrees with the `dest_ip` string the record carries (an IPv4 event
+/// fills only the first 4 bytes of the 16-byte buffer).
+fn socket_tuple_is_complete(af: u32, src_port: u16, dest_addr: &[u8; 16], dest_port: u16) -> bool {
+    src_port != 0 && !(dest_port == 0 && parse_ip_addr(af, dest_addr).is_unspecified())
+}
+
 /// Decide whether a NetworkSocketRecord should be emitted for this
 /// sighting of `socket_id`, updating the seen-map. True on first sight,
 /// and ONCE more as an upgrade when the first record was emitted from a
-/// pre-bind event (src_port=0) and this sighting carries the bound port
-/// — after the upgrade the id is marked bound and never re-emits. A
-/// port-less sighting never downgrades a bound mark.
+/// degraded sighting (port-less connect-start, or peer-less pre-6.15
+/// LISTEN→SYN_RECV clone) and this sighting carries the complete tuple
+/// — after the upgrade the id is marked complete and never re-emits. A
+/// degraded sighting never downgrades a complete mark, and a socket that
+/// only ever shows degraded tuples (a real listener, an unconnected UDP
+/// socket) emits exactly one record.
 fn should_emit_socket_record(
     seen_sockets: &mut HashMap<SocketId, bool>,
     socket_id: SocketId,
-    src_port: u16,
+    complete: bool,
 ) -> bool {
     match seen_sockets.get(&socket_id) {
         Some(true) => false,
-        Some(false) if src_port == 0 => false,
+        Some(false) if !complete => false,
         _ => {
-            seen_sockets.insert(socket_id, src_port != 0);
+            seen_sockets.insert(socket_id, complete);
             true
         }
     }
@@ -386,8 +408,8 @@ impl NetworkRecorder {
 
     /// Helper to emit NetworkSocketRecord if not yet seen for this socket,
     /// or ONCE more as an upgrade when the first record was emitted from a
-    /// pre-bind event (src_port=0) and this event carries the bound tuple.
-    /// Returns true if a record was emitted.
+    /// degraded sighting (port-less or peer-less tuple) and this event
+    /// carries the complete tuple. Returns true if a record was emitted.
     #[allow(clippy::too_many_arguments)]
     fn maybe_emit_socket_record(
         &mut self,
@@ -403,7 +425,8 @@ impl NetworkRecorder {
     ) -> Result<bool> {
         use crate::systing_core::types::{network_address_family, network_protocol};
 
-        if !should_emit_socket_record(&mut self.seen_sockets, socket_id, src_port) {
+        let complete = socket_tuple_is_complete(af, src_port, dest_addr, dest_port);
+        if !should_emit_socket_record(&mut self.seen_sockets, socket_id, complete) {
             return Ok(false);
         }
 
@@ -1146,44 +1169,136 @@ mod tests {
 mod socket_record_emission_tests {
     use super::*;
 
+    use crate::systing_core::types::network_address_family;
+
+    const AF4: u32 = network_address_family::NETWORK_AF_INET.0;
+    const AF6: u32 = network_address_family::NETWORK_AF_INET6.0;
+    const UNSPEC: [u8; 16] = [0; 16];
+    // 10.0.0.2 as an IPv4 event stores it (first 4 bytes; the rest is
+    // whatever the buffer held — nonzero here to prove the family-aware
+    // decode ignores it) and a native IPv6 peer.
+    const PEER_V4: [u8; 16] = [10, 0, 0, 2, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0];
+    const PEER_V6: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    // 0.0.0.0 as an IPv4 event stores it when the buffer's tail is dirty:
+    // still the unspecified address for the family.
+    const UNSPEC_V4_DIRTY_TAIL: [u8; 16] =
+        [0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    /// The three sighting shapes the emission contract distinguishes.
+    /// `portless` = connect-start (CLOSE→SYN_SENT fires before the
+    /// ephemeral port is assigned); `peerless` = the pre-6.15
+    /// LISTEN→SYN_RECV clone (bound src, unspecified peer — also the shape
+    /// of a real listener and of an unconnected UDP socket); `full` = both
+    /// endpoints known.
+    fn portless() -> bool {
+        socket_tuple_is_complete(AF4, 0, &PEER_V4, 443)
+    }
+    fn peerless() -> bool {
+        socket_tuple_is_complete(AF4, 443, &UNSPEC, 0)
+    }
+    fn full() -> bool {
+        socket_tuple_is_complete(AF4, 33000, &PEER_V4, 443)
+    }
+
+    /// The completeness test itself: bound src_port AND a real peer.
+    #[test]
+    fn tuple_completeness_matrix() {
+        assert!(!portless());
+        assert!(!peerless());
+        assert!(full());
+        // Unspecified peer in either family, dest_port 0: incomplete —
+        // including an IPv4 event whose buffer tail is dirty.
+        assert!(!socket_tuple_is_complete(AF4, 10250, &UNSPEC, 0));
+        assert!(!socket_tuple_is_complete(AF6, 10250, &UNSPEC, 0));
+        assert!(!socket_tuple_is_complete(
+            AF4,
+            10250,
+            &UNSPEC_V4_DIRTY_TAIL,
+            0
+        ));
+        // A UDP socket reporting dest_port 0 with a REAL dest_addr is a
+        // real peer, not a listener clone: complete.
+        assert!(socket_tuple_is_complete(AF4, 53, &PEER_V4, 0));
+        assert!(socket_tuple_is_complete(AF6, 53, &PEER_V6, 0));
+        // Both halves of the peer test are required: an unspecified addr
+        // with a nonzero port is not the listener-clone shape.
+        assert!(socket_tuple_is_complete(AF4, 33000, &UNSPEC, 443));
+        assert!(socket_tuple_is_complete(AF6, 33000, &UNSPEC, 443));
+        // src_port 0 is incomplete regardless of the peer.
+        assert!(!socket_tuple_is_complete(AF6, 0, &PEER_V6, 443));
+        assert!(!socket_tuple_is_complete(AF4, 0, &UNSPEC, 0));
+    }
+
     /// The upgrade lifecycle (the close-storm RCA's recorder half): a
     /// socket first seen via a pre-bind event emits a port-less record,
-    /// the first bound-tuple sighting emits exactly one upgrade, and
+    /// the first complete-tuple sighting emits exactly one upgrade, and
     /// nothing after that re-emits.
     #[test]
     fn upgrade_emits_once_after_portless_first_sight() {
         let mut seen = HashMap::new();
         // First sight, pre-bind (connect-start): emit the port-less record.
-        assert!(should_emit_socket_record(&mut seen, 42, 0));
+        assert!(should_emit_socket_record(&mut seen, 42, portless()));
         // More pre-bind sightings: no re-emit.
-        assert!(!should_emit_socket_record(&mut seen, 42, 0));
+        assert!(!should_emit_socket_record(&mut seen, 42, portless()));
         // Bound tuple arrives: the ONE upgrade.
-        assert!(should_emit_socket_record(&mut seen, 42, 33000));
-        // Nothing re-emits afterwards — bound, port-less, or otherwise.
-        assert!(!should_emit_socket_record(&mut seen, 42, 33000));
-        assert!(!should_emit_socket_record(&mut seen, 42, 0));
-        assert!(!should_emit_socket_record(&mut seen, 42, 44000));
+        assert!(should_emit_socket_record(&mut seen, 42, full()));
+        // Nothing re-emits afterwards — complete, degraded, or otherwise.
+        assert!(!should_emit_socket_record(&mut seen, 42, full()));
+        assert!(!should_emit_socket_record(&mut seen, 42, portless()));
+        assert!(!should_emit_socket_record(&mut seen, 42, peerless()));
     }
 
-    /// A socket first seen with its bound tuple behaves exactly as
-    /// before this change: one record, no upgrades, and a later
-    /// port-less sighting (a terminal transition) never re-emits.
+    /// The passive-open lifecycle on kernels before 6.15: the
+    /// LISTEN→SYN_RECV clone is first seen with the listener's wildcard
+    /// peer, the SYN_RECV→ESTABLISHED transition microseconds later
+    /// carries the real peer and emits exactly one upgrade, and nothing
+    /// after that (ESTABLISHED→CLOSE_WAIT, →CLOSE) re-emits.
     #[test]
-    fn bound_first_sight_is_single_emission() {
+    fn upgrade_emits_once_after_peerless_first_sight() {
         let mut seen = HashMap::new();
-        assert!(should_emit_socket_record(&mut seen, 7, 443));
-        assert!(!should_emit_socket_record(&mut seen, 7, 443));
-        assert!(!should_emit_socket_record(&mut seen, 7, 0));
-        assert!(!should_emit_socket_record(&mut seen, 7, 443));
+        assert!(should_emit_socket_record(&mut seen, 9, peerless()));
+        assert!(!should_emit_socket_record(&mut seen, 9, peerless()));
+        assert!(should_emit_socket_record(&mut seen, 9, full()));
+        assert!(!should_emit_socket_record(&mut seen, 9, full()));
+        assert!(!should_emit_socket_record(&mut seen, 9, peerless()));
+        assert!(!should_emit_socket_record(&mut seen, 9, portless()));
+    }
+
+    /// A socket that only ever shows a degraded tuple — a real listener
+    /// (LISTEN, then LISTEN→CLOSE at teardown) or an unconnected UDP
+    /// socket — emits exactly one record and never an upgrade.
+    #[test]
+    fn degraded_only_lifecycle_is_single_emission() {
+        let mut seen = HashMap::new();
+        assert!(should_emit_socket_record(&mut seen, 11, peerless()));
+        assert!(!should_emit_socket_record(&mut seen, 11, peerless()));
+        assert!(!should_emit_socket_record(&mut seen, 11, portless()));
+        assert!(!should_emit_socket_record(&mut seen, 11, peerless()));
+    }
+
+    /// A socket first seen with its complete tuple behaves exactly as
+    /// before this change: one record, no upgrades, and a later degraded
+    /// sighting (a terminal transition) never re-emits.
+    #[test]
+    fn complete_first_sight_is_single_emission() {
+        let mut seen = HashMap::new();
+        assert!(should_emit_socket_record(&mut seen, 7, full()));
+        assert!(!should_emit_socket_record(&mut seen, 7, full()));
+        assert!(!should_emit_socket_record(&mut seen, 7, portless()));
+        assert!(!should_emit_socket_record(&mut seen, 7, peerless()));
+        assert!(!should_emit_socket_record(&mut seen, 7, full()));
     }
 
     /// Distinct sockets track independently.
     #[test]
     fn sockets_are_independent() {
         let mut seen = HashMap::new();
-        assert!(should_emit_socket_record(&mut seen, 1, 0));
-        assert!(should_emit_socket_record(&mut seen, 2, 80));
-        assert!(should_emit_socket_record(&mut seen, 1, 1024));
-        assert!(!should_emit_socket_record(&mut seen, 2, 0));
+        assert!(should_emit_socket_record(&mut seen, 1, portless()));
+        assert!(should_emit_socket_record(&mut seen, 2, full()));
+        assert!(should_emit_socket_record(&mut seen, 3, peerless()));
+        assert!(should_emit_socket_record(&mut seen, 1, full()));
+        assert!(!should_emit_socket_record(&mut seen, 2, portless()));
+        assert!(should_emit_socket_record(&mut seen, 3, full()));
+        assert!(!should_emit_socket_record(&mut seen, 3, full()));
     }
 }
