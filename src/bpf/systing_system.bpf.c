@@ -5561,6 +5561,16 @@ int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
 	s64 enter_rss = saved->enter_rss;
 	bpf_map_delete_elem(&memory_syscall_scratch, &tgidpid);
 
+	/* The enter-side mm->brk read can yield 0 (the same mm edge the munmap
+	 * total_vm bound skips on). There is then no previous break to diff
+	 * against, and ret - 0 would record the new break ADDRESS as the
+	 * "delta": a page-aligned value in the tens of TB on a 47-bit VA,
+	 * observed in production as a count=1 brk row of ~92 TB on a process
+	 * that exited during the capture. An unknown previous break is not a
+	 * delta of that size; emit nothing, as a failed or query brk does. */
+	if (!old_brk)
+		return 0;
+
 	/* brk(0) queries the current break and failed brk returns it unchanged. */
 	if ((u64)ctx->ret == old_brk)
 		return 0;
