@@ -10,6 +10,7 @@ mod network_connections;
 mod network_interfaces;
 mod network_socket_pairs;
 mod query;
+mod sched_aggregate;
 mod sched_stats;
 
 pub use cpu_stats::{CpuStatsParams, CpuStatsResult, CpuStatsSummary, PerCpuStats};
@@ -25,6 +26,10 @@ pub use network_interfaces::{
 };
 pub use network_socket_pairs::{
     NetworkSocketPairsParams, NetworkSocketPairsResult, SocketPair, SocketSide,
+};
+pub use sched_aggregate::{
+    Dist, Imbalance, PerCpu, RqDist, SchedAggregate, SchedAggregateMeta, SchedAggregateParams,
+    SwitchStats, TailContributor, HIST_BASE_LOG2, HIST_OCTAVES,
 };
 pub use sched_stats::{
     EndStateCount, ProcessSchedStats, SchedStatsParams, SchedStatsResult, SchedSummary,
