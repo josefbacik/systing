@@ -166,6 +166,7 @@ const SCHED_BPF_PROGRAMS: &[&str] = &[
     "systing_sched_wakeup_new",
     "systing_sched_switch",
     "systing_sched_waking",
+    "systing_sched_migrate",
     "systing_sched_process_exit",
 ];
 
@@ -915,12 +916,17 @@ impl SystingEvent for task_event {
             event_type::SCHED_SWITCH
             | event_type::SCHED_WAKING
             | event_type::SCHED_WAKEUP
-            | event_type::SCHED_WAKEUP_NEW => Some(&self.next),
+            | event_type::SCHED_WAKEUP_NEW
+            | event_type::SCHED_MIGRATE => Some(&self.next),
             _ => None,
         }
     }
     fn prev_task_info(&self) -> Option<&task_info> {
-        Some(&self.prev)
+        match self.r#type {
+            // The migrated task rides in `next`; `prev` is left zeroed.
+            event_type::SCHED_MIGRATE => None,
+            _ => Some(&self.prev),
+        }
     }
 }
 
@@ -2220,6 +2226,7 @@ fn warn_failed_probe_attachments(skel: &SystingSystemSkel) {
             "systing_sched_wakeup_new" => skel.links.systing_sched_wakeup_new.is_none(),
             "systing_sched_switch" => skel.links.systing_sched_switch.is_none(),
             "systing_sched_waking" => skel.links.systing_sched_waking.is_none(),
+            "systing_sched_migrate" => skel.links.systing_sched_migrate.is_none(),
             "systing_sched_process_exit" => skel.links.systing_sched_process_exit.is_none(),
             "systing_sched_process_fork" => skel.links.systing_sched_process_fork.is_none(),
             "systing_sched_process_exec" => skel.links.systing_sched_process_exec.is_none(),

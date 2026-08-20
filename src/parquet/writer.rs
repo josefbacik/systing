@@ -31,9 +31,10 @@ use crate::trace::{
     InstantArgRecord, InstantRecord, IrqSliceRecord, MemoryAllocRecord, MemoryFaultRecord,
     MemoryMapRecord, MemoryRssRecord, NetworkDnsRecord, NetworkInterfaceRecord,
     NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord,
-    ProcessExitRecord, ProcessRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord,
-    SoftirqSliceRecord, StackRecord, StackSampleRecord, SysInfoRecord, ThreadRecord,
-    ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
+    ProcessExitRecord, ProcessRecord, SchedMigrateRecord, SchedSliceRecord, SliceRecord,
+    SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord, SysInfoRecord,
+    ThreadRecord, ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord,
+    WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -109,6 +110,7 @@ pub struct StreamingParquetWriter {
     irq_slices: Vec<IrqSliceRecord>,
     softirq_slices: Vec<SoftirqSliceRecord>,
     wakeup_news: Vec<WakeupNewRecord>,
+    sched_migrates: Vec<SchedMigrateRecord>,
     process_exits: Vec<ProcessExitRecord>,
     counters: Vec<CounterRecord>,
     counter_tracks: Vec<CounterTrackRecord>,
@@ -145,6 +147,7 @@ pub struct StreamingParquetWriter {
     irq_slice_writer: Option<TableWriter>,
     softirq_slice_writer: Option<TableWriter>,
     wakeup_new_writer: Option<TableWriter>,
+    sched_migrate_writer: Option<TableWriter>,
     process_exit_writer: Option<TableWriter>,
     counter_writer: Option<TableWriter>,
     counter_track_writer: Option<TableWriter>,
@@ -223,6 +226,7 @@ impl StreamingParquetWriter {
             irq_slices: Vec::new(),
             softirq_slices: Vec::new(),
             wakeup_news: Vec::new(),
+            sched_migrates: Vec::new(),
             process_exits: Vec::new(),
             counters: Vec::new(),
             counter_tracks: Vec::new(),
@@ -258,6 +262,7 @@ impl StreamingParquetWriter {
             irq_slice_writer: None,
             softirq_slice_writer: None,
             wakeup_new_writer: None,
+            sched_migrate_writer: None,
             process_exit_writer: None,
             counter_writer: None,
             counter_track_writer: None,
@@ -481,6 +486,27 @@ impl StreamingParquetWriter {
         let batch = build_wakeup_new_batch(&self.wakeup_news, &schema)?;
         writer.write(&batch)?;
         self.wakeup_news.clear();
+        Ok(())
+    }
+
+    // Flush sched_migrates buffer
+    fn flush_sched_migrates(&mut self) -> Result<()> {
+        if self.sched_migrates.is_empty() {
+            return Ok(());
+        }
+
+        let schema = trace::sched_migrate_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.sched_migrate_writer,
+            &self.sink,
+            "sched_migrate",
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_sched_migrate_batch(&self.sched_migrates, &schema)?;
+        writer.write(&batch)?;
+        self.sched_migrates.clear();
         Ok(())
     }
 
@@ -1065,6 +1091,7 @@ impl StreamingParquetWriter {
         close_writer!(self.irq_slice_writer);
         close_writer!(self.softirq_slice_writer);
         close_writer!(self.wakeup_new_writer);
+        close_writer!(self.sched_migrate_writer);
         close_writer!(self.process_exit_writer);
         close_writer!(self.counter_writer);
         close_writer!(self.counter_track_writer);
@@ -1110,6 +1137,7 @@ impl Drop for StreamingParquetWriter {
             || self.irq_slice_writer.is_some()
             || self.softirq_slice_writer.is_some()
             || self.wakeup_new_writer.is_some()
+            || self.sched_migrate_writer.is_some()
             || self.process_exit_writer.is_some()
             || self.counter_writer.is_some()
             || self.counter_track_writer.is_some()
@@ -1212,6 +1240,15 @@ impl RecordCollector for StreamingParquetWriter {
         self.total_records += 1;
         if Self::should_flush(&self.wakeup_news, self.batch_size) {
             self.flush_wakeup_news()?;
+        }
+        Ok(())
+    }
+
+    fn add_sched_migrate(&mut self, record: SchedMigrateRecord) -> Result<()> {
+        self.sched_migrates.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.sched_migrates, self.batch_size) {
+            self.flush_sched_migrates()?;
         }
         Ok(())
     }
@@ -1476,6 +1513,7 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_irq_slices()?;
         self.flush_softirq_slices()?;
         self.flush_wakeup_news()?;
+        self.flush_sched_migrates()?;
         self.flush_process_exits()?;
         self.flush_counters()?;
         self.flush_counter_tracks()?;
@@ -1733,6 +1771,33 @@ fn build_wakeup_new_batch(
             Arc::new(cpu_builder.finish()),
             Arc::new(utid_builder.finish()),
             Arc::new(target_cpu_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_sched_migrate_batch(
+    records: &[SchedMigrateRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    let mut ts_builder = Int64Builder::with_capacity(records.len());
+    let mut utid_builder = Int64Builder::with_capacity(records.len());
+    let mut orig_cpu_builder = Int32Builder::with_capacity(records.len());
+    let mut dest_cpu_builder = Int32Builder::with_capacity(records.len());
+
+    for record in records {
+        ts_builder.append_value(record.ts);
+        utid_builder.append_value(record.utid);
+        orig_cpu_builder.append_value(record.orig_cpu);
+        dest_cpu_builder.append_value(record.dest_cpu);
+    }
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(ts_builder.finish()),
+            Arc::new(utid_builder.finish()),
+            Arc::new(orig_cpu_builder.finish()),
+            Arc::new(dest_cpu_builder.finish()),
         ],
     )?)
 }

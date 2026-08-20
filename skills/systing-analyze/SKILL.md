@@ -23,7 +23,7 @@ Systing stores traces in **DuckDB**. The `systing-analyze` MCP server exposes st
 | Why is the process blocked / off-CPU? | `flamegraph` | `stack_type="uninterruptible-sleep"` (D) or `"interruptible-sleep"` (S), or `"all-sleep"` |
 | Is the scheduler oversubscribed? Latency? | `sched_stats` | no filter = whole-trace ranking; `pid` = per-thread breakdown; `tid` = single thread with end-state distribution |
 | Which CPUs are busy / idle? | `cpu_stats` | per-CPU utilization, idle%, IRQ/softIRQ time, runqueue depth p50/p90/p99 |
-| How does the scheduler behave overall? Compare two schedulers/hosts? | `sched_aggregate` | one summary per capture: wakeup latency (same/cross-CPU), preempt wait, slice length, switch + migration rates, time-weighted runqueue length, per-CPU load vectors + imbalance metrics, log2 histograms, tail threads; percentiles within ~6%, per-CPU runqueue approximate |
+| How does the scheduler behave overall? Compare two schedulers/hosts? | `sched_aggregate` | one summary per capture: wakeup latency (ran on previous CPU / migrated), preempt wait, slice length, switch + migration rates, migrate-event counts, time-weighted runqueue length, per-CPU load vectors (incl. placement) + imbalance metrics, log2 histograms, tail threads; percentiles within ~6%; per-CPU runqueue exact on traces with `sched_migrate` (`meta.placement_exact`), approximate before |
 | What's the network doing? | `network_connections` | per-connection bytes, retransmit % |
 | Interface-level network? | `network_interfaces` | per-interface, per-protocol breakdown |
 | Both sides of a connection (multi-node)? | `network_socket_pairs` | matched socket pairs, within or across traces |
@@ -81,7 +81,7 @@ WHERE list_contains(sf.frame_names, 'do_futex_wait');
   - `& 4` stopped, `& 8` traced, `& 16` exit/dead, `& 32` exit/zombie
   - Test bits (`end_state & 2 != 0`), don't compare for equality — compound states occur.
 
-Related: `thread_state(ts, dur, utid, state, cpu)`, `wakeup_new`, `process_exit`, `irq_slice(irq, name, ret)`, `softirq_slice(vec)`.
+Related: `thread_state(ts, dur, utid, state, cpu)` (a `state = 0` row is a runnable marker; its `cpu` is the CPU the thread last ran on, recorded before the scheduler picked one), `wakeup_new`, `sched_migrate(ts, utid, orig_cpu, dest_cpu)` (schema ≥ 16: every change of a task's CPU — placement away from the previous CPU at wakeup, or a balancer/affinity move of a runnable task; a woken thread with no row before its next slice ran on its previous CPU), `process_exit`, `irq_slice(irq, name, ret)`, `softirq_slice(vec)`.
 
 ```sql
 -- Longest uninterruptible-sleep episodes

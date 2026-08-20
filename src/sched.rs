@@ -10,8 +10,8 @@ use crate::systing_core::types::event_type;
 use crate::systing_core::types::task_event;
 use crate::systing_core::SystingRecordEvent;
 use crate::trace::{
-    IrqSliceRecord, ProcessExitRecord, SchedSliceRecord, SoftirqSliceRecord, ThreadStateRecord,
-    WakeupNewRecord,
+    IrqSliceRecord, ProcessExitRecord, SchedMigrateRecord, SchedSliceRecord, SoftirqSliceRecord,
+    ThreadStateRecord, WakeupNewRecord,
 };
 use crate::utid::{ThreadAwareRecorder, UtidGenerator};
 
@@ -84,6 +84,7 @@ pub struct SchedEventRecorder {
     pending_irq_slices: Vec<IrqSliceRecord>,
     pending_softirq_slices: Vec<SoftirqSliceRecord>,
     pending_wakeup_news: Vec<WakeupNewRecord>,
+    pending_sched_migrates: Vec<SchedMigrateRecord>,
     pending_process_exits: Vec<ProcessExitRecord>,
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
     // Shared utid generator for consistent thread IDs across all recorders
@@ -255,6 +256,23 @@ impl SystingRecordEvent<task_event> for SchedEventRecorder {
                 }
             }
 
+            // Task migrated to another CPU (sched_migrate_task) - `next` is
+            // the task, `cpu` the CPU it leaves, `target_cpu` the destination.
+            event_type::SCHED_MIGRATE => {
+                let tid = event.next.tgidpid as i32;
+                let utid = self.utid_generator.get_or_create_utid(tid);
+
+                if self.streaming_collector.is_some() {
+                    self.pending_sched_migrates.push(SchedMigrateRecord {
+                        ts: event.ts as i64,
+                        utid,
+                        orig_cpu: event.cpu as i32,
+                        dest_cpu: event.target_cpu as i32,
+                    });
+                    self.maybe_flush_pending();
+                }
+            }
+
             // Process exit - the `prev` field contains the exiting process info
             event_type::SCHED_PROCESS_EXIT => {
                 // Extract tid from lower 32 bits of tgidpid
@@ -301,6 +319,7 @@ impl SchedEventRecorder {
             pending_irq_slices: Vec::new(),
             pending_softirq_slices: Vec::new(),
             pending_wakeup_news: Vec::new(),
+            pending_sched_migrates: Vec::new(),
             pending_process_exits: Vec::new(),
             streaming_collector: None,
             utid_generator,
@@ -320,6 +339,7 @@ impl SchedEventRecorder {
             + self.pending_irq_slices.len()
             + self.pending_softirq_slices.len()
             + self.pending_wakeup_news.len()
+            + self.pending_sched_migrates.len()
             + self.pending_process_exits.len()
     }
 
@@ -366,6 +386,11 @@ impl SchedEventRecorder {
         for record in self.pending_wakeup_news.drain(..) {
             if let Err(e) = collector.add_wakeup_new(record) {
                 warn("wakeup_new", e, &mut failed);
+            }
+        }
+        for record in self.pending_sched_migrates.drain(..) {
+            if let Err(e) = collector.add_sched_migrate(record) {
+                warn("sched_migrate", e, &mut failed);
             }
         }
         for record in self.pending_process_exits.drain(..) {
@@ -507,6 +532,7 @@ mod tests {
             add_irq_slice(IrqSliceRecord),
             add_softirq_slice(SoftirqSliceRecord),
             add_wakeup_new(WakeupNewRecord),
+            add_sched_migrate(SchedMigrateRecord),
             add_process_exit(ProcessExitRecord),
             add_counter(crate::trace::CounterRecord),
             add_counter_track(crate::trace::CounterTrackRecord),
@@ -593,6 +619,8 @@ mod tests {
         recorder.handle_event(mk(event_type::SCHED_SOFTIRQ_EXIT, 4200, 3, 6, 500));
 
         recorder.handle_event(mk(event_type::SCHED_WAKEUP_NEW, 5000, 4, 5, 600));
+        // A migrate: the task (tgidpid 300) leaves cpu 1 for cpu 7.
+        recorder.handle_event(mk(event_type::SCHED_MIGRATE, 5500, 1, 7, 300));
         recorder.handle_event(mk(event_type::SCHED_PROCESS_EXIT, 6000, 5, 0, 700));
 
         // Below the flush threshold, everything is still buffered locally.
@@ -603,6 +631,7 @@ mod tests {
             assert!(inner.data().irq_slices.is_empty());
             assert!(inner.data().softirq_slices.is_empty());
             assert!(inner.data().wakeup_news.is_empty());
+            assert!(inner.data().sched_migrates.is_empty());
             assert!(inner.data().process_exits.is_empty());
         }
 
@@ -618,6 +647,19 @@ mod tests {
         assert_eq!(data.irq_slices.len(), 1);
         assert_eq!(data.softirq_slices.len(), 1);
         assert_eq!(data.wakeup_news.len(), 1);
+        // The migrate row carries the task's utid (the same thread the
+        // waking event named), the CPU it left and the destination.
+        assert_eq!(data.sched_migrates.len(), 1);
+        let m = &data.sched_migrates[0];
+        assert_eq!(m.ts, 5500);
+        assert_eq!(m.orig_cpu, 1);
+        assert_eq!(m.dest_cpu, 7);
+        let woken = data
+            .thread_states
+            .iter()
+            .find(|t| t.state == 0)
+            .expect("runnable state from the waking event");
+        assert_eq!(m.utid, woken.utid);
         assert_eq!(data.process_exits.len(), 1);
     }
 

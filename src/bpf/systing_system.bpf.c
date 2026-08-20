@@ -146,6 +146,10 @@ enum event_type {
 	SCHED_IRQ_ENTER,
 	SCHED_IRQ_EXIT,
 	SCHED_PROCESS_EXIT,
+	/* sched_migrate_task: the task's CPU changed (wakeup placement away
+	 * from the CPU it last ran on, or a balancer/affinity move while
+	 * runnable). Appended last so the values above stay stable. */
+	SCHED_MIGRATE,
 };
 
 enum stack_event_type {
@@ -2079,6 +2083,45 @@ SEC("tp_btf/sched_waking")
 int BPF_PROG(systing_sched_waking, struct task_struct *task)
 {
 	return handle_sched_waking(task);
+}
+
+/*
+ * sched_migrate_task fires from set_task_cpu(), i.e. whenever a task's CPU
+ * changes: at wakeup, after select_task_rq() picked a CPU other than the one
+ * the task last ran on (the sched_waking event above is recorded BEFORE that
+ * choice, so its target_cpu is only the previous CPU); and when the load
+ * balancer, NUMA balancing, or an affinity change moves a runnable task. It
+ * is the only place the placement decision is visible, so it is what makes
+ * per-CPU runqueue accounting exact. At the tracepoint the task still carries
+ * its old CPU, so `cpu` = the CPU it is leaving and `target_cpu` = dest_cpu.
+ * Only the task ringbuf is touched (tp_btf context, no map the perf_event
+ * sampler writes), and the program is only loaded with the sched recorder.
+ */
+static int handle_sched_migrate(struct task_struct *task, int dest_cpu)
+{
+	struct task_event *event;
+	long flags;
+	u64 ts = bpf_ktime_get_boot_ns();
+
+	if (!trace_task(task))
+		return 0;
+	event = reserve_task_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_SCHED_EVENT);
+	event->ts = ts;
+	event->type = SCHED_MIGRATE;
+	event->cpu = task_cpu(task);
+	event->target_cpu = dest_cpu;
+	event->next_prio = task->prio;
+	record_task_info(&event->next, task);
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("tp_btf/sched_migrate_task")
+int BPF_PROG(systing_sched_migrate, struct task_struct *task, int dest_cpu)
+{
+	return handle_sched_migrate(task, dest_cpu);
 }
 
 static int handle_sched_process_exit(struct task_struct *task)

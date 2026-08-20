@@ -13,9 +13,10 @@ use crate::trace::{
     ExtractedData, InstantArgRecord, InstantRecord, IrqSliceRecord, MemoryAllocRecord,
     MemoryFaultRecord, MemoryMapRecord, MemoryRssRecord, NetworkDnsRecord, NetworkInterfaceRecord,
     NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord,
-    ProcessExitRecord, ProcessRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord,
-    SoftirqSliceRecord, StackRecord, StackSampleRecord, SysInfoRecord, ThreadRecord,
-    ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
+    ProcessExitRecord, ProcessRecord, SchedMigrateRecord, SchedSliceRecord, SliceRecord,
+    SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord, SysInfoRecord,
+    ThreadRecord, ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord,
+    WakeupNewRecord,
 };
 
 /// Trait for collecting trace records during recording.
@@ -54,6 +55,9 @@ pub trait RecordCollector {
 
     /// Add a wakeup new record.
     fn add_wakeup_new(&mut self, record: WakeupNewRecord) -> Result<()>;
+
+    /// Add a sched migrate record.
+    fn add_sched_migrate(&mut self, record: SchedMigrateRecord) -> Result<()>;
 
     /// Add a process exit record.
     fn add_process_exit(&mut self, record: ProcessExitRecord) -> Result<()>;
@@ -234,6 +238,7 @@ impl RecordCollector for SharedCollector {
         add_irq_slice(IrqSliceRecord),
         add_softirq_slice(SoftirqSliceRecord),
         add_wakeup_new(WakeupNewRecord),
+        add_sched_migrate(SchedMigrateRecord),
         add_process_exit(ProcessExitRecord),
         add_counter(CounterRecord),
         add_counter_track(CounterTrackRecord),
@@ -337,6 +342,11 @@ impl RecordCollector for InMemoryCollector {
 
     fn add_wakeup_new(&mut self, record: WakeupNewRecord) -> Result<()> {
         self.data.wakeup_news.push(record);
+        Ok(())
+    }
+
+    fn add_sched_migrate(&mut self, record: SchedMigrateRecord) -> Result<()> {
+        self.data.sched_migrates.push(record);
         Ok(())
     }
 
