@@ -5,7 +5,7 @@
 
 use crate::analyze::{
     AnalyzeDb, CpuStatsParams, FlamegraphParams, NetworkConnectionsParams, NetworkInterfacesParams,
-    NetworkSocketPairsParams, SchedStatsParams, StackTypeFilter,
+    NetworkSocketPairsParams, SchedAggregateParams, SchedStatsParams, StackTypeFilter,
 };
 use anyhow::Result;
 use rmcp::{
@@ -30,6 +30,7 @@ enum DbRequest {
     Flamegraph(Option<PathBuf>, FlamegraphParams),
     SchedStats(Option<PathBuf>, SchedStatsParams),
     CpuStats(Option<PathBuf>, CpuStatsParams),
+    SchedAggregate(Option<PathBuf>, SchedAggregateParams),
     TraceInfo(Option<PathBuf>),
     NetworkConnections(Option<PathBuf>, NetworkConnectionsParams),
     NetworkInterfaces(Option<PathBuf>, NetworkInterfacesParams),
@@ -192,6 +193,14 @@ fn handle_db_request(
                     serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
                 })
                 .map_err(|e| format!("CPU stats error: {e}"))
+        }
+        DbRequest::SchedAggregate(path, params) => {
+            let db = get_or_open(dbs, last_used, spill_cap, path)?;
+            db.sched_aggregate(&params)
+                .and_then(|r| {
+                    serde_json::to_value(r).map_err(|e| anyhow::anyhow!("Serialization error: {e}"))
+                })
+                .map_err(|e| format!("Sched aggregate error: {e}"))
         }
         DbRequest::TraceInfo(path) => {
             let db = get_or_open(dbs, last_used, spill_cap, path)?;
@@ -412,6 +421,27 @@ struct CpuStatsToolParams {
 
     /// Filter to a specific trace ID (for multi-trace databases).
     trace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SchedAggregateToolParams {
+    /// Absolute path to a .duckdb trace database file. If omitted, uses the most recently accessed database.
+    path: Option<String>,
+
+    /// Filter to a specific trace ID (required for multi-trace databases).
+    trace_id: Option<String>,
+
+    /// Window start in seconds from the first scheduler event (default: trace start).
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
+    start_time: Option<f64>,
+
+    /// Window end in seconds from the first scheduler event (default: trace end).
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
+    end_time: Option<f64>,
+
+    /// Number of tail-contributor threads to list per distribution (default 10).
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
+    top_k: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -650,6 +680,32 @@ impl SystingMcpServer {
     }
 
     #[tool(
+        name = "sched_aggregate",
+        description = "Per-capture scheduler summary for comparing schedulers or hosts: wakeup latency (marker to first run, split same-CPU/cross-CPU), preempt wait, run delay, on-CPU slice length, context-switch rate (voluntary/involuntary), migrations (wakeup/preempt), a time-weighted runqueue-length distribution, per-CPU vectors (busy, idle, switches, wakeups, runnable wait, rq avg) with imbalance metrics (busy/wakeup max-share and CV, work-conservation-violation time), log2 histograms beside every percentile, and the threads above the p99 of each latency tail. Percentiles come from log-linear histograms (within ~6%); per-CPU runqueue lengths are approximate (no migrate events), the node total is exact; waits that do not end inside the window are counted as censored."
+    )]
+    async fn sched_aggregate(
+        &self,
+        Parameters(params): Parameters<SchedAggregateToolParams>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let path = params.path.map(PathBuf::from);
+        let agg_params = SchedAggregateParams {
+            trace_id: params.trace_id,
+            start_time: params.start_time,
+            end_time: params.end_time,
+            top_k: params.top_k.unwrap_or(10),
+        };
+
+        match self
+            .db
+            .request(DbRequest::SchedAggregate(path, agg_params))
+            .await
+        {
+            Ok(value) => Ok(make_tool_result(value)),
+            Err(e) => Ok(make_error_result(&e)),
+        }
+    }
+
+    #[tool(
         name = "network_connections",
         description = "Per-connection network traffic summary. Shows protocol, address family, source/destination IP:port, interface, namespace, send/recv bytes, and TCP retransmit percentage for each socket. Results are grouped by trace and sorted by total bytes descending within each trace."
     )]
@@ -792,11 +848,15 @@ If `path` is omitted, the most recently accessed database is used.
    tid = single thread detail with end-state distribution.
 7. cpu_stats \u{2014} Per-CPU scheduling statistics. Shows utilization, idle%, \
    thread count, IRQ/softIRQ time, and runqueue depth percentiles per CPU.
-8. network_connections \u{2014} Per-connection traffic summary. Shows protocol, \
+8. sched_aggregate \u{2014} Per-capture scheduler summary for A/B comparisons: \
+   wakeup latency, preempt wait, slice length, switch/migration rates, \
+   time-weighted runqueue length, per-CPU load vectors with imbalance metrics, \
+   log2 histograms, and the threads above each latency tail's p99.
+9. network_connections \u{2014} Per-connection traffic summary. Shows protocol, \
    source/dest IP:port, interface, send/recv bytes, and TCP retransmit rate.
-9. network_interfaces \u{2014} Per-interface traffic summary. Shows namespace, \
-   interface, IP addresses, and per-protocol traffic breakdown.
-10. network_socket_pairs \u{2014} Find matched socket pairs (both sides of a \
+10. network_interfaces \u{2014} Per-interface traffic summary. Shows namespace, \
+    interface, IP addresses, and per-protocol traffic breakdown.
+11. network_socket_pairs \u{2014} Find matched socket pairs (both sides of a \
     connection captured). Shows traffic stats for both sides, useful for \
     analyzing cross-node or same-node connection pairs in multi-trace databases.
 
@@ -866,6 +926,7 @@ mod tests {
             "flamegraph",
             "sched_stats",
             "cpu_stats",
+            "sched_aggregate",
             "network_connections",
             "network_interfaces",
             "network_socket_pairs",

@@ -1,6 +1,6 @@
 ---
 name: systing-analyze
-description: Analyze a systing trace database (.duckdb). Use when the user asks about a systing trace — flamegraphs, scheduling latency, CPU hotspots, network behavior, memory/allocation activity, off-CPU time, TPU op/metric data, or any question about what's in a trace.duckdb file. Orchestrates the systing-analyze MCP tools (trace_info, query, flamegraph, sched_stats, cpu_stats, network_*).
+description: Analyze a systing trace database (.duckdb). Use when the user asks about a systing trace — flamegraphs, scheduling latency, CPU hotspots, network behavior, memory/allocation activity, off-CPU time, TPU op/metric data, or any question about what's in a trace.duckdb file. Orchestrates the systing-analyze MCP tools (trace_info, query, flamegraph, sched_stats, cpu_stats, sched_aggregate, network_*).
 ---
 
 # Analyzing systing traces
@@ -23,6 +23,7 @@ Systing stores traces in **DuckDB**. The `systing-analyze` MCP server exposes st
 | Why is the process blocked / off-CPU? | `flamegraph` | `stack_type="uninterruptible-sleep"` (D) or `"interruptible-sleep"` (S), or `"all-sleep"` |
 | Is the scheduler oversubscribed? Latency? | `sched_stats` | no filter = whole-trace ranking; `pid` = per-thread breakdown; `tid` = single thread with end-state distribution |
 | Which CPUs are busy / idle? | `cpu_stats` | per-CPU utilization, idle%, IRQ/softIRQ time, runqueue depth p50/p90/p99 |
+| How does the scheduler behave overall? Compare two schedulers/hosts? | `sched_aggregate` | one summary per capture: wakeup latency (same/cross-CPU), preempt wait, slice length, switch + migration rates, time-weighted runqueue length, per-CPU load vectors + imbalance metrics, log2 histograms, tail threads; percentiles within ~6%, per-CPU runqueue approximate |
 | What's the network doing? | `network_connections` | per-connection bytes, retransmit % |
 | Interface-level network? | `network_interfaces` | per-interface, per-protocol breakdown |
 | Both sides of a connection (multi-node)? | `network_socket_pairs` | matched socket pairs, within or across traces |
@@ -30,7 +31,7 @@ Systing stores traces in **DuckDB**. The `systing-analyze` MCP server exposes st
 | What ran on the TPU? Duty cycle? HBM? | `query` | no dedicated tool — see TPU schema below |
 | Anything else | `query` | raw SQL; see schema below |
 
-There is also a CLI with the same analyses: `systing-analyze query|stacktrace flamegraph|sched stats|sched cpu-stats|network connections|network interfaces|network socket-pairs` (and `systing-analyze mcp` to start this server).
+There is also a CLI with the same analyses: `systing-analyze query|stacktrace flamegraph|sched stats|sched cpu-stats|sched aggregate|network connections|network interfaces|network socket-pairs` (and `systing-analyze mcp` to start this server).
 
 ## Key schema for `query`
 

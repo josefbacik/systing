@@ -239,6 +239,8 @@ enum SchedCommands {
     Stats(SchedStatsArgs),
     /// Show per-CPU scheduling statistics
     CpuStats(SchedCpuStatsArgs),
+    /// Per-capture scheduler summary (latencies, runqueue, imbalance) for A/B comparisons
+    Aggregate(SchedAggregateArgs),
 }
 
 #[derive(Args)]
@@ -281,6 +283,33 @@ struct SchedCpuStatsArgs {
     /// Filter to a specific trace (for multi-trace DBs)
     #[arg(long)]
     trace_id: Option<String>,
+}
+
+#[derive(Args)]
+struct SchedAggregateArgs {
+    /// Path to DuckDB database
+    #[arg(short, long)]
+    database: PathBuf,
+
+    /// Output format: table or json
+    #[arg(short, long, default_value = "table")]
+    format: String,
+
+    /// Filter to a specific trace (required for multi-trace DBs)
+    #[arg(long)]
+    trace_id: Option<String>,
+
+    /// Window start in seconds from the first scheduler event
+    #[arg(long)]
+    start_time: Option<f64>,
+
+    /// Window end in seconds from the first scheduler event
+    #[arg(long)]
+    end_time: Option<f64>,
+
+    /// Threads to list per latency tail (0 disables the attribution pass)
+    #[arg(long, default_value = "10")]
+    top_k: usize,
 }
 
 /// Run the query command
@@ -665,6 +694,141 @@ fn run_sched_stats(args: SchedStatsArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Run the sched aggregate subcommand
+fn run_sched_aggregate(args: SchedAggregateArgs) -> Result<()> {
+    let db = AnalyzeDb::open(&args.database, true)?;
+
+    let params = analyze::SchedAggregateParams {
+        trace_id: args.trace_id,
+        start_time: args.start_time,
+        end_time: args.end_time,
+        top_k: args.top_k,
+    };
+
+    let r = db.sched_aggregate(&params)?;
+
+    if args.format == "json" {
+        println!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(());
+    }
+
+    let fmt_dist = |name: &str, d: &analyze::Dist| {
+        println!(
+            "{:<22} n={:<9} avg={:>10} p50={:>10} p90={:>10} p99={:>10} max={:>10}",
+            name,
+            d.count,
+            format_ns(d.avg_ns),
+            format_ns(d.p50_ns as f64),
+            format_ns(d.p90_ns as f64),
+            format_ns(d.p99_ns as f64),
+            format_ns(d.max_ns as f64),
+        );
+    };
+
+    eprintln!("# Sched aggregate: {}", args.database.display());
+    eprintln!(
+        "# Window: {:.3}s, {} CPUs ({} observed), {} slices, {} wakeups, {} threads",
+        r.meta.window_ns as f64 / 1e9,
+        r.meta.ncpu,
+        r.meta.observed_cpus,
+        r.meta.slices,
+        r.meta.runnable_markers,
+        r.meta.threads_seen
+    );
+    eprintln!(
+        "# Censored: {} wakeups, {} preemptions; spurious wakeups {}; missed sched events {}",
+        r.meta.wakeup_censored,
+        r.meta.preempt_censored,
+        r.meta.spurious_wakeups,
+        r.meta
+            .missed_sched_events
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    );
+    eprintln!("# Percentiles are histogram-derived (within ~6%); per-CPU runqueue is approximate (no migrate events).");
+
+    fmt_dist("wakeup latency", &r.wakeup_latency);
+    fmt_dist("  same-cpu", &r.wakeup_latency_same_cpu);
+    fmt_dist("  cross-cpu", &r.wakeup_latency_cross_cpu);
+    fmt_dist("preempt wait", &r.preempt_wait);
+    fmt_dist("run delay", &r.run_delay);
+    fmt_dist("on-cpu slice", &r.slice_len);
+    println!(
+        "{:<22} {}/s ({} voluntary, {} involuntary); migrations {}/s ({} at wakeup, {} while runnable)",
+        "switches",
+        format_rate(r.switches.switches_per_s),
+        r.switches.voluntary,
+        r.switches.involuntary,
+        format_rate(r.switches.migrations_per_s),
+        r.switches.wakeup_migrations,
+        r.switches.preempt_migrations
+    );
+    println!(
+        "{:<22} avg={:.3} p50={} p90={} p99={} max={} (time-weighted over {} observed cpus)",
+        "runqueue length",
+        r.runqueue.avg,
+        r.runqueue.p50,
+        r.runqueue.p90,
+        r.runqueue.p99,
+        r.runqueue.max,
+        r.meta.observed_cpus
+    );
+    println!(
+        "{:<22} busy max-share={:.3} cv={:.3}; wakeup max-share={:.3} cv={:.3}; work-conservation violation {:.1}% of window",
+        "imbalance",
+        r.imbalance.busy_max_share,
+        r.imbalance.busy_cv,
+        r.imbalance.wakeups_max_share,
+        r.imbalance.wakeups_cv,
+        r.imbalance.work_conservation_violation_frac * 100.0
+    );
+    if !r.wakeup_tail_top.is_empty() {
+        println!("wakeup-latency tail (> p99) by thread name:");
+        for c in &r.wakeup_tail_top {
+            println!(
+                "  {:<24} n={:<8} sum={}",
+                c.comm,
+                c.count,
+                format_ns(c.sum_ns as f64)
+            );
+        }
+    }
+    if !r.preempt_tail_top.is_empty() {
+        println!("preempt-wait tail (> p99) by thread name:");
+        for c in &r.preempt_tail_top {
+            println!(
+                "  {:<24} n={:<8} sum={}",
+                c.comm,
+                c.count,
+                format_ns(c.sum_ns as f64)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn format_ns(ns: f64) -> String {
+    if ns >= 1e9 {
+        format!("{:.3}s", ns / 1e9)
+    } else if ns >= 1e6 {
+        format!("{:.3}ms", ns / 1e6)
+    } else if ns >= 1e3 {
+        format!("{:.3}us", ns / 1e3)
+    } else {
+        format!("{ns:.0}ns")
+    }
+}
+
+fn format_rate(per_s: f64) -> String {
+    if per_s >= 1e6 {
+        format!("{:.2}M", per_s / 1e6)
+    } else if per_s >= 1e3 {
+        format!("{:.2}k", per_s / 1e3)
+    } else {
+        format!("{per_s:.1}")
+    }
 }
 
 /// Run the sched cpu-stats subcommand
@@ -1057,6 +1221,7 @@ fn main() -> Result<()> {
         Commands::Sched(args) => match args.command {
             SchedCommands::Stats(stats_args) => run_sched_stats(stats_args),
             SchedCommands::CpuStats(cpu_stats_args) => run_sched_cpu_stats(cpu_stats_args),
+            SchedCommands::Aggregate(agg_args) => run_sched_aggregate(agg_args),
         },
         Commands::Network(args) => match args.command {
             NetworkCommands::Connections(conn_args) => run_network_connections(conn_args),
