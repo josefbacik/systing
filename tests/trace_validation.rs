@@ -850,6 +850,38 @@ fn test_e2e_validation_suite() {
         );
     }
 
+    // --- Check: sched_migrate rows (schema 16) ---
+    // The fork/exit workload on a multi-CPU host moves tasks between CPUs at
+    // wakeup and via the balancer; a single-CPU host has nothing to migrate,
+    // so the row count is only asserted with two or more CPUs in the trace.
+    // Every row must name a known thread (utid FK integrity).
+    eprintln!("  sched_migrate (duckdb)...");
+    {
+        let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+        let (migrates, orphans, cpus): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM sched_migrate),
+                    (SELECT COUNT(*) FROM sched_migrate m
+                      WHERE NOT EXISTS (SELECT 1 FROM thread t WHERE t.utid = m.utid)),
+                    (SELECT COUNT(DISTINCT cpu) FROM sched_slice)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("Failed to query sched_migrate");
+        assert_eq!(
+            orphans, 0,
+            "[sched_migrate duckdb] {orphans} rows reference a utid missing from thread"
+        );
+        if cpus >= 2 {
+            assert!(
+                migrates > 0,
+                "[sched_migrate duckdb] No sched_migrate rows although the trace saw {cpus} CPUs"
+            );
+        }
+        eprintln!("    found {migrates} sched_migrate rows over {cpus} CPUs, {orphans} orphans");
+    }
+
     // --- Check: perfetto->duckdb preserves end_state (test_e2e_perfetto_to_duckdb_preserves_end_state) ---
     eprintln!("  perfetto -> duckdb end_state...");
     {

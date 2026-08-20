@@ -379,3 +379,26 @@ Read rules, stated once here and in the record docs:
 - Churn built from this column: freed = sum(-rss_delta_bytes) over negative
   rows; committed-at-map = sum over positive rows. The old `size` sums remain
   VA-range churn and keep their v13/v14 meaning for historical continuity.
+
+## Schema Version 16 (unreleased) — 2026-08-20
+
+New table `sched_migrate (trace_id, ts, utid, orig_cpu, dest_cpu)`: one row
+per `sched_migrate_task` event, i.e. every change of a task's CPU. The kernel
+fires it from `set_task_cpu()`: at wakeup, right after `sched_waking`, when
+the scheduler picked a CPU other than the one the task last ran on; and when
+the load balancer, NUMA balancing or an affinity change moves a runnable task.
+
+Why: the runnable marker in `thread_state` (`state = 0`) is recorded at
+`sched_waking`, which fires BEFORE the scheduler picks a CPU, so its `cpu` is
+the CPU the thread last ran on — not where it was queued. Without this table
+a trace cannot say which CPU a woken thread was placed on until the thread
+runs, so per-CPU runqueue lengths and work-conservation analysis had to treat
+woken threads as unplaced. With it, placement is exact: a woken thread with no
+`sched_migrate` row before its next `sched_slice` stayed on its previous CPU;
+otherwise the row's `dest_cpu` is the placement (and later rows are moves).
+
+Recorded only with the `sched` recorder (the program is part of its set). The
+Perfetto export does not carry these rows yet. `systing-analyze sched
+aggregate` switches to exact placement when the table is present
+(`meta.placement_exact`) and reports the event counts under `switches.migrate_*`
+and the placement vector `per_cpu.wakeups_placed`.

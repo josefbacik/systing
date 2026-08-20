@@ -3517,6 +3517,7 @@ fn run_convert(
     import_table("irq_slice", |p| &p.irq_slice)?;
     import_table("softirq_slice", |p| &p.softirq_slice)?;
     import_table("wakeup_new", |p| &p.wakeup_new)?;
+    import_table("sched_migrate", |p| &p.sched_migrate)?;
     import_table("process_exit", |p| &p.process_exit)?;
     import_table("counter_track", |p| &p.counter_track)?;
     import_table("counter", |p| &p.counter)?;
