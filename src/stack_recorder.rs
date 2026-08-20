@@ -651,7 +651,9 @@ fn read_spill_record(reader: &mut BufReader<File>) -> Result<Option<(Stack, i32,
         .read_exact(&mut py_bytes)
         .context("reading stack spill record body")?;
     let py_stack = py_bytes
-        .chunks_exact(PY_FRAME_BYTES)
+        .as_chunks::<PY_FRAME_BYTES>()
+        .0
+        .iter()
         .map(|c| PyAddr {
             addr: crate::pystacks::types::StackWalkerFrame {
                 symbol_id: u64::from_le_bytes(c[0..8].try_into().unwrap()),
