@@ -107,6 +107,18 @@ struct FlamegraphArgs {
     /// Minimum sample count to include a stack
     #[arg(long, default_value = "1")]
     min_count: u64,
+
+    /// Emit only the N stacks with the most samples (the `# Unique stacks`
+    /// footer still counts every stack). Bounds memory on large traces: the
+    /// cut happens inside the database, not after everything was built.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    top: Option<u64>,
+
+    /// Truncate every stack to its D root-most frames before merging, so
+    /// stacks that only differ deeper than D count as one (the top-N is
+    /// then exact for that depth). Default: full depth.
+    #[arg(long, value_name = "D", value_parser = clap::value_parser!(u64).range(1..))]
+    max_depth: Option<u64>,
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -478,6 +490,8 @@ fn run_interactive(db: &AnalyzeDb, format: &str) -> Result<()> {
 
 /// Run the flamegraph subcommand
 fn run_flamegraph(args: FlamegraphArgs) -> Result<()> {
+    use std::io::Write as _;
+
     let db = AnalyzeDb::open(&args.database, true)?;
 
     let params = analyze::FlamegraphParams {
@@ -488,24 +502,14 @@ fn run_flamegraph(args: FlamegraphArgs) -> Result<()> {
         end_time: args.end_time,
         trace_id: args.trace_id.clone(),
         min_count: args.min_count,
-        top_n: usize::MAX, // No limit for CLI output
+        top_n: args.top.map(|n| n as usize), // None = every stack
+        max_depth: args.max_depth.map(|d| d as usize),
     };
 
-    let result = db.flamegraph(&params)?;
-
-    // Print metadata to stderr
+    // The lines that only describe the request go first; the counts come
+    // after the stream, once they are known. Consumers that parse the
+    // footer key on the `# ...:` prefixes, not on position.
     eprintln!("# Flamegraph: {}", args.database.display());
-    eprintln!("# Stack type: {}", result.metadata.stack_type);
-    eprintln!("# Total trace samples: {}", result.metadata.total_samples);
-    eprintln!(
-        "# Output samples: {}",
-        result.stacks.iter().map(|s| s.count).sum::<u64>()
-    );
-    eprintln!("# Unique stacks: {}", result.metadata.unique_stacks);
-    eprintln!(
-        "# Time range: {:.3}s - {:.3}s",
-        result.metadata.time_range_seconds.0, result.metadata.time_range_seconds.1
-    );
 
     let mut filters = Vec::new();
     if let Some(p) = &args.pid {
@@ -527,11 +531,36 @@ fn run_flamegraph(args: FlamegraphArgs) -> Result<()> {
         eprintln!("# Filters: {}", filters.join(", "));
     }
 
-    // Print folded stacks to stdout
-    for stack in &result.stacks {
-        let folded = stack.frames.join(";");
-        println!("{folded} {}", stack.count);
+    // Stream folded stacks to stdout as the database hands them over: one
+    // line in flight at a time, never the whole fold in memory.
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::with_capacity(256 * 1024, stdout.lock());
+    let mut output_stacks: u64 = 0;
+    let mut output_samples: u64 = 0;
+    let metadata = db.flamegraph_stream(&params, |folded, count| {
+        writeln!(out, "{folded} {count}")?;
+        output_stacks += 1;
+        output_samples += count;
+        Ok(())
+    })?;
+    out.flush()?;
+
+    // `Matched samples` / `Unique stacks` describe everything that passed the
+    // filters; `Output samples` / `Output stacks` describe what was printed.
+    // The two pairs differ only under --top.
+    eprintln!("# Stack type: {}", metadata.stack_type);
+    eprintln!("# Total trace samples: {}", metadata.total_samples);
+    eprintln!("# Matched samples: {}", metadata.matched_samples);
+    eprintln!("# Output samples: {output_samples}");
+    eprintln!("# Unique stacks: {}", metadata.unique_stacks);
+    eprintln!("# Output stacks: {output_stacks}");
+    if let Some(d) = args.max_depth {
+        eprintln!("# Max depth: {d}");
     }
+    eprintln!(
+        "# Time range: {:.3}s - {:.3}s",
+        metadata.time_range_seconds.0, metadata.time_range_seconds.1
+    );
 
     Ok(())
 }

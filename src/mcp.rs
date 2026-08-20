@@ -391,6 +391,11 @@ struct FlamegraphToolParams {
     /// Limit to top N stacks by sample count. Default: 500.
     #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
     top_n: Option<usize>,
+
+    /// Truncate every stack to its D root-most frames before merging, so
+    /// stacks that only differ deeper than D count as one. Default: full depth.
+    #[serde(default, deserialize_with = "string_or_number::option::deserialize")]
+    max_depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -579,7 +584,7 @@ impl SystingMcpServer {
 
     #[tool(
         name = "flamegraph",
-        description = "Query stack traces and return structured results for flame graph analysis. Returns 'stacks' (array of {frames, count}), 'metadata' (total_samples, unique_stacks, time_range, stack_type), and 'folded' (folded-stack text compatible with flamegraph tools like inferno or brendangregg/FlameGraph)."
+        description = "Query stack traces and return structured results for flame graph analysis. Returns 'stacks' (array of {frames, count}), 'metadata' (total_samples, matched_samples, unique_stacks, time_range, stack_type — matched_samples and unique_stacks count everything that passed the filters before the top_n cut), and 'folded' (folded-stack text compatible with flamegraph tools like inferno or brendangregg/FlameGraph)."
     )]
     async fn flamegraph(
         &self,
@@ -600,7 +605,8 @@ impl SystingMcpServer {
             end_time: params.end_time,
             trace_id: params.trace_id,
             min_count: params.min_count.unwrap_or(1),
-            top_n: params.top_n.unwrap_or(500),
+            top_n: Some(params.top_n.unwrap_or(500)),
+            max_depth: params.max_depth,
         };
 
         match self

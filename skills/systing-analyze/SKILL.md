@@ -180,12 +180,13 @@ Every table has a `trace_id` column. Always include it in joins, and filter on i
 
 ## Using `flamegraph`
 
-Returns `stacks` (array of `{frames, count}`), `metadata` (total_samples, unique_stacks, time_range, stack_type), and `folded` — folded-stack text (semicolon-separated frames root→leaf, space, count) for inferno / brendangregg's FlameGraph. Parameters:
+Returns `stacks` (array of `{frames, count}`), `metadata` (total_samples, matched_samples, unique_stacks, time_range, stack_type), and `folded` — folded-stack text (semicolon-separated frames root→leaf, space, count) for inferno / brendangregg's FlameGraph. `total_samples` is the whole trace; `matched_samples` and `unique_stacks` count what passed the filters BEFORE the `top_n` cut, so you can tell how much was cut. Parameters:
 - `stack_type` — `"cpu"` (default), `"interruptible-sleep"`, `"uninterruptible-sleep"`, `"all-sleep"`, `"all"`
 - `pid` / `tid` — restrict to a process or thread
 - `start_time` / `end_time` — seconds offset from trace start
 - `min_count` — minimum sample count per stack (default 1)
-- `top_n` — keep the top N stacks (default 500)
+- `top_n` — keep the top N stacks (default 500); the cut happens inside the database, so large traces stay cheap
+- `max_depth` — truncate every stack to its D root-most frames before merging (stacks that only differ deeper than D count as one); default full depth
 - `trace_id` — for multi-trace DBs
 
 ## Common investigation patterns
