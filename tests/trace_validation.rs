@@ -1037,6 +1037,287 @@ fn test_e2e_validation_suite() {
 }
 
 // =============================================================================
+// --cgroup filter: ancestry match
+//
+// Regression test for the start-time-snapshot bug: the filter used to load the
+// ids of the target cgroup and its descendants *as they existed when the trace
+// started* and match a task's leaf cgroup id exactly, so a task in a cgroup
+// created after that snapshot (a nested container runtime making cgroups inside
+// a pod) was never traced and the whole --cgroup trace came back empty. The
+// filter now matches by ancestry, so only the target's own id is loaded and a
+// leaf created mid-trace still matches through its ancestors.
+// =============================================================================
+
+/// Recording duration for the cgroup filter test (seconds). The late cgroup and
+/// its workload are created `CGROUP_LATE_CREATE_DELAY_SECS` in, which is after
+/// the filter snapshot (taken before the BPF skeleton is even loaded) on any
+/// machine, and leaves the rest of the window for the workload to be sampled.
+const CGROUP_FILTER_DURATION_SECS: u64 = 10;
+const CGROUP_LATE_CREATE_DELAY_SECS: u64 = 3;
+
+/// Cgroup directories created by the cgroup filter test, removed (deepest first)
+/// when the guard drops — on the test's panic path too, so a failed run does not
+/// leave cgroups behind. Removal is best-effort with a few retries because a
+/// cgroup stays "populated" for a moment after its last task is reaped.
+struct CgroupFixture {
+    dirs: Vec<PathBuf>,
+}
+
+impl CgroupFixture {
+    fn create(&mut self, dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir(dir)?;
+        self.dirs.push(dir.to_path_buf());
+        Ok(())
+    }
+}
+
+impl Drop for CgroupFixture {
+    fn drop(&mut self) {
+        for dir in self.dirs.iter().rev() {
+            for _ in 0..50 {
+                match std::fs::remove_dir(dir) {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                }
+            }
+        }
+    }
+}
+
+/// A busy-loop child process placed into `cgroup` by writing its pid to that
+/// cgroup's `cgroup.procs`, killed and reaped when the guard drops.
+struct CgroupWorkload {
+    child: std::process::Child,
+}
+
+impl CgroupWorkload {
+    fn spawn_in(cgroup: &Path) -> CgroupWorkload {
+        use std::process::{Command, Stdio};
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("while :; do :; done")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Failed to spawn cgroup workload");
+        let procs = cgroup.join("cgroup.procs");
+        std::fs::write(&procs, child.id().to_string()).unwrap_or_else(|e| {
+            panic!(
+                "Failed to move workload pid {} into {}: {e}",
+                child.id(),
+                procs.display()
+            )
+        });
+        // Read back: the move is what the test is about, so prove it happened.
+        let listed = std::fs::read_to_string(&procs).expect("Failed to read cgroup.procs");
+        assert!(
+            listed.lines().any(|l| l.trim() == child.id().to_string()),
+            "workload pid {} not listed in {} after the move (contents: {listed:?})",
+            child.id(),
+            procs.display()
+        );
+        CgroupWorkload { child }
+    }
+
+    fn pid(&self) -> i32 {
+        self.child.id() as i32
+    }
+}
+
+impl Drop for CgroupWorkload {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_cgroup_filter_follows_cgroups_created_after_start() {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    let Some(cgroup_root) = systing::cgroup::cgroup2_root() else {
+        eprintln!("skipping: no cgroup v2 unified hierarchy on this system");
+        return;
+    };
+    // Build the fixture under this process's own cgroup (the root when the
+    // test runs in a plain VM), so it needs no delegation beyond what a root
+    // test already has:
+    //   <base>/systing-cgf-<pid>/                 <- the --cgroup target
+    //   <base>/systing-cgf-<pid>/mid/late/        <- created AFTER the trace starts
+    //   <base>/systing-cgf-<pid>-outside/leaf/    <- sibling, must NOT be traced
+    // The traced workload sits two levels below the target, so the match has to
+    // come from ancestors[level - 2], not from the target being the task's own
+    // cgroup or its parent.
+    let base = match current_cgroup_v2_path() {
+        Some(p) if p != "/" => cgroup_root.join(p.trim_start_matches('/')),
+        _ => cgroup_root,
+    };
+    let tag = format!("systing-cgf-{}", std::process::id());
+    let target = base.join(&tag);
+    let mid = target.join("mid");
+    let late = mid.join("late");
+    let outside = base.join(format!("{tag}-outside"));
+    let outside_leaf = outside.join("leaf");
+
+    let mut fixture = CgroupFixture { dirs: Vec::new() };
+    match fixture.create(&target) {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            eprintln!(
+                "skipping: cannot create a cgroup under {} ({e})",
+                base.display()
+            );
+            return;
+        }
+        Err(e) => panic!("Failed to create cgroup {}: {e}", target.display()),
+    }
+    fixture
+        .create(&outside)
+        .unwrap_or_else(|e| panic!("Failed to create cgroup {}: {e}", outside.display()));
+    fixture
+        .create(&outside_leaf)
+        .unwrap_or_else(|e| panic!("Failed to create cgroup {}: {e}", outside_leaf.display()));
+    let target_id = std::fs::metadata(&target)
+        .expect("Failed to stat target cgroup")
+        .ino();
+
+    // The negative control exists from the start: a busy task in a sibling
+    // hierarchy the filter must keep excluding.
+    let outside_workload = CgroupWorkload::spawn_in(&outside_leaf);
+
+    // Mid-trace: create the nested cgroups and put a busy task in the leaf. This
+    // runs on a helper thread because `systing()` blocks for the whole trace.
+    // The helper hands the created dirs back so the fixture removes them.
+    let (tx, rx) = mpsc::channel();
+    let (mid_t, late_t) = (mid.clone(), late.clone());
+    let creator = thread::spawn(move || {
+        thread::sleep(Duration::from_secs(CGROUP_LATE_CREATE_DELAY_SECS));
+        let mut created = Vec::new();
+        for dir in [&mid_t, &late_t] {
+            std::fs::create_dir(dir)
+                .unwrap_or_else(|e| panic!("Failed to create cgroup {}: {e}", dir.display()));
+            created.push(dir.clone());
+        }
+        let workload = CgroupWorkload::spawn_in(&late_t);
+        tx.send(created).expect("test thread went away");
+        workload
+    });
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+    eprintln!(
+        "Recording trace ({CGROUP_FILTER_DURATION_SECS}s, --cgroup {}, late cgroup at +{CGROUP_LATE_CREATE_DELAY_SECS}s)...",
+        target.display()
+    );
+    let config = Config {
+        duration: CGROUP_FILTER_DURATION_SECS,
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path,
+        cgroup: vec![target.to_string_lossy().into_owned()],
+        ..Config::default()
+    };
+    let result = systing(config, None);
+
+    // Collect the helper's state before asserting anything so cleanup always runs.
+    // A helper that panicked before reporting re-raises its own panic below.
+    if let Ok(late_dirs) = rx.recv() {
+        fixture.dirs.extend(late_dirs);
+    }
+    let late_workload = match creator.join() {
+        Ok(workload) => workload,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+    result.expect("systing recording failed");
+    let late_pid = late_workload.pid();
+    let outside_pid = outside_workload.pid();
+    let late_id = std::fs::metadata(&late)
+        .expect("Failed to stat late cgroup")
+        .ino();
+    drop(late_workload);
+    drop(outside_workload);
+    eprintln!("Recording complete.\n");
+
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "cgroup_filter")
+        .expect("parquet -> duckdb failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    // The task in the cgroup created after the trace started was traced...
+    let late_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM process WHERE pid = ?",
+            [late_pid],
+            |row| row.get(0),
+        )
+        .expect("Failed to count late workload process rows");
+    assert!(
+        late_rows > 0,
+        "[cgroup filter] workload pid {late_pid} in a cgroup created after the trace \
+         started (two levels below the --cgroup target) was not traced: the filter is \
+         matching a start-time snapshot of leaf ids, not ancestry"
+    );
+    // ...and it was recorded in its own (new) leaf cgroup, not in the target: the
+    // match came from an ancestor, which is the whole point.
+    let late_cgroup_id: u64 = conn
+        .query_row(
+            "SELECT cgroup_id FROM process WHERE pid = ? LIMIT 1",
+            [late_pid],
+            |row| row.get(0),
+        )
+        .expect("Failed to query late workload cgroup_id");
+    assert_eq!(
+        late_cgroup_id, late_id,
+        "[cgroup filter] workload pid {late_pid} recorded with cgroup_id {late_cgroup_id}, \
+         expected its leaf {late_id} (target is {target_id})"
+    );
+    // Its activity was recorded, not just its existence.
+    let late_events: i64 = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM stack_sample s JOIN thread t USING (utid) \
+                     JOIN process p USING (upid) WHERE p.pid = ?) \
+                  + (SELECT COUNT(*) FROM sched_slice s JOIN thread t USING (utid) \
+                     JOIN process p USING (upid) WHERE p.pid = ?)",
+            [late_pid, late_pid],
+            |row| row.get(0),
+        )
+        .expect("Failed to count late workload events");
+    assert!(
+        late_events > 0,
+        "[cgroup filter] workload pid {late_pid} has a process row but no stack samples or \
+         sched slices"
+    );
+    eprintln!(
+        "  late workload pid {late_pid}: traced, cgroup_id {late_cgroup_id} (leaf), \
+         {late_events} stack samples + sched slices"
+    );
+
+    // The sibling hierarchy is still excluded: ancestry matching must not widen
+    // the filter beyond the target's subtree.
+    let outside_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM process WHERE pid = ?",
+            [outside_pid],
+            |row| row.get(0),
+        )
+        .expect("Failed to query outside workload process row");
+    assert_eq!(
+        outside_rows, 0,
+        "[cgroup filter] workload pid {outside_pid} outside the --cgroup target was traced"
+    );
+    eprintln!("  outside workload pid {outside_pid}: not traced (correct)");
+}
+
+// =============================================================================
 // Consolidated network suite
 //
 // Records ONE trace (3s, network=true, with traffic) and runs all network
