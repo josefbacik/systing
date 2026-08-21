@@ -2738,23 +2738,37 @@ fn collect_memory_alloc_target_pids(opts: &Config) -> Vec<u32> {
     pids.into_iter().collect()
 }
 
-/// Resolve every cgroup id the BPF filter must match for the configured
-/// `--cgroup` targets: each target plus all of its descendant cgroups,
-/// deduplicated across targets.
+/// Resolve the cgroup ids the BPF filter must hold for the configured
+/// `--cgroup` targets, deduplicated across targets.
 ///
-/// A target is frequently an interior node (e.g. a k8s pod cgroup) whose tasks
-/// live in descendant container/slice cgroups, and the BPF filter matches a
-/// task's leaf cgroup id exactly — so the whole subtree must be included. The
-/// result drives both the size of the `cgroups` BPF map and its contents, which
-/// is why it is resolved before the skeleton is loaded.
-fn collect_cgroup_filter_ids(opts: &Config) -> Result<Vec<u64>> {
+/// Normally that is each target's own id and nothing else: the BPF side
+/// (`task_in_cgroup_filter()`) matches a task whose cgroup is a target OR has a
+/// target among its ancestors, so a target that is an interior node (a k8s pod
+/// cgroup whose tasks live in per-container children, say) is covered without
+/// enumerating its subtree — including children that did not exist yet when
+/// the trace started. A start-time snapshot of the descendants could never
+/// contain those, which is how a nested container runtime creating cgroups
+/// under a pod used to yield an empty `--cgroup` trace.
+///
+/// Under kernel lockdown confidentiality mode the ancestry walk is unavailable
+/// (it needs probe reads, which lockdown restricts) and the BPF side falls back
+/// to exact-id matching, so the pre-ancestry behaviour is kept there: enumerate
+/// each target's descendants at start, accepting that limitation.
+///
+/// The result drives both the size of the `cgroups` BPF map and its contents,
+/// which is why it is resolved before the skeleton is loaded.
+fn collect_cgroup_filter_ids(opts: &Config, confidentiality_mode: bool) -> Result<Vec<u64>> {
     let mut ids = Vec::new();
     let mut seen = HashSet::new();
     for cgroup in opts.cgroup.iter() {
-        let descendants =
-            crate::cgroup::collect_descendant_cgroup_ids(std::path::Path::new(cgroup))
-                .with_context(|| format!("Failed to access cgroup path: {cgroup}"))?;
-        for id in descendants {
+        let path = std::path::Path::new(cgroup);
+        let target_ids = if confidentiality_mode {
+            crate::cgroup::collect_descendant_cgroup_ids(path)
+        } else {
+            crate::cgroup::cgroup_id(path).map(|id| vec![id])
+        }
+        .with_context(|| format!("Failed to access cgroup path: {cgroup}"))?;
+        for id in target_ids {
             if seen.insert(id) {
                 ids.push(id);
             }
@@ -3607,12 +3621,20 @@ pub fn systing(
                 format!("Failed to set missed_events map size to {num_cpus} entries")
             })?;
 
-        // Resolve the full cgroup filter set (each --cgroup target plus its whole
-        // subtree) before load so the cgroups map can be sized to fit. Pointing
-        // --cgroup at a high-level node (a systemd slice, kubepods.slice, the root)
-        // can enumerate far more than the static default, so size the map to the
-        // actual count rather than risk an E2BIG failure when populating it.
-        let cgroup_filter_ids = collect_cgroup_filter_ids(&opts)?;
+        // Resolve the cgroup filter set before load so the cgroups map can be
+        // sized to fit. Normally that is one id per --cgroup target (the BPF side
+        // matches by ancestry); under lockdown confidentiality mode it is each
+        // target's whole subtree, and pointing --cgroup at a high-level node (a
+        // systemd slice, kubepods.slice, the root) can then enumerate far more
+        // than the static default — so size the map to the actual count rather
+        // than risk an E2BIG failure when populating it.
+        let confidentiality_mode = open_skel
+            .maps
+            .rodata_data
+            .as_deref()
+            .map(|rodata| rodata.tool_config.confidentiality_mode != 0)
+            .unwrap_or(false);
+        let cgroup_filter_ids = collect_cgroup_filter_ids(&opts, confidentiality_mode)?;
         if !cgroup_filter_ids.is_empty() {
             open_skel
                 .maps
