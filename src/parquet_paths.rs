@@ -17,6 +17,7 @@ pub struct ParquetPaths {
     pub irq_slice: PathBuf,
     pub softirq_slice: PathBuf,
     pub wakeup_new: PathBuf,
+    pub sched_migrate: PathBuf,
     pub process_exit: PathBuf,
     pub counter: PathBuf,
     pub counter_track: PathBuf,
@@ -79,6 +80,7 @@ impl ParquetPaths {
             irq_slice: dir.join("irq_slice.parquet"),
             softirq_slice: dir.join("softirq_slice.parquet"),
             wakeup_new: dir.join("wakeup_new.parquet"),
+            sched_migrate: dir.join("sched_migrate.parquet"),
             process_exit: dir.join("process_exit.parquet"),
             counter: dir.join("counter.parquet"),
             counter_track: dir.join("counter_track.parquet"),
@@ -135,6 +137,7 @@ impl ParquetPaths {
             irq_slice: dir.join(format!("{trace_id}_irq_slice.parquet")),
             softirq_slice: dir.join(format!("{trace_id}_softirq_slice.parquet")),
             wakeup_new: dir.join(format!("{trace_id}_wakeup_new.parquet")),
+            sched_migrate: dir.join(format!("{trace_id}_sched_migrate.parquet")),
             process_exit: dir.join(format!("{trace_id}_process_exit.parquet")),
             counter: dir.join(format!("{trace_id}_counter.parquet")),
             counter_track: dir.join(format!("{trace_id}_counter_track.parquet")),
@@ -172,7 +175,7 @@ impl ParquetPaths {
     }
 
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 39] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 40] {
         [
             PathEntry {
                 path: &self.process,
@@ -201,6 +204,10 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.wakeup_new,
                 name: "wakeup_new",
+            },
+            PathEntry {
+                path: &self.sched_migrate,
+                name: "sched_migrate",
             },
             PathEntry {
                 path: &self.process_exit,

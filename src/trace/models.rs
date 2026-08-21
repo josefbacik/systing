@@ -142,6 +142,28 @@ pub struct WakeupNewRecord {
     pub target_cpu: i32,
 }
 
+/// Sched migrate record - a task's CPU changed (`sched_migrate_task`).
+///
+/// Emitted at wakeup when the scheduler placed the task on a CPU other than
+/// the one it last ran on (the runnable marker in `thread_state` is recorded
+/// before that choice and carries only the previous CPU), and whenever the
+/// load balancer, NUMA balancing, or an affinity change moves a runnable
+/// task. A woken task with no migrate record before its next slice ran on
+/// its previous CPU.
+///
+/// # Fields
+/// - `ts`: Timestamp in nanoseconds
+/// - `utid`: Unique thread ID of the migrated thread
+/// - `orig_cpu`: CPU the task is leaving (its CPU before the move)
+/// - `dest_cpu`: CPU the task is moved to
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SchedMigrateRecord {
+    pub ts: i64,
+    pub utid: i64,
+    pub orig_cpu: i32,
+    pub dest_cpu: i32,
+}
+
 /// Process exit record - represents a process/thread exiting.
 ///
 /// # Fields
@@ -657,6 +679,7 @@ pub struct ExtractedData {
     pub irq_slices: Vec<IrqSliceRecord>,
     pub softirq_slices: Vec<SoftirqSliceRecord>,
     pub wakeup_news: Vec<WakeupNewRecord>,
+    pub sched_migrates: Vec<SchedMigrateRecord>,
     pub process_exits: Vec<ProcessExitRecord>,
     pub counters: Vec<CounterRecord>,
     pub counter_tracks: Vec<CounterTrackRecord>,

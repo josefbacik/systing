@@ -111,6 +111,16 @@ pub fn wakeup_new_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Schema for sched_migrate.parquet
+pub fn sched_migrate_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("utid", DataType::Int64, false),
+        Field::new("orig_cpu", DataType::Int32, false),
+        Field::new("dest_cpu", DataType::Int32, false),
+    ]))
+}
+
 /// Schema for process_exit.parquet
 pub fn process_exit_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
