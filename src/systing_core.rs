@@ -2511,21 +2511,28 @@ fn cycles_sample_period(target_freq_hz: u64) -> u64 {
     (max_hz / target_freq_hz).max(1)
 }
 
-fn setup_perf_events(
+/// Open the per-CPU clock sampling events (hardware cpu-cycles, falling back
+/// to the software cpu-clock inside a VM) and attach `systing_perf_event_clock`
+/// to them.
+///
+/// This runs LAST in the attach sequence — after `skel.attach()`, the
+/// USDT/uprobe probes and the memory-alloc uprobes — so the stack sampler
+/// never observes the tracer's own attach phase. Enabling a tracepoint,
+/// raw_tp or fentry link goes through `text_poke_bp`, whose IPI batches stall
+/// every CPU on a many-core host; a sampler that is already live records that
+/// stall (kworkers spinning on `text_mutex`, the IPI handlers themselves) as
+/// if it were the workload. On a 224-CPU host mid IPI storm the attach phase
+/// ran ~9 s and read as ~6 cores of lock contention in a 10 s capture.
+/// The capture window is unchanged: `--duration` starts counting after the
+/// whole attach sequence either way.
+fn attach_clock_sampler(
     skel: &mut SystingSystemSkel,
     opts: &Config,
-    counters: &PerfCounters,
-    perf_counter_names: &[String],
     num_cpus: u32,
-) -> Result<(
-    Vec<libbpf_rs::Link>,
-    Vec<PerfOpenEvents>,
-    ClockSamplingConfig,
-)> {
+) -> Result<(Vec<libbpf_rs::Link>, ClockSamplingConfig)> {
     use crate::perf;
 
     let mut perf_links = Vec::new();
-    let mut event_files_vec = Vec::new();
 
     // Clamp to avoid divide-by-zero for library callers that bypass the
     // clap range(1..) validator on --sample-freq.
@@ -2605,6 +2612,22 @@ fn setup_perf_events(
         perf_links.push(link);
     }
 
+    Ok((perf_links, clock_sampling))
+}
+
+/// Open the `--perf-counter` events (plus the `slots` events topdown counters
+/// need) and populate the `perf_counters` map the BPF side reads on context
+/// switches. Runs before `skel.attach()` so the map is populated before the
+/// first event that reads it; the clock sampler is attached separately and
+/// last (see [`attach_clock_sampler`]).
+fn setup_perf_counter_events(
+    skel: &mut SystingSystemSkel,
+    counters: &PerfCounters,
+    perf_counter_names: &[String],
+    num_cpus: u32,
+) -> Result<Vec<PerfOpenEvents>> {
+    let mut event_files_vec = Vec::new();
+
     // Determine if we need slots for topdown counters
     let need_slots = perf_counter_names
         .iter()
@@ -2660,7 +2683,7 @@ fn setup_perf_events(
         event_files_vec.push(slots_files);
     }
 
-    Ok((perf_links, event_files_vec, clock_sampling))
+    Ok(event_files_vec)
 }
 
 /// Returns PIDs to attach probes to with their resolved library paths.
@@ -3731,15 +3754,10 @@ pub fn systing(
             &task_info_tx,
         )?;
 
-        // Set up perf events (clock events and counter events)
-        let (_perf_links, _events_files, clock_sampling) =
-            setup_perf_events(&mut skel, &opts, &counters, &perf_counter_names, num_cpus)?;
-
-        // Record which event/period drives stack sampling so the trace's
-        // sysinfo row documents what each stack sample represents. Perf
-        // events are opened once per recording session, so the set cannot
-        // race or repeat.
-        let _ = recorder.clock_sampling.set(clock_sampling);
+        // Set up the perf counter events and populate the perf_counters map
+        // before anything that reads it is attached.
+        let _events_files =
+            setup_perf_counter_events(&mut skel, &counters, &perf_counter_names, num_cpus)?;
 
         skel.attach().with_context(|| {
             "Failed to attach BPF programs to tracepoints. Check if tracepoints are enabled."
@@ -3760,6 +3778,17 @@ pub fn systing(
         } else {
             Vec::new()
         };
+
+        // Every tracepoint, raw_tp, fentry, USDT and uprobe link is in place:
+        // start the CPU stack sampler now, so the capture never contains the
+        // tracer's own attach phase (see attach_clock_sampler).
+        let (_perf_links, clock_sampling) = attach_clock_sampler(&mut skel, &opts, num_cpus)?;
+
+        // Record which event/period drives stack sampling so the trace's
+        // sysinfo row documents what each stack sample represents. Perf
+        // events are opened once per recording session, so the set cannot
+        // race or repeat.
+        let _ = recorder.clock_sampling.set(clock_sampling);
 
         // Signal the traced child to exec now that BPF is fully attached.
         // All tracing is active, so we capture everything from exec onwards.
