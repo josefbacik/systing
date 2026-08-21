@@ -10,9 +10,12 @@
 //!
 //! Definitions (all times in ns; "window" = the analyzed time range):
 //! - **wakeup latency**: first `sched_slice.ts` of a thread at or after its
-//!   runnable marker (`thread_state.state = 0`, stamped with the wakeup's
-//!   target CPU) minus the marker's ts. Split by placement: the thread ran on
-//!   the target CPU (same) or elsewhere (cross).
+//!   runnable marker (`thread_state.state = 0`) minus the marker's ts. The
+//!   marker's `cpu` is recorded at `sched_waking`, which the kernel fires
+//!   BEFORE it picks a CPU, so it is the CPU the thread last ran on, not where
+//!   it was queued. The split is therefore: the thread ran on its previous CPU
+//!   (`prev_cpu`) or somewhere else (`migrated`). Markers from `wakeup_new`
+//!   (new tasks; their `target_cpu` is the placement) are included.
 //! - **preempt wait**: a slice that ended with `end_state` NULL left the thread
 //!   runnable; the wait is until its next slice starts.
 //! - **run delay**: wakeup latency and preempt wait together (all
@@ -25,22 +28,28 @@
 //!   woke, and ran elsewhere than it last ran), a "preempt migration" did not
 //!   (it was moved while runnable).
 //! - **runqueue length** of a CPU: 1 if it runs a non-idle task, plus the
-//!   threads runnable-but-not-running that are assigned to it — a woken thread
-//!   to its wakeup target CPU, a preempted thread to the CPU it was preempted
-//!   on — until each starts running. A runnable thread the load balancer moves
-//!   before it runs is still counted on its previous CPU (the trace carries no
-//!   migrate event), so the per-CPU length is an approximation; the node-wide
-//!   total is exact. Distributions are time-weighted over (cpu × time).
+//!   threads that were PREEMPTED on it and have not run again (their queue is
+//!   known: they stay runnable on that CPU until they run or are moved; the
+//!   trace carries no migrate event, so a balancer move before they run is
+//!   invisible). Woken threads are NOT assigned to any CPU until they run —
+//!   the trace does not record their placement — and are counted separately,
+//!   node-wide, as `unplaced_avg` (time-weighted average number of woken
+//!   threads waiting to run). Distributions are time-weighted over
+//!   (cpu × time). `wakeups_ran` per CPU is the placement the scheduler
+//!   actually made (the CPU of the first slice after the marker) and is exact.
 //! - **work-conservation violation**: time during which some observed CPU has
-//!   runqueue length > 1 while another observed CPU is idle.
+//!   runqueue length > 1 (a preempted thread waiting behind a running one)
+//!   while another observed CPU is idle. Woken-unplaced threads do not count,
+//!   so this is the balancer-failure shape, not the wakeup-placement shape.
 //! - Per-CPU accounting starts at the CPU's first event in the window (before
 //!   that its state is unknown); CPUs with no events at all are reported as
 //!   unobserved, never assumed idle or busy. Waits that do not end inside the
 //!   window are counted as censored, never extrapolated.
 //!
 //! Percentiles come from a log-linear histogram (16 sub-buckets per octave,
-//! upper bucket edge reported, so a percentile is within ~6% of the exact
-//! value); averages, sums and maxima are exact. The `hist_log2` arrays are the
+//! upper bucket edge reported, so a percentile is at most 6.25% above the
+//! exact value and never above the exact maximum); averages, sums and maxima
+//! are exact. The `hist_log2` arrays are the
 //! same histograms folded to one count per octave so rows from different
 //! captures and hosts can be merged.
 
@@ -222,12 +231,17 @@ impl LogHist {
     }
 }
 
-/// Time-weighted distribution of runqueue length over (cpu × time).
+/// Time-weighted distribution of per-CPU runqueue length (running + preempted
+/// waiters) over (cpu × time), plus the node-wide count of woken threads that
+/// have no known CPU until they run.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RqDist {
     /// Total observed (cpu × time) in ns the distribution is over.
     pub observed_cpu_ns: u64,
     pub avg: f64,
+    /// Time-weighted average number of woken, not-yet-run threads on the node
+    /// (not attributed to a CPU because the trace records no placement).
+    pub unplaced_avg: f64,
     pub p50: u32,
     pub p90: u32,
     pub p99: u32,
@@ -257,8 +271,13 @@ pub struct PerCpu {
     pub busy_ns: Vec<u64>,
     pub idle_ns: Vec<u64>,
     pub switches: Vec<u64>,
-    pub wakeups_targeted: Vec<u64>,
+    /// Runnable markers whose thread last ran on this CPU (the CPU recorded at
+    /// `sched_waking`, before placement).
+    pub wakeups_prev_cpu: Vec<u64>,
+    /// Wakeups whose first run landed on this CPU (the placement actually made).
     pub wakeups_ran: Vec<u64>,
+    /// Runnable wait (preempt waits on this CPU + wakeup waits of threads that
+    /// then ran on this CPU).
     pub runnable_wait_ns: Vec<u64>,
     pub rq_avg: Vec<f64>,
     pub unobserved_cpus: Vec<u32>,
@@ -267,13 +286,15 @@ pub struct PerCpu {
 /// Imbalance metrics over the observed CPUs.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Imbalance {
-    /// Busiest CPU's share of total busy time (1/ncpu = perfectly even, 1.0 = one CPU does everything).
+    /// Busiest CPU's share of total busy time (1/observed_cpus = perfectly even, 1.0 = one CPU does everything).
     pub busy_max_share: f64,
     /// Coefficient of variation (stddev / mean) of per-CPU busy time.
     pub busy_cv: f64,
+    /// Same two over `wakeups_ran` (where wakeups actually landed).
     pub wakeups_max_share: f64,
     pub wakeups_cv: f64,
-    /// Time some observed CPU had runqueue length > 1 while another was idle.
+    /// Time some observed CPU had a preempted thread waiting behind a running
+    /// one (runqueue length > 1) while another observed CPU was idle.
     pub work_conservation_violation_ns: u64,
     /// The same as a fraction of the window.
     pub work_conservation_violation_frac: f64,
@@ -300,6 +321,7 @@ pub struct SchedAggregateMeta {
     pub slices: u64,
     pub runnable_markers: u64,
     pub wakeup_new: u64,
+    /// Non-idle threads with at least one event in the window.
     pub threads_seen: u64,
     /// Runnable markers whose thread never ran inside the window.
     pub wakeup_censored: u64,
@@ -309,6 +331,9 @@ pub struct SchedAggregateMeta {
     pub spurious_wakeups: u64,
     /// Slice starts for a thread with no marker (first run in the window).
     pub first_runs: u64,
+    /// Threads still running when the window ended (the recorder closes their
+    /// slice with no end state; not counted as preemptions).
+    pub running_at_end: u64,
     /// Cumulative scheduler events the BPF side reported dropped (None = no counter track in the trace).
     pub missed_sched_events: Option<u64>,
     pub aggregate_ms: u64,
@@ -319,8 +344,10 @@ pub struct SchedAggregateMeta {
 pub struct SchedAggregate {
     pub meta: SchedAggregateMeta,
     pub wakeup_latency: Dist,
-    pub wakeup_latency_same_cpu: Dist,
-    pub wakeup_latency_cross_cpu: Dist,
+    /// Wakeups whose first run was on the CPU the thread last ran on.
+    pub wakeup_latency_prev_cpu: Dist,
+    /// Wakeups whose first run was on a different CPU than it last ran on.
+    pub wakeup_latency_migrated: Dist,
     pub preempt_wait: Dist,
     pub run_delay: Dist,
     pub slice_len: Dist,
@@ -333,11 +360,12 @@ pub struct SchedAggregate {
 }
 
 // Event kinds in the merged stream; ordered so that at one timestamp a slice
-// end is handled before the slice that starts on the same CPU, then markers.
+// end is handled first, then runnable markers, then the slice that starts (a
+// marker stamped at the same ns as the run it precedes still yields a wait).
 const EV_END: i32 = 0;
-const EV_START: i32 = 1;
-const EV_WAKING: i32 = 2;
-const EV_NEW: i32 = 3;
+const EV_WAKING: i32 = 1;
+const EV_NEW: i32 = 2;
+const EV_START: i32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum WaitKind {
@@ -378,7 +406,7 @@ struct CpuState {
     busy_ns: u64,
     idle_ns: u64,
     switches: u64,
-    wakeups_targeted: u64,
+    wakeups_prev_cpu: u64,
     wakeups_ran: u64,
     runnable_wait_ns: u64,
 }
@@ -401,10 +429,13 @@ struct Pass {
     n_observed: u32,
     last_global_t: Option<i64>,
     wcv_ns: u64,
+    // Woken threads with no known CPU until they run (node-wide).
+    unplaced: u64,
+    unplaced_weight: u128,
     // Distributions.
     wakeup_lat: LogHist,
-    wakeup_same: LogHist,
-    wakeup_cross: LogHist,
+    wakeup_prev: LogHist,
+    wakeup_migrated: LogHist,
     preempt_wait: LogHist,
     run_delay: LogHist,
     slice_len: LogHist,
@@ -419,6 +450,7 @@ struct Pass {
     preempt_migrations: u64,
     spurious_wakeups: u64,
     first_runs: u64,
+    running_at_end: u64,
     // Tail attribution: per-thread-name histograms of each wait kind, so the
     // threads above the p99 can be named without a second pass. Keyed by
     // comm (bounded by the distinct thread names in the window); empty when
@@ -447,9 +479,11 @@ impl Pass {
             n_observed: 0,
             last_global_t: None,
             wcv_ns: 0,
+            unplaced: 0,
+            unplaced_weight: 0,
             wakeup_lat: LogHist::new(),
-            wakeup_same: LogHist::new(),
-            wakeup_cross: LogHist::new(),
+            wakeup_prev: LogHist::new(),
+            wakeup_migrated: LogHist::new(),
             preempt_wait: LogHist::new(),
             run_delay: LogHist::new(),
             slice_len: LogHist::new(),
@@ -463,6 +497,7 @@ impl Pass {
             preempt_migrations: 0,
             spurious_wakeups: 0,
             first_runs: 0,
+            running_at_end: 0,
             names,
             attribute_tails,
             wakeup_by_comm: HashMap::new(),
@@ -490,8 +525,12 @@ impl Pass {
     /// work-conservation state that held during it.
     fn advance_global(&mut self, t: i64) {
         if let Some(last) = self.last_global_t {
-            if t > last && self.n_over > 0 && self.n_idle > 0 {
-                self.wcv_ns += (t - last) as u64;
+            if t > last {
+                let dt = (t - last) as u64;
+                if self.n_over > 0 && self.n_idle > 0 {
+                    self.wcv_ns += dt;
+                }
+                self.unplaced_weight += (self.unplaced as u128) * (dt as u128);
             }
         }
         self.last_global_t = Some(t);
@@ -558,9 +597,9 @@ impl Pass {
             WaitKind::Wakeup => {
                 self.wakeup_lat.record(wait_ns);
                 if same_cpu {
-                    self.wakeup_same.record(wait_ns);
+                    self.wakeup_prev.record(wait_ns);
                 } else {
-                    self.wakeup_cross.record(wait_ns);
+                    self.wakeup_migrated.record(wait_ns);
                 }
             }
             WaitKind::Preempt => self.preempt_wait.record(wait_ns),
@@ -600,12 +639,22 @@ impl Pass {
                     let wait_ns = (t - since).max(0) as u64;
                     let same = wc == cpu;
                     self.record_wait(utid, kind, wait_ns, same);
-                    self.change_rq(wc, t, |c| {
-                        c.waiting = c.waiting.saturating_sub(1);
-                        c.runnable_wait_ns += wait_ns;
-                    });
-                    if kind == WaitKind::Wakeup {
-                        self.cpu_mut(cpu).wakeups_ran += 1;
+                    match kind {
+                        WaitKind::Preempt => {
+                            // Queued on the CPU it was preempted on.
+                            self.change_rq(wc, t, |c| {
+                                c.waiting = c.waiting.saturating_sub(1);
+                                c.runnable_wait_ns += wait_ns;
+                            });
+                        }
+                        WaitKind::Wakeup => {
+                            // Placement is known only now: the run CPU.
+                            self.advance_global(t);
+                            self.unplaced = self.unplaced.saturating_sub(1);
+                            let c = self.cpu_mut(cpu);
+                            c.wakeups_ran += 1;
+                            c.runnable_wait_ns += wait_ns;
+                        }
                     }
                 }
                 ThreadSt::Running { cpu: rc } => {
@@ -664,7 +713,15 @@ impl Pass {
             self.thread_mut(utid).st = ThreadSt::Sleeping;
             return;
         }
-        let preempted = end_state.is_none();
+        // The recorder closes the slice of every thread still running at the
+        // end of the trace with no end state; that is not a preemption.
+        let at_end = end_state.is_none() && t >= self.window_end;
+        let preempted = end_state.is_none() && !at_end;
+        if at_end {
+            self.running_at_end += 1;
+            self.involuntary = self.involuntary.saturating_sub(1);
+            self.voluntary += 1;
+        }
         self.change_rq(cpu, t, |c| {
             if c.running == Some(utid) {
                 c.running = None;
@@ -701,10 +758,12 @@ impl Pass {
                 self.thread_mut(utid).woke_since_last_run = true;
             }
             ThreadSt::Unknown | ThreadSt::Sleeping => {
-                self.change_rq(target_cpu, t, |c| {
-                    c.waiting += 1;
-                    c.wakeups_targeted += 1;
-                });
+                // The marker's CPU is where the thread last ran, not where it
+                // will be queued; count it there and keep the thread unplaced
+                // until its first slice says where it landed.
+                self.advance_global(t);
+                self.cpu_mut(target_cpu).wakeups_prev_cpu += 1;
+                self.unplaced += 1;
                 let th = self.thread_mut(utid);
                 th.st = ThreadSt::Waiting {
                     since: t,
@@ -974,7 +1033,7 @@ impl AnalyzeDb {
             busy_ns: vec![0; n],
             idle_ns: vec![0; n],
             switches: vec![0; n],
-            wakeups_targeted: vec![0; n],
+            wakeups_prev_cpu: vec![0; n],
             wakeups_ran: vec![0; n],
             runnable_wait_ns: vec![0; n],
             rq_avg: vec![0.0; n],
@@ -989,7 +1048,7 @@ impl AnalyzeDb {
                     per_cpu.busy_ns[i] = c.busy_ns;
                     per_cpu.idle_ns[i] = c.idle_ns;
                     per_cpu.switches[i] = c.switches;
-                    per_cpu.wakeups_targeted[i] = c.wakeups_targeted;
+                    per_cpu.wakeups_prev_cpu[i] = c.wakeups_prev_cpu;
                     per_cpu.wakeups_ran[i] = c.wakeups_ran;
                     per_cpu.runnable_wait_ns[i] = c.runnable_wait_ns;
                     per_cpu.rq_avg[i] = if c.observed_ns > 0 {
@@ -998,9 +1057,16 @@ impl AnalyzeDb {
                         0.0
                     };
                     observed_busy.push(c.busy_ns);
-                    observed_wakeups.push(c.wakeups_targeted);
+                    observed_wakeups.push(c.wakeups_ran);
                 }
-                _ => per_cpu.unobserved_cpus.push(i as u32),
+                other => {
+                    // A CPU only named as a wakeup's previous CPU is not
+                    // observed, but the count is still a fact about it.
+                    if let Some(c) = other {
+                        per_cpu.wakeups_prev_cpu[i] = c.wakeups_prev_cpu;
+                    }
+                    per_cpu.unobserved_cpus.push(i as u32);
+                }
             }
         }
         let (busy_max_share, busy_cv) = share_and_cv(&observed_busy);
@@ -1046,6 +1112,11 @@ impl AnalyzeDb {
             } else {
                 0.0
             },
+            unplaced_avg: if window_ns > 0 {
+                pass.unplaced_weight as f64 / window_ns as f64
+            } else {
+                0.0
+            },
             p50: rq_pct(0.50),
             p90: rq_pct(0.90),
             p99: rq_pct(0.99),
@@ -1074,17 +1145,22 @@ impl AnalyzeDb {
                 slices: pass.slices,
                 runnable_markers: pass.markers,
                 wakeup_new: pass.new_tasks,
-                threads_seen: pass.threads.len() as u64,
+                threads_seen: pass
+                    .threads
+                    .keys()
+                    .filter(|u| !pass.idle_utids.contains_key(u))
+                    .count() as u64,
                 wakeup_censored,
                 preempt_censored,
                 spurious_wakeups: pass.spurious_wakeups,
                 first_runs: pass.first_runs,
+                running_at_end: pass.running_at_end,
                 missed_sched_events,
                 aggregate_ms: started.elapsed().as_millis() as u64,
             },
             wakeup_latency: pass.wakeup_lat.dist(),
-            wakeup_latency_same_cpu: pass.wakeup_same.dist(),
-            wakeup_latency_cross_cpu: pass.wakeup_cross.dist(),
+            wakeup_latency_prev_cpu: pass.wakeup_prev.dist(),
+            wakeup_latency_migrated: pass.wakeup_migrated.dist(),
             preempt_wait: pass.preempt_wait.dist(),
             run_delay: pass.run_delay.dist(),
             slice_len: pass.slice_len.dist(),
@@ -1248,9 +1324,10 @@ mod tests {
     }
 
     #[test]
-    fn wakeup_latency_same_cpu() {
-        // A wakes at 1000 targeting cpu 0, runs on cpu 0 from 1500 for 500 ns,
-        // then sleeps (end_state 1). Idle fills the rest of cpu 0.
+    fn wakeup_latency_prev_cpu() {
+        // A wakes at 1000 (marker cpu 0 = where it last ran), runs on cpu 0
+        // from 1500 for 500 ns, then sleeps (end_state 1). Idle fills the rest
+        // of cpu 0.
         let db = db_with(
             &[
                 (0, 1500, 0, IDLE, None),
@@ -1265,8 +1342,8 @@ mod tests {
             .unwrap();
         assert_eq!(r.wakeup_latency.count, 1);
         assert_eq!(r.wakeup_latency.sum_ns, 500);
-        assert_eq!(r.wakeup_latency_same_cpu.count, 1);
-        assert_eq!(r.wakeup_latency_cross_cpu.count, 0);
+        assert_eq!(r.wakeup_latency_prev_cpu.count, 1);
+        assert_eq!(r.wakeup_latency_migrated.count, 0);
         assert_eq!(r.run_delay.count, 1);
         assert_eq!(r.slice_len.count, 1);
         assert_eq!(r.slice_len.sum_ns, 500);
@@ -1276,26 +1353,35 @@ mod tests {
         assert_eq!(r.meta.wakeup_censored, 0);
         assert_eq!(r.per_cpu.busy_ns[0], 500);
         assert_eq!(r.per_cpu.idle_ns[0], 2500);
-        assert_eq!(r.per_cpu.wakeups_targeted[0], 1);
+        assert_eq!(r.per_cpu.wakeups_prev_cpu[0], 1);
         assert_eq!(r.per_cpu.wakeups_ran[0], 1);
         assert_eq!(r.per_cpu.runnable_wait_ns[0], 500);
         assert_eq!(r.meta.window_ns, 3000);
-        // Runqueue over cpu 0 time: 0 for [0,1000), 1 for [1000,2000) (waiting then running), 0 after.
+        assert_eq!(r.meta.threads_seen, 1);
+        // Runqueue over cpu 0 time: the woken thread is unplaced while it
+        // waits [1000,1500), so the CPU's queue is 1 only while A runs.
         assert_eq!(r.runqueue.observed_cpu_ns, 3000);
         assert!(
-            (r.runqueue.avg - 1000.0 / 3000.0).abs() < 1e-9,
+            (r.runqueue.avg - 500.0 / 3000.0).abs() < 1e-9,
             "avg {}",
             r.runqueue.avg
         );
+        assert!(
+            (r.runqueue.unplaced_avg - 500.0 / 3000.0).abs() < 1e-9,
+            "unplaced {}",
+            r.runqueue.unplaced_avg
+        );
         assert_eq!(r.runqueue.max, 1);
         assert_eq!(r.imbalance.work_conservation_violation_ns, 0);
+        assert_eq!(r.meta.running_at_end, 0);
     }
 
     #[test]
-    fn wakeup_cross_cpu_migration_and_preempt_wait() {
-        // B wakes targeting cpu 1 at 100 but runs on cpu 0 at 600 (cross-CPU
-        // placement). It is preempted at 1600 (end_state NULL), waits, then
-        // runs again on cpu 1 from 2600 (a preempt migration), and sleeps.
+    fn wakeup_migrated_and_preempt_wait() {
+        // B wakes at 100 having last run on cpu 1, but runs on cpu 0 at 600
+        // (migrated at wakeup). It is preempted at 1600 (end_state NULL),
+        // waits, then runs again on cpu 1 from 2600 (a preempt migration),
+        // and sleeps.
         let db = db_with(
             &[
                 (0, 600, 0, IDLE, None),
@@ -1313,8 +1399,8 @@ mod tests {
             .unwrap();
         assert_eq!(r.wakeup_latency.count, 1);
         assert_eq!(r.wakeup_latency.sum_ns, 500);
-        assert_eq!(r.wakeup_latency_cross_cpu.count, 1);
-        assert_eq!(r.wakeup_latency_same_cpu.count, 0);
+        assert_eq!(r.wakeup_latency_migrated.count, 1);
+        assert_eq!(r.wakeup_latency_prev_cpu.count, 0);
         assert_eq!(r.preempt_wait.count, 1);
         assert_eq!(r.preempt_wait.sum_ns, 1000);
         assert_eq!(r.run_delay.count, 2);
@@ -1325,28 +1411,43 @@ mod tests {
         assert_eq!(r.switches.migrations, 1);
         assert_eq!(r.switches.preempt_migrations, 1);
         assert_eq!(r.switches.wakeup_migrations, 0);
-        // The wakeup wait was assigned to the target cpu 1, the preempt wait to cpu 0.
-        assert_eq!(r.per_cpu.runnable_wait_ns[1], 500);
-        assert_eq!(r.per_cpu.runnable_wait_ns[0], 1000);
-        assert_eq!(r.per_cpu.wakeups_targeted[1], 1);
+        // The wakeup wait lands on the CPU it ran on (cpu 0), as does the
+        // preempt wait (preempted on cpu 0): 500 + 1000.
+        assert_eq!(r.per_cpu.runnable_wait_ns[0], 1500);
+        assert_eq!(r.per_cpu.runnable_wait_ns[1], 0);
+        assert_eq!(r.per_cpu.wakeups_prev_cpu[1], 1);
         assert_eq!(r.per_cpu.wakeups_ran[0], 1);
+        // Runqueue: cpu 0 has B running [600,1600) and B queued (preempted)
+        // [1600,2600) → 1 over 2000 ns; cpu 1 has B running [2600,3000).
+        assert!(
+            (r.runqueue.avg - 2400.0 / 7200.0).abs() < 1e-9,
+            "avg {}",
+            r.runqueue.avg
+        );
+        // Unplaced: B between its marker (100) and its first run (600).
+        assert!(
+            (r.runqueue.unplaced_avg - 500.0 / 3600.0).abs() < 1e-9,
+            "unplaced {}",
+            r.runqueue.unplaced_avg
+        );
         // Work-conservation violation: B waits on cpu 0's queue [1600,2600)
         // while cpu 1 is idle — but cpu 0 itself is idle during that wait, so
-        // its rq is 1 (not >1): no violation. During [100,600) cpu 1 has
-        // rq 1 (B waiting) and cpu 0 is idle: rq 1 is not >1 either.
+        // its rq is 1 (not >1): no violation.
         assert_eq!(r.imbalance.work_conservation_violation_ns, 0);
     }
 
     #[test]
     fn work_conservation_violation_and_imbalance() {
-        // cpu 0 runs A and has B waiting behind it (rq 2) for [1000,2000)
-        // while cpu 1 sits idle the whole window: 1000 ns of violation, and
-        // all busy time on cpu 0.
+        // cpu 0 runs A [1000,1500), preempts it for B [1500,2000) (A waits
+        // behind B: rq 2), then A finishes [2000,2500); cpu 1 sits idle the
+        // whole window: 500 ns of violation, and all busy time on cpu 0. B's
+        // wakeup (marker 1000) is unplaced until it runs and does not count.
         let db = db_with(
             &[
                 (0, 1000, 0, IDLE, None),
-                (1000, 1000, 0, A, Some(1)),
-                (2000, 500, 0, B, Some(1)),
+                (1000, 500, 0, A, None),
+                (1500, 500, 0, B, Some(1)),
+                (2000, 500, 0, A, Some(1)),
                 (2500, 500, 0, IDLE, None),
                 (0, 3000, 1, IDLE, None),
             ],
@@ -1356,17 +1457,59 @@ mod tests {
         let r = db
             .sched_aggregate(&SchedAggregateParams::default())
             .unwrap();
-        assert_eq!(r.imbalance.work_conservation_violation_ns, 1000);
-        assert!((r.imbalance.work_conservation_violation_frac - 1000.0 / 3000.0).abs() < 1e-9);
+        assert_eq!(r.imbalance.work_conservation_violation_ns, 500);
+        assert!((r.imbalance.work_conservation_violation_frac - 500.0 / 3000.0).abs() < 1e-9);
         assert_eq!(r.imbalance.busy_max_share, 1.0);
         assert!(r.imbalance.busy_cv > 0.99, "cv {}", r.imbalance.busy_cv);
+        // Wakeup placement: both ran on cpu 0.
+        assert_eq!(r.per_cpu.wakeups_ran[0], 2);
+        assert_eq!(r.imbalance.wakeups_max_share, 1.0);
         assert_eq!(r.runqueue.max, 2);
         assert_eq!(r.meta.observed_cpus, 2);
         assert_eq!(r.per_cpu.unobserved_cpus, Vec::<u32>::new());
-        // B's wakeup latency is 1000 (waiting behind A), A's is 500.
+        // A's wakeup latency is 500, B's is 500 (marker 1000, ran 1500);
+        // A's preempt wait is 500.
         assert_eq!(r.wakeup_latency.count, 2);
-        assert_eq!(r.wakeup_latency.sum_ns, 1500);
-        assert_eq!(r.wakeup_latency.max_ns, 1000);
+        assert_eq!(r.wakeup_latency.sum_ns, 1000);
+        assert_eq!(r.preempt_wait.count, 1);
+        assert_eq!(r.preempt_wait.sum_ns, 500);
+        assert_eq!(r.switches.involuntary, 1);
+        assert_eq!(r.switches.voluntary, 2);
+    }
+
+    #[test]
+    fn running_at_window_end_is_not_a_preemption() {
+        // The recorder closes A's slice at the trace end with no end state.
+        let db = db_with(
+            &[(0, 1000, 0, IDLE, None), (1000, 1000, 0, A, None)],
+            &[(500, A, 0)],
+            &threads(),
+        );
+        let r = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        assert_eq!(r.meta.running_at_end, 1);
+        assert_eq!(r.meta.preempt_censored, 0);
+        assert_eq!(r.switches.involuntary, 0);
+        assert_eq!(r.switches.voluntary, 1);
+    }
+
+    #[test]
+    fn marker_at_slice_start_yields_zero_wait() {
+        // A marker stamped at the same ns as the run it precedes is ordered
+        // before the slice start, so the wait is 0, not a spurious wakeup.
+        let db = db_with(
+            &[(0, 1000, 0, IDLE, None), (1000, 500, 0, A, Some(1))],
+            &[(1000, A, 0)],
+            &threads(),
+        );
+        let r = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        assert_eq!(r.wakeup_latency.count, 1);
+        assert_eq!(r.wakeup_latency.sum_ns, 0);
+        assert_eq!(r.meta.spurious_wakeups, 0);
+        assert_eq!(r.meta.first_runs, 0);
     }
 
     #[test]

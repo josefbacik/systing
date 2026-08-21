@@ -738,20 +738,21 @@ fn run_sched_aggregate(args: SchedAggregateArgs) -> Result<()> {
         r.meta.threads_seen
     );
     eprintln!(
-        "# Censored: {} wakeups, {} preemptions; spurious wakeups {}; missed sched events {}",
+        "# Censored: {} wakeups, {} preemptions; running at end {}; spurious wakeups {}; missed sched events {}",
         r.meta.wakeup_censored,
         r.meta.preempt_censored,
+        r.meta.running_at_end,
         r.meta.spurious_wakeups,
         r.meta
             .missed_sched_events
             .map(|v| v.to_string())
             .unwrap_or_else(|| "n/a".to_string())
     );
-    eprintln!("# Percentiles are histogram-derived (within ~6%); per-CPU runqueue is approximate (no migrate events).");
+    eprintln!("# Percentiles are histogram-derived (<= 6.25% above exact); woken threads are unplaced until they run (no placement event in the trace).");
 
     fmt_dist("wakeup latency", &r.wakeup_latency);
-    fmt_dist("  same-cpu", &r.wakeup_latency_same_cpu);
-    fmt_dist("  cross-cpu", &r.wakeup_latency_cross_cpu);
+    fmt_dist("  ran on prev cpu", &r.wakeup_latency_prev_cpu);
+    fmt_dist("  migrated", &r.wakeup_latency_migrated);
     fmt_dist("preempt wait", &r.preempt_wait);
     fmt_dist("run delay", &r.run_delay);
     fmt_dist("on-cpu slice", &r.slice_len);
@@ -766,14 +767,15 @@ fn run_sched_aggregate(args: SchedAggregateArgs) -> Result<()> {
         r.switches.preempt_migrations
     );
     println!(
-        "{:<22} avg={:.3} p50={} p90={} p99={} max={} (time-weighted over {} observed cpus)",
+        "{:<22} avg={:.3} p50={} p90={} p99={} max={} (running + preempted waiters, time-weighted over {} observed cpus); woken-unplaced avg={:.3}",
         "runqueue length",
         r.runqueue.avg,
         r.runqueue.p50,
         r.runqueue.p90,
         r.runqueue.p99,
         r.runqueue.max,
-        r.meta.observed_cpus
+        r.meta.observed_cpus,
+        r.runqueue.unplaced_avg
     );
     println!(
         "{:<22} busy max-share={:.3} cv={:.3}; wakeup max-share={:.3} cv={:.3}; work-conservation violation {:.1}% of window",
