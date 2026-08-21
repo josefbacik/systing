@@ -18,6 +18,19 @@ pub struct PerfHwEvent {
     pub event_config: u64,
     pub disabled: bool,
     pub need_slots: bool,
+    /// Count only user-mode occurrences (perf_event_attr.exclude_kernel).
+    /// Used by the page-fault software event so the fault leg sees the same
+    /// user-mode fault population on every arch that the x86
+    /// exceptions:page_fault_user tracepoint sees.
+    pub exclude_kernel: bool,
+    /// Request PERF_SAMPLE_ADDR in perf_event_attr.sample_type so the
+    /// sample's `addr` field is always defined when a BPF program attached to
+    /// the event reads it (`ctx->addr`): the kernel only stores the address a
+    /// software event was raised with when it is non-zero, and zeroes the
+    /// field for every other sample only if the event asked for it. The
+    /// page-fault software event sets this so a fault at address 0 reads as 0
+    /// rather than as whatever was on the stack.
+    pub sample_addr: bool,
     pub cpus: Vec<u32>,
 }
 
@@ -138,6 +151,17 @@ pub const PERF_COUNT_HW_STALLED_CYCLES_FRONTEND: u64 = 7;
 pub const PERF_COUNT_HW_STALLED_CYCLES_BACKEND: u64 = 8;
 
 pub const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
+/// Software page-fault counter: fires once per page fault in the faulting
+/// task's context, on every arch. Opened per CPU with `sample_period = N` it
+/// samples 1:N kernel-side; with `exclude_kernel` it counts user-mode faults
+/// only. The memory recorder's fault leg uses it where the x86-only
+/// exceptions:page_fault_user tracepoint does not exist.
+#[allow(dead_code)]
+pub const PERF_COUNT_SW_PAGE_FAULTS: u64 = 2;
+
+/// perf_event_attr.sample_type bit: include the sample address
+/// (enum perf_event_sample_format, PERF_SAMPLE_ADDR).
+pub const PERF_SAMPLE_ADDR: u64 = 1 << 3;
 
 extern "C" {
     fn syscall(number: libc::c_long, ...) -> libc::c_long;
@@ -255,6 +279,12 @@ impl PerfOpenEvents {
             }
             if hwevent.disabled {
                 attr.flags.set_disabled(1);
+            }
+            if hwevent.exclude_kernel {
+                attr.flags.set_exclude_kernel(1);
+            }
+            if hwevent.sample_addr {
+                attr.sample_type |= PERF_SAMPLE_ADDR;
             }
             for cpu in hwevent.cpus.iter() {
                 let group_fd = if hwevent.need_slots {

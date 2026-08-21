@@ -236,25 +236,37 @@ fn test_memory_recorder_e2e() {
     );
     eprintln!("    {} memory_map rows join to stack table", joined);
 
-    // --- Check: memory_fault has rows (x86_64 only) ---
-    #[cfg(target_arch = "x86_64")]
-    {
-        eprintln!("  memory_fault events (x86_64)...");
-        let fault_rows: i64 = conn
-            .query_row(
-                &format!("SELECT COUNT(*) FROM memory_fault WHERE utid IN {UTIDS_FOR_PID}"),
-                [child_pid],
-                |row| row.get(0),
-            )
-            .expect("Failed to query memory_fault");
-        assert!(
-            fault_rows > 0,
-            "[memory_fault] no page-fault rows for workload pid {child_pid}"
-        );
-        eprintln!("    {} page-fault events", fault_rows);
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    eprintln!("  memory_fault: skipped (non-x86_64)");
+    // --- Check: memory_fault has rows (every arch: the x86 tracepoint path or
+    // the perf software page-fault event elsewhere) ---
+    eprintln!("  memory_fault events...");
+    let fault_rows: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM memory_fault WHERE utid IN {UTIDS_FOR_PID}"),
+            [child_pid],
+            |row| row.get(0),
+        )
+        .expect("Failed to query memory_fault");
+    assert!(
+        fault_rows > 0,
+        "[memory_fault] no page-fault rows for workload pid {child_pid}"
+    );
+    eprintln!("    {} page-fault events", fault_rows);
+    // The fault address is the one field both attach paths fill the same way;
+    // error_code is the x86 tracepoint's error_code and 0 on the software-event
+    // path, so only its presence is pinned here.
+    let fault_rows_with_addr: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM memory_fault WHERE utid IN {UTIDS_FOR_PID} AND addr != 0"
+            ),
+            [child_pid],
+            |row| row.get(0),
+        )
+        .expect("Failed to query memory_fault addr");
+    assert!(
+        fault_rows_with_addr > 0,
+        "[memory_fault] page-fault rows carry no fault address for workload pid {child_pid}"
+    );
 
     // --- Check: every memory_* utid joins to thread.utid ---
     eprintln!("  memory_*.utid -> thread.utid FK integrity...");
