@@ -256,12 +256,20 @@ fn assert_flamegraph_metadata(stderr: &str, stack_type: &str) {
         "missing total samples in stderr"
     );
     assert!(
+        stderr.contains("# Matched samples:"),
+        "missing matched samples in stderr"
+    );
+    assert!(
         stderr.contains("# Output samples:"),
         "missing output samples in stderr"
     );
     assert!(
         stderr.contains("# Unique stacks:"),
         "missing unique stacks in stderr"
+    );
+    assert!(
+        stderr.contains("# Output stacks:"),
+        "missing output stacks in stderr"
     );
     assert!(
         stderr.contains("# Time range:"),
@@ -399,6 +407,126 @@ fn test_flamegraph_with_min_count(db: &Path) {
     assert!(
         filtered_lines <= baseline_lines,
         "min-count=5 ({filtered_lines} stacks) should be <= unfiltered ({baseline_lines} stacks)"
+    );
+}
+
+/// Pull the integer after a `# <key>:` footer line.
+fn footer_count(stderr: &str, key: &str) -> u64 {
+    let prefix = format!("# {key}:");
+    stderr
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("missing `{prefix}` in stderr: {stderr}"))
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("`{prefix}` is not a number ({e}): {stderr}"))
+}
+
+fn test_flamegraph_top_and_max_depth(db: &Path) {
+    let baseline = run_analyze(&[
+        "stacktrace",
+        "flamegraph",
+        "-d",
+        db.to_str().unwrap(),
+        "-t",
+        "all",
+    ]);
+    assert!(baseline.status.success(), "{}", lossy(&baseline.stderr));
+    let baseline_stdout = lossy(&baseline.stdout);
+    let baseline_stderr = lossy(&baseline.stderr);
+    let baseline_lines: Vec<&str> = baseline_stdout.lines().collect();
+    let baseline_unique = footer_count(&baseline_stderr, "Unique stacks");
+    let baseline_matched = footer_count(&baseline_stderr, "Matched samples");
+    assert_eq!(
+        footer_count(&baseline_stderr, "Output stacks"),
+        baseline_lines.len() as u64,
+        "without --top every unique stack is emitted"
+    );
+    assert_eq!(baseline_unique, baseline_lines.len() as u64);
+    assert_eq!(
+        footer_count(&baseline_stderr, "Output samples"),
+        baseline_matched,
+        "without --top every matched sample is printed"
+    );
+    assert!(baseline_matched <= footer_count(&baseline_stderr, "Total trace samples"));
+
+    // --top 1: exactly one line (the heaviest stack), and the footer still
+    // reports the full unique-stack and matched-sample counts.
+    let output = run_analyze(&[
+        "stacktrace",
+        "flamegraph",
+        "-d",
+        db.to_str().unwrap(),
+        "-t",
+        "all",
+        "--top",
+        "1",
+    ]);
+    assert!(
+        output.status.success(),
+        "flamegraph (--top 1) failed: {}",
+        lossy(&output.stderr)
+    );
+    let stdout = lossy(&output.stdout);
+    let stderr = lossy(&output.stderr);
+    assert_valid_folded_output(&stdout);
+    assert_flamegraph_metadata(&stderr, "all");
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "--top 1 emits one stack: {stdout}"
+    );
+    assert_eq!(stdout.lines().next(), baseline_lines.first().copied());
+    assert_eq!(footer_count(&stderr, "Output stacks"), 1);
+    assert_eq!(
+        footer_count(&stderr, "Unique stacks"),
+        baseline_unique,
+        "--top does not change the unique-stack total"
+    );
+    assert_eq!(
+        footer_count(&stderr, "Matched samples"),
+        baseline_matched,
+        "--top does not change the matched-sample total"
+    );
+    assert!(footer_count(&stderr, "Output samples") <= baseline_matched);
+
+    // --max-depth 1: every stack collapses to its root frame, so no line has
+    // a ';' and the merged stacks cover the same samples as the full fold.
+    let output = run_analyze(&[
+        "stacktrace",
+        "flamegraph",
+        "-d",
+        db.to_str().unwrap(),
+        "-t",
+        "all",
+        "--max-depth",
+        "1",
+    ]);
+    assert!(
+        output.status.success(),
+        "flamegraph (--max-depth 1) failed: {}",
+        lossy(&output.stderr)
+    );
+    let stdout = lossy(&output.stdout);
+    let stderr = lossy(&output.stderr);
+    assert_valid_folded_output(&stdout);
+    for line in stdout.lines() {
+        let frames = line.rsplit_once(' ').map(|(f, _)| f).unwrap_or(line);
+        assert!(
+            !frames.contains(';'),
+            "--max-depth 1 left a multi-frame stack: {line}"
+        );
+    }
+    assert!(stderr.contains("# Max depth: 1"), "{stderr}");
+    assert_eq!(
+        footer_count(&stderr, "Output samples"),
+        footer_count(&baseline_stderr, "Output samples"),
+        "merging by depth keeps every sample"
+    );
+    assert_eq!(footer_count(&stderr, "Matched samples"), baseline_matched);
+    assert!(
+        footer_count(&stderr, "Unique stacks") <= baseline_unique,
+        "merged stacks cannot outnumber the full fold"
     );
 }
 
@@ -1745,6 +1873,9 @@ fn test_analyze_commands() {
 
     eprintln!("  min-count...");
     test_flamegraph_with_min_count(&duckdb_path);
+
+    eprintln!("  top + max-depth...");
+    test_flamegraph_top_and_max_depth(&duckdb_path);
 
     eprintln!("  nonexistent database...");
     test_flamegraph_nonexistent_db(&duckdb_path);
