@@ -580,6 +580,16 @@ struct {
 	__uint(max_entries, 10240);
 } perf_counters SEC(".maps");
 
+/*
+ * The --cgroup filter set: cgroup v2 ids (dfl_cgrp->kn->id, the directory
+ * inode) of each --cgroup target. Written by userspace before tracing starts,
+ * read-only from BPF (lookups only, from both the perf_event sampler and the
+ * tp_btf/fentry programs, so it must stay a plain preallocated HASH — never
+ * LRU). A task matches when its own cgroup OR any ancestor is in the set (see
+ * task_in_cgroup_filter()); userspace only enumerates descendants into this
+ * map under kernel lockdown, where the ancestor walk's probe reads are
+ * unavailable. Sized by userspace to the ids it loads.
+ */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, u64);
@@ -1454,6 +1464,98 @@ static u64 task_cg_id(struct task_struct *task)
 }
 
 /*
+ * CO-RE flavor type for kernels < 6.1, where struct cgroup carried its
+ * ancestors' cgroup ids directly (u64 ancestor_ids[], indexed by level) instead
+ * of the struct cgroup *ancestors[] pointer array that replaced it in 6.1. The
+ * ___pre61 suffix is ignored by CO-RE type matching, so this matches the
+ * kernel's actual struct cgroup at runtime.
+ */
+struct cgroup___pre61 {
+	u64 ancestor_ids[0];
+};
+
+/*
+ * Deepest cgroup v2 nesting level the --cgroup ancestry walk inspects. Real
+ * hierarchies are shallow (a Kubernetes container leaf sits at level 4-6; a
+ * nested runtime inside it adds a few more); the bound keeps the walk a
+ * verifier-bounded loop. A task deeper than this is still matched on its own
+ * cgroup id and on its first CGROUP_FILTER_MAX_DEPTH ancestors.
+ */
+#define CGROUP_FILTER_MAX_DEPTH 16
+
+/*
+ * --cgroup filter: is the task's own cgroup, or any ancestor of it, one of the
+ * --cgroup targets?
+ *
+ * Matching by ancestry rather than by exact id keeps the filter correct for
+ * cgroups created AFTER the trace started - a nested container runtime making
+ * cgroups inside a pod, a systemd unit spawning transient scopes. The task's
+ * leaf cgroup may be brand new, but its ancestor chain still reaches the
+ * target. Userspace therefore loads only the targets' own ids into the
+ * `cgroups` map, not a start-time snapshot of their descendants (which by
+ * construction could never contain a cgroup that did not exist yet).
+ *
+ * The walk probe-reads cgrp->ancestors[i] (cgrp->ancestor_ids[i] before 6.1)
+ * from a CO-RE-relocated array base: ancestors[] is a flexible array member,
+ * and the verifier does not accept a direct BTF load of its pointer elements
+ * past the struct's declared size, so each element is read with
+ * bpf_probe_read_kernel at an explicit offset. Probe reads are restricted under
+ * kernel lockdown confidentiality mode; there the walk is skipped and
+ * userspace enumerates each target's descendants at start instead (the
+ * pre-ancestry behaviour, with its known start-time-snapshot limitation).
+ *
+ * Cost, paid only when --cgroup is set: one hash lookup, plus at most
+ * level x (up to 3 probe reads + 1 hash lookup) when the task is not directly
+ * in a target. Lookups only - this map is never written from BPF, so it is
+ * safe from both the perf_event (NMI) sampler and the tp_btf/fentry programs.
+ */
+static bool task_in_cgroup_filter(struct task_struct *task)
+{
+	struct cgroup *cgrp = task->cgroups->dfl_cgrp;
+	u64 cgid = cgrp->kn->id;
+
+	/* The task sits directly in a target (or, under lockdown, in one of the
+	 * pre-enumerated descendants). */
+	if (bpf_map_lookup_elem(&cgroups, &cgid))
+		return true;
+	if (tool_config.confidentiality_mode)
+		return false;
+
+	/* ancestors[level] is the cgroup itself, checked above; walk the proper
+	 * ancestors, root first. */
+	int level = cgrp->level;
+	if (level > CGROUP_FILTER_MAX_DEPTH)
+		level = CGROUP_FILTER_MAX_DEPTH;
+
+	if (bpf_core_field_exists(cgrp->ancestors)) {
+		/* >= 6.1: struct cgroup *ancestors[], one pointer per level. */
+		struct cgroup **ancestors =
+			(void *)cgrp + bpf_core_field_offset(cgrp->ancestors);
+		for (int i = 0; i < CGROUP_FILTER_MAX_DEPTH && i < level; i++) {
+			struct cgroup *anc;
+			if (bpf_probe_read_kernel(&anc, sizeof(anc), &ancestors[i]))
+				break;
+			u64 id = BPF_CORE_READ(anc, kn, id);
+			if (id && bpf_map_lookup_elem(&cgroups, &id))
+				return true;
+		}
+	} else {
+		/* < 6.1: u64 ancestor_ids[], the cgroup id itself per level. */
+		struct cgroup___pre61 *old = (void *)cgrp;
+		u64 *ancestor_ids =
+			(void *)cgrp + bpf_core_field_offset(old->ancestor_ids);
+		for (int i = 0; i < CGROUP_FILTER_MAX_DEPTH && i < level; i++) {
+			u64 id;
+			if (bpf_probe_read_kernel(&id, sizeof(id), &ancestor_ids[i]))
+				break;
+			if (id && bpf_map_lookup_elem(&cgroups, &id))
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
  * CO-RE flavor type for kernels < 6.18 that have icsk_timeout as a separate field.
  * The ___pre618 suffix is ignored by CO-RE type matching, so this matches the
  * kernel's actual struct inet_connection_sock at runtime.
@@ -1562,11 +1664,8 @@ static bool trace_task(struct task_struct *task)
 		if (bpf_map_lookup_elem(&pids, &pid) == NULL)
 			return false;
 	}
-	if (tool_config.filter_cgroup) {
-		u64 cgid = task_cg_id(task);
-		if (bpf_map_lookup_elem(&cgroups, &cgid) == NULL)
-			return false;
-	}
+	if (tool_config.filter_cgroup && !task_in_cgroup_filter(task))
+		return false;
 	return true;
 }
 

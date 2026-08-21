@@ -111,16 +111,42 @@ pub fn build_cgroup_id_map() -> HashMap<u64, String> {
     map
 }
 
+/// The cgroup id (directory inode, matching the BPF `dfl_cgrp->kn->id`) of the
+/// cgroup at `path`.
+///
+/// This is what the `--cgroup` filter loads per target: the BPF side matches a
+/// task whose cgroup is the target or has the target among its ancestors, so
+/// the target's own id is all it needs — its subtree is never enumerated, and
+/// cgroups created under the target after the trace starts are matched too.
+///
+/// Failure to stat `path`, or `path` not being a directory, is reported to the
+/// caller so an invalid `--cgroup` argument is a clear error rather than a
+/// silently-empty filter.
+pub fn cgroup_id(path: &Path) -> io::Result<u64> {
+    let meta = fs::metadata(path)?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a cgroup directory", path.display()),
+        ));
+    }
+    Ok(meta.ino())
+}
+
 /// Collect the cgroup id (directory inode) of `path` and of every cgroup nested
 /// beneath it in the cgroup2 hierarchy.
 ///
-/// A `--cgroup` target is frequently an interior node rather than a leaf: a
-/// Kubernetes pod cgroup, for instance, contains per-container child cgroups and
-/// the tasks live in those children (cgroup v2 forbids processes in interior
-/// cgroups once they have controllers enabled). The BPF cgroup filter matches a
-/// task's *leaf* cgroup id (`dfl_cgrp->kn->id`) exactly, so filtering on only the
+/// This is the `--cgroup` filter's fallback under kernel lockdown confidentiality
+/// mode, where the BPF side cannot walk a task's cgroup ancestors (the walk needs
+/// probe reads, which lockdown restricts) and matches a task's *leaf* cgroup id
+/// exactly instead. A target is frequently an interior node rather than a leaf:
+/// a Kubernetes pod cgroup, for instance, contains per-container child cgroups
+/// and the tasks live in those children (cgroup v2 forbids processes in interior
+/// cgroups once they have controllers enabled), so filtering on only the
 /// interior id would miss every task. Descending and adding every descendant id
-/// makes `--cgroup <pod>` capture the whole subtree.
+/// makes `--cgroup <pod>` capture the subtree as it exists at the time of the
+/// walk — a cgroup created afterwards is not matched, which is the limitation
+/// the ancestry match removes everywhere else.
 ///
 /// The returned vector lists `path`'s own id first, followed by its descendants
 /// in an unspecified order, deduplicated. Failure to stat `path` (or `path` not
@@ -251,6 +277,39 @@ mod tests {
             relative_cgroup_path(root, Path::new("/sys/fs/cgroup/a/b/c")),
             "/a/b/c"
         );
+    }
+
+    #[test]
+    fn test_cgroup_id_is_the_target_inode_only() {
+        // The ancestry-matching filter loads just the target's own id: an
+        // interior pod cgroup with children must yield exactly its inode, never
+        // the children's (those are matched in-kernel through their ancestors).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pod = tmp.path().join("pod");
+        let child = pod.join("container-a");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(pod.join("cgroup.procs"), b"").unwrap();
+
+        let id = cgroup_id(&pod).unwrap();
+        assert_eq!(id, fs::metadata(&pod).unwrap().ino());
+        assert_ne!(id, fs::metadata(&child).unwrap().ino());
+    }
+
+    #[test]
+    fn test_cgroup_id_missing_path_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(cgroup_id(&tmp.path().join("does-not-exist")).is_err());
+    }
+
+    #[test]
+    fn test_cgroup_id_non_dir_errors() {
+        // A typo'd --cgroup pointing at a file must be a clear error, not a
+        // silently-empty filter.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("a-file");
+        fs::write(&file, b"").unwrap();
+        let err = cgroup_id(&file).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
