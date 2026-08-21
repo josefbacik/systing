@@ -432,7 +432,7 @@ enum memory_event_type {
 	MEMORY_MMAP,          // sys_exit_mmap - new VM area
 	MEMORY_MUNMAP,        // sys_exit_munmap (success-gated) - VM area removed
 	MEMORY_BRK,           // sys_exit_brk - heap boundary change
-	MEMORY_PAGE_FAULT,    // exceptions:page_fault_user - demand fault (sampled)
+	MEMORY_PAGE_FAULT,    // exceptions:page_fault_user (x86) / perf sw page-faults (other arches) - demand fault (sampled)
 	MEMORY_MM_SAMPLE,     // periodic mm_struct snapshot (from perf_event_clock)
 	MEMORY_ALLOC,         // uretprobe malloc/calloc/realloc/... - heap object allocated
 	MEMORY_FREE,          // uprobe free - heap object released
@@ -492,7 +492,7 @@ struct memory_event_header {
 	u64 addr;          // mmap ret / munmap addr / fault addr / brk new / hiwater_rss / alloc ret / thrash maj_flt
 	u64 size;          // mmap len / munmap len / rss size (bytes) / total_vm (bytes) / alloc bytes / thrash stall count
 	u32 member;        // rss_stat: enum memory_rss_member; mmap: prot; alloc: enum memory_alloc_op
-	u32 flags;         // mmap: MAP_* flags; page_fault: error_code; rss_stat: MEMORY_RSS_FLAG_*
+	u32 flags;         // mmap: MAP_* flags; page_fault: x86 error_code (0 on other arches); rss_stat: MEMORY_RSS_FLAG_*
 	u64 old_addr;      // realloc: previous pointer / thrash stall delay ns / map legs: signed rss-delta bytes as two's-complement (MEMORY_RSS_DELTA_ABSENT = no read); else 0
 	u64 kernel_stack_length;
 	u64 user_stack_length;
@@ -1053,7 +1053,8 @@ struct {
 	__type(value, struct memory_syscall_args);
 } memory_syscall_scratch SEC(".maps");
 
-/* Per-CPU counter for page-fault sampling. */
+/* Per-CPU counter for page-fault sampling (x86 tracepoint path only; on other
+ * arches the perf software event samples kernel-side via sample_period). */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
@@ -5682,6 +5683,47 @@ int systing_page_fault_user(struct systing_pf_args *ctx)
 	record_task_info(&event->hdr.task, task);
 	event->hdr.addr = ctx->address;
 	event->hdr.flags = (u32)ctx->error_code;
+	memory_capture_stack(ctx, event, task, false);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+#else
+/* Outside x86 there is no exceptions:page_fault_user tracepoint to attach to
+ * (trace_page_fault_user() is called from arch/x86/mm/fault.c and, from 6.18,
+ * arch/riscv/mm/fault.c; arch/arm64/mm/fault.c never fires it), so the fault
+ * leg rides the perf software event PERF_COUNT_SW_PAGE_FAULTS instead. The
+ * events are opened per CPU from userspace (attach_page_fault_sw_events in
+ * systing_core.rs) with exclude_kernel=1 — user-mode faults only, the same
+ * population the x86 tracepoint sees — and sample_period =
+ * memory_fault_sample_rate, so the kernel does the 1:N sampling and no BPF-side
+ * counter is needed. The program runs in the faulting task's own context (the
+ * software event fires synchronously from the fault path, not from an NMI or
+ * a timer), so it writes the memory ringbuf like every other memory program.
+ * ctx->addr is the faulting address (perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS,
+ * 1, regs, address) in the arch fault handlers; the event is opened with
+ * PERF_SAMPLE_ADDR so the field reads 0, not stale stack, for a fault at
+ * address 0). The x86 error_code has no portable equivalent, so flags is 0 on
+ * this path; the user stack is walked from the sample's registers, i.e. from
+ * the faulting user frame. */
+SEC("perf_event")
+int systing_page_fault_sw(struct bpf_perf_event_data *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->hdr.type = MEMORY_PAGE_FAULT;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = ctx->addr;
+	event->hdr.flags = 0;
 	memory_capture_stack(ctx, event, task, false);
 
 	bpf_ringbuf_submit(event, flags);
