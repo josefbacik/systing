@@ -133,7 +133,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -144,6 +144,7 @@ pub const DATA_TABLES: &[&str] = &[
     "irq_slice",
     "softirq_slice",
     "wakeup_new",
+    "sched_migrate",
     "process_exit",
     "counter_track",
     "counter",
@@ -267,6 +268,14 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             cpu INTEGER,
             utid BIGINT,
             target_cpu INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS sched_migrate (
+            trace_id VARCHAR,
+            ts BIGINT,
+            utid BIGINT,
+            orig_cpu INTEGER,
+            dest_cpu INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS process_exit (
@@ -868,6 +877,7 @@ fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Res
     import_table("irq_slice", &paths.irq_slice)?;
     import_table("softirq_slice", &paths.softirq_slice)?;
     import_table("wakeup_new", &paths.wakeup_new)?;
+    import_table("sched_migrate", &paths.sched_migrate)?;
     import_table("process_exit", &paths.process_exit)?;
 
     // Counter tables
@@ -1304,6 +1314,7 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
     export_table("irq_slice", &paths.irq_slice)?;
     export_table("softirq_slice", &paths.softirq_slice)?;
     export_table("wakeup_new", &paths.wakeup_new)?;
+    export_table("sched_migrate", &paths.sched_migrate)?;
     export_table("process_exit", &paths.process_exit)?;
 
     // Counter tables

@@ -1,7 +1,8 @@
 //! Per-capture scheduler aggregates (`systing-analyze sched aggregate`).
 //!
 //! One pass over the scheduler event stream of a trace (`sched_slice` starts
-//! and ends, `thread_state` runnable markers, `wakeup_new`) produces a compact
+//! and ends, `thread_state` runnable markers, `wakeup_new`, and — on traces
+//! recorded with schema 16 or later — `sched_migrate`) produces a compact
 //! summary meant to be emitted once per capture and compared across hosts or
 //! schedulers: wakeup latency, preempt wait, on-CPU slice length, context
 //! switch and migration rates, a time-weighted runqueue-length distribution,
@@ -16,6 +17,21 @@
 //!   it was queued. The split is therefore: the thread ran on its previous CPU
 //!   (`prev_cpu`) or somewhere else (`migrated`). Markers from `wakeup_new`
 //!   (new tasks; their `target_cpu` is the placement) are included.
+//! - **placement** (`meta.placement_exact`): the `sched_migrate` table holds
+//!   every `sched_migrate_task` event — the kernel fires it from
+//!   `set_task_cpu()`, i.e. right after `sched_waking` when it picks a CPU
+//!   other than the previous one, and whenever the balancer, NUMA balancing
+//!   or an affinity change moves a runnable task. With it, a woken thread is
+//!   queued on its previous CPU from its marker on and moved by the events
+//!   (no event before its first run = the scheduler kept it there), so the
+//!   per-CPU runqueue lengths below, the work-conservation violation and
+//!   `per_cpu.runnable_wait_ns` include woken waiters exactly (up to the
+//!   sub-microsecond between `sched_waking` and the placement, during which
+//!   the thread is counted on its previous CPU). `per_cpu.wakeups_placed` is
+//!   the scheduler's placement per CPU (the first migrate's destination, or
+//!   the previous CPU); `wakeups_ran` is where the thread then ran. Without
+//!   the table (older traces) woken threads are unplaced until they run, as
+//!   described under runqueue length.
 //! - **preempt wait**: a slice that ended with `end_state` NULL left the thread
 //!   runnable; the wait is until its next slice starts.
 //! - **run delay**: wakeup latency and preempt wait together (all
@@ -26,21 +42,26 @@
 //! - **migrations**: consecutive slices of one thread on different CPUs; a
 //!   "wakeup migration" had a runnable marker in between (the thread slept,
 //!   woke, and ran elsewhere than it last ran), a "preempt migration" did not
-//!   (it was moved while runnable).
+//!   (it was moved while runnable). `switches.migrate_events` counts the
+//!   `sched_migrate_task` events themselves (every CPU change, including
+//!   moves of runnable threads that never ran in between), split by the
+//!   thread's state at the event: placed at wakeup, moved while queued, or
+//!   other.
 //! - **runqueue length** of a CPU: 1 if it runs a non-idle task, plus the
-//!   threads that were PREEMPTED on it and have not run again (their queue is
-//!   known: they stay runnable on that CPU until they run or are moved; the
-//!   trace carries no migrate event, so a balancer move before they run is
-//!   invisible). Woken threads are NOT assigned to any CPU until they run —
-//!   the trace does not record their placement — and are counted separately,
-//!   node-wide, as `unplaced_avg` (time-weighted average number of woken
-//!   threads waiting to run). Distributions are time-weighted over
-//!   (cpu × time). `wakeups_ran` per CPU is the placement the scheduler
-//!   actually made (the CPU of the first slice after the marker) and is exact.
+//!   threads queued on it: threads PREEMPTED on it that have not run again
+//!   (moved by migrate events when the trace carries them) and, with exact
+//!   placement, the woken threads placed on it. Without migrate events woken
+//!   threads are NOT assigned to any CPU until they run — the trace does not
+//!   record their placement — and are counted separately, node-wide, as
+//!   `unplaced_avg` (time-weighted average number of woken threads waiting to
+//!   run; 0 with exact placement). Distributions are time-weighted over
+//!   (cpu × time). `wakeups_ran` per CPU is the CPU of the first slice after
+//!   the marker and is exact either way.
 //! - **work-conservation violation**: time during which some observed CPU has
-//!   runqueue length > 1 (a preempted thread waiting behind a running one)
-//!   while another observed CPU is idle. Woken-unplaced threads do not count,
-//!   so this is the balancer-failure shape, not the wakeup-placement shape.
+//!   runqueue length > 1 (a thread waiting behind a running one) while
+//!   another observed CPU is idle. Without exact placement woken-unplaced
+//!   threads do not count, so this is then the balancer-failure shape only,
+//!   not the wakeup-placement shape; with it, both.
 //! - Per-CPU accounting starts at the CPU's first event in the window (before
 //!   that its state is unknown); CPUs with no events at all are reported as
 //!   unobserved, never assumed idle or busy. Waits that do not end inside the
@@ -257,10 +278,25 @@ pub struct SwitchStats {
     pub switches_per_s: f64,
     pub voluntary: u64,
     pub involuntary: u64,
+    /// Consecutive slices of one thread on different CPUs (the thread ran
+    /// somewhere else than the last time it ran).
     pub migrations: u64,
     pub migrations_per_s: f64,
     pub wakeup_migrations: u64,
     pub preempt_migrations: u64,
+    /// `sched_migrate_task` events in the window (every change of a task's
+    /// CPU, including moves of runnable threads that did not run in
+    /// between); 0 on traces without the `sched_migrate` table.
+    pub migrate_events: u64,
+    pub migrate_events_per_s: f64,
+    /// Migrate events that placed a woken thread away from the CPU it last
+    /// ran on.
+    pub migrate_at_wakeup: u64,
+    /// Migrate events that moved a preempted (runnable, queued) thread.
+    pub migrate_while_runnable: u64,
+    /// Migrate events for threads in any other state (running, sleeping, or
+    /// not yet seen in the window).
+    pub migrate_other: u64,
 }
 
 /// Per-CPU vectors; index = CPU id. Unobserved CPUs carry zeros and are
@@ -274,10 +310,18 @@ pub struct PerCpu {
     /// Runnable markers whose thread last ran on this CPU (the CPU recorded at
     /// `sched_waking`, before placement).
     pub wakeups_prev_cpu: Vec<u64>,
-    /// Wakeups whose first run landed on this CPU (the placement actually made).
+    /// Wakeups the scheduler placed on this CPU: the destination of the
+    /// migrate event that followed the marker, or the previous CPU when no
+    /// migrate event came before the first run. Only on traces carrying the
+    /// `sched_migrate` table (`meta.placement_exact`); `None` otherwise.
+    pub wakeups_placed: Option<Vec<u64>>,
+    /// Wakeups whose first run landed on this CPU (the placement actually
+    /// made, after any balancer move).
     pub wakeups_ran: Vec<u64>,
-    /// Runnable wait (preempt waits on this CPU + wakeup waits of threads that
-    /// then ran on this CPU).
+    /// Runnable wait on this CPU's queue. With `meta.placement_exact`: the
+    /// time woken and preempted threads spent queued on this CPU (split at
+    /// migrations). Without: preempt waits on this CPU + wakeup waits of
+    /// threads that then ran on this CPU.
     pub runnable_wait_ns: Vec<u64>,
     pub rq_avg: Vec<f64>,
     pub unobserved_cpus: Vec<u32>,
@@ -336,6 +380,17 @@ pub struct SchedAggregateMeta {
     pub running_at_end: u64,
     /// Cumulative scheduler events the BPF side reported dropped (None = no counter track in the trace).
     pub missed_sched_events: Option<u64>,
+    /// True when the trace carries the `sched_migrate` table: woken threads
+    /// are then queued on a known CPU from their marker on (their previous
+    /// CPU, moved by migrate events), so per-CPU runqueue lengths, the
+    /// work-conservation violation and `per_cpu.runnable_wait_ns` include
+    /// them and `runqueue.unplaced_avg` is 0. False on older traces: woken
+    /// threads stay unplaced until they run.
+    pub placement_exact: bool,
+    /// Migrate events whose `orig_cpu` disagreed with the queue this pass
+    /// had the thread on (a dropped event in between; the pass trusts its
+    /// own bookkeeping and moves the thread from where it had it).
+    pub migrate_mismatch: u64,
     pub aggregate_ms: u64,
 }
 
@@ -360,12 +415,15 @@ pub struct SchedAggregate {
 }
 
 // Event kinds in the merged stream; ordered so that at one timestamp a slice
-// end is handled first, then runnable markers, then the slice that starts (a
-// marker stamped at the same ns as the run it precedes still yields a wait).
+// end is handled first, then runnable markers, then migrations (the kernel
+// fires sched_migrate_task after sched_waking and before the task is queued),
+// then the slice that starts (a marker stamped at the same ns as the run it
+// precedes still yields a wait).
 const EV_END: i32 = 0;
 const EV_WAKING: i32 = 1;
 const EV_NEW: i32 = 2;
-const EV_START: i32 = 3;
+const EV_MIGRATE: i32 = 3;
+const EV_START: i32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum WaitKind {
@@ -380,9 +438,24 @@ enum ThreadSt {
         cpu: u32,
     },
     Waiting {
+        /// When the wait began (marker or preemption).
         since: i64,
+        /// When the thread joined the queue of `cpu` (== `since` until a
+        /// migrate event moves it).
+        seg_since: i64,
+        /// The queue the thread is on: for a wakeup its previous CPU (the
+        /// marker's), for a preemption the CPU it was preempted on — moved
+        /// by migrate events when the trace carries them.
         cpu: u32,
+        /// Where the wait started: the marker's CPU (the CPU the thread last
+        /// ran on) or the preempting CPU. Unlike `cpu` this never moves, so
+        /// "ran on its previous CPU or somewhere else" stays answerable.
+        origin_cpu: u32,
         kind: WaitKind,
+        /// Wakeup waits with exact placement: a migrate event has fixed the
+        /// placement (counted in `wakeups_placed`); otherwise the first run
+        /// does.
+        placed: bool,
     },
     Sleeping,
 }
@@ -407,6 +480,7 @@ struct CpuState {
     idle_ns: u64,
     switches: u64,
     wakeups_prev_cpu: u64,
+    wakeups_placed: u64,
     wakeups_ran: u64,
     runnable_wait_ns: u64,
 }
@@ -422,6 +496,9 @@ struct Pass {
     cpus: Vec<CpuState>,
     idle_utids: HashMap<i64, ()>,
     window_end: i64,
+    /// The trace carries migrate events: woken threads are queued on their
+    /// previous CPU from the marker on and moved by the events.
+    placement_exact: bool,
     // Node-wide runqueue bookkeeping.
     rq_hist: Vec<u64>,
     n_over: u32,
@@ -448,6 +525,11 @@ struct Pass {
     migrations: u64,
     wakeup_migrations: u64,
     preempt_migrations: u64,
+    migrate_events: u64,
+    migrate_at_wakeup: u64,
+    migrate_while_runnable: u64,
+    migrate_other: u64,
+    migrate_mismatch: u64,
     spurious_wakeups: u64,
     first_runs: u64,
     running_at_end: u64,
@@ -467,12 +549,14 @@ impl Pass {
         idle_utids: HashMap<i64, ()>,
         names: HashMap<i64, String>,
         attribute_tails: bool,
+        placement_exact: bool,
     ) -> Self {
         Self {
             threads: HashMap::new(),
             cpus: Vec::new(),
             idle_utids,
             window_end,
+            placement_exact,
             rq_hist: vec![0; RQ_HIST_MAX + 1],
             n_over: 0,
             n_idle: 0,
@@ -495,6 +579,11 @@ impl Pass {
             migrations: 0,
             wakeup_migrations: 0,
             preempt_migrations: 0,
+            migrate_events: 0,
+            migrate_at_wakeup: 0,
+            migrate_while_runnable: 0,
+            migrate_other: 0,
+            migrate_mismatch: 0,
             spurious_wakeups: 0,
             first_runs: 0,
             running_at_end: 0,
@@ -591,6 +680,28 @@ impl Pass {
         }
     }
 
+    /// Add or remove one waiting thread on `cpu`'s queue and charge `seg_ns`
+    /// of queue time to it. An observed CPU gets the interval bookkeeping;
+    /// a CPU not yet observed (no slice seen in the window so far) only
+    /// carries the count, so a marker or migrate alone never registers a CPU
+    /// as observed — its queue length enters the distributions when its
+    /// first slice does.
+    fn queue_change(&mut self, cpu: u32, t: i64, delta: i32, seg_ns: u64) {
+        let apply = |c: &mut CpuState| {
+            if delta > 0 {
+                c.waiting += delta as u32;
+            } else {
+                c.waiting = c.waiting.saturating_sub((-delta) as u32);
+            }
+            c.runnable_wait_ns += seg_ns;
+        };
+        if self.cpu_mut(cpu).seen {
+            self.change_rq(cpu, t, apply);
+        } else {
+            apply(self.cpu_mut(cpu));
+        }
+    }
+
     fn record_wait(&mut self, utid: i64, kind: WaitKind, wait_ns: u64, same_cpu: bool) {
         self.run_delay.record(wait_ns);
         match kind {
@@ -633,19 +744,35 @@ impl Pass {
             match th.st {
                 ThreadSt::Waiting {
                     since,
+                    seg_since,
                     cpu: wc,
+                    origin_cpu,
                     kind,
+                    placed,
                 } => {
                     let wait_ns = (t - since).max(0) as u64;
-                    let same = wc == cpu;
-                    self.record_wait(utid, kind, wait_ns, same);
+                    let seg_ns = (t - seg_since).max(0) as u64;
+                    // For a wakeup the split is "ran on the CPU it last ran
+                    // on" (the marker's CPU) vs "somewhere else".
+                    self.record_wait(utid, kind, wait_ns, origin_cpu == cpu);
                     match kind {
                         WaitKind::Preempt => {
-                            // Queued on the CPU it was preempted on.
-                            self.change_rq(wc, t, |c| {
-                                c.waiting = c.waiting.saturating_sub(1);
-                                c.runnable_wait_ns += wait_ns;
-                            });
+                            // Queued on the CPU it was preempted on (or moved
+                            // to); the last queue segment is charged there.
+                            self.queue_change(wc, t, -1, seg_ns);
+                        }
+                        WaitKind::Wakeup if self.placement_exact => {
+                            // The thread was queued on `wc` since its marker
+                            // (or its last migrate); it leaves that queue now.
+                            // No migrate event before the first run means the
+                            // scheduler kept it on its previous CPU, so the
+                            // placement is the run CPU.
+                            self.queue_change(wc, t, -1, seg_ns);
+                            let c = self.cpu_mut(cpu);
+                            c.wakeups_ran += 1;
+                            if !placed {
+                                c.wakeups_placed += 1;
+                            }
                         }
                         WaitKind::Wakeup => {
                             // Placement is known only now: the run CPU.
@@ -734,8 +861,11 @@ impl Pass {
         th.st = if preempted {
             ThreadSt::Waiting {
                 since: t,
+                seg_since: t,
                 cpu,
+                origin_cpu: cpu,
                 kind: WaitKind::Preempt,
+                placed: true,
             }
         } else {
             ThreadSt::Sleeping
@@ -759,18 +889,90 @@ impl Pass {
             }
             ThreadSt::Unknown | ThreadSt::Sleeping => {
                 // The marker's CPU is where the thread last ran, not where it
-                // will be queued; count it there and keep the thread unplaced
-                // until its first slice says where it landed.
+                // will be queued; count it there. (For a new task the marker
+                // comes from wakeup_new and target_cpu is its placement.)
                 self.advance_global(t);
                 self.cpu_mut(target_cpu).wakeups_prev_cpu += 1;
-                self.unplaced += 1;
+                if self.placement_exact {
+                    // The trace carries migrate events: the thread is queued
+                    // on its previous CPU unless and until one moves it (the
+                    // kernel fires sched_migrate_task right after
+                    // sched_waking when it picks another CPU), so it joins
+                    // that queue now.
+                    self.queue_change(target_cpu, t, 1, 0);
+                    if new_task {
+                        self.cpu_mut(target_cpu).wakeups_placed += 1;
+                    }
+                } else {
+                    // No placement information: keep the thread unplaced
+                    // until its first slice says where it landed.
+                    self.unplaced += 1;
+                }
                 let th = self.thread_mut(utid);
                 th.st = ThreadSt::Waiting {
                     since: t,
+                    seg_since: t,
                     cpu: target_cpu,
+                    origin_cpu: target_cpu,
                     kind: WaitKind::Wakeup,
+                    placed: new_task,
                 };
                 th.woke_since_last_run = true;
+            }
+        }
+    }
+
+    /// A `sched_migrate_task` event: the thread's CPU changed from `orig` to
+    /// `dest`. A waiting thread (woken and not yet run, or preempted) moves
+    /// from the queue this pass has it on to `dest`'s; the queue time so far
+    /// is charged to the CPU it leaves. Only reached on traces that carry the
+    /// events, i.e. with exact placement, where every waiting thread is on a
+    /// queue.
+    fn on_migrate(&mut self, t: i64, orig: u32, dest: u32, utid: i64) {
+        if self.idle_utids.contains_key(&utid) {
+            return;
+        }
+        self.migrate_events += 1;
+        let th = *self.thread_mut(utid);
+        match th.st {
+            ThreadSt::Waiting {
+                since,
+                seg_since,
+                cpu: wc,
+                origin_cpu,
+                kind,
+                placed,
+            } => {
+                match kind {
+                    WaitKind::Wakeup => self.migrate_at_wakeup += 1,
+                    WaitKind::Preempt => self.migrate_while_runnable += 1,
+                }
+                if wc != orig {
+                    self.migrate_mismatch += 1;
+                }
+                let seg_ns = (t - seg_since).max(0) as u64;
+                self.advance_global(t);
+                self.queue_change(wc, t, -1, seg_ns);
+                self.queue_change(dest, t, 1, 0);
+                if !placed {
+                    // The scheduler's placement decision for this wakeup.
+                    self.cpu_mut(dest).wakeups_placed += 1;
+                }
+                let th = self.thread_mut(utid);
+                th.st = ThreadSt::Waiting {
+                    since,
+                    seg_since: t,
+                    cpu: dest,
+                    origin_cpu,
+                    kind,
+                    placed: true,
+                };
+            }
+            ThreadSt::Running { .. } | ThreadSt::Unknown | ThreadSt::Sleeping => {
+                // A running thread is preempted before it can be moved and a
+                // sleeping one gets its CPU at the next wakeup, so this is
+                // rare outside the window edge (state not yet known).
+                self.migrate_other += 1;
             }
         }
     }
@@ -789,6 +991,8 @@ impl Pass {
             EV_START => self.on_start(ts, cpu, utid, dur, end_state),
             EV_WAKING => self.on_runnable(ts, cpu, utid, false),
             EV_NEW => self.on_runnable(ts, cpu, utid, true),
+            // For migrate rows `cpu` is orig_cpu and `dur` carries dest_cpu.
+            EV_MIGRATE if dur >= 0 => self.on_migrate(ts, cpu, dur as u32, utid),
             _ => {}
         }
     }
@@ -871,10 +1075,27 @@ fn top_contributors(
     v
 }
 
-fn build_event_stream_query(trace_id: Option<&str>, start: i64, end: i64) -> String {
+fn build_event_stream_query(
+    trace_id: Option<&str>,
+    start: i64,
+    end: i64,
+    with_migrate: bool,
+) -> String {
     let f_ss = trace_id_filter(trace_id, "ss.");
     let f_ts = trace_id_filter(trace_id, "t.");
     let f_w = trace_id_filter(trace_id, "w.");
+    let f_m = trace_id_filter(trace_id, "m.");
+    // Migrate rows ride the `cpu` column as orig_cpu and the `dur` column as
+    // dest_cpu; the table exists only in traces recorded with schema >= 16.
+    let migrate_arm = if with_migrate {
+        format!(
+            "UNION ALL \
+           SELECT m.ts, {EV_MIGRATE}, m.orig_cpu, m.utid, CAST(m.dest_cpu AS BIGINT), CAST(NULL AS INTEGER) \
+             FROM sched_migrate m WHERE m.ts >= {start} AND m.ts <= {end}{f_m} "
+        )
+    } else {
+        String::new()
+    };
     format!(
         "SELECT ts, kind, cpu, utid, dur, end_state FROM ( \
            SELECT ss.ts AS ts, {EV_START} AS kind, ss.cpu AS cpu, ss.utid AS utid, ss.dur AS dur, ss.end_state AS end_state \
@@ -888,6 +1109,7 @@ fn build_event_stream_query(trace_id: Option<&str>, start: i64, end: i64) -> Str
            UNION ALL \
            SELECT w.ts, {EV_NEW}, w.target_cpu, w.utid, CAST(0 AS BIGINT), CAST(NULL AS INTEGER) \
              FROM wakeup_new w WHERE w.ts >= {start} AND w.ts <= {end}{f_w} \
+           {migrate_arm}\
          ) ORDER BY ts, kind"
     )
 }
@@ -992,8 +1214,12 @@ impl AnalyzeDb {
             }
         }
 
-        let stream_sql = build_event_stream_query(trace_id, window_start, window_end);
-        let mut pass = Pass::new(window_end, idle, names, params.top_k > 0);
+        // Traces recorded with schema >= 16 carry `sched_migrate`; with it the
+        // placement of woken threads is exact (see the module docs).
+        let placement_exact = self.table_exists("sched_migrate")?;
+        let stream_sql =
+            build_event_stream_query(trace_id, window_start, window_end, placement_exact);
+        let mut pass = Pass::new(window_end, idle, names, params.top_k > 0, placement_exact);
         {
             let mut stmt = self.conn.prepare(&stream_sql)?;
             let mut rows = stmt.query([])?;
@@ -1034,6 +1260,7 @@ impl AnalyzeDb {
             idle_ns: vec![0; n],
             switches: vec![0; n],
             wakeups_prev_cpu: vec![0; n],
+            wakeups_placed: placement_exact.then(|| vec![0; n]),
             wakeups_ran: vec![0; n],
             runnable_wait_ns: vec![0; n],
             rq_avg: vec![0.0; n],
@@ -1049,6 +1276,9 @@ impl AnalyzeDb {
                     per_cpu.idle_ns[i] = c.idle_ns;
                     per_cpu.switches[i] = c.switches;
                     per_cpu.wakeups_prev_cpu[i] = c.wakeups_prev_cpu;
+                    if let Some(placed) = per_cpu.wakeups_placed.as_mut() {
+                        placed[i] = c.wakeups_placed;
+                    }
                     per_cpu.wakeups_ran[i] = c.wakeups_ran;
                     per_cpu.runnable_wait_ns[i] = c.runnable_wait_ns;
                     per_cpu.rq_avg[i] = if c.observed_ns > 0 {
@@ -1060,10 +1290,14 @@ impl AnalyzeDb {
                     observed_wakeups.push(c.wakeups_ran);
                 }
                 other => {
-                    // A CPU only named as a wakeup's previous CPU is not
-                    // observed, but the count is still a fact about it.
+                    // A CPU only named as a wakeup's previous CPU or as a
+                    // placement is not observed, but the counts are still
+                    // facts about it.
                     if let Some(c) = other {
                         per_cpu.wakeups_prev_cpu[i] = c.wakeups_prev_cpu;
+                        if let Some(placed) = per_cpu.wakeups_placed.as_mut() {
+                            placed[i] = c.wakeups_placed;
+                        }
                     }
                     per_cpu.unobserved_cpus.push(i as u32);
                 }
@@ -1133,6 +1367,11 @@ impl AnalyzeDb {
             migrations_per_s: pass.migrations as f64 / window_s,
             wakeup_migrations: pass.wakeup_migrations,
             preempt_migrations: pass.preempt_migrations,
+            migrate_events: pass.migrate_events,
+            migrate_events_per_s: pass.migrate_events as f64 / window_s,
+            migrate_at_wakeup: pass.migrate_at_wakeup,
+            migrate_while_runnable: pass.migrate_while_runnable,
+            migrate_other: pass.migrate_other,
         };
 
         Ok(SchedAggregate {
@@ -1156,6 +1395,8 @@ impl AnalyzeDb {
                 first_runs: pass.first_runs,
                 running_at_end: pass.running_at_end,
                 missed_sched_events,
+                placement_exact,
+                migrate_mismatch: pass.migrate_mismatch,
                 aggregate_ms: started.elapsed().as_millis() as u64,
             },
             wakeup_latency: pass.wakeup_lat.dist(),
@@ -1581,11 +1822,259 @@ mod tests {
 
     #[test]
     fn event_stream_query_shape() {
-        let sql = build_event_stream_query(Some("x"), 10, 20);
+        let sql = build_event_stream_query(Some("x"), 10, 20, false);
         assert!(sql.contains("FROM sched_slice ss"));
         assert!(sql.contains("FROM thread_state t WHERE t.state = 0"));
         assert!(sql.contains("FROM wakeup_new w"));
+        assert!(!sql.contains("sched_migrate"));
         assert!(sql.contains("ORDER BY ts, kind"));
         assert!(sql.contains("ss.trace_id = 'x'"));
+        let sql = build_event_stream_query(Some("x"), 10, 20, true);
+        assert!(sql.contains("FROM sched_migrate m WHERE m.ts >= 10 AND m.ts <= 20"));
+        assert!(sql.contains("m.trace_id = 'x'"));
+    }
+
+    /// Like `db_with`, plus a `sched_migrate` table with the given
+    /// (ts, utid, orig_cpu, dest_cpu) rows — the trace shape of schema >= 16,
+    /// which switches the analysis to exact placement.
+    fn db_with_migrates(
+        slices: &[(i64, i64, i32, i64, Option<i32>)],
+        markers: &[(i64, i64, i32)],
+        threads: &[(i64, i32, &str)],
+        migrates: &[(i64, i64, i32, i32)],
+    ) -> AnalyzeDb {
+        let db = db_with(slices, markers, threads);
+        db.conn
+            .execute_batch(
+                "CREATE TABLE sched_migrate (trace_id VARCHAR, ts BIGINT, utid BIGINT, orig_cpu INTEGER, dest_cpu INTEGER);",
+            )
+            .unwrap();
+        for (ts, utid, orig, dest) in migrates {
+            db.conn
+                .execute(
+                    "INSERT INTO sched_migrate VALUES ('t', ?, ?, ?, ?)",
+                    duckdb::params![ts, utid, orig, dest],
+                )
+                .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn legacy_trace_reports_inexact_placement() {
+        // No sched_migrate table: the pre-16 shape. Woken threads stay
+        // unplaced and the new fields say so.
+        let db = db_with(
+            &[(0, 1500, 0, IDLE, None), (1500, 500, 0, A, Some(1))],
+            &[(1000, A, 0)],
+            &threads(),
+        );
+        let r = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        assert!(!r.meta.placement_exact);
+        assert_eq!(r.per_cpu.wakeups_placed, None);
+        assert_eq!(r.switches.migrate_events, 0);
+        assert!(r.runqueue.unplaced_avg > 0.0);
+    }
+
+    #[test]
+    fn migrate_at_wakeup_places_the_thread_exactly() {
+        // A last ran on cpu 1 (marker cpu 1 at 1000); the scheduler picks cpu
+        // 0 at 1100 (migrate 1 -> 0); A runs on cpu 0 from 1500. cpu 1 idles
+        // all window, cpu 0 runs B [0, 2000) and then A.
+        //
+        // Exact placement: A is queued on cpu 1 during [1000, 1100) and on
+        // cpu 0 during [1100, 1500). cpu 0 runs B then, so its rq is 2 over
+        // those 400 ns while cpu 1 is idle: a 400 ns work-conservation
+        // violation that the legacy shape cannot see.
+        let db = db_with_migrates(
+            &[
+                (0, 1500, 0, B, Some(1)),
+                (1500, 500, 0, A, Some(1)),
+                (2000, 1000, 0, IDLE, None),
+                (0, 3000, 1, IDLE, None),
+            ],
+            &[(1000, A, 1)],
+            &threads(),
+            &[(1100, A, 1, 0)],
+        );
+        let r = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        assert!(r.meta.placement_exact);
+        assert_eq!(r.meta.migrate_mismatch, 0);
+        // Wakeup latency 500 ns, a migrated wakeup (ran elsewhere than it
+        // last ran); B's first slice is a first run, not a wakeup.
+        assert_eq!(r.wakeup_latency.count, 1);
+        assert_eq!(r.wakeup_latency.sum_ns, 500);
+        assert_eq!(r.wakeup_latency_migrated.count, 1);
+        assert_eq!(r.wakeup_latency_prev_cpu.count, 0);
+        // Event counters: one migrate, at wakeup.
+        assert_eq!(r.switches.migrate_events, 1);
+        assert_eq!(r.switches.migrate_at_wakeup, 1);
+        assert_eq!(r.switches.migrate_while_runnable, 0);
+        assert_eq!(r.switches.migrate_other, 0);
+        // The slice-based count sees nothing: A had no earlier slice.
+        assert_eq!(r.switches.migrations, 0);
+        // Placement vectors: previous cpu 1, placed on 0, ran on 0.
+        assert_eq!(r.per_cpu.wakeups_prev_cpu, vec![0, 1]);
+        assert_eq!(r.per_cpu.wakeups_placed, Some(vec![1, 0]));
+        assert_eq!(r.per_cpu.wakeups_ran, vec![1, 0]);
+        // Queue time by queue: 100 ns on cpu 1, 400 ns on cpu 0.
+        assert_eq!(r.per_cpu.runnable_wait_ns, vec![400, 100]);
+        // Nothing is ever unplaced with exact placement.
+        assert_eq!(r.runqueue.unplaced_avg, 0.0);
+        // cpu 0: rq 1 over [0,1100) (B running) and [1500,2000) (A running)
+        // = 1600 ns, rq 2 over [1100,1500) (B running, A queued) = 400 ns,
+        // rq 0 over [2000,3000). cpu 1: rq 1 over [1000,1100) (A queued on
+        // an idle CPU), rq 0 otherwise. Time-weighted over both CPUs:
+        // rq 0 = 1000 + 2900 = 3900 ns, rq 1 = 1600 + 100 = 1700 ns, rq 2 =
+        // 400 ns.
+        assert_eq!(r.runqueue.hist, vec![3900, 1700, 400]);
+        assert_eq!(r.runqueue.max, 2);
+        assert_eq!(r.imbalance.work_conservation_violation_ns, 400);
+    }
+
+    #[test]
+    fn migrate_while_runnable_moves_a_preempted_waiter() {
+        // A runs on cpu 0 [1000,1500) and is preempted (end_state NULL) by B
+        // [1500,2000). The balancer moves A to cpu 1 at 1700; A runs there
+        // [2200,2700). cpu 1 is otherwise idle.
+        let db = db_with_migrates(
+            &[
+                (0, 1000, 0, IDLE, None),
+                (1000, 500, 0, A, None),
+                (1500, 500, 0, B, Some(1)),
+                (2000, 1000, 0, IDLE, None),
+                (0, 2200, 1, IDLE, None),
+                (2200, 500, 1, A, Some(1)),
+                (2700, 300, 1, IDLE, None),
+            ],
+            &[(500, A, 0), (1400, B, 0)],
+            &threads(),
+            &[(1700, A, 0, 1)],
+        );
+        let r = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        assert!(r.meta.placement_exact);
+        assert_eq!(r.switches.migrate_events, 1);
+        assert_eq!(r.switches.migrate_while_runnable, 1);
+        assert_eq!(r.switches.migrate_at_wakeup, 0);
+        // Slice-based: A ran on cpu 0 then cpu 1 without a wake in between.
+        assert_eq!(r.switches.migrations, 1);
+        assert_eq!(r.switches.preempt_migrations, 1);
+        // A's preempt wait is [1500,2200) = 700 ns: 200 ns queued on cpu 0,
+        // 500 ns queued on cpu 1.
+        assert_eq!(r.preempt_wait.count, 1);
+        assert_eq!(r.preempt_wait.sum_ns, 700);
+        // Queue time: cpu 0 gets A's 200 ns (preempt) + A's wakeup wait
+        // [500,1000) = 500 ns queued on cpu 0 + B's wakeup wait [1400,1500)
+        // = 100 ns queued on cpu 0 -> 800; cpu 1 gets 500.
+        assert_eq!(r.per_cpu.runnable_wait_ns, vec![800, 500]);
+        // Work-conservation violation: cpu 0 has rq 2 while cpu 1 idles
+        // during [1400,1500) (B queued behind A) and [1500,1700) (A queued
+        // behind B) = 300 ns; after the move cpu 1 has rq 1 (A queued, idle)
+        // and cpu 0 has rq 1 (B running) -> no violation.
+        assert_eq!(r.imbalance.work_conservation_violation_ns, 300);
+        assert_eq!(r.meta.migrate_mismatch, 0);
+    }
+
+    #[test]
+    fn no_migrate_before_first_run_means_previous_cpu() {
+        // With exact placement a woken thread with no migrate event is queued
+        // on its previous CPU from the marker on: A (marker cpu 0 at 1000)
+        // waits behind B running on cpu 0 until 1500 while cpu 1 idles.
+        let db = db_with_migrates(
+            &[
+                (0, 1500, 0, B, Some(1)),
+                (1500, 500, 0, A, Some(1)),
+                (2000, 1000, 0, IDLE, None),
+                (0, 3000, 1, IDLE, None),
+            ],
+            &[(1000, A, 0)],
+            &threads(),
+            &[],
+        );
+        let r = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        assert!(r.meta.placement_exact);
+        assert_eq!(r.wakeup_latency_prev_cpu.count, 1);
+        assert_eq!(r.per_cpu.wakeups_placed, Some(vec![1, 0]));
+        assert_eq!(r.per_cpu.wakeups_ran, vec![1, 0]);
+        assert_eq!(r.per_cpu.runnable_wait_ns, vec![500, 0]);
+        assert_eq!(r.runqueue.unplaced_avg, 0.0);
+        // cpu 0 rq 2 over [1000,1500) while cpu 1 idles.
+        assert_eq!(r.imbalance.work_conservation_violation_ns, 500);
+        assert_eq!(r.runqueue.max, 2);
+    }
+
+    #[test]
+    fn new_task_placement_is_its_wakeup_new_target() {
+        // A new task (wakeup_new, target cpu 1) is placed at its marker; a
+        // balancer move to cpu 0 before it runs is a migrate at wakeup that
+        // does not count a second placement.
+        let db = db_with_migrates(
+            &[
+                (0, 2000, 0, IDLE, None),
+                (2000, 500, 0, A, Some(1)),
+                (2500, 500, 0, IDLE, None),
+                (0, 3000, 1, IDLE, None),
+            ],
+            &[],
+            &threads(),
+            &[(1500, A, 1, 0)],
+        );
+        db.conn
+            .execute(
+                "INSERT INTO wakeup_new VALUES ('t', 1000, 0, ?, 1)",
+                duckdb::params![A],
+            )
+            .unwrap();
+        let r = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        assert_eq!(r.meta.wakeup_new, 1);
+        assert_eq!(r.per_cpu.wakeups_placed, Some(vec![0, 1]));
+        assert_eq!(r.per_cpu.wakeups_ran, vec![1, 0]);
+        assert_eq!(r.switches.migrate_at_wakeup, 1);
+        // Queued on cpu 1 [1000,1500), then on cpu 0 [1500,2000).
+        assert_eq!(r.per_cpu.runnable_wait_ns, vec![500, 500]);
+        // The wakeup ran elsewhere than its marker's CPU.
+        assert_eq!(r.wakeup_latency_migrated.count, 1);
+        assert_eq!(r.wakeup_latency.sum_ns, 1000);
+    }
+
+    #[test]
+    fn migrate_of_an_unseen_thread_counts_as_other_and_never_observes_a_cpu() {
+        // A migrate for a thread with no prior event (state unknown) is
+        // counted but moves no queue; a migrate naming a CPU with no slices
+        // (cpu 5) does not make that CPU observed.
+        let db = db_with_migrates(
+            &[(0, 1000, 0, IDLE, None), (1000, 1000, 0, A, Some(1))],
+            &[(1500, B, 5)],
+            &threads(),
+            &[(500, A, 3, 0), (1600, B, 5, 0)],
+        );
+        let r = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        assert_eq!(r.switches.migrate_events, 2);
+        assert_eq!(r.switches.migrate_other, 1);
+        assert_eq!(r.switches.migrate_at_wakeup, 1);
+        // B: marker on cpu 5 (unseen), moved to cpu 0 at 1600, never runs:
+        // a censored wakeup; cpu 5 stays unobserved, cpu 0 is the only
+        // observed CPU.
+        assert_eq!(r.meta.wakeup_censored, 1);
+        assert_eq!(r.meta.observed_cpus, 1);
+        assert!(r.per_cpu.unobserved_cpus.contains(&5));
+        // B's placement was cpu 0 (counted even though it never ran).
+        assert_eq!(r.per_cpu.wakeups_placed.as_ref().unwrap()[0], 1);
+        // B queued on cpu 0 from 1600 while A runs there -> rq 2 over
+        // [1600,2000); no other observed CPU is idle, so no violation.
+        assert_eq!(r.runqueue.max, 2);
+        assert_eq!(r.imbalance.work_conservation_violation_ns, 0);
     }
 }

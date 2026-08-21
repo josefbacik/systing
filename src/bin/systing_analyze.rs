@@ -777,7 +777,14 @@ fn run_sched_aggregate(args: SchedAggregateArgs) -> Result<()> {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "n/a".to_string())
     );
-    eprintln!("# Percentiles are histogram-derived (<= 6.25% above exact); woken threads are unplaced until they run (no placement event in the trace).");
+    if r.meta.placement_exact {
+        eprintln!(
+            "# Percentiles are histogram-derived (<= 6.25% above exact); placement is exact (sched_migrate events: {} in window, {} mismatched).",
+            r.switches.migrate_events, r.meta.migrate_mismatch
+        );
+    } else {
+        eprintln!("# Percentiles are histogram-derived (<= 6.25% above exact); woken threads are unplaced until they run (no placement event in the trace).");
+    }
 
     fmt_dist("wakeup latency", &r.wakeup_latency);
     fmt_dist("  ran on prev cpu", &r.wakeup_latency_prev_cpu);
@@ -795,17 +802,38 @@ fn run_sched_aggregate(args: SchedAggregateArgs) -> Result<()> {
         r.switches.wakeup_migrations,
         r.switches.preempt_migrations
     );
-    println!(
-        "{:<22} avg={:.3} p50={} p90={} p99={} max={} (running + preempted waiters, time-weighted over {} observed cpus); woken-unplaced avg={:.3}",
-        "runqueue length",
-        r.runqueue.avg,
-        r.runqueue.p50,
-        r.runqueue.p90,
-        r.runqueue.p99,
-        r.runqueue.max,
-        r.meta.observed_cpus,
-        r.runqueue.unplaced_avg
-    );
+    if r.meta.placement_exact {
+        println!(
+            "{:<22} {}/s ({} placed at wakeup, {} moved while runnable, {} other)",
+            "migrate events",
+            format_rate(r.switches.migrate_events_per_s),
+            r.switches.migrate_at_wakeup,
+            r.switches.migrate_while_runnable,
+            r.switches.migrate_other
+        );
+        println!(
+            "{:<22} avg={:.3} p50={} p90={} p99={} max={} (running + queued waiters, time-weighted over {} observed cpus)",
+            "runqueue length",
+            r.runqueue.avg,
+            r.runqueue.p50,
+            r.runqueue.p90,
+            r.runqueue.p99,
+            r.runqueue.max,
+            r.meta.observed_cpus
+        );
+    } else {
+        println!(
+            "{:<22} avg={:.3} p50={} p90={} p99={} max={} (running + preempted waiters, time-weighted over {} observed cpus); woken-unplaced avg={:.3}",
+            "runqueue length",
+            r.runqueue.avg,
+            r.runqueue.p50,
+            r.runqueue.p90,
+            r.runqueue.p99,
+            r.runqueue.max,
+            r.meta.observed_cpus,
+            r.runqueue.unplaced_avg
+        );
+    }
     println!(
         "{:<22} busy max-share={:.3} cv={:.3}; wakeup max-share={:.3} cv={:.3}; work-conservation violation {:.1}% of window",
         "imbalance",

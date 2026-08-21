@@ -44,6 +44,7 @@ pub const TABLE_NAMES: &[&str] = &[
     "irq_slice",
     "softirq_slice",
     "wakeup_new",
+    "sched_migrate",
     "process_exit",
     "counter",
     "counter_track",
