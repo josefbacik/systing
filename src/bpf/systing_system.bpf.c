@@ -65,7 +65,17 @@
  */
 #define SKIP_STACK_DEPTH 3
 #define PERF_EVENT_SKIP_STACK_DEPTH 0
-#define NR_RINGBUFS 8
+/*
+ * Upper bound on rings per family. The live count is
+ * tool_config.nr_ringbufs (min(num_cpus, NR_RINGBUFS_MAX), or the
+ * --ringbuf-shards override), set by userspace before load; the outer
+ * ARRAY_OF_MAPS below are sized to it and populated from userspace after
+ * load. A compile-time 8 was the ceiling before: on a 192-CPU host that
+ * put 24 CPUs behind one ring, and __bpf_ringbuf_reserve takes the ring's
+ * spinlock before it checks for space, so a full ring is also a lock every
+ * producer on those CPUs spins on.
+ */
+#define NR_RINGBUFS_MAX 64
 
 /* Mirror of the kernel's struct bpf_stack_build_id (filled by bpf_get_stack
  * under BPF_F_USER_BUILD_ID), with the offset/ip union flattened to one u64
@@ -134,6 +144,13 @@ const volatile struct {
 				* gate is belt-and-braces (and lets the verifier
 				* prune the bodies if the programs ever get loaded
 				* for another reason). */
+	u32 nr_ringbufs;       /* Rings per family: events land in ring
+				* `cpu % nr_ringbufs`. Userspace sizes each outer
+				* ARRAY_OF_MAPS to this before load and creates +
+				* inserts the inner rings after load (one batch
+				* update per family). Rodata, so the modulo is by
+				* a constant the verifier can see; 0 is never
+				* loaded (userspace pins it >= 1). */
 } tool_config = {};
 
 enum event_type {
@@ -770,89 +787,60 @@ struct {
 	__uint(max_entries, 1);
 } cpu_running_pid SEC(".maps");
 
+/*
+ * Inner-ring TEMPLATES for the eight per-CPU-sharded ring families. These
+ * types are only the `__array(values, ...)` template of each outer
+ * ARRAY_OF_MAPS below: libbpf creates one transient map from the template
+ * to obtain the outer's inner_map_fd and destroys it again. The rings the
+ * programs actually write are created by userspace after load, at the size
+ * it chose (--ringbuf-size-mib, split across tool_config.nr_ringbufs rings
+ * on hosts with more than eight CPUs), and inserted into the outer map in
+ * one batch. The kernel's inner-map compatibility check for ringbufs
+ * (bpf_map_meta_equal) compares type, key/value size and flags, not
+ * max_entries, so the template size is free; 64 KiB is a legal ring on
+ * every page size we run (power of two, page aligned).
+ */
+#define RINGBUF_TEMPLATE_BYTES (64 * 1024)
+
 struct ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
-} ringbuf_events_node0 SEC(".maps"), ringbuf_events_node1 SEC(".maps"),
-  ringbuf_events_node2 SEC(".maps"), ringbuf_events_node3 SEC(".maps"),
-  ringbuf_events_node4 SEC(".maps"), ringbuf_events_node5 SEC(".maps"),
-  ringbuf_events_node6 SEC(".maps"), ringbuf_events_node7 SEC(".maps");
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
 
 struct stack_ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
-} ringbuf_stack_events_node0 SEC(".maps"), ringbuf_stack_events_node1 SEC(".maps"),
-  ringbuf_stack_events_node2 SEC(".maps"), ringbuf_stack_events_node3 SEC(".maps"),
-  ringbuf_stack_events_node4 SEC(".maps"), ringbuf_stack_events_node5 SEC(".maps"),
-  ringbuf_stack_events_node6 SEC(".maps"), ringbuf_stack_events_node7 SEC(".maps");
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
 
 struct probe_ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
-} ringbuf_probe_events_node0 SEC(".maps"), ringbuf_probe_events_node1 SEC(".maps"),
-  ringbuf_probe_events_node2 SEC(".maps"), ringbuf_probe_events_node3 SEC(".maps"),
-  ringbuf_probe_events_node4 SEC(".maps"), ringbuf_probe_events_node5 SEC(".maps"),
-  ringbuf_probe_events_node6 SEC(".maps"), ringbuf_probe_events_node7 SEC(".maps");
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
 
 struct perf_counter_ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
-} ringbuf_perf_counter_events_node0 SEC(".maps"),
-	ringbuf_perf_counter_events_node1 SEC(".maps"),
-	ringbuf_perf_counter_events_node2 SEC(".maps"),
-	ringbuf_perf_counter_events_node3 SEC(".maps"),
-	ringbuf_perf_counter_events_node4 SEC(".maps"),
-	ringbuf_perf_counter_events_node5 SEC(".maps"),
-	ringbuf_perf_counter_events_node6 SEC(".maps"),
-	ringbuf_perf_counter_events_node7 SEC(".maps");
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
 
 struct network_ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
-} ringbuf_network_events_node0 SEC(".maps"),
-	ringbuf_network_events_node1 SEC(".maps"),
-	ringbuf_network_events_node2 SEC(".maps"),
-	ringbuf_network_events_node3 SEC(".maps"),
-	ringbuf_network_events_node4 SEC(".maps"),
-	ringbuf_network_events_node5 SEC(".maps"),
-	ringbuf_network_events_node6 SEC(".maps"),
-	ringbuf_network_events_node7 SEC(".maps");
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
 
 struct packet_ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
-} ringbuf_packet_events_node0 SEC(".maps"),
-	ringbuf_packet_events_node1 SEC(".maps"),
-	ringbuf_packet_events_node2 SEC(".maps"),
-	ringbuf_packet_events_node3 SEC(".maps"),
-	ringbuf_packet_events_node4 SEC(".maps"),
-	ringbuf_packet_events_node5 SEC(".maps"),
-	ringbuf_packet_events_node6 SEC(".maps"),
-	ringbuf_packet_events_node7 SEC(".maps");
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
 
 struct epoll_ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
-} ringbuf_epoll_events_node0 SEC(".maps"),
-	ringbuf_epoll_events_node1 SEC(".maps"),
-	ringbuf_epoll_events_node2 SEC(".maps"),
-	ringbuf_epoll_events_node3 SEC(".maps"),
-	ringbuf_epoll_events_node4 SEC(".maps"),
-	ringbuf_epoll_events_node5 SEC(".maps"),
-	ringbuf_epoll_events_node6 SEC(".maps"),
-	ringbuf_epoll_events_node7 SEC(".maps");
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
 
 struct memory_ringbuf_map {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 50 * 1024 * 1024 /* 50Mib */);
-} ringbuf_memory_events_node0 SEC(".maps"),
-	ringbuf_memory_events_node1 SEC(".maps"),
-	ringbuf_memory_events_node2 SEC(".maps"),
-	ringbuf_memory_events_node3 SEC(".maps"),
-	ringbuf_memory_events_node4 SEC(".maps"),
-	ringbuf_memory_events_node5 SEC(".maps"),
-	ringbuf_memory_events_node6 SEC(".maps"),
-	ringbuf_memory_events_node7 SEC(".maps");
+	__uint(max_entries, RINGBUF_TEMPLATE_BYTES);
+};
 
 #ifdef SYSTING_PYSTACKS
 struct {
@@ -876,147 +864,59 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, NR_RINGBUFS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
 	__type(key, u32);
 	__array(values, struct ringbuf_map);
-} ringbufs SEC(".maps") = {
-	.values = {
-		&ringbuf_events_node0,
-		&ringbuf_events_node1,
-		&ringbuf_events_node2,
-		&ringbuf_events_node3,
-		&ringbuf_events_node4,
-		&ringbuf_events_node5,
-		&ringbuf_events_node6,
-		&ringbuf_events_node7,
-	},
-};
+} ringbufs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, NR_RINGBUFS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
 	__type(key, u32);
 	__array(values, struct stack_ringbuf_map);
-} stack_ringbufs SEC(".maps") = {
-	.values = {
-		&ringbuf_stack_events_node0,
-		&ringbuf_stack_events_node1,
-		&ringbuf_stack_events_node2,
-		&ringbuf_stack_events_node3,
-		&ringbuf_stack_events_node4,
-		&ringbuf_stack_events_node5,
-		&ringbuf_stack_events_node6,
-		&ringbuf_stack_events_node7,
-	},
-};
+} stack_ringbufs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, NR_RINGBUFS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
 	__type(key, u32);
 	__array(values, struct perf_counter_ringbuf_map);
-} perf_counter_ringbufs SEC(".maps") = {
-	.values = {
-		&ringbuf_perf_counter_events_node0,
-		&ringbuf_perf_counter_events_node1,
-		&ringbuf_perf_counter_events_node2,
-		&ringbuf_perf_counter_events_node3,
-		&ringbuf_perf_counter_events_node4,
-		&ringbuf_perf_counter_events_node5,
-		&ringbuf_perf_counter_events_node6,
-		&ringbuf_perf_counter_events_node7,
-	},
-};
+} perf_counter_ringbufs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, NR_RINGBUFS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
 	__type(key, u32);
 	__array(values, struct probe_ringbuf_map);
-} probe_ringbufs SEC(".maps") = {
-	.values = {
-		&ringbuf_probe_events_node0,
-		&ringbuf_probe_events_node1,
-		&ringbuf_probe_events_node2,
-		&ringbuf_probe_events_node3,
-		&ringbuf_probe_events_node4,
-		&ringbuf_probe_events_node5,
-		&ringbuf_probe_events_node6,
-		&ringbuf_probe_events_node7,
-	},
-};
+} probe_ringbufs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, NR_RINGBUFS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
 	__type(key, u32);
 	__array(values, struct network_ringbuf_map);
-} network_ringbufs SEC(".maps") = {
-	.values = {
-		&ringbuf_network_events_node0,
-		&ringbuf_network_events_node1,
-		&ringbuf_network_events_node2,
-		&ringbuf_network_events_node3,
-		&ringbuf_network_events_node4,
-		&ringbuf_network_events_node5,
-		&ringbuf_network_events_node6,
-		&ringbuf_network_events_node7,
-	},
-};
+} network_ringbufs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, NR_RINGBUFS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
 	__type(key, u32);
 	__array(values, struct packet_ringbuf_map);
-} packet_ringbufs SEC(".maps") = {
-	.values = {
-		&ringbuf_packet_events_node0,
-		&ringbuf_packet_events_node1,
-		&ringbuf_packet_events_node2,
-		&ringbuf_packet_events_node3,
-		&ringbuf_packet_events_node4,
-		&ringbuf_packet_events_node5,
-		&ringbuf_packet_events_node6,
-		&ringbuf_packet_events_node7,
-	},
-};
+} packet_ringbufs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, NR_RINGBUFS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
 	__type(key, u32);
 	__array(values, struct epoll_ringbuf_map);
-} epoll_ringbufs SEC(".maps") = {
-	.values = {
-		&ringbuf_epoll_events_node0,
-		&ringbuf_epoll_events_node1,
-		&ringbuf_epoll_events_node2,
-		&ringbuf_epoll_events_node3,
-		&ringbuf_epoll_events_node4,
-		&ringbuf_epoll_events_node5,
-		&ringbuf_epoll_events_node6,
-		&ringbuf_epoll_events_node7,
-	},
-};
+} epoll_ringbufs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
-	__uint(max_entries, NR_RINGBUFS);
+	__uint(max_entries, NR_RINGBUFS_MAX);
 	__type(key, u32);
 	__array(values, struct memory_ringbuf_map);
-} memory_ringbufs SEC(".maps") = {
-	.values = {
-		&ringbuf_memory_events_node0,
-		&ringbuf_memory_events_node1,
-		&ringbuf_memory_events_node2,
-		&ringbuf_memory_events_node3,
-		&ringbuf_memory_events_node4,
-		&ringbuf_memory_events_node5,
-		&ringbuf_memory_events_node6,
-		&ringbuf_memory_events_node7,
-	},
-};
+} memory_ringbufs SEC(".maps");
 
 /* Per-thread scratch map for pairing mmap/munmap/brk enter→exit. */
 struct memory_syscall_args {
@@ -1359,7 +1259,7 @@ static __always_inline long get_ringbuf_flags(void *rb)
 
 static struct task_event *reserve_task_event(long *flags)
 {
-	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
 	void *rb;
 
 	rb = bpf_map_lookup_elem(&ringbufs, &rb_idx);
@@ -1374,7 +1274,7 @@ static struct task_event *reserve_task_event(long *flags)
 
 static struct stack_event *reserve_stack_event(long *flags)
 {
-	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
 	void *rb;
 
 	rb = bpf_map_lookup_elem(&stack_ringbufs, &rb_idx);
@@ -1419,7 +1319,7 @@ static struct stack_event *reserve_stack_event(long *flags)
 
 static struct perf_counter_event *reserve_perf_counter_event(long *flags)
 {
-	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
 	void *rb;
 
 	rb = bpf_map_lookup_elem(&perf_counter_ringbufs, &rb_idx);
@@ -1434,7 +1334,7 @@ static struct perf_counter_event *reserve_perf_counter_event(long *flags)
 
 static struct probe_event *reserve_probe_event(long *flags)
 {
-	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
 	void *rb;
 
 	rb = bpf_map_lookup_elem(&probe_ringbufs, &rb_idx);
@@ -1449,7 +1349,7 @@ static struct probe_event *reserve_probe_event(long *flags)
 
 static struct network_event *reserve_network_event(long *flags)
 {
-	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
 	void *rb;
 
 	rb = bpf_map_lookup_elem(&network_ringbufs, &rb_idx);
@@ -1464,7 +1364,7 @@ static struct network_event *reserve_network_event(long *flags)
 
 static struct packet_event *reserve_packet_event(long *flags)
 {
-	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
 	void *rb;
 
 	rb = bpf_map_lookup_elem(&packet_ringbufs, &rb_idx);
@@ -1479,7 +1379,7 @@ static struct packet_event *reserve_packet_event(long *flags)
 
 static __always_inline void *reserve_memory_ringbuf(long *flags, u64 size)
 {
-	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
 	void *rb;
 
 	rb = bpf_map_lookup_elem(&memory_ringbufs, &rb_idx);
@@ -1524,7 +1424,7 @@ static struct memory_event *reserve_memory_event(long *flags)
 
 static struct epoll_event_bpf *reserve_epoll_event(long *flags)
 {
-	u32 rb_idx = bpf_get_smp_processor_id() % NR_RINGBUFS;
+	u32 rb_idx = bpf_get_smp_processor_id() % tool_config.nr_ringbufs;
 	void *rb;
 
 	rb = bpf_map_lookup_elem(&epoll_ringbufs, &rb_idx);

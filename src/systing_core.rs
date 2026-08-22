@@ -8,7 +8,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
@@ -460,21 +460,110 @@ const CORE_BPF_PROGRAMS: &[&str] = &["systing_perf_event_clock"];
 /// `probe_ringbufs` can be `autocreate=false` otherwise.
 const PROBE_BPF_PROGRAMS: &[&str] = &["systing_usdt", "systing_uprobe", "systing_kprobe"];
 
-/// Number of per-CPU-sharded ring buffers in each ringbuf ARRAY_OF_MAPS
-/// family (events land in ring `cpu % NR_RINGBUFS`).
-/// Must match NR_RINGBUFS in src/bpf/systing_system.bpf.c.
-pub(crate) const NR_RINGBUFS: usize = 8;
+/// Upper bound on per-CPU-sharded ring buffers in each ringbuf ARRAY_OF_MAPS
+/// family. Must match NR_RINGBUFS_MAX in src/bpf/systing_system.bpf.c (the
+/// outer maps are declared with that many slots; only the first
+/// `RingbufPlan::nr_rings` are populated).
+pub(crate) const NR_RINGBUFS_MAX: u32 = 64;
 
-/// Per-CPU ringbuf ARRAY_OF_MAPS families: (outer map name, inner-map name prefix).
-const RINGBUF_FAMILIES: &[(&str, &str)] = &[
-    ("ringbufs", "ringbuf_events_node"),
-    ("perf_counter_ringbufs", "ringbuf_perf_counter_events_node"),
-    ("probe_ringbufs", "ringbuf_probe_events_node"),
-    ("network_ringbufs", "ringbuf_network_events_node"),
-    ("packet_ringbufs", "ringbuf_packet_events_node"),
-    ("epoll_ringbufs", "ringbuf_epoll_events_node"),
-    ("memory_ringbufs", "ringbuf_memory_events_node"),
+/// The ring count of the original fixed layout. `--ringbuf-size-mib` keeps
+/// its per-ring meaning up to this many rings; above it the family keeps the
+/// byte budget that count implied and splits it across the shards (see
+/// [`plan_ringbufs`]).
+const NR_RINGBUFS_LEGACY: u32 = 8;
+
+/// Default per-ring size when `--ringbuf-size-mib` is not given.
+const DEFAULT_RINGBUF_SIZE_MIB: u32 = 50;
+
+/// Per-CPU ringbuf ARRAY_OF_MAPS families: (outer map name, inner-ring name
+/// prefix, always-on). The stack family backs the cpu-stacks recorder and the
+/// sleep-stack path of sched_switch, so it is created on every run; the rest
+/// follow `get_required_ringbuf_families`. Inner names are cosmetic (the
+/// kernel keeps 15 bytes): they exist so `bpftool map` and the
+/// `SYSTING_DIAG_RINGBUFS` dump can tell the families apart.
+const RINGBUF_FAMILIES: &[(&str, &str, bool)] = &[
+    ("ringbufs", "rb_ev_", false),
+    ("stack_ringbufs", "rb_stk_", true),
+    ("perf_counter_ringbufs", "rb_pc_", false),
+    ("probe_ringbufs", "rb_prb_", false),
+    ("network_ringbufs", "rb_net_", false),
+    ("packet_ringbufs", "rb_pkt_", false),
+    ("epoll_ringbufs", "rb_epl_", false),
+    ("memory_ringbufs", "rb_mem_", false),
 ];
+
+/// How many rings each family gets and how big each is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RingbufPlan {
+    /// Rings per family; events land in ring `cpu % nr_rings`.
+    pub nr_rings: u32,
+    /// Bytes per ring: a power of two, at least 1 MiB.
+    pub ring_bytes: u32,
+}
+
+/// Decide the ring layout for this host.
+///
+/// Shard count: one ring per CPU up to [`NR_RINGBUFS_MAX`], or the explicit
+/// `--ringbuf-shards` override (`shards_override` > 0, capped the same way).
+/// The old layout had a compile-time eight: on a 192-CPU host that put 24
+/// CPUs behind one ring and one consumer, and `__bpf_ringbuf_reserve` takes
+/// the ring's spinlock before it checks for space, so a full ring is also a
+/// lock every producer on those CPUs spins on.
+///
+/// Ring size, at a constant family budget: up to eight rings each ring is
+/// `--ringbuf-size-mib` rounded up to a power of two (what libbpf did to the
+/// static rings, 25 MiB -> 32 MiB), so hosts with at most eight CPUs get
+/// exactly the footprint they had. Above eight rings the family keeps the
+/// budget eight such rings implied and splits it: `8 * ring / nr_rings`,
+/// rounded down to a power of two, never below 1 MiB. A 192-CPU host at
+/// `--ringbuf-size-mib 25` therefore runs 64 rings of 4 MiB = 256 MiB per
+/// family, the same 8 x 32 MiB it ran before; the per-CPU share is unchanged
+/// and the consumer count is eight times higher.
+pub(crate) fn plan_ringbufs(
+    num_cpus: u32,
+    ringbuf_size_mib: u32,
+    shards_override: u32,
+) -> RingbufPlan {
+    const MIB: u64 = 1024 * 1024;
+    let size_mib = if ringbuf_size_mib > 0 {
+        ringbuf_size_mib
+    } else {
+        DEFAULT_RINGBUF_SIZE_MIB
+    };
+    let legacy_ring = (u64::from(size_mib) * MIB).next_power_of_two();
+    let nr_rings = if shards_override > 0 {
+        shards_override.min(NR_RINGBUFS_MAX)
+    } else {
+        num_cpus.clamp(1, NR_RINGBUFS_MAX)
+    };
+    let ring_bytes = if nr_rings <= NR_RINGBUFS_LEGACY {
+        legacy_ring
+    } else {
+        let split = legacy_ring * u64::from(NR_RINGBUFS_LEGACY) / u64::from(nr_rings);
+        // Round DOWN to a power of two so the family never exceeds its budget.
+        let floored = if split.is_power_of_two() {
+            split
+        } else {
+            split.next_power_of_two() / 2
+        };
+        floored.max(MIB)
+    };
+    RingbufPlan {
+        nr_rings,
+        ring_bytes: u32::try_from(ring_bytes).expect("ring size fits in u32"),
+    }
+}
+
+/// The inner rings of every created family, created by userspace after load
+/// and inserted into the outer ARRAY_OF_MAPS in one batch per family. The
+/// handles own the ring fds: libbpf's ring_buffer registers the fd with its
+/// epoll set without duplicating it, so the handles must outlive the poller
+/// threads (the whole trace), which is why this struct rides in
+/// `ThreadHandles` until the pollers are joined.
+pub(crate) struct RingShards {
+    /// (outer map name, inner-ring name prefix, inner rings in slot order)
+    pub families: Vec<(&'static str, &'static str, Vec<libbpf_rs::MapHandle>)>,
+}
 
 /// Collect ringbuf ARRAY_OF_MAPS families written by any enabled recorder or
 /// probe. Drives both autocreate in `configure_bpf_skeleton` and mmap/consume
@@ -566,6 +655,9 @@ pub struct Config {
     pub no_stack_traces: bool,
     /// Ring buffer size in MiB (0 = default)
     pub ringbuf_size_mib: u32,
+    /// Rings per ring-buffer family (0 = one per CPU, capped at
+    /// NR_RINGBUFS_MAX); see `plan_ringbufs`
+    pub ringbuf_shards: u32,
     /// Trace events to attach
     pub trace_event: Vec<String>,
     /// PIDs for trace events
@@ -690,6 +782,7 @@ impl Default for Config {
             duration: 0,
             no_stack_traces: false,
             ringbuf_size_mib: 0,
+            ringbuf_shards: 0,
             trace_event: Vec::new(),
             trace_event_pid: Vec::new(),
             sw_event: false,
@@ -1216,14 +1309,14 @@ fn spawn_recorder_threads(
     let mut threads = Vec::new();
 
     // Spawn one sched consumer per ring. Each consumer owns its recorder
-    // shard: cpu -> ring is static (cpu % NR_RINGBUFS) and all
+    // shard: cpu -> ring is static (cpu % nr_ringbufs) and all
     // SchedEventRecorder state is keyed by CPU, so shards share nothing and
     // the per-shard mutex is effectively uncontended (the shard's consumer
     // is the only per-event lock holder; trace finalization locks it once
     // after consumers exit).
     anyhow::ensure!(
         event_rxs.len() <= recorder.event_recorders.len(),
-        "{} sched/IRQ rings but only {} recorder shards (NR_RINGBUFS out of sync?)",
+        "{} sched/IRQ rings but only {} recorder shards (NR_RINGBUFS_MAX out of sync?)",
         event_rxs.len(),
         recorder.event_recorders.len()
     );
@@ -2070,10 +2163,96 @@ fn discover_processes_with_mapping(
     Ok(discovered_pids)
 }
 
+/// Create the inner rings of every family this run writes and insert them
+/// into their outer ARRAY_OF_MAPS. Runs after `skel.load()` (the outers must
+/// exist) and before `skel.attach()` (no program may look up an empty slot).
+///
+/// One BPF_MAP_UPDATE_BATCH per family: the kernel waits an RCU grace period
+/// after map-of-maps updates (`maybe_wait_bpf_programs`), once per batch
+/// call rather than once per slot, which is the difference between a few
+/// hundred milliseconds and a multi-second startup at 64 rings. Kernels
+/// without batch support for this map type (pre-5.6) fall back to per-slot
+/// updates, which are correct and merely slow.
+fn create_ring_shards(
+    skel: &SystingSystemSkel,
+    opts: &Config,
+    plan: RingbufPlan,
+) -> Result<RingShards> {
+    let required = get_required_ringbuf_families(opts);
+    let mut families = Vec::new();
+    let mut per_slot_fallback_reported = false;
+    for map in skel.object().maps() {
+        let name = map.name().to_str().unwrap().to_owned();
+        let Some((outer, prefix, always_on)) = RINGBUF_FAMILIES.iter().find(|(o, _, _)| *o == name)
+        else {
+            continue;
+        };
+        if !always_on && !required.contains(outer) {
+            continue;
+        }
+        anyhow::ensure!(
+            map.value_size() == 4,
+            "ring family '{outer}' has value_size {} (expected a map-of-maps fd slot)",
+            map.value_size()
+        );
+        let mut inners = Vec::with_capacity(plan.nr_rings as usize);
+        let mut keys = Vec::with_capacity(plan.nr_rings as usize * 4);
+        let mut fds = Vec::with_capacity(plan.nr_rings as usize * 4);
+        // libbpf validates opts by their `sz`; a zeroed struct is rejected.
+        let create_opts = libbpf_rs::libbpf_sys::bpf_map_create_opts {
+            sz: std::mem::size_of::<libbpf_rs::libbpf_sys::bpf_map_create_opts>() as _,
+            ..Default::default()
+        };
+        for i in 0..plan.nr_rings {
+            let inner = libbpf_rs::MapHandle::create(
+                libbpf_rs::MapType::RingBuf,
+                Some(format!("{prefix}{i}")),
+                0,
+                0,
+                plan.ring_bytes,
+                &create_opts,
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to create ring {i} of '{outer}' ({} bytes)",
+                    plan.ring_bytes
+                )
+            })?;
+            keys.extend_from_slice(&i.to_ne_bytes());
+            fds.extend_from_slice(&(inner.as_fd().as_raw_fd() as u32).to_ne_bytes());
+            inners.push(inner);
+        }
+        if let Err(batch_err) = map.update_batch(
+            &keys,
+            &fds,
+            plan.nr_rings,
+            libbpf_rs::MapFlags::ANY,
+            libbpf_rs::MapFlags::ANY,
+        ) {
+            if !per_slot_fallback_reported {
+                eprintln!(
+                    "Note: batch insert into ring family '{outer}' unsupported ({batch_err}); \
+                     inserting {} rings one slot at a time (slower startup, same result)",
+                    plan.nr_rings
+                );
+                per_slot_fallback_reported = true;
+            }
+            for (i, inner) in inners.iter().enumerate() {
+                let fd = (inner.as_fd().as_raw_fd() as u32).to_ne_bytes();
+                map.update(&(i as u32).to_ne_bytes(), &fd, libbpf_rs::MapFlags::ANY)
+                    .with_context(|| format!("Failed to insert ring {i} into '{outer}'"))?;
+            }
+        }
+        families.push((*outer, *prefix, inners));
+    }
+    Ok(RingShards { families })
+}
+
 fn setup_ringbuffers<'a>(
     skel: &SystingSystemSkel,
     opts: &Config,
     collect_pystacks: bool,
+    shards: &RingShards,
 ) -> Result<(Vec<(String, libbpf_rs::RingBuffer<'a>)>, RecorderChannels)> {
     // Per-channel capacity. Bounded so that a slow recorder thread applies
     // backpressure to the ringbuf reader instead of letting an unbounded
@@ -2088,7 +2267,7 @@ fn setup_ringbuffers<'a>(
     // throughput ceiling that makes BPF drop events even with large rings,
     // so each ring's poller feeds its own consumer. (Possible because all
     // SchedEventRecorder state is keyed by CPU and cpu -> ring is a static
-    // `cpu % NR_RINGBUFS`, so no state is shared across rings.)
+    // `cpu % nr_ringbufs`, so no state is shared across rings.)
     let mut event_rxs = Vec::new();
     let (stack_tx, stack_rx) = sync_channel(CHANNEL_CAPACITY);
     let (cache_tx, cache_rx) = sync_channel(CHANNEL_CAPACITY);
@@ -2103,40 +2282,53 @@ fn setup_ringbuffers<'a>(
 
     let object = skel.object();
 
-    // Ringbuf families for disabled recorders are autocreate=false and have no
-    // fd to mmap; gate each create_ring on the same required-set that governed
-    // autocreate (see configure_bpf_skeleton).
-    let required = get_required_ringbuf_families(opts);
-    for (i, map) in object.maps().enumerate() {
-        let name = map.name().to_str().unwrap();
-        if name.starts_with("ringbuf_events") && required.contains("ringbufs") {
-            let (event_tx, event_rx) = sync_channel(CHANNEL_CAPACITY);
-            let ring = create_ring::<task_event>(&map, event_tx)?;
-            event_rxs.push(event_rx);
-            rings.push((format!("events_{i}"), ring));
-        } else if name.starts_with("ringbuf_stack") {
-            let ring = create_ring_zero_extend::<stack_event>(&map, stack_tx.clone())?;
-            rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_perf_counter")
-            && required.contains("perf_counter_ringbufs")
-        {
-            let ring = create_ring::<perf_counter_event>(&map, cache_tx.clone())?;
-            rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_probe") && required.contains("probe_ringbufs") {
-            let ring = create_ring::<probe_event>(&map, probe_tx.clone())?;
-            rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_network") && required.contains("network_ringbufs") {
-            let ring = create_ring::<network_event>(&map, network_tx.clone())?;
-            rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_packet") && required.contains("packet_ringbufs") {
-            let ring = create_ring::<packet_event>(&map, packet_tx.clone())?;
-            rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_epoll") && required.contains("epoll_ringbufs") {
-            let ring = create_ring::<epoll_event_bpf>(&map, epoll_tx.clone())?;
-            rings.push((name.to_string(), ring));
-        } else if name.starts_with("ringbuf_memory") && required.contains("memory_ringbufs") {
-            let ring = create_memory_ring(&map, memory_tx.clone())?;
-            rings.push((name.to_string(), ring));
+    // Families a disabled recorder would write were never created (see
+    // configure_bpf_skeleton / create_ring_shards); only the shards that exist
+    // get a poller. Each inner ring gets its own RingBuffer and poller thread,
+    // as the eight static rings did. The poller is named after the ring it
+    // drains (`rb_stk_17`): the kernel keeps 15 bytes of a thread name, so a
+    // family-name prefix would leave every poller of a family looking alike
+    // in ps and in systing's own traces.
+    for (outer, prefix, inners) in &shards.families {
+        for (i, inner) in inners.iter().enumerate() {
+            let poller = format!("{prefix}{i}");
+            match *outer {
+                "ringbufs" => {
+                    let (event_tx, event_rx) = sync_channel(CHANNEL_CAPACITY);
+                    let ring = create_ring::<task_event>(inner, event_tx)?;
+                    event_rxs.push(event_rx);
+                    rings.push((format!("events_{i}"), ring));
+                }
+                "stack_ringbufs" => {
+                    let ring = create_ring_zero_extend::<stack_event>(inner, stack_tx.clone())?;
+                    rings.push((poller, ring));
+                }
+                "perf_counter_ringbufs" => {
+                    let ring = create_ring::<perf_counter_event>(inner, cache_tx.clone())?;
+                    rings.push((poller, ring));
+                }
+                "probe_ringbufs" => {
+                    let ring = create_ring::<probe_event>(inner, probe_tx.clone())?;
+                    rings.push((poller, ring));
+                }
+                "network_ringbufs" => {
+                    let ring = create_ring::<network_event>(inner, network_tx.clone())?;
+                    rings.push((poller, ring));
+                }
+                "packet_ringbufs" => {
+                    let ring = create_ring::<packet_event>(inner, packet_tx.clone())?;
+                    rings.push((poller, ring));
+                }
+                "epoll_ringbufs" => {
+                    let ring = create_ring::<epoll_event_bpf>(inner, epoll_tx.clone())?;
+                    rings.push((poller, ring));
+                }
+                "memory_ringbufs" => {
+                    let ring = create_memory_ring(inner, memory_tx.clone())?;
+                    rings.push((poller, ring));
+                }
+                other => anyhow::bail!("unknown ring family '{other}'"),
+            }
         }
     }
 
@@ -2298,6 +2490,7 @@ fn configure_bpf_skeleton(
     old_kernel: bool,
     collect_pystacks: bool,
     recorder: &Arc<SessionRecorder>,
+    ring_plan: RingbufPlan,
 ) -> Result<()> {
     // Setup probe recorder with trace events
     {
@@ -2379,75 +2572,44 @@ fn configure_bpf_skeleton(
             rodata.tool_config.memory_alloc_sample_rate = opts.memory_alloc_sample_rate;
         }
 
-        // Set wakeup threshold to 50% of ringbuf size for batched wakeups
-        // Default ringbuf size is 50 MiB if not specified
-        let ringbuf_size = if opts.ringbuf_size_mib > 0 {
-            opts.ringbuf_size_mib as u64 * 1024 * 1024
-        } else {
-            50 * 1024 * 1024 // Default 50 MiB
-        };
-        rodata.tool_config.wakeup_data_size = ringbuf_size / 2;
+        // Rings per family and the wakeup threshold (half a ring, so
+        // consumers batch) come from the plan; see plan_ringbufs.
+        rodata.tool_config.nr_ringbufs = ring_plan.nr_rings;
+        rodata.tool_config.wakeup_data_size = u64::from(ring_plan.ring_bytes) / 2;
     }
 
-    // Configure ringbuf size if specified
-    if opts.ringbuf_size_mib > 0 {
-        let size = opts.ringbuf_size_mib * 1024 * 1024;
-        let object = open_skel.open_object_mut();
-        for mut map in object.maps_mut() {
-            let name = map.name().to_str().unwrap().to_string();
-            if name.starts_with("ringbuf_") && name.contains("_node") {
-                map.set_max_entries(size).with_context(|| {
-                    format!(
-                        "Failed to set ringbuf size to {} MiB for map '{}'",
-                        opts.ringbuf_size_mib, name
-                    )
-                })?;
-            }
-        }
-    }
-
-    // Skip creating ringbuf ARRAY_OF_MAPS for disabled recorders. The cost
-    // isn't the inner-map vmalloc (shrinking those to PAGE_SIZE makes creates
-    // ~25 µs each) — it's `synchronize_rcu()` in the kernel's
-    // `maybe_wait_bpf_programs()` after every `BPF_MAP_UPDATE_ELEM` on a
-    // map-of-maps, which libbpf calls once per `.values` slot. On a busy
-    // many-core host a grace period is ~100 ms, so 8 families × 8 slots ≈
-    // 6.4 s of startup even with every inner shrunk. Setting
-    // `autocreate(false)` on the outer skips the whole family (template,
-    // inners, and the slot updates that trigger the RCU waits). All programs
-    // that reference a skipped outer are already `autoload=false` via
-    // `required_programs` below, so the verifier never sees the dangling
-    // reference.
-    //
-    // Inners for families that ARE enabled still get shrunk to PAGE_SIZE when
-    // their slot index >= num_cpus, to save mlocked memory on small hosts
-    // (the slot update still happens, so no time saving there).
+    // Ring families. The inner rings are NOT declared in the BPF object any
+    // more: each outer ARRAY_OF_MAPS carries only a template, is sized here to
+    // the planned shard count, and is populated by `create_ring_shards` after
+    // load with rings of the planned size, inserted in ONE batch update per
+    // family. That batch matters: the kernel runs `synchronize_rcu()` in
+    // `maybe_wait_bpf_programs()` after a map-of-maps update, once per
+    // BPF_MAP_UPDATE_ELEM but only once per BPF_MAP_UPDATE_BATCH, and on a
+    // busy many-core host a grace period is ~100 ms -- 64 per-slot updates per
+    // family would be a multi-second startup. Families no enabled recorder
+    // writes are `autocreate(false)` so the outer (and its transient template
+    // ring) is never created; every program that references a skipped outer
+    // is already `autoload=false` via `required_programs` below, so the
+    // verifier never sees the dangling reference.
     //
     // SAFETY: sysconf is always safe to call; _SC_PAGESIZE cannot fail.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
     let required = get_required_ringbuf_families(opts);
-    let unused: Vec<(&str, &str)> = RINGBUF_FAMILIES
-        .iter()
-        .copied()
-        .filter(|(outer, _)| !required.contains(outer))
-        .collect();
     for mut map in open_skel.open_object_mut().maps_mut() {
         let name = map.name().to_str().unwrap().to_owned();
-        if unused
-            .iter()
-            .any(|(outer, inner)| name == *outer || name.starts_with(inner))
-        {
-            map.set_autocreate(false)
-                .with_context(|| format!("Failed to disable autocreate for '{name}'"))?;
+        if let Some((outer, _, always_on)) = RINGBUF_FAMILIES.iter().find(|(o, _, _)| *o == name) {
+            if !always_on && !required.contains(outer) {
+                map.set_autocreate(false)
+                    .with_context(|| format!("Failed to disable autocreate for '{name}'"))?;
+            } else {
+                map.set_max_entries(ring_plan.nr_rings).with_context(|| {
+                    format!(
+                        "Failed to size ring family '{name}' to {} slots",
+                        ring_plan.nr_rings
+                    )
+                })?;
+            }
             continue;
-        }
-        let unreachable_slot = name
-            .rfind("_node")
-            .and_then(|pos| name[pos + 5..].parse::<u32>().ok())
-            .is_some_and(|idx| idx >= num_cpus && num_cpus < NR_RINGBUFS as u32);
-        if unreachable_slot {
-            map.set_max_entries(page_size)
-                .with_context(|| format!("Failed to shrink unreachable ringbuf slot '{name}'"))?;
         }
         // The pysym maps are referenced by always-loaded programs (the
         // sched_switch pystacks path is rodata-gated via
@@ -3240,6 +3402,9 @@ fn attach_probes(
 
 struct ThreadHandles {
     ringbuf_threads: Vec<thread::JoinHandle<i32>>,
+    /// Owns the inner ring fds the pollers above mmap'd and registered with
+    /// epoll; dropped only after those threads are joined.
+    ring_shards: RingShards,
     sysinfo_thread: Option<thread::JoinHandle<i32>>,
     missed_poller_thread: thread::JoinHandle<i32>,
     recorder_threads: Vec<thread::JoinHandle<i32>>,
@@ -3382,6 +3547,9 @@ fn run_tracing_loop(
         for thread in handles.ringbuf_threads {
             thread.join().expect("Failed to join thread");
         }
+        // Every poller has exited, so nothing mmaps or epolls the inner rings
+        // any more: release their fds here, explicitly after the join.
+        drop(handles.ring_shards);
     }
     // The exec handler thread reads from a channel fed by ringbuf callbacks,
     // so it terminates after ringbuf threads exit and senders are dropped.
@@ -3504,6 +3672,15 @@ pub fn systing(
     }
 
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
+    let ring_plan = plan_ringbufs(num_cpus, opts.ringbuf_size_mib, opts.ringbuf_shards);
+    // One startup note, unconditional: the ring layout is the first thing to
+    // read when a host drops events, and host logs are where it gets read.
+    eprintln!(
+        "Ring buffers: {} rings per family x {} MiB ({} possible CPUs)",
+        ring_plan.nr_rings,
+        ring_plan.ring_bytes / (1024 * 1024),
+        num_cpus
+    );
     let mut perf_counter_names = Vec::new();
     let mut counters = PerfCounters::default();
     let (stop_tx, stop_rx) = channel();
@@ -3558,6 +3735,7 @@ pub fn systing(
             old_kernel,
             collect_pystacks,
             &recorder,
+            ring_plan,
         )?;
 
         for counter in perf_counter_names.iter() {
@@ -3721,7 +3899,12 @@ pub fn systing(
             );
         }
 
-        let (rings, mut channels) = setup_ringbuffers(&skel, &opts, collect_pystacks)?;
+        // Inner rings: created here, after load (the outers exist) and before
+        // attach (no program may find an empty slot). The handles live in
+        // ThreadHandles until the poller threads are joined.
+        let ring_shards = create_ring_shards(&skel, &opts, ring_plan)?;
+        let (rings, mut channels) =
+            setup_ringbuffers(&skel, &opts, collect_pystacks, &ring_shards)?;
         // Take exec_event_rx/pysym_rx out before channels is moved into
         // spawn_recorder_threads
         let exec_event_rx = channels.exec_event_rx.take();
@@ -4114,6 +4297,7 @@ pub fn systing(
 
         let handles = ThreadHandles {
             ringbuf_threads,
+            ring_shards,
             sysinfo_thread,
             missed_poller_thread,
             recorder_threads: recv_threads,
@@ -4387,5 +4571,91 @@ mod tests {
             sightings.observe(&info(7, "late-name")),
             "real comm after zeroed first sight forwards"
         );
+    }
+
+    const MIB: u32 = 1024 * 1024;
+
+    /// The byte budget a family had under the fixed eight-ring layout, after
+    /// libbpf rounded each static ring up to a power of two.
+    fn legacy_family_bytes(size_mib: u32) -> u64 {
+        8 * u64::from((size_mib * MIB).next_power_of_two())
+    }
+
+    #[test]
+    fn ring_plan_small_hosts_keep_the_old_footprint() {
+        // Up to eight CPUs: one ring per CPU at the legacy per-ring size, the
+        // same bytes the reachable static slots used to occupy.
+        for cpus in 1..=8 {
+            let p = plan_ringbufs(cpus, 25, 0);
+            assert_eq!(p.nr_rings, cpus);
+            assert_eq!(p.ring_bytes, 32 * MIB, "{cpus} CPUs");
+        }
+        let p = plan_ringbufs(4, 0, 0);
+        assert_eq!(
+            (p.nr_rings, p.ring_bytes),
+            (4, 64 * MIB),
+            "default 50 MiB rounds to 64"
+        );
+    }
+
+    #[test]
+    fn ring_plan_big_hosts_split_a_constant_family_budget() {
+        // 192 vCPU: 64 rings of 4 MiB = the old 8 x 32 MiB.
+        let p = plan_ringbufs(192, 25, 0);
+        assert_eq!((p.nr_rings, p.ring_bytes), (64, 4 * MIB));
+        assert_eq!(
+            u64::from(p.nr_rings) * u64::from(p.ring_bytes),
+            legacy_family_bytes(25)
+        );
+        // Default size, same host: 64 x 8 MiB = the old 8 x 64 MiB.
+        let p = plan_ringbufs(192, 0, 0);
+        assert_eq!((p.nr_rings, p.ring_bytes), (64, 8 * MIB));
+        assert_eq!(
+            u64::from(p.nr_rings) * u64::from(p.ring_bytes),
+            legacy_family_bytes(50)
+        );
+        // 384 vCPU caps at the 64-ring ceiling (6 CPUs per ring).
+        let p = plan_ringbufs(384, 25, 0);
+        assert_eq!((p.nr_rings, p.ring_bytes), (64, 4 * MIB));
+        // Power-of-two counts divide the budget exactly.
+        let p = plan_ringbufs(16, 25, 0);
+        assert_eq!((p.nr_rings, p.ring_bytes), (16, 16 * MIB));
+        let p = plan_ringbufs(32, 25, 0);
+        assert_eq!((p.nr_rings, p.ring_bytes), (32, 8 * MIB));
+    }
+
+    #[test]
+    fn ring_plan_never_exceeds_the_budget_on_odd_counts() {
+        // 48 CPUs: 8 x 32 / 48 = 5.33 MiB -> rounds DOWN to 4 MiB (192 MiB
+        // family, under the 256 MiB budget), never up to 8 (384 MiB, over).
+        let p = plan_ringbufs(48, 25, 0);
+        assert_eq!((p.nr_rings, p.ring_bytes), (48, 4 * MIB));
+        for cpus in 9..=NR_RINGBUFS_MAX {
+            for size in [1u32, 8, 25, 50, 100] {
+                let p = plan_ringbufs(cpus, size, 0);
+                let family = u64::from(p.nr_rings) * u64::from(p.ring_bytes);
+                assert!(
+                    family <= legacy_family_bytes(size) || p.ring_bytes == MIB,
+                    "{cpus} CPUs x {size} MiB: {family} bytes over budget"
+                );
+                assert!(p.ring_bytes.is_power_of_two() && p.ring_bytes >= MIB);
+            }
+        }
+    }
+
+    #[test]
+    fn ring_plan_honours_the_override_and_the_ceiling() {
+        // --ringbuf-shards 8 on a big host restores the fixed layout exactly.
+        let p = plan_ringbufs(192, 25, 8);
+        assert_eq!((p.nr_rings, p.ring_bytes), (8, 32 * MIB));
+        // An override above the ceiling is capped, not rejected.
+        let p = plan_ringbufs(192, 25, 1000);
+        assert_eq!(p.nr_rings, NR_RINGBUFS_MAX);
+        // An override above the CPU count is honoured (lab use); size still
+        // follows the budget rule.
+        let p = plan_ringbufs(4, 25, 16);
+        assert_eq!((p.nr_rings, p.ring_bytes), (16, 16 * MIB));
+        // Zero possible CPUs cannot happen, but the plan must stay loadable.
+        assert_eq!(plan_ringbufs(0, 25, 0).nr_rings, 1);
     }
 }
