@@ -138,9 +138,11 @@ pub struct SessionRecorder {
     pub clock_snapshot: Mutex<ClockSnapshot>,
     /// Scheduler/IRQ event recorder shards, one per `ringbufs`-family ring.
     /// Shard i is fed only by ring i's consumer thread; all recorder state is
-    /// keyed by CPU and cpu -> ring is static (cpu % NR_RINGBUFS), so shards
+    /// keyed by CPU and cpu -> ring is static (cpu % nr_ringbufs), so shards
     /// never see each other's CPUs. They stream into one shared parquet
-    /// writer (see `init_streaming_output`).
+    /// writer (see `init_streaming_output`). Sized to the ring-count ceiling
+    /// (NR_RINGBUFS_MAX); a run with fewer rings leaves the tail shards empty,
+    /// which costs nothing (empty collections, no consumer thread).
     pub event_recorders: Vec<Mutex<SchedEventRecorder>>,
     pub stack_recorder: Mutex<StackRecorder>,
     pub perf_counter_recorder: Mutex<PerfCounterRecorder>,
@@ -845,7 +847,7 @@ impl SessionRecorder {
         let track_event_ids = Arc::new(TrackEventIdGenerator::new());
         Self {
             clock_snapshot: Mutex::new(ClockSnapshot::default()),
-            event_recorders: (0..crate::systing_core::NR_RINGBUFS)
+            event_recorders: (0..crate::systing_core::NR_RINGBUFS_MAX)
                 .map(|_| Mutex::new(SchedEventRecorder::new(Arc::clone(&utid_generator))))
                 .collect(),
             stack_recorder: Mutex::new(StackRecorder::new(
@@ -1969,7 +1971,7 @@ mod tests {
         let track_event_ids = Arc::new(TrackEventIdGenerator::new());
         SessionRecorder {
             clock_snapshot: Mutex::new(ClockSnapshot::default()),
-            event_recorders: (0..crate::systing_core::NR_RINGBUFS)
+            event_recorders: (0..crate::systing_core::NR_RINGBUFS_MAX)
                 .map(|_| Mutex::new(SchedEventRecorder::new(Arc::clone(&utid_generator))))
                 .collect(),
             stack_recorder: Mutex::new(StackRecorder::new(false, Arc::clone(&utid_generator))),

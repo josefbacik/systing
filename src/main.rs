@@ -32,6 +32,11 @@ struct Command {
     no_stack_traces: bool,
     #[arg(long, default_value = "0")]
     ringbuf_size_mib: u32,
+    /// Rings per ring-buffer family (0 = one per CPU, capped at 64). Above
+    /// eight rings the family keeps the byte budget eight rings of
+    /// --ringbuf-size-mib would have had and splits it across the shards.
+    #[arg(long, default_value = "0")]
+    ringbuf_shards: u32,
     #[arg(long)]
     trace_event: Vec<String>,
     #[arg(long)]
@@ -226,6 +231,7 @@ impl From<Command> for Config {
             duration: cmd.duration,
             no_stack_traces: cmd.no_stack_traces,
             ringbuf_size_mib: cmd.ringbuf_size_mib,
+            ringbuf_shards: cmd.ringbuf_shards,
             trace_event: cmd.trace_event,
             trace_event_pid: cmd.trace_event_pid,
             sw_event: cmd.sw_event,
