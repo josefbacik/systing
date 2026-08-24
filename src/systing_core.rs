@@ -499,6 +499,45 @@ const RINGBUF_FAMILIES: &[(&str, &str, bool)] = &[
     ("memory_ringbufs", "rb_mem_", false),
 ];
 
+/// The first kernel whose BPF_MAP_UPDATE_BATCH on a map-of-maps waits ONE RCU
+/// grace period per batch call rather than one per element. Before it
+/// (through every 6.6.y release) `generic_map_update_batch` reaches
+/// `maybe_wait_bpf_programs` -> `synchronize_rcu()` for each inserted inner
+/// ring, so inserting 64 rings into a family costs 64 grace periods at start,
+/// on a busy many-core host tens of milliseconds each, paid again on every
+/// capture. The auto shard count stays at the legacy eight below this
+/// version; an explicit `--ringbuf-shards` is always honoured.
+const MAP_OF_MAPS_BATCH_WAIT_ONCE_KERNEL: (u32, u32) = (6, 8);
+
+/// The running kernel's `major.minor`, from the release string (`6.12.0`,
+/// `6.18.44-custom.2`, `6.6.97-generic`); `None` when it cannot be read or parsed.
+pub(crate) fn kernel_release_major_minor() -> Option<(u32, u32)> {
+    parse_kernel_release(&sysinfo::System::kernel_version()?)
+}
+
+/// Parse `major.minor` out of a kernel release string, tolerating whatever
+/// follows the minor (`.0`, `-custom.2`, `+`). Anything short of two numbers is
+/// `None`.
+pub(crate) fn parse_kernel_release(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.split('.');
+    let major = parts.next()?.trim().parse::<u32>().ok()?;
+    let minor_part = parts.next()?;
+    let minor_digits: String = minor_part
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let minor = minor_digits.parse::<u32>().ok()?;
+    Some((major, minor))
+}
+
+/// Does this kernel insert a batch of inner rings with one RCU grace period
+/// (6.8+)? An unreadable version counts as "no": the cost of being wrong that
+/// way is eight rings instead of sixty-four, the cost of the other way is a
+/// multi-second set-up on every capture.
+pub(crate) fn kernel_batches_map_of_maps_updates(kernel: Option<(u32, u32)>) -> bool {
+    kernel.is_some_and(|v| v >= MAP_OF_MAPS_BATCH_WAIT_ONCE_KERNEL)
+}
+
 /// How many rings each family gets and how big each is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RingbufPlan {
@@ -512,6 +551,9 @@ pub(crate) struct RingbufPlan {
 ///
 /// Shard count: one ring per CPU up to [`NR_RINGBUFS_MAX`], or the explicit
 /// `--ringbuf-shards` override (`shards_override` > 0, capped the same way).
+/// On a kernel older than [`MAP_OF_MAPS_BATCH_WAIT_ONCE_KERNEL`] (or one whose
+/// version cannot be read) the automatic count stays at the legacy eight:
+/// there every inserted ring costs an RCU grace period at start.
 /// The old layout had a compile-time eight: on a 192-CPU host that put 24
 /// CPUs behind one ring and one consumer, and `__bpf_ringbuf_reserve` takes
 /// the ring's spinlock before it checks for space, so a full ring is also a
@@ -530,6 +572,7 @@ pub(crate) fn plan_ringbufs(
     num_cpus: u32,
     ringbuf_size_mib: u32,
     shards_override: u32,
+    kernel: Option<(u32, u32)>,
 ) -> RingbufPlan {
     const MIB: u64 = 1024 * 1024;
     let size_mib = if ringbuf_size_mib > 0 {
@@ -540,8 +583,13 @@ pub(crate) fn plan_ringbufs(
     let legacy_ring = (u64::from(size_mib) * MIB).next_power_of_two();
     let nr_rings = if shards_override > 0 {
         shards_override.min(NR_RINGBUFS_MAX)
-    } else {
+    } else if kernel_batches_map_of_maps_updates(kernel) {
         num_cpus.clamp(1, NR_RINGBUFS_MAX)
+    } else {
+        // Per-ring RCU grace period at insert (see
+        // MAP_OF_MAPS_BATCH_WAIT_ONCE_KERNEL): keep the legacy count so the
+        // set-up cost stays what it was before sharding.
+        num_cpus.clamp(1, NR_RINGBUFS_LEGACY)
     };
     let ring_bytes = if nr_rings <= NR_RINGBUFS_LEGACY {
         legacy_ring
@@ -1594,6 +1642,79 @@ fn select_rss_stat_prog(force_classic: bool) -> &'static str {
     }
 }
 
+/// This process's RLIMIT_NOFILE before and after the raise, plus the hard
+/// limit; `None` when the limit could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FdLimits {
+    soft_before: u64,
+    soft_after: u64,
+    hard: u64,
+}
+
+/// Raise the soft RLIMIT_NOFILE to the hard limit (no privilege needed: a
+/// process may always move its soft limit up to its hard one). Rust does not
+/// do this for us, and a unit that inherits the 1024 default runs out of
+/// descriptors on a many-core host once every ring and every CPU holds a few.
+/// A failed raise is reported, not fatal: the projection printed after it
+/// says whether the run will fit anyway.
+fn raise_fd_soft_limit() -> Option<FdLimits> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit fills a plain struct we own.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return None;
+    }
+    // rlim_t is u64 on every 64-bit Linux target this builds for.
+    let soft_before: u64 = lim.rlim_cur;
+    let hard: u64 = lim.rlim_max;
+    let mut soft_after = soft_before;
+    if lim.rlim_cur < lim.rlim_max {
+        let raised = libc::rlimit {
+            rlim_cur: lim.rlim_max,
+            rlim_max: lim.rlim_max,
+        };
+        // SAFETY: setrlimit reads a plain struct we own.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            soft_after = hard;
+        } else {
+            eprintln!(
+                "Warning: could not raise the file-descriptor soft limit {soft_before} -> {hard}: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+    Some(FdLimits {
+        soft_before,
+        soft_after,
+        hard,
+    })
+}
+
+/// How many file descriptors a run of this shape holds at once, roughly:
+/// three per inner ring (the map handle, the consumer's ring_buffer epoll and
+/// the poller thread's epoll) across the families the run creates, the
+/// per-CPU perf descriptors (the clock sampler's event and link on every
+/// arch; with `--memory` on a non-x86 host the software page-fault event and
+/// its link as well), and a fixed allowance for everything else (the
+/// skeleton's maps and links, the output files, stdio).
+pub(crate) fn projected_fd_need(
+    nr_rings: u32,
+    families: u32,
+    num_cpus: u32,
+    collect_memory: bool,
+) -> u32 {
+    const PER_RING: u32 = 3;
+    const FIXED: u32 = 256;
+    let per_cpu = if !cfg!(target_arch = "x86_64") && collect_memory {
+        4
+    } else {
+        2
+    };
+    nr_rings * families * PER_RING + num_cpus * per_cpu + FIXED
+}
+
 fn is_old_kernel() -> bool {
     if let Some(kernel_version) = sysinfo::System::kernel_version() {
         let parts = kernel_version.split('.').collect::<Vec<&str>>();
@@ -2175,11 +2296,12 @@ fn discover_processes_with_mapping(
 /// exist) and before `skel.attach()` (no program may look up an empty slot).
 ///
 /// One BPF_MAP_UPDATE_BATCH per family: the kernel waits an RCU grace period
-/// after map-of-maps updates (`maybe_wait_bpf_programs`), once per batch
-/// call rather than once per slot, which is the difference between a few
-/// hundred milliseconds and a multi-second startup at 64 rings. Kernels
-/// without batch support for this map type (pre-5.6) fall back to per-slot
-/// updates, which are correct and merely slow.
+/// after map-of-maps updates (`maybe_wait_bpf_programs`). From 6.8 that wait
+/// happens once per batch call; before it (every 6.6.y release included) it
+/// happens once per inserted slot even inside a batch, which is why
+/// `plan_ringbufs` keeps the legacy ring count there. Kernels without batch
+/// support for map-of-maps (before 5.19) fall back to per-slot updates, which
+/// are correct and merely slow.
 fn create_ring_shards(
     skel: &SystingSystemSkel,
     opts: &Config,
@@ -3740,15 +3862,74 @@ pub fn systing(
     }
 
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
-    let ring_plan = plan_ringbufs(num_cpus, opts.ringbuf_size_mib, opts.ringbuf_shards);
+    if opts.ringbuf_size_mib >= 4096 {
+        bail!(
+            "--ringbuf-size-mib {} is out of range: a ring is at most 4095 MiB",
+            opts.ringbuf_size_mib
+        );
+    }
+    let kernel = kernel_release_major_minor();
+    let ring_plan = plan_ringbufs(num_cpus, opts.ringbuf_size_mib, opts.ringbuf_shards, kernel);
     // One startup note, unconditional: the ring layout is the first thing to
     // read when a host drops events, and host logs are where it gets read.
     eprintln!(
-        "Ring buffers: {} rings per family x {} MiB ({} possible CPUs)",
+        "Ring buffers: {} rings per family x {} MiB ({} possible CPUs; kernel {}; {})",
         ring_plan.nr_rings,
         ring_plan.ring_bytes / (1024 * 1024),
-        num_cpus
+        num_cpus,
+        match kernel {
+            Some((major, minor)) => format!("{major}.{minor}"),
+            None => "unknown".to_string(),
+        },
+        if opts.ringbuf_shards > 0 {
+            "--ringbuf-shards"
+        } else if kernel_batches_map_of_maps_updates(kernel) {
+            "one per CPU"
+        } else {
+            "legacy count, kernel inserts rings one grace period at a time"
+        }
     );
+    // Every ring costs file descriptors (its map handle, its consumer's epoll
+    // and the poller's) and every CPU costs perf fds, so a sharded layout on
+    // a big host outruns the 1024 soft limit most units inherit. Raise it to
+    // the hard limit up front and say what the run is going to need.
+    let fd_limits = raise_fd_soft_limit();
+    // Families: the ones the enabled recorders and probes need, plus the
+    // always-on stack family (see RINGBUF_FAMILIES).
+    let fd_need = projected_fd_need(
+        ring_plan.nr_rings,
+        get_required_ringbuf_families(&opts).len() as u32 + 1,
+        num_cpus,
+        is_recorder_enabled("memory", &opts),
+    );
+    match fd_limits {
+        Some(FdLimits {
+            soft_before,
+            soft_after,
+            hard,
+        }) => {
+            if soft_after > soft_before {
+                eprintln!(
+                    "File descriptors: soft limit raised {soft_before} -> {soft_after} (hard {hard}); \
+                     this run needs about {fd_need}"
+                );
+            } else {
+                eprintln!(
+                    "File descriptors: soft limit {soft_after} (hard {hard}); this run needs about {fd_need}"
+                );
+            }
+            if u64::from(fd_need) > hard {
+                eprintln!(
+                    "Warning: the projected file-descriptor need ({fd_need}) exceeds the hard \
+                     limit ({hard}); expect EMFILE while setting up rings or perf events - \
+                     lower --ringbuf-shards or raise the limit for this process"
+                );
+            }
+        }
+        None => eprintln!(
+            "Warning: could not read the file-descriptor limit; this run needs about {fd_need}"
+        ),
+    }
     let mut perf_counter_names = Vec::new();
     let mut counters = PerfCounters::default();
     let (stop_tx, stop_rx) = channel();
@@ -3970,7 +4151,16 @@ pub fn systing(
         // Inner rings: created here, after load (the outers exist) and before
         // attach (no program may find an empty slot). The handles live in
         // ThreadHandles until the poller threads are joined.
+        let t_rings = std::time::Instant::now();
         let ring_shards = create_ring_shards(&skel, &opts, ring_plan)?;
+        if diag {
+            eprintln!(
+                "[diag] create_ring_shards ({} rings x {} families) took {:?}",
+                ring_plan.nr_rings,
+                ring_shards.families.len(),
+                t_rings.elapsed()
+            );
+        }
         let (rings, mut channels) =
             setup_ringbuffers(&skel, &opts, collect_pystacks, &ring_shards)?;
         // Take exec_event_rx/pysym_rx out before channels is moved into
@@ -4654,11 +4844,11 @@ mod tests {
         // Up to eight CPUs: one ring per CPU at the legacy per-ring size, the
         // same bytes the reachable static slots used to occupy.
         for cpus in 1..=8 {
-            let p = plan_ringbufs(cpus, 25, 0);
+            let p = plan_ringbufs(cpus, 25, 0, Some((6, 12)));
             assert_eq!(p.nr_rings, cpus);
             assert_eq!(p.ring_bytes, 32 * MIB, "{cpus} CPUs");
         }
-        let p = plan_ringbufs(4, 0, 0);
+        let p = plan_ringbufs(4, 0, 0, Some((6, 12)));
         assert_eq!(
             (p.nr_rings, p.ring_bytes),
             (4, 64 * MIB),
@@ -4669,26 +4859,26 @@ mod tests {
     #[test]
     fn ring_plan_big_hosts_split_a_constant_family_budget() {
         // 192 vCPU: 64 rings of 4 MiB = the old 8 x 32 MiB.
-        let p = plan_ringbufs(192, 25, 0);
+        let p = plan_ringbufs(192, 25, 0, Some((6, 12)));
         assert_eq!((p.nr_rings, p.ring_bytes), (64, 4 * MIB));
         assert_eq!(
             u64::from(p.nr_rings) * u64::from(p.ring_bytes),
             legacy_family_bytes(25)
         );
         // Default size, same host: 64 x 8 MiB = the old 8 x 64 MiB.
-        let p = plan_ringbufs(192, 0, 0);
+        let p = plan_ringbufs(192, 0, 0, Some((6, 12)));
         assert_eq!((p.nr_rings, p.ring_bytes), (64, 8 * MIB));
         assert_eq!(
             u64::from(p.nr_rings) * u64::from(p.ring_bytes),
             legacy_family_bytes(50)
         );
         // 384 vCPU caps at the 64-ring ceiling (6 CPUs per ring).
-        let p = plan_ringbufs(384, 25, 0);
+        let p = plan_ringbufs(384, 25, 0, Some((6, 12)));
         assert_eq!((p.nr_rings, p.ring_bytes), (64, 4 * MIB));
         // Power-of-two counts divide the budget exactly.
-        let p = plan_ringbufs(16, 25, 0);
+        let p = plan_ringbufs(16, 25, 0, Some((6, 12)));
         assert_eq!((p.nr_rings, p.ring_bytes), (16, 16 * MIB));
-        let p = plan_ringbufs(32, 25, 0);
+        let p = plan_ringbufs(32, 25, 0, Some((6, 12)));
         assert_eq!((p.nr_rings, p.ring_bytes), (32, 8 * MIB));
     }
 
@@ -4696,11 +4886,11 @@ mod tests {
     fn ring_plan_never_exceeds_the_budget_on_odd_counts() {
         // 48 CPUs: 8 x 32 / 48 = 5.33 MiB -> rounds DOWN to 4 MiB (192 MiB
         // family, under the 256 MiB budget), never up to 8 (384 MiB, over).
-        let p = plan_ringbufs(48, 25, 0);
+        let p = plan_ringbufs(48, 25, 0, Some((6, 12)));
         assert_eq!((p.nr_rings, p.ring_bytes), (48, 4 * MIB));
         for cpus in 9..=NR_RINGBUFS_MAX {
             for size in [1u32, 8, 25, 50, 100] {
-                let p = plan_ringbufs(cpus, size, 0);
+                let p = plan_ringbufs(cpus, size, 0, Some((6, 12)));
                 let family = u64::from(p.nr_rings) * u64::from(p.ring_bytes);
                 assert!(
                     family <= legacy_family_bytes(size) || p.ring_bytes == MIB,
@@ -4714,16 +4904,70 @@ mod tests {
     #[test]
     fn ring_plan_honours_the_override_and_the_ceiling() {
         // --ringbuf-shards 8 on a big host restores the fixed layout exactly.
-        let p = plan_ringbufs(192, 25, 8);
+        let p = plan_ringbufs(192, 25, 8, Some((6, 12)));
         assert_eq!((p.nr_rings, p.ring_bytes), (8, 32 * MIB));
         // An override above the ceiling is capped, not rejected.
-        let p = plan_ringbufs(192, 25, 1000);
+        let p = plan_ringbufs(192, 25, 1000, Some((6, 12)));
         assert_eq!(p.nr_rings, NR_RINGBUFS_MAX);
         // An override above the CPU count is honoured (lab use); size still
         // follows the budget rule.
-        let p = plan_ringbufs(4, 25, 16);
+        let p = plan_ringbufs(4, 25, 16, Some((6, 12)));
         assert_eq!((p.nr_rings, p.ring_bytes), (16, 16 * MIB));
         // Zero possible CPUs cannot happen, but the plan must stay loadable.
-        assert_eq!(plan_ringbufs(0, 25, 0).nr_rings, 1);
+        assert_eq!(plan_ringbufs(0, 25, 0, Some((6, 12))).nr_rings, 1);
+    }
+
+    #[test]
+    fn ring_plan_keeps_the_legacy_count_where_inserts_wait_per_ring() {
+        // Below 6.8 every inserted ring costs an RCU grace period at start,
+        // so the automatic count stays at eight (the old layout exactly)...
+        for old in [Some((6, 6)), Some((6, 7)), Some((5, 19)), None] {
+            let p = plan_ringbufs(192, 25, 0, old);
+            assert_eq!((p.nr_rings, p.ring_bytes), (8, 32 * MIB), "{old:?}");
+            // ...and small hosts are unaffected either way.
+            assert_eq!(plan_ringbufs(4, 25, 0, old).nr_rings, 4, "{old:?}");
+        }
+        // ...while an explicit --ringbuf-shards is honoured on any kernel.
+        let p = plan_ringbufs(192, 25, 64, Some((6, 6)));
+        assert_eq!((p.nr_rings, p.ring_bytes), (64, 4 * MIB));
+        // From 6.8 the batch insert waits once, and the per-CPU layout applies.
+        for new in [Some((6, 8)), Some((6, 12)), Some((6, 18)), Some((7, 1))] {
+            assert_eq!(plan_ringbufs(192, 25, 0, new).nr_rings, 64, "{new:?}");
+        }
+    }
+
+    #[test]
+    fn kernel_release_parses_real_release_strings() {
+        assert_eq!(parse_kernel_release("6.12.0"), Some((6, 12)));
+        assert_eq!(parse_kernel_release("6.6.97-generic"), Some((6, 6)));
+        assert_eq!(parse_kernel_release("6.18.44-custom.2"), Some((6, 18)));
+        assert_eq!(parse_kernel_release("7.1.7"), Some((7, 1)));
+        assert_eq!(parse_kernel_release("6.12"), Some((6, 12)));
+        assert_eq!(parse_kernel_release("6"), None);
+        assert_eq!(parse_kernel_release("garbage"), None);
+        assert_eq!(parse_kernel_release(""), None);
+        assert!(kernel_batches_map_of_maps_updates(Some((6, 8))));
+        assert!(kernel_batches_map_of_maps_updates(Some((7, 0))));
+        assert!(!kernel_batches_map_of_maps_updates(Some((6, 7))));
+        assert!(!kernel_batches_map_of_maps_updates(None));
+    }
+
+    #[test]
+    fn fd_projection_counts_rings_cpus_and_a_fixed_allowance() {
+        // 64 rings x 8 families x 3 + 192 CPUs x 2 (x86: clock event + link)
+        // + the fixed allowance.
+        assert_eq!(
+            projected_fd_need(64, 8, 192, false),
+            64 * 8 * 3 + 192 * 2 + 256
+        );
+        // The memory lane's fault leg adds two per CPU off x86 only.
+        let with_memory = projected_fd_need(64, 8, 192, true);
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(with_memory, projected_fd_need(64, 8, 192, false));
+        } else {
+            assert_eq!(with_memory, 64 * 8 * 3 + 192 * 4 + 256);
+        }
+        // The old layout on a small host stays well under a 1024 soft limit.
+        assert!(projected_fd_need(8, 2, 8, false) < 1024);
     }
 }
