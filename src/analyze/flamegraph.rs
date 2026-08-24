@@ -950,6 +950,7 @@ mod tests {
         AnalyzeDb {
             conn,
             path: std::path::PathBuf::new(),
+            mem_limit_mib: None,
         }
     }
 
