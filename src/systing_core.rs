@@ -214,8 +214,15 @@ const MEMORY_BPF_PROGRAMS: &[&str] = &[
     "systing_munmap_exit",
     "systing_brk_enter",
     "systing_brk_exit",
+    // The fault leg has two attach paths, selected at build time: the
+    // exceptions:page_fault_user tracepoint on x86 (auto-attached by
+    // skel.attach), and the perf software page-fault event everywhere else
+    // (SEC("perf_event"), attached per CPU in attach_clock_sampler) — arm64
+    // never fires that tracepoint.
     #[cfg(target_arch = "x86_64")]
     "systing_page_fault_user",
+    #[cfg(not(target_arch = "x86_64"))]
+    "systing_page_fault_sw",
 ];
 
 /// Allocator uprobe programs. Listed here only so `enable_programs` loads them
@@ -2721,6 +2728,8 @@ fn attach_clock_sampler(
             },
             disabled: false,
             need_slots: false,
+            exclude_kernel: false,
+            sample_addr: false,
             cpus: (0..num_cpus).collect(),
         };
         let mut clock_sampling = if opts.sw_event {
@@ -2772,6 +2781,15 @@ fn attach_clock_sampler(
                 },
             )?;
         perf_links.push(link);
+    }
+
+    // Non-x86: the memory recorder's fault leg is a perf software event, not an
+    // auto-attached tracepoint (see attach_page_fault_sw_events). It rides this
+    // last attach slot — after every tracepoint, USDT and uprobe link, like the
+    // clock sampler — and its links live in the same `perf_links`.
+    #[cfg(not(target_arch = "x86_64"))]
+    if opts.memory {
+        attach_page_fault_sw_events(skel, opts, num_cpus, &mut perf_links)?;
     }
 
     Ok((perf_links, clock_sampling))
@@ -2846,6 +2864,56 @@ fn setup_perf_counter_events(
     }
 
     Ok(event_files_vec)
+}
+
+/// Memory recorder, fault leg, on arches without the x86-only
+/// exceptions:page_fault_user tracepoint: one PERF_COUNT_SW_PAGE_FAULTS event
+/// per CPU, user-mode faults only, sampled kernel-side 1:N, driving the
+/// systing_page_fault_sw program (the BPF side carries the context and
+/// semantics notes). Called from [`attach_clock_sampler`], so it attaches in
+/// the same last slot as the clock sampler; the links go into `perf_links`
+/// like the clock sampler's.
+#[cfg(not(target_arch = "x86_64"))]
+fn attach_page_fault_sw_events(
+    skel: &mut SystingSystemSkel,
+    opts: &Config,
+    num_cpus: u32,
+    perf_links: &mut Vec<libbpf_rs::Link>,
+) -> Result<()> {
+    use crate::perf;
+
+    let mut fault_files = PerfOpenEvents::default();
+    fault_files.add_hw_event(PerfHwEvent {
+        name: "page-faults".to_string(),
+        event_type: perf::PERF_TYPE_SOFTWARE,
+        event_config: perf::PERF_COUNT_SW_PAGE_FAULTS,
+        disabled: false,
+        need_slots: false,
+        exclude_kernel: true,
+        sample_addr: true,
+        cpus: (0..num_cpus).collect(),
+    })?;
+    // 0 or 1 means every fault (the x86 path's convention for
+    // memory_fault_sample_rate); a software event needs a non-zero period, so
+    // clamp.
+    let period = u64::from(opts.memory_fault_sample_rate).max(1);
+    fault_files.open_events(None, period).with_context(|| {
+        "Failed to open the software page-fault perf events for the memory recorder"
+    })?;
+    for (_, file) in fault_files {
+        let link = skel
+            .progs
+            .systing_page_fault_sw
+            .attach_perf_event_with_opts(
+                file.as_raw_fd(),
+                libbpf_rs::PerfEventOpts {
+                    cookie: 0,
+                    ..Default::default()
+                },
+            )?;
+        perf_links.push(link);
+    }
+    Ok(())
 }
 
 /// Returns PIDs to attach probes to with their resolved library paths.
