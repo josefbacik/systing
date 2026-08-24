@@ -103,6 +103,12 @@ const volatile struct {
 				 * cgroup_targets / cgroup_target_refs maps;
 				 * rodata so the filter loops are
 				 * verifier-bounded. */
+	u32 cgroup_match_kernel; /* 1: the kernel decides --cgroup membership
+				  * (cgroup_targets / cgroup_target_refs);
+				  * 0: legacy exact match of the task's own
+				  * cgroup id against the cgroups map (see the
+				  * map comments). Rodata, so the branch not
+				  * taken is dead code to the verifier. */
 	u32 no_stack_traces;
 	u32 no_cpu_stack_traces;
 	u32 no_sleep_stack_traces;
@@ -642,6 +648,23 @@ struct {
 	__type(value, struct cgroup_target_ref);
 	__uint(max_entries, 1);
 } cgroup_target_refs SEC(".maps");
+
+/*
+ * Legacy --cgroup matching, used when the running kernel's BTF does not
+ * export bpf_task_under_cgroup (before 6.5) or when SYSTING_CGROUP_FILTER_LEGACY
+ * forces it: userspace loads the cgroup ids of each target and of every
+ * descendant that exists when the trace starts, sized to that count, and the
+ * tracing programs match the task's own cgroup id against the set exactly.
+ * Cgroups created under a target after the trace started are not in the set
+ * and their tasks are not traced - the limitation the kernel-side matching
+ * above removes. Written by userspace only, lookup-only from BPF.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, u8);
+	__uint(max_entries, 1);
+} cgroups SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -1716,6 +1739,18 @@ static bool should_filter_systing(struct task_struct *task)
 	return false;
 }
 
+/*
+ * Legacy --cgroup matching (cgroup_match_kernel == 0): the task's own cgroup
+ * id looked up in the start-time set userspace loaded into the cgroups map.
+ * Any program type, any kernel; misses cgroups created after the trace
+ * started (see the cgroups map comment).
+ */
+static bool task_in_legacy_cgroup_set(struct task_struct *task)
+{
+	u64 cgid = task_cg_id(task);
+	return bpf_map_lookup_elem(&cgroups, &cgid) != NULL;
+}
+
 /* Every filter except --cgroup; see trace_task() and trace_task_btf(). */
 static bool trace_task_common(struct task_struct *task)
 {
@@ -1743,8 +1778,11 @@ static bool trace_task(struct task_struct *task)
 {
 	if (!trace_task_common(task))
 		return false;
-	if (tool_config.filter_cgroup && !current_in_cgroup_filter())
-		return false;
+	if (tool_config.filter_cgroup) {
+		if (tool_config.cgroup_match_kernel)
+			return current_in_cgroup_filter();
+		return task_in_legacy_cgroup_set(task);
+	}
 	return true;
 }
 
@@ -1760,8 +1798,11 @@ static bool trace_task_btf(struct task_struct *task)
 {
 	if (!trace_task_common(task))
 		return false;
-	if (tool_config.filter_cgroup && !task_in_cgroup_filter(task))
-		return false;
+	if (tool_config.filter_cgroup) {
+		if (tool_config.cgroup_match_kernel)
+			return task_in_cgroup_filter(task);
+		return task_in_legacy_cgroup_set(task);
+	}
 	return true;
 }
 

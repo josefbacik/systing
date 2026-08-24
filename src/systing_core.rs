@@ -601,6 +601,7 @@ pub fn get_required_bpf_programs(
     opts: &Config,
     old_kernel: bool,
     collect_pystacks: bool,
+    cgroup_kernel_mode: bool,
 ) -> HashSet<&'static str> {
     let mut required = HashSet::new();
 
@@ -624,9 +625,11 @@ pub fn get_required_bpf_programs(
         required.insert("systing_sched_process_fork");
     }
 
-    // The --cgroup filter parks a reference to each target cgroup through the
-    // cgroup iterator program; it is run by userspace, never attached.
-    if !opts.cgroup.is_empty() {
+    // In kernel mode the --cgroup filter parks a reference to each target
+    // cgroup through the cgroup iterator program; it is run by userspace, never
+    // attached. Legacy mode (no kfunc on this kernel, or forced) loads no
+    // program for the filter: the exact-match set is a map userspace fills.
+    if !opts.cgroup.is_empty() && cgroup_kernel_mode {
         required.insert("systing_cgroup_target_add");
     }
 
@@ -2496,12 +2499,17 @@ fn warn_failed_probe_attachments(skel: &SystingSystemSkel) {
     }
 }
 
+// Eight inputs: the skeleton, the config, and the per-run facts it needs at
+// open time (CPU count, kernel age, pystacks, the --cgroup mode, the ring plan)
+// — the same shape the repo allows on the other open-time configurators.
+#[allow(clippy::too_many_arguments)]
 fn configure_bpf_skeleton(
     open_skel: &mut OpenSystingSystemSkel,
     opts: &Config,
     num_cpus: u32,
     old_kernel: bool,
     collect_pystacks: bool,
+    cgroup_kernel_mode: bool,
     recorder: &Arc<SessionRecorder>,
     ring_plan: RingbufPlan,
 ) -> Result<()> {
@@ -2544,6 +2552,7 @@ fn configure_bpf_skeleton(
         rodata.tool_config.confidentiality_mode = detect_confidentiality_mode();
         if !opts.cgroup.is_empty() {
             rodata.tool_config.filter_cgroup = 1;
+            rodata.tool_config.cgroup_match_kernel = cgroup_kernel_mode as u32;
         }
         if opts.no_stack_traces {
             rodata.tool_config.no_stack_traces = 1;
@@ -2655,7 +2664,8 @@ fn configure_bpf_skeleton(
 
     // Determine which BPF programs are needed based on enabled recorders.
     // Each recorder declares its required programs; we coalesce them and disable the rest.
-    let required_programs = get_required_bpf_programs(opts, old_kernel, collect_pystacks);
+    let required_programs =
+        get_required_bpf_programs(opts, old_kernel, collect_pystacks, cgroup_kernel_mode);
 
     for mut prog in open_skel.open_object_mut().progs_mut() {
         let name = prog
@@ -2997,9 +3007,8 @@ struct CgroupTarget {
 }
 
 /// Does the running kernel's vmlinux BTF export the `bpf_task_under_cgroup`
-/// kfunc (Linux 6.5+)? The sched tracepoints test tasks other than current
-/// against the `--cgroup` targets through it, so the filter refuses to start
-/// without it rather than trace the wrong set of tasks.
+/// kfunc (Linux 6.5+)? That is the capability the kernel-side `--cgroup`
+/// matching needs; without it the filter runs in legacy mode.
 fn kernel_has_task_under_cgroup_kfunc() -> bool {
     match libbpf_rs::btf::Btf::from_vmlinux() {
         Ok(btf) => btf
@@ -3015,49 +3024,128 @@ fn kernel_has_task_under_cgroup_kfunc() -> bool {
     }
 }
 
-/// Resolve the `--cgroup` targets, deduplicated by cgroup id.
-///
-/// Membership is decided in the kernel (`task_under_cgroup_hierarchy()`: the
-/// task's cgroup is the target or somewhere below it, so cgroups created after
-/// the trace started match too), which is why this opens each target directory
-/// and reads its id and nothing more — no subtree enumeration. The fd and the
-/// id size the two filter maps, so this runs before the skeleton is loaded. A
-/// path that is not a cgroup directory, more than `MAX_CGROUP_TARGETS` targets,
-/// and a kernel without the kfunc the sched tracepoints need are all reported
-/// as errors up front.
-fn resolve_cgroup_targets(opts: &Config) -> Result<Vec<CgroupTarget>> {
-    let mut targets: Vec<CgroupTarget> = Vec::new();
-    if opts.cgroup.is_empty() {
-        return Ok(targets);
+/// Environment knob that forces the legacy `--cgroup` matching on a kernel that
+/// has the kfunc — so the fallback can be exercised (and tested) anywhere.
+const CGROUP_FILTER_LEGACY_ENV: &str = "SYSTING_CGROUP_FILTER_LEGACY";
+
+/// How the `--cgroup` filter decides membership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CgroupMatchMode {
+    /// The kernel decides (`bpf_current_task_under_cgroup()` /
+    /// `bpf_task_under_cgroup()`): a task in the target or anywhere below it
+    /// matches, cgroups created after the trace started included.
+    Kernel,
+    /// The pre-kfunc mechanism: the target's subtree is enumerated once at
+    /// start and a task's own cgroup id is matched against that set exactly;
+    /// cgroups created afterwards are not traced.
+    LegacySnapshot,
+}
+
+/// The mode decision, kept pure so it can be unit-tested: kernel-side matching
+/// when the kfunc exists and nothing forces the fallback.
+fn cgroup_match_mode(kfunc_available: bool, force_legacy: bool) -> CgroupMatchMode {
+    if kfunc_available && !force_legacy {
+        CgroupMatchMode::Kernel
+    } else {
+        CgroupMatchMode::LegacySnapshot
     }
-    if !kernel_has_task_under_cgroup_kfunc() {
-        bail!(
-            "--cgroup needs the bpf_task_under_cgroup kfunc (Linux 6.5 and later); \
-             this kernel's BTF does not export it"
-        );
-    }
-    for cgroup in opts.cgroup.iter() {
-        let path = std::path::Path::new(cgroup);
-        let id = crate::cgroup::cgroup_id(path)
-            .with_context(|| format!("Failed to access cgroup path: {cgroup}"))?;
-        if targets.iter().any(|t| t.id == id) {
-            continue;
+}
+
+/// The resolved `--cgroup` filter: the mode plus what each mode loads into BPF.
+/// Empty (no targets, no ids) when `--cgroup` was not given.
+struct CgroupFilter {
+    mode: CgroupMatchMode,
+    /// Kernel mode: one entry per distinct target.
+    targets: Vec<CgroupTarget>,
+    /// Legacy mode: the ids of every target and of every descendant that existed
+    /// at resolve time, deduplicated.
+    legacy_ids: Vec<u64>,
+}
+
+impl CgroupFilter {
+    fn none() -> Self {
+        CgroupFilter {
+            mode: CgroupMatchMode::Kernel,
+            targets: Vec::new(),
+            legacy_ids: Vec::new(),
         }
-        let dir = fs::File::open(path)
-            .with_context(|| format!("Failed to open cgroup directory: {cgroup}"))?;
-        targets.push(CgroupTarget {
-            path: cgroup.clone(),
-            dir,
-            id,
-        });
     }
-    if targets.len() > MAX_CGROUP_TARGETS {
-        bail!(
-            "at most {MAX_CGROUP_TARGETS} distinct --cgroup targets are supported, got {}",
-            targets.len()
-        );
+
+    fn kernel_mode(&self) -> bool {
+        self.mode == CgroupMatchMode::Kernel
     }
-    Ok(targets)
+}
+
+/// Resolve the `--cgroup` targets for whichever mode the running kernel gets.
+///
+/// Kernel mode opens each target directory and reads its id and nothing more
+/// (no subtree enumeration): the fd and the id fill the two filter maps. Legacy
+/// mode enumerates each target's subtree as it exists now
+/// (`collect_descendant_cgroup_ids()`) for the exact-match set. Either way the
+/// counts size the maps, so this runs before the skeleton is opened. A path that
+/// is not a cgroup directory and more than `MAX_CGROUP_TARGETS` targets are
+/// reported as errors up front; the mode in use is printed once so a trace's
+/// log says which semantics it ran with.
+fn resolve_cgroup_filter(opts: &Config) -> Result<CgroupFilter> {
+    if opts.cgroup.is_empty() {
+        return Ok(CgroupFilter::none());
+    }
+    let force_legacy = std::env::var_os(CGROUP_FILTER_LEGACY_ENV).is_some_and(|v| !v.is_empty());
+    let mode = cgroup_match_mode(kernel_has_task_under_cgroup_kfunc(), force_legacy);
+    let mut filter = CgroupFilter {
+        mode,
+        targets: Vec::new(),
+        legacy_ids: Vec::new(),
+    };
+    match mode {
+        CgroupMatchMode::Kernel => {
+            eprintln!("--cgroup: membership decided by the kernel (bpf_task_under_cgroup)");
+            for cgroup in opts.cgroup.iter() {
+                let path = std::path::Path::new(cgroup);
+                let id = crate::cgroup::cgroup_id(path)
+                    .with_context(|| format!("Failed to access cgroup path: {cgroup}"))?;
+                if filter.targets.iter().any(|t| t.id == id) {
+                    continue;
+                }
+                let dir = fs::File::open(path)
+                    .with_context(|| format!("Failed to open cgroup directory: {cgroup}"))?;
+                filter.targets.push(CgroupTarget {
+                    path: cgroup.clone(),
+                    dir,
+                    id,
+                });
+            }
+            if filter.targets.len() > MAX_CGROUP_TARGETS {
+                bail!(
+                    "at most {MAX_CGROUP_TARGETS} distinct --cgroup targets are supported, got {}",
+                    filter.targets.len()
+                );
+            }
+        }
+        CgroupMatchMode::LegacySnapshot => {
+            eprintln!(
+                "--cgroup: {}; matching a start-time snapshot of each target's cgroups \
+                 (cgroups created under a target after this point are not traced)",
+                if force_legacy {
+                    format!("{CGROUP_FILTER_LEGACY_ENV} is set")
+                } else {
+                    "this kernel's BTF does not export bpf_task_under_cgroup".to_string()
+                }
+            );
+            let mut seen = HashSet::new();
+            for cgroup in opts.cgroup.iter() {
+                let path = std::path::Path::new(cgroup);
+                let ids = crate::cgroup::collect_descendant_cgroup_ids(path)
+                    .with_context(|| format!("Failed to access cgroup path: {cgroup}"))?;
+                for id in ids {
+                    if seen.insert(id) {
+                        filter.legacy_ids.push(id);
+                    }
+                }
+            }
+        }
+    }
+    Ok(filter)
 }
 
 /// Hand one `--cgroup` target to BPF as a referenced `struct cgroup *`.
@@ -3897,6 +3985,15 @@ pub fn systing(
         opts.pid.push(child.pid);
     }
 
+    // Resolve the --cgroup filter (mode + targets) first thing: the mode
+    // selects BPF programs and a rodata flag and the counts size the filter
+    // maps, and in legacy mode the snapshot of each target's cgroups is taken
+    // here, so it is as close to the caller's "start" as it can be — every
+    // second spent on set-up after this point (symbolizer, output sink, the
+    // skeleton) is a second in which a cgroup created under a target would
+    // still make the snapshot.
+    let cgroup_filter = resolve_cgroup_filter(&opts)?;
+
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     let ring_plan = plan_ringbufs(num_cpus, opts.ringbuf_size_mib, opts.ringbuf_shards);
     // One startup note, unconditional: the ring layout is the first thing to
@@ -3960,6 +4057,7 @@ pub fn systing(
             num_cpus,
             old_kernel,
             collect_pystacks,
+            cgroup_filter.kernel_mode(),
             &recorder,
             ring_plan,
         )?;
@@ -4011,12 +4109,13 @@ pub fn systing(
                 format!("Failed to set missed_events map size to {num_cpus} entries")
             })?;
 
-        // Resolve the --cgroup targets before load: both filter maps are sized to
-        // one slot per distinct target, and the count goes into rodata so the
-        // BPF filter loops are bounded by it.
-        let cgroup_targets = resolve_cgroup_targets(&opts)?;
-        if !cgroup_targets.is_empty() {
-            let n = cgroup_targets.len() as u32;
+        // Size the --cgroup filter maps for the mode resolved above (the maps of
+        // the other mode stay at their 1-entry default, unused): kernel mode
+        // gets one slot per distinct target in both target maps, with the count
+        // in rodata so the BPF filter loops are bounded by it; legacy mode gets
+        // the exact-match set sized to the ids enumerated at start.
+        if !cgroup_filter.targets.is_empty() {
+            let n = cgroup_filter.targets.len() as u32;
             open_skel
                 .maps
                 .cgroup_targets
@@ -4037,6 +4136,14 @@ pub fn systing(
                 .tool_config
                 .num_cgroup_targets = n;
         }
+        if !cgroup_filter.legacy_ids.is_empty() {
+            let n = cgroup_filter.legacy_ids.len() as u32;
+            open_skel
+                .maps
+                .cgroups
+                .set_max_entries(n)
+                .with_context(|| format!("Failed to set cgroups map size to {n} entries"))?;
+        }
 
         let diag = std::env::var_os("SYSTING_DIAG_RINGBUFS").is_some();
         let t_load = std::time::Instant::now();
@@ -4046,10 +4153,22 @@ pub fn systing(
         if diag {
             eprintln!("[diag] open_skel.load() took {:?}", t_load.elapsed());
         }
-        // The maps were sized to exactly these targets above; this fills them
-        // (fds, then the references via the iterator program) and verifies each
-        // slot before any tracing program is attached.
-        install_cgroup_targets(&mut skel, &cgroup_targets)?;
+        // The maps were sized to exactly these entries above. Kernel mode: the
+        // fds, then the references via the iterator program, each slot verified
+        // before any tracing program is attached. Legacy mode: the start-time
+        // id set.
+        install_cgroup_targets(&mut skel, &cgroup_filter.targets)?;
+        let cgroup_filter_val = (1_u8).to_ne_bytes();
+        for id in &cgroup_filter.legacy_ids {
+            skel.maps
+                .cgroups
+                .update(
+                    &id.to_ne_bytes(),
+                    &cgroup_filter_val,
+                    libbpf_rs::MapFlags::ANY,
+                )
+                .with_context(|| format!("Failed to add cgroup id {id} to BPF map"))?;
+        }
 
         for pid in opts.pid.iter() {
             let val = (1_u8).to_ne_bytes();
@@ -4882,5 +5001,38 @@ mod tests {
         assert_eq!((p.nr_rings, p.ring_bytes), (16, 16 * MIB));
         // Zero possible CPUs cannot happen, but the plan must stay loadable.
         assert_eq!(plan_ringbufs(0, 25, 0).nr_rings, 1);
+    }
+
+    #[test]
+    fn test_cgroup_match_mode_prefers_kernel_unless_forced() {
+        // The kfunc decides; the env knob only ever forces the fallback.
+        assert_eq!(cgroup_match_mode(true, false), CgroupMatchMode::Kernel);
+        assert_eq!(
+            cgroup_match_mode(true, true),
+            CgroupMatchMode::LegacySnapshot
+        );
+        assert_eq!(
+            cgroup_match_mode(false, false),
+            CgroupMatchMode::LegacySnapshot
+        );
+        assert_eq!(
+            cgroup_match_mode(false, true),
+            CgroupMatchMode::LegacySnapshot
+        );
+    }
+
+    #[test]
+    fn test_cgroup_filter_iterator_program_only_in_kernel_mode() {
+        let opts = Config {
+            cgroup: vec!["/sys/fs/cgroup/some-target".to_string()],
+            ..Default::default()
+        };
+        assert!(get_required_bpf_programs(&opts, false, false, true)
+            .contains("systing_cgroup_target_add"));
+        assert!(!get_required_bpf_programs(&opts, false, false, false)
+            .contains("systing_cgroup_target_add"));
+        let none = Config::default();
+        assert!(!get_required_bpf_programs(&none, false, false, true)
+            .contains("systing_cgroup_target_add"));
     }
 }

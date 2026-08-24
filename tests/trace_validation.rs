@@ -1050,10 +1050,13 @@ fn test_e2e_validation_suite() {
 // matches.
 // =============================================================================
 
-/// Recording duration for the cgroup filter test (seconds). The late cgroup and
+/// Recording duration for the cgroup filter tests (seconds). The late cgroup and
 /// its workload are created `CGROUP_LATE_CREATE_DELAY_SECS` in, which is after
-/// the targets are handed to BPF (before the trace even starts) on any
-/// machine, and leaves the rest of the window for the workload to be sampled.
+/// `systing()` has resolved the `--cgroup` targets (the first thing it does —
+/// in legacy mode that is the start-time snapshot, so the delay must exceed
+/// the time to reach it, not the whole set-up, which runs tens of seconds on
+/// an emulated guest), and leaves the rest of the window for the workload to
+/// be sampled.
 const CGROUP_FILTER_DURATION_SECS: u64 = 10;
 const CGROUP_LATE_CREATE_DELAY_SECS: u64 = 3;
 
@@ -1315,6 +1318,222 @@ fn test_e2e_cgroup_filter_follows_cgroups_created_after_start() {
     assert_eq!(
         outside_rows, 0,
         "[cgroup filter] workload pid {outside_pid} outside the --cgroup target was traced"
+    );
+    eprintln!("  outside workload pid {outside_pid}: not traced (correct)");
+}
+
+/// Sets `SYSTING_CGROUP_FILTER_LEGACY` for the duration of one test and clears
+/// it on drop (the panic path included), so the kernel-mode test in this file
+/// never inherits the forced fallback. The integration runner executes these
+/// tests with `--test-threads=1`.
+struct LegacyCgroupFilterEnv;
+
+impl LegacyCgroupFilterEnv {
+    fn set() -> LegacyCgroupFilterEnv {
+        std::env::set_var("SYSTING_CGROUP_FILTER_LEGACY", "1");
+        LegacyCgroupFilterEnv
+    }
+}
+
+impl Drop for LegacyCgroupFilterEnv {
+    fn drop(&mut self) {
+        std::env::remove_var("SYSTING_CGROUP_FILTER_LEGACY");
+    }
+}
+
+/// The legacy (pre-kfunc) `--cgroup` matching, forced through
+/// `SYSTING_CGROUP_FILTER_LEGACY` so it runs on any kernel: the fixture of the
+/// test above plus a leaf that exists under the target BEFORE the trace starts.
+/// The early task must be traced (the start-time snapshot includes the target's
+/// descendants), the late task must NOT be (a cgroup created after the snapshot
+/// is invisible to this mode — the known limitation, and the discriminator that
+/// proves the fallback was in effect), and the sibling hierarchy stays excluded.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_cgroup_filter_legacy_snapshot_fallback() {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    let Some(cgroup_root) = systing::cgroup::cgroup2_root() else {
+        eprintln!("skipping: no cgroup v2 unified hierarchy on this system");
+        return;
+    };
+    let base = match current_cgroup_v2_path() {
+        Some(p) if p != "/" => cgroup_root.join(p.trim_start_matches('/')),
+        _ => cgroup_root,
+    };
+    //   <base>/systing-cgl-<pid>/                 <- the --cgroup target
+    //   <base>/systing-cgl-<pid>/early/           <- exists BEFORE the trace starts
+    //   <base>/systing-cgl-<pid>/mid/late/        <- created AFTER the trace starts
+    //   <base>/systing-cgl-<pid>-outside/leaf/    <- sibling, must NOT be traced
+    let tag = format!("systing-cgl-{}", std::process::id());
+    let target = base.join(&tag);
+    let early = target.join("early");
+    let mid = target.join("mid");
+    let late = mid.join("late");
+    let outside = base.join(format!("{tag}-outside"));
+    let outside_leaf = outside.join("leaf");
+
+    let mut fixture = CgroupFixture { dirs: Vec::new() };
+    match fixture.create(&target) {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            eprintln!(
+                "skipping: cannot create a cgroup under {} ({e})",
+                base.display()
+            );
+            return;
+        }
+        Err(e) => panic!("Failed to create cgroup {}: {e}", target.display()),
+    }
+    for dir in [&early, &outside, &outside_leaf] {
+        fixture
+            .create(dir)
+            .unwrap_or_else(|e| panic!("Failed to create cgroup {}: {e}", dir.display()));
+    }
+    let early_id = std::fs::metadata(&early)
+        .expect("Failed to stat early cgroup")
+        .ino();
+
+    let early_workload = CgroupWorkload::spawn_in(&early);
+    let outside_workload = CgroupWorkload::spawn_in(&outside_leaf);
+
+    let (tx, rx) = mpsc::channel();
+    let (mid_t, late_t) = (mid.clone(), late.clone());
+    let creator = thread::spawn(move || {
+        thread::sleep(Duration::from_secs(CGROUP_LATE_CREATE_DELAY_SECS));
+        let mut created = Vec::new();
+        for dir in [&mid_t, &late_t] {
+            std::fs::create_dir(dir)
+                .unwrap_or_else(|e| panic!("Failed to create cgroup {}: {e}", dir.display()));
+            created.push(dir.clone());
+        }
+        let workload = CgroupWorkload::spawn_in(&late_t);
+        tx.send(created).expect("test thread went away");
+        workload
+    });
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+    eprintln!(
+        "Recording trace ({CGROUP_FILTER_DURATION_SECS}s, --cgroup {}, LEGACY mode forced, \
+         late cgroup at +{CGROUP_LATE_CREATE_DELAY_SECS}s)...",
+        target.display()
+    );
+    let config = Config {
+        duration: CGROUP_FILTER_DURATION_SECS,
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path,
+        cgroup: vec![target.to_string_lossy().into_owned()],
+        ..Config::default()
+    };
+    let result = {
+        let _legacy = LegacyCgroupFilterEnv::set();
+        systing(config, None)
+    };
+
+    if let Ok(late_dirs) = rx.recv() {
+        fixture.dirs.extend(late_dirs);
+    }
+    let late_workload = match creator.join() {
+        Ok(workload) => workload,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+    result.expect("systing recording failed");
+    let early_pid = early_workload.pid();
+    let late_pid = late_workload.pid();
+    let outside_pid = outside_workload.pid();
+    drop(early_workload);
+    drop(late_workload);
+    drop(outside_workload);
+    eprintln!("Recording complete.\n");
+
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "cgroup_filter_legacy")
+        .expect("parquet -> duckdb failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    // The task in a descendant that existed at start was traced, in its own
+    // leaf: the snapshot covers the subtree as it was.
+    let early_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM process WHERE pid = ?",
+            [early_pid],
+            |row| row.get(0),
+        )
+        .expect("Failed to count early workload process rows");
+    assert!(
+        early_rows > 0,
+        "[cgroup filter, legacy] workload pid {early_pid} in a leaf that existed under the \
+         --cgroup target before the trace started was not traced"
+    );
+    let early_cgroup_id: u64 = conn
+        .query_row(
+            "SELECT cgroup_id FROM process WHERE pid = ? LIMIT 1",
+            [early_pid],
+            |row| row.get(0),
+        )
+        .expect("Failed to query early workload cgroup_id");
+    assert_eq!(
+        early_cgroup_id, early_id,
+        "[cgroup filter, legacy] workload pid {early_pid} recorded with cgroup_id \
+         {early_cgroup_id}, expected its leaf {early_id}"
+    );
+    let early_events: i64 = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM stack_sample s JOIN thread t USING (utid) \
+                     JOIN process p USING (upid) WHERE p.pid = ?) \
+                  + (SELECT COUNT(*) FROM sched_slice s JOIN thread t USING (utid) \
+                     JOIN process p USING (upid) WHERE p.pid = ?)",
+            [early_pid, early_pid],
+            |row| row.get(0),
+        )
+        .expect("Failed to count early workload events");
+    assert!(
+        early_events > 0,
+        "[cgroup filter, legacy] workload pid {early_pid} has a process row but no stack \
+         samples or sched slices"
+    );
+    eprintln!(
+        "  early workload pid {early_pid}: traced, cgroup_id {early_cgroup_id} (leaf), \
+         {early_events} stack samples + sched slices"
+    );
+
+    // The task in the cgroup created after the trace started was NOT traced:
+    // that is the legacy mode's known loss, and the proof that legacy mode ran
+    // (the kernel-side matching would have caught it).
+    let late_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM process WHERE pid = ?",
+            [late_pid],
+            |row| row.get(0),
+        )
+        .expect("Failed to count late workload process rows");
+    assert_eq!(
+        late_rows, 0,
+        "[cgroup filter, legacy] workload pid {late_pid} in a cgroup created after the \
+         trace started was traced: the forced legacy mode is not in effect"
+    );
+    eprintln!("  late workload pid {late_pid}: not traced (the legacy mode's known loss)");
+
+    let outside_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM process WHERE pid = ?",
+            [outside_pid],
+            |row| row.get(0),
+        )
+        .expect("Failed to query outside workload process row");
+    assert_eq!(
+        outside_rows, 0,
+        "[cgroup filter, legacy] workload pid {outside_pid} outside the --cgroup target was \
+         traced"
     );
     eprintln!("  outside workload pid {outside_pid}: not traced (correct)");
 }

@@ -133,12 +133,38 @@ pub fn cgroup_id(path: &Path) -> io::Result<u64> {
     Ok(meta.ino())
 }
 
+/// Collect the cgroup id (directory inode) of `path` and of every cgroup nested
+/// beneath it in the cgroup2 hierarchy.
+///
+/// This is the `--cgroup` filter's legacy mode, used when the running kernel's
+/// BTF does not export `bpf_task_under_cgroup` (before 6.5) or when
+/// `SYSTING_CGROUP_FILTER_LEGACY` forces it: the BPF side then matches a task's
+/// *leaf* cgroup id exactly against a start-time set. A target is frequently an
+/// interior node rather than a leaf: a Kubernetes pod cgroup, for instance,
+/// contains per-container child cgroups and the tasks live in those children
+/// (cgroup v2 forbids processes in interior cgroups once they have controllers
+/// enabled), so filtering on only the interior id would miss every task.
+/// Descending and adding every descendant id makes `--cgroup <pod>` capture the
+/// subtree as it exists at the time of the walk — a cgroup created afterwards is
+/// not matched, which is the limitation the kernel-side matching removes.
+///
+/// The returned vector lists `path`'s own id first, followed by its descendants
+/// in an unspecified order, deduplicated. Failure to stat `path` (or `path` not
+/// being a directory) is returned to the caller so an invalid `--cgroup` argument
+/// is reported; errors reading individual descendants are ignored (best-effort:
+/// cgroups can come and go mid-walk).
+pub fn collect_descendant_cgroup_ids(path: &Path) -> io::Result<Vec<u64>> {
+    let mut ids = Vec::new();
+    for_each_cgroup_dir(path, &mut |_, meta| ids.push(meta.ino()))?;
+    Ok(ids)
+}
+
 /// Collect the pids listed in `cgroup.procs` of `start` and of every cgroup
 /// nested beneath it, inserting them into `pids`.
 ///
-/// This descends because a `--cgroup` target is often an interior node whose
-/// own `cgroup.procs` is empty (the tasks live in child container/slice
-/// cgroups). Best-effort: an unreadable or
+/// Like [`collect_descendant_cgroup_ids`], this descends because a `--cgroup`
+/// target is often an interior node whose own `cgroup.procs` is empty (the tasks
+/// live in child container/slice cgroups). Best-effort: an unreadable or
 /// non-existent `start` simply contributes nothing.
 pub fn collect_cgroup_procs(start: &Path, pids: &mut HashSet<u32>) {
     let _ = for_each_cgroup_dir(start, &mut |path, _| {
@@ -284,6 +310,80 @@ mod tests {
         fs::write(&file, b"").unwrap();
         let err = cgroup_id(&file).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_collect_descendant_cgroup_ids() {
+        // Build a tree mimicking a pod cgroup with nested container cgroups:
+        //   pod/                      <- the --cgroup target (interior node)
+        //   pod/container-a/
+        //   pod/container-a/leaf/
+        //   pod/container-b/
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pod = tmp.path().join("pod");
+        let a = pod.join("container-a");
+        let a_leaf = a.join("leaf");
+        let b = pod.join("container-b");
+        for d in [&pod, &a, &a_leaf, &b] {
+            fs::create_dir_all(d).unwrap();
+        }
+        // A regular file inside a cgroup (like cgroup.procs) must not be treated as
+        // a child cgroup.
+        fs::write(pod.join("cgroup.procs"), b"").unwrap();
+
+        let ids = collect_descendant_cgroup_ids(&pod).unwrap();
+
+        let mut expected = HashSet::new();
+        for d in [&pod, &a, &a_leaf, &b] {
+            expected.insert(fs::metadata(d).unwrap().ino());
+        }
+        let got: HashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(got, expected);
+        // The target's own id is reported first.
+        assert_eq!(ids[0], fs::metadata(&pod).unwrap().ino());
+        // No duplicates.
+        assert_eq!(ids.len(), got.len());
+    }
+
+    #[test]
+    fn test_collect_descendant_cgroup_ids_missing_path_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        assert!(collect_descendant_cgroup_ids(&missing).is_err());
+    }
+
+    #[test]
+    fn test_collect_descendant_cgroup_ids_non_dir_errors() {
+        // A typo'd --cgroup pointing at a file must be a clear error, not a
+        // silently-empty filter.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("a-file");
+        fs::write(&file, b"").unwrap();
+        assert!(collect_descendant_cgroup_ids(&file).is_err());
+    }
+
+    #[test]
+    fn test_collect_descendant_cgroup_ids_skips_symlinks() {
+        // A symlink to a sibling directory must neither be collected (it is not a
+        // directory per file_type) nor descended into.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        let real = root.join("real");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let ids = collect_descendant_cgroup_ids(&root).unwrap();
+        let got: HashSet<u64> = ids.iter().copied().collect();
+
+        let expected: HashSet<u64> = [&root, &real]
+            .iter()
+            .map(|d| fs::metadata(d).unwrap().ino())
+            .collect();
+        assert_eq!(got, expected);
+        // The symlink target lives outside the tree and must not be pulled in.
+        assert!(!got.contains(&fs::metadata(&outside).unwrap().ino()));
     }
 
     #[test]
