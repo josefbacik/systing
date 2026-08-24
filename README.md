@@ -253,6 +253,11 @@ the process going off the CPU or going on the CPU in addition to the process
 being traced, so you will miss events for the unwanted process leaving the CPU.
 Perfetto handles this appropriately, but it looks odd.
 
+`--cgroup <path>` traces every task whose cgroup is that cgroup or any cgroup
+below it, including cgroups created after the trace started (membership is
+decided by the kernel's `bpf_task_under_cgroup()`); it requires **Linux kernel
+6.5 or newer** and fails with a clear error on older kernels.
+
 `--trace-event` - This will add an `instant` track event for each event that
 this tool captures.  The format is "<trace type>:<optional
 info>:<class>:<name>".  This is most easily obtained by running

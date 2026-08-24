@@ -1037,20 +1037,22 @@ fn test_e2e_validation_suite() {
 }
 
 // =============================================================================
-// --cgroup filter: ancestry match
+// --cgroup filter: membership decided by the kernel
 //
 // Regression test for the start-time-snapshot bug: the filter used to load the
 // ids of the target cgroup and its descendants *as they existed when the trace
 // started* and match a task's leaf cgroup id exactly, so a task in a cgroup
 // created after that snapshot (a nested container runtime making cgroups inside
 // a pod) was never traced and the whole --cgroup trace came back empty. The
-// filter now matches by ancestry, so only the target's own id is loaded and a
-// leaf created mid-trace still matches through its ancestors.
+// filter now asks the kernel (bpf_current_task_under_cgroup() /
+// bpf_task_under_cgroup(): is the task's cgroup the target or below it?), so
+// only the target itself is handed over and a leaf created mid-trace still
+// matches.
 // =============================================================================
 
 /// Recording duration for the cgroup filter test (seconds). The late cgroup and
 /// its workload are created `CGROUP_LATE_CREATE_DELAY_SECS` in, which is after
-/// the filter snapshot (taken before the BPF skeleton is even loaded) on any
+/// the targets are handed to BPF (before the trace even starts) on any
 /// machine, and leaves the rest of the window for the workload to be sampled.
 const CGROUP_FILTER_DURATION_SECS: u64 = 10;
 const CGROUP_LATE_CREATE_DELAY_SECS: u64 = 3;
@@ -1264,10 +1266,10 @@ fn test_e2e_cgroup_filter_follows_cgroups_created_after_start() {
         late_rows > 0,
         "[cgroup filter] workload pid {late_pid} in a cgroup created after the trace \
          started (two levels below the --cgroup target) was not traced: the filter is \
-         matching a start-time snapshot of leaf ids, not ancestry"
+         matching a start-time snapshot of leaf ids, not the kernel's own membership test"
     );
     // ...and it was recorded in its own (new) leaf cgroup, not in the target: the
-    // match came from an ancestor, which is the whole point.
+    // kernel matched it through its ancestors, which is the whole point.
     let late_cgroup_id: u64 = conn
         .query_row(
             "SELECT cgroup_id FROM process WHERE pid = ? LIMIT 1",
@@ -1301,7 +1303,7 @@ fn test_e2e_cgroup_filter_follows_cgroups_created_after_start() {
          {late_events} stack samples + sched slices"
     );
 
-    // The sibling hierarchy is still excluded: ancestry matching must not widen
+    // The sibling hierarchy is still excluded: kernel-side matching must not widen
     // the filter beyond the target's subtree.
     let outside_rows: i64 = conn
         .query_row(

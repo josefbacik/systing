@@ -99,6 +99,10 @@ _Static_assert(sizeof(struct systing_stack_build_id) ==
 const volatile struct {
 	u32 filter_pid;
 	u32 filter_cgroup;
+	u32 num_cgroup_targets; /* --cgroup arguments = filled slots of the
+				 * cgroup_targets / cgroup_target_refs maps;
+				 * rodata so the filter loops are
+				 * verifier-bounded. */
 	u32 no_stack_traces;
 	u32 no_cpu_stack_traces;
 	u32 no_sleep_stack_traces;
@@ -581,21 +585,63 @@ struct {
 } perf_counters SEC(".maps");
 
 /*
- * The --cgroup filter set: cgroup v2 ids (dfl_cgrp->kn->id, the directory
- * inode) of each --cgroup target. Written by userspace before tracing starts,
- * read-only from BPF (lookups only, from both the perf_event sampler and the
- * tp_btf/fentry programs, so it must stay a plain preallocated HASH — never
- * LRU). A task matches when its own cgroup OR any ancestor is in the set (see
- * task_in_cgroup_filter()); userspace only enumerates descendants into this
- * map under kernel lockdown, where the ancestor walk's probe reads are
- * unavailable. Sized by userspace to the ids it loads.
+ * --cgroup filter targets: one slot per --cgroup argument in each of the two
+ * maps below, both filled by userspace before tracing starts and only ever
+ * READ from the tracing programs (no BPF-side writer in any program that runs
+ * in NMI or IRQ context, nothing LRU). Sized by userspace to the number of
+ * --cgroup arguments, at most MAX_CGROUP_TARGETS.
+ *
+ * The matching is the kernel's own: task_under_cgroup_hierarchy(), "is the
+ * task's cgroup the target or somewhere below it", which is what makes
+ * cgroups created AFTER the trace started (a nested container runtime making
+ * cgroups inside a pod, a transient systemd scope) match too. Two entry
+ * points into it exist and we need both:
+ *
+ *   cgroup_targets      BPF_MAP_TYPE_CGROUP_ARRAY of the target directory fds
+ *                       (the kernel holds a cgroup reference per slot).
+ *                       bpf_current_task_under_cgroup(map, idx) tests CURRENT
+ *                       against a slot: a READ_ONCE of the slot plus an
+ *                       ancestors[] compare, lock-free and NMI-safe, available
+ *                       to every tracing program type since 4.8. trace_task()
+ *                       uses it - all of its callers outside the sched
+ *                       tracepoints pass current.
+ *
+ *   cgroup_target_refs  the same targets as referenced struct cgroup kptrs,
+ *                       for bpf_task_under_cgroup(task, cgrp) on a task that
+ *                       is NOT current: the switched-in task, a woken task, a
+ *                       migrating one. Only TRACING programs (tp_btf) may call
+ *                       that kfunc on 6.6 and 6.12 kernels - 6.6 registers the
+ *                       generic kfuncs for TRACING alone, 6.12 adds tracepoint
+ *                       and perf_event but never kprobe or raw_tracepoint - so
+ *                       it cannot replace the helper above, and the kfunc
+ *                       needs a trusted cgroup pointer, which
+ *                       bpf_cgroup_from_id() must not produce from IRQ or NMI
+ *                       context (it takes kernfs_idr_lock on 6.6). The
+ *                       references are therefore taken once, in process
+ *                       context, by systing_cgroup_target_add below and read
+ *                       under bpf_rcu_read_lock() by task_in_cgroup_filter().
  */
+#define MAX_CGROUP_TARGETS 64
+
+struct cgroup_target_ref {
+	struct cgroup __kptr *cgrp;
+	u64 id; /* the target's cgroup id (kn->id), set with the reference so
+		 * userspace can confirm the slot was filled */
+};
+
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, u64);
-	__type(value, u8);
-	__uint(max_entries, 10240);
-} cgroups SEC(".maps");
+	__uint(type, BPF_MAP_TYPE_CGROUP_ARRAY);
+	__type(key, u32);
+	__type(value, u32);
+	__uint(max_entries, 1);
+} cgroup_targets SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, struct cgroup_target_ref);
+	__uint(max_entries, 1);
+} cgroup_target_refs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -1464,95 +1510,114 @@ static u64 task_cg_id(struct task_struct *task)
 }
 
 /*
- * CO-RE flavor type for kernels < 6.1, where struct cgroup carried its
- * ancestors' cgroup ids directly (u64 ancestor_ids[], indexed by level) instead
- * of the struct cgroup *ancestors[] pointer array that replaced it in 6.1. The
- * ___pre61 suffix is ignored by CO-RE type matching, so this matches the
- * kernel's actual struct cgroup at runtime.
+ * --cgroup filter for the CURRENT task, from any program type. The helper runs
+ * the kernel's task_under_cgroup_hierarchy() on current against each target
+ * slot of cgroup_targets (see the map comment): 1 when current's cgroup is the
+ * target or below it, 0 when not, negative for an unfilled slot. Lock-free and
+ * NMI-safe, so the perf_event sampler may call it like everything else.
  */
-struct cgroup___pre61 {
-	u64 ancestor_ids[0];
-};
+static bool current_in_cgroup_filter(void)
+{
+	for (u32 i = 0; i < MAX_CGROUP_TARGETS; i++) {
+		if (i >= tool_config.num_cgroup_targets)
+			break;
+		if (bpf_current_task_under_cgroup(&cgroup_targets, i) == 1)
+			return true;
+	}
+	return false;
+}
 
 /*
- * Deepest cgroup v2 nesting level the --cgroup ancestry walk inspects. Real
- * hierarchies are shallow (a Kubernetes container leaf sits at level 4-6; a
- * nested runtime inside it adds a few more); the bound keeps the walk a
- * verifier-bounded loop. A task deeper than this is still matched on its own
- * cgroup id and on its first CGROUP_FILTER_MAX_DEPTH ancestors.
- */
-#define CGROUP_FILTER_MAX_DEPTH 16
-
-/*
- * --cgroup filter: is the task's own cgroup, or any ancestor of it, one of the
- * --cgroup targets?
+ * --cgroup filter for ANY task, from tp_btf programs only: the sched
+ * tracepoints test tasks other than current (the switched-in task, a woken
+ * task, a migrating one). bpf_task_under_cgroup() is the same kernel predicate
+ * as the helper above, taking the task and a trusted cgroup pointer; the
+ * pointer is the reference systing_cgroup_target_add parked in
+ * cgroup_target_refs, loaded under bpf_rcu_read_lock() (struct cgroup is an
+ * RCU-protected kptr type, so the verifier accepts the load as trusted for
+ * this KF_RCU kfunc). The rcu section holds no lock and takes no reference:
+ * one map lookup and one ancestors[] compare per target.
  *
- * Matching by ancestry rather than by exact id keeps the filter correct for
- * cgroups created AFTER the trace started - a nested container runtime making
- * cgroups inside a pod, a systemd unit spawning transient scopes. The task's
- * leaf cgroup may be brand new, but its ancestor chain still reaches the
- * target. Userspace therefore loads only the targets' own ids into the
- * `cgroups` map, not a start-time snapshot of their descendants (which by
- * construction could never contain a cgroup that did not exist yet).
- *
- * The walk probe-reads cgrp->ancestors[i] (cgrp->ancestor_ids[i] before 6.1)
- * from a CO-RE-relocated array base: ancestors[] is a flexible array member,
- * and the verifier does not accept a direct BTF load of its pointer elements
- * past the struct's declared size, so each element is read with
- * bpf_probe_read_kernel at an explicit offset. Probe reads are restricted under
- * kernel lockdown confidentiality mode; there the walk is skipped and
- * userspace enumerates each target's descendants at start instead (the
- * pre-ancestry behaviour, with its known start-time-snapshot limitation).
- *
- * Cost, paid only when --cgroup is set: one hash lookup, plus at most
- * level x (up to 3 probe reads + 1 hash lookup) when the task is not directly
- * in a target. Lookups only - this map is never written from BPF, so it is
- * safe from both the perf_event (NMI) sampler and the tp_btf/fentry programs.
+ * Kernels without the kfunc (< 6.5) never get here - userspace refuses
+ * --cgroup on them - and bpf_ksym_exists() keeps every program that inlines
+ * this loadable there for traces without --cgroup.
  */
 static bool task_in_cgroup_filter(struct task_struct *task)
 {
-	struct cgroup *cgrp = task->cgroups->dfl_cgrp;
-	u64 cgid = cgrp->kn->id;
+	bool hit = false;
 
-	/* The task sits directly in a target (or, under lockdown, in one of the
-	 * pre-enumerated descendants). */
-	if (bpf_map_lookup_elem(&cgroups, &cgid))
-		return true;
-	if (tool_config.confidentiality_mode)
+	if (!bpf_ksym_exists(bpf_task_under_cgroup))
 		return false;
 
-	/* ancestors[level] is the cgroup itself, checked above; walk the proper
-	 * ancestors, root first. */
-	int level = cgrp->level;
-	if (level > CGROUP_FILTER_MAX_DEPTH)
-		level = CGROUP_FILTER_MAX_DEPTH;
+	bpf_rcu_read_lock();
+	for (u32 i = 0; i < MAX_CGROUP_TARGETS && !hit; i++) {
+		struct cgroup_target_ref *ref;
+		struct cgroup *cgrp;
+		/* A separate key keeps the loop counter in a register; passing &i
+		 * to the lookup spills it and the verifier loses its bound. */
+		u32 key = i;
 
-	if (bpf_core_field_exists(cgrp->ancestors)) {
-		/* >= 6.1: struct cgroup *ancestors[], one pointer per level. */
-		struct cgroup **ancestors =
-			(void *)cgrp + bpf_core_field_offset(cgrp->ancestors);
-		for (int i = 0; i < CGROUP_FILTER_MAX_DEPTH && i < level; i++) {
-			struct cgroup *anc;
-			if (bpf_probe_read_kernel(&anc, sizeof(anc), &ancestors[i]))
-				break;
-			u64 id = BPF_CORE_READ(anc, kn, id);
-			if (id && bpf_map_lookup_elem(&cgroups, &id))
-				return true;
-		}
-	} else {
-		/* < 6.1: u64 ancestor_ids[], the cgroup id itself per level. */
-		struct cgroup___pre61 *old = (void *)cgrp;
-		u64 *ancestor_ids =
-			(void *)cgrp + bpf_core_field_offset(old->ancestor_ids);
-		for (int i = 0; i < CGROUP_FILTER_MAX_DEPTH && i < level; i++) {
-			u64 id;
-			if (bpf_probe_read_kernel(&id, sizeof(id), &ancestor_ids[i]))
-				break;
-			if (id && bpf_map_lookup_elem(&cgroups, &id))
-				return true;
-		}
+		if (i >= tool_config.num_cgroup_targets)
+			break;
+		ref = bpf_map_lookup_elem(&cgroup_target_refs, &key);
+		if (!ref)
+			break;
+		cgrp = ref->cgrp;
+		if (cgrp && bpf_task_under_cgroup(task, cgrp) == 1)
+			hit = true;
 	}
-	return false;
+	bpf_rcu_read_unlock();
+	return hit;
+}
+
+/*
+ * Hands a --cgroup target to BPF as a referenced struct cgroup pointer.
+ *
+ * Userspace runs this once per target, before tracing starts, through a cgroup
+ * iterator pinned to the target with BPF_CGROUP_ITER_SELF_ONLY, so the program
+ * is called exactly once with ctx->cgroup = the target (and once more with
+ * NULL, the iterator's end). It runs in the context of the read(2) on the
+ * iterator fd: process context, where bpf_cgroup_from_id() may take
+ * kernfs_idr_lock. The reference goes into the first free slot of
+ * cgroup_target_refs together with the cgroup id, which is what userspace
+ * checks afterwards. Taking the reference by id rather than by acquiring
+ * ctx->cgroup keeps this loadable on 6.6, where the iterator's cgroup argument
+ * is not yet a trusted pointer. The references are dropped with the map when
+ * systing exits. Autoloaded only with --cgroup.
+ */
+SEC("iter/cgroup")
+int systing_cgroup_target_add(struct bpf_iter__cgroup *ctx)
+{
+	struct cgroup *cgrp = ctx->cgroup;
+	u64 id;
+
+	if (!cgrp)
+		return 0;
+	id = cgrp->kn->id;
+	if (!id)
+		return 0;
+
+	for (u32 i = 0; i < MAX_CGROUP_TARGETS; i++) {
+		struct cgroup_target_ref *slot;
+		struct cgroup *ref;
+		u32 key = i; /* see task_in_cgroup_filter() */
+
+		slot = bpf_map_lookup_elem(&cgroup_target_refs, &key);
+		if (!slot)
+			break;
+		if (slot->id)
+			continue;
+
+		ref = bpf_cgroup_from_id(id);
+		if (!ref)
+			break;
+		ref = bpf_kptr_xchg(&slot->cgrp, ref);
+		if (ref)
+			bpf_cgroup_release(ref);
+		slot->id = id;
+		break;
+	}
+	return 0;
 }
 
 /*
@@ -1651,7 +1716,8 @@ static bool should_filter_systing(struct task_struct *task)
 	return false;
 }
 
-static bool trace_task(struct task_struct *task)
+/* Every filter except --cgroup; see trace_task() and trace_task_btf(). */
+static bool trace_task_common(struct task_struct *task)
 {
 	if (!tracing_enabled)
 		return false;
@@ -1664,6 +1730,36 @@ static bool trace_task(struct task_struct *task)
 		if (bpf_map_lookup_elem(&pids, &pid) == NULL)
 			return false;
 	}
+	return true;
+}
+
+/*
+ * Is this task traced? For callers that pass current (every program outside
+ * the sched tracepoints: the --cgroup test here is on current, through the
+ * helper every program type may call). A caller in a tp_btf program that
+ * tests a task other than current uses trace_task_btf() instead.
+ */
+static bool trace_task(struct task_struct *task)
+{
+	if (!trace_task_common(task))
+		return false;
+	if (tool_config.filter_cgroup && !current_in_cgroup_filter())
+		return false;
+	return true;
+}
+
+/*
+ * trace_task() for tp_btf programs, where the task need not be current (the
+ * switched-in task, a wakee, a migrating task, a forked child's parent): the
+ * --cgroup test is bpf_task_under_cgroup() on the task itself. tp_btf only -
+ * the kfunc does not verify in kprobe or raw_tracepoint programs on any
+ * kernel, nor in tracepoint or perf_event programs before 6.12 (see the
+ * cgroup_targets comment).
+ */
+static bool trace_task_btf(struct task_struct *task)
+{
+	if (!trace_task_common(task))
+		return false;
 	if (tool_config.filter_cgroup && !task_in_cgroup_filter(task))
 		return false;
 	return true;
@@ -1960,7 +2056,7 @@ static int handle_sched_wakeup_new(struct task_struct *task)
 {
 	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
 
-	if (!trace_task(cur) && !trace_task(task))
+	if (!trace_task_btf(cur) && !trace_task_btf(task))
 		return 0;
 	return handle_wakeup(cur, task, SCHED_WAKEUP_NEW);
 }
@@ -1989,7 +2085,7 @@ static int handle_sched_switch(void *ctx, bool preempt, struct task_struct *prev
 
 	u64 ts = bpf_ktime_get_boot_ns();
 
-	if (!trace_task(prev) && !trace_task(next))
+	if (!trace_task_btf(prev) && !trace_task_btf(next))
 		return 0;
 
 	/*
@@ -2074,7 +2170,7 @@ static int handle_sched_waking(struct task_struct *task)
 {
 	struct task_struct *cur = (struct task_struct *)bpf_get_current_task_btf();
 
-	if (!trace_task(cur) && !trace_task(task))
+	if (!trace_task_btf(cur) && !trace_task_btf(task))
 		return 0;
 	return handle_wakeup(cur, task, SCHED_WAKING);
 }
@@ -2103,7 +2199,7 @@ static int handle_sched_migrate(struct task_struct *task, int dest_cpu)
 	long flags;
 	u64 ts = bpf_ktime_get_boot_ns();
 
-	if (!trace_task(task))
+	if (!trace_task_btf(task))
 		return 0;
 	event = reserve_task_event(&flags);
 	if (!event)
@@ -2130,7 +2226,7 @@ static int handle_sched_process_exit(struct task_struct *task)
 	long flags;
 	u64 ts = bpf_ktime_get_boot_ns();
 
-	if (!trace_task(task))
+	if (!trace_task_btf(task))
 		return 0;
 
 #ifdef SYSTING_PYSTACKS
@@ -2174,7 +2270,7 @@ static int handle_sched_process_fork(struct task_struct *parent,
 				     struct task_struct *child)
 {
 	// Check if parent is being traced
-	if (!trace_task(parent))
+	if (!trace_task_btf(parent))
 		return 0;
 
 	// Add child to the pids map so we trace it too
@@ -2229,7 +2325,7 @@ int BPF_PROG(systing_sched_process_exec, struct task_struct *task,
 {
 	if (!tool_config.collect_pystacks)
 		return 0;
-	if (!trace_task(task))
+	if (!trace_task_btf(task))
 		return 0;
 
 	/*

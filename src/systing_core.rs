@@ -624,6 +624,12 @@ pub fn get_required_bpf_programs(
         required.insert("systing_sched_process_fork");
     }
 
+    // The --cgroup filter parks a reference to each target cgroup through the
+    // cgroup iterator program; it is run by userspace, never attached.
+    if !opts.cgroup.is_empty() {
+        required.insert("systing_cgroup_target_add");
+    }
+
     // Pystacks with PID filtering needs exec tracking to discover new Python processes
     if collect_pystacks && !opts.pid.is_empty() {
         required.insert("systing_sched_process_exec");
@@ -2656,8 +2662,15 @@ fn configure_bpf_skeleton(
             .name()
             .to_str()
             .expect("BPF program name is not valid UTF-8");
-        if !required_programs.contains(name) {
+        let autoload = required_programs.contains(name);
+        // The cgroup iterator program is driven by userspace (install_cgroup_targets)
+        // once per --cgroup target; skel.attach() must not create a link for it.
+        let manual_attach = name == "systing_cgroup_target_add";
+        if !autoload {
             prog.set_autoload(false);
+        }
+        if manual_attach {
+            prog.set_autoattach(false);
         }
     }
 
@@ -2968,43 +2981,174 @@ fn collect_memory_alloc_target_pids(opts: &Config) -> Vec<u32> {
     pids.into_iter().collect()
 }
 
-/// Resolve the cgroup ids the BPF filter must hold for the configured
-/// `--cgroup` targets, deduplicated across targets.
-///
-/// Normally that is each target's own id and nothing else: the BPF side
-/// (`task_in_cgroup_filter()`) matches a task whose cgroup is a target OR has a
-/// target among its ancestors, so a target that is an interior node (a k8s pod
-/// cgroup whose tasks live in per-container children, say) is covered without
-/// enumerating its subtree — including children that did not exist yet when
-/// the trace started. A start-time snapshot of the descendants could never
-/// contain those, which is how a nested container runtime creating cgroups
-/// under a pod used to yield an empty `--cgroup` trace.
-///
-/// Under kernel lockdown confidentiality mode the ancestry walk is unavailable
-/// (it needs probe reads, which lockdown restricts) and the BPF side falls back
-/// to exact-id matching, so the pre-ancestry behaviour is kept there: enumerate
-/// each target's descendants at start, accepting that limitation.
-///
-/// The result drives both the size of the `cgroups` BPF map and its contents,
-/// which is why it is resolved before the skeleton is loaded.
-fn collect_cgroup_filter_ids(opts: &Config, confidentiality_mode: bool) -> Result<Vec<u64>> {
-    let mut ids = Vec::new();
-    let mut seen = HashSet::new();
-    for cgroup in opts.cgroup.iter() {
-        let path = std::path::Path::new(cgroup);
-        let target_ids = if confidentiality_mode {
-            crate::cgroup::collect_descendant_cgroup_ids(path)
-        } else {
-            crate::cgroup::cgroup_id(path).map(|id| vec![id])
-        }
-        .with_context(|| format!("Failed to access cgroup path: {cgroup}"))?;
-        for id in target_ids {
-            if seen.insert(id) {
-                ids.push(id);
-            }
+/// Upper bound on distinct `--cgroup` targets, mirroring `MAX_CGROUP_TARGETS`
+/// in the BPF source (the filter loops there are verifier-bounded by it).
+const MAX_CGROUP_TARGETS: usize = 64;
+
+/// One `--cgroup` target as the BPF filter consumes it: the open directory,
+/// whose fd goes into the `cgroup_targets` cgroup array (the kernel keeps the
+/// cgroup referenced for the map's lifetime), and the cgroup id (directory
+/// inode) that the matching `cgroup_target_refs` slot must report back once
+/// the iterator program has parked a reference there.
+struct CgroupTarget {
+    path: String,
+    dir: fs::File,
+    id: u64,
+}
+
+/// Does the running kernel's vmlinux BTF export the `bpf_task_under_cgroup`
+/// kfunc (Linux 6.5+)? The sched tracepoints test tasks other than current
+/// against the `--cgroup` targets through it, so the filter refuses to start
+/// without it rather than trace the wrong set of tasks.
+fn kernel_has_task_under_cgroup_kfunc() -> bool {
+    match libbpf_rs::btf::Btf::from_vmlinux() {
+        Ok(btf) => btf
+            .type_by_name::<libbpf_rs::btf::types::Func<'_>>("bpf_task_under_cgroup")
+            .is_some(),
+        Err(e) => {
+            eprintln!(
+                "Warning: failed to open vmlinux BTF ({e}); \
+                 treating bpf_task_under_cgroup as unavailable"
+            );
+            false
         }
     }
-    Ok(ids)
+}
+
+/// Resolve the `--cgroup` targets, deduplicated by cgroup id.
+///
+/// Membership is decided in the kernel (`task_under_cgroup_hierarchy()`: the
+/// task's cgroup is the target or somewhere below it, so cgroups created after
+/// the trace started match too), which is why this opens each target directory
+/// and reads its id and nothing more — no subtree enumeration. The fd and the
+/// id size the two filter maps, so this runs before the skeleton is loaded. A
+/// path that is not a cgroup directory, more than `MAX_CGROUP_TARGETS` targets,
+/// and a kernel without the kfunc the sched tracepoints need are all reported
+/// as errors up front.
+fn resolve_cgroup_targets(opts: &Config) -> Result<Vec<CgroupTarget>> {
+    let mut targets: Vec<CgroupTarget> = Vec::new();
+    if opts.cgroup.is_empty() {
+        return Ok(targets);
+    }
+    if !kernel_has_task_under_cgroup_kfunc() {
+        bail!(
+            "--cgroup needs the bpf_task_under_cgroup kfunc (Linux 6.5 and later); \
+             this kernel's BTF does not export it"
+        );
+    }
+    for cgroup in opts.cgroup.iter() {
+        let path = std::path::Path::new(cgroup);
+        let id = crate::cgroup::cgroup_id(path)
+            .with_context(|| format!("Failed to access cgroup path: {cgroup}"))?;
+        if targets.iter().any(|t| t.id == id) {
+            continue;
+        }
+        let dir = fs::File::open(path)
+            .with_context(|| format!("Failed to open cgroup directory: {cgroup}"))?;
+        targets.push(CgroupTarget {
+            path: cgroup.clone(),
+            dir,
+            id,
+        });
+    }
+    if targets.len() > MAX_CGROUP_TARGETS {
+        bail!(
+            "at most {MAX_CGROUP_TARGETS} distinct --cgroup targets are supported, got {}",
+            targets.len()
+        );
+    }
+    Ok(targets)
+}
+
+/// Hand one `--cgroup` target to BPF as a referenced `struct cgroup *`.
+///
+/// Runs the `systing_cgroup_target_add` iterator program over exactly that
+/// cgroup — a cgroup iterator on the target's directory fd with
+/// `BPF_CGROUP_ITER_SELF_ONLY` — by reading the iterator once: the read drives
+/// the program in process context, where it takes the reference and parks it
+/// in the next free `cgroup_target_refs` slot. libbpf-rs's `attach_iter` only
+/// knows map iterators, so the link is created through libbpf directly.
+fn add_cgroup_target_ref(prog: &libbpf_rs::ProgramMut<'_>, target: &CgroupTarget) -> Result<()> {
+    use libbpf_rs::libbpf_sys;
+    use libbpf_rs::AsRawLibbpf;
+    use std::io::Read;
+
+    let mut link_info = libbpf_sys::bpf_iter_link_info::default();
+    link_info.cgroup.order = libbpf_sys::BPF_CGROUP_ITER_SELF_ONLY;
+    link_info.cgroup.cgroup_fd = target.dir.as_raw_fd() as u32;
+    let attach_opts = libbpf_sys::bpf_iter_attach_opts {
+        sz: std::mem::size_of::<libbpf_sys::bpf_iter_attach_opts>() as _,
+        link_info: &mut link_info as *mut libbpf_sys::bpf_iter_link_info,
+        link_info_len: std::mem::size_of::<libbpf_sys::bpf_iter_link_info>() as _,
+        ..Default::default()
+    };
+    // SAFETY: `prog` is a loaded program owned by the live skeleton, and
+    // `attach_opts` / `link_info` outlive the call, which copies what it keeps.
+    let ptr = unsafe {
+        libbpf_sys::bpf_program__attach_iter(
+            prog.as_libbpf_object().as_ptr(),
+            &attach_opts as *const libbpf_sys::bpf_iter_attach_opts,
+        )
+    };
+    let ptr = std::ptr::NonNull::new(ptr).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Failed to attach the cgroup iterator for {}: {}",
+            target.path,
+            io::Error::last_os_error()
+        )
+    })?;
+    // SAFETY: a non-NULL return is a link libbpf created for us to own.
+    let link = unsafe { libbpf_rs::Link::from_ptr(ptr) };
+    let mut iter = libbpf_rs::Iter::new(&link)
+        .with_context(|| format!("Failed to create the cgroup iterator for {}", target.path))?;
+    let mut out = Vec::new();
+    iter.read_to_end(&mut out)
+        .with_context(|| format!("Failed to run the cgroup iterator for {}", target.path))?;
+    Ok(())
+}
+
+/// Fill the two `--cgroup` filter maps after load: slot `i` of `cgroup_targets`
+/// gets target `i`'s directory fd, slot `i` of `cgroup_target_refs` gets its
+/// cgroup reference via the iterator program, and the slot is read back to
+/// confirm it holds that target's id — a silently-empty filter is exactly what
+/// this change exists to rule out.
+fn install_cgroup_targets(skel: &mut SystingSystemSkel, targets: &[CgroupTarget]) -> Result<()> {
+    for (i, target) in targets.iter().enumerate() {
+        let key = (i as u32).to_ne_bytes();
+        let fd = (target.dir.as_raw_fd() as u32).to_ne_bytes();
+        skel.maps
+            .cgroup_targets
+            .update(&key, &fd, libbpf_rs::MapFlags::ANY)
+            .with_context(|| {
+                format!(
+                    "Failed to add cgroup {} to the cgroup_targets map",
+                    target.path
+                )
+            })?;
+        add_cgroup_target_ref(&skel.progs.systing_cgroup_target_add, target)?;
+        let slot = skel
+            .maps
+            .cgroup_target_refs
+            .lookup(&key, libbpf_rs::MapFlags::ANY)
+            .with_context(|| format!("Failed to read back cgroup_target_refs[{i}]"))?
+            .ok_or_else(|| anyhow::anyhow!("cgroup_target_refs[{i}] is missing"))?;
+        // struct cgroup_target_ref { struct cgroup __kptr *cgrp; u64 id; }:
+        // the kptr reads back as zero from userspace, the id is what we check.
+        let id = slot
+            .get(8..16)
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_ne_bytes)
+            .ok_or_else(|| anyhow::anyhow!("cgroup_target_refs[{i}] has an unexpected size"))?;
+        if id != target.id {
+            bail!(
+                "cgroup_target_refs[{i}] holds cgroup id {id} after the iterator run, \
+                 expected {} for {}",
+                target.id,
+                target.path
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Override allocator libraries, checked before libc. When one of these is
@@ -3867,31 +4011,31 @@ pub fn systing(
                 format!("Failed to set missed_events map size to {num_cpus} entries")
             })?;
 
-        // Resolve the cgroup filter set before load so the cgroups map can be
-        // sized to fit. Normally that is one id per --cgroup target (the BPF side
-        // matches by ancestry); under lockdown confidentiality mode it is each
-        // target's whole subtree, and pointing --cgroup at a high-level node (a
-        // systemd slice, kubepods.slice, the root) can then enumerate far more
-        // than the static default — so size the map to the actual count rather
-        // than risk an E2BIG failure when populating it.
-        let confidentiality_mode = open_skel
-            .maps
-            .rodata_data
-            .as_deref()
-            .map(|rodata| rodata.tool_config.confidentiality_mode != 0)
-            .unwrap_or(false);
-        let cgroup_filter_ids = collect_cgroup_filter_ids(&opts, confidentiality_mode)?;
-        if !cgroup_filter_ids.is_empty() {
+        // Resolve the --cgroup targets before load: both filter maps are sized to
+        // one slot per distinct target, and the count goes into rodata so the
+        // BPF filter loops are bounded by it.
+        let cgroup_targets = resolve_cgroup_targets(&opts)?;
+        if !cgroup_targets.is_empty() {
+            let n = cgroup_targets.len() as u32;
             open_skel
                 .maps
-                .cgroups
-                .set_max_entries(cgroup_filter_ids.len() as u32)
+                .cgroup_targets
+                .set_max_entries(n)
+                .with_context(|| format!("Failed to set cgroup_targets map size to {n} entries"))?;
+            open_skel
+                .maps
+                .cgroup_target_refs
+                .set_max_entries(n)
                 .with_context(|| {
-                    format!(
-                        "Failed to set cgroups map size to {} entries",
-                        cgroup_filter_ids.len()
-                    )
+                    format!("Failed to set cgroup_target_refs map size to {n} entries")
                 })?;
+            open_skel
+                .maps
+                .rodata_data
+                .as_deref_mut()
+                .expect("'rodata' is not mmap'ed, your kernel is too old")
+                .tool_config
+                .num_cgroup_targets = n;
         }
 
         let diag = std::env::var_os("SYSTING_DIAG_RINGBUFS").is_some();
@@ -3902,19 +4046,10 @@ pub fn systing(
         if diag {
             eprintln!("[diag] open_skel.load() took {:?}", t_load.elapsed());
         }
-        // The map was sized to hold exactly these ids above, so populating it now
-        // cannot overflow.
-        let cgroup_filter_val = (1_u8).to_ne_bytes();
-        for id in &cgroup_filter_ids {
-            skel.maps
-                .cgroups
-                .update(
-                    &id.to_ne_bytes(),
-                    &cgroup_filter_val,
-                    libbpf_rs::MapFlags::ANY,
-                )
-                .with_context(|| format!("Failed to add cgroup id {id} to BPF map"))?;
-        }
+        // The maps were sized to exactly these targets above; this fills them
+        // (fds, then the references via the iterator program) and verifies each
+        // slot before any tracing program is attached.
+        install_cgroup_targets(&mut skel, &cgroup_targets)?;
 
         for pid in opts.pid.iter() {
             let val = (1_u8).to_ne_bytes();
