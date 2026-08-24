@@ -5,11 +5,11 @@
 use super::offsets;
 use super::process::{self, MemoryMapping};
 use super::types::{BpfLibBinaryId, PyPidData, BPF_LIB_DEFAULT_FIELD_OFFSET};
+use object::read::{ReadCache, ReadRef};
 use object::{Object, ObjectSymbol};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
@@ -49,29 +49,56 @@ fn elf_py_info(file_path: &str) -> Option<Arc<ElfPyInfo>> {
     // Known limit: the version fallback in detect_python_version keys off
     // the basename, so hardlinks to one inode under different names share
     // whichever result was cached first.
-    let mut file = fs::File::open(file_path).ok()?;
+    let file = fs::File::open(file_path).ok()?;
     let meta = file.metadata().ok()?;
     let key = (meta.dev(), meta.ino(), meta.len());
     if let Some(cached) = ELF_CACHE.lock().unwrap().get(&key) {
         return cached.clone();
     }
-    // Read and parse outside the lock; two threads racing on the same binary
-    // produce identical results, so last-write-wins is fine.
-    let mut data = Vec::new();
-    file.read_to_end(&mut data).ok()?;
-    let parsed = parse_elf_py_info(file_path, &data);
+    // Prove the file is readable before parsing: an I/O failure here
+    // (EISDIR, ESTALE, a /proc/pid/root path vanishing) returns without
+    // caching, so a transient error never blacklists an interpreter.
+    if !file_readable(&file) {
+        return None;
+    }
+    // Parse outside the lock; two threads racing on the same binary produce
+    // identical results, so last-write-wins is fine.
+    let parsed = parse_elf_py_info(file_path, &file);
+    // A rejection is cached only if the file is still readable: an I/O
+    // error mid-parse (the file vanished under us) is indistinguishable
+    // from "not a runtime" inside the parser, and must not be remembered.
+    if parsed.is_none() && !file_readable(&file) {
+        return None;
+    }
     ELF_CACHE.lock().unwrap().insert(key, parsed.clone());
     parsed
 }
 
+/// Whether the ELF identification header can be read: false on any I/O
+/// error (EISDIR, ESTALE, a vanished /proc path).
+fn file_readable(file: &fs::File) -> bool {
+    let mut header = [0u8; 64];
+    file.read_exact_at(&mut header, 0).is_ok()
+}
+
 /// Rejections costing at least this long are logged: a large non-Python
-/// embedder pays the same full read and symbol scans as an accept, and the
-/// log line makes the negative-cache benefit attributable.
+/// embedder pays the same symbol scans as an accept, and the log line makes
+/// the negative-cache benefit attributable.
 const SLOW_REJECT_SECS: f64 = 0.5;
 
-fn parse_elf_py_info(file_path: &str, data: &[u8]) -> Option<Arc<ElfPyInfo>> {
+/// Parse the runtime facts out of an open ELF file.
+///
+/// The file is read on demand through `object`'s `ReadCache` rather than
+/// slurped into memory: the check needs the headers, the symbol tables and
+/// the few bytes behind `_PySys_ImplCacheTag`, which for a libpython is a
+/// few MB out of tens, and for a rejected binary only the tables. Discovery
+/// runs once per process per run (the per-binary cache is process-local),
+/// so on a page-cache-starved host every byte it touches is a cold read
+/// that competes with the traced workload's own page faults.
+fn parse_elf_py_info(file_path: &str, file: &fs::File) -> Option<Arc<ElfPyInfo>> {
     let start = Instant::now();
-    let result = object::File::parse(data).ok().and_then(|elf| {
+    let reader = ReadCache::new(file);
+    let result = object::File::parse(&reader).ok().and_then(|elf| {
         let py_runtime_addr = find_symbol_address(&elf, "_PyRuntime")?;
         let version = detect_python_version(&elf, file_path)?;
         Some(Arc::new(ElfPyInfo {
@@ -136,16 +163,14 @@ pub fn check_python_process(pid: i32) -> Option<PyProcessInfo> {
         return None;
     }
 
-    // Strategy:
-    // 1. Check if exe is a Python binary
-    // 2. If not, scan maps for libpython*.so
+    // Strategy: the exe, then any libpython shared object (runtime_candidates).
     let exe_path = process::read_exe_path(pid)?;
     let exe_str = exe_path.to_string_lossy();
 
-    // Cheap gate: try_python_module() reads and ELF-parses the whole binary.
-    // This is now called for every traced exec, so short-circuit when neither
-    // the exe path nor any mapped module mentions python. Embedders like
-    // uwsgi/gunicorn are still detected via their libpython mapping.
+    // Cheap gate: try_python_module() opens and ELF-parses candidate
+    // binaries. This is called for every traced exec, so short-circuit when
+    // neither the exe path nor any mapped module mentions python. Embedders
+    // like uwsgi/gunicorn are still detected via their libpython mapping.
     let exe_lower = exe_str.to_lowercase();
     let looks_like_python = exe_lower.contains("python")
         || maps
@@ -155,34 +180,44 @@ pub fn check_python_process(pid: i32) -> Option<PyProcessInfo> {
         return None;
     }
 
-    // Check exe first
-    let mut checked_paths = std::collections::HashSet::new();
-
-    // Try the exe
-    if let Some(info) = try_python_module(pid, &exe_str, &maps, true) {
-        return Some(info);
-    }
-    checked_paths.insert(exe_str.to_string());
-
-    // Scan maps for libpython or python shared libraries
-    for mapping in &maps {
-        if mapping.name.is_empty() || checked_paths.contains(&mapping.name) {
-            continue;
-        }
-        if mapping.offset != 0 {
-            continue; // Only check first mapping of each module
-        }
-
-        let name_lower = mapping.name.to_lowercase();
-        if name_lower.contains("libpython") || name_lower.contains("python") {
-            checked_paths.insert(mapping.name.clone());
-            if let Some(info) = try_python_module(pid, &mapping.name, &maps, false) {
-                return Some(info);
-            }
+    for candidate in runtime_candidates(&exe_str, &maps) {
+        let is_exe = candidate == exe_str;
+        if let Some(info) = try_python_module(pid, &candidate, &maps, is_exe) {
+            return Some(info);
         }
     }
 
     None
+}
+
+/// The objects worth parsing for a CPython runtime, in the order to try
+/// them: the executable first (static and `--enable-shared` launcher builds
+/// alike), then each distinct `libpython*` shared object in mapping order.
+///
+/// Nothing else is a candidate. A CPython runtime lives in the executable or
+/// in a libpython shared object; `site-packages/*.so`, `lib/python3.X/...`
+/// and every other object whose path merely contains "python" never carries
+/// `_PyRuntime`. Parsing them anyway was how discovery read gigabytes per
+/// run on ML images: later-`dlopen`ed extension modules (libtpu, jaxlib,
+/// torch) map below libpython, so they were read in full — cold, on every
+/// run — before the runtime was reached.
+fn runtime_candidates(exe: &str, maps: &[MemoryMapping]) -> Vec<String> {
+    let mut candidates = vec![exe.to_string()];
+    for mapping in maps {
+        // Only the first mapping of each module; later mappings carry a
+        // non-zero file offset.
+        if mapping.name.is_empty() || mapping.offset != 0 {
+            continue;
+        }
+        let is_libpython = Path::new(&mapping.name)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|f| f.to_lowercase().starts_with("libpython"));
+        if is_libpython && !candidates.contains(&mapping.name) {
+            candidates.push(mapping.name.clone());
+        }
+    }
+    candidates
 }
 
 /// Try to identify a module as a Python runtime.
@@ -311,7 +346,10 @@ fn resolve_proc_path(pid: i32, path: &str) -> String {
 }
 
 /// Find a symbol's address in an ELF file.
-fn find_symbol_address(elf: &object::File, name: &str) -> Option<usize> {
+fn find_symbol_address<'data, R: ReadRef<'data>>(
+    elf: &object::File<'data, R>,
+    name: &str,
+) -> Option<usize> {
     for sym in elf.symbols() {
         if sym.name() == Ok(name) && sym.address() != 0 {
             return Some(sym.address() as usize);
@@ -330,7 +368,10 @@ fn find_symbol_address(elf: &object::File, name: &str) -> Option<usize> {
 /// Tries _PySys_ImplCacheTag first, then falls back to filename pattern
 /// (the resolved on-disk path has the same basename as the mapped module,
 /// so the pattern match is unaffected by /proc/pid/root resolution).
-fn detect_python_version(elf: &object::File, module_path: &str) -> Option<(i32, i32, i32)> {
+fn detect_python_version<'data, R: ReadRef<'data>>(
+    elf: &object::File<'data, R>,
+    module_path: &str,
+) -> Option<(i32, i32, i32)> {
     // Try to find version from _PySys_ImplCacheTag symbol value
     if let Some(version_str) = read_impl_cache_tag(elf) {
         if let Some(ver) = parse_cpython_version(&version_str) {
@@ -343,8 +384,16 @@ fn detect_python_version(elf: &object::File, module_path: &str) -> Option<(i32, 
 }
 
 /// Try to read the _PySys_ImplCacheTag string from ELF.
-fn read_impl_cache_tag(elf: &object::File) -> Option<String> {
+///
+/// Reads only the bytes it needs through `data_range` — the 8-byte pointer
+/// at the symbol and up to `TAG_MAX_LEN` bytes of the string it points at
+/// (or the string itself, for a non-PIE executable) — never a whole
+/// section: on a lazily-read file a `.rodata`/`.data` section is MBs.
+fn read_impl_cache_tag<'data, R: ReadRef<'data>>(elf: &object::File<'data, R>) -> Option<String> {
     use object::ObjectSection;
+
+    /// "cpython-313" is 11 bytes; the tag never approaches this.
+    const TAG_MAX_LEN: u64 = 32;
 
     // Find the symbol
     let sym = elf
@@ -357,49 +406,38 @@ fn read_impl_cache_tag(elf: &object::File) -> Option<String> {
         return None;
     }
 
-    // Read string value from the ELF section data
-    // For non-PIE executables, the symbol points to a pointer to the string.
-    // For shared libs, we need the relocation-adjusted value.
-    // Simplified: try to read from .rodata section at the symbol offset.
-    for section in elf.sections() {
-        let section_addr = section.address();
-        let section_size = section.size();
-        if addr >= section_addr && addr < section_addr + section_size {
-            let section_data = section.data().ok()?;
-            let offset = (addr - section_addr) as usize;
+    // Up to `TAG_MAX_LEN` bytes at a virtual address, clamped to the
+    // section that holds it.
+    let bytes_at = |va: u64| -> Option<&'data [u8]> {
+        elf.sections().find_map(|section| {
+            let (s_addr, s_size) = (section.address(), section.size());
+            if va < s_addr || va >= s_addr + s_size {
+                return None;
+            }
+            let len = TAG_MAX_LEN.min(s_addr + s_size - va);
+            section.data_range(va, len).ok().flatten()
+        })
+    };
 
-            // The symbol might point to a pointer (for dynamically linked Python)
-            // or directly to the string. Try reading as a string first.
-            if offset < section_data.len() {
-                // Read pointer value at the offset
-                if offset + 8 <= section_data.len() {
-                    let ptr_bytes: [u8; 8] = section_data[offset..offset + 8].try_into().ok()?;
-                    let ptr_val = u64::from_le_bytes(ptr_bytes);
+    let at_symbol = bytes_at(addr)?;
 
-                    // Check if ptr_val looks like a valid section offset
-                    for sec2 in elf.sections() {
-                        let s2_addr = sec2.address();
-                        let s2_size = sec2.size();
-                        if ptr_val >= s2_addr && ptr_val < s2_addr + s2_size {
-                            let s2_data = sec2.data().ok()?;
-                            let s2_offset = (ptr_val - s2_addr) as usize;
-                            if s2_offset < s2_data.len() {
-                                let s = read_cstring(&s2_data[s2_offset..]);
-                                if !s.is_empty() && s.starts_with("cpython") {
-                                    return Some(s);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Maybe it's directly a string
-                let s = read_cstring(&section_data[offset..]);
-                if !s.is_empty() && s.starts_with("cpython") {
-                    return Some(s);
-                }
+    // The symbol is normally a `const char *`: read the pointer and follow
+    // it (unrelocated link-time address, which is what the section
+    // addresses are too).
+    if at_symbol.len() >= 8 {
+        let ptr_val = u64::from_le_bytes(at_symbol[..8].try_into().ok()?);
+        if let Some(target) = bytes_at(ptr_val) {
+            let s = read_cstring(target);
+            if !s.is_empty() && s.starts_with("cpython") {
+                return Some(s);
             }
         }
+    }
+
+    // Maybe it's directly a string
+    let s = read_cstring(at_symbol);
+    if !s.is_empty() && s.starts_with("cpython") {
+        return Some(s);
     }
 
     None
@@ -539,6 +577,255 @@ mod tests {
     #[test]
     fn test_elf_py_info_unreadable_path() {
         assert!(elf_py_info("/nonexistent/definitely-not-a-file").is_none());
+    }
+
+    fn mapping(start: usize, offset: u64, name: &str) -> MemoryMapping {
+        MemoryMapping {
+            start,
+            end: start + 0x1000,
+            perms: "r--p".to_string(),
+            offset,
+            dev_major: 8,
+            dev_minor: 1,
+            inode: 1,
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_runtime_candidates_exe_then_libpython_only() {
+        // An ML image as /proc/pid/maps lists it: extension modules dlopen'ed
+        // after start-up sit BELOW libpython, every one of them under a path
+        // containing "python". None of them may be a candidate — they were
+        // the gigabytes of cold reads per run — while the exe and each
+        // distinct libpython are, exe first, then in mapping order.
+        let exe = "/opt/venv/bin/python3.13";
+        let maps = vec![
+            mapping(
+                0x7f0000000000,
+                0,
+                "/opt/venv/lib/python3.13/site-packages/libtpu/libtpu.so",
+            ),
+            mapping(
+                0x7f0100000000,
+                0,
+                "/opt/venv/lib/python3.13/site-packages/jaxlib/xla_extension.so",
+            ),
+            mapping(
+                0x7f0200000000,
+                0,
+                "/opt/venv/lib/python3.13/site-packages/torch/lib/libtorch_python.so",
+            ),
+            mapping(0x7f0300000000, 0, "/usr/lib/x86_64-linux-gnu/libc.so.6"),
+            // A stale linker reservation and the real mapping of one libpython.
+            mapping(0x7f0400000000, 0, "/opt/python/lib/libpython3.13.so.1.0"),
+            mapping(0x7f0500000000, 0, "/opt/python/lib/libpython3.13.so.1.0"),
+            mapping(
+                0x7f0500100000,
+                0x100000,
+                "/opt/python/lib/libpython3.13.so.1.0",
+            ),
+            mapping(
+                0x7f0600000000,
+                0,
+                "/opt/venv/lib/python3.13/lib-dynload/math.cpython-313-x86_64-linux-gnu.so",
+            ),
+            mapping(0x7f0700000000, 0, exe),
+        ];
+        assert_eq!(
+            runtime_candidates(exe, &maps),
+            vec![
+                exe.to_string(),
+                "/opt/python/lib/libpython3.13.so.1.0".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_runtime_candidates_embedder_without_python_exe() {
+        // uwsgi/gunicorn-style embedder: the exe is not python, the runtime
+        // is the mapped libpython. Basename match is case-insensitive and
+        // accepts debug/versioned spellings.
+        let exe = "/usr/bin/uwsgi";
+        let maps = vec![
+            mapping(0x7f0000000000, 0, "/usr/lib/libpython3.11d.so.1.0"),
+            mapping(0x7f0100000000, 0, exe),
+        ];
+        assert_eq!(
+            runtime_candidates(exe, &maps),
+            vec![
+                exe.to_string(),
+                "/usr/lib/libpython3.11d.so.1.0".to_string()
+            ]
+        );
+        // No libpython anywhere: only the exe is examined.
+        let maps = vec![mapping(0x7f0100000000, 0, exe)];
+        assert_eq!(runtime_candidates(exe, &maps), vec![exe.to_string()]);
+    }
+
+    #[test]
+    fn test_elf_py_info_real_interpreters() {
+        // Real CPython builds on the host: a pyenv `--enable-shared` build has
+        // a launcher exe without _PyRuntime and the runtime in libpython;
+        // both must parse through the lazy reader with the right verdict and
+        // the version read from _PySys_ImplCacheTag. Skipped (with a note)
+        // where no pyenv interpreter is installed.
+        let root = std::env::var("PYENV_ROOT")
+            .unwrap_or_else(|_| format!("{}/.pyenv", std::env::var("HOME").unwrap_or_default()));
+        let Ok(versions) = fs::read_dir(format!("{root}/versions")) else {
+            eprintln!("no pyenv at {root}: skipping real-interpreter check");
+            return;
+        };
+        let mut checked = 0;
+        for entry in versions.flatten() {
+            let dir = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let mut parts = name.split('.');
+            let (Some(major), Some(minor)) = (
+                parts.next().and_then(|s| s.parse::<i32>().ok()),
+                parts.next().and_then(|s| s.parse::<i32>().ok()),
+            ) else {
+                continue;
+            };
+            let lib = dir.join(format!("lib/libpython{major}.{minor}.so.1.0"));
+            if !lib.exists() {
+                continue;
+            }
+            let info = elf_py_info(&lib.to_string_lossy())
+                .unwrap_or_else(|| panic!("{} not recognized as a runtime", lib.display()));
+            assert_eq!(
+                (info.version.0, info.version.1),
+                (major, minor),
+                "{}",
+                lib.display()
+            );
+            assert!(
+                info.is_dynamic,
+                "{} should be a shared object",
+                lib.display()
+            );
+            assert_ne!(info.py_runtime_addr, 0);
+            // The exe of a shared build is usually a launcher linked against
+            // libpython (no _PyRuntime of its own); a build that also links
+            // the runtime statically is legal, so this is reported, not
+            // asserted. Either way the lazy reader must classify it.
+            let exe = dir.join(format!("bin/python{major}.{minor}"));
+            if exe.exists() {
+                let exe_is_runtime = elf_py_info(&exe.to_string_lossy()).is_some();
+                eprintln!(
+                    "{}: exe {} a runtime",
+                    exe.display(),
+                    if exe_is_runtime { "is" } else { "is not" }
+                );
+            }
+            checked += 1;
+        }
+        eprintln!("real-interpreter check: {checked} shared builds verified");
+    }
+
+    /// Bytes this THREAD has requested through read(2) so far (`rchar` in
+    /// /proc/thread-self/io — counted whether or not the page cache served
+    /// them, so it measures what discovery asks for; per-thread so the
+    /// other tests running in this process do not pollute the figure).
+    fn rchar() -> u64 {
+        fs::read_to_string("/proc/thread-self/io")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("rchar: ")?.trim().parse().ok())
+            .unwrap()
+    }
+
+    #[test]
+    fn test_discovery_read_volume_real_python() {
+        // Discover a live interpreter that has loaded a spread of extension
+        // modules (every one of them under a "python"-containing path) and
+        // measure what the check reads, against what the previous scan
+        // order would have read: every python-pathed object below libpython
+        // in full, plus libpython itself in full. Skipped where no pyenv
+        // interpreter is installed.
+        let root = std::env::var("PYENV_ROOT")
+            .unwrap_or_else(|_| format!("{}/.pyenv", std::env::var("HOME").unwrap_or_default()));
+        let Some(python) = fs::read_dir(format!("{root}/versions")).ok().and_then(|d| {
+            d.flatten().find_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                let mut parts = name.split('.');
+                let major = parts.next()?.parse::<i32>().ok()?;
+                let minor = parts.next()?.parse::<i32>().ok()?;
+                let exe = e.path().join(format!("bin/python{major}.{minor}"));
+                exe.exists().then_some(exe)
+            })
+        }) else {
+            eprintln!("no pyenv at {root}: skipping read-volume check");
+            return;
+        };
+        let mut child = std::process::Command::new(&python)
+            .args([
+                "-c",
+                "import ssl, sqlite3, ctypes, decimal, hashlib, zlib, bz2, lzma, json, socket, select, struct, time\n\
+                 print('ready', flush=True)\n\
+                 time.sleep(120)",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn python");
+        let pid = child.id() as i32;
+        {
+            use std::io::BufRead;
+            let mut line = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line.trim(), "ready");
+        }
+
+        let maps = process::parse_proc_maps(pid);
+        let exe = process::read_exe_path(pid)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        // What the previous order read: the exe, then every offset-0
+        // mapping whose path contains "python", in full, up to and
+        // including the first libpython.
+        let mut previous_bytes = fs::metadata(&exe).map(|m| m.len()).unwrap_or(0);
+        let mut previous_files = 1;
+        let mut seen = std::collections::HashSet::new();
+        for m in &maps {
+            if m.offset != 0 || m.name.is_empty() || m.name == exe || !seen.insert(&m.name) {
+                continue;
+            }
+            if m.name.to_lowercase().contains("python") {
+                previous_bytes += fs::metadata(&m.name).map(|m| m.len()).unwrap_or(0);
+                previous_files += 1;
+                if Path::new(&m.name)
+                    .file_name()
+                    .is_some_and(|f| f.to_string_lossy().starts_with("libpython"))
+                {
+                    break;
+                }
+            }
+        }
+
+        // Run alone (`cargo test test_discovery_read_volume_real_python`)
+        // for a cold-cache number: in the full suite the sibling test above
+        // may already have cached this libpython, which only lowers the
+        // measured bytes.
+        let before = rchar();
+        let info = check_python_process(pid);
+        let read_bytes = rchar() - before;
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let info = info.expect("live pyenv interpreter not discovered");
+        assert_eq!(info.pid, pid);
+        assert_eq!(info.version_major, 3);
+        eprintln!(
+            "discovery read {read_bytes} bytes; the previous scan order would have read \
+             {previous_bytes} bytes across {previous_files} files"
+        );
+        assert!(
+            read_bytes * 4 < previous_bytes,
+            "lazy discovery read {read_bytes} bytes vs {previous_bytes} for the full-file scan"
+        );
     }
 
     #[test]
