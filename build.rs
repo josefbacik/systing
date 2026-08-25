@@ -96,6 +96,47 @@ fn detect_multiarch_include() -> Option<String> {
         .map(|t| format!("-I/usr/include/{t}"))
 }
 
+/// The compiler flags every BPF object is compiled with so that a local or CI
+/// build produces the release build's program, not merely the same source.
+///
+/// `-mcpu=v3`: the release build compiles with clang 21, whose default
+/// `-mcpu` for the BPF target is v3; a distro clang 18 defaults to v1. The
+/// two levels produce different programs from the same source — different
+/// register allocation around the same stores — and the verifier judges the
+/// program, not the source, so a local or CI build at v1 can load where the
+/// release object is rejected (that is how the rss_stat index bound was
+/// wrong in a release while every local check passed).
+///
+/// `-fwrapv`: the release build's toolchain compiles with `-fwrapv` (its
+/// hardening set makes signed overflow wrap). That changes the code generated
+/// for signed delta arithmetic — the memory recorder's brk/mmap/munmap exit
+/// handlers differ in register allocation without it — so pin it too; with
+/// both flags the embedded object is instruction-identical to the release's.
+/// `SYSTING_BPF_CLANG` (below) closes the remaining compiler-version gap.
+const BPF_CFLAGS: &[&str] = &["-mcpu=v3", "-fwrapv"];
+
+/// Optional override for the C compiler used for the BPF objects, so a
+/// local or CI build can use the exact compiler the release build uses
+/// (`SYSTING_BPF_CLANG=/path/to/clang-21`). Unset: libbpf-cargo's default
+/// (`clang` on PATH).
+fn bpf_clang_override() -> Option<PathBuf> {
+    println!("cargo:rerun-if-env-changed=SYSTING_BPF_CLANG");
+    env::var_os("SYSTING_BPF_CLANG")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Apply the compiler pinning every BPF object build shares.
+fn pin_bpf_compiler<'a>(
+    builder: &'a mut SkeletonBuilder,
+    clang_override: &Option<PathBuf>,
+) -> &'a mut SkeletonBuilder {
+    if let Some(clang) = clang_override {
+        builder.clang(clang);
+    }
+    builder
+}
+
 fn build_pystacks_bpf(out_dir: &Path, arch_define: &str, multiarch_include: &Option<String>) {
     let out_dir_include_arg = format!("-I{}", out_dir.display());
 
@@ -125,19 +166,22 @@ fn build_pystacks_bpf(out_dir: &Path, arch_define: &str, multiarch_include: &Opt
 
     let obj_path = out_dir.join("pystacks.bpf.o");
 
-    let mut clang_args = vec![
+    let mut clang_args: Vec<&OsStr> = BPF_CFLAGS.iter().map(OsStr::new).collect();
+    clang_args.extend([
         OsStr::new(&out_dir_include_arg),
         OsStr::new(&bpf_include_arg),
         OsStr::new(&pystacks_include_arg),
         OsStr::new(&pystacks_bpf_arg),
         OsStr::new(arch_define),
-    ];
+    ]);
 
     if let Some(ref include_path) = multiarch_include {
         clang_args.push(OsStr::new(include_path));
     }
 
-    SkeletonBuilder::new()
+    let clang_override = bpf_clang_override();
+    let mut builder = SkeletonBuilder::new();
+    pin_bpf_compiler(&mut builder, &clang_override)
         .source("src/pystacks/bpf/pystacks.bpf.c")
         .clang_args(clang_args)
         .obj(obj_path.to_str().unwrap())
@@ -253,20 +297,23 @@ fn main() {
         };
         let obj_path = out_dir.join(format!("{prefix}_tmp.bpf.o"));
 
-        let mut clang_args = vec![
+        let mut clang_args: Vec<&OsStr> = BPF_CFLAGS.iter().map(OsStr::new).collect();
+        clang_args.extend([
             OsStr::new(&include_arg),
             OsStr::new(&bpf_include_arg),
             OsStr::new(arch_define),
             OsStr::new("-DSYSTING_PYSTACKS"),
             OsStr::new(&pystacks_inc_arg),
             OsStr::new(&pystacks_bpf_arg),
-        ];
+        ]);
 
         if let Some(ref include_path) = multiarch_include {
             clang_args.push(OsStr::new(include_path));
         }
 
-        SkeletonBuilder::new()
+        let clang_override = bpf_clang_override();
+        let mut builder = SkeletonBuilder::new();
+        pin_bpf_compiler(&mut builder, &clang_override)
             .source(src)
             .clang_args(clang_args)
             .obj(obj_path.to_str().unwrap())
