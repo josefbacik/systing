@@ -17,7 +17,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -61,15 +61,13 @@ impl DbHandle {
 
             if let Some(path) = initial_db {
                 match std::fs::canonicalize(&path) {
-                    Ok(canonical) => {
-                        match AnalyzeDb::open_with_spill_cap(&canonical, true, spill_cap) {
-                            Ok(db) => {
-                                dbs.insert(canonical.clone(), db);
-                                last_used = Some(canonical);
-                            }
-                            Err(e) => eprintln!("Warning: failed to open initial database: {e}"),
+                    Ok(canonical) => match open_locked(&canonical, spill_cap) {
+                        Ok(db) => {
+                            dbs.insert(canonical.clone(), db);
+                            last_used = Some(canonical);
                         }
-                    }
+                        Err(e) => eprintln!("Warning: failed to open initial database: {e}"),
+                    },
                     Err(e) => eprintln!("Warning: cannot resolve path '{}': {e}", path.display()),
                 }
             }
@@ -97,6 +95,21 @@ impl DbHandle {
 }
 
 const MAX_CACHED_DBS: usize = 8;
+
+/// The one way this server opens a trace database: read-only, under the
+/// spill cap, and with DuckDB's configuration locked before any SQL can
+/// reach it. Every bound the server was started with (memory limit, thread
+/// count, spill cap, external access) is frozen from here on, so SQL
+/// arriving through the tools cannot lift them with SET / PRAGMA. Both open
+/// sites — the database named on the command line and the ones opened
+/// lazily by path — go through here, so neither can be served unlocked.
+fn open_locked(canonical: &Path, spill_cap: Option<&str>) -> Result<AnalyzeDb, String> {
+    let db = AnalyzeDb::open_with_spill_cap(canonical, true, spill_cap)
+        .map_err(|e| format!("Failed to open database '{}': {e}", canonical.display()))?;
+    db.lock_configuration()
+        .map_err(|e| format!("Failed to open database '{}': {e}", canonical.display()))?;
+    Ok(db)
+}
 
 fn get_or_open<'a>(
     dbs: &'a mut HashMap<PathBuf, AnalyzeDb>,
@@ -128,13 +141,7 @@ fn get_or_open<'a>(
                 dbs.insert(k, db);
             }
         }
-        let db = AnalyzeDb::open_with_spill_cap(&canonical, true, spill_cap)
-            .map_err(|e| format!("Failed to open database '{}': {e}", canonical.display()))?;
-        // Every bound the server was started with (memory limit, thread
-        // count, spill cap, external access) is frozen from here on, so SQL
-        // arriving through the tools cannot lift them with SET / PRAGMA.
-        db.lock_configuration()
-            .map_err(|e| format!("Failed to open database '{}': {e}", canonical.display()))?;
+        let db = open_locked(&canonical, spill_cap)?;
         dbs.insert(canonical.clone(), db);
     }
 
@@ -540,7 +547,7 @@ impl SystingMcpServer {
 
     #[tool(
         name = "query",
-        description = "Execute one read-only SQL statement against a trace database. Returns JSON with 'columns' (array of column names), 'rows' (array of arrays with properly typed values — numbers as numbers, not strings), and 'row_count'. Results are capped at 10,000 rows, applied inside DuckDB (the statement runs as a subquery with LIMIT 10,001, so rows beyond the cap are never produced); if truncated, includes 'truncated: true' and 'total_row_count' from a separate count(*) over the same statement (null if that count fails). Use SQL LIMIT/OFFSET for pagination. One statement per call: comments are fine, a second ';'-separated statement is refused. DuckDB runs under fixed, locked memory and spill bounds — SET/PRAGMA of memory_limit, threads or max_temp_directory_size are refused — and a query that exceeds the memory bound fails with a message saying so: narrow the time window, add LIMIT, or aggregate. The database is read-only, so INSERT/UPDATE/DELETE will fail."
+        description = "Execute one read-only SQL statement against a trace database. Returns JSON with 'columns' (array of column names), 'rows' (array of arrays with properly typed values — numbers as numbers, not strings), and 'row_count'. Results are capped at 10,000 rows, applied inside DuckDB (the statement runs as a subquery with LIMIT 10,001, so rows beyond the cap are never produced); if truncated, includes 'truncated: true' and 'total_row_count' from a separate count(*) over the same statement (null if that count fails). Use SQL LIMIT/OFFSET for pagination. One statement per call: comments are fine, a second ';'-separated statement is refused, and so are dollar-quoted strings ($$...$$) and $-parameters — use single-quoted literals. DuckDB runs under fixed, locked memory and spill bounds — SET/PRAGMA of memory_limit, threads or max_temp_directory_size are refused — and a query that exceeds the memory bound fails with a message saying so: narrow the time window, add LIMIT, or aggregate. The database is read-only, so INSERT/UPDATE/DELETE will fail."
     )]
     async fn query(
         &self,
@@ -939,6 +946,41 @@ mod tests {
             .query("SELECT current_setting('max_temp_directory_size')")
             .unwrap();
         assert_eq!(cap.rows[0][0].as_str().unwrap(), "100.0 MiB");
+    }
+
+    /// The database named on the command line (`mcp -d <path>`, the shape a
+    /// caller that spawns this server for one trace uses) is served locked
+    /// too: it is opened before the first request and must not be the one
+    /// path that skips the lock.
+    #[test]
+    fn test_initial_db_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("initial.duckdb");
+        {
+            let conn = duckdb::Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE t AS SELECT range AS id FROM range(10)")
+                .unwrap();
+        }
+        let handle = DbHandle::new(Some(db_path), Some("100MiB".to_string())).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // No path on the request: the initial database is the one in use.
+        let refused = rt.block_on(handle.request(DbRequest::Query(
+            None,
+            "SET memory_limit = '100GB'".to_string(),
+        )));
+        let err = refused.expect_err("SET on the initial database was accepted");
+        assert!(err.contains("locked"), "{err}");
+        let cap = rt
+            .block_on(handle.request(DbRequest::Query(
+                None,
+                "SELECT current_setting('max_temp_directory_size')".to_string(),
+            )))
+            .unwrap();
+        assert_eq!(cap["rows"][0][0].as_str().unwrap(), "100.0 MiB");
+        let count = rt
+            .block_on(handle.request(DbRequest::Query(None, "SELECT count(*) FROM t".to_string())))
+            .unwrap();
+        assert_eq!(count["rows"][0][0], serde_json::json!(10));
     }
 
     /// Verify that the MCP tool router contains exactly the expected set of tools.

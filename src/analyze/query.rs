@@ -66,6 +66,11 @@ pub(super) enum StatementShape {
     Empty,
     /// More than one `;`-separated statement.
     Multiple,
+    /// A `$` outside a quoted run: a dollar-quoted string (`$$ ... $$`,
+    /// `$tag$ ... $tag$`) or a `$n` parameter. Neither has a use through
+    /// this path, and a dollar-quoted string can hide a quote character or
+    /// a `;` from this scan — so the text is refused rather than guessed at.
+    Dollar,
     /// Exactly one statement. `text` is that statement without comments and
     /// without leading or trailing terminators; `must_wrap` says whether it
     /// can read rows from a table — `SELECT`, `WITH`, `FROM`, `VALUES`,
@@ -79,8 +84,17 @@ pub(super) enum StatementShape {
 /// block comments included), drop leading and trailing `;`, and report
 /// whether what remains is one statement. Single- and double-quoted strings
 /// are passed through untouched, so a `;` or `--` inside a literal is not a
-/// separator or a comment. A dollar-quoted string (`$$ ... $$`) is not
-/// recognised; a `;` inside one reads as a separator, which fails closed.
+/// separator or a comment.
+///
+/// This scan has to agree with DuckDB's own lexer about where statements
+/// end, because the binding's `prepare` executes every statement but the
+/// last of the text it is given. The scan is built so that every place it
+/// can disagree errs toward seeing MORE separators (and refusing): an
+/// escape-string literal (`E'...'`) whose `\'` extends the string in DuckDB
+/// ends it here, so a `;` DuckDB hides is one this scan refuses; and the one
+/// construct that would go the other way — a dollar-quoted string, inside
+/// which a `'` makes this scan believe it is in a literal while DuckDB is
+/// not — is refused outright with every other bare `$` (`Dollar`).
 pub(super) fn statement_shape(sql: &str) -> StatementShape {
     let mut out = String::with_capacity(sql.len());
     // Byte offsets in `out` of every `;` that separates statements.
@@ -109,6 +123,7 @@ pub(super) fn statement_shape(sql: &str) -> StatementShape {
                 }
                 i += 1;
             }
+            '$' => return StatementShape::Dollar,
             '-' if next == Some('-') => {
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
@@ -247,6 +262,28 @@ mod tests {
         );
         assert_eq!(statement_shape("  -- nothing\n;"), StatementShape::Empty);
         assert_eq!(statement_shape(""), StatementShape::Empty);
+    }
+
+    #[test]
+    fn test_statement_shape_refuses_bare_dollar() {
+        // A dollar-quoted string holding a quote character is the one
+        // shape under which this scan would think it is inside a literal
+        // while DuckDB is not; every bare `$` is refused instead.
+        for sql in [
+            "SELECT $$'$$; SET memory_limit='100GB'; SELECT $$'$$",
+            "SELECT $$'$$) AS x; SET memory_limit='100GB'; SELECT * FROM (SELECT $$'$$",
+            "SELECT $tag$a'b$tag$",
+            "SELECT $$a--b$$",
+            "SELECT id FROM t WHERE id = $1",
+            "SELECT a$b FROM t",
+        ] {
+            assert_eq!(statement_shape(sql), StatementShape::Dollar, "{sql:?}");
+        }
+        // Inside a quoted run or a comment a `$` is just a character.
+        assert_eq!(
+            single("SELECT '$$; SET x' AS s, \"a$b\" FROM t /* $5 */ -- $$"),
+            ("SELECT '$$; SET x' AS s, \"a$b\" FROM t".to_string(), true)
+        );
     }
 
     #[test]

@@ -417,16 +417,22 @@ impl AnalyzeDb {
     ///
     /// The text is classified first (`statement_shape`): comments and
     /// leading/trailing `;` are stripped so they cannot hide a statement
-    /// from the wrapper, and more than one statement is refused. A
+    /// from the wrapper, more than one statement is refused, and so is any
+    /// bare `$` (dollar-quoted strings, `$n` parameters) — the one lexical
+    /// construct under which the classifier and DuckDB could disagree about
+    /// where a statement ends. That agreement matters: the binding's
+    /// `prepare` is not parse-only, it EXECUTES every statement but the last
+    /// of the text it is handed, so nothing may reach `prepare` unless the
+    /// classifier has established that it is exactly one statement. A
     /// statement that reads rows (`SELECT`, `WITH`, `FROM`, `VALUES`, ...)
     /// runs ONLY in wrapped form: if it cannot be wrapped it is refused, and
     /// a SQL error in it is reported against the user's own text by
-    /// preparing — never executing — the raw statement. Statements that
-    /// cannot be embedded as a subquery (`SHOW`, `PRAGMA`, `DESCRIBE`,
-    /// `SUMMARIZE`, `EXPLAIN`, ...) run as written with the cap applied as
-    /// rows are read; their results are small by nature. A failure while
-    /// *executing* the wrapped statement is reported directly — the raw
-    /// statement is never re-run unbounded.
+    /// preparing the raw statement — safe only because it is one statement.
+    /// Statements that cannot be embedded as a subquery (`SHOW`, `PRAGMA`,
+    /// `DESCRIBE`, `SUMMARIZE`, `EXPLAIN`, ...) run as written with the cap
+    /// applied as rows are read; their results are small by nature. A
+    /// failure while *executing* the wrapped statement is reported directly
+    /// — the raw statement is never re-run unbounded.
     ///
     /// Execution-time errors from the wrapped form name line numbers
     /// relative to the user's text plus the wrapper's first line.
@@ -435,6 +441,9 @@ impl AnalyzeDb {
             StatementShape::Empty => bail!("empty query"),
             StatementShape::Multiple => bail!(
                 "only one statement per query is supported; remove the `;`-separated statement that follows the first one"
+            ),
+            StatementShape::Dollar => bail!(
+                "dollar-quoted strings ($$...$$) and $-parameters are not supported here; use a single-quoted string literal"
             ),
             StatementShape::Single { text, must_wrap } => (text, must_wrap),
         };
@@ -1502,6 +1511,23 @@ mod tests {
         }
         let err = db.query("  -- nothing here\n;").unwrap_err().to_string();
         assert!(err.contains("empty query"), "{err}");
+
+        // A dollar-quoted string holding a quote character used to make the
+        // classifier believe the rest of the text was a literal, and the
+        // binding's `prepare` then EXECUTED the hidden statements (it runs
+        // every statement but the last). Both shapes are refused before
+        // anything reaches `prepare`, and the hidden SET never ran.
+        let before = db.query("SELECT current_setting('memory_limit')").unwrap();
+        for sql in [
+            "SELECT $$'$$; SET memory_limit='100GB'; SELECT $$'$$",
+            "SELECT $$'$$) AS x; SET memory_limit='100GB'; SELECT * FROM (SELECT $$'$$",
+            "SELECT $$a--b$$",
+        ] {
+            let err = db.query(sql).unwrap_err().to_string();
+            assert!(err.contains("dollar-quoted"), "{sql:?}: {err}");
+        }
+        let after = db.query("SELECT current_setting('memory_limit')").unwrap();
+        assert_eq!(before.rows, after.rows);
     }
 
     #[test]
