@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -8,10 +9,13 @@ use crate::record::RecordCollector;
 use crate::ringbuf::RingBuffer;
 use crate::stack_recorder::{Stack, StackInterner};
 use crate::systing_core::types::{
-    memory_alloc_op, memory_event, memory_event_type, memory_rss_member,
+    memory_alloc_op, memory_event, memory_event_type, memory_rss_member, memory_thp_split_kind,
 };
-use crate::systing_core::SystingRecordEvent;
-use crate::trace::{MemoryAllocRecord, MemoryFaultRecord, MemoryMapRecord, MemoryRssRecord};
+use crate::systing_core::{MemoryIommuHistEntry, SystingRecordEvent};
+use crate::trace::{
+    MemoryAllocRecord, MemoryFaultRecord, MemoryIommuRecord, MemoryMapRecord, MemoryRssRecord,
+    MemoryThpRecord, MemoryVfioRecord, MemoryVmstatRecord,
+};
 use crate::utid::{ResolvedTask, ThreadAwareRecorder, UtidGenerator};
 
 /// stack_id offset for stacks interned by the memory recorder. Each
@@ -36,6 +40,39 @@ pub const MEMORY_MEMBER_TOTAL_VM: i8 = -2;
 pub const MEMORY_MEMBER_MAJ_FLT: i8 = -3;
 pub const MEMORY_MEMBER_THRASHING_COUNT: i8 = -4;
 pub const MEMORY_MEMBER_THRASHING_DELAY: i8 = -5;
+/// Synthetic `member` for the process's transparent-huge-page-backed
+/// anonymous memory in bytes (`AnonHugePages` from `/proc/<pid>/smaps_rollup`),
+/// sampled once at the end of the capture for every process that produced a
+/// memory event — "did this process get THP" beside its `rss_anon`. Absent
+/// when the process had exited by then.
+pub const MEMORY_MEMBER_ANON_HUGE: i8 = -6;
+
+/// The `/proc/vmstat` counters sampled at capture start and end into
+/// `memory_vmstat`: the THP allocation / split families, compaction and
+/// direct reclaim — the host-wide "how often" behind the sampled legs.
+pub const VMSTAT_COUNTERS: &[&str] = &[
+    "thp_fault_alloc",
+    "thp_fault_fallback",
+    "thp_fault_fallback_charge",
+    "thp_collapse_alloc",
+    "thp_collapse_alloc_failed",
+    "thp_split_page",
+    "thp_split_page_failed",
+    "thp_deferred_split_page",
+    "thp_split_pmd",
+    "thp_zero_page_alloc",
+    "thp_swpout",
+    "compact_stall",
+    "compact_success",
+    "compact_fail",
+    "compact_migrate_scanned",
+    "compact_free_scanned",
+    "pgscan_direct",
+    "pgsteal_direct",
+    "pgmigrate_success",
+    "pgmigrate_fail",
+    "nr_anon_transparent_hugepages",
+];
 
 /// Mirror of `MEMORY_RSS_FLAG_EXTERNAL` in systing_system.bpf.c: the rss_stat
 /// counter update came from outside the process's thread group (external
@@ -57,8 +94,15 @@ pub struct MemoryRecorder {
     interner: StackInterner,
     next_map_id: i64,
     next_alloc_id: i64,
+    next_vfio_id: i64,
+    next_thp_id: i64,
     write_error_reported: bool,
     utid_generator: Arc<UtidGenerator>,
+    /// Every tgid that produced a memory event, for the end-of-capture
+    /// per-process AnonHugePages sample.
+    seen_tgids: HashSet<i32>,
+    /// The start-of-capture vmstat sample (boot ns, name -> value).
+    vmstat_start: Option<(i64, Vec<(String, i64)>)>,
 }
 
 impl MemoryRecorder {
@@ -70,10 +114,55 @@ impl MemoryRecorder {
             interner: StackInterner::new(MEMORY_STACK_ID_OFFSET),
             next_map_id: 1,
             next_alloc_id: 1,
+            next_vfio_id: 1,
+            next_thp_id: 1,
             write_error_reported: false,
             utid_generator,
+            seen_tgids: HashSet::new(),
+            vmstat_start: None,
         }
     }
+}
+
+/// Read the `VMSTAT_COUNTERS` present in `/proc/vmstat` (a counter a kernel
+/// lacks is simply absent from the sample).
+pub fn read_vmstat_counters() -> Vec<(String, i64)> {
+    match std::fs::read_to_string("/proc/vmstat") {
+        Ok(contents) => parse_vmstat(&contents),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `parse_vmstat` over the text of `/proc/vmstat`, keeping `VMSTAT_COUNTERS`
+/// in file order.
+pub fn parse_vmstat(contents: &str) -> Vec<(String, i64)> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let mut it = line.split_whitespace();
+            let name = it.next()?;
+            let value = it.next()?.parse::<i64>().ok()?;
+            VMSTAT_COUNTERS
+                .contains(&name)
+                .then(|| (name.to_string(), value))
+        })
+        .collect()
+}
+
+/// `AnonHugePages` (bytes) from `/proc/<pid>/smaps_rollup`; `None` when the
+/// process is gone or the file is unreadable.
+fn read_anon_huge_pages(pid: i32) -> Option<i64> {
+    let contents = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+    parse_smaps_anon_huge(&contents)
+}
+
+/// The `AnonHugePages: <n> kB` line of a smaps / smaps_rollup text, in bytes.
+pub fn parse_smaps_anon_huge(contents: &str) -> Option<i64> {
+    contents.lines().find_map(|line| {
+        let rest = line.strip_prefix("AnonHugePages:")?;
+        let kb = rest.split_whitespace().next()?.parse::<i64>().ok()?;
+        Some(kb * 1024)
+    })
 }
 
 impl ThreadAwareRecorder for MemoryRecorder {
@@ -127,6 +216,93 @@ impl MemoryRecorder {
             own.finish_boxed()?;
         }
         Ok(collector)
+    }
+
+    /// Keep the start-of-capture vmstat sample until the end sample arrives.
+    pub fn set_vmstat_start(&mut self, ts: i64, samples: Vec<(String, i64)>) {
+        self.vmstat_start = Some((ts, samples));
+    }
+
+    /// Write the `memory_vmstat` rows: every counter present in both samples.
+    pub fn emit_vmstat_end(&mut self, ts_end: i64, end: Vec<(String, i64)>) {
+        let Some((ts_start, start)) = self.vmstat_start.take() else {
+            return;
+        };
+        let Some(mut collector) = self.streaming_collector.take() else {
+            return;
+        };
+        for (name, value_start) in start {
+            let Some((_, value_end)) = end.iter().find(|(n, _)| *n == name) else {
+                continue;
+            };
+            let r = collector.add_memory_vmstat(MemoryVmstatRecord {
+                name,
+                ts_start,
+                value_start,
+                ts_end,
+                value_end: *value_end,
+            });
+            self.report_write_error(r);
+        }
+        self.streaming_collector = Some(collector);
+    }
+
+    /// Write the `memory_iommu` rows from the drained BPF histogram; `utid`
+    /// is the mapping process's main thread.
+    pub fn emit_iommu_hist(&mut self, ts: i64, entries: &[MemoryIommuHistEntry]) {
+        if entries.is_empty() {
+            return;
+        }
+        let Some(mut collector) = self.streaming_collector.take() else {
+            return;
+        };
+        for e in entries {
+            let utid = self.utid_generator.get_or_create_utid(e.tgid);
+            let op = match e.op {
+                1 => "map",
+                2 => "unmap",
+                _ => "unknown",
+            };
+            let r = collector.add_memory_iommu(MemoryIommuRecord {
+                ts,
+                utid,
+                op: op.to_string(),
+                iova_gib: e.iova_gib as i64,
+                size_order: e.order as i32,
+                count: e.count as i64,
+                bytes: e.bytes as i64,
+            });
+            self.report_write_error(r);
+        }
+        self.streaming_collector = Some(collector);
+    }
+
+    /// One `memory_rss` row (member `MEMORY_MEMBER_ANON_HUGE`) per process
+    /// that produced a memory event and is still alive, read from
+    /// `/proc/<pid>/smaps_rollup`.
+    pub fn emit_anon_huge_pages(&mut self, ts: i64) {
+        let tgids: Vec<i32> = self.seen_tgids.iter().copied().collect();
+        if tgids.is_empty() {
+            return;
+        }
+        let Some(mut collector) = self.streaming_collector.take() else {
+            return;
+        };
+        for tgid in tgids {
+            let Some(bytes) = read_anon_huge_pages(tgid) else {
+                continue;
+            };
+            let utid = self.utid_generator.get_or_create_utid(tgid);
+            let r = collector.add_memory_rss(MemoryRssRecord {
+                ts,
+                utid,
+                member: MEMORY_MEMBER_ANON_HUGE,
+                size: bytes,
+                external: false,
+            });
+            self.report_write_error(r);
+        }
+        self.streaming_collector = Some(collector);
     }
 
     fn report_write_error(&mut self, r: Result<()>) {
@@ -202,6 +378,7 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
         let hdr = &event.hdr;
         let task = self.utid_generator.resolve_task(&hdr.task);
         let ResolvedTask { utid, tgid } = task;
+        self.seen_tgids.insert(tgid);
 
         match hdr.r#type {
             memory_event_type::MEMORY_RSS_STAT => {
@@ -280,6 +457,46 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
                 });
                 self.report_write_error(r);
             }
+            memory_event_type::MEMORY_VFIO_MAP | memory_event_type::MEMORY_VFIO_UNMAP => {
+                // Per-type field reuse: addr = iova, size = region bytes,
+                // old_addr = user vaddr (map only), flags = ioctl flags.
+                let is_map = hdr.r#type == memory_event_type::MEMORY_VFIO_MAP;
+                let stack_id = self.intern_stack(&event, tgid);
+                let id = self.next_vfio_id;
+                self.next_vfio_id += 1;
+                let r = collector.add_memory_vfio(MemoryVfioRecord {
+                    id,
+                    ts: hdr.ts as i64,
+                    utid,
+                    op: if is_map { "map" } else { "unmap" }.to_string(),
+                    iova: hdr.addr as i64,
+                    vaddr: is_map.then_some(hdr.old_addr as i64),
+                    size: hdr.size as i64,
+                    flags: hdr.flags as i32,
+                    stack_id,
+                });
+                self.report_write_error(r);
+            }
+            memory_event_type::MEMORY_THP_SPLIT => {
+                // Per-type field reuse: member = memory_thp_split_kind, addr =
+                // the split address (pmd only), flags = the kernel's return
+                // value (page only; 0 = split).
+                let kind = memory_thp_split_kind(hdr.member);
+                let is_pmd = kind == memory_thp_split_kind::MEMORY_THP_SPLIT_PMD;
+                let stack_id = self.intern_stack(&event, tgid);
+                let id = self.next_thp_id;
+                self.next_thp_id += 1;
+                let r = collector.add_memory_thp(MemoryThpRecord {
+                    id,
+                    ts: hdr.ts as i64,
+                    utid,
+                    kind: if is_pmd { "pmd" } else { "page" }.to_string(),
+                    addr: is_pmd.then_some(hdr.addr as i64),
+                    result: hdr.flags as i32,
+                    stack_id,
+                });
+                self.report_write_error(r);
+            }
             memory_event_type::MEMORY_THRASH_SAMPLE => {
                 // Per-type field reuse: addr = maj_flt, size = delayacct
                 // thrashing_count, old_addr = thrashing_delay ns.
@@ -328,6 +545,7 @@ pub fn memory_rss_member_name(member: i8) -> &'static str {
     match member {
         MEMORY_MEMBER_HIWATER_RSS => "hiwater_rss",
         MEMORY_MEMBER_TOTAL_VM => "total_vm",
+        MEMORY_MEMBER_ANON_HUGE => "anon_huge",
         MEMORY_MEMBER_MAJ_FLT => "maj_flt",
         MEMORY_MEMBER_THRASHING_COUNT => "thrashing_count",
         MEMORY_MEMBER_THRASHING_DELAY => "thrashing_delay_ns",
@@ -354,7 +572,35 @@ mod tests {
         assert_eq!(memory_rss_member_name(-3), "maj_flt");
         assert_eq!(memory_rss_member_name(-4), "thrashing_count");
         assert_eq!(memory_rss_member_name(-5), "thrashing_delay_ns");
-        assert_eq!(memory_rss_member_name(-6), "unknown");
+        assert_eq!(memory_rss_member_name(-6), "anon_huge");
+        assert_eq!(memory_rss_member_name(-7), "unknown");
         assert_eq!(memory_rss_member_name(99), "unknown");
+    }
+
+    #[test]
+    fn test_parse_vmstat_keeps_the_listed_counters_in_file_order() {
+        let text = "nr_free_pages 12345\nthp_fault_alloc 10\nthp_fault_fallback 3\n\
+                    bogus line\nthp_split_pmd 7\nnr_anon_transparent_hugepages 2048\n\
+                    pgscan_direct notanumber\ncompact_stall 1\n";
+        let got = parse_vmstat(text);
+        assert_eq!(
+            got,
+            vec![
+                ("thp_fault_alloc".to_string(), 10),
+                ("thp_fault_fallback".to_string(), 3),
+                ("thp_split_pmd".to_string(), 7),
+                ("nr_anon_transparent_hugepages".to_string(), 2048),
+                ("compact_stall".to_string(), 1),
+            ]
+        );
+        assert!(parse_vmstat("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_smaps_anon_huge() {
+        let text = "Rss:              123456 kB\nAnonHugePages:     4096 kB\nShmemPmdMapped:        0 kB\n";
+        assert_eq!(parse_smaps_anon_huge(text), Some(4096 * 1024));
+        assert_eq!(parse_smaps_anon_huge("Rss: 1 kB\n"), None);
+        assert_eq!(parse_smaps_anon_huge("AnonHugePages: x kB\n"), None);
     }
 }

@@ -754,3 +754,182 @@ fn test_memory_rss_threshold_tp_btf() {
 fn test_memory_rss_threshold_classic_fallback() {
     run_rss_threshold_test(true);
 }
+
+/// The THP-split and vmstat legs (`--memory-thp-sample-rate`, and the
+/// always-on `memory_vmstat` sample). The workload maps 64 MiB of anonymous
+/// memory, asks for huge pages (`MADV_HUGEPAGE`), touches it, then frees one
+/// 4 KiB page inside each 2 MiB range (`MADV_DONTNEED`) — on a kernel with
+/// THP enabled for madvise, every such partial free splits the PMD
+/// (`thp_split_pmd`) and the huge folio itself (`thp_split_page`, possibly
+/// deferred). The split kprobes need the kernel symbols; the test asserts
+/// the leg's own status from `sysinfo` and only demands `memory_thp` rows
+/// when the leg says it is on and THP is enabled in the guest.
+///
+/// The VFIO leg cannot be exercised here (no VFIO device in the guest): it
+/// is asserted only as far as a host without vfio_iommu_type1 reports —
+/// `memory_vfio_leg = off:nosym` with the capture intact.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_thp_vmstat_e2e() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let trace_path = dir.path().join("trace.pb");
+
+    let py_prog = "import mmap, ctypes, time\n\
+         libc = ctypes.CDLL(None, use_errno=True)\n\
+         libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]\n\
+         MADV_DONTNEED, MADV_HUGEPAGE = 4, 14\n\
+         HUGE = 2 * 1024 * 1024\n\
+         size = 32 * HUGE\n\
+         m = mmap.mmap(-1, size + HUGE, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)\n\
+         base = ctypes.addressof(ctypes.c_char.from_buffer(m))\n\
+         start = (base + HUGE - 1) & ~(HUGE - 1)\n\
+         libc.madvise(ctypes.c_void_p(start), size, MADV_HUGEPAGE)\n\
+         off = start - base\n\
+         for i in range(0, size, 4096):\n\
+         \x20 m[off + i] = 1\n\
+         time.sleep(0.1)\n\
+         for i in range(0, size, HUGE):\n\
+         \x20 libc.madvise(ctypes.c_void_p(start + i + 8192), 4096, MADV_DONTNEED)\n\
+         time.sleep(0.3)\n\
+         m.close()\n\
+         time.sleep(0.2)\n"
+        .to_string();
+    let run_cmd = vec!["python3".to_string(), "-c".to_string(), py_prog];
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+    let child_pid = traced_child.pid as i32;
+
+    let config = Config {
+        memory: true,
+        memory_vfio: true,
+        memory_thp_sample_rate: 1,
+        parquet_only: true,
+        output_dir: dir.path().to_path_buf(),
+        output: trace_path,
+        ..Config::default()
+    };
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+    assert_eq!(exit_code, 0, "THP workload should exit with code 0");
+
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "thptest")
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    // --- sysinfo names both legs' status ---
+    let (vfio_leg, thp_leg, thp_rate): (Option<String>, Option<String>, Option<i64>) = conn
+        .query_row(
+            "SELECT memory_vfio_leg, memory_thp_leg, memory_thp_sample_rate FROM sysinfo",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("sysinfo row");
+    eprintln!("  sysinfo: vfio_leg={vfio_leg:?} thp_leg={thp_leg:?} thp_rate={thp_rate:?}");
+    let vfio_leg = vfio_leg.expect("memory_vfio_leg must be recorded when --memory-vfio is given");
+    assert!(
+        vfio_leg == "on" || vfio_leg.starts_with("off:"),
+        "memory_vfio_leg must be 'on' or 'off:<cause>', got {vfio_leg}"
+    );
+    let thp_leg = thp_leg.expect("memory_thp_leg must be recorded when the rate is non-zero");
+    assert_eq!(thp_rate, Some(1));
+
+    // --- memory_vmstat: start/end samples of the THP family, monotonic ---
+    let (vmstat_rows, thp_fault_delta, split_pmd_delta, bad_rows): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(value_end - value_start) FILTER (WHERE name = 'thp_fault_alloc'), 0),
+                    COALESCE(SUM(value_end - value_start) FILTER (WHERE name = 'thp_split_pmd'), 0),
+                    COUNT(*) FILTER (WHERE ts_end <= ts_start OR (value_end < value_start AND name NOT LIKE 'nr_%'))
+             FROM memory_vmstat",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("memory_vmstat query");
+    eprintln!(
+        "  memory_vmstat: {vmstat_rows} counters, thp_fault_alloc +{thp_fault_delta}, thp_split_pmd +{split_pmd_delta}"
+    );
+    assert!(
+        vmstat_rows >= 10,
+        "[memory_vmstat] expected the THP/compaction counter family, got {vmstat_rows} rows"
+    );
+    assert_eq!(
+        bad_rows, 0,
+        "[memory_vmstat] counters must be monotonic between the start and end samples"
+    );
+
+    // --- memory_thp: split events when the leg is on and THP is enabled ---
+    let thp_enabled = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
+        .map(|s| s.contains("[always]") || s.contains("[madvise]"))
+        .unwrap_or(false);
+    let (thp_rows, pmd_rows, page_rows, with_stack): (i64, i64, i64, i64) = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*),
+                        COUNT(*) FILTER (WHERE kind = 'pmd'),
+                        COUNT(*) FILTER (WHERE kind = 'page'),
+                        COUNT(*) FILTER (WHERE stack_id IS NOT NULL)
+                 FROM memory_thp WHERE utid IN {UTIDS_FOR_PID}"
+            ),
+            [child_pid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("memory_thp query");
+    eprintln!(
+        "  memory_thp: {thp_rows} rows ({pmd_rows} pmd, {page_rows} page, {with_stack} with stacks); thp_enabled={thp_enabled} leg={thp_leg}"
+    );
+    if thp_leg.starts_with("on") && thp_enabled && thp_fault_delta > 0 {
+        assert!(
+            pmd_rows > 0,
+            "[memory_thp] the partial MADV_DONTNEED frees should split PMDs (vmstat thp_split_pmd +{split_pmd_delta})"
+        );
+        assert!(
+            with_stack > 0,
+            "[memory_thp] split rows should carry kernel stacks"
+        );
+        assert!(
+            split_pmd_delta >= pmd_rows,
+            "[memory_thp] per-process pmd rows ({pmd_rows}) cannot exceed the host-wide thp_split_pmd delta ({split_pmd_delta})"
+        );
+    } else {
+        eprintln!("  (THP split assertions skipped: leg={thp_leg}, thp_enabled={thp_enabled}, thp faults={thp_fault_delta})");
+    }
+
+    // --- memory_rss anon_huge sample for the workload when THP faulted ---
+    let anon_huge: Option<i64> = conn
+        .query_row(
+            &format!(
+                "SELECT MAX(size) FROM memory_rss WHERE member = -6 AND utid IN {UTIDS_FOR_PID}"
+            ),
+            [child_pid],
+            |row| row.get(0),
+        )
+        .expect("memory_rss anon_huge query");
+    eprintln!("  memory_rss anon_huge (member -6): {anon_huge:?}");
+
+    // --- utid FK integrity: every new-table utid resolves to a thread row ---
+    for table in ["memory_thp", "memory_vfio", "memory_iommu"] {
+        let orphans: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table} m LEFT JOIN thread t ON t.utid = m.utid WHERE t.utid IS NULL"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .expect("orphan query");
+        assert_eq!(orphans, 0, "[{table}] utids without a thread row");
+    }
+
+    // --- the VFIO tables: empty in the guest, and the leg says why ---
+    let vfio_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memory_vfio", [], |row| row.get(0))
+        .expect("memory_vfio count");
+    let iommu_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memory_iommu", [], |row| row.get(0))
+        .expect("memory_iommu count");
+    eprintln!("  memory_vfio rows={vfio_rows} memory_iommu rows={iommu_rows} (leg {vfio_leg})");
+    if vfio_leg != "on" {
+        assert_eq!(vfio_rows, 0);
+        assert_eq!(iommu_rows, 0);
+    }
+}

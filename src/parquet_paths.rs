@@ -49,6 +49,10 @@ pub struct ParquetPaths {
     pub memory_map: PathBuf,
     pub memory_fault: PathBuf,
     pub memory_alloc: PathBuf,
+    pub memory_vfio: PathBuf,
+    pub memory_iommu: PathBuf,
+    pub memory_thp: PathBuf,
+    pub memory_vmstat: PathBuf,
     // Clock snapshot table
     pub clock_snapshot: PathBuf,
     // System info table
@@ -112,6 +116,10 @@ impl ParquetPaths {
             memory_map: dir.join("memory_map.parquet"),
             memory_fault: dir.join("memory_fault.parquet"),
             memory_alloc: dir.join("memory_alloc.parquet"),
+            memory_vfio: dir.join("memory_vfio.parquet"),
+            memory_iommu: dir.join("memory_iommu.parquet"),
+            memory_thp: dir.join("memory_thp.parquet"),
+            memory_vmstat: dir.join("memory_vmstat.parquet"),
             // Clock snapshot table
             clock_snapshot: dir.join("clock_snapshot.parquet"),
             // System info table
@@ -164,6 +172,10 @@ impl ParquetPaths {
             memory_map: dir.join(format!("{trace_id}_memory_map.parquet")),
             memory_fault: dir.join(format!("{trace_id}_memory_fault.parquet")),
             memory_alloc: dir.join(format!("{trace_id}_memory_alloc.parquet")),
+            memory_vfio: dir.join(format!("{trace_id}_memory_vfio.parquet")),
+            memory_iommu: dir.join(format!("{trace_id}_memory_iommu.parquet")),
+            memory_thp: dir.join(format!("{trace_id}_memory_thp.parquet")),
+            memory_vmstat: dir.join(format!("{trace_id}_memory_vmstat.parquet")),
             clock_snapshot: dir.join(format!("{trace_id}_clock_snapshot.parquet")),
             sysinfo: dir.join(format!("{trace_id}_sysinfo.parquet")),
             cpu_info: dir.join(format!("{trace_id}_cpu_info.parquet")),
@@ -175,7 +187,7 @@ impl ParquetPaths {
     }
 
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 40] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 44] {
         [
             PathEntry {
                 path: &self.process,
@@ -285,6 +297,22 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.memory_alloc,
                 name: "memory_alloc",
+            },
+            PathEntry {
+                path: &self.memory_vfio,
+                name: "memory_vfio",
+            },
+            PathEntry {
+                path: &self.memory_iommu,
+                name: "memory_iommu",
+            },
+            PathEntry {
+                path: &self.memory_thp,
+                name: "memory_thp",
+            },
+            PathEntry {
+                path: &self.memory_vmstat,
+                name: "memory_vmstat",
             },
             PathEntry {
                 path: &self.network_interface,

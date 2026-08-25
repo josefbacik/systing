@@ -29,12 +29,12 @@ use crate::record::RecordCollector;
 use crate::trace::{
     self, ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, CpuInfoRecord,
     InstantArgRecord, InstantRecord, IrqSliceRecord, MemoryAllocRecord, MemoryFaultRecord,
-    MemoryMapRecord, MemoryRssRecord, NetworkDnsRecord, NetworkInterfaceRecord,
-    NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord,
-    ProcessExitRecord, ProcessRecord, SchedMigrateRecord, SchedSliceRecord, SliceRecord,
-    SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord, SysInfoRecord,
-    ThreadRecord, ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord,
-    WakeupNewRecord,
+    MemoryIommuRecord, MemoryMapRecord, MemoryRssRecord, MemoryThpRecord, MemoryVfioRecord,
+    MemoryVmstatRecord, NetworkDnsRecord, NetworkInterfaceRecord, NetworkPacketRecord,
+    NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord,
+    SchedMigrateRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord,
+    StackRecord, StackSampleRecord, SysInfoRecord, ThreadRecord, ThreadStateRecord,
+    TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -132,6 +132,10 @@ pub struct StreamingParquetWriter {
     memory_maps: Vec<MemoryMapRecord>,
     memory_faults: Vec<MemoryFaultRecord>,
     memory_allocs: Vec<MemoryAllocRecord>,
+    memory_vfio: Vec<MemoryVfioRecord>,
+    memory_iommu: Vec<MemoryIommuRecord>,
+    memory_thp: Vec<MemoryThpRecord>,
+    memory_vmstat: Vec<MemoryVmstatRecord>,
     clock_snapshots: Vec<ClockSnapshotRecord>,
     sysinfo: Option<SysInfoRecord>,
     cpu_infos: Vec<CpuInfoRecord>,
@@ -169,6 +173,10 @@ pub struct StreamingParquetWriter {
     memory_map_writer: Option<TableWriter>,
     memory_fault_writer: Option<TableWriter>,
     memory_alloc_writer: Option<TableWriter>,
+    memory_vfio_writer: Option<TableWriter>,
+    memory_iommu_writer: Option<TableWriter>,
+    memory_thp_writer: Option<TableWriter>,
+    memory_vmstat_writer: Option<TableWriter>,
     clock_snapshot_writer: Option<TableWriter>,
     sysinfo_writer: Option<TableWriter>,
     cpu_info_writer: Option<TableWriter>,
@@ -248,6 +256,10 @@ impl StreamingParquetWriter {
             memory_maps: Vec::new(),
             memory_faults: Vec::new(),
             memory_allocs: Vec::new(),
+            memory_vfio: Vec::new(),
+            memory_iommu: Vec::new(),
+            memory_thp: Vec::new(),
+            memory_vmstat: Vec::new(),
             clock_snapshots: Vec::new(),
             sysinfo: None,
             cpu_infos: Vec::new(),
@@ -284,6 +296,10 @@ impl StreamingParquetWriter {
             memory_map_writer: None,
             memory_fault_writer: None,
             memory_alloc_writer: None,
+            memory_vfio_writer: None,
+            memory_iommu_writer: None,
+            memory_thp_writer: None,
+            memory_vmstat_writer: None,
             clock_snapshot_writer: None,
             sysinfo_writer: None,
             cpu_info_writer: None,
@@ -1004,6 +1020,78 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    fn flush_memory_vfio(&mut self) -> Result<()> {
+        if self.memory_vfio.is_empty() {
+            return Ok(());
+        }
+        let schema = trace::memory_vfio_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.memory_vfio_writer,
+            &self.sink,
+            "memory_vfio",
+            schema.clone(),
+            &self.writer_props,
+        )?;
+        let batch = build_memory_vfio_batch(&self.memory_vfio, &schema)?;
+        writer.write(&batch)?;
+        self.memory_vfio.clear();
+        Ok(())
+    }
+
+    fn flush_memory_iommu(&mut self) -> Result<()> {
+        if self.memory_iommu.is_empty() {
+            return Ok(());
+        }
+        let schema = trace::memory_iommu_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.memory_iommu_writer,
+            &self.sink,
+            "memory_iommu",
+            schema.clone(),
+            &self.writer_props,
+        )?;
+        let batch = build_memory_iommu_batch(&self.memory_iommu, &schema)?;
+        writer.write(&batch)?;
+        self.memory_iommu.clear();
+        Ok(())
+    }
+
+    fn flush_memory_thp(&mut self) -> Result<()> {
+        if self.memory_thp.is_empty() {
+            return Ok(());
+        }
+        let schema = trace::memory_thp_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.memory_thp_writer,
+            &self.sink,
+            "memory_thp",
+            schema.clone(),
+            &self.writer_props,
+        )?;
+        let batch = build_memory_thp_batch(&self.memory_thp, &schema)?;
+        writer.write(&batch)?;
+        self.memory_thp.clear();
+        Ok(())
+    }
+
+    fn flush_memory_vmstat(&mut self) -> Result<()> {
+        if self.memory_vmstat.is_empty() {
+            return Ok(());
+        }
+        let schema = trace::memory_vmstat_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.memory_vmstat_writer,
+            &self.sink,
+            "memory_vmstat",
+            schema.clone(),
+            &self.writer_props,
+        )?;
+        let batch = build_memory_vmstat_batch(&self.memory_vmstat, &schema)?;
+        writer.write(&batch)?;
+        self.memory_vmstat.clear();
+        Ok(())
+    }
+
     // Flush tpu_devices buffer
     fn flush_tpu_devices(&mut self) -> Result<()> {
         if self.tpu_devices.is_empty() {
@@ -1113,6 +1201,10 @@ impl StreamingParquetWriter {
         close_writer!(self.memory_map_writer);
         close_writer!(self.memory_fault_writer);
         close_writer!(self.memory_alloc_writer);
+        close_writer!(self.memory_vfio_writer);
+        close_writer!(self.memory_iommu_writer);
+        close_writer!(self.memory_thp_writer);
+        close_writer!(self.memory_vmstat_writer);
         close_writer!(self.clock_snapshot_writer);
         close_writer!(self.sysinfo_writer);
         close_writer!(self.cpu_info_writer);
@@ -1454,6 +1546,46 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn add_memory_vfio(&mut self, record: MemoryVfioRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.memory_vfio, self.batch_size);
+        self.memory_vfio.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.memory_vfio, self.batch_size) {
+            self.flush_memory_vfio()?;
+        }
+        Ok(())
+    }
+
+    fn add_memory_iommu(&mut self, record: MemoryIommuRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.memory_iommu, self.batch_size);
+        self.memory_iommu.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.memory_iommu, self.batch_size) {
+            self.flush_memory_iommu()?;
+        }
+        Ok(())
+    }
+
+    fn add_memory_thp(&mut self, record: MemoryThpRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.memory_thp, self.batch_size);
+        self.memory_thp.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.memory_thp, self.batch_size) {
+            self.flush_memory_thp()?;
+        }
+        Ok(())
+    }
+
+    fn add_memory_vmstat(&mut self, record: MemoryVmstatRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.memory_vmstat, self.batch_size);
+        self.memory_vmstat.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.memory_vmstat, self.batch_size) {
+            self.flush_memory_vmstat()?;
+        }
+        Ok(())
+    }
+
     fn add_memory_fault(&mut self, record: MemoryFaultRecord) -> Result<()> {
         Self::reserve_if_empty(&mut self.memory_faults, self.batch_size);
         self.memory_faults.push(record);
@@ -1535,6 +1667,10 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_memory_maps()?;
         self.flush_memory_faults()?;
         self.flush_memory_allocs()?;
+        self.flush_memory_vfio()?;
+        self.flush_memory_iommu()?;
+        self.flush_memory_thp()?;
+        self.flush_memory_vmstat()?;
         self.flush_clock_snapshots()?;
         self.flush_sysinfo()?;
         self.flush_cpu_infos()?;
@@ -2191,6 +2327,9 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     let mut memory_fault_sample_rate_builder = Int64Builder::with_capacity(1);
     let mut memory_map_sample_rate_builder = Int64Builder::with_capacity(1);
     let mut memory_alloc_sample_rate_builder = Int64Builder::with_capacity(1);
+    let mut memory_vfio_leg_builder = StringBuilder::with_capacity(1, 16);
+    let mut memory_thp_leg_builder = StringBuilder::with_capacity(1, 48);
+    let mut memory_thp_sample_rate_builder = Int64Builder::with_capacity(1);
 
     sysname_builder.append_value(&record.sysname);
     release_builder.append_value(&record.release);
@@ -2206,6 +2345,9 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     memory_fault_sample_rate_builder.append_option(record.memory_fault_sample_rate);
     memory_map_sample_rate_builder.append_option(record.memory_map_sample_rate);
     memory_alloc_sample_rate_builder.append_option(record.memory_alloc_sample_rate);
+    memory_vfio_leg_builder.append_option(record.memory_vfio_leg.as_deref());
+    memory_thp_leg_builder.append_option(record.memory_thp_leg.as_deref());
+    memory_thp_sample_rate_builder.append_option(record.memory_thp_sample_rate);
 
     Ok(RecordBatch::try_new(
         schema.clone(),
@@ -2224,6 +2366,9 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
             Arc::new(memory_fault_sample_rate_builder.finish()),
             Arc::new(memory_map_sample_rate_builder.finish()),
             Arc::new(memory_alloc_sample_rate_builder.finish()),
+            Arc::new(memory_vfio_leg_builder.finish()),
+            Arc::new(memory_thp_leg_builder.finish()),
+            Arc::new(memory_thp_sample_rate_builder.finish()),
         ],
     )?)
 }
@@ -2610,6 +2755,150 @@ fn build_memory_alloc_batch(
             Arc::new(size.finish()),
             Arc::new(old_addr.finish()),
             Arc::new(stack_id.finish()),
+        ],
+    )?)
+}
+
+fn build_memory_vfio_batch(
+    records: &[MemoryVfioRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    use arrow::array::{Int32Builder, Int64Builder};
+    let n = records.len();
+    let mut id = Int64Builder::with_capacity(n);
+    let mut ts = Int64Builder::with_capacity(n);
+    let mut utid = Int64Builder::with_capacity(n);
+    let mut op = StringBuilder::with_capacity(n, n * 6);
+    let mut iova = Int64Builder::with_capacity(n);
+    let mut vaddr = Int64Builder::with_capacity(n);
+    let mut size = Int64Builder::with_capacity(n);
+    let mut flags = Int32Builder::with_capacity(n);
+    let mut stack_id = Int64Builder::with_capacity(n);
+    for r in records {
+        id.append_value(r.id);
+        ts.append_value(r.ts);
+        utid.append_value(r.utid);
+        op.append_value(&r.op);
+        iova.append_value(r.iova);
+        vaddr.append_option(r.vaddr);
+        size.append_value(r.size);
+        flags.append_value(r.flags);
+        stack_id.append_option(r.stack_id);
+    }
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id.finish()),
+            Arc::new(ts.finish()),
+            Arc::new(utid.finish()),
+            Arc::new(op.finish()),
+            Arc::new(iova.finish()),
+            Arc::new(vaddr.finish()),
+            Arc::new(size.finish()),
+            Arc::new(flags.finish()),
+            Arc::new(stack_id.finish()),
+        ],
+    )?)
+}
+
+fn build_memory_iommu_batch(
+    records: &[MemoryIommuRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    use arrow::array::{Int32Builder, Int64Builder};
+    let n = records.len();
+    let mut ts = Int64Builder::with_capacity(n);
+    let mut utid = Int64Builder::with_capacity(n);
+    let mut op = StringBuilder::with_capacity(n, n * 6);
+    let mut iova_gib = Int64Builder::with_capacity(n);
+    let mut size_order = Int32Builder::with_capacity(n);
+    let mut count = Int64Builder::with_capacity(n);
+    let mut bytes = Int64Builder::with_capacity(n);
+    for r in records {
+        ts.append_value(r.ts);
+        utid.append_value(r.utid);
+        op.append_value(&r.op);
+        iova_gib.append_value(r.iova_gib);
+        size_order.append_value(r.size_order);
+        count.append_value(r.count);
+        bytes.append_value(r.bytes);
+    }
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(ts.finish()),
+            Arc::new(utid.finish()),
+            Arc::new(op.finish()),
+            Arc::new(iova_gib.finish()),
+            Arc::new(size_order.finish()),
+            Arc::new(count.finish()),
+            Arc::new(bytes.finish()),
+        ],
+    )?)
+}
+
+fn build_memory_thp_batch(
+    records: &[MemoryThpRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    use arrow::array::{Int32Builder, Int64Builder};
+    let n = records.len();
+    let mut id = Int64Builder::with_capacity(n);
+    let mut ts = Int64Builder::with_capacity(n);
+    let mut utid = Int64Builder::with_capacity(n);
+    let mut kind = StringBuilder::with_capacity(n, n * 5);
+    let mut addr = Int64Builder::with_capacity(n);
+    let mut result = Int32Builder::with_capacity(n);
+    let mut stack_id = Int64Builder::with_capacity(n);
+    for r in records {
+        id.append_value(r.id);
+        ts.append_value(r.ts);
+        utid.append_value(r.utid);
+        kind.append_value(&r.kind);
+        addr.append_option(r.addr);
+        result.append_value(r.result);
+        stack_id.append_option(r.stack_id);
+    }
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id.finish()),
+            Arc::new(ts.finish()),
+            Arc::new(utid.finish()),
+            Arc::new(kind.finish()),
+            Arc::new(addr.finish()),
+            Arc::new(result.finish()),
+            Arc::new(stack_id.finish()),
+        ],
+    )?)
+}
+
+fn build_memory_vmstat_batch(
+    records: &[MemoryVmstatRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    use arrow::array::Int64Builder;
+    let n = records.len();
+    let mut name = StringBuilder::with_capacity(n, n * 24);
+    let mut ts_start = Int64Builder::with_capacity(n);
+    let mut value_start = Int64Builder::with_capacity(n);
+    let mut ts_end = Int64Builder::with_capacity(n);
+    let mut value_end = Int64Builder::with_capacity(n);
+    for r in records {
+        name.append_value(&r.name);
+        ts_start.append_value(r.ts_start);
+        value_start.append_value(r.value_start);
+        ts_end.append_value(r.ts_end);
+        value_end.append_value(r.value_end);
+    }
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(name.finish()),
+            Arc::new(ts_start.finish()),
+            Arc::new(value_start.finish()),
+            Arc::new(ts_end.finish()),
+            Arc::new(value_end.finish()),
         ],
     )?)
 }
@@ -3032,6 +3321,9 @@ mod tests {
                 memory_fault_sample_rate: Some(97),
                 memory_map_sample_rate: Some(1),
                 memory_alloc_sample_rate: None,
+                memory_vfio_leg: Some("off:nosym".to_string()),
+                memory_thp_leg: Some("on:page-only".to_string()),
+                memory_thp_sample_rate: Some(13),
             })
             .unwrap();
         writer.finish().unwrap();
@@ -3053,6 +3345,9 @@ mod tests {
             Option<i64>,
             Option<i64>,
             Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
         );
 
         let conn = Connection::open(&db_path).unwrap();
@@ -3060,7 +3355,8 @@ mod tests {
             .query_row(
                 "SELECT sysname, machine, cpufreq_driver, hypervisor, sys_vendor, product_name, \
                  sample_event, sample_period, memory_fault_leg, memory_fault_sample_rate, \
-                 memory_map_sample_rate, memory_alloc_sample_rate FROM sysinfo",
+                 memory_map_sample_rate, memory_alloc_sample_rate, memory_vfio_leg, \
+                 memory_thp_leg, memory_thp_sample_rate FROM sysinfo",
                 [],
                 |row| {
                     Ok((
@@ -3076,6 +3372,9 @@ mod tests {
                         row.get(9)?,
                         row.get(10)?,
                         row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
                     ))
                 },
             )
@@ -3096,6 +3395,9 @@ mod tests {
             row.11, None,
             "memory_alloc_sample_rate should round-trip as NULL when memory-alloc is off"
         );
+        assert_eq!(row.12, Some("off:nosym".to_string()));
+        assert_eq!(row.13, Some("on:page-only".to_string()));
+        assert_eq!(row.14, Some(13));
     }
 
     /// A sysinfo.parquet written before the memory columns existed (systing

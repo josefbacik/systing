@@ -442,3 +442,116 @@ lane continues without the fault leg, one line is logged, and
 old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
+
+## Schema Version 18 (unreleased) — 2026-08-25
+
+The memory recorder learns about device DMA mappings and transparent huge
+pages: how often VFIO regions are mapped and unmapped, how fragmented the
+memory behind them is, and how often THPs split or fail to be allocated on
+the host. Motivation: a model-unload regression whose suspected cause is
+4 KiB-fragmented VFIO-pinned arenas (the unmap/unpin walk has 512x the
+entries of a 2 MiB-backed one). New tables are empty unless the leg was
+asked for (`--memory-vfio`, `--memory-thp-sample-rate`); `memory_vmstat`
+is written whenever the memory recorder runs.
+
+### Added tables
+- `memory_vfio` — one row per VFIO DMA region mapped or unmapped through
+  vfio_iommu_type1 (`VFIO_IOMMU_MAP_DMA` / `UNMAP_DMA`, kprobes on
+  `vfio_dma_do_map` / `vfio_dma_do_unmap`): `id`, `ts`, `utid`, `op`
+  (`map` / `unmap`), `iova`, `vaddr` (the user address backing a map; NULL
+  on unmap), `size` (bytes), `flags` (the ioctl flags), `stack_id`.
+  Unsampled — a region is one ioctl. The kprobes sit at the handlers'
+  entry, so a row is the region AS REQUESTED: an ioctl the kernel then
+  refuses still produces it, and an unmap with `VFIO_DMA_UNMAP_FLAG_ALL`
+  (flags bit 1) carries `iova = 0, size = 0` and means every region of the
+  container.
+- `memory_iommu` — the IOMMU map/unmap run-size histogram per process
+  and per GiB of IOVA space, counted in BPF from the `iommu:map` /
+  `iommu:unmap` tracepoints and drained once at the end of the capture
+  (`ts`): `utid` (the mapping process's main thread), `op` (`map` /
+  `unmap`), `iova_gib` (`iova >> 30` — where in the device address space
+  the runs sit), `size_order` (log2 of the run size in bytes: 12 = 4 KiB,
+  21 = 2 MiB, 30 = 1 GiB), `count`, `bytes`. vfio_iommu_type1 maps and
+  unmaps a region one physically contiguous run per `iommu_map()` /
+  `iommu_unmap()` call, so this is the contiguity of the memory behind the
+  device mappings: the share of `bytes` at `size_order >= 21` is the
+  THP-backed share, `sum(count)` over `memory_vfio` rows of the same
+  process is the number of runs per region, and grouping by `iova_gib`
+  shows which GiBs of a device's arena are fragmented. Only runs inside
+  the region the counting task is mapping or unmapping through a
+  `VFIO_IOMMU_MAP_DMA` / `UNMAP_DMA` ioctl at that moment are counted
+  (the kprobe/kretprobe pair brackets the window), so the table is VFIO's
+  by construction — the host's other IOMMU users (NIC / NVMe DMA-API
+  mappings on an IOMMU-translated host) are never in it. The BPF map holds
+  131072 entries (≈23 processes with 150 GiB arenas at every size order);
+  runs that find it full are dropped and counted (systing prints
+  `memory-vfio: N iommu map/unmap runs not counted`), so the table is a
+  floor in that case.
+- `memory_thp` — sampled transparent-huge-page splits: `id`, `ts`, `utid`,
+  `kind` (`pmd`: a PMD mapping split into PTEs, `addr` = the virtual
+  address, what `/proc/vmstat` counts as `thp_split_pmd` — probed at
+  `__split_huge_pmd`, so the rmap-path splits of `try_to_unmap` /
+  `try_to_migrate` on 6.10+ are in the vmstat delta but not here; `page`:
+  the folio itself split, `result` = the kernel's return value, 0 = split,
+  negative errno = failed — `thp_split_page` / `thp_split_page_failed`),
+  `addr` (NULL for `page`), `result`, `stack_id`. 1 in N sampled
+  (`sysinfo.memory_thp_sample_rate`).
+- `memory_vmstat` — `/proc/vmstat` counters sampled at the start and the
+  end of the capture: `name`, `ts_start`, `value_start`, `ts_end`,
+  `value_end`. The THP allocation and split families (`thp_fault_alloc`,
+  `thp_fault_fallback`, `thp_fault_fallback_charge`, `thp_collapse_*`,
+  `thp_split_page`, `thp_split_page_failed`, `thp_deferred_split_page`,
+  `thp_split_pmd`, `thp_zero_page_alloc`, `thp_swpout`), compaction
+  (`compact_stall` / `_success` / `_fail` / `_migrate_scanned` /
+  `_free_scanned`), direct reclaim (`pgscan_direct`, `pgsteal_direct`),
+  migration (`pgmigrate_success` / `_fail`) and the instantaneous
+  `nr_anon_transparent_hugepages`. `value_end - value_start` is the
+  host-wide count over the capture (for `nr_*` gauges it is the change in
+  level); a counter the kernel lacks is absent.
+
+### Added columns
+- `memory_rss`: a new synthetic `member` -6 (`anon_huge`): the process's
+  THP-backed anonymous bytes (`AnonHugePages` from
+  `/proc/<pid>/smaps_rollup`), sampled once at the end of the capture for
+  every process that produced a memory event and was still alive — "did
+  this process get huge pages", beside its `anon` rows.
+- `sysinfo`: added `memory_vfio_leg VARCHAR` (`on`, or `off:nosym` when
+  the vfio_iommu_type1 module is not loaded / `off:notracepoint` when the
+  kernel has no iommu tracepoints; NULL when `--memory-vfio` was not
+  given), `memory_thp_leg VARCHAR` (`on` when both the PMD-split kprobe
+  (`__split_huge_pmd`) and the folio-split kretprobe
+  (`split_huge_page_to_list_to_order` on 6.9+, `split_huge_page_to_list` on
+  the 6.6 series) attached, `on:pmd-only` / `on:page-only` when one symbol
+  is missing, `off:nosym`; NULL when the sample rate was 0),
+  `memory_thp_sample_rate BIGINT`.
+  An unavailable leg turns only that leg off and says so here; the
+  capture runs.
+
+### Reading the new tables (the three questions, as queries)
+```sql
+-- 1. VFIO map/unmap rate: regions and bytes per process and op
+SELECT p.name, v.op, count(*) AS regions, sum(v.size) / 1073741824.0 AS gib
+FROM memory_vfio v JOIN thread t ON t.utid = v.utid JOIN process p ON p.upid = t.upid
+GROUP BY 1, 2 ORDER BY 1, 2;
+
+-- 2. Fragmentation: share of mapped bytes in >= 2 MiB runs, per process and
+--    op (and where: add iova_gib to the GROUP BY for the per-GiB picture)
+SELECT p.name, i.op,
+       sum(i.bytes) FILTER (WHERE i.size_order >= 21) * 1.0 / sum(i.bytes) AS huge_share,
+       sum(i.count) AS runs, sum(i.bytes) / 1073741824.0 AS gib
+FROM memory_iommu i JOIN thread t ON t.utid = i.utid JOIN process p ON p.upid = t.upid
+GROUP BY 1, 2 ORDER BY 1, 2;
+
+-- 3. THP: host-wide deltas over the capture, and who split
+SELECT name, value_end - value_start AS delta FROM memory_vmstat
+WHERE name LIKE 'thp_%' OR name LIKE 'compact_%' ORDER BY 1;
+SELECT p.name, m.kind, count(*) AS splits, count(*) FILTER (WHERE m.result <> 0) AS failed
+FROM memory_thp m JOIN thread t ON t.utid = m.utid JOIN process p ON p.upid = t.upid
+GROUP BY 1, 2 ORDER BY 3 DESC;
+-- and per process: AnonHugePages (member -6) beside anon (member 1) in memory_rss.
+```
+
+### Behaviour change (no schema effect)
+The new legs are off by default and attach only the kernel symbols the
+running host has (probed in /proc/kallsyms and tracefs before the BPF
+programs are selected), on 6.6, 6.12 and 6.18-series kernels alike.

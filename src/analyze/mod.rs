@@ -241,6 +241,17 @@ pub struct TraceSystemInfo {
     /// `memory-alloc` recorder was off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_alloc_sample_rate: Option<i64>,
+    /// How the VFIO/IOMMU legs ran ("on" / "off:<cause>"); `None` when not
+    /// requested or for traces from systing < 1.15.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_vfio_leg: Option<String>,
+    /// How the THP split leg ran ("on", "on:pmd-only", "on:page-only" or
+    /// "off:<cause>"); `None` when its sample rate was 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_thp_leg: Option<String>,
+    /// `--memory-thp-sample-rate` at capture time (1 in N splits).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_thp_sample_rate: Option<i64>,
 }
 
 /// Trace metadata.
@@ -804,7 +815,7 @@ impl AnalyzeDb {
             }
         };
         let sql = format!(
-            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
+            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
             col("trace_id"),
             col("release"),
             col("machine"),
@@ -818,6 +829,9 @@ impl AnalyzeDb {
             col("memory_fault_sample_rate"),
             col("memory_map_sample_rate"),
             col("memory_alloc_sample_rate"),
+            col("memory_vfio_leg"),
+            col("memory_thp_leg"),
+            col("memory_thp_sample_rate"),
         );
 
         let Ok(mut stmt) = self.conn.prepare(&sql) else {
@@ -838,6 +852,9 @@ impl AnalyzeDb {
                 memory_fault_sample_rate: row.get(10)?,
                 memory_map_sample_rate: row.get(11)?,
                 memory_alloc_sample_rate: row.get(12)?,
+                memory_vfio_leg: row.get(13)?,
+                memory_thp_leg: row.get(14)?,
+                memory_thp_sample_rate: row.get(15)?,
             })
         }) else {
             return Vec::new();
@@ -1253,10 +1270,11 @@ mod tests {
                  cpufreq_driver, hypervisor, sys_vendor, product_name, \
                  sample_event, sample_period, memory_fault_leg, \
                  memory_fault_sample_rate, memory_map_sample_rate, \
-                 memory_alloc_sample_rate) \
+                 memory_alloc_sample_rate, memory_vfio_leg, memory_thp_leg, \
+                 memory_thp_sample_rate) \
                  VALUES ('t1', 'Linux', '6.12.0', '#1 SMP', 'x86_64', \
                  NULL, 'kvm', 'Amazon EC2', 'm7i.16xlarge', 'cpu-clock', 1000000, \
-                 'tracepoint', 97, 1, NULL)",
+                 'tracepoint', 97, 1, NULL, 'on', NULL, NULL)",
             )
             .unwrap();
         }
@@ -1285,6 +1303,9 @@ mod tests {
             sys.memory_alloc_sample_rate, None,
             "NULL memory_alloc_sample_rate (memory-alloc off) must come back as None"
         );
+        assert_eq!(sys.memory_vfio_leg.as_deref(), Some("on"));
+        assert_eq!(sys.memory_thp_leg, None);
+        assert_eq!(sys.memory_thp_sample_rate, None);
     }
 
     #[test]
@@ -1309,6 +1330,9 @@ mod tests {
                  ALTER TABLE sysinfo DROP COLUMN memory_fault_sample_rate; \
                  ALTER TABLE sysinfo DROP COLUMN memory_map_sample_rate; \
                  ALTER TABLE sysinfo DROP COLUMN memory_alloc_sample_rate; \
+                 ALTER TABLE sysinfo DROP COLUMN memory_vfio_leg; \
+                 ALTER TABLE sysinfo DROP COLUMN memory_thp_leg; \
+                 ALTER TABLE sysinfo DROP COLUMN memory_thp_sample_rate; \
                  INSERT INTO sysinfo (trace_id, sysname, release, version, machine) \
                  VALUES ('t1', 'Linux', '5.10.0', '#1 SMP', 'aarch64')",
             )
@@ -1332,6 +1356,9 @@ mod tests {
         assert_eq!(sys.memory_fault_sample_rate, None);
         assert_eq!(sys.memory_map_sample_rate, None);
         assert_eq!(sys.memory_alloc_sample_rate, None);
+        assert_eq!(sys.memory_vfio_leg, None);
+        assert_eq!(sys.memory_thp_leg, None);
+        assert_eq!(sys.memory_thp_sample_rate, None);
     }
 
     #[test]

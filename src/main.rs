@@ -126,6 +126,12 @@ struct Command {
     /// Sample 1 in N mmap/munmap/brk events when the memory recorder is enabled (0 or 1 = record all). Byte aggregates over sampled map events scale by the rate; per-event address pairing (an mmap with its munmap) is unreliable at rates > 1.
     #[arg(long, default_value = "1")]
     memory_map_sample_rate: u32,
+    /// With the memory recorder, also record VFIO DMA regions (one memory_vfio row per VFIO_IOMMU_MAP_DMA/UNMAP_DMA, with stacks) and the IOMMU map/unmap run-size histogram (memory_iommu: how fragmented the memory behind device mappings is). Needs the vfio_iommu_type1 module loaded; otherwise the leg is off (sysinfo.memory_vfio_leg) and the capture proceeds.
+    #[arg(long)]
+    memory_vfio: bool,
+    /// With the memory recorder, sample 1 in N transparent-huge-page splits into memory_thp (0 = off, 1 = every split). The host-wide split/fallback/compaction counters are always sampled into memory_vmstat when the memory recorder runs.
+    #[arg(long, default_value = "0")]
+    memory_thp_sample_rate: u32,
     /// Override the minimum byte-drift between emitted rss_stat events (default: max(16 MiB, 64*nr_cpus*page_size); 0 = emit every event)
     #[arg(long)]
     memory_rss_threshold_bytes: Option<u64>,
@@ -262,6 +268,8 @@ impl From<Command> for Config {
             memory: cmd.memory,
             memory_fault_sample_rate: cmd.memory_fault_sample_rate,
             memory_map_sample_rate: cmd.memory_map_sample_rate,
+            memory_vfio: cmd.memory_vfio,
+            memory_thp_sample_rate: cmd.memory_thp_sample_rate,
             memory_rss_threshold_bytes: cmd.memory_rss_threshold_bytes,
             memory_rss_force_classic: cmd.memory_rss_force_classic,
             memory_alloc: cmd.memory_alloc,
