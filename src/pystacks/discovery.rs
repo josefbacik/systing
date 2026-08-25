@@ -28,10 +28,10 @@ struct ElfPyInfo {
 
 /// Per-binary ELF parse results keyed by (st_dev, st_ino, st_size). `None`
 /// records a binary that is not a Python runtime — rejections cost a full
-/// ELF parse too, so they're worth remembering. I/O failures are never
-/// cached: a transient read error (ESTALE, a /proc/pid/root path vanishing
-/// when the process exits mid-check) must not blacklist an interpreter for
-/// the rest of the session.
+/// ELF parse too, so they're worth remembering. A file that fails a
+/// readability probe (see `elf_py_info`) is not cached: a transient read
+/// error (ESTALE, a /proc/pid/root path vanishing when the process exits
+/// mid-check) must not blacklist an interpreter for the rest of the session.
 type ElfCache = HashMap<(u64, u64, u64), Option<Arc<ElfPyInfo>>>;
 
 static ELF_CACHE: LazyLock<Mutex<ElfCache>> = LazyLock::new(Default::default);
@@ -67,6 +67,10 @@ fn elf_py_info(file_path: &str) -> Option<Arc<ElfPyInfo>> {
     // A rejection is cached only if the file is still readable: an I/O
     // error mid-parse (the file vanished under us) is indistinguishable
     // from "not a runtime" inside the parser, and must not be remembered.
+    // The probe reads the first 64 bytes, so it stands in for "the file is
+    // gone or unreadable", not for an error in the middle of a file that
+    // is otherwise fine — that narrower case would be cached as a
+    // rejection.
     if parsed.is_none() && !file_readable(&file) {
         return None;
     }
@@ -100,7 +104,7 @@ fn parse_elf_py_info(file_path: &str, file: &fs::File) -> Option<Arc<ElfPyInfo>>
     let reader = ReadCache::new(file);
     let result = object::File::parse(&reader).ok().and_then(|elf| {
         let py_runtime_addr = find_symbol_address(&elf, "_PyRuntime")?;
-        let version = detect_python_version(&elf, file_path)?;
+        let version = detect_python_version(&elf, &reader, file_path)?;
         Some(Arc::new(ElfPyInfo {
             py_runtime_addr,
             version,
@@ -370,10 +374,11 @@ fn find_symbol_address<'data, R: ReadRef<'data>>(
 /// so the pattern match is unaffected by /proc/pid/root resolution).
 fn detect_python_version<'data, R: ReadRef<'data>>(
     elf: &object::File<'data, R>,
+    reader: R,
     module_path: &str,
 ) -> Option<(i32, i32, i32)> {
     // Try to find version from _PySys_ImplCacheTag symbol value
-    if let Some(version_str) = read_impl_cache_tag(elf) {
+    if let Some(version_str) = read_impl_cache_tag(elf, reader) {
         if let Some(ver) = parse_cpython_version(&version_str) {
             return Some(ver);
         }
@@ -385,12 +390,18 @@ fn detect_python_version<'data, R: ReadRef<'data>>(
 
 /// Try to read the _PySys_ImplCacheTag string from ELF.
 ///
-/// Reads only the bytes it needs through `data_range` — the 8-byte pointer
-/// at the symbol and up to `TAG_MAX_LEN` bytes of the string it points at
-/// (or the string itself, for a non-PIE executable) — never a whole
-/// section: on a lazily-read file a `.rodata`/`.data` section is MBs.
-fn read_impl_cache_tag<'data, R: ReadRef<'data>>(elf: &object::File<'data, R>) -> Option<String> {
-    use object::ObjectSection;
+/// Reads only the bytes it needs, straight from the file through `reader`:
+/// the 8-byte pointer at the symbol and up to `TAG_MAX_LEN` bytes of the
+/// string it points at (or the string itself, for a non-PIE executable).
+/// The virtual address is translated to a file offset through the section
+/// that holds it rather than read with `Section::data_range`, which pulls
+/// the whole section through the reader first — on a lazily-read libpython
+/// that is the MBs of `.rodata`/`.data` this path exists to avoid.
+fn read_impl_cache_tag<'data, R: ReadRef<'data>>(
+    elf: &object::File<'data, R>,
+    reader: R,
+) -> Option<String> {
+    use object::{ObjectSection, SectionFlags};
 
     /// "cpython-313" is 11 bytes; the tag never approaches this.
     const TAG_MAX_LEN: u64 = 32;
@@ -406,16 +417,28 @@ fn read_impl_cache_tag<'data, R: ReadRef<'data>>(elf: &object::File<'data, R>) -
         return None;
     }
 
-    // Up to `TAG_MAX_LEN` bytes at a virtual address, clamped to the
-    // section that holds it.
+    // Up to `TAG_MAX_LEN` bytes at a virtual address, read from the file
+    // range of the allocated section that holds it. Only allocated sections
+    // with an address are candidates (non-allocated ones carry no virtual
+    // address, and `.bss`-style sections have no file bytes), so the lookup
+    // does not depend on section order.
     let bytes_at = |va: u64| -> Option<&'data [u8]> {
         elf.sections().find_map(|section| {
+            let allocated = matches!(
+                section.flags(),
+                SectionFlags::Elf { sh_flags } if sh_flags & u64::from(object::elf::SHF_ALLOC) != 0
+            );
             let (s_addr, s_size) = (section.address(), section.size());
-            if va < s_addr || va >= s_addr + s_size {
+            if !allocated || s_addr == 0 || va < s_addr || va >= s_addr + s_size {
                 return None;
             }
-            let len = TAG_MAX_LEN.min(s_addr + s_size - va);
-            section.data_range(va, len).ok().flatten()
+            let (file_off, file_size) = section.file_range()?;
+            let within = va - s_addr;
+            if within >= file_size {
+                return None;
+            }
+            let len = TAG_MAX_LEN.min(file_size - within);
+            reader.read_bytes_at(file_off + within, len).ok()
         })
     };
 
@@ -663,64 +686,168 @@ mod tests {
         assert_eq!(runtime_candidates(exe, &maps), vec![exe.to_string()]);
     }
 
-    #[test]
-    fn test_elf_py_info_real_interpreters() {
-        // Real CPython builds on the host: a pyenv `--enable-shared` build has
-        // a launcher exe without _PyRuntime and the runtime in libpython;
-        // both must parse through the lazy reader with the right verdict and
-        // the version read from _PySys_ImplCacheTag. Skipped (with a note)
-        // where no pyenv interpreter is installed.
+    /// A real CPython runtime on this host: the file that carries
+    /// `_PyRuntime` (libpython for a shared build, the executable for a
+    /// static one) and the version it should report. Sources: every pyenv
+    /// `--enable-shared` build under `$PYENV_ROOT/versions`, and the system
+    /// interpreter at `/usr/bin/python3` (asked where its runtime lives).
+    struct RealRuntime {
+        path: std::path::PathBuf,
+        exe: std::path::PathBuf,
+        major: i32,
+        minor: i32,
+        shared: bool,
+    }
+
+    fn real_runtimes() -> Vec<RealRuntime> {
+        let mut out: Vec<RealRuntime> = Vec::new();
         let root = std::env::var("PYENV_ROOT")
             .unwrap_or_else(|_| format!("{}/.pyenv", std::env::var("HOME").unwrap_or_default()));
-        let Ok(versions) = fs::read_dir(format!("{root}/versions")) else {
-            eprintln!("no pyenv at {root}: skipping real-interpreter check");
-            return;
-        };
-        let mut checked = 0;
-        for entry in versions.flatten() {
-            let dir = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            let mut parts = name.split('.');
-            let (Some(major), Some(minor)) = (
-                parts.next().and_then(|s| s.parse::<i32>().ok()),
-                parts.next().and_then(|s| s.parse::<i32>().ok()),
-            ) else {
-                continue;
-            };
-            let lib = dir.join(format!("lib/libpython{major}.{minor}.so.1.0"));
-            if !lib.exists() {
-                continue;
+        if let Ok(versions) = fs::read_dir(format!("{root}/versions")) {
+            for entry in versions.flatten() {
+                let dir = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                let mut parts = name.split('.');
+                let (Some(major), Some(minor)) = (
+                    parts.next().and_then(|s| s.parse::<i32>().ok()),
+                    parts.next().and_then(|s| s.parse::<i32>().ok()),
+                ) else {
+                    continue;
+                };
+                let lib = dir.join(format!("lib/libpython{major}.{minor}.so.1.0"));
+                let exe = dir.join(format!("bin/python{major}.{minor}"));
+                if lib.exists() && exe.exists() {
+                    out.push(RealRuntime {
+                        path: lib,
+                        exe,
+                        major,
+                        minor,
+                        shared: true,
+                    });
+                }
             }
-            let info = elf_py_info(&lib.to_string_lossy())
-                .unwrap_or_else(|| panic!("{} not recognized as a runtime", lib.display()));
+        }
+        // The distribution's interpreter, typically a static (non-shared)
+        // build whose executable IS the runtime — and the one a CI runner
+        // has when it has nothing else.
+        let probe = "import sys, sysconfig\n\
+                     print(sys.version_info[0], sys.version_info[1], \
+                     int(bool(sysconfig.get_config_var('Py_ENABLE_SHARED'))), \
+                     sysconfig.get_config_var('LIBDIR') or '', \
+                     sysconfig.get_config_var('INSTSONAME') or '', \
+                     sys.executable, sep='\\n')";
+        if let Ok(output) = std::process::Command::new("/usr/bin/python3")
+            .args(["-c", probe])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let lines: Vec<&str> = text.lines().collect();
+            if output.status.success() && lines.len() == 6 {
+                if let (Ok(major), Ok(minor)) = (lines[0].parse::<i32>(), lines[1].parse::<i32>()) {
+                    let shared = lines[2] == "1";
+                    let exe = fs::canonicalize(lines[5]).unwrap_or_else(|_| lines[5].into());
+                    let path = if shared {
+                        Path::new(lines[3]).join(lines[4])
+                    } else {
+                        exe.clone()
+                    };
+                    if path.exists() && !out.iter().any(|r| r.path == path) {
+                        out.push(RealRuntime {
+                            path,
+                            exe,
+                            major,
+                            minor,
+                            shared,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether a skip is allowed: locally a host without CPython just skips
+    /// the real-interpreter checks with a note; in CI (`CI` set, as GitHub
+    /// Actions does) a skip would make the green run prove nothing about the
+    /// lazy reader on a real runtime, so it fails instead.
+    fn skip_or_fail_without_runtime(what: &str) {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "no CPython runtime on this host (pyenv shared builds or /usr/bin/python3): \
+             the {what} check must not pass vacuously in CI"
+        );
+        eprintln!("no CPython runtime on this host: skipping the {what} check");
+    }
+
+    #[test]
+    fn test_elf_py_info_real_interpreters() {
+        // Real CPython builds on the host, through the lazy reader: the
+        // runtime file (libpython of a shared build, the exe of a static
+        // one) must parse with the right verdict and version. Where the
+        // build carries `_PySys_ImplCacheTag` the tag read is checked
+        // directly against the expected string — `(major, minor)` alone
+        // would also be satisfied by the filename fallback in
+        // `detect_python_version`, so it cannot tell the two apart.
+        let runtimes = real_runtimes();
+        if runtimes.is_empty() {
+            skip_or_fail_without_runtime("real-interpreter");
+            return;
+        }
+        let mut tag_checked = 0;
+        for rt in &runtimes {
+            let path = rt.path.to_string_lossy().to_string();
+            let info = elf_py_info(&path)
+                .unwrap_or_else(|| panic!("{} not recognized as a runtime", rt.path.display()));
             assert_eq!(
                 (info.version.0, info.version.1),
-                (major, minor),
+                (rt.major, rt.minor),
                 "{}",
-                lib.display()
+                rt.path.display()
             );
-            assert!(
+            assert_eq!(
                 info.is_dynamic,
-                "{} should be a shared object",
-                lib.display()
+                rt.shared,
+                "{}: shared build {} should {}be a shared object",
+                rt.path.display(),
+                rt.shared,
+                if rt.shared { "" } else { "not " }
             );
             assert_ne!(info.py_runtime_addr, 0);
+
+            let file = fs::File::open(&rt.path).unwrap();
+            let reader = ReadCache::new(&file);
+            let elf = object::File::parse(&reader).unwrap();
+            let has_tag = elf
+                .symbols()
+                .chain(elf.dynamic_symbols())
+                .any(|s| s.name() == Ok("_PySys_ImplCacheTag") && s.address() != 0);
+            if has_tag {
+                assert_eq!(
+                    read_impl_cache_tag(&elf, &reader).as_deref(),
+                    Some(format!("cpython-{}{}", rt.major, rt.minor).as_str()),
+                    "{}: the cache tag read",
+                    rt.path.display()
+                );
+                tag_checked += 1;
+            }
+
             // The exe of a shared build is usually a launcher linked against
             // libpython (no _PyRuntime of its own); a build that also links
             // the runtime statically is legal, so this is reported, not
             // asserted. Either way the lazy reader must classify it.
-            let exe = dir.join(format!("bin/python{major}.{minor}"));
-            if exe.exists() {
-                let exe_is_runtime = elf_py_info(&exe.to_string_lossy()).is_some();
+            if rt.shared {
+                let exe_is_runtime = elf_py_info(&rt.exe.to_string_lossy()).is_some();
                 eprintln!(
                     "{}: exe {} a runtime",
-                    exe.display(),
+                    rt.exe.display(),
                     if exe_is_runtime { "is" } else { "is not" }
                 );
             }
-            checked += 1;
         }
-        eprintln!("real-interpreter check: {checked} shared builds verified");
+        eprintln!(
+            "real-interpreter check: {} runtimes verified, {tag_checked} of them through the cache tag",
+            runtimes.len()
+        );
     }
 
     /// Bytes this THREAD has requested through read(2) so far (`rchar` in
@@ -741,21 +868,17 @@ mod tests {
         // modules (every one of them under a "python"-containing path) and
         // measure what the check reads, against what the previous scan
         // order would have read: every python-pathed object below libpython
-        // in full, plus libpython itself in full. Skipped where no pyenv
-        // interpreter is installed.
-        let root = std::env::var("PYENV_ROOT")
-            .unwrap_or_else(|_| format!("{}/.pyenv", std::env::var("HOME").unwrap_or_default()));
-        let Some(python) = fs::read_dir(format!("{root}/versions")).ok().and_then(|d| {
-            d.flatten().find_map(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                let mut parts = name.split('.');
-                let major = parts.next()?.parse::<i32>().ok()?;
-                let minor = parts.next()?.parse::<i32>().ok()?;
-                let exe = e.path().join(format!("bin/python{major}.{minor}"));
-                exe.exists().then_some(exe)
-            })
-        }) else {
-            eprintln!("no pyenv at {root}: skipping read-volume check");
+        // in full, plus libpython itself in full (or the exe in full, for a
+        // static build). A pyenv shared build is preferred; the system
+        // interpreter serves where there is none.
+        let runtimes = real_runtimes();
+        let Some(python) = runtimes
+            .iter()
+            .find(|r| r.shared)
+            .or(runtimes.first())
+            .map(|r| r.exe.clone())
+        else {
+            skip_or_fail_without_runtime("read-volume");
             return;
         };
         let mut child = std::process::Command::new(&python)
