@@ -27,7 +27,8 @@ use crate::perf_recorder::PerfCounterRecorder;
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::session_recorder::{
-    get_clock_value, ClockSamplingConfig, MissedEvent, SessionRecorder, SysInfoEvent,
+    get_clock_value, ClockSamplingConfig, MemoryFaultLeg, MemoryRecorderConfig, MissedEvent,
+    SessionRecorder, SysInfoEvent,
 };
 use crate::stack_recorder::StackRecorder;
 
@@ -2843,7 +2844,11 @@ fn attach_clock_sampler(
     skel: &mut SystingSystemSkel,
     opts: &Config,
     num_cpus: u32,
-) -> Result<(Vec<libbpf_rs::Link>, ClockSamplingConfig)> {
+) -> Result<(
+    Vec<libbpf_rs::Link>,
+    ClockSamplingConfig,
+    Option<MemoryFaultLeg>,
+)> {
     use crate::perf;
 
     let mut perf_links = Vec::new();
@@ -2928,16 +2933,108 @@ fn attach_clock_sampler(
         perf_links.push(link);
     }
 
-    // Non-x86: the memory recorder's fault leg is a perf software event, not an
-    // auto-attached tracepoint (see attach_page_fault_sw_events). It rides this
-    // last attach slot — after every tracepoint, USDT and uprobe link, like the
-    // clock sampler — and its links live in the same `perf_links`.
-    #[cfg(not(target_arch = "x86_64"))]
-    if opts.memory {
-        attach_page_fault_sw_events(skel, opts, num_cpus, &mut perf_links)?;
-    }
+    // The memory recorder's fault leg. On x86 it is the
+    // exceptions:page_fault_user tracepoint, auto-attached with the rest of the
+    // skeleton, so by this point it is up. Everywhere else it is a perf software
+    // event (see attach_page_fault_sw_events) that rides this last attach slot
+    // — after every tracepoint, USDT and uprobe link, like the clock sampler —
+    // with its links in the same `perf_links`. Unlike the clock sampler, the
+    // fault leg is optional: a CPU profile without page-fault samples is still a
+    // capture (the other memory legs and the stack sampler keep running), so a
+    // failure to open or attach it degrades the memory lane for this capture
+    // instead of refusing the whole capture, and the sysinfo row says so.
+    let memory_fault_leg = if !opts.memory {
+        None
+    } else {
+        #[cfg(target_arch = "x86_64")]
+        {
+            Some(MemoryFaultLeg::Tracepoint)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            match attach_page_fault_sw_events(skel, opts, num_cpus) {
+                Ok(links) => {
+                    perf_links.extend(links);
+                    Some(MemoryFaultLeg::PerfSw)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "memory recorder: page-fault sampling is unavailable on this host \
+                         ({e:#}); continuing without it (memory_fault will be empty)"
+                    );
+                    Some(MemoryFaultLeg::Off(fault_leg_failure_cause(&e)))
+                }
+            }
+        }
+    };
 
-    Ok((perf_links, clock_sampling))
+    Ok((perf_links, clock_sampling, memory_fault_leg))
+}
+
+/// Name the cause of a fault-leg open/attach failure for the sysinfo row:
+/// the errno's symbolic name for the ones a host actually produces here
+/// (the perf fd and BPF link opens), `errno=<n>` for any other OS error, and
+/// `error` when the failure carried no errno at all. The full error text goes
+/// to stderr; the sysinfo value is meant to be grouped on.
+///
+/// The errno is read from the error chain: a `std::io::Error` that still
+/// carries its raw OS error, else the `(os error N)` suffix the standard
+/// library prints into every OS error's message (perf.rs wraps the perf
+/// open error's text into a new io::Error, and libbpf-rs does not expose its
+/// inner io::Error through `source()`, so the text is the one place the
+/// number survives both paths).
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+fn fault_leg_failure_cause(err: &anyhow::Error) -> String {
+    let io_errors = || {
+        err.chain()
+            .filter_map(|e| e.downcast_ref::<std::io::Error>())
+    };
+    let errno = io_errors()
+        .find_map(|io| io.raw_os_error())
+        .or_else(|| os_error_number(&format!("{err:#}")));
+    if errno.is_some() {
+        return errno_cause_name(errno);
+    }
+    // perf.rs rewrites a NotFound open error into advice text without the
+    // "(os error N)" suffix, and other wrappers may keep only the kind: name
+    // the kind when that is all that survived.
+    let kind = io_errors()
+        .map(|io| io.kind())
+        .find(|k| *k != std::io::ErrorKind::Other);
+    match kind {
+        Some(std::io::ErrorKind::NotFound) => "ENOENT".to_string(),
+        Some(std::io::ErrorKind::PermissionDenied) => "EPERM".to_string(),
+        Some(std::io::ErrorKind::InvalidInput) => "EINVAL".to_string(),
+        Some(std::io::ErrorKind::OutOfMemory) => "ENOMEM".to_string(),
+        Some(std::io::ErrorKind::ResourceBusy) => "EBUSY".to_string(),
+        Some(std::io::ErrorKind::Unsupported) => "EOPNOTSUPP".to_string(),
+        _ => "error".to_string(),
+    }
+}
+
+/// Parse the first `(os error N)` in an error's text.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+fn os_error_number(text: &str) -> Option<i32> {
+    let start = text.find("(os error ")? + "(os error ".len();
+    let rest = &text[start..];
+    let end = rest.find(')')?;
+    rest[..end].trim().parse().ok()
+}
+
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+fn errno_cause_name(errno: Option<i32>) -> String {
+    match errno {
+        Some(libc::EMFILE) => "EMFILE".to_string(),
+        Some(libc::ENFILE) => "ENFILE".to_string(),
+        Some(libc::EPERM) => "EPERM".to_string(),
+        Some(libc::EACCES) => "EACCES".to_string(),
+        Some(libc::EINVAL) => "EINVAL".to_string(),
+        Some(libc::ENOMEM) => "ENOMEM".to_string(),
+        Some(libc::EBUSY) => "EBUSY".to_string(),
+        Some(libc::EOPNOTSUPP) => "EOPNOTSUPP".to_string(),
+        Some(n) => format!("errno={n}"),
+        None => "error".to_string(),
+    }
 }
 
 /// Open the `--perf-counter` events (plus the `slots` events topdown counters
@@ -3023,9 +3120,14 @@ fn attach_page_fault_sw_events(
     skel: &mut SystingSystemSkel,
     opts: &Config,
     num_cpus: u32,
-    perf_links: &mut Vec<libbpf_rs::Link>,
-) -> Result<()> {
+) -> Result<Vec<libbpf_rs::Link>> {
     use crate::perf;
+
+    // Links are collected locally and only handed back on full success: on
+    // an error part-way through, the links opened so far are dropped
+    // (detached) with the perf fds, so a degraded capture holds no
+    // half-attached fault leg.
+    let mut perf_links = Vec::new();
 
     let mut fault_files = PerfOpenEvents::default();
     fault_files.add_hw_event(PerfHwEvent {
@@ -3055,10 +3157,11 @@ fn attach_page_fault_sw_events(
                     cookie: 0,
                     ..Default::default()
                 },
-            )?;
+            )
+            .with_context(|| "Failed to attach the software page-fault perf event")?;
         perf_links.push(link);
     }
-    Ok(())
+    Ok(perf_links)
 }
 
 /// Returns PIDs to attach probes to with their resolved library paths.
@@ -4541,13 +4644,27 @@ pub fn systing(
         // Every tracepoint, raw_tp, fentry, USDT and uprobe link is in place:
         // start the CPU stack sampler now, so the capture never contains the
         // tracer's own attach phase (see attach_clock_sampler).
-        let (_perf_links, clock_sampling) = attach_clock_sampler(&mut skel, &opts, num_cpus)?;
+        let (_perf_links, clock_sampling, memory_fault_leg) =
+            attach_clock_sampler(&mut skel, &opts, num_cpus)?;
 
         // Record which event/period drives stack sampling so the trace's
         // sysinfo row documents what each stack sample represents. Perf
         // events are opened once per recording session, so the set cannot
         // race or repeat.
         let _ = recorder.clock_sampling.set(clock_sampling);
+
+        // Likewise for the memory recorder: which fault leg ran (or why it
+        // did not) and the sample rates, so a consumer can scale the sampled
+        // tables and tell an empty memory_fault from a host where the leg
+        // never attached.
+        if let Some(fault_leg) = memory_fault_leg {
+            let _ = recorder.memory_recorder_config.set(MemoryRecorderConfig {
+                fault_leg,
+                fault_sample_rate: opts.memory_fault_sample_rate,
+                map_sample_rate: opts.memory_map_sample_rate,
+                alloc_sample_rate: opts.memory_alloc.then_some(opts.memory_alloc_sample_rate),
+            });
+        }
 
         // Signal the traced child to exec now that BPF is fully attached.
         // All tracing is active, so we capture everything from exec onwards.
@@ -5356,5 +5473,72 @@ mod tests {
             "bpf_task_under_cgroup in vmlinux BTF: {}",
             btf_has_func(&btf, "bpf_task_under_cgroup")
         );
+    }
+
+    #[test]
+    fn test_memory_fault_leg_sysinfo_values() {
+        assert_eq!(MemoryFaultLeg::Tracepoint.as_sysinfo_value(), "tracepoint");
+        assert_eq!(MemoryFaultLeg::PerfSw.as_sysinfo_value(), "perf_sw");
+        assert_eq!(
+            MemoryFaultLeg::Off("EMFILE".to_string()).as_sysinfo_value(),
+            "off:EMFILE"
+        );
+    }
+
+    #[test]
+    fn test_fault_leg_failure_cause_from_perf_open_error() {
+        // perf.rs reports a failed perf_event_open as a new io::Error whose
+        // message carries the original error's text (and so its
+        // "(os error N)" suffix) but not its raw OS error; the cause must
+        // still name the errno.
+        let open_err = std::io::Error::from_raw_os_error(libc::EMFILE);
+        let wrapped = std::io::Error::new(
+            open_err.kind(),
+            format!("Failed to open perf event page-faults on cpu 3: {open_err}"),
+        );
+        assert_eq!(wrapped.raw_os_error(), None);
+        let err = anyhow::Error::from(wrapped)
+            .context("Failed to open the software page-fault perf events for the memory recorder");
+        assert_eq!(fault_leg_failure_cause(&err), "EMFILE");
+    }
+
+    #[test]
+    fn test_fault_leg_failure_cause_from_raw_os_error() {
+        let err = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EPERM));
+        assert_eq!(fault_leg_failure_cause(&err), "EPERM");
+        let err = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENXIO));
+        assert_eq!(
+            fault_leg_failure_cause(&err),
+            format!("errno={}", libc::ENXIO)
+        );
+    }
+
+    #[test]
+    fn test_fault_leg_failure_cause_from_kind_only() {
+        // perf.rs's NotFound branch drops the "(os error N)" text and keeps
+        // only the kind (a software event the kernel does not know returns
+        // ENOENT): the cause names the kind.
+        let wrapped = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Failed to open perf event page-faults.\nTry running the profile example with the `--sw-event` option.",
+        );
+        let err = anyhow::Error::from(wrapped)
+            .context("Failed to open the software page-fault perf events for the memory recorder");
+        assert_eq!(fault_leg_failure_cause(&err), "ENOENT");
+        let err = anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "perf_event_open denied",
+        ));
+        assert_eq!(fault_leg_failure_cause(&err), "EPERM");
+    }
+
+    #[test]
+    fn test_fault_leg_failure_cause_without_errno() {
+        let err = anyhow::anyhow!("Failed to attach the software page-fault perf event");
+        assert_eq!(fault_leg_failure_cause(&err), "error");
+        assert_eq!(os_error_number("no number here"), None);
+        assert_eq!(os_error_number("x (os error 24) y (os error 1)"), Some(24));
+        assert_eq!(errno_cause_name(Some(libc::EACCES)), "EACCES");
+        assert_eq!(errno_cause_name(None), "error");
     }
 }

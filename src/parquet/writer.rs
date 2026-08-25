@@ -2187,6 +2187,10 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     let mut product_name_builder = StringBuilder::with_capacity(1, 16);
     let mut sample_event_builder = StringBuilder::with_capacity(1, 16);
     let mut sample_period_builder = Int64Builder::with_capacity(1);
+    let mut memory_fault_leg_builder = StringBuilder::with_capacity(1, 16);
+    let mut memory_fault_sample_rate_builder = Int64Builder::with_capacity(1);
+    let mut memory_map_sample_rate_builder = Int64Builder::with_capacity(1);
+    let mut memory_alloc_sample_rate_builder = Int64Builder::with_capacity(1);
 
     sysname_builder.append_value(&record.sysname);
     release_builder.append_value(&record.release);
@@ -2198,6 +2202,10 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     product_name_builder.append_option(record.product_name.as_deref());
     sample_event_builder.append_option(record.sample_event.as_deref());
     sample_period_builder.append_option(record.sample_period);
+    memory_fault_leg_builder.append_option(record.memory_fault_leg.as_deref());
+    memory_fault_sample_rate_builder.append_option(record.memory_fault_sample_rate);
+    memory_map_sample_rate_builder.append_option(record.memory_map_sample_rate);
+    memory_alloc_sample_rate_builder.append_option(record.memory_alloc_sample_rate);
 
     Ok(RecordBatch::try_new(
         schema.clone(),
@@ -2212,6 +2220,10 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
             Arc::new(product_name_builder.finish()),
             Arc::new(sample_event_builder.finish()),
             Arc::new(sample_period_builder.finish()),
+            Arc::new(memory_fault_leg_builder.finish()),
+            Arc::new(memory_fault_sample_rate_builder.finish()),
+            Arc::new(memory_map_sample_rate_builder.finish()),
+            Arc::new(memory_alloc_sample_rate_builder.finish()),
         ],
     )?)
 }
@@ -3016,6 +3028,10 @@ mod tests {
                 product_name: None,
                 sample_event: Some("cpu-cycles".to_string()),
                 sample_period: Some(3_500_000),
+                memory_fault_leg: Some("off:EMFILE".to_string()),
+                memory_fault_sample_rate: Some(97),
+                memory_map_sample_rate: Some(1),
+                memory_alloc_sample_rate: None,
             })
             .unwrap();
         writer.finish().unwrap();
@@ -3033,13 +3049,18 @@ mod tests {
             Option<String>,
             Option<String>,
             Option<i64>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
         );
 
         let conn = Connection::open(&db_path).unwrap();
         let row: SysInfoRow = conn
             .query_row(
                 "SELECT sysname, machine, cpufreq_driver, hypervisor, sys_vendor, product_name, \
-                 sample_event, sample_period FROM sysinfo",
+                 sample_event, sample_period, memory_fault_leg, memory_fault_sample_rate, \
+                 memory_map_sample_rate, memory_alloc_sample_rate FROM sysinfo",
                 [],
                 |row| {
                     Ok((
@@ -3051,6 +3072,10 @@ mod tests {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
                     ))
                 },
             )
@@ -3064,6 +3089,77 @@ mod tests {
         assert_eq!(row.5, None, "absent product_name should round-trip as NULL");
         assert_eq!(row.6, Some("cpu-cycles".to_string()));
         assert_eq!(row.7, Some(3_500_000));
+        assert_eq!(row.8, Some("off:EMFILE".to_string()));
+        assert_eq!(row.9, Some(97));
+        assert_eq!(row.10, Some(1));
+        assert_eq!(
+            row.11, None,
+            "memory_alloc_sample_rate should round-trip as NULL when memory-alloc is off"
+        );
+    }
+
+    /// A sysinfo.parquet written before the memory columns existed (systing
+    /// < 1.14) must still import: the import is BY NAME, so the missing
+    /// columns read back as NULL rather than failing the whole trace.
+    #[test]
+    fn test_sysinfo_duckdb_import_without_memory_columns() {
+        use crate::duckdb::parquet_to_duckdb;
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field};
+        use duckdb::Connection;
+
+        let dir = TempDir::new().unwrap();
+        let old_schema = Arc::new(Schema::new(vec![
+            Field::new("sysname", DataType::Utf8, false),
+            Field::new("release", DataType::Utf8, false),
+            Field::new("version", DataType::Utf8, false),
+            Field::new("machine", DataType::Utf8, false),
+            Field::new("cpufreq_driver", DataType::Utf8, true),
+            Field::new("hypervisor", DataType::Utf8, true),
+            Field::new("sys_vendor", DataType::Utf8, true),
+            Field::new("product_name", DataType::Utf8, true),
+            Field::new("sample_event", DataType::Utf8, true),
+            Field::new("sample_period", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            old_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["Linux"])),
+                Arc::new(StringArray::from(vec!["6.12.0"])),
+                Arc::new(StringArray::from(vec!["#1 SMP"])),
+                Arc::new(StringArray::from(vec!["aarch64"])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(StringArray::from(vec![Some("kvm")])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(StringArray::from(vec![Some("cpu-clock")])),
+                Arc::new(Int64Array::from(vec![Some(1_000_000)])),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(dir.path().join("sysinfo.parquet")).unwrap();
+        let mut pw = ArrowWriter::try_new(file, old_schema, None).unwrap();
+        pw.write(&batch).unwrap();
+        pw.close().unwrap();
+
+        let db_path = dir.path().join("test.duckdb");
+        parquet_to_duckdb(dir.path(), &db_path, "old-trace")
+            .expect("a pre-1.14 sysinfo.parquet must still import");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let row: (String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT machine, memory_fault_leg, memory_fault_sample_rate FROM sysinfo",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "aarch64");
+        assert_eq!(
+            row.1, None,
+            "memory_fault_leg is NULL in traces from systing < 1.14"
+        );
+        assert_eq!(row.2, None);
     }
 
     #[test]

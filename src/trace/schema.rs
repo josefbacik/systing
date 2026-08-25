@@ -253,6 +253,10 @@ pub fn sysinfo_schema() -> Arc<Schema> {
         Field::new("product_name", DataType::Utf8, true),
         Field::new("sample_event", DataType::Utf8, true),
         Field::new("sample_period", DataType::Int64, true),
+        Field::new("memory_fault_leg", DataType::Utf8, true),
+        Field::new("memory_fault_sample_rate", DataType::Int64, true),
+        Field::new("memory_map_sample_rate", DataType::Int64, true),
+        Field::new("memory_alloc_sample_rate", DataType::Int64, true),
     ]))
 }
 

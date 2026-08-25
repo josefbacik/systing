@@ -56,6 +56,51 @@ pub struct ClockSamplingConfig {
     pub period: u64,
 }
 
+/// How the memory recorder's page-fault leg attached for this capture.
+/// Recorded into the trace's sysinfo row (`memory_fault_leg`) so a consumer
+/// that finds no `memory_fault` rows can tell "no faults sampled" from "the
+/// leg was not running on this host".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoryFaultLeg {
+    /// x86: the `exceptions:page_fault_user` tracepoint (auto-attached with
+    /// the rest of the skeleton).
+    Tracepoint,
+    /// Every other arch: one PERF_COUNT_SW_PAGE_FAULTS software event per
+    /// CPU, attached after the clock sampler (see attach_page_fault_sw_events).
+    PerfSw,
+    /// The perf-event leg could not be opened or attached on this host; the
+    /// capture went on without it. The payload names the cause
+    /// (e.g. "EMFILE", "EPERM", or "errno=<n>" / "error" when unnamed).
+    Off(String),
+}
+
+impl MemoryFaultLeg {
+    /// The sysinfo value: "tracepoint", "perf_sw", or "off:<cause>".
+    pub fn as_sysinfo_value(&self) -> String {
+        match self {
+            MemoryFaultLeg::Tracepoint => "tracepoint".to_string(),
+            MemoryFaultLeg::PerfSw => "perf_sw".to_string(),
+            MemoryFaultLeg::Off(cause) => format!("off:{cause}"),
+        }
+    }
+}
+
+/// The memory recorder's capture-time configuration, recorded into the
+/// trace's sysinfo row so consumers can scale sampled counts to absolute
+/// figures and see which fault leg ran (before this was recorded, the sample
+/// rates were only known to whoever launched the capture).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryRecorderConfig {
+    pub fault_leg: MemoryFaultLeg,
+    /// `--memory-fault-sample-rate` as configured (0 and 1 both mean every
+    /// fault).
+    pub fault_sample_rate: u32,
+    /// `--memory-map-sample-rate` as configured (1 = every event).
+    pub map_sample_rate: u32,
+    /// `--memory-alloc-sample-rate` when the `memory-alloc` recorder is on.
+    pub alloc_sample_rate: Option<u32>,
+}
+
 /// Static per-CPU frequency limits from sysfs cpufreq, in kHz (sysfs's native
 /// unit). `base_freq_khz` is the sustained (non-turbo) frequency and is only
 /// exposed by some drivers (e.g. intel_pstate).
@@ -168,6 +213,10 @@ pub struct SessionRecorder {
     /// The perf event/period driving CPU stack sampling, set once perf events
     /// are opened. Unset until then (or in unit tests that never open them).
     pub clock_sampling: OnceLock<ClockSamplingConfig>,
+    /// The memory recorder's capture-time configuration and fault-leg
+    /// status, set once BPF is attached. Unset when the memory recorder is
+    /// not enabled (the sysinfo columns are then NULL).
+    pub memory_recorder_config: OnceLock<MemoryRecorderConfig>,
 }
 
 pub fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -892,6 +941,7 @@ impl SessionRecorder {
             kernel_threads: RwLock::new(HashSet::new()),
             utid_generator,
             clock_sampling: OnceLock::new(),
+            memory_recorder_config: OnceLock::new(),
         }
     }
 
@@ -1523,6 +1573,7 @@ impl SessionRecorder {
         // Write system info (utsname + platform provenance)
         if let Some(utsname) = get_system_utsname() {
             let clock_sampling = self.clock_sampling.get();
+            let memory = self.memory_recorder_config.get();
             writer.set_sysinfo(crate::trace::SysInfoRecord {
                 sysname: utsname.sysname().to_string(),
                 release: utsname.release().to_string(),
@@ -1534,6 +1585,10 @@ impl SessionRecorder {
                 product_name: dmi_product_name(),
                 sample_event: clock_sampling.map(|c| c.event.to_string()),
                 sample_period: clock_sampling.map(|c| c.period as i64),
+                memory_fault_leg: memory.map(|m| m.fault_leg.as_sysinfo_value()),
+                memory_fault_sample_rate: memory.map(|m| i64::from(m.fault_sample_rate)),
+                memory_map_sample_rate: memory.map(|m| i64::from(m.map_sample_rate)),
+                memory_alloc_sample_rate: memory.and_then(|m| m.alloc_sample_rate).map(i64::from),
             })?;
         }
 
@@ -2005,6 +2060,7 @@ mod tests {
             utid_generator,
             tpu_metrics_recorder: None,
             clock_sampling: OnceLock::new(),
+            memory_recorder_config: OnceLock::new(),
         }
     }
 

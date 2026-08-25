@@ -223,6 +223,24 @@ pub struct TraceSystemInfo {
     /// nanoseconds ("cpu-clock") of execution.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sample_period: Option<i64>,
+    /// How the memory recorder's page-fault leg ran: "tracepoint" (x86),
+    /// "perf_sw" (other arches) or "off:<cause>" (the leg could not be
+    /// opened/attached on this host, so `memory_fault` is empty by
+    /// construction). `None` when the memory recorder was off, and for
+    /// traces from systing < 1.14.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_fault_leg: Option<String>,
+    /// `--memory-fault-sample-rate` at capture time (1 in N; 0 or 1 = every
+    /// fault): the factor to scale `memory_fault` counts by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_fault_sample_rate: Option<i64>,
+    /// `--memory-map-sample-rate` at capture time (1 in N per event type).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_map_sample_rate: Option<i64>,
+    /// `--memory-alloc-sample-rate` at capture time; `None` when the
+    /// `memory-alloc` recorder was off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_alloc_sample_rate: Option<i64>,
 }
 
 /// Trace metadata.
@@ -777,7 +795,7 @@ impl AnalyzeDb {
             }
         };
         let sql = format!(
-            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
+            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
             col("trace_id"),
             col("release"),
             col("machine"),
@@ -787,6 +805,10 @@ impl AnalyzeDb {
             col("cpufreq_driver"),
             col("sample_event"),
             col("sample_period"),
+            col("memory_fault_leg"),
+            col("memory_fault_sample_rate"),
+            col("memory_map_sample_rate"),
+            col("memory_alloc_sample_rate"),
         );
 
         let Ok(mut stmt) = self.conn.prepare(&sql) else {
@@ -803,6 +825,10 @@ impl AnalyzeDb {
                 cpufreq_driver: row.get(6)?,
                 sample_event: row.get(7)?,
                 sample_period: row.get(8)?,
+                memory_fault_leg: row.get(9)?,
+                memory_fault_sample_rate: row.get(10)?,
+                memory_map_sample_rate: row.get(11)?,
+                memory_alloc_sample_rate: row.get(12)?,
             })
         }) else {
             return Vec::new();
@@ -1216,9 +1242,12 @@ mod tests {
             conn.execute_batch(
                 "INSERT INTO sysinfo (trace_id, sysname, release, version, machine, \
                  cpufreq_driver, hypervisor, sys_vendor, product_name, \
-                 sample_event, sample_period) \
+                 sample_event, sample_period, memory_fault_leg, \
+                 memory_fault_sample_rate, memory_map_sample_rate, \
+                 memory_alloc_sample_rate) \
                  VALUES ('t1', 'Linux', '6.12.0', '#1 SMP', 'x86_64', \
-                 NULL, 'kvm', 'Amazon EC2', 'm7i.16xlarge', 'cpu-clock', 1000000)",
+                 NULL, 'kvm', 'Amazon EC2', 'm7i.16xlarge', 'cpu-clock', 1000000, \
+                 'tracepoint', 97, 1, NULL)",
             )
             .unwrap();
         }
@@ -1240,6 +1269,13 @@ mod tests {
         );
         assert_eq!(sys.sample_event.as_deref(), Some("cpu-clock"));
         assert_eq!(sys.sample_period, Some(1_000_000));
+        assert_eq!(sys.memory_fault_leg.as_deref(), Some("tracepoint"));
+        assert_eq!(sys.memory_fault_sample_rate, Some(97));
+        assert_eq!(sys.memory_map_sample_rate, Some(1));
+        assert_eq!(
+            sys.memory_alloc_sample_rate, None,
+            "NULL memory_alloc_sample_rate (memory-alloc off) must come back as None"
+        );
     }
 
     #[test]
@@ -1260,6 +1296,10 @@ mod tests {
                  ALTER TABLE sysinfo DROP COLUMN product_name; \
                  ALTER TABLE sysinfo DROP COLUMN sample_event; \
                  ALTER TABLE sysinfo DROP COLUMN sample_period; \
+                 ALTER TABLE sysinfo DROP COLUMN memory_fault_leg; \
+                 ALTER TABLE sysinfo DROP COLUMN memory_fault_sample_rate; \
+                 ALTER TABLE sysinfo DROP COLUMN memory_map_sample_rate; \
+                 ALTER TABLE sysinfo DROP COLUMN memory_alloc_sample_rate; \
                  INSERT INTO sysinfo (trace_id, sysname, release, version, machine) \
                  VALUES ('t1', 'Linux', '5.10.0', '#1 SMP', 'aarch64')",
             )
@@ -1279,6 +1319,10 @@ mod tests {
         assert_eq!(sys.cpufreq_driver, None);
         assert_eq!(sys.sample_event, None);
         assert_eq!(sys.sample_period, None);
+        assert_eq!(sys.memory_fault_leg, None);
+        assert_eq!(sys.memory_fault_sample_rate, None);
+        assert_eq!(sys.memory_map_sample_rate, None);
+        assert_eq!(sys.memory_alloc_sample_rate, None);
     }
 
     #[test]
