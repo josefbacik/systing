@@ -43,7 +43,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use query::{duckdb_value_to_json, duckdb_value_to_string};
+use query::{duckdb_value_to_json, duckdb_value_to_string, statement_shape, StatementShape};
 
 /// Distinguishes the spill directories of databases opened by one process:
 /// DuckDB names temp files by block id, which is only unique per instance, so
@@ -118,19 +118,36 @@ pub const MAX_QUERY_ROWS: usize = 10_000;
 const MAX_TRACE_INFO_PROCESSES: usize = 25;
 
 /// Result of a SQL query.
-#[derive(Debug, Serialize)]
+///
+/// Serialized as `columns`, `rows`, `row_count`, and — only when the result
+/// was cut at `MAX_QUERY_ROWS` — `truncated: true` plus `total_row_count`,
+/// which is `null` when the separate count could not be computed.
+#[derive(Debug)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
     pub row_count: usize,
-    #[serde(skip_serializing_if = "is_false")]
     pub truncated: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_row_count: Option<usize>,
 }
 
-fn is_false(b: &bool) -> bool {
-    !b
+impl Serialize for QueryResult {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let fields = if self.truncated { 5 } else { 3 };
+        let mut s = serializer.serialize_struct("QueryResult", fields)?;
+        s.serialize_field("columns", &self.columns)?;
+        s.serialize_field("rows", &self.rows)?;
+        s.serialize_field("row_count", &self.row_count)?;
+        if self.truncated {
+            s.serialize_field("truncated", &true)?;
+            s.serialize_field("total_row_count", &self.total_row_count)?;
+        }
+        s.end()
+    }
 }
 
 /// Table information.
@@ -253,16 +270,11 @@ pub struct AnalyzeDb {
 
 /// Text DuckDB puts at the front of every `OutOfMemoryException` message,
 /// whether the buffer pool hit `memory_limit` or a spill hit
-/// `max_temp_directory_size` ("failed to offload data block"). Matched as a
-/// substring because the binding may wrap the engine's message.
+/// `max_temp_directory_size` ("failed to offload data block"). The binding's
+/// `Display` prints the engine's message bare, so it is matched as a prefix:
+/// a user's own string literal that happens to contain the words cannot
+/// trigger the rewrite.
 const DUCKDB_OOM_MARKER: &str = "Out of Memory Error";
-
-/// Strip trailing whitespace and statement terminators so the text can be
-/// embedded as a subquery.
-fn trim_statement(sql: &str) -> &str {
-    sql.trim()
-        .trim_end_matches(|c: char| c == ';' || c.is_whitespace())
-}
 
 impl AnalyzeDb {
     /// Open a trace database.
@@ -281,11 +293,12 @@ impl AnalyzeDb {
     /// passes it here (any DuckDB size string, e.g. "8GiB") so an oversized
     /// aggregation fails that one query instead of killing the process.
     ///
-    /// This is a structural default, not a jail: unlike `temp_directory`,
-    /// DuckDB does not lock this setting when external access is disabled,
-    /// so in-session SQL can still raise it (covered by a test). That is the
-    /// right trade for the intended failure mode — queries that never think
-    /// about spill — and it keeps deliberate in-session tuning possible.
+    /// On its own this is a structural default, not a jail: unlike
+    /// `temp_directory`, DuckDB does not lock this setting when external
+    /// access is disabled, so in-session SQL can still raise it (covered by a
+    /// test), which keeps deliberate tuning possible on the CLI. The MCP
+    /// server, whose SQL is untrusted, freezes it along with every other
+    /// setting by calling [`AnalyzeDb::lock_configuration`] right after open.
     pub fn open_with_spill_cap(
         path: &Path,
         read_only: bool,
@@ -360,7 +373,7 @@ impl AnalyzeDb {
     /// offending column or table.
     fn classify_query_error(&self, err: duckdb::Error) -> anyhow::Error {
         let msg = err.to_string();
-        if msg.contains(DUCKDB_OOM_MARKER) {
+        if msg.starts_with(DUCKDB_OOM_MARKER) {
             let bound = match self.mem_limit_mib {
                 Some(m) => format!(" ({m} MiB)"),
                 None => String::new(),
@@ -371,6 +384,21 @@ impl AnalyzeDb {
         } else {
             err.into()
         }
+    }
+
+    /// Freeze DuckDB's configuration for the rest of this connection's life:
+    /// every later `SET` / `RESET` / `PRAGMA` of a configuration option
+    /// (`memory_limit`, `threads`, `max_temp_directory_size`, ...) fails with
+    /// DuckDB's own "configuration has been locked" error, and the lock
+    /// itself cannot be undone. The MCP server calls this right after
+    /// `open`, so SQL that reaches it — including SQL an AI assistant was
+    /// talked into running — cannot lift the memory and spill bounds the
+    /// server was started with. The CLI does not lock, so an operator's own
+    /// in-session tuning keeps working there.
+    pub fn lock_configuration(&self) -> Result<()> {
+        self.conn
+            .execute_batch("SET lock_configuration = true")
+            .map_err(|e| anyhow::anyhow!("failed to lock the DuckDB configuration: {e}"))
     }
 
     /// Execute a SQL query and return typed results.
@@ -384,17 +412,35 @@ impl AnalyzeDb {
     /// process past its cgroup limit. When the result is truncated,
     /// `total_row_count` comes from a separate `SELECT count(*) FROM (<sql>)`,
     /// which re-runs the query's pipeline once under DuckDB's memory bound
-    /// without materializing rows.
+    /// without materializing rows (the inner ORDER BY runs again too; that is
+    /// time, not memory).
     ///
-    /// Statements that cannot be embedded as a subquery (`SHOW`, `PRAGMA`,
-    /// `SET`, `COPY`, ...) fail to *prepare* in wrapped form; they then run
-    /// exactly as written, with the row cap applied as rows are read. A
-    /// failure while *executing* the wrapped statement is reported directly —
-    /// the raw statement is never re-run unbounded.
+    /// The text is classified first (`statement_shape`): comments and
+    /// leading/trailing `;` are stripped so they cannot hide a statement
+    /// from the wrapper, and more than one statement is refused. A
+    /// statement that reads rows (`SELECT`, `WITH`, `FROM`, `VALUES`, ...)
+    /// runs ONLY in wrapped form: if it cannot be wrapped it is refused, and
+    /// a SQL error in it is reported against the user's own text by
+    /// preparing — never executing — the raw statement. Statements that
+    /// cannot be embedded as a subquery (`SHOW`, `PRAGMA`, `DESCRIBE`,
+    /// `SUMMARIZE`, `EXPLAIN`, ...) run as written with the cap applied as
+    /// rows are read; their results are small by nature. A failure while
+    /// *executing* the wrapped statement is reported directly — the raw
+    /// statement is never re-run unbounded.
+    ///
+    /// Execution-time errors from the wrapped form name line numbers
+    /// relative to the user's text plus the wrapper's first line.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
-        let inner = trim_statement(sql);
-        // The newline before the closing paren keeps a trailing `--` comment
-        // in the user's SQL from swallowing it.
+        let (inner, must_wrap) = match statement_shape(sql) {
+            StatementShape::Empty => bail!("empty query"),
+            StatementShape::Multiple => bail!(
+                "only one statement per query is supported; remove the `;`-separated statement that follows the first one"
+            ),
+            StatementShape::Single { text, must_wrap } => (text, must_wrap),
+        };
+        // The newline before the closing paren is a belt on top of the
+        // comment stripping: a `--` the classifier missed still cannot
+        // swallow it.
         let wrapped = format!(
             "SELECT * FROM (\n{inner}\n) AS __systing_query LIMIT {}",
             MAX_QUERY_ROWS + 1
@@ -405,16 +451,26 @@ impl AnalyzeDb {
                 let (mut result, beyond_cap) = self.run_capped(&mut stmt, false)?;
                 if beyond_cap > 0 {
                     result.truncated = true;
-                    result.total_row_count = self.count_rows(inner);
+                    result.total_row_count = self.count_rows(&inner);
                 }
                 Ok(result)
             }
             Err(_) => {
-                // Not a SELECT-shaped statement (or a SQL error that the raw
-                // form reports against the user's own text): run it as
-                // written. The result is already materialized, so the rows
-                // beyond the cap are drained and counted as before.
-                let mut stmt = self.conn.prepare(sql)?;
+                // Prepare the user's own text so a SQL error names their
+                // line and column, not the wrapper's.
+                let mut stmt = self.conn.prepare(&inner)?;
+                if must_wrap {
+                    // It prepares on its own but not inside the wrapper: a
+                    // shape that can read rows and that the cap cannot
+                    // bound, so it does not run at all rather than run
+                    // unbounded.
+                    bail!(
+                        "query could not be bounded by the {MAX_QUERY_ROWS}-row cap; rewrite it as a single SELECT statement"
+                    );
+                }
+                // A non-row-reading statement: run it as written. Its result
+                // is small by nature and already materialized, so the rows
+                // beyond the cap are drained and counted.
                 let (mut result, beyond_cap) = self.run_capped(&mut stmt, true)?;
                 if beyond_cap > 0 {
                     result.truncated = true;
@@ -1025,12 +1081,13 @@ mod tests {
         assert!(err.is_err(), "malformed spill cap was silently accepted");
     }
 
-    /// Documents the cap's trust boundary: `enable_external_access(false)`
-    /// locks `temp_directory` but NOT `max_temp_directory_size`, so SQL run
-    /// in-session can still raise the bound. The flag is a structural
-    /// default protecting against queries that never think about spill (the
-    /// real-world failure mode), not a jail against adversarial SQL — an
-    /// adversary with query access could raise it back. If DuckDB ever
+    /// Documents the cap's trust boundary on an UNLOCKED connection (the CLI):
+    /// `enable_external_access(false)` locks `temp_directory` but NOT
+    /// `max_temp_directory_size`, so SQL run in-session can still raise the
+    /// bound. The flag alone is a structural default protecting against
+    /// queries that never think about spill (the real-world failure mode);
+    /// the MCP server closes the adversarial case with `lock_configuration`
+    /// (see `test_lock_configuration_refuses_settings`). If DuckDB ever
     /// starts locking this setting alongside temp_directory, this test
     /// fails and the doc-comments should be updated to promise more.
     #[test]
@@ -1376,6 +1433,15 @@ mod tests {
             Some("Binder Error: Referenced column \"nope\" not found".to_string()),
         );
         assert!(db.classify_query_error(other).to_string().contains("nope"));
+        // A user's own string literal containing the marker is not an OOM.
+        let literal = duckdb::Error::DuckDBFailure(
+            duckdb::ffi::Error::new(1),
+            Some("Binder Error: column \"Out of Memory Error\" not found".to_string()),
+        );
+        assert!(db
+            .classify_query_error(literal)
+            .to_string()
+            .starts_with("Binder Error"));
 
         // End to end: a sort that cannot fit in a tiny memory limit with a
         // tiny spill cap is refused by DuckDB's out-of-memory class, and the
@@ -1392,5 +1458,160 @@ mod tests {
             err.starts_with("query exceeded the DuckDB memory bound"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_query_comments_and_terminators_cannot_bypass_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_query_test_db(dir.path());
+
+        // Each of these used to fail the wrapped prepare on the internal `;`
+        // and fall back to an unbounded raw run.
+        for sql in [
+            "SELECT bucket FROM t; -- all of them",
+            "SELECT bucket FROM t;\n-- note",
+            "SELECT bucket FROM t; /* x */",
+            ";SELECT bucket FROM t",
+            "/* leading */ SELECT bucket FROM t /* trailing */ ;",
+        ] {
+            let result = db.query(sql).unwrap();
+            assert_eq!(result.row_count, MAX_QUERY_ROWS, "{sql:?}");
+            assert!(result.truncated, "{sql:?} was not capped");
+            assert_eq!(result.total_row_count, Some(25000), "{sql:?}");
+        }
+
+        // A comment-looking sequence inside a string literal is data.
+        let result = db
+            .query("SELECT '-- not a comment; still one statement' AS s, id FROM t")
+            .unwrap();
+        assert!(result.truncated);
+        assert_eq!(
+            result.rows[0][0],
+            serde_json::json!("-- not a comment; still one statement")
+        );
+
+        // More than one statement is refused outright, whatever the second
+        // one is — it never runs.
+        for sql in [
+            "SELECT 1; SELECT 2",
+            "SELECT id FROM t; SET memory_limit = '100GB'",
+            "SELECT id FROM t LIMIT 1; PRAGMA max_temp_directory_size = '100GB'",
+        ] {
+            let err = db.query(sql).unwrap_err().to_string();
+            assert!(err.contains("one statement"), "{sql:?}: {err}");
+        }
+        let err = db.query("  -- nothing here\n;").unwrap_err().to_string();
+        assert!(err.contains("empty query"), "{err}");
+    }
+
+    #[test]
+    fn test_query_refuses_row_readers_it_cannot_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_query_test_db(dir.path());
+
+        // `CALL` and `EXECUTE` run whatever they name, so they may not take
+        // the raw path; neither can be a subquery, so both are refused with
+        // the fixed message — never run unbounded.
+        db.conn
+            .execute_batch("PREPARE q AS SELECT id FROM t")
+            .unwrap();
+        for sql in ["EXECUTE q", "CALL pragma_table_info('t')"] {
+            let err = db.query(sql).unwrap_err().to_string();
+            assert!(err.contains("could not be bounded"), "{sql:?}: {err}");
+        }
+        // The same rows are reachable through a bounded SELECT.
+        assert_eq!(
+            db.query("SELECT * FROM pragma_table_info('t')")
+                .unwrap()
+                .row_count,
+            2
+        );
+    }
+
+    #[test]
+    fn test_query_cap_boundaries_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_query_test_db(dir.path());
+
+        // Descending order is kept through the wrapper: the first cap-many
+        // rows of the query's own order come back.
+        let result = db.query("SELECT id FROM t ORDER BY id DESC").unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.rows[0][0], serde_json::json!(24999));
+        assert_eq!(
+            result.rows[MAX_QUERY_ROWS - 1][0],
+            serde_json::json!(25000 - MAX_QUERY_ROWS)
+        );
+
+        // Exactly cap + 1 rows is the smallest truncated result.
+        let result = db
+            .query(&format!("SELECT id FROM t WHERE id <= {MAX_QUERY_ROWS}"))
+            .unwrap();
+        assert_eq!(result.row_count, MAX_QUERY_ROWS);
+        assert!(result.truncated);
+        assert_eq!(result.total_row_count, Some(MAX_QUERY_ROWS + 1));
+    }
+
+    #[test]
+    fn test_query_result_json_shape() {
+        let not_truncated = QueryResult {
+            columns: vec!["a".into()],
+            rows: vec![vec![serde_json::json!(1)]],
+            row_count: 1,
+            truncated: false,
+            total_row_count: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&not_truncated).unwrap(),
+            serde_json::json!({"columns": ["a"], "rows": [[1]], "row_count": 1})
+        );
+        let uncounted = QueryResult {
+            columns: vec!["a".into()],
+            rows: vec![],
+            row_count: 0,
+            truncated: true,
+            total_row_count: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&uncounted).unwrap(),
+            serde_json::json!({"columns": ["a"], "rows": [], "row_count": 0, "truncated": true, "total_row_count": null})
+        );
+    }
+
+    #[test]
+    fn test_lock_configuration_refuses_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_query_test_db(dir.path());
+        let before = db.query("SELECT current_setting('memory_limit')").unwrap();
+        db.lock_configuration().unwrap();
+
+        // Every spelling of "raise the bound" is refused with DuckDB's
+        // locked-configuration class, and none changes the setting.
+        for sql in [
+            "SET memory_limit = '100GB'",
+            "SET max_memory = '100GB'",
+            "SET threads = 1",
+            "SET max_temp_directory_size = '100GB'",
+            "PRAGMA max_temp_directory_size = '100GB'",
+            "PRAGMA memory_limit = '100GB'",
+            "RESET memory_limit",
+            "SET GLOBAL memory_limit = '100GB'",
+            "SET lock_configuration = false",
+        ] {
+            let err = db.query(sql).unwrap_err().to_string();
+            assert!(err.contains("locked"), "{sql:?}: {err}");
+        }
+        let after = db.query("SELECT current_setting('memory_limit')").unwrap();
+        assert_eq!(before.rows, after.rows);
+
+        // Reads are unaffected, including the statements that take the raw
+        // path.
+        assert_eq!(
+            db.query("SELECT count(*) FROM t").unwrap().rows[0][0],
+            serde_json::json!(25000)
+        );
+        assert_eq!(db.query("PRAGMA table_info('t')").unwrap().row_count, 2);
+        assert_eq!(db.query("SHOW TABLES").unwrap().row_count, 1);
+        assert!(db.query("SELECT id FROM t").unwrap().truncated);
     }
 }

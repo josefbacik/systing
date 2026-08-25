@@ -130,6 +130,11 @@ fn get_or_open<'a>(
         }
         let db = AnalyzeDb::open_with_spill_cap(&canonical, true, spill_cap)
             .map_err(|e| format!("Failed to open database '{}': {e}", canonical.display()))?;
+        // Every bound the server was started with (memory limit, thread
+        // count, spill cap, external access) is frozen from here on, so SQL
+        // arriving through the tools cannot lift them with SET / PRAGMA.
+        db.lock_configuration()
+            .map_err(|e| format!("Failed to open database '{}': {e}", canonical.display()))?;
         dbs.insert(canonical.clone(), db);
     }
 
@@ -535,7 +540,7 @@ impl SystingMcpServer {
 
     #[tool(
         name = "query",
-        description = "Execute a read-only SQL query against a trace database. Returns JSON with 'columns' (array of column names), 'rows' (array of arrays with properly typed values — numbers as numbers, not strings), and 'row_count'. Results are capped at 10,000 rows, applied inside DuckDB (the query runs as a subquery with LIMIT 10,001, so rows beyond the cap are never produced); if truncated, includes 'truncated: true' and 'total_row_count' from a separate count(*) over the same query. Use SQL LIMIT/OFFSET for pagination. DuckDB runs under a fixed memory bound; a query that exceeds it fails with a message saying so — narrow the time window, add LIMIT, or aggregate. The database is read-only, so INSERT/UPDATE/DELETE will fail."
+        description = "Execute one read-only SQL statement against a trace database. Returns JSON with 'columns' (array of column names), 'rows' (array of arrays with properly typed values — numbers as numbers, not strings), and 'row_count'. Results are capped at 10,000 rows, applied inside DuckDB (the statement runs as a subquery with LIMIT 10,001, so rows beyond the cap are never produced); if truncated, includes 'truncated: true' and 'total_row_count' from a separate count(*) over the same statement (null if that count fails). Use SQL LIMIT/OFFSET for pagination. One statement per call: comments are fine, a second ';'-separated statement is refused. DuckDB runs under fixed, locked memory and spill bounds — SET/PRAGMA of memory_limit, threads or max_temp_directory_size are refused — and a query that exceeds the memory bound fails with a message saying so: narrow the time window, add LIMIT, or aggregate. The database is read-only, so INSERT/UPDATE/DELETE will fail."
     )]
     async fn query(
         &self,
@@ -903,6 +908,38 @@ pub async fn run_mcp_server(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// A database the server opens is locked: the bounds it was opened with
+    /// cannot be changed by SQL arriving through the tools.
+    #[test]
+    fn test_get_or_open_locks_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("locked.duckdb");
+        {
+            let conn = duckdb::Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE t AS SELECT range AS id FROM range(10)")
+                .unwrap();
+        }
+        let mut dbs = HashMap::new();
+        let mut last_used = None;
+        let db = get_or_open(&mut dbs, &mut last_used, Some("100MiB"), Some(db_path)).unwrap();
+        for sql in [
+            "SET memory_limit = '100GB'",
+            "SET max_temp_directory_size = '100GB'",
+            "PRAGMA threads = 1",
+        ] {
+            let err = db.query(sql).unwrap_err().to_string();
+            assert!(err.contains("locked"), "{sql:?}: {err}");
+        }
+        assert_eq!(
+            db.query("SELECT count(*) FROM t").unwrap().rows[0][0],
+            serde_json::json!(10)
+        );
+        let cap = db
+            .query("SELECT current_setting('max_temp_directory_size')")
+            .unwrap();
+        assert_eq!(cap.rows[0][0].as_str().unwrap(), "100.0 MiB");
+    }
 
     /// Verify that the MCP tool router contains exactly the expected set of tools.
     ///
