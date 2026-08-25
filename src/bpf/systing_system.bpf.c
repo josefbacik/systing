@@ -1561,9 +1561,10 @@ static bool current_in_cgroup_filter(void)
  * this KF_RCU kfunc). The rcu section holds no lock and takes no reference:
  * one map lookup and one ancestors[] compare per target.
  *
- * Kernels without the kfunc (< 6.5) never get here - userspace refuses
- * --cgroup on them - and bpf_ksym_exists() keeps every program that inlines
- * this loadable there for traces without --cgroup.
+ * Kernels without the kfunc (< 6.5) never get here - userspace selects the
+ * legacy snapshot matching on them (tool_config.cgroup_match_kernel == 0,
+ * see task_in_legacy_cgroup_set) - and bpf_ksym_exists() keeps every program
+ * that inlines this loadable there.
  */
 static bool task_in_cgroup_filter(struct task_struct *task)
 {
@@ -1773,6 +1774,12 @@ static bool trace_task_common(struct task_struct *task)
  * the sched tracepoints: the --cgroup test here is on current, through the
  * helper every program type may call). A caller in a tp_btf program that
  * tests a task other than current uses trace_task_btf() instead.
+ *
+ * The task argument feeds the pid/tgid checks only: in kernel mode the
+ * --cgroup decision is bpf_current_task_under_cgroup(), which judges current
+ * whatever task was passed. There is no runtime guard (a helper call per
+ * event on the sampling paths is not worth it), so a new caller must pass
+ * current or use trace_task_btf().
  */
 static bool trace_task(struct task_struct *task)
 {
