@@ -535,7 +535,7 @@ impl SystingMcpServer {
 
     #[tool(
         name = "query",
-        description = "Execute a read-only SQL query against a trace database. Returns JSON with 'columns' (array of column names), 'rows' (array of arrays with properly typed values — numbers as numbers, not strings), and 'row_count'. Results are capped at 10,000 rows; if truncated, includes 'truncated: true' and 'total_row_count'. Use SQL LIMIT/OFFSET for pagination. The database is read-only, so INSERT/UPDATE/DELETE will fail."
+        description = "Execute a read-only SQL query against a trace database. Returns JSON with 'columns' (array of column names), 'rows' (array of arrays with properly typed values — numbers as numbers, not strings), and 'row_count'. Results are capped at 10,000 rows, applied inside DuckDB (the query runs as a subquery with LIMIT 10,001, so rows beyond the cap are never produced); if truncated, includes 'truncated: true' and 'total_row_count' from a separate count(*) over the same query. Use SQL LIMIT/OFFSET for pagination. DuckDB runs under a fixed memory bound; a query that exceeds it fails with a message saying so — narrow the time window, add LIMIT, or aggregate. The database is read-only, so INSERT/UPDATE/DELETE will fail."
     )]
     async fn query(
         &self,

@@ -1498,6 +1498,7 @@ mod tests {
         AnalyzeDb {
             conn,
             path: PathBuf::new(),
+            mem_limit_mib: None,
         }
     }
 

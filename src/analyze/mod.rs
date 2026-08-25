@@ -246,6 +246,22 @@ fn extract_column_names(rows: &duckdb::Rows<'_>) -> (usize, Vec<String>) {
 pub struct AnalyzeDb {
     conn: Connection,
     path: PathBuf,
+    /// DuckDB's configured `memory_limit` in MiB, when one was derived from
+    /// the cgroup at open; named in the error a query gets when it exceeds it.
+    mem_limit_mib: Option<u64>,
+}
+
+/// Text DuckDB puts at the front of every `OutOfMemoryException` message,
+/// whether the buffer pool hit `memory_limit` or a spill hit
+/// `max_temp_directory_size` ("failed to offload data block"). Matched as a
+/// substring because the binding may wrap the engine's message.
+const DUCKDB_OOM_MARKER: &str = "Out of Memory Error";
+
+/// Strip trailing whitespace and statement terminators so the text can be
+/// embedded as a subquery.
+fn trim_statement(sql: &str) -> &str {
+    sql.trim()
+        .trim_end_matches(|c: char| c == ';' || c.is_whitespace())
 }
 
 impl AnalyzeDb {
@@ -334,44 +350,133 @@ impl AnalyzeDb {
         Ok(Self {
             conn,
             path: path.to_path_buf(),
+            mem_limit_mib,
         })
     }
 
-    /// Execute a SQL query and return typed results.
-    pub fn query(&self, sql: &str) -> Result<QueryResult> {
-        let mut stmt = self.conn.prepare(sql)?;
-        let mut rows = stmt.query([])?;
+    /// Rewrite a DuckDB out-of-memory failure into a fixed, actionable message
+    /// that names the bound instead of echoing the engine's allocation text;
+    /// every other error is returned as-is so SQL mistakes keep naming the
+    /// offending column or table.
+    fn classify_query_error(&self, err: duckdb::Error) -> anyhow::Error {
+        let msg = err.to_string();
+        if msg.contains(DUCKDB_OOM_MARKER) {
+            let bound = match self.mem_limit_mib {
+                Some(m) => format!(" ({m} MiB)"),
+                None => String::new(),
+            };
+            anyhow::anyhow!(
+                "query exceeded the DuckDB memory bound{bound}: narrow the time window, add LIMIT, or aggregate"
+            )
+        } else {
+            err.into()
+        }
+    }
 
+    /// Execute a SQL query and return typed results.
+    ///
+    /// At most `MAX_QUERY_ROWS` rows come back. The bound is applied inside
+    /// DuckDB — the statement runs as `SELECT * FROM (<sql>) LIMIT
+    /// MAX_QUERY_ROWS + 1` — so a query whose full result would be millions of
+    /// rows never materializes them: the binding fetches the whole result set
+    /// of whatever statement it executes, outside DuckDB's `memory_limit`
+    /// accounting, and an unbounded result on a large trace is what grew the
+    /// process past its cgroup limit. When the result is truncated,
+    /// `total_row_count` comes from a separate `SELECT count(*) FROM (<sql>)`,
+    /// which re-runs the query's pipeline once under DuckDB's memory bound
+    /// without materializing rows.
+    ///
+    /// Statements that cannot be embedded as a subquery (`SHOW`, `PRAGMA`,
+    /// `SET`, `COPY`, ...) fail to *prepare* in wrapped form; they then run
+    /// exactly as written, with the row cap applied as rows are read. A
+    /// failure while *executing* the wrapped statement is reported directly —
+    /// the raw statement is never re-run unbounded.
+    pub fn query(&self, sql: &str) -> Result<QueryResult> {
+        let inner = trim_statement(sql);
+        // The newline before the closing paren keeps a trailing `--` comment
+        // in the user's SQL from swallowing it.
+        let wrapped = format!(
+            "SELECT * FROM (\n{inner}\n) AS __systing_query LIMIT {}",
+            MAX_QUERY_ROWS + 1
+        );
+
+        match self.conn.prepare(&wrapped) {
+            Ok(mut stmt) => {
+                let (mut result, beyond_cap) = self.run_capped(&mut stmt, false)?;
+                if beyond_cap > 0 {
+                    result.truncated = true;
+                    result.total_row_count = self.count_rows(inner);
+                }
+                Ok(result)
+            }
+            Err(_) => {
+                // Not a SELECT-shaped statement (or a SQL error that the raw
+                // form reports against the user's own text): run it as
+                // written. The result is already materialized, so the rows
+                // beyond the cap are drained and counted as before.
+                let mut stmt = self.conn.prepare(sql)?;
+                let (mut result, beyond_cap) = self.run_capped(&mut stmt, true)?;
+                if beyond_cap > 0 {
+                    result.truncated = true;
+                    result.total_row_count = Some(result.row_count + beyond_cap);
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    /// Execute a prepared statement and read up to `MAX_QUERY_ROWS` rows into
+    /// a `QueryResult`. The second value is the number of rows seen beyond
+    /// the cap: with `drain` set, every remaining row is read and counted;
+    /// otherwise reading stops at the first one (so the value is 0 or 1).
+    fn run_capped(
+        &self,
+        stmt: &mut duckdb::Statement<'_>,
+        drain: bool,
+    ) -> Result<(QueryResult, usize)> {
+        let mut rows = stmt.query([]).map_err(|e| self.classify_query_error(e))?;
         let (column_count, column_names) = extract_column_names(&rows);
 
         let mut rows_data: Vec<Vec<serde_json::Value>> = Vec::new();
-        let mut total_count: usize = 0;
-        let mut truncated = false;
+        let mut beyond_cap = 0usize;
 
-        while let Some(row) = rows.next()? {
-            total_count += 1;
+        while let Some(row) = rows.next().map_err(|e| self.classify_query_error(e))? {
             if rows_data.len() >= MAX_QUERY_ROWS {
-                truncated = true;
-                continue; // Keep counting for total
+                beyond_cap += 1;
+                if drain {
+                    continue;
+                }
+                break;
             }
-
-            let mut row_values = Vec::new();
+            let mut row_values = Vec::with_capacity(column_count);
             for i in 0..column_count {
                 let value: duckdb::types::Value = row.get(i)?;
-                let json_value = duckdb_value_to_json(value);
-                row_values.push(json_value);
+                row_values.push(duckdb_value_to_json(value));
             }
             rows_data.push(row_values);
         }
 
         let row_count = rows_data.len();
-        Ok(QueryResult {
-            columns: column_names,
-            rows: rows_data,
-            row_count,
-            truncated,
-            total_row_count: if truncated { Some(total_count) } else { None },
-        })
+        Ok((
+            QueryResult {
+                columns: column_names,
+                rows: rows_data,
+                row_count,
+                truncated: false,
+                total_row_count: None,
+            },
+            beyond_cap,
+        ))
+    }
+
+    /// Count the rows `sql` would produce, without materializing them. `None`
+    /// if the count itself fails — the caller still reports the truncation.
+    fn count_rows(&self, inner: &str) -> Option<usize> {
+        let count_sql = format!("SELECT count(*) FROM (\n{inner}\n) AS __systing_query");
+        self.conn
+            .query_row(&count_sql, [], |r| r.get::<_, i64>(0))
+            .ok()
+            .and_then(|n| usize::try_from(n).ok())
     }
 
     /// Execute a query and return rows as string vectors (for table/csv display).
@@ -1135,5 +1240,157 @@ mod tests {
         let db = AnalyzeDb::open(&db_path, true).unwrap();
         let info = db.trace_info().unwrap();
         assert!(info.system.is_empty());
+    }
+
+    /// A small database for the query-bound tests: one table, 25,000 rows.
+    fn open_query_test_db(dir: &Path) -> AnalyzeDb {
+        let db_path = dir.join("query.duckdb");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t AS SELECT range AS id, range % 7 AS bucket FROM range(25000)",
+            )
+            .unwrap();
+        }
+        AnalyzeDb::open(&db_path, true).unwrap()
+    }
+
+    #[test]
+    fn test_query_caps_rows_and_counts_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_query_test_db(dir.path());
+
+        let result = db.query("SELECT id FROM t ORDER BY id").unwrap();
+        assert_eq!(result.row_count, MAX_QUERY_ROWS);
+        assert_eq!(result.rows.len(), MAX_QUERY_ROWS);
+        assert!(result.truncated);
+        assert_eq!(result.total_row_count, Some(25000));
+        // The kept rows are the first MAX_QUERY_ROWS in the query's own order.
+        assert_eq!(result.rows[0][0], serde_json::json!(0));
+        assert_eq!(
+            result.rows[MAX_QUERY_ROWS - 1][0],
+            serde_json::json!(MAX_QUERY_ROWS - 1)
+        );
+    }
+
+    #[test]
+    fn test_query_below_cap_is_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_query_test_db(dir.path());
+
+        let result = db.query("SELECT id FROM t WHERE id < 5").unwrap();
+        assert_eq!(result.row_count, 5);
+        assert!(!result.truncated);
+        assert_eq!(result.total_row_count, None);
+
+        // Exactly at the cap is not truncated either.
+        let result = db
+            .query(&format!("SELECT id FROM t WHERE id < {MAX_QUERY_ROWS}"))
+            .unwrap();
+        assert_eq!(result.row_count, MAX_QUERY_ROWS);
+        assert!(!result.truncated);
+        assert_eq!(result.total_row_count, None);
+    }
+
+    #[test]
+    fn test_query_wraps_common_select_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_query_test_db(dir.path());
+
+        // Trailing terminator and whitespace.
+        let result = db.query("SELECT count(*) AS n FROM t;  \n").unwrap();
+        assert_eq!(result.columns, vec!["n"]);
+        assert_eq!(result.rows[0][0], serde_json::json!(25000));
+
+        // Trailing line comment must not swallow the wrapper's closing paren.
+        let result = db.query("SELECT bucket FROM t -- all of them").unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.total_row_count, Some(25000));
+
+        // A CTE embeds as a subquery.
+        let result = db
+            .query("WITH b AS (SELECT bucket, count(*) AS n FROM t GROUP BY bucket) SELECT * FROM b ORDER BY bucket")
+            .unwrap();
+        assert_eq!(result.row_count, 7);
+        assert_eq!(result.columns, vec!["bucket", "n"]);
+
+        // Column names survive the wrapper, duplicates included.
+        let result = db
+            .query("SELECT id, id, bucket AS id FROM t WHERE id < 3")
+            .unwrap();
+        assert_eq!(result.row_count, 3);
+        assert_eq!(result.columns.len(), 3);
+        assert_eq!(
+            result.rows[2],
+            vec![
+                serde_json::json!(2),
+                serde_json::json!(2),
+                serde_json::json!(2)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_query_falls_back_for_non_select_statements() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_query_test_db(dir.path());
+
+        // Statements that cannot be embedded as a subquery still run.
+        let result = db.query("PRAGMA table_info('t')").unwrap();
+        assert_eq!(result.row_count, 2);
+        let result = db.query("SHOW TABLES").unwrap();
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result.rows[0][0], serde_json::json!("t"));
+
+        // A SQL error is reported against the user's own statement, with the
+        // engine's text intact (it names the missing column).
+        let err = db.query("SELECT nope FROM t").unwrap_err().to_string();
+        assert!(err.contains("nope"), "unexpected error: {err}");
+        assert!(!err.contains("__systing_query"), "wrapper leaked: {err}");
+    }
+
+    #[test]
+    fn test_query_out_of_memory_is_reported_as_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_query_test_db(dir.path());
+
+        // The classifier alone, on DuckDB's message shapes for both the
+        // buffer-pool limit and a full spill directory.
+        for text in [
+            "Out of Memory Error: failed to allocate data of size 256.0 KiB (3.9 GiB/4.0 GiB used)",
+            "Out of Memory Error: failed to offload data block of size 256.0 KiB (1.0 MiB/1.0 MiB used)",
+        ] {
+            let err = duckdb::Error::DuckDBFailure(
+                duckdb::ffi::Error::new(1),
+                Some(text.to_string()),
+            );
+            let msg = db.classify_query_error(err).to_string();
+            assert!(
+                msg.starts_with("query exceeded the DuckDB memory bound"),
+                "unexpected: {msg}"
+            );
+            assert!(!msg.contains("failed to"), "engine text leaked: {msg}");
+        }
+        let other = duckdb::Error::DuckDBFailure(
+            duckdb::ffi::Error::new(1),
+            Some("Binder Error: Referenced column \"nope\" not found".to_string()),
+        );
+        assert!(db.classify_query_error(other).to_string().contains("nope"));
+
+        // End to end: a sort that cannot fit in a tiny memory limit with a
+        // tiny spill cap is refused by DuckDB's out-of-memory class, and the
+        // tool sees the fixed message, not the allocation text. Both settings
+        // are session-level and stay adjustable with external access off.
+        db.conn
+            .execute_batch("SET memory_limit = '1MB'; SET max_temp_directory_size = '1MB'")
+            .unwrap();
+        let err = db
+            .query("SELECT * FROM (SELECT range AS v FROM range(20000000)) ORDER BY hash(v)")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("query exceeded the DuckDB memory bound"),
+            "unexpected error: {err}"
+        );
     }
 }
