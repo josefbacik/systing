@@ -1189,8 +1189,9 @@ struct rss_stat_state {
 
 /* handle_rss_stat() re-bounds its member index with a mask at the point of
  * use (see the comment there); a mask is only an exact bound when the array
- * length is a power of two. */
-_Static_assert((NR_MM_COUNTERS & (NR_MM_COUNTERS - 1)) == 0,
+ * length is a non-zero power of two. */
+_Static_assert(NR_MM_COUNTERS > 0 &&
+		       (NR_MM_COUNTERS & (NR_MM_COUNTERS - 1)) == 0,
 	       "NR_MM_COUNTERS must be a power of two for the rss_stat index mask");
 
 struct {
@@ -5482,19 +5483,30 @@ static __always_inline int handle_rss_stat(struct task_struct *task,
 			return emit_rss_stat_event(task, member, size_bytes, rss_flags);
 	}
 
-	/* Re-bound the index AT THE USE, not only at the entry check above.
-	 * Two map-helper calls separate that check from these stores, and a
-	 * newer 6.12-series verifier (and 6.18) no longer carries the bound
-	 * across them once the compiler rebuilds the index from the
-	 * sign-extended tracepoint argument: it rejects the whole object with
-	 * "R0 unbounded memory access, make sure to bounds check any such
-	 * access" at the first st->...[member] store, and the memory recorder
-	 * cannot load at all. NR_MM_COUNTERS is a power of two (asserted at
-	 * the struct), so the mask is an exact bound the verifier sees on
-	 * every kernel; barrier_var() pins the masked value in a register at
-	 * the access so the compiler cannot fold it back onto the argument. */
-	u64 idx = member & (NR_MM_COUNTERS - 1);
+	/* Re-bound the index AT THE USE, on the register the access uses.
+	 *
+	 * The entry check above is what the compiler compares, but which
+	 * register it compares is its choice: clang 21 at the default -mcpu
+	 * (v3) checks a 32-bit copy of the argument and later rebuilds the
+	 * index from the zero-extended raw argument in another register, two
+	 * map-helper calls later; clang 18 at -mcpu=v1 compares the index
+	 * register itself. Whether a bound on the copy reaches the index
+	 * register is then the verifier's choice: a vanilla 6.12.0 propagates
+	 * it, the newer 6.12-stable and 6.18 verifiers on the affected hosts
+	 * do not and reject the whole object at the first st->...[] store
+	 * ("R0 unbounded memory access, make sure to bounds check any such
+	 * access"). An explicit mask on the index register itself is bounded
+	 * on every verifier and under every compiler.
+	 *
+	 * The barrier comes FIRST. With the entry check dominating, the
+	 * optimizer proves `member & (NR_MM_COUNTERS - 1) == member` and
+	 * deletes the mask; barrier_var() makes `idx` opaque, so the mask that
+	 * follows it cannot be folded and lands on the very register used as
+	 * the index. NR_MM_COUNTERS is a power of two (asserted at the struct),
+	 * so the mask is an exact bound (umax NR_MM_COUNTERS - 1). */
+	u64 idx = member;
 	barrier_var(idx);
+	idx &= (NR_MM_COUNTERS - 1);
 
 	/* Unsynchronized per-member s64 stores — multiple threads of a tgid
 	 * may race here. Benign: worst case is a duplicate emit or one stale
