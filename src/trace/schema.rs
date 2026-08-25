@@ -257,6 +257,9 @@ pub fn sysinfo_schema() -> Arc<Schema> {
         Field::new("memory_fault_sample_rate", DataType::Int64, true),
         Field::new("memory_map_sample_rate", DataType::Int64, true),
         Field::new("memory_alloc_sample_rate", DataType::Int64, true),
+        Field::new("memory_vfio_leg", DataType::Utf8, true),
+        Field::new("memory_thp_leg", DataType::Utf8, true),
+        Field::new("memory_thp_sample_rate", DataType::Int64, true),
     ]))
 }
 
@@ -485,6 +488,58 @@ pub fn memory_alloc_schema() -> Arc<Schema> {
         Field::new("size", DataType::Int64, false),
         Field::new("old_addr", DataType::Int64, true),
         Field::new("stack_id", DataType::Int64, true),
+    ]))
+}
+
+/// Schema for memory_vfio.parquet
+pub fn memory_vfio_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("utid", DataType::Int64, false),
+        Field::new("op", DataType::Utf8, false),
+        Field::new("iova", DataType::Int64, false),
+        Field::new("vaddr", DataType::Int64, true),
+        Field::new("size", DataType::Int64, false),
+        Field::new("flags", DataType::Int32, false),
+        Field::new("stack_id", DataType::Int64, true),
+    ]))
+}
+
+/// Schema for memory_iommu.parquet
+pub fn memory_iommu_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("utid", DataType::Int64, false),
+        Field::new("op", DataType::Utf8, false),
+        Field::new("iova_gib", DataType::Int64, false),
+        Field::new("size_order", DataType::Int32, false),
+        Field::new("count", DataType::Int64, false),
+        Field::new("bytes", DataType::Int64, false),
+    ]))
+}
+
+/// Schema for memory_thp.parquet
+pub fn memory_thp_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("utid", DataType::Int64, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("addr", DataType::Int64, true),
+        Field::new("result", DataType::Int32, false),
+        Field::new("stack_id", DataType::Int64, true),
+    ]))
+}
+
+/// Schema for memory_vmstat.parquet
+pub fn memory_vmstat_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("ts_start", DataType::Int64, false),
+        Field::new("value_start", DataType::Int64, false),
+        Field::new("ts_end", DataType::Int64, false),
+        Field::new("value_end", DataType::Int64, false),
     ]))
 }
 

@@ -566,6 +566,21 @@ pub struct SysInfoRecord {
     /// when the `memory-alloc` recorder was not enabled, and in traces from
     /// systing < 1.14.
     pub memory_alloc_sample_rate: Option<i64>,
+    /// How the VFIO/IOMMU legs ran: "on" (the vfio_dma_do_* kprobes and the
+    /// iommu:map/unmap histogram attached) or "off:<cause>" (`--memory-vfio`
+    /// was asked for but the host has no vfio_iommu_type1 symbols / iommu
+    /// tracepoints — `memory_vfio` and `memory_iommu` are then empty by
+    /// construction). `None` when not requested, and in traces from
+    /// systing < 1.15.
+    pub memory_vfio_leg: Option<String>,
+    /// How the THP split leg ran: "on" (both the PMD-split kprobe and the
+    /// folio-split kretprobe attached), "on:pmd-only" / "on:page-only", or
+    /// "off:<cause>". `None` when `--memory-thp-sample-rate` was 0, and in
+    /// traces from systing < 1.15.
+    pub memory_thp_leg: Option<String>,
+    /// `--memory-thp-sample-rate` as configured (1 in N splits; 1 = every
+    /// split). `None` when the leg was off.
+    pub memory_thp_sample_rate: Option<i64>,
 }
 
 /// Per-CPU static frequency limits from sysfs cpufreq, in kHz.
@@ -690,6 +705,79 @@ pub struct MemoryAllocRecord {
     pub stack_id: Option<i64>,
 }
 
+/// One VFIO DMA region mapped or unmapped through the vfio_iommu_type1
+/// ioctls (`VFIO_IOMMU_MAP_DMA` / `VFIO_IOMMU_UNMAP_DMA`), from kprobes on
+/// `vfio_dma_do_map` / `vfio_dma_do_unmap`. `op` is "map" or "unmap";
+/// `iova` and `size` are the region as the caller asked for it, `vaddr` the
+/// user address backing a map (`None` on unmap), `flags` the ioctl flags.
+/// `stack_id` joins to the `stack` table and names the runtime thread doing
+/// the mapping. One row per region, unsampled.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryVfioRecord {
+    pub id: i64,
+    pub ts: i64,
+    pub utid: i64,
+    pub op: String,
+    pub iova: i64,
+    pub vaddr: Option<i64>,
+    pub size: i64,
+    pub flags: i32,
+    pub stack_id: Option<i64>,
+}
+
+/// IOMMU map/unmap run-size histogram: how many `iommu_map()` /
+/// `iommu_unmap()` calls of each size a process issued in each GiB of its
+/// IOVA space during the capture, counted in BPF from the `iommu:map` /
+/// `iommu:unmap` tracepoints and drained once at the end (`ts` is the drain
+/// time). vfio_iommu_type1 maps and unmaps a DMA region one physically
+/// contiguous run at a time, so `size_order` (log2 of the run size: 12 =
+/// 4 KiB, 21 = 2 MiB, 30 = 1 GiB) is the contiguity of the memory behind
+/// the device mappings — the fragmentation read — and `iova_gib`
+/// (`iova >> 30`) says where in the device address space it sits. `utid`
+/// is the mapping process's main thread.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryIommuRecord {
+    pub ts: i64,
+    pub utid: i64,
+    pub op: String,
+    pub iova_gib: i64,
+    pub size_order: i32,
+    pub count: i64,
+    pub bytes: i64,
+}
+
+/// A sampled transparent-huge-page split. `kind` is "pmd" (a PMD mapping
+/// split into PTEs, the folio intact — what `/proc/vmstat` counts as
+/// `thp_split_pmd`; `addr` is the virtual address) or "page" (the folio
+/// itself split — `thp_split_page` / `thp_split_page_failed`; `result` is
+/// the kernel's return value, 0 = split, negative errno = failed; `addr` is
+/// `None`). `stack_id` names the path that split (madvise, munmap, reclaim,
+/// migration, ...). 1 in N sampled (`sysinfo.memory_thp_sample_rate`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryThpRecord {
+    pub id: i64,
+    pub ts: i64,
+    pub utid: i64,
+    pub kind: String,
+    pub addr: Option<i64>,
+    pub result: i32,
+    pub stack_id: Option<i64>,
+}
+
+/// A `/proc/vmstat` counter sampled at the start and the end of the capture
+/// (the THP, compaction and direct-reclaim families), so `value_end -
+/// value_start` is the host-wide count over the capture: the fleet-general
+/// "how often do hugepage splits / THP fault fallbacks happen" read, with no
+/// probe attached.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryVmstatRecord {
+    pub name: String,
+    pub ts_start: i64,
+    pub value_start: i64,
+    pub ts_end: i64,
+    pub value_end: i64,
+}
+
 #[derive(Debug, Default)]
 pub struct ExtractedData {
     pub processes: Vec<ProcessRecord>,
@@ -721,6 +809,10 @@ pub struct ExtractedData {
     pub memory_maps: Vec<MemoryMapRecord>,
     pub memory_faults: Vec<MemoryFaultRecord>,
     pub memory_allocs: Vec<MemoryAllocRecord>,
+    pub memory_vfio: Vec<MemoryVfioRecord>,
+    pub memory_iommu: Vec<MemoryIommuRecord>,
+    pub memory_thp: Vec<MemoryThpRecord>,
+    pub memory_vmstat: Vec<MemoryVmstatRecord>,
     pub clock_snapshots: Vec<ClockSnapshotRecord>,
     pub sysinfo: Option<SysInfoRecord>,
     pub cpu_infos: Vec<CpuInfoRecord>,

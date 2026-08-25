@@ -819,7 +819,8 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO _schema_version VALUES (1, 11);
              INSERT INTO sysinfo VALUES ('t', 'Linux', '6.12.0', '#1', 'x86_64', \
-                 NULL, NULL, NULL, NULL, 'cpu-clock', 1000000, NULL, NULL, NULL, NULL);
+                 NULL, NULL, NULL, NULL, 'cpu-clock', 1000000, NULL, NULL, NULL, NULL, \
+                 NULL, NULL, NULL);
              INSERT INTO process VALUES ('t', 10, 100, 'workload', NULL, NULL, false, 0, NULL);
              INSERT INTO process VALUES ('t', 11, 200, 'bystander', NULL, NULL, false, 0, NULL);
              INSERT INTO thread VALUES ('t', 1, 101, 'worker', 10);

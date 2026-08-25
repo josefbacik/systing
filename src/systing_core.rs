@@ -11,7 +11,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
@@ -651,6 +651,7 @@ pub fn get_required_bpf_programs(
     old_kernel: bool,
     collect_pystacks: bool,
     cgroup_kernel_mode: bool,
+    memory_legs: &MemoryKernelLegs,
 ) -> HashSet<&'static str> {
     let mut required = HashSet::new();
 
@@ -700,7 +701,150 @@ pub fn get_required_bpf_programs(
         required.insert(select_rss_stat_prog(opts.memory_rss_force_classic));
     }
 
+    // The optional memory legs load only what the running kernel can attach
+    // (probed before the skeleton is opened, see probe_memory_kernel_legs):
+    // a kprobe on a symbol the host lacks would fail skel.attach() and with
+    // it the whole capture, so an unavailable leg is left unloaded and
+    // recorded as off in sysinfo instead.
+    if opts.memory && opts.memory_vfio && memory_legs.vfio_off.is_none() {
+        required.extend(MEMORY_VFIO_BPF_PROGRAMS);
+    }
+    if opts.memory && opts.memory_thp_sample_rate > 0 {
+        if memory_legs.thp_pmd_off.is_none() {
+            required.insert("systing_thp_split_pmd");
+        }
+        if let Some(prog) = memory_legs.thp_page_prog {
+            required.insert(prog);
+        }
+    }
+
     required
+}
+
+/// The VFIO/IOMMU legs of the memory recorder: kprobe + kretprobe pairs on
+/// the vfio_iommu_type1 ioctl handlers (module symbols; the pair brackets
+/// the window the histogram counts in) and the two iommu tracepoints
+/// feeding the run-size histogram. Loaded as a set.
+const MEMORY_VFIO_BPF_PROGRAMS: &[&str] = &[
+    "systing_vfio_dma_map",
+    "systing_vfio_dma_map_ret",
+    "systing_vfio_dma_unmap",
+    "systing_vfio_dma_unmap_ret",
+    "systing_iommu_map",
+    "systing_iommu_unmap",
+];
+
+/// Which of the memory recorder's optional kernel legs this host can serve,
+/// probed once from kallsyms and tracefs before the skeleton is opened.
+/// `None` in an `*_off` field means available; `Some(cause)` is the short
+/// cause recorded in `sysinfo` (`off:<cause>`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryKernelLegs {
+    /// Why the VFIO/IOMMU legs cannot attach here (`nosym`: the
+    /// vfio_iommu_type1 module is not loaded; `notracepoint`: no iommu
+    /// tracepoints).
+    pub vfio_off: Option<String>,
+    /// Why the PMD split kprobe cannot attach (`nosym`).
+    pub thp_pmd_off: Option<String>,
+    /// The folio-split kretprobe program to load: the 6.9+ entry
+    /// (`split_huge_page_to_list_to_order`) or the 6.6-series one
+    /// (`split_huge_page_to_list`), whichever the kernel has; `None` when
+    /// neither does.
+    pub thp_page_prog: Option<&'static str>,
+}
+
+impl MemoryKernelLegs {
+    /// The `sysinfo.memory_thp_leg` value for these legs: `on` when both
+    /// the PMD-split and the folio-split probes attach, `on:pmd-only` /
+    /// `on:page-only` when one symbol is missing, `off:<cause>` when both are.
+    pub fn thp_leg_value(&self) -> String {
+        match (self.thp_page_prog, &self.thp_pmd_off) {
+            (Some(_), None) => "on".to_string(),
+            (Some(_), Some(_)) => "on:page-only".to_string(),
+            (None, None) => "on:pmd-only".to_string(),
+            (None, Some(cause)) => format!("off:{cause}"),
+        }
+    }
+
+    /// The `sysinfo.memory_vfio_leg` value for these legs.
+    pub fn vfio_leg_value(&self) -> String {
+        match &self.vfio_off {
+            None => "on".to_string(),
+            Some(cause) => format!("off:{cause}"),
+        }
+    }
+}
+
+/// Probe the kernel symbols and tracepoints the optional memory legs attach
+/// to. Reads /proc/kallsyms once (module symbols appear there while the
+/// module is loaded, which is exactly the condition a kprobe needs) and
+/// looks for the iommu tracepoint directory under tracefs. Only the legs the
+/// configuration asks for are probed; the rest report available-but-unused.
+fn probe_memory_kernel_legs(opts: &Config) -> MemoryKernelLegs {
+    let mut legs = MemoryKernelLegs::default();
+    if !opts.memory || (!opts.memory_vfio && opts.memory_thp_sample_rate == 0) {
+        return legs;
+    }
+    let wanted: &[&str] = &[
+        "vfio_dma_do_map",
+        "vfio_dma_do_unmap",
+        "__split_huge_pmd",
+        "split_huge_page_to_list_to_order",
+        "split_huge_page_to_list",
+    ];
+    let present = kallsyms_has_funcs(wanted);
+    if opts.memory_vfio {
+        if !present.contains("vfio_dma_do_map") || !present.contains("vfio_dma_do_unmap") {
+            legs.vfio_off = Some("nosym".to_string());
+        } else if !iommu_tracepoints_present() {
+            legs.vfio_off = Some("notracepoint".to_string());
+        }
+    }
+    if opts.memory_thp_sample_rate > 0 {
+        if !present.contains("__split_huge_pmd") {
+            legs.thp_pmd_off = Some("nosym".to_string());
+        }
+        legs.thp_page_prog = if present.contains("split_huge_page_to_list_to_order") {
+            Some("systing_thp_split_page")
+        } else if present.contains("split_huge_page_to_list") {
+            Some("systing_thp_split_page_legacy")
+        } else {
+            None
+        };
+    }
+    legs
+}
+
+/// Which of `names` /proc/kallsyms lists as text symbols (`t`/`T`). An
+/// unreadable kallsyms reads as "none present", which turns the legs off
+/// rather than failing the capture.
+fn kallsyms_has_funcs(names: &[&str]) -> HashSet<String> {
+    let mut found = HashSet::new();
+    let Ok(contents) = fs::read_to_string("/proc/kallsyms") else {
+        return found;
+    };
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(_addr), Some(kind), Some(sym)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if (kind == "t" || kind == "T") && names.contains(&sym) {
+            found.insert(sym.to_string());
+        }
+    }
+    found
+}
+
+/// Does tracefs carry the iommu:map tracepoint (the IOMMU API's trace events
+/// are built in whenever CONFIG_IOMMU_API is)?
+fn iommu_tracepoints_present() -> bool {
+    [
+        "/sys/kernel/tracing/events/iommu/map",
+        "/sys/kernel/debug/tracing/events/iommu/map",
+    ]
+    .iter()
+    .any(|p| Path::new(p).is_dir())
 }
 
 /// Configuration for the systing system tracing.
@@ -790,6 +934,11 @@ pub struct Config {
     pub memory_fault_sample_rate: u32,
     /// Sample 1 in N mmap/munmap/brk events (0 or 1 = record all)
     pub memory_map_sample_rate: u32,
+    /// Record VFIO DMA regions (kprobes on vfio_dma_do_map/unmap) and the
+    /// IOMMU map/unmap run-size histogram (iommu:map/unmap tracepoints).
+    pub memory_vfio: bool,
+    /// Sample 1 in N THP splits (0 = leg off, 1 = record every split).
+    pub memory_thp_sample_rate: u32,
     /// Minimum absolute byte-drift between emitted rss_stat events (0 = emit
     /// every event). Default is max(16 MiB, 64 * nr_cpus * page_size); see
     /// `memory_rss_threshold_bytes` in `tool_config` for the derivation.
@@ -878,6 +1027,8 @@ impl Default for Config {
             memory: false,
             memory_fault_sample_rate: 97,
             memory_map_sample_rate: 1,
+            memory_vfio: false,
+            memory_thp_sample_rate: 0,
             memory_rss_threshold_bytes: None,
             memory_rss_force_classic: false,
             memory_alloc: false,
@@ -984,6 +1135,8 @@ pub use types::event_type;
 pub use types::marker_event;
 pub use types::memory_event;
 pub use types::memory_event_header;
+pub use types::memory_iommu_key;
+pub use types::memory_iommu_value;
 pub use types::network_event;
 pub use types::packet_event;
 pub use types::perf_counter_event;
@@ -1000,6 +1153,8 @@ unsafe impl Plain for network_event {}
 unsafe impl Plain for packet_event {}
 unsafe impl Plain for epoll_event_bpf {}
 unsafe impl Plain for arg_desc {}
+unsafe impl Plain for memory_iommu_key {}
+unsafe impl Plain for memory_iommu_value {}
 unsafe impl Plain for arg_desc_array {}
 unsafe impl Plain for marker_event {}
 unsafe impl Plain for memory_event {}
@@ -1604,6 +1759,48 @@ fn dump_missed_events(map: &dyn libbpf_rs::MapCore, index: u32) -> u64 {
         }
     }
     missed
+}
+
+/// Read every (tgid, op, order) -> (count, bytes) entry of the IOMMU
+/// run-size histogram the iommu:map/unmap tracepoint programs counted into.
+fn drain_memory_iommu_hist(map: &dyn libbpf_rs::MapCore) -> Vec<MemoryIommuHistEntry> {
+    let mut rows = Vec::new();
+    for key in map.keys() {
+        let Ok(Some(value)) = map.lookup(&key, libbpf_rs::MapFlags::ANY) else {
+            continue;
+        };
+        let mut k = memory_iommu_key::default();
+        let mut v = memory_iommu_value::default();
+        if plain::copy_from_bytes(&mut k, &key).is_err()
+            || plain::copy_from_bytes(&mut v, &value).is_err()
+        {
+            continue;
+        }
+        rows.push(MemoryIommuHistEntry {
+            tgid: k.tgid as i32,
+            op: k.op,
+            iova_gib: k.iova_gib,
+            order: k.order,
+            count: v.count,
+            bytes: v.bytes,
+        });
+    }
+    rows
+}
+
+/// One drained entry of the IOMMU run-size histogram (see
+/// `drain_memory_iommu_hist`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryIommuHistEntry {
+    pub tgid: i32,
+    /// 1 = map, 2 = unmap (the BPF program's encoding).
+    pub op: u32,
+    /// `iova >> 30`: the GiB of IOVA space the runs sit in.
+    pub iova_gib: u32,
+    /// log2 of the run size in bytes.
+    pub order: u32,
+    pub count: u64,
+    pub bytes: u64,
 }
 
 fn sum_percpu_counter(map: &dyn libbpf_rs::MapCore) -> u64 {
@@ -2633,6 +2830,7 @@ fn configure_bpf_skeleton(
     old_kernel: bool,
     collect_pystacks: bool,
     cgroup_kernel_mode: bool,
+    memory_legs: &MemoryKernelLegs,
     recorder: &Arc<SessionRecorder>,
     ring_plan: RingbufPlan,
 ) -> Result<()> {
@@ -2701,6 +2899,8 @@ fn configure_bpf_skeleton(
             rodata.tool_config.collect_memory = 1;
             rodata.tool_config.memory_fault_sample_rate = opts.memory_fault_sample_rate;
             rodata.tool_config.memory_map_sample_rate = opts.memory_map_sample_rate;
+            rodata.tool_config.memory_vfio = opts.memory_vfio as u32;
+            rodata.tool_config.memory_thp_sample_rate = opts.memory_thp_sample_rate;
             let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
             rodata.tool_config.page_size = page_size;
             // Default threshold: max(16 MiB, 64 * nr_cpus * page_size). The
@@ -2756,6 +2956,18 @@ fn configure_bpf_skeleton(
             }
             continue;
         }
+        // The IOMMU run-size histogram is referenced only by the iommu
+        // tracepoint programs, which are autoload=false unless the vfio leg
+        // is on, so its 64K preallocated entries are skipped with them.
+        if (name == "memory_iommu_hist"
+            || name == "memory_iommu_overflow"
+            || name == "memory_vfio_inflight")
+            && !(opts.memory && opts.memory_vfio && memory_legs.vfio_off.is_none())
+        {
+            map.set_autocreate(false)
+                .with_context(|| format!("Failed to disable autocreate for '{name}'"))?;
+            continue;
+        }
         // The pysym maps are referenced by always-loaded programs (the
         // sched_switch pystacks path is rodata-gated via
         // tool_config.collect_pystacks, not autoload-gated), so they can't be
@@ -2787,8 +2999,13 @@ fn configure_bpf_skeleton(
 
     // Determine which BPF programs are needed based on enabled recorders.
     // Each recorder declares its required programs; we coalesce them and disable the rest.
-    let required_programs =
-        get_required_bpf_programs(opts, old_kernel, collect_pystacks, cgroup_kernel_mode);
+    let required_programs = get_required_bpf_programs(
+        opts,
+        old_kernel,
+        collect_pystacks,
+        cgroup_kernel_mode,
+        memory_legs,
+    );
 
     for mut prog in open_skel.open_object_mut().progs_mut() {
         let name = prog
@@ -4218,6 +4435,14 @@ fn run_tracing_loop(
             dump_missed_events(&skel.maps.missed_events, 8)
         );
     }
+    if opts.memory && opts.memory_vfio {
+        let dropped = sum_percpu_counter(&skel.maps.memory_iommu_overflow);
+        if dropped > 0 {
+            println!(
+                "memory-vfio: {dropped} iommu map/unmap runs not counted (histogram full; memory_iommu is a floor)"
+            );
+        }
+    }
     if opts.memory_alloc {
         let enters = sum_percpu_counter(&skel.maps.memory_alloc_enter_count);
         let exits = sum_percpu_counter(&skel.maps.memory_alloc_exit_count);
@@ -4376,6 +4601,23 @@ pub fn systing(
             "Failed to open BPF skeleton. Ensure BPF is supported on your kernel."
         })?;
 
+        // Which optional memory legs this kernel can serve (kallsyms +
+        // tracefs), decided before the programs are selected for load.
+        let memory_legs = probe_memory_kernel_legs(&opts);
+        if opts.memory && opts.memory_vfio {
+            println!(
+                "memory recorder: vfio/iommu leg {}",
+                memory_legs.vfio_leg_value()
+            );
+        }
+        if opts.memory && opts.memory_thp_sample_rate > 0 {
+            println!(
+                "memory recorder: thp split leg {} (1 in {})",
+                memory_legs.thp_leg_value(),
+                opts.memory_thp_sample_rate
+            );
+        }
+
         // Configure the BPF skeleton with all settings
         configure_bpf_skeleton(
             &mut open_skel,
@@ -4384,6 +4626,7 @@ pub fn systing(
             old_kernel,
             collect_pystacks,
             cgroup_filter.kernel_mode(),
+            &memory_legs,
             &recorder,
             ring_plan,
         )?;
@@ -4663,7 +4906,24 @@ pub fn systing(
                 fault_sample_rate: opts.memory_fault_sample_rate,
                 map_sample_rate: opts.memory_map_sample_rate,
                 alloc_sample_rate: opts.memory_alloc.then_some(opts.memory_alloc_sample_rate),
+                vfio_leg: opts.memory_vfio.then(|| memory_legs.vfio_leg_value()),
+                thp_leg: (opts.memory_thp_sample_rate > 0).then(|| memory_legs.thp_leg_value()),
+                thp_sample_rate: (opts.memory_thp_sample_rate > 0)
+                    .then_some(opts.memory_thp_sample_rate),
             });
+        }
+
+        // The host-wide THP / compaction / reclaim counters at the start of
+        // the capture; the matching end sample turns them into the
+        // memory_vmstat table's per-capture deltas.
+        if opts.memory {
+            let ts = get_clock_value(libc::CLOCK_BOOTTIME) as i64;
+            let samples = crate::memory_recorder::read_vmstat_counters();
+            recorder
+                .memory_recorder
+                .lock()
+                .unwrap()
+                .set_vmstat_start(ts, samples);
         }
 
         // Signal the traced child to exec now that BPF is fully attached.
@@ -5011,6 +5271,23 @@ pub fn systing(
             &mut skel,
             &traced_child,
         )?;
+
+        // The memory recorder's end-of-capture rows, while skel is still
+        // alive: the IOMMU run-size histogram the tracepoints counted into,
+        // the closing vmstat sample, and each traced process's AnonHugePages.
+        if opts.memory {
+            let _p = stop_phase("memory recorder end samples");
+            let ts = get_clock_value(libc::CLOCK_BOOTTIME) as i64;
+            let hist = if opts.memory_vfio && memory_legs.vfio_off.is_none() {
+                drain_memory_iommu_hist(&skel.maps.memory_iommu_hist)
+            } else {
+                Vec::new()
+            };
+            let mut memory = recorder.memory_recorder.lock().unwrap();
+            memory.emit_iommu_hist(ts, &hist);
+            memory.emit_vmstat_end(ts, crate::memory_recorder::read_vmstat_counters());
+            memory.emit_anon_huge_pages(ts);
+        }
 
         // Load socket metadata from BPF map after tracing completes
         // This must be done while skel is still alive
@@ -5426,17 +5703,113 @@ mod tests {
 
     #[test]
     fn test_cgroup_filter_iterator_program_only_in_kernel_mode() {
+        let legs = MemoryKernelLegs::default();
         let opts = Config {
             cgroup: vec!["/sys/fs/cgroup/some-target".to_string()],
             ..Default::default()
         };
-        assert!(get_required_bpf_programs(&opts, false, false, true)
+        assert!(get_required_bpf_programs(&opts, false, false, true, &legs)
             .contains("systing_cgroup_target_add"));
-        assert!(!get_required_bpf_programs(&opts, false, false, false)
-            .contains("systing_cgroup_target_add"));
+        assert!(
+            !get_required_bpf_programs(&opts, false, false, false, &legs)
+                .contains("systing_cgroup_target_add")
+        );
         let none = Config::default();
-        assert!(!get_required_bpf_programs(&none, false, false, true)
+        assert!(!get_required_bpf_programs(&none, false, false, true, &legs)
             .contains("systing_cgroup_target_add"));
+    }
+
+    /// The optional memory legs load exactly what the kernel probe allows,
+    /// and nothing at all unless asked for — and the sysinfo leg strings
+    /// name the outcome.
+    #[test]
+    fn test_memory_optional_legs_follow_the_kernel_probe() {
+        let asked = Config {
+            memory: true,
+            memory_vfio: true,
+            memory_thp_sample_rate: 7,
+            ..Default::default()
+        };
+        let all = MemoryKernelLegs {
+            vfio_off: None,
+            thp_pmd_off: None,
+            thp_page_prog: Some("systing_thp_split_page"),
+        };
+        let req = get_required_bpf_programs(&asked, false, false, false, &all);
+        assert!(MEMORY_VFIO_BPF_PROGRAMS.iter().all(|p| req.contains(p)));
+        assert!(req.contains("systing_thp_split_pmd"));
+        assert!(req.contains("systing_thp_split_page"));
+        assert!(!req.contains("systing_thp_split_page_legacy"));
+        assert_eq!(all.vfio_leg_value(), "on");
+        assert_eq!(all.thp_leg_value(), "on");
+
+        let legacy = MemoryKernelLegs {
+            thp_page_prog: Some("systing_thp_split_page_legacy"),
+            ..all.clone()
+        };
+        let req = get_required_bpf_programs(&asked, false, false, false, &legacy);
+        assert!(req.contains("systing_thp_split_page_legacy"));
+        assert!(!req.contains("systing_thp_split_page"));
+        assert_eq!(legacy.thp_leg_value(), "on");
+        let page_only = MemoryKernelLegs {
+            thp_pmd_off: Some("nosym".to_string()),
+            ..all.clone()
+        };
+        assert_eq!(page_only.thp_leg_value(), "on:page-only");
+
+        let pmd_only = MemoryKernelLegs {
+            thp_page_prog: None,
+            ..all.clone()
+        };
+        assert_eq!(pmd_only.thp_leg_value(), "on:pmd-only");
+
+        let none = MemoryKernelLegs {
+            vfio_off: Some("nosym".to_string()),
+            thp_pmd_off: Some("nosym".to_string()),
+            thp_page_prog: None,
+        };
+        let req = get_required_bpf_programs(&asked, false, false, false, &none);
+        assert!(MEMORY_VFIO_BPF_PROGRAMS.iter().all(|p| !req.contains(p)));
+        assert!(!req.contains("systing_thp_split_pmd"));
+        assert!(!req.contains("systing_thp_split_page"));
+        assert_eq!(none.vfio_leg_value(), "off:nosym");
+        assert_eq!(none.thp_leg_value(), "off:nosym");
+        assert_eq!(
+            MemoryKernelLegs {
+                vfio_off: Some("notracepoint".to_string()),
+                ..Default::default()
+            }
+            .vfio_leg_value(),
+            "off:notracepoint"
+        );
+
+        // Off by default: a kernel that has everything still loads nothing
+        // the configuration did not ask for.
+        let not_asked = Config {
+            memory: true,
+            ..Default::default()
+        };
+        let req = get_required_bpf_programs(&not_asked, false, false, false, &all);
+        assert!(MEMORY_VFIO_BPF_PROGRAMS.iter().all(|p| !req.contains(p)));
+        assert!(!req.contains("systing_thp_split_pmd"));
+        assert!(!req.contains("systing_thp_split_page"));
+        assert_eq!(
+            probe_memory_kernel_legs(&not_asked),
+            MemoryKernelLegs::default()
+        );
+    }
+
+    /// The kallsyms probe sees real text symbols and not made-up ones.
+    #[test]
+    fn test_kallsyms_probe() {
+        if fs::read_to_string("/proc/kallsyms").is_err() {
+            eprintln!("skipping: /proc/kallsyms unreadable");
+            return;
+        }
+        let found = kallsyms_has_funcs(&["schedule", "do_exit", "systing_no_such_kernel_function"]);
+        assert!(found.contains("schedule"));
+        assert!(found.contains("do_exit"));
+        assert!(!found.contains("systing_no_such_kernel_function"));
     }
 
     #[test]

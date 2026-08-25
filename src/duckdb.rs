@@ -133,7 +133,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -172,6 +172,10 @@ pub const DATA_TABLES: &[&str] = &[
     "memory_map",
     "memory_fault",
     "memory_alloc",
+    "memory_vfio",
+    "memory_iommu",
+    "memory_thp",
+    "memory_vmstat",
     "clock_snapshot",
     "sysinfo",
     "cpu_info",
@@ -599,6 +603,66 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             old_addr BIGINT,
             stack_id BIGINT
         );
+
+        -- VFIO DMA regions mapped/unmapped through vfio_iommu_type1 (one row
+        -- per VFIO_IOMMU_MAP_DMA / UNMAP_DMA region, unsampled). op is 'map'
+        -- or 'unmap'; vaddr is NULL on unmap.
+        CREATE TABLE IF NOT EXISTS memory_vfio (
+            trace_id VARCHAR,
+            id BIGINT,
+            ts BIGINT,
+            utid BIGINT,
+            op VARCHAR,
+            iova BIGINT,
+            vaddr BIGINT,
+            size BIGINT,
+            flags INTEGER,
+            stack_id BIGINT
+        );
+
+        -- IOMMU map/unmap run-size histogram per process and per GiB of IOVA
+        -- space (iova_gib = iova >> 30), from the iommu:map / iommu:unmap
+        -- tracepoints, drained once at the end of the capture (ts).
+        -- vfio_iommu_type1 maps a region one physically contiguous run per
+        -- iommu_map() call, so size_order (log2 bytes: 12 = 4 KiB, 21 = 2 MiB,
+        -- 30 = 1 GiB) is the contiguity of the memory behind the device
+        -- mappings and iova_gib says where. utid is the mapping process's
+        -- main thread.
+        CREATE TABLE IF NOT EXISTS memory_iommu (
+            trace_id VARCHAR,
+            ts BIGINT,
+            utid BIGINT,
+            op VARCHAR,
+            iova_gib BIGINT,
+            size_order INTEGER,
+            count BIGINT,
+            bytes BIGINT
+        );
+
+        -- Sampled THP splits: kind 'pmd' (PMD mapping split, addr set) or
+        -- 'page' (folio split, result = kernel return, 0 = split).
+        CREATE TABLE IF NOT EXISTS memory_thp (
+            trace_id VARCHAR,
+            id BIGINT,
+            ts BIGINT,
+            utid BIGINT,
+            kind VARCHAR,
+            addr BIGINT,
+            result INTEGER,
+            stack_id BIGINT
+        );
+
+        -- /proc/vmstat counters (THP, compaction, direct reclaim families)
+        -- sampled at capture start and end; value_end - value_start is the
+        -- host-wide count over the capture.
+        CREATE TABLE IF NOT EXISTS memory_vmstat (
+            trace_id VARCHAR,
+            name VARCHAR,
+            ts_start BIGINT,
+            value_start BIGINT,
+            ts_end BIGINT,
+            value_end BIGINT
+        );
         CREATE TABLE IF NOT EXISTS clock_snapshot (
             trace_id VARCHAR,
             clock_id INTEGER,
@@ -636,7 +700,13 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             memory_fault_leg VARCHAR,
             memory_fault_sample_rate BIGINT,
             memory_map_sample_rate BIGINT,
-            memory_alloc_sample_rate BIGINT
+            memory_alloc_sample_rate BIGINT,
+            -- The VFIO/IOMMU and THP-split legs (systing >= 1.15): 'on' /
+            -- 'on:<entry symbol>' or 'off:<cause>' when requested, NULL when
+            -- not; memory_thp_sample_rate is the configured 1-in-N.
+            memory_vfio_leg VARCHAR,
+            memory_thp_leg VARCHAR,
+            memory_thp_sample_rate BIGINT
         );
 
         -- Per-CPU static frequency limits (kHz) from sysfs cpufreq. Empty on
@@ -927,6 +997,10 @@ fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Res
     import_table("memory_map", &paths.memory_map)?;
     import_table("memory_fault", &paths.memory_fault)?;
     import_table("memory_alloc", &paths.memory_alloc)?;
+    import_table("memory_vfio", &paths.memory_vfio)?;
+    import_table("memory_iommu", &paths.memory_iommu)?;
+    import_table("memory_thp", &paths.memory_thp)?;
+    import_table("memory_vmstat", &paths.memory_vmstat)?;
 
     // Clock snapshot
     import_table("clock_snapshot", &paths.clock_snapshot)?;
@@ -1387,6 +1461,10 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
     export_table("memory_map", &paths.memory_map)?;
     export_table("memory_fault", &paths.memory_fault)?;
     export_table("memory_alloc", &paths.memory_alloc)?;
+    export_table("memory_vfio", &paths.memory_vfio)?;
+    export_table("memory_iommu", &paths.memory_iommu)?;
+    export_table("memory_thp", &paths.memory_thp)?;
+    export_table("memory_vmstat", &paths.memory_vmstat)?;
 
     // Clock snapshot
     export_table("clock_snapshot", &paths.clock_snapshot)?;

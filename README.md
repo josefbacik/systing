@@ -124,7 +124,7 @@ This will display all available recorders and their default states:
 - `network` - Network connection state tracking
 - `network-syscalls` - Network syscall-level tracing (send/recv bytes, retransmits, drops, stalls) without per-packet probes
 - `network-packets` - Network packet-level tracing (sendmsg, recvmsg, qdisc, drops)
-- `memory` - Memory usage tracking (RSS, mmap/munmap/brk, page faults)
+- `memory` - Memory usage tracking (RSS, mmap/munmap/brk, page faults; host-wide THP/compaction counters into `memory_vmstat`). `--memory-vfio` adds VFIO DMA regions and the IOMMU map/unmap run-size histogram (how fragmented the memory behind device mappings is); `--memory-thp-sample-rate N` adds sampled THP-split events with stacks. Both legs turn themselves off (named in `sysinfo`) on hosts without the symbols.
 - `memory-alloc` - Heap allocator uprobes (malloc/calloc/realloc/free) with stacks
 - `markers` - Userspace marker events (faccessat2 with mode=-975)
 - `tpu` - TPU profiling (gRPC to XLA runtime profiler service)

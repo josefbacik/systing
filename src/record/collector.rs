@@ -11,7 +11,8 @@ use anyhow::Result;
 use crate::trace::{
     ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, CpuInfoRecord,
     ExtractedData, InstantArgRecord, InstantRecord, IrqSliceRecord, MemoryAllocRecord,
-    MemoryFaultRecord, MemoryMapRecord, MemoryRssRecord, NetworkDnsRecord, NetworkInterfaceRecord,
+    MemoryFaultRecord, MemoryIommuRecord, MemoryMapRecord, MemoryRssRecord, MemoryThpRecord,
+    MemoryVfioRecord, MemoryVmstatRecord, NetworkDnsRecord, NetworkInterfaceRecord,
     NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord,
     ProcessExitRecord, ProcessRecord, SchedMigrateRecord, SchedSliceRecord, SliceRecord,
     SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord, SysInfoRecord,
@@ -124,6 +125,18 @@ pub trait RecordCollector {
 
     /// Add a heap allocator (malloc/free/...) record.
     fn add_memory_alloc(&mut self, record: MemoryAllocRecord) -> Result<()>;
+
+    /// Add a VFIO DMA region map/unmap record.
+    fn add_memory_vfio(&mut self, record: MemoryVfioRecord) -> Result<()>;
+
+    /// Add an IOMMU map/unmap run-size histogram row.
+    fn add_memory_iommu(&mut self, record: MemoryIommuRecord) -> Result<()>;
+
+    /// Add a sampled THP split record.
+    fn add_memory_thp(&mut self, record: MemoryThpRecord) -> Result<()>;
+
+    /// Add a start/end vmstat counter sample.
+    fn add_memory_vmstat(&mut self, record: MemoryVmstatRecord) -> Result<()>;
 
     /// Set the system info record (only one per trace).
     fn set_sysinfo(&mut self, record: SysInfoRecord) -> Result<()>;
@@ -261,6 +274,10 @@ impl RecordCollector for SharedCollector {
         add_memory_map(MemoryMapRecord),
         add_memory_fault(MemoryFaultRecord),
         add_memory_alloc(MemoryAllocRecord),
+        add_memory_vfio(MemoryVfioRecord),
+        add_memory_iommu(MemoryIommuRecord),
+        add_memory_thp(MemoryThpRecord),
+        add_memory_vmstat(MemoryVmstatRecord),
         set_sysinfo(SysInfoRecord),
         add_cpu_info(CpuInfoRecord),
         add_tpu_device(TpuDeviceRecord),
@@ -457,6 +474,26 @@ impl RecordCollector for InMemoryCollector {
 
     fn add_memory_alloc(&mut self, record: MemoryAllocRecord) -> Result<()> {
         self.data.memory_allocs.push(record);
+        Ok(())
+    }
+
+    fn add_memory_vfio(&mut self, record: MemoryVfioRecord) -> Result<()> {
+        self.data.memory_vfio.push(record);
+        Ok(())
+    }
+
+    fn add_memory_iommu(&mut self, record: MemoryIommuRecord) -> Result<()> {
+        self.data.memory_iommu.push(record);
+        Ok(())
+    }
+
+    fn add_memory_thp(&mut self, record: MemoryThpRecord) -> Result<()> {
+        self.data.memory_thp.push(record);
+        Ok(())
+    }
+
+    fn add_memory_vmstat(&mut self, record: MemoryVmstatRecord) -> Result<()> {
+        self.data.memory_vmstat.push(record);
         Ok(())
     }
 

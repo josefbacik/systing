@@ -99,6 +99,14 @@ pub struct MemoryRecorderConfig {
     pub map_sample_rate: u32,
     /// `--memory-alloc-sample-rate` when the `memory-alloc` recorder is on.
     pub alloc_sample_rate: Option<u32>,
+    /// The VFIO/IOMMU legs' status ("on" / "off:<cause>") when
+    /// `--memory-vfio` was asked for.
+    pub vfio_leg: Option<String>,
+    /// The THP split leg's status ("on", "on:pmd-only", "on:page-only" or
+    /// "off:<cause>") when `--memory-thp-sample-rate` was non-zero.
+    pub thp_leg: Option<String>,
+    /// `--memory-thp-sample-rate` when non-zero.
+    pub thp_sample_rate: Option<u32>,
 }
 
 /// Static per-CPU frequency limits from sysfs cpufreq, in kHz (sysfs's native
@@ -1589,6 +1597,9 @@ impl SessionRecorder {
                 memory_fault_sample_rate: memory.map(|m| i64::from(m.fault_sample_rate)),
                 memory_map_sample_rate: memory.map(|m| i64::from(m.map_sample_rate)),
                 memory_alloc_sample_rate: memory.and_then(|m| m.alloc_sample_rate).map(i64::from),
+                memory_vfio_leg: memory.and_then(|m| m.vfio_leg.clone()),
+                memory_thp_leg: memory.and_then(|m| m.thp_leg.clone()),
+                memory_thp_sample_rate: memory.and_then(|m| m.thp_sample_rate).map(i64::from),
             })?;
         }
 

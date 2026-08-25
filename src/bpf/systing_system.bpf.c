@@ -127,6 +127,8 @@ const volatile struct {
 	u32 memory_fault_sample_rate; /* Sample 1 in N page faults (0 or 1 = all) */
 	u32 memory_alloc_sample_rate; /* Sample 1 in N malloc/free calls (0 or 1 = all) */
 	u32 memory_map_sample_rate; /* Sample 1 in N mmap/munmap/brk events (0 or 1 = all) */
+	u32 memory_vfio;            /* VFIO/IOMMU legs enabled (vfio_dma_do_* kprobes + iommu:map/unmap histogram) */
+	u32 memory_thp_sample_rate; /* Sample 1 in N THP split events (0 = leg off, 1 = all) */
 	u32 page_size;         /* sysconf(_SC_PAGESIZE) for page-count -> byte conversion */
 	/* Minimum absolute byte-drift before an rss_stat event is emitted.
 	 * Computed by userspace as max(16 MiB, 64 * nr_cpus * page_size). On the
@@ -464,6 +466,15 @@ enum memory_event_type {
 	MEMORY_ALLOC,         // uretprobe malloc/calloc/realloc/... - heap object allocated
 	MEMORY_FREE,          // uprobe free - heap object released
 	MEMORY_THRASH_SAMPLE, // periodic per-task thrash counters (from perf_event_clock)
+	MEMORY_VFIO_MAP,      // kprobe vfio_dma_do_map - one VFIO DMA region mapped (iova, size, vaddr)
+	MEMORY_VFIO_UNMAP,    // kprobe vfio_dma_do_unmap - one VFIO DMA region unmapped (iova, size)
+	MEMORY_THP_SPLIT,     // kprobe __split_huge_pmd / kretprobe split_huge_page_to_list* - a THP split (sampled)
+};
+
+/* memory_event_header.member for MEMORY_THP_SPLIT: which split. */
+enum memory_thp_split_kind {
+	MEMORY_THP_SPLIT_PMD = 1,  /* __split_huge_pmd: a PMD mapping split into PTEs (thp_split_pmd) */
+	MEMORY_THP_SPLIT_PAGE = 2, /* split_huge_page_to_list[_to_order]: the folio itself split (thp_split_page / _failed) */
 };
 
 /* RSS stat member indices (mirrors include/linux/mm_types_task.h) */
@@ -1040,6 +1051,104 @@ struct {
 	__type(key, u32);
 	__type(value, u64);
 } memory_fault_counter SEC(".maps");
+
+/* ---- VFIO / IOMMU legs ----
+ *
+ * Two things the memory recorder records about device DMA mappings when
+ * tool_config.memory_vfio is set:
+ *
+ * 1. The VFIO DMA regions themselves (MEMORY_VFIO_MAP / MEMORY_VFIO_UNMAP
+ *    events with stacks), from kprobes on the vfio_iommu_type1 ioctl
+ *    handlers vfio_dma_do_map / vfio_dma_do_unmap — one event per region, so
+ *    the ring sees tens to thousands of events per model load.
+ *
+ * 2. How fragmented the memory behind those regions is. vfio_iommu_type1
+ *    pins a DMA region one physically contiguous run at a time
+ *    (vfio_pin_pages_remote extends the run while pfns stay contiguous) and
+ *    maps each run with ONE iommu_map() call, and vfio_unmap_unpin unmaps
+ *    by "the largest contiguous physical memory chunk"; iommu_map/unmap fire
+ *    the iommu:map / iommu:unmap tracepoints once per call with that run's
+ *    size. So the size of each tracepoint event IS the contiguity of the
+ *    backing memory: a THP-backed region maps in >=2 MiB runs, a
+ *    4 KiB-fragmented one in 4 KiB runs. A 146 GiB region backed by 4 KiB
+ *    pages is ~38M events, far beyond any ring budget, so the tracepoints
+ *    never emit events — they count into this histogram, keyed by the
+ *    mapping process, the operation and log2(size), drained by userspace
+ *    at the end of the capture into memory_iommu rows — and only while the
+ *    current task is inside a vfio_dma_do_map/unmap ioctl, for runs inside
+ *    that region (memory_vfio_inflight): the tracepoints are host-wide
+ *    DMA-API paths, and every other iommu_map() costs one hash miss.
+ *
+ * Writers are classic tracepoint programs (task context; bpf_prog_active
+ * is raised around them), never the perf_event sampler, so a plain
+ * preallocated HASH is safe here.
+ */
+struct memory_iommu_key {
+	u32 tgid;
+	u32 op;       /* 1 = map, 2 = unmap */
+	u32 iova_gib; /* iova >> 30: which GiB of the IOVA space the run sits in */
+	u32 order;    /* log2 of the run size in bytes (12 = 4 KiB, 21 = 2 MiB, 30 = 1 GiB) */
+};
+
+struct memory_iommu_value {
+	u64 count;
+	u64 bytes;
+};
+
+/* Keyed per process AND per GiB of IOVA so the rows say where in the
+ * device's address space the fragmentation sits, not only how much. Bound:
+ * a 150 GiB arena touches ~150 IOVA GiBs x 19 size orders (4 KiB..1 GiB) x 2
+ * ops = 5.7K entries per process, so 131072 preallocated entries hold ~23
+ * such processes; an update that finds the map full is counted in
+ * memory_iommu_overflow and dropped (the histogram is then a floor). */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 131072);
+	__type(key, struct memory_iommu_key);
+	__type(value, struct memory_iommu_value);
+} memory_iommu_hist SEC(".maps");
+
+/* Per-CPU count of histogram updates dropped because the map was full. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_iommu_overflow SEC(".maps");
+
+/* The DMA region a traced task is mapping or unmapping RIGHT NOW, keyed by
+ * tgidpid: set by the vfio_dma_do_* kprobes, cleared by their kretprobes.
+ * The iommu tracepoints are host-wide DMA-API paths (every NIC/NVMe
+ * dma_map on an IOMMU-translated host, softirq/IRQ context included), so
+ * the tracepoint programs consult this map FIRST and count only runs that
+ * fall inside the region the current task is mapping through VFIO: every
+ * other iommu_map() on the host costs one lookup miss in a small
+ * preallocated hash and touches nothing else, and the histogram is VFIO's
+ * by construction. An IRQ landing on a CPU whose task is inside the ioctl
+ * would be counted only if its iova fell inside that region's range. */
+struct memory_vfio_inflight {
+	u64 iova;
+	u64 size;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, u64); /* tgidpid */
+	__type(value, struct memory_vfio_inflight);
+} memory_vfio_inflight SEC(".maps");
+
+/* Per-CPU counter for THP split sampling (1 in N, like the fault leg). */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} memory_thp_counter SEC(".maps");
+
+struct memory_iommu_key _memory_iommu_key = {0};
+struct memory_iommu_value _memory_iommu_value = {0};
+enum memory_thp_split_kind _memory_thp_split_kind = MEMORY_THP_SPLIT_PMD;
 
 /* Per-CPU sampling counters for mmap/munmap/brk. One per syscall type:
  * a shared counter would correlate the three event streams, so a
@@ -5873,6 +5982,277 @@ int systing_page_fault_sw(struct bpf_perf_event_data *ctx)
 	return 0;
 }
 #endif
+
+/* ---- VFIO DMA regions: kprobes on the vfio_iommu_type1 ioctl handlers ----
+ *
+ * vfio_dma_do_map(struct vfio_iommu *, struct vfio_iommu_type1_dma_map *)
+ * vfio_dma_do_unmap(struct vfio_iommu *, struct vfio_iommu_type1_dma_unmap *, ...)
+ * take the uapi argument struct already copied into kernel memory by the
+ * ioctl handler, so arg2 is a kernel pointer to a fixed uapi layout
+ * (include/uapi/linux/vfio.h; the same at 6.6, 6.12 and 6.18). The functions
+ * are static in drivers/vfio/vfio_iommu_type1.c and live in a module, so
+ * userspace only loads and attaches these programs when kallsyms carries the
+ * symbol (attach_memory_vfio_legs in systing_core.rs) and records the leg as
+ * off in sysinfo.memory_vfio_leg otherwise — the other memory legs run
+ * regardless. One event per DMA region (a model load is tens to thousands
+ * of regions), so no sampling. The pin/unpin cost of the region is charged
+ * to the calling task in the same ioctl, which is why the stacks are kept:
+ * they name the runtime thread doing the mapping.
+ */
+struct vfio_iommu_type1_dma_map_uapi {
+	u32 argsz;
+	u32 flags;
+	u64 vaddr;
+	u64 iova;
+	u64 size;
+};
+
+struct vfio_iommu_type1_dma_unmap_uapi {
+	u32 argsz;
+	u32 flags;
+	u64 iova;
+	u64 size;
+};
+
+/* include/uapi/linux/vfio.h: VFIO_DMA_UNMAP_FLAG_ALL — unmap every region. */
+#define MEMORY_VFIO_DMA_UNMAP_FLAG_ALL (1 << 1)
+
+static __always_inline int memory_vfio_emit(void *ctx, enum memory_event_type type,
+					    u64 iova, u64 size, u64 vaddr, u32 uflags)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+
+	/* Open the window for the iommu:map/unmap histogram: the runs this
+	 * ioctl maps or unmaps are the ones inside [iova, iova + size). */
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_vfio_inflight inflight = { .iova = iova, .size = size };
+	if (type == MEMORY_VFIO_UNMAP && (uflags & MEMORY_VFIO_DMA_UNMAP_FLAG_ALL)) {
+		inflight.iova = 0;
+		inflight.size = ~0ULL;
+	}
+	bpf_map_update_elem(&memory_vfio_inflight, &tgidpid, &inflight, BPF_ANY);
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->hdr.type = type;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = iova;
+	event->hdr.size = size;
+	event->hdr.old_addr = vaddr;
+	event->hdr.member = 0;
+	event->hdr.flags = uflags;
+	memory_capture_stack(ctx, event, task, true);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("kprobe/vfio_dma_do_map")
+int BPF_KPROBE(systing_vfio_dma_map, void *iommu, struct vfio_iommu_type1_dma_map_uapi *map)
+{
+	struct vfio_iommu_type1_dma_map_uapi args;
+	if (bpf_probe_read_kernel(&args, sizeof(args), map))
+		return 0;
+	return memory_vfio_emit(ctx, MEMORY_VFIO_MAP, args.iova, args.size, args.vaddr, args.flags);
+}
+
+SEC("kprobe/vfio_dma_do_unmap")
+int BPF_KPROBE(systing_vfio_dma_unmap, void *iommu, struct vfio_iommu_type1_dma_unmap_uapi *unmap)
+{
+	struct vfio_iommu_type1_dma_unmap_uapi args;
+	if (bpf_probe_read_kernel(&args, sizeof(args), unmap))
+		return 0;
+	return memory_vfio_emit(ctx, MEMORY_VFIO_UNMAP, args.iova, args.size, 0, args.flags);
+}
+
+static __always_inline int memory_vfio_close_window(void)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	bpf_map_delete_elem(&memory_vfio_inflight, &tgidpid);
+	return 0;
+}
+
+SEC("kretprobe/vfio_dma_do_map")
+int BPF_KRETPROBE(systing_vfio_dma_map_ret)
+{
+	return memory_vfio_close_window();
+}
+
+SEC("kretprobe/vfio_dma_do_unmap")
+int BPF_KRETPROBE(systing_vfio_dma_unmap_ret)
+{
+	return memory_vfio_close_window();
+}
+
+/* ---- IOMMU map/unmap run-size histogram: iommu:map / iommu:unmap ----
+ *
+ * Classic tracepoint programs reading the event record by the fixed layout
+ * of the iommu events (the common 8-byte header, then the u64 fields in
+ * TP_STRUCT__entry order — unchanged since the tracepoints were added). See
+ * the memory_iommu_hist comment for why these count instead of emitting.
+ */
+struct systing_iommu_map_args {
+	u64 common;
+	u64 iova;
+	u64 paddr;
+	u64 size;
+};
+
+struct systing_iommu_unmap_args {
+	u64 common;
+	u64 iova;
+	u64 size;
+	u64 unmapped_size;
+};
+
+/* floor(log2(v)) by binary search — a fixed six-step sequence the verifier
+ * reads as straight-line code (no clz instruction on BPF). 0 for v == 0. */
+static __always_inline u32 memory_log2_u64(u64 v)
+{
+	u32 r = 0;
+	if (v >> 32) { v >>= 32; r += 32; }
+	if (v >> 16) { v >>= 16; r += 16; }
+	if (v >> 8) { v >>= 8; r += 8; }
+	if (v >> 4) { v >>= 4; r += 4; }
+	if (v >> 2) { v >>= 2; r += 2; }
+	if (v >> 1) { r += 1; }
+	return r;
+}
+
+static __always_inline void memory_iommu_account(u32 op, u64 iova, u64 size)
+{
+	/* Host-wide hot path: one small-hash miss for every iommu_map() that
+	 * is not a traced task's VFIO region (the only entries the vfio
+	 * kprobes create are for tasks that passed trace_task). */
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_vfio_inflight *in = bpf_map_lookup_elem(&memory_vfio_inflight, &tgidpid);
+	if (!in)
+		return;
+	if (iova < in->iova || iova - in->iova >= in->size)
+		return;
+
+	struct memory_iommu_key key = {
+		.tgid = (u32)(tgidpid >> 32),
+		.op = op,
+		.iova_gib = (u32)(iova >> 30),
+		.order = memory_log2_u64(size),
+	};
+	struct memory_iommu_value *v = bpf_map_lookup_elem(&memory_iommu_hist, &key);
+	if (!v) {
+		struct memory_iommu_value init = {};
+		bpf_map_update_elem(&memory_iommu_hist, &key, &init, BPF_NOEXIST);
+		v = bpf_map_lookup_elem(&memory_iommu_hist, &key);
+		if (!v) {
+			u32 zero = 0;
+			u64 *dropped = bpf_map_lookup_elem(&memory_iommu_overflow, &zero);
+			if (dropped)
+				*dropped += 1;
+			return;
+		}
+	}
+	__sync_fetch_and_add(&v->count, 1);
+	__sync_fetch_and_add(&v->bytes, size);
+}
+
+SEC("tracepoint/iommu/map")
+int systing_iommu_map(struct systing_iommu_map_args *ctx)
+{
+	memory_iommu_account(1, ctx->iova, ctx->size);
+	return 0;
+}
+
+SEC("tracepoint/iommu/unmap")
+int systing_iommu_unmap(struct systing_iommu_unmap_args *ctx)
+{
+	memory_iommu_account(2, ctx->iova, ctx->unmapped_size ? ctx->unmapped_size : ctx->size);
+	return 0;
+}
+
+/* ---- THP splits: sampled kprobes on the split paths ----
+ *
+ * Two kinds, matching /proc/vmstat: thp_split_pmd (a PMD mapping split into
+ * PTEs, the folio intact) is probed at __split_huge_pmd, the public entry
+ * the split_huge_pmd() macro calls only for a huge PMD (the same name at
+ * 6.6, 6.12 and 6.18; the static worker __split_huge_pmd_locked that holds
+ * the counter is inlined in some builds, so it is not a probe target). The
+ * rmap paths that split a PMD directly through split_huge_pmd_locked
+ * (try_to_unmap / try_to_migrate on 6.10+) are not attributed here — they
+ * show in the vmstat delta only. thp_split_page / thp_split_page_failed
+ * count at the end of the folio split whose entry is
+ * split_huge_page_to_list (<= 6.8) or split_huge_page_to_list_to_order
+ * (>= 6.9; at 6.18 the counter sits in its static callee __folio_split);
+ * the entry's return value is the result: 0 split, -EBUSY/-EAGAIN failed.
+ * Userspace loads the programs whose symbols the running kernel has and
+ * records the leg in sysinfo.memory_thp_leg. Splits run in task context
+ * (madvise, munmap, reclaim, migration), so the memory ring is written as
+ * usual; the leg is 1:N sampled (memory_thp_sample_rate, 0 = off) because
+ * reclaim storms can split thousands of folios a second.
+ */
+static __always_inline bool memory_thp_sample_hit(void)
+{
+	if (tool_config.memory_thp_sample_rate <= 1)
+		return true;
+	u32 zero = 0;
+	u64 *cnt = bpf_map_lookup_elem(&memory_thp_counter, &zero);
+	if (!cnt)
+		return true;
+	*cnt += 1;
+	return (*cnt % tool_config.memory_thp_sample_rate) == 0;
+}
+
+static __always_inline int memory_thp_emit(void *ctx, u32 kind, u64 address, u32 result)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	if (!memory_thp_sample_hit())
+		return 0;
+
+	long flags;
+	struct memory_event *event = reserve_memory_event(&flags);
+	if (!event)
+		return handle_missed_event(MISSED_MEMORY_EVENT);
+
+	event->hdr.type = MEMORY_THP_SPLIT;
+	event->hdr.ts = bpf_ktime_get_boot_ns();
+	event->hdr.cpu = bpf_get_smp_processor_id();
+	record_task_info(&event->hdr.task, task);
+	event->hdr.addr = address;
+	event->hdr.size = 0;
+	event->hdr.old_addr = 0;
+	event->hdr.member = kind;
+	event->hdr.flags = result;
+	memory_capture_stack(ctx, event, task, true);
+
+	bpf_ringbuf_submit(event, flags);
+	return 0;
+}
+
+SEC("kprobe/__split_huge_pmd")
+int BPF_KPROBE(systing_thp_split_pmd, void *vma, void *pmd, unsigned long address)
+{
+	return memory_thp_emit(ctx, MEMORY_THP_SPLIT_PMD, address, 0);
+}
+
+SEC("kretprobe/split_huge_page_to_list_to_order")
+int BPF_KRETPROBE(systing_thp_split_page, int ret)
+{
+	return memory_thp_emit(ctx, MEMORY_THP_SPLIT_PAGE, 0, (u32)ret);
+}
+
+/* The same entry under its pre-6.9 name (the 6.6 series). */
+SEC("kretprobe/split_huge_page_to_list")
+int BPF_KRETPROBE(systing_thp_split_page_legacy, int ret)
+{
+	return memory_thp_emit(ctx, MEMORY_THP_SPLIT_PAGE, 0, (u32)ret);
+}
 
 /* ---- memory-alloc: libc allocator uprobes ----
  *
