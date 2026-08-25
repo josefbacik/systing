@@ -1187,6 +1187,12 @@ struct rss_stat_state {
 	s64 latest_seen[NR_MM_COUNTERS];
 };
 
+/* handle_rss_stat() re-bounds its member index with a mask at the point of
+ * use (see the comment there); a mask is only an exact bound when the array
+ * length is a power of two. */
+_Static_assert((NR_MM_COUNTERS & (NR_MM_COUNTERS - 1)) == 0,
+	       "NR_MM_COUNTERS must be a power of two for the rss_stat index mask");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	/* Bounds concurrent TRACED processes (tgids), not threads or events.
@@ -5476,11 +5482,25 @@ static __always_inline int handle_rss_stat(struct task_struct *task,
 			return emit_rss_stat_event(task, member, size_bytes, rss_flags);
 	}
 
+	/* Re-bound the index AT THE USE, not only at the entry check above.
+	 * Two map-helper calls separate that check from these stores, and a
+	 * newer 6.12-series verifier (and 6.18) no longer carries the bound
+	 * across them once the compiler rebuilds the index from the
+	 * sign-extended tracepoint argument: it rejects the whole object with
+	 * "R0 unbounded memory access, make sure to bounds check any such
+	 * access" at the first st->...[member] store, and the memory recorder
+	 * cannot load at all. NR_MM_COUNTERS is a power of two (asserted at
+	 * the struct), so the mask is an exact bound the verifier sees on
+	 * every kernel; barrier_var() pins the masked value in a register at
+	 * the access so the compiler cannot fold it back onto the argument. */
+	u64 idx = member & (NR_MM_COUNTERS - 1);
+	barrier_var(idx);
+
 	/* Unsynchronized per-member s64 stores — multiple threads of a tgid
 	 * may race here. Benign: worst case is a duplicate emit or one stale
 	 * last_emitted (one extra emit); never a lost sample. */
-	st->latest_seen[member] = size_bytes;
-	s64 last = st->last_emitted[member];
+	st->latest_seen[idx] = size_bytes;
+	s64 last = st->last_emitted[idx];
 	/* First sighting for this member: always emit so consumers have a
 	 * baseline (last == -1 from the 0xff memset). */
 	s64 drift = last < 0 ? (s64)tool_config.memory_rss_threshold_bytes
@@ -5490,7 +5510,7 @@ static __always_inline int handle_rss_stat(struct task_struct *task,
 	if ((u64)drift < tool_config.memory_rss_threshold_bytes)
 		return 0;
 
-	st->last_emitted[member] = size_bytes;
+	st->last_emitted[idx] = size_bytes;
 	return emit_rss_stat_event(task, member, size_bytes, rss_flags);
 }
 
