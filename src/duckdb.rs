@@ -133,7 +133,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -623,7 +623,20 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             -- sample_period cycles/ns of execution. NULL in traces recorded
             -- by systing < 1.9.
             sample_event VARCHAR,
-            sample_period BIGINT
+            sample_period BIGINT,
+            -- The memory recorder's capture-time configuration. memory_fault_leg
+            -- is how the page-fault leg ran: 'tracepoint' (x86), 'perf_sw'
+            -- (other arches) or 'off:<cause>' (the perf-event leg could not
+            -- be opened/attached on this host and the capture ran without it,
+            -- so memory_fault is empty by construction). The three rates are
+            -- the configured --memory-*-sample-rate values (1 in N; 0 or 1 =
+            -- every event), the scale factor a consumer applies to sampled
+            -- counts. NULL when the recorder (or memory-alloc) was not
+            -- enabled, and in traces recorded by systing < 1.14.
+            memory_fault_leg VARCHAR,
+            memory_fault_sample_rate BIGINT,
+            memory_map_sample_rate BIGINT,
+            memory_alloc_sample_rate BIGINT
         );
 
         -- Per-CPU static frequency limits (kHz) from sysfs cpufreq. Empty on

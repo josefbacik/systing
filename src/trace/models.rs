@@ -546,6 +546,26 @@ pub struct SysInfoRecord {
     /// nanoseconds ("cpu-clock") of execution. `None` in traces from
     /// systing < 1.9.
     pub sample_period: Option<i64>,
+    /// How the memory recorder's page-fault leg ran: "tracepoint" (x86,
+    /// `exceptions:page_fault_user`), "perf_sw" (every other arch, one
+    /// PERF_COUNT_SW_PAGE_FAULTS event per CPU) or "off:<cause>" (the
+    /// perf-event leg could not be opened or attached on this host, e.g.
+    /// "off:EMFILE", and the capture ran without it — `memory_fault` is then
+    /// empty by construction). `None` when the memory recorder was not
+    /// enabled, and in traces from systing < 1.14.
+    pub memory_fault_leg: Option<String>,
+    /// `--memory-fault-sample-rate` as configured: `memory_fault` holds 1 in
+    /// N user page faults (0 and 1 both mean every fault). `None` when the
+    /// memory recorder was not enabled, and in traces from systing < 1.14.
+    pub memory_fault_sample_rate: Option<i64>,
+    /// `--memory-map-sample-rate` as configured: each `memory_map` event
+    /// type is sampled 1 in N (1 = every event). `None` when the memory
+    /// recorder was not enabled, and in traces from systing < 1.14.
+    pub memory_map_sample_rate: Option<i64>,
+    /// `--memory-alloc-sample-rate` as configured (1 = every call). `None`
+    /// when the `memory-alloc` recorder was not enabled, and in traces from
+    /// systing < 1.14.
+    pub memory_alloc_sample_rate: Option<i64>,
 }
 
 /// Per-CPU static frequency limits from sysfs cpufreq, in kHz.
