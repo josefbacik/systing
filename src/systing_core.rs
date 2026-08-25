@@ -3133,9 +3133,7 @@ struct CgroupTarget {
 /// matching needs; without it the filter runs in legacy mode.
 fn kernel_has_task_under_cgroup_kfunc() -> bool {
     match libbpf_rs::btf::Btf::from_vmlinux() {
-        Ok(btf) => btf
-            .type_by_name::<libbpf_rs::btf::types::Func<'_>>("bpf_task_under_cgroup")
-            .is_some(),
+        Ok(btf) => btf_has_func(&btf, "bpf_task_under_cgroup"),
         Err(e) => {
             eprintln!(
                 "Warning: failed to open vmlinux BTF ({e}); \
@@ -3144,6 +3142,15 @@ fn kernel_has_task_under_cgroup_kfunc() -> bool {
             false
         }
     }
+}
+
+/// Does `btf` carry a FUNC named `name`? Kfuncs are ordinary kernel
+/// functions in vmlinux BTF, so this is the capability probe for any of
+/// them; it is the part of `kernel_has_task_under_cgroup_kfunc` a test can
+/// point at a real BTF with known positive and negative names.
+fn btf_has_func(btf: &libbpf_rs::btf::Btf<'_>, name: &str) -> bool {
+    btf.type_by_name::<libbpf_rs::btf::types::Func<'_>>(name)
+        .is_some()
 }
 
 /// Environment knob that forces the legacy `--cgroup` matching on a kernel that
@@ -3322,6 +3329,31 @@ fn add_cgroup_target_ref(prog: &libbpf_rs::ProgramMut<'_>, target: &CgroupTarget
 /// cgroup reference via the iterator program, and the slot is read back to
 /// confirm it holds that target's id — a silently-empty filter is exactly what
 /// this change exists to rule out.
+/// Userspace mirror of the BPF side's `struct cgroup_target_ref` (one entry
+/// of `cgroup_target_refs`): a kptr to the target cgroup, which reads back
+/// as zero from userspace, and the target's cgroup id beside it. The layout
+/// is what the id accessor derives its offset from; the size is checked
+/// against the bytes the map hands back, so a change on the BPF side fails
+/// loudly here instead of reading the wrong eight bytes.
+#[repr(C)]
+struct CgroupTargetRef {
+    cgrp: u64,
+    id: u64,
+}
+
+/// The `id` field of a `cgroup_target_refs` value as read from the map;
+/// `None` when the value is not the size of the struct.
+fn cgroup_target_ref_id(value: &[u8]) -> Option<u64> {
+    if value.len() != std::mem::size_of::<CgroupTargetRef>() {
+        return None;
+    }
+    let at = std::mem::offset_of!(CgroupTargetRef, id);
+    value
+        .get(at..at + std::mem::size_of::<u64>())
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_ne_bytes)
+}
+
 fn install_cgroup_targets(skel: &mut SystingSystemSkel, targets: &[CgroupTarget]) -> Result<()> {
     for (i, target) in targets.iter().enumerate() {
         let key = (i as u32).to_ne_bytes();
@@ -3342,13 +3374,23 @@ fn install_cgroup_targets(skel: &mut SystingSystemSkel, targets: &[CgroupTarget]
             .lookup(&key, libbpf_rs::MapFlags::ANY)
             .with_context(|| format!("Failed to read back cgroup_target_refs[{i}]"))?
             .ok_or_else(|| anyhow::anyhow!("cgroup_target_refs[{i}] is missing"))?;
-        // struct cgroup_target_ref { struct cgroup __kptr *cgrp; u64 id; }:
-        // the kptr reads back as zero from userspace, the id is what we check.
-        let id = slot
-            .get(8..16)
-            .and_then(|b| b.try_into().ok())
-            .map(u64::from_ne_bytes)
+        // The kptr reads back as zero from userspace; the id beside it is
+        // what the iterator program filled in (or left at zero).
+        let id = cgroup_target_ref_id(&slot)
             .ok_or_else(|| anyhow::anyhow!("cgroup_target_refs[{i}] has an unexpected size"))?;
+        if id == 0 {
+            bail!(
+                "--cgroup {}: the kernel could not resolve this cgroup (id {}) from the \
+                 tracer's cgroup namespace, so the iterator program left its slot empty. \
+                 That happens when systing runs in a container with a private cgroup \
+                 namespace and the host's cgroup filesystem mounted: the path is visible \
+                 but the cgroup is outside the namespace the kernel resolves it in. Run \
+                 systing in the host cgroup namespace, or set {CGROUP_FILTER_LEGACY_ENV} \
+                 to match a snapshot of the target's cgroups taken at start instead",
+                target.path,
+                target.id
+            );
+        }
         if id != target.id {
             bail!(
                 "cgroup_target_refs[{i}] holds cgroup id {id} after the iterator run, \
@@ -5278,5 +5320,41 @@ mod tests {
         let none = Config::default();
         assert!(!get_required_bpf_programs(&none, false, false, true)
             .contains("systing_cgroup_target_add"));
+    }
+
+    #[test]
+    fn cgroup_target_ref_id_reads_the_id_beside_the_kptr() {
+        // The value the map hands back: the kptr (zero from userspace) then
+        // the id, native endian, at the offset the mirror struct derives.
+        let mut value = [0u8; 16];
+        value[8..16].copy_from_slice(&0x1234_5678_9abc_def0u64.to_ne_bytes());
+        assert_eq!(cgroup_target_ref_id(&value), Some(0x1234_5678_9abc_def0));
+        // An unfilled slot reads as id 0 (the cgroup-namespace case).
+        assert_eq!(cgroup_target_ref_id(&[0u8; 16]), Some(0));
+        // Anything but the struct's size is refused, not mis-read.
+        assert_eq!(cgroup_target_ref_id(&[0u8; 8]), None);
+        assert_eq!(cgroup_target_ref_id(&[0u8; 24]), None);
+        assert_eq!(std::mem::size_of::<CgroupTargetRef>(), 16);
+        assert_eq!(std::mem::offset_of!(CgroupTargetRef, id), 8);
+    }
+
+    #[test]
+    fn btf_func_probe_sees_real_functions_and_not_invented_ones() {
+        // The capability probe behind the --cgroup mode choice, pointed at
+        // the running kernel's BTF: a function every Linux kernel exports
+        // must be found, an invented name must not. Skipped (with a note)
+        // where vmlinux BTF cannot be read.
+        let Ok(btf) = libbpf_rs::btf::Btf::from_vmlinux() else {
+            eprintln!("vmlinux BTF unavailable: skipping the BTF probe check");
+            return;
+        };
+        assert!(btf_has_func(&btf, "schedule"));
+        assert!(btf_has_func(&btf, "do_exit"));
+        assert!(!btf_has_func(&btf, "systing_no_such_kernel_function"));
+        // Reported, not asserted: whether this kernel has the kfunc.
+        eprintln!(
+            "bpf_task_under_cgroup in vmlinux BTF: {}",
+            btf_has_func(&btf, "bpf_task_under_cgroup")
+        );
     }
 }

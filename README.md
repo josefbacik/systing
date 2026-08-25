@@ -260,7 +260,12 @@ decided by the kernel's `bpf_task_under_cgroup()`, which needs **Linux kernel
 BTF) systing falls back to matching a snapshot of the target's cgroups taken
 when the trace starts, so cgroups created under the target afterwards are not
 traced; the mode in use is printed at start. Setting
-`SYSTING_CGROUP_FILTER_LEGACY=1` forces the fallback on any kernel.
+`SYSTING_CGROUP_FILTER_LEGACY` to any non-empty value (`=1` will do) forces the
+fallback on any kernel. The kernel resolves the target within systing's own
+cgroup namespace: from a container with a private cgroup namespace and the
+host's cgroup filesystem mounted, a host path is visible but cannot be
+resolved, and systing says so at start — run it in the host cgroup namespace
+or use the fallback.
 
 `--trace-event` - This will add an `instant` track event for each event that
 this tool captures.  The format is "<trace type>:<optional

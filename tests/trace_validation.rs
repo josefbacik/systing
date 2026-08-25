@@ -1538,6 +1538,126 @@ fn test_e2e_cgroup_filter_legacy_snapshot_fallback() {
     eprintln!("  outside workload pid {outside_pid}: not traced (correct)");
 }
 
+/// Kernel-mode `--cgroup` from a private cgroup namespace whose root does not
+/// contain the target: the kernel resolves the target within the caller's
+/// namespace, so it cannot be found, and systing must say so and name the
+/// fallback instead of failing on a bare map check. Runs systing as a child
+/// process (the test process's own namespaces are left alone): the child
+/// joins a leaf cgroup, unshares its cgroup namespace there, and asks for a
+/// sibling of that leaf. The second half runs the same command with the
+/// fallback forced and expects a trace.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_cgroup_filter_outside_cgroupns_names_the_cause() {
+    use std::process::Command;
+
+    let Some(cgroup_root) = systing::cgroup::cgroup2_root() else {
+        eprintln!("skipping: no cgroup v2 unified hierarchy on this system");
+        return;
+    };
+    if !Path::new("/usr/bin/unshare").exists() {
+        eprintln!("skipping: no /usr/bin/unshare on this system");
+        return;
+    }
+    let base = match current_cgroup_v2_path() {
+        Some(p) if p != "/" => cgroup_root.join(p.trim_start_matches('/')),
+        _ => cgroup_root,
+    };
+    //   <base>/systing-cgn-<pid>/inside/   <- the child joins this, then unshares
+    //                                         its cgroup namespace: this leaf is
+    //                                         the namespace's root
+    //   <base>/systing-cgn-<pid>/outside/  <- the --cgroup target: a sibling,
+    //                                         outside that root
+    let tag = format!("systing-cgn-{}", std::process::id());
+    let parent = base.join(&tag);
+    let inside = parent.join("inside");
+    let outside = parent.join("outside");
+
+    let mut fixture = CgroupFixture { dirs: Vec::new() };
+    match fixture.create(&parent) {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            eprintln!(
+                "skipping: cannot create a cgroup under {} ({e})",
+                base.display()
+            );
+            return;
+        }
+        Err(e) => panic!("Failed to create cgroup {}: {e}", parent.display()),
+    }
+    for dir in [&inside, &outside] {
+        fixture
+            .create(dir)
+            .unwrap_or_else(|e| panic!("Failed to create cgroup {}: {e}", dir.display()));
+    }
+
+    let out_dir = TempDir::new().expect("Failed to create temp dir");
+    let script = format!(
+        "echo $$ > {procs} && exec /usr/bin/unshare -C {systing} --cgroup {target} \
+         --duration 1 --no-stack-traces --output-dir {out} --output {out}/trace.pb",
+        procs = inside.join("cgroup.procs").display(),
+        systing = env!("CARGO_BIN_EXE_systing"),
+        target = outside.display(),
+        out = out_dir.path().display(),
+    );
+    let run = |force_legacy: bool| {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(&script);
+        if force_legacy {
+            cmd.env("SYSTING_CGROUP_FILTER_LEGACY", "1");
+        } else {
+            cmd.env_remove("SYSTING_CGROUP_FILTER_LEGACY");
+        }
+        let output = cmd
+            .output()
+            .expect("Failed to run systing in a cgroup namespace");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+
+    eprintln!(
+        "Running systing --cgroup {} from a private cgroup namespace rooted at {}",
+        outside.display(),
+        inside.display()
+    );
+    let (ok, stderr) = run(false);
+    if stderr.contains("does not export bpf_task_under_cgroup") {
+        eprintln!("kernel mode unavailable on this kernel; the namespace check only applies there");
+    } else {
+        assert!(
+            !ok,
+            "[cgroupns] systing should refuse a target outside its cgroup namespace:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("from the tracer's cgroup namespace"),
+            "[cgroupns] the refusal must name the cause:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("SYSTING_CGROUP_FILTER_LEGACY"),
+            "[cgroupns] the refusal must name the fallback:\n{stderr}"
+        );
+        eprintln!("  refused with the cause named (correct)");
+    }
+
+    let (ok, stderr) = run(true);
+    assert!(
+        ok,
+        "[cgroupns] the forced fallback should trace the same target:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("SYSTING_CGROUP_FILTER_LEGACY is set"),
+        "[cgroupns] the fallback run must announce its mode:\n{stderr}"
+    );
+    eprintln!("  forced fallback traced it (correct)");
+}
+
 // =============================================================================
 // Consolidated network suite
 //
