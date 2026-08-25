@@ -135,6 +135,7 @@ sudo systing --only-recorder sched --only-recorder network -d 10 --output trace.
 | `--marker-threshold <N>` | Stop after N marker instant events — **requires `--continuous`** |
 | `--marker-duration-threshold <MS>` | Stop when a marker range exceeds MS ms — **requires `--continuous`** |
 | `--ringbuf-size-mib <N>` | Increase BPF ring buffer size if events are lost |
+| `--ringbuf-shards <N>` | Rings per ring-buffer family: `0` (default) = one per CPU up to 64 at a constant family byte budget, except on kernels before 6.8, which keep 8; `8` restores the fixed eight-ring layout exactly |
 | `--resolve-addresses` | Resolve network IPs to hostnames via DNS (off by default) |
 
 ### TPU

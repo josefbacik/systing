@@ -241,7 +241,7 @@ Sets the target CPU stack-sampling rate in samples per second per CPU.
 The default is 1000.
 Sampling runs in fixed-period mode: with `--sw-event` (cpu-clock) the rate is exact; with the cpu-cycles hardware event it is the rate at the CPU's maximum frequency, so a throttled CPU samples proportionally slower.
 The chosen period is recorded in the trace's `sysinfo.sample_period` column.
-Higher values give finer-grained profiles at the cost of more overhead and larger traces; very high rates may be throttled by the kernel's perf interrupt-rate limit and can increase ringbuf drops (raise `--ringbuf-size-mib` if needed).
+Higher values give finer-grained profiles at the cost of more overhead and larger traces; very high rates may be throttled by the kernel's perf interrupt-rate limit and can increase ringbuf drops (raise `--ringbuf-size-mib` if needed). Ring buffers are sharded per CPU, up to 64 rings per family at a constant family byte budget; `--ringbuf-shards N` sets the count explicitly (`8` is the fixed layout of older releases), and kernels before 6.8 stay at 8 by default because inserting each ring costs them an RCU grace period at start.
 
 === *--sw-event*
 
