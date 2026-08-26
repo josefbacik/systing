@@ -4243,6 +4243,11 @@ impl Drop for StopPhase {
     }
 }
 
+/// Runs the capture until it is asked to stop, then runs the stop sequence.
+///
+/// Returns the `CLOCK_BOOTTIME` instant at which the tracing gate closed —
+/// the end of event collection, and the timestamp the trace's open sched
+/// slices close at.
 #[allow(clippy::too_many_arguments)]
 fn run_tracing_loop(
     handles: ThreadHandles,
@@ -4253,7 +4258,7 @@ fn run_tracing_loop(
     shutdown_signal: Arc<AtomicBool>,
     skel: &mut SystingSystemSkel,
     traced_child: &Option<crate::traced_command::TracedChild>,
-) -> Result<()> {
+) -> Result<i64> {
     sd_notify()?;
 
     if let Some(child) = traced_child.as_ref() {
@@ -4335,11 +4340,18 @@ fn run_tracing_loop(
         thread::sleep(Duration::from_secs(CONTINUOUS_MODE_STOP_DELAY_SECS));
     }
     println!("Stopping...");
-    {
+    // The instant event collection ends. Everything below (draining the
+    // rings, joining the pollers and the symbol loader) can take seconds on a
+    // loaded host, and the still-running sched slices must close at the gate,
+    // not at whatever time the trace is finally written — see
+    // `SessionRecorder::generate_parquet_trace`.
+    let capture_end_ts = {
         let _p = stop_phase("disable tracing gate");
         skel.maps.data_data.as_deref_mut().unwrap().tracing_enabled = false;
+        let ts = get_clock_value(libc::CLOCK_BOOTTIME) as i64;
         ringbuf_shutdown.signal();
-    }
+        ts
+    };
     {
         let _p = stop_phase("join ring buffer consumers");
         for thread in handles.ringbuf_threads {
@@ -4460,7 +4472,7 @@ fn run_tracing_loop(
         );
     }
 
-    Ok(())
+    Ok(capture_end_ts)
 }
 
 /// Main tracing function that sets up and runs the BPF-based system tracer.
@@ -4587,6 +4599,9 @@ pub fn systing(
     // joined after skel is dropped.
     let mut tpu_thread: Option<std::thread::JoinHandle<Result<crate::tpu::recorder::TpuRecorder>>> =
         None;
+    // The instant the tracing gate closed, set by `run_tracing_loop` inside
+    // the skel scope and consumed when the trace is written after it.
+    let capture_end_ts: i64;
 
     {
         let mut skel_builder = SystingSystemSkelBuilder::default();
@@ -5261,7 +5276,7 @@ pub fn systing(
             tpu_metrics_thread,
         };
 
-        run_tracing_loop(
+        capture_end_ts = run_tracing_loop(
             handles,
             &opts,
             stop_tx,
@@ -5341,7 +5356,7 @@ pub fn systing(
     println!("Writing Parquet trace files to {sink}...");
     {
         let _p = stop_phase("symbolize and write parquet");
-        recorder.generate_parquet_trace(tpu_recorder)?;
+        recorder.generate_parquet_trace(tpu_recorder, capture_end_ts)?;
     }
     println!("Successfully wrote Parquet trace files");
 

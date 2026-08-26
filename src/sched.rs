@@ -420,6 +420,13 @@ impl SchedEventRecorder {
     /// 2. Emit unpaired IRQs/softirqs with dur=0
     /// 3. Drain every locally buffered record type to the collector
     ///
+    /// `end_ts` is the instant event collection ended — the tracing gate, not
+    /// the time this method happens to run — and is where the final slices
+    /// close. A switch observed in the last microseconds before the gate can
+    /// carry a timestamp past it (the gate and the event clock are read
+    /// independently), so a slice that would end before it started is
+    /// closed with zero length instead of a negative one.
+    ///
     /// Returns the streaming collector so the caller can call finish() on it.
     pub fn finish(&mut self, end_ts: i64) -> Result<Option<Box<dyn RecordCollector + Send>>> {
         if self.streaming_collector.is_some() {
@@ -428,7 +435,7 @@ impl SchedEventRecorder {
                 .cpu_states
                 .iter()
                 .map(|(cpu, state)| {
-                    let dur = end_ts - state.start_ts;
+                    let dur = (end_ts - state.start_ts).max(0);
                     SchedSliceRecord {
                         ts: state.start_ts,
                         dur,
@@ -665,6 +672,75 @@ mod tests {
             .expect("runnable state from the waking event");
         assert_eq!(m.utid, woken.utid);
         assert_eq!(data.process_exits.len(), 1);
+    }
+
+    /// The final slice of a task still running when collection stops closes
+    /// at the end timestamp the caller passes — the tracing gate — and not
+    /// at any later time: `finish()` runs after the stop sequence (ring
+    /// drain, thread joins), and a slice closed "now" would carry all of it.
+    /// A switch whose timestamp lands past the gate (the event clock and the
+    /// gate are read independently, so the last in-flight event can) closes
+    /// with zero length, never a negative one.
+    #[test]
+    fn test_finish_closes_running_slices_at_the_gate() {
+        let mut recorder = create_test_recorder();
+        let handle = SharedInMemoryCollector::new();
+        recorder.set_streaming_collector(Box::new(handle.clone()));
+
+        let switch = |ts: u64, cpu: u32, tgidpid: u64| task_event {
+            r#type: event_type::SCHED_SWITCH,
+            ts,
+            cpu,
+            next: task_info {
+                tgidpid,
+                ..Default::default()
+            },
+            prev: task_info {
+                tgidpid,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // CPU 0: task 100 runs from 1_000 and is still running at the gate.
+        recorder.handle_event(switch(1_000, 0, 100));
+        // CPU 1: task 200 was switched in at 9_500, and a later switch to
+        // task 300 is stamped 10_020 — past the gate the caller will pass.
+        recorder.handle_event(switch(9_500, 1, 200));
+        recorder.handle_event(switch(10_020, 1, 300));
+
+        // The gate closed at 10_000; finish() itself runs "later".
+        recorder.finish(10_000).unwrap();
+        let inner = handle.0.lock().unwrap();
+        let data = inner.data();
+
+        let on_cpu = |cpu: i32| -> Vec<&SchedSliceRecord> {
+            data.sched_slices.iter().filter(|s| s.cpu == cpu).collect()
+        };
+
+        // CPU 0: one final slice, ended exactly at the gate.
+        let cpu0 = on_cpu(0);
+        assert_eq!(cpu0.len(), 1);
+        assert_eq!(cpu0[0].ts, 1_000);
+        assert_eq!(cpu0[0].dur, 9_000);
+        assert_eq!(cpu0[0].end_state, None);
+
+        // CPU 1: the completed slice keeps its event-clock length (9_500 →
+        // 10_020), and the task switched in past the gate gets a zero-length
+        // final slice, not a negative one.
+        let cpu1 = on_cpu(1);
+        assert_eq!(cpu1.len(), 2);
+        let completed = cpu1
+            .iter()
+            .find(|s| s.ts == 9_500)
+            .expect("the completed slice on CPU 1");
+        assert_eq!(completed.dur, 520);
+        let last = cpu1
+            .iter()
+            .find(|s| s.ts == 10_020)
+            .expect("the final slice on CPU 1");
+        assert_eq!(last.dur, 0);
+        assert_eq!(last.end_state, None);
     }
 
     #[test]
