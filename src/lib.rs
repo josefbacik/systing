@@ -32,6 +32,7 @@ pub mod analyze;
 pub mod mcp;
 
 // Core library modules
+pub mod bpf_load_shapes;
 pub mod build_id_store;
 pub mod cgroup;
 pub mod duckdb;
