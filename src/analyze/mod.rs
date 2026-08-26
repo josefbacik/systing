@@ -252,6 +252,16 @@ pub struct TraceSystemInfo {
     /// `--memory-thp-sample-rate` at capture time (1 in N splits).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_thp_sample_rate: Option<i64>,
+    /// iommu runs / VFIO windows the `memory_iommu` histogram could not
+    /// count (0 = complete, else a floor); `None` when the VFIO leg did not
+    /// run or for traces from systing < 1.16.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_iommu_overflow: Option<i64>,
+    /// What the end-of-capture AnonHugePages walk did
+    /// ("complete:<read>/<candidates>", "capped:…", "budget:…"); `None` when
+    /// the THP leg did not run or for traces from systing < 1.16.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_anon_huge_walk: Option<String>,
 }
 
 /// Trace metadata.
@@ -815,7 +825,7 @@ impl AnalyzeDb {
             }
         };
         let sql = format!(
-            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
+            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
             col("trace_id"),
             col("release"),
             col("machine"),
@@ -832,6 +842,8 @@ impl AnalyzeDb {
             col("memory_vfio_leg"),
             col("memory_thp_leg"),
             col("memory_thp_sample_rate"),
+            col("memory_iommu_overflow"),
+            col("memory_anon_huge_walk"),
         );
 
         let Ok(mut stmt) = self.conn.prepare(&sql) else {
@@ -855,6 +867,8 @@ impl AnalyzeDb {
                 memory_vfio_leg: row.get(13)?,
                 memory_thp_leg: row.get(14)?,
                 memory_thp_sample_rate: row.get(15)?,
+                memory_iommu_overflow: row.get(16)?,
+                memory_anon_huge_walk: row.get(17)?,
             })
         }) else {
             return Vec::new();
@@ -1271,10 +1285,11 @@ mod tests {
                  sample_event, sample_period, memory_fault_leg, \
                  memory_fault_sample_rate, memory_map_sample_rate, \
                  memory_alloc_sample_rate, memory_vfio_leg, memory_thp_leg, \
-                 memory_thp_sample_rate) \
+                 memory_thp_sample_rate, memory_iommu_overflow, \
+                 memory_anon_huge_walk) \
                  VALUES ('t1', 'Linux', '6.12.0', '#1 SMP', 'x86_64', \
                  NULL, 'kvm', 'Amazon EC2', 'm7i.16xlarge', 'cpu-clock', 1000000, \
-                 'tracepoint', 97, 1, NULL, 'on', NULL, NULL)",
+                 'tracepoint', 97, 1, NULL, 'on', NULL, NULL, 0, NULL)",
             )
             .unwrap();
         }
@@ -1306,6 +1321,12 @@ mod tests {
         assert_eq!(sys.memory_vfio_leg.as_deref(), Some("on"));
         assert_eq!(sys.memory_thp_leg, None);
         assert_eq!(sys.memory_thp_sample_rate, None);
+        assert_eq!(
+            sys.memory_iommu_overflow,
+            Some(0),
+            "0 overflow = the histogram is complete"
+        );
+        assert_eq!(sys.memory_anon_huge_walk, None);
     }
 
     #[test]

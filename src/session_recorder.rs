@@ -109,6 +109,20 @@ pub struct MemoryRecorderConfig {
     pub thp_sample_rate: Option<u32>,
 }
 
+/// What the memory recorder found at the END of the capture — facts a
+/// consumer needs beside the configuration to read the tables right, known
+/// only once the maps are drained and the end samples taken.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryRecorderEnd {
+    /// iommu:map/unmap runs and VFIO windows the `memory_iommu` histogram
+    /// could not count (`sysinfo.memory_iommu_overflow`); `None` when the
+    /// VFIO leg did not run.
+    pub iommu_overflow: Option<i64>,
+    /// The AnonHugePages walk's outcome (`sysinfo.memory_anon_huge_walk`);
+    /// `None` when the THP leg did not run.
+    pub anon_huge_walk: Option<String>,
+}
+
 /// Static per-CPU frequency limits from sysfs cpufreq, in kHz (sysfs's native
 /// unit). `base_freq_khz` is the sustained (non-turbo) frequency and is only
 /// exposed by some drivers (e.g. intel_pstate).
@@ -225,6 +239,9 @@ pub struct SessionRecorder {
     /// status, set once BPF is attached. Unset when the memory recorder is
     /// not enabled (the sysinfo columns are then NULL).
     pub memory_recorder_config: OnceLock<MemoryRecorderConfig>,
+    /// The memory recorder's end-of-capture facts (set at stop, before the
+    /// trace is written).
+    pub memory_recorder_end: OnceLock<MemoryRecorderEnd>,
 }
 
 pub fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -950,6 +967,7 @@ impl SessionRecorder {
             utid_generator,
             clock_sampling: OnceLock::new(),
             memory_recorder_config: OnceLock::new(),
+            memory_recorder_end: OnceLock::new(),
         }
     }
 
@@ -1588,6 +1606,7 @@ impl SessionRecorder {
         if let Some(utsname) = get_system_utsname() {
             let clock_sampling = self.clock_sampling.get();
             let memory = self.memory_recorder_config.get();
+            let memory_end = self.memory_recorder_end.get();
             writer.set_sysinfo(crate::trace::SysInfoRecord {
                 sysname: utsname.sysname().to_string(),
                 release: utsname.release().to_string(),
@@ -1606,6 +1625,8 @@ impl SessionRecorder {
                 memory_vfio_leg: memory.and_then(|m| m.vfio_leg.clone()),
                 memory_thp_leg: memory.and_then(|m| m.thp_leg.clone()),
                 memory_thp_sample_rate: memory.and_then(|m| m.thp_sample_rate).map(i64::from),
+                memory_iommu_overflow: memory_end.and_then(|m| m.iommu_overflow),
+                memory_anon_huge_walk: memory_end.and_then(|m| m.anon_huge_walk.clone()),
             })?;
         }
 
@@ -2078,6 +2099,7 @@ mod tests {
             tpu_metrics_recorder: None,
             clock_sampling: OnceLock::new(),
             memory_recorder_config: OnceLock::new(),
+            memory_recorder_end: OnceLock::new(),
         }
     }
 

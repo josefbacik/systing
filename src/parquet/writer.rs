@@ -2330,6 +2330,8 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     let mut memory_vfio_leg_builder = StringBuilder::with_capacity(1, 16);
     let mut memory_thp_leg_builder = StringBuilder::with_capacity(1, 48);
     let mut memory_thp_sample_rate_builder = Int64Builder::with_capacity(1);
+    let mut memory_iommu_overflow_builder = Int64Builder::with_capacity(1);
+    let mut memory_anon_huge_walk_builder = StringBuilder::with_capacity(1, 32);
 
     sysname_builder.append_value(&record.sysname);
     release_builder.append_value(&record.release);
@@ -2348,6 +2350,8 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
     memory_vfio_leg_builder.append_option(record.memory_vfio_leg.as_deref());
     memory_thp_leg_builder.append_option(record.memory_thp_leg.as_deref());
     memory_thp_sample_rate_builder.append_option(record.memory_thp_sample_rate);
+    memory_iommu_overflow_builder.append_option(record.memory_iommu_overflow);
+    memory_anon_huge_walk_builder.append_option(record.memory_anon_huge_walk.as_deref());
 
     Ok(RecordBatch::try_new(
         schema.clone(),
@@ -2369,6 +2373,8 @@ fn build_sysinfo_batch(record: &SysInfoRecord, schema: &Arc<Schema>) -> Result<R
             Arc::new(memory_vfio_leg_builder.finish()),
             Arc::new(memory_thp_leg_builder.finish()),
             Arc::new(memory_thp_sample_rate_builder.finish()),
+            Arc::new(memory_iommu_overflow_builder.finish()),
+            Arc::new(memory_anon_huge_walk_builder.finish()),
         ],
     )?)
 }
@@ -3324,6 +3330,8 @@ mod tests {
                 memory_vfio_leg: Some("off:nosym".to_string()),
                 memory_thp_leg: Some("on:page-only".to_string()),
                 memory_thp_sample_rate: Some(13),
+                memory_iommu_overflow: None,
+                memory_anon_huge_walk: Some("capped:64/212".to_string()),
             })
             .unwrap();
         writer.finish().unwrap();
@@ -3348,6 +3356,8 @@ mod tests {
             Option<String>,
             Option<String>,
             Option<i64>,
+            Option<i64>,
+            Option<String>,
         );
 
         let conn = Connection::open(&db_path).unwrap();
@@ -3356,7 +3366,8 @@ mod tests {
                 "SELECT sysname, machine, cpufreq_driver, hypervisor, sys_vendor, product_name, \
                  sample_event, sample_period, memory_fault_leg, memory_fault_sample_rate, \
                  memory_map_sample_rate, memory_alloc_sample_rate, memory_vfio_leg, \
-                 memory_thp_leg, memory_thp_sample_rate FROM sysinfo",
+                 memory_thp_leg, memory_thp_sample_rate, memory_iommu_overflow, \
+                 memory_anon_huge_walk FROM sysinfo",
                 [],
                 |row| {
                     Ok((
@@ -3375,6 +3386,8 @@ mod tests {
                         row.get(12)?,
                         row.get(13)?,
                         row.get(14)?,
+                        row.get(15)?,
+                        row.get(16)?,
                     ))
                 },
             )
@@ -3398,6 +3411,11 @@ mod tests {
         assert_eq!(row.12, Some("off:nosym".to_string()));
         assert_eq!(row.13, Some("on:page-only".to_string()));
         assert_eq!(row.14, Some(13));
+        assert_eq!(
+            row.15, None,
+            "memory_iommu_overflow should round-trip as NULL when the VFIO leg is off"
+        );
+        assert_eq!(row.16, Some("capped:64/212".to_string()));
     }
 
     /// A sysinfo.parquet written before the memory columns existed (systing

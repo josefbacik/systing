@@ -5900,6 +5900,15 @@ int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
 	if (!old_brk)
 		return 0;
 
+	/* sys_brk returns an address or the unchanged break; the one error it
+	 * can return is -EINTR, when its mmap_write_lock_killable() fails
+	 * because a fatal signal is pending (the process is being killed). An
+	 * error carries no break: ret - old_brk would record -(old_brk + 4) as
+	 * a delta (a negative value of ~90 TB, seen in production as a
+	 * count=1 brk row with |bytes| ≡ 4 mod 4096). */
+	if ((s64)ctx->ret < 0)
+		return 0;
+
 	/* brk(0) queries the current break and failed brk returns it unchanged. */
 	if ((u64)ctx->ret == old_brk)
 		return 0;
@@ -6049,6 +6058,27 @@ struct vfio_iommu_type1_dma_unmap_uapi {
 
 /* include/uapi/linux/vfio.h: VFIO_DMA_UNMAP_FLAG_ALL — unmap every region. */
 #define MEMORY_VFIO_DMA_UNMAP_FLAG_ALL (1 << 1)
+/* Not a uapi flag: the unmap row stands for a container teardown
+ * (vfio_iommu_type1_release), which unmaps every region without an ioctl. */
+#define MEMORY_VFIO_FLAG_TEARDOWN (1u << 31)
+
+/* Open the window the iommu:map/unmap histogram counts in: the runs this
+ * task maps or unmaps inside [iova, iova + size) until the matching
+ * kretprobe closes it. A window that cannot be opened (the inflight hash is
+ * full: more than 1024 traced tasks inside a VFIO path at once) leaves
+ * this path's runs uncounted — counted under memory_iommu_overflow so the
+ * histogram reads as a floor rather than silently short. */
+static __always_inline void memory_vfio_open_window(u64 iova, u64 size)
+{
+	u64 tgidpid = bpf_get_current_pid_tgid();
+	struct memory_vfio_inflight inflight = { .iova = iova, .size = size };
+	if (bpf_map_update_elem(&memory_vfio_inflight, &tgidpid, &inflight, BPF_ANY)) {
+		u32 zero = 0;
+		u64 *dropped = bpf_map_lookup_elem(&memory_iommu_overflow, &zero);
+		if (dropped)
+			*dropped += 1;
+	}
+}
 
 static __always_inline int memory_vfio_emit(void *ctx, enum memory_event_type type,
 					    u64 iova, u64 size, u64 vaddr, u32 uflags)
@@ -6057,24 +6087,10 @@ static __always_inline int memory_vfio_emit(void *ctx, enum memory_event_type ty
 	if (!trace_task(task))
 		return 0;
 
-	/* Open the window for the iommu:map/unmap histogram: the runs this
-	 * ioctl maps or unmaps are the ones inside [iova, iova + size). A
-	 * window that cannot be opened (the inflight hash is full: more than
-	 * 1024 traced tasks inside a VFIO ioctl at once) leaves this ioctl's
-	 * runs uncounted — counted under memory_iommu_overflow so the
-	 * histogram reads as a floor rather than silently short. */
-	u64 tgidpid = bpf_get_current_pid_tgid();
-	struct memory_vfio_inflight inflight = { .iova = iova, .size = size };
-	if (type == MEMORY_VFIO_UNMAP && (uflags & MEMORY_VFIO_DMA_UNMAP_FLAG_ALL)) {
-		inflight.iova = 0;
-		inflight.size = ~0ULL;
-	}
-	if (bpf_map_update_elem(&memory_vfio_inflight, &tgidpid, &inflight, BPF_ANY)) {
-		u32 zero = 0;
-		u64 *dropped = bpf_map_lookup_elem(&memory_iommu_overflow, &zero);
-		if (dropped)
-			*dropped += 1;
-	}
+	if (type == MEMORY_VFIO_UNMAP && (uflags & MEMORY_VFIO_DMA_UNMAP_FLAG_ALL))
+		memory_vfio_open_window(0, ~0ULL);
+	else
+		memory_vfio_open_window(iova, size);
 
 	long flags;
 	struct memory_event *event = reserve_memory_event(&flags);
@@ -6129,6 +6145,52 @@ int BPF_KRETPROBE(systing_vfio_dma_map_ret)
 
 SEC("kretprobe/vfio_dma_do_unmap")
 int BPF_KRETPROBE(systing_vfio_dma_unmap_ret)
+{
+	return memory_vfio_close_window();
+}
+
+/* ---- Teardown without an ioctl: container release and group detach ----
+ *
+ * Closing the last file of a VFIO container runs vfio_iommu_type1_release,
+ * which unmaps and unpins every region (vfio_iommu_unmap_unpin_all); a
+ * group detaching from a domain (vfio_iommu_type1_detach_group) unmaps the
+ * regions from that domain, every one of them when it was the domain's last
+ * group. Neither passes vfio_dma_do_unmap, so without these probes a model
+ * unload that simply closes its device files would leave no unmap row and
+ * its iommu:unmap runs outside any window. The release pair opens a
+ * [0, ~0) window and writes one unmap row flagged MEMORY_VFIO_FLAG_TEARDOWN
+ * (iova 0, size ~0: "everything"); the detach pair only opens the window,
+ * because how much a detach unmaps is known only from the runs the
+ * histogram then counts. Both functions are static ops callbacks of the
+ * vfio_iommu_type1 module (out-of-line, so kallsyms lists them while the
+ * module is loaded); the release runs in the closing task, so trace_task()
+ * decides attribution exactly as for the ioctls.
+ */
+SEC("kprobe/vfio_iommu_type1_release")
+int BPF_KPROBE(systing_vfio_release, void *iommu_data)
+{
+	return memory_vfio_emit(ctx, MEMORY_VFIO_UNMAP, 0, ~0ULL, 0,
+				MEMORY_VFIO_DMA_UNMAP_FLAG_ALL | MEMORY_VFIO_FLAG_TEARDOWN);
+}
+
+SEC("kretprobe/vfio_iommu_type1_release")
+int BPF_KRETPROBE(systing_vfio_release_ret)
+{
+	return memory_vfio_close_window();
+}
+
+SEC("kprobe/vfio_iommu_type1_detach_group")
+int BPF_KPROBE(systing_vfio_detach_group, void *iommu_data, void *iommu_group)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	memory_vfio_open_window(0, ~0ULL);
+	return 0;
+}
+
+SEC("kretprobe/vfio_iommu_type1_detach_group")
+int BPF_KRETPROBE(systing_vfio_detach_group_ret)
 {
 	return memory_vfio_close_window();
 }
@@ -6219,23 +6281,27 @@ int systing_iommu_unmap(struct systing_iommu_unmap_args *ctx)
 
 /* ---- THP splits: sampled kprobes on the split paths ----
  *
- * Two kinds, matching /proc/vmstat: thp_split_pmd (a PMD mapping split into
- * PTEs, the folio intact) is probed at __split_huge_pmd, the public entry
- * the split_huge_pmd() macro calls only for a huge PMD (the same name at
- * 6.6, 6.12 and 6.18; the static worker __split_huge_pmd_locked that holds
- * the counter is inlined in some builds, so it is not a probe target). The
- * rmap paths that split a PMD directly through split_huge_pmd_locked
- * (try_to_unmap / try_to_migrate on 6.10+) are not attributed here — they
- * show in the vmstat delta only. thp_split_page / thp_split_page_failed
- * count at the end of the folio split whose entry is
- * split_huge_page_to_list (<= 6.8) or split_huge_page_to_list_to_order
- * (>= 6.9; at 6.18 the counter sits in its static callee __folio_split);
- * the entry's return value is the result: 0 split, -EBUSY/-EAGAIN failed.
- * Userspace loads the programs whose symbols the running kernel has and
- * records the leg in sysinfo.memory_thp_leg. Splits run in task context
- * (madvise, munmap, reclaim, migration), so the memory ring is written as
- * usual; the leg is 1:N sampled (memory_thp_sample_rate, 0 = off) because
- * reclaim storms can split thousands of folios a second.
+ * Two kinds, matching /proc/vmstat. thp_split_pmd (a PMD mapping split into
+ * PTEs, the folio intact) is counted in the static worker
+ * __split_huge_pmd_locked, which every PMD split reaches — the
+ * split_huge_pmd() callers through __split_huge_pmd, and the rmap paths
+ * (try_to_unmap / try_to_migrate on 6.10+) through split_huge_pmd_locked.
+ * When kallsyms lists the worker, the probe sits there and counts exactly
+ * what vmstat counts; when the build inlined it, the fallback probes the
+ * public entry __split_huge_pmd, which is also reached for a PMD that is
+ * NOT huge (split_huge_pmd_address calls it for any populated PMD on a VMA
+ * adjust), so the entry probe over-counts on VMA churn and misses the rmap
+ * paths; userspace records which one ran (sysinfo.memory_thp_leg
+ * on:pmd-entry). thp_split_page / thp_split_page_failed count at the end of
+ * the folio split whose entry is split_huge_page_to_list (<= 6.8) or
+ * split_huge_page_to_list_to_order (>= 6.9; at 6.18 the counter sits in its
+ * static callee __folio_split); the entry's return value is the result: 0
+ * split, -EBUSY/-EAGAIN failed. Userspace loads the programs whose symbols
+ * the running kernel has and records the leg in sysinfo.memory_thp_leg.
+ * Splits run in task context (madvise, munmap, reclaim, migration), so the
+ * memory ring is written as usual; the leg is 1:N sampled
+ * (memory_thp_sample_rate, 0 = off) because reclaim storms can split
+ * thousands of folios a second.
  */
 static __always_inline bool memory_thp_sample_hit(void)
 {
@@ -6281,6 +6347,15 @@ SEC("kprobe/__split_huge_pmd")
 int BPF_KPROBE(systing_thp_split_pmd, void *vma, void *pmd, unsigned long address)
 {
 	return memory_thp_emit(ctx, MEMORY_THP_SPLIT_PMD, address, 0);
+}
+
+/* The worker every PMD split reaches (see above); `freeze` is set when the
+ * split is for migration or unmap (the PTEs are written as migration
+ * entries), clear for a plain split — carried in the row's flags. */
+SEC("kprobe/__split_huge_pmd_locked")
+int BPF_KPROBE(systing_thp_split_pmd_locked, void *vma, void *pmd, unsigned long haddr, bool freeze)
+{
+	return memory_thp_emit(ctx, MEMORY_THP_SPLIT_PMD, haddr, freeze ? 1 : 0);
 }
 
 SEC("kretprobe/split_huge_page_to_list_to_order")

@@ -27,8 +27,8 @@ use crate::perf_recorder::PerfCounterRecorder;
 use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::session_recorder::{
-    get_clock_value, ClockSamplingConfig, MemoryFaultLeg, MemoryRecorderConfig, MissedEvent,
-    SessionRecorder, SysInfoEvent,
+    get_clock_value, ClockSamplingConfig, MemoryFaultLeg, MemoryRecorderConfig, MemoryRecorderEnd,
+    MissedEvent, SessionRecorder, SysInfoEvent,
 };
 use crate::stack_recorder::StackRecorder;
 
@@ -708,10 +708,13 @@ pub fn get_required_bpf_programs(
     // recorded as off in sysinfo instead.
     if opts.memory && opts.memory_vfio && memory_legs.vfio_off.is_none() {
         required.extend(MEMORY_VFIO_BPF_PROGRAMS);
+        if memory_legs.vfio_teardown_off.is_none() {
+            required.extend(MEMORY_VFIO_TEARDOWN_BPF_PROGRAMS);
+        }
     }
     if opts.memory && opts.memory_thp_sample_rate > 0 {
-        if memory_legs.thp_pmd_off.is_none() {
-            required.insert("systing_thp_split_pmd");
+        if let Some(prog) = memory_legs.thp_pmd_prog {
+            required.insert(prog);
         }
         if let Some(prog) = memory_legs.thp_page_prog {
             required.insert(prog);
@@ -734,43 +737,80 @@ const MEMORY_VFIO_BPF_PROGRAMS: &[&str] = &[
     "systing_iommu_unmap",
 ];
 
+/// The teardown half of the VFIO leg: the container release and the group
+/// detach unmap regions without an ioctl, so they get their own window (and
+/// the release its own unmap row). Loaded as a set, on top of the ioctl set.
+const MEMORY_VFIO_TEARDOWN_BPF_PROGRAMS: &[&str] = &[
+    "systing_vfio_release",
+    "systing_vfio_release_ret",
+    "systing_vfio_detach_group",
+    "systing_vfio_detach_group_ret",
+];
+
+/// The PMD-split probe at the worker every split reaches
+/// (`__split_huge_pmd_locked`): counts what vmstat's thp_split_pmd counts.
+const THP_PMD_LOCKED_PROG: &str = "systing_thp_split_pmd_locked";
+/// The PMD-split probe at the public entry (`__split_huge_pmd`), the fallback
+/// for a build that inlined the worker: reached for any populated PMD on a
+/// VMA adjust, so it over-counts on VMA churn and misses the rmap paths.
+const THP_PMD_ENTRY_PROG: &str = "systing_thp_split_pmd";
+
 /// Which of the memory recorder's optional kernel legs this host can serve,
-/// probed once from kallsyms and tracefs before the skeleton is opened.
-/// `None` in an `*_off` field means available; `Some(cause)` is the short
-/// cause recorded in `sysinfo` (`off:<cause>`).
+/// probed once from kallsyms and tracefs before the skeleton is opened and
+/// revised once more at attach (a leg whose probes fail to attach is turned
+/// off for the capture, the rest of the recorder runs). `None` in an
+/// `*_off` field means available; `Some(cause)` is the short cause recorded
+/// in `sysinfo` (`off:<cause>`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryKernelLegs {
-    /// Why the VFIO/IOMMU legs cannot attach here (`nosym`: the
+    /// Why the VFIO/IOMMU legs cannot run here (`nosym`: the
     /// vfio_iommu_type1 module is not loaded; `notracepoint`: no iommu
-    /// tracepoints).
+    /// tracepoints; `attach`: a probe failed to attach).
     pub vfio_off: Option<String>,
-    /// Why the PMD split kprobe cannot attach (`nosym`).
-    pub thp_pmd_off: Option<String>,
+    /// Why the teardown pair (container release, group detach) cannot run
+    /// while the ioctl pair can (`nosym`, `attach`); the leg then reads
+    /// `on:noteardown` and close-path unmaps stay invisible.
+    pub vfio_teardown_off: Option<String>,
+    /// The PMD-split program: [`THP_PMD_LOCKED_PROG`] when kallsyms lists
+    /// the worker, else [`THP_PMD_ENTRY_PROG`]; `None` when the kernel has
+    /// neither symbol (or the probe failed to attach).
+    pub thp_pmd_prog: Option<&'static str>,
     /// The folio-split kretprobe program to load: the 6.9+ entry
     /// (`split_huge_page_to_list_to_order`) or the 6.6-series one
     /// (`split_huge_page_to_list`), whichever the kernel has; `None` when
     /// neither does.
     pub thp_page_prog: Option<&'static str>,
+    /// Why the THP leg is off when both programs are `None` (`nosym`,
+    /// `attach`).
+    pub thp_off: Option<String>,
 }
 
 impl MemoryKernelLegs {
-    /// The `sysinfo.memory_thp_leg` value for these legs: `on` when both
-    /// the PMD-split and the folio-split probes attach, `on:pmd-only` /
-    /// `on:page-only` when one symbol is missing, `off:<cause>` when both are.
+    /// The `sysinfo.memory_thp_leg` value for these legs: `on` when the
+    /// PMD-split worker probe and the folio-split probe attach,
+    /// `on:pmd-entry` when the PMD probe had to sit at the public entry
+    /// (over-counts VMA churn), `on:pmd-only` / `on:page-only` when one
+    /// half is missing, `off:<cause>` when both are.
     pub fn thp_leg_value(&self) -> String {
-        match (self.thp_page_prog, &self.thp_pmd_off) {
-            (Some(_), None) => "on".to_string(),
-            (Some(_), Some(_)) => "on:page-only".to_string(),
-            (None, None) => "on:pmd-only".to_string(),
-            (None, Some(cause)) => format!("off:{cause}"),
+        let pmd_locked = self.thp_pmd_prog == Some(THP_PMD_LOCKED_PROG);
+        match (self.thp_pmd_prog, self.thp_page_prog) {
+            (Some(_), Some(_)) if pmd_locked => "on".to_string(),
+            (Some(_), Some(_)) => "on:pmd-entry".to_string(),
+            (None, Some(_)) => "on:page-only".to_string(),
+            (Some(_), None) if pmd_locked => "on:pmd-only".to_string(),
+            (Some(_), None) => "on:pmd-only:entry".to_string(),
+            (None, None) => format!("off:{}", self.thp_off.as_deref().unwrap_or("nosym")),
         }
     }
 
-    /// The `sysinfo.memory_vfio_leg` value for these legs.
+    /// The `sysinfo.memory_vfio_leg` value for these legs: `on`,
+    /// `on:noteardown` (the ioctl pair runs, the release/detach pair does
+    /// not), or `off:<cause>`.
     pub fn vfio_leg_value(&self) -> String {
-        match &self.vfio_off {
-            None => "on".to_string(),
-            Some(cause) => format!("off:{cause}"),
+        match (&self.vfio_off, &self.vfio_teardown_off) {
+            (Some(cause), _) => format!("off:{cause}"),
+            (None, Some(_)) => "on:noteardown".to_string(),
+            (None, None) => "on".to_string(),
         }
     }
 }
@@ -788,6 +828,9 @@ fn probe_memory_kernel_legs(opts: &Config) -> MemoryKernelLegs {
     let wanted: &[&str] = &[
         "vfio_dma_do_map",
         "vfio_dma_do_unmap",
+        "vfio_iommu_type1_release",
+        "vfio_iommu_type1_detach_group",
+        "__split_huge_pmd_locked",
         "__split_huge_pmd",
         "split_huge_page_to_list_to_order",
         "split_huge_page_to_list",
@@ -799,11 +842,20 @@ fn probe_memory_kernel_legs(opts: &Config) -> MemoryKernelLegs {
         } else if !iommu_tracepoints_present() {
             legs.vfio_off = Some("notracepoint".to_string());
         }
+        if !present.contains("vfio_iommu_type1_release")
+            || !present.contains("vfio_iommu_type1_detach_group")
+        {
+            legs.vfio_teardown_off = Some("nosym".to_string());
+        }
     }
     if opts.memory_thp_sample_rate > 0 {
-        if !present.contains("__split_huge_pmd") {
-            legs.thp_pmd_off = Some("nosym".to_string());
-        }
+        legs.thp_pmd_prog = if present.contains("__split_huge_pmd_locked") {
+            Some(THP_PMD_LOCKED_PROG)
+        } else if present.contains("__split_huge_pmd") {
+            Some(THP_PMD_ENTRY_PROG)
+        } else {
+            None
+        };
         legs.thp_page_prog = if present.contains("split_huge_page_to_list_to_order") {
             Some("systing_thp_split_page")
         } else if present.contains("split_huge_page_to_list") {
@@ -3015,7 +3067,12 @@ fn configure_bpf_skeleton(
         let autoload = required_programs.contains(name);
         // The cgroup iterator program is driven by userspace (install_cgroup_targets)
         // once per --cgroup target; skel.attach() must not create a link for it.
-        let manual_attach = name == "systing_cgroup_target_add";
+        // The memory recorder's kernel-probed legs attach one leg at a time
+        // after skel.attach() (attach_memory_kernel_legs), so a probe whose
+        // symbol went away between the kallsyms read and the attach turns
+        // that leg off instead of failing the capture.
+        let manual_attach =
+            name == "systing_cgroup_target_add" || is_memory_kernel_leg_program(name);
         if !autoload {
             prog.set_autoload(false);
         }
@@ -3806,6 +3863,108 @@ fn discover_allocator_paths(pids: &[u32]) -> (Vec<(String, &'static str)>, usize
         }
     }
     dedup_by_inode(raw)
+}
+
+/// Is `name` one of the memory recorder's kernel-probed leg programs, which
+/// are attached by `attach_memory_kernel_legs` rather than by `skel.attach()`.
+fn is_memory_kernel_leg_program(name: &str) -> bool {
+    MEMORY_VFIO_BPF_PROGRAMS.contains(&name)
+        || MEMORY_VFIO_TEARDOWN_BPF_PROGRAMS.contains(&name)
+        || name == THP_PMD_LOCKED_PROG
+        || name == THP_PMD_ENTRY_PROG
+        || name == "systing_thp_split_page"
+        || name == "systing_thp_split_page_legacy"
+}
+
+/// Attach the memory recorder's optional kernel legs (VFIO ioctl pair,
+/// VFIO teardown pair, THP PMD-split probe, THP folio-split probe), each as
+/// a unit: the first program of a leg that fails to attach drops that leg's
+/// links, records the cause in `legs` (read into `sysinfo` afterwards) and
+/// leaves the other legs and the rest of the capture running. A symbol can
+/// disappear between the kallsyms read and here (a module unload), and a
+/// kprobe can be refused on a symbol kallsyms lists but the kernel will not
+/// probe (a `.isra`/`.constprop` clone, a notrace function); neither should
+/// cost the CPU profile. Returns the links, which must outlive the capture.
+fn attach_memory_kernel_legs(
+    skel: &mut SystingSystemSkel,
+    opts: &Config,
+    legs: &mut MemoryKernelLegs,
+) -> Vec<libbpf_rs::Link> {
+    if !opts.memory {
+        return Vec::new();
+    }
+    let vfio_on = opts.memory_vfio && legs.vfio_off.is_none();
+    let thp_on = opts.memory_thp_sample_rate > 0;
+    let mut groups: Vec<(&str, Vec<&'static str>)> = Vec::new();
+    if vfio_on {
+        groups.push(("vfio", MEMORY_VFIO_BPF_PROGRAMS.to_vec()));
+        if legs.vfio_teardown_off.is_none() {
+            groups.push(("vfio-teardown", MEMORY_VFIO_TEARDOWN_BPF_PROGRAMS.to_vec()));
+        }
+    }
+    if thp_on {
+        if let Some(prog) = legs.thp_pmd_prog {
+            groups.push(("thp-pmd", vec![prog]));
+        }
+        if let Some(prog) = legs.thp_page_prog {
+            groups.push(("thp-page", vec![prog]));
+        }
+    }
+
+    let mut links = Vec::new();
+    let mut vfio_failed = false;
+    for (leg, programs) in groups {
+        // The teardown pair is meaningless without the ioctl pair's window
+        // bookkeeping having attached; skip it when the core leg failed.
+        if leg == "vfio-teardown" && vfio_failed {
+            legs.vfio_teardown_off = Some("attach".to_string());
+            continue;
+        }
+        let mut leg_links = Vec::new();
+        let mut failure: Option<(String, libbpf_rs::Error)> = None;
+        for prog in skel.object_mut().progs_mut() {
+            let name = prog.name().to_string_lossy().into_owned();
+            if !programs.contains(&name.as_str()) {
+                continue;
+            }
+            match prog.attach() {
+                Ok(link) => leg_links.push(link),
+                Err(e) => {
+                    failure = Some((name, e));
+                    break;
+                }
+            }
+        }
+        match failure {
+            None => links.extend(leg_links),
+            Some((name, e)) => {
+                // Dropping leg_links detaches the probes attached so far.
+                eprintln!(
+                    "memory recorder: {leg} leg off for this capture: {name} failed to attach: {e}"
+                );
+                match leg {
+                    "vfio" => {
+                        legs.vfio_off = Some("attach".to_string());
+                        vfio_failed = true;
+                    }
+                    "vfio-teardown" => legs.vfio_teardown_off = Some("attach".to_string()),
+                    "thp-pmd" => {
+                        legs.thp_pmd_prog = None;
+                        if legs.thp_page_prog.is_none() {
+                            legs.thp_off = Some("attach".to_string());
+                        }
+                    }
+                    _ => {
+                        legs.thp_page_prog = None;
+                        if legs.thp_pmd_prog.is_none() {
+                            legs.thp_off = Some("attach".to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    links
 }
 
 /// Attach malloc/free/... uprobes to each discovered allocator library. Probes
@@ -4618,7 +4777,7 @@ pub fn systing(
 
         // Which optional memory legs this kernel can serve (kallsyms +
         // tracefs), decided before the programs are selected for load.
-        let memory_legs = probe_memory_kernel_legs(&opts);
+        let mut memory_legs = probe_memory_kernel_legs(&opts);
         if opts.memory && opts.memory_vfio {
             println!(
                 "memory recorder: vfio/iommu leg {}",
@@ -4885,6 +5044,11 @@ pub fn systing(
 
         // Check for any probes that failed to attach and warn about them
         warn_failed_probe_attachments(&skel);
+
+        // The memory recorder's optional kernel legs, one leg at a time: a
+        // leg whose probe fails to attach is turned off for this capture
+        // (recorded in sysinfo) and the rest of the recorder runs.
+        let _memory_leg_links = attach_memory_kernel_legs(&mut skel, &opts, &mut memory_legs);
 
         // Attach any usdt's that we may have
         let _probe_links = attach_probes(&mut skel, &recorder, &opts, old_kernel)?;
@@ -5304,12 +5468,31 @@ pub fn systing(
             } else {
                 Vec::new()
             };
+            let iommu_overflow = (opts.memory_vfio && memory_legs.vfio_off.is_none())
+                .then(|| sum_percpu_counter(&skel.maps.memory_iommu_overflow) as i64);
             let mut memory = recorder.memory_recorder.lock().unwrap();
             memory.emit_iommu_hist(ts, &hist);
             memory.emit_vmstat_end(ts, crate::memory_recorder::read_vmstat_counters());
-            if opts.memory_thp_sample_rate > 0 {
-                memory.emit_anon_huge_pages(ts);
-            }
+            let anon_huge_walk = (opts.memory_thp_sample_rate > 0).then(|| {
+                let walk = memory.emit_anon_huge_pages(ts);
+                if walk.skipped_cap + walk.skipped_budget > 0 {
+                    println!(
+                        "memory recorder: AnonHugePages sample {}: {} processes read, {} gone, {} past the {}-process cap, {} past the {:?} budget (sysinfo.memory_anon_huge_walk)",
+                        walk.sysinfo_value(),
+                        walk.read,
+                        walk.gone,
+                        walk.skipped_cap,
+                        crate::memory_recorder::ANON_HUGE_WALK_MAX_TGIDS,
+                        walk.skipped_budget,
+                        crate::memory_recorder::ANON_HUGE_WALK_BUDGET,
+                    );
+                }
+                walk.sysinfo_value()
+            });
+            let _ = recorder.memory_recorder_end.set(MemoryRecorderEnd {
+                iommu_overflow,
+                anon_huge_walk,
+            });
         }
 
         // Load socket metadata from BPF map after tracing completes
@@ -5329,6 +5512,7 @@ pub fn systing(
         // the kernel on every CPU.
         let _p = stop_phase("detach bpf programs");
         drop(_memory_alloc_links);
+        drop(_memory_leg_links);
         drop(_probe_links);
         drop(skel);
     }
@@ -5595,10 +5779,15 @@ pub fn bpf_load_probe(
 
     let memory_legs = match legs {
         LegSelection::Host => probe_memory_kernel_legs(opts),
-        LegSelection::Force { thp_page_prog } => MemoryKernelLegs {
+        LegSelection::Force {
+            thp_pmd_prog,
+            thp_page_prog,
+        } => MemoryKernelLegs {
             vfio_off: None,
-            thp_pmd_off: None,
+            vfio_teardown_off: None,
+            thp_pmd_prog: Some(thp_pmd_prog),
             thp_page_prog: Some(thp_page_prog),
+            thp_off: None,
         },
     };
     let collect_pystacks = opts.collect_pystacks;
@@ -5964,12 +6153,18 @@ mod tests {
         };
         let all = MemoryKernelLegs {
             vfio_off: None,
-            thp_pmd_off: None,
+            vfio_teardown_off: None,
+            thp_pmd_prog: Some(THP_PMD_LOCKED_PROG),
             thp_page_prog: Some("systing_thp_split_page"),
+            thp_off: None,
         };
         let req = get_required_bpf_programs(&asked, false, false, false, &all);
         assert!(MEMORY_VFIO_BPF_PROGRAMS.iter().all(|p| req.contains(p)));
-        assert!(req.contains("systing_thp_split_pmd"));
+        assert!(MEMORY_VFIO_TEARDOWN_BPF_PROGRAMS
+            .iter()
+            .all(|p| req.contains(p)));
+        assert!(req.contains(THP_PMD_LOCKED_PROG));
+        assert!(!req.contains(THP_PMD_ENTRY_PROG));
         assert!(req.contains("systing_thp_split_page"));
         assert!(!req.contains("systing_thp_split_page_legacy"));
         assert_eq!(all.vfio_leg_value(), "on");
@@ -5983,8 +6178,28 @@ mod tests {
         assert!(req.contains("systing_thp_split_page_legacy"));
         assert!(!req.contains("systing_thp_split_page"));
         assert_eq!(legacy.thp_leg_value(), "on");
+
+        // A build that inlined the worker: the entry probe, and the leg
+        // says so.
+        let entry = MemoryKernelLegs {
+            thp_pmd_prog: Some(THP_PMD_ENTRY_PROG),
+            ..all.clone()
+        };
+        let req = get_required_bpf_programs(&asked, false, false, false, &entry);
+        assert!(req.contains(THP_PMD_ENTRY_PROG));
+        assert!(!req.contains(THP_PMD_LOCKED_PROG));
+        assert_eq!(entry.thp_leg_value(), "on:pmd-entry");
+        assert_eq!(
+            MemoryKernelLegs {
+                thp_page_prog: None,
+                ..entry.clone()
+            }
+            .thp_leg_value(),
+            "on:pmd-only:entry"
+        );
+
         let page_only = MemoryKernelLegs {
-            thp_pmd_off: Some("nosym".to_string()),
+            thp_pmd_prog: None,
             ..all.clone()
         };
         assert_eq!(page_only.thp_leg_value(), "on:page-only");
@@ -5995,14 +6210,32 @@ mod tests {
         };
         assert_eq!(pmd_only.thp_leg_value(), "on:pmd-only");
 
+        // The ioctl pair without the teardown pair (an older module build).
+        let no_teardown = MemoryKernelLegs {
+            vfio_teardown_off: Some("nosym".to_string()),
+            ..all.clone()
+        };
+        let req = get_required_bpf_programs(&asked, false, false, false, &no_teardown);
+        assert!(MEMORY_VFIO_BPF_PROGRAMS.iter().all(|p| req.contains(p)));
+        assert!(MEMORY_VFIO_TEARDOWN_BPF_PROGRAMS
+            .iter()
+            .all(|p| !req.contains(p)));
+        assert_eq!(no_teardown.vfio_leg_value(), "on:noteardown");
+
         let none = MemoryKernelLegs {
             vfio_off: Some("nosym".to_string()),
-            thp_pmd_off: Some("nosym".to_string()),
+            vfio_teardown_off: Some("nosym".to_string()),
+            thp_pmd_prog: None,
             thp_page_prog: None,
+            thp_off: None,
         };
         let req = get_required_bpf_programs(&asked, false, false, false, &none);
         assert!(MEMORY_VFIO_BPF_PROGRAMS.iter().all(|p| !req.contains(p)));
-        assert!(!req.contains("systing_thp_split_pmd"));
+        assert!(MEMORY_VFIO_TEARDOWN_BPF_PROGRAMS
+            .iter()
+            .all(|p| !req.contains(p)));
+        assert!(!req.contains(THP_PMD_LOCKED_PROG));
+        assert!(!req.contains(THP_PMD_ENTRY_PROG));
         assert!(!req.contains("systing_thp_split_page"));
         assert_eq!(none.vfio_leg_value(), "off:nosym");
         assert_eq!(none.thp_leg_value(), "off:nosym");
@@ -6013,6 +6246,15 @@ mod tests {
             }
             .vfio_leg_value(),
             "off:notracepoint"
+        );
+        // After a failed attach the cause says so.
+        assert_eq!(
+            MemoryKernelLegs {
+                thp_off: Some("attach".to_string()),
+                ..Default::default()
+            }
+            .thp_leg_value(),
+            "off:attach"
         );
 
         // Off by default: a kernel that has everything still loads nothing

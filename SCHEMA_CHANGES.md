@@ -443,6 +443,81 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 19 (unreleased) — 2026-08-26
+
+Follow-ups to the VFIO/THP legs from reading the kernel they probe: the
+PMD-split probe moves to the worker every split reaches, device-container
+teardown gets its own window, the per-process AnonHugePages walk is bounded,
+and two facts a reader needed from stdout now sit in `sysinfo`. The tables
+keep their columns; the new columns are nullable.
+
+### Added columns
+- `sysinfo`: added `memory_iommu_overflow BIGINT` — how many `iommu:map` /
+  `iommu:unmap` runs or VFIO windows the `memory_iommu` histogram could not
+  count (its BPF hash or the in-flight table was full): 0 means the
+  histogram is complete, anything else that it is a floor; NULL when the
+  VFIO leg did not run. Added `memory_anon_huge_walk VARCHAR` — what the
+  end-of-capture AnonHugePages walk (the `memory_rss` member -6 rows) did:
+  `complete:<read>/<candidates>` when every live candidate was read,
+  `capped:<read>/<candidates>` when the per-capture cap of 64 processes
+  stopped it, `budget:<read>/<candidates>` when its 500 ms budget did
+  (`candidates` = every process that produced a memory event; those gone
+  by capture end are neither). A capped or budgeted walk read the
+  processes whose memory events moved the most bytes first, so a process
+  without a member -6 row under `capped:` / `budget:` was a small one, not
+  a gone one. NULL when the THP leg did not run.
+
+### Changed meaning (same columns)
+- `memory_thp` rows with `kind = 'pmd'`: the probe now sits at
+  `__split_huge_pmd_locked`, the worker every PMD split reaches and where
+  `/proc/vmstat` counts `thp_split_pmd`, when the kernel exports it
+  (`sysinfo.memory_thp_leg = on` / `on:pmd-only`). A row is then one counted
+  split — the `split_huge_pmd()` callers AND the rmap paths
+  (`try_to_unmap` / `try_to_migrate` on 6.10+), so the per-process rows are
+  bounded by the vmstat delta — and `result` carries the split's `freeze`
+  flag (1: the split was for migration or unmap, the PTEs written as
+  migration entries; 0: a plain split). On a build that inlined the worker
+  the probe falls back to the public entry `__split_huge_pmd`
+  (`memory_thp_leg = on:pmd-entry` / `on:pmd-only:entry`), which is also
+  reached for a PMD that is not huge (`split_huge_pmd_address` calls it for
+  any populated PMD on a VMA adjust): those rows over-count on VMA churn,
+  miss the rmap paths, and carry `result = 0` — read the vmstat delta as
+  the host-wide truth there, as before.
+- `memory_vfio`: a container's regions are also unmapped WITHOUT an
+  ioctl — when the last file of the container is closed
+  (`vfio_iommu_type1_release`: every region) or a group detaches from a
+  domain (`vfio_iommu_type1_detach_group`). The release now writes one
+  `op = 'unmap'` row with `flags` bit 31 set — `flags < 0` in the INTEGER
+  column (not a uapi flag; the uapi `VFIO_DMA_UNMAP_FLAG_ALL` bit is set
+  beside it), `iova = 0`, `size = -1` (all ones: every region), `vaddr`
+  NULL and the stack of the closing thread — so a model unload that just
+  closes its device files shows up; a detach writes no
+  row (how much it unmaps depends on whether it was the domain's last
+  group) but opens the histogram window, so its `iommu:unmap` runs are
+  counted in `memory_iommu` like an ioctl's. Both are probed only when
+  kallsyms lists the two functions: `sysinfo.memory_vfio_leg` reads
+  `on:noteardown` when the ioctl pair attached but the teardown pair did
+  not (close-path unmaps then stay invisible, as in v18), `on` when both
+  did. The `VFIO_DMA_UNMAP_FLAG_ALL` ioctl row keeps `size = 0` and
+  `flags >= 0` as in v18; the teardown row's `size = -1` / `flags < 0`
+  tells the two "everything" rows apart.
+- `sysinfo.memory_vfio_leg` / `memory_thp_leg`: a leg whose probes fail to
+  ATTACH (a module unloaded between the symbol read and the attach, a
+  symbol the kernel will not probe) now turns only that leg off —
+  `off:attach`, or `on:noteardown` for the teardown pair alone — and the
+  capture runs; before, `skel.attach()` failed the whole capture, CPU
+  profile included.
+
+### Behaviour change (no schema effect)
+- `memory_map` `brk` rows: an `-EINTR` return from `brk` (the process is
+  being killed while the syscall waits for the mmap lock) no longer
+  produces a row. The exit handler used to compute `ret - old_brk` with
+  `ret = -4`, recording a delta of `-(old_brk + 4)` — a negative value of
+  tens of TB whose magnitude is ≡ 4 (mod 4096). An error return carries
+  no break.
+- The AnonHugePages walk at the end of a THP-leg capture is bounded (64
+  processes, heaviest first, 500 ms), see `memory_anon_huge_walk` above.
+
 ## Schema Version 18 (unreleased) — 2026-08-25
 
 The memory recorder learns about device DMA mappings and transparent huge
@@ -496,10 +571,13 @@ is written whenever the memory recorder runs.
   below its size — `bytes` is exact, `count` per order is the rounding.
   Only the vfio_iommu_type1 container path is instrumented: a host whose
   devices are attached through iommufd (`/dev/iommu`, the cdev path) maps
-  through `iommufd_ioas_map` instead, reads `memory_vfio_leg = off:nosym`
-  and gets no `memory_vfio` / `memory_iommu` rows although DMA mappings
-  happen; the same string appears when the kernel's symbols carry a
-  `.isra` / `.constprop` suffix the exact-name probe does not match.
+  through `iommufd_ioas_map` instead and gets no `memory_vfio` /
+  `memory_iommu` rows although DMA mappings happen — it reads
+  `memory_vfio_leg = off:nosym` only when the vfio_iommu_type1 module is
+  not loaded at all (with the module loaded beside iommufd the leg reads
+  `on` and simply sees nothing). The same `off:nosym` appears when the
+  kernel's symbols carry a `.isra` / `.constprop` suffix the exact-name
+  probe does not match.
 - `memory_thp` — sampled transparent-huge-page splits: `id`, `ts`, `utid`,
   `kind` (`pmd`: a PMD mapping split into PTEs, `addr` = the virtual
   address, what `/proc/vmstat` counts as `thp_split_pmd` — probed at
@@ -536,8 +614,8 @@ is written whenever the memory recorder runs.
   the THP-split leg ran (`--memory-thp-sample-rate` > 0, i.e.
   `sysinfo.memory_thp_leg` is not NULL): each sample is a kernel
   page-table walk of that process, which is why the plain memory recorder
-  does not take it (from the first release after v1.15.2; v1.15.0–v1.15.2
-  took it on every memory capture).
+  does not take it (from v1.15.4; v1.15.0–v1.15.3 took it on every memory
+  capture).
 - `sysinfo`: added `memory_vfio_leg VARCHAR` (`on`, or `off:nosym` when
   the vfio_iommu_type1 module is not loaded / `off:notracepoint` when the
   kernel has no iommu tracepoints; NULL when `--memory-vfio` was not
