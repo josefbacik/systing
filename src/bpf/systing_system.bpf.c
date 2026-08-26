@@ -5489,14 +5489,15 @@ static __always_inline int handle_rss_stat(struct task_struct *task,
 	 * register it compares is its choice: clang 21 at the default -mcpu
 	 * (v3) checks a 32-bit copy of the argument and later rebuilds the
 	 * index from the zero-extended raw argument in another register, two
-	 * map-helper calls later; clang 18 at -mcpu=v1 compares the index
-	 * register itself. Whether a bound on the copy reaches the index
-	 * register is then the verifier's choice: a vanilla 6.12.0 propagates
-	 * it, the newer 6.12-stable and 6.18 verifiers on the affected hosts
-	 * do not and reject the whole object at the first st->...[] store
-	 * ("R0 unbounded memory access, make sure to bounds check any such
-	 * access"). An explicit mask on the index register itself is bounded
-	 * on every verifier and under every compiler.
+	 * map-helper calls later — and the verifier does not carry a bound
+	 * from a 32-bit copy of an unknown 64-bit value back to the original,
+	 * so it reaches the st->...[] stores with no bound on the index and
+	 * rejects the whole object ("R0 unbounded memory access, make sure to
+	 * bounds check any such access"). clang 18 at -mcpu=v1 happens to
+	 * compare the index register itself. Note that this store path is
+	 * live only when tool_config.memory_rss_threshold_bytes is non-zero:
+	 * at the object's default the verifier prunes it as dead code, so a
+	 * load test must set the threshold to exercise it at all.
 	 *
 	 * The barrier comes FIRST. With the entry check dominating, the
 	 * optimizer proves `member & (NR_MM_COUNTERS - 1) == member` and

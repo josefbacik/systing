@@ -16,6 +16,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq libjemalloc2
+      - name: Install clang 21 (the release build's BPF compiler)
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh -O /tmp/llvm.sh
+          sudo bash /tmp/llvm.sh 21
+          clang-21 --version
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -34,6 +39,7 @@ jobs:
           DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
           DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
           LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+          SYSTING_BPF_CLANG: "clang-21"
         run: cargo test --workspace --no-default-features
 
   fmt:
@@ -52,6 +58,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq libjemalloc2
+      - name: Install clang 21 (the release build's BPF compiler)
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh -O /tmp/llvm.sh
+          sudo bash /tmp/llvm.sh 21
+          clang-21 --version
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -70,4 +81,5 @@ jobs:
           DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
           DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
           LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+          SYSTING_BPF_CLANG: "clang-21"
         run: cargo clippy --workspace --no-default-features -- -D warnings
