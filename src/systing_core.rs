@@ -4439,7 +4439,7 @@ fn run_tracing_loop(
         let dropped = sum_percpu_counter(&skel.maps.memory_iommu_overflow);
         if dropped > 0 {
             println!(
-                "memory-vfio: {dropped} iommu map/unmap runs not counted (histogram full; memory_iommu is a floor)"
+                "memory-vfio: {dropped} iommu map/unmap runs or VFIO ioctl windows not counted (histogram or inflight table full; memory_iommu is a floor)"
             );
         }
     }
@@ -5274,7 +5274,13 @@ pub fn systing(
 
         // The memory recorder's end-of-capture rows, while skel is still
         // alive: the IOMMU run-size histogram the tracepoints counted into,
-        // the closing vmstat sample, and each traced process's AnonHugePages.
+        // the closing vmstat sample, and — only when the THP-split leg was
+        // requested — each traced process's AnonHugePages. That last read
+        // is one /proc/<pid>/smaps_rollup per live traced process, a
+        // page-table walk the kernel performs on every read (seconds on a
+        // host whose processes map terabytes at 4 KiB), so it belongs to
+        // the capture that asked the huge-page question, not to every
+        // memory capture.
         if opts.memory {
             let _p = stop_phase("memory recorder end samples");
             let ts = get_clock_value(libc::CLOCK_BOOTTIME) as i64;
@@ -5286,7 +5292,9 @@ pub fn systing(
             let mut memory = recorder.memory_recorder.lock().unwrap();
             memory.emit_iommu_hist(ts, &hist);
             memory.emit_vmstat_end(ts, crate::memory_recorder::read_vmstat_counters());
-            memory.emit_anon_huge_pages(ts);
+            if opts.memory_thp_sample_rate > 0 {
+                memory.emit_anon_huge_pages(ts);
+            }
         }
 
         // Load socket metadata from BPF map after tracing completes

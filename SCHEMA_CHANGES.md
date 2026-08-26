@@ -484,9 +484,22 @@ is written whenever the memory recorder runs.
   by construction — the host's other IOMMU users (NIC / NVMe DMA-API
   mappings on an IOMMU-translated host) are never in it. The BPF map holds
   131072 entries (≈23 processes with 150 GiB arenas at every size order);
-  runs that find it full are dropped and counted (systing prints
-  `memory-vfio: N iommu map/unmap runs not counted`), so the table is a
-  floor in that case.
+  runs that find it full are dropped and counted, as is an ioctl whose
+  window could not be opened (more than 1024 traced tasks inside a VFIO
+  ioctl at once) — systing prints `memory-vfio: N iommu map/unmap runs or
+  VFIO ioctl windows not counted` — so the table is a floor in that case.
+  Two more reading rules: a container attached to several IOMMU domains
+  fires the tracepoints once per domain, so its runs are counted once per
+  domain (compare `count` against `memory_vfio` sizes per domain count);
+  and `size_order` is floor(log2) of the run, so a run that is not a
+  power of two (a partially huge-page-backed tail) lands in the order
+  below its size — `bytes` is exact, `count` per order is the rounding.
+  Only the vfio_iommu_type1 container path is instrumented: a host whose
+  devices are attached through iommufd (`/dev/iommu`, the cdev path) maps
+  through `iommufd_ioas_map` instead, reads `memory_vfio_leg = off:nosym`
+  and gets no `memory_vfio` / `memory_iommu` rows although DMA mappings
+  happen; the same string appears when the kernel's symbols carry a
+  `.isra` / `.constprop` suffix the exact-name probe does not match.
 - `memory_thp` — sampled transparent-huge-page splits: `id`, `ts`, `utid`,
   `kind` (`pmd`: a PMD mapping split into PTEs, `addr` = the virtual
   address, what `/proc/vmstat` counts as `thp_split_pmd` — probed at
@@ -495,7 +508,12 @@ is written whenever the memory recorder runs.
   the folio itself split, `result` = the kernel's return value, 0 = split,
   negative errno = failed — `thp_split_page` / `thp_split_page_failed`),
   `addr` (NULL for `page`), `result`, `stack_id`. 1 in N sampled
-  (`sysinfo.memory_thp_sample_rate`).
+  (`sysinfo.memory_thp_sample_rate`). Kernel-version notes: on 6.9+ the
+  `page` kretprobe is `split_huge_page_to_list_to_order`, which every
+  large-folio split goes through (file and shmem folios included), so its
+  rows are a superset of the vmstat `thp_split_page` family; on 6.15+ the
+  `folio_split` path can bypass it, so the vmstat delta stays the
+  host-wide truth and the rows are the sampled, attributed subset.
 - `memory_vmstat` — `/proc/vmstat` counters sampled at the start and the
   end of the capture: `name`, `ts_start`, `value_start`, `ts_end`,
   `value_end`. The THP allocation and split families (`thp_fault_alloc`,
@@ -514,7 +532,12 @@ is written whenever the memory recorder runs.
   THP-backed anonymous bytes (`AnonHugePages` from
   `/proc/<pid>/smaps_rollup`), sampled once at the end of the capture for
   every process that produced a memory event and was still alive — "did
-  this process get huge pages", beside its `anon` rows.
+  this process get huge pages", beside its `anon` rows. Present only when
+  the THP-split leg ran (`--memory-thp-sample-rate` > 0, i.e.
+  `sysinfo.memory_thp_leg` is not NULL): each sample is a kernel
+  page-table walk of that process, which is why the plain memory recorder
+  does not take it (from the first release after v1.15.2; v1.15.0–v1.15.2
+  took it on every memory capture).
 - `sysinfo`: added `memory_vfio_leg VARCHAR` (`on`, or `off:nosym` when
   the vfio_iommu_type1 module is not loaded / `off:notracepoint` when the
   kernel has no iommu tracepoints; NULL when `--memory-vfio` was not

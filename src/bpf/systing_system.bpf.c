@@ -6057,14 +6057,23 @@ static __always_inline int memory_vfio_emit(void *ctx, enum memory_event_type ty
 		return 0;
 
 	/* Open the window for the iommu:map/unmap histogram: the runs this
-	 * ioctl maps or unmaps are the ones inside [iova, iova + size). */
+	 * ioctl maps or unmaps are the ones inside [iova, iova + size). A
+	 * window that cannot be opened (the inflight hash is full: more than
+	 * 1024 traced tasks inside a VFIO ioctl at once) leaves this ioctl's
+	 * runs uncounted — counted under memory_iommu_overflow so the
+	 * histogram reads as a floor rather than silently short. */
 	u64 tgidpid = bpf_get_current_pid_tgid();
 	struct memory_vfio_inflight inflight = { .iova = iova, .size = size };
 	if (type == MEMORY_VFIO_UNMAP && (uflags & MEMORY_VFIO_DMA_UNMAP_FLAG_ALL)) {
 		inflight.iova = 0;
 		inflight.size = ~0ULL;
 	}
-	bpf_map_update_elem(&memory_vfio_inflight, &tgidpid, &inflight, BPF_ANY);
+	if (bpf_map_update_elem(&memory_vfio_inflight, &tgidpid, &inflight, BPF_ANY)) {
+		u32 zero = 0;
+		u64 *dropped = bpf_map_lookup_elem(&memory_iommu_overflow, &zero);
+		if (dropped)
+			*dropped += 1;
+	}
 
 	long flags;
 	struct memory_event *event = reserve_memory_event(&flags);

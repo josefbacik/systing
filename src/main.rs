@@ -129,7 +129,7 @@ struct Command {
     /// With the memory recorder, also record VFIO DMA regions (one memory_vfio row per VFIO_IOMMU_MAP_DMA/UNMAP_DMA, with stacks) and the IOMMU map/unmap run-size histogram (memory_iommu: how fragmented the memory behind device mappings is). Needs the vfio_iommu_type1 module loaded; otherwise the leg is off (sysinfo.memory_vfio_leg) and the capture proceeds.
     #[arg(long)]
     memory_vfio: bool,
-    /// With the memory recorder, sample 1 in N transparent-huge-page splits into memory_thp (0 = off, 1 = every split). The host-wide split/fallback/compaction counters are always sampled into memory_vmstat when the memory recorder runs.
+    /// With the memory recorder, sample 1 in N transparent-huge-page splits into memory_thp (0 = off, 1 = every split), and record each traced process's AnonHugePages at capture end (memory_rss member -6; one /proc/<pid>/smaps_rollup page-table walk per live process, so only with this leg). The host-wide split/fallback/compaction counters are always sampled into memory_vmstat when the memory recorder runs.
     #[arg(long, default_value = "0")]
     memory_thp_sample_rate: u32,
     /// Override the minimum byte-drift between emitted rss_stat events (default: max(16 MiB, 64*nr_cpus*page_size); 0 = emit every event)
