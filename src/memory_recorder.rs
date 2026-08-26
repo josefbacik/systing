@@ -279,7 +279,10 @@ impl MemoryRecorder {
 
     /// One `memory_rss` row (member `MEMORY_MEMBER_ANON_HUGE`) per process
     /// that produced a memory event and is still alive, read from
-    /// `/proc/<pid>/smaps_rollup`.
+    /// `/proc/<pid>/smaps_rollup`. Each read is a page-table walk of that
+    /// process in the kernel, so the caller runs this only for captures
+    /// that asked the huge-page question (the THP-split leg), never on
+    /// every memory capture.
     pub fn emit_anon_huge_pages(&mut self, ts: i64) {
         let tgids: Vec<i32> = self.seen_tgids.iter().copied().collect();
         if tgids.is_empty() {

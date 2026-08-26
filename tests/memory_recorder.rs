@@ -111,6 +111,20 @@ fn test_memory_recorder_e2e() {
         max_anon,
         RSS_SANITY_CEILING_BYTES
     );
+    // The AnonHugePages sample (member -6) belongs to the THP-split leg:
+    // a plain memory capture must not take the per-process smaps_rollup
+    // walk, so it writes no such row.
+    let anon_huge_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_rss WHERE member = -6",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Failed to query memory_rss anon_huge rows");
+    assert_eq!(
+        anon_huge_rows, 0,
+        "[memory_rss] anon_huge rows (member=-6) written without the THP-split leg"
+    );
     eprintln!(
         "    {} anon-RSS rows, max {} MiB",
         anon_rows,
