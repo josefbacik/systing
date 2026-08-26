@@ -1510,9 +1510,18 @@ impl SessionRecorder {
     /// Flushes all streaming recorders and writes process/thread metadata to
     /// the configured sink. Streaming must have been initialized via
     /// `init_streaming_output` before calling this method.
+    ///
+    /// `end_ts` is the `CLOCK_BOOTTIME` instant at which event collection
+    /// ended (the tracing gate), and it is where the sched slices still open
+    /// at that point close. It must be the gate and not "now": this runs after
+    /// the rings have been drained and every collection thread joined, which
+    /// on a loaded host is seconds or minutes later, and a slice closed at
+    /// that later time would stretch the trace's last slice per CPU by the
+    /// whole stop sequence.
     pub fn generate_parquet_trace(
         &self,
         tpu_recorder: Option<crate::tpu::recorder::TpuRecorder>,
+        end_ts: i64,
     ) -> Result<()> {
         // Per-stage elapsed lines below let fleet log pipelines attribute
         // stop-phase cost without relying on collector timestamp granularity.
@@ -1523,9 +1532,6 @@ impl SessionRecorder {
             *start = std::time::Instant::now();
         };
         eprintln!("Generating Parquet trace...");
-
-        // Get the end timestamp for flushing streaming data
-        let end_ts = get_clock_value(libc::CLOCK_BOOTTIME) as i64;
 
         // Step 1: Finish streaming collection in every event recorder shard
         // and retrieve the collector. The shards share one underlying writer

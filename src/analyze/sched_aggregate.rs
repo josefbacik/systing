@@ -66,6 +66,14 @@
 //!   that its state is unknown); CPUs with no events at all are reported as
 //!   unobserved, never assumed idle or busy. Waits that do not end inside the
 //!   window are counted as censored, never extrapolated.
+//! - The default window is the trace's own extent: from its first slice or
+//!   runnable marker to the end of its last slice. The recorder closes the
+//!   slices still open when collection stops at the instant the tracing gate
+//!   closed, so that end is the end of collection. (Traces written by
+//!   recorders before that change closed them after the stop sequence — ring
+//!   drain and thread joins — so on a loaded host their window, `slice_len`
+//!   maximum and every per-window count or rate carry that stop latency;
+//!   compare such rows by `window_ns`, not by `max`.)
 //!
 //! Percentiles come from a log-linear histogram (16 sub-buckets per octave,
 //! upper bucket edge reported, so a percentile is at most 6.25% above the
