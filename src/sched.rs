@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::record::RecordCollector;
+use crate::record::{RecordCollector, SchedRecordBatch};
 use crate::ringbuf::RingBuffer;
 use crate::systing_core::types::event_type;
 use crate::systing_core::types::task_event;
@@ -343,10 +343,13 @@ impl SchedEventRecorder {
             + self.pending_process_exits.len()
     }
 
-    /// Hand all locally buffered records to the collector. The collector may
-    /// be shared with the other per-ring recorder shards, so this is the only
-    /// place that writes records to it: batching keeps the shards from
-    /// serializing on the shared writer's lock.
+    /// Hand all locally buffered records to the collector in one
+    /// `add_sched_batch` call. The collector may be shared with the other
+    /// per-ring recorder shards, so this is the only place that writes records
+    /// to it, and the whole batch goes through one acquisition of the shared
+    /// writer's lock rather than one per record: with every shard flushing
+    /// thousands of records at once, per-record locking made the shards fight
+    /// over the mutex's futex for the length of each flush.
     ///
     /// Every buffer is fully drained even when individual adds fail: a failed
     /// record is warned about and dropped (matching the previous per-record
@@ -358,46 +361,19 @@ impl SchedEventRecorder {
         let Some(collector) = &mut self.streaming_collector else {
             return Ok(());
         };
-        let mut failed = 0usize;
-        let warn = |what: &str, e: anyhow::Error, failed: &mut usize| {
-            eprintln!("Warning: Failed to stream {what}: {e}");
-            *failed += 1;
+        let batch = SchedRecordBatch {
+            slices: &mut self.pending_slices,
+            thread_states: &mut self.pending_thread_states,
+            irq_slices: &mut self.pending_irq_slices,
+            softirq_slices: &mut self.pending_softirq_slices,
+            wakeup_news: &mut self.pending_wakeup_news,
+            sched_migrates: &mut self.pending_sched_migrates,
+            process_exits: &mut self.pending_process_exits,
         };
-        for record in self.pending_slices.drain(..) {
-            if let Err(e) = collector.add_sched_slice(record) {
-                warn("sched slice", e, &mut failed);
-            }
+        if batch.is_empty() {
+            return Ok(());
         }
-        for record in self.pending_thread_states.drain(..) {
-            if let Err(e) = collector.add_thread_state(record) {
-                warn("thread state", e, &mut failed);
-            }
-        }
-        for record in self.pending_irq_slices.drain(..) {
-            if let Err(e) = collector.add_irq_slice(record) {
-                warn("IRQ slice", e, &mut failed);
-            }
-        }
-        for record in self.pending_softirq_slices.drain(..) {
-            if let Err(e) = collector.add_softirq_slice(record) {
-                warn("softirq slice", e, &mut failed);
-            }
-        }
-        for record in self.pending_wakeup_news.drain(..) {
-            if let Err(e) = collector.add_wakeup_new(record) {
-                warn("wakeup_new", e, &mut failed);
-            }
-        }
-        for record in self.pending_sched_migrates.drain(..) {
-            if let Err(e) = collector.add_sched_migrate(record) {
-                warn("sched_migrate", e, &mut failed);
-            }
-        }
-        for record in self.pending_process_exits.drain(..) {
-            if let Err(e) = collector.add_process_exit(record) {
-                warn("process_exit", e, &mut failed);
-            }
-        }
+        let failed = collector.add_sched_batch(batch);
         if failed > 0 {
             anyhow::bail!("failed to stream {failed} sched/IRQ records");
         }

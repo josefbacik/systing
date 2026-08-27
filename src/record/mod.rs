@@ -5,4 +5,4 @@
 
 pub mod collector;
 
-pub use collector::{InMemoryCollector, RecordCollector, SharedCollector};
+pub use collector::{InMemoryCollector, RecordCollector, SchedRecordBatch, SharedCollector};
