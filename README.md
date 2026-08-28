@@ -17,6 +17,11 @@ cargo build
 sudo ./target/debug/systing --duration 60
 ```
 
+The BPF objects are compiled with `-mcpu=v3 -fwrapv` (pinned in `build.rs`)
+so a local build produces the same programs as a release build; set
+`SYSTING_BPF_CLANG=/path/to/clang-21` to also use the release build's
+compiler version (clang 21), otherwise `clang` on `PATH` is used.
+
 Alternatively, install directly with cargo. Use `--locked` so the build uses
 the dependency versions from `Cargo.lock`:
 
