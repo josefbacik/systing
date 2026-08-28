@@ -5507,6 +5507,215 @@ pub fn systing(
     Ok(exit_code)
 }
 
+/// Load-only probe of the BPF object at one configuration: open the skeleton,
+/// configure it exactly as [`systing`] does for `opts` (rodata, map sizes,
+/// the autoload set), load it into the kernel, and attach nothing. The report
+/// carries, per program, whether it was selected for load, its instruction
+/// count, and — for the programs `log_level` puts at verifier log level 2 —
+/// the set of instructions the verifier visited, read from that log, so a
+/// caller can tell which code a configuration shape actually verified.
+///
+/// Why this exists: the verifier constant-folds the frozen `.rodata`
+/// configuration and prunes the branches it makes unreachable, so a load at
+/// one shape proves nothing about code another shape enables. A program the
+/// verifier rejected under the memory recorder's configuration had loaded
+/// cleanly everywhere at the defaults because the rejected instructions were
+/// dead at the defaults. `crate::bpf_load_shapes` drives this probe over the
+/// shapes that ship and unions the visited sets.
+///
+/// `log_level` is consulted once per selected program and returns the
+/// verifier log level to load it with: 0 is the plain load (the cheapest
+/// read — a rejection still comes back with its log, because libbpf retries
+/// a failed load at level 1 to fetch it), 2 records every instruction the
+/// verifier visited. Level 2 is expensive — the verifier formats a line per
+/// instruction per state, and the VM rig runs without KVM — so a coverage
+/// read asks for it only on the programs it still needs.
+///
+/// Requires CAP_BPF/CAP_PERFMON (root). libbpf's print callback is replaced
+/// for the duration of the load and restored afterwards; probes in one
+/// process are serialized on a lock, so two tests in one binary cannot
+/// interleave their captures.
+///
+/// `legs` selects how the kernel-probed memory legs are decided: `Host`
+/// probes this kernel as [`systing`] does (a leg whose symbol the host lacks
+/// is left unloaded); `Force` selects them regardless, which is what a
+/// load-only read wants — a kprobe or tracepoint program verifies without
+/// its attach target, so a host without the VFIO module can still verify
+/// the VFIO programs.
+pub fn bpf_load_probe(
+    opts: &Config,
+    legs: crate::bpf_load_shapes::LegSelection,
+    log_level: &dyn Fn(&str) -> u32,
+) -> Result<crate::bpf_load_shapes::LoadReport> {
+    use crate::bpf_load_shapes::{LegSelection, LoadReport, ProgramLoad};
+    use libbpf_rs::PrintLevel;
+    use std::collections::BTreeSet;
+
+    // The libbpf print callback is a plain function pointer, so the capture
+    // buffer is process-global, and one probe at a time owns it.
+    static CAPTURE: Mutex<String> = Mutex::new(String::new());
+    static PROBE: Mutex<()> = Mutex::new(());
+    fn capture_print(_level: PrintLevel, msg: String) {
+        if let Ok(mut buf) = CAPTURE.lock() {
+            buf.push_str(&msg);
+        }
+    }
+    let _probe = PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let cgroup_filter = resolve_cgroup_filter(opts)?;
+    let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
+    if opts.ringbuf_size_mib >= 4096 {
+        bail!(
+            "--ringbuf-size-mib {} is out of range: a ring is at most 4095 MiB",
+            opts.ringbuf_size_mib
+        );
+    }
+    let kernel = kernel_release_major_minor();
+    let ring_plan = plan_ringbufs(num_cpus, opts.ringbuf_size_mib, opts.ringbuf_shards, kernel);
+    let old_kernel = is_old_kernel();
+
+    // The recorder is only consulted for trace-event probes while configuring;
+    // no output sink is initialised for a load-only probe.
+    let recorder = Arc::new(SessionRecorder::new(
+        false,
+        false,
+        opts.marker_threshold,
+        opts.marker_duration_threshold,
+        false,
+    ));
+    configure_recorder(opts, &recorder);
+
+    let skel_builder = SystingSystemSkelBuilder::default();
+    let mut open_object = MaybeUninit::uninit();
+    let mut open_skel = skel_builder
+        .open(&mut open_object)
+        .with_context(|| "Failed to open BPF skeleton. Ensure BPF is supported on your kernel.")?;
+
+    let memory_legs = match legs {
+        LegSelection::Host => probe_memory_kernel_legs(opts),
+        LegSelection::Force { thp_page_prog } => MemoryKernelLegs {
+            vfio_off: None,
+            thp_pmd_off: None,
+            thp_page_prog: Some(thp_page_prog),
+        },
+    };
+    let collect_pystacks = opts.collect_pystacks;
+    configure_bpf_skeleton(
+        &mut open_skel,
+        opts,
+        num_cpus,
+        old_kernel,
+        collect_pystacks,
+        cgroup_filter.kernel_mode(),
+        &memory_legs,
+        &recorder,
+        ring_plan,
+    )?;
+
+    // The map sizing systing() performs between configure and load, for the
+    // shapes without perf counters or cgroup targets (both are attach-time
+    // inputs a load-only probe does not take): perf_counters at zero events
+    // and missed_events at one slot per CPU.
+    open_skel
+        .maps
+        .rodata_data
+        .as_deref_mut()
+        .unwrap()
+        .tool_config
+        .num_perf_counters = 0;
+    open_skel
+        .maps
+        .perf_counters
+        .set_max_entries(0)
+        .with_context(|| "Failed to set perf_counters map size to 0 entries")?;
+    open_skel
+        .maps
+        .missed_events
+        .set_max_entries(num_cpus)
+        .with_context(|| format!("Failed to set missed_events map size to {num_cpus} entries"))?;
+
+    let required = get_required_bpf_programs(
+        opts,
+        old_kernel,
+        collect_pystacks,
+        cgroup_filter.kernel_mode(),
+        &memory_legs,
+    );
+    let mut autoloaded: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for mut prog in open_skel.open_object_mut().progs_mut() {
+        let name = prog
+            .name()
+            .to_str()
+            .expect("BPF program name is not valid UTF-8")
+            .to_string();
+        if required.contains(name.as_str()) {
+            let level = log_level(&name);
+            if level > 0 {
+                prog.set_log_level(level);
+            }
+            autoloaded.push(name);
+        } else {
+            skipped.push(name);
+        }
+    }
+
+    CAPTURE.lock().unwrap().clear();
+    let previous = libbpf_rs::set_print(Some((PrintLevel::Debug, capture_print)));
+    let load_result = open_skel.load();
+    libbpf_rs::set_print(previous);
+    let log = std::mem::take(&mut *CAPTURE.lock().unwrap());
+
+    // Instruction counts are read from the LOADED object: subprogram calls
+    // are appended to each caller at load, and the verifier log indexes that
+    // final program, not the one the open object holds.
+    let (loaded, error, insn_counts): (bool, Option<String>, HashMap<String, usize>) =
+        match load_result {
+            Ok(skel) => {
+                let counts = skel
+                    .object()
+                    .progs()
+                    .map(|p| (p.name().to_string_lossy().into_owned(), p.insn_cnt()))
+                    .collect();
+                (true, None, counts)
+            }
+            Err(e) => (false, Some(format!("{e:#}")), HashMap::new()),
+        };
+    let sections = crate::bpf_load_shapes::split_prog_load_logs(&log);
+    let mut programs = Vec::new();
+    for name in autoloaded {
+        let visited: BTreeSet<u32> = sections
+            .get(name.as_str())
+            .map(|s| crate::bpf_load_shapes::visited_insns(s))
+            .unwrap_or_default();
+        let verifier_log = sections.get(name.as_str()).cloned();
+        let insn_total = insn_counts.get(&name).copied().unwrap_or(0);
+        programs.push(ProgramLoad {
+            name,
+            autoload: true,
+            insn_total,
+            visited,
+            verifier_log,
+        });
+    }
+    for name in skipped {
+        programs.push(ProgramLoad {
+            name,
+            autoload: false,
+            insn_total: 0,
+            visited: BTreeSet::new(),
+            verifier_log: None,
+        });
+    }
+    Ok(LoadReport {
+        loaded,
+        error,
+        programs,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
