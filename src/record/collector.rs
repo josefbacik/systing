@@ -155,6 +155,61 @@ pub trait RecordCollector {
     /// Add a TPU runtime metric record.
     fn add_tpu_metric(&mut self, record: TpuMetricRecord) -> Result<()>;
 
+    /// Add a batch of scheduler-lane records, draining every buffer in the
+    /// batch. Returns the number of records that could not be added; each
+    /// failure is warned about and dropped rather than aborting the batch, so
+    /// one bad record cannot silently discard the rest of a buffer.
+    ///
+    /// The default forwards record by record through the `add_*` methods.
+    /// A collector that guards shared state should override it so the whole
+    /// batch goes through one guard acquisition: the sched recorder's ring
+    /// shards flush tens of thousands of records at a time into one
+    /// [`SharedCollector`], and taking its mutex per record turns every flush
+    /// into a futex storm between the shards.
+    fn add_sched_batch(&mut self, batch: SchedRecordBatch<'_>) -> usize {
+        let mut failed = 0usize;
+        let mut warn = |what: &str, e: anyhow::Error| {
+            eprintln!("Warning: Failed to stream {what}: {e}");
+            failed += 1;
+        };
+        for record in batch.slices.drain(..) {
+            if let Err(e) = self.add_sched_slice(record) {
+                warn("sched slice", e);
+            }
+        }
+        for record in batch.thread_states.drain(..) {
+            if let Err(e) = self.add_thread_state(record) {
+                warn("thread state", e);
+            }
+        }
+        for record in batch.irq_slices.drain(..) {
+            if let Err(e) = self.add_irq_slice(record) {
+                warn("IRQ slice", e);
+            }
+        }
+        for record in batch.softirq_slices.drain(..) {
+            if let Err(e) = self.add_softirq_slice(record) {
+                warn("softirq slice", e);
+            }
+        }
+        for record in batch.wakeup_news.drain(..) {
+            if let Err(e) = self.add_wakeup_new(record) {
+                warn("wakeup_new", e);
+            }
+        }
+        for record in batch.sched_migrates.drain(..) {
+            if let Err(e) = self.add_sched_migrate(record) {
+                warn("sched_migrate", e);
+            }
+        }
+        for record in batch.process_exits.drain(..) {
+            if let Err(e) = self.add_process_exit(record) {
+                warn("process_exit", e);
+            }
+        }
+        failed
+    }
+
     /// Flush any buffered records to storage.
     fn flush(&mut self) -> Result<()>;
 
@@ -165,6 +220,36 @@ pub trait RecordCollector {
     /// Finish writing and close all files (boxed version for trait objects).
     /// This is the same as finish() but takes a Box to work with trait objects.
     fn finish_boxed(self: Box<Self>) -> Result<()>;
+}
+
+/// The scheduler lane's locally buffered records, handed to a collector in
+/// one [`RecordCollector::add_sched_batch`] call. The buffers are borrowed
+/// and drained in place so the recorder keeps their capacity across flushes.
+pub struct SchedRecordBatch<'a> {
+    pub slices: &'a mut Vec<SchedSliceRecord>,
+    pub thread_states: &'a mut Vec<ThreadStateRecord>,
+    pub irq_slices: &'a mut Vec<IrqSliceRecord>,
+    pub softirq_slices: &'a mut Vec<SoftirqSliceRecord>,
+    pub wakeup_news: &'a mut Vec<WakeupNewRecord>,
+    pub sched_migrates: &'a mut Vec<SchedMigrateRecord>,
+    pub process_exits: &'a mut Vec<ProcessExitRecord>,
+}
+
+impl SchedRecordBatch<'_> {
+    /// Total number of records across all buffers.
+    pub fn len(&self) -> usize {
+        self.slices.len()
+            + self.thread_states.len()
+            + self.irq_slices.len()
+            + self.softirq_slices.len()
+            + self.wakeup_news.len()
+            + self.sched_migrates.len()
+            + self.process_exits.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// A cloneable, thread-safe handle that lets several recorders stream into one
@@ -283,6 +368,13 @@ impl RecordCollector for SharedCollector {
         add_tpu_device(TpuDeviceRecord),
         add_tpu_op(TpuOpRecord),
         add_tpu_metric(TpuMetricRecord),
+    }
+
+    fn add_sched_batch(&mut self, batch: SchedRecordBatch<'_>) -> usize {
+        // One acquisition for the whole batch: the inner collector's default
+        // loop runs under it, so the shards contend once per flush instead of
+        // once per record.
+        self.lock().add_sched_batch(batch)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -534,5 +626,261 @@ impl RecordCollector for InMemoryCollector {
 
     fn finish_boxed(self: Box<Self>) -> Result<()> {
         (*self).finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Forwards every per-record method to an inner [`InMemoryCollector`],
+    /// so a test double only has to spell out the methods it observes.
+    macro_rules! forward_to_inner {
+        ($($method:ident($record:ty)),* $(,)?) => {
+            $(
+                fn $method(&mut self, record: $record) -> Result<()> {
+                    self.inner.$method(record)
+                }
+            )*
+        };
+    }
+
+    macro_rules! forward_all_but_sched {
+        () => {
+            forward_to_inner! {
+                add_process(ProcessRecord),
+                add_thread(ThreadRecord),
+                add_irq_slice(IrqSliceRecord),
+                add_softirq_slice(SoftirqSliceRecord),
+                add_wakeup_new(WakeupNewRecord),
+                add_sched_migrate(SchedMigrateRecord),
+                add_process_exit(ProcessExitRecord),
+                add_counter(CounterRecord),
+                add_counter_track(CounterTrackRecord),
+                add_slice(SliceRecord),
+                add_track(TrackRecord),
+                add_instant(InstantRecord),
+                add_arg(ArgRecord),
+                add_instant_arg(InstantArgRecord),
+                add_network_interface(NetworkInterfaceRecord),
+                add_socket_connection(SocketConnectionRecord),
+                add_clock_snapshot(ClockSnapshotRecord),
+                add_stack(StackRecord),
+                add_stack_sample(StackSampleRecord),
+                add_network_syscall(NetworkSyscallRecord),
+                add_network_packet(NetworkPacketRecord),
+                add_network_socket(NetworkSocketRecord),
+                add_network_poll(NetworkPollRecord),
+                add_network_dns(NetworkDnsRecord),
+                add_memory_rss(MemoryRssRecord),
+                add_memory_map(MemoryMapRecord),
+                add_memory_fault(MemoryFaultRecord),
+                add_memory_alloc(MemoryAllocRecord),
+                add_memory_vfio(MemoryVfioRecord),
+                add_memory_iommu(MemoryIommuRecord),
+                add_memory_thp(MemoryThpRecord),
+                add_memory_vmstat(MemoryVmstatRecord),
+                set_sysinfo(SysInfoRecord),
+                add_cpu_info(CpuInfoRecord),
+                add_tpu_device(TpuDeviceRecord),
+                add_tpu_op(TpuOpRecord),
+                add_tpu_metric(TpuMetricRecord),
+            }
+
+            fn flush(&mut self) -> Result<()> {
+                self.inner.flush()
+            }
+
+            fn finish(self) -> Result<()> {
+                self.inner.finish()
+            }
+
+            fn finish_boxed(self: Box<Self>) -> Result<()> {
+                (*self).finish()
+            }
+        };
+    }
+
+    /// Counts how many times it is handed a sched batch (and how many records
+    /// it carried), then drains the batch without going through the
+    /// per-record methods. Its counters outlive it through the `Arc`s so the
+    /// test can read them after the collector has been boxed into a
+    /// [`SharedCollector`].
+    struct BatchProbe {
+        inner: InMemoryCollector,
+        batches: Arc<AtomicUsize>,
+        records: Arc<AtomicUsize>,
+        per_record_adds: Arc<AtomicUsize>,
+    }
+
+    impl RecordCollector for BatchProbe {
+        forward_all_but_sched!();
+
+        fn add_sched_slice(&mut self, record: SchedSliceRecord) -> Result<()> {
+            self.per_record_adds.fetch_add(1, Ordering::SeqCst);
+            self.inner.add_sched_slice(record)
+        }
+
+        fn add_thread_state(&mut self, record: ThreadStateRecord) -> Result<()> {
+            self.per_record_adds.fetch_add(1, Ordering::SeqCst);
+            self.inner.add_thread_state(record)
+        }
+
+        fn add_sched_batch(&mut self, batch: SchedRecordBatch<'_>) -> usize {
+            self.batches.fetch_add(1, Ordering::SeqCst);
+            self.records.fetch_add(batch.len(), Ordering::SeqCst);
+            batch.slices.clear();
+            batch.thread_states.clear();
+            batch.irq_slices.clear();
+            batch.softirq_slices.clear();
+            batch.wakeup_news.clear();
+            batch.sched_migrates.clear();
+            batch.process_exits.clear();
+            0
+        }
+    }
+
+    /// Uses the trait's default `add_sched_batch`, and refuses thread-state
+    /// records whose `state` is `REJECTED_STATE`.
+    struct FlakyCollector {
+        inner: InMemoryCollector,
+    }
+
+    const REJECTED_STATE: i32 = 7;
+
+    impl RecordCollector for FlakyCollector {
+        forward_all_but_sched!();
+
+        fn add_sched_slice(&mut self, record: SchedSliceRecord) -> Result<()> {
+            self.inner.add_sched_slice(record)
+        }
+
+        fn add_thread_state(&mut self, record: ThreadStateRecord) -> Result<()> {
+            if record.state == REJECTED_STATE {
+                anyhow::bail!("rejected thread state at ts {}", record.ts);
+            }
+            self.inner.add_thread_state(record)
+        }
+    }
+
+    fn slices(n: usize) -> Vec<SchedSliceRecord> {
+        (0..n)
+            .map(|i| SchedSliceRecord {
+                ts: i as i64 * 1000,
+                dur: 500,
+                cpu: (i % 4) as i32,
+                utid: 10 + i as i64,
+                end_state: None,
+                priority: 120,
+            })
+            .collect()
+    }
+
+    fn thread_states(states: &[i32]) -> Vec<ThreadStateRecord> {
+        states
+            .iter()
+            .enumerate()
+            .map(|(i, &state)| ThreadStateRecord {
+                ts: i as i64 * 1000 + 1,
+                dur: 0,
+                utid: 10 + i as i64,
+                state,
+                cpu: Some((i % 4) as i32),
+            })
+            .collect()
+    }
+
+    fn process_exits(n: usize) -> Vec<ProcessExitRecord> {
+        (0..n)
+            .map(|i| ProcessExitRecord {
+                ts: i as i64 * 1000 + 2,
+                cpu: 0,
+                utid: 10 + i as i64,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shared_collector_hands_a_sched_batch_to_the_inner_in_one_call() {
+        let batches = Arc::new(AtomicUsize::new(0));
+        let records = Arc::new(AtomicUsize::new(0));
+        let per_record_adds = Arc::new(AtomicUsize::new(0));
+        let probe = BatchProbe {
+            inner: InMemoryCollector::new(),
+            batches: Arc::clone(&batches),
+            records: Arc::clone(&records),
+            per_record_adds: Arc::clone(&per_record_adds),
+        };
+        let mut shared: Box<dyn RecordCollector + Send> =
+            Box::new(SharedCollector::new(Box::new(probe)));
+
+        let mut slices = slices(1000);
+        let mut thread_states = thread_states(&[0; 500]);
+        let mut irq_slices = Vec::new();
+        let mut softirq_slices = Vec::new();
+        let mut wakeup_news = Vec::new();
+        let mut sched_migrates = Vec::new();
+        let mut process_exits = process_exits(7);
+        let failed = shared.add_sched_batch(SchedRecordBatch {
+            slices: &mut slices,
+            thread_states: &mut thread_states,
+            irq_slices: &mut irq_slices,
+            softirq_slices: &mut softirq_slices,
+            wakeup_news: &mut wakeup_news,
+            sched_migrates: &mut sched_migrates,
+            process_exits: &mut process_exits,
+        });
+
+        assert_eq!(failed, 0);
+        // One batch call carried every record; the shared handle did not fall
+        // back to locking per record.
+        assert_eq!(batches.load(Ordering::SeqCst), 1);
+        assert_eq!(records.load(Ordering::SeqCst), 1507);
+        assert_eq!(per_record_adds.load(Ordering::SeqCst), 0);
+        assert!(slices.is_empty() && thread_states.is_empty() && process_exits.is_empty());
+    }
+
+    #[test]
+    fn default_sched_batch_drains_every_buffer_and_counts_failures() {
+        let mut flaky = FlakyCollector {
+            inner: InMemoryCollector::new(),
+        };
+        let mut slices = slices(5);
+        let mut thread_states = thread_states(&[0, REJECTED_STATE, 2, REJECTED_STATE]);
+        let mut irq_slices = Vec::new();
+        let mut softirq_slices = Vec::new();
+        let mut wakeup_news = Vec::new();
+        let mut sched_migrates = Vec::new();
+        let mut process_exits = process_exits(3);
+        let slice_capacity = slices.capacity();
+
+        let failed = flaky.add_sched_batch(SchedRecordBatch {
+            slices: &mut slices,
+            thread_states: &mut thread_states,
+            irq_slices: &mut irq_slices,
+            softirq_slices: &mut softirq_slices,
+            wakeup_news: &mut wakeup_news,
+            sched_migrates: &mut sched_migrates,
+            process_exits: &mut process_exits,
+        });
+
+        // The two rejected records are counted and dropped; everything else
+        // arrives in order, and the buffers are drained but keep their
+        // capacity for the next flush.
+        assert_eq!(failed, 2);
+        let data = flaky.inner.data();
+        assert_eq!(data.sched_slices.len(), 5);
+        assert!(data.sched_slices.windows(2).all(|w| w[0].ts < w[1].ts));
+        assert_eq!(
+            data.thread_states
+                .iter()
+                .map(|t| t.state)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(data.process_exits.len(), 3);
+        assert!(slices.is_empty() && thread_states.is_empty() && process_exits.is_empty());
+        assert_eq!(slices.capacity(), slice_capacity);
     }
 }
