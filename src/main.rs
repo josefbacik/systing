@@ -71,6 +71,17 @@ struct Command {
     /// "unknown ([buildid:<hex>]) <0x<offset>>" and stay resolvable offline
     #[arg(long)]
     collect_build_id: bool,
+    /// With --collect-build-id: the most distinct files the end-of-trace
+    /// build-id index may read the ELF note of (the walk over every live
+    /// process's executable mappings); 0 = unbounded. A binary the walk
+    /// never reaches still resolves through the .build-id directories,
+    /// debuginfod, or the deferred [buildid:...] rendering
+    #[arg(long, default_value_t = systing::stack_recorder::DEFAULT_BUILD_ID_INDEX_MAX_FILES)]
+    build_id_index_max_files: usize,
+    /// With --collect-build-id: the longest the end-of-trace build-id index
+    /// walk may run, in milliseconds; 0 = unbounded
+    #[arg(long, default_value_t = systing::stack_recorder::DEFAULT_BUILD_ID_INDEX_MAX_MS)]
+    build_id_index_max_ms: u64,
     /// Enable debug output for pystacks (Python stack tracing)
     #[arg(long)]
     pystacks_debug: bool,
@@ -251,6 +262,8 @@ impl From<Command> for Config {
             continuous: cmd.continuous,
             collect_pystacks: cmd.collect_pystacks,
             collect_build_id: cmd.collect_build_id,
+            build_id_index_max_files: cmd.build_id_index_max_files,
+            build_id_index_max_ms: cmd.build_id_index_max_ms,
             pystacks_pids: Vec::new(), // CLI doesn't expose this yet, uses discovery
             pystacks_debug: cmd.pystacks_debug,
             enable_debuginfod: cmd.enable_debuginfod,
