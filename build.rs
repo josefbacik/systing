@@ -135,14 +135,21 @@ fn bpf_clang_override() -> Option<PathBuf> {
 /// caller that assembled its own list (or called `clang_args` twice) would
 /// silently compile that object without the pin. Callers pass only their
 /// object-specific arguments and never hold the builder, which is what makes
-/// the pin structural. Because clang lets a later flag win, an object argument
-/// that would override a pinned flag is refused rather than silently applied.
+/// the pin structural. Because clang lets a later flag win — and its driver
+/// has more spellings that move a pinned flag than the pin itself has
+/// (`-fstrict-overflow` drops `-fwrapv` from the cc1 line on newer compilers,
+/// `-ftrapv` beside it makes cc1 trap instead of wrap, `-Xclang` and an
+/// `@response-file` reach cc1 around any list) — an object argument is
+/// admitted only in the two forms the callers use, an include path or a
+/// define, and anything else is refused rather than enumerated. The guard
+/// covers this file's callers only: the compiler's own environment can still
+/// change its behaviour without an argument here.
 fn compile_bpf_object(source: &str, obj_path: &Path, object_args: &[&OsStr]) {
     for arg in object_args {
         let arg = arg.to_string_lossy();
         assert!(
-            !(arg.starts_with("-mcpu") || arg == "-fwrapv" || arg == "-fno-wrapv"),
-            "object argument {arg:?} for {source} would override the pinned BPF compiler flags {BPF_CFLAGS:?}"
+            arg.starts_with("-I") || arg.starts_with("-D"),
+            "object argument {arg:?} for {source} is neither an include path nor a define; only those may follow the pinned BPF compiler flags {BPF_CFLAGS:?}"
         );
     }
 
