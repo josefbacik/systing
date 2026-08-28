@@ -272,6 +272,8 @@ impl From<Command> for Config {
             memory_thp_sample_rate: cmd.memory_thp_sample_rate,
             memory_rss_threshold_bytes: cmd.memory_rss_threshold_bytes,
             memory_rss_force_classic: cmd.memory_rss_force_classic,
+            // Testing-only; never a CLI flag (the agent's argv cannot reach it).
+            memory_syscall_force_fallback: false,
             memory_alloc: cmd.memory_alloc,
             memory_alloc_sample_rate: cmd.memory_alloc_sample_rate,
             memory_alloc_lib: cmd.memory_alloc_lib,
@@ -279,6 +281,8 @@ impl From<Command> for Config {
             network: cmd.network,
             network_packets: cmd.network_packets,
             network_syscalls: cmd.network_syscalls,
+            // Testing-only; never a CLI flag (the agent's argv cannot reach it).
+            network_tw_force_fallback: false,
             resolve_addresses: cmd.resolve_addresses,
             tpu_profile: cmd.tpu_profile,
             tpu_service_addr: cmd.tpu_service_addr,

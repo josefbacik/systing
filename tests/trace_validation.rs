@@ -1943,9 +1943,102 @@ fn test_e2e_network_suite() {
         eprintln!("    {} transitions from TIME_WAIT to CLOSE", tw_close_count);
         // Don't assert on tw_close_count > 0 because TIME_WAIT lasts 60s and
         // the test trace is only 3s. TIME_WAIT → CLOSE may not happen during the trace.
+
+        // The TIME_WAIT rows above came through one of the leg's two program
+        // sets, and sysinfo says which: the fentry set on a kernel that
+        // attaches trampolines, else the kprobe fallback. Never off — the
+        // TIME_WAIT assertion above could not have passed with the leg off.
+        let tw_leg: Option<String> = conn
+            .query_row("SELECT network_tw_leg FROM sysinfo", [], |row| row.get(0))
+            .expect("[network duckdb] sysinfo row missing");
+        eprintln!("    network_tw_leg = {tw_leg:?}");
+        let tw_leg = tw_leg.expect(
+            "[network duckdb] sysinfo.network_tw_leg must be recorded when the network recorder ran",
+        );
+        assert!(
+            tw_leg == "fentry" || tw_leg.starts_with("kprobe:"),
+            "[network duckdb] network_tw_leg = {tw_leg}: the TIME_WAIT leg must have attached \
+             for the TIME_WAIT rows above to exist"
+        );
     }
 
     eprintln!("\n  All network suite checks passed");
+}
+
+/// The TIME_WAIT leg's fallback path, forced: with the testing-only switch
+/// the trampoline set fails at attach after its first program attached
+/// (the partial links dropped, exactly as on a kernel that refuses the
+/// trampoline), the kprobe set attaches instead, the trace carries the same
+/// TIME_WAIT transitions, and sysinfo names the path the way that host
+/// would (`kprobe:notramp`). The positive control for the fallback; runs
+/// under the same rig as the network suite.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_network_tw_leg_kprobe_fallback() {
+    use std::net::TcpStream;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let config = Config {
+        duration: NETWORK_SUITE_DURATION_SECS,
+        parquet_only: true,
+        network: true,
+        network_tw_force_fallback: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+
+    let traffic = stoppable_workload(move |stop| {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind traffic listener");
+        let addr = listener.local_addr().unwrap();
+        while !stop.load(Ordering::Relaxed) {
+            if let Ok(_stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+                let _ = listener.accept();
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    });
+
+    eprintln!("Recording trace with the forced TIME_WAIT kprobe fallback...");
+    let recorded = systing(config, None);
+    traffic.stop();
+    recorded.expect("systing recording (forced kprobe TIME_WAIT leg) failed");
+
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "network_tw_fallback")
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    let tw_leg: Option<String> = conn
+        .query_row("SELECT network_tw_leg FROM sysinfo", [], |row| row.get(0))
+        .expect("[network tw fallback] sysinfo row missing");
+    assert_eq!(
+        tw_leg.as_deref(),
+        Some("kprobe:notramp"),
+        "[network tw fallback] the switch must route the leg through the kprobe set"
+    );
+
+    let time_wait_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM network_packet \
+             WHERE event_type = 'TCP state_change' \
+             AND new_state_str = 'TIME_WAIT'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    eprintln!(
+        "    {} transitions to TIME_WAIT state (kprobe set)",
+        time_wait_count
+    );
+    assert!(
+        time_wait_count > 0,
+        "[network tw fallback] the kprobe set must produce the TIME_WAIT transitions the fentry set does"
+    );
 }
 
 // =============================================================================

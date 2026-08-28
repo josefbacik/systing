@@ -28,7 +28,7 @@ use crate::ringbuf::RingBuffer;
 use crate::sched::SchedEventRecorder;
 use crate::session_recorder::{
     get_clock_value, ClockSamplingConfig, MemoryFaultLeg, MemoryRecorderConfig, MemoryRecorderEnd,
-    MissedEvent, SessionRecorder, SysInfoEvent,
+    MissedEvent, NetworkRecorderConfig, SessionRecorder, SysInfoEvent,
 };
 use crate::stack_recorder::StackRecorder;
 
@@ -209,22 +209,73 @@ const MEMORY_BPF_PROGRAMS: &[&str] = &[
     // the memory_ringbufs map reference stays out of the sched recorder's
     // program and each recorder's ringbuf families stay independent.
     "systing_rss_stat_exit_flush",
+    // The mmap/munmap/brk hooks also ship in two forms (fentry/fexit on the
+    // arch syscall wrappers, and the classic syscalls tracepoints); both are
+    // selected in get_required_bpf_programs and attached one set at a time
+    // after skel.attach() — see MEMORY_SYSCALL_FENTRY_PROGS.
+    // The fault leg has two attach paths, selected at build time: the
+    // exceptions:page_fault_user raw tracepoint (tp_btf) on x86,
+    // auto-attached by skel.attach, and the perf software page-fault event
+    // everywhere else (SEC("perf_event"), attached per CPU in
+    // attach_clock_sampler) — arm64 never fires that tracepoint.
+    #[cfg(target_arch = "x86_64")]
+    "systing_page_fault_user",
+    #[cfg(not(target_arch = "x86_64"))]
+    "systing_page_fault_sw",
+];
+
+/// The memory recorder's mmap/munmap/brk hooks in trampoline form: fentry and
+/// fexit on the arch syscall wrappers (`__x64_sys_mmap` …). Attached first,
+/// one program at a time, after `skel.attach()`; a trampoline call replaces
+/// the perf-sample build per event, puts nothing on other syscalls' entry
+/// path, and detaches without the perf tracepoint's synchronous grace
+/// periods. Needs the wrappers in kallsyms (probed up front) and, at attach,
+/// a kernel that can build a trampoline (arm64 without
+/// DYNAMIC_FTRACE_WITH_DIRECT_CALLS cannot — the load succeeds, the attach
+/// does not, and the classic set takes over).
+const MEMORY_SYSCALL_FENTRY_PROGS: &[&str] = &[
+    "systing_mmap_fentry",
+    "systing_mmap_fexit",
+    "systing_munmap_fentry",
+    "systing_munmap_fexit",
+    "systing_brk_fentry",
+    "systing_brk_fexit",
+];
+
+/// The same hooks in classic form: the six `syscalls/sys_{enter,exit}_*`
+/// tracepoints through perf_event_open, the fallback set when the trampoline
+/// set cannot attach (or a kernel without the wrapper symbols). Always
+/// loaded beside the trampoline set so both forms are verified at every
+/// load; attached only when needed.
+const MEMORY_SYSCALL_TP_PROGS: &[&str] = &[
     "systing_mmap_enter",
     "systing_mmap_exit",
     "systing_munmap_enter",
     "systing_munmap_exit",
     "systing_brk_enter",
     "systing_brk_exit",
-    // The fault leg has two attach paths, selected at build time: the
-    // exceptions:page_fault_user tracepoint on x86 (auto-attached by
-    // skel.attach), and the perf software page-fault event everywhere else
-    // (SEC("perf_event"), attached per CPU in attach_clock_sampler) — arm64
-    // never fires that tracepoint.
-    #[cfg(target_arch = "x86_64")]
-    "systing_page_fault_user",
-    #[cfg(not(target_arch = "x86_64"))]
-    "systing_page_fault_sw",
 ];
+
+/// The arch syscall wrapper prefix the trampoline set attaches to (the BPF
+/// object selects the same one at compile time). The compat wrappers
+/// (`__ia32_sys_*`) are separate symbols and are not attached, as the
+/// syscalls tracepoints excluded compat calls before.
+#[cfg(target_arch = "x86_64")]
+const SYSCALL_WRAPPER_PREFIX: &str = "__x64_sys_";
+#[cfg(target_arch = "aarch64")]
+const SYSCALL_WRAPPER_PREFIX: &str = "__arm64_sys_";
+#[cfg(target_arch = "riscv64")]
+const SYSCALL_WRAPPER_PREFIX: &str = "__riscv_sys_";
+
+/// The three syscalls the memory recorder hooks, as the wrapper symbols the
+/// trampoline set needs in kallsyms.
+fn memory_syscall_wrapper_symbols() -> [String; 3] {
+    [
+        format!("{SYSCALL_WRAPPER_PREFIX}mmap"),
+        format!("{SYSCALL_WRAPPER_PREFIX}munmap"),
+        format!("{SYSCALL_WRAPPER_PREFIX}brk"),
+    ]
+}
 
 /// Allocator uprobe programs. Listed here only so `enable_programs` loads them
 /// when the `memory-alloc` recorder is on; actual attachment is manual via
@@ -243,11 +294,48 @@ const MEMORY_ALLOC_BPF_PROGRAMS: &[&str] = &[
     "systing_free_enter",
 ];
 
-const NETWORK_BPF_PROGRAMS: &[&str] = &[
-    "inet_sock_set_state",
+/// The network recorder's always-on program: the inet_sock_set_state
+/// tracepoint (auto-attached by `skel.attach()`). The TIME_WAIT leg — the
+/// three hooks that turn tcp_time_wait()'s CLOSE into TIME_WAIT and emit the
+/// TIME_WAIT -> CLOSE teardown — is a kernel-probed leg selected at load and
+/// attached after `skel.attach()` (see `NETWORK_TW_FENTRY_PROGRAMS`), so
+/// it is deliberately not listed here.
+const NETWORK_BPF_PROGRAMS: &[&str] = &["inet_sock_set_state"];
+
+/// The TIME_WAIT leg's trampoline set: fentry programs on tcp_time_wait,
+/// inet_twsk_hashdance_schedule and inet_twsk_deschedule_put. Attached by
+/// default; a trampoline link detaches through the kernel's async path, so
+/// "detach bpf programs" stays at milliseconds where three kprobes cost a
+/// serialized RCU/SRCU grace period each.
+const NETWORK_TW_FENTRY_PROGRAMS: &[&str] = &[
+    "tcp_time_wait_fentry",
+    "inet_twsk_hashdance_schedule_fentry",
+    "inet_twsk_deschedule_put_fentry",
+];
+
+/// The TIME_WAIT leg's fallback set: the same three hooks as kprobes, the
+/// shape that shipped through v1.16. Loaded beside the trampoline set (so
+/// the verifier checks both on every load) and attached only when the
+/// trampoline attach fails on this host (an arm64 kernel built without
+/// DYNAMIC_FTRACE_WITH_DIRECT_CALLS attaches no fentry program: the symbol
+/// resolves, the load succeeds, the attach returns ENOTSUPP) or when the
+/// trampoline set could not be loaded at all (the kernel's BTF lacks the
+/// function). Which set ran is `sysinfo.network_tw_leg`.
+const NETWORK_TW_KPROBE_PROGRAMS: &[&str] = &[
     "tcp_time_wait_entry",
     "inet_twsk_hashdance_schedule_entry",
     "inet_twsk_deschedule_put_entry",
+];
+
+/// The kernel functions the TIME_WAIT leg hooks; every one must be present
+/// for the leg to run. `inet_twsk_hashdance_schedule` exists from 6.11
+/// (b334b924c9b7) — a 6.6-series kernel lacks it, and before this gate a
+/// network capture on such a node failed its every attach (the whole
+/// capture, CPU lane included) rather than running without the leg.
+const NETWORK_TW_SYMBOLS: &[&str] = &[
+    "tcp_time_wait",
+    "inet_twsk_hashdance_schedule",
+    "inet_twsk_deschedule_put",
 ];
 
 const NETWORK_PACKETS_BPF_PROGRAMS: &[&str] = &[
@@ -701,6 +789,18 @@ pub fn get_required_bpf_programs(
         required.insert(select_rss_stat_prog(opts.memory_rss_force_classic));
     }
 
+    // The mmap/munmap/brk hooks: the classic tracepoint set always loads
+    // (it is the fallback, and loading both keeps both forms verified), the
+    // trampoline set only when the wrapper symbols are there for it to
+    // attach to — a fentry program's BTF target is resolved at load, so an
+    // unresolvable one would fail the whole object.
+    if opts.memory {
+        required.extend(MEMORY_SYSCALL_TP_PROGS);
+        if memory_legs.syscall_fentry_off.is_none() {
+            required.extend(MEMORY_SYSCALL_FENTRY_PROGS);
+        }
+    }
+
     // The optional memory legs load only what the running kernel can attach
     // (probed before the skeleton is opened, see probe_memory_kernel_legs):
     // a kprobe on a symbol the host lacks would fail skel.attach() and with
@@ -722,6 +822,29 @@ pub fn get_required_bpf_programs(
     }
 
     required
+}
+
+/// The network recorder's TIME_WAIT leg programs to load, given the kernel
+/// probe (added to [`get_required_bpf_programs`]'s set by the callers that
+/// hold a [`NetworkKernelLegs`]): nothing of the leg on a kernel without its
+/// symbols, otherwise the kprobe set always and the trampoline set whenever
+/// the kernel's BTF describes the three functions — an fentry program whose
+/// target is missing from vmlinux BTF fails the whole object at LOAD, which
+/// no attach-time fallback can catch. Both sets load together so the
+/// verifier checks both on every load; `attach_network_tw_leg` attaches
+/// exactly one.
+pub fn network_tw_leg_programs(
+    opts: &Config,
+    network_legs: &NetworkKernelLegs,
+) -> Vec<&'static str> {
+    let mut programs = Vec::new();
+    if opts.network && network_legs.tw_off.is_none() {
+        programs.extend(NETWORK_TW_KPROBE_PROGRAMS);
+        if network_legs.tw_fentry_loadable {
+            programs.extend(NETWORK_TW_FENTRY_PROGRAMS);
+        }
+    }
+    programs
 }
 
 /// The VFIO/IOMMU legs of the memory recorder: kprobe + kretprobe pairs on
@@ -763,6 +886,20 @@ const THP_PMD_ENTRY_PROG: &str = "systing_thp_split_pmd";
 /// in `sysinfo` (`off:<cause>`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryKernelLegs {
+    /// Why the trampoline form of the mmap/munmap/brk hooks is not in use:
+    /// `nosym` (the arch syscall wrappers are not in kallsyms) or `nobtf`
+    /// (they are, but not as functions in vmlinux BTF, which the fentry
+    /// programs need to load) — the set is not even loaded in either case;
+    /// `notramp` (the set loaded but a program failed to attach, as on an
+    /// arm64 kernel without direct-call ftrace — the classic set was
+    /// attached instead); `forced` (the test-only switch took the fallback
+    /// path). `None`: the wrappers are present and, once attached, the
+    /// trampoline set is the one running.
+    pub syscall_fentry_off: Option<String>,
+    /// Why neither form of the mmap/munmap/brk hooks attached (`attach`):
+    /// the capture then carries no memory_map rows for those syscalls, and
+    /// the rest of the memory recorder runs.
+    pub syscall_off: Option<String>,
     /// Why the VFIO/IOMMU legs cannot run here (`nosym`: the
     /// vfio_iommu_type1 module is not loaded; `notracepoint`: no iommu
     /// tracepoints; `attach`: a probe failed to attach).
@@ -786,6 +923,24 @@ pub struct MemoryKernelLegs {
 }
 
 impl MemoryKernelLegs {
+    /// The `sysinfo.memory_syscall_leg` value: `fentry` when the trampoline
+    /// set is attached; `tracepoint:nosym` / `tracepoint:nobtf` when the
+    /// classic set was attached because the wrappers are not in kallsyms /
+    /// not in vmlinux BTF (the trampoline set was not loaded);
+    /// `tracepoint:notramp` when it was attached because the trampoline set
+    /// failed to attach (or the test switch forced that path); `off:<cause>`
+    /// when neither attached.
+    pub fn syscall_leg_value(&self) -> String {
+        match (&self.syscall_off, &self.syscall_fentry_off) {
+            (Some(cause), _) => format!("off:{cause}"),
+            (None, None) => "fentry".to_string(),
+            (None, Some(cause)) if cause == "nosym" || cause == "nobtf" => {
+                format!("tracepoint:{cause}")
+            }
+            (None, Some(_)) => "tracepoint:notramp".to_string(),
+        }
+    }
+
     /// The `sysinfo.memory_thp_leg` value for these legs: `on` when the
     /// PMD-split worker probe and the folio-split probe attach,
     /// `on:pmd-entry` when the PMD probe had to sit at the public entry
@@ -815,27 +970,100 @@ impl MemoryKernelLegs {
     }
 }
 
-/// Probe the kernel symbols and tracepoints the optional memory legs attach
-/// to. Reads /proc/kallsyms once (module symbols appear there while the
-/// module is loaded, which is exactly the condition a kprobe needs) and
-/// looks for the iommu tracepoint directory under tracefs. Only the legs the
-/// configuration asks for are probed; the rest report available-but-unused.
-fn probe_memory_kernel_legs(opts: &Config) -> MemoryKernelLegs {
+/// The kernel symbols of the optional memory legs (VFIO ioctl and teardown
+/// pairs, the PMD-split and folio-split probes), probed from kallsyms.
+const MEMORY_OPTIONAL_LEG_SYMBOLS: &[&str] = &[
+    "vfio_dma_do_map",
+    "vfio_dma_do_unmap",
+    "vfio_iommu_type1_release",
+    "vfio_iommu_type1_detach_group",
+    "__split_huge_pmd_locked",
+    "__split_huge_pmd",
+    "split_huge_page_to_list_to_order",
+    "split_huge_page_to_list",
+];
+
+/// What the running kernel exports of the symbols the recorders' kernel
+/// legs attach to, read ONCE per capture: /proc/kallsyms (the condition a
+/// kprobe or a trampoline needs at attach) and, for the trampoline targets
+/// kallsyms lists, vmlinux BTF (the condition an fentry program needs at
+/// LOAD — libbpf resolves the target's BTF id while loading and fails the
+/// whole object when it is missing, which no attach-time fallback catches).
+/// Both reads are bounded by what the configuration asks for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KernelSymbols {
+    /// Text symbols present in kallsyms, of the names probed.
+    pub kallsyms: HashSet<String>,
+    /// Trampoline targets present as functions in vmlinux BTF, of the names
+    /// probed (only names kallsyms listed were looked up).
+    pub btf_funcs: HashSet<String>,
+}
+
+/// Read kallsyms and vmlinux BTF once for every kernel leg the configuration
+/// turns on (the memory recorder's syscall hooks and optional legs, the
+/// network recorder's TIME_WAIT hooks).
+fn probe_kernel_symbols(opts: &Config) -> KernelSymbols {
+    let wrappers = memory_syscall_wrapper_symbols();
+    let mut wanted: Vec<&str> = Vec::new();
+    let mut trampoline_targets: Vec<&str> = Vec::new();
+    if opts.memory {
+        wanted.extend(wrappers.iter().map(String::as_str));
+        wanted.extend(MEMORY_OPTIONAL_LEG_SYMBOLS);
+        trampoline_targets.extend(wrappers.iter().map(String::as_str));
+    }
+    if opts.network {
+        wanted.extend(NETWORK_TW_SYMBOLS);
+        trampoline_targets.extend(NETWORK_TW_SYMBOLS);
+    }
+    if wanted.is_empty() {
+        return KernelSymbols::default();
+    }
+    let kallsyms = kallsyms_has_funcs(&wanted);
+    // A target kallsyms does not list never loads either way; only the
+    // ones it does are worth the BTF parse.
+    let listed: Vec<&str> = trampoline_targets
+        .into_iter()
+        .filter(|s| kallsyms.contains(*s))
+        .collect();
+    let btf_funcs = if listed.is_empty() {
+        HashSet::new()
+    } else {
+        vmlinux_btf_has_funcs(&listed)
+    };
+    KernelSymbols {
+        kallsyms,
+        btf_funcs,
+    }
+}
+
+/// Decide the memory recorder's kernel legs from what the kernel exports
+/// (see [`probe_kernel_symbols`]) and the iommu tracepoint directory under
+/// tracefs. The syscall hooks are probed whenever the recorder is on: the
+/// trampoline set needs the arch wrappers in kallsyms AND in vmlinux BTF
+/// (`nosym` / `nobtf` otherwise, the classic set alone then); the optional
+/// legs only when the configuration asks for them, the rest report
+/// available-but-unused.
+fn probe_memory_kernel_legs(opts: &Config, kernel: &KernelSymbols) -> MemoryKernelLegs {
     let mut legs = MemoryKernelLegs::default();
-    if !opts.memory || (!opts.memory_vfio && opts.memory_thp_sample_rate == 0) {
+    if !opts.memory {
         return legs;
     }
-    let wanted: &[&str] = &[
-        "vfio_dma_do_map",
-        "vfio_dma_do_unmap",
-        "vfio_iommu_type1_release",
-        "vfio_iommu_type1_detach_group",
-        "__split_huge_pmd_locked",
-        "__split_huge_pmd",
-        "split_huge_page_to_list_to_order",
-        "split_huge_page_to_list",
-    ];
-    let present = kallsyms_has_funcs(wanted);
+    let wrappers = memory_syscall_wrapper_symbols();
+    let present = &kernel.kallsyms;
+    if !wrappers.iter().all(|w| present.contains(w.as_str())) {
+        legs.syscall_fentry_off = Some("nosym".to_string());
+    } else if !wrappers
+        .iter()
+        .all(|w| kernel.btf_funcs.contains(w.as_str()))
+    {
+        legs.syscall_fentry_off = Some("nobtf".to_string());
+    }
+    // (The test-only fallback switch, memory_syscall_force_fallback, acts
+    // at attach time so the path it exercises is the real one — the
+    // trampoline set stays selected for load here.)
+    if !opts.memory_vfio && opts.memory_thp_sample_rate == 0 {
+        return legs;
+    }
     if opts.memory_vfio {
         if !present.contains("vfio_dma_do_map") || !present.contains("vfio_dma_do_unmap") {
             legs.vfio_off = Some("nosym".to_string());
@@ -897,6 +1125,95 @@ fn iommu_tracepoints_present() -> bool {
     ]
     .iter()
     .any(|p| Path::new(p).is_dir())
+}
+
+/// Whether this host can serve the network recorder's TIME_WAIT leg (the
+/// tcp_time_wait / inet_twsk_hashdance_schedule / inet_twsk_deschedule_put
+/// hooks), probed once from kallsyms and vmlinux BTF before the programs
+/// are selected for load, and settled at attach (`attach_network_tw_leg`).
+/// `None` in `tw_off` means available; `Some(cause)` is the short cause
+/// recorded in `sysinfo.network_tw_leg` as `off:<cause>`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkKernelLegs {
+    /// Why the TIME_WAIT leg cannot run here (`nosym`: one of the hooked
+    /// functions is missing from kallsyms — a pre-6.11 kernel has no
+    /// `inet_twsk_hashdance_schedule`; `attach`: neither program set
+    /// attached).
+    pub tw_off: Option<String>,
+    /// Whether the trampoline (fentry) set may be loaded: every hooked
+    /// function has a FUNC entry in vmlinux BTF. When false only the kprobe
+    /// set is loaded and the leg reads `kprobe:nobtf`.
+    pub tw_fentry_loadable: bool,
+    /// Which set attached — `fentry`, or `kprobe:<why>` — settled by
+    /// `attach_network_tw_leg`; `None` until then.
+    pub tw_attached: Option<String>,
+}
+
+impl NetworkKernelLegs {
+    /// The `sysinfo.network_tw_leg` value: `fentry` (the trampoline set
+    /// ran), `kprobe:notramp` (a trampoline attach failed — or the test
+    /// switch forced that path — and the kprobe set ran), `kprobe:nobtf`
+    /// (the trampoline set could not be loaded, the kprobe set ran), or
+    /// `off:<cause>`.
+    pub fn tw_leg_value(&self) -> String {
+        match (&self.tw_off, &self.tw_attached) {
+            (Some(cause), _) => format!("off:{cause}"),
+            (None, Some(attached)) => attached.clone(),
+            (None, None) => "off:notattached".to_string(),
+        }
+    }
+}
+
+/// Decide the TIME_WAIT leg from what the kernel exports (see
+/// [`probe_kernel_symbols`] — one read shared with the memory recorder):
+/// kallsyms for whether the hooks can attach at all, vmlinux BTF for whether
+/// the trampoline set can be loaded. Only decided when the network recorder
+/// is on; otherwise reports available-but-unused. (The testing-only fallback
+/// switch, `network_tw_force_fallback`, acts at attach time so the path it
+/// exercises is the real one — the trampoline set stays selected for load.)
+fn probe_network_kernel_legs(opts: &Config, kernel: &KernelSymbols) -> NetworkKernelLegs {
+    if !opts.network {
+        return NetworkKernelLegs::default();
+    }
+    select_network_kernel_legs(&kernel.kallsyms, &kernel.btf_funcs)
+}
+
+/// The decision half of [`probe_network_kernel_legs`], over the two symbol
+/// sets it read (unit-tested without a kernel): no leg without every symbol
+/// in kallsyms; the trampoline set only with every symbol in BTF.
+fn select_network_kernel_legs(
+    kallsyms: &HashSet<String>,
+    btf: &HashSet<String>,
+) -> NetworkKernelLegs {
+    let mut legs = NetworkKernelLegs::default();
+    if !NETWORK_TW_SYMBOLS.iter().all(|s| kallsyms.contains(*s)) {
+        legs.tw_off = Some("nosym".to_string());
+        return legs;
+    }
+    legs.tw_fentry_loadable = NETWORK_TW_SYMBOLS.iter().all(|s| btf.contains(*s));
+    legs
+}
+
+/// Which of `names` vmlinux BTF describes as functions — the condition an
+/// fentry program needs to LOAD: libbpf resolves the attach target's BTF id
+/// while loading the object and fails the whole object (every program, the
+/// CPU lane's included) when it is missing, which no attach-time fallback
+/// can catch. An unreadable vmlinux BTF reads as "none present", which
+/// keeps the trampoline set unloaded rather than failing the capture.
+fn vmlinux_btf_has_funcs(names: &[&str]) -> HashSet<String> {
+    let mut found = HashSet::new();
+    let Ok(btf) = libbpf_rs::btf::Btf::from_vmlinux() else {
+        return found;
+    };
+    for name in names {
+        if btf
+            .type_by_name::<libbpf_rs::btf::types::Func<'_>>(name)
+            .is_some()
+        {
+            found.insert((*name).to_string());
+        }
+    }
+    found
 }
 
 /// Configuration for the systing system tracing.
@@ -998,6 +1315,13 @@ pub struct Config {
     /// Force the classic `tracepoint/kmem/rss_stat` attach path even when
     /// `tp_btf/rss_stat` is available. Testing-only (exercises the fallback).
     pub memory_rss_force_classic: bool,
+    /// Make the trampoline (fentry/fexit) form of the mmap/munmap/brk hooks
+    /// fail at attach after its first program attached, so the capture
+    /// takes the attach-time fallback to the classic tracepoint set exactly
+    /// as it would on a kernel that refuses the trampoline (partial links
+    /// dropped, `memory_syscall_leg = tracepoint:notramp`). Testing-only;
+    /// no CLI flag.
+    pub memory_syscall_force_fallback: bool,
     /// Enable heap allocator uprobes (malloc/free/calloc/realloc/...)
     pub memory_alloc: bool,
     /// Sample 1 in N allocator calls (0 or 1 = record all)
@@ -1015,6 +1339,12 @@ pub struct Config {
     /// plus retransmit/drop/stall diagnostics, without the per-packet probes.
     /// Never enabled implicitly; name it.
     pub network_syscalls: bool,
+    /// Make the trampoline (fentry) form of the TIME_WAIT hooks fail at
+    /// attach after its first program attached, so the capture takes the
+    /// attach-time fallback to the kprobe set exactly as it would on a
+    /// kernel that refuses the trampoline (partial links dropped,
+    /// `network_tw_leg = kprobe:notramp`). Testing-only; no CLI flag.
+    pub network_tw_force_fallback: bool,
     /// Resolve network IP addresses to hostnames via DNS
     pub resolve_addresses: bool,
     /// Enable TPU profiling
@@ -1083,6 +1413,7 @@ impl Default for Config {
             memory_thp_sample_rate: 0,
             memory_rss_threshold_bytes: None,
             memory_rss_force_classic: false,
+            memory_syscall_force_fallback: false,
             memory_alloc: false,
             memory_alloc_sample_rate: 1,
             memory_alloc_lib: None,
@@ -1090,6 +1421,7 @@ impl Default for Config {
             network: false,
             network_packets: false,
             network_syscalls: false,
+            network_tw_force_fallback: false,
             resolve_addresses: false,
             tpu_profile: false,
             tpu_service_addr: None,
@@ -2883,6 +3215,7 @@ fn configure_bpf_skeleton(
     collect_pystacks: bool,
     cgroup_kernel_mode: bool,
     memory_legs: &MemoryKernelLegs,
+    network_legs: &NetworkKernelLegs,
     recorder: &Arc<SessionRecorder>,
     ring_plan: RingbufPlan,
 ) -> Result<()> {
@@ -3051,13 +3384,14 @@ fn configure_bpf_skeleton(
 
     // Determine which BPF programs are needed based on enabled recorders.
     // Each recorder declares its required programs; we coalesce them and disable the rest.
-    let required_programs = get_required_bpf_programs(
+    let mut required_programs = get_required_bpf_programs(
         opts,
         old_kernel,
         collect_pystacks,
         cgroup_kernel_mode,
         memory_legs,
     );
+    required_programs.extend(network_tw_leg_programs(opts, network_legs));
 
     for mut prog in open_skel.open_object_mut().progs_mut() {
         let name = prog
@@ -3070,9 +3404,12 @@ fn configure_bpf_skeleton(
         // The memory recorder's kernel-probed legs attach one leg at a time
         // after skel.attach() (attach_memory_kernel_legs), so a probe whose
         // symbol went away between the kallsyms read and the attach turns
-        // that leg off instead of failing the capture.
-        let manual_attach =
-            name == "systing_cgroup_target_add" || is_memory_kernel_leg_program(name);
+        // that leg off instead of failing the capture. The network
+        // recorder's TIME_WAIT leg likewise (attach_network_tw_leg): both of
+        // its program sets are loaded, and exactly one is attached.
+        let manual_attach = name == "systing_cgroup_target_add"
+            || is_memory_kernel_leg_program(name)
+            || is_network_tw_leg_program(name);
         if !autoload {
             prog.set_autoload(false);
         }
@@ -3868,7 +4205,9 @@ fn discover_allocator_paths(pids: &[u32]) -> (Vec<(String, &'static str)>, usize
 /// Is `name` one of the memory recorder's kernel-probed leg programs, which
 /// are attached by `attach_memory_kernel_legs` rather than by `skel.attach()`.
 fn is_memory_kernel_leg_program(name: &str) -> bool {
-    MEMORY_VFIO_BPF_PROGRAMS.contains(&name)
+    MEMORY_SYSCALL_FENTRY_PROGS.contains(&name)
+        || MEMORY_SYSCALL_TP_PROGS.contains(&name)
+        || MEMORY_VFIO_BPF_PROGRAMS.contains(&name)
         || MEMORY_VFIO_TEARDOWN_BPF_PROGRAMS.contains(&name)
         || name == THP_PMD_LOCKED_PROG
         || name == THP_PMD_ENTRY_PROG
@@ -3876,15 +4215,98 @@ fn is_memory_kernel_leg_program(name: &str) -> bool {
         || name == "systing_thp_split_page_legacy"
 }
 
-/// Attach the memory recorder's optional kernel legs (VFIO ioctl pair,
-/// VFIO teardown pair, THP PMD-split probe, THP folio-split probe), each as
-/// a unit: the first program of a leg that fails to attach drops that leg's
-/// links, records the cause in `legs` (read into `sysinfo` afterwards) and
-/// leaves the other legs and the rest of the capture running. A symbol can
-/// disappear between the kallsyms read and here (a module unload), and a
-/// kprobe can be refused on a symbol kallsyms lists but the kernel will not
-/// probe (a `.isra`/`.constprop` clone, a notrace function); neither should
-/// cost the CPU profile. Returns the links, which must outlive the capture.
+/// Attach every program named in `programs`, in order, by name; the links
+/// are returned together. The first attach error returns that program's
+/// name and error, and the links attached before it are dropped with the
+/// partial vector — the kernel detaches them, so a set is attached as a
+/// unit or not at all. `fail_after_first` is the testing-only switch that
+/// synthesizes the error after the first program attached, so the drop of a
+/// real partial link is what the fallback test exercises.
+fn attach_program_set(
+    skel: &mut SystingSystemSkel,
+    programs: &[&str],
+    fail_after_first: bool,
+) -> Result<Vec<libbpf_rs::Link>, (String, String)> {
+    let mut links = Vec::with_capacity(programs.len());
+    for wanted in programs {
+        if fail_after_first && !links.is_empty() {
+            return Err((
+                wanted.to_string(),
+                "forced fallback (testing switch)".to_string(),
+            ));
+        }
+        let mut attached = false;
+        for prog in skel.object_mut().progs_mut() {
+            if prog.name().to_string_lossy() != *wanted {
+                continue;
+            }
+            match prog.attach() {
+                Ok(link) => links.push(link),
+                Err(e) => return Err((wanted.to_string(), e.to_string())),
+            }
+            attached = true;
+            break;
+        }
+        if !attached {
+            return Err((wanted.to_string(), "program not in the object".to_string()));
+        }
+    }
+    Ok(links)
+}
+
+/// How a leg with a primary program set and a fallback set ended up
+/// attached — the shape both the memory recorder's syscall hooks and the
+/// network recorder's TIME_WAIT hooks use: the primary (trampoline) set
+/// first, and when any of its programs fails to attach, the fallback
+/// (classic) set, so a kernel that loads a trampoline program but cannot
+/// attach it (arm64 without direct-call ftrace) costs the detach-cost fix,
+/// never the capture.
+pub(crate) enum LegAttach {
+    /// The primary set attached; the links.
+    Primary(Vec<libbpf_rs::Link>),
+    /// The primary set did not attach (the program and the error); the
+    /// fallback set did.
+    Fallback(Vec<libbpf_rs::Link>, String),
+    /// Neither set attached (the fallback's program and error).
+    Neither(String),
+}
+
+/// Attach `primary` and, on its first attach error, `fallback` (see
+/// [`LegAttach`]). An empty `primary` (the set was not loaded — its symbols
+/// were missing at probe time) goes straight to the fallback.
+/// `force_fallback` is the testing-only switch (see [`attach_program_set`]).
+pub(crate) fn attach_leg_with_fallback(
+    skel: &mut SystingSystemSkel,
+    primary: &[&str],
+    fallback: &[&str],
+    force_fallback: bool,
+) -> LegAttach {
+    let primary_error = if primary.is_empty() {
+        None
+    } else {
+        match attach_program_set(skel, primary, force_fallback) {
+            Ok(links) => return LegAttach::Primary(links),
+            Err((name, e)) => Some(format!("{name}: {e}")),
+        }
+    };
+    match attach_program_set(skel, fallback, false) {
+        Ok(links) => LegAttach::Fallback(links, primary_error.unwrap_or_default()),
+        Err((name, e)) => LegAttach::Neither(format!("{name}: {e}")),
+    }
+}
+
+/// Attach the memory recorder's kernel-probed legs — the mmap/munmap/brk
+/// hooks (trampoline set, classic set as the fallback) and the optional
+/// VFIO ioctl pair, VFIO teardown pair, THP PMD-split probe and THP
+/// folio-split probe — each as a unit: the first program of a leg that
+/// fails to attach drops that leg's links, records the cause in `legs`
+/// (read into `sysinfo` afterwards) and leaves the other legs and the rest
+/// of the capture running. A symbol can disappear between the kallsyms read
+/// and here (a module unload), a kprobe can be refused on a symbol kallsyms
+/// lists but the kernel will not probe (a `.isra`/`.constprop` clone, a
+/// notrace function), and a trampoline can be refused by a kernel that
+/// loaded the program (no direct-call ftrace); none should cost the CPU
+/// profile. Returns the links, which must outlive the capture.
 fn attach_memory_kernel_legs(
     skel: &mut SystingSystemSkel,
     opts: &Config,
@@ -3893,6 +4315,42 @@ fn attach_memory_kernel_legs(
     if !opts.memory {
         return Vec::new();
     }
+    let mut links = Vec::new();
+
+    // The syscall hooks first: the trampoline set when it was loaded (the
+    // wrappers were in kallsyms), the classic tracepoint set when it was
+    // not or when a trampoline program is refused at attach.
+    let fentry_set: &[&str] = if legs.syscall_fentry_off.is_none() {
+        MEMORY_SYSCALL_FENTRY_PROGS
+    } else {
+        &[]
+    };
+    match attach_leg_with_fallback(
+        skel,
+        fentry_set,
+        MEMORY_SYSCALL_TP_PROGS,
+        opts.memory_syscall_force_fallback,
+    ) {
+        LegAttach::Primary(l) => links.extend(l),
+        LegAttach::Fallback(l, primary_error) => {
+            links.extend(l);
+            if legs.syscall_fentry_off.is_none() {
+                eprintln!(
+                    "memory recorder: syscall hooks on the classic tracepoints for this capture: {primary_error}"
+                );
+                legs.syscall_fentry_off = Some(if opts.memory_syscall_force_fallback {
+                    "forced".to_string()
+                } else {
+                    "notramp".to_string()
+                });
+            }
+        }
+        LegAttach::Neither(e) => {
+            eprintln!("memory recorder: mmap/munmap/brk hooks off for this capture: {e}");
+            legs.syscall_off = Some("attach".to_string());
+        }
+    }
+
     let vfio_on = opts.memory_vfio && legs.vfio_off.is_none();
     let thp_on = opts.memory_thp_sample_rate > 0;
     let mut groups: Vec<(&str, Vec<&'static str>)> = Vec::new();
@@ -3911,7 +4369,6 @@ fn attach_memory_kernel_legs(
         }
     }
 
-    let mut links = Vec::new();
     let mut vfio_failed = false;
     for (leg, programs) in groups {
         // The teardown pair is meaningless without the ioctl pair's window
@@ -3920,25 +4377,11 @@ fn attach_memory_kernel_legs(
             legs.vfio_teardown_off = Some("attach".to_string());
             continue;
         }
-        let mut leg_links = Vec::new();
-        let mut failure: Option<(String, libbpf_rs::Error)> = None;
-        for prog in skel.object_mut().progs_mut() {
-            let name = prog.name().to_string_lossy().into_owned();
-            if !programs.contains(&name.as_str()) {
-                continue;
-            }
-            match prog.attach() {
-                Ok(link) => leg_links.push(link),
-                Err(e) => {
-                    failure = Some((name, e));
-                    break;
-                }
-            }
-        }
-        match failure {
-            None => links.extend(leg_links),
-            Some((name, e)) => {
-                // Dropping leg_links detaches the probes attached so far.
+        match attach_program_set(skel, &programs, false) {
+            Ok(leg_links) => links.extend(leg_links),
+            Err((name, e)) => {
+                // The partial links were dropped with the Err: the probes
+                // attached so far are detached.
                 eprintln!(
                     "memory recorder: {leg} leg off for this capture: {name} failed to attach: {e}"
                 );
@@ -3965,6 +4408,68 @@ fn attach_memory_kernel_legs(
         }
     }
     links
+}
+
+/// Is `name` one of the network recorder's TIME_WAIT leg programs (either
+/// set), which are attached by `attach_network_tw_leg` rather than by
+/// `skel.attach()`.
+fn is_network_tw_leg_program(name: &str) -> bool {
+    NETWORK_TW_FENTRY_PROGRAMS.contains(&name) || NETWORK_TW_KPROBE_PROGRAMS.contains(&name)
+}
+
+/// Attach the network recorder's TIME_WAIT leg after `skel.attach()`, through
+/// [`attach_leg_with_fallback`]: the trampoline (fentry) set first — when it
+/// was loaded, i.e. vmlinux BTF describes the three functions — and on its
+/// first attach failure the kprobe set instead (the partial links dropped;
+/// never a mixed leg, the three hooks share maps and must agree on their
+/// attach path); when the kprobe set fails too the leg is off for this
+/// capture (`off:attach`) and the rest of the recorder runs. The trampoline
+/// attach is the failure the load-time gates cannot see: an arm64 kernel
+/// without DYNAMIC_FTRACE_WITH_DIRECT_CALLS resolves the BTF id, loads the
+/// program and refuses the link. Runs before `attach_clock_sampler`, which
+/// must not observe the trampoline links' text_poke_bp IPI batches. Returns
+/// the links; the "detach bpf programs" stop phase drops them.
+fn attach_network_tw_leg(
+    skel: &mut SystingSystemSkel,
+    opts: &Config,
+    legs: &mut NetworkKernelLegs,
+) -> Vec<libbpf_rs::Link> {
+    if !opts.network || legs.tw_off.is_some() {
+        return Vec::new();
+    }
+    let fentry_set: &[&str] = if legs.tw_fentry_loadable {
+        NETWORK_TW_FENTRY_PROGRAMS
+    } else {
+        &[]
+    };
+    match attach_leg_with_fallback(
+        skel,
+        fentry_set,
+        NETWORK_TW_KPROBE_PROGRAMS,
+        opts.network_tw_force_fallback,
+    ) {
+        LegAttach::Primary(links) => {
+            legs.tw_attached = Some("fentry".to_string());
+            links
+        }
+        LegAttach::Fallback(links, primary_error) => {
+            let why = if legs.tw_fentry_loadable {
+                eprintln!(
+                    "network recorder: TIME_WAIT hooks on the kprobe set for this capture: {primary_error}"
+                );
+                "notramp"
+            } else {
+                "nobtf"
+            };
+            legs.tw_attached = Some(format!("kprobe:{why}"));
+            links
+        }
+        LegAttach::Neither(e) => {
+            eprintln!("network recorder: TIME_WAIT leg off for this capture: {e}");
+            legs.tw_off = Some("attach".to_string());
+            Vec::new()
+        }
+    }
 }
 
 /// Attach malloc/free/... uprobes to each discovered allocator library. Probes
@@ -4775,9 +5280,16 @@ pub fn systing(
             "Failed to open BPF skeleton. Ensure BPF is supported on your kernel."
         })?;
 
-        // Which optional memory legs this kernel can serve (kallsyms +
-        // tracefs), decided before the programs are selected for load.
-        let mut memory_legs = probe_memory_kernel_legs(&opts);
+        // Which kernel legs this kernel can serve, decided before the
+        // programs are selected for load: one read of kallsyms + vmlinux
+        // BTF for every leg the configuration turns on, then the memory
+        // recorder's legs (syscall hooks; VFIO/THP with tracefs) and the
+        // network recorder's TIME_WAIT leg (off on a kernel without
+        // inet_twsk_hashdance_schedule, pre-6.11; else both program sets
+        // load and one attaches after skel.attach(), where the leg's value
+        // is printed and recorded).
+        let kernel_symbols = probe_kernel_symbols(&opts);
+        let mut memory_legs = probe_memory_kernel_legs(&opts, &kernel_symbols);
         if opts.memory && opts.memory_vfio {
             println!(
                 "memory recorder: vfio/iommu leg {}",
@@ -4791,6 +5303,7 @@ pub fn systing(
                 opts.memory_thp_sample_rate
             );
         }
+        let mut network_legs = probe_network_kernel_legs(&opts, &kernel_symbols);
 
         // Configure the BPF skeleton with all settings
         configure_bpf_skeleton(
@@ -4801,6 +5314,7 @@ pub fn systing(
             collect_pystacks,
             cgroup_filter.kernel_mode(),
             &memory_legs,
+            &network_legs,
             &recorder,
             ring_plan,
         )?;
@@ -5045,10 +5559,33 @@ pub fn systing(
         // Check for any probes that failed to attach and warn about them
         warn_failed_probe_attachments(&skel);
 
-        // The memory recorder's optional kernel legs, one leg at a time: a
-        // leg whose probe fails to attach is turned off for this capture
-        // (recorded in sysinfo) and the rest of the recorder runs.
+        // The memory recorder's kernel legs, one leg at a time: the
+        // mmap/munmap/brk hooks (trampolines first, the classic tracepoints
+        // when those cannot attach) and the optional VFIO/THP probes; a leg
+        // that fails to attach is turned off for this capture (recorded in
+        // sysinfo) and the rest of the recorder runs.
         let _memory_leg_links = attach_memory_kernel_legs(&mut skel, &opts, &mut memory_legs);
+        if opts.memory {
+            println!(
+                "memory recorder: syscall hooks {}",
+                memory_legs.syscall_leg_value()
+            );
+        }
+
+        // The network recorder's TIME_WAIT leg: the trampoline set, or the
+        // kprobe set when a trampoline attach fails on this host; which one
+        // ran is sysinfo.network_tw_leg (per capture, so a read across
+        // hosts can count the legs per arch).
+        let _network_tw_links = attach_network_tw_leg(&mut skel, &opts, &mut network_legs);
+        if opts.network {
+            println!(
+                "network recorder: TIME_WAIT leg {}",
+                network_legs.tw_leg_value()
+            );
+            let _ = recorder.network_recorder_config.set(NetworkRecorderConfig {
+                tw_leg: network_legs.tw_leg_value(),
+            });
+        }
 
         // Attach any usdt's that we may have
         let _probe_links = attach_probes(&mut skel, &recorder, &opts, old_kernel)?;
@@ -5075,13 +5612,14 @@ pub fn systing(
         // race or repeat.
         let _ = recorder.clock_sampling.set(clock_sampling);
 
-        // Likewise for the memory recorder: which fault leg ran (or why it
-        // did not) and the sample rates, so a consumer can scale the sampled
-        // tables and tell an empty memory_fault from a host where the leg
-        // never attached.
+        // Likewise for the memory recorder: which fault leg and which form
+        // of the syscall hooks ran (or why not) and the sample rates, so a
+        // consumer can scale the sampled tables and tell an empty
+        // memory_fault / memory_map from a host where the leg never attached.
         if let Some(fault_leg) = memory_fault_leg {
             let _ = recorder.memory_recorder_config.set(MemoryRecorderConfig {
                 fault_leg,
+                syscall_leg: memory_legs.syscall_leg_value(),
                 fault_sample_rate: opts.memory_fault_sample_rate,
                 map_sample_rate: opts.memory_map_sample_rate,
                 alloc_sample_rate: opts.memory_alloc.then_some(opts.memory_alloc_sample_rate),
@@ -5513,6 +6051,7 @@ pub fn systing(
         let _p = stop_phase("detach bpf programs");
         drop(_memory_alloc_links);
         drop(_memory_leg_links);
+        drop(_network_tw_links);
         drop(_probe_links);
         drop(skel);
     }
@@ -5777,18 +6316,41 @@ pub fn bpf_load_probe(
         .open(&mut open_object)
         .with_context(|| "Failed to open BPF skeleton. Ensure BPF is supported on your kernel.")?;
 
+    let kernel_symbols = probe_kernel_symbols(opts);
     let memory_legs = match legs {
-        LegSelection::Host => probe_memory_kernel_legs(opts),
+        LegSelection::Host => probe_memory_kernel_legs(opts, &kernel_symbols),
         LegSelection::Force {
             thp_pmd_prog,
             thp_page_prog,
         } => MemoryKernelLegs {
+            // The syscall hooks as the host decides them (the trampoline
+            // set needs the wrappers to resolve at load); the rest forced.
+            syscall_fentry_off: probe_memory_kernel_legs(opts, &kernel_symbols).syscall_fentry_off,
+            syscall_off: None,
             vfio_off: None,
             vfio_teardown_off: None,
             thp_pmd_prog: Some(thp_pmd_prog),
             thp_page_prog: Some(thp_page_prog),
             thp_off: None,
         },
+        LegSelection::SyscallTracepointOnly => MemoryKernelLegs {
+            syscall_fentry_off: Some("nosym".to_string()),
+            ..probe_memory_kernel_legs(opts, &kernel_symbols)
+        },
+        LegSelection::NetworkTwKprobeOnly => probe_memory_kernel_legs(opts, &kernel_symbols),
+    };
+    // The network recorder's TIME_WAIT leg as the host decides it (its
+    // trampoline set cannot be forced onto a kernel whose BTF lacks the
+    // functions — the load, not the attach, would fail — and on one that
+    // has them the Host probe selects both sets), except the kprobe-only
+    // row, which loads the object a host without BTF for the functions
+    // loads.
+    let network_legs = match legs {
+        LegSelection::NetworkTwKprobeOnly => NetworkKernelLegs {
+            tw_fentry_loadable: false,
+            ..probe_network_kernel_legs(opts, &kernel_symbols)
+        },
+        _ => probe_network_kernel_legs(opts, &kernel_symbols),
     };
     let collect_pystacks = opts.collect_pystacks;
     configure_bpf_skeleton(
@@ -5799,6 +6361,7 @@ pub fn bpf_load_probe(
         collect_pystacks,
         cgroup_filter.kernel_mode(),
         &memory_legs,
+        &network_legs,
         &recorder,
         ring_plan,
     )?;
@@ -5825,13 +6388,14 @@ pub fn bpf_load_probe(
         .set_max_entries(num_cpus)
         .with_context(|| format!("Failed to set missed_events map size to {num_cpus} entries"))?;
 
-    let required = get_required_bpf_programs(
+    let mut required = get_required_bpf_programs(
         opts,
         old_kernel,
         collect_pystacks,
         cgroup_filter.kernel_mode(),
         &memory_legs,
     );
+    required.extend(network_tw_leg_programs(opts, &network_legs));
     let mut autoloaded: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     for mut prog in open_skel.open_object_mut().progs_mut() {
@@ -6152,6 +6716,8 @@ mod tests {
             ..Default::default()
         };
         let all = MemoryKernelLegs {
+            syscall_fentry_off: None,
+            syscall_off: None,
             vfio_off: None,
             vfio_teardown_off: None,
             thp_pmd_prog: Some(THP_PMD_LOCKED_PROG),
@@ -6223,6 +6789,8 @@ mod tests {
         assert_eq!(no_teardown.vfio_leg_value(), "on:noteardown");
 
         let none = MemoryKernelLegs {
+            syscall_fentry_off: None,
+            syscall_off: None,
             vfio_off: Some("nosym".to_string()),
             vfio_teardown_off: Some("nosym".to_string()),
             thp_pmd_prog: None,
@@ -6267,10 +6835,198 @@ mod tests {
         assert!(MEMORY_VFIO_BPF_PROGRAMS.iter().all(|p| !req.contains(p)));
         assert!(!req.contains("systing_thp_split_pmd"));
         assert!(!req.contains("systing_thp_split_page"));
+        // The optional legs read available-but-unused; the syscall hooks
+        // are probed whenever the recorder is on (host-dependent, tested
+        // separately).
+        let probed = probe_memory_kernel_legs(&not_asked, &probe_kernel_symbols(&not_asked));
         assert_eq!(
-            probe_memory_kernel_legs(&not_asked),
+            MemoryKernelLegs {
+                syscall_fentry_off: None,
+                ..probed
+            },
             MemoryKernelLegs::default()
         );
+    }
+
+    /// The mmap/munmap/brk hooks: the classic set always loads with the
+    /// recorder, the trampoline set only when the wrappers are there; the
+    /// sysinfo value names the form that ran.
+    #[test]
+    fn test_memory_syscall_hooks_selection_and_leg_values() {
+        let memory = Config {
+            memory: true,
+            ..Default::default()
+        };
+        let both = MemoryKernelLegs::default();
+        let req = get_required_bpf_programs(&memory, false, false, false, &both);
+        assert!(MEMORY_SYSCALL_TP_PROGS.iter().all(|p| req.contains(p)));
+        assert!(MEMORY_SYSCALL_FENTRY_PROGS.iter().all(|p| req.contains(p)));
+        assert_eq!(both.syscall_leg_value(), "fentry");
+
+        let nosym = MemoryKernelLegs {
+            syscall_fentry_off: Some("nosym".to_string()),
+            ..Default::default()
+        };
+        let req = get_required_bpf_programs(&memory, false, false, false, &nosym);
+        assert!(MEMORY_SYSCALL_TP_PROGS.iter().all(|p| req.contains(p)));
+        assert!(MEMORY_SYSCALL_FENTRY_PROGS.iter().all(|p| !req.contains(p)));
+        assert_eq!(nosym.syscall_leg_value(), "tracepoint:nosym");
+
+        // The wrappers in kallsyms but not in vmlinux BTF: the trampoline
+        // set would fail the whole object at load, so it is left unselected.
+        let nobtf = MemoryKernelLegs {
+            syscall_fentry_off: Some("nobtf".to_string()),
+            ..Default::default()
+        };
+        let req = get_required_bpf_programs(&memory, false, false, false, &nobtf);
+        assert!(MEMORY_SYSCALL_TP_PROGS.iter().all(|p| req.contains(p)));
+        assert!(MEMORY_SYSCALL_FENTRY_PROGS.iter().all(|p| !req.contains(p)));
+        assert_eq!(nobtf.syscall_leg_value(), "tracepoint:nobtf");
+
+        for cause in ["notramp", "forced"] {
+            let fell_back = MemoryKernelLegs {
+                syscall_fentry_off: Some(cause.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(fell_back.syscall_leg_value(), "tracepoint:notramp");
+        }
+        let neither = MemoryKernelLegs {
+            syscall_fentry_off: Some("notramp".to_string()),
+            syscall_off: Some("attach".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(neither.syscall_leg_value(), "off:attach");
+
+        // Neither set rides skel.attach(): both are attached by hand.
+        for prog in MEMORY_SYSCALL_TP_PROGS
+            .iter()
+            .chain(MEMORY_SYSCALL_FENTRY_PROGS)
+        {
+            assert!(is_memory_kernel_leg_program(prog), "{prog}");
+        }
+        // Without the recorder nothing of either set loads.
+        let req = get_required_bpf_programs(&Config::default(), false, false, false, &both);
+        assert!(MEMORY_SYSCALL_TP_PROGS.iter().all(|p| !req.contains(p)));
+        assert!(MEMORY_SYSCALL_FENTRY_PROGS.iter().all(|p| !req.contains(p)));
+
+        // The probe's verdict on this host follows kallsyms + vmlinux BTF
+        // exactly, through the shared one-read probe.
+        if fs::read_to_string("/proc/kallsyms").is_ok() {
+            let wrappers = memory_syscall_wrapper_symbols();
+            let names: Vec<&str> = wrappers.iter().map(String::as_str).collect();
+            let present = kallsyms_has_funcs(&names);
+            let kernel = probe_kernel_symbols(&memory);
+            let probed = probe_memory_kernel_legs(&memory, &kernel);
+            if !wrappers.iter().all(|w| present.contains(w.as_str())) {
+                assert_eq!(probed.syscall_fentry_off.as_deref(), Some("nosym"));
+                assert!(
+                    kernel.btf_funcs.is_empty(),
+                    "no BTF lookup without the symbols"
+                );
+            } else if wrappers
+                .iter()
+                .all(|w| kernel.btf_funcs.contains(w.as_str()))
+            {
+                assert_eq!(probed.syscall_fentry_off, None);
+            } else {
+                assert_eq!(probed.syscall_fentry_off.as_deref(), Some("nobtf"));
+            }
+            assert_eq!(probed.syscall_off, None);
+            // Nothing is read for a configuration with no kernel leg on.
+            assert_eq!(
+                probe_kernel_symbols(&Config::default()),
+                KernelSymbols::default()
+            );
+        }
+    }
+
+    /// The network recorder's TIME_WAIT leg loads exactly what the kernel
+    /// probe allows — nothing without the 6.11 symbol, the kprobe set alone
+    /// without BTF for the functions, both sets with it — and the sysinfo
+    /// leg strings name the outcome.
+    #[test]
+    fn test_network_tw_leg_follows_the_kernel_probe() {
+        let network = Config {
+            network: true,
+            ..Default::default()
+        };
+        let all: HashSet<String> = NETWORK_TW_SYMBOLS.iter().map(|s| s.to_string()).collect();
+        let none: HashSet<String> = HashSet::new();
+
+        // 6.11+ with BTF: both sets load; the trampoline set is what
+        // attach_network_tw_leg tries first.
+        let both = select_network_kernel_legs(&all, &all);
+        assert_eq!(both.tw_off, None);
+        assert!(both.tw_fentry_loadable);
+        let req = network_tw_leg_programs(&network, &both);
+        assert!(NETWORK_TW_FENTRY_PROGRAMS.iter().all(|p| req.contains(p)));
+        assert!(NETWORK_TW_KPROBE_PROGRAMS.iter().all(|p| req.contains(p)));
+
+        // The symbols without BTF FUNC entries: the kprobe set alone (a
+        // forced fentry load would fail the whole object).
+        let nobtf = select_network_kernel_legs(&all, &none);
+        assert_eq!(nobtf.tw_off, None);
+        assert!(!nobtf.tw_fentry_loadable);
+        let req = network_tw_leg_programs(&network, &nobtf);
+        assert!(NETWORK_TW_FENTRY_PROGRAMS.iter().all(|p| !req.contains(p)));
+        assert!(NETWORK_TW_KPROBE_PROGRAMS.iter().all(|p| req.contains(p)));
+
+        // A pre-6.11 kernel (no inet_twsk_hashdance_schedule): the leg is
+        // off, nothing of it loads, the rest of the capture runs.
+        let mut old = all.clone();
+        old.remove("inet_twsk_hashdance_schedule");
+        let off = select_network_kernel_legs(&old, &old);
+        assert_eq!(off.tw_off.as_deref(), Some("nosym"));
+        assert!(network_tw_leg_programs(&network, &off).is_empty());
+        assert_eq!(off.tw_leg_value(), "off:nosym");
+
+        // Not asked for: nothing loads whatever the kernel has.
+        assert!(network_tw_leg_programs(&Config::default(), &both).is_empty());
+        assert_eq!(
+            probe_network_kernel_legs(&Config::default(), &KernelSymbols::default()),
+            NetworkKernelLegs::default()
+        );
+
+        // The sysinfo values an attach settles.
+        let attached = |s: &str| NetworkKernelLegs {
+            tw_attached: Some(s.to_string()),
+            ..both.clone()
+        };
+        assert_eq!(attached("fentry").tw_leg_value(), "fentry");
+        assert_eq!(attached("kprobe:notramp").tw_leg_value(), "kprobe:notramp");
+        assert_eq!(attached("kprobe:nobtf").tw_leg_value(), "kprobe:nobtf");
+        assert_eq!(
+            NetworkKernelLegs {
+                tw_off: Some("attach".to_string()),
+                ..both.clone()
+            }
+            .tw_leg_value(),
+            "off:attach"
+        );
+
+        // Both sets are manual-attach; the always-on tracepoint is not.
+        assert!(NETWORK_TW_FENTRY_PROGRAMS
+            .iter()
+            .chain(NETWORK_TW_KPROBE_PROGRAMS)
+            .all(|p| is_network_tw_leg_program(p)));
+        assert!(!NETWORK_BPF_PROGRAMS
+            .iter()
+            .any(|p| is_network_tw_leg_program(p)));
+    }
+
+    /// The vmlinux BTF probe sees real kernel functions and not made-up ones
+    /// (the kallsyms probe's sibling).
+    #[test]
+    fn test_vmlinux_btf_probe() {
+        if !Path::new("/sys/kernel/btf/vmlinux").exists() {
+            eprintln!("skipping: no vmlinux BTF");
+            return;
+        }
+        let found =
+            vmlinux_btf_has_funcs(&["schedule", "do_exit", "systing_no_such_kernel_function"]);
+        assert!(found.contains("schedule"));
+        assert!(found.contains("do_exit"));
+        assert!(!found.contains("systing_no_such_kernel_function"));
     }
 
     /// The kallsyms probe sees real text symbols and not made-up ones.

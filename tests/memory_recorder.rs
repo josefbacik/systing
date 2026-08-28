@@ -89,6 +89,28 @@ fn test_memory_recorder_e2e() {
         .expect("DuckDB conversion failed");
     let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
 
+    // --- Check: sysinfo says which form of the mmap/munmap/brk hooks ran ---
+    // The trampoline form on a kernel that lists the arch syscall wrappers
+    // in kallsyms and can attach a trampoline to them (the rig guest); a
+    // kernel without the wrappers records the classic form instead.
+    eprintln!("  sysinfo.memory_syscall_leg...");
+    let syscall_leg = read_syscall_leg(&conn);
+    if host_has_syscall_wrappers() {
+        // `tracepoint:nobtf` only on a kernel whose BTF lacks the wrappers
+        // (the trampoline set is then never loaded); the rig guest has them.
+        assert!(
+            syscall_leg == "fentry" || syscall_leg == "tracepoint:nobtf",
+            "[sysinfo] memory_syscall_leg = {syscall_leg:?}: expected the trampoline form \
+             on a kernel that lists the syscall wrappers"
+        );
+    } else {
+        assert_eq!(
+            syscall_leg, "tracepoint:nosym",
+            "[sysinfo] memory_syscall_leg: the classic form on a kernel without the wrappers"
+        );
+    }
+    eprintln!("    memory_syscall_leg = {syscall_leg}");
+
     // --- Check: memory_rss has anon rows with plausible byte values ---
     eprintln!("  memory_rss anon sanity...");
     let (anon_rows, max_anon): (i64, i64) = conn
@@ -293,6 +315,131 @@ fn test_memory_recorder_e2e() {
     );
 
     eprintln!("\ntest_memory_recorder_e2e: all checks passed");
+}
+
+/// `sysinfo.memory_syscall_leg` of the one trace in `conn`.
+fn read_syscall_leg(conn: &duckdb::Connection) -> String {
+    conn.query_row("SELECT memory_syscall_leg FROM sysinfo", [], |row| {
+        row.get::<_, Option<String>>(0)
+    })
+    .expect("Failed to query sysinfo.memory_syscall_leg")
+    .expect("memory_syscall_leg must be recorded when the memory recorder ran")
+}
+
+/// Does this kernel list the arch syscall wrappers the trampoline set attaches
+/// to (`__x64_sys_mmap` … on x86, `__arm64_sys_*` on arm64)? The same read
+/// the recorder's own probe makes; decides which form the tests can expect.
+fn host_has_syscall_wrappers() -> bool {
+    let prefix = if cfg!(target_arch = "x86_64") {
+        "__x64_sys_"
+    } else if cfg!(target_arch = "aarch64") {
+        "__arm64_sys_"
+    } else {
+        "__riscv_sys_"
+    };
+    let Ok(kallsyms) = std::fs::read_to_string("/proc/kallsyms") else {
+        return false;
+    };
+    ["mmap", "munmap", "brk"].iter().all(|name| {
+        let sym = format!("{prefix}{name}");
+        kallsyms.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            matches!(
+                (fields.next(), fields.next(), fields.next()),
+                (Some(_), Some("t" | "T"), Some(s)) if s == sym
+            )
+        })
+    })
+}
+
+/// The attach-time fallback of the mmap/munmap/brk hooks: when a program of
+/// the trampoline set fails to attach, the links attached before it are
+/// dropped and the classic tracepoint set takes over — the capture still
+/// carries the syscall rows, and sysinfo says which form ran. The failure is
+/// the testing-only switch (after the first trampoline program attached, so a
+/// real link is dropped), because no rig kernel refuses trampolines; on a
+/// kernel that does (arm64 without direct-call ftrace) this is the path a
+/// capture takes.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_syscall_hooks_fall_back_to_tracepoints() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let py_prog = format!(
+        "import time\n\
+         bufs=[]\n\
+         for _ in range({count}):\n\
+         \x20 b=bytearray({size})\n\
+         \x20 b[0]=1; b[-1]=1\n\
+         \x20 bufs.append(b)\n\
+         del bufs\n\
+         time.sleep(0.2)\n",
+        count = ALLOC_COUNT,
+        size = ALLOC_SIZE_BYTES,
+    );
+    let run_cmd = vec!["python3".to_string(), "-c".to_string(), py_prog];
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+    let child_pid = traced_child.pid as i32;
+    eprintln!("Recording memory trace with the forced syscall-hook fallback (pid {child_pid})...");
+
+    let config = Config {
+        memory: true,
+        memory_syscall_force_fallback: true,
+        parquet_only: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+    assert_eq!(exit_code, 0, "allocator workload should exit with code 0");
+
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "fallback")
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+
+    let syscall_leg = read_syscall_leg(&conn);
+    if host_has_syscall_wrappers() {
+        // (`tracepoint:nobtf` only on a kernel whose BTF lacks the wrappers:
+        // no trampoline set loaded, nothing for the switch to force.)
+        assert!(
+            syscall_leg == "tracepoint:notramp" || syscall_leg == "tracepoint:nobtf",
+            "[sysinfo] memory_syscall_leg = {syscall_leg:?}: the forced trampoline failure \
+             must land on the classic tracepoint set"
+        );
+    } else {
+        // No trampoline set was loaded to fail: the classic set is the
+        // only form, and the switch has nothing to force.
+        assert_eq!(syscall_leg, "tracepoint:nosym");
+    }
+
+    // The classic set carries the rows: the big mmaps and their munmaps.
+    let (mmap_rows, munmap_rows): (i64, i64) = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FILTER (WHERE event_type = 'mmap' AND size >= ?),
+                        COUNT(*) FILTER (WHERE event_type = 'munmap')
+                 FROM memory_map WHERE utid IN {UTIDS_FOR_PID}"
+            ),
+            [ALLOC_SIZE_BYTES, child_pid as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Failed to query memory_map");
+    assert!(
+        mmap_rows >= ALLOC_COUNT / 2,
+        "[memory_map] expected >= {} mmap events of >= {} bytes through the classic set, got {}",
+        ALLOC_COUNT / 2,
+        ALLOC_SIZE_BYTES,
+        mmap_rows
+    );
+    assert!(
+        munmap_rows > 0,
+        "[memory_map] no munmap events for workload pid {child_pid} through the classic set"
+    );
+    eprintln!(
+        "    memory_syscall_leg = {syscall_leg}; {mmap_rows} big mmap + {munmap_rows} munmap rows"
+    );
+    eprintln!("\ntest_memory_syscall_hooks_fall_back_to_tracepoints: all checks passed");
 }
 
 #[test]

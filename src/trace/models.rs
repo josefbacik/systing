@@ -594,6 +594,27 @@ pub struct SysInfoRecord {
     /// processes whose memory events moved the most bytes. `None` when the
     /// THP leg did not run, and in traces from systing < 1.16.
     pub memory_anon_huge_walk: Option<String>,
+    /// How the memory recorder's mmap/munmap/brk hooks attached: `fentry`
+    /// (trampolines on the arch syscall wrappers), `tracepoint:nosym` /
+    /// `tracepoint:nobtf` / `tracepoint:notramp` (the classic syscalls
+    /// tracepoints — the wrappers are not in kallsyms / not in vmlinux BTF /
+    /// the trampoline set failed to attach) or
+    /// `off:<cause>` (neither attached: no mmap/munmap/brk rows in
+    /// memory_map for this capture). `None` when the memory recorder did
+    /// not run, and in traces from systing < 1.17 (which attached the
+    /// classic tracepoints, always).
+    pub memory_syscall_leg: Option<String>,
+    /// How the network recorder's TIME_WAIT leg (the tcp_time_wait /
+    /// inet_twsk_hashdance_schedule / inet_twsk_deschedule_put hooks)
+    /// attached: `fentry` (the trampoline set), `kprobe:notramp` (the
+    /// trampoline attach failed on this host and the kprobe set ran),
+    /// `kprobe:nobtf` (the trampoline set could not be loaded, the kprobe
+    /// set ran), or `off:<cause>` (`nosym`: a pre-6.11 kernel has no
+    /// inet_twsk_hashdance_schedule; `attach`: neither set attached) — with
+    /// the leg off the trace has no TIME_WAIT transitions at all. `None` when
+    /// the network recorder was off, and in traces from systing < 1.17
+    /// (which attached the kprobes, always).
+    pub network_tw_leg: Option<String>,
 }
 
 /// Per-CPU static frequency limits from sysfs cpufreq, in kHz.
