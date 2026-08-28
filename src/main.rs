@@ -126,7 +126,7 @@ struct Command {
     /// Sample 1 in N mmap/munmap/brk events when the memory recorder is enabled (0 or 1 = record all). Byte aggregates over sampled map events scale by the rate; per-event address pairing (an mmap with its munmap) is unreliable at rates > 1.
     #[arg(long, default_value = "1")]
     memory_map_sample_rate: u32,
-    /// With the memory recorder, also record VFIO DMA regions (one memory_vfio row per VFIO_IOMMU_MAP_DMA/UNMAP_DMA, with stacks) and the IOMMU map/unmap run-size histogram (memory_iommu: how fragmented the memory behind device mappings is). Needs the vfio_iommu_type1 module loaded; otherwise the leg is off (sysinfo.memory_vfio_leg) and the capture proceeds.
+    /// With the memory recorder, also record VFIO DMA regions (one memory_vfio row per VFIO_IOMMU_MAP_DMA/UNMAP_DMA and per container teardown, with stacks) and the IOMMU map/unmap run-size histogram (memory_iommu: how fragmented the memory behind device mappings is, ioctl and teardown unmaps alike). Needs the vfio_iommu_type1 module loaded; otherwise the leg is off (sysinfo.memory_vfio_leg) and the capture proceeds.
     #[arg(long)]
     memory_vfio: bool,
     /// With the memory recorder, sample 1 in N transparent-huge-page splits into memory_thp (0 = off, 1 = every split), and record each traced process's AnonHugePages at capture end (memory_rss member -6; one /proc/<pid>/smaps_rollup page-table walk per live process, so only with this leg). The host-wide split/fallback/compaction counters are always sampled into memory_vmstat when the memory recorder runs.

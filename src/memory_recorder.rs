@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -98,9 +99,10 @@ pub struct MemoryRecorder {
     next_thp_id: i64,
     write_error_reported: bool,
     utid_generator: Arc<UtidGenerator>,
-    /// Every tgid that produced a memory event, for the end-of-capture
-    /// per-process AnonHugePages sample.
-    seen_tgids: HashSet<i32>,
+    /// Every tgid that produced a memory event, with the bytes its events
+    /// moved (|size| summed), for the end-of-capture per-process
+    /// AnonHugePages sample: the walk takes the heaviest processes first.
+    seen_tgids: HashMap<i32, u64>,
     /// The start-of-capture vmstat sample (boot ns, name -> value).
     vmstat_start: Option<(i64, Vec<(String, i64)>)>,
 }
@@ -118,7 +120,7 @@ impl MemoryRecorder {
             next_thp_id: 1,
             write_error_reported: false,
             utid_generator,
-            seen_tgids: HashSet::new(),
+            seen_tgids: HashMap::new(),
             vmstat_start: None,
         }
     }
@@ -154,6 +156,43 @@ pub fn parse_vmstat(contents: &str) -> Vec<(String, i64)> {
 fn read_anon_huge_pages(pid: i32) -> Option<i64> {
     let contents = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
     parse_smaps_anon_huge(&contents)
+}
+
+/// The most processes the end-of-capture AnonHugePages walk reads; each
+/// read is a kernel page-table walk of that process.
+pub const ANON_HUGE_WALK_MAX_TGIDS: usize = 64;
+/// The wall-time budget of the whole AnonHugePages walk; a host whose
+/// processes map terabytes at 4 KiB would otherwise hold the capture's stop
+/// for seconds.
+pub const ANON_HUGE_WALK_BUDGET: Duration = Duration::from_millis(500);
+
+/// What the end-of-capture AnonHugePages walk did, for `sysinfo`
+/// (`memory_anon_huge_walk`): `complete:<read>/<candidates>` when every
+/// live candidate was read, `capped:<read>/<candidates>` when the process
+/// cap stopped it, `budget:<read>/<candidates>` when the time budget did.
+/// `candidates` counts every process that produced a memory event; those
+/// already gone at capture end are neither read nor skipped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AnonHugeWalk {
+    pub candidates: usize,
+    pub read: usize,
+    pub gone: usize,
+    pub skipped_cap: usize,
+    pub skipped_budget: usize,
+}
+
+impl AnonHugeWalk {
+    /// The `sysinfo.memory_anon_huge_walk` value.
+    pub fn sysinfo_value(&self) -> String {
+        let state = if self.skipped_budget > 0 {
+            "budget"
+        } else if self.skipped_cap > 0 {
+            "capped"
+        } else {
+            "complete"
+        };
+        format!("{state}:{}/{}", self.read, self.candidates)
+    }
 }
 
 /// The `AnonHugePages: <n> kB` line of a smaps / smaps_rollup text, in bytes.
@@ -282,20 +321,43 @@ impl MemoryRecorder {
     /// `/proc/<pid>/smaps_rollup`. Each read is a page-table walk of that
     /// process in the kernel, so the caller runs this only for captures
     /// that asked the huge-page question (the THP-split leg), never on
-    /// every memory capture.
-    pub fn emit_anon_huge_pages(&mut self, ts: i64) {
-        let tgids: Vec<i32> = self.seen_tgids.iter().copied().collect();
+    /// every memory capture — and even then the walk is bounded: at most
+    /// [`ANON_HUGE_WALK_MAX_TGIDS`] processes, the ones whose memory events
+    /// moved the most bytes first, under [`ANON_HUGE_WALK_BUDGET`] of wall
+    /// time. The outcome (how many were read, how many the cap or the
+    /// budget skipped) is returned for the capture's `sysinfo` row, so a
+    /// reader can tell a complete sample from a capped one.
+    pub fn emit_anon_huge_pages(&mut self, ts: i64) -> AnonHugeWalk {
+        let mut tgids: Vec<(i32, u64)> = self.seen_tgids.iter().map(|(t, b)| (*t, *b)).collect();
+        let candidates = tgids.len();
+        let mut walk = AnonHugeWalk {
+            candidates,
+            ..AnonHugeWalk::default()
+        };
         if tgids.is_empty() {
-            return;
+            return walk;
         }
         let Some(mut collector) = self.streaming_collector.take() else {
-            return;
+            return walk;
         };
-        for tgid in tgids {
-            let Some(bytes) = read_anon_huge_pages(tgid) else {
+        // Heaviest first, then by tgid so the order is stable.
+        tgids.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let started = Instant::now();
+        for (i, (tgid, _)) in tgids.iter().enumerate() {
+            if i >= ANON_HUGE_WALK_MAX_TGIDS {
+                walk.skipped_cap = candidates - i;
+                break;
+            }
+            if started.elapsed() > ANON_HUGE_WALK_BUDGET {
+                walk.skipped_budget = candidates - i;
+                break;
+            }
+            let Some(bytes) = read_anon_huge_pages(*tgid) else {
+                walk.gone += 1;
                 continue;
             };
-            let utid = self.utid_generator.get_or_create_utid(tgid);
+            walk.read += 1;
+            let utid = self.utid_generator.get_or_create_utid(*tgid);
             let r = collector.add_memory_rss(MemoryRssRecord {
                 ts,
                 utid,
@@ -306,6 +368,7 @@ impl MemoryRecorder {
             self.report_write_error(r);
         }
         self.streaming_collector = Some(collector);
+        walk
     }
 
     fn report_write_error(&mut self, r: Result<()>) {
@@ -381,7 +444,7 @@ impl SystingRecordEvent<memory_event> for MemoryRecorder {
         let hdr = &event.hdr;
         let task = self.utid_generator.resolve_task(&hdr.task);
         let ResolvedTask { utid, tgid } = task;
-        self.seen_tgids.insert(tgid);
+        *self.seen_tgids.entry(tgid).or_insert(0) += (hdr.size as i64).unsigned_abs();
 
         match hdr.r#type {
             memory_event_type::MEMORY_RSS_STAT => {

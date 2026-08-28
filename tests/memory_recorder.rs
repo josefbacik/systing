@@ -111,20 +111,12 @@ fn test_memory_recorder_e2e() {
         max_anon,
         RSS_SANITY_CEILING_BYTES
     );
-    // The AnonHugePages sample (member -6) belongs to the THP-split leg:
-    // a plain memory capture must not take the per-process smaps_rollup
-    // walk, so it writes no such row.
-    let anon_huge_rows: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM memory_rss WHERE member = -6",
-            [],
-            |row| row.get(0),
-        )
-        .expect("Failed to query memory_rss anon_huge rows");
-    assert_eq!(
-        anon_huge_rows, 0,
-        "[memory_rss] anon_huge rows (member=-6) written without the THP-split leg"
-    );
+    // The AnonHugePages sample (member -6) belongs to the THP-split leg.
+    // Whether a plain capture takes it cannot be told here: in command
+    // mode the workload is reaped before the end samples, so its
+    // smaps_rollup is gone on either code path. The gate is asserted in
+    // test_memory_anon_huge_sample_follows_the_thp_leg against a workload
+    // that outlives the capture.
     eprintln!(
         "    {} anon-RSS rows, max {} MiB",
         anon_rows,
@@ -769,6 +761,146 @@ fn test_memory_rss_threshold_classic_fallback() {
     run_rss_threshold_test(true);
 }
 
+/// The per-process AnonHugePages sample (`memory_rss` member -6) is taken
+/// only with the THP-split leg, and when it is taken the capture says how
+/// complete it was (`sysinfo.memory_anon_huge_walk`). Both halves need a
+/// workload that is still alive at the end of the capture — in command mode
+/// the child is reaped before the end samples, so `/proc/<pid>/smaps_rollup`
+/// is gone on either code path and an "absent" assertion proves nothing.
+/// So: one long-lived workload (huge-page-advised, touched, then mapping and
+/// unmapping a page every turn — a memory event per turn, so each capture
+/// sees the process — until a stop file appears), two duration-stopped
+/// pid-filtered captures against it: without the leg the sample must be
+/// absent (and the workload still alive, so its absence is the gate's
+/// doing), with the leg it must be present, complete, and non-zero when the
+/// guest has THP enabled.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_anon_huge_sample_follows_the_thp_leg() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let stop_file = dir.path().join("stop-workload");
+    let ready_file = dir.path().join("workload-ready");
+    let orphan_backstop_secs = 2 * SLOW_MACHINE_BUDGET.as_secs();
+    let mut child = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import mmap, ctypes, os, sys, time\n\
+             libc = ctypes.CDLL(None, use_errno=True)\n\
+             libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]\n\
+             MADV_HUGEPAGE = 14\n\
+             HUGE = 2 * 1024 * 1024\n\
+             size = 16 * HUGE\n\
+             m = mmap.mmap(-1, size + HUGE, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)\n\
+             base = ctypes.addressof(ctypes.c_char.from_buffer(m))\n\
+             start = (base + HUGE - 1) & ~(HUGE - 1)\n\
+             libc.madvise(ctypes.c_void_p(start), size, MADV_HUGEPAGE)\n\
+             off = start - base\n\
+             for i in range(0, size, 4096):\n\
+             \x20 m[off + i] = 1\n\
+             open(sys.argv[2], 'w').close()\n\
+             deadline = time.time() + {orphan_backstop_secs}\n\
+             while time.time() < deadline and not os.path.exists(sys.argv[1]):\n\
+             \x20 m[off] = 2\n\
+             \x20 mmap.mmap(-1, 4096, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS).close()\n\
+             \x20 time.sleep(0.05)\n"
+        ))
+        .arg(&stop_file)
+        .arg(&ready_file)
+        .spawn()
+        .expect("Failed to spawn THP workload");
+    let child_pid = child.id();
+    wait_until("the THP workload to touch its mapping", || {
+        ready_file.exists()
+    });
+
+    let capture = |name: &str, thp_rate: u32| -> duckdb::Connection {
+        let out = dir.path().join(name);
+        std::fs::create_dir_all(&out).expect("mkdir");
+        let config = Config {
+            memory: true,
+            memory_thp_sample_rate: thp_rate,
+            pid: vec![child_pid],
+            duration: 2,
+            parquet_only: true,
+            output_dir: out.clone(),
+            output: out.join("trace.pb"),
+            ..Config::default()
+        };
+        let exit_code = systing(config, None).expect("systing recording failed");
+        assert_eq!(exit_code, 0);
+        let duckdb_path = out.join("trace.duckdb");
+        systing::duckdb::parquet_to_duckdb(&out, &duckdb_path, name)
+            .expect("DuckDB conversion failed");
+        duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB")
+    };
+    let anon_huge_for = |conn: &duckdb::Connection| -> (i64, Option<i64>) {
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*), MAX(size) FROM memory_rss WHERE member = -6 AND utid IN {UTIDS_FOR_PID}"
+            ),
+            [child_pid as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("memory_rss anon_huge query")
+    };
+
+    // Without the leg: no sample, and the workload was there to be sampled.
+    let without = capture("without-thp-leg", 0);
+    assert!(
+        child.try_wait().expect("try_wait failed").is_none(),
+        "workload exited before the first capture completed; the absent sample would prove nothing"
+    );
+    let (rows_without, _) = anon_huge_for(&without);
+    assert_eq!(
+        rows_without, 0,
+        "[memory_rss] anon_huge rows (member=-6) written for a live workload without the THP-split leg"
+    );
+    let walk_without: Option<String> = without
+        .query_row("SELECT memory_anon_huge_walk FROM sysinfo", [], |row| {
+            row.get(0)
+        })
+        .expect("sysinfo query");
+    assert_eq!(walk_without, None, "no walk, no walk outcome");
+
+    // With the leg: the sample, and the walk's own account of itself.
+    let with = capture("with-thp-leg", 1);
+    assert!(
+        child.try_wait().expect("try_wait failed").is_none(),
+        "workload exited before the second capture completed"
+    );
+    let (rows_with, max_with) = anon_huge_for(&with);
+    let walk_with: Option<String> = with
+        .query_row("SELECT memory_anon_huge_walk FROM sysinfo", [], |row| {
+            row.get(0)
+        })
+        .expect("sysinfo query");
+    let thp_enabled = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
+        .map(|s| !s.contains("[never]"))
+        .unwrap_or(false);
+    eprintln!(
+        "  anon_huge: without leg {rows_without} rows; with leg {rows_with} rows, max {max_with:?} bytes; walk {walk_with:?}; thp_enabled={thp_enabled}"
+    );
+    assert_eq!(
+        rows_with, 1,
+        "[memory_rss] one anon_huge row (member=-6) expected for the live workload with the THP-split leg"
+    );
+    let walk_with = walk_with.expect("memory_anon_huge_walk must be recorded when the leg ran");
+    assert!(
+        walk_with.starts_with("complete:"),
+        "one live process cannot hit the walk's cap or budget: {walk_with}"
+    );
+    if thp_enabled {
+        assert!(
+            max_with.unwrap_or(0) > 0,
+            "[memory_rss] a huge-page-advised, touched 32 MiB mapping should show AnonHugePages > 0 with THP enabled"
+        );
+    }
+
+    let _ = std::fs::write(&stop_file, b"");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// The THP-split and vmstat legs (`--memory-thp-sample-rate`, and the
 /// always-on `memory_vmstat` sample). The workload maps 64 MiB of anonymous
 /// memory, asks for huge pages (`MADV_HUGEPAGE`), touches it, then frees one
@@ -900,10 +1032,20 @@ fn test_memory_thp_vmstat_e2e() {
             with_stack > 0,
             "[memory_thp] split rows should carry kernel stacks"
         );
-        assert!(
-            split_pmd_delta >= pmd_rows,
-            "[memory_thp] per-process pmd rows ({pmd_rows}) cannot exceed the host-wide thp_split_pmd delta ({split_pmd_delta})"
-        );
+        // At the worker probe (`on`, `on:pmd-only`) a row is one counted
+        // split, so the per-process rows are bounded by the host-wide
+        // counter. The entry fallback (`on:pmd-entry`) also fires for a PMD
+        // that is not huge, so there the bound does not hold.
+        if thp_leg == "on" || thp_leg == "on:pmd-only" {
+            assert!(
+                split_pmd_delta >= pmd_rows,
+                "[memory_thp] per-process pmd rows ({pmd_rows}) cannot exceed the host-wide thp_split_pmd delta ({split_pmd_delta})"
+            );
+        } else {
+            eprintln!(
+                "  (pmd-vs-vmstat bound not asserted: leg={thp_leg} probes the public entry)"
+            );
+        }
     } else {
         eprintln!("  (THP split assertions skipped: leg={thp_leg}, thp_enabled={thp_enabled}, thp faults={thp_fault_delta})");
     }

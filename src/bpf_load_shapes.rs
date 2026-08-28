@@ -133,10 +133,14 @@ pub fn visited_insns(section: &str) -> BTreeSet<u32> {
 pub enum LegSelection {
     /// Probe this kernel's symbols and tracepoints, as a capture does.
     Host,
-    /// Select every leg regardless of the host, naming which folio-split
-    /// kretprobe program to load (the kernel picks one of two at capture
-    /// time; a load-only read wants each in turn).
-    Force { thp_page_prog: &'static str },
+    /// Select every leg regardless of the host (the VFIO ioctl and teardown
+    /// pairs included), naming which PMD-split and folio-split programs to
+    /// load (the kernel picks one of two of each at capture time; a
+    /// load-only read wants each in turn).
+    Force {
+        thp_pmd_prog: &'static str,
+        thp_page_prog: &'static str,
+    },
 }
 
 /// One row of the shape table: a name, the configuration it loads, and how
@@ -283,11 +287,17 @@ pub fn shape_table() -> Vec<LoadShape> {
     // The VFIO/IOMMU and THP-split legs, forced on: a host without the
     // vfio_iommu_type1 module or the split symbols never selects these
     // programs for a capture, so this is the only load they get on such a
-    // host — once per folio-split twin.
-    for (name, thp_page_prog) in [
-        ("memory-vfio-thp-forced", "systing_thp_split_page"),
+    // host — once per PMD-split twin (the worker probe, the entry
+    // fallback) and once per folio-split twin.
+    for (name, thp_pmd_prog, thp_page_prog) in [
+        (
+            "memory-vfio-thp-forced",
+            "systing_thp_split_pmd_locked",
+            "systing_thp_split_page",
+        ),
         (
             "memory-vfio-thp-forced-legacy",
+            "systing_thp_split_pmd",
             "systing_thp_split_page_legacy",
         ),
     ] {
@@ -298,7 +308,10 @@ pub fn shape_table() -> Vec<LoadShape> {
         shapes.push(LoadShape {
             name,
             config: c,
-            legs: LegSelection::Force { thp_page_prog },
+            legs: LegSelection::Force {
+                thp_pmd_prog,
+                thp_page_prog,
+            },
         });
     }
 

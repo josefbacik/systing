@@ -581,6 +581,19 @@ pub struct SysInfoRecord {
     /// `--memory-thp-sample-rate` as configured (1 in N splits; 1 = every
     /// split). `None` when the leg was off.
     pub memory_thp_sample_rate: Option<i64>,
+    /// How many iommu:map/unmap runs or VFIO windows the `memory_iommu`
+    /// histogram could not count (its hash or the in-flight table was
+    /// full): 0 means the histogram is complete, anything else that it is
+    /// a floor. `None` when the VFIO leg did not run, and in traces from
+    /// systing < 1.16.
+    pub memory_iommu_overflow: Option<i64>,
+    /// What the end-of-capture AnonHugePages walk (the `memory_rss` member
+    /// -6 rows) did: `complete:<read>/<candidates>`, `capped:<read>/<candidates>`
+    /// (the per-capture process cap stopped it) or `budget:<read>/<candidates>`
+    /// (its time budget did) — a capped or budgeted walk read the
+    /// processes whose memory events moved the most bytes. `None` when the
+    /// THP leg did not run, and in traces from systing < 1.16.
+    pub memory_anon_huge_walk: Option<String>,
 }
 
 /// Per-CPU static frequency limits from sysfs cpufreq, in kHz.

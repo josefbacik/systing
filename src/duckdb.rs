@@ -133,7 +133,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 18;
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -706,7 +706,14 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             -- not; memory_thp_sample_rate is the configured 1-in-N.
             memory_vfio_leg VARCHAR,
             memory_thp_leg VARCHAR,
-            memory_thp_sample_rate BIGINT
+            memory_thp_sample_rate BIGINT,
+            -- systing >= 1.16: how many iommu runs / VFIO windows the
+            -- memory_iommu histogram could not count (0 = complete, else a
+            -- floor; NULL = VFIO leg not run) and what the end-of-capture
+            -- AnonHugePages walk did ('complete:<read>/<candidates>',
+            -- 'capped:…' or 'budget:…'; NULL = THP leg not run).
+            memory_iommu_overflow BIGINT,
+            memory_anon_huge_walk VARCHAR
         );
 
         -- Per-CPU static frequency limits (kHz) from sysfs cpufreq. Empty on
