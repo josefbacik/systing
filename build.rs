@@ -135,8 +135,17 @@ fn bpf_clang_override() -> Option<PathBuf> {
 /// caller that assembled its own list (or called `clang_args` twice) would
 /// silently compile that object without the pin. Callers pass only their
 /// object-specific arguments and never hold the builder, which is what makes
-/// the pin structural.
+/// the pin structural. Because clang lets a later flag win, an object argument
+/// that would override a pinned flag is refused rather than silently applied.
 fn compile_bpf_object(source: &str, obj_path: &Path, object_args: &[&OsStr]) {
+    for arg in object_args {
+        let arg = arg.to_string_lossy();
+        assert!(
+            !(arg.starts_with("-mcpu") || arg == "-fwrapv" || arg == "-fno-wrapv"),
+            "object argument {arg:?} for {source} would override the pinned BPF compiler flags {BPF_CFLAGS:?}"
+        );
+    }
+
     let mut clang_args: Vec<&OsStr> = BPF_CFLAGS.iter().map(OsStr::new).collect();
     clang_args.extend_from_slice(object_args);
 
@@ -144,12 +153,14 @@ fn compile_bpf_object(source: &str, obj_path: &Path, object_args: &[&OsStr]) {
     if let Some(clang) = bpf_clang_override() {
         builder.clang(clang);
     }
+    // `{err:?}` prints the error's cause chain, which is where the compiler's
+    // own diagnostics are; the outermost message alone names only the file.
     builder
         .source(source)
         .clang_args(clang_args)
         .obj(obj_path)
         .build()
-        .unwrap_or_else(|err| panic!("Failed to build BPF object from {source}: {err}"));
+        .unwrap_or_else(|err| panic!("Failed to build BPF object from {source}: {err:?}"));
 }
 
 fn build_pystacks_bpf(out_dir: &Path, arch_define: &str, multiarch_include: &Option<String>) {
