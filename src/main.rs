@@ -149,6 +149,9 @@ struct Command {
     /// Force the classic tracepoint/kmem/rss_stat attach path even when tp_btf/rss_stat is available (testing only)
     #[arg(long, hide = true)]
     memory_rss_force_classic: bool,
+    /// The form of the memory recorder's mmap/munmap/brk hooks and the network recorder's TIME_WAIT hooks: `classic` (the default: the syscalls tracepoints through perf_event_open and kprobes) or `trampoline` (fentry/fexit programs on the kernel functions, with the classic set as the attach-time fallback). The trampoline form puts nothing on other syscalls' entry path while the capture runs, but its detach runs two synchronous Tasks-RCU grace periods per hooked function on the capture's stop path — measured at about six times the classic set's `detach bpf programs` phase — so it is opt-in. Which form ran is `sysinfo.memory_syscall_leg` / `sysinfo.network_tw_leg`.
+    #[arg(long, default_value = "classic", value_parser = clap::builder::PossibleValuesParser::new(["classic", "trampoline"]))]
+    kernel_hooks: String,
     // Heap-allocator tracing enabled state (set by recorder management, not a CLI flag)
     #[arg(skip)]
     memory_alloc: bool,
@@ -285,6 +288,10 @@ impl From<Command> for Config {
             memory_thp_sample_rate: cmd.memory_thp_sample_rate,
             memory_rss_threshold_bytes: cmd.memory_rss_threshold_bytes,
             memory_rss_force_classic: cmd.memory_rss_force_classic,
+            kernel_hooks: cmd
+                .kernel_hooks
+                .parse()
+                .expect("clap admits only the values KernelHooks parses"),
             // Testing-only; never a CLI flag (the agent's argv cannot reach it).
             memory_syscall_force_fallback: false,
             memory_alloc: cmd.memory_alloc,

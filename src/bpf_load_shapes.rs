@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::systing_core::Config;
+use crate::systing_core::{Config, KernelHooks};
 
 /// One program's outcome in a load probe.
 #[derive(Debug, Clone)]
@@ -144,15 +144,16 @@ pub enum LegSelection {
         thp_pmd_prog: &'static str,
         thp_page_prog: &'static str,
     },
-    /// The mmap/munmap/brk hooks in classic form only — the trampoline set
-    /// left unselected, as on a kernel whose kallsyms lacks the arch syscall
-    /// wrappers (riscv before 6.7) — so the object a capture there loads is
-    /// verified too. The other legs as the host decides them.
+    /// The mmap/munmap/brk hooks in classic form only under the trampoline
+    /// form — the trampoline set left unselected, as on a kernel whose
+    /// kallsyms lacks the arch syscall wrappers (riscv before 6.6) — so the
+    /// object a capture there loads is verified too. The other legs as the
+    /// host decides them.
     SyscallTracepointOnly,
-    /// The network recorder's TIME_WAIT hooks in kprobe form only — the
-    /// fentry set left unselected, as on a kernel whose vmlinux BTF lacks
-    /// the three functions — so the object a capture there loads is
-    /// verified too. The other legs as the host decides them.
+    /// The network recorder's TIME_WAIT hooks in kprobe form only under the
+    /// trampoline form — the fentry set left unselected, as on a kernel
+    /// whose vmlinux BTF lacks the three functions — so the object a capture
+    /// there loads is verified too. The other legs as the host decides them.
     NetworkTwKprobeOnly,
 }
 
@@ -272,13 +273,15 @@ pub fn shape_table() -> Vec<LoadShape> {
     });
 
     // Network lane. Every network row selects the TIME_WAIT leg as the host
-    // allows (`probe_network_kernel_legs`): on a 6.11+ kernel with BTF —
-    // every rig kernel — BOTH its program sets load (the fentry trio and
-    // the kprobe fallback trio), so the verifier checks both here and a
-    // capture attaches one. Its fentry set cannot be forced onto a kernel
-    // whose BTF lacks the functions (the load, not the attach, would
-    // fail); the kprobe-only object a host without that BTF loads is the
-    // `network-tw-kprobe-only` row below.
+    // and the hook form allow (`probe_network_kernel_legs`): under the
+    // default classic form the kprobe trio alone loads; the `-trampoline`
+    // rows below opt into the fentry form, where on a 6.11+ kernel with BTF
+    // — every rig kernel — BOTH its program sets load (the fentry trio and
+    // the kprobe fallback trio), so the verifier checks both and a capture
+    // attaches one. The fentry set cannot be forced onto a kernel whose BTF
+    // lacks the functions (the load, not the attach, would fail); the
+    // kprobe-only object a trampoline-form capture on such a host loads is
+    // the `network-tw-kprobe-only` row below.
     add("network", &|c| c.network = true);
     add("network-packets", &|c| {
         c.network = true;
@@ -287,6 +290,20 @@ pub fn shape_table() -> Vec<LoadShape> {
     add("network-syscalls", &|c| {
         c.network = true;
         c.network_syscalls = true;
+    });
+
+    // The opt-in trampoline form (`--kernel-hooks trampoline`): the
+    // fentry/fexit syscall hooks and the fentry TIME_WAIT trio load beside
+    // their classic fallbacks, so the trampoline programs meet the verifier
+    // at the agent's memory and network shapes even though no shipped
+    // configuration selects them by default.
+    add("memory-trampoline", &|c| {
+        c.memory = true;
+        c.kernel_hooks = KernelHooks::Trampoline;
+    });
+    add("network-trampoline", &|c| {
+        c.network = true;
+        c.kernel_hooks = KernelHooks::Trampoline;
     });
 
     // Everything on: the widest autoload set in one object.
@@ -302,6 +319,7 @@ pub fn shape_table() -> Vec<LoadShape> {
         c.syscalls = true;
         c.markers = true;
         c.sw_event = true;
+        c.kernel_hooks = KernelHooks::Trampoline;
     });
 
     // The VFIO/IOMMU and THP-split legs, forced on: a host without the
@@ -335,24 +353,29 @@ pub fn shape_table() -> Vec<LoadShape> {
         });
     }
 
-    // The mmap/munmap/brk hooks with only the classic tracepoint set
-    // selected (a host without the arch syscall wrappers in kallsyms never
-    // loads the trampoline set); the trampoline set itself is verified by
-    // every memory row above on a host that has the wrappers.
+    // The trampoline form on a host without the arch syscall wrappers in
+    // kallsyms (riscv before 6.6): only the classic tracepoint set is
+    // selected, the object of a `--kernel-hooks trampoline` capture there.
+    // (Under the default classic form every memory row above already loads
+    // exactly that set; the trampoline set itself is verified by the
+    // `memory-trampoline` row on a host that has the wrappers.)
     let mut c = base();
     c.memory = true;
+    c.kernel_hooks = KernelHooks::Trampoline;
     shapes.push(LoadShape {
         name: "memory-syscall-tracepoint-only",
         config: c,
         legs: LegSelection::SyscallTracepointOnly,
     });
 
-    // The TIME_WAIT hooks with only the kprobe set selected (a host whose
-    // vmlinux BTF lacks the three functions never loads the fentry set);
-    // the fentry set itself is verified by every network row above on a
-    // host that has them.
+    // The trampoline form on a host whose vmlinux BTF lacks the three
+    // TIME_WAIT functions: only the kprobe set is selected, the object of a
+    // `--kernel-hooks trampoline` capture there. (The default classic form
+    // loads that set on every network row above; the fentry set itself is
+    // verified by the `network-trampoline` row on a host that has them.)
     let mut c = base();
     c.network = true;
+    c.kernel_hooks = KernelHooks::Trampoline;
     shapes.push(LoadShape {
         name: "network-tw-kprobe-only",
         config: c,
@@ -567,5 +590,20 @@ R0 unbounded memory access\n\
         assert!(shapes
             .iter()
             .any(|s| s.config.network && s.legs == LegSelection::NetworkTwKprobeOnly));
+        // The shipped shapes take the default (classic) form; the opt-in
+        // trampoline form has its own rows for both legs, so the trampoline
+        // programs still meet the verifier on every run of the gate.
+        assert!(shapes
+            .iter()
+            .any(|s| s.name == "memory-default" && s.config.kernel_hooks == KernelHooks::Classic));
+        assert!(shapes
+            .iter()
+            .any(|s| s.name == "network" && s.config.kernel_hooks == KernelHooks::Classic));
+        assert!(shapes.iter().any(|s| s.config.memory
+            && s.config.kernel_hooks == KernelHooks::Trampoline
+            && s.legs == LegSelection::Host));
+        assert!(shapes.iter().any(|s| s.config.network
+            && s.config.kernel_hooks == KernelHooks::Trampoline
+            && s.legs == LegSelection::Host));
     }
 }
