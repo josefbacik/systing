@@ -237,18 +237,28 @@ fn build_softirq_time_query(trace_id: Option<&str>) -> String {
 fn build_runqueue_query(trace_id: Option<&str>) -> String {
     let filter_ts = trace_id_filter(trace_id, "ts.");
     let filter_ss = trace_id_filter(trace_id, "ss.");
-    // Deduplicate wakeups per (utid, scheduling-window) so that spurious
-    // wakeups between the same pair of sched_slices produce only one +1 event.
-    // The -1 side already uses DISTINCT, so this keeps +1/-1 balanced.
+    // Deduplicate wakeups per (utid, target cpu, ts) so that spurious wakeups
+    // between the same pair of sched_slices produce only one +1 event. The -1
+    // side is one row per matched wakeup, so this keeps +1/-1 balanced.
+    //
+    // A wakeup is matched to the sched_slice it precedes: the first slice of
+    // the same utid that starts at or after the wakeup, provided the wakeup
+    // came after the thread's previous slice ended (a wakeup that lands inside
+    // the previous run is spurious and stays unmatched). Consecutive slices of
+    // one utid have disjoint [prev_end_ts, ts] windows, so at most one slice
+    // qualifies per wakeup, and an ASOF JOIN -- one ordered merge over both
+    // sides -- yields the same matches as the range join
+    // `w.ts BETWEEN COALESCE(s.prev_end_ts, 0) AND s.ts` it replaces. That
+    // range join built an intermediate DuckDB cannot spill: on a 192-CPU trace
+    // of 62 M rows it took 58 s and failed with an out-of-memory error under a
+    // 1.5 GiB memory_limit, and at 186 M rows it took 428 s at 8 GiB and
+    // failed at 4 GiB, while this form takes 15 s / 53 s and spills gracefully
+    // under the same limits.
     format!(
-        "WITH dedup_wakeups AS (\
-             SELECT ts.ts, ts.utid, ts.cpu as target_cpu, \
-                    ROW_NUMBER() OVER (PARTITION BY ts.utid, ts.cpu, ts.ts ORDER BY ts.ts) as rn \
+        "WITH wakeups AS (\
+             SELECT DISTINCT ts.ts, ts.utid, ts.cpu as target_cpu \
              FROM thread_state ts \
              WHERE ts.state = 0 AND ts.cpu IS NOT NULL{filter_ts}\
-         ), \
-         wakeups AS (\
-             SELECT ts, utid, target_cpu FROM dedup_wakeups WHERE rn = 1\
          ), \
          sched_with_prev AS (\
              SELECT ss.ts, ss.cpu, ss.utid, \
@@ -257,11 +267,11 @@ fn build_runqueue_query(trace_id: Option<&str>) -> String {
              WHERE ss.dur > 0{filter_ss}\
          ), \
          matched_schedules AS (\
-             SELECT DISTINCT s.ts, s.cpu, s.utid, w.target_cpu, w.ts as wakeup_ts \
-             FROM sched_with_prev s \
-             INNER JOIN wakeups w ON w.utid = s.utid \
-                 AND w.ts >= COALESCE(s.prev_end_ts, 0) \
-                 AND w.ts <= s.ts\
+             SELECT s.ts, s.cpu, s.utid, w.target_cpu, w.ts as wakeup_ts \
+             FROM wakeups w \
+             ASOF JOIN sched_with_prev s \
+                 ON w.utid = s.utid AND w.ts <= s.ts \
+             WHERE w.ts >= COALESCE(s.prev_end_ts, 0)\
          ), \
          events AS (\
              SELECT target_cpu as cpu, ts, 1 as delta \
@@ -339,8 +349,7 @@ mod tests {
     #[test]
     fn test_build_runqueue_query_structure() {
         let sql = build_runqueue_query(None);
-        assert!(sql.contains("WITH dedup_wakeups AS"));
-        assert!(sql.contains("wakeups AS"));
+        assert!(sql.contains("WITH wakeups AS"));
         assert!(sql.contains("sched_with_prev AS"));
         assert!(sql.contains("matched_schedules AS"));
         assert!(sql.contains("events AS"));
@@ -369,10 +378,15 @@ mod tests {
     #[test]
     fn test_build_runqueue_query_matched_schedules_join() {
         let sql = build_runqueue_query(None);
-        // Should join on utid and require wakeup between prev_end and current start
-        assert!(sql.contains("INNER JOIN wakeups w ON w.utid = s.utid"));
-        assert!(sql.contains("w.ts >= COALESCE(s.prev_end_ts, 0)"));
-        assert!(sql.contains("w.ts <= s.ts"));
+        // Each wakeup is matched to the first slice of its utid starting at or
+        // after it (ASOF), and only counts when it fell after the previous
+        // slice ended -- the same match set as the range join this replaced.
+        assert!(sql.contains("FROM wakeups w ASOF JOIN sched_with_prev s"));
+        assert!(sql.contains("ON w.utid = s.utid AND w.ts <= s.ts"));
+        assert!(sql.contains("WHERE w.ts >= COALESCE(s.prev_end_ts, 0)"));
+        // No range join and no DISTINCT on the match side: ASOF is 1:1.
+        assert!(!sql.contains("INNER JOIN"));
+        assert!(!sql.contains("SELECT DISTINCT s.ts"));
     }
 
     #[test]
@@ -386,10 +400,10 @@ mod tests {
     #[test]
     fn test_build_runqueue_query_deduplicates_wakeups() {
         let sql = build_runqueue_query(None);
-        // Should have a dedup CTE that uses ROW_NUMBER to eliminate duplicates
-        assert!(sql.contains("dedup_wakeups"));
-        assert!(sql.contains("ROW_NUMBER()"));
-        assert!(sql.contains("WHERE rn = 1"));
+        // One +1 event per (ts, utid, target cpu): duplicate wakeup rows and
+        // spurious repeats between the same pair of slices collapse.
+        assert!(sql.contains("SELECT DISTINCT ts.ts, ts.utid, ts.cpu as target_cpu"));
+        assert!(!sql.contains("ROW_NUMBER()"));
     }
 
     #[test]
@@ -399,6 +413,253 @@ mod tests {
         assert!(sql.contains("w.ts as wakeup_ts"));
         // -1 events should use wakeup_ts (not schedule ts)
         assert!(sql.contains("wakeup_ts as ts, -1 as delta"));
+    }
+
+    /// The range-join form of the runqueue query this module shipped before
+    /// the ASOF JOIN, kept verbatim as the oracle for
+    /// `test_runqueue_query_asof_matches_range_join`.
+    fn legacy_range_join_runqueue_query() -> String {
+        "WITH dedup_wakeups AS (\
+             SELECT ts.ts, ts.utid, ts.cpu as target_cpu, \
+                    ROW_NUMBER() OVER (PARTITION BY ts.utid, ts.cpu, ts.ts ORDER BY ts.ts) as rn \
+             FROM thread_state ts \
+             WHERE ts.state = 0 AND ts.cpu IS NOT NULL\
+         ), \
+         wakeups AS (\
+             SELECT ts, utid, target_cpu FROM dedup_wakeups WHERE rn = 1\
+         ), \
+         sched_with_prev AS (\
+             SELECT ss.ts, ss.cpu, ss.utid, \
+                    LAG(ss.ts + ss.dur) OVER (PARTITION BY ss.utid ORDER BY ss.ts) as prev_end_ts \
+             FROM sched_slice ss \
+             WHERE ss.dur > 0\
+         ), \
+         matched_schedules AS (\
+             SELECT DISTINCT s.ts, s.cpu, s.utid, w.target_cpu, w.ts as wakeup_ts \
+             FROM sched_with_prev s \
+             INNER JOIN wakeups w ON w.utid = s.utid \
+                 AND w.ts >= COALESCE(s.prev_end_ts, 0) \
+                 AND w.ts <= s.ts\
+         ), \
+         events AS (\
+             SELECT target_cpu as cpu, ts, 1 as delta \
+             FROM wakeups \
+             UNION ALL \
+             SELECT target_cpu as cpu, wakeup_ts as ts, -1 as delta \
+             FROM matched_schedules\
+         ), \
+         rq_depth AS (\
+             SELECT cpu, ts, \
+                    SUM(delta) OVER (PARTITION BY cpu ORDER BY ts \
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as depth \
+             FROM events\
+         ) \
+         SELECT cpu, \
+                QUANTILE_CONT(GREATEST(depth, 0), 0.5) as p50, \
+                QUANTILE_CONT(GREATEST(depth, 0), 0.9) as p90, \
+                QUANTILE_CONT(GREATEST(depth, 0), 0.99) as p99 \
+         FROM rq_depth \
+         WHERE depth IS NOT NULL \
+         GROUP BY cpu \
+         ORDER BY cpu"
+            .to_string()
+    }
+
+    /// Rewrite a full runqueue query so it returns the `events` multiset
+    /// (one row per (cpu, ts) with the summed delta and the row count) instead
+    /// of the percentiles: the part of the query the join change can alter.
+    fn events_multiset_query(sql: &str) -> String {
+        let (prefix, _) = sql
+            .split_once("rq_depth AS (")
+            .expect("runqueue query has an rq_depth CTE");
+        let prefix = prefix.trim_end().trim_end_matches(',');
+        format!(
+            "{prefix} SELECT cpu, ts, CAST(SUM(delta) AS BIGINT), COUNT(*) \
+             FROM events GROUP BY cpu, ts ORDER BY cpu, ts"
+        )
+    }
+
+    /// Same, but counting the matched wakeups, so the fixture can be shown to
+    /// exercise both the matched and the unmatched branches.
+    fn matched_count_query(sql: &str) -> String {
+        let (prefix, _) = sql
+            .split_once("events AS (")
+            .expect("runqueue query has an events CTE");
+        let prefix = prefix.trim_end().trim_end_matches(',');
+        format!("{prefix} SELECT COUNT(*) FROM matched_schedules")
+    }
+
+    fn query_rows<T, F>(conn: &duckdb::Connection, sql: &str, map: F) -> Vec<T>
+    where
+        F: Fn(&duckdb::Row<'_>) -> duckdb::Result<T>,
+    {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt.query_map([], |r| map(r)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// A deterministic CI-node-shaped fixture: 4 CPUs, 5 threads pinned to
+    /// each, 300 slices per CPU, a wakeup before most slices (matched), some
+    /// wakeups inside the thread's previous run (spurious, unmatched), cross-
+    /// CPU wakeup targets, duplicate wakeup rows, a thread that wakes but
+    /// never runs, and thread_state rows that are not wakeups.
+    fn fixture_db() -> duckdb::Connection {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sched_slice (trace_id VARCHAR, ts BIGINT, dur BIGINT, cpu INTEGER, utid BIGINT, end_state INTEGER, priority INTEGER); \
+             CREATE TABLE thread_state (trace_id VARCHAR, ts BIGINT, dur BIGINT, utid BIGINT, state INTEGER, cpu INTEGER);",
+        )
+        .unwrap();
+        let mut seed: u64 = 0x5eed_1234_abcd;
+        let mut lcg = move |modulus: i64| -> i64 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as i64) % modulus
+        };
+        let mut slices: Vec<(i64, i64, i32, i64)> = Vec::new();
+        let mut wakeups: Vec<(i64, i64, i32)> = Vec::new();
+        // Per-utid end of the previous slice, to place spurious wakeups inside it.
+        let mut prev_end: std::collections::HashMap<i64, (i64, i64)> = Default::default();
+        for cpu in 0..4i32 {
+            // Disjoint timestamp ranges per CPU keep the only tied event
+            // timestamps the +1/-1 pair of one matched wakeup.
+            let mut t: i64 = i64::from(cpu) * 10_000_000_000;
+            for i in 0..300i64 {
+                let utid = i64::from(cpu) * 5 + (i % 5);
+                let gap = 1_000 + lcg(20_000);
+                let dur = 50_000 + lcg(400_000);
+                let ts = t + gap;
+                let target = if i % 5 == 0 { (cpu + 1) % 4 } else { cpu };
+                if i % 7 == 3 {
+                    // Spurious: the wakeup lands inside the thread's previous
+                    // run, so neither form matches it to this slice.
+                    if let Some(&(pts, pdur)) = prev_end.get(&utid) {
+                        wakeups.push((pts + pdur / 2, utid, target));
+                    }
+                } else {
+                    let w = ts - 1 - lcg(gap.max(1));
+                    wakeups.push((w, utid, target));
+                    if i % 11 == 0 {
+                        // Exact duplicate wakeup row: must collapse to one +1.
+                        wakeups.push((w, utid, target));
+                    }
+                }
+                slices.push((ts, dur, cpu, utid));
+                prev_end.insert(utid, (ts, dur));
+                t = ts + dur;
+            }
+        }
+        // A thread that wakes up but never gets a slice.
+        for k in 0..5i64 {
+            wakeups.push((5_000_000 + k * 777, 999, 2));
+        }
+        for (ts, dur, cpu, utid) in &slices {
+            conn.execute(
+                "INSERT INTO sched_slice VALUES ('t', ?, ?, ?, ?, 1, 120)",
+                duckdb::params![ts, dur, cpu, utid],
+            )
+            .unwrap();
+        }
+        for (ts, utid, cpu) in &wakeups {
+            conn.execute(
+                "INSERT INTO thread_state VALUES ('t', ?, 0, ?, 0, ?)",
+                duckdb::params![ts, utid, cpu],
+            )
+            .unwrap();
+        }
+        // Not wakeups: a sleeping state and a wakeup with no CPU.
+        conn.execute_batch(
+            "INSERT INTO thread_state VALUES ('t', 123456, 1000, 1, 2, 0); \
+             INSERT INTO thread_state VALUES ('t', 234567, 0, 1, 0, NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_runqueue_query_asof_matches_range_join() {
+        let conn = fixture_db();
+        let new_sql = build_runqueue_query(None);
+        let old_sql = legacy_range_join_runqueue_query();
+
+        // The join is the only thing that changed, and it feeds `events`:
+        // the (cpu, ts, summed delta, row count) multiset must be identical.
+        let events = |sql: &str| {
+            query_rows(&conn, &events_multiset_query(sql), |r| {
+                Ok((
+                    r.get::<_, i32>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+        };
+        let old_events = events(&old_sql);
+        let new_events = events(&new_sql);
+        assert!(!old_events.is_empty());
+        assert_eq!(old_events, new_events);
+
+        // The fixture exercises both branches: most wakeups match a slice,
+        // the spurious ones, the duplicates and the never-running thread's
+        // do not.
+        let matched =
+            |sql: &str| query_rows(&conn, &matched_count_query(sql), |r| r.get::<_, i64>(0))[0];
+        let old_matched = matched(&old_sql);
+        assert_eq!(old_matched, matched(&new_sql));
+        let distinct_wakeups: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT DISTINCT ts, utid, cpu FROM thread_state \
+                 WHERE state = 0 AND cpu IS NOT NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(old_matched > 0);
+        assert!(old_matched < distinct_wakeups);
+
+        // The percentile stage is untouched; with identical events its only
+        // freedom is the order of the +1/-1 pair a matched wakeup puts at one
+        // timestamp, which can move a percentile by at most one depth step.
+        let percentiles = |sql: &str| {
+            query_rows(&conn, sql, |r| {
+                Ok((
+                    r.get::<_, i32>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, f64>(3)?,
+                ))
+            })
+        };
+        let old_pct = percentiles(&old_sql);
+        let new_pct = percentiles(&new_sql);
+        assert_eq!(old_pct.len(), 4);
+        assert_eq!(old_pct.len(), new_pct.len());
+        for (o, n) in old_pct.iter().zip(new_pct.iter()) {
+            assert_eq!(o.0, n.0);
+            assert!(
+                (o.1 - n.1).abs() <= 1.0,
+                "p50 cpu {}: {} vs {}",
+                o.0,
+                o.1,
+                n.1
+            );
+            assert!(
+                (o.2 - n.2).abs() <= 1.0,
+                "p90 cpu {}: {} vs {}",
+                o.0,
+                o.2,
+                n.2
+            );
+            assert!(
+                (o.3 - n.3).abs() <= 1.0,
+                "p99 cpu {}: {} vs {}",
+                o.0,
+                o.3,
+                n.3
+            );
+        }
+        assert!(old_pct.iter().any(|p| p.3 > 0.0));
     }
 
     #[test]
