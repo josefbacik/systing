@@ -147,7 +147,14 @@ symbolization still resolve — through a build-id-keyed store filled from
 binaries of still-running processes. Frames whose build-id no source knows
 render as `unknown ([buildid:<hex>]) <0x<offset>>`, a stable identity that can
 be resolved offline later. Costs ~40% larger stack-ring reservations while
-enabled; off by default and free when off.
+enabled; off by default and free when off. The still-running-processes source
+is an end-of-trace walk over every live process's executable mappings that
+reads each distinct file's build-id note once (deduplicated by dev/inode across
+processes) and is bounded by `--build-id-index-max-files` (default 10000) and
+`--build-id-index-max-ms` (default 2000; 0 = unbounded for either); it prints a
+`build-id index: …` line with what it read and whether a bound stopped it. A
+binary the walk never reaches still resolves through the other sources or
+keeps its `[buildid:<hex>]` identity.
 
 Note: `sleep-stacks` acts as a master switch for all sleep stack collection. When enabled,
 both uninterruptible (D state) and interruptible (S state) sleep stacks are collected by

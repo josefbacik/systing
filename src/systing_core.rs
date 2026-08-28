@@ -1265,6 +1265,12 @@ pub struct Config {
     /// symbolizable from a build-id-keyed store and unresolved frames keep a
     /// durable identity (`unknown ([buildid:<hex>]) <0x<offset>>`)
     pub collect_build_id: bool,
+    /// With `collect_build_id`: the most distinct files the end-of-trace
+    /// build-id index walk may read the ELF note of; 0 = unbounded
+    pub build_id_index_max_files: usize,
+    /// With `collect_build_id`: the longest that walk may run, in
+    /// milliseconds; 0 = unbounded
+    pub build_id_index_max_ms: u64,
     /// Explicit PIDs for pystacks (bypasses auto-discovery)
     pub pystacks_pids: Vec<u32>,
     /// Enable debug output for pystacks
@@ -1392,6 +1398,8 @@ impl Default for Config {
             continuous: 0,
             collect_pystacks: false,
             collect_build_id: false,
+            build_id_index_max_files: crate::stack_recorder::DEFAULT_BUILD_ID_INDEX_MAX_FILES,
+            build_id_index_max_ms: crate::stack_recorder::DEFAULT_BUILD_ID_INDEX_MAX_MS,
             pystacks_pids: Vec::new(),
             pystacks_debug: false,
             enable_debuginfod: false,
@@ -2406,11 +2414,12 @@ fn configure_recorder(opts: &Config, recorder: &Arc<SessionRecorder>) {
         set_ringbuf_duration(recorder, duration_nanos);
     }
     if opts.collect_build_id {
-        recorder
-            .stack_recorder
-            .lock()
-            .unwrap()
-            .set_build_id_mode(true);
+        let mut stack_recorder = recorder.stack_recorder.lock().unwrap();
+        stack_recorder.set_build_id_mode(true);
+        stack_recorder.set_build_id_index_budget(crate::stack_recorder::BuildIdIndexBudget {
+            max_files: opts.build_id_index_max_files,
+            max_time: Duration::from_millis(opts.build_id_index_max_ms),
+        });
     }
     if opts.no_frame_labels {
         recorder

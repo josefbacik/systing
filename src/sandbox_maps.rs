@@ -55,6 +55,37 @@ struct MapEntry {
     /// and meaningless for ELF math; file offsets are real).
     offset: u64,
     backing: Backing,
+    /// The maps line's `dev` and `inode` fields, which together identify the
+    /// backing file across every process that maps it (the path cannot: it
+    /// is namespace-relative, and one path can name different files in
+    /// different mount namespaces). `None` for anonymous entries and for
+    /// lines whose fields do not parse.
+    file_id: Option<FileId>,
+}
+
+/// Identity of a mapped file host-wide: the maps line's `(major:minor, inode)`.
+/// Two mappings with the same `FileId` are the same file, whatever process
+/// or mount namespace they were read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileId {
+    pub dev_major: u32,
+    pub dev_minor: u32,
+    pub inode: u64,
+}
+
+impl FileId {
+    fn parse(dev: &str, inode: &str) -> Option<Self> {
+        let (major, minor) = dev.split_once(':')?;
+        let inode: u64 = inode.parse().ok()?;
+        if inode == 0 {
+            return None;
+        }
+        Some(FileId {
+            dev_major: u32::from_str_radix(major, 16).ok()?,
+            dev_minor: u32::from_str_radix(minor, 16).ok()?,
+            inode,
+        })
+    }
 }
 
 /// Result of a bridge lookup: symbolize `file_offset` against the ELF that
@@ -214,6 +245,18 @@ impl ProcessMaps {
     /// path may not resolve from the host); the display path names the
     /// binary for humans. Feed for the build-id store's live-binary fills.
     pub fn exec_file_links(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.exec_file_links_with_ids()
+            .into_iter()
+            .map(|(link, display, _)| (link, display))
+            .collect()
+    }
+
+    /// [`exec_file_links`](Self::exec_file_links) plus each mapping's
+    /// host-wide file identity, so a caller walking many processes can skip
+    /// a file it has already read from another process. `None` when the
+    /// maps line carried no usable dev/inode (the caller then treats the
+    /// mapping as unique).
+    pub fn exec_file_links_with_ids(&self) -> Vec<(PathBuf, PathBuf, Option<FileId>)> {
         let mut seen = std::collections::HashSet::new();
         self.entries
             .iter()
@@ -225,6 +268,7 @@ impl ProcessMaps {
                         self.tgid, e.start, e.end
                     )),
                     p.clone(),
+                    e.file_id,
                 )),
                 _ => None,
             })
@@ -444,8 +488,8 @@ fn parse_maps_line(line: &str) -> Option<MapEntry> {
     let range = it.next()?;
     let perms = it.next()?;
     let offset = it.next()?;
-    let _dev = it.next()?;
-    let _inode = it.next()?;
+    let dev = it.next()?;
+    let inode = it.next()?;
     let path = it.next().unwrap_or("").trim_start();
 
     let (start, end) = range.split_once('-')?;
@@ -453,6 +497,7 @@ fn parse_maps_line(line: &str) -> Option<MapEntry> {
     let end = u64::from_str_radix(end, 16).ok()?;
     let offset = u64::from_str_radix(offset, 16).ok()?;
     let exec = perms.as_bytes().get(2) == Some(&b'x');
+    let file_id = FileId::parse(dev, inode);
 
     let backing = if path.is_empty() {
         Backing::Anon
@@ -471,6 +516,7 @@ fn parse_maps_line(line: &str) -> Option<MapEntry> {
         exec,
         offset,
         backing,
+        file_id,
     })
 }
 
@@ -487,6 +533,58 @@ pub fn format_unresolved(addr: u64, maps: Option<&ProcessMaps>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_maps_line_carries_the_file_identity() {
+        // dev major:minor is hex, the inode decimal; both name the file
+        // host-wide, so two mappings of one file agree and a different file
+        // differs even at the same path.
+        let pm = ProcessMaps::parse(
+            7,
+            "400000-401000 r-xp 00000000 08:01 42 /usr/bin/foo\n\
+             500000-501000 r-xp 00000000 08:01 42 /usr/bin/foo\n\
+             600000-601000 r-xp 00000000 fe:0a 99 /usr/lib/bar.so\n\
+             700000-701000 r-xp 00000000 00:00 0\n\
+             800000-801000 r-xp 00000000 00:1b 4 /memfd:runsc-memory (deleted)",
+            "foo",
+        );
+        let foo = FileId {
+            dev_major: 0x08,
+            dev_minor: 0x01,
+            inode: 42,
+        };
+        let bar = FileId {
+            dev_major: 0xfe,
+            dev_minor: 0x0a,
+            inode: 99,
+        };
+        assert_eq!(pm.entries[0].file_id, Some(foo));
+        assert_eq!(pm.entries[1].file_id, Some(foo));
+        assert_eq!(pm.entries[2].file_id, Some(bar));
+        assert_eq!(pm.entries[3].file_id, None, "inode 0 = no file");
+        assert_ne!(foo, bar);
+
+        // exec_file_links_with_ids: one entry per distinct path (as before),
+        // now carrying the identity; the memfd is not a file.
+        let links = pm.exec_file_links_with_ids();
+        assert_eq!(
+            links
+                .iter()
+                .map(|(_, p, id)| (p.to_str().unwrap(), *id))
+                .collect::<Vec<_>>(),
+            vec![("/usr/bin/foo", Some(foo)), ("/usr/lib/bar.so", Some(bar))]
+        );
+        assert_eq!(
+            links[0].0,
+            PathBuf::from("/proc/7/map_files/400000-401000"),
+            "the link names the first mapping of the path"
+        );
+        // A line whose dev field is not major:minor parses with no identity
+        // rather than failing the line.
+        let odd = ProcessMaps::parse(8, "400000-401000 r-xp 00000000 0801 42 /usr/bin/foo", "");
+        assert_eq!(odd.entries.len(), 1);
+        assert_eq!(odd.entries[0].file_id, None);
+    }
 
     /// Maps shape observed on a live runsc systrap stub (trimmed): guest
     /// text file-backed with 4KiB pool islands at patched syscall sites,
