@@ -117,8 +117,8 @@ const BPF_CFLAGS: &[&str] = &["-mcpu=v3", "-fwrapv"];
 
 /// Optional override for the C compiler used for the BPF objects, so a
 /// local or CI build can use the exact compiler the release build uses
-/// (`SYSTING_BPF_CLANG=/path/to/clang-21`). Unset: libbpf-cargo's default
-/// (`clang` on PATH).
+/// (`SYSTING_BPF_CLANG=/path/to/clang-21`). Unset or empty: libbpf-cargo's
+/// default (`clang` on PATH).
 fn bpf_clang_override() -> Option<PathBuf> {
     println!("cargo:rerun-if-env-changed=SYSTING_BPF_CLANG");
     env::var_os("SYSTING_BPF_CLANG")
@@ -126,15 +126,30 @@ fn bpf_clang_override() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Apply the compiler pinning every BPF object build shares.
-fn pin_bpf_compiler<'a>(
-    builder: &'a mut SkeletonBuilder,
-    clang_override: &Option<PathBuf>,
-) -> &'a mut SkeletonBuilder {
-    if let Some(clang) = clang_override {
+/// Compile one BPF object with the compiler pinning every BPF object build
+/// shares: the pinned flags ([`BPF_CFLAGS`]) and the `SYSTING_BPF_CLANG`
+/// override.
+///
+/// The pinned flags are prepended here, not by the callers: libbpf-cargo's
+/// `clang_args` REPLACES the argument list rather than appending to it, so a
+/// caller that assembled its own list (or called `clang_args` twice) would
+/// silently compile that object without the pin. Callers pass only their
+/// object-specific arguments and never hold the builder, which is what makes
+/// the pin structural.
+fn compile_bpf_object(source: &str, obj_path: &Path, object_args: &[&OsStr]) {
+    let mut clang_args: Vec<&OsStr> = BPF_CFLAGS.iter().map(OsStr::new).collect();
+    clang_args.extend_from_slice(object_args);
+
+    let mut builder = SkeletonBuilder::new();
+    if let Some(clang) = bpf_clang_override() {
         builder.clang(clang);
     }
     builder
+        .source(source)
+        .clang_args(clang_args)
+        .obj(obj_path)
+        .build()
+        .unwrap_or_else(|err| panic!("Failed to build BPF object from {source}: {err}"));
 }
 
 fn build_pystacks_bpf(out_dir: &Path, arch_define: &str, multiarch_include: &Option<String>) {
@@ -166,27 +181,19 @@ fn build_pystacks_bpf(out_dir: &Path, arch_define: &str, multiarch_include: &Opt
 
     let obj_path = out_dir.join("pystacks.bpf.o");
 
-    let mut clang_args: Vec<&OsStr> = BPF_CFLAGS.iter().map(OsStr::new).collect();
-    clang_args.extend([
+    let mut object_args = vec![
         OsStr::new(&out_dir_include_arg),
         OsStr::new(&bpf_include_arg),
         OsStr::new(&pystacks_include_arg),
         OsStr::new(&pystacks_bpf_arg),
         OsStr::new(arch_define),
-    ]);
+    ];
 
     if let Some(ref include_path) = multiarch_include {
-        clang_args.push(OsStr::new(include_path));
+        object_args.push(OsStr::new(include_path));
     }
 
-    let clang_override = bpf_clang_override();
-    let mut builder = SkeletonBuilder::new();
-    pin_bpf_compiler(&mut builder, &clang_override)
-        .source("src/pystacks/bpf/pystacks.bpf.c")
-        .clang_args(clang_args)
-        .obj(obj_path.to_str().unwrap())
-        .build()
-        .expect("Failed to build pystacks BPF object");
+    compile_bpf_object("src/pystacks/bpf/pystacks.bpf.c", &obj_path, &object_args);
 
     // Generate pystacks skeleton for typed access to BSS variables and maps.
     let pystacks_skel_path = out_dir.join("pystacks.skel.rs");
@@ -297,28 +304,20 @@ fn main() {
         };
         let obj_path = out_dir.join(format!("{prefix}_tmp.bpf.o"));
 
-        let mut clang_args: Vec<&OsStr> = BPF_CFLAGS.iter().map(OsStr::new).collect();
-        clang_args.extend([
+        let mut object_args = vec![
             OsStr::new(&include_arg),
             OsStr::new(&bpf_include_arg),
             OsStr::new(arch_define),
             OsStr::new("-DSYSTING_PYSTACKS"),
             OsStr::new(&pystacks_inc_arg),
             OsStr::new(&pystacks_bpf_arg),
-        ]);
+        ];
 
         if let Some(ref include_path) = multiarch_include {
-            clang_args.push(OsStr::new(include_path));
+            object_args.push(OsStr::new(include_path));
         }
 
-        let clang_override = bpf_clang_override();
-        let mut builder = SkeletonBuilder::new();
-        pin_bpf_compiler(&mut builder, &clang_override)
-            .source(src)
-            .clang_args(clang_args)
-            .obj(obj_path.to_str().unwrap())
-            .build()
-            .expect("Failed to build BPF skeleton");
+        compile_bpf_object(src, &obj_path, &object_args);
 
         println!("cargo:rerun-if-changed={src}");
     }
