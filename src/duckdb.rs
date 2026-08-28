@@ -133,7 +133,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 20;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -713,7 +713,28 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             -- AnonHugePages walk did ('complete:<read>/<candidates>',
             -- 'capped:…' or 'budget:…'; NULL = THP leg not run).
             memory_iommu_overflow BIGINT,
-            memory_anon_huge_walk VARCHAR
+            memory_anon_huge_walk VARCHAR,
+            -- systing >= 1.17: how the mmap/munmap/brk hooks attached —
+            -- 'fentry' (trampolines on the arch syscall wrappers),
+            -- 'tracepoint:nosym' / 'tracepoint:nobtf' / 'tracepoint:notramp'
+            -- (the classic syscalls tracepoints: the wrappers are not in
+            -- kallsyms / not in vmlinux BTF / the trampoline set failed to
+            -- attach) or 'off:<cause>' (neither
+            -- attached: no mmap/munmap/brk rows in memory_map). NULL when
+            -- the memory recorder did not run, and in traces from systing
+            -- < 1.17 (always the classic tracepoints there).
+            memory_syscall_leg VARCHAR,
+            -- systing >= 1.17: how the network recorder's TIME_WAIT leg
+            -- (tcp_time_wait / inet_twsk_hashdance_schedule /
+            -- inet_twsk_deschedule_put) attached: 'fentry' (the trampoline
+            -- set), 'kprobe:notramp' (the trampoline attach failed on this
+            -- host and the kprobe set ran), 'kprobe:nobtf' (the trampoline
+            -- set could not be loaded, the kprobe set ran) or 'off:<cause>'
+            -- ('nosym': a pre-6.11 kernel; 'attach': neither set attached)
+            -- — with the leg off the trace carries no TIME_WAIT transitions.
+            -- NULL when the network recorder did not run, and in traces
+            -- from systing < 1.17 (always the kprobes there).
+            network_tw_leg VARCHAR
         );
 
         -- Per-CPU static frequency limits (kHz) from sysfs cpufreq. Empty on

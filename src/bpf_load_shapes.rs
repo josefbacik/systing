@@ -127,20 +127,33 @@ pub fn visited_insns(section: &str) -> BTreeSet<u32> {
     visited
 }
 
-/// How a probe decides the memory recorder's kernel-probed legs (VFIO,
-/// THP): as the host allows, or forced on for a load-only read.
+/// How a probe decides the recorders' kernel-probed legs (the memory
+/// recorder's mmap/munmap/brk hook form, VFIO and THP; the network
+/// recorder's TIME_WAIT hook form): as the host allows, or forced for a
+/// load-only read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegSelection {
     /// Probe this kernel's symbols and tracepoints, as a capture does.
     Host,
-    /// Select every leg regardless of the host (the VFIO ioctl and teardown
-    /// pairs included), naming which PMD-split and folio-split programs to
-    /// load (the kernel picks one of two of each at capture time; a
-    /// load-only read wants each in turn).
+    /// Select every optional leg regardless of the host (the VFIO ioctl and
+    /// teardown pairs included), naming which PMD-split and folio-split
+    /// programs to load (the kernel picks one of two of each at capture
+    /// time; a load-only read wants each in turn). The syscall hooks stay as
+    /// the host decides them.
     Force {
         thp_pmd_prog: &'static str,
         thp_page_prog: &'static str,
     },
+    /// The mmap/munmap/brk hooks in classic form only — the trampoline set
+    /// left unselected, as on a kernel whose kallsyms lacks the arch syscall
+    /// wrappers (riscv before 6.7) — so the object a capture there loads is
+    /// verified too. The other legs as the host decides them.
+    SyscallTracepointOnly,
+    /// The network recorder's TIME_WAIT hooks in kprobe form only — the
+    /// fentry set left unselected, as on a kernel whose vmlinux BTF lacks
+    /// the three functions — so the object a capture there loads is
+    /// verified too. The other legs as the host decides them.
+    NetworkTwKprobeOnly,
 }
 
 /// One row of the shape table: a name, the configuration it loads, and how
@@ -258,7 +271,14 @@ pub fn shape_table() -> Vec<LoadShape> {
         c.ringbuf_shards = 8;
     });
 
-    // Network lane.
+    // Network lane. Every network row selects the TIME_WAIT leg as the host
+    // allows (`probe_network_kernel_legs`): on a 6.11+ kernel with BTF —
+    // every rig kernel — BOTH its program sets load (the fentry trio and
+    // the kprobe fallback trio), so the verifier checks both here and a
+    // capture attaches one. Its fentry set cannot be forced onto a kernel
+    // whose BTF lacks the functions (the load, not the attach, would
+    // fail); the kprobe-only object a host without that BTF loads is the
+    // `network-tw-kprobe-only` row below.
     add("network", &|c| c.network = true);
     add("network-packets", &|c| {
         c.network = true;
@@ -314,6 +334,30 @@ pub fn shape_table() -> Vec<LoadShape> {
             },
         });
     }
+
+    // The mmap/munmap/brk hooks with only the classic tracepoint set
+    // selected (a host without the arch syscall wrappers in kallsyms never
+    // loads the trampoline set); the trampoline set itself is verified by
+    // every memory row above on a host that has the wrappers.
+    let mut c = base();
+    c.memory = true;
+    shapes.push(LoadShape {
+        name: "memory-syscall-tracepoint-only",
+        config: c,
+        legs: LegSelection::SyscallTracepointOnly,
+    });
+
+    // The TIME_WAIT hooks with only the kprobe set selected (a host whose
+    // vmlinux BTF lacks the three functions never loads the fentry set);
+    // the fentry set itself is verified by every network row above on a
+    // host that has them.
+    let mut c = base();
+    c.network = true;
+    shapes.push(LoadShape {
+        name: "network-tw-kprobe-only",
+        config: c,
+        legs: LegSelection::NetworkTwKprobeOnly,
+    });
 
     shapes
 }
@@ -517,5 +561,11 @@ R0 unbounded memory access\n\
             .any(|s| s.config.memory_vfio && s.config.memory_thp_sample_rate > 0));
         assert!(shapes.iter().any(|s| s.config.network_packets));
         assert!(shapes.iter().any(|s| s.config.memory_alloc));
+        assert!(shapes
+            .iter()
+            .any(|s| s.config.memory && s.legs == LegSelection::SyscallTracepointOnly));
+        assert!(shapes
+            .iter()
+            .any(|s| s.config.network && s.legs == LegSelection::NetworkTwKprobeOnly));
     }
 }

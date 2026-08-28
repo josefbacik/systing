@@ -5223,19 +5223,32 @@ int BPF_PROG(inet_sock_set_state, const struct sock *sk, int oldstate, int newst
 // The kernel never fires inet_sock_set_state with TCP_TIME_WAIT.
 // Instead, tcp_time_wait() creates a lightweight inet_timewait_sock and
 // calls tcp_done(sk) which fires the tracepoint with new_state=TCP_CLOSE.
-// These kprobes fix the gap:
+// Three hooks fix the gap:
 // 1. tcp_time_wait entry: set per-CPU flag so inet_sock_set_state rewrites CLOSE->TIME_WAIT
 // 2. inet_twsk_hashdance_schedule: map tw sock pointer -> socket_id
 // 3. inet_twsk_deschedule_put: emit TIME_WAIT -> CLOSE when tw sock is destroyed
 //
-// Note: inet_twsk_hashdance_schedule was introduced in kernel 6.12 (commit ec94c2696f0b).
-// On older kernels the function was named inet_twsk_hashdance with a different signature.
+// Each hook ships twice, with one shared body: an fentry program (the
+// trampoline set, attached by default — its link detaches through the
+// trampoline's async path, so the capture's "detach bpf programs" phase
+// stays at milliseconds) and a kprobe program (the fallback set — attached
+// only when the trampoline attach fails, e.g. an arm64 kernel without
+// DYNAMIC_FTRACE_WITH_DIRECT_CALLS). Userspace loads both sets and attaches
+// exactly one of them (see NETWORK_TW_FENTRY_PROGRAMS / attach_network_tw_leg
+// in systing_core.rs); which one ran is recorded as sysinfo.network_tw_leg.
+//
+// Note: inet_twsk_hashdance_schedule was introduced in kernel 6.11 (commit
+// b334b924c9b7, "net: tcp/dccp: prepare for tw_timer un-pinning", v6.11-rc1;
+// absent from the 6.6 stable series). On older kernels the function was named
+// inet_twsk_hashdance with a different signature and no single scheduling
+// point. Userspace gates the whole leg on the symbol before the object is
+// loaded (sysinfo.network_tw_leg = off:nosym): a capture on such a kernel
+// runs without TIME_WAIT tracking instead of failing its every attach.
 
 // Set per-CPU flag when entering tcp_time_wait().
 // The flag is checked by inet_sock_set_state (above) to rewrite CLOSE -> TIME_WAIT.
 // Safe to use per-CPU because tcp_time_wait runs with BH disabled (softirq or lock_sock).
-SEC("kprobe/tcp_time_wait")
-int BPF_KPROBE(tcp_time_wait_entry, struct sock *sk, int state, int timeo)
+static __always_inline int tcp_time_wait_common(struct sock *sk)
 {
 	if (!tracing_enabled)
 		return 0;
@@ -5254,12 +5267,22 @@ int BPF_KPROBE(tcp_time_wait_entry, struct sock *sk, int state, int timeo)
 	return 0;
 }
 
+SEC("fentry/tcp_time_wait")
+int BPF_PROG(tcp_time_wait_fentry, struct sock *sk, int state, int timeo)
+{
+	return tcp_time_wait_common(sk);
+}
+
+SEC("kprobe/tcp_time_wait")
+int BPF_KPROBE(tcp_time_wait_entry, struct sock *sk, int state, int timeo)
+{
+	return tcp_time_wait_common(sk);
+}
+
 // Map the tw sock pointer to the original socket_id.
 // Called from tcp_time_wait() after tw allocation, before tcp_done() destroys the original sk.
-SEC("kprobe/inet_twsk_hashdance_schedule")
-int BPF_KPROBE(inet_twsk_hashdance_schedule_entry,
-	       struct inet_timewait_sock *tw, struct sock *sk,
-	       struct inet_hashinfo *hashinfo, int timeo)
+static __always_inline int inet_twsk_hashdance_schedule_common(struct inet_timewait_sock *tw,
+							       struct sock *sk)
 {
 	if (!tracing_enabled)
 		return 0;
@@ -5277,11 +5300,26 @@ int BPF_KPROBE(inet_twsk_hashdance_schedule_entry,
 	return 0;
 }
 
+SEC("fentry/inet_twsk_hashdance_schedule")
+int BPF_PROG(inet_twsk_hashdance_schedule_fentry,
+	     struct inet_timewait_sock *tw, struct sock *sk,
+	     struct inet_hashinfo *hashinfo, int timeo)
+{
+	return inet_twsk_hashdance_schedule_common(tw, sk);
+}
+
+SEC("kprobe/inet_twsk_hashdance_schedule")
+int BPF_KPROBE(inet_twsk_hashdance_schedule_entry,
+	       struct inet_timewait_sock *tw, struct sock *sk,
+	       struct inet_hashinfo *hashinfo, int timeo)
+{
+	return inet_twsk_hashdance_schedule_common(tw, sk);
+}
+
 // Emit TIME_WAIT → CLOSE when a timewait socket is destroyed.
 // inet_twsk_deschedule_put is the universal destruction point for all TIME_WAIT
 // sockets: timer expiry, RST received, tw_reuse, and namespace purge.
-SEC("kprobe/inet_twsk_deschedule_put")
-int BPF_KPROBE(inet_twsk_deschedule_put_entry, struct inet_timewait_sock *tw)
+static __always_inline int inet_twsk_deschedule_put_common(struct inet_timewait_sock *tw)
 {
 	if (!tracing_enabled)
 		return 0;
@@ -5319,6 +5357,18 @@ int BPF_KPROBE(inet_twsk_deschedule_put_entry, struct inet_timewait_sock *tw)
 	return 0;
 }
 
+SEC("fentry/inet_twsk_deschedule_put")
+int BPF_PROG(inet_twsk_deschedule_put_fentry, struct inet_timewait_sock *tw)
+{
+	return inet_twsk_deschedule_put_common(tw);
+}
+
+SEC("kprobe/inet_twsk_deschedule_put")
+int BPF_KPROBE(inet_twsk_deschedule_put_entry, struct inet_timewait_sock *tw)
+{
+	return inet_twsk_deschedule_put_common(tw);
+}
+
 /* ===== Memory recorder ===== */
 
 /* `with_kernel` selects whether the kernel half is captured at all. The
@@ -5328,7 +5378,8 @@ int BPF_KPROBE(inet_twsk_deschedule_put_entry, struct inet_timewait_sock *tw)
  * (6.12.55 leaves asm_exc_page_fault; 6.12.68+ leaves nothing), so the
  * capture carries no analytical signal and made `leaf` grouping split by
  * kernel. The mmap/munmap/brk legs still pass true: their captures sit at
- * syscall enter/exit tracepoints, so the kernel half there is the same
+ * the syscall wrapper's entry/exit (a trampoline frame, or the syscall
+ * tracepoints on the fallback set), so the kernel half there is the same
  * plumbing class (the syscall body is not on the stack at either point) —
  * they are kept for now only to hold this change to the measured hot
  * path, and dropping them the same way is a candidate follow-up. */
@@ -5711,32 +5762,64 @@ static __always_inline u64 map_rss_delta_enc(struct task_struct *task,
 	return (u64)(exit_rss - enter_rss);
 }
 
-SEC("tracepoint/syscalls/sys_enter_mmap")
-int systing_mmap_enter(struct trace_event_raw_sys_enter *ctx)
-{
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
-	if (!trace_task(task))
-		return 0;
+/* ---- mmap / munmap / brk: two attach forms, one body each ----
+ *
+ * The syscall hooks ship in two forms that share the bodies below. The
+ * trampoline form — fentry/fexit on the arch syscall wrappers
+ * (`__x64_sys_mmap` and friends; the arch prefix is selected at compile
+ * time, and the compat wrappers `__ia32_sys_*` are a separate symbol never
+ * attached, so native-only semantics hold as they did at the syscalls
+ * tracepoints) — is what a capture attaches first: a trampoline call
+ * replaces the perf-sample build the classic tracepoint runs per event,
+ * puts nothing on the entry path of the other syscalls (the syscalls
+ * tracepoints keep every task of the host on the SYSCALL_WORK_SYSCALL_
+ * TRACEPOINT slow path for the whole capture), and detaches through
+ * bpf_trampoline_update's text poke plus asynchronous RCU-tasks frees
+ * instead of the perf tracepoint's synchronous tracepoint_synchronize_
+ * unregister (one SRCU and one RCU grace period per program, serialized —
+ * six of them at every capture stop, hundreds of ms on a many-core host,
+ * seconds on the largest). The classic form — the six `syscalls/sys_{enter,exit}_*`
+ * tracepoints through perf_event_open — is loaded beside it and attached
+ * only when the trampoline set cannot be: userspace attaches the trampoline
+ * programs one by one after skel.attach() and falls back on the first
+ * error (a kernel without the wrappers in kallsyms never tries; an arm64
+ * kernel built without DYNAMIC_FTRACE_WITH_DIRECT_CALLS loads the programs
+ * and refuses the attach), recording which form ran in
+ * sysinfo.memory_syscall_leg. Both forms write memory_syscall_scratch and
+ * the memory ringbuf; neither is fenced by bpf_prog_active.
+ *
+ * The user stack a trampoline program captures is the same as the
+ * tracepoint's (bpf_get_stack walks task_pt_regs(current) for the user
+ * half); the kernel half at fentry/fexit is the trampoline's own frame
+ * above the wrapper — plumbing either way, see memory_capture_stack. */
+#if defined(__TARGET_ARCH_x86)
+#define SYSTING_SYSCALL_WRAPPER_PREFIX "__x64_sys_"
+#elif defined(__TARGET_ARCH_arm64)
+#define SYSTING_SYSCALL_WRAPPER_PREFIX "__arm64_sys_"
+#elif defined(__TARGET_ARCH_riscv)
+#define SYSTING_SYSCALL_WRAPPER_PREFIX "__riscv_sys_"
+#else
+#error "no syscall wrapper prefix for this BPF target arch"
+#endif
 
+static __always_inline int memory_mmap_enter_common(struct task_struct *task, u64 addr,
+						    u64 size, u32 prot, u32 flags)
+{
 	u64 tgidpid = bpf_get_current_pid_tgid();
 	struct memory_syscall_args args = {
-		.addr = (u64)ctx->args[0],
-		.size = (u64)ctx->args[1],
-		.prot = (u32)ctx->args[2],
-		.flags = (u32)ctx->args[3],
+		.addr = addr,
+		.size = size,
+		.prot = prot,
+		.flags = flags,
 		.enter_rss = current_task_rss_bytes(task),
 	};
 	bpf_map_update_elem(&memory_syscall_scratch, &tgidpid, &args, BPF_ANY);
 	return 0;
 }
 
-SEC("tracepoint/syscalls/sys_exit_mmap")
-int systing_mmap_exit(struct trace_event_raw_sys_exit *ctx)
+static __always_inline int memory_mmap_exit_common(void *ctx, struct task_struct *task,
+						   long ret)
 {
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
-	if (!trace_task(task))
-		return 0;
-
 	u64 tgidpid = bpf_get_current_pid_tgid();
 	struct memory_syscall_args *saved = bpf_map_lookup_elem(&memory_syscall_scratch, &tgidpid);
 	if (!saved)
@@ -5745,7 +5828,6 @@ int systing_mmap_exit(struct trace_event_raw_sys_exit *ctx)
 	bpf_map_delete_elem(&memory_syscall_scratch, &tgidpid);
 
 	/* mmap returns MAP_FAILED (-1) or -errno on failure; skip those. */
-	long ret = ctx->ret;
 	if (ret < 0 && ret > -4096)
 		return 0;
 
@@ -5776,17 +5858,53 @@ int systing_mmap_exit(struct trace_event_raw_sys_exit *ctx)
 	return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_munmap")
-int systing_munmap_enter(struct trace_event_raw_sys_enter *ctx)
+SEC("tracepoint/syscalls/sys_enter_mmap")
+int systing_mmap_enter(struct trace_event_raw_sys_enter *ctx)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	if (!trace_task(task))
 		return 0;
+	return memory_mmap_enter_common(task, (u64)ctx->args[0], (u64)ctx->args[1],
+					(u32)ctx->args[2], (u32)ctx->args[3]);
+}
 
+SEC("tracepoint/syscalls/sys_exit_mmap")
+int systing_mmap_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_mmap_exit_common(ctx, task, ctx->ret);
+}
+
+SEC("fentry/" SYSTING_SYSCALL_WRAPPER_PREFIX "mmap")
+int BPF_PROG(systing_mmap_fentry, const struct pt_regs *regs)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_mmap_enter_common(task, (u64)PT_REGS_PARM1_CORE_SYSCALL(regs),
+					(u64)PT_REGS_PARM2_CORE_SYSCALL(regs),
+					(u32)PT_REGS_PARM3_CORE_SYSCALL(regs),
+					(u32)PT_REGS_PARM4_CORE_SYSCALL(regs));
+}
+
+SEC("fexit/" SYSTING_SYSCALL_WRAPPER_PREFIX "mmap")
+int BPF_PROG(systing_mmap_fexit, const struct pt_regs *regs, long ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_mmap_exit_common(ctx, task, ret);
+}
+
+static __always_inline int memory_munmap_enter_common(struct task_struct *task, u64 addr,
+						      u64 size)
+{
 	u64 tgidpid = bpf_get_current_pid_tgid();
 	struct memory_syscall_args args = {
-		.addr = (u64)ctx->args[0],
-		.size = (u64)ctx->args[1],
+		.addr = addr,
+		.size = size,
 		.vm_limit = (u64)BPF_CORE_READ(task, mm, total_vm) *
 			    tool_config.page_size,
 		.enter_rss = current_task_rss_bytes(task),
@@ -5795,13 +5913,9 @@ int systing_munmap_enter(struct trace_event_raw_sys_enter *ctx)
 	return 0;
 }
 
-SEC("tracepoint/syscalls/sys_exit_munmap")
-int systing_munmap_exit(struct trace_event_raw_sys_exit *ctx)
+static __always_inline int memory_munmap_exit_common(void *ctx, struct task_struct *task,
+						     long ret)
 {
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
-	if (!trace_task(task))
-		return 0;
-
 	u64 tgidpid = bpf_get_current_pid_tgid();
 	struct memory_syscall_args *saved = bpf_map_lookup_elem(&memory_syscall_scratch, &tgidpid);
 	if (!saved)
@@ -5823,7 +5937,7 @@ int systing_munmap_exit(struct trace_event_raw_sys_exit *ctx)
 	 * (what aggregations consume) comes from the stash and stays
 	 * correct, and stashing full stacks per thread would multiply the
 	 * scratch map's footprint by the stack-buffer size. */
-	if (ctx->ret != 0)
+	if (ret != 0)
 		return 0;
 
 	if (tool_config.memory_map_sample_rate > 1) {
@@ -5858,13 +5972,45 @@ int systing_munmap_exit(struct trace_event_raw_sys_exit *ctx)
 	return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_brk")
-int systing_brk_enter(struct trace_event_raw_sys_enter *ctx)
+SEC("tracepoint/syscalls/sys_enter_munmap")
+int systing_munmap_enter(struct trace_event_raw_sys_enter *ctx)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	if (!trace_task(task))
 		return 0;
+	return memory_munmap_enter_common(task, (u64)ctx->args[0], (u64)ctx->args[1]);
+}
 
+SEC("tracepoint/syscalls/sys_exit_munmap")
+int systing_munmap_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_munmap_exit_common(ctx, task, ctx->ret);
+}
+
+SEC("fentry/" SYSTING_SYSCALL_WRAPPER_PREFIX "munmap")
+int BPF_PROG(systing_munmap_fentry, const struct pt_regs *regs)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_munmap_enter_common(task, (u64)PT_REGS_PARM1_CORE_SYSCALL(regs),
+					  (u64)PT_REGS_PARM2_CORE_SYSCALL(regs));
+}
+
+SEC("fexit/" SYSTING_SYSCALL_WRAPPER_PREFIX "munmap")
+int BPF_PROG(systing_munmap_fexit, const struct pt_regs *regs, long ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_munmap_exit_common(ctx, task, ret);
+}
+
+static __always_inline int memory_brk_enter_common(struct task_struct *task)
+{
 	u64 tgidpid = bpf_get_current_pid_tgid();
 	/* Stash the current brk so exit can compute the delta. */
 	struct memory_syscall_args args = {
@@ -5875,13 +6021,9 @@ int systing_brk_enter(struct trace_event_raw_sys_enter *ctx)
 	return 0;
 }
 
-SEC("tracepoint/syscalls/sys_exit_brk")
-int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
+static __always_inline int memory_brk_exit_common(void *ctx, struct task_struct *task,
+						  long ret)
 {
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
-	if (!trace_task(task))
-		return 0;
-
 	u64 tgidpid = bpf_get_current_pid_tgid();
 	struct memory_syscall_args *saved = bpf_map_lookup_elem(&memory_syscall_scratch, &tgidpid);
 	if (!saved)
@@ -5906,11 +6048,11 @@ int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
 	 * error carries no break: ret - old_brk would record -(old_brk + 4) as
 	 * a delta (a negative value of ~90 TB, seen in production as a
 	 * count=1 brk row with |bytes| ≡ 4 mod 4096). */
-	if ((s64)ctx->ret < 0)
+	if ((s64)ret < 0)
 		return 0;
 
 	/* brk(0) queries the current break and failed brk returns it unchanged. */
-	if ((u64)ctx->ret == old_brk)
+	if ((u64)ret == old_brk)
 		return 0;
 
 	if (tool_config.memory_map_sample_rate > 1) {
@@ -5929,8 +6071,8 @@ int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
 	event->hdr.ts = bpf_ktime_get_boot_ns();
 	event->hdr.cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->hdr.task, task);
-	event->hdr.addr = (u64)ctx->ret;
-	event->hdr.size = (u64)((s64)ctx->ret - (s64)old_brk);
+	event->hdr.addr = (u64)ret;
+	event->hdr.size = (u64)((s64)ret - (s64)old_brk);
 	event->hdr.old_addr = map_rss_delta_enc(task, enter_rss);
 	memory_capture_stack(ctx, event, task, true);
 
@@ -5938,18 +6080,57 @@ int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
 	return 0;
 }
 
-#if defined(__TARGET_ARCH_x86)
-/* vmlinux.h does not expose the exceptions tracepoint layout on all builds;
- * define the fixed-layout args locally (matches format/exceptions/page_fault_user). */
-struct systing_pf_args {
-	u64 __pad;
-	unsigned long address;
-	unsigned long ip;
-	unsigned long error_code;
-};
+SEC("tracepoint/syscalls/sys_enter_brk")
+int systing_brk_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_brk_enter_common(task);
+}
 
-SEC("tracepoint/exceptions/page_fault_user")
-int systing_page_fault_user(struct systing_pf_args *ctx)
+SEC("tracepoint/syscalls/sys_exit_brk")
+int systing_brk_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_brk_exit_common(ctx, task, ctx->ret);
+}
+
+SEC("fentry/" SYSTING_SYSCALL_WRAPPER_PREFIX "brk")
+int BPF_PROG(systing_brk_fentry, const struct pt_regs *regs)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_brk_enter_common(task);
+}
+
+SEC("fexit/" SYSTING_SYSCALL_WRAPPER_PREFIX "brk")
+int BPF_PROG(systing_brk_fexit, const struct pt_regs *regs, long ret)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	return memory_brk_exit_common(ctx, task, ret);
+}
+
+#if defined(__TARGET_ARCH_x86)
+/* The x86 fault leg is the exceptions:page_fault_user tracepoint attached
+ * raw, through its BTF-typed arguments (tp_btf), not through perf_event_open:
+ * a raw tracepoint's probe is a direct call with no perf-sample build per
+ * fault, and its detach is tracepoint_probe_unregister's asynchronous
+ * call_rcu path instead of the perf tracepoint's synchronous SRCU + RCU
+ * grace periods (see the syscall hooks above). The tracepoint's own
+ * enable/disable is a static-key flip either way. No fallback set: every
+ * other raw tracepoint of the object (the scheduler, IRQ and network lanes)
+ * already requires the kernel's BTF, so a kernel that cannot attach this
+ * one cannot load the object at all. sysinfo.memory_fault_leg keeps reading
+ * `tracepoint` on x86 for this attach form. */
+SEC("tp_btf/page_fault_user")
+int BPF_PROG(systing_page_fault_user, unsigned long address, struct pt_regs *regs,
+	     unsigned long error_code)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
 	if (!trace_task(task))
@@ -5975,8 +6156,8 @@ int systing_page_fault_user(struct systing_pf_args *ctx)
 	event->hdr.ts = bpf_ktime_get_boot_ns();
 	event->hdr.cpu = bpf_get_smp_processor_id();
 	record_task_info(&event->hdr.task, task);
-	event->hdr.addr = ctx->address;
-	event->hdr.flags = (u32)ctx->error_code;
+	event->hdr.addr = address;
+	event->hdr.flags = (u32)error_code;
 	memory_capture_stack(ctx, event, task, false);
 
 	bpf_ringbuf_submit(event, flags);
@@ -6350,12 +6531,22 @@ int BPF_KPROBE(systing_thp_split_pmd, void *vma, void *pmd, unsigned long addres
 }
 
 /* The worker every PMD split reaches (see above); `freeze` is set when the
- * split is for migration or unmap (the PTEs are written as migration
- * entries), clear for a plain split — carried in the row's flags. */
+ * PTEs are written as migration entries — the migrate path
+ * (try_to_migrate_one, and the folio split's own unmap of anon folios);
+ * reclaim's try_to_unmap_one splits with it clear, like a plain split —
+ * carried in the row's `result` column. The worker runs inside the PMD's
+ * page-table lock (pmd_lock in __split_huge_pmd, IRQs on, preemption off),
+ * so this probe's ringbuf reserve and user+kernel stack capture sit inside
+ * that spinlock hold too, bounded by the 1-in-N sample rate; the entry
+ * probe below fires before the lock is taken. The `bool` argument arrives
+ * as a full register whose upper bits the ABIs leave unspecified, and a
+ * `bool` parameter here would test the whole register: take it as the raw
+ * register and test the low byte only. */
 SEC("kprobe/__split_huge_pmd_locked")
-int BPF_KPROBE(systing_thp_split_pmd_locked, void *vma, void *pmd, unsigned long haddr, bool freeze)
+int BPF_KPROBE(systing_thp_split_pmd_locked, void *vma, void *pmd, unsigned long haddr,
+	       unsigned long freeze)
 {
-	return memory_thp_emit(ctx, MEMORY_THP_SPLIT_PMD, haddr, freeze ? 1 : 0);
+	return memory_thp_emit(ctx, MEMORY_THP_SPLIT_PMD, haddr, ((u8)freeze) ? 1 : 0);
 }
 
 SEC("kretprobe/split_huge_page_to_list_to_order")

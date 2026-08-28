@@ -62,8 +62,8 @@ pub struct ClockSamplingConfig {
 /// leg was not running on this host".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemoryFaultLeg {
-    /// x86: the `exceptions:page_fault_user` tracepoint (auto-attached with
-    /// the rest of the skeleton).
+    /// x86: the `exceptions:page_fault_user` tracepoint (attached raw,
+    /// through its BTF-typed arguments, with the rest of the skeleton).
     Tracepoint,
     /// Every other arch: one PERF_COUNT_SW_PAGE_FAULTS software event per
     /// CPU, attached after the clock sampler (see attach_page_fault_sw_events).
@@ -92,6 +92,13 @@ impl MemoryFaultLeg {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryRecorderConfig {
     pub fault_leg: MemoryFaultLeg,
+    /// How the mmap/munmap/brk hooks attached (`sysinfo.memory_syscall_leg`):
+    /// "fentry" (trampolines on the arch syscall wrappers),
+    /// "tracepoint:nosym" / "tracepoint:nobtf" / "tracepoint:notramp" (the
+    /// classic syscalls tracepoints, because the wrappers are not in kallsyms /
+    /// not in vmlinux BTF / because the trampoline set failed to attach) or "off:<cause>" (neither attached:
+    /// no mmap/munmap/brk rows in memory_map for this capture).
+    pub syscall_leg: String,
     /// `--memory-fault-sample-rate` as configured (0 and 1 both mean every
     /// fault).
     pub fault_sample_rate: u32,
@@ -121,6 +128,22 @@ pub struct MemoryRecorderEnd {
     /// The AnonHugePages walk's outcome (`sysinfo.memory_anon_huge_walk`);
     /// `None` when the THP leg did not run.
     pub anon_huge_walk: Option<String>,
+}
+
+/// The network recorder's capture-time facts, recorded into the trace's
+/// sysinfo row so a consumer can tell an empty TIME_WAIT lifecycle from a
+/// host where the leg never ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkRecorderConfig {
+    /// How the TIME_WAIT leg (tcp_time_wait / inet_twsk_hashdance_schedule
+    /// / inet_twsk_deschedule_put) attached (`sysinfo.network_tw_leg`):
+    /// `fentry`, `kprobe:notramp` (the trampoline attach failed on this
+    /// host — or the test switch forced that path), `kprobe:nobtf` (the
+    /// trampoline set could not be loaded), or `off:<cause>` (`nosym`: a
+    /// pre-6.11 kernel, `attach`: neither set attached) — with the leg off
+    /// the capture has no TIME_WAIT rows and every TIME_WAIT entry reads as
+    /// a CLOSE.
+    pub tw_leg: String,
 }
 
 /// Static per-CPU frequency limits from sysfs cpufreq, in kHz (sysfs's native
@@ -242,6 +265,10 @@ pub struct SessionRecorder {
     /// The memory recorder's end-of-capture facts (set at stop, before the
     /// trace is written).
     pub memory_recorder_end: OnceLock<MemoryRecorderEnd>,
+    /// The network recorder's TIME_WAIT leg status, set once BPF is
+    /// attached. Unset when the network recorder is not enabled (the sysinfo
+    /// column is then NULL).
+    pub network_recorder_config: OnceLock<NetworkRecorderConfig>,
 }
 
 pub fn get_clock_value(clock_id: libc::c_int) -> u64 {
@@ -968,6 +995,7 @@ impl SessionRecorder {
             clock_sampling: OnceLock::new(),
             memory_recorder_config: OnceLock::new(),
             memory_recorder_end: OnceLock::new(),
+            network_recorder_config: OnceLock::new(),
         }
     }
 
@@ -1607,6 +1635,7 @@ impl SessionRecorder {
             let clock_sampling = self.clock_sampling.get();
             let memory = self.memory_recorder_config.get();
             let memory_end = self.memory_recorder_end.get();
+            let network = self.network_recorder_config.get();
             writer.set_sysinfo(crate::trace::SysInfoRecord {
                 sysname: utsname.sysname().to_string(),
                 release: utsname.release().to_string(),
@@ -1627,6 +1656,8 @@ impl SessionRecorder {
                 memory_thp_sample_rate: memory.and_then(|m| m.thp_sample_rate).map(i64::from),
                 memory_iommu_overflow: memory_end.and_then(|m| m.iommu_overflow),
                 memory_anon_huge_walk: memory_end.and_then(|m| m.anon_huge_walk.clone()),
+                memory_syscall_leg: memory.map(|m| m.syscall_leg.clone()),
+                network_tw_leg: network.map(|n| n.tw_leg.clone()),
             })?;
         }
 
@@ -2100,6 +2131,7 @@ mod tests {
             clock_sampling: OnceLock::new(),
             memory_recorder_config: OnceLock::new(),
             memory_recorder_end: OnceLock::new(),
+            network_recorder_config: OnceLock::new(),
         }
     }
 

@@ -297,7 +297,7 @@ peer, not a local interface) and IPv4-mapped-IPv6 sockets correctly.
 Pre-v13 databases and traces have neither column; readers join on `netns_inum`
 where present and fall back to the `src_ip`→interface heuristic otherwise.
 
-## Schema Version 14 (unreleased) — 2026-08-11
+## Schema Version 14 (systing 1.12.0) — 2026-08-11
 
 `memory_rss` gains an `external BOOLEAN` column and three synthetic members
 (-3/-4/-5), fixing rss_stat attribution in reclaim context and adding passive
@@ -345,7 +345,7 @@ pre-v14 DuckDB into a v14 database (`systing-util convert`) NULL-fills
 `external` via the column-intersection import, and readers of raw pre-v14
 parquet must treat the column as absent.
 
-## Schema Version 15 (unreleased) — 2026-08-13
+## Schema Version 15 (systing 1.13.0) — 2026-08-13
 
 `memory_map` gains `rss_delta_bytes BIGINT` (nullable): the SIGNED change in
 the process's resident set across each mmap/munmap/brk call — pages actually
@@ -380,7 +380,7 @@ Read rules, stated once here and in the record docs:
   rows; committed-at-map = sum over positive rows. The old `size` sums remain
   VA-range churn and keep their v13/v14 meaning for historical continuity.
 
-## Schema Version 16 (unreleased) — 2026-08-20
+## Schema Version 16 (systing 1.13.9) — 2026-08-20
 
 New table `sched_migrate (trace_id, ts, utid, orig_cpu, dest_cpu)`: one row
 per `sched_migrate_task` event, i.e. every change of a task's CPU. The kernel
@@ -403,7 +403,7 @@ aggregate` switches to exact placement when the table is present
 (`meta.placement_exact`) and reports the event counts under `switches.migrate_*`
 and the placement vector `per_cpu.wakeups_placed`.
 
-## Schema Version 17 (unreleased) — 2026-08-25
+## Schema Version 17 (systing 1.14.0) — 2026-08-25
 
 The memory recorder's capture-time configuration is now in the trace. Until
 now the three `--memory-*-sample-rate` values were "a capture-time setting,
@@ -443,7 +443,100 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
-## Schema Version 19 (unreleased) — 2026-08-26
+## Schema Version 20 (unreleased) — 2026-08-28
+
+The memory recorder's syscall hooks change attach form so that stopping a
+capture no longer waits on the kernel: the six `syscalls/sys_{enter,exit}_
+{mmap,munmap,brk}` tracepoints attached through perf_event_open become
+fentry/fexit trampolines on the arch syscall wrappers (`__x64_sys_mmap` …,
+`__arm64_sys_*`, `__riscv_sys_*`), and the x86 `exceptions/page_fault_user`
+tracepoint is attached raw (BTF-typed) instead of through perf. A
+perf-attached tracepoint's detach runs `tracepoint_synchronize_unregister()`
+— one SRCU and one RCU grace period per program, serialized, seven programs
+— which made the `detach bpf programs` stop phase hundreds of ms on a
+many-core host and seconds on the biggest ones; trampolines and raw
+tracepoints detach through asynchronous RCU frees. The syscalls
+tracepoints also kept every task of the host on the syscall slow path for
+the whole capture; the trampolines put nothing on other syscalls. The
+classic tracepoint set stays in the object as the fallback and is attached
+when the trampoline set cannot be, decided at attach time. The network
+recorder's TIME_WAIT hooks (`tcp_time_wait`, `inet_twsk_hashdance_schedule`,
+`inet_twsk_deschedule_put`) make the same move from kprobes to fentry
+trampolines, with the kprobe trio as their fallback, and the leg is gated
+on the kernel before the object loads (see `network_tw_leg`). The tables
+keep their columns; the new columns are nullable.
+
+### Added columns
+- `sysinfo`: added `memory_syscall_leg VARCHAR` — how the mmap/munmap/brk
+  hooks attached for the capture: `fentry` (the trampoline set),
+  `tracepoint:nosym` (the classic tracepoints, because the arch syscall
+  wrappers are not in kallsyms — riscv before 6.7), `tracepoint:nobtf` (the
+  classic tracepoints, because vmlinux BTF has no FUNC entry for the
+  wrappers — an fentry program's target is resolved at load, so the set is
+  not loaded there), `tracepoint:notramp`
+  (the classic tracepoints, because a trampoline program loaded but did not
+  attach — an arm64 kernel without `DYNAMIC_FTRACE_WITH_DIRECT_CALLS`
+  refuses the trampoline while resolving the BTF target fine) or
+  `off:<cause>` (neither set attached: the capture has no `mmap` /
+  `munmap` / `brk` rows in `memory_map`, by construction rather than for
+  lack of syscalls). NULL when the memory recorder did not run, and in
+  traces from systing < 1.17, which always attached the classic
+  tracepoints. `memory_fault_leg` keeps reading `tracepoint` on x86 for the
+  raw-attached tracepoint — the same event, the same rows.
+- `sysinfo`: added `network_tw_leg VARCHAR` — how the network recorder's
+  TIME_WAIT leg (the `tcp_time_wait` / `inet_twsk_hashdance_schedule` /
+  `inet_twsk_deschedule_put` hooks that turn `tcp_time_wait()`'s CLOSE into
+  a TIME_WAIT transition and emit TIME_WAIT -> CLOSE at teardown) attached:
+  `fentry` (the trampoline set, the default), `kprobe:notramp` (a trampoline
+  program loaded but did not attach — the same arm64 case — and the kprobe
+  set ran instead), `kprobe:nobtf` (vmlinux BTF lacks one of the three
+  functions, so the trampoline set was never loaded — an fentry program
+  whose target is missing from BTF fails the whole object at LOAD, which no
+  attach-time fallback could catch — and the kprobe set ran), or
+  `off:<cause>` — `off:nosym` when the kernel lacks one of the functions
+  (`inet_twsk_hashdance_schedule` exists from 6.11, kernel commit
+  b334b924c9b7; a 6.6-series kernel has no leg) and `off:attach` when
+  neither set attached. With the leg off the trace carries NO TIME_WAIT
+  transitions: a socket entering TIME_WAIT reads as a plain CLOSE and no
+  TIME_WAIT -> CLOSE teardown row exists, so a `network_packet` consumer
+  counting TIME_WAIT reads this column first. NULL when the network
+  recorder was off, and in traces from systing < 1.17, which always
+  attached the kprobes.
+
+### Changed meaning (same columns)
+- `memory_map` `mmap` / `munmap` / `brk` rows are unchanged in value:
+  the trampoline programs read the same arguments from the wrapper's
+  `pt_regs` and the same return from the fexit, and the row-building code
+  is shared with the classic programs. Native-only semantics hold as
+  before (the compat `__ia32_sys_*` wrappers are separate symbols and are
+  not attached; the syscalls tracepoints excluded compat calls the same
+  way). One difference in the stacks: the kernel half of a syscall row's
+  stack at fentry/fexit is the trampoline's frame above the wrapper, where
+  the tracepoint's was the syscall-entry glue — plumbing either way; the
+  user half is the same walk of the task's user registers.
+- `network_packet` TIME_WAIT rows are unchanged in value: the fentry and
+  kprobe programs share one body per hook, so the rows are identical
+  whichever set attached.
+
+### Behaviour change (no schema effect)
+- Stopping a capture with the memory recorder on no longer serializes
+  seven synchronous grace-period waits in `detach bpf programs`; the
+  per-capture stop-phase line shows the difference. The `attach bpf
+  programs` phase now includes the trampolines' text pokes (an IPI batch
+  each), before the clock sampler starts, so no capture contains them.
+- The classic set is loaded beside the trampoline set on every memory
+  capture (both forms are then verified by the kernel at every load) and
+  attached only when needed. The network recorder's kprobe trio is loaded
+  beside its fentry trio the same way.
+- The network recorder no longer fails the whole capture on a kernel
+  without `inet_twsk_hashdance_schedule` (pre-6.11): the TIME_WAIT leg is
+  gated on the symbol before the object is loaded and left off
+  (`off:nosym`), and a leg whose programs fail to ATTACH is turned off for
+  that capture (`off:attach`) while the rest of the recorder — and the CPU
+  profile — runs. Before, `skel.attach()` failed every capture on such a
+  node, CPU lane included.
+
+## Schema Version 19 (systing 1.16.0) — 2026-08-26
 
 Follow-ups to the VFIO/THP legs from reading the kernel they probe: the
 PMD-split probe moves to the worker every split reaches, device-container
@@ -475,8 +568,10 @@ keep their columns; the new columns are nullable.
   split — the `split_huge_pmd()` callers AND the rmap paths
   (`try_to_unmap` / `try_to_migrate` on 6.10+), so the per-process rows are
   bounded by the vmstat delta — and `result` carries the split's `freeze`
-  flag (1: the split was for migration or unmap, the PTEs written as
-  migration entries; 0: a plain split). On a build that inlined the worker
+  flag (1: the PTEs were written as migration entries — the migrate path,
+  `try_to_migrate` and the folio split's own unmap of anon folios; 0: a
+  plain split, which includes reclaim's `try_to_unmap` — the kernel passes
+  `freeze = false` there). On a build that inlined the worker
   the probe falls back to the public entry `__split_huge_pmd`
   (`memory_thp_leg = on:pmd-entry` / `on:pmd-only:entry`), which is also
   reached for a PMD that is not huge (`split_huge_pmd_address` calls it for
@@ -518,7 +613,7 @@ keep their columns; the new columns are nullable.
 - The AnonHugePages walk at the end of a THP-leg capture is bounded (64
   processes, heaviest first, 500 ms), see `memory_anon_huge_walk` above.
 
-## Schema Version 18 (unreleased) — 2026-08-25
+## Schema Version 18 (systing 1.15.0) — 2026-08-25
 
 The memory recorder learns about device DMA mappings and transparent huge
 pages: how often VFIO regions are mapped and unmapped, how fragmented the

@@ -262,6 +262,19 @@ pub struct TraceSystemInfo {
     /// the THP leg did not run or for traces from systing < 1.16.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_anon_huge_walk: Option<String>,
+    /// How the memory recorder's mmap/munmap/brk hooks attached ("fentry",
+    /// "tracepoint:nosym", "tracepoint:nobtf", "tracepoint:notramp" or "off:<cause>" — the last
+    /// means the capture has no mmap/munmap/brk rows in memory_map); `None`
+    /// when the memory recorder did not run or for traces from systing
+    /// < 1.17, which always attached the classic tracepoints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_syscall_leg: Option<String>,
+    /// How the network recorder's TIME_WAIT leg attached ("fentry",
+    /// "kprobe:notramp", "kprobe:nobtf" or "off:<cause>" — off means the
+    /// trace carries no TIME_WAIT transitions); `None` when the network
+    /// recorder was off or for traces from systing < 1.17.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_tw_leg: Option<String>,
 }
 
 /// Trace metadata.
@@ -825,7 +838,7 @@ impl AnalyzeDb {
             }
         };
         let sql = format!(
-            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
+            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
             col("trace_id"),
             col("release"),
             col("machine"),
@@ -844,6 +857,8 @@ impl AnalyzeDb {
             col("memory_thp_sample_rate"),
             col("memory_iommu_overflow"),
             col("memory_anon_huge_walk"),
+            col("memory_syscall_leg"),
+            col("network_tw_leg"),
         );
 
         let Ok(mut stmt) = self.conn.prepare(&sql) else {
@@ -869,6 +884,8 @@ impl AnalyzeDb {
                 memory_thp_sample_rate: row.get(15)?,
                 memory_iommu_overflow: row.get(16)?,
                 memory_anon_huge_walk: row.get(17)?,
+                memory_syscall_leg: row.get(18)?,
+                network_tw_leg: row.get(19)?,
             })
         }) else {
             return Vec::new();
@@ -1286,10 +1303,11 @@ mod tests {
                  memory_fault_sample_rate, memory_map_sample_rate, \
                  memory_alloc_sample_rate, memory_vfio_leg, memory_thp_leg, \
                  memory_thp_sample_rate, memory_iommu_overflow, \
-                 memory_anon_huge_walk) \
+                 memory_anon_huge_walk, memory_syscall_leg, network_tw_leg) \
                  VALUES ('t1', 'Linux', '6.12.0', '#1 SMP', 'x86_64', \
                  NULL, 'kvm', 'Amazon EC2', 'm7i.16xlarge', 'cpu-clock', 1000000, \
-                 'tracepoint', 97, 1, NULL, 'on', NULL, NULL, 0, NULL)",
+                 'tracepoint', 97, 1, NULL, 'on', NULL, NULL, 0, NULL, 'fentry', \
+                 'kprobe:nobtf')",
             )
             .unwrap();
         }
@@ -1327,6 +1345,8 @@ mod tests {
             "0 overflow = the histogram is complete"
         );
         assert_eq!(sys.memory_anon_huge_walk, None);
+        assert_eq!(sys.memory_syscall_leg.as_deref(), Some("fentry"));
+        assert_eq!(sys.network_tw_leg.as_deref(), Some("kprobe:nobtf"));
     }
 
     #[test]
@@ -1354,6 +1374,8 @@ mod tests {
                  ALTER TABLE sysinfo DROP COLUMN memory_vfio_leg; \
                  ALTER TABLE sysinfo DROP COLUMN memory_thp_leg; \
                  ALTER TABLE sysinfo DROP COLUMN memory_thp_sample_rate; \
+                 ALTER TABLE sysinfo DROP COLUMN memory_syscall_leg; \
+                 ALTER TABLE sysinfo DROP COLUMN network_tw_leg; \
                  INSERT INTO sysinfo (trace_id, sysname, release, version, machine) \
                  VALUES ('t1', 'Linux', '5.10.0', '#1 SMP', 'aarch64')",
             )
@@ -1380,6 +1402,8 @@ mod tests {
         assert_eq!(sys.memory_vfio_leg, None);
         assert_eq!(sys.memory_thp_leg, None);
         assert_eq!(sys.memory_thp_sample_rate, None);
+        assert_eq!(sys.memory_syscall_leg, None);
+        assert_eq!(sys.network_tw_leg, None);
     }
 
     #[test]
