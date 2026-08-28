@@ -73,13 +73,15 @@ struct Command {
     collect_build_id: bool,
     /// With --collect-build-id: the most distinct files the end-of-trace
     /// build-id index may read the ELF note of (the walk over every live
-    /// process's executable mappings); 0 = unbounded. A binary the walk
-    /// never reaches still resolves through the .build-id directories,
-    /// debuginfod, or the deferred [buildid:...] rendering
+    /// process's executable mappings, sampled processes first); 0, or more
+    /// than the build-id store keeps (16384), means the store's capacity.
+    /// A binary the walk never reaches still resolves through the .build-id
+    /// directories, debuginfod, or the deferred [buildid:...] rendering
     #[arg(long, default_value_t = systing::stack_recorder::DEFAULT_BUILD_ID_INDEX_MAX_FILES)]
     build_id_index_max_files: usize,
     /// With --collect-build-id: the longest the end-of-trace build-id index
-    /// walk may run, in milliseconds; 0 = unbounded
+    /// walk may run, in milliseconds, checked between file reads; 0 =
+    /// unbounded
     #[arg(long, default_value_t = systing::stack_recorder::DEFAULT_BUILD_ID_INDEX_MAX_MS)]
     build_id_index_max_ms: u64,
     /// Enable debug output for pystacks (Python stack tracing)

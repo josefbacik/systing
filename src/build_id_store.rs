@@ -102,6 +102,13 @@ impl BuildIdStore {
         self
     }
 
+    /// How many build-ids the store keeps before evicting the least recently
+    /// used; a fill past this count evicts rather than grows, so a caller
+    /// filling the store has no reason to read more files than this.
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
     /// Resolve a build-id to the binary to symbolize against, probing
     /// trusted sources on first sight. Returns `None` when no source knows
     /// the id (the caller renders the deferred `[buildid:...]` form).

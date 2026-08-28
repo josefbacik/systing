@@ -1266,10 +1266,11 @@ pub struct Config {
     /// durable identity (`unknown ([buildid:<hex>]) <0x<offset>>`)
     pub collect_build_id: bool,
     /// With `collect_build_id`: the most distinct files the end-of-trace
-    /// build-id index walk may read the ELF note of; 0 = unbounded
+    /// build-id index walk may read the ELF note of; 0, or more than the
+    /// build-id store keeps, means the store's capacity
     pub build_id_index_max_files: usize,
     /// With `collect_build_id`: the longest that walk may run, in
-    /// milliseconds; 0 = unbounded
+    /// milliseconds, checked between file reads; 0 = unbounded
     pub build_id_index_max_ms: u64,
     /// Explicit PIDs for pystacks (bypasses auto-discovery)
     pub pystacks_pids: Vec<u32>,
