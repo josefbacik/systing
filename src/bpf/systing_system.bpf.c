@@ -6476,12 +6476,19 @@ int systing_iommu_unmap(struct systing_iommu_unmap_args *ctx)
  * split_huge_pmd() callers through __split_huge_pmd, and the rmap paths
  * (try_to_unmap / try_to_migrate on 6.10+) through split_huge_pmd_locked.
  * When kallsyms lists the worker, the probe sits there and counts exactly
- * what vmstat counts; when the build inlined it, the fallback probes the
- * public entry __split_huge_pmd, which is also reached for a PMD that is
- * NOT huge (split_huge_pmd_address calls it for any populated PMD on a VMA
- * adjust), so the entry probe over-counts on VMA churn and misses the rmap
- * paths; userspace records which one ran (sysinfo.memory_thp_leg
- * on:pmd-entry). thp_split_page / thp_split_page_failed count at the end of
+ * what vmstat counts. When the build inlined it, the probe falls back to
+ * the global funnel split_huge_pmd_locked (6.10+, a T symbol): on 6.12 and
+ * 6.18 both __split_huge_pmd and the rmap paths call it, and it calls the
+ * worker once the PMD is huge (or a migration entry) — so it covers every
+ * split the worker does, but it is also reached for a PMD that is NOT huge
+ * (the huge check is inside it), so it over-counts on VMA churn; userspace
+ * records that tier as sysinfo.memory_thp_leg on:pmd-global. On a kernel
+ * without the funnel (before 6.10, where the rmap paths still go through
+ * __split_huge_pmd) the last fallback probes the public entry
+ * __split_huge_pmd, which over-counts the same way — and on a 6.10+ kernel
+ * whose kallsyms lacked the funnel it would also miss the rmap paths
+ * (sysinfo.memory_thp_leg on:pmd-entry). thp_split_page /
+ * thp_split_page_failed count at the end of
  * the folio split whose entry is split_huge_page_to_list (<= 6.8) or
  * split_huge_page_to_list_to_order (>= 6.9; at 6.18 the counter sits in its
  * static callee __folio_split); the entry's return value is the result: 0
@@ -6546,7 +6553,7 @@ int BPF_KPROBE(systing_thp_split_pmd, void *vma, void *pmd, unsigned long addres
  * page-table lock (pmd_lock in __split_huge_pmd, IRQs on, preemption off),
  * so this probe's ringbuf reserve and user+kernel stack capture sit inside
  * that spinlock hold too, bounded by the 1-in-N sample rate; the entry
- * probe below fires before the lock is taken. The `bool` argument arrives
+ * probe above fires before the lock is taken. The `bool` argument arrives
  * as a full register whose upper bits the ABIs leave unspecified, and a
  * `bool` parameter here would test the whole register: take it as the raw
  * register and test the low byte only. */
@@ -6555,6 +6562,25 @@ int BPF_KPROBE(systing_thp_split_pmd_locked, void *vma, void *pmd, unsigned long
 	       unsigned long freeze)
 {
 	return memory_thp_emit(ctx, MEMORY_THP_SPLIT_PMD, haddr, ((u8)freeze) ? 1 : 0);
+}
+
+/* The global funnel on 6.10+ (`split_huge_pmd_locked`, the middle tier —
+ * see above): reached by __split_huge_pmd AND the rmap paths, inside the
+ * PMD's page-table lock like the worker, and before its own huge check,
+ * so it also fires for a PMD that is not huge. Its parameters are
+ * (vma, address, pmd, freeze, folio) on 6.12 and (vma, address, pmd,
+ * freeze) on 6.18: the first four are the same on both, with `address`
+ * and `pmd` swapped relative to the worker, and `freeze` the fourth
+ * register — masked to its low byte as in the worker probe. A build that
+ * also inlined the funnel into its same-file caller __split_huge_pmd
+ * (the symbol stays exported for rmap.c) would leave this probe with the
+ * rmap paths only; the memory_recorder e2e's madvise split check is what
+ * catches that on a test kernel. */
+SEC("kprobe/split_huge_pmd_locked")
+int BPF_KPROBE(systing_thp_split_pmd_global, void *vma, unsigned long address, void *pmd,
+	       unsigned long freeze)
+{
+	return memory_thp_emit(ctx, MEMORY_THP_SPLIT_PMD, address, ((u8)freeze) ? 1 : 0);
 }
 
 SEC("kretprobe/split_huge_page_to_list_to_order")
