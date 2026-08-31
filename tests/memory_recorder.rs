@@ -11,7 +11,7 @@
 mod common;
 
 use common::workload::{wait_until, SLOW_MACHINE_BUDGET};
-use systing::{systing, Config};
+use systing::{systing, Config, KernelHooks};
 use tempfile::TempDir;
 
 /// Size of each allocation in the workload. Must be well above the glibc
@@ -90,25 +90,16 @@ fn test_memory_recorder_e2e() {
     let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
 
     // --- Check: sysinfo says which form of the mmap/munmap/brk hooks ran ---
-    // The trampoline form on a kernel that lists the arch syscall wrappers
-    // in kallsyms and can attach a trampoline to them (the rig guest); a
-    // kernel without the wrappers records the classic form instead.
+    // The default form is the classic tracepoint set on every kernel (the
+    // trampoline form is opt-in, `kernel_hooks: Trampoline`, exercised by
+    // its own tests below): the value is the plain `tracepoint`, never a
+    // qualified one, since no trampoline was tried.
     eprintln!("  sysinfo.memory_syscall_leg...");
     let syscall_leg = read_syscall_leg(&conn);
-    if host_has_syscall_wrappers() {
-        // `tracepoint:nobtf` only on a kernel whose BTF lacks the wrappers
-        // (the trampoline set is then never loaded); the rig guest has them.
-        assert!(
-            syscall_leg == "fentry" || syscall_leg == "tracepoint:nobtf",
-            "[sysinfo] memory_syscall_leg = {syscall_leg:?}: expected the trampoline form \
-             on a kernel that lists the syscall wrappers"
-        );
-    } else {
-        assert_eq!(
-            syscall_leg, "tracepoint:nosym",
-            "[sysinfo] memory_syscall_leg: the classic form on a kernel without the wrappers"
-        );
-    }
+    assert_eq!(
+        syscall_leg, "tracepoint",
+        "[sysinfo] memory_syscall_leg: the classic form is the default on every kernel"
+    );
     eprintln!("    memory_syscall_leg = {syscall_leg}");
 
     // --- Check: memory_rss has anon rows with plausible byte values ---
@@ -352,18 +343,15 @@ fn host_has_syscall_wrappers() -> bool {
     })
 }
 
-/// The attach-time fallback of the mmap/munmap/brk hooks: when a program of
-/// the trampoline set fails to attach, the links attached before it are
-/// dropped and the classic tracepoint set takes over — the capture still
-/// carries the syscall rows, and sysinfo says which form ran. The failure is
-/// the testing-only switch (after the first trampoline program attached, so a
-/// real link is dropped), because no rig kernel refuses trampolines; on a
-/// kernel that does (arm64 without direct-call ftrace) this is the path a
-/// capture takes.
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_memory_syscall_hooks_fall_back_to_tracepoints() {
-    let dir = TempDir::new().expect("Failed to create temp dir");
+/// One memory capture of the allocator workload under the opt-in trampoline
+/// form of the mmap/munmap/brk hooks (`kernel_hooks: Trampoline`), with the
+/// testing-only attach-failure switch on or off. Returns the trace's DuckDB
+/// connection, the workload's pid and the `sysinfo.memory_syscall_leg` value.
+fn record_trampoline_capture(
+    dir: &TempDir,
+    label: &str,
+    force_fallback: bool,
+) -> (duckdb::Connection, i32, String) {
     let py_prog = format!(
         "import time\n\
          bufs=[]\n\
@@ -380,11 +368,12 @@ fn test_memory_syscall_hooks_fall_back_to_tracepoints() {
     let traced_child =
         systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
     let child_pid = traced_child.pid as i32;
-    eprintln!("Recording memory trace with the forced syscall-hook fallback (pid {child_pid})...");
+    eprintln!("Recording memory trace ({label}, pid {child_pid})...");
 
     let config = Config {
         memory: true,
-        memory_syscall_force_fallback: true,
+        kernel_hooks: KernelHooks::Trampoline,
+        memory_syscall_force_fallback: force_fallback,
         parquet_only: true,
         output_dir: dir.path().to_path_buf(),
         output: dir.path().join("trace.pb"),
@@ -394,26 +383,16 @@ fn test_memory_syscall_hooks_fall_back_to_tracepoints() {
     assert_eq!(exit_code, 0, "allocator workload should exit with code 0");
 
     let duckdb_path = dir.path().join("trace.duckdb");
-    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "fallback")
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, label)
         .expect("DuckDB conversion failed");
     let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
-
     let syscall_leg = read_syscall_leg(&conn);
-    if host_has_syscall_wrappers() {
-        // (`tracepoint:nobtf` only on a kernel whose BTF lacks the wrappers:
-        // no trampoline set loaded, nothing for the switch to force.)
-        assert!(
-            syscall_leg == "tracepoint:notramp" || syscall_leg == "tracepoint:nobtf",
-            "[sysinfo] memory_syscall_leg = {syscall_leg:?}: the forced trampoline failure \
-             must land on the classic tracepoint set"
-        );
-    } else {
-        // No trampoline set was loaded to fail: the classic set is the
-        // only form, and the switch has nothing to force.
-        assert_eq!(syscall_leg, "tracepoint:nosym");
-    }
+    (conn, child_pid, syscall_leg)
+}
 
-    // The classic set carries the rows: the big mmaps and their munmaps.
+/// The rows either form of the hooks must carry for the allocator workload:
+/// the big mmaps and their munmaps.
+fn assert_syscall_rows(conn: &duckdb::Connection, child_pid: i32, form: &str) -> (i64, i64) {
     let (mmap_rows, munmap_rows): (i64, i64) = conn
         .query_row(
             &format!(
@@ -427,15 +406,76 @@ fn test_memory_syscall_hooks_fall_back_to_tracepoints() {
         .expect("Failed to query memory_map");
     assert!(
         mmap_rows >= ALLOC_COUNT / 2,
-        "[memory_map] expected >= {} mmap events of >= {} bytes through the classic set, got {}",
+        "[memory_map] expected >= {} mmap events of >= {} bytes through the {form}, got {}",
         ALLOC_COUNT / 2,
         ALLOC_SIZE_BYTES,
         mmap_rows
     );
     assert!(
         munmap_rows > 0,
-        "[memory_map] no munmap events for workload pid {child_pid} through the classic set"
+        "[memory_map] no munmap events for workload pid {child_pid} through the {form}"
     );
+    (mmap_rows, munmap_rows)
+}
+
+/// The opt-in trampoline form of the mmap/munmap/brk hooks
+/// (`--kernel-hooks trampoline`): on a kernel that lists the arch syscall
+/// wrappers in kallsyms and vmlinux BTF and can attach a trampoline to them
+/// (the rig guest) the fentry/fexit set runs and carries the rows; a kernel
+/// without the wrappers records the classic form with the reason.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_syscall_hooks_trampoline_opt_in() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let (conn, child_pid, syscall_leg) = record_trampoline_capture(&dir, "trampoline", false);
+    if host_has_syscall_wrappers() {
+        // `tracepoint:nobtf` only on a kernel whose BTF lacks the wrappers
+        // (the trampoline set is then never loaded); the rig guest has them.
+        assert!(
+            syscall_leg == "fentry" || syscall_leg == "tracepoint:nobtf",
+            "[sysinfo] memory_syscall_leg = {syscall_leg:?}: expected the trampoline form \
+             on a kernel that lists the syscall wrappers"
+        );
+    } else {
+        assert_eq!(
+            syscall_leg, "tracepoint:nosym",
+            "[sysinfo] memory_syscall_leg: the classic form on a kernel without the wrappers"
+        );
+    }
+    let (mmap_rows, munmap_rows) = assert_syscall_rows(&conn, child_pid, "trampoline form");
+    eprintln!(
+        "    memory_syscall_leg = {syscall_leg}; {mmap_rows} big mmap + {munmap_rows} munmap rows"
+    );
+    eprintln!("\ntest_memory_syscall_hooks_trampoline_opt_in: all checks passed");
+}
+
+/// The attach-time fallback of the opt-in trampoline form: when a program
+/// of the trampoline set fails to attach, the links attached before it are
+/// dropped and the classic tracepoint set takes over — the capture still
+/// carries the syscall rows, and sysinfo says which form ran. The failure is
+/// the testing-only switch (after the first trampoline program attached, so a
+/// real link is dropped), because no rig kernel refuses trampolines; on a
+/// kernel that does (arm64 without direct-call ftrace) this is the path a
+/// trampoline-form capture takes.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_syscall_hooks_fall_back_to_tracepoints() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let (conn, child_pid, syscall_leg) = record_trampoline_capture(&dir, "fallback", true);
+    if host_has_syscall_wrappers() {
+        // (`tracepoint:nobtf` only on a kernel whose BTF lacks the wrappers:
+        // no trampoline set loaded, nothing for the switch to force.)
+        assert!(
+            syscall_leg == "tracepoint:notramp" || syscall_leg == "tracepoint:nobtf",
+            "[sysinfo] memory_syscall_leg = {syscall_leg:?}: the forced trampoline failure \
+             must land on the classic tracepoint set"
+        );
+    } else {
+        // No trampoline set was loaded to fail: the classic set is the
+        // only form, and the switch has nothing to force.
+        assert_eq!(syscall_leg, "tracepoint:nosym");
+    }
+    let (mmap_rows, munmap_rows) = assert_syscall_rows(&conn, child_pid, "classic set");
     eprintln!(
         "    memory_syscall_leg = {syscall_leg}; {mmap_rows} big mmap + {munmap_rows} munmap rows"
     );

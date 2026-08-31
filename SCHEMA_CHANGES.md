@@ -443,57 +443,81 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
-## Schema Version 20 (unreleased) — 2026-08-28
+## Schema Version 20 (systing 1.17.0) — 2026-08-28
 
-The memory recorder's syscall hooks change attach form so that stopping a
-capture no longer waits on the kernel: the six `syscalls/sys_{enter,exit}_
-{mmap,munmap,brk}` tracepoints attached through perf_event_open become
-fentry/fexit trampolines on the arch syscall wrappers (`__x64_sys_mmap` …,
-`__arm64_sys_*`, `__riscv_sys_*`), and the x86 `exceptions/page_fault_user`
-tracepoint is attached raw (BTF-typed) instead of through perf. A
-perf-attached tracepoint's detach runs `tracepoint_synchronize_unregister()`
-— one SRCU and one RCU grace period per program, serialized, seven programs
-— which made the `detach bpf programs` stop phase hundreds of ms on a
-many-core host and seconds on the biggest ones; trampolines and raw
-tracepoints detach through asynchronous RCU frees. The syscalls
-tracepoints also kept every task of the host on the syscall slow path for
-the whole capture; the trampolines put nothing on other syscalls. The
-classic tracepoint set stays in the object as the fallback and is attached
-when the trampoline set cannot be, decided at attach time. The network
-recorder's TIME_WAIT hooks (`tcp_time_wait`, `inet_twsk_hashdance_schedule`,
-`inet_twsk_deschedule_put`) make the same move from kprobes to fentry
-trampolines, with the kprobe trio as their fallback, and the leg is gated
-on the kernel before the object loads (see `network_tw_leg`). The tables
-keep their columns; the new columns are nullable.
+Two `sysinfo` columns record the FORM of the recorders' kernel-function
+hooks, and the form is now a switch. systing 1.17.0 introduced a trampoline
+form of the memory recorder's mmap/munmap/brk hooks — fentry/fexit programs
+on the arch syscall wrappers (`__x64_sys_mmap` …, `__arm64_sys_*`,
+`__riscv_sys_*`) in place of the six `syscalls/sys_{enter,exit}_
+{mmap,munmap,brk}` tracepoints attached through perf_event_open — and of
+the network recorder's TIME_WAIT hooks (`tcp_time_wait`,
+`inet_twsk_hashdance_schedule`, `inet_twsk_deschedule_put`: fentry in
+place of kprobes), as the DEFAULT, on the claim that trampolines detach in
+milliseconds. That claim was wrong, and the next release (unreleased at
+the time of writing; 1.17.0–1.17.2 shipped the trampoline default) makes
+the classic form the default again with the trampoline form opt-in
+(`--kernel-hooks trampoline`; `sysinfo.memory_syscall_leg` /
+`network_tw_leg` say which ran). What the kernel does, read at v6.6, v6.12
+and v6.18: a perf-attached
+tracepoint's detach runs `tracepoint_synchronize_unregister()` — one SRCU
+and one RCU grace period per program — while dropping the last program on
+a kernel-function trampoline runs `bpf_trampoline_update` →
+`unregister_fentry` → `unregister_ftrace_direct` → `ftrace_shutdown()`,
+whose tail waits `synchronize_rcu_tasks_rude()` and then
+`synchronize_rcu_tasks()` (kernel/trace/ftrace.c, v6.12 lines 3181 and
+3190) — two Tasks-RCU grace periods, each of which sleeps at least 100 ms
+whenever any task is runnable at its scan — once per hooked FUNCTION,
+serialized on the capture's stop path. The three TIME_WAIT kprobes share
+one `ftrace_ops` and pay that shutdown once; three trampolines pay it three
+times. Measured on the printed `stop-phase: detach bpf programs` line, 2
+vCPU guests with two busy loops and a live mmap/TCP workload, 3-second
+whole-system captures (systing 1.16.3 = classic vs 1.17.1 = trampoline):
+on vanilla 6.12.0, memory recorder only 116 ms → 672 ms (medians of 4),
+network recorder only 140 ms → 622 ms, the default set plus both recorders
+957 ms → 2146 ms; on 6.12.85, 188 ms → 648 ms, 179 ms → 604 ms and 1418 ms
+→ 2378 ms (medians of 2). The trampoline form's one real saving is during
+the capture — the syscalls tracepoints keep every task of the host on the
+syscall slow path (`SYSCALL_WORK_SYSCALL_TRACEPOINT`) for the whole
+capture, the trampolines put nothing on other syscalls — which is why the
+form stays available. The x86 `exceptions/page_fault_user` tracepoint's
+move from perf to a raw (BTF-typed) attach stands in both forms: a raw
+tracepoint's last detach is `release_probes()`' `call_rcu`, with no wait.
+The tables keep their columns; the new columns are nullable.
 
 ### Added columns
 - `sysinfo`: added `memory_syscall_leg VARCHAR` — how the mmap/munmap/brk
-  hooks attached for the capture: `fentry` (the trampoline set),
-  `tracepoint:nosym` (the classic tracepoints, because the arch syscall
-  wrappers are not in kallsyms — riscv before 6.7), `tracepoint:nobtf` (the
-  classic tracepoints, because vmlinux BTF has no FUNC entry for the
-  wrappers — an fentry program's target is resolved at load, so the set is
-  not loaded there), `tracepoint:notramp`
-  (the classic tracepoints, because a trampoline program loaded but did not
-  attach — an arm64 kernel without `DYNAMIC_FTRACE_WITH_DIRECT_CALLS`
-  refuses the trampoline while resolving the BTF target fine) or
-  `off:<cause>` (neither set attached: the capture has no `mmap` /
-  `munmap` / `brk` rows in `memory_map`, by construction rather than for
-  lack of syscalls). NULL when the memory recorder did not run, and in
-  traces from systing < 1.17, which always attached the classic
-  tracepoints. `memory_fault_leg` keeps reading `tracepoint` on x86 for the
-  raw-attached tracepoint — the same event, the same rows.
+  hooks attached for the capture: `tracepoint` (the classic tracepoints as
+  the default form, from the correction release), `fentry` (the trampoline
+  set — the default in 1.17.0–1.17.2, opt-in after), `tracepoint:nosym` (the
+  classic tracepoints under the trampoline form, because the arch syscall
+  wrappers are not in kallsyms — riscv before 6.6), `tracepoint:nobtf` (the
+  classic tracepoints under the trampoline form, because vmlinux BTF has no
+  FUNC entry for the wrappers — an fentry program's target is resolved at
+  load, so the set is not loaded there), `tracepoint:notramp` (the classic
+  tracepoints, because a trampoline program loaded but did not attach — an
+  arm64 kernel without `DYNAMIC_FTRACE_WITH_DIRECT_CALLS` refuses the
+  trampoline while resolving the BTF target fine) or `off:<cause>` (neither
+  set attached: the capture has no `mmap` / `munmap` / `brk` rows in
+  `memory_map`, by construction rather than for lack of syscalls). NULL
+  when the memory recorder did not run, and in traces from systing < 1.17,
+  which always attached the classic tracepoints. `memory_fault_leg` keeps
+  reading `tracepoint` on x86 for the raw-attached tracepoint — the same
+  event, the same rows.
 - `sysinfo`: added `network_tw_leg VARCHAR` — how the network recorder's
   TIME_WAIT leg (the `tcp_time_wait` / `inet_twsk_hashdance_schedule` /
   `inet_twsk_deschedule_put` hooks that turn `tcp_time_wait()`'s CLOSE into
   a TIME_WAIT transition and emit TIME_WAIT -> CLOSE at teardown) attached:
-  `fentry` (the trampoline set, the default), `kprobe:notramp` (a trampoline
-  program loaded but did not attach — the same arm64 case — and the kprobe
-  set ran instead), `kprobe:nobtf` (vmlinux BTF lacks one of the three
-  functions, so the trampoline set was never loaded — an fentry program
-  whose target is missing from BTF fails the whole object at LOAD, which no
-  attach-time fallback could catch — and the kprobe set ran), or
-  `off:<cause>` — `off:nosym` when the kernel lacks one of the functions
+  `kprobe` (the kprobe set as the default form, from the correction
+  release), `fentry` (the trampoline set — the default in 1.17.0–1.17.2,
+  opt-in after),
+  `kprobe:notramp` (a trampoline program loaded but did not attach — the
+  same arm64 case — and the kprobe set ran instead), `kprobe:nobtf` (under
+  the trampoline form, vmlinux BTF lacks one of the three functions, so the
+  trampoline set was never loaded — an fentry program whose target is
+  missing from BTF fails the whole object at LOAD, which no attach-time
+  fallback could catch — and the kprobe set ran), or `off:<cause>` —
+  `off:nosym` when the kernel lacks one of the functions
   (`inet_twsk_hashdance_schedule` exists from 6.11, kernel commit
   b334b924c9b7; a 6.6-series kernel has no leg) and `off:attach` when
   neither set attached. With the leg off the trace carries NO TIME_WAIT
@@ -504,30 +528,46 @@ keep their columns; the new columns are nullable.
   attached the kprobes.
 
 ### Changed meaning (same columns)
-- `memory_map` `mmap` / `munmap` / `brk` rows are unchanged in value:
-  the trampoline programs read the same arguments from the wrapper's
-  `pt_regs` and the same return from the fexit, and the row-building code
-  is shared with the classic programs. Native-only semantics hold as
-  before (the compat `__ia32_sys_*` wrappers are separate symbols and are
-  not attached; the syscalls tracepoints excluded compat calls the same
-  way). One difference in the stacks: the kernel half of a syscall row's
-  stack at fentry/fexit is the trampoline's frame above the wrapper, where
-  the tracepoint's was the syscall-entry glue — plumbing either way; the
-  user half is the same walk of the task's user registers.
+- `memory_map` `mmap` / `munmap` / `brk` rows are unchanged in value
+  whichever form attached: the trampoline programs read the same arguments
+  from the wrapper's `pt_regs` and the same return from the fexit, and the
+  row-building code is shared with the classic programs. Native-only
+  semantics hold as before (the compat `__ia32_sys_*` wrappers are separate
+  symbols and are not attached; the syscalls tracepoints excluded compat
+  calls the same way). One difference in the stacks under the trampoline
+  form: the kernel half of a syscall row's stack at fentry/fexit is the
+  trampoline's frame above the wrapper, where the tracepoint's is the
+  syscall-entry glue — plumbing either way; the user half is the same walk
+  of the task's user registers.
 - `network_packet` TIME_WAIT rows are unchanged in value: the fentry and
   kprobe programs share one body per hook, so the rows are identical
   whichever set attached.
+- `memory_thp` `result` for `kind = 'pmd'` rows from the worker probe
+  (`__split_huge_pmd_locked`, `memory_thp_leg = on` / `on:pmd-only`): the
+  kprobe now reads the worker's `freeze` parameter as a whole register and
+  masks its low byte (the x86-64 psABI leaves a `_Bool` argument's upper
+  register bits unspecified, and the old cast tested the whole register),
+  so a split whose caller left stale upper bits no longer reads as
+  `freeze = true`. Rows from 1.16.x may carry a spurious `true` on such
+  splits; from 1.17.0 the value is the flag the kernel passed.
 
 ### Behaviour change (no schema effect)
-- Stopping a capture with the memory recorder on no longer serializes
-  seven synchronous grace-period waits in `detach bpf programs`; the
-  per-capture stop-phase line shows the difference. The `attach bpf
-  programs` phase now includes the trampolines' text pokes (an IPI batch
-  each), before the clock sampler starts, so no capture contains them.
-- The classic set is loaded beside the trampoline set on every memory
-  capture (both forms are then verified by the kernel at every load) and
-  attached only when needed. The network recorder's kprobe trio is loaded
-  beside its fentry trio the same way.
+- The capture's `detach bpf programs` stop phase: under the default classic
+  form it is what it was through 1.16 (the seven perf-attached programs'
+  serialized SRCU + RCU grace periods — hundreds of ms on a many-core host,
+  seconds on the biggest); under the opt-in trampoline form it is longer by
+  two Tasks-RCU grace periods per hooked function (the numbers above), and
+  the `attach bpf programs` phase then also carries the trampolines' text
+  pokes (an IPI batch each), before the clock sampler starts, so no capture
+  contains them. In 1.17.0–1.17.2 the trampoline form was the default, so
+  those releases stop a memory or network capture more slowly than 1.16.x
+  did.
+- Under the default classic form only the classic set is loaded (the
+  object a 1.16 capture loaded, plus the raw page-fault tracepoint on x86);
+  under the trampoline form the classic set is loaded beside the trampoline
+  set (both verified by the kernel at every load) and attached only when
+  needed. The network recorder's kprobe trio and fentry trio behave the
+  same way.
 - The network recorder no longer fails the whole capture on a kernel
   without `inet_twsk_hashdance_schedule` (pre-6.11): the TIME_WAIT leg is
   gated on the symbol before the object is loaded and left off

@@ -5228,14 +5228,19 @@ int BPF_PROG(inet_sock_set_state, const struct sock *sk, int oldstate, int newst
 // 2. inet_twsk_hashdance_schedule: map tw sock pointer -> socket_id
 // 3. inet_twsk_deschedule_put: emit TIME_WAIT -> CLOSE when tw sock is destroyed
 //
-// Each hook ships twice, with one shared body: an fentry program (the
-// trampoline set, attached by default — its link detaches through the
-// trampoline's async path, so the capture's "detach bpf programs" phase
-// stays at milliseconds) and a kprobe program (the fallback set — attached
-// only when the trampoline attach fails, e.g. an arm64 kernel without
-// DYNAMIC_FTRACE_WITH_DIRECT_CALLS). Userspace loads both sets and attaches
-// exactly one of them (see NETWORK_TW_FENTRY_PROGRAMS / attach_network_tw_leg
-// in systing_core.rs); which one ran is recorded as sysinfo.network_tw_leg.
+// Each hook ships twice, with one shared body: a kprobe program (the
+// default set — the three kprobes share one ftrace_ops, so dropping them
+// costs one ftrace_shutdown) and an fentry program (the trampoline set,
+// opt-in through `--kernel-hooks trampoline`: cheaper while the capture
+// runs, but each trampoline's last link drop runs ftrace_shutdown()'s two
+// synchronous Tasks-RCU grace periods, three times for the three hooks —
+// measured at about four times the kprobe set's "detach bpf programs"
+// phase, see SCHEMA_CHANGES.md schema 20; the kprobe set is its fallback
+// when the attach fails, e.g. an arm64 kernel without
+// DYNAMIC_FTRACE_WITH_DIRECT_CALLS). Userspace loads the kprobe set always
+// and the fentry set only when opted in, and attaches exactly one of them
+// (see NETWORK_TW_FENTRY_PROGRAMS / attach_network_tw_leg in
+// systing_core.rs); which one ran is recorded as sysinfo.network_tw_leg.
 //
 // Note: inet_twsk_hashdance_schedule was introduced in kernel 6.11 (commit
 // b334b924c9b7, "net: tcp/dccp: prepare for tw_timer un-pinning", v6.11-rc1;
@@ -5765,28 +5770,31 @@ static __always_inline u64 map_rss_delta_enc(struct task_struct *task,
 /* ---- mmap / munmap / brk: two attach forms, one body each ----
  *
  * The syscall hooks ship in two forms that share the bodies below. The
- * trampoline form — fentry/fexit on the arch syscall wrappers
- * (`__x64_sys_mmap` and friends; the arch prefix is selected at compile
- * time, and the compat wrappers `__ia32_sys_*` are a separate symbol never
- * attached, so native-only semantics hold as they did at the syscalls
- * tracepoints) — is what a capture attaches first: a trampoline call
- * replaces the perf-sample build the classic tracepoint runs per event,
- * puts nothing on the entry path of the other syscalls (the syscalls
- * tracepoints keep every task of the host on the SYSCALL_WORK_SYSCALL_
- * TRACEPOINT slow path for the whole capture), and detaches through
- * bpf_trampoline_update's text poke plus asynchronous RCU-tasks frees
- * instead of the perf tracepoint's synchronous tracepoint_synchronize_
- * unregister (one SRCU and one RCU grace period per program, serialized —
- * six of them at every capture stop, hundreds of ms on a many-core host,
- * seconds on the largest). The classic form — the six `syscalls/sys_{enter,exit}_*`
- * tracepoints through perf_event_open — is loaded beside it and attached
- * only when the trampoline set cannot be: userspace attaches the trampoline
- * programs one by one after skel.attach() and falls back on the first
- * error (a kernel without the wrappers in kallsyms never tries; an arm64
- * kernel built without DYNAMIC_FTRACE_WITH_DIRECT_CALLS loads the programs
- * and refuses the attach), recording which form ran in
- * sysinfo.memory_syscall_leg. Both forms write memory_syscall_scratch and
- * the memory ringbuf; neither is fenced by bpf_prog_active.
+ * classic form — the six `syscalls/sys_{enter,exit}_*` tracepoints through
+ * perf_event_open — is the default: its detach is one SRCU and one RCU
+ * grace period per program (serialized, six of them at every capture stop
+ * — hundreds of ms on a many-core host, seconds on the largest), and it
+ * keeps every task of the host on the SYSCALL_WORK_SYSCALL_TRACEPOINT slow
+ * path for the whole capture. The trampoline form — fentry/fexit on the
+ * arch syscall wrappers (`__x64_sys_mmap` and friends; the arch prefix is
+ * selected at compile time, and the compat wrappers `__ia32_sys_*` are a
+ * separate symbol never attached, so native-only semantics hold as they do
+ * at the syscalls tracepoints) — is opt-in (`--kernel-hooks trampoline`): a
+ * trampoline call replaces the perf-sample build the classic tracepoint
+ * runs per event and puts nothing on the entry path of the other syscalls,
+ * but dropping the last program on a function's trampoline runs
+ * ftrace_shutdown()'s two synchronous Tasks-RCU grace periods, once per
+ * hooked function (three here), serialized on the stop path — measured at
+ * about six times the classic set's "detach bpf programs" phase (see
+ * SCHEMA_CHANGES.md, schema 20). Under the trampoline form the classic set
+ * is loaded beside it and attached only when the trampoline set cannot be:
+ * userspace attaches the trampoline programs one by one after skel.attach()
+ * and falls back on the first error (a kernel without the wrappers in
+ * kallsyms or vmlinux BTF never tries; an arm64 kernel built without
+ * DYNAMIC_FTRACE_WITH_DIRECT_CALLS loads the programs and refuses the
+ * attach), recording which form ran in sysinfo.memory_syscall_leg. Both
+ * forms write memory_syscall_scratch and the memory ringbuf; neither is
+ * fenced by bpf_prog_active.
  *
  * The user stack a trampoline program captures is the same as the
  * tracepoint's (bpf_get_stack walks task_pt_regs(current) for the user

@@ -20,7 +20,9 @@ use common::{
 };
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use systing::{systing, validate_duckdb, validate_parquet_dir, validate_perfetto_trace, Config};
+use systing::{
+    systing, validate_duckdb, validate_parquet_dir, validate_perfetto_trace, Config, KernelHooks,
+};
 use tempfile::TempDir;
 
 /// Total recording duration for netns tests (seconds). Workloads loop until
@@ -1944,10 +1946,11 @@ fn test_e2e_network_suite() {
         // Don't assert on tw_close_count > 0 because TIME_WAIT lasts 60s and
         // the test trace is only 3s. TIME_WAIT → CLOSE may not happen during the trace.
 
-        // The TIME_WAIT rows above came through one of the leg's two program
-        // sets, and sysinfo says which: the fentry set on a kernel that
-        // attaches trampolines, else the kprobe fallback. Never off — the
-        // TIME_WAIT assertion above could not have passed with the leg off.
+        // The TIME_WAIT rows above came through the leg's default program
+        // set, and sysinfo says so: the plain `kprobe` (the trampoline form
+        // is opt-in, exercised by `test_e2e_network_tw_leg_trampoline_opt_in`
+        // and the forced-fallback test below). Never off — the TIME_WAIT
+        // assertion above could not have passed with the leg off.
         let tw_leg: Option<String> = conn
             .query_row("SELECT network_tw_leg FROM sysinfo", [], |row| row.get(0))
             .expect("[network duckdb] sysinfo row missing");
@@ -1955,37 +1958,36 @@ fn test_e2e_network_suite() {
         let tw_leg = tw_leg.expect(
             "[network duckdb] sysinfo.network_tw_leg must be recorded when the network recorder ran",
         );
-        assert!(
-            tw_leg == "fentry" || tw_leg.starts_with("kprobe:"),
-            "[network duckdb] network_tw_leg = {tw_leg}: the TIME_WAIT leg must have attached \
-             for the TIME_WAIT rows above to exist"
+        assert_eq!(
+            tw_leg, "kprobe",
+            "[network duckdb] network_tw_leg = {tw_leg}: the classic kprobe set is the default \
+             form of the TIME_WAIT leg"
         );
     }
 
     eprintln!("\n  All network suite checks passed");
 }
 
-/// The TIME_WAIT leg's fallback path, forced: with the testing-only switch
-/// the trampoline set fails at attach after its first program attached
-/// (the partial links dropped, exactly as on a kernel that refuses the
-/// trampoline), the kprobe set attaches instead, the trace carries the same
-/// TIME_WAIT transitions, and sysinfo names the path the way that host
-/// would (`kprobe:notramp`). The positive control for the fallback; runs
-/// under the same rig as the network suite.
-#[test]
-#[ignore] // Requires root/BPF privileges
-fn test_e2e_network_tw_leg_kprobe_fallback() {
+/// One network capture over a TCP connect/close workload with the opt-in
+/// trampoline form of the TIME_WAIT leg (`kernel_hooks: Trampoline`), with
+/// the testing-only attach-failure switch on or off. Returns the trace's
+/// DuckDB connection and the `sysinfo.network_tw_leg` value.
+fn record_network_trampoline_capture(
+    dir: &TempDir,
+    label: &str,
+    force_fallback: bool,
+) -> (duckdb::Connection, String) {
     use std::net::TcpStream;
     use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::Duration;
 
-    let dir = TempDir::new().expect("Failed to create temp dir");
     let config = Config {
         duration: NETWORK_SUITE_DURATION_SECS,
         parquet_only: true,
         network: true,
-        network_tw_force_fallback: true,
+        kernel_hooks: KernelHooks::Trampoline,
+        network_tw_force_fallback: force_fallback,
         output_dir: dir.path().to_path_buf(),
         output: dir.path().join("trace.pb"),
         ..Config::default()
@@ -2003,25 +2005,24 @@ fn test_e2e_network_tw_leg_kprobe_fallback() {
         }
     });
 
-    eprintln!("Recording trace with the forced TIME_WAIT kprobe fallback...");
+    eprintln!("Recording trace ({label})...");
     let recorded = systing(config, None);
     traffic.stop();
-    recorded.expect("systing recording (forced kprobe TIME_WAIT leg) failed");
+    recorded.expect("systing recording (trampoline TIME_WAIT leg) failed");
 
     let duckdb_path = dir.path().join("trace.duckdb");
-    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, "network_tw_fallback")
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, label)
         .expect("DuckDB conversion failed");
     let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
-
     let tw_leg: Option<String> = conn
         .query_row("SELECT network_tw_leg FROM sysinfo", [], |row| row.get(0))
-        .expect("[network tw fallback] sysinfo row missing");
-    assert_eq!(
-        tw_leg.as_deref(),
-        Some("kprobe:notramp"),
-        "[network tw fallback] the switch must route the leg through the kprobe set"
-    );
+        .expect("[network tw] sysinfo row missing");
+    let tw_leg = tw_leg.expect("[network tw] sysinfo.network_tw_leg must be recorded");
+    (conn, tw_leg)
+}
 
+/// The TIME_WAIT transitions the trace must carry whichever set attached.
+fn assert_time_wait_rows(conn: &duckdb::Connection, form: &str) -> i64 {
     let time_wait_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM network_packet \
@@ -2031,14 +2032,50 @@ fn test_e2e_network_tw_leg_kprobe_fallback() {
             |row| row.get(0),
         )
         .unwrap_or(0);
-    eprintln!(
-        "    {} transitions to TIME_WAIT state (kprobe set)",
-        time_wait_count
-    );
+    eprintln!("    {time_wait_count} transitions to TIME_WAIT state ({form})");
     assert!(
         time_wait_count > 0,
-        "[network tw fallback] the kprobe set must produce the TIME_WAIT transitions the fentry set does"
+        "[network tw] the {form} must produce the TIME_WAIT transitions"
     );
+    time_wait_count
+}
+
+/// The opt-in trampoline form of the TIME_WAIT leg (`--kernel-hooks
+/// trampoline`): the fentry set attaches on a kernel whose BTF describes the
+/// three functions and that can build a trampoline (the rig guest), the
+/// trace carries the TIME_WAIT transitions, and sysinfo reads `fentry`
+/// (`kprobe:nobtf` only on a kernel whose BTF lacks a function).
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_network_tw_leg_trampoline_opt_in() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let (conn, tw_leg) = record_network_trampoline_capture(&dir, "network_tw_trampoline", false);
+    eprintln!("    network_tw_leg = {tw_leg}");
+    assert!(
+        tw_leg == "fentry" || tw_leg == "kprobe:nobtf",
+        "[network tw trampoline] network_tw_leg = {tw_leg}: the opted-in trampoline form \
+         must run (or name why its set was not loaded)"
+    );
+    assert_time_wait_rows(&conn, "trampoline form");
+}
+
+/// The trampoline form's fallback path, forced: with the testing-only
+/// switch the trampoline set fails at attach after its first program
+/// attached (the partial links dropped, exactly as on a kernel that refuses
+/// the trampoline), the kprobe set attaches instead, the trace carries the
+/// same TIME_WAIT transitions, and sysinfo names the path the way that host
+/// would (`kprobe:notramp`). The positive control for the fallback; runs
+/// under the same rig as the network suite.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_network_tw_leg_kprobe_fallback() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let (conn, tw_leg) = record_network_trampoline_capture(&dir, "network_tw_fallback", true);
+    assert_eq!(
+        tw_leg, "kprobe:notramp",
+        "[network tw fallback] the switch must route the leg through the kprobe set"
+    );
+    assert_time_wait_rows(&conn, "kprobe set");
 }
 
 // =============================================================================
