@@ -148,13 +148,18 @@ binaries of still-running processes. Frames whose build-id no source knows
 render as `unknown ([buildid:<hex>]) <0x<offset>>`, a stable identity that can
 be resolved offline later. Costs ~40% larger stack-ring reservations while
 enabled; off by default and free when off. The still-running-processes source
-is an end-of-trace walk over every live process's executable mappings that
-reads each distinct file's build-id note once (deduplicated by dev/inode across
-processes) and is bounded by `--build-id-index-max-files` (default 10000) and
-`--build-id-index-max-ms` (default 2000; 0 = unbounded for either); it prints a
-`build-id index: …` line with what it read and whether a bound stopped it. A
-binary the walk never reaches still resolves through the other sources or
-keeps its `[buildid:<hex>]` identity.
+is an end-of-trace walk over every live process's executable mappings — the
+sampled processes first, then the rest newest first — that reads each distinct
+file's build-id note once: a file is recognised across processes by the maps
+line's dev/inode and, across mounts (one container image's file shows a
+different device in every container), by its mapped path, size and mtime from
+one stat. The walk is bounded by `--build-id-index-max-files` (default 10000;
+0, or more than the store keeps, means the store's capacity of 16384) and
+`--build-id-index-max-ms` (default 2000, checked between file reads; 0 =
+unbounded); it prints a `build-id index: …` line with what it read, how much
+each tier deduplicated, and whether a bound stopped it. A binary the walk never
+reaches — a bound stops it at the oldest processes — still resolves through the
+other sources or keeps its `[buildid:<hex>]` identity.
 
 Note: `sleep-stacks` acts as a master switch for all sleep stack collection. When enabled,
 both uninterruptible (D state) and interruptible (S state) sleep stacks are collected by

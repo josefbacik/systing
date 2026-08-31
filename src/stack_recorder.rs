@@ -509,6 +509,11 @@ pub(crate) struct StackInterner {
     /// means the process runs out of memory orders of magnitude earlier.
     id_limit: Option<i64>,
     id_limit_warned: bool,
+    /// Every tgid a unique stack was interned for. Filled on the miss path
+    /// only (once per unique stack, not per event), so the hot path pays one
+    /// small-set insert per new stack. Read at symbolization time to order
+    /// the build-id fill walk: the processes that were sampled go first.
+    sampled_tgids: HashSet<i32>,
 }
 
 impl StackInterner {
@@ -520,6 +525,7 @@ impl StackInterner {
             next_id: first_id,
             id_limit: None,
             id_limit_warned: false,
+            sampled_tgids: HashSet::new(),
         }
     }
 
@@ -532,6 +538,11 @@ impl StackInterner {
     /// recording starts; without it, stack contents are kept in memory.
     pub(crate) fn set_spill_dir(&mut self, dir: &Path) {
         self.spill.set_dir(dir);
+    }
+
+    /// The tgids at least one unique stack was interned for.
+    pub(crate) fn sampled_tgids(&self) -> &HashSet<i32> {
+        &self.sampled_tgids
     }
 
     /// Get or assign the stack id for this (stack, tgid) pair, persisting the
@@ -552,6 +563,7 @@ impl StackInterner {
             );
         }
         self.stack_ids.insert(hash, id);
+        self.sampled_tgids.insert(tgid);
         self.spill.push(stack, tgid, id);
         id
     }
@@ -715,10 +727,13 @@ const SAMPLE_FLAG_IN_GUEST: u32 = 1;
 
 /// Bounds on the build-id store's host-wide fill walk (build-id mode only):
 /// how many distinct files it may read the ELF note of, and how long it may
-/// run, per capture. Either limit at zero means unbounded. The walk is
-/// opportunistic — a binary it never reaches still resolves through the
-/// `.build-id` directories, debuginfod, or the deferred `[buildid:…]`
-/// rendering — so exhausting a budget costs names, never samples.
+/// run, per capture. A file limit of zero, or one above the store's
+/// capacity, means the store's capacity (reading more files than the store
+/// keeps would only evict what was just read); a time limit of zero means
+/// unbounded. The walk is opportunistic — a binary it never reaches still
+/// resolves through the `.build-id` directories, debuginfod, or the deferred
+/// `[buildid:…]` rendering — so exhausting a budget costs names, never
+/// samples.
 #[derive(Debug, Clone, Copy)]
 pub struct BuildIdIndexBudget {
     pub max_files: usize,
@@ -754,14 +769,23 @@ pub struct BuildIdIndexStats {
     /// Executable file-backed mappings visited.
     pub mappings: usize,
     /// Mappings skipped because their file had already been read from
-    /// another process (or another mapping of the same process).
+    /// another process (or another mapping of the same process), on either
+    /// tier.
     pub deduped: usize,
+    /// The part of `deduped` that the second tier caught: the same file
+    /// seen through another mount (another container's view of one image).
+    pub deduped_across_mounts: usize,
     /// Distinct files whose ELF note was read and carried a build-id.
     pub files_indexed: usize,
     /// Distinct files read whose note was absent or unreadable.
     pub files_without_id: usize,
     /// Which budget stopped the walk, if one did.
     pub budget_hit: Option<BuildIdIndexLimit>,
+    /// The file budget the walk ran under, after clamping.
+    pub file_budget: usize,
+    /// Whether the configured file budget was brought down to the store's
+    /// capacity.
+    pub file_budget_clamped: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -777,30 +801,103 @@ pub enum BuildIdIndexLimit {
 /// processes that were never sampled (the `systing record -- short_cmd`
 /// shape: the traced command dies, its binary lives on in unsampled
 /// processes).
+///
+/// A file is "the same" across processes on two tiers. The maps line's
+/// `(dev, inode)` is exact but only within one mount: since Linux 6.8 the
+/// line shows the overlay superblock's device for a container's files, so
+/// one image's `libc.so.6` in N containers carries N different devices
+/// (and, unless every layer shares one filesystem, N different inode
+/// numbers). On a miss there, one `statx` of the mapping's `map_files`
+/// link keys the file by `(mapped path, size, mtime)`: the lower file's
+/// size and mtime pass through overlay unchanged, so the same image's file
+/// collapses across every container, while two different files at one
+/// in-container path are kept apart unless they also share size and mtime
+/// to the nanosecond. A false merge there skips the second file's note
+/// read, so its frames keep their own build-id and simply find no entry
+/// in the store (names lost, never mis-named: the store is keyed by the
+/// note actually read, and a frame looks up its own id).
+///
+/// The walk visits the sampled processes first, then every other process
+/// newest first (descending pid), so that a budget trip drops the oldest,
+/// longest-lived processes — the ones whose binaries are most likely to
+/// have been indexed through a sampled peer already. What a trip costs is
+/// names for the binaries of the processes not reached, never samples.
 struct BuildIdIndexWalk<'a> {
     store: &'a mut BuildIdStore,
     budget: BuildIdIndexBudget,
+    /// Whether the file budget was brought down to the store's capacity.
+    file_budget_clamped: bool,
     started: Instant,
-    /// Files already read, by the maps line's dev/inode.
+    /// Files already read, by the maps line's dev/inode (exact within one
+    /// mount).
     seen: HashSet<FileId>,
+    /// Files already read, by mapped path + size + mtime (the same file
+    /// across mounts).
+    seen_by_stat: HashSet<StatKey>,
     stats: BuildIdIndexStats,
 }
 
+/// The second-tier file identity: the path as the process maps it, the
+/// file's size and its modification time to the nanosecond.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StatKey {
+    path: PathBuf,
+    size: u64,
+    mtime_ns: i128,
+}
+
+impl StatKey {
+    /// One `statx` through the mapping's namespace-immune link, falling
+    /// back to the path as mapped (which works unprivileged for
+    /// same-namespace processes). `None` when neither can be read — a
+    /// process that raced to exit — and the caller goes on to the note
+    /// read, which fails the same way and is counted.
+    fn read(link: &Path, display: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(link)
+            .or_else(|_| std::fs::metadata(display))
+            .ok()?;
+        Some(StatKey {
+            path: display.to_path_buf(),
+            size: meta.size(),
+            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+        })
+    }
+}
+
+/// The order the fill walk visits processes in: the sampled ones first (in
+/// pid order, for a stable line), then every other pid newest first.
+fn build_id_index_walk_order(mut pids: Vec<i32>, sampled: &HashSet<i32>) -> Vec<i32> {
+    pids.sort_unstable();
+    pids.dedup();
+    let (first, rest): (Vec<i32>, Vec<i32>) = pids.into_iter().partition(|p| sampled.contains(p));
+    first.into_iter().chain(rest.into_iter().rev()).collect()
+}
+
 impl<'a> BuildIdIndexWalk<'a> {
-    fn new(store: &'a mut BuildIdStore, budget: BuildIdIndexBudget) -> Self {
+    fn new(store: &'a mut BuildIdStore, mut budget: BuildIdIndexBudget) -> Self {
+        let cap = store.capacity();
+        let file_budget_clamped = budget.max_files == 0 || budget.max_files > cap;
+        if file_budget_clamped {
+            budget.max_files = cap;
+        }
         Self {
             store,
             budget,
+            file_budget_clamped,
             started: Instant::now(),
             seen: HashSet::new(),
+            seen_by_stat: HashSet::new(),
             stats: BuildIdIndexStats::default(),
         }
     }
 
-    /// Whether a budget is exhausted; records which one.
+    /// Whether a budget is exhausted; records which one. The time budget is
+    /// checked between reads: a read already in progress is not
+    /// interrupted.
     fn over_budget(&mut self) -> bool {
         let files_read = self.stats.files_indexed + self.stats.files_without_id;
-        if self.budget.max_files > 0 && files_read >= self.budget.max_files {
+        if files_read >= self.budget.max_files {
             self.stats.budget_hit = Some(BuildIdIndexLimit::Files);
             return true;
         }
@@ -828,6 +925,11 @@ impl<'a> BuildIdIndexWalk<'a> {
                 self.stats.deduped += 1;
                 continue;
             }
+            if StatKey::read(&link, &display).is_some_and(|key| !self.seen_by_stat.insert(key)) {
+                self.stats.deduped += 1;
+                self.stats.deduped_across_mounts += 1;
+                continue;
+            }
             if self.over_budget() {
                 return false;
             }
@@ -853,28 +955,30 @@ impl<'a> BuildIdIndexWalk<'a> {
         true
     }
 
-    /// Walk `/proc`; returns what was done and how long it took.
-    fn run(mut self) -> (BuildIdIndexStats, Duration) {
-        if let Ok(entries) = std::fs::read_dir("/proc") {
-            for entry in entries.flatten() {
-                let Some(tgid) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|s| s.parse::<i32>().ok())
-                else {
-                    continue;
-                };
-                if self.over_budget() {
-                    break;
-                }
-                let Some(maps) = ProcessMaps::load(tgid) else {
-                    continue;
-                };
-                if !self.fill_from(&maps) {
-                    break;
-                }
+    /// Walk `/proc` — the sampled processes first, then the rest newest
+    /// first; returns what was done and how long it took.
+    fn run(mut self, sampled: &HashSet<i32>) -> (BuildIdIndexStats, Duration) {
+        let pids: Vec<i32> = std::fs::read_dir("/proc")
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for tgid in build_id_index_walk_order(pids, sampled) {
+            if self.over_budget() {
+                break;
+            }
+            let Some(maps) = ProcessMaps::load(tgid) else {
+                continue;
+            };
+            if !self.fill_from(&maps) {
+                break;
             }
         }
+        self.stats.file_budget = self.budget.max_files;
+        self.stats.file_budget_clamped = self.file_budget_clamped;
         (self.stats, self.started.elapsed())
     }
 }
@@ -883,20 +987,27 @@ impl<'a> BuildIdIndexWalk<'a> {
 /// per-phase cost lines so the walk's cost is visible per capture.
 fn build_id_index_summary(stats: &BuildIdIndexStats, elapsed: Duration) -> String {
     let budget = match stats.budget_hit {
+        Some(BuildIdIndexLimit::Files) if stats.file_budget_clamped => {
+            format!(
+                " (file budget hit at the store's capacity of {}; the rest resolves through the store paths)",
+                stats.file_budget
+            )
+        }
         Some(BuildIdIndexLimit::Files) => {
-            " (file budget hit; the rest resolves through the store paths)"
+            " (file budget hit; the rest resolves through the store paths)".to_string()
         }
         Some(BuildIdIndexLimit::Time) => {
-            " (time budget hit; the rest resolves through the store paths)"
+            " (time budget hit; the rest resolves through the store paths)".to_string()
         }
-        None => "",
+        None => String::new(),
     };
     format!(
-        "build-id index: {} files indexed, {} without a build-id note, {} mappings deduplicated, \
-         {} mappings across {} processes, in {}ms{budget}",
+        "build-id index: {} files indexed, {} without a readable build-id note, \
+         {} mappings deduplicated ({} across mounts), {} mappings across {} processes, in {}ms{budget}",
         stats.files_indexed,
         stats.files_without_id,
         stats.deduped,
+        stats.deduped_across_mounts,
         stats.mappings,
         stats.processes,
         elapsed.as_millis(),
@@ -1422,13 +1533,18 @@ impl StackRecorder {
         // Index live processes' executable mappings by build-id note — the
         // store's opportunistic source (see BuildIdIndexWalk for why it is
         // host-wide). One pass at symbolization time, deduplicated by file
-        // across processes and bounded in files and time; nothing here runs
-        // during capture. Its cost line goes to stdout beside the other
-        // per-phase cost lines, because on a host running thousands of
-        // containers the unbounded walk once cost more than the capture.
+        // across processes and mounts, bounded in files and time, the
+        // sampled processes first; nothing here runs during capture. Its
+        // cost line goes to stdout beside the other per-phase cost lines,
+        // because on a host running thousands of containers the unbounded
+        // walk once cost more than the capture.
         if self.build_id_mode {
+            let sampled: HashSet<i32> = interners
+                .iter()
+                .flat_map(|i| i.sampled_tgids().iter().copied())
+                .collect();
             let (stats, elapsed) =
-                BuildIdIndexWalk::new(&mut bid_store, self.build_id_index_budget).run();
+                BuildIdIndexWalk::new(&mut bid_store, self.build_id_index_budget).run(&sampled);
             println!("{}", build_id_index_summary(&stats, elapsed));
         }
 
@@ -2317,14 +2433,18 @@ mod tests {
             processes: 1200,
             mappings: 48_000,
             deduped: 46_100,
+            deduped_across_mounts: 40_000,
             files_indexed: 1_850,
             files_without_id: 50,
             budget_hit: None,
+            file_budget: DEFAULT_BUILD_ID_INDEX_MAX_FILES,
+            file_budget_clamped: false,
         };
         assert_eq!(
             build_id_index_summary(&stats, Duration::from_millis(412)),
-            "build-id index: 1850 files indexed, 50 without a build-id note, \
-             46100 mappings deduplicated, 48000 mappings across 1200 processes, in 412ms"
+            "build-id index: 1850 files indexed, 50 without a readable build-id note, \
+             46100 mappings deduplicated (40000 across mounts), 48000 mappings across \
+             1200 processes, in 412ms"
         );
         assert_eq!(
             BuildIdIndexBudget::default().max_files,
@@ -2334,6 +2454,143 @@ mod tests {
             BuildIdIndexBudget::default().max_time,
             Duration::from_millis(DEFAULT_BUILD_ID_INDEX_MAX_MS)
         );
+    }
+
+    /// A file budget of zero or above the store's capacity is the store's
+    /// capacity, and a walk stopped there says so on its line.
+    #[test]
+    fn test_build_id_fill_clamps_the_file_budget_to_the_store() {
+        let mut store = BuildIdStore::new(None);
+        let cap = store.capacity();
+        for configured in [0, cap + 1, usize::MAX] {
+            let walk = BuildIdIndexWalk::new(
+                &mut store,
+                BuildIdIndexBudget {
+                    max_files: configured,
+                    max_time: Duration::ZERO,
+                },
+            );
+            assert_eq!(walk.budget.max_files, cap, "configured {configured}");
+            assert!(walk.file_budget_clamped);
+        }
+        let walk = BuildIdIndexWalk::new(
+            &mut store,
+            BuildIdIndexBudget {
+                max_files: cap,
+                max_time: Duration::ZERO,
+            },
+        );
+        assert!(
+            !walk.file_budget_clamped,
+            "exactly the capacity is not a clamp"
+        );
+        let stats = BuildIdIndexStats {
+            budget_hit: Some(BuildIdIndexLimit::Files),
+            file_budget: cap,
+            file_budget_clamped: true,
+            ..BuildIdIndexStats::default()
+        };
+        let line = build_id_index_summary(&stats, Duration::from_millis(1));
+        assert!(
+            line.contains(&format!("file budget hit at the store's capacity of {cap}")),
+            "{line}"
+        );
+    }
+
+    /// The walk order: sampled pids first, then the rest newest first.
+    #[test]
+    fn test_build_id_index_walk_order() {
+        let sampled: HashSet<i32> = [7, 3000].into_iter().collect();
+        assert_eq!(
+            build_id_index_walk_order(vec![1, 3000, 42, 7, 999, 42], &sampled),
+            vec![7, 3000, 999, 42, 1]
+        );
+        assert_eq!(
+            build_id_index_walk_order(vec![5, 2, 9], &HashSet::new()),
+            vec![9, 5, 2],
+            "nothing sampled: newest first"
+        );
+    }
+
+    /// The same file seen through two mounts: each container's maps line
+    /// carries its own overlay device, so the exact key differs, and the
+    /// second tier (path + size + mtime through one stat) collapses them.
+    /// Built with one real file: two fake processes map it at the same
+    /// path with different devices.
+    #[test]
+    fn test_build_id_fill_dedupes_the_same_file_across_mounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("libc.so.6");
+        std::fs::write(&file, b"not an elf").unwrap();
+        let path = file.display();
+        let a = ProcessMaps::parse(
+            -45,
+            &format!("400000-500000 r-xp 00000000 00:d4 100 {path}"),
+            "a",
+        );
+        let b = ProcessMaps::parse(
+            -46,
+            &format!("400000-500000 r-xp 00000000 00:d5 100 {path}"),
+            "b",
+        );
+        let mut store = BuildIdStore::new(None);
+        let budget = BuildIdIndexBudget {
+            max_files: 0,
+            max_time: Duration::ZERO,
+        };
+        let mut walk = BuildIdIndexWalk::new(&mut store, budget);
+        assert!(walk.fill_from(&a));
+        assert!(walk.fill_from(&b));
+        let stats = walk.stats;
+        assert_eq!(stats.mappings, 2);
+        assert_eq!(
+            stats.deduped, 1,
+            "b's mapping is a's file through another mount"
+        );
+        assert_eq!(stats.deduped_across_mounts, 1);
+        assert_eq!(stats.files_without_id, 1, "one read for the one file");
+    }
+
+    /// The negative control for the second tier: the same path and size
+    /// with a different mtime is a different file and is read again.
+    #[test]
+    fn test_build_id_fill_reads_a_changed_file_at_the_same_path_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("libc.so.6");
+        std::fs::write(&file, b"not an elf").unwrap();
+        let path = file.display();
+        let a = ProcessMaps::parse(
+            -47,
+            &format!("400000-500000 r-xp 00000000 00:d4 100 {path}"),
+            "a",
+        );
+        let b = ProcessMaps::parse(
+            -48,
+            &format!("400000-500000 r-xp 00000000 00:d5 100 {path}"),
+            "b",
+        );
+        let mut store = BuildIdStore::new(None);
+        let budget = BuildIdIndexBudget {
+            max_files: 0,
+            max_time: Duration::ZERO,
+        };
+        let mut walk = BuildIdIndexWalk::new(&mut store, budget);
+        assert!(walk.fill_from(&a));
+        // The file is replaced by one of the same size an hour older, as a
+        // rebuilt image would carry.
+        let older = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
+        assert!(walk.fill_from(&b));
+        let stats = walk.stats;
+        assert_eq!(stats.mappings, 2);
+        assert_eq!(stats.deduped, 0, "a different mtime is a different file");
+        assert_eq!(stats.deduped_across_mounts, 0);
+        assert_eq!(stats.files_without_id, 2, "two reads, one per file");
     }
 
     #[test]
@@ -3263,6 +3520,14 @@ mod tests {
         let mut rec = StackRecorder::new(false, Arc::new(UtidGenerator::new()));
         rec.set_build_id_mode(true);
         rec.set_spill_dir(dir.path());
+        // The fill walk must reach our own process whatever else runs on
+        // the host: our tgid is sampled below, so the walk visits it first,
+        // and the budget is pinned unbounded so the test never depends on
+        // the default budget against the host's process count.
+        rec.set_build_id_index_budget(BuildIdIndexBudget {
+            max_files: 0,
+            max_time: Duration::ZERO,
+        });
 
         // The live stack makes pass 2 visit our own tgid and index our
         // executable mappings by build-id; the dead stack then resolves
