@@ -325,12 +325,17 @@ pub fn shape_table() -> Vec<LoadShape> {
     // The VFIO/IOMMU and THP-split legs, forced on: a host without the
     // vfio_iommu_type1 module or the split symbols never selects these
     // programs for a capture, so this is the only load they get on such a
-    // host — once per PMD-split twin (the worker probe, the entry
-    // fallback) and once per folio-split twin.
+    // host — once per PMD-split tier (the worker probe, the 6.10+ global
+    // funnel, the entry fallback) and once per folio-split twin.
     for (name, thp_pmd_prog, thp_page_prog) in [
         (
             "memory-vfio-thp-forced",
             "systing_thp_split_pmd_locked",
+            "systing_thp_split_page",
+        ),
+        (
+            "memory-vfio-thp-forced-global",
+            "systing_thp_split_pmd_global",
             "systing_thp_split_page",
         ),
         (

@@ -884,9 +884,16 @@ const MEMORY_VFIO_TEARDOWN_BPF_PROGRAMS: &[&str] = &[
 /// The PMD-split probe at the worker every split reaches
 /// (`__split_huge_pmd_locked`): counts what vmstat's thp_split_pmd counts.
 const THP_PMD_LOCKED_PROG: &str = "systing_thp_split_pmd_locked";
-/// The PMD-split probe at the public entry (`__split_huge_pmd`), the fallback
-/// for a build that inlined the worker: reached for any populated PMD on a
-/// VMA adjust, so it over-counts on VMA churn and misses the rmap paths.
+/// The PMD-split probe at the global funnel (`split_huge_pmd_locked`, 6.10+),
+/// the middle tier for a build that inlined the worker: reached by
+/// `__split_huge_pmd` AND the rmap paths, so it covers every split the
+/// worker does, but also for a PMD that is not huge (the huge check is
+/// inside it), so it over-counts on VMA churn.
+const THP_PMD_GLOBAL_PROG: &str = "systing_thp_split_pmd_global";
+/// The PMD-split probe at the public entry (`__split_huge_pmd`), the last
+/// fallback for a build that inlined the worker on a kernel without the
+/// funnel: reached for any populated PMD on a VMA adjust, so it over-counts
+/// on VMA churn, and on 6.10+ it would also miss the rmap paths.
 const THP_PMD_ENTRY_PROG: &str = "systing_thp_split_pmd";
 
 /// Which of the memory recorder's optional kernel legs this host can serve,
@@ -923,8 +930,9 @@ pub struct MemoryKernelLegs {
     /// `on:noteardown` and close-path unmaps stay invisible.
     pub vfio_teardown_off: Option<String>,
     /// The PMD-split program: [`THP_PMD_LOCKED_PROG`] when kallsyms lists
-    /// the worker, else [`THP_PMD_ENTRY_PROG`]; `None` when the kernel has
-    /// neither symbol (or the probe failed to attach).
+    /// the worker, else [`THP_PMD_GLOBAL_PROG`] when it lists the 6.10+
+    /// funnel, else [`THP_PMD_ENTRY_PROG`]; `None` when the kernel has none
+    /// of the three symbols (or the probe failed to attach).
     pub thp_pmd_prog: Option<&'static str>,
     /// The folio-split kretprobe program to load: the 6.9+ entry
     /// (`split_huge_page_to_list_to_order`) or the 6.6-series one
@@ -960,18 +968,27 @@ impl MemoryKernelLegs {
 
     /// The `sysinfo.memory_thp_leg` value for these legs: `on` when the
     /// PMD-split worker probe and the folio-split probe attach,
-    /// `on:pmd-entry` when the PMD probe had to sit at the public entry
-    /// (over-counts VMA churn), `on:pmd-only` / `on:page-only` when one
-    /// half is missing, `off:<cause>` when both are.
+    /// `on:pmd-global` when the PMD probe sits at the 6.10+ funnel
+    /// `split_huge_pmd_locked` (the build inlined the worker; the rows cover
+    /// every split but over-count VMA churn), `on:pmd-entry` when it had to
+    /// sit at the public entry (over-counts VMA churn, and on 6.10+ misses
+    /// the rmap paths), `on:pmd-only` / `on:page-only` when one half is
+    /// missing (`on:pmd-only:global` / `on:pmd-only:entry` naming the PMD
+    /// tier), `off:<cause>` when both are.
     pub fn thp_leg_value(&self) -> String {
-        let pmd_locked = self.thp_pmd_prog == Some(THP_PMD_LOCKED_PROG);
-        match (self.thp_pmd_prog, self.thp_page_prog) {
-            (Some(_), Some(_)) if pmd_locked => "on".to_string(),
-            (Some(_), Some(_)) => "on:pmd-entry".to_string(),
-            (None, Some(_)) => "on:page-only".to_string(),
-            (Some(_), None) if pmd_locked => "on:pmd-only".to_string(),
-            (Some(_), None) => "on:pmd-only:entry".to_string(),
-            (None, None) => format!("off:{}", self.thp_off.as_deref().unwrap_or("nosym")),
+        // The PMD tier's name when the probe is not at the worker.
+        let pmd_tier = match self.thp_pmd_prog {
+            Some(THP_PMD_GLOBAL_PROG) => Some("global"),
+            Some(THP_PMD_ENTRY_PROG) => Some("entry"),
+            _ => None,
+        };
+        match (self.thp_pmd_prog, self.thp_page_prog, pmd_tier) {
+            (Some(_), Some(_), None) => "on".to_string(),
+            (Some(_), Some(_), Some(tier)) => format!("on:pmd-{tier}"),
+            (None, Some(_), _) => "on:page-only".to_string(),
+            (Some(_), None, None) => "on:pmd-only".to_string(),
+            (Some(_), None, Some(tier)) => format!("on:pmd-only:{tier}"),
+            (None, None, _) => format!("off:{}", self.thp_off.as_deref().unwrap_or("nosym")),
         }
     }
 
@@ -995,6 +1012,7 @@ const MEMORY_OPTIONAL_LEG_SYMBOLS: &[&str] = &[
     "vfio_iommu_type1_release",
     "vfio_iommu_type1_detach_group",
     "__split_huge_pmd_locked",
+    "split_huge_pmd_locked",
     "__split_huge_pmd",
     "split_huge_page_to_list_to_order",
     "split_huge_page_to_list",
@@ -1106,6 +1124,8 @@ fn probe_memory_kernel_legs(opts: &Config, kernel: &KernelSymbols) -> MemoryKern
     if opts.memory_thp_sample_rate > 0 {
         legs.thp_pmd_prog = if present.contains("__split_huge_pmd_locked") {
             Some(THP_PMD_LOCKED_PROG)
+        } else if present.contains("split_huge_pmd_locked") {
+            Some(THP_PMD_GLOBAL_PROG)
         } else if present.contains("__split_huge_pmd") {
             Some(THP_PMD_ENTRY_PROG)
         } else {
@@ -4310,6 +4330,7 @@ fn is_memory_kernel_leg_program(name: &str) -> bool {
         || MEMORY_VFIO_BPF_PROGRAMS.contains(&name)
         || MEMORY_VFIO_TEARDOWN_BPF_PROGRAMS.contains(&name)
         || name == THP_PMD_LOCKED_PROG
+        || name == THP_PMD_GLOBAL_PROG
         || name == THP_PMD_ENTRY_PROG
         || name == "systing_thp_split_page"
         || name == "systing_thp_split_page_legacy"
@@ -6849,8 +6870,28 @@ mod tests {
         assert!(!req.contains("systing_thp_split_page"));
         assert_eq!(legacy.thp_leg_value(), "on");
 
-        // A build that inlined the worker: the entry probe, and the leg
-        // says so.
+        // A build that inlined the worker on a 6.10+ kernel: the global
+        // funnel, and the leg says so.
+        let global = MemoryKernelLegs {
+            thp_pmd_prog: Some(THP_PMD_GLOBAL_PROG),
+            ..all.clone()
+        };
+        let req = get_required_bpf_programs(&asked, false, false, false, &global);
+        assert!(req.contains(THP_PMD_GLOBAL_PROG));
+        assert!(!req.contains(THP_PMD_LOCKED_PROG));
+        assert!(!req.contains(THP_PMD_ENTRY_PROG));
+        assert_eq!(global.thp_leg_value(), "on:pmd-global");
+        assert_eq!(
+            MemoryKernelLegs {
+                thp_page_prog: None,
+                ..global.clone()
+            }
+            .thp_leg_value(),
+            "on:pmd-only:global"
+        );
+
+        // A build that inlined the worker on a kernel without the funnel:
+        // the entry probe, and the leg says so.
         let entry = MemoryKernelLegs {
             thp_pmd_prog: Some(THP_PMD_ENTRY_PROG),
             ..all.clone()
@@ -6858,6 +6899,7 @@ mod tests {
         let req = get_required_bpf_programs(&asked, false, false, false, &entry);
         assert!(req.contains(THP_PMD_ENTRY_PROG));
         assert!(!req.contains(THP_PMD_LOCKED_PROG));
+        assert!(!req.contains(THP_PMD_GLOBAL_PROG));
         assert_eq!(entry.thp_leg_value(), "on:pmd-entry");
         assert_eq!(
             MemoryKernelLegs {
@@ -6907,6 +6949,7 @@ mod tests {
             .iter()
             .all(|p| !req.contains(p)));
         assert!(!req.contains(THP_PMD_LOCKED_PROG));
+        assert!(!req.contains(THP_PMD_GLOBAL_PROG));
         assert!(!req.contains(THP_PMD_ENTRY_PROG));
         assert!(!req.contains("systing_thp_split_page"));
         assert_eq!(none.vfio_leg_value(), "off:nosym");
@@ -7071,6 +7114,60 @@ mod tests {
                 KernelSymbols::default()
             );
         }
+    }
+
+    /// The PMD-split probe's tier follows kallsyms in order: the worker
+    /// when the build kept it, else the 6.10+ global funnel, else the public
+    /// entry, else nothing — and a kernel that lists the worker AND the
+    /// funnel (every 6.10+ build that kept the worker) still gets the worker.
+    #[test]
+    fn test_thp_pmd_probe_tier_follows_kallsyms_in_order() {
+        let asked = Config {
+            memory: true,
+            memory_thp_sample_rate: 1,
+            ..Default::default()
+        };
+        let kernel_with = |syms: &[&str]| KernelSymbols {
+            kallsyms: syms.iter().map(|s| s.to_string()).collect(),
+            btf_funcs: HashSet::new(),
+        };
+        let tier =
+            |syms: &[&str]| probe_memory_kernel_legs(&asked, &kernel_with(syms)).thp_pmd_prog;
+        assert_eq!(
+            tier(&[
+                "__split_huge_pmd_locked",
+                "split_huge_pmd_locked",
+                "__split_huge_pmd"
+            ]),
+            Some(THP_PMD_LOCKED_PROG)
+        );
+        assert_eq!(
+            tier(&["__split_huge_pmd_locked", "__split_huge_pmd"]),
+            Some(THP_PMD_LOCKED_PROG)
+        );
+        // The worker inlined on 6.10+: the funnel, whether or not the entry
+        // is listed too.
+        assert_eq!(
+            tier(&["split_huge_pmd_locked", "__split_huge_pmd"]),
+            Some(THP_PMD_GLOBAL_PROG)
+        );
+        assert_eq!(tier(&["split_huge_pmd_locked"]), Some(THP_PMD_GLOBAL_PROG));
+        // The worker inlined before 6.10: the entry.
+        assert_eq!(tier(&["__split_huge_pmd"]), Some(THP_PMD_ENTRY_PROG));
+        assert_eq!(tier(&[]), None);
+        // Not asked for: no PMD probe whatever the kernel lists.
+        let not_asked = Config {
+            memory: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            probe_memory_kernel_legs(
+                &not_asked,
+                &kernel_with(&["__split_huge_pmd_locked", "split_huge_pmd_locked"])
+            )
+            .thp_pmd_prog,
+            None
+        );
     }
 
     /// The network recorder's TIME_WAIT leg loads exactly what the hook form

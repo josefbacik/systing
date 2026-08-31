@@ -1166,6 +1166,47 @@ fn test_memory_thp_vmstat_e2e() {
     let thp_leg = thp_leg.expect("memory_thp_leg must be recorded when the rate is non-zero");
     assert_eq!(thp_rate, Some(1));
 
+    // --- the PMD probe's tier follows the guest's own kallsyms in order ---
+    // The worker when the build kept it (`on` / `on:pmd-only`), else the
+    // 6.10+ global funnel (`on:pmd-global`), else the public entry
+    // (`on:pmd-entry`); the folio-split half is read the same way. The
+    // rig's vanilla 6.12 kernel inlines the worker and exports the funnel,
+    // so this is where the middle tier is exercised for real.
+    let kallsyms = std::fs::read_to_string("/proc/kallsyms").expect("read /proc/kallsyms");
+    let has_text_symbol = |name: &str| {
+        kallsyms.lines().any(|line| {
+            let mut f = line.split_whitespace();
+            matches!(
+                (f.next(), f.next(), f.next()),
+                (Some(_), Some("t" | "T"), Some(sym)) if sym == name
+            )
+        })
+    };
+    let expected_pmd_tier = if has_text_symbol("__split_huge_pmd_locked") {
+        Some("worker")
+    } else if has_text_symbol("split_huge_pmd_locked") {
+        Some("global")
+    } else if has_text_symbol("__split_huge_pmd") {
+        Some("entry")
+    } else {
+        None
+    };
+    let has_page_probe = has_text_symbol("split_huge_page_to_list_to_order")
+        || has_text_symbol("split_huge_page_to_list");
+    let expected_leg = match (expected_pmd_tier, has_page_probe) {
+        (Some("worker"), true) => "on".to_string(),
+        (Some(tier), true) => format!("on:pmd-{tier}"),
+        (Some("worker"), false) => "on:pmd-only".to_string(),
+        (Some(tier), false) => format!("on:pmd-only:{tier}"),
+        (None, true) => "on:page-only".to_string(),
+        (None, false) => "off:nosym".to_string(),
+    };
+    eprintln!("  kallsyms says the THP leg should read {expected_leg}");
+    assert!(
+        thp_leg == expected_leg || thp_leg == "off:attach",
+        "[memory_thp] sysinfo.memory_thp_leg = {thp_leg}, but this kernel's kallsyms selects {expected_leg}"
+    );
+
     // --- memory_vmstat: start/end samples of the THP family, monotonic ---
     let (vmstat_rows, thp_fault_delta, split_pmd_delta, bad_rows): (i64, i64, i64, i64) = conn
         .query_row(
@@ -1221,8 +1262,9 @@ fn test_memory_thp_vmstat_e2e() {
         );
         // At the worker probe (`on`, `on:pmd-only`) a row is one counted
         // split, so the per-process rows are bounded by the host-wide
-        // counter. The entry fallback (`on:pmd-entry`) also fires for a PMD
-        // that is not huge, so there the bound does not hold.
+        // counter. The global funnel (`on:pmd-global`) and the entry
+        // fallback (`on:pmd-entry`) also fire for a PMD that is not huge,
+        // so there the bound does not hold.
         if thp_leg == "on" || thp_leg == "on:pmd-only" {
             assert!(
                 split_pmd_delta >= pmd_rows,
@@ -1230,7 +1272,7 @@ fn test_memory_thp_vmstat_e2e() {
             );
         } else {
             eprintln!(
-                "  (pmd-vs-vmstat bound not asserted: leg={thp_leg} probes the public entry)"
+                "  (pmd-vs-vmstat bound not asserted: leg={thp_leg} probes before the huge check)"
             );
         }
     } else {

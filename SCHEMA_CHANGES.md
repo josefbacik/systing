@@ -550,6 +550,32 @@ The tables keep their columns; the new columns are nullable.
   so a split whose caller left stale upper bits no longer reads as
   `freeze = true`. Rows from 1.16.x may carry a spurious `true` on such
   splits; from 1.17.0 the value is the flag the kernel passed.
+- `memory_thp` rows with `kind = 'pmd'` on a build that inlined the worker
+  (from the next release, unreleased): the probe now falls back first to
+  the global funnel `split_huge_pmd_locked` (6.10+; `sysinfo.memory_thp_leg
+  = on:pmd-global` / `on:pmd-only:global`) and only then to the public entry
+  `__split_huge_pmd` (`on:pmd-entry`, as in v19). On 6.12 and 6.18 both
+  `__split_huge_pmd` and the rmap paths (`try_to_unmap` / `try_to_migrate`)
+  call the funnel, which calls the worker once the PMD is huge or a
+  migration entry — so a `pmd-global` row set covers every split the worker
+  counts, including reclaim's unmap side that the entry probe misses, and
+  `result` carries the split's `freeze` flag as at the worker; but the
+  funnel is also reached for a PMD that is not huge (its huge check is
+  inside), so `pmd-global` rows still over-count on VMA churn like
+  `pmd-entry` rows, and the vmstat delta stays the host-wide truth for both.
+  The funnel runs inside the PMD's page-table lock like the worker (the
+  probe's ringbuf reserve and stack capture sit inside that spinlock hold,
+  bounded by the 1-in-N sample rate); the entry probe fires before the lock.
+  Consumers keying on `memory_thp_leg` treat `on:pmd-global` as a
+  "covers every split, over-counts VMA churn" tier between `on` and
+  `on:pmd-entry`. One residual the recorder cannot see: a build that ALSO
+  inlined the funnel into `__split_huge_pmd` (a same-file caller; the
+  symbol stays exported for the rmap callers in another file) would leave
+  the funnel probe with only the rmap paths — `pmd-global` rows without
+  the `split_huge_pmd()` callers' splits (`madvise`, `munmap`, a partial
+  free). On the kernels the test suite runs the funnel is not inlined
+  (the e2e's `madvise` split check asserts rows at the funnel), and a
+  kernel where it is would fail that check rather than pass quietly.
 
 ### Behaviour change (no schema effect)
 - The capture's `detach bpf programs` stop phase: under the default classic
@@ -629,7 +655,14 @@ keep their columns; the new columns are nullable.
   closes its device files shows up; a detach writes no
   row (how much it unmaps depends on whether it was the domain's last
   group) but opens the histogram window, so its `iommu:unmap` runs are
-  counted in `memory_iommu` like an ioctl's. Both are probed only when
+  counted in `memory_iommu` like an ioctl's. Both teardown windows stay open
+  for the whole unmap-and-unpin walk (`vfio_iommu_unmap_unpin_all` — seconds
+  to minutes for hundreds of GB pinned), so an `iommu:unmap` run by an
+  interrupt on a CPU where the tearing-down task is current is counted under
+  that task's window, exactly as the ioctl windows already admit: a small
+  pollution of `memory_iommu` on teardown (an IRQ-attribution class the
+  windows have always had, now over a longer window), not a defect. Both are
+  probed only when
   kallsyms lists the two functions: `sysinfo.memory_vfio_leg` reads
   `on:noteardown` when the ioctl pair attached but the teardown pair did
   not (close-path unmaps then stay invisible, as in v18), `on` when both

@@ -245,8 +245,11 @@ pub struct TraceSystemInfo {
     /// requested or for traces from systing < 1.15.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_vfio_leg: Option<String>,
-    /// How the THP split leg ran ("on", "on:pmd-only", "on:page-only" or
-    /// "off:<cause>"); `None` when its sample rate was 0.
+    /// How the THP split leg ran ("on"; "on:pmd-global" / "on:pmd-entry"
+    /// when the PMD probe sat at the 6.10+ funnel / the public entry on a
+    /// build that inlined the worker; "on:pmd-only" (or ":global" /
+    /// ":entry" suffixed), "on:page-only" or "off:<cause>"); `None` when
+    /// its sample rate was 0.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_thp_leg: Option<String>,
     /// `--memory-thp-sample-rate` at capture time (1 in N splits).
