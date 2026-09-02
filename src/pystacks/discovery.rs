@@ -421,15 +421,19 @@ fn read_impl_cache_tag<'data, R: ReadRef<'data>>(
     // range of the allocated section that holds it. Only allocated sections
     // with an address are candidates (non-allocated ones carry no virtual
     // address, and `.bss`-style sections have no file bytes), so the lookup
-    // does not depend on section order.
+    // does not depend on section order. The range arithmetic is checked: a
+    // malformed header whose address plus size wraps is skipped rather than
+    // matched, in the release build as in the test profile.
+    let alloc_flag = u64::from(object::elf::SHF_ALLOC);
     let bytes_at = |va: u64| -> Option<&'data [u8]> {
         elf.sections().find_map(|section| {
-            let allocated = matches!(
-                section.flags(),
-                SectionFlags::Elf { sh_flags } if sh_flags & u64::from(object::elf::SHF_ALLOC) != 0
-            );
+            let allocated = match section.flags() {
+                SectionFlags::Elf { sh_flags } => sh_flags & alloc_flag != 0,
+                _ => false,
+            };
             let (s_addr, s_size) = (section.address(), section.size());
-            if !allocated || s_addr == 0 || va < s_addr || va >= s_addr + s_size {
+            let s_end = s_addr.checked_add(s_size)?;
+            if !allocated || s_addr == 0 || va < s_addr || va >= s_end {
                 return None;
             }
             let (file_off, file_size) = section.file_range()?;
@@ -438,7 +442,8 @@ fn read_impl_cache_tag<'data, R: ReadRef<'data>>(
                 return None;
             }
             let len = TAG_MAX_LEN.min(file_size - within);
-            reader.read_bytes_at(file_off + within, len).ok()
+            let at = file_off.checked_add(within)?;
+            reader.read_bytes_at(at, len).ok()
         })
     };
 
@@ -744,12 +749,22 @@ mod tests {
             let lines: Vec<&str> = text.lines().collect();
             if output.status.success() && lines.len() == 6 {
                 if let (Ok(major), Ok(minor)) = (lines[0].parse::<i32>(), lines[1].parse::<i32>()) {
-                    let shared = lines[2] == "1";
                     let exe = fs::canonicalize(lines[5]).unwrap_or_else(|_| lines[5].into());
-                    let path = if shared {
-                        Path::new(lines[3]).join(lines[4])
+                    // `Py_ENABLE_SHARED` says how the interpreter was
+                    // configured, not what is installed: Debian's python3
+                    // reports 1 while /usr/bin/python3.X is statically
+                    // linked and the libpython package may be absent. When
+                    // the shared library is not there, the executable is
+                    // the runtime (the static exe is a good one, as the
+                    // objprobe of every distro build showed), so use it
+                    // rather than skip the check — a runner image without
+                    // the libpython package must not turn the real-
+                    // interpreter check vacuous.
+                    let lib = Path::new(lines[3]).join(lines[4]);
+                    let (path, shared) = if lines[2] == "1" && lib.exists() {
+                        (lib, true)
                     } else {
-                        exe.clone()
+                        (exe.clone(), false)
                     };
                     if path.exists() && !out.iter().any(|r| r.path == path) {
                         out.push(RealRuntime {
@@ -804,14 +819,27 @@ mod tests {
                 "{}",
                 rt.path.display()
             );
-            assert_eq!(
-                info.is_dynamic,
-                rt.shared,
-                "{}: shared build {} should {}be a shared object",
-                rt.path.display(),
-                rt.shared,
-                if rt.shared { "" } else { "not " }
-            );
+            // `is_dynamic` is the ELF kind (ET_DYN), which a shared build's
+            // libpython always is; a static build's executable may be ET_DYN
+            // too (a PIE exe) or ET_EXEC, and either is a fine runtime, so
+            // for those it is reported rather than pinned to "not shared".
+            if rt.shared {
+                assert!(
+                    info.is_dynamic,
+                    "{}: the shared build's runtime library should be a shared object",
+                    rt.path.display()
+                );
+            } else {
+                eprintln!(
+                    "{}: static build, the exe is {}",
+                    rt.path.display(),
+                    if info.is_dynamic {
+                        "position-independent (ET_DYN)"
+                    } else {
+                        "ET_EXEC"
+                    }
+                );
+            }
             assert_ne!(info.py_runtime_addr, 0);
 
             let file = fs::File::open(&rt.path).unwrap();
@@ -848,6 +876,125 @@ mod tests {
             "real-interpreter check: {} runtimes verified, {tag_checked} of them through the cache tag",
             runtimes.len()
         );
+    }
+
+    /// A stand-in CPython runtime built on the spot: the two symbols
+    /// discovery keys on and nothing else, with a cache tag no real build
+    /// has and a filename that carries no version, so the version the lazy
+    /// reader reports can only have come through the tag read. The
+    /// real-interpreter check above only exercises that path where a build
+    /// still ships `_PySys_ImplCacheTag` (pyenv 3.13.14 does not; a distro
+    /// libpython is stripped of it), so on a runner it proved nothing about
+    /// the most intricate hunk of the reader. Two shapes, as the two shapes
+    /// of real runtimes: a shared object whose symbol IS the string (the
+    /// direct-string branch), and a non-PIE executable whose symbol is a
+    /// pointer resolved at link time (the follow-the-pointer branch, without
+    /// depending on how the linker fills a dynamic relocation's slot).
+    /// Needs a C compiler; in CI its absence fails the test rather than
+    /// skipping it, for the same reason as `skip_or_fail_without_runtime`.
+    #[test]
+    fn test_read_impl_cache_tag_on_a_built_fixture() {
+        use std::process::Command;
+
+        const TAG: &str = "cpython-399";
+        // `CC` may carry a driver prefix ("sccache clang", "ccache cc"), as
+        // the cc crate accepts it: the first word is the program.
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        let mut cc_words = cc.split_whitespace();
+        let cc_prog = cc_words.next().unwrap_or("cc").to_string();
+        let cc_args: Vec<String> = cc_words.map(String::from).collect();
+        let compile = |flags: &[&str], out: &Path, src: &Path| -> bool {
+            Command::new(&cc_prog)
+                .args(&cc_args)
+                .args(flags)
+                .arg("-o")
+                .arg(out)
+                .arg(src)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if Command::new(&cc_prog)
+            .args(&cc_args)
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "no C compiler ({cc}) on this host: the built-fixture tag check must not \
+                 pass vacuously in CI"
+            );
+            eprintln!("no C compiler ({cc}) on this host: skipping the built-fixture tag check");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_string = dir.path().join("string.c");
+        let src_pointer = dir.path().join("pointer.c");
+        // The tag as the symbol's own bytes.
+        fs::write(
+            &src_string,
+            format!(
+                "const char _PySys_ImplCacheTag[] = \"{TAG}\";\n\
+                 char _PyRuntime[64];\n\
+                 int systing_fixture_keep(void) {{ return _PyRuntime[0]; }}\n"
+            ),
+        )
+        .unwrap();
+        // The tag behind a pointer, the way CPython declares it.
+        fs::write(
+            &src_pointer,
+            format!(
+                "static const char tag[] = \"{TAG}\";\n\
+                 const char *_PySys_ImplCacheTag = tag;\n\
+                 char _PyRuntime[64];\n\
+                 int main(void) {{ return _PyRuntime[0] + (int)_PySys_ImplCacheTag[0]; }}\n"
+            ),
+        )
+        .unwrap();
+        // Filenames without a version: the filename fallback cannot supply
+        // one, so a (3, 99) can only have been read from the tag.
+        let so = dir.path().join("fixture-runtime.so");
+        let exe = dir.path().join("fixture-runtime");
+        let built_so = compile(&["-shared", "-fPIC"], &so, &src_string);
+        assert!(built_so, "{cc} could not build the shared-object fixture");
+        let built_exe = compile(&["-no-pie"], &exe, &src_pointer);
+
+        let mut checked = 0;
+        for (path, expect_dynamic, built) in [(&so, true, true), (&exe, false, built_exe)] {
+            if !built {
+                // A toolchain without -no-pie (some clang setups) loses the
+                // pointer leg locally; in CI the runner's gcc has it.
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "{cc} could not build the non-PIE executable fixture"
+                );
+                eprintln!("{cc} could not build the non-PIE executable fixture: skipping that leg");
+                continue;
+            }
+            let file = fs::File::open(path).unwrap();
+            let reader = ReadCache::new(&file);
+            let elf = object::File::parse(&reader).unwrap();
+            assert_eq!(
+                read_impl_cache_tag(&elf, &reader).as_deref(),
+                Some(TAG),
+                "{}: the cache tag read",
+                path.display()
+            );
+            let info = elf_py_info(&path.to_string_lossy())
+                .unwrap_or_else(|| panic!("{} not recognized as a runtime", path.display()));
+            assert_eq!(
+                (info.version.0, info.version.1),
+                (3, 99),
+                "{}: the version must come from the tag, not the filename",
+                path.display()
+            );
+            assert_eq!(info.is_dynamic, expect_dynamic, "{}", path.display());
+            assert_ne!(info.py_runtime_addr, 0, "{}", path.display());
+            checked += 1;
+        }
+        assert!(checked >= 1);
+        eprintln!("built-fixture check: {checked} fixture(s) read their cache tag");
     }
 
     /// Bytes this THREAD has requested through read(2) so far (`rchar` in

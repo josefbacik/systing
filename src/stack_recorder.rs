@@ -820,13 +820,14 @@ pub enum BuildIdIndexLimit {
 /// The walk visits the sampled processes first, then every other process
 /// newest first (descending pid), so that a budget trip drops the oldest,
 /// longest-lived processes — the ones whose binaries are most likely to
-/// have been indexed through a sampled peer already. What a trip costs is
-/// names for the binaries of the processes not reached, never samples.
+/// have been indexed through a sampled peer already. Pid order is a
+/// heuristic for age, not a guarantee: after the pid space wraps, a young
+/// process that was handed a recycled low pid walks last and a budget trip
+/// can drop it. What a trip costs is names for the binaries of the
+/// processes not reached, never samples.
 struct BuildIdIndexWalk<'a> {
     store: &'a mut BuildIdStore,
     budget: BuildIdIndexBudget,
-    /// Whether the file budget was brought down to the store's capacity.
-    file_budget_clamped: bool,
     started: Instant,
     /// Files already read, by the maps line's dev/inode (exact within one
     /// mount).
@@ -881,14 +882,21 @@ impl<'a> BuildIdIndexWalk<'a> {
         if file_budget_clamped {
             budget.max_files = cap;
         }
+        // The budget the walk runs under is known here, so the stats carry
+        // it from the start: a caller that only ever calls `fill_from`
+        // (the tests' shape) reads the same figures as one that `run`s.
+        let stats = BuildIdIndexStats {
+            file_budget: budget.max_files,
+            file_budget_clamped,
+            ..BuildIdIndexStats::default()
+        };
         Self {
             store,
             budget,
-            file_budget_clamped,
             started: Instant::now(),
             seen: HashSet::new(),
             seen_by_stat: HashSet::new(),
-            stats: BuildIdIndexStats::default(),
+            stats,
         }
     }
 
@@ -925,6 +933,11 @@ impl<'a> BuildIdIndexWalk<'a> {
                 self.stats.deduped += 1;
                 continue;
             }
+            // The second-tier stat runs for every first-tier miss before
+            // the budget check, by design: it is bounded by the process's
+            // mapping count, and one `statx` is far cheaper than the note
+            // read it saves when the file is one already read through
+            // another mount — the budget bounds note reads, not stats.
             if StatKey::read(&link, &display).is_some_and(|key| !self.seen_by_stat.insert(key)) {
                 self.stats.deduped += 1;
                 self.stats.deduped_across_mounts += 1;
@@ -977,8 +990,6 @@ impl<'a> BuildIdIndexWalk<'a> {
                 break;
             }
         }
-        self.stats.file_budget = self.budget.max_files;
-        self.stats.file_budget_clamped = self.file_budget_clamped;
         (self.stats, self.started.elapsed())
     }
 }
@@ -2457,7 +2468,8 @@ mod tests {
     }
 
     /// A file budget of zero or above the store's capacity is the store's
-    /// capacity, and a walk stopped there says so on its line.
+    /// capacity, and a walk stopped there says so on its line. The stats
+    /// carry the budget from construction, not only after `run()`.
     #[test]
     fn test_build_id_fill_clamps_the_file_budget_to_the_store() {
         let mut store = BuildIdStore::new(None);
@@ -2471,7 +2483,8 @@ mod tests {
                 },
             );
             assert_eq!(walk.budget.max_files, cap, "configured {configured}");
-            assert!(walk.file_budget_clamped);
+            assert!(walk.stats.file_budget_clamped, "configured {configured}");
+            assert_eq!(walk.stats.file_budget, cap, "configured {configured}");
         }
         let walk = BuildIdIndexWalk::new(
             &mut store,
@@ -2481,9 +2494,10 @@ mod tests {
             },
         );
         assert!(
-            !walk.file_budget_clamped,
+            !walk.stats.file_budget_clamped,
             "exactly the capacity is not a clamp"
         );
+        assert_eq!(walk.stats.file_budget, cap);
         let stats = BuildIdIndexStats {
             budget_hit: Some(BuildIdIndexLimit::Files),
             file_budget: cap,
@@ -3522,8 +3536,10 @@ mod tests {
         rec.set_spill_dir(dir.path());
         // The fill walk must reach our own process whatever else runs on
         // the host: our tgid is sampled below, so the walk visits it first,
-        // and the budget is pinned unbounded so the test never depends on
-        // the default budget against the host's process count.
+        // and the budget is opened as far as it goes (a file budget of 0 is
+        // the store's capacity, 16384 files; no time bound) so the test
+        // never depends on the default budget against the host's process
+        // count.
         rec.set_build_id_index_budget(BuildIdIndexBudget {
             max_files: 0,
             max_time: Duration::ZERO,
