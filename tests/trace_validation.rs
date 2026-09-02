@@ -1541,13 +1541,20 @@ fn test_e2e_cgroup_filter_legacy_snapshot_fallback() {
 }
 
 /// Kernel-mode `--cgroup` from a private cgroup namespace whose root does not
-/// contain the target: the kernel resolves the target within the caller's
-/// namespace, so it cannot be found, and systing must say so and name the
-/// fallback instead of failing on a bare map check. Runs systing as a child
-/// process (the test process's own namespaces are left alone): the child
-/// joins a leaf cgroup, unshares its cgroup namespace there, and asks for a
-/// sibling of that leaf. The second half runs the same command with the
-/// fallback forced and expects a trace.
+/// contain the target. What the kernel does with that depends on its
+/// version: before the backport of upstream 2c8951339506 (6.6.117 / 6.12.58 /
+/// 6.18) `bpf_cgroup_from_id()` resolves the target within the caller's
+/// namespace, so it cannot be found and systing must say so and name the
+/// fallback instead of failing on a bare map check; from those kernels on
+/// any cgroup id resolves and the trace simply runs. The test branches on
+/// the outcome and proves whichever one it got — a refusal must carry the
+/// cause, a success must have traced the target — rather than pinning the
+/// pre-backport behaviour. Runs systing as a child process (the test
+/// process's own namespaces are left alone): the child joins a leaf cgroup,
+/// unshares its cgroup namespace there, and asks for a sibling of that leaf,
+/// in which a busy workload runs so "traced" means rows for its pid. The
+/// last half runs the same command with the fallback forced and expects a
+/// trace of that workload on every kernel.
 #[test]
 #[ignore] // Requires root/BPF privileges
 fn test_e2e_cgroup_filter_outside_cgroupns_names_the_cause() {
@@ -1569,7 +1576,8 @@ fn test_e2e_cgroup_filter_outside_cgroupns_names_the_cause() {
     //                                         its cgroup namespace: this leaf is
     //                                         the namespace's root
     //   <base>/systing-cgn-<pid>/outside/  <- the --cgroup target: a sibling,
-    //                                         outside that root
+    //                                         outside that root, with a busy
+    //                                         workload in it
     let tag = format!("systing-cgn-{}", std::process::id());
     let parent = base.join(&tag);
     let inside = parent.join("inside");
@@ -1597,17 +1605,22 @@ fn test_e2e_cgroup_filter_outside_cgroupns_names_the_cause() {
             .create(dir)
             .unwrap_or_else(|e| panic!("Failed to create cgroup {}: {e}", dir.display()));
     }
+    // The target has something to trace, so a run that succeeds can be
+    // checked for having traced it rather than for exit status alone.
+    let workload = CgroupWorkload::spawn_in(&outside);
+    let workload_pid = workload.pid();
 
-    let out_dir = TempDir::new().expect("Failed to create temp dir");
-    let script = format!(
-        "echo $$ > {procs} && exec /usr/bin/unshare -C {systing} --cgroup {target} \
-         --duration 1 --no-stack-traces --output-dir {out} --output {out}/trace.pb",
-        procs = inside.join("cgroup.procs").display(),
-        systing = env!("CARGO_BIN_EXE_systing"),
-        target = outside.display(),
-        out = out_dir.path().display(),
-    );
+    // One output directory per run: each run's parquet is read back on its own.
     let run = |force_legacy: bool| {
+        let out_dir = TempDir::new().expect("Failed to create temp dir");
+        let script = format!(
+            "echo $$ > {procs} && exec /usr/bin/unshare -C {systing} --cgroup {target} \
+             --duration 2 --no-stack-traces --output-dir {out} --output {out}/trace.pb",
+            procs = inside.join("cgroup.procs").display(),
+            systing = env!("CARGO_BIN_EXE_systing"),
+            target = outside.display(),
+            out = out_dir.path().display(),
+        );
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(&script);
         if force_legacy {
@@ -1621,7 +1634,22 @@ fn test_e2e_cgroup_filter_outside_cgroupns_names_the_cause() {
         (
             output.status.success(),
             String::from_utf8_lossy(&output.stderr).to_string(),
+            out_dir,
         )
+    };
+    // Rows for the workload's pid in a run's output: the proof that the
+    // target was traced, not merely that systing exited 0.
+    let workload_rows = |out_dir: &TempDir, label: &str| -> i64 {
+        let duckdb_path = out_dir.path().join("trace.duckdb");
+        systing::duckdb::parquet_to_duckdb(out_dir.path(), &duckdb_path, label)
+            .expect("parquet -> duckdb failed");
+        let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+        conn.query_row(
+            "SELECT COUNT(*) FROM process WHERE pid = ?",
+            [workload_pid],
+            |row| row.get(0),
+        )
+        .expect("Failed to count the workload's process rows")
     };
 
     eprintln!(
@@ -1629,26 +1657,40 @@ fn test_e2e_cgroup_filter_outside_cgroupns_names_the_cause() {
         outside.display(),
         inside.display()
     );
-    let (ok, stderr) = run(false);
+    let (ok, stderr, out_dir) = run(false);
     if stderr.contains("does not export bpf_task_under_cgroup") {
         eprintln!("kernel mode unavailable on this kernel; the namespace check only applies there");
-    } else {
+    } else if ok {
+        // A kernel with the backport: the id resolved from inside the
+        // namespace and the trace ran in kernel mode against the target.
         assert!(
-            !ok,
-            "[cgroupns] systing should refuse a target outside its cgroup namespace:\n{stderr}"
+            stderr.contains("membership decided by the kernel"),
+            "[cgroupns] a successful run must have used kernel mode:\n{stderr}"
         );
+        let rows = workload_rows(&out_dir, "cgroupns_kernel");
         assert!(
-            stderr.contains("from the tracer's cgroup namespace"),
+            rows > 0,
+            "[cgroupns] systing exited 0 from the private cgroup namespace but did not \
+             trace workload pid {workload_pid} in the target:\n{stderr}"
+        );
+        eprintln!(
+            "  resolved from the private namespace (a kernel with the bpf_cgroup_from_id \
+             namespace fix): traced the target, {rows} process row(s) for pid {workload_pid}"
+        );
+    } else {
+        // A kernel without it: the refusal must name the cause and the cure.
+        assert!(
+            stderr.contains("tracer's cgroup namespace"),
             "[cgroupns] the refusal must name the cause:\n{stderr}"
         );
         assert!(
             stderr.contains("SYSTING_CGROUP_FILTER_LEGACY"),
             "[cgroupns] the refusal must name the fallback:\n{stderr}"
         );
-        eprintln!("  refused with the cause named (correct)");
+        eprintln!("  refused with the cause named (a kernel without the namespace fix)");
     }
 
-    let (ok, stderr) = run(true);
+    let (ok, stderr, out_dir) = run(true);
     assert!(
         ok,
         "[cgroupns] the forced fallback should trace the same target:\n{stderr}"
@@ -1657,7 +1699,14 @@ fn test_e2e_cgroup_filter_outside_cgroupns_names_the_cause() {
         stderr.contains("SYSTING_CGROUP_FILTER_LEGACY is set"),
         "[cgroupns] the fallback run must announce its mode:\n{stderr}"
     );
-    eprintln!("  forced fallback traced it (correct)");
+    let rows = workload_rows(&out_dir, "cgroupns_legacy");
+    assert!(
+        rows > 0,
+        "[cgroupns] the forced fallback exited 0 but did not trace workload pid \
+         {workload_pid} in the target:\n{stderr}"
+    );
+    drop(workload);
+    eprintln!("  forced fallback traced it: {rows} process row(s) for pid {workload_pid}");
 }
 
 // =============================================================================
