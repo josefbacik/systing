@@ -539,42 +539,53 @@ impl AnalyzeDb {
                 }
                 Ok(result)
             }
-            // The binding's `prepare` is not parse-only: it executes every
-            // statement but the last of the text it is handed, so a prepare
-            // can already have run a scan (a DuckDB-expanded statement the
-            // classifier let through) and hit the memory bound. That failure
-            // is reported as the bound — never as the engine's allocation
-            // text, which would tell the caller to raise a locked setting —
-            // and the text is not prepared a second time, which would run
-            // the same scan again for the same answer.
-            Err(err) if is_memory_bound_error(&err) => Err(self.classify_query_error(err)),
-            Err(_) => {
-                // Prepare the user's own text so a SQL error names their
-                // line and column, not the wrapper's.
-                let mut stmt = self
-                    .conn
-                    .prepare(&inner)
-                    .map_err(|e| self.classify_query_error(e))?;
-                if must_wrap {
-                    // It prepares on its own but not inside the wrapper: a
-                    // shape that can read rows and that the cap cannot
-                    // bound, so it does not run at all rather than run
-                    // unbounded.
-                    bail!(
-                        "query could not be bounded by the {MAX_QUERY_ROWS}-row cap; rewrite it as a single SELECT statement"
-                    );
-                }
-                // A non-row-reading statement: run it as written. Its result
-                // is small by nature and already materialized, so the rows
-                // beyond the cap are drained and counted.
-                let (mut result, beyond_cap) = self.run_capped(&mut stmt, true)?;
-                if beyond_cap > 0 {
-                    result.truncated = true;
-                    result.total_row_count = Some(result.row_count + beyond_cap);
-                }
-                Ok(result)
-            }
+            Err(err) => self.query_after_wrapped_prepare_failed(err, &inner, must_wrap),
         }
+    }
+
+    /// The rest of [`Self::query`] once the wrapped form failed to prepare
+    /// with `err`. Split out so the decision below can be driven directly.
+    ///
+    /// The binding's `prepare` is not parse-only: it executes every
+    /// statement but the last of the text it is handed, so a prepare can
+    /// already have run a scan (a DuckDB-expanded statement the classifier
+    /// let through) and hit the memory bound. That failure is reported as
+    /// the bound — never as the engine's allocation text, which would tell
+    /// the caller to raise a locked setting — and the text is not prepared
+    /// a second time, which would run the same scan again for the same
+    /// answer. Any other prepare failure falls through to the raw form.
+    fn query_after_wrapped_prepare_failed(
+        &self,
+        err: duckdb::Error,
+        inner: &str,
+        must_wrap: bool,
+    ) -> Result<QueryResult> {
+        if is_memory_bound_error(&err) {
+            return Err(self.classify_query_error(err));
+        }
+        // Prepare the user's own text so a SQL error names their line and
+        // column, not the wrapper's.
+        let mut stmt = self
+            .conn
+            .prepare(inner)
+            .map_err(|e| self.classify_query_error(e))?;
+        if must_wrap {
+            // It prepares on its own but not inside the wrapper: a shape
+            // that can read rows and that the cap cannot bound, so it does
+            // not run at all rather than run unbounded.
+            bail!(
+                "query could not be bounded by the {MAX_QUERY_ROWS}-row cap; rewrite it as a single SELECT statement"
+            );
+        }
+        // A non-row-reading statement: run it as written. Its result is
+        // small by nature and already materialized, so the rows beyond the
+        // cap are drained and counted.
+        let (mut result, beyond_cap) = self.run_capped(&mut stmt, true)?;
+        if beyond_cap > 0 {
+            result.truncated = true;
+            result.total_row_count = Some(result.row_count + beyond_cap);
+        }
+        Ok(result)
     }
 
     /// Execute a prepared statement and read up to `MAX_QUERY_ROWS` rows into
@@ -1688,10 +1699,15 @@ mod tests {
         // shape is refused before it reaches `prepare`, so no such type is
         // ever created; the same pivot with its values named runs wrapped
         // (one row per id here, so the cap and the count are exercised).
+        // Only the pivot's own ON clause counts: the bypass probe, a
+        // pivot whose only `IN (` sits in its source subquery, is refused
+        // too (DuckDB still expands it; it left a type behind before).
         for sql in [
             "PIVOT t ON bucket USING count(id)",
             "pivot_wider t on bucket using count(id) group by id",
             "PIVOT t ON bucket USING count(id) -- IN (0, 1)",
+            "PIVOT (SELECT * FROM t WHERE id IN (3, 4, 5)) ON bucket USING count(id)",
+            "PIVOT t ON bucket IN (0, 1), id USING count(*)",
         ] {
             let err = db.query(sql).unwrap_err().to_string();
             assert!(err.contains("PIVOT without an IN"), "{sql:?}: {err}");
@@ -1706,6 +1722,13 @@ mod tests {
         assert_eq!(pivoted.row_count, MAX_QUERY_ROWS);
         assert!(pivoted.truncated);
         assert_eq!(pivoted.total_row_count, Some(25000));
+        let pivoted = db
+            .query(
+                "PIVOT (SELECT * FROM t WHERE id IN (3, 4, 5)) ON bucket IN (3, 4, 5) USING count(id) GROUP BY id",
+            )
+            .unwrap();
+        assert_eq!(pivoted.row_count, 3);
+        assert!(!pivoted.truncated);
         let enums = db
             .query("SELECT count(*) FROM duckdb_types() WHERE type_name LIKE '__pivot_enum%'")
             .unwrap();
@@ -1717,16 +1740,51 @@ mod tests {
         // `is_memory_bound_error` is what keeps a prepare that hit the bound
         // from being retried unwrapped and from surfacing the engine's
         // allocation text (which names the setting the lock refuses).
-        let oom = duckdb::Error::DuckDBFailure(
-            duckdb::ffi::Error::new(1),
-            Some(format!("{DUCKDB_OOM_MARKER}: could not allocate block")),
+        let oom = || {
+            duckdb::Error::DuckDBFailure(
+                duckdb::ffi::Error::new(1),
+                Some(format!("{DUCKDB_OOM_MARKER}: could not allocate block")),
+            )
+        };
+        let other = || {
+            duckdb::Error::DuckDBFailure(
+                duckdb::ffi::Error::new(1),
+                Some("Binder Error: column nope not found".to_string()),
+            )
+        };
+        assert!(is_memory_bound_error(&oom()));
+        assert!(!is_memory_bound_error(&other()));
+
+        // The decision itself, driven with a statement whose raw form would
+        // prepare and run fine: after a memory-bound failure of the wrapped
+        // prepare the raw form is NOT prepared (no rows come back, the
+        // error is the bound's fixed text, not the engine's); after any
+        // other failure it is, and a non-row-reading statement runs raw.
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_query_test_db(dir.path());
+        let err = db
+            .query_after_wrapped_prepare_failed(oom(), "SELECT 1 AS one", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("query exceeded the DuckDB memory bound"),
+            "unexpected: {err}"
         );
-        assert!(is_memory_bound_error(&oom));
-        let other = duckdb::Error::DuckDBFailure(
-            duckdb::ffi::Error::new(1),
-            Some("Binder Error: column nope not found".to_string()),
-        );
-        assert!(!is_memory_bound_error(&other));
+        assert!(!err.contains("allocate"), "engine text leaked: {err}");
+        let err = db
+            .query_after_wrapped_prepare_failed(oom(), "SELECT 1 AS one", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("query exceeded the DuckDB memory bound"));
+        let raw = db
+            .query_after_wrapped_prepare_failed(other(), "SELECT 1 AS one", false)
+            .unwrap();
+        assert_eq!(raw.rows, vec![vec![serde_json::json!(1)]]);
+        let err = db
+            .query_after_wrapped_prepare_failed(other(), "SELECT 1 AS one", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not be bounded"), "{err}");
     }
 
     #[test]
