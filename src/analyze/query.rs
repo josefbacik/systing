@@ -71,6 +71,15 @@ pub(super) enum StatementShape {
     /// this path, and a dollar-quoted string can hide a quote character or
     /// a `;` from this scan — so the text is refused rather than guessed at.
     Dollar,
+    /// A `PIVOT` (or `PIVOT_WIDER`) statement with no `IN (...)` list. DuckDB
+    /// expands that form into two statements — a `CREATE TYPE
+    /// __pivot_enum_<uuid> AS ENUM (SELECT DISTINCT ...)` that scans the
+    /// pivot column, then the SELECT — and the binding's `prepare` executes
+    /// the first one, outside the row cap and before the second is bound; a
+    /// successful run also leaves that type behind in the temp catalog. The
+    /// text is refused; the same pivot with its values named (`ON col IN
+    /// (...)`) is one statement and runs wrapped like any other row reader.
+    PivotWithoutIn,
     /// Exactly one statement. `text` is that statement without comments and
     /// without leading or trailing terminators; `must_wrap` says whether it
     /// can read rows from a table — `SELECT`, `WITH`, `FROM`, `VALUES`,
@@ -78,6 +87,44 @@ pub(super) enum StatementShape {
     /// whatever they name — and so may only run inside the
     /// `SELECT * FROM (...) LIMIT n` wrapper.
     Single { text: String, must_wrap: bool },
+}
+
+/// Whether `text` (comments already stripped) contains an `IN (` token
+/// outside a quoted run — the `PIVOT ... ON col IN (...)` value list that
+/// keeps DuckDB from expanding the pivot into an enum-building statement.
+/// An `IN (...)` anywhere else in the text (a WHERE clause) also counts:
+/// this scan errs toward accepting a pivot whose ON clause it cannot place,
+/// and the row cap and the memory bound still hold for it.
+fn has_in_list(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != c {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        let word_start = i == 0 || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
+        if word_start
+            && c.eq_ignore_ascii_case(&'i')
+            && matches!(chars.get(i + 1), Some(n) if n.eq_ignore_ascii_case(&'n'))
+            && !matches!(chars.get(i + 2), Some(n) if n.is_ascii_alphanumeric() || *n == '_')
+        {
+            let mut j = i + 2;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if chars.get(j) == Some(&'(') {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Classify `sql` for the row cap: strip `--` and `/* */` comments (nested
@@ -182,9 +229,26 @@ pub(super) fn statement_shape(sql: &str) -> StatementShape {
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
         .collect::<String>()
         .to_ascii_lowercase();
+    // A pivot that names no `IN (...)` list is parser-expanded by DuckDB
+    // into an enum-building statement ahead of the SELECT, which `prepare`
+    // would execute; refuse it before anything reaches the binding.
+    if matches!(first_word.as_str(), "pivot" | "pivot_wider") && !has_in_list(text) {
+        return StatementShape::PivotWithoutIn;
+    }
+    // Every statement that reads rows runs wrapped; `pivot_wider` is the
+    // spelled-out form of `pivot` and reads rows the same way.
     let must_wrap = matches!(
         first_word.as_str(),
-        "select" | "with" | "from" | "values" | "table" | "pivot" | "unpivot" | "call" | "execute"
+        "select"
+            | "with"
+            | "from"
+            | "values"
+            | "table"
+            | "pivot"
+            | "pivot_wider"
+            | "unpivot"
+            | "call"
+            | "execute"
     );
     StatementShape::Single {
         text: text.to_string(),
@@ -296,7 +360,7 @@ mod tests {
             "TABLE t",
             "(SELECT 1) UNION ALL (SELECT 2)",
             "(\n  (SELECT 1)\n)",
-            "PIVOT t ON bucket",
+            "PIVOT t ON bucket IN (0, 1) USING count(id)",
             "CALL pragma_table_info('t')",
             "EXECUTE q",
         ] {
@@ -312,6 +376,43 @@ mod tests {
         ] {
             assert!(!single(sql).1, "{sql:?} takes the raw path");
         }
+    }
+
+    #[test]
+    fn test_statement_shape_refuses_pivot_without_an_in_list() {
+        // DuckDB expands a pivot with no value list into `CREATE TYPE ... AS
+        // ENUM (SELECT DISTINCT ...)` + the SELECT, and the binding's
+        // `prepare` executes the first of the two — so the shape is refused
+        // before it can reach `prepare`.
+        for sql in [
+            "PIVOT t ON bucket",
+            "PIVOT t ON bucket USING count(id)",
+            "pivot_wider t on bucket using sum(id) group by id",
+            "PIVOT t ON bucket USING count(id) -- IN (0, 1) in a comment",
+            "PIVOT t ON bucket USING count(id) WHERE s = 'IN (x)'",
+            "( PIVOT t ON bucket USING count(id) )",
+        ] {
+            assert_eq!(
+                statement_shape(sql),
+                StatementShape::PivotWithoutIn,
+                "{sql:?}"
+            );
+        }
+        // With the values named the statement is one statement; it runs
+        // wrapped like every other row reader. `IN(` without a space and an
+        // `IN (...)` elsewhere in the text both count.
+        for sql in [
+            "PIVOT t ON bucket IN (0, 1) USING count(id)",
+            "PIVOT t ON bucket IN(0, 1) USING count(id)",
+            "pivot_wider t on bucket in (0) using sum(id)",
+            "PIVOT t ON bucket USING count(id) WHERE id IN (1, 2)",
+        ] {
+            assert!(single(sql).1, "{sql:?} must run wrapped");
+        }
+        // A word that merely starts with `in` is not the keyword, and
+        // `UNPIVOT` creates no type, so neither is refused.
+        assert!(single("UNPIVOT t ON bucket INTO NAME k VALUE v").1);
+        assert!(single("SELECT index_col FROM t").1);
     }
 
     #[test]

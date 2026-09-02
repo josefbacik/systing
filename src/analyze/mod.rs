@@ -336,6 +336,14 @@ pub struct AnalyzeDb {
 /// trigger the rewrite.
 const DUCKDB_OOM_MARKER: &str = "Out of Memory Error";
 
+/// Whether `err` is DuckDB reporting that a query ran into the memory bound
+/// (`memory_limit`) or the spill bound (`max_temp_directory_size`) — the
+/// class `classify_query_error` rewrites, and the one a failed `prepare`
+/// must not be retried on.
+fn is_memory_bound_error(err: &duckdb::Error) -> bool {
+    err.to_string().starts_with(DUCKDB_OOM_MARKER)
+}
+
 impl AnalyzeDb {
     /// Open a trace database.
     pub fn open(path: &Path, read_only: bool) -> Result<Self> {
@@ -432,8 +440,7 @@ impl AnalyzeDb {
     /// every other error is returned as-is so SQL mistakes keep naming the
     /// offending column or table.
     fn classify_query_error(&self, err: duckdb::Error) -> anyhow::Error {
-        let msg = err.to_string();
-        if msg.starts_with(DUCKDB_OOM_MARKER) {
+        if is_memory_bound_error(&err) {
             let bound = match self.mem_limit_mib {
                 Some(m) => format!(" ({m} MiB)"),
                 None => String::new(),
@@ -483,7 +490,12 @@ impl AnalyzeDb {
     /// where a statement ends. That agreement matters: the binding's
     /// `prepare` is not parse-only, it EXECUTES every statement but the last
     /// of the text it is handed, so nothing may reach `prepare` unless the
-    /// classifier has established that it is exactly one statement. A
+    /// classifier has established that it is exactly one statement. One
+    /// statement of the user's can still become two inside DuckDB: a
+    /// `PIVOT` with no `IN (...)` list is expanded by the parser into a
+    /// `CREATE TYPE ... AS ENUM (SELECT DISTINCT ...)` ahead of the SELECT,
+    /// so that shape is refused too, and a prepare that nevertheless runs
+    /// into the memory bound is reported as the bound and never retried. A
     /// statement that reads rows (`SELECT`, `WITH`, `FROM`, `VALUES`, ...)
     /// runs ONLY in wrapped form: if it cannot be wrapped it is refused, and
     /// a SQL error in it is reported against the user's own text by
@@ -505,6 +517,9 @@ impl AnalyzeDb {
             StatementShape::Dollar => bail!(
                 "dollar-quoted strings ($$...$$) and $-parameters are not supported here; use a single-quoted string literal"
             ),
+            StatementShape::PivotWithoutIn => bail!(
+                "PIVOT without an IN (...) value list is not supported here: DuckDB expands it into a CREATE TYPE ... AS ENUM (SELECT DISTINCT ...) statement ahead of the SELECT, which would run outside the row cap; name the pivot values with ON <column> IN (...)"
+            ),
             StatementShape::Single { text, must_wrap } => (text, must_wrap),
         };
         // The newline before the closing paren is a belt on top of the
@@ -524,10 +539,22 @@ impl AnalyzeDb {
                 }
                 Ok(result)
             }
+            // The binding's `prepare` is not parse-only: it executes every
+            // statement but the last of the text it is handed, so a prepare
+            // can already have run a scan (a DuckDB-expanded statement the
+            // classifier let through) and hit the memory bound. That failure
+            // is reported as the bound — never as the engine's allocation
+            // text, which would tell the caller to raise a locked setting —
+            // and the text is not prepared a second time, which would run
+            // the same scan again for the same answer.
+            Err(err) if is_memory_bound_error(&err) => Err(self.classify_query_error(err)),
             Err(_) => {
                 // Prepare the user's own text so a SQL error names their
                 // line and column, not the wrapper's.
-                let mut stmt = self.conn.prepare(&inner)?;
+                let mut stmt = self
+                    .conn
+                    .prepare(&inner)
+                    .map_err(|e| self.classify_query_error(e))?;
                 if must_wrap {
                     // It prepares on its own but not inside the wrapper: a
                     // shape that can read rows and that the cap cannot
@@ -1652,6 +1679,54 @@ mod tests {
         }
         let after = db.query("SELECT current_setting('memory_limit')").unwrap();
         assert_eq!(before.rows, after.rows);
+
+        // A PIVOT with no IN (...) list is parser-expanded by DuckDB into a
+        // `CREATE TYPE __pivot_enum_<uuid> AS ENUM (SELECT DISTINCT ...)`
+        // ahead of the SELECT, and the binding's `prepare` executed that
+        // scan at prepare time — outside the row cap, twice on the failure
+        // path, and leaving the type in the temp catalog on success. The
+        // shape is refused before it reaches `prepare`, so no such type is
+        // ever created; the same pivot with its values named runs wrapped
+        // (one row per id here, so the cap and the count are exercised).
+        for sql in [
+            "PIVOT t ON bucket USING count(id)",
+            "pivot_wider t on bucket using count(id) group by id",
+            "PIVOT t ON bucket USING count(id) -- IN (0, 1)",
+        ] {
+            let err = db.query(sql).unwrap_err().to_string();
+            assert!(err.contains("PIVOT without an IN"), "{sql:?}: {err}");
+        }
+        let enums = db
+            .query("SELECT count(*) FROM duckdb_types() WHERE type_name LIKE '__pivot_enum%'")
+            .unwrap();
+        assert_eq!(enums.rows[0][0], serde_json::json!(0));
+        let pivoted = db
+            .query("PIVOT t ON bucket IN (0, 1) USING count(id) GROUP BY id")
+            .unwrap();
+        assert_eq!(pivoted.row_count, MAX_QUERY_ROWS);
+        assert!(pivoted.truncated);
+        assert_eq!(pivoted.total_row_count, Some(25000));
+        let enums = db
+            .query("SELECT count(*) FROM duckdb_types() WHERE type_name LIKE '__pivot_enum%'")
+            .unwrap();
+        assert_eq!(enums.rows[0][0], serde_json::json!(0));
+    }
+
+    #[test]
+    fn test_query_reports_a_prepare_time_memory_failure_as_the_bound() {
+        // `is_memory_bound_error` is what keeps a prepare that hit the bound
+        // from being retried unwrapped and from surfacing the engine's
+        // allocation text (which names the setting the lock refuses).
+        let oom = duckdb::Error::DuckDBFailure(
+            duckdb::ffi::Error::new(1),
+            Some(format!("{DUCKDB_OOM_MARKER}: could not allocate block")),
+        );
+        assert!(is_memory_bound_error(&oom));
+        let other = duckdb::Error::DuckDBFailure(
+            duckdb::ffi::Error::new(1),
+            Some("Binder Error: column nope not found".to_string()),
+        );
+        assert!(!is_memory_bound_error(&other));
     }
 
     #[test]
