@@ -286,7 +286,9 @@ lifted that limit): there, from a container with a private cgroup namespace and
 the host's cgroup filesystem mounted, a host path is visible but cannot be
 resolved, and systing says so at start — run it in the host cgroup namespace
 or use the fallback. Only the unified cgroup v2 hierarchy is supported; a
-target on a cgroup v1 hierarchy is refused the same way.
+target on a cgroup v1 hierarchy, or a directory that is not on a cgroup
+filesystem at all, is refused at start with that cause named (systing checks
+the target's filesystem before blaming the namespace).
 
 `--trace-event` - This will add an `instant` track event for each event that
 this tool captures.  The format is "<trace type>:<optional

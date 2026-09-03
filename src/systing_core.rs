@@ -4198,20 +4198,47 @@ const CGROUP_FROM_ID_NAMESPACE_FIX_KERNELS: &str = "6.6.117 / 6.12.58 / 6.18";
 
 /// The error for a `--cgroup` target whose `cgroup_target_refs` slot came back
 /// empty after the iterator run: the cause is named from what the path says
-/// NOW (`now` is a fresh `cgroup_id()` of the same path), because the empty
-/// slot has three different explanations and only one of them is about
-/// where systing runs.
+/// NOW (`now` is a fresh `cgroup_id()` of the same path, `fs` a `statfs` of
+/// it), because the empty slot has four different explanations and only one
+/// of them is about where systing runs.
 ///
 /// The kernel takes its reference with `bpf_cgroup_from_id(id)`; it returns
 /// nothing when that id no longer names a cgroup (removed, or removed and
 /// re-created with a new inode since systing resolved it a moment earlier),
-/// when the path is on a cgroup v1 hierarchy (ids are looked up in the
-/// unified v2 hierarchy only), or — on kernels before
-/// [`CGROUP_FROM_ID_NAMESPACE_FIX_KERNELS`] — when the cgroup sits outside the
-/// calling process's cgroup namespace: a container with a private cgroup
-/// namespace and the host's cgroup filesystem mounted sees the host path but
-/// cannot resolve it. Pure, so the wording is unit-tested.
-fn empty_cgroup_target_slot_cause(path: &str, expected_id: u64, now: io::Result<u64>) -> String {
+/// when the path is not on the unified cgroup v2 hierarchy at all — a cgroup
+/// v1 mount, or a plain directory whose inode `cgroup_id()` resolved just as
+/// readily (ids are looked up in the v2 hierarchy only) — or, on kernels
+/// before [`CGROUP_FROM_ID_NAMESPACE_FIX_KERNELS`], when the cgroup sits
+/// outside the calling process's cgroup namespace: a container with a private
+/// cgroup namespace and the host's cgroup filesystem mounted sees the host
+/// path but cannot resolve it. When the filesystem could not be read the last
+/// two causes are named together. Pure, so the wording is unit-tested.
+fn empty_cgroup_target_slot_cause(
+    path: &str,
+    expected_id: u64,
+    now: io::Result<u64>,
+    fs: io::Result<crate::cgroup::CgroupFs>,
+) -> String {
+    use crate::cgroup::CgroupFs;
+    let namespace_cause = |also_v1: bool| {
+        let v1 = if also_v1 {
+            "Either the path is on a cgroup v1 hierarchy (only the unified cgroup v2 \
+             hierarchy is supported), or — "
+        } else {
+            "The path is on the cgroup v2 hierarchy, so — "
+        };
+        format!(
+            "--cgroup {path}: the kernel could not resolve this cgroup (id {expected_id}), \
+             so the iterator program left its slot empty. {v1}on a kernel before \
+             {CGROUP_FROM_ID_NAMESPACE_FIX_KERNELS}, where the kernel resolves the id \
+             within the tracer's cgroup namespace — systing runs in a container with a \
+             private cgroup namespace and the host's cgroup filesystem mounted: the path \
+             is visible but the cgroup is outside the namespace the kernel resolves it \
+             in. Run systing in the host cgroup namespace, or set \
+             {CGROUP_FILTER_LEGACY_ENV} to match a snapshot of the target's cgroups \
+             taken at start instead"
+        )
+    };
     match now {
         Err(e) if e.kind() == io::ErrorKind::NotFound => format!(
             "--cgroup {path}: this cgroup (id {expected_id}) was removed while systing \
@@ -4222,18 +4249,22 @@ fn empty_cgroup_target_slot_cause(path: &str, expected_id: u64, now: io::Result<
              had id {expected_id}, the directory at that path now has id {current}), so \
              the kernel could not take a reference to the one that was resolved"
         ),
-        _ => format!(
-            "--cgroup {path}: the kernel could not resolve this cgroup (id {expected_id}), \
-             so the iterator program left its slot empty. Either the path is on a cgroup \
-             v1 hierarchy (only the unified cgroup v2 hierarchy is supported), or — on a \
-             kernel before {CGROUP_FROM_ID_NAMESPACE_FIX_KERNELS}, where the kernel \
-             resolves the id within the tracer's cgroup namespace — systing runs in a \
-             container with a private cgroup namespace and the host's cgroup filesystem \
-             mounted: the path is visible but the cgroup is outside the namespace the \
-             kernel resolves it in. Run systing in the host cgroup namespace, or set \
-             {CGROUP_FILTER_LEGACY_ENV} to match a snapshot of the target's cgroups \
-             taken at start instead"
-        ),
+        _ => match fs {
+            Ok(CgroupFs::V1) => format!(
+                "--cgroup {path}: this path is on a cgroup v1 hierarchy, and only the \
+                 unified cgroup v2 hierarchy is supported (the kernel looks the id up \
+                 there, so it could not resolve id {expected_id}). Give a cgroup under \
+                 the cgroup2 mount instead, usually /sys/fs/cgroup"
+            ),
+            Ok(CgroupFs::Other(magic)) => format!(
+                "--cgroup {path}: this path is not on a cgroup filesystem at all (its \
+                 filesystem magic is {magic:#x}), so the directory's inode {expected_id} \
+                 is not a cgroup id the kernel can resolve. Give a cgroup directory under \
+                 the cgroup2 mount instead, usually /sys/fs/cgroup"
+            ),
+            Ok(CgroupFs::V2) => namespace_cause(false),
+            Err(_) => namespace_cause(true),
+        },
     }
 }
 
@@ -4264,12 +4295,15 @@ fn install_cgroup_targets(skel: &mut SystingSystemSkel, targets: &[CgroupTarget]
         if id == 0 {
             // Ask the filesystem again before naming a cause: the slot is
             // empty either because the cgroup is gone (or has been replaced)
-            // since it was resolved, or because the kernel could not look
+            // since it was resolved, because the path was never a cgroup2
+            // directory to begin with, or because the kernel could not look
             // its id up from where systing runs.
-            let now = crate::cgroup::cgroup_id(std::path::Path::new(&target.path));
+            let path = std::path::Path::new(&target.path);
+            let now = crate::cgroup::cgroup_id(path);
+            let fs = crate::cgroup::cgroup_fs(path);
             bail!(
                 "{}",
-                empty_cgroup_target_slot_cause(&target.path, target.id, now)
+                empty_cgroup_target_slot_cause(&target.path, target.id, now, fs)
             );
         }
         if id != target.id {
@@ -6861,11 +6895,14 @@ mod tests {
     #[test]
     fn test_empty_cgroup_target_slot_cause_names_what_the_path_says_now() {
         let path = "/sys/fs/cgroup/kubepods.slice/pod-x";
+        let v2 = || Ok(crate::cgroup::CgroupFs::V2);
+        let unread = || Err(io::Error::from(io::ErrorKind::PermissionDenied));
         // The cgroup vanished between resolving it and the iterator run.
         let gone = empty_cgroup_target_slot_cause(
             path,
             4242,
             Err(io::Error::from(io::ErrorKind::NotFound)),
+            unread(),
         );
         assert!(
             gone.contains("was removed while systing was starting"),
@@ -6875,7 +6912,7 @@ mod tests {
         assert!(!gone.contains("cgroup namespace"), "{gone}");
 
         // Removed and re-created: the path is back with a different inode.
-        let replaced = empty_cgroup_target_slot_cause(path, 4242, Ok(9001));
+        let replaced = empty_cgroup_target_slot_cause(path, 4242, Ok(9001), v2());
         assert!(
             replaced.contains("was replaced while systing was starting"),
             "{replaced}"
@@ -6886,26 +6923,86 @@ mod tests {
         );
         assert!(!replaced.contains("cgroup namespace"), "{replaced}");
 
-        // Still there with the same id: the kernel refused the lookup, which
-        // on a pre-backport kernel is the namespace, on any kernel a v1
-        // hierarchy. The message names the kernel bar and both cures.
-        let refused = empty_cgroup_target_slot_cause(path, 4242, Ok(4242));
+        // Still there with the same id on the cgroup2 hierarchy: the kernel
+        // refused the lookup, which leaves only the pre-backport namespace
+        // cause. The message names the kernel bar and both cures, and no
+        // longer hedges about a v1 hierarchy the filesystem ruled out.
+        let refused = empty_cgroup_target_slot_cause(path, 4242, Ok(4242), v2());
         assert!(refused.contains("cgroup namespace"), "{refused}");
         assert!(
             refused.contains(CGROUP_FROM_ID_NAMESPACE_FIX_KERNELS),
             "{refused}"
         );
-        assert!(refused.contains("cgroup v1 hierarchy"), "{refused}");
+        assert!(refused.contains("on the cgroup v2 hierarchy"), "{refused}");
+        assert!(!refused.contains("cgroup v1 hierarchy"), "{refused}");
         assert!(refused.contains("host cgroup namespace"), "{refused}");
         assert!(refused.contains(CGROUP_FILTER_LEGACY_ENV), "{refused}");
+
+        // The same, but the filesystem could not be read: both remaining
+        // causes are named, as before the filesystem was consulted.
+        let either = empty_cgroup_target_slot_cause(path, 4242, Ok(4242), unread());
+        assert!(either.contains("cgroup v1 hierarchy"), "{either}");
+        assert!(either.contains("cgroup namespace"), "{either}");
+        assert!(either.contains(CGROUP_FILTER_LEGACY_ENV), "{either}");
         // Any other stat failure (EACCES, EIO…) says nothing it cannot know
         // and falls to the same cause as an unchanged id.
         let unknown = empty_cgroup_target_slot_cause(
             path,
             4242,
             Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            unread(),
         );
-        assert_eq!(unknown, refused);
+        assert_eq!(unknown, either);
+
+        // A cgroup v1 mount: the filesystem says so, and the namespace is
+        // not offered as a cause.
+        let v1 =
+            empty_cgroup_target_slot_cause(path, 4242, Ok(4242), Ok(crate::cgroup::CgroupFs::V1));
+        assert!(v1.contains("is on a cgroup v1 hierarchy"), "{v1}");
+        assert!(v1.contains("cgroup2 mount"), "{v1}");
+        assert!(!v1.contains("cgroup namespace"), "{v1}");
+
+        // A plain directory (a mistyped path): `cgroup_id()` resolved its
+        // inode like any other, but it is on no cgroup filesystem — the
+        // fourth cause, named with the filesystem magic it did find.
+        let plain = empty_cgroup_target_slot_cause(
+            "/tmp/pod-x",
+            4242,
+            Ok(4242),
+            Ok(crate::cgroup::CgroupFs::Other(0x0187_3e19)),
+        );
+        assert!(
+            plain.contains("not on a cgroup filesystem at all"),
+            "{plain}"
+        );
+        assert!(plain.contains("0x1873e19"), "{plain}");
+        assert!(
+            plain.contains("/tmp/pod-x") && plain.contains("4242"),
+            "{plain}"
+        );
+        assert!(!plain.contains("cgroup namespace"), "{plain}");
+    }
+
+    #[test]
+    fn test_cgroup_fs_reads_the_filesystem_magic() {
+        use crate::cgroup::{cgroup_fs, CgroupFs};
+        // A directory that is certainly not a cgroup: the magic is whatever
+        // the temp filesystem's is, never a cgroup one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        match cgroup_fs(dir.path()).expect("statfs of a temp dir") {
+            CgroupFs::Other(_) => {}
+            other => panic!("a temp dir read as a cgroup filesystem: {other:?}"),
+        }
+        // A missing path is an error, never a guessed kind.
+        let missing = dir.path().join("missing");
+        assert!(cgroup_fs(&missing).is_err());
+        // The cgroup2 root, where the host mounts one.
+        if let Some(root) = crate::cgroup::cgroup2_root() {
+            assert_eq!(
+                cgroup_fs(&root).expect("statfs of the cgroup2 root"),
+                CgroupFs::V2
+            );
+        }
     }
 
     #[test]

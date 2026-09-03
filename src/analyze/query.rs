@@ -89,42 +89,110 @@ pub(super) enum StatementShape {
     Single { text: String, must_wrap: bool },
 }
 
-/// Whether `text` (comments already stripped) contains an `IN (` token
-/// outside a quoted run — the `PIVOT ... ON col IN (...)` value list that
-/// keeps DuckDB from expanding the pivot into an enum-building statement.
-/// An `IN (...)` anywhere else in the text (a WHERE clause) also counts:
-/// this scan errs toward accepting a pivot whose ON clause it cannot place,
-/// and the row cap and the memory bound still hold for it.
-fn has_in_list(text: &str) -> bool {
+/// Whether a `PIVOT` / `PIVOT_WIDER` statement (`text`, comments already
+/// stripped) names a value list for EVERY pivot column: in its own `ON`
+/// clause — the first `ON` at the statement's own paren depth, after the
+/// source — each comma-separated element carries an `IN (` at that depth,
+/// up to the clause's end (`USING`, `GROUP`, `ORDER`, `LIMIT`, or the end
+/// of the text). Only that list keeps DuckDB from expanding the pivot
+/// into an enum-building statement; an `IN (` anywhere else — inside a
+/// parenthesised source subquery, a WHERE clause — is not one, so it does
+/// not count (the bypass this closes: `PIVOT (SELECT * FROM t WHERE id IN (3))
+/// ON bucket USING count(id)` is still expanded). A pivot whose `ON`
+/// clause this scan cannot find is refused with the rest.
+fn pivot_names_every_value_list(text: &str) -> bool {
+    /// A token at the statement's own paren depth.
+    enum Tok {
+        /// A word (lowercased), and whether the next non-blank character
+        /// after it is `(`.
+        Word(String, bool),
+        Comma,
+    }
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\'' || c == '"' {
-            i += 1;
-            while i < chars.len() && chars[i] != c {
-                i += 1;
-            }
-            i += 1;
-            continue;
-        }
-        let word_start = i == 0 || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
-        if word_start
-            && c.eq_ignore_ascii_case(&'i')
-            && matches!(chars.get(i + 1), Some(n) if n.eq_ignore_ascii_case(&'n'))
-            && !matches!(chars.get(i + 2), Some(n) if n.is_ascii_alphanumeric() || *n == '_')
-        {
-            let mut j = i + 2;
-            while j < chars.len() && chars[j].is_whitespace() {
-                j += 1;
-            }
-            if chars.get(j) == Some(&'(') {
-                return true;
-            }
+    // The statement may sit inside outer parens (`( PIVOT ... )`): its own
+    // depth is where its first word is.
+    let mut depth = 0i32;
+    while i < chars.len() && (chars[i].is_whitespace() || chars[i] == '(') {
+        if chars[i] == '(' {
+            depth += 1;
         }
         i += 1;
     }
-    false
+    let base = depth;
+    let mut toks: Vec<Tok> = Vec::new();
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' | '"' => {
+                i += 1;
+                while i < chars.len() && chars[i] != c {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '(' => {
+                depth += 1;
+                i += 1;
+            }
+            ')' => {
+                depth -= 1;
+                i += 1;
+            }
+            ',' if depth == base => {
+                toks.push(Tok::Comma);
+                i += 1;
+            }
+            _ if c.is_ascii_alphanumeric() || c == '_' => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                if depth == base {
+                    let word: String = chars[start..i]
+                        .iter()
+                        .collect::<String>()
+                        .to_ascii_lowercase();
+                    let mut j = i;
+                    while j < chars.len() && chars[j].is_whitespace() {
+                        j += 1;
+                    }
+                    toks.push(Tok::Word(word, chars.get(j) == Some(&'(')));
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    // The pivot's own ON clause: from the first top-level `ON` after the
+    // first word to the first clause keyword after it. A second top-level
+    // `ON` before that keyword means the first one was a join's, in a
+    // source written without parentheses (`PIVOT t JOIN u ON ... ON col`):
+    // its predicate is not a value list, so the pivot is refused rather
+    // than read from the wrong clause; the same source in parentheses
+    // reads fine.
+    let Some(on) = toks
+        .iter()
+        .skip(1)
+        .position(|t| matches!(t, Tok::Word(w, _) if w == "on"))
+        .map(|p| p + 1)
+    else {
+        return false;
+    };
+    let clause = &toks[on + 1..];
+    let end = clause
+        .iter()
+        .position(|t| matches!(t, Tok::Word(w, _) if matches!(w.as_str(), "using" | "group" | "order" | "limit")))
+        .unwrap_or(clause.len());
+    let clause = &clause[..end];
+    !clause.is_empty()
+        && !clause
+            .iter()
+            .any(|t| matches!(t, Tok::Word(w, _) if w == "on"))
+        && clause.split(|t| matches!(t, Tok::Comma)).all(|element| {
+            element
+                .iter()
+                .any(|t| matches!(t, Tok::Word(w, true) if w == "in"))
+        })
 }
 
 /// Classify `sql` for the row cap: strip `--` and `/* */` comments (nested
@@ -229,10 +297,12 @@ pub(super) fn statement_shape(sql: &str) -> StatementShape {
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
         .collect::<String>()
         .to_ascii_lowercase();
-    // A pivot that names no `IN (...)` list is parser-expanded by DuckDB
-    // into an enum-building statement ahead of the SELECT, which `prepare`
-    // would execute; refuse it before anything reaches the binding.
-    if matches!(first_word.as_str(), "pivot" | "pivot_wider") && !has_in_list(text) {
+    // A pivot whose ON clause leaves any pivot column without an `IN (...)`
+    // list is parser-expanded by DuckDB into an enum-building statement
+    // ahead of the SELECT, which `prepare` would execute; refuse it before
+    // anything reaches the binding.
+    if matches!(first_word.as_str(), "pivot" | "pivot_wider") && !pivot_names_every_value_list(text)
+    {
         return StatementShape::PivotWithoutIn;
     }
     // Every statement that reads rows runs wrapped; `pivot_wider` is the
@@ -383,7 +453,9 @@ mod tests {
         // DuckDB expands a pivot with no value list into `CREATE TYPE ... AS
         // ENUM (SELECT DISTINCT ...)` + the SELECT, and the binding's
         // `prepare` executes the first of the two — so the shape is refused
-        // before it can reach `prepare`.
+        // before it can reach `prepare`. Only a list in the pivot's own ON
+        // clause counts: one in the source subquery, a WHERE clause, a
+        // comment or a literal leaves the pivot column unlisted.
         for sql in [
             "PIVOT t ON bucket",
             "PIVOT t ON bucket USING count(id)",
@@ -391,6 +463,22 @@ mod tests {
             "PIVOT t ON bucket USING count(id) -- IN (0, 1) in a comment",
             "PIVOT t ON bucket USING count(id) WHERE s = 'IN (x)'",
             "( PIVOT t ON bucket USING count(id) )",
+            // The bypass this closes: the only `IN (` sits in the source subquery.
+            "PIVOT (SELECT * FROM t WHERE id IN (3, 4, 5)) ON bucket USING count(id)",
+            "PIVOT (SELECT * FROM t WHERE id IN (3)) ON bucket USING count(id) GROUP BY id",
+            // Not runnable DuckDB (a WHERE after USING) — and the ON clause
+            // names no list either way.
+            "PIVOT t ON bucket USING count(id) WHERE id IN (1, 2)",
+            // Two pivot columns, one of them unlisted.
+            "PIVOT t ON bucket IN (0, 1), id USING count(*)",
+            "PIVOT t ON bucket, id IN (1) USING count(*)",
+            // No ON clause at all.
+            "PIVOT t USING count(id)",
+            // A join source written without parentheses: the first ON is
+            // the join's, so its predicate must not vouch for the pivot
+            // column (write the source as a parenthesised subquery).
+            "PIVOT t JOIN u ON u.k IN (1) ON bucket USING count(*)",
+            "PIVOT t JOIN u ON t.k = u.k ON bucket IN (0) USING count(*)",
         ] {
             assert_eq!(
                 statement_shape(sql),
@@ -398,14 +486,21 @@ mod tests {
                 "{sql:?}"
             );
         }
-        // With the values named the statement is one statement; it runs
-        // wrapped like every other row reader. `IN(` without a space and an
-        // `IN (...)` elsewhere in the text both count.
+        // With every pivot column's values named the statement is one
+        // statement; it runs wrapped like every other row reader. `IN(`
+        // without a space, an expression pivot column, a quoted column, a
+        // parenthesised source and outer parens all read the same.
         for sql in [
             "PIVOT t ON bucket IN (0, 1) USING count(id)",
             "PIVOT t ON bucket IN(0, 1) USING count(id)",
             "pivot_wider t on bucket in (0) using sum(id)",
-            "PIVOT t ON bucket USING count(id) WHERE id IN (1, 2)",
+            "PIVOT t ON bucket IN (0, 1) USING count(id) GROUP BY id",
+            "PIVOT t ON bucket IN (0), id IN (1, 2) USING count(*)",
+            "PIVOT t ON lower(comm) IN ('a', 'b') USING count(*) GROUP BY id",
+            "PIVOT t ON \"bucket\" IN (0) USING count(id)",
+            "PIVOT (SELECT * FROM t WHERE id IN (3, 4)) ON bucket IN (0, 1) USING count(id)",
+            "PIVOT (SELECT * FROM t JOIN u ON t.k = u.k) ON bucket IN (0) USING count(*)",
+            "( PIVOT t ON bucket IN (0) USING count(id) )",
         ] {
             assert!(single(sql).1, "{sql:?} must run wrapped");
         }
