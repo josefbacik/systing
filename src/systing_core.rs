@@ -4297,10 +4297,12 @@ fn install_cgroup_targets(skel: &mut SystingSystemSkel, targets: &[CgroupTarget]
             // empty either because the cgroup is gone (or has been replaced)
             // since it was resolved, because the path was never a cgroup2
             // directory to begin with, or because the kernel could not look
-            // its id up from where systing runs.
-            let path = std::path::Path::new(&target.path);
-            let now = crate::cgroup::cgroup_id(path);
-            let fs = crate::cgroup::cgroup_fs(path);
+            // its id up from where systing runs. The path is re-resolved on
+            // purpose (that is how removal and replacement show), while the
+            // filesystem is read from the directory this target holds open,
+            // so a path re-pointed meanwhile cannot change that answer.
+            let now = crate::cgroup::cgroup_id(std::path::Path::new(&target.path));
+            let fs = crate::cgroup::cgroup_fs_of_fd(target.dir.as_fd());
             bail!(
                 "{}",
                 empty_cgroup_target_slot_cause(&target.path, target.id, now, fs)
@@ -6985,21 +6987,34 @@ mod tests {
 
     #[test]
     fn test_cgroup_fs_reads_the_filesystem_magic() {
-        use crate::cgroup::{cgroup_fs, CgroupFs};
+        use crate::cgroup::{cgroup_fs, cgroup_fs_of_fd, CgroupFs};
         // A directory that is certainly not a cgroup: the magic is whatever
-        // the temp filesystem's is, never a cgroup one.
+        // the temp filesystem's is, never a cgroup one — and the descriptor
+        // form answers for the directory it holds, the same as the path.
         let dir = tempfile::tempdir().expect("tempdir");
-        match cgroup_fs(dir.path()).expect("statfs of a temp dir") {
+        let by_path = cgroup_fs(dir.path()).expect("statfs of a temp dir");
+        match by_path {
             CgroupFs::Other(_) => {}
             other => panic!("a temp dir read as a cgroup filesystem: {other:?}"),
         }
+        let held = fs::File::open(dir.path()).expect("open the temp dir");
+        assert_eq!(
+            cgroup_fs_of_fd(held.as_fd()).expect("fstatfs of the held temp dir"),
+            by_path
+        );
         // A missing path is an error, never a guessed kind.
         let missing = dir.path().join("missing");
         assert!(cgroup_fs(&missing).is_err());
-        // The cgroup2 root, where the host mounts one.
+        // The cgroup2 root, where the host mounts one, by path and by the
+        // descriptor a `--cgroup` target keeps open.
         if let Some(root) = crate::cgroup::cgroup2_root() {
             assert_eq!(
                 cgroup_fs(&root).expect("statfs of the cgroup2 root"),
+                CgroupFs::V2
+            );
+            let held = fs::File::open(&root).expect("open the cgroup2 root");
+            assert_eq!(
+                cgroup_fs_of_fd(held.as_fd()).expect("fstatfs of the cgroup2 root"),
                 CgroupFs::V2
             );
         }
