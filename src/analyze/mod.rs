@@ -523,7 +523,7 @@ impl AnalyzeDb {
                 "dollar-quoted strings ($$...$$) and $-parameters are not supported here; use a single-quoted string literal"
             ),
             StatementShape::PivotWithoutIn => bail!(
-                "PIVOT without an IN (...) value list is not supported here: DuckDB expands it into a CREATE TYPE ... AS ENUM (SELECT DISTINCT ...) statement ahead of the SELECT, which would run outside the row cap; name the pivot values with ON <column> IN (...)"
+                "PIVOT without an IN (...) value list is not supported here: DuckDB expands it into a CREATE TYPE ... AS ENUM (...) statement ahead of the query, which would run outside the row cap; write the pivot as one top-level statement whose every pivot column names a literal list — PIVOT <source> ON <column> IN (<values>) USING <aggregate> — with a join source as a parenthesised subquery, no IN (<subquery>) list, no CASE or list literal as a pivot column, and no pivot nested inside another statement"
             ),
             StatementShape::Single { text, must_wrap } => (text, must_wrap),
         };
@@ -1706,21 +1706,33 @@ mod tests {
         // (one row per id here, so the cap and the count are exercised).
         // Only the pivot's own ON clause counts: the bypass probe, a
         // pivot whose only `IN (` sits in its source subquery, is refused
-        // too (DuckDB still expands it; it left a type behind before).
+        // too (DuckDB still expands it; it left a type behind before). So
+        // is a pivot nested inside another statement (the parser hoists
+        // its enum the same way), one whose list is a subquery (the enum
+        // is built by running it) and one whose column is a CASE or a
+        // list literal (its `IN (` belongs to a branch, not the column):
+        // each of those made DuckDB create a type at prepare time before.
         for sql in [
             "PIVOT t ON bucket USING count(id)",
             "pivot_wider t on bucket using count(id) group by id",
             "PIVOT t ON bucket USING count(id) -- IN (0, 1)",
             "PIVOT (SELECT * FROM t WHERE id IN (3, 4, 5)) ON bucket USING count(id)",
             "PIVOT t ON bucket IN (0, 1), id USING count(*)",
+            "SELECT * FROM (PIVOT t ON bucket USING count(id))",
+            "WITH p AS (PIVOT t ON bucket USING count(id)) SELECT * FROM p",
+            "FROM (PIVOT t ON bucket USING count(id))",
+            "(SELECT 1 AS one) UNION ALL (SELECT count(*) FROM (PIVOT t ON bucket USING count(id)))",
+            "PIVOT t ON bucket IN (SELECT DISTINCT bucket FROM t) USING count(id)",
+            "PIVOT t ON CASE WHEN bucket IN (0) THEN 'a' ELSE 'b' END USING count(id)",
+            "PIVOT t ON [bucket IN (0)] USING count(id)",
         ] {
             let err = db.query(sql).unwrap_err().to_string();
             assert!(err.contains("PIVOT without an IN"), "{sql:?}: {err}");
+            let enums = db
+                .query("SELECT count(*) FROM duckdb_types() WHERE type_name LIKE '__pivot_enum%'")
+                .unwrap();
+            assert_eq!(enums.rows[0][0], serde_json::json!(0), "{sql:?} created a type");
         }
-        let enums = db
-            .query("SELECT count(*) FROM duckdb_types() WHERE type_name LIKE '__pivot_enum%'")
-            .unwrap();
-        assert_eq!(enums.rows[0][0], serde_json::json!(0));
         let pivoted = db
             .query("PIVOT t ON bucket IN (0, 1) USING count(id) GROUP BY id")
             .unwrap();
