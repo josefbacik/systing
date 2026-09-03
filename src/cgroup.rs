@@ -133,6 +133,42 @@ pub fn cgroup_id(path: &Path) -> io::Result<u64> {
     Ok(meta.ino())
 }
 
+/// Which filesystem a `--cgroup` path sits on, as far as the filter cares.
+///
+/// [`cgroup_id`] is the inode of whatever directory the path names, so it
+/// resolves just as happily on a plain directory as on a cgroup; the
+/// filesystem's magic is what tells a real cgroup2 target from a mistyped
+/// path or a cgroup v1 mount, and the kernel refuses both of those the same
+/// way it refuses a cgroup outside the tracer's cgroup namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CgroupFs {
+    /// The unified cgroup v2 hierarchy (`CGROUP2_SUPER_MAGIC`).
+    V2,
+    /// A legacy cgroup v1 hierarchy (`CGROUP_SUPER_MAGIC`).
+    V1,
+    /// Not a cgroup filesystem at all; carries the `statfs` magic.
+    Other(libc::c_long),
+}
+
+/// The filesystem kind of the directory at `path`, from `statfs(2)`.
+pub fn cgroup_fs(path: &Path) -> io::Result<CgroupFs> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c_path` is a NUL-terminated path that outlives the call and
+    // `st` is a zeroed `struct statfs` the kernel fills in whole.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut st) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(match st.f_type {
+        libc::CGROUP2_SUPER_MAGIC => CgroupFs::V2,
+        libc::CGROUP_SUPER_MAGIC => CgroupFs::V1,
+        other => CgroupFs::Other(other),
+    })
+}
+
 /// Collect the cgroup id (directory inode) of `path` and of every cgroup nested
 /// beneath it in the cgroup2 hierarchy.
 ///

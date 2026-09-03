@@ -330,10 +330,15 @@ pub struct AnalyzeDb {
 
 /// Text DuckDB puts at the front of every `OutOfMemoryException` message,
 /// whether the buffer pool hit `memory_limit` or a spill hit
-/// `max_temp_directory_size` ("failed to offload data block"). The binding's
-/// `Display` prints the engine's message bare, so it is matched as a prefix:
-/// a user's own string literal that happens to contain the words cannot
-/// trigger the rewrite.
+/// `max_temp_directory_size` ("failed to offload data block"): both bounds
+/// throw that one exception class (DuckDB 1.5.4, the version `libduckdb-sys`
+/// pins: the block-offload throw in `src/storage/temporary_file_manager.cpp`
+/// for the spill bound, `src/storage/buffer/buffer_pool.cpp` for the buffer
+/// pool), and the class renders with the "Out of Memory Error" prefix
+/// (`src/common/exception.cpp`, `ExceptionType::OUT_OF_MEMORY`). The
+/// binding's `Display` prints the engine's message bare, so it is matched as
+/// a prefix: a user's own string literal that happens to contain the words
+/// cannot trigger the rewrite.
 const DUCKDB_OOM_MARKER: &str = "Out of Memory Error";
 
 /// Whether `err` is DuckDB reporting that a query ran into the memory bound
