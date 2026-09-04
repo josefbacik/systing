@@ -36,7 +36,7 @@ pub use sched_stats::{
     ThreadDetailStats, ThreadSchedStats,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use duckdb::Connection;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -366,6 +366,21 @@ impl AnalyzeDb {
     /// passes it here (any DuckDB size string, e.g. "8GiB") so an oversized
     /// aggregation fails that one query instead of killing the process.
     ///
+    /// The cap is applied twice on purpose. On the `Config` before the open,
+    /// where DuckDB validates the size string (a malformed cap fails the open
+    /// loudly) and records the value `current_setting` echoes — but DuckDB
+    /// 1.5.4, the version `libduckdb-sys` pins, never hands a pre-open value
+    /// to its buffer manager: `DatabaseInstance::Initialize` builds the
+    /// buffer manager from the temp directory alone and only the setting's
+    /// post-open path calls `BufferManager::SetSwapLimit`
+    /// (`src/main/settings/custom_settings.cpp`, `src/main/database.cpp`), so
+    /// a Config-only cap leaves the 90 %-of-free-space default in force while
+    /// reading back as the requested bound. Then with a `SET` on the opened
+    /// connection, which does reach the buffer manager and takes effect at
+    /// the first spill. Because the readback cannot tell the two apart, the
+    /// bound is proven by behaviour (`test_open_with_spill_cap_applies_bound`
+    /// makes a query spill past it), never by `current_setting`.
+    ///
     /// On its own this is a structural default, not a jail: unlike
     /// `temp_directory`, DuckDB does not lock this setting when external
     /// access is disabled, so in-session SQL can still raise it (covered by a
@@ -405,12 +420,12 @@ impl AnalyzeDb {
             None => config.with("temp_directory", "")?,
         };
         if let Some(cap) = spill_cap {
-            // Set on the Config, like temp_directory above, so the bound is
-            // in force from the first query. DuckDB validates the size string
-            // at open, so a malformed cap fails loudly here rather than being
-            // silently ignored.
+            // Set on the Config, like temp_directory above: DuckDB validates
+            // the size string at open, so a malformed cap fails loudly here
+            // rather than being silently ignored, and `current_setting`
+            // reports this value. It does NOT bound anything on its own (see
+            // the doc-comment): the enforcing SET follows the open below.
             config = config.with("max_temp_directory_size", cap)?;
-            eprintln!("duckdb: max_temp_directory_size={cap}");
         }
         if let Some(m) = mem_limit_mib {
             config = config.max_memory(&format!("{m}MiB"))?;
@@ -432,6 +447,20 @@ impl AnalyzeDb {
         }
 
         let conn = Connection::open_with_flags(path, config)?;
+
+        if let Some(cap) = spill_cap {
+            // The enforcing half: on a live database the setting's global
+            // setter calls `BufferManager::SetSwapLimit`, which the buffer
+            // manager carries until its temp directory is created and
+            // applies at the first spill. This runs before any caller's
+            // `lock_configuration`, which is what freezes it afterwards. The
+            // string was validated by the Config above; the single quotes
+            // are doubled anyway so a size string can never end the literal.
+            let literal = cap.replace('\'', "''");
+            conn.execute_batch(&format!("SET max_temp_directory_size = '{literal}'"))
+                .with_context(|| format!("failed to apply max_temp_directory_size={cap}"))?;
+            eprintln!("duckdb: max_temp_directory_size={cap}");
+        }
 
         Ok(Self {
             conn,
@@ -1167,6 +1196,16 @@ mod tests {
         }
     }
 
+    /// The spill bound is proven by BEHAVIOUR, never by `current_setting`:
+    /// DuckDB 1.5.4 echoes a Config-time `max_temp_directory_size` from the
+    /// config while its buffer manager can be enforcing the default (90 % of
+    /// the filesystem's free space), so a readback assertion held for as long
+    /// as the cap was dead. A hash aggregate with millions of groups must go
+    /// out of core under a small memory limit — a `LIMIT`-wrapped `ORDER BY`
+    /// would become a top-N heap and never spill — and under a 1MiB cap the
+    /// spill is refused by DuckDB's out-of-memory class naming the setting;
+    /// the same aggregate under a 10GiB cap completes, which pins the refusal
+    /// on the spill bound rather than on the memory limit.
     #[test]
     fn test_open_with_spill_cap_applies_bound() {
         let dir = tempfile::tempdir().unwrap();
@@ -1176,29 +1215,49 @@ mod tests {
             conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
                 .unwrap();
         }
+        // 12M distinct groups: hundreds of MB of hash table, far past 1MiB of
+        // spill under a 128MiB memory limit, comfortably under 10GiB.
+        const SPILLING_AGGREGATE: &str = "SELECT count(*) FROM \
+             (SELECT hash(v) AS h, count(*) AS c FROM range(12000000) t(v) GROUP BY h) \
+             WHERE c = 1";
+        // The memory limit is not under test: large enough that the
+        // aggregate spills instead of failing on memory, small enough that it
+        // must spill.
+        const SPILLING_MEMORY_LIMIT: &str = "SET memory_limit = '128MiB'";
 
-        let read_setting = |db: &AnalyzeDb| -> String {
-            let result = db
-                .query("SELECT current_setting('max_temp_directory_size')")
-                .unwrap();
-            result.rows[0][0].as_str().unwrap().to_string()
-        };
-
-        // Capped open reports the requested bound.
-        let capped = AnalyzeDb::open_with_spill_cap(&db_path, true, Some("100MiB")).unwrap();
-        let capped_value = read_setting(&capped);
+        let capped = AnalyzeDb::open_with_spill_cap(&db_path, true, Some("1MiB")).unwrap();
+        capped.conn.execute_batch(SPILLING_MEMORY_LIMIT).unwrap();
+        // The raw engine error names the bound that refused the spill.
+        let raw = capped
+            .conn
+            .execute_batch(SPILLING_AGGREGATE)
+            .expect_err("a spill past a 1MiB cap completed: the cap is not in force")
+            .to_string();
         assert!(
-            capped_value.starts_with("100") && capped_value.contains("MiB"),
-            "expected the 100MiB cap to be in force, got '{capped_value}'"
+            raw.contains("max_temp_directory_size"),
+            "the spill was refused by something other than the spill bound: {raw}"
+        );
+        // Through the query path the tool sees the fixed memory-bound message.
+        let err = capped.query(SPILLING_AGGREGATE).unwrap_err().to_string();
+        assert!(
+            err.starts_with("query exceeded the DuckDB memory bound"),
+            "unexpected error: {err}"
         );
 
-        // Uncapped open differs — proves the assertion above is not vacuous.
-        let uncapped = AnalyzeDb::open(&db_path, true).unwrap();
-        assert_ne!(
-            read_setting(&uncapped),
-            capped_value,
-            "uncapped open unexpectedly reports the capped value"
-        );
+        // Control: the same aggregate under a cap it never reaches completes,
+        // so the refusal above is the spill bound, not the memory limit.
+        let roomy = AnalyzeDb::open_with_spill_cap(&db_path, true, Some("10GiB")).unwrap();
+        roomy.conn.execute_batch(SPILLING_MEMORY_LIMIT).unwrap();
+        let result = roomy
+            .query(SPILLING_AGGREGATE)
+            .expect("the aggregate under a 10GiB cap");
+        assert_eq!(result.row_count, 1);
+
+        // Secondary: the readback still reports the requested value.
+        let v = capped
+            .query("SELECT current_setting('max_temp_directory_size')")
+            .unwrap();
+        assert_eq!(v.rows[0][0].as_str().unwrap(), "1.0 MiB");
     }
 
     #[test]
