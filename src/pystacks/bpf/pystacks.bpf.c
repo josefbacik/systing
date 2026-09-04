@@ -164,11 +164,29 @@ struct sample_state_t {
   uint64_t cur_cpu;
   void* frame_ptr;
   bool sync_use_shadow_frame;
+  /* The frame just visited by pystacks_get_frame_data was a CPython 3.12+
+   * entry ("shim") frame: nothing was read from it and no symbol is to be
+   * emitted for it. */
+  bool frame_skipped;
   char long_file_name[BPF_LIB_FILE_NAME_TRYGET];
   struct pystacks_symbol sym;
   struct pystacks_line_table linetable;
   int32_t lasti;
 };
+
+/*
+ * _PyInterpreterFrame.owner values whose frame carries no code object.
+ * CPython 3.12+ pushes an entry ("shim") frame onto the frame chain for every
+ * entry into _PyEval_EvalFrameDefault, i.e. at every C -> Python re-entry
+ * (PyObject_Call from C, a bound method's __call__, functools.partial, ...):
+ * owner = FRAME_OWNED_BY_CSTACK (3) and f_executable = None. 3.14 renames
+ * that value FRAME_OWNED_BY_INTERPRETER (3) and adds FRAME_OWNED_BY_CSTACK
+ * (4); both are non-Python frames. The values below it (THREAD 0,
+ * GENERATOR 1, FRAME_OBJECT 2) are real frames. Reading the (None) code
+ * object of a shim frame yields a "[Frame Error]" placeholder and spends a
+ * slot of the stack budget, so such frames are skipped instead.
+ */
+#define PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER 3
 
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -678,10 +696,33 @@ __noinline bool pystacks_get_frame_data(int pid) {
     return false;
   }
 
-  void* code_ptr =
-      get_code_ptr(state->frame_ptr, offsets, use_shadow_frame, task);
+  /*
+   * CPython 3.12+ interleaves entry ("shim") frames with the real ones on
+   * the `previous` chain; they carry no code object (see
+   * PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER). Read the frame's owner first
+   * and step over such a frame without reading names for it.
+   */
+  state->frame_skipped = false;
+  if (!use_shadow_frame && offsets->PyVersion_major >= 3 &&
+      offsets->PyVersion_minor >= 12 &&
+      offsets->PyFrameObject_owner != BPF_LIB_DEFAULT_FIELD_OFFSET) {
+    uint8_t owner = 0;
+    if (bpf_probe_read_user_task(
+            &owner,
+            sizeof(owner),
+            state->frame_ptr + offsets->PyFrameObject_owner,
+            task) == 0 &&
+        owner >= PYSTACKS_FIRST_NON_PYTHON_FRAME_OWNER) {
+      state->frame_skipped = true;
+    }
+  }
 
-  get_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task);
+  if (!state->frame_skipped) {
+    void* code_ptr =
+        get_code_ptr(state->frame_ptr, offsets, use_shadow_frame, task);
+
+    get_names(state, state->frame_ptr, code_ptr, use_shadow_frame, task);
+  }
 
   int ret_code = 0;
 
@@ -869,7 +910,9 @@ __hidden int walk_and_load_py_stack(
   for (; i < stack_max_len && i < BPF_LIB_MAX_STACK_DEPTH &&
        (last_frame_read = pystacks_get_frame_data(pid));
        ++i) {
-    add_symbol_to_buffer(py_msg);
+    if (!state->frame_skipped) {
+      add_symbol_to_buffer(py_msg);
+    }
   }
 
   set_py_stack_status(
