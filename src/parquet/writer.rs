@@ -24,6 +24,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 
 use crate::network_recorder::{drop_reason_str, format_tcp_flags, tcp_state_name};
+use crate::parquet::lane::{encode_workers, EncodeLane};
 use crate::parquet::ParquetSink;
 use crate::record::RecordCollector;
 use crate::trace::{
@@ -165,7 +166,9 @@ pub struct StreamingParquetWriter {
     network_interface_writer: Option<TableWriter>,
     socket_connection_writer: Option<TableWriter>,
     network_syscall_writer: Option<TableWriter>,
-    network_packet_writer: Option<TableWriter>,
+    /// The network_packet table encodes off the flushing thread: see
+    /// [`EncodeLane`]. Started on the first flush, finished with the others.
+    network_packet_lane: Option<EncodeLane<NetworkPacketRecord>>,
     network_socket_writer: Option<TableWriter>,
     network_poll_writer: Option<TableWriter>,
     network_dns_writer: Option<TableWriter>,
@@ -288,7 +291,7 @@ impl StreamingParquetWriter {
             network_interface_writer: None,
             socket_connection_writer: None,
             network_syscall_writer: None,
-            network_packet_writer: None,
+            network_packet_lane: None,
             network_socket_writer: None,
             network_poll_writer: None,
             network_dns_writer: None,
@@ -864,25 +867,38 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
-    // Flush network_packets buffer
+    // Flush network_packets buffer: the rows go whole to the table's encode
+    // lane (started here on the first flush) and this thread returns with a
+    // fresh buffer; the arrow build and the parquet encode run on the lane.
     fn flush_network_packets(&mut self) -> Result<()> {
         if self.network_packets.is_empty() {
             return Ok(());
         }
 
-        let schema = trace::network_packet_schema();
-        let writer = Self::get_or_create_writer(
-            &mut self.network_packet_writer,
-            &self.sink,
-            "network_packet",
-            schema.clone(),
-            &self.writer_props,
-        )?;
-
-        let batch = build_network_packet_batch(&self.network_packets, &schema)?;
-        writer.write(&batch)?;
-        self.network_packets.clear();
-        Ok(())
+        if self.network_packet_lane.is_none() {
+            let out = self
+                .sink
+                .open("network_packet")
+                .context("Failed to open parquet sink for table network_packet")?;
+            let lane = EncodeLane::start(
+                "network_packet",
+                out,
+                trace::network_packet_schema(),
+                self.writer_props.clone(),
+                build_network_packet_batch,
+                encode_workers(),
+                self.writer_props.max_row_group_size(),
+            )?;
+            self.network_packet_lane = Some(lane);
+        }
+        let rows = std::mem::replace(
+            &mut self.network_packets,
+            Vec::with_capacity(self.batch_size),
+        );
+        self.network_packet_lane
+            .as_mut()
+            .expect("lane started above")
+            .push(rows)
     }
 
     // Flush network_sockets buffer
@@ -1193,7 +1209,13 @@ impl StreamingParquetWriter {
         close_writer!(self.network_interface_writer);
         close_writer!(self.socket_connection_writer);
         close_writer!(self.network_syscall_writer);
-        close_writer!(self.network_packet_writer);
+        if let Some(lane) = self.network_packet_lane.take() {
+            if let Err(e) = lane.finish() {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
         close_writer!(self.network_socket_writer);
         close_writer!(self.network_poll_writer);
         close_writer!(self.network_dns_writer);
@@ -1243,7 +1265,7 @@ impl Drop for StreamingParquetWriter {
             || self.network_interface_writer.is_some()
             || self.socket_connection_writer.is_some()
             || self.network_syscall_writer.is_some()
-            || self.network_packet_writer.is_some()
+            || self.network_packet_lane.is_some()
             || self.network_socket_writer.is_some()
             || self.network_poll_writer.is_some()
             || self.network_dns_writer.is_some()
@@ -1482,6 +1504,16 @@ impl RecordCollector for StreamingParquetWriter {
         Self::reserve_if_empty(&mut self.network_packets, self.batch_size);
         self.network_packets.push(record);
         self.total_records += 1;
+        if Self::should_flush(&self.network_packets, self.batch_size) {
+            self.flush_network_packets()?;
+        }
+        Ok(())
+    }
+
+    fn add_network_packet_batch(&mut self, records: Vec<NetworkPacketRecord>) -> Result<()> {
+        Self::reserve_if_empty(&mut self.network_packets, self.batch_size);
+        self.total_records += records.len();
+        self.network_packets.extend(records);
         if Self::should_flush(&self.network_packets, self.batch_size) {
             self.flush_network_packets()?;
         }
@@ -3688,5 +3720,152 @@ mod tests {
         assert!((samples[1].1 - 2_400.0).abs() < f64::EPSILON);
         assert_eq!(samples[2].0, 2);
         assert!((samples[2].1 - 2_500.0).abs() < f64::EPSILON);
+    }
+}
+
+/// Encode-side benchmark for the network_packet table: what one 200K-row flush
+/// costs on the thread that runs it, split into the arrow batch build and the
+/// parquet write (encode + compression). Ignored by default; run in release
+/// mode with `--nocapture`:
+///
+/// ```text
+/// cargo test --release --lib packet_encode_bench -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod packet_encode_bench {
+    use super::*;
+    use std::time::Instant;
+    use tempfile::TempDir;
+
+    /// The record shape `NetworkRecorder::stream_packet_event` builds for a
+    /// TX data-path event (the send-buffer, RTT and TSQ fields set, the
+    /// diagnostic fields None), on a 4096-socket pool.
+    fn synth_record(i: i64) -> NetworkPacketRecord {
+        let socket = 1 + (i / 4) % 4096;
+        NetworkPacketRecord {
+            id: i + 1,
+            ts: 1_000_000_000 + i * 700,
+            socket_id: socket,
+            event_type: match i % 4 {
+                0 => "TCP packet_enqueue",
+                1 => "qdisc_enqueue",
+                2 => "qdisc_dequeue",
+                _ => "TCP packet_send",
+            },
+            seq: Some((i / 4) * 1448),
+            length: 1448,
+            tcp_flags: Some(0x10),
+            sndbuf_used: Some(120_000),
+            sndbuf_limit: Some(4_194_304),
+            sndbuf_fill_pct: Some(2),
+            is_retransmit: false,
+            retransmit_count: None,
+            rto_ms: None,
+            srtt_ms: Some(0),
+            rttvar_us: Some(40),
+            backoff: None,
+            is_zero_window_probe: false,
+            is_zero_window_ack: false,
+            probe_count: None,
+            snd_wnd: Some(65_535),
+            rcv_wnd: Some(65_535),
+            rcv_buf_used: None,
+            rcv_buf_limit: None,
+            window_clamp: None,
+            rcv_wscale: None,
+            icsk_pending: None,
+            icsk_timeout: None,
+            drop_reason: None,
+            drop_location: None,
+            qlen: None,
+            qlen_limit: None,
+            sk_wmem_alloc: Some(3_000),
+            tsq_limit: Some(1_048_576),
+            txq_state: None,
+            qdisc_state: None,
+            qdisc_backlog: Some(12),
+            skb_addr: Some(0x7fff_0000_0000 + i),
+            qdisc_latency_us: Some(7),
+            old_state: None,
+            new_state: None,
+        }
+    }
+
+    fn write_with(
+        props: WriterProperties,
+        batches: &[RecordBatch],
+        schema: &Arc<Schema>,
+        label: &str,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let file = std::fs::File::create(dir.path().join("network_packet.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let start = Instant::now();
+        for b in batches {
+            writer.write(b).unwrap();
+        }
+        let wrote = start.elapsed();
+        let start = Instant::now();
+        writer.close().unwrap();
+        let closed = start.elapsed();
+        let bytes = std::fs::metadata(dir.path().join("network_packet.parquet"))
+            .unwrap()
+            .len();
+        eprintln!(
+            "BENCH write[{label}]: {rows} rows in {:.1} ms write + {:.1} ms close = {:.0} ns/row, {:.1} MB on disk",
+            wrote.as_secs_f64() * 1e3,
+            closed.as_secs_f64() * 1e3,
+            (wrote + closed).as_nanos() as f64 / rows as f64,
+            bytes as f64 / 1e6
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn flush_split() {
+        const ROWS: i64 = 200_000;
+        const BATCHES: usize = 5;
+        let records: Vec<NetworkPacketRecord> = (0..ROWS).map(synth_record).collect();
+        let schema = trace::network_packet_schema();
+
+        // The arrow batch build, on the flushing thread today.
+        let start = Instant::now();
+        let batch = build_network_packet_batch(&records, &schema).unwrap();
+        let built = start.elapsed();
+        eprintln!(
+            "BENCH build_network_packet_batch: {ROWS} rows in {:.1} ms = {:.0} ns/row",
+            built.as_secs_f64() * 1e3,
+            built.as_nanos() as f64 / ROWS as f64
+        );
+
+        let batches: Vec<RecordBatch> = (0..BATCHES).map(|_| batch.clone()).collect();
+
+        // The production properties (ZSTD-3, DELTA_BINARY_PACKED on the
+        // integer columns, 1M-row row groups).
+        write_with(
+            build_writer_properties(),
+            &batches,
+            &schema,
+            "production ZSTD-3",
+        );
+        // The same encodings at ZSTD-1.
+        let zstd1 = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(1).unwrap()))
+            .set_max_row_group_size(1_000_000)
+            .build();
+        write_with(zstd1, &batches, &schema, "ZSTD-1 default encodings");
+        // LZ4_RAW: the codec floor.
+        let lz4 = WriterProperties::builder()
+            .set_compression(Compression::LZ4_RAW)
+            .set_max_row_group_size(1_000_000)
+            .build();
+        write_with(lz4, &batches, &schema, "LZ4_RAW default encodings");
+        // No compression: the encode alone.
+        let none = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_max_row_group_size(1_000_000)
+            .build();
+        write_with(none, &batches, &schema, "UNCOMPRESSED default encodings");
     }
 }
