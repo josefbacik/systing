@@ -443,6 +443,49 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 21 (systing 1.18.0) — 2026-09-04
+
+The network-packets recorder learns to sample, and says so. On a big host
+the packets tier — one `packet_event` per skb at every transmit and
+delivery hook — loses most of its events to the userspace consumer, not
+the ring: a 192-vCPU host running 90 s of `--only-recorder network-packets
+--ringbuf-size-mib 256` (already a 2 GiB packet family, 64 rings of 32 MiB)
+printed `Missed packet events: 81,428,216` — about 1 M events/s — with
+`Missed network events: 0` on the same run, and the `.duckdb` packet table
+was an unlabelled sample. A ring step only delays the overrun by seconds
+(2 GiB of ~130-byte events is ~16 s of a 1 M/s deficit); the cure is to
+record fewer packets, and to say how many. The tables keep their columns;
+the new column is nullable.
+
+### Added columns
+- `sysinfo`: added `network_packet_sample_rate BIGINT` — the
+  `--packet-sample-rate N` the network-packets recorder ran with: 1 = every
+  packet (the default, and the behaviour through 1.17); N > 1 = 1 in N
+  packets of the data-path event types kept — `PACKET_ENQUEUE`, `PACKET_SEND`,
+  `PACKET_RCV_ESTABLISHED`, `PACKET_QUEUE_RCV`, `PACKET_BUFFER_QUEUE`, the
+  UDP `send` / `receive` / `enqueue` triple and the qdisc `enqueue` /
+  `dequeue` pair. The keep decision is made once per PACKET, from the
+  socket and the packet's own key (the TCP sequence number; the packet
+  buffer for UDP), so every stage of a kept packet is kept and the per-stage
+  latencies (enqueue → qdisc → send, receive → queue → buffer) stay pairable
+  under sampling; scale the packet tables' counts and bytes by N. The
+  diagnostic event types — zero-window probes and acks, RTO timeouts, skb
+  drops, CPU backlog drops, memory pressure, TX queue stop / wake, TCP state
+  changes — are never sampled, so their counts stay exact at any N. NULL
+  when the packets recorder did not run, and in traces from systing < 1.18.
+
+### Behaviour change (no schema effect)
+- The exit summary gains one line when the packets recorder dropped
+  anything: `WARNING: packet events: <recorded> recorded, <missed> missed
+  (<pct>% of the total) — the packet tables are a sample; on this host use
+  --packet-sample-rate <N>` (stderr), beside the `Missed packet events`
+  counter the summary already printed and the `Missed packet events`
+  counter track the trace already carried (polled once a second, the
+  settled total at the end). `<N>` is the rate that would have kept the
+  consumer up with the traffic, on top of any rate already in force.
+- A `network recorder: packet sample rate 1/N` stdout line at start when
+  N > 1.
+
 ## Schema Version 20 (systing 1.17.0) — 2026-08-28
 
 Two `sysinfo` columns record the FORM of the recorders' kernel-function

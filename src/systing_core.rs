@@ -1450,6 +1450,12 @@ pub struct Config {
     /// Enable network packet-level probes (sendmsg, recvmsg, transmit, qdisc, drops).
     /// Automatically enabled when "network" is enabled via `--add-recorder`.
     pub network_packets: bool,
+    /// With `network_packets`, keep 1 in N packets of the data-path event
+    /// types (0 or 1 = every packet). The BPF side hashes the socket and the
+    /// packet's own key (the TCP seq, the packet buffer for UDP) so every
+    /// stage of a kept packet is kept; the diagnostic event types are never
+    /// sampled. Recorded as `sysinfo.network_packet_sample_rate`.
+    pub packet_sample_rate: u32,
     /// Enable network syscall-level probes: per-syscall send/recv accounting
     /// plus retransmit/drop/stall diagnostics, without the per-packet probes.
     /// Never enabled implicitly; name it.
@@ -1539,6 +1545,7 @@ impl Default for Config {
             memory_alloc_symbol_prefix: None,
             network: false,
             network_packets: false,
+            packet_sample_rate: 1,
             network_syscalls: false,
             network_tw_force_fallback: false,
             resolve_addresses: false,
@@ -3420,6 +3427,13 @@ fn configure_bpf_skeleton(
         }
         if opts.memory_alloc {
             rodata.tool_config.memory_alloc_sample_rate = opts.memory_alloc_sample_rate;
+        }
+        if opts.network_packets {
+            // Rodata: with the knob at its default (1) the verifier prunes
+            // the hash arm of every data-path packet hook, so the default
+            // configuration costs one rodata compare per packet event and
+            // records every packet as before.
+            rodata.tool_config.packet_sample_rate = opts.packet_sample_rate;
         }
 
         // Rings per family and the wakeup threshold (half a ring, so
@@ -5787,8 +5801,18 @@ pub fn systing(
                 "network recorder: TIME_WAIT leg {}",
                 network_legs.tw_leg_value()
             );
+            // The packets recorder's sampling rate, so a consumer can scale
+            // the packet tables (sysinfo.network_packet_sample_rate) and a
+            // log reader can tell a sampled capture from a whole one.
+            let packet_sample_rate = opts
+                .network_packets
+                .then_some(opts.packet_sample_rate.max(1));
+            if let Some(rate) = packet_sample_rate.filter(|rate| *rate > 1) {
+                println!("network recorder: packet sample rate 1/{rate}");
+            }
             let _ = recorder.network_recorder_config.set(NetworkRecorderConfig {
                 tw_leg: network_legs.tw_leg_value(),
+                packet_sample_rate,
             });
         }
 
@@ -6193,6 +6217,41 @@ pub fn systing(
             &mut skel,
             &traced_child,
         )?;
+
+        // The packets tier's honesty line: the exit summary above prints
+        // the ring's `Missed packet events` counter, but nothing said what
+        // share of the traffic that was. On a big host the userspace
+        // consumer, not the ring, is the ceiling (a 192-vCPU host misses
+        // ~1 M packet events/s at a 2 GiB family), so the requester's packet
+        // tables are a sample — say so, with the rate that would have kept
+        // up, beside the counter track the trace already carries.
+        if opts.network_packets {
+            let recorded = recorder
+                .network_recorder
+                .lock()
+                .unwrap()
+                .packet_events_recorded();
+            let missed = dump_missed_events(&skel.maps.missed_events, 5);
+            if missed > 0 {
+                let total = recorded.saturating_add(missed);
+                let pct = 100.0 * missed as f64 / total.max(1) as f64;
+                let rate = opts.packet_sample_rate.max(1);
+                let on_top = if rate > 1 {
+                    format!(", on top of the 1/{rate} sampling")
+                } else {
+                    String::new()
+                };
+                let advice = if recorded > 0 {
+                    let suggested = u64::from(rate).saturating_mul(total.div_ceil(recorded));
+                    format!("on this host use --packet-sample-rate {suggested}")
+                } else {
+                    "nothing was recorded; use a much larger --packet-sample-rate".to_string()
+                };
+                eprintln!(
+                    "WARNING: packet events: {recorded} recorded, {missed} missed ({pct:.1}% of the total{on_top}) — the packet tables are a sample; {advice} (sysinfo.network_packet_sample_rate = {rate})"
+                );
+            }
+        }
 
         // The memory recorder's end-of-capture rows, while skel is still
         // alive: the IOMMU run-size histogram the tracepoints counted into,

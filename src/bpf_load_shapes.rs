@@ -287,6 +287,14 @@ pub fn shape_table() -> Vec<LoadShape> {
         c.network = true;
         c.network_packets = true;
     });
+    // The per-packet sampling arm of the data-path packet hooks is dead
+    // code at the default rate (rodata, pruned by the verifier); this row
+    // is the load that walks it.
+    add("network-packets-sampled", &|c| {
+        c.network = true;
+        c.network_packets = true;
+        c.packet_sample_rate = 4;
+    });
     add("network-syscalls", &|c| {
         c.network = true;
         c.network_syscalls = true;
@@ -588,6 +596,9 @@ R0 unbounded memory access\n\
             .iter()
             .any(|s| s.config.memory_vfio && s.config.memory_thp_sample_rate > 0));
         assert!(shapes.iter().any(|s| s.config.network_packets));
+        assert!(shapes
+            .iter()
+            .any(|s| s.config.network_packets && s.config.packet_sample_rate > 1));
         assert!(shapes.iter().any(|s| s.config.memory_alloc));
         assert!(shapes
             .iter()

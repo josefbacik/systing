@@ -615,6 +615,15 @@ pub struct SysInfoRecord {
     /// the network recorder was off, and in traces from systing < 1.17
     /// (which attached the kprobes, always).
     pub network_tw_leg: Option<String>,
+    /// The `--packet-sample-rate` the network-packets recorder ran with:
+    /// 1 = every packet; N > 1 = 1 in N packets of the data-path event
+    /// types (enqueue / send / receive / queue / buffer, the UDP triple, the
+    /// qdisc pair) kept, chosen per packet so a kept packet's stages stay
+    /// pairable — scale packet and byte counts by N; the diagnostic types
+    /// (zero-window, RTO, drops, backlog, memory pressure, TX queue
+    /// stop/wake, state changes) are never sampled. `None` when the packets
+    /// recorder was off, and in traces from systing < 1.18.
+    pub network_packet_sample_rate: Option<i64>,
 }
 
 /// Per-CPU static frequency limits from sysfs cpufreq, in kHz.
