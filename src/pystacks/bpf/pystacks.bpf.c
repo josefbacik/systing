@@ -907,7 +907,15 @@ __hidden int walk_and_load_py_stack(
   bool last_frame_read = false;
   int pid = task ? BPF_CORE_READ(task, pid) : 0;
 
-  for (; i < stack_max_len && i < BPF_LIB_MAX_STACK_DEPTH &&
+  /*
+   * Bound the walk on emitted symbols rather than on visited frames, so a
+   * stack of N Python frames interleaved with shim frames still yields up
+   * to stack_max_len symbols. The visited-frame bound stays for the
+   * verifier; a shim frame never follows another shim frame on the chain
+   * (each hosts at least one real frame above it), so at most every other
+   * visited frame is skipped and twice the symbol budget covers the walk.
+   */
+  for (; i < 2 * BPF_LIB_MAX_STACK_DEPTH && py_msg->stack_len < stack_max_len &&
        (last_frame_read = pystacks_get_frame_data(pid));
        ++i) {
     if (!state->frame_skipped) {
@@ -919,7 +927,7 @@ __hidden int walk_and_load_py_stack(
       &py_msg->stack_status,
       (long)state->frame_ptr,
       last_frame_read,
-      (i == stack_max_len - 1) /* is_final_iteration */);
+      (py_msg->stack_len == stack_max_len - 1) /* is_final_iteration */);
 
   return py_msg->header.len;
 }
