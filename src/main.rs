@@ -172,6 +172,9 @@ struct Command {
     // Network packet-level probes (set by recorder management, not a CLI flag)
     #[arg(skip)]
     network_packets: bool,
+    /// With the network-packets recorder, keep 1 in N packets of the data-path event types (0 or 1 = every packet). The decision is per PACKET — the socket and the TCP sequence number (the packet buffer for UDP) — so every stage of a kept packet (enqueue, qdisc, send; receive, queue, buffer) is kept together and the per-stage latencies stay pairable; packet and byte counts scale by N. The diagnostic events (zero-window probes and acks, RTO timeouts, drops, backlog drops, memory pressure, TX queue stop/wake, state changes) are never sampled. On a big host the packets tier otherwise loses most events to the userspace consumer (`Missed packet events` in the exit summary and the trace's counter track); the rate ran is `sysinfo.network_packet_sample_rate`.
+    #[arg(long, default_value = "1")]
+    packet_sample_rate: u32,
     // Network syscall-level probes (set by recorder management, not a CLI flag)
     #[arg(skip)]
     network_syscalls: bool,
@@ -302,6 +305,7 @@ impl From<Command> for Config {
             memory_alloc_symbol_prefix: cmd.memory_alloc_symbol_prefix,
             network: cmd.network,
             network_packets: cmd.network_packets,
+            packet_sample_rate: cmd.packet_sample_rate,
             network_syscalls: cmd.network_syscalls,
             // Testing-only; never a CLI flag (the agent's argv cannot reach it).
             network_tw_force_fallback: false,
@@ -655,6 +659,30 @@ mod tests {
             "packet probes require the base network recorder"
         );
         assert!(opts.network_packets);
+    }
+
+    #[test]
+    fn packet_sample_rate_defaults_to_every_packet() {
+        // The knob is inert by absence: every packet is kept, and the
+        // sysinfo column will read 1 when the packets recorder runs.
+        let opts = opts_from(&["--only-recorder", "network-packets"]);
+        assert_eq!(opts.packet_sample_rate, 1);
+        let opts = opts_from(&[
+            "--only-recorder",
+            "network-packets",
+            "--packet-sample-rate",
+            "8",
+        ]);
+        assert_eq!(opts.packet_sample_rate, 8);
+        // 0 is accepted and means the same as 1 (the BPF side treats
+        // rate <= 1 as "keep everything").
+        let opts = opts_from(&[
+            "--only-recorder",
+            "network-packets",
+            "--packet-sample-rate",
+            "0",
+        ]);
+        assert_eq!(opts.packet_sample_rate, 0);
     }
 
     #[test]

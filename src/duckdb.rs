@@ -133,7 +133,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 20;
+pub const SCHEMA_VERSION: u32 = 21;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -734,7 +734,17 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             -- — with the leg off the trace carries no TIME_WAIT transitions.
             -- NULL when the network recorder did not run, and in traces
             -- from systing < 1.17 (always the kprobes there).
-            network_tw_leg VARCHAR
+            network_tw_leg VARCHAR,
+            -- The --packet-sample-rate the network-packets recorder ran
+            -- with: 1 = every packet; N > 1 = 1 in N packets of the
+            -- data-path event types kept (enqueue / send / receive / queue /
+            -- buffer, the UDP triple, the qdisc pair), chosen per packet so a
+            -- kept packet's stages stay pairable — scale the packet tables'
+            -- counts and bytes by N; the diagnostic event types
+            -- (zero-window, RTO, drops, backlog, memory pressure, TX queue
+            -- stop/wake, state changes) are never sampled. NULL when the
+            -- packets recorder did not run, and in traces from systing < 1.18.
+            network_packet_sample_rate BIGINT
         );
 
         -- Per-CPU static frequency limits (kHz) from sysfs cpufreq. Empty on

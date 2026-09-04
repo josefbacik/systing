@@ -144,6 +144,13 @@ pub struct NetworkRecorderConfig {
     /// the capture has no TIME_WAIT rows and every TIME_WAIT entry reads as
     /// a CLOSE.
     pub tw_leg: String,
+    /// The `--packet-sample-rate` the packets recorder ran with
+    /// (`sysinfo.network_packet_sample_rate`): `Some(n)` when the
+    /// network-packets recorder ran, `n` = 1 for every packet, `n` > 1 for
+    /// 1 in `n` packets of the data-path event types (scale packet and byte
+    /// counts by `n`; the diagnostic types are never sampled); `None` when
+    /// the packets recorder did not run.
+    pub packet_sample_rate: Option<u32>,
 }
 
 /// Static per-CPU frequency limits from sysfs cpufreq, in kHz (sysfs's native
@@ -1658,6 +1665,9 @@ impl SessionRecorder {
                 memory_anon_huge_walk: memory_end.and_then(|m| m.anon_huge_walk.clone()),
                 memory_syscall_leg: memory.map(|m| m.syscall_leg.clone()),
                 network_tw_leg: network.map(|n| n.tw_leg.clone()),
+                network_packet_sample_rate: network
+                    .and_then(|n| n.packet_sample_rate)
+                    .map(i64::from),
             })?;
         }
 

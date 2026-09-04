@@ -283,6 +283,14 @@ pub struct TraceSystemInfo {
     /// recorder was off or for traces from systing < 1.17.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_tw_leg: Option<String>,
+    /// The `--packet-sample-rate` the network-packets recorder ran with:
+    /// 1 = every packet; N > 1 = 1 in N packets of the data-path event types
+    /// kept, chosen per packet so a kept packet's stages stay pairable —
+    /// scale the packet tables' counts and bytes by N (the diagnostic event
+    /// types are never sampled); `None` when the packets recorder was off
+    /// or for traces from systing < 1.18.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_packet_sample_rate: Option<i64>,
 }
 
 /// Trace metadata.
@@ -889,7 +897,7 @@ impl AnalyzeDb {
             }
         };
         let sql = format!(
-            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
+            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM sysinfo ORDER BY 1",
             col("trace_id"),
             col("release"),
             col("machine"),
@@ -910,6 +918,7 @@ impl AnalyzeDb {
             col("memory_anon_huge_walk"),
             col("memory_syscall_leg"),
             col("network_tw_leg"),
+            col("network_packet_sample_rate"),
         );
 
         let Ok(mut stmt) = self.conn.prepare(&sql) else {
@@ -937,6 +946,7 @@ impl AnalyzeDb {
                 memory_anon_huge_walk: row.get(17)?,
                 memory_syscall_leg: row.get(18)?,
                 network_tw_leg: row.get(19)?,
+                network_packet_sample_rate: row.get(20)?,
             })
         }) else {
             return Vec::new();
@@ -1354,11 +1364,12 @@ mod tests {
                  memory_fault_sample_rate, memory_map_sample_rate, \
                  memory_alloc_sample_rate, memory_vfio_leg, memory_thp_leg, \
                  memory_thp_sample_rate, memory_iommu_overflow, \
-                 memory_anon_huge_walk, memory_syscall_leg, network_tw_leg) \
+                 memory_anon_huge_walk, memory_syscall_leg, network_tw_leg, \
+                 network_packet_sample_rate) \
                  VALUES ('t1', 'Linux', '6.12.0', '#1 SMP', 'x86_64', \
                  NULL, 'kvm', 'Amazon EC2', 'm7i.16xlarge', 'cpu-clock', 1000000, \
                  'tracepoint', 97, 1, NULL, 'on', NULL, NULL, 0, NULL, 'fentry', \
-                 'kprobe:nobtf')",
+                 'kprobe:nobtf', 8)",
             )
             .unwrap();
         }
@@ -1398,6 +1409,7 @@ mod tests {
         assert_eq!(sys.memory_anon_huge_walk, None);
         assert_eq!(sys.memory_syscall_leg.as_deref(), Some("fentry"));
         assert_eq!(sys.network_tw_leg.as_deref(), Some("kprobe:nobtf"));
+        assert_eq!(sys.network_packet_sample_rate, Some(8));
     }
 
     #[test]
@@ -1427,6 +1439,7 @@ mod tests {
                  ALTER TABLE sysinfo DROP COLUMN memory_thp_sample_rate; \
                  ALTER TABLE sysinfo DROP COLUMN memory_syscall_leg; \
                  ALTER TABLE sysinfo DROP COLUMN network_tw_leg; \
+                 ALTER TABLE sysinfo DROP COLUMN network_packet_sample_rate; \
                  INSERT INTO sysinfo (trace_id, sysname, release, version, machine) \
                  VALUES ('t1', 'Linux', '5.10.0', '#1 SMP', 'aarch64')",
             )
@@ -1455,6 +1468,7 @@ mod tests {
         assert_eq!(sys.memory_thp_sample_rate, None);
         assert_eq!(sys.memory_syscall_leg, None);
         assert_eq!(sys.network_tw_leg, None);
+        assert_eq!(sys.network_packet_sample_rate, None);
     }
 
     #[test]
