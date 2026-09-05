@@ -91,9 +91,10 @@ fn test_memory_recorder_e2e() {
 
     // --- Check: sysinfo says which form of the mmap/munmap/brk hooks ran ---
     // The default form is the classic tracepoint set on every kernel (the
-    // trampoline form is opt-in, `kernel_hooks: Trampoline`, exercised by
-    // its own tests below): the value is the plain `tracepoint`, never a
-    // qualified one, since no trampoline was tried.
+    // raw-tracepoint and trampoline forms are opt-in, `kernel_hooks:
+    // RawTracepoint` / `Trampoline`, exercised by their own tests below):
+    // the value is the plain `tracepoint`, never a qualified one, since no
+    // opt-in set was tried.
     eprintln!("  sysinfo.memory_syscall_leg...");
     let syscall_leg = read_syscall_leg(&conn);
     assert_eq!(
@@ -480,6 +481,382 @@ fn test_memory_syscall_hooks_fall_back_to_tracepoints() {
         "    memory_syscall_leg = {syscall_leg}; {mmap_rows} big mmap + {munmap_rows} munmap rows"
     );
     eprintln!("\ntest_memory_syscall_hooks_fall_back_to_tracepoints: all checks passed");
+}
+
+/// Does this kernel's vmlinux BTF carry the `btf_trace_sys_enter` and
+/// `btf_trace_sys_exit` typedefs the raw-tracepoint pair attaches through?
+/// The same read the recorder's own probe makes; decides what the
+/// raw-tracepoint form's tests can expect.
+fn host_has_raw_syscall_btf() -> bool {
+    let Ok(btf) = libbpf_rs::btf::Btf::from_vmlinux() else {
+        return false;
+    };
+    ["btf_trace_sys_enter", "btf_trace_sys_exit"]
+        .iter()
+        .all(|name| {
+            btf.type_by_name::<libbpf_rs::btf::types::Typedef<'_>>(name)
+                .is_some()
+        })
+}
+
+/// One memory capture of the allocator workload under the opt-in
+/// RAW-TRACEPOINT form of the mmap/munmap/brk hooks (`kernel_hooks:
+/// RawTracepoint`: the tp_btf sys_enter/sys_exit pair, the classic set as
+/// its fallback), with the testing-only attach-failure switch on or off.
+/// Returns the trace's DuckDB connection, the workload's pid and the
+/// `sysinfo.memory_syscall_leg` value.
+fn record_raw_tracepoint_capture(
+    dir: &TempDir,
+    label: &str,
+    force_fallback: bool,
+) -> (duckdb::Connection, i32, String) {
+    let py_prog = format!(
+        "import time\n\
+         bufs=[]\n\
+         for _ in range({count}):\n\
+         \x20 b=bytearray({size})\n\
+         \x20 b[0]=1; b[-1]=1\n\
+         \x20 bufs.append(b)\n\
+         del bufs\n\
+         time.sleep(0.2)\n",
+        count = ALLOC_COUNT,
+        size = ALLOC_SIZE_BYTES,
+    );
+    let run_cmd = vec!["python3".to_string(), "-c".to_string(), py_prog];
+    let traced_child =
+        systing::traced_command::spawn_traced_child(&run_cmd).expect("Failed to spawn child");
+    let child_pid = traced_child.pid as i32;
+    eprintln!("Recording memory trace ({label}, pid {child_pid})...");
+
+    let config = Config {
+        memory: true,
+        kernel_hooks: KernelHooks::RawTracepoint,
+        memory_syscall_force_fallback: force_fallback,
+        parquet_only: true,
+        output_dir: dir.path().to_path_buf(),
+        output: dir.path().join("trace.pb"),
+        ..Config::default()
+    };
+    let exit_code = systing(config, Some(traced_child)).expect("systing recording failed");
+    assert_eq!(exit_code, 0, "allocator workload should exit with code 0");
+
+    let duckdb_path = dir.path().join("trace.duckdb");
+    systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, label)
+        .expect("DuckDB conversion failed");
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+    let syscall_leg = read_syscall_leg(&conn);
+    (conn, child_pid, syscall_leg)
+}
+
+/// The opt-in raw-tracepoint form: the tp_btf sys_enter/sys_exit pair
+/// carries the mmap/munmap/brk rows and sysinfo says so (`raw_tracepoint`)
+/// on a kernel whose BTF has the pair's typedefs; on one that lacks them
+/// the pair is never loaded and the classic set runs as `tracepoint:nobtf`,
+/// with the same rows. The measurement legs of the release that added the
+/// pair read the `stop-phase: detach bpf programs` line of this test (the
+/// pair at stop) against the fallback test's (the classic set at stop).
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_syscall_hooks_raw_tracepoint_opt_in() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let (conn, child_pid, syscall_leg) = record_raw_tracepoint_capture(&dir, "raw-opt-in", false);
+    let expected = if host_has_raw_syscall_btf() {
+        "raw_tracepoint"
+    } else {
+        "tracepoint:nobtf"
+    };
+    assert_eq!(
+        syscall_leg, expected,
+        "[sysinfo] memory_syscall_leg: the raw-tracepoint pair when opted in on a kernel \
+         whose BTF has the sys_enter/sys_exit typedefs, the classic set with the reason otherwise"
+    );
+    let (mmap_rows, munmap_rows) = assert_syscall_rows(&conn, child_pid, "raw pair");
+    eprintln!(
+        "    memory_syscall_leg = {syscall_leg}; {mmap_rows} big mmap + {munmap_rows} munmap rows"
+    );
+    eprintln!("\ntest_memory_syscall_hooks_raw_tracepoint_opt_in: all checks passed");
+}
+
+/// The attach-time fallback of the raw-tracepoint form: when a program of
+/// the pair fails to attach, the link attached before it is dropped and the
+/// classic tracepoint set takes over — the capture still carries the
+/// syscall rows, and sysinfo says which form ran (`tracepoint:noraw`). The
+/// failure is the testing-only switch (after the first program of the pair
+/// attached, so a real link is dropped); on a kernel whose BTF lacks the
+/// typedefs the pair is never loaded and the classic set runs as
+/// `tracepoint:nobtf` with nothing for the switch to force.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_syscall_hooks_raw_fall_back_to_tracepoints() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let (conn, child_pid, syscall_leg) = record_raw_tracepoint_capture(&dir, "raw-fallback", true);
+    if host_has_raw_syscall_btf() {
+        assert_eq!(
+            syscall_leg, "tracepoint:noraw",
+            "[sysinfo] memory_syscall_leg: the forced raw-pair failure must land on the \
+             classic tracepoint set"
+        );
+    } else {
+        assert_eq!(syscall_leg, "tracepoint:nobtf");
+    }
+    let (mmap_rows, munmap_rows) = assert_syscall_rows(&conn, child_pid, "classic set");
+    eprintln!(
+        "    memory_syscall_leg = {syscall_leg}; {mmap_rows} big mmap + {munmap_rows} munmap rows"
+    );
+    eprintln!("\ntest_memory_syscall_hooks_raw_fall_back_to_tracepoints: all checks passed");
+}
+
+/// One second of a syscall storm: the CLOCK_BOOTTIME stamps that bound it
+/// (the trace's own clock, so a second can be placed against the capture's
+/// traced window) and the `getpid()` calls made in it across every thread.
+#[derive(Clone, Copy, Debug)]
+struct StormSecond {
+    start_ns: i64,
+    end_ns: i64,
+    calls: u64,
+}
+
+fn boottime_ns() -> i64 {
+    systing::session_recorder::get_clock_value(libc::CLOCK_BOOTTIME) as i64
+}
+
+/// A `getpid()` storm on `threads` spinning threads for `secs` seconds,
+/// counted per second per thread and folded into per-second totals; each
+/// second carries its CLOCK_BOOTTIME bounds (the latest start and the
+/// earliest end across the threads, so a second the caller places inside a
+/// window was inside it on every thread). `getpid` is the cheapest syscall
+/// that always enters the kernel (glibc has not cached it since 2.25), so
+/// its rate is a direct read of what a program on the syscall entry/exit
+/// path costs.
+fn syscall_storm(threads: usize, secs: u64) -> Vec<StormSecond> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::with_capacity(threads);
+    for _ in 0..threads {
+        let stop = Arc::clone(&stop);
+        handles.push(std::thread::spawn(move || {
+            let start = Instant::now();
+            let mut per_second: Vec<StormSecond> = Vec::with_capacity(secs as usize + 1);
+            let mut count: u64 = 0;
+            let mut second = 1u64;
+            let mut second_start_ns = boottime_ns();
+            loop {
+                for _ in 0..1024 {
+                    // SAFETY: getpid takes no arguments and cannot fail.
+                    let _ = unsafe { libc::getpid() };
+                }
+                count += 1024;
+                if start.elapsed() >= Duration::from_secs(second) {
+                    let now = boottime_ns();
+                    per_second.push(StormSecond {
+                        start_ns: second_start_ns,
+                        end_ns: now,
+                        calls: count,
+                    });
+                    second_start_ns = now;
+                    count = 0;
+                    second += 1;
+                }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            per_second
+        }));
+    }
+    std::thread::sleep(Duration::from_secs(secs));
+    stop.store(true, Ordering::Relaxed);
+    let mut totals: Vec<StormSecond> = Vec::new();
+    for h in handles {
+        let per_second = h.join().expect("storm thread panicked");
+        for (i, s) in per_second.into_iter().enumerate() {
+            if totals.len() <= i {
+                totals.push(s);
+            } else {
+                totals[i].calls += s.calls;
+                totals[i].start_ns = totals[i].start_ns.max(s.start_ns);
+                totals[i].end_ns = totals[i].end_ns.min(s.end_ns);
+            }
+        }
+    }
+    totals
+}
+
+/// (median, min, max, n) of the per-second call counts of `seconds`.
+fn rate_stats(seconds: &[StormSecond]) -> (u64, u64, u64, usize) {
+    let mut calls: Vec<u64> = seconds.iter().map(|s| s.calls).collect();
+    assert!(!calls.is_empty(), "no seconds to take a statistic over");
+    calls.sort_unstable();
+    (
+        calls[calls.len() / 2],
+        calls[0],
+        calls[calls.len() - 1],
+        calls.len(),
+    )
+}
+
+/// The traced window of a memory capture in CLOCK_BOOTTIME ns: the
+/// memory_vmstat start sample is taken right after the BPF programs are
+/// attached and the end sample right before they are detached, so
+/// [ts_start, ts_end] is exactly the span in which the syscall hooks were
+/// live.
+fn traced_window(conn: &duckdb::Connection) -> (i64, i64) {
+    conn.query_row(
+        "SELECT MIN(ts_start), MAX(ts_end) FROM memory_vmstat",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )
+    .expect("memory_vmstat has the capture's start and end samples")
+}
+
+/// The per-syscall cost of the mmap/munmap/brk hook forms, measured: a
+/// getpid() storm on four threads (its rate = what one program on the
+/// syscall entry/exit path costs every syscall of every task) with no
+/// capture, then under a duration-stopped, pid-filtered memory capture of
+/// this process with the opt-in raw-tracepoint pair (`kernel_hooks:
+/// RawTracepoint`), then with the default classic tracepoint set
+/// (`kernel_hooks: Classic`). The storm under a capture runs from before
+/// the capture's BPF load until after its traced window ends, every second
+/// stamped with CLOCK_BOOTTIME, and the traced seconds are the ones the
+/// trace's own `memory_vmstat` window (start sample after attach, end
+/// sample before detach) contains whole — no guessed sleep decides what was
+/// measured under the hooks; the seconds before the window are the same
+/// run's untraced reference (the capture's load and verifier running beside
+/// them). Both forms register the same two tracepoints, so the difference
+/// between the two traced rates is the raw pair's own dispatch against the
+/// classic form's enabled-syscall bitmap test; the difference from the
+/// uncaptured rate is the tracepoint registration itself
+/// (`SYSCALL_WORK_SYSCALL_TRACEPOINT` puts every task on the syscall slow
+/// path under either form). Prints the medians with their min/max and
+/// second counts; asserts that at least three whole seconds fell inside
+/// each traced window and that the captures recorded the form they ran,
+/// since the numbers are the release's measurement, not a bound. That
+/// measurement is why the pair is opt-in: on a 4-vCPU 6.12.0 guest under
+/// TCG the storm ran at about half of its uncaptured rate under the pair
+/// against 84–88 % under the classic set, over three runs.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_memory_syscall_storm_cost() {
+    const THREADS: usize = 4;
+    const BASELINE_SECS: u64 = 8;
+    const CAPTURE_SECS: u64 = 10;
+    // The storm outlasts the capture's load (the memory shape's ~20
+    // programs take ~8 s to load and verify on a 4-vCPU TCG guest, ~35 s
+    // beside four spinning threads) plus its traced window.
+    const STORM_SECS: u64 = 40;
+
+    // Phase 0: no capture.
+    let baseline = syscall_storm(THREADS, BASELINE_SECS);
+    let (b_med, b_min, b_max, b_n) = rate_stats(&baseline[1..baseline.len() - 1]);
+    eprintln!(
+        "storm without a capture: median {b_med}/s (min {b_min}, max {b_max}, {b_n} middle seconds of {})",
+        baseline.len()
+    );
+
+    // Phases 1 and 2: the storm under a capture of this process, first with
+    // the raw pair, then with the classic set.
+    let mut legs = Vec::new();
+    let mut rates = Vec::new();
+    for (label, hooks) in [
+        ("raw_tracepoint", KernelHooks::RawTracepoint),
+        ("classic", KernelHooks::Classic),
+    ] {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+        let config = Config {
+            memory: true,
+            kernel_hooks: hooks,
+            pid: vec![std::process::id()],
+            duration: CAPTURE_SECS,
+            parquet_only: true,
+            output_dir: dir.path().to_path_buf(),
+            output: dir.path().join("trace.pb"),
+            ..Config::default()
+        };
+        let capture = std::thread::spawn(move || systing(config, None));
+        let per_second = syscall_storm(THREADS, STORM_SECS);
+        let exit_code = capture
+            .join()
+            .expect("capture thread panicked")
+            .expect("systing recording failed");
+        assert_eq!(exit_code, 0);
+
+        let duckdb_path = dir.path().join("trace.duckdb");
+        systing::duckdb::parquet_to_duckdb(dir.path(), &duckdb_path, label)
+            .expect("DuckDB conversion failed");
+        let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+        let syscall_leg = read_syscall_leg(&conn);
+        let (ts_start, ts_end) = traced_window(&conn);
+        let traced: Vec<StormSecond> = per_second
+            .iter()
+            .copied()
+            .filter(|s| s.start_ns >= ts_start && s.end_ns <= ts_end)
+            .collect();
+        let before: Vec<StormSecond> = per_second
+            .iter()
+            .copied()
+            .filter(|s| s.end_ns <= ts_start)
+            .collect();
+        let after: Vec<StormSecond> = per_second
+            .iter()
+            .copied()
+            .filter(|s| s.start_ns >= ts_end)
+            .collect();
+        let series: Vec<u64> = per_second.iter().map(|s| s.calls).collect();
+        eprintln!(
+            "storm under a capture ({label}, leg {syscall_leg}): traced window {:.2} s; \
+             {} seconds before it, {} inside, {} after; per-second calls {series:?}",
+            (ts_end - ts_start) as f64 / 1e9,
+            before.len(),
+            traced.len(),
+            after.len()
+        );
+        assert!(
+            traced.len() >= 3,
+            "[{label}] only {} whole storm seconds fell inside the traced window \
+             [{ts_start}, {ts_end}] — lengthen STORM_SECS",
+            traced.len()
+        );
+        let (t_med, t_min, t_max, t_n) = rate_stats(&traced);
+        eprintln!("    traced seconds: median {t_med}/s (min {t_min}, max {t_max}, n={t_n})");
+        if before.len() >= 2 {
+            let (p_med, p_min, p_max, p_n) = rate_stats(&before[..before.len() - 1]);
+            eprintln!(
+                "    seconds before the window (the capture loading beside the storm): \
+                 median {p_med}/s (min {p_min}, max {p_max}, n={p_n})"
+            );
+        }
+        if after.len() >= 2 {
+            let (a_med, a_min, a_max, a_n) = rate_stats(&after[1..]);
+            eprintln!(
+                "    seconds after the window (parquet being written beside the storm): \
+                 median {a_med}/s (min {a_min}, max {a_max}, n={a_n})"
+            );
+        }
+        eprintln!("    memory_syscall_leg = {syscall_leg}");
+        legs.push(syscall_leg);
+        rates.push((label, t_med));
+    }
+    if host_has_raw_syscall_btf() {
+        assert_eq!(legs[0], "raw_tracepoint");
+    } else {
+        assert_eq!(legs[0], "tracepoint:nobtf");
+    }
+    assert_eq!(legs[1], "tracepoint");
+    assert!(b_med > 0 && rates.iter().all(|(_, r)| *r > 0));
+    let pct = |captured: u64| 100.0 * (1.0 - captured as f64 / b_med as f64);
+    eprintln!(
+        "\nsyscall storm ({THREADS} threads, getpid): no capture {b_med}/s; \
+         traced under the raw pair {}/s ({:.1}% below); \
+         traced under the classic set {}/s ({:.1}% below)",
+        rates[0].1,
+        pct(rates[0].1),
+        rates[1].1,
+        pct(rates[1].1)
+    );
+    eprintln!("\ntest_memory_syscall_storm_cost: all checks passed");
 }
 
 #[test]

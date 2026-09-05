@@ -715,11 +715,18 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             memory_iommu_overflow BIGINT,
             memory_anon_huge_walk VARCHAR,
             -- systing >= 1.17: how the mmap/munmap/brk hooks attached —
-            -- 'fentry' (trampolines on the arch syscall wrappers),
-            -- 'tracepoint:nosym' / 'tracepoint:nobtf' / 'tracepoint:notramp'
-            -- (the classic syscalls tracepoints: the wrappers are not in
-            -- kallsyms / not in vmlinux BTF / the trampoline set failed to
-            -- attach) or 'off:<cause>' (neither
+            -- 'tracepoint' (the six classic syscalls tracepoints, the
+            -- default form), 'raw_tracepoint' (the opt-in raw-tracepoint
+            -- form from the next release, unreleased at the time of
+            -- writing: one tp_btf program each on sys_enter and sys_exit),
+            -- 'tracepoint:nobtf' / 'tracepoint:noraw' (the classic set
+            -- under that form: vmlinux BTF lacks the sys_enter/sys_exit
+            -- typedefs / the raw pair failed to attach), 'fentry'
+            -- (trampolines on the arch syscall wrappers, the opt-in
+            -- trampoline form), 'tracepoint:nosym' / 'tracepoint:nobtf' /
+            -- 'tracepoint:notramp' (the classic set under the trampoline
+            -- form: the wrappers are not in kallsyms / not in vmlinux BTF /
+            -- the trampoline set failed to attach) or 'off:<cause>' (nothing
             -- attached: no mmap/munmap/brk rows in memory_map). NULL when
             -- the memory recorder did not run, and in traces from systing
             -- < 1.17 (always the classic tracepoints there).

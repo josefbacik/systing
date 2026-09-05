@@ -266,14 +266,18 @@ pub struct TraceSystemInfo {
     /// the THP leg did not run or for traces from systing < 1.16.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_anon_huge_walk: Option<String>,
-    /// How the memory recorder's mmap/munmap/brk hooks attached ("tracepoint"
-    /// — the classic set as the default form; "fentry" — the opt-in
-    /// trampoline set, the default in 1.17.0–1.17.2; "tracepoint:nosym",
-    /// "tracepoint:nobtf", "tracepoint:notramp" — the classic set under the
-    /// trampoline form, with why; or "off:<cause>" — the capture has no
-    /// mmap/munmap/brk rows in memory_map); `None` when the memory recorder
-    /// did not run or for traces from systing < 1.17, which always attached
-    /// the classic tracepoints.
+    /// How the memory recorder's mmap/munmap/brk hooks attached
+    /// ("tracepoint" — the classic set, the default form; "raw_tracepoint" —
+    /// the opt-in raw-tracepoint form from the next release (unreleased at
+    /// the time of writing): one tp_btf program each on sys_enter and
+    /// sys_exit; "tracepoint:nobtf", "tracepoint:noraw" — the classic set
+    /// under that form, with why the raw pair did not run; "fentry" — the
+    /// opt-in trampoline set, the default in 1.17.0–1.17.2;
+    /// "tracepoint:nosym", "tracepoint:nobtf", "tracepoint:notramp" — the
+    /// classic set under the trampoline form, with why; or "off:<cause>" —
+    /// the capture has no mmap/munmap/brk rows in memory_map); `None` when
+    /// the memory recorder did not run or for traces from systing < 1.17,
+    /// which always attached the classic tracepoints.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_syscall_leg: Option<String>,
     /// How the network recorder's TIME_WAIT leg attached ("kprobe" — the
