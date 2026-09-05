@@ -93,11 +93,17 @@ impl MemoryFaultLeg {
 pub struct MemoryRecorderConfig {
     pub fault_leg: MemoryFaultLeg,
     /// How the mmap/munmap/brk hooks attached (`sysinfo.memory_syscall_leg`):
-    /// "fentry" (trampolines on the arch syscall wrappers),
-    /// "tracepoint:nosym" / "tracepoint:nobtf" / "tracepoint:notramp" (the
-    /// classic syscalls tracepoints, because the wrappers are not in kallsyms /
-    /// not in vmlinux BTF / because the trampoline set failed to attach) or "off:<cause>" (neither attached:
-    /// no mmap/munmap/brk rows in memory_map for this capture).
+    /// "tracepoint" (the classic syscalls tracepoints, the default form),
+    /// "raw_tracepoint" (the opt-in raw-tracepoint form: one tp_btf program
+    /// each on sys_enter and sys_exit), "tracepoint:nobtf" /
+    /// "tracepoint:noraw" (the classic set under that form — vmlinux BTF
+    /// without the pair's typedefs / the pair failed to attach), "fentry"
+    /// (trampolines on the arch syscall wrappers, the opt-in trampoline
+    /// form), "tracepoint:nosym" / "tracepoint:nobtf" / "tracepoint:notramp"
+    /// (the classic set under the trampoline form, because the wrappers are
+    /// not in kallsyms / not in vmlinux BTF / because the trampoline set
+    /// failed to attach) or "off:<cause>" (nothing attached: no
+    /// mmap/munmap/brk rows in memory_map for this capture).
     pub syscall_leg: String,
     /// `--memory-fault-sample-rate` as configured (0 and 1 both mean every
     /// fault).

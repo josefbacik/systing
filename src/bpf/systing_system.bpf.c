@@ -5914,6 +5914,20 @@ static __always_inline u64 map_rss_delta_enc(struct task_struct *task,
 #error "no syscall wrapper prefix for this BPF target arch"
 #endif
 
+/* The syscall numbers the raw-tracepoint form (systing_sys_enter /
+ * systing_sys_exit, below the three hook pairs) dispatches on: x86-64's
+ * own table; arm64 and riscv share the asm-generic table. An arch without
+ * a row here builds no raw pair and runs the classic set. */
+#if defined(__TARGET_ARCH_x86)
+#define SYSTING_NR_MMAP 9
+#define SYSTING_NR_MUNMAP 11
+#define SYSTING_NR_BRK 12
+#elif defined(__TARGET_ARCH_arm64) || defined(__TARGET_ARCH_riscv)
+#define SYSTING_NR_MMAP 222
+#define SYSTING_NR_MUNMAP 215
+#define SYSTING_NR_BRK 214
+#endif
+
 static __always_inline int memory_mmap_enter_common(struct task_struct *task, u64 addr,
 						    u64 size, u32 prot, u32 flags)
 {
@@ -6227,6 +6241,101 @@ int BPF_PROG(systing_brk_fexit, const struct pt_regs *regs, long ret)
 		return 0;
 	return memory_brk_exit_common(ctx, task, ret);
 }
+
+/* The raw-tracepoint form of the mmap/munmap/brk hooks — the opt-in form
+ * under `--kernel-hooks raw-tracepoint`: one program on the sys_enter
+ * tracepoint and one on sys_exit, attached raw through their BTF-typed
+ * arguments (tp_btf) and dispatching on the syscall number, in place of the
+ * six classic syscalls/sys_{enter,exit}_* programs above, which stay in the
+ * object as the fallback and as the default form.
+ *
+ * What it buys is the DETACH. A perf-attached tracepoint program's link
+ * teardown runs perf_trace_event_unreg() -> tracepoint_synchronize_unregister()
+ * — one SRCU plus one RCU grace period, serialized, once per program, so
+ * six times for the classic set — while a raw tracepoint's last probe
+ * removal takes tracepoint_remove_func()'s RCU-state snapshot and frees the
+ * probe array through call_rcu, with no grace period waited on the stop
+ * path (kernel/tracepoint.c, the same on 6.6, 6.12 and 6.18); the phase
+ * the difference lands in is the "detach bpf programs" stop phase, of
+ * which this set is the memory lane's share (see SCHEMA_CHANGES.md,
+ * schema 20). Both forms register the same two tracepoints, so the
+ * static-key flip and syscall_regfunc()'s task walk at the first
+ * registration and last removal are paid either way.
+ *
+ * What it costs is the ENTRY, and that cost is why the form is opt-in:
+ * every syscall of every task carrying TIF_SYSCALL_TRACEPOINT (all of them
+ * once sys_enter is registered, under either form) enters these two
+ * programs, where the classic form's perf_syscall_enter() returned on its
+ * enabled-syscall bitmap test. The syscall-number test is therefore each
+ * program's first act and every other syscall returns before any helper
+ * call or task filter — yet the entry itself is paid: on a 4-vCPU 6.12.0
+ * guest under TCG a four-thread getpid() storm ran at about half of its
+ * uncaptured rate under this pair against 84-88 % under the classic set,
+ * three runs (SCHEMA_CHANGES.md, schema 20). sys_exit carries only the
+ * return value, so the exit program reads the number from pt_regs (orig_ax
+ * on x86; the arm64 and riscv fields, below).
+ *
+ * The arguments are the pt_regs reads the trampoline form makes and the
+ * rows are built by the shared *_common helpers, so a row is byte-identical
+ * whichever form produced it. Selection: loaded only under the
+ * raw-tracepoint form and when vmlinux BTF has the btf_trace_sys_enter /
+ * btf_trace_sys_exit typedefs (a tp_btf target resolves at LOAD, and a
+ * missing one fails the whole object — the same gate systing_rss_stat_btf
+ * uses), attached one program at a time after skel.attach() with the
+ * classic set as the fallback, and recorded in sysinfo.memory_syscall_leg
+ * as `raw_tracepoint`. */
+#if defined(SYSTING_NR_MMAP)
+/* The number of the syscall that is exiting, read straight from the
+ * tracepoint's BTF-typed pt_regs (a direct load, no probe-read helper: this
+ * runs on every syscall exit while the pair is attached). */
+static __always_inline long systing_syscall_nr(const struct pt_regs *regs)
+{
+#if defined(__TARGET_ARCH_x86)
+	return (long)regs->orig_ax;
+#elif defined(__TARGET_ARCH_arm64)
+	return (long)regs->syscallno;
+#else
+	/* riscv keeps the number in a7 through the syscall; a7 is not a
+	 * return register, so it is intact at the exit tracepoint. */
+	return (long)regs->a7;
+#endif
+}
+
+SEC("tp_btf/sys_enter")
+int BPF_PROG(systing_sys_enter, struct pt_regs *regs, long id)
+{
+	if (id != SYSTING_NR_MMAP && id != SYSTING_NR_MUNMAP && id != SYSTING_NR_BRK)
+		return 0;
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	if (id == SYSTING_NR_MMAP)
+		return memory_mmap_enter_common(task, (u64)PT_REGS_PARM1_CORE_SYSCALL(regs),
+						(u64)PT_REGS_PARM2_CORE_SYSCALL(regs),
+						(u32)PT_REGS_PARM3_CORE_SYSCALL(regs),
+						(u32)PT_REGS_PARM4_CORE_SYSCALL(regs));
+	if (id == SYSTING_NR_MUNMAP)
+		return memory_munmap_enter_common(task, (u64)PT_REGS_PARM1_CORE_SYSCALL(regs),
+						  (u64)PT_REGS_PARM2_CORE_SYSCALL(regs));
+	return memory_brk_enter_common(task);
+}
+
+SEC("tp_btf/sys_exit")
+int BPF_PROG(systing_sys_exit, struct pt_regs *regs, long ret)
+{
+	long id = systing_syscall_nr(regs);
+	if (id != SYSTING_NR_MMAP && id != SYSTING_NR_MUNMAP && id != SYSTING_NR_BRK)
+		return 0;
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	if (!trace_task(task))
+		return 0;
+	if (id == SYSTING_NR_MMAP)
+		return memory_mmap_exit_common(ctx, task, ret);
+	if (id == SYSTING_NR_MUNMAP)
+		return memory_munmap_exit_common(ctx, task, ret);
+	return memory_brk_exit_common(ctx, task, ret);
+}
+#endif /* SYSTING_NR_MMAP */
 
 #if defined(__TARGET_ARCH_x86)
 /* The x86 fault leg is the exceptions:page_fault_user tracepoint attached
