@@ -443,6 +443,30 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Parquet import across schema versions (no schema version change)
+
+The parquet→DuckDB import (`parquet_to_duckdb`, `systing-util convert`) is
+`INSERT INTO <table> BY NAME SELECT … FROM read_parquet(…)`, and DuckDB's
+`BY NAME` has two faces. A target column the parquet lacks — an OLDER trace
+read by a NEWER systing — is filled with NULL, which is how every "NULL in
+traces from systing < 1.N" note in this file works. A parquet column the
+target lacks — a NEWER trace read by an OLDER systing — used to fail the
+whole import with a binder error on the first unknown column, so a trace
+written after a schema bump was unreadable by any systing before it. The
+import now reads the parquet's column list first and projects the unknown
+columns away, one warning line per table naming them and this systing's
+schema version, and the database is a complete database of the READER's
+schema (`_schema_version` says which; the newer columns are simply not in
+it). A caller that wants the old refusal — a test, or a pipeline that must
+not analyse a trace with columns it cannot see — passes
+`ImportOptions { strict_schema: true }` (`systing-util convert
+--strict-schema`), which fails with a message naming the table, the unknown
+columns and the reader's schema version. Neither the parquet directory nor
+`_traces` records the WRITER's schema version (`_traces.systing_version` is
+the converting binary's, see the v12 entry), so the report of what was
+dropped reaches only the importing process — the recorder's version in the
+parquet directory remains the planned follow-up.
+
 ## Schema Version 21 (systing 1.18.0) — 2026-09-04
 
 The network-packets recorder learns to sample, and says so. On a big host
@@ -497,9 +521,9 @@ on the arch syscall wrappers (`__x64_sys_mmap` …, `__arm64_sys_*`,
 the network recorder's TIME_WAIT hooks (`tcp_time_wait`,
 `inet_twsk_hashdance_schedule`, `inet_twsk_deschedule_put`: fentry in
 place of kprobes), as the DEFAULT, on the claim that trampolines detach in
-milliseconds. That claim was wrong, and the next release (unreleased at
-the time of writing; 1.17.0–1.17.2 shipped the trampoline default) makes
-the classic form the default again with the trampoline form opt-in
+milliseconds. That claim was wrong, and 1.17.4 (1.17.0–1.17.3 shipped the
+trampoline default) makes the classic form the default again with the
+trampoline form opt-in
 (`--kernel-hooks trampoline`; `sysinfo.memory_syscall_leg` /
 `network_tw_leg` say which ran). What the kernel does, read at v6.6, v6.12
 and v6.18: a perf-attached
@@ -531,8 +555,8 @@ The tables keep their columns; the new columns are nullable.
 ### Added columns
 - `sysinfo`: added `memory_syscall_leg VARCHAR` — how the mmap/munmap/brk
   hooks attached for the capture: `tracepoint` (the classic tracepoints as
-  the default form, from the correction release), `fentry` (the trampoline
-  set — the default in 1.17.0–1.17.2, opt-in after), `tracepoint:nosym` (the
+  the default form, from 1.17.4), `fentry` (the trampoline
+  set — the default in 1.17.0–1.17.3, opt-in from 1.17.4), `tracepoint:nosym` (the
   classic tracepoints under the trampoline form, because the arch syscall
   wrappers are not in kallsyms — riscv before 6.6), `tracepoint:nobtf` (the
   classic tracepoints under the trampoline form, because vmlinux BTF has no
@@ -594,7 +618,7 @@ The tables keep their columns; the new columns are nullable.
   `freeze = true`. Rows from 1.16.x may carry a spurious `true` on such
   splits; from 1.17.0 the value is the flag the kernel passed.
 - `memory_thp` rows with `kind = 'pmd'` on a build that inlined the worker
-  (from the next release, unreleased): the probe now falls back first to
+  (from 1.17.5): the probe now falls back first to
   the global funnel `split_huge_pmd_locked` (6.10+; `sysinfo.memory_thp_leg
   = on:pmd-global` / `on:pmd-only:global`) and only then to the public entry
   `__split_huge_pmd` (`on:pmd-entry`, as in v19). On 6.12 and 6.18 both
@@ -775,8 +799,11 @@ is written whenever the memory recorder runs.
   ioctl at once) — systing prints `memory-vfio: N iommu map/unmap runs or
   VFIO ioctl windows not counted` — so the table is a floor in that case.
   Two more reading rules: a container attached to several IOMMU domains
-  fires the tracepoints once per domain, so its runs are counted once per
-  domain (compare `count` against `memory_vfio` sizes per domain count);
+  maps every pinned run once per domain (`vfio_iommu_map` loops over the
+  container's domain list), so its `map` runs are counted once per domain
+  (compare `count` against `memory_vfio` sizes per domain count), while on
+  unmap only the first domain is unmapped run by run and each further
+  domain gets one `unmap` event of the whole region's size;
   and `size_order` is floor(log2) of the run, so a run that is not a
   power of two (a partially huge-page-backed tail) lands in the order
   below its size — `bytes` is exact, `count` per order is the rounding.

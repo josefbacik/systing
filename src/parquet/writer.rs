@@ -3504,6 +3504,106 @@ mod tests {
         assert_eq!(row.2, None);
     }
 
+    /// The other face of schema skew: a sysinfo.parquet written by a NEWER
+    /// systing carries a column this schema does not have. DuckDB's BY NAME
+    /// import refuses the whole statement on it, so the importer projects
+    /// the unknown column away by default (the known columns import, the
+    /// drop is reported) and refuses only under `strict_schema`, naming it.
+    #[test]
+    fn test_sysinfo_duckdb_import_with_unknown_column() {
+        use crate::duckdb::{parquet_to_duckdb_with_options, ImportOptions, SCHEMA_VERSION};
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field};
+        use duckdb::Connection;
+
+        let dir = TempDir::new().unwrap();
+        let newer_schema = Arc::new(Schema::new(vec![
+            Field::new("sysname", DataType::Utf8, false),
+            Field::new("release", DataType::Utf8, false),
+            Field::new("version", DataType::Utf8, false),
+            Field::new("machine", DataType::Utf8, false),
+            Field::new("sample_event", DataType::Utf8, true),
+            Field::new("sample_period", DataType::Int64, true),
+            Field::new("memory_fault_leg", DataType::Utf8, true),
+            Field::new("memory_future_leg", DataType::Utf8, true),
+            Field::new("memory_future_sample_rate", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            newer_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["Linux"])),
+                Arc::new(StringArray::from(vec!["6.12.0"])),
+                Arc::new(StringArray::from(vec!["#1 SMP"])),
+                Arc::new(StringArray::from(vec!["x86_64"])),
+                Arc::new(StringArray::from(vec![Some("cpu-clock")])),
+                Arc::new(Int64Array::from(vec![Some(1_000_000)])),
+                Arc::new(StringArray::from(vec![Some("tracepoint")])),
+                Arc::new(StringArray::from(vec![Some("on")])),
+                Arc::new(Int64Array::from(vec![Some(7)])),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(dir.path().join("sysinfo.parquet")).unwrap();
+        let mut pw = ArrowWriter::try_new(file, newer_schema, None).unwrap();
+        pw.write(&batch).unwrap();
+        pw.close().unwrap();
+
+        let db_path = dir.path().join("test.duckdb");
+        let report = parquet_to_duckdb_with_options(
+            dir.path(),
+            &db_path,
+            "newer-trace",
+            ImportOptions::default(),
+        )
+        .expect("a sysinfo.parquet with a column this schema lacks must still import");
+        assert_eq!(
+            report.dropped_columns,
+            vec![(
+                "sysinfo".to_string(),
+                vec![
+                    "memory_future_leg".to_string(),
+                    "memory_future_sample_rate".to_string()
+                ]
+            )],
+            "the report names the table and the columns left out, in source order"
+        );
+
+        let conn = Connection::open(&db_path).unwrap();
+        let row: (String, String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT trace_id, machine, memory_fault_leg, sample_period FROM sysinfo",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "newer-trace");
+        assert_eq!(row.1, "x86_64");
+        assert_eq!(row.2, Some("tracepoint".to_string()));
+        assert_eq!(row.3, Some(1_000_000));
+        let version: u32 = conn
+            .query_row("SELECT version FROM _schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION, "the database is this schema's");
+        drop(conn);
+
+        let err = parquet_to_duckdb_with_options(
+            dir.path(),
+            &db_path,
+            "newer-trace",
+            ImportOptions {
+                strict_schema: true,
+            },
+        )
+        .expect_err("strict_schema refuses a column this schema lacks");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("table 'sysinfo'")
+                && msg.contains("memory_future_leg, memory_future_sample_rate")
+                && msg.contains(&format!("schema {SCHEMA_VERSION}")),
+            "the refusal names the table, the unknown columns and this schema: {msg}"
+        );
+    }
+
     #[test]
     fn test_cpu_info_duckdb_round_trip() {
         use crate::duckdb::parquet_to_duckdb;

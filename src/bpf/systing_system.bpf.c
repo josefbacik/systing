@@ -1082,9 +1082,15 @@ struct {
  *    that region (memory_vfio_inflight): the tracepoints are host-wide
  *    DMA-API paths, and every other iommu_map() costs one hash miss.
  *
- * Writers are classic tracepoint programs (task context; bpf_prog_active
- * is raised around them), never the perf_event sampler, so a plain
- * preallocated HASH is safe here.
+ * Writers are the iommu tracepoint programs, which run in whatever context
+ * calls the DMA API — the vfio ioctl path this histogram counts is task
+ * context, but a driver mapping under a softirq fires the same tracepoint
+ * (and is dropped at the memory_vfio_inflight miss). A plain preallocated
+ * HASH is safe from any of them: the bucket lock is a raw spinlock taken
+ * with interrupts disabled (htab_lock_bucket), so writers on one CPU cannot
+ * interleave, and the one context that could still re-enter a held bucket,
+ * an NMI, is the perf_event sampler's, which never writes this map (a
+ * re-entering update is refused with -EBUSY rather than deadlocking).
  */
 struct memory_iommu_key {
 	u32 tgid;
@@ -6354,7 +6360,14 @@ struct vfio_iommu_type1_dma_unmap_uapi {
  * kretprobe closes it. A window that cannot be opened (the inflight hash is
  * full: more than 1024 traced tasks inside a VFIO path at once) leaves
  * this path's runs uncounted — counted under memory_iommu_overflow so the
- * histogram reads as a floor rather than silently short. */
+ * histogram reads as a floor rather than silently short. The other way a
+ * window goes wrong is not counted: a kretprobe that misses its return
+ * (the kernel's per-probe pool of pending returns exhausted — an ioctl
+ * holds an instance for seconds, and the pool is sized per probe by the
+ * kernel) leaves the window open, so this task's later runs inside that
+ * range count until its next VFIO path re-opens the window or the capture
+ * ends; a perf-attached kretprobe's miss count is not exported, so the
+ * case is a documented bound rather than a counter. */
 static __always_inline void memory_vfio_open_window(u64 iova, u64 size)
 {
 	u64 tgidpid = bpf_get_current_pid_tgid();
@@ -6488,6 +6501,17 @@ int BPF_KRETPROBE(systing_vfio_detach_group_ret)
  * of the iommu events (the common 8-byte header, then the u64 fields in
  * TP_STRUCT__entry order — unchanged since the tracepoints were added). See
  * the memory_iommu_hist comment for why these count instead of emitting.
+ *
+ * What one event is, read at vfio_iommu_type1.c (v6.12): a map is pinned
+ * one physically contiguous run at a time and vfio_iommu_map() issues one
+ * iommu_map() per run PER DOMAIN in the container's domain_list, so a
+ * container whose devices sit in two IOMMU domains counts every map run
+ * twice; on unmap (vfio_unmap_unpin) only the first domain is unmapped run
+ * by run — each further domain gets ONE iommu_unmap() of the whole region,
+ * one event of the region's size. The order key is floor(log2(size)): a run
+ * that is not a power of two (three contiguous pages, 12 KiB) counts under
+ * the order below it (13, 8 KiB) with its exact size added to bytes, so
+ * bytes is exact per bucket and count-by-order is a floor histogram.
  */
 struct systing_iommu_map_args {
 	u64 common;
@@ -6590,8 +6614,13 @@ int systing_iommu_unmap(struct systing_iommu_unmap_args *ctx)
  * the folio split whose entry is split_huge_page_to_list (<= 6.8) or
  * split_huge_page_to_list_to_order (>= 6.9; at 6.18 the counter sits in its
  * static callee __folio_split); the entry's return value is the result: 0
- * split, -EBUSY/-EAGAIN failed. Userspace loads the programs whose symbols
- * the running kernel has and records the leg in sysinfo.memory_thp_leg.
+ * split, -EBUSY/-EAGAIN failed. On 6.9+ every large-folio split goes through
+ * that entry, file and shmem folios included, so its rows are a superset of
+ * the vmstat thp_split_page family; on 6.15+ the folio_split() path splits
+ * without passing it, so the vmstat delta stays the host-wide truth and the
+ * rows are the sampled, attributed subset. Userspace loads the programs
+ * whose symbols the running kernel has and records the leg in
+ * sysinfo.memory_thp_leg.
  * Splits run in task context (madvise, munmap, reclaim, migration), so the
  * memory ring is written as usual; the leg is 1:N sampled
  * (memory_thp_sample_rate, 0 = off) because reclaim storms can split

@@ -922,8 +922,13 @@ pub struct MemoryKernelLegs {
     /// the rest of the memory recorder runs.
     pub syscall_off: Option<String>,
     /// Why the VFIO/IOMMU legs cannot run here (`nosym`: the
-    /// vfio_iommu_type1 module is not loaded; `notracepoint`: no iommu
-    /// tracepoints; `attach`: a probe failed to attach).
+    /// vfio_iommu_type1 module is not loaded, or its handlers are listed
+    /// only as `.isra` / `.constprop` clones the exact-name probe does not
+    /// match; `notracepoint`: no iommu tracepoints; `attach`: a probe failed
+    /// to attach). The legs instrument the vfio_iommu_type1 container path
+    /// only: a host whose devices are attached through iommufd (the cdev
+    /// path, `iommufd_ioas_map`) reads `on` with the module loaded beside it
+    /// and sees no VFIO region or IOMMU run at all.
     pub vfio_off: Option<String>,
     /// Why the teardown pair (container release, group detach) cannot run
     /// while the ioctl pair can (`nosym`, `attach`); the leg then reads
