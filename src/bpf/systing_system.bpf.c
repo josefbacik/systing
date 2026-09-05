@@ -739,7 +739,12 @@ struct {
 #define MISSED_EPOLL_EVENT 6
 #define MISSED_MARKER_EVENT 7
 #define MISSED_MEMORY_EVENT 8
-#define MISSED_EVENT_MAX 9
+/* Not a lost event: a memory syscall exit that found the thread's scratch
+ * entry written by a DIFFERENT leg (an mmap/munmap enter whose exit never
+ * ran) and dropped it instead of pairing with it -- see
+ * memory_syscall_leg below. Counted so the rate is visible in the trace. */
+#define MISSED_MEMORY_XLEG_EVENT 9
+#define MISSED_EVENT_MAX 10
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
@@ -898,12 +903,38 @@ struct {
 	__array(values, struct memory_ringbuf_map);
 } memory_ringbufs SEC(".maps");
 
+/* Which leg wrote a memory_syscall_scratch entry. The three legs share the
+ * map (one entry per thread, keyed by tgidpid), and an entry outlives its
+ * syscall whenever an enter ran without its exit: the attach window at
+ * capture start is the known source -- the enter and exit programs of a
+ * leg attach one after the other, and a syscall that enters after the
+ * enter program is live and exits before the exit program is leaves its
+ * entry behind (the attach order in systing_core.rs now puts each exit
+ * before its enter to close that window; this tag catches any other
+ * source). Untagged, a stale munmap entry was read by the thread's next
+ * brk exit as the previous break: `ret - saved->addr` with `addr` the
+ * unmapped address recorded page-aligned negative brk deltas of 13-46 TB
+ * (the mmap region minus the PIE heap) on real hosts -- rare, a handful of
+ * rows a week across thousands of hosts, each under an ordinary glibc
+ * systrim stack. An exit that finds another leg's entry drops it and
+ * counts MISSED_MEMORY_XLEG_EVENT. */
+enum memory_syscall_leg {
+	MEMORY_SYSCALL_LEG_NONE = 0,
+	MEMORY_SYSCALL_LEG_MMAP = 1,
+	MEMORY_SYSCALL_LEG_MUNMAP = 2,
+	MEMORY_SYSCALL_LEG_BRK = 3,
+};
+
 /* Per-thread scratch map for pairing mmap/munmap/brk enter→exit. */
 struct memory_syscall_args {
 	u64 addr;
 	u64 size;
 	u32 prot;
 	u32 flags;
+	/* The leg whose enter wrote this entry (enum memory_syscall_leg);
+	 * an exit of another leg drops the entry instead of pairing. */
+	u32 leg;
+	u32 pad;
 	/* munmap only: the process's total mapped size in bytes at enter,
 	 * used to bound the recorded unmap size. munmap's length argument is
 	 * the REQUESTED range, not the amount actually unmapped -- the kernel
@@ -5733,17 +5764,37 @@ static __always_inline int memory_mmap_enter_common(struct task_struct *task, u6
 		.size = size,
 		.prot = prot,
 		.flags = flags,
+		.leg = MEMORY_SYSCALL_LEG_MMAP,
 		.enter_rss = current_task_rss_bytes(task),
 	};
 	bpf_map_update_elem(&memory_syscall_scratch, &tgidpid, &args, BPF_ANY);
 	return 0;
 }
 
+/* Take the thread's scratch entry for `leg`: NULL when there is none, or
+ * when the entry belongs to another leg (a stale enter-without-exit of
+ * that leg -- dropped and counted, never paired; see memory_syscall_leg).
+ * The entry is deleted either way; the caller copies what it needs first. */
+static __always_inline struct memory_syscall_args *
+memory_syscall_scratch_take(u64 tgidpid, u32 leg)
+{
+	struct memory_syscall_args *saved = bpf_map_lookup_elem(&memory_syscall_scratch, &tgidpid);
+	if (!saved)
+		return NULL;
+	if (saved->leg != leg) {
+		bpf_map_delete_elem(&memory_syscall_scratch, &tgidpid);
+		handle_missed_event(MISSED_MEMORY_XLEG_EVENT);
+		return NULL;
+	}
+	return saved;
+}
+
 static __always_inline int memory_mmap_exit_common(void *ctx, struct task_struct *task,
 						   long ret)
 {
 	u64 tgidpid = bpf_get_current_pid_tgid();
-	struct memory_syscall_args *saved = bpf_map_lookup_elem(&memory_syscall_scratch, &tgidpid);
+	struct memory_syscall_args *saved =
+		memory_syscall_scratch_take(tgidpid, MEMORY_SYSCALL_LEG_MMAP);
 	if (!saved)
 		return 0;
 	struct memory_syscall_args args = *saved;
@@ -5827,6 +5878,7 @@ static __always_inline int memory_munmap_enter_common(struct task_struct *task, 
 	struct memory_syscall_args args = {
 		.addr = addr,
 		.size = size,
+		.leg = MEMORY_SYSCALL_LEG_MUNMAP,
 		.vm_limit = (u64)BPF_CORE_READ(task, mm, total_vm) *
 			    tool_config.page_size,
 		.enter_rss = current_task_rss_bytes(task),
@@ -5839,7 +5891,8 @@ static __always_inline int memory_munmap_exit_common(void *ctx, struct task_stru
 						     long ret)
 {
 	u64 tgidpid = bpf_get_current_pid_tgid();
-	struct memory_syscall_args *saved = bpf_map_lookup_elem(&memory_syscall_scratch, &tgidpid);
+	struct memory_syscall_args *saved =
+		memory_syscall_scratch_take(tgidpid, MEMORY_SYSCALL_LEG_MUNMAP);
 	if (!saved)
 		return 0;
 	struct memory_syscall_args args = *saved;
@@ -5937,6 +5990,7 @@ static __always_inline int memory_brk_enter_common(struct task_struct *task)
 	/* Stash the current brk so exit can compute the delta. */
 	struct memory_syscall_args args = {
 		.addr = BPF_CORE_READ(task, mm, brk),
+		.leg = MEMORY_SYSCALL_LEG_BRK,
 		.enter_rss = current_task_rss_bytes(task),
 	};
 	bpf_map_update_elem(&memory_syscall_scratch, &tgidpid, &args, BPF_ANY);
@@ -5947,7 +6001,11 @@ static __always_inline int memory_brk_exit_common(void *ctx, struct task_struct 
 						  long ret)
 {
 	u64 tgidpid = bpf_get_current_pid_tgid();
-	struct memory_syscall_args *saved = bpf_map_lookup_elem(&memory_syscall_scratch, &tgidpid);
+	/* A stale entry of another leg (a munmap's unmapped address) read here
+	 * as the previous break is what recorded page-aligned negative deltas
+	 * of 13-46 TB on real hosts; the take drops it. */
+	struct memory_syscall_args *saved =
+		memory_syscall_scratch_take(tgidpid, MEMORY_SYSCALL_LEG_BRK);
 	if (!saved)
 		return 0;
 	u64 old_brk = saved->addr;
