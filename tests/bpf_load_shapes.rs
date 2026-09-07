@@ -30,7 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use systing::bpf_load_shapes::{coverage_gaps, ranges, shape_table, LoadReport};
-use systing::systing_core::bpf_load_probe;
+use systing::systing_core::{bpf_load_probe, kallsyms_has_funcs, NETWORK_TW_SYMBOLS};
 
 /// Instructions known to be unreachable at every shipping shape, with the
 /// reason. Add a row only with the reason; the entry is `(program, ranges)`
@@ -60,6 +60,22 @@ const SELECTED_ELSEWHERE: &[(&str, &str)] = &[
         "systing_rss_stat_btf",
         "loads only on a kernel whose BTF carries the rss_stat tracepoint; the classic twin loads elsewhere",
     ),
+];
+
+/// Programs of a kernel leg the recorder itself switches off on a kernel that
+/// lacks one of the leg's hooked functions (`tw_off = nosym`): the network
+/// shapes select them wherever the functions exist and no shape selects them
+/// where one is missing. They are allowed unselected ONLY on a kernel that
+/// lacks one of the functions; on a kernel that has them all, an unselected
+/// program here is a real finding. `inet_twsk_hashdance_schedule` exists from
+/// 6.11 (b334b924c9b7), so the 6.6 series takes this branch.
+const SELECTED_WHEN_KERNEL_HAS: &[(&str, &[&str])] = &[
+    ("tcp_time_wait_fentry", NETWORK_TW_SYMBOLS),
+    ("tcp_time_wait_entry", NETWORK_TW_SYMBOLS),
+    ("inet_twsk_hashdance_schedule_fentry", NETWORK_TW_SYMBOLS),
+    ("inet_twsk_hashdance_schedule_entry", NETWORK_TW_SYMBOLS),
+    ("inet_twsk_deschedule_put_fentry", NETWORK_TW_SYMBOLS),
+    ("inet_twsk_deschedule_put_entry", NETWORK_TW_SYMBOLS),
 ];
 
 fn allowed(program: &str) -> Option<(&'static str, &'static str)> {
@@ -127,10 +143,30 @@ fn selection_findings(reports: &[(String, LoadReport)]) -> Vec<String> {
             if selected_somewhere {
                 continue;
             }
-            match SELECTED_ELSEWHERE.iter().find(|(name, _)| *name == p.name) {
-                Some((_, why)) => eprintln!("[selection] {} selected by no shape ({why})", p.name),
-                None => never_selected.push(p.name.clone()),
+            if let Some((_, why)) = SELECTED_ELSEWHERE.iter().find(|(name, _)| *name == p.name) {
+                eprintln!("[selection] {} selected by no shape ({why})", p.name);
+                continue;
             }
+            if let Some((_, symbols)) = SELECTED_WHEN_KERNEL_HAS
+                .iter()
+                .find(|(name, _)| *name == p.name)
+            {
+                let present = kallsyms_has_funcs(symbols);
+                let missing: Vec<&str> = symbols
+                    .iter()
+                    .copied()
+                    .filter(|s| !present.contains(*s))
+                    .collect();
+                if !missing.is_empty() {
+                    eprintln!(
+                        "[selection] {} selected by no shape (this kernel lacks {}, so the recorder keeps the leg off)",
+                        p.name,
+                        missing.join(", ")
+                    );
+                    continue;
+                }
+            }
+            never_selected.push(p.name.clone());
         }
     }
     if never_selected.is_empty() {
