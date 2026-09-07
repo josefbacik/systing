@@ -81,8 +81,41 @@
 //! are exact. The `hist_log2` arrays are the
 //! same histograms folded to one count per octave so rows from different
 //! captures and hosts can be merged.
+//!
+//! # Bounded folding
+//!
+//! The pass consumes one event stream ordered by `(ts, kind)`. The engine
+//! materializes that stream to sort it, and the sort does not spill: on a
+//! host that records tens of millions of context switches per second a
+//! 10-second capture holds hundreds of millions of stream rows, more than a
+//! bounded process can hold. Two guards keep the fold inside a budget, both
+//! set from [`SchedAggregateParams`] and both reported in the metadata:
+//!
+//! - **Chunking** (`chunk_rows`): the stream is fetched in consecutive time
+//!   chunks of the window, each sorted by the engine on its own and consumed
+//!   by the same pass, so at most one chunk is materialized at a time. The
+//!   result is identical to one pass over the whole stream — an ordered
+//!   stream is the concatenation of its ordered time chunks, and a slice
+//!   whose start and end fall in different chunks is two events in the
+//!   stream either way. `meta.stream_chunks` says how many chunks were used;
+//!   1 means the fold ran as a single query.
+//! - **The event budget** (`max_rows`): when the requested window holds more
+//!   stream rows than the budget, the window is shortened from its END so
+//!   that it holds about the budget, and the pass runs over that shorter
+//!   window. Every statistic stays exactly defined over a contiguous,
+//!   un-sampled window — nothing is sampled or extrapolated — and the row
+//!   says so: `meta.window_truncated` is true, `meta.window_ns` is the
+//!   window actually folded, and `meta.slice_rows_capture` is the number of
+//!   slices the requested window held. A shorter window on the hosts where a
+//!   full one cannot be folded beats no row at all.
+//!
+//! The stream rows of a window are counted before the fold (one aggregate
+//! query per source table) to size both guards.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use duckdb::arrow::array::{Array, AsArray, PrimitiveArray};
+use duckdb::arrow::datatypes::{Int32Type, Int64Type};
+use duckdb::arrow::record_batch::RecordBatch;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -100,6 +133,18 @@ const HIST_SUB: usize = 1 << HIST_SUB_BITS;
 /// Largest runqueue length tracked exactly by the time-weighted histogram;
 /// longer queues are clamped into the last bucket.
 const RQ_HIST_MAX: usize = 4096;
+/// Default stream rows per fetched chunk (see the module docs, "Bounded
+/// folding"): the engine sorts one chunk at a time, so this bounds the
+/// memory the sort holds — measured, a 16 M-row chunk keeps the process
+/// near 2 GB where one query over 96 M rows exhausts a 4 GiB memory limit;
+/// chunking costs no wall time, so the default errs small.
+pub const DEFAULT_CHUNK_ROWS: u64 = 16_000_000;
+/// Default event budget for one fold (stream rows in the window): above it
+/// the window is shortened from its end so the pass stays inside the time
+/// a bounded process allows it — about 10 s at the measured 125 ns per
+/// stream row. A stream row is a slice start, a slice end, a runnable
+/// marker, a new-task wakeup or a migrate event.
+pub const DEFAULT_MAX_ROWS: u64 = 80_000_000;
 
 /// Parameters for [`AnalyzeDb::sched_aggregate`].
 ///
@@ -117,6 +162,11 @@ pub struct SchedAggregateParams {
     pub end_time: Option<f64>,
     /// Number of tail-contributor threads to report per distribution.
     pub top_k: usize,
+    /// Stream rows fetched per chunk; 0 fetches the whole window at once.
+    pub chunk_rows: u64,
+    /// Event budget for the fold (stream rows); 0 disables the budget. See
+    /// the module docs, "Bounded folding".
+    pub max_rows: u64,
 }
 
 impl Default for SchedAggregateParams {
@@ -126,6 +176,8 @@ impl Default for SchedAggregateParams {
             start_time: None,
             end_time: None,
             top_k: 10,
+            chunk_rows: DEFAULT_CHUNK_ROWS,
+            max_rows: DEFAULT_MAX_ROWS,
         }
     }
 }
@@ -399,6 +451,20 @@ pub struct SchedAggregateMeta {
     /// had the thread on (a dropped event in between; the pass trusts its
     /// own bookkeeping and moves the thread from where it had it).
     pub migrate_mismatch: u64,
+    /// `sched_slice` rows (idle slices included) that lie inside the
+    /// REQUESTED window — the whole trace's, or the `--start-time` /
+    /// `--end-time` range — counted before the fold. When the window was
+    /// truncated to the event budget this is the size the fold could not
+    /// take whole; `slices` counts what the pass folded (non-idle only).
+    pub slice_rows_capture: u64,
+    /// True when the window was shortened from its end to fit the event
+    /// budget (see the module docs, "Bounded folding"): `window_ns` and
+    /// `window_end_ns` are the window actually folded, and every count and
+    /// rate is exact over that shorter window.
+    pub window_truncated: bool,
+    /// Time chunks the stream was fetched in (1 = one query over the whole
+    /// window). Chunking never changes a result; the count is diagnostic.
+    pub stream_chunks: u32,
     pub aggregate_ms: u64,
 }
 
@@ -1083,7 +1149,116 @@ fn top_contributors(
     v
 }
 
+/// One time chunk of the event stream: events with a timestamp in
+/// `[lo, hi)`, or `[lo, hi]` for the last chunk so the window's final
+/// instant (a slice end at exactly `window_end`) is not lost.
+#[derive(Debug, Clone, Copy)]
+struct StreamChunk {
+    lo: i64,
+    hi: i64,
+    last: bool,
+}
+
+impl StreamChunk {
+    /// The predicate on one arm's event timestamp expression.
+    fn predicate(&self, ts_expr: &str) -> String {
+        let hi_op = if self.last { "<=" } else { "<" };
+        format!(
+            " AND {ts_expr} >= {} AND {ts_expr} {hi_op} {}",
+            self.lo, self.hi
+        )
+    }
+}
+
+/// Split `[start, end]` into `n` consecutive chunks of equal length (the
+/// remainder goes to the last one).
+fn stream_chunks(start: i64, end: i64, n: u32) -> Vec<StreamChunk> {
+    let n = n.max(1) as i64;
+    let span = end - start;
+    (0..n)
+        .map(|k| StreamChunk {
+            lo: start + span * k / n,
+            hi: if k + 1 == n {
+                end
+            } else {
+                start + span * (k + 1) / n
+            },
+            last: k + 1 == n,
+        })
+        .collect()
+}
+
+/// The event stream of the window: every arm carries the window's own
+/// filter (a slice lies entirely inside it; a marker, new-task wakeup or
+/// migrate falls inside it) and, when `chunk` is given, the chunk's
+/// predicate on that arm's event timestamp — a slice start at `ss.ts`, a
+/// slice end at `ss.ts + ss.dur`, the others at their own `ts`. The column
+/// types are cast explicitly so the fetched batches have one fixed shape
+/// whatever the source tables' integer widths.
 fn build_event_stream_query(
+    trace_id: Option<&str>,
+    start: i64,
+    end: i64,
+    with_migrate: bool,
+    chunk: Option<StreamChunk>,
+) -> String {
+    let f_ss = trace_id_filter(trace_id, "ss.");
+    let f_ts = trace_id_filter(trace_id, "t.");
+    let f_w = trace_id_filter(trace_id, "w.");
+    let f_m = trace_id_filter(trace_id, "m.");
+    let c = |ts_expr: &str| chunk.map(|c| c.predicate(ts_expr)).unwrap_or_default();
+    let c_start = c("ss.ts");
+    let c_end = c("(ss.ts + ss.dur)");
+    let c_ts = c("t.ts");
+    let c_w = c("w.ts");
+    let c_m = c("m.ts");
+    // Migrate rows ride the `cpu` column as orig_cpu and the `dur` column as
+    // dest_cpu; the table exists only in traces recorded with schema >= 16.
+    let migrate_arm = if with_migrate {
+        format!(
+            "UNION ALL \
+           SELECT CAST(m.ts AS BIGINT), CAST({EV_MIGRATE} AS INTEGER), CAST(m.orig_cpu AS INTEGER), CAST(m.utid AS BIGINT), CAST(m.dest_cpu AS BIGINT), CAST(NULL AS INTEGER) \
+             FROM sched_migrate m WHERE m.ts >= {start} AND m.ts <= {end}{f_m}{c_m} "
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "SELECT ts, kind, cpu, utid, dur, end_state FROM ( \
+           SELECT CAST(ss.ts AS BIGINT) AS ts, CAST({EV_START} AS INTEGER) AS kind, CAST(ss.cpu AS INTEGER) AS cpu, CAST(ss.utid AS BIGINT) AS utid, CAST(ss.dur AS BIGINT) AS dur, CAST(ss.end_state AS INTEGER) AS end_state \
+             FROM sched_slice ss WHERE ss.dur > 0 AND ss.ts >= {start} AND ss.ts + ss.dur <= {end}{f_ss}{c_start} \
+           UNION ALL \
+           SELECT CAST(ss.ts + ss.dur AS BIGINT), CAST({EV_END} AS INTEGER), CAST(ss.cpu AS INTEGER), CAST(ss.utid AS BIGINT), CAST(ss.dur AS BIGINT), CAST(ss.end_state AS INTEGER) \
+             FROM sched_slice ss WHERE ss.dur > 0 AND ss.ts >= {start} AND ss.ts + ss.dur <= {end}{f_ss}{c_end} \
+           UNION ALL \
+           SELECT CAST(t.ts AS BIGINT), CAST({EV_WAKING} AS INTEGER), CAST(t.cpu AS INTEGER), CAST(t.utid AS BIGINT), CAST(0 AS BIGINT), CAST(NULL AS INTEGER) \
+             FROM thread_state t WHERE t.state = 0 AND t.cpu IS NOT NULL AND t.ts >= {start} AND t.ts <= {end}{f_ts}{c_ts} \
+           UNION ALL \
+           SELECT CAST(w.ts AS BIGINT), CAST({EV_NEW} AS INTEGER), CAST(w.target_cpu AS INTEGER), CAST(w.utid AS BIGINT), CAST(0 AS BIGINT), CAST(NULL AS INTEGER) \
+             FROM wakeup_new w WHERE w.ts >= {start} AND w.ts <= {end}{f_w}{c_w} \
+           {migrate_arm}\
+         ) ORDER BY ts, kind"
+    )
+}
+
+/// Stream rows the window holds, per source, counted before the fold. The
+/// filters are exactly the stream query's, so the sum is the number of rows
+/// the stream would yield.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct StreamCounts {
+    slices: u64,
+    markers: u64,
+    wakeup_new: u64,
+    migrates: u64,
+}
+
+impl StreamCounts {
+    fn stream_rows(&self) -> u64 {
+        2 * self.slices + self.markers + self.wakeup_new + self.migrates
+    }
+}
+
+fn build_stream_count_query(
     trace_id: Option<&str>,
     start: i64,
     end: i64,
@@ -1093,33 +1268,55 @@ fn build_event_stream_query(
     let f_ts = trace_id_filter(trace_id, "t.");
     let f_w = trace_id_filter(trace_id, "w.");
     let f_m = trace_id_filter(trace_id, "m.");
-    // Migrate rows ride the `cpu` column as orig_cpu and the `dur` column as
-    // dest_cpu; the table exists only in traces recorded with schema >= 16.
-    let migrate_arm = if with_migrate {
+    let migrates = if with_migrate {
         format!(
-            "UNION ALL \
-           SELECT m.ts, {EV_MIGRATE}, m.orig_cpu, m.utid, CAST(m.dest_cpu AS BIGINT), CAST(NULL AS INTEGER) \
-             FROM sched_migrate m WHERE m.ts >= {start} AND m.ts <= {end}{f_m} "
+            "(SELECT COUNT(*) FROM sched_migrate m WHERE m.ts >= {start} AND m.ts <= {end}{f_m})"
         )
     } else {
-        String::new()
+        "CAST(0 AS BIGINT)".to_string()
     };
     format!(
-        "SELECT ts, kind, cpu, utid, dur, end_state FROM ( \
-           SELECT ss.ts AS ts, {EV_START} AS kind, ss.cpu AS cpu, ss.utid AS utid, ss.dur AS dur, ss.end_state AS end_state \
-             FROM sched_slice ss WHERE ss.dur > 0 AND ss.ts >= {start} AND ss.ts + ss.dur <= {end}{f_ss} \
-           UNION ALL \
-           SELECT ss.ts + ss.dur, {EV_END}, ss.cpu, ss.utid, ss.dur, ss.end_state \
-             FROM sched_slice ss WHERE ss.dur > 0 AND ss.ts >= {start} AND ss.ts + ss.dur <= {end}{f_ss} \
-           UNION ALL \
-           SELECT t.ts, {EV_WAKING}, t.cpu, t.utid, CAST(0 AS BIGINT), CAST(NULL AS INTEGER) \
-             FROM thread_state t WHERE t.state = 0 AND t.cpu IS NOT NULL AND t.ts >= {start} AND t.ts <= {end}{f_ts} \
-           UNION ALL \
-           SELECT w.ts, {EV_NEW}, w.target_cpu, w.utid, CAST(0 AS BIGINT), CAST(NULL AS INTEGER) \
-             FROM wakeup_new w WHERE w.ts >= {start} AND w.ts <= {end}{f_w} \
-           {migrate_arm}\
-         ) ORDER BY ts, kind"
+        "SELECT \
+           (SELECT COUNT(*) FROM sched_slice ss WHERE ss.dur > 0 AND ss.ts >= {start} AND ss.ts + ss.dur <= {end}{f_ss}), \
+           (SELECT COUNT(*) FROM thread_state t WHERE t.state = 0 AND t.cpu IS NOT NULL AND t.ts >= {start} AND t.ts <= {end}{f_ts}), \
+           (SELECT COUNT(*) FROM wakeup_new w WHERE w.ts >= {start} AND w.ts <= {end}{f_w}), \
+           {migrates}"
     )
+}
+
+/// A BIGINT column of a fetched stream batch, by position; the query casts
+/// every column, so any other type is a defect in the query, not the trace.
+fn stream_column_i64<'a>(
+    batch: &'a RecordBatch,
+    idx: usize,
+    name: &str,
+) -> Result<&'a PrimitiveArray<Int64Type>> {
+    batch
+        .column(idx)
+        .as_primitive_opt::<Int64Type>()
+        .with_context(|| {
+            format!(
+                "scheduler event stream column `{name}` is {:?}, expected BIGINT",
+                batch.column(idx).data_type()
+            )
+        })
+}
+
+/// An INTEGER column of a fetched stream batch, by position.
+fn stream_column_i32<'a>(
+    batch: &'a RecordBatch,
+    idx: usize,
+    name: &str,
+) -> Result<&'a PrimitiveArray<Int32Type>> {
+    batch
+        .column(idx)
+        .as_primitive_opt::<Int32Type>()
+        .with_context(|| {
+            format!(
+                "scheduler event stream column `{name}` is {:?}, expected INTEGER",
+                batch.column(idx).data_type()
+            )
+        })
 }
 
 fn build_window_query(trace_id: Option<&str>) -> String {
@@ -1225,24 +1422,54 @@ impl AnalyzeDb {
         // Traces recorded with schema >= 16 carry `sched_migrate`; with it the
         // placement of woken threads is exact (see the module docs).
         let placement_exact = self.table_exists("sched_migrate")?;
-        let stream_sql =
-            build_event_stream_query(trace_id, window_start, window_end, placement_exact);
-        let mut pass = Pass::new(window_end, idle, names, params.top_k > 0, placement_exact);
-        {
-            let mut stmt = self.conn.prepare(&stream_sql)?;
-            let mut rows = stmt.query([])?;
-            while let Some(r) = rows.next()? {
-                let ts: i64 = r.get(0)?;
-                let kind: i32 = r.get(1)?;
-                let cpu: i32 = r.get(2)?;
-                let utid: i64 = r.get(3)?;
-                let dur: i64 = r.get(4)?;
-                let end_state: Option<i32> = r.get(5)?;
-                if cpu < 0 {
-                    continue;
-                }
-                pass.handle(ts, kind, cpu as u32, utid, dur, end_state);
+
+        // Size the fold (module docs, "Bounded folding"): count the stream
+        // rows the requested window holds, shorten the window from its end
+        // when they exceed the event budget, then pick the chunk count from
+        // what the (possibly shortened) window holds.
+        let requested = self.stream_counts(trace_id, window_start, window_end, placement_exact)?;
+        let slice_rows_capture = requested.slices;
+        let mut window_end = window_end;
+        let mut window_truncated = false;
+        let mut folded = requested;
+        if params.max_rows > 0 && requested.stream_rows() > params.max_rows {
+            let span = (window_end - window_start) as u128;
+            let keep = span * params.max_rows as u128 / requested.stream_rows() as u128;
+            let end = window_start.saturating_add(keep as i64);
+            if end <= window_start {
+                bail!(
+                    "The window holds {} scheduler stream rows, more than the event budget \
+                     of {} fits in any part of it; raise --max-rows.",
+                    requested.stream_rows(),
+                    params.max_rows
+                );
             }
+            window_end = end;
+            window_truncated = true;
+            folded = self.stream_counts(trace_id, window_start, window_end, placement_exact)?;
+        }
+        let stream_chunk_count: u32 = if params.chunk_rows > 0 {
+            folded
+                .stream_rows()
+                .div_ceil(params.chunk_rows)
+                .clamp(1, u32::MAX as u64) as u32
+        } else {
+            1
+        };
+
+        let mut pass = Pass::new(window_end, idle, names, params.top_k > 0, placement_exact);
+        for chunk in stream_chunks(window_start, window_end, stream_chunk_count) {
+            // A single chunk is the whole window: no chunk predicate, the
+            // query as it always was.
+            let chunk = (stream_chunk_count > 1).then_some(chunk);
+            let sql = build_event_stream_query(
+                trace_id,
+                window_start,
+                window_end,
+                placement_exact,
+                chunk,
+            );
+            self.fold_stream(&sql, &mut pass)?;
         }
         let (wakeup_censored, preempt_censored) = pass.finish();
 
@@ -1405,6 +1632,9 @@ impl AnalyzeDb {
                 missed_sched_events,
                 placement_exact,
                 migrate_mismatch: pass.migrate_mismatch,
+                slice_rows_capture,
+                window_truncated,
+                stream_chunks: stream_chunk_count,
                 aggregate_ms: started.elapsed().as_millis() as u64,
             },
             wakeup_latency: pass.wakeup_lat.dist(),
@@ -1431,6 +1661,78 @@ impl AnalyzeDb {
             wakeup_tail_top,
             preempt_tail_top,
         })
+    }
+
+    /// Count the stream rows a window holds, per source (see
+    /// [`build_stream_count_query`]).
+    fn stream_counts(
+        &self,
+        trace_id: Option<&str>,
+        start: i64,
+        end: i64,
+        with_migrate: bool,
+    ) -> Result<StreamCounts> {
+        let sql = build_stream_count_query(trace_id, start, end, with_migrate);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        let Some(r) = rows.next()? else {
+            return Ok(StreamCounts::default());
+        };
+        let count = |i: usize| -> Result<u64> { Ok(r.get::<_, i64>(i)?.max(0) as u64) };
+        Ok(StreamCounts {
+            slices: count(0)?,
+            markers: count(1)?,
+            wakeup_new: count(2)?,
+            migrates: count(3)?,
+        })
+    }
+
+    /// Run one event-stream query and feed its rows to the pass, a record
+    /// batch at a time: the engine hands each batch over as typed column
+    /// slices, so a row costs the pass alone rather than six per-value
+    /// fetches through the driver.
+    fn fold_stream(&self, sql: &str, pass: &mut Pass) -> Result<()> {
+        let mut stmt = self.conn.prepare(sql)?;
+        for batch in stmt.query_arrow([])? {
+            let n = batch.num_rows();
+            if n == 0 {
+                continue;
+            }
+            let ts = stream_column_i64(&batch, 0, "ts")?;
+            let kind = stream_column_i32(&batch, 1, "kind")?;
+            let cpu = stream_column_i32(&batch, 2, "cpu")?;
+            let utid = stream_column_i64(&batch, 3, "utid")?;
+            let dur = stream_column_i64(&batch, 4, "dur")?;
+            let end_state = stream_column_i32(&batch, 5, "end_state")?;
+            if ts.null_count() > 0
+                || kind.null_count() > 0
+                || cpu.null_count() > 0
+                || utid.null_count() > 0
+                || dur.null_count() > 0
+            {
+                bail!("NULL in a non-nullable column of the scheduler event stream.");
+            }
+            for i in 0..n {
+                let cpu = cpu.value(i);
+                if cpu < 0 {
+                    continue;
+                }
+                let end_state = if end_state.is_null(i) {
+                    None
+                } else {
+                    Some(end_state.value(i))
+                };
+                pass.handle(
+                    ts.value(i),
+                    kind.value(i),
+                    cpu as u32,
+                    utid.value(i),
+                    dur.value(i),
+                    end_state,
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The final value of the "Missed sched/IRQ events" counter track, if the
@@ -1831,16 +2133,241 @@ mod tests {
 
     #[test]
     fn event_stream_query_shape() {
-        let sql = build_event_stream_query(Some("x"), 10, 20, false);
+        let sql = build_event_stream_query(Some("x"), 10, 20, false, None);
         assert!(sql.contains("FROM sched_slice ss"));
         assert!(sql.contains("FROM thread_state t WHERE t.state = 0"));
         assert!(sql.contains("FROM wakeup_new w"));
         assert!(!sql.contains("sched_migrate"));
         assert!(sql.contains("ORDER BY ts, kind"));
         assert!(sql.contains("ss.trace_id = 'x'"));
-        let sql = build_event_stream_query(Some("x"), 10, 20, true);
+        let sql = build_event_stream_query(Some("x"), 10, 20, true, None);
         assert!(sql.contains("FROM sched_migrate m WHERE m.ts >= 10 AND m.ts <= 20"));
         assert!(sql.contains("m.trace_id = 'x'"));
+    }
+
+    #[test]
+    fn chunked_stream_query_bounds_each_arm_on_its_own_timestamp() {
+        let chunk = StreamChunk {
+            lo: 12,
+            hi: 16,
+            last: false,
+        };
+        let sql = build_event_stream_query(None, 10, 20, true, Some(chunk));
+        // The window filter stays on every arm; the chunk bounds the START
+        // arm at the slice start, the END arm at the slice end.
+        assert!(sql.contains("ss.ts >= 10 AND ss.ts + ss.dur <= 20 AND ss.ts >= 12 AND ss.ts < 16"));
+        assert!(sql.contains(
+            "ss.ts >= 10 AND ss.ts + ss.dur <= 20 AND (ss.ts + ss.dur) >= 12 AND (ss.ts + ss.dur) < 16"
+        ));
+        assert!(sql.contains("t.ts >= 10 AND t.ts <= 20 AND t.ts >= 12 AND t.ts < 16"));
+        assert!(sql.contains("w.ts >= 10 AND w.ts <= 20 AND w.ts >= 12 AND w.ts < 16"));
+        assert!(sql.contains("m.ts >= 10 AND m.ts <= 20 AND m.ts >= 12 AND m.ts < 16"));
+        // The last chunk closes at the window end inclusively.
+        let last = StreamChunk {
+            lo: 16,
+            hi: 20,
+            last: true,
+        };
+        let sql = build_event_stream_query(None, 10, 20, false, Some(last));
+        assert!(sql.contains("(ss.ts + ss.dur) >= 16 AND (ss.ts + ss.dur) <= 20"));
+        assert!(sql.contains("t.ts >= 16 AND t.ts <= 20"));
+    }
+
+    #[test]
+    fn stream_chunks_cover_the_window_exactly() {
+        let c = stream_chunks(0, 10, 3);
+        assert_eq!(c.len(), 3);
+        assert_eq!((c[0].lo, c[0].hi, c[0].last), (0, 3, false));
+        assert_eq!((c[1].lo, c[1].hi, c[1].last), (3, 6, false));
+        assert_eq!((c[2].lo, c[2].hi, c[2].last), (6, 10, true));
+        let c = stream_chunks(5, 6, 1);
+        assert_eq!(c.len(), 1);
+        assert_eq!((c[0].lo, c[0].hi, c[0].last), (5, 6, true));
+        // Zero chunks is one chunk.
+        assert_eq!(stream_chunks(0, 100, 0).len(), 1);
+    }
+
+    #[test]
+    fn stream_count_query_shape() {
+        let sql = build_stream_count_query(Some("x"), 10, 20, false);
+        assert!(sql.contains(
+            "SELECT COUNT(*) FROM sched_slice ss WHERE ss.dur > 0 AND ss.ts >= 10 AND ss.ts + ss.dur <= 20 AND ss.trace_id = 'x'"
+        ));
+        assert!(sql.contains(
+            "SELECT COUNT(*) FROM thread_state t WHERE t.state = 0 AND t.cpu IS NOT NULL AND t.ts >= 10 AND t.ts <= 20"
+        ));
+        assert!(sql.contains("SELECT COUNT(*) FROM wakeup_new w WHERE w.ts >= 10 AND w.ts <= 20"));
+        assert!(sql.contains("CAST(0 AS BIGINT)"));
+        assert!(!sql.contains("sched_migrate"));
+        let sql = build_stream_count_query(None, 10, 20, true);
+        assert!(
+            sql.contains("SELECT COUNT(*) FROM sched_migrate m WHERE m.ts >= 10 AND m.ts <= 20")
+        );
+        assert_eq!(
+            StreamCounts {
+                slices: 10,
+                markers: 3,
+                wakeup_new: 2,
+                migrates: 1
+            }
+            .stream_rows(),
+            26
+        );
+    }
+
+    const C: i64 = 3;
+
+    /// `(ts, dur, cpu, utid, end_state)`, as `db_with` takes them.
+    type SliceRow = (i64, i64, i32, i64, Option<i32>);
+    /// `(ts, utid, cpu)`, as `db_with` takes them.
+    type MarkerRow = (i64, i64, i32);
+    /// `(utid, tid, name)`, as `db_with` takes them.
+    type ThreadRow = (i64, i32, &'static str);
+
+    /// A one-second workload on two CPUs with wakeups, sleeps, preemptions,
+    /// idle stretches and periodic migrations: 400 steps of 2.5 ms, four
+    /// slices and three markers per step, the last slice ending at exactly
+    /// 1 s — 1,600 slices and 1,200 markers, 4,400 stream rows.
+    fn busy_workload() -> (Vec<SliceRow>, Vec<MarkerRow>, Vec<ThreadRow>) {
+        let mut slices = Vec::new();
+        let mut markers = Vec::new();
+        for i in 0..400i64 {
+            let t = i * 2_500_000;
+            // Every tenth step A and B swap CPUs.
+            let (ca, cb) = if i % 10 == 9 { (1, 0) } else { (0, 1) };
+            slices.push((t, 1_000_000, ca, A, Some(1)));
+            slices.push((t + 1_000_000, 1_500_000, ca, IDLE, None));
+            markers.push((t + 2_000_000, A, ca));
+            slices.push((t, 1_500_000, cb, B, None));
+            slices.push((t + 1_500_000, 1_000_000, cb, C, Some(1)));
+            markers.push((t + 1_200_000, C, cb));
+            markers.push((t + 2_400_000, B, cb));
+        }
+        let mut threads = threads();
+        threads.push((C, 103, "worker-c"));
+        (slices, markers, threads)
+    }
+
+    /// Everything but the figures chunking and timing are allowed to move.
+    fn comparable(mut r: SchedAggregate) -> SchedAggregate {
+        r.meta.aggregate_ms = 0;
+        r.meta.stream_chunks = 0;
+        r
+    }
+
+    #[test]
+    fn chunked_fold_matches_the_single_query() {
+        let (slices, markers, threads) = busy_workload();
+        let db = db_with(&slices, &markers, &threads);
+        let whole = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        assert_eq!(whole.meta.stream_chunks, 1);
+        assert_eq!(whole.meta.slice_rows_capture, 1600);
+        assert!(!whole.meta.window_truncated);
+        assert_eq!(whole.meta.window_ns, 1_000_000_000);
+        assert!(whole.switches.migrations > 0, "the workload must migrate");
+        assert!(whole.preempt_wait.count > 0, "the workload must preempt");
+        let chunked = db
+            .sched_aggregate(&SchedAggregateParams {
+                chunk_rows: 500,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(chunked.meta.stream_chunks, 9);
+        assert_eq!(comparable(chunked), comparable(whole.clone()));
+        // The same with exact placement (a migrate table, schema >= 16).
+        let db = db_with_migrates(&slices, &markers, &threads, &[(1_200_000, C, 1, 0)]);
+        let whole = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        assert!(whole.meta.placement_exact);
+        let chunked = db
+            .sched_aggregate(&SchedAggregateParams {
+                chunk_rows: 1000,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(chunked.meta.stream_chunks, 5);
+        assert_eq!(comparable(chunked), comparable(whole));
+    }
+
+    #[test]
+    fn event_budget_truncates_the_window_and_stamps_it() {
+        let (slices, markers, threads) = busy_workload();
+        let db = db_with(&slices, &markers, &threads);
+        // Half the stream rows fit: the window is cut to exactly half.
+        let truncated = db
+            .sched_aggregate(&SchedAggregateParams {
+                max_rows: 2200,
+                chunk_rows: 700,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(truncated.meta.window_truncated);
+        assert_eq!(truncated.meta.window_start_ns, 0);
+        assert_eq!(truncated.meta.window_end_ns, 500_000_000);
+        assert_eq!(truncated.meta.window_ns, 500_000_000);
+        assert_eq!(truncated.meta.slice_rows_capture, 1600);
+        assert_eq!(
+            truncated.meta.slices, 600,
+            "non-idle slices in half the window"
+        );
+        assert_eq!(truncated.meta.stream_chunks, 4);
+        // It is exactly the explicit half-window run.
+        let explicit = db
+            .sched_aggregate(&SchedAggregateParams {
+                end_time: Some(0.5),
+                max_rows: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!explicit.meta.window_truncated);
+        assert_eq!(explicit.meta.window_end_ns, 500_000_000);
+        assert_eq!(explicit.meta.slice_rows_capture, 800);
+        let mut t = comparable(truncated);
+        t.meta.window_truncated = false;
+        t.meta.slice_rows_capture = 800;
+        assert_eq!(t, comparable(explicit));
+        // A budget the window fits leaves it whole.
+        let whole = db
+            .sched_aggregate(&SchedAggregateParams {
+                max_rows: 4400,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!whole.meta.window_truncated);
+        assert_eq!(whole.meta.window_ns, 1_000_000_000);
+        // A budget far below the window keeps a sliver of it — stamped, and
+        // exact over that sliver (here: nothing lies inside 227 µs).
+        let sliver = db
+            .sched_aggregate(&SchedAggregateParams {
+                max_rows: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(sliver.meta.window_truncated);
+        assert_eq!(sliver.meta.window_end_ns, 1_000_000_000 / 4400);
+        assert_eq!(sliver.meta.slices, 0);
+        assert_eq!(sliver.meta.slice_rows_capture, 1600);
+        // A budget no span of the window fits (more rows than nanoseconds) is
+        // an error, not a silent row.
+        let db = db_with(
+            &[
+                (0, 1, 0, A, Some(1)),
+                (1, 1, 0, B, Some(1)),
+                (2, 1, 0, A, Some(1)),
+            ],
+            &[],
+            &threads,
+        );
+        let err = db
+            .sched_aggregate(&SchedAggregateParams {
+                max_rows: 1,
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("max-rows"), "{err}");
     }
 
     /// Like `db_with`, plus a `sched_migrate` table with the given
