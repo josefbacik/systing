@@ -163,6 +163,9 @@ const volatile struct {
 				* update per family). Rodata, so the modulo is by
 				* a constant the verifier can see; 0 is never
 				* loaded (userspace pins it >= 1). */
+	u32 packet_sample_rate; /* network-packets: keep 1 in N PACKETS of the
+				 * data-path event types (0 or 1 = every packet).
+				 * See packet_sample_keep(). */
 } tool_config = {};
 
 enum event_type {
@@ -1571,6 +1574,45 @@ static struct packet_event *reserve_packet_event(long *flags)
 	if (event)
 		__builtin_memset(event, 0, sizeof(*event));
 	return event;
+}
+
+/*
+ * --packet-sample-rate N: keep 1 in N PACKETS of the network-packets
+ * recorder's data-path event types (PACKET_ENQUEUE / SEND / RCV_ESTABLISHED
+ * / QUEUE_RCV / BUFFER_QUEUE, the UDP send / rcv / enqueue triple and the
+ * qdisc pair). The decision is a pure function of the socket and the
+ * packet's own key - the TCP sequence number, or the buffer address for UDP
+ * (udp_packet_key) - so every stage of one packet hashes to the same verdict
+ * and the per-stage latencies (enqueue -> qdisc -> send, rcv -> queue ->
+ * buffer) stay pairable under sampling; counts and bytes scale by N. The
+ * diagnostic types (zero-window probe / ack, RTO, drops, backlog, memory
+ * pressure, TX queue stop / wake, state changes) never come through here and
+ * are always recorded. 0 or 1 = every packet (the default). No map is
+ * touched: nothing for the map / context pairing check to see.
+ */
+static __always_inline bool packet_sample_keep(u64 sk_ptr, u64 key)
+{
+	u32 rate = tool_config.packet_sample_rate;
+	if (rate <= 1)
+		return true;
+	u64 h = (sk_ptr ^ (key * 0x9E3779B97F4A7C15ULL)) * 0xBF58476D1CE4E5B9ULL;
+	h ^= h >> 32;
+	return ((u32)h % rate) == 0;
+}
+
+/*
+ * The UDP packet's sampling key: the skb's buffer address, read as a value.
+ * Reading it (rather than hashing the skb pointer itself) keeps the key a
+ * scalar in every program — in the tp_btf programs the skb is a BTF pointer
+ * and the verifier refuses arithmetic on it — and the buffer is shared by
+ * the clones the stack makes on the way out, so every stage of one datagram
+ * hashes alike.
+ */
+static __always_inline u64 udp_packet_key(const struct sk_buff *skb)
+{
+	unsigned char *head = NULL;
+	bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+	return (u64)head;
 }
 
 static __always_inline void *reserve_memory_ringbuf(long *flags, u64 size)
@@ -3582,6 +3624,9 @@ int BPF_KPROBE(udp_send_skb_entry, struct sk_buff *skb, struct flowi4 *fl4, stru
 	bpf_probe_read_kernel(&sk, sizeof(sk), &skb->sk);
 	if (!sk)
 		return 0;
+	if (tool_config.packet_sample_rate > 1 &&
+	    !packet_sample_keep((u64)sk, udp_packet_key(skb)))
+		return 0;
 
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
@@ -3663,6 +3708,8 @@ int BPF_KPROBE(udp_queue_rcv_one_skb_entry, struct sock *sk, struct sk_buff *skb
 
 	if (!head)
 		return 0;
+	if (!packet_sample_keep((u64)sk, (u64)head))
+		return 0;
 
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
@@ -3734,6 +3781,8 @@ int BPF_KPROBE(udp_enqueue_schedule_skb_entry, struct sock *sk, struct sk_buff *
 
 	if (!head)
 		return 0;
+	if (!packet_sample_keep((u64)sk, (u64)head))
+		return 0;
 
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
@@ -3794,6 +3843,16 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	if (!sk || !skb)
 		return 0;
 
+	struct tcp_skb_cb *tcb = (struct tcp_skb_cb *)&skb->cb[0];
+	u32 start_seq = 0;
+	u32 end_seq = 0;
+	u8 tcp_flags = 0;
+	u8 sacked = 0;
+
+	bpf_probe_read_kernel(&start_seq, sizeof(start_seq), &tcb->seq);
+	if (!packet_sample_keep((u64)sk, start_seq))
+		return 0;
+
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event)
@@ -3808,13 +3867,6 @@ int BPF_KPROBE(tcp_transmit_skb_entry, struct sock *sk, struct sk_buff *skb, int
 	read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
 			  event->dest_addr, &event->dest_port);
 
-	struct tcp_skb_cb *tcb = (struct tcp_skb_cb *)&skb->cb[0];
-	u32 start_seq = 0;
-	u32 end_seq = 0;
-	u8 tcp_flags = 0;
-	u8 sacked = 0;
-
-	bpf_probe_read_kernel(&start_seq, sizeof(start_seq), &tcb->seq);
 	bpf_probe_read_kernel(&end_seq, sizeof(end_seq), &tcb->end_seq);
 	bpf_probe_read_kernel(&tcp_flags, sizeof(tcp_flags), &tcb->tcp_flags);
 	bpf_probe_read_kernel(&sacked, sizeof(sacked), &tcb->sacked);
@@ -3876,6 +3928,13 @@ static __always_inline int read_tcp_seq_from_skb(struct sk_buff *skb, u32 *seq)
 static __always_inline int emit_tcp_packet_event(struct sock *sk, struct sk_buff *skb,
 						  enum packet_event_type event_type)
 {
+	// Read seq from TCP header in skb: the packet's sampling key and its
+	// seq field.
+	u32 seq = 0;
+	read_tcp_seq_from_skb(skb, &seq);
+	if (!packet_sample_keep((u64)sk, seq))
+		return 0;
+
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event)
@@ -3890,9 +3949,6 @@ static __always_inline int emit_tcp_packet_event(struct sock *sk, struct sk_buff
 	read_socket_addrs(sk, &event->af, event->src_addr, &event->src_port,
 			  event->dest_addr, &event->dest_port);
 
-	// Read seq from TCP header in skb
-	u32 seq = 0;
-	read_tcp_seq_from_skb(skb, &seq);
 	event->seq = seq;
 
 	u32 len = 0;
@@ -3929,6 +3985,10 @@ static __always_inline int emit_tcp_packet_event(struct sock *sk, struct sk_buff
 static __always_inline int emit_udp_packet_event(struct sock *sk, struct sk_buff *skb,
 						  u32 length, enum packet_event_type event_type)
 {
+	if (tool_config.packet_sample_rate > 1 &&
+	    !packet_sample_keep((u64)sk, udp_packet_key(skb)))
+		return 0;
+
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event)
@@ -4057,6 +4117,15 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 	if (!sk || !skb)
 		return 0;
 
+	struct tcp_skb_cb *tcb = (struct tcp_skb_cb *)&skb->cb[0];
+	u32 start_seq = 0;
+	u32 end_seq = 0;
+	u8 tcp_flags = 0;
+
+	bpf_probe_read_kernel(&start_seq, sizeof(start_seq), &tcb->seq);
+	if (!packet_sample_keep((u64)sk, start_seq))
+		return 0;
+
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event)
@@ -4076,12 +4145,6 @@ int BPF_KPROBE(tcp_rcv_established_entry, struct sock *sk, struct sk_buff *skb)
 	// Read our local source address from the socket
 	read_socket_src_info(sk, &event->af, event->src_addr, &event->src_port);
 
-	struct tcp_skb_cb *tcb = (struct tcp_skb_cb *)&skb->cb[0];
-	u32 start_seq = 0;
-	u32 end_seq = 0;
-	u8 tcp_flags = 0;
-
-	bpf_probe_read_kernel(&start_seq, sizeof(start_seq), &tcb->seq);
 	bpf_probe_read_kernel(&end_seq, sizeof(end_seq), &tcb->end_seq);
 	bpf_probe_read_kernel(&tcp_flags, sizeof(tcp_flags), &tcb->tcp_flags);
 
@@ -4120,6 +4183,12 @@ int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *
 	if (!sk || !skb)
 		return 0;
 
+	// Read seq from TCP header: the packet's sampling key and its seq field
+	u32 seq = 0;
+	read_tcp_seq_from_skb(skb, &seq);
+	if (!packet_sample_keep((u64)sk, seq))
+		return 0;
+
 	long flags;
 	struct packet_event *event = reserve_packet_event(&flags);
 	if (!event)
@@ -4139,9 +4208,6 @@ int BPF_KPROBE(tcp_queue_rcv_entry, struct sock *sk, struct sk_buff *skb, bool *
 	// Read our local source address from the socket
 	read_socket_src_info(sk, &event->af, event->src_addr, &event->src_port);
 
-	// Read seq from TCP header
-	u32 seq = 0;
-	read_tcp_seq_from_skb(skb, &seq);
 	event->seq = seq;
 
 	// Read length from tcp_skb_cb
@@ -4190,6 +4256,20 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 	if (!sk)
 		return 0;
 
+	// Read seq from TCP header: the packet's sampling key and its seq field.
+	// This hook fires for UDP reads too (the event is labelled TCP either
+	// way, as before); under sampling a UDP packet's key is its buffer, the
+	// key its receive and enqueue stages hashed.
+	u32 seq = 0;
+	read_tcp_seq_from_skb(skb, &seq);
+	if (tool_config.packet_sample_rate > 1) {
+		u16 sk_protocol = 0;
+		bpf_probe_read_kernel(&sk_protocol, sizeof(sk_protocol), &sk->sk_protocol);
+		u64 sample_key = (sk_protocol == IPPROTO_UDP) ? udp_packet_key(skb) : seq;
+		if (!packet_sample_keep((u64)sk, sample_key))
+			return 0;
+	}
+
 	long flags;
 	struct packet_event *pkt_event = reserve_packet_event(&flags);
 	if (!pkt_event)
@@ -4209,9 +4289,6 @@ int BPF_PROG(skb_copy_datagram_iovec, const struct sk_buff *skb, int len)
 	// Read our local source address from the socket
 	read_socket_src_info(sk, &pkt_event->af, pkt_event->src_addr, &pkt_event->src_port);
 
-	// Read seq from TCP header
-	u32 seq = 0;
-	read_tcp_seq_from_skb(skb, &seq);
 	pkt_event->seq = seq;
 	pkt_event->length = len;
 	pkt_event->tcp_flags = 0;
@@ -4979,6 +5056,27 @@ int tracepoint__qdisc__qdisc_enqueue(struct trace_event_raw_qdisc_enqueue *ctx)
 		return 0;
 
 	u64 socket_id = *socket_id_ptr;
+
+	// The packet's sampling key: the TCP seq (the key the transmit and
+	// send stages hash), the buffer address for UDP — read only when
+	// sampling is on (rodata: the whole arm is pruned at the default). A
+	// packet sampled out is never inserted into pending_qdisc_packets, so
+	// the dequeue side finds nothing and the pair is kept or dropped
+	// together.
+	if (tool_config.packet_sample_rate > 1) {
+		u16 sk_protocol = 0;
+		bpf_probe_read_kernel(&sk_protocol, sizeof(sk_protocol), &sk->sk_protocol);
+		u64 sample_key;
+		if (sk_protocol == IPPROTO_TCP) {
+			u32 seq = 0;
+			read_tcp_seq_from_skb(skb, &seq);
+			sample_key = seq;
+		} else {
+			sample_key = udp_packet_key(skb);
+		}
+		if (!packet_sample_keep((u64)sk, sample_key))
+			return 0;
+	}
 
 	// Read qdisc state
 	struct Qdisc *qdisc = (struct Qdisc *)ctx->qdisc;

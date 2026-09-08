@@ -960,6 +960,13 @@ impl NetworkRecorder {
         }
     }
 
+    /// Packet records written so far (one per packet event the consumer
+    /// drained): the denominator for the exit summary's sample-ratio line
+    /// beside the ring's `Missed packet events` counter.
+    pub fn packet_events_recorded(&self) -> u64 {
+        u64::try_from(self.next_packet_id - 1).unwrap_or(0)
+    }
+
     pub fn handle_packet_event(&mut self, event: crate::systing_core::types::packet_event) {
         debug_assert!(
             self.streaming_collector.is_some(),

@@ -264,6 +264,7 @@ pub fn sysinfo_schema() -> Arc<Schema> {
         Field::new("memory_anon_huge_walk", DataType::Utf8, true),
         Field::new("memory_syscall_leg", DataType::Utf8, true),
         Field::new("network_tw_leg", DataType::Utf8, true),
+        Field::new("network_packet_sample_rate", DataType::Int64, true),
     ]))
 }
 

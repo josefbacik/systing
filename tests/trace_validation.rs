@@ -2012,9 +2012,123 @@ fn test_e2e_network_suite() {
             "[network duckdb] network_tw_leg = {tw_leg}: the classic kprobe set is the default \
              form of the TIME_WAIT leg"
         );
+
+        // This capture ran the state tier only (network_packets is off), so
+        // sysinfo says the packets recorder did not run: NULL, never a
+        // default of 1 — a consumer scaling by the column must be able to
+        // tell "unsampled" from "no packet tables at all". The rate itself
+        // is recorded by `test_e2e_network_packet_sample_rate`.
+        let packet_sample_rate: Option<i64> = conn
+            .query_row(
+                "SELECT network_packet_sample_rate FROM sysinfo",
+                [],
+                |row| row.get(0),
+            )
+            .expect("[network duckdb] sysinfo row missing");
+        eprintln!("    network_packet_sample_rate = {packet_sample_rate:?}");
+        assert_eq!(
+            packet_sample_rate, None,
+            "[network duckdb] sysinfo.network_packet_sample_rate must be NULL when the packets \
+             recorder did not run"
+        );
     }
 
     eprintln!("\n  All network suite checks passed");
+}
+
+/// One capture with the packets recorder on and `packet_sample_rate = 4`
+/// over a TCP ping/pong workload. The rate is rodata, so this is the only
+/// capture that loads the BPF object with the sampling arm live (the
+/// default-rate captures verify it as dead code); the capture must run,
+/// sysinfo must carry the rate for the consumer to scale by, and the
+/// diagnostic rows (TCP state changes) — never sampled — must be there in
+/// full beside whatever share of the data-path events the hash kept.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_network_packet_sample_rate() {
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let duckdb_path = dir.path().join("trace.duckdb");
+    let config = Config {
+        duration: NETWORK_SUITE_DURATION_SECS,
+        network: true,
+        network_packets: true,
+        packet_sample_rate: 4,
+        output_dir: dir.path().to_path_buf(),
+        output: duckdb_path.clone(),
+        ..Config::default()
+    };
+
+    let traffic = stoppable_workload(|stop| {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind traffic listener");
+        let addr = listener.local_addr().unwrap();
+        while !stop.load(Ordering::Relaxed) {
+            if let Ok(mut client) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+                if let Ok((mut server, _)) = listener.accept() {
+                    let _ = client.write_all(b"ping");
+                    let mut buf = [0u8; 4];
+                    let _ = server.read_exact(&mut buf);
+                    let _ = server.write_all(b"pong");
+                    let _ = client.read_exact(&mut buf);
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    eprintln!(
+        "Recording trace ({}s, network + packets, packet sample rate 1/4)...",
+        NETWORK_SUITE_DURATION_SECS
+    );
+    let recorded = systing(config, None);
+    traffic.stop();
+    recorded.expect("systing recording (packets recorder, sample rate 4) failed");
+
+    let conn = duckdb::Connection::open(&duckdb_path).expect("Failed to open DuckDB");
+    let packet_sample_rate: Option<i64> = conn
+        .query_row(
+            "SELECT network_packet_sample_rate FROM sysinfo",
+            [],
+            |row| row.get(0),
+        )
+        .expect("[packet sample] sysinfo row missing");
+    eprintln!("    network_packet_sample_rate = {packet_sample_rate:?}");
+    assert_eq!(
+        packet_sample_rate,
+        Some(4),
+        "[packet sample] sysinfo.network_packet_sample_rate must record the rate the packets \
+         recorder ran with"
+    );
+
+    let state_changes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM network_packet WHERE event_type = 'TCP state_change'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let data_path: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM network_packet WHERE event_type IN \
+             ('TCP packet_enqueue', 'TCP packet_send', 'TCP packet_rcv_established', \
+              'TCP packet_queue_rcv', 'TCP buffer_queue')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    eprintln!(
+        "    {state_changes} TCP state changes (never sampled), {data_path} data-path packet \
+         events kept at 1/4"
+    );
+    assert!(
+        state_changes > 0,
+        "[packet sample] the diagnostic rows are never sampled: the connect/close workload \
+         must produce TCP state changes at any rate"
+    );
 }
 
 /// One network capture over a TCP connect/close workload with the opt-in
