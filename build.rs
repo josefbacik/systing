@@ -236,6 +236,64 @@ fn build_pystacks_bpf(out_dir: &Path, arch_define: &str, multiarch_include: &Opt
     }
 }
 
+/// Build the task-stacks recorder's BPF object and its skeleton: an object of
+/// its own rather than a part of `systing_system.bpf.o`, compiled with
+/// `-DSTROBELIGHT_SLEEPABLE_BPF`. It includes `pystacks.bpf.c` and so builds its
+/// own, sleepable, pystacks in the same compilation (see
+/// `src/bpf/task_stacks.bpf.c` for why).
+fn build_task_stacks_bpf(out_dir: &Path, arch_define: &str, multiarch_include: &Option<String>) {
+    let src = "src/bpf/task_stacks.bpf.c";
+    let out_dir_include_arg = format!("-I{}", out_dir.display());
+    let pystacks_include_arg = format!(
+        "-I{}",
+        Path::new("src/pystacks/bpf/include")
+            .canonicalize()
+            .expect("src/pystacks/bpf/include directory exists")
+            .display()
+    );
+
+    let bpf_include_arg = format!(
+        "-I{}",
+        Path::new("src/bpf")
+            .canonicalize()
+            .expect("src/bpf directory exists")
+            .display()
+    );
+
+    // For `#include "pystacks.bpf.c"`.
+    let pystacks_src_arg = format!(
+        "-I{}",
+        Path::new("src/pystacks/bpf")
+            .canonicalize()
+            .expect("src/pystacks/bpf directory exists")
+            .display()
+    );
+
+    let obj_path = out_dir.join("task_stacks.bpf.o");
+    let mut object_args = vec![
+        OsStr::new(&out_dir_include_arg),
+        OsStr::new(&bpf_include_arg),
+        OsStr::new(&pystacks_include_arg),
+        OsStr::new(&pystacks_src_arg),
+        OsStr::new(arch_define),
+        OsStr::new("-DSTROBELIGHT_SLEEPABLE_BPF"),
+    ];
+    if let Some(ref include_path) = multiarch_include {
+        object_args.push(OsStr::new(include_path));
+    }
+
+    compile_bpf_object(src, &obj_path, &object_args);
+
+    SkeletonBuilder::new()
+        .obj(&obj_path)
+        .generate(out_dir.join("task_stacks.skel.rs"))
+        .expect("Failed to generate task_stacks skeleton");
+
+    // The pystacks sources it includes are watched by build_pystacks_bpf.
+    println!("cargo:rerun-if-changed={src}");
+    println!("cargo:rerun-if-changed=src/bpf/task_stack_unwinder.bpf.h");
+}
+
 /// Detect the target architecture and return the corresponding clang define
 /// and vmlinux header filename.
 ///
@@ -281,6 +339,7 @@ fn main() {
         .unwrap_or_else(|e| panic!("Failed to copy {}: {e}", vmlinux_src.display()));
 
     println!("cargo:rerun-if-changed={}", vmlinux_src.display());
+    println!("cargo:rerun-if-changed=src/bpf/systing_shared.bpf.h");
     // Defensive: Cargo already re-runs build scripts when the target changes, but
     // this makes the dependency on the target architecture explicit.
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
@@ -290,6 +349,9 @@ fn main() {
 
     // Build pystacks BPF object
     build_pystacks_bpf(&out_dir, arch_define, &multiarch_include);
+
+    // Build the task-stacks recorder's (sleepable) BPF object
+    build_task_stacks_bpf(&out_dir, arch_define, &multiarch_include);
 
     let include_arg = format!("-I{}", out_dir.display());
     let bpf_include_arg = format!(

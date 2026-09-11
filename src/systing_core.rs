@@ -39,6 +39,8 @@ use anyhow::Result;
 use anyhow::{bail, Context};
 
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
+
+use crate::target_filter::{set_target_filter, TargetFilter, TargetFilterMaps};
 use libbpf_rs::{
     MapCore, RawTracepointOpts, RingBufferBuilder, TracepointOpts, UprobeOpts, UsdtOpts,
 };
@@ -513,6 +515,16 @@ pub fn get_available_recorders() -> Vec<RecorderInfo> {
             bpf_programs: &[],
             ringbuf_families: &[],
         },
+        RecorderInfo {
+            name: "task-stacks",
+            description: "Periodic snapshots of the targeted threads via a sleepable BPF task iterator (--task-stacks-interval-ms)",
+            default_enabled: false,
+            // The iterator is its own BPF object (src/bpf/task_stacks.bpf.c),
+            // loaded only when this recorder runs, and reads through a seq
+            // file rather than a ring.
+            bpf_programs: &[],
+            ringbuf_families: &[],
+        },
     ]
 }
 
@@ -550,6 +562,7 @@ fn is_recorder_enabled(name: &str, opts: &Config) -> bool {
         "markers" => opts.markers,
         "tpu" => opts.tpu_profile,
         "tpu-metrics" => opts.tpu_metrics,
+        "task-stacks" => opts.task_stacks,
         _ => false,
     }
 }
@@ -1362,6 +1375,9 @@ pub struct Config {
     pub continuous: u64,
     /// Collect Python stack traces
     pub collect_pystacks: bool,
+    /// With the task-stacks recorder, record only Python stacks (implies
+    /// `collect_pystacks`)
+    pub only_pystacks: bool,
     /// Capture user stacks as (build-id, file offset) pairs instead of raw
     /// IPs (BPF_F_USER_BUILD_ID), so frames of exited processes remain
     /// symbolizable from a build-id-keyed store and unresolved frames keep a
@@ -1479,6 +1495,10 @@ pub struct Config {
     pub tpu_metrics_addr: Option<String>,
     /// TPU metrics polling interval in milliseconds
     pub tpu_metrics_interval: u64,
+    /// Enable the task-stacks recorder (periodic task-iterator snapshots)
+    pub task_stacks: bool,
+    /// Interval between task-stacks snapshots in milliseconds
+    pub task_stacks_interval_ms: u64,
     /// Output directory for parquet files
     pub output_dir: PathBuf,
     /// Output path (format auto-detected from extension: .pb = Perfetto, .duckdb = DuckDB)
@@ -1513,6 +1533,7 @@ impl Default for Config {
             trace_event_config: Vec::new(),
             continuous: 0,
             collect_pystacks: false,
+            only_pystacks: false,
             collect_build_id: false,
             build_id_index_max_files: crate::stack_recorder::DEFAULT_BUILD_ID_INDEX_MAX_FILES,
             build_id_index_max_ms: crate::stack_recorder::DEFAULT_BUILD_ID_INDEX_MAX_MS,
@@ -1554,6 +1575,8 @@ impl Default for Config {
             tpu_metrics: false,
             tpu_metrics_addr: None,
             tpu_metrics_interval: 1000,
+            task_stacks: false,
+            task_stacks_interval_ms: 1000,
             output_dir: PathBuf::from("./traces"),
             output: PathBuf::from("trace.pb"),
             parquet_only: false,
@@ -1669,6 +1692,7 @@ unsafe impl Plain for arg_desc_array {}
 unsafe impl Plain for marker_event {}
 unsafe impl Plain for memory_event {}
 unsafe impl Plain for memory_event_header {}
+unsafe impl Plain for task_info {}
 
 /// BPF exec/fork event - delivered via the `ringbuf_exec_events` ringbuf when
 /// a traced process execs (any traced task) or forks (Python parents only).
@@ -1920,19 +1944,19 @@ const CONSUME_BATCH: usize = 4096;
 /// false positives would permanently suppress a task's record; zeroed comms
 /// never count as a change since smaller BPF events leave task_info fields
 /// uninitialized.
-struct TaskSightings {
+pub(crate) struct TaskSightings {
     seen: std::collections::HashMap<u64, [u8; 16]>,
 }
 
 impl TaskSightings {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             seen: std::collections::HashMap::new(),
         }
     }
 
     /// Returns true when this sighting should be forwarded downstream.
-    fn observe(&mut self, info: &task_info) -> bool {
+    pub(crate) fn observe(&mut self, info: &task_info) -> bool {
         use std::collections::hash_map::Entry;
         match self.seen.entry(info.tgidpid) {
             Entry::Vacant(entry) => {
@@ -3331,7 +3355,7 @@ fn warn_failed_probe_attachments(skel: &SystingSystemSkel) {
 }
 
 // Eight inputs: the skeleton, the config, and the per-run facts it needs at
-// open time (CPU count, kernel age, pystacks, the --cgroup mode, the ring plan)
+// open time (CPU count, kernel age, pystacks, the target filter, the ring plan)
 // — the same shape the repo allows on the other open-time configurators.
 #[allow(clippy::too_many_arguments)]
 fn configure_bpf_skeleton(
@@ -3340,7 +3364,7 @@ fn configure_bpf_skeleton(
     num_cpus: u32,
     old_kernel: bool,
     collect_pystacks: bool,
-    cgroup_kernel_mode: bool,
+    target_filter: &TargetFilter,
     memory_legs: &MemoryKernelLegs,
     network_legs: &NetworkKernelLegs,
     recorder: &Arc<SessionRecorder>,
@@ -3383,15 +3407,9 @@ fn configure_bpf_skeleton(
         rodata.tool_config.no_sched = opts.no_sched as u32;
         rodata.tool_config.no_irq = opts.no_irq as u32;
         rodata.tool_config.confidentiality_mode = detect_confidentiality_mode();
-        if !opts.cgroup.is_empty() {
-            rodata.tool_config.filter_cgroup = 1;
-            rodata.tool_config.cgroup_match_kernel = cgroup_kernel_mode as u32;
-        }
+        set_target_filter!(rodata, target_filter);
         if opts.no_stack_traces {
             rodata.tool_config.no_stack_traces = 1;
-        }
-        if !opts.pid.is_empty() {
-            rodata.tool_config.filter_pid = 1;
         }
         if collect_pystacks {
             rodata.tool_config.collect_pystacks = 1;
@@ -3522,7 +3540,7 @@ fn configure_bpf_skeleton(
         opts,
         old_kernel,
         collect_pystacks,
-        cgroup_kernel_mode,
+        target_filter.cgroup_match_kernel,
         memory_legs,
     );
     required_programs.extend(network_tw_leg_programs(opts, network_legs));
@@ -4050,6 +4068,44 @@ impl CgroupFilter {
 
     fn kernel_mode(&self) -> bool {
         self.mode == CgroupMatchMode::Kernel
+    }
+}
+
+/// The `--pid` / `--cgroup` targeting of this capture, as every BPF object's
+/// `target_filter` rodata carries it.
+fn resolve_target_filter(opts: &Config, cgroup_filter: &CgroupFilter) -> TargetFilter {
+    let filter_cgroup = !opts.cgroup.is_empty();
+    TargetFilter {
+        filter_pid: !opts.pid.is_empty(),
+        filter_cgroup,
+        cgroup_match_kernel: filter_cgroup && cgroup_filter.kernel_mode(),
+        num_cgroup_targets: cgroup_filter.targets.len() as u32,
+    }
+}
+
+/// The main object's target maps, for the other BPF objects to reuse.
+fn target_filter_maps<'a>(skel: &'a SystingSystemSkel) -> TargetFilterMaps<'a> {
+    TargetFilterMaps {
+        cgroup_targets: skel.maps.cgroup_targets.as_fd(),
+        cgroup_target_refs: skel.maps.cgroup_target_refs.as_fd(),
+        cgroups: skel.maps.cgroups.as_fd(),
+        pids: skel.maps.pids.as_fd(),
+    }
+}
+
+/// The main object's pystacks maps, for the task-stacks object to reuse.
+fn shared_pystacks_maps<'a>(
+    skel: &'a SystingSystemSkel,
+) -> crate::task_stacks_recorder::SharedPystacksMaps<'a> {
+    crate::task_stacks_recorder::SharedPystacksMaps {
+        targeted_pids: skel.maps.targeted_pids.as_fd(),
+        pid_config: skel.maps.pystacks_pid_config.as_fd(),
+        binaryid_config: skel.maps.pystacks_binaryid_config.as_fd(),
+        symbols: skel.maps.pystacks_symbols.as_fd(),
+        pysym_events: skel.maps.ringbuf_pysym_events.as_fd(),
+        emitted_cache: skel.maps.pystacks_emitted_cache.as_fd(),
+        ending_frames: skel.maps.pystacks_ending_frames.as_fd(),
+        ending_frame_qualnames: skel.maps.pystacks_ending_frame_qualnames.as_fd(),
     }
 }
 
@@ -5093,6 +5149,9 @@ struct ThreadHandles {
     symbol_loader_thread: thread::JoinHandle<i32>,
     exec_handler_thread: Option<thread::JoinHandle<()>>,
     tpu_metrics_thread: Option<thread::JoinHandle<i32>>,
+    /// Holds a `task_info_tx` clone, so it is stopped before the discovery
+    /// thread is joined.
+    task_stacks_thread: Option<crate::task_stacks_recorder::TaskStacksThread>,
     task_info_tx: Sender<task_info>,
 }
 
@@ -5235,6 +5294,10 @@ fn run_tracing_loop(
         ringbuf_shutdown.signal();
         ts
     };
+    if let Some(task_stacks) = handles.task_stacks_thread {
+        let _p = stop_phase("join task-stacks iterator");
+        task_stacks.stop();
+    }
     {
         let _p = stop_phase("join ring buffer consumers");
         for thread in handles.ringbuf_threads {
@@ -5380,6 +5443,7 @@ pub fn systing(
     // skeleton) is a second in which a cgroup created under a target would
     // still make the snapshot.
     let cgroup_filter = resolve_cgroup_filter(&opts)?;
+    let target_filter = resolve_target_filter(&opts, &cgroup_filter);
 
     let num_cpus = libbpf_rs::num_possible_cpus().unwrap() as u32;
     if opts.ringbuf_size_mib >= 4096 {
@@ -5531,7 +5595,7 @@ pub fn systing(
             num_cpus,
             old_kernel,
             collect_pystacks,
-            cgroup_filter.kernel_mode(),
+            &target_filter,
             &memory_legs,
             &network_legs,
             &recorder,
@@ -5604,13 +5668,6 @@ pub fn systing(
                 .with_context(|| {
                     format!("Failed to set cgroup_target_refs map size to {n} entries")
                 })?;
-            open_skel
-                .maps
-                .rodata_data
-                .as_deref_mut()
-                .expect("'rodata' is not mmap'ed, your kernel is too old")
-                .tool_config
-                .num_cgroup_targets = n;
         }
         if !cgroup_filter.legacy_ids.is_empty() {
             let n = cgroup_filter.legacy_ids.len() as u32;
@@ -5872,6 +5929,26 @@ pub fn systing(
                 .set_vmstat_start(ts, samples);
         }
 
+        // The task-stacks iterator: loaded here, before the traced child is
+        // released, so a load failure cannot leave it running untraced; its
+        // snapshot thread starts after the exec, so the first snapshot sees
+        // the command rather than the forked parent. It shares the target
+        // maps filled above.
+        let task_stack_mode = crate::task_stacks_recorder::TaskStackMode::from_flags(
+            opts.collect_pystacks,
+            opts.only_pystacks,
+        );
+        let task_stacks_iter = if opts.task_stacks {
+            Some(crate::task_stacks_recorder::TaskStacksIter::load(
+                &target_filter,
+                &target_filter_maps(&skel),
+                &shared_pystacks_maps(&skel),
+                task_stack_mode,
+            )?)
+        } else {
+            None
+        };
+
         // Signal the traced child to exec now that BPF is fully attached.
         // All tracing is active, so we capture everything from exec onwards.
         if let Some(ref mut child) = traced_child {
@@ -5920,6 +5997,28 @@ pub fn systing(
             .lock()
             .unwrap()
             .set_pystacks_run(psr.clone());
+
+        // The task-stacks snapshot thread: after the exec, so the first
+        // iteration sees the command rather than the forked parent, and after
+        // pystacks init, which needs the stack walker unshared.
+        let task_stacks_thread = match task_stacks_iter {
+            Some(iter) => {
+                let interval = Duration::from_millis(opts.task_stacks_interval_ms);
+                Some(crate::task_stacks_recorder::TaskStacksThread::spawn(
+                    iter,
+                    interval,
+                    crate::task_stacks_recorder::iteration_count(
+                        Duration::from_secs(opts.duration),
+                        interval,
+                    ),
+                    task_stack_mode,
+                    psr.clone(),
+                    recorder.clone(),
+                    task_info_tx.clone(),
+                )?)
+            }
+            None => None,
+        };
 
         // Spawn exec event handler thread to dynamically add Python PIDs.
         // See handle_exec_events() for details.
@@ -6205,6 +6304,7 @@ pub fn systing(
             exec_handler_thread,
             task_info_tx,
             tpu_metrics_thread,
+            task_stacks_thread,
         };
 
         capture_end_ts = run_tracing_loop(
@@ -6624,7 +6724,7 @@ pub fn bpf_load_probe(
         num_cpus,
         old_kernel,
         collect_pystacks,
-        cgroup_filter.kernel_mode(),
+        &resolve_target_filter(opts, &cgroup_filter),
         &memory_legs,
         &network_legs,
         &recorder,

@@ -65,6 +65,9 @@ struct Command {
     continuous: u64,
     #[arg(long)]
     collect_pystacks: bool,
+    /// With the task-stacks recorder, record only Python stacks (no kernel or native frames), and only the threads that have one. Implies --collect-pystacks
+    #[arg(long)]
+    only_pystacks: bool,
     /// Capture user stacks as (build-id, file offset) pairs instead of raw
     /// IPs, so frames of exited processes remain symbolizable from a
     /// build-id-keyed store; unresolved frames render as
@@ -205,6 +208,12 @@ struct Command {
     /// TPU metrics polling interval in milliseconds (default: 1000)
     #[arg(long, default_value = "1000")]
     tpu_metrics_interval: u64,
+    // Task-stacks recording enabled state (set by recorder management, not a CLI flag)
+    #[arg(skip)]
+    task_stacks: bool,
+    /// With the task-stacks recorder, the interval between snapshots of the targeted threads, in milliseconds. With --duration the recorder takes ceil(duration / interval) snapshots, numbered from 1 (10 s at 1000 ms: iterations 1-10)
+    #[arg(long, default_value = "1000", value_parser = clap::value_parser!(u64).range(1..))]
+    task_stacks_interval_ms: u64,
     /// List all available recorders and their default states
     #[arg(long)]
     list_recorders: bool,
@@ -269,6 +278,7 @@ impl From<Command> for Config {
             trace_event_config: cmd.trace_event_config,
             continuous: cmd.continuous,
             collect_pystacks: cmd.collect_pystacks,
+            only_pystacks: cmd.only_pystacks,
             collect_build_id: cmd.collect_build_id,
             build_id_index_max_files: cmd.build_id_index_max_files,
             build_id_index_max_ms: cmd.build_id_index_max_ms,
@@ -315,6 +325,8 @@ impl From<Command> for Config {
             tpu_metrics: cmd.tpu_metrics,
             tpu_metrics_addr: cmd.tpu_metrics_addr,
             tpu_metrics_interval: cmd.tpu_metrics_interval,
+            task_stacks: cmd.task_stacks,
+            task_stacks_interval_ms: cmd.task_stacks_interval_ms,
             output_dir: cmd.output_dir,
             output: cmd.output,
             parquet_only: cmd.parquet_only,
@@ -391,6 +403,7 @@ fn enable_recorder(opts: &mut Command, recorder_name: &str, enable: bool, select
         }
         "markers" => opts.markers = enable,
         "tpu-metrics" => opts.tpu_metrics = enable,
+        "task-stacks" => opts.task_stacks = enable,
         _ => unreachable!("validated recorder name not handled: {recorder_name}"),
     }
 }
@@ -415,6 +428,7 @@ fn process_recorder_options(opts: &mut Command) -> Result<()> {
         opts.markers = false;
         opts.tpu_profile = false;
         opts.tpu_metrics = false;
+        opts.task_stacks = false;
 
         // Then enable exactly the specified recorders — no companion
         // defaults, so `--only-recorder network` yields state-only tracing.
@@ -586,6 +600,16 @@ fn main() -> Result<()> {
         }
     }
 
+    // --only-pystacks is a task-stacks mode; it needs the Python stack walker.
+    if opts.only_pystacks {
+        if !opts.task_stacks {
+            anyhow::bail!(
+                "--only-pystacks applies to the task-stacks recorder (--add-recorder task-stacks)"
+            );
+        }
+        opts.collect_pystacks = true;
+    }
+
     // Auto-enable pystacks for Python commands
     if !opts.run_command.is_empty()
         && !opts.collect_pystacks
@@ -635,6 +659,32 @@ mod tests {
         let mut opts = Command::parse_from(std::iter::once("systing").chain(args.iter().copied()));
         process_recorder_options(&mut opts).expect("valid recorder names");
         opts
+    }
+
+    #[test]
+    fn task_stacks_is_off_by_default_and_selectable() {
+        let opts = opts_from(&[]);
+        assert!(!opts.task_stacks);
+        assert_eq!(opts.task_stacks_interval_ms, 1000);
+
+        let opts = opts_from(&["--add-recorder", "task-stacks"]);
+        assert!(opts.task_stacks);
+        assert!(!opts.no_sched, "--add-recorder keeps the defaults");
+
+        let opts = opts_from(&[
+            "--only-recorder",
+            "task-stacks",
+            "--task-stacks-interval-ms",
+            "250",
+        ]);
+        assert!(opts.task_stacks);
+        assert!(opts.no_sched && opts.no_cpu_stack_traces);
+        assert_eq!(opts.task_stacks_interval_ms, 250);
+    }
+
+    #[test]
+    fn task_stacks_interval_must_be_positive() {
+        assert!(Command::try_parse_from(["systing", "--task-stacks-interval-ms", "0"]).is_err());
     }
 
     #[test]

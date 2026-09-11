@@ -167,6 +167,9 @@ impl ParquetToPerfettoConverter {
         // 9. Write perf samples
         self.write_perf_samples(input_dir, writer)?;
 
+        // Task-stacks events: per-thread event and stack tracks
+        self.write_task_stack_events(input_dir, writer)?;
+
         // 10. Write network data (sockets, packets, syscalls, polls)
         self.write_network_data(input_dir, writer)?;
 
@@ -1548,6 +1551,91 @@ impl ParquetToPerfettoConverter {
         Ok(())
     }
 
+    /// Write the task-stacks recorder's events (task_stack_event.parquet) as a
+    /// `Task Stacks: <thread>` track under each thread: the thread's stack over
+    /// time, each frame a slice (see [`merge_frames`]). What else an event
+    /// carries (its iterations, CPU-time deltas, state) stays in the table.
+    fn write_task_stack_events(
+        &mut self,
+        input_dir: &Path,
+        writer: &mut dyn TraceWriter,
+    ) -> Result<()> {
+        let path = input_dir.join("task_stack_event.parquet");
+        if !path.exists() {
+            return Ok(());
+        }
+        let stacks = read_stack_data(input_dir)?;
+        let thread_names = read_thread_names(input_dir)?;
+
+        struct Event {
+            ts: i64,
+            dur: i64,
+            stack_id: Option<i64>,
+        }
+        // The threads in the order they first appear, each with its events.
+        let mut threads: Vec<(i64, Vec<Event>)> = Vec::new();
+        let mut thread_idx: HashMap<i64, usize> = HashMap::new();
+        for batch in &read_parquet_file(&path)? {
+            let int = |name: &str| {
+                batch
+                    .column_by_name(name)
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .with_context(|| format!("Missing {name} column in task_stack_event"))
+            };
+            let (ts, dur, utids, stack_ids) =
+                (int("ts")?, int("dur")?, int("utid")?, int("stack_id")?);
+            for i in 0..batch.num_rows() {
+                let utid = utids.value(i);
+                let idx = *thread_idx.entry(utid).or_insert_with(|| {
+                    threads.push((utid, Vec::new()));
+                    threads.len() - 1
+                });
+                threads[idx].1.push(Event {
+                    ts: ts.value(i),
+                    dur: dur.value(i),
+                    stack_id: get_optional_i64(Some(stack_ids), i),
+                });
+            }
+        }
+
+        let seq_id = self.alloc_seq_id();
+        for (utid, mut events) in threads {
+            events.sort_by_key(|e| e.ts);
+            let stack = merge_frames(events.iter().map(|e| {
+                let frames = e.stack_id.and_then(|id| stacks.get(&id));
+                (
+                    e.ts,
+                    e.ts + e.dur,
+                    frames.map_or(&[][..], |s| s.frame_names.as_slice()),
+                )
+            }));
+            if stack.is_empty() {
+                continue;
+            }
+
+            let track = self.alloc_uuid();
+            let mut desc = TrackDescriptor::default();
+            desc.set_uuid(track);
+            desc.set_name(match thread_names.get(&utid) {
+                Some(thread) => format!("Task Stacks: {thread}"),
+                None => format!("Task Stacks: utid {utid}"),
+            });
+            if let Some(&thread_uuid) = self.utid_to_uuid.get(&utid) {
+                desc.set_parent_uuid(thread_uuid);
+            }
+            let mut packet = TracePacket::default();
+            packet.set_track_descriptor(desc);
+            writer.write_packet(&packet)?;
+
+            // In begin order, parents first: an end event closes whichever
+            // slice of the track began last.
+            for frame in stack {
+                write_slice(writer, seq_id, track, &frame.name, frame.start, frame.end)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Write perf sample packets
     ///
     /// Supports both new schema (stack_sample.parquet) and legacy schema (perf_sample.parquet).
@@ -2496,52 +2584,181 @@ fn get_optional_f64(arr: Option<&Float64Array>, i: usize) -> Option<f64> {
     arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
 }
 
-/// Get the minimum timestamp from parquet files in the directory.
-///
-/// Scans sched_slice.parquet and thread_state.parquet for the minimum timestamp,
-/// which represents the trace start time. Returns 0 if no timestamps are found.
+/// Write one slice of `track`: a begin event at `start` and its end at `end`.
+fn write_slice(
+    writer: &mut dyn TraceWriter,
+    seq_id: u32,
+    track: u64,
+    name: &str,
+    start: i64,
+    end: i64,
+) -> Result<()> {
+    let mut begin = TrackEvent::default();
+    begin.set_type(Type::TYPE_SLICE_BEGIN);
+    begin.set_track_uuid(track);
+    begin.set_name(name.to_string());
+    let mut finish = TrackEvent::default();
+    finish.set_type(Type::TYPE_SLICE_END);
+    finish.set_track_uuid(track);
+    for (at, event) in [(start, begin), (end, finish)] {
+        let mut packet = TracePacket::default();
+        packet.set_timestamp(at as u64);
+        packet.set_track_event(event);
+        packet.set_trusted_packet_sequence_id(seq_id);
+        writer.write_packet(&packet)?;
+    }
+    Ok(())
+}
+
+/// The threads' names by utid, from thread.parquet.
+fn read_thread_names(input_dir: &Path) -> Result<HashMap<i64, String>> {
+    let path = input_dir.join("thread.parquet");
+    let mut names = HashMap::new();
+    if !path.exists() {
+        return Ok(names);
+    }
+    for batch in &read_parquet_file(&path)? {
+        let utids = batch
+            .column_by_name("utid")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .context("Missing utid column in thread.parquet")?;
+        let thread_names = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        for i in 0..batch.num_rows() {
+            if let Some(name) = get_optional_string(thread_names, i) {
+                names.insert(utids.value(i), name);
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// The frame name as far as merging goes: two frames are the same frame when
+/// their keys and their depths are equal. The key is the symbolized name
+/// (`function (module [file:line]) <0xaddress>`) without the address, which
+/// moves within one function from sample to sample; a frame with no symbol
+/// (`unknown (module) <0xaddress>`) has nothing but the address to tell it
+/// from its neighbours and keeps it. Python frames carry none. This is what
+/// py-spy merges on with line numbers on: function, file and line.
+fn merge_key(frame: &str) -> &str {
+    if frame.starts_with("unknown (") {
+        return frame;
+    }
+    match frame.rfind(" <0x") {
+        Some(at) if frame.ends_with('>') => &frame[..at],
+        _ => frame,
+    }
+}
+
+/// One frame of a thread's stack, for as long as it stayed on the stack.
+#[derive(Debug, PartialEq, Eq)]
+struct FrameSlice {
+    /// 0 is the root.
+    depth: i32,
+    name: String,
+    start: i64,
+    end: i64,
+}
+
+/// A thread's stack over time from its task-stacks events, as py-spy's Chrome
+/// trace output builds it: each event's frames are compared with the ones
+/// open before it, from the root; the ones they share stay open, the rest of
+/// the old ones end where the event starts and the rest of the new ones begin
+/// there. `events` are one thread's, in time order: start, end, and frames
+/// root first. An event that does not start where the one before it ended
+/// (the thread went unseen in between) shares nothing with it. The result is
+/// in begin order, parents before children.
+fn merge_frames<'a>(events: impl Iterator<Item = (i64, i64, &'a [String])>) -> Vec<FrameSlice> {
+    fn close(open: &mut Vec<(&str, i64)>, keep: usize, at: i64, out: &mut Vec<FrameSlice>) {
+        while open.len() > keep {
+            let (name, start) = open.pop().expect("open is longer than keep");
+            if at > start {
+                out.push(FrameSlice {
+                    depth: open.len() as i32,
+                    name: name.to_string(),
+                    start,
+                    end: at,
+                });
+            }
+        }
+    }
+
+    let mut open: Vec<(&str, i64)> = Vec::new();
+    let mut out = Vec::new();
+    let mut last_end = None;
+    for (start, end, frames) in events {
+        if let Some(last_end) = last_end.filter(|&e| e != start) {
+            close(&mut open, 0, last_end, &mut out);
+        }
+        let shared = open
+            .iter()
+            .zip(frames)
+            .take_while(|((name, _), frame)| *name == merge_key(frame))
+            .count();
+        close(&mut open, shared, start, &mut out);
+        open.extend(frames[shared..].iter().map(|f| (merge_key(f), start)));
+        last_end = Some(end);
+    }
+    if let Some(last_end) = last_end {
+        close(&mut open, 0, last_end, &mut out);
+    }
+    out.sort_by_key(|f| (f.start, f.depth));
+    out
+}
+
+/// Event tables whose earliest `ts` is the trace start for a capture with no
+/// scheduler tables (e.g. only the task-stacks or marker recorders).
+const TRACE_START_FALLBACK_TABLES: &[&str] = &[
+    "task_stack_event",
+    "slice",
+    "instant",
+    "counter",
+    "stack_sample",
+    "irq_slice",
+    "softirq_slice",
+    "memory_rss",
+    "network_syscall",
+    "network_packet",
+];
+
+/// The minimum `ts` in `<table>.parquet` under `input_dir`, if it has rows.
+fn min_ts_in(input_dir: &Path, table: &str) -> Option<i64> {
+    let path = input_dir.join(format!("{table}.parquet"));
+    if !path.exists() {
+        return None;
+    }
+    let batches = read_parquet_file(&path).ok()?;
+    batches
+        .iter()
+        .filter_map(|batch| {
+            let ts = batch
+                .column_by_name("ts")?
+                .as_any()
+                .downcast_ref::<Int64Array>()?;
+            (0..ts.len())
+                .filter(|&i| !ts.is_null(i))
+                .map(|i| ts.value(i))
+                .min()
+        })
+        .min()
+}
+
+/// The trace start timestamp: the minimum `ts` of sched_slice.parquet, else
+/// of thread_state.parquet, else the earliest of the other event tables
+/// ([`TRACE_START_FALLBACK_TABLES`]). Returns 0 only if no table has a
+/// timestamp: metadata written at 0 would otherwise stretch the trace back to
+/// boot.
 fn get_trace_start_timestamp(input_dir: &Path) -> u64 {
-    let mut min_ts: Option<i64> = None;
-
-    // Try sched_slice.parquet first
-    let sched_path = input_dir.join("sched_slice.parquet");
-    if sched_path.exists() {
-        if let Ok(batches) = read_parquet_file(&sched_path) {
-            for batch in &batches {
-                if let Some(ts_col) = batch
-                    .column_by_name("ts")
-                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                {
-                    for i in 0..batch.num_rows() {
-                        let ts = ts_col.value(i);
-                        min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
-                    }
-                }
-            }
-        }
-    }
-
-    // Try thread_state.parquet as fallback
-    if min_ts.is_none() {
-        let thread_state_path = input_dir.join("thread_state.parquet");
-        if thread_state_path.exists() {
-            if let Ok(batches) = read_parquet_file(&thread_state_path) {
-                for batch in &batches {
-                    if let Some(ts_col) = batch
-                        .column_by_name("ts")
-                        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                    {
-                        for i in 0..batch.num_rows() {
-                            let ts = ts_col.value(i);
-                            min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    min_ts.unwrap_or(0) as u64
+    min_ts_in(input_dir, "sched_slice")
+        .or_else(|| min_ts_in(input_dir, "thread_state"))
+        .or_else(|| {
+            TRACE_START_FALLBACK_TABLES
+                .iter()
+                .filter_map(|table| min_ts_in(input_dir, table))
+                .min()
+        })
+        .unwrap_or(0) as u64
 }
 
 /// Helper struct for stack records from stack.parquet
@@ -3238,6 +3455,64 @@ mod tests {
         Ok(())
     }
 
+    /// A parquet table with only a `ts` column, enough for the trace-start scan.
+    fn create_test_ts_only_parquet(dir: &Path, table: &str, ts: &[i64]) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(ts.to_vec()))],
+        )?;
+        let file = File::create(dir.join(format!("{table}.parquet")))?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn trace_start_prefers_sched_then_falls_back_to_other_event_tables() {
+        let dir = tempdir().unwrap();
+        assert_eq!(get_trace_start_timestamp(dir.path()), 0);
+
+        // No scheduler tables (e.g. a task-stacks-only capture): the earliest event.
+        create_test_ts_only_parquet(dir.path(), "slice", &[5_000, 3_000]).unwrap();
+        create_test_ts_only_parquet(dir.path(), "counter", &[4_000]).unwrap();
+        assert_eq!(get_trace_start_timestamp(dir.path()), 3_000);
+
+        // Scheduler data stays the anchor when present.
+        create_test_ts_only_parquet(dir.path(), "sched_slice", &[7_000]).unwrap();
+        assert_eq!(get_trace_start_timestamp(dir.path()), 7_000);
+    }
+
+    #[test]
+    fn network_interface_metadata_sits_at_the_first_event_without_sched_data() {
+        use crate::perfetto::VecTraceWriter;
+
+        const FIRST_EVENT_TS: i64 = 161_785_670_888_199;
+        let dir = tempdir().unwrap();
+        create_test_network_interface_parquet(dir.path(), "host", "lo", "127.0.0.1", "ipv4")
+            .unwrap();
+        create_test_ts_only_parquet(dir.path(), "slice", &[FIRST_EVENT_TS]).unwrap();
+
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut writer = VecTraceWriter::default();
+        converter
+            .write_network_interfaces(dir.path(), &mut writer)
+            .unwrap();
+
+        let timestamps: Vec<u64> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_track_event())
+            .map(|p| p.timestamp())
+            .collect();
+        assert!(!timestamps.is_empty(), "no interface events written");
+        assert!(
+            timestamps.iter().all(|&ts| ts == FIRST_EVENT_TS as u64),
+            "interface events not at the first event: {timestamps:?}"
+        );
+    }
+
     #[test]
     fn test_network_data_conversion_creates_socket_tracks() {
         use crate::perfetto::VecTraceWriter;
@@ -3661,5 +3936,239 @@ mod tests {
             has_new_state,
             "TCP state_change event should have new_state=TIME_WAIT annotation"
         );
+    }
+
+    fn names(frames: &[&str]) -> Vec<String> {
+        frames.iter().map(|f| f.to_string()).collect()
+    }
+
+    #[test]
+    fn merge_key_drops_the_address_of_a_frame_that_has_a_symbol() {
+        assert_eq!(
+            merge_key("time_sleep (libpython3.13.so.1.0 [timemodule.c:408]) <0x7f1a59dec773>"),
+            "time_sleep (libpython3.13.so.1.0 [timemodule.c:408])"
+        );
+        assert_eq!(
+            merge_key("hrtimer_nanosleep ([kernel]) <0xffffffff9b1bd463>"),
+            "hrtimer_nanosleep ([kernel])"
+        );
+        // Nothing but the address tells two unsymbolized frames apart.
+        assert_eq!(
+            merge_key("unknown (libc.so.6) <0x7f1a595821ca>"),
+            "unknown (libc.so.6) <0x7f1a595821ca>"
+        );
+        // No address to drop.
+        assert_eq!(
+            merge_key("ts_sleeper (python) [ts_workload.py:4]"),
+            "ts_sleeper (python) [ts_workload.py:4]"
+        );
+        assert_eq!(merge_key("unknown ([guest])"), "unknown ([guest])");
+    }
+
+    #[test]
+    fn frames_that_stay_on_the_stack_are_one_slice_across_events() {
+        let main = names(&["main (app) <0x10>", "run (app) <0x20>"]);
+        let a = [main.clone(), names(&["read (libc.so.6) <0x30>"])].concat();
+        // The same function at another address: the same frame.
+        let a2 = [main.clone(), names(&["read (libc.so.6) <0x34>"])].concat();
+        let b = [
+            main.clone(),
+            names(&["write (libc.so.6) <0x40>", "ksys_write ([kernel]) <0x50>"]),
+        ]
+        .concat();
+        let events = [
+            (1_000, 2_000, &a[..]),
+            (2_000, 3_000, &a2[..]),
+            (3_000, 4_000, &b[..]),
+        ];
+        let frame = |depth, name: &str, start, end| FrameSlice {
+            depth,
+            name: name.to_string(),
+            start,
+            end,
+        };
+        assert_eq!(
+            merge_frames(events.into_iter()),
+            [
+                frame(0, "main (app)", 1_000, 4_000),
+                frame(1, "run (app)", 1_000, 4_000),
+                frame(2, "read (libc.so.6)", 1_000, 3_000),
+                frame(2, "write (libc.so.6)", 3_000, 4_000),
+                frame(3, "ksys_write ([kernel])", 3_000, 4_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_changed_outer_frame_restarts_everything_under_it() {
+        let a = names(&["main (app) <0x10>", "f (app) <0x20>", "leaf (app) <0x30>"]);
+        let b = names(&["main (app) <0x10>", "g (app) <0x28>", "leaf (app) <0x30>"]);
+        let events = [(1_000, 2_000, &a[..]), (2_000, 3_000, &b[..])];
+        let got: Vec<(i32, String, i64, i64)> = merge_frames(events.into_iter())
+            .into_iter()
+            .map(|f| (f.depth, f.name, f.start, f.end))
+            .collect();
+        // `leaf` is under another caller: a new slice, though the name is the
+        // same. Begin order, parents first; all that ends at 2000 began
+        // before anything that begins there.
+        assert_eq!(
+            got,
+            [
+                (0, "main (app)".to_string(), 1_000, 3_000),
+                (1, "f (app)".to_string(), 1_000, 2_000),
+                (2, "leaf (app)".to_string(), 1_000, 2_000),
+                (1, "g (app)".to_string(), 2_000, 3_000),
+                (2, "leaf (app)".to_string(), 2_000, 3_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn frames_do_not_carry_over_an_iteration_that_missed_the_thread() {
+        let a = names(&["main (app) <0x10>"]);
+        let none: [String; 0] = [];
+        let events = [
+            (1_000, 2_000, &a[..]),
+            // Seen again at 3000, not at 2000.
+            (3_000, 4_000, &a[..]),
+            // An event without a stack ends the frames too.
+            (4_000, 5_000, &none[..]),
+        ];
+        let got: Vec<(i64, i64)> = merge_frames(events.into_iter())
+            .iter()
+            .map(|f| (f.start, f.end))
+            .collect();
+        assert_eq!(got, [(1_000, 2_000), (3_000, 4_000)]);
+    }
+
+    /// stack.parquet with the given stacks, root first.
+    fn create_test_stack_parquet(dir: &Path, stacks: &[(i64, &[&str])]) -> Result<()> {
+        let mut frames = ListBuilder::new(arrow::array::StringBuilder::new());
+        for (_, stack) in stacks {
+            for frame in *stack {
+                frames.values().append_value(frame);
+            }
+            frames.append(true);
+        }
+        let frames = frames.finish();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("frame_names", frames.data_type().clone(), true),
+        ]));
+        let ids = Int64Array::from(stacks.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(frames)])?;
+        let mut writer =
+            ArrowWriter::try_new(File::create(dir.join("stack.parquet"))?, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    /// task_stack_event.parquet: (ts, dur, utid, stack id).
+    fn create_test_task_stack_event_parquet(
+        dir: &Path,
+        events: &[(i64, i64, i64, Option<i64>)],
+    ) -> Result<()> {
+        let schema = crate::trace::task_stack_event_schema();
+        let column = |values: Vec<i64>| -> Arc<dyn arrow::array::Array> {
+            Arc::new(Int64Array::from(values))
+        };
+        let constant = |value: i64| column(vec![value; events.len()]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                column(events.iter().map(|e| e.0).collect()),
+                column(events.iter().map(|e| e.1).collect()),
+                column(events.iter().map(|e| e.2).collect()),
+                // The reserved thread name: not populated.
+                Arc::new(StringArray::from(vec![None::<&str>; events.len()])),
+                // The iterations, deltas and state: not drawn.
+                constant(1),
+                constant(1),
+                constant(0),
+                constant(0),
+                Arc::new(events.iter().map(|_| Some("S")).collect::<StringArray>()),
+                Arc::new(events.iter().map(|e| e.3).collect::<Int64Array>()),
+            ],
+        )?;
+        let file = File::create(dir.join("task_stack_event.parquet"))?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn task_stack_events_become_a_merged_stack_track_under_the_thread() {
+        use crate::perfetto::VecTraceWriter;
+
+        let dir = tempdir().unwrap();
+        create_test_process_parquet(dir.path(), 1, 1000).unwrap();
+        create_test_thread_parquet(dir.path(), 100, 2000, Some(1)).unwrap();
+        create_test_stack_parquet(
+            dir.path(),
+            &[
+                (5, &["main (app) <0x10>", "read (libc.so.6) <0x30>"]),
+                (6, &["main (app) <0x10>", "write (libc.so.6) <0x40>"]),
+            ],
+        )
+        .unwrap();
+        create_test_task_stack_event_parquet(
+            dir.path(),
+            &[
+                (1_000, 3_000, 100, Some(5)),
+                (4_000, 1_000, 100, Some(6)),
+                // A thread that never had a stack gets no track.
+                (1_000, 4_000, 101, None),
+            ],
+        )
+        .unwrap();
+        // A task-stacks-only capture starts at its first event.
+        assert_eq!(get_trace_start_timestamp(dir.path()), 1_000);
+
+        let mut converter = ParquetToPerfettoConverter::new();
+        let mut writer = VecTraceWriter::default();
+        converter
+            .write_process_and_thread_descriptors(dir.path(), &mut writer)
+            .unwrap();
+        let thread_uuid = converter.utid_to_uuid[&100];
+        writer.packets.clear();
+        converter
+            .write_task_stack_events(dir.path(), &mut writer)
+            .unwrap();
+
+        // One track, under the thread.
+        let tracks: Vec<_> = writer
+            .packets
+            .iter()
+            .filter(|p| p.has_track_descriptor())
+            .map(|p| p.track_descriptor())
+            .collect();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].name(), "Task Stacks: test_thread");
+        assert_eq!(tracks[0].parent_uuid(), thread_uuid);
+
+        // The slices' names and begin timestamps in packet order, and the end
+        // timestamps.
+        let (mut begins, mut ends) = (Vec::new(), Vec::new());
+        for packet in writer.packets.iter().filter(|p| p.has_track_event()) {
+            let event = packet.track_event();
+            assert_eq!(event.track_uuid(), tracks[0].uuid());
+            match event.type_() {
+                Type::TYPE_SLICE_BEGIN => begins.push((event.name(), packet.timestamp())),
+                Type::TYPE_SLICE_END => ends.push(packet.timestamp()),
+                other => panic!("unexpected track event type {other:?}"),
+            }
+        }
+        // `main` is on both stacks: one slice; parents begin first.
+        assert_eq!(
+            begins,
+            [
+                ("main (app)", 1_000),
+                ("read (libc.so.6)", 1_000),
+                ("write (libc.so.6)", 4_000),
+            ]
+        );
+        assert_eq!(ends, [5_000, 4_000, 5_000]);
     }
 }

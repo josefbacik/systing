@@ -807,6 +807,32 @@ pub struct MemoryThpRecord {
     pub stack_id: Option<i64>,
 }
 
+/// One thread as the task-stacks recorder found it, for as long as it stayed
+/// that way: from `ts`, the start of the iteration (`start_iteration`) whose
+/// snapshot recorded it, for `dur`, to the start of the iteration that found it
+/// changed or did not find it (the capture's end for the last). The iterations
+/// in between, through `end_iteration`, found the thread not to have run and
+/// left the event standing. `utime_delta_ns` / `stime_delta_ns` are the
+/// thread's CPU time since its previous event (0 on its first); `state` is the
+/// kernel's one-letter task state; `stack_id` is the thread's stack then
+/// (kernel, native user and Python frames as the capture's mode collects them),
+/// `None` when it had no frames. `thread_name` is reserved for the thread's
+/// name as the snapshot read it (a thread can rename itself mid-capture); it is
+/// not filled in yet and is always `None`: join `thread` on `utid` for a name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskStackEventRecord {
+    pub ts: i64,
+    pub dur: i64,
+    pub utid: i64,
+    pub thread_name: Option<String>,
+    pub start_iteration: i64,
+    pub end_iteration: i64,
+    pub utime_delta_ns: i64,
+    pub stime_delta_ns: i64,
+    pub state: String,
+    pub stack_id: Option<i64>,
+}
+
 /// A `/proc/vmstat` counter sampled at the start and the end of the capture
 /// (the THP, compaction and direct-reclaim families), so `value_end -
 /// value_start` is the host-wide count over the capture: the fleet-general
@@ -856,6 +882,7 @@ pub struct ExtractedData {
     pub memory_iommu: Vec<MemoryIommuRecord>,
     pub memory_thp: Vec<MemoryThpRecord>,
     pub memory_vmstat: Vec<MemoryVmstatRecord>,
+    pub task_stack_events: Vec<TaskStackEventRecord>,
     pub clock_snapshots: Vec<ClockSnapshotRecord>,
     pub sysinfo: Option<SysInfoRecord>,
     pub cpu_infos: Vec<CpuInfoRecord>,
