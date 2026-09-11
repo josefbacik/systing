@@ -53,6 +53,7 @@ pub struct ParquetPaths {
     pub memory_iommu: PathBuf,
     pub memory_thp: PathBuf,
     pub memory_vmstat: PathBuf,
+    pub task_stack_event: PathBuf,
     // Clock snapshot table
     pub clock_snapshot: PathBuf,
     // System info table
@@ -120,6 +121,7 @@ impl ParquetPaths {
             memory_iommu: dir.join("memory_iommu.parquet"),
             memory_thp: dir.join("memory_thp.parquet"),
             memory_vmstat: dir.join("memory_vmstat.parquet"),
+            task_stack_event: dir.join("task_stack_event.parquet"),
             // Clock snapshot table
             clock_snapshot: dir.join("clock_snapshot.parquet"),
             // System info table
@@ -176,6 +178,7 @@ impl ParquetPaths {
             memory_iommu: dir.join(format!("{trace_id}_memory_iommu.parquet")),
             memory_thp: dir.join(format!("{trace_id}_memory_thp.parquet")),
             memory_vmstat: dir.join(format!("{trace_id}_memory_vmstat.parquet")),
+            task_stack_event: dir.join(format!("{trace_id}_task_stack_event.parquet")),
             clock_snapshot: dir.join(format!("{trace_id}_clock_snapshot.parquet")),
             sysinfo: dir.join(format!("{trace_id}_sysinfo.parquet")),
             cpu_info: dir.join(format!("{trace_id}_cpu_info.parquet")),
@@ -187,7 +190,7 @@ impl ParquetPaths {
     }
 
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 44] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 45] {
         [
             PathEntry {
                 path: &self.process,
@@ -313,6 +316,10 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.memory_vmstat,
                 name: "memory_vmstat",
+            },
+            PathEntry {
+                path: &self.task_stack_event,
+                name: "task_stack_event",
             },
             PathEntry {
                 path: &self.network_interface,

@@ -33,8 +33,8 @@ use crate::trace::{
     MemoryVmstatRecord, NetworkDnsRecord, NetworkInterfaceRecord, NetworkPacketRecord,
     NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord,
     SchedMigrateRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord,
-    StackRecord, StackSampleRecord, SysInfoRecord, ThreadRecord, ThreadStateRecord,
-    TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
+    StackRecord, StackSampleRecord, SysInfoRecord, TaskStackEventRecord, ThreadRecord,
+    ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -136,6 +136,7 @@ pub struct StreamingParquetWriter {
     memory_iommu: Vec<MemoryIommuRecord>,
     memory_thp: Vec<MemoryThpRecord>,
     memory_vmstat: Vec<MemoryVmstatRecord>,
+    task_stack_events: Vec<TaskStackEventRecord>,
     clock_snapshots: Vec<ClockSnapshotRecord>,
     sysinfo: Option<SysInfoRecord>,
     cpu_infos: Vec<CpuInfoRecord>,
@@ -177,6 +178,7 @@ pub struct StreamingParquetWriter {
     memory_iommu_writer: Option<TableWriter>,
     memory_thp_writer: Option<TableWriter>,
     memory_vmstat_writer: Option<TableWriter>,
+    task_stack_event_writer: Option<TableWriter>,
     clock_snapshot_writer: Option<TableWriter>,
     sysinfo_writer: Option<TableWriter>,
     cpu_info_writer: Option<TableWriter>,
@@ -260,6 +262,7 @@ impl StreamingParquetWriter {
             memory_iommu: Vec::new(),
             memory_thp: Vec::new(),
             memory_vmstat: Vec::new(),
+            task_stack_events: Vec::new(),
             clock_snapshots: Vec::new(),
             sysinfo: None,
             cpu_infos: Vec::new(),
@@ -300,6 +303,7 @@ impl StreamingParquetWriter {
             memory_iommu_writer: None,
             memory_thp_writer: None,
             memory_vmstat_writer: None,
+            task_stack_event_writer: None,
             clock_snapshot_writer: None,
             sysinfo_writer: None,
             cpu_info_writer: None,
@@ -1074,6 +1078,24 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    fn flush_task_stack_events(&mut self) -> Result<()> {
+        if self.task_stack_events.is_empty() {
+            return Ok(());
+        }
+        let schema = trace::task_stack_event_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.task_stack_event_writer,
+            &self.sink,
+            "task_stack_event",
+            schema.clone(),
+            &self.writer_props,
+        )?;
+        let batch = build_task_stack_event_batch(&self.task_stack_events, &schema)?;
+        writer.write(&batch)?;
+        self.task_stack_events.clear();
+        Ok(())
+    }
+
     fn flush_memory_vmstat(&mut self) -> Result<()> {
         if self.memory_vmstat.is_empty() {
             return Ok(());
@@ -1205,6 +1227,7 @@ impl StreamingParquetWriter {
         close_writer!(self.memory_iommu_writer);
         close_writer!(self.memory_thp_writer);
         close_writer!(self.memory_vmstat_writer);
+        close_writer!(self.task_stack_event_writer);
         close_writer!(self.clock_snapshot_writer);
         close_writer!(self.sysinfo_writer);
         close_writer!(self.cpu_info_writer);
@@ -1576,6 +1599,16 @@ impl RecordCollector for StreamingParquetWriter {
         Ok(())
     }
 
+    fn add_task_stack_event(&mut self, record: TaskStackEventRecord) -> Result<()> {
+        Self::reserve_if_empty(&mut self.task_stack_events, self.batch_size);
+        self.task_stack_events.push(record);
+        self.total_records += 1;
+        if Self::should_flush(&self.task_stack_events, self.batch_size) {
+            self.flush_task_stack_events()?;
+        }
+        Ok(())
+    }
+
     fn add_memory_vmstat(&mut self, record: MemoryVmstatRecord) -> Result<()> {
         Self::reserve_if_empty(&mut self.memory_vmstat, self.batch_size);
         self.memory_vmstat.push(record);
@@ -1671,6 +1704,7 @@ impl RecordCollector for StreamingParquetWriter {
         self.flush_memory_iommu()?;
         self.flush_memory_thp()?;
         self.flush_memory_vmstat()?;
+        self.flush_task_stack_events()?;
         self.flush_clock_snapshots()?;
         self.flush_sysinfo()?;
         self.flush_cpu_infos()?;
@@ -2883,6 +2917,51 @@ fn build_memory_thp_batch(
             Arc::new(kind.finish()),
             Arc::new(addr.finish()),
             Arc::new(result.finish()),
+            Arc::new(stack_id.finish()),
+        ],
+    )?)
+}
+
+fn build_task_stack_event_batch(
+    records: &[TaskStackEventRecord],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    use arrow::array::Int64Builder;
+    let n = records.len();
+    let mut ts = Int64Builder::with_capacity(n);
+    let mut dur = Int64Builder::with_capacity(n);
+    let mut utid = Int64Builder::with_capacity(n);
+    let mut thread_name = StringBuilder::with_capacity(n, 0);
+    let mut start_iteration = Int64Builder::with_capacity(n);
+    let mut end_iteration = Int64Builder::with_capacity(n);
+    let mut utime_delta_ns = Int64Builder::with_capacity(n);
+    let mut stime_delta_ns = Int64Builder::with_capacity(n);
+    let mut state = StringBuilder::with_capacity(n, n);
+    let mut stack_id = Int64Builder::with_capacity(n);
+    for r in records {
+        ts.append_value(r.ts);
+        dur.append_value(r.dur);
+        utid.append_value(r.utid);
+        thread_name.append_option(r.thread_name.as_deref());
+        start_iteration.append_value(r.start_iteration);
+        end_iteration.append_value(r.end_iteration);
+        utime_delta_ns.append_value(r.utime_delta_ns);
+        stime_delta_ns.append_value(r.stime_delta_ns);
+        state.append_value(&r.state);
+        stack_id.append_option(r.stack_id);
+    }
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(ts.finish()),
+            Arc::new(dur.finish()),
+            Arc::new(utid.finish()),
+            Arc::new(thread_name.finish()),
+            Arc::new(start_iteration.finish()),
+            Arc::new(end_iteration.finish()),
+            Arc::new(utime_delta_ns.finish()),
+            Arc::new(stime_delta_ns.finish()),
+            Arc::new(state.finish()),
             Arc::new(stack_id.finish()),
         ],
     )?)

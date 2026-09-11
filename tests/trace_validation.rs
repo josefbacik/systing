@@ -5220,3 +5220,144 @@ fn test_e2e_only_cpu_stacks_emits_samples() {
         );
     }
 }
+
+/// The task-stacks recorder end to end: a task-iterator-only recording
+/// targeted at a child process must land the child's thread in the
+/// task_stack_event table, its iterations spanned by few events because it
+/// sleeps, with its symbolized stack in the stack table, and register the
+/// thread's name through process discovery.
+#[test]
+#[ignore] // Requires root/BPF privileges
+fn test_e2e_task_stacks_recording() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("Failed to spawn sleep");
+
+    let config = Config {
+        duration: 3,
+        pid: vec![child.id()],
+        output_dir: dir.path().to_path_buf(),
+        no_sched: true,
+        no_irq: true,
+        no_cpu_stack_traces: true,
+        no_sleep_stack_traces: true,
+        no_interruptible_stack_traces: true,
+        collect_pystacks: false,
+        task_stacks: true,
+        task_stacks_interval_ms: 500,
+        parquet_only: true,
+        ..Config::default()
+    };
+    let result = systing(config, None);
+    let _ = child.kill();
+    let _ = child.wait();
+    result.expect("systing recording failed");
+
+    let events_path = dir.path().join("task_stack_event.parquet");
+    assert!(
+        events_path.exists(),
+        "task_stack_event.parquet not found - no task-stacks snapshot was recorded"
+    );
+    // 3 s at 500 ms is iterations 1-6, but the thread sleeps through them:
+    // once it has settled, its snapshots find it unchanged and extend one
+    // event instead of adding five.
+    let events = parquet_row_count(&events_path);
+    assert!(
+        (1..6).contains(&events),
+        "expected the sleeping thread's unchanged iterations to share an event, got {events} events for 6 iterations"
+    );
+    assert!(
+        parquet_int_column_contains(&events_path, "start_iteration", 1),
+        "no event starts at iteration 1"
+    );
+    assert!(
+        parquet_int_column_contains(&events_path, "end_iteration", 6),
+        "no event reaches iteration 6"
+    );
+    assert!(
+        parquet_column_contains(&events_path, "state", "S"),
+        "the sleeping thread was never recorded in state S"
+    );
+    assert!(
+        parquet_column_contains(&dir.path().join("thread.parquet"), "name", "sleep"),
+        "the targeted thread's name did not reach thread.parquet"
+    );
+    // The sleeping thread's stack, symbolized with the other recorders': it
+    // is blocked in the kernel's nanosleep.
+    let stack_path = dir.path().join("stack.parquet");
+    assert!(
+        stack_path.exists(),
+        "the task-stacks stacks were not symbolized into stack.parquet"
+    );
+    assert!(
+        parquet_column_matches(&stack_path, "leaf_name", |v| v.contains("nanosleep")
+            && v.contains("([kernel])")),
+        "no stack ends in the kernel's nanosleep"
+    );
+    // Nothing is drawn at record time: the Perfetto converter does that.
+    assert!(
+        !dir.path().join("slice.parquet").exists(),
+        "the task-stacks recorder wrote slices"
+    );
+}
+
+/// The task-stacks recorder with pystacks: `--collect-pystacks` merges each
+/// thread's Python frames with its native and kernel frames, and
+/// `--only-pystacks` records the Python frames alone.
+#[test]
+#[ignore] // Requires root/BPF privileges and pyenv Python (./scripts/setup-pystacks.sh)
+fn test_e2e_task_stacks_python_frames() {
+    let python_bin = pyenv_python(PYTHON_313_VERSION);
+    let defs = r#"
+def task_stacks_marker():
+    time.sleep(0.2)
+"#;
+    for only_pystacks in [false, true] {
+        let dir = TempDir::new().expect("Failed to create temp dir");
+        let workload = spawn_python_workload(
+            &python_bin,
+            dir.path(),
+            "task_stacks.py",
+            defs,
+            "task_stacks_marker()",
+        );
+        let config = Config {
+            duration: 2,
+            pid: vec![workload.pid],
+            pystacks_pids: vec![workload.pid],
+            output_dir: dir.path().to_path_buf(),
+            no_sched: true,
+            no_irq: true,
+            no_cpu_stack_traces: true,
+            no_sleep_stack_traces: true,
+            no_interruptible_stack_traces: true,
+            collect_pystacks: true,
+            only_pystacks,
+            task_stacks: true,
+            task_stacks_interval_ms: 500,
+            parquet_only: true,
+            ..Config::default()
+        };
+        systing(config, None).expect("systing recording failed");
+        drop(workload);
+
+        assert!(
+            dir.path().join("task_stack_event.parquet").exists(),
+            "[only_pystacks={only_pystacks}] task_stack_event.parquet not found"
+        );
+        let stack_path = dir.path().join("stack.parquet");
+        let (python_frames, marker) =
+            find_python_symbols_in_parquet(&stack_path, "task_stacks_marker (python)");
+        assert!(
+            python_frames && marker,
+            "[only_pystacks={only_pystacks}] the thread's Python frame is in none of its stacks"
+        );
+        let (_, has_kernel_frames) = find_python_symbols_in_parquet(&stack_path, "([kernel])");
+        assert_eq!(
+            has_kernel_frames, !only_pystacks,
+            "[only_pystacks={only_pystacks}] kernel frames present: {has_kernel_frames}"
+        );
+    }
+}

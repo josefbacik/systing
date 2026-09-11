@@ -18,6 +18,7 @@ use crate::sched::SchedEventRecorder;
 use crate::stack_recorder::StackRecorder;
 use crate::systing_core::types::task_info;
 use crate::systing_core::SystingRecordEvent;
+use crate::task_stacks_recorder::TaskStacksRecorder;
 use crate::tpu::metrics_recorder::TpuMetricsRecorder;
 use crate::trace::{
     ClockSnapshotRecord, CounterRecord, CounterTrackRecord, ProcessRecord, ThreadRecord,
@@ -249,6 +250,7 @@ pub struct SessionRecorder {
     pub network_recorder: Mutex<NetworkRecorder>,
     pub memory_recorder: Mutex<MemoryRecorder>,
     pub marker_recorder: Mutex<MarkerRecorder>,
+    pub task_stacks_recorder: Mutex<TaskStacksRecorder>,
     pub tpu_metrics_recorder: Option<Mutex<TpuMetricsRecorder>>,
     pub process_descriptors: RwLock<HashMap<u64, ProcessDescriptor>>,
     pub processes: RwLock<HashMap<u64, ProtoProcess>>,
@@ -988,6 +990,7 @@ impl SessionRecorder {
                     .with_threshold(marker_threshold)
                     .with_duration_threshold(marker_duration_threshold),
             ),
+            task_stacks_recorder: Mutex::new(TaskStacksRecorder::new(Arc::clone(&utid_generator))),
             tpu_metrics_recorder: if tpu_metrics_enabled {
                 Some(Mutex::new(TpuMetricsRecorder::new()))
             } else {
@@ -1515,6 +1518,11 @@ impl SessionRecorder {
             memory_recorder.set_streaming_collector(Box::new(make_writer()));
             memory_recorder.set_spill_dir(spill_dir);
         }
+        // The task-stacks recorder's unique stacks spill the same way.
+        self.task_stacks_recorder
+            .lock()
+            .unwrap()
+            .set_spill_dir(spill_dir);
 
         // Set up streaming collector for probe recorder (events emitted on completion).
         // Note: marker records are also written through this collector during
@@ -1781,6 +1789,17 @@ impl SessionRecorder {
         }
         stage_done("Flushed memory trace records", &mut stage_start);
 
+        // The task-stacks recorder's stacks are symbolized with the others.
+        {
+            let task_stacks_interner = self.task_stacks_recorder.lock().unwrap().take_interner();
+            if task_stacks_interner.total() > 0 {
+                self.stack_recorder
+                    .lock()
+                    .unwrap()
+                    .merge_external_interner(task_stacks_interner);
+            }
+        }
+
         eprintln!("Flushing stack samples and symbolizing stacks...");
         writer = self.stack_recorder.lock().unwrap().finish(writer)?;
         stage_done("Flushed and symbolized stack samples", &mut stage_start);
@@ -1834,6 +1853,17 @@ impl SessionRecorder {
             if marker_recorder.has_data() {
                 eprintln!("Writing marker records...");
                 marker_recorder.write_records(&mut *track_writer)?;
+            }
+        }
+
+        // Write task-stacks records (only if any snapshots were taken); the
+        // events still open close at the capture end, like the still-running
+        // sched slices.
+        {
+            let task_stacks_recorder = self.task_stacks_recorder.lock().unwrap();
+            if task_stacks_recorder.has_data() {
+                eprintln!("Writing task-stacks records...");
+                task_stacks_recorder.write_records(&mut *track_writer, end_ts as u64)?;
             }
         }
         track_writer.finish_boxed()?;
@@ -1937,6 +1967,11 @@ mod tests {
         [
             recorder.network_recorder.lock().unwrap().min_timestamp(),
             recorder.marker_recorder.lock().unwrap().min_timestamp(),
+            recorder
+                .task_stacks_recorder
+                .lock()
+                .unwrap()
+                .min_timestamp(),
         ]
         .into_iter()
         .flatten()
@@ -2131,6 +2166,7 @@ mod tests {
                 Arc::clone(&utid_generator),
                 Arc::clone(&track_event_ids),
             )),
+            task_stacks_recorder: Mutex::new(TaskStacksRecorder::new(Arc::clone(&utid_generator))),
             process_descriptors: RwLock::new(HashMap::new()),
             processes: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashMap::new()),

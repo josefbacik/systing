@@ -134,6 +134,7 @@ This will display all available recorders and their default states:
 - `markers` - Userspace marker events (faccessat2 with mode=-975)
 - `tpu` - TPU profiling (gRPC to XLA runtime profiler service)
 - `tpu-metrics` - TPU runtime metrics polling (port 8431, always available)
+- `task-stacks` - Periodic snapshots of every targeted thread's stack through a sleepable BPF task iterator, every `--task-stacks-interval-ms` (default 1000); with `-d`, ceil(duration / interval) iterations numbered from 1 (10 s at 1000 ms: iterations 1-10). Kernel and native user frames by default; `--collect-pystacks` merges in Python frames and `--only-pystacks` records only Python frames, and only the threads that have any. A thread that has not run since its last snapshot and is still in the same non-runnable state cannot have changed its stack: it is not walked again, and its event is extended instead. The events are the `task_stack_event` table (`ts`, `dur`, `utid`, `thread_name` (reserved, not populated yet), `start_iteration`, `end_iteration`, `utime_delta_ns`, `stime_delta_ns`, `state`, `stack_id` into `stack`). In the Perfetto trace each thread gets a `Task Stacks: <thread>` track: the stack over time drawn the way py-spy's Chrome trace output draws it, each frame one slice for as long as it stays on the stack, root at the top
 
 The three `network*` recorders are tiers of the same subsystem, ordered by event
 volume — see Network Traffic Recording below for when to use each.

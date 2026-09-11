@@ -537,6 +537,22 @@ pub fn memory_thp_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Schema for task_stack_event.parquet
+pub fn task_stack_event_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("dur", DataType::Int64, false),
+        Field::new("utid", DataType::Int64, false),
+        Field::new("thread_name", DataType::Utf8, true),
+        Field::new("start_iteration", DataType::Int64, false),
+        Field::new("end_iteration", DataType::Int64, false),
+        Field::new("utime_delta_ns", DataType::Int64, false),
+        Field::new("stime_delta_ns", DataType::Int64, false),
+        Field::new("state", DataType::Utf8, false),
+        Field::new("stack_id", DataType::Int64, true),
+    ]))
+}
+
 /// Schema for memory_vmstat.parquet
 pub fn memory_vmstat_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
