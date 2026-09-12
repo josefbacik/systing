@@ -94,6 +94,12 @@ Integration tests require root/BPF privileges and are marked as `#[ignore]` by d
 
 The script builds as your user (preserving artifact ownership), then runs only the test binary with sudo.
 
+CI runs one of them on every push and pull request: the `bpf-load-shapes` workflow builds the
+`bpf_load_shapes` test binary with the release BPF compiler and runs its `every_shape_loads` gate in a
+guest per kernel (the repository's vmtest kernel and the Container-Optimized OS kernels pinned in
+`.github/workflows/bpf-load-shapes.yml`), so a program the verifier rejects at a shipping configuration
+fails the change before a tag.
+
 ## Usage
 
 Detailed options can be found [here](docs/USAGE.adoc).

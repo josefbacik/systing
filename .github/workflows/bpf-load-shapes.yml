@@ -1,0 +1,163 @@
+name: bpf-load-shapes
+
+# Load every BPF program of the release-compiler object, at every configuration
+# shape that ships, on the kernels the object runs on — in a guest per kernel,
+# before any tag. `every_shape_loads` (tests/bpf_load_shapes.rs) is the gate;
+# the object is built here with the same BPF compiler the release build uses.
+#
+# Kernel images are executed, so each one is pinned by its sha256 in the matrix
+# below and verified after the download; the download is cached by that digest.
+# The verdict travels in a file the guest writes into the shared workspace, not in
+# the VM tool's exit code: a Container-Optimized OS kernel has no virtio console,
+# so vng cannot read the guest's exit code there and returns 255 either way.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build the load-shape gate (release BPF compiler)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-common libelf-dev linux-libc-dev clang libbpf-dev make pkg-config jq libjemalloc2
+      - name: Install clang 21 (the release build's BPF compiler)
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh -O /tmp/llvm.sh
+          sudo bash /tmp/llvm.sh 21
+          clang-21 --version
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+      - name: Download the pre-built DuckDB library the crate pins
+        run: |
+          LIBDUCKDB_VERSION="$(scripts/libduckdb-version.sh)"
+          echo "libduckdb v${LIBDUCKDB_VERSION} (the DuckDB version Cargo.lock pins)"
+          wget -nv "https://github.com/duckdb/duckdb/releases/download/v${LIBDUCKDB_VERSION}/libduckdb-linux-amd64.zip" -O /tmp/libduckdb.zip
+          unzip /tmp/libduckdb.zip -d ${{ github.workspace }}/libduckdb
+      - name: Build the bpf_load_shapes test binary
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          DUCKDB_LIB_DIR: "${{ github.workspace }}/libduckdb"
+          DUCKDB_INCLUDE_DIR: "${{ github.workspace }}/libduckdb"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/libduckdb"
+          SYSTING_BPF_CLANG: "clang-21"
+        run: |
+          cargo test --test bpf_load_shapes --no-run --no-default-features --message-format=json > /tmp/build.json
+          BIN="$(jq -r 'select(.reason == "compiler-artifact") | select(.target.kind[] == "test") | select(.target.name == "bpf_load_shapes") | .executable' /tmp/build.json | tail -1)"
+          test -x "$BIN"
+          mkdir -p gate
+          cp "$BIN" gate/bpf_load_shapes
+          cp libduckdb/libduckdb.so gate/
+          ls -l gate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: load-shape-gate
+          path: gate/
+          retention-days: 1
+          if-no-files-found: error
+
+  load-shapes:
+    name: Load every shape on ${{ matrix.kernel.id }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel:
+          # The repository's own vmtest kernel: vanilla v6.12 with the BPF
+          # selftests config (kernel/build.sh, the `vmtest-kernels` release).
+          - id: vmtest-6.12
+            url: https://github.com/josefbacik/systing/releases/download/vmtest-kernels/bzImage-v6.12-bpf
+            sha256: 324f2d6cad6763886afc0392a205b27f71176ae5f9357a06219e773177089244
+          # Container-Optimized OS, milestone 125 build 19216.395.138: kernel
+          # 6.12.85+ (the ELF `vmlinux` Google publishes for the build; it boots
+          # directly — CONFIG_PVH=y — with 9p built in and no virtio console).
+          - id: cos-125-6.12.85
+            url: https://storage.googleapis.com/cos-tools/19216.395.138/gke-amd64-gcp/vmlinux
+            sha256: 6c9460560118608c7ca90d7da324fd100d40fb18ecf03c06fa7902cf2b57011a
+          # Container-Optimized OS, milestone 129 build 19506.224.80: kernel 6.12.90+.
+          - id: cos-129-6.12.90
+            url: https://storage.googleapis.com/cos-tools/19506.224.80/gke-amd64-gcp/vmlinux
+            sha256: 0c39e1964e6dfe2871227d30c4141a01a05b1e7fd1e184e87608b461e64ef69e
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: load-shape-gate
+          path: gate
+      - name: Install qemu and virtme-ng
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils pipx
+          pipx install virtme-ng==1.41
+          # pipx puts its apps where PIPX_BIN_DIR points (the runner image sets
+          # it to /opt/pipx_bin; a bare install defaults to ~/.local/bin): ask
+          # pipx rather than assume a path.
+          PIPX_BIN="$(pipx environment --value PIPX_BIN_DIR)"
+          echo "pipx apps: $PIPX_BIN"
+          echo "$PIPX_BIN" >> "$GITHUB_PATH"
+          "$PIPX_BIN/vng" --version
+      - name: Restore the kernel image from the cache
+        id: kernel
+        uses: actions/cache@v4
+        with:
+          path: kernels/${{ matrix.kernel.id }}
+          key: kernel-${{ matrix.kernel.id }}-${{ matrix.kernel.sha256 }}
+      - name: Download the kernel image
+        if: steps.kernel.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "kernels/${{ matrix.kernel.id }}"
+          curl -sSL --max-time 900 -o "kernels/${{ matrix.kernel.id }}/kernel" "${{ matrix.kernel.url }}"
+      - name: Verify the kernel image's pinned digest
+        run: echo "${{ matrix.kernel.sha256 }}  kernels/${{ matrix.kernel.id }}/kernel" | sha256sum -c -
+      - name: Use KVM when the runner exposes it
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            echo "accelerator: kvm"
+          else
+            echo "accelerator: tcg (no /dev/kvm on this runner)"
+          fi
+      - name: Boot the kernel and load every shape
+        run: |
+          chmod +x gate/bpf_load_shapes scripts/ci/vmtest-load-shapes.sh
+          mkdir -p guest-tmp
+          OUT="$GITHUB_WORKSPACE/load-shapes-${{ matrix.kernel.id }}.log"
+          KVM_FLAG=""
+          [ -w /dev/kvm ] || KVM_FLAG="--disable-kvm"
+          set +e
+          timeout 900 vng --run "kernels/${{ matrix.kernel.id }}/kernel" $KVM_FLAG --force-9p --cpus 2 --memory 2G \
+            --rwdir "$GITHUB_WORKSPACE" --rwdir "/tmp=$GITHUB_WORKSPACE/guest-tmp" \
+            --append oops=panic --append virtme_root_user=1 --verbose \
+            -- bash "$GITHUB_WORKSPACE/scripts/ci/vmtest-load-shapes.sh" \
+                 "$GITHUB_WORKSPACE/gate/bpf_load_shapes" "$GITHUB_WORKSPACE/gate" "$OUT"
+          echo "vng exited $? (informational: a guest without a virtio console returns 255 whatever the test did; the guest-written file decides)"
+          set -e
+          echo "::group::guest output (${{ matrix.kernel.id }})"
+          cat "$OUT" || true
+          echo "::endgroup::"
+          grep -q '^VNG-TEST-EXIT:0$' "$OUT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: load-shapes-${{ matrix.kernel.id }}
+          path: load-shapes-${{ matrix.kernel.id }}.log
+          if-no-files-found: ignore
+          retention-days: 7
