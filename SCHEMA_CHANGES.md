@@ -571,6 +571,35 @@ The tables keep their columns; the new columns are nullable.
   which always attached the classic tracepoints. `memory_fault_leg` keeps
   reading `tracepoint` on x86 for the raw-attached tracepoint — the same
   event, the same rows.
+  New VALUES from the next release (unreleased at the time of writing; no
+  schema version change — the column and the rows are the same):
+  `raw_tracepoint` — a third form, `--kernel-hooks raw-tracepoint`, opt-in:
+  one `tp_btf/sys_enter` and one `tp_btf/sys_exit` program dispatching on
+  the syscall number in place of the six perf-attached tracepoints, whose
+  detach takes `tracepoint_probe_unregister`'s asynchronous `call_rcu` path
+  instead of six synchronous SRCU + RCU grace-period pairs (the `detach bpf
+  programs` stop phase: 81 / 70 / 79 / 62 / 66 ms against the classic set's
+  146 / 161 / 141 / 125 / 135 / 137 ms, one capture per boot on a 4-vCPU
+  6.12.0 guest under TCG — the direction; the magnitude is a busy host's);
+  the six classic programs stay
+  in the object as the fallback, selected when vmlinux BTF lacks the
+  `btf_trace_sys_enter` / `btf_trace_sys_exit` typedefs (`tracepoint:nobtf`
+  under that form — a tp_btf target is resolved at load, so the pair is not
+  loaded there) or when the pair fails to attach (`tracepoint:noraw`).
+  Why the pair is opt-in and not the default: both forms register the same
+  two tracepoints (`syscall_regfunc`'s task walk and the static-key flip
+  are paid once either way), but every syscall of every task then enters
+  the recorder's two programs — returned at their first instruction, the
+  syscall-number test, yet an entry each — where the classic form's
+  `perf_syscall_enter` returns on its enabled-syscall bitmap. Measured on
+  that guest with a four-thread `getpid()` storm placed against the trace's
+  own `memory_vmstat` attach-to-detach window, three runs: 1,667–1,729 K
+  calls/s with no capture, 1,398–1,516 K/s under the classic set (−12 to
+  −16 %: the sys_enter/sys_exit slow path), 818–868 K/s under the pair
+  (−49 to −52 %) — a tax on every syscall of every traced-host task for the
+  capture's duration, in exchange for a stop-path saving on the tracer
+  alone. The rows a form produces are byte-identical: both feed the same
+  row-building code.
 - `sysinfo`: added `network_tw_leg VARCHAR` — how the network recorder's
   TIME_WAIT leg (the `tcp_time_wait` / `inet_twsk_hashdance_schedule` /
   `inet_twsk_deschedule_put` hooks that turn `tcp_time_wait()`'s CLOSE into

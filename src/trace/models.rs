@@ -594,15 +594,23 @@ pub struct SysInfoRecord {
     /// processes whose memory events moved the most bytes. `None` when the
     /// THP leg did not run, and in traces from systing < 1.16.
     pub memory_anon_huge_walk: Option<String>,
-    /// How the memory recorder's mmap/munmap/brk hooks attached: `fentry`
-    /// (trampolines on the arch syscall wrappers), `tracepoint:nosym` /
-    /// `tracepoint:nobtf` / `tracepoint:notramp` (the classic syscalls
-    /// tracepoints — the wrappers are not in kallsyms / not in vmlinux BTF /
-    /// the trampoline set failed to attach) or
-    /// `off:<cause>` (neither attached: no mmap/munmap/brk rows in
-    /// memory_map for this capture). `None` when the memory recorder did
-    /// not run, and in traces from systing < 1.17 (which attached the
-    /// classic tracepoints, always).
+    /// How the memory recorder's mmap/munmap/brk hooks attached:
+    /// `tracepoint` (the six classic syscalls tracepoints through
+    /// perf_event_open — the default form, `--kernel-hooks classic`),
+    /// `raw_tracepoint` (the opt-in `--kernel-hooks raw-tracepoint` form,
+    /// from the next release — unreleased at the time of writing:
+    /// one `tp_btf` program each on the sys_enter and sys_exit tracepoints,
+    /// dispatching on the syscall number), `tracepoint:nobtf` /
+    /// `tracepoint:noraw` (the classic set under that form because vmlinux
+    /// BTF lacks the sys_enter/sys_exit typedefs / the raw pair failed to
+    /// attach), `fentry` (trampolines on the arch syscall wrappers, the
+    /// opt-in `--kernel-hooks trampoline` form), `tracepoint:nosym` /
+    /// `tracepoint:nobtf` / `tracepoint:notramp` (the classic set under
+    /// that form — the wrappers are not in kallsyms / not in vmlinux BTF /
+    /// the trampoline set failed to attach) or `off:<cause>` (nothing
+    /// attached: no mmap/munmap/brk rows in memory_map for this capture).
+    /// `None` when the memory recorder did not run, and in traces from
+    /// systing < 1.17 (which attached the classic tracepoints, always).
     pub memory_syscall_leg: Option<String>,
     /// How the network recorder's TIME_WAIT leg (the tcp_time_wait /
     /// inet_twsk_hashdance_schedule / inet_twsk_deschedule_put hooks)
