@@ -71,6 +71,17 @@ pub(super) enum StatementShape {
     /// this path, and a dollar-quoted string can hide a quote character or
     /// a `;` from this scan — so the text is refused rather than guessed at.
     Dollar,
+    /// A character outside the ASCII range that sits outside every quoted
+    /// run and comment. DuckDB replaces a set of Unicode spaces (U+00A0,
+    /// U+2000–U+200B, U+202F, U+205F, U+2060, U+3000, U+FEFF) outside
+    /// quotes with a space BEFORE it lexes the text, and its lexer folds
+    /// every other non-ASCII byte into identifiers; neither is something
+    /// this scan should track version by version, and a zero-width space
+    /// that DuckDB reads as whitespace would let a word this scan keys on
+    /// (`IN (` + `SELECT`) hide behind a character that is not whitespace
+    /// to it. The schemas a trace database carries are ASCII, so such a
+    /// character has no use outside a literal; the text is refused.
+    NonAscii(char),
     /// A `PIVOT` (or `PIVOT_WIDER`) that is not the one fully understood
     /// shape — a single top-level pivot whose every pivot column names a
     /// literal `IN (...)` list. DuckDB expands any statement holding a pivot
@@ -93,6 +104,87 @@ pub(super) enum StatementShape {
     Single { text: String, must_wrap: bool },
 }
 
+/// Whether `c` can continue an identifier in DuckDB's lexer: ASCII letters,
+/// digits and `_`, and every character outside ASCII (the lexer admits
+/// every byte at or above 0x80 into an identifier).
+fn continues_identifier(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii()
+}
+
+/// Whether the `'` at `chars[i]` opens an escape-string literal (`E'...'`),
+/// inside which a backslash escapes the character after it. DuckDB's lexer
+/// starts one at `[eE]` immediately followed by a quote, but only when that
+/// `E` begins a token of its own: an `E` that ends a longer identifier is
+/// part of the identifier (`name'x'` is the identifier `name` and an
+/// ordinary string), while the `E` after a numeric literal is not — `1E'x'`
+/// lexes as the number `1` and an escape string, because the exponent form
+/// of a number needs digits after its `E`. So the run of identifier
+/// characters ending at the `E` is read the way the lexer reads it: leading
+/// digits are a number (with an exponent when `[eE]` is followed by
+/// digits), and the `E` is the prefix only when nothing else stands between
+/// the number, or the run's start, and it.
+fn opens_escape_string(chars: &[char], i: usize) -> bool {
+    if i == 0 || !matches!(chars[i - 1], 'e' | 'E') {
+        return false;
+    }
+    let mut start = i - 1;
+    while start > 0 && continues_identifier(chars[start - 1]) {
+        start -= 1;
+    }
+    // `run` ends with the `E` itself.
+    let run = &chars[start..i];
+    let mut p = 0;
+    loop {
+        let digits = run[p..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 {
+            break;
+        }
+        p += digits;
+        let exponent = match run.get(p) {
+            Some('e' | 'E') => run[p + 1..]
+                .iter()
+                .take_while(|c| c.is_ascii_digit())
+                .count(),
+            _ => 0,
+        };
+        if exponent == 0 {
+            break;
+        }
+        p += 1 + exponent;
+    }
+    p == run.len() - 1
+}
+
+/// The index just past the quoted run that opens at `chars[open]` (a `'` or
+/// a `"`), or `chars.len()` when the run never closes. A doubled quote
+/// inside the run is an escaped quote and does not end it; inside an
+/// escape-string literal (a `'` run that `opens_escape_string` says is one)
+/// a backslash also escapes the character after it, so `E'\''` is one
+/// string here as it is to DuckDB's lexer. Every scan in this module walks
+/// quoted runs through this one function, so they cannot disagree with
+/// each other about where a run ends.
+fn quoted_run_end(chars: &[char], open: usize) -> usize {
+    let quote = chars[open];
+    let escapes = quote == '\'' && opens_escape_string(chars, open);
+    let mut i = open + 1;
+    while i < chars.len() {
+        let c = chars[i];
+        if escapes && c == '\\' {
+            i += 2;
+            continue;
+        }
+        if c == quote {
+            if chars.get(i + 1) == Some(&quote) {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    chars.len()
+}
+
 /// Whether `text` (comments already stripped) carries the `PIVOT` /
 /// `PIVOT_WIDER` keyword anywhere outside a quoted run, and how many times.
 /// `UNPIVOT` and identifiers that merely contain the word (`pivot_count`)
@@ -104,11 +196,7 @@ fn pivot_keyword_count(text: &str) -> usize {
     while i < chars.len() {
         let c = chars[i];
         if c == '\'' || c == '"' {
-            i += 1;
-            while i < chars.len() && chars[i] != c {
-                i += 1;
-            }
-            i += 1;
+            i = quoted_run_end(&chars, i);
             continue;
         }
         if c.is_ascii_alphanumeric() || c == '_' {
@@ -179,11 +267,7 @@ fn pivot_is_fully_listed(text: &str) -> bool {
         let c = chars[i];
         match c {
             '\'' | '"' => {
-                i += 1;
-                while i < chars.len() && chars[i] != c {
-                    i += 1;
-                }
-                i += 1;
+                i = quoted_run_end(&chars, i);
             }
             '(' | '[' | '{' => {
                 depth += 1;
@@ -261,6 +345,7 @@ fn pivot_is_fully_listed(text: &str) -> bool {
     // Words that make an element something other than a plain column or
     // expression with a literal list: a CASE expression (its `IN (` belongs
     // to a branch, not to the pivot column), a join's `ON`, a nested query.
+    // `PIVOT_LONGER` is DuckDB's other spelling of `UNPIVOT`.
     const NOT_A_PLAIN_ELEMENT: &[&str] = &[
         "case",
         "when",
@@ -276,6 +361,7 @@ fn pivot_is_fully_listed(text: &str) -> bool {
         "pivot",
         "pivot_wider",
         "unpivot",
+        "pivot_longer",
         "union",
         "intersect",
         "except",
@@ -291,6 +377,7 @@ fn pivot_is_fully_listed(text: &str) -> bool {
         "pivot",
         "pivot_wider",
         "unpivot",
+        "pivot_longer",
         "describe",
         "show",
         "summarize",
@@ -320,13 +407,17 @@ fn pivot_is_fully_listed(text: &str) -> bool {
 ///
 /// This scan has to agree with DuckDB's own lexer about where statements
 /// end, because the binding's `prepare` executes every statement but the
-/// last of the text it is given. The scan is built so that every place it
-/// can disagree errs toward seeing MORE separators (and refusing): an
-/// escape-string literal (`E'...'`) whose `\'` extends the string in DuckDB
-/// ends it here, so a `;` DuckDB hides is one this scan refuses; and the one
-/// construct that would go the other way — a dollar-quoted string, inside
-/// which a `'` makes this scan believe it is in a literal while DuckDB is
-/// not — is refused outright with every other bare `$` (`Dollar`).
+/// last of the text it is given. It models the string forms the lexer has
+/// — an ordinary quoted run with `''` as an escaped quote, and the
+/// escape-string literal `E'...'`, inside which a backslash also escapes
+/// the character after it (`quoted_run_end`, `opens_escape_string`) — and
+/// refuses outright the two constructs it does not model rather than guess
+/// at them: a dollar-quoted string, inside which a `'` would make this scan
+/// believe it is in a literal while DuckDB is not (refused with every other
+/// bare `$`, `Dollar`), and any non-ASCII character outside a quoted run or
+/// comment, where DuckDB's pre-lexing replacement of certain Unicode spaces
+/// would make it read whitespace where this scan reads a character
+/// (`NonAscii`).
 pub(super) fn statement_shape(sql: &str) -> StatementShape {
     let mut out = String::with_capacity(sql.len());
     // Byte offsets in `out` of every `;` that separates statements.
@@ -338,22 +429,11 @@ pub(super) fn statement_shape(sql: &str) -> StatementShape {
         let next = chars.get(i + 1).copied();
         match c {
             '\'' | '"' => {
-                // Copy the quoted run verbatim; a doubled quote is an escape.
-                out.push(c);
-                i += 1;
-                while i < chars.len() {
-                    out.push(chars[i]);
-                    if chars[i] == c {
-                        if chars.get(i + 1) == Some(&c) {
-                            out.push(c);
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-                i += 1;
+                // Copy the quoted run verbatim (its closing quote included
+                // when it has one).
+                let end = quoted_run_end(&chars, i);
+                out.extend(&chars[i..end]);
+                i = end;
             }
             '$' => return StatementShape::Dollar,
             '-' if next == Some('-') => {
@@ -388,6 +468,12 @@ pub(super) fn statement_shape(sql: &str) -> StatementShape {
                 }
                 i += 1;
             }
+            // Outside every quoted run and comment the text is keywords,
+            // identifiers, numbers and punctuation, all ASCII in a trace
+            // database's schemas; a non-ASCII character here is one DuckDB
+            // may read as whitespace (its stripped Unicode spaces) or as
+            // part of an identifier, and this scan cannot know which.
+            _ if !c.is_ascii() => return StatementShape::NonAscii(c),
             _ => {
                 out.push(c);
                 i += 1;
@@ -431,7 +517,8 @@ pub(super) fn statement_shape(sql: &str) -> StatementShape {
         return StatementShape::PivotWithoutIn;
     }
     // Every statement that reads rows runs wrapped; `pivot_wider` is the
-    // spelled-out form of `pivot` and reads rows the same way.
+    // spelled-out form of `pivot` and `pivot_longer` that of `unpivot`, and
+    // each reads rows the same way as the word it stands for.
     let must_wrap = matches!(
         first_word.as_str(),
         "select"
@@ -442,6 +529,7 @@ pub(super) fn statement_shape(sql: &str) -> StatementShape {
             | "pivot"
             | "pivot_wider"
             | "unpivot"
+            | "pivot_longer"
             | "call"
             | "execute"
     );
@@ -503,6 +591,156 @@ mod tests {
             single("SELECT 'it''s; fine' FROM t"),
             ("SELECT 'it''s; fine' FROM t".to_string(), true)
         );
+        // An escape-string literal is one string through its `\'`, as it is
+        // to DuckDB, and comes out untouched like every other literal.
+        assert_eq!(
+            single("SELECT E'it\\'s; fine' FROM t"),
+            ("SELECT E'it\\'s; fine' FROM t".to_string(), true)
+        );
+        assert_eq!(
+            single("SELECT e'a\\\\' AS s, E'\\'' AS q FROM t"),
+            ("SELECT e'a\\\\' AS s, E'\\'' AS q FROM t".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn test_statement_shape_reads_escape_strings_as_duckdb_does() {
+        // DuckDB's lexer reads `E'\''` as ONE string (a backslash escapes
+        // the quote after it). A scan that ended the string at the `\'`
+        // would take everything from there to the next lone `'` as a
+        // literal — code to DuckDB — and a `;` or a PIVOT in that span
+        // would reach `prepare` hidden: the first two statements below are
+        // the ones `prepare` would have EXECUTED.
+        for sql in [
+            "SELECT E'\\''; SET memory_limit = '100GB'; SELECT E'\\''",
+            "SELECT e'\\''; SET memory_limit = '100GB'; SELECT e'\\''",
+            // The escape-string prefix after a numeric literal: `1E'` is
+            // the number 1 and an escape string (an exponent needs digits).
+            "SELECT 1E'\\''; SET memory_limit = '100GB'; SELECT 1E'\\''",
+            "SELECT 1e5E'\\''; SET memory_limit = '100GB'; SELECT 1e5E'\\''",
+        ] {
+            assert_eq!(statement_shape(sql), StatementShape::Multiple, "{sql:?}");
+        }
+        assert_eq!(
+            statement_shape(
+                "SELECT E'\\'' AS q FROM (PIVOT t ON bucket USING count(id)) WHERE '' = ''"
+            ),
+            StatementShape::PivotWithoutIn
+        );
+        assert_eq!(
+            pivot_keyword_count("SELECT E'\\'' AS q FROM (PIVOT t ON a) WHERE '' = ''"),
+            1
+        );
+        // The other way round: inside the escape string a `;` and a PIVOT
+        // are literal text, so this is one statement, and the pivot
+        // column's list of escape-string literals is a literal list.
+        assert_eq!(
+            pivot_keyword_count("SELECT E'\\' PIVOT t ON a; ' FROM t"),
+            0
+        );
+        assert_eq!(
+            single("SELECT E'\\'; SELECT 2 --' AS s FROM t"),
+            ("SELECT E'\\'; SELECT 2 --' AS s FROM t".to_string(), true)
+        );
+        assert!(single("PIVOT t ON comm IN (E'\\'', e'a\\\\b') USING count(id)").1);
+        // An `E` that ends a longer identifier is part of the identifier —
+        // `name'...'` is the identifier `name` and an ordinary string, in
+        // which a backslash is just a character — so the `;` after it is a
+        // separator to DuckDB and to this scan.
+        for sql in [
+            "SELECT name'\\'; SELECT 2 --'",
+            "SELECT x1E'\\'; SELECT 2 --'",
+            "SELECT _e'\\'; SELECT 2 --'",
+            "SELECT 1ee'\\'; SELECT 2 --'",
+        ] {
+            assert_eq!(statement_shape(sql), StatementShape::Multiple, "{sql:?}");
+        }
+        assert!(opens_escape_string(&['E', '\''], 1));
+        assert!(opens_escape_string(&[' ', 'e', '\''], 2));
+        assert!(opens_escape_string(&['1', 'E', '\''], 2));
+        assert!(opens_escape_string(&['1', 'e', '5', 'E', '\''], 4));
+        assert!(opens_escape_string(&['1', 'e', '\''], 2));
+        assert!(!opens_escape_string(&['a', 'E', '\''], 2));
+        assert!(!opens_escape_string(&['_', 'E', '\''], 2));
+        assert!(!opens_escape_string(&['1', '_', 'E', '\''], 3));
+        assert!(!opens_escape_string(&['1', 'e', 'e', '\''], 3));
+        assert!(!opens_escape_string(&['é', 'E', '\''], 2));
+        assert!(!opens_escape_string(&['E', ' ', '\''], 2));
+        assert!(!opens_escape_string(&['\''], 0));
+        // The run's end: just past the closing quote, or the text's end when
+        // the run never closes.
+        let run = |s: &str, open: usize| quoted_run_end(&s.chars().collect::<Vec<_>>(), open);
+        assert_eq!(run("E'\\''", 1), 5);
+        assert_eq!(run("x'\\'; ", 1), 4);
+        assert_eq!(run("'a''b' c", 0), 6);
+        assert_eq!(run("\"a\"\"b\" c", 0), 6);
+        assert_eq!(run("E'a\\\\'", 1), 6);
+        assert_eq!(run("E'a\\", 1), 4);
+        assert_eq!(run("'never", 0), 6);
+    }
+
+    #[test]
+    fn test_statement_shape_refuses_non_ascii_outside_literals() {
+        // DuckDB replaces certain Unicode spaces outside quotes with a space
+        // before it lexes, and Rust's `char::is_whitespace` excludes three of
+        // them (U+200B, U+2060, U+FEFF): to this scan `\u{200B}SELECT` is a
+        // word that is not `select`, to DuckDB it is `IN (<subquery>)`. Every
+        // non-ASCII character outside a quoted run or a comment is refused,
+        // so no such disagreement can be reached.
+        for (sql, ch) in [
+            (
+                "PIVOT t ON bucket IN (\u{200B}SELECT DISTINCT bucket FROM t) USING count(id)",
+                '\u{200B}',
+            ),
+            (
+                "PIVOT t ON bucket IN (\u{2060}SELECT id FROM t) USING count(id)",
+                '\u{2060}',
+            ),
+            (
+                "PIVOT t ON bucket IN (\u{FEFF}SELECT id FROM t) USING count(id)",
+                '\u{FEFF}',
+            ),
+            ("SELECT 1\u{00A0}; SET memory_limit = '100GB'", '\u{00A0}'),
+            ("SELECT \u{E9}t\u{E9} FROM t", '\u{E9}'),
+            ("SELECT 1 \u{2014} 2", '\u{2014}'),
+        ] {
+            assert_eq!(
+                statement_shape(sql),
+                StatementShape::NonAscii(ch),
+                "{sql:?}"
+            );
+        }
+        // Inside a literal, a quoted identifier or a comment it is text.
+        assert_eq!(
+            single("SELECT '\u{E9}\u{200B}' AS s, \"\u{FC}n\" FROM t -- \u{2014}\n"),
+            (
+                "SELECT '\u{E9}\u{200B}' AS s, \"\u{FC}n\" FROM t".to_string(),
+                true
+            )
+        );
+        assert_eq!(
+            single("/* \u{2014} \u{200B} */ SELECT 1"),
+            ("SELECT 1".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn test_statement_shape_treats_pivot_longer_as_unpivot() {
+        // `PIVOT_LONGER` is DuckDB's other spelling of `UNPIVOT`: as a list
+        // it is a subquery (the enum would be built by running it), and as
+        // a statement it reads rows and runs wrapped.
+        for sql in [
+            "PIVOT t ON bucket IN (PIVOT_LONGER t ON id INTO NAME k VALUE v) USING count(id)",
+            "PIVOT t ON bucket IN ( pivot_longer t ON id INTO NAME k VALUE v ) USING count(id)",
+        ] {
+            assert_eq!(
+                statement_shape(sql),
+                StatementShape::PivotWithoutIn,
+                "{sql:?}"
+            );
+        }
+        assert!(single("PIVOT_LONGER t ON bucket INTO NAME k VALUE v").1);
+        assert!(single("pivot_longer t on bucket into name k value v").1);
     }
 
     #[test]
