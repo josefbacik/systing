@@ -227,6 +227,30 @@ impl ProcessMaps {
         self.gvisor_exe || self.gvisor_memfd
     }
 
+    /// Whether `addr` lies in a mapping of one of gVisor's memory pools
+    /// (`runsc-memory`, `systrap-memory` — [`GVISOR_MEMFDS`]).
+    ///
+    /// Such an address must never be handed to a symbolizer as a live
+    /// process address: the mapping's `map_files` link opens the pool memfd
+    /// itself — for `runsc-memory` the sandbox's entire MemoryFile, every
+    /// guest page of every process in it, gigabytes — which is not an ELF.
+    /// A symbolizer that resolves the address through the process's maps
+    /// opens that file and parses it from byte 0; whenever the pool's first
+    /// page happens to hold an ELF header (guest images live in the same
+    /// pool), the "symbol tables" it builds are read out of guest memory,
+    /// bounded only by the pool's size. An island's identity comes from its
+    /// file-backed neighbors ([`Self::bridge_for`]) or the guest's own maps
+    /// instead, so skipping the process source loses nothing.
+    ///
+    /// Only the pools count. The sandbox binary that runsc re-execs from a
+    /// memfd (`/memfd:runsc (deleted)`) is a real ELF and keeps the ordinary
+    /// path — the test is the memfd's name, never `memfd:` as a class.
+    pub fn is_pool_backed(&self, addr: u64) -> bool {
+        self.entry_for(addr).is_some_and(|e| {
+            matches!(&e.backing, Backing::Memfd(name) if GVISOR_MEMFDS.contains(&name.as_str()))
+        })
+    }
+
     /// Executable file-backed ranges of this process — for a systrap stub,
     /// the fragments of guest text it maps directly. Used as the
     /// fingerprint for correlating a stub to the guest process it mirrors
@@ -616,6 +640,76 @@ mod tests {
             "foo",
         );
         assert!(!pm_plain.is_gvisor());
+    }
+
+    /// The pool test keys on the memfd's NAME: islands of `runsc-memory`
+    /// and pages of `systrap-memory` are pool-backed; the sandbox binary
+    /// runsc re-execs from a memfd named `runsc` is a real ELF and is not;
+    /// file-backed, anonymous, special and unmapped addresses are not.
+    #[test]
+    fn test_is_pool_backed_names_the_pools_only() {
+        // The Sentry's own text — `/proc/self/exe` re-exec'd from a memfd —
+        // beside a stub's islands, in one maps text.
+        let maps = "\
+64000-69000 r-xs 3ff26000 00:01 4                          /memfd:runsc-memory (deleted)
+400000-4c2000 r-xs 00000000 00:13 426                      /root/bin/guestbox
+4c2000-4c3000 r-xs 3ff1f000 00:01 4                        /memfd:runsc-memory (deleted)
+4c3000-4cd000 r-xs 000c3000 00:13 426                      /root/bin/guestbox
+711000-714000 rw-s 3fe00000 00:01 4                        /memfd:runsc-memory (deleted)
+5600000-8a00000 r-xp 00000000 00:01 9                      /memfd:runsc (deleted)
+7fa398efc000-7fa398eff000 r-xp 00000000 00:00 0
+7fee63d08000-7fee63d09000 r--s 3fffe000 00:01 3            /memfd:systrap-memory (deleted)
+7ffd1c000000-7ffd1c021000 rw-p 00000000 00:00 0                          [stack]";
+        let pm = ProcessMaps::parse(510, maps, "exe");
+        assert!(pm.is_gvisor());
+
+        // Pool islands and pages, executable or not.
+        assert!(
+            pm.is_pool_backed(0x64000),
+            "usertrap trampolines below the image"
+        );
+        assert!(
+            pm.is_pool_backed(0x4c2800),
+            "a patched-syscall island inside guest text"
+        );
+        assert!(pm.is_pool_backed(0x711000), "a writable pool mapping");
+        assert!(
+            pm.is_pool_backed(0x7fee63d08010),
+            "a sysmsg page of systrap-memory"
+        );
+
+        // Everything else keeps the ordinary path.
+        assert!(!pm.is_pool_backed(0x401000), "file-backed guest text");
+        assert!(
+            !pm.is_pool_backed(0x4c3000),
+            "the file fragment right after an island"
+        );
+        assert!(
+            !pm.is_pool_backed(0x5600100),
+            "the runsc binary's own memfd is a real ELF, never a pool"
+        );
+        assert!(!pm.is_pool_backed(0x7fa398efc000), "anonymous");
+        assert!(!pm.is_pool_backed(0x7ffd1c000100), "[stack]");
+        assert!(!pm.is_pool_backed(0x4c3000 + 0x20000), "unmapped");
+        assert!(
+            !pm.is_pool_backed(0x4c2000 - 1),
+            "the byte before an island is guest text"
+        );
+        assert!(
+            pm.is_pool_backed(0x4c3000 - 1),
+            "an island's last byte is pool"
+        );
+
+        // A non-gVisor process with an unrelated exec memfd (a JIT's code
+        // file) is untouched: only the two gVisor pool names count.
+        let jit = ProcessMaps::parse(
+            7,
+            "400000-500000 r-xp 00000000 08:01 42 /usr/bin/node\n\
+             7f0000000000-7f0000100000 r-xp 00000000 00:01 11 /memfd:jit-code (deleted)",
+            "node",
+        );
+        assert!(!jit.is_gvisor());
+        assert!(!jit.is_pool_backed(0x7f0000000800));
     }
 
     #[test]

@@ -1820,12 +1820,21 @@ impl StackRecorder {
         ctx: &UserSymbolizeCtx<'_>,
         addr: u64,
     ) -> String {
-        if let Some(sym) = symbolizer
-            .symbolize_single(ctx.proc_src, Input::AbsAddr(addr))
-            .ok()
-            .and_then(|s| s.into_sym())
-        {
-            return format_symbolized_frame(&sym, addr, "unknown", self.elide_generics);
+        // A pool-backed address (a `runsc-memory` island, a `systrap-memory`
+        // page) never goes through the process source: blazesym would open
+        // the pool memfd — the sandbox's whole memory file, never an ELF —
+        // and parse it, costing time and symbol-cache memory for no name.
+        // Such an address resolves through the bridge and the guest view
+        // below; see `ProcessMaps::is_pool_backed` for the discriminator.
+        let pool_backed = ctx.maps.is_some_and(|m| m.is_pool_backed(addr));
+        if !pool_backed {
+            if let Some(sym) = symbolizer
+                .symbolize_single(ctx.proc_src, Input::AbsAddr(addr))
+                .ok()
+                .and_then(|s| s.into_sym())
+            {
+                return format_symbolized_frame(&sym, addr, "unknown", self.elide_generics);
+            }
         }
 
         if let Some(bridge) = ctx.maps.and_then(|m| m.bridge_for(addr)) {
@@ -2639,6 +2648,12 @@ mod tests {
         assert!(guest.virt_candidates_for_file_offset(0x3ff1f500).is_empty());
         assert_eq!(guest.pool_candidates_for_offset(0x3ff1f500), vec![0x4c2500]);
         assert!(guest.bridge_for(0x4c2500).is_some());
+        // The island address `symbolize_user_addr` routes past the process
+        // source is exactly the one the bridge resolves; its file-backed
+        // neighbors keep the process source.
+        assert!(guest.is_pool_backed(0x4c2500));
+        assert!(!guest.is_pool_backed(0x4c1500));
+        assert!(!guest.is_pool_backed(0x4c3500));
         assert_eq!(
             reconstruct_build_id_addr(Some(&guest), &[1; 20], 0x3ff1f500),
             None
