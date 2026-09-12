@@ -830,3 +830,298 @@ mod tests {
         assert_eq!(runnable.state, 0);
     }
 }
+
+/// Release-mode benchmark legs for the sched consumer path — the userspace
+/// ceiling behind `Missed sched/IRQ events` on many-CPU hosts. Ignored by
+/// default; run one with
+/// `cargo test --release --lib sched_consumer_bench::<leg> -- --ignored --nocapture`.
+///
+/// Every leg drives N shard threads the way the `sched_rec_{i}` consumers
+/// run: each shard owns one `SchedEventRecorder` behind its own mutex and
+/// feeds it 4,096-event batches under that lock; the shards share only what
+/// production shares — the utid generator's DashMap and, in the legs that
+/// have one, the collector. Three collector shapes separate the candidate
+/// ceilings: a private `InMemoryCollector` per shard (the record cost plus
+/// the DashMap), one `SharedCollector(InMemoryCollector)` (adds the shared
+/// lock without an encode) and the production
+/// `SharedCollector(StreamingParquetWriter)` (adds the parquet flushes).
+/// A batch under the lock that takes longer than a few milliseconds is a
+/// stall — a flush of the shared writer, or a wait on the shard that is
+/// flushing — and each leg reports how many, the worst, and their share.
+#[cfg(test)]
+mod sched_consumer_bench {
+    use super::*;
+    use crate::parquet::StreamingParquetWriter;
+    use crate::record::{InMemoryCollector, SharedCollector};
+    use crate::systing_core::types::event_type;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// The host shape the finding came from: 144 CPUs, ~29K threads.
+    const CPUS: u64 = 144;
+    const TIDS: u64 = 29_000;
+    /// Events handed to the recorder per lock acquisition, as `consume_loop`.
+    const BATCH: usize = 4096;
+    /// A batch under the lock slower than this is counted as a stall.
+    const STALL: Duration = Duration::from_millis(5);
+
+    /// One CPU's stream, as the kernel emits it: a WAKING of the next task
+    /// (targeting this CPU), then the SWITCH to it. Every other switch puts
+    /// the previous task to sleep (prev_state 2), which also emits a
+    /// thread_state row, so the model is 2.5 rows per 2 events.
+    fn synth_event(shard: u64, shards: u64, i: u64) -> task_event {
+        let cpus_here = (CPUS / shards).max(1);
+        let cpu = shard + shards * ((i / 2) % cpus_here);
+        let pair = i / 2;
+        let tid = 1000 + (pair * 7919 + shard * 104_729) % TIDS;
+        let prev_tid = 1000 + (pair * 7919 + shard * 104_729 + 7919 * cpus_here) % TIDS;
+        let mut e = task_event {
+            ts: 1_000_000_000 + i * 2_000 + shard,
+            cpu: cpu as u32,
+            ..Default::default()
+        };
+        if i.is_multiple_of(2) {
+            e.r#type = event_type::SCHED_WAKING;
+            e.target_cpu = cpu as u32;
+            e.next.tgidpid = (tid << 32) | tid;
+        } else {
+            e.r#type = event_type::SCHED_SWITCH;
+            e.prev.tgidpid = (prev_tid << 32) | prev_tid;
+            e.next.tgidpid = (tid << 32) | tid;
+            e.next_prio = 120;
+            e.prev_state = if pair.is_multiple_of(2) { 0 } else { 2 };
+        }
+        e
+    }
+
+    struct ShardStats {
+        events: u64,
+        stalls: u64,
+        stall_time: Duration,
+        worst: Duration,
+    }
+
+    /// Run N shards concurrently, `per_shard` events each; `make` builds
+    /// each shard's collector. Returns the wall (join of the slowest shard)
+    /// and every shard's stats.
+    fn run_shards(
+        shards: usize,
+        per_shard: u64,
+        utid: Arc<UtidGenerator>,
+        make: impl Fn(usize) -> Box<dyn RecordCollector + Send>,
+    ) -> (Duration, Vec<ShardStats>, Vec<SchedEventRecorder>) {
+        let recorders: Vec<Arc<Mutex<SchedEventRecorder>>> = (0..shards)
+            .map(|i| {
+                let mut rec = SchedEventRecorder::new(utid.clone());
+                rec.set_streaming_collector(make(i));
+                Arc::new(Mutex::new(rec))
+            })
+            .collect();
+        // Events are synthesized before the clock starts.
+        let streams: Vec<Vec<task_event>> = (0..shards)
+            .map(|s| {
+                (0..per_shard)
+                    .map(|i| synth_event(s as u64, shards as u64, i))
+                    .collect()
+            })
+            .collect();
+        let start = Instant::now();
+        let handles: Vec<_> = streams
+            .into_iter()
+            .zip(recorders.iter().cloned())
+            .map(|(events, rec)| {
+                std::thread::spawn(move || {
+                    let mut stats = ShardStats {
+                        events: 0,
+                        stalls: 0,
+                        stall_time: Duration::ZERO,
+                        worst: Duration::ZERO,
+                    };
+                    for batch in events.chunks(BATCH) {
+                        let t = Instant::now();
+                        {
+                            let mut rec = rec.lock().unwrap();
+                            for e in batch {
+                                rec.handle_event(*e);
+                            }
+                        }
+                        let d = t.elapsed();
+                        stats.events += batch.len() as u64;
+                        if d > STALL {
+                            stats.stalls += 1;
+                            stats.stall_time += d;
+                        }
+                        stats.worst = stats.worst.max(d);
+                    }
+                    stats
+                })
+            })
+            .collect();
+        let stats: Vec<ShardStats> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let wall = start.elapsed();
+        let recorders = recorders
+            .into_iter()
+            .map(|r| Arc::try_unwrap(r).ok().unwrap().into_inner().unwrap())
+            .collect();
+        (wall, stats, recorders)
+    }
+
+    fn report(leg: &str, shards: usize, wall: Duration, stats: &[ShardStats]) {
+        let events: u64 = stats.iter().map(|s| s.events).sum();
+        let stalls: u64 = stats.iter().map(|s| s.stalls).sum();
+        let stall_time: Duration = stats.iter().map(|s| s.stall_time).sum();
+        let worst = stats.iter().map(|s| s.worst).max().unwrap_or_default();
+        let ns = wall.as_nanos() as f64 / events as f64;
+        let per_shard_ns = ns * shards as f64;
+        eprintln!(
+            "BENCH {leg}: {shards} shards x {} events = {events} in {:.3} s = {:.2} M events/s host-wide \
+             ({per_shard_ns:.0} ns/event per shard); stalls > {} ms: {stalls} totalling {:.3} s \
+             = {:.1} % of the shard-seconds, worst {:.1} ms",
+            events / shards as u64,
+            wall.as_secs_f64(),
+            1e3 / ns,
+            STALL.as_millis(),
+            stall_time.as_secs_f64(),
+            100.0 * stall_time.as_secs_f64() / (wall.as_secs_f64() * shards as f64),
+            worst.as_secs_f64() * 1e3,
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn sizes() {
+        eprintln!(
+            "BENCH sizes: task_event {} B, SchedSliceRecord {} B, ThreadStateRecord {} B",
+            std::mem::size_of::<task_event>(),
+            std::mem::size_of::<SchedSliceRecord>(),
+            std::mem::size_of::<ThreadStateRecord>()
+        );
+    }
+
+    /// Leg A: a private InMemoryCollector per shard — the record build and
+    /// the shared DashMap, no shared collector lock, no encode. Also prints
+    /// the rows per event the stream produces per table.
+    fn private_in_memory(shards: usize) {
+        const PER_SHARD: u64 = 1_000_000;
+        let utid = Arc::new(UtidGenerator::new());
+        let (wall, stats, recorders) = run_shards(shards, PER_SHARD, utid, |_| {
+            Box::new(InMemoryCollector::new())
+        });
+        report("private InMemoryCollector per shard", shards, wall, &stats);
+        let (mut slices, mut states) = (0usize, 0usize);
+        for mut rec in recorders {
+            let mut collector = rec.finish(i64::MAX / 2).unwrap().unwrap();
+            let data = collector
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<InMemoryCollector>())
+                .expect("InMemoryCollector")
+                .data();
+            slices += data.sched_slices.len();
+            states += data.thread_states.len();
+        }
+        let events = PER_SHARD * shards as u64;
+        eprintln!(
+            "BENCH rows/event: sched_slice {:.3}, thread_state {:.3} (model 0.5 + 0.75)",
+            slices as f64 / events as f64,
+            states as f64 / events as f64
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn private_in_memory_1() {
+        private_in_memory(1);
+    }
+    #[test]
+    #[ignore]
+    fn private_in_memory_8() {
+        private_in_memory(8);
+    }
+    #[test]
+    #[ignore]
+    fn private_in_memory_64() {
+        private_in_memory(64);
+    }
+
+    /// Leg B: one SharedCollector(InMemoryCollector) for every shard — the
+    /// shared lock per 10K-record flush, no encode.
+    fn shared_in_memory(shards: usize) {
+        const PER_SHARD: u64 = 1_000_000;
+        let utid = Arc::new(UtidGenerator::new());
+        let shared = SharedCollector::new(Box::new(InMemoryCollector::new()));
+        let (wall, stats, _) = run_shards(shards, PER_SHARD, utid, |_| Box::new(shared.clone()));
+        report("SharedCollector(InMemoryCollector)", shards, wall, &stats);
+    }
+
+    #[test]
+    #[ignore]
+    fn shared_in_memory_1() {
+        shared_in_memory(1);
+    }
+    #[test]
+    #[ignore]
+    fn shared_in_memory_64() {
+        shared_in_memory(64);
+    }
+
+    /// Leg C: the production path — one SharedCollector(StreamingParquetWriter)
+    /// for every shard: the shared lock per flush AND the parquet encode of
+    /// sched_slice / thread_state (inline before the encode lane, on the
+    /// lane after it). The final drain and the writer's finish are timed
+    /// apart from the consumer wall.
+    fn shared_parquet(shards: usize) {
+        const PER_SHARD: u64 = 1_000_000;
+        let dir = tempfile::TempDir::new().unwrap();
+        let utid = Arc::new(UtidGenerator::new());
+        let writer = StreamingParquetWriter::new(dir.path()).unwrap();
+        let shared = SharedCollector::new(Box::new(writer));
+        let (wall, stats, recorders) =
+            run_shards(shards, PER_SHARD, utid, |_| Box::new(shared.clone()));
+        report(
+            "SharedCollector(StreamingParquetWriter)",
+            shards,
+            wall,
+            &stats,
+        );
+        let t = Instant::now();
+        for mut rec in recorders {
+            // The returned collector handle is dropped here; the writer is
+            // finished through the one handle left below.
+            rec.finish(i64::MAX / 2).unwrap();
+        }
+        let drained = t.elapsed();
+        let t = Instant::now();
+        shared.finish().unwrap();
+        eprintln!(
+            "BENCH final drain {:.3} s + writer finish {:.3} s",
+            drained.as_secs_f64(),
+            t.elapsed().as_secs_f64()
+        );
+        let mut sizes = Vec::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("sched_slice") || name.starts_with("thread_state") {
+                sizes.push(format!("{name} {} B", entry.metadata().unwrap().len()));
+            }
+        }
+        sizes.sort();
+        eprintln!("BENCH files: {}", sizes.join(", "));
+    }
+
+    #[test]
+    #[ignore]
+    fn shared_parquet_1() {
+        shared_parquet(1);
+    }
+    #[test]
+    #[ignore]
+    fn shared_parquet_8() {
+        shared_parquet(8);
+    }
+    #[test]
+    #[ignore]
+    fn shared_parquet_64() {
+        shared_parquet(64);
+    }
+}

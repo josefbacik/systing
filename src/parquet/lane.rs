@@ -40,6 +40,11 @@ use parquet::schema::types::SchemaDescriptor;
 /// Builds the arrow batch for a slice of rows.
 pub type BatchBuilder<R> = fn(&[R], &SchemaRef) -> Result<RecordBatch>;
 
+/// Rewrites a flushed batch on the lane thread before it is built — the
+/// per-batch sort a table wants for its delta encodings, which the inline
+/// writer ran on the producing thread.
+pub type BatchPrepare<R> = fn(&mut [R]);
+
 /// Flushed row batches the producing thread may run ahead of the lane by
 /// before its `push` blocks. Two 200,000-row batches of the widest record
 /// are under 200 MB; the backpressure is the point — a lane that cannot
@@ -72,12 +77,15 @@ pub struct EncodeLane<R: Send + Sync + 'static> {
 impl<R: Send + Sync + 'static> EncodeLane<R> {
     /// Start the lane: the file writer, the arrow-to-parquet schema and the
     /// `ARROW:schema` metadata are set up on the lane thread exactly as
-    /// `ArrowWriter::try_new` does.
+    /// `ArrowWriter::try_new` does. `prepare`, when given, runs over every
+    /// batch on the lane thread before `build` sees it.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         table: &str,
         out: Box<dyn Write + Send>,
         schema: SchemaRef,
         props: WriterProperties,
+        prepare: Option<BatchPrepare<R>>,
         build: BatchBuilder<R>,
         workers: usize,
         row_group_rows: usize,
@@ -94,6 +102,7 @@ impl<R: Send + Sync + 'static> EncodeLane<R> {
                     out,
                     schema,
                     props,
+                    prepare,
                     build,
                     workers.max(1),
                     row_group_rows.max(1),
@@ -179,6 +188,7 @@ fn run_lane<R: Send + Sync + 'static>(
     out: Box<dyn Write + Send>,
     schema: SchemaRef,
     mut props: WriterProperties,
+    prepare: Option<BatchPrepare<R>>,
     build: BatchBuilder<R>,
     workers: usize,
     row_group_rows: usize,
@@ -193,9 +203,12 @@ fn run_lane<R: Send + Sync + 'static>(
         .with_context(|| format!("opening the parquet file of table {table}"))?;
 
     let mut group: Option<RowGroup> = None;
-    for rows in rx {
+    for mut rows in rx {
         if rows.is_empty() {
             continue;
+        }
+        if let Some(prepare) = prepare {
+            prepare(&mut rows);
         }
         let batches = build_parallel(&rows, &schema, build, workers)?;
         drop(rows);
@@ -433,7 +446,7 @@ mod tests {
         let props = WriterProperties::builder()
             .set_max_row_group_size(250)
             .build();
-        let mut lane = EncodeLane::start("t", out, schema(), props, build, 3, 250).unwrap();
+        let mut lane = EncodeLane::start("t", out, schema(), props, None, build, 3, 250).unwrap();
         for b in 0..7 {
             let rows: Vec<Row> = (0..100)
                 .map(|i| Row {
@@ -468,6 +481,7 @@ mod tests {
             out,
             schema(),
             WriterProperties::default(),
+            None,
             build,
             2,
             1000,
@@ -497,6 +511,7 @@ mod tests {
             out,
             schema(),
             WriterProperties::default(),
+            None,
             build,
             2,
             10,
@@ -508,5 +523,42 @@ mod tests {
         let _ = lane.push(rows);
         let err = lane.finish().unwrap_err();
         assert!(format!("{err:#}").contains("disk gone"), "{err:#}");
+    }
+
+    /// `prepare` runs on the lane thread over each batch before the build:
+    /// rows pushed in reverse come out sorted, batch by batch.
+    #[test]
+    fn prepare_rewrites_each_batch_before_the_build() {
+        fn sort_rows(rows: &mut [Row]) {
+            rows.sort_unstable_by_key(|r| r.id);
+        }
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("p.parquet");
+        let out: Box<dyn Write + Send> = Box::new(File::create(&path).unwrap());
+        let mut lane = EncodeLane::start(
+            "p",
+            out,
+            schema(),
+            WriterProperties::default(),
+            Some(sort_rows),
+            build,
+            2,
+            1000,
+        )
+        .unwrap();
+        for b in 0..3 {
+            let rows: Vec<Row> = (0..100)
+                .rev()
+                .map(|i| Row {
+                    id: b * 100 + i,
+                    name: "r",
+                })
+                .collect();
+            lane.push(rows).unwrap();
+        }
+        lane.finish().unwrap();
+        let (n, ids, _) = read_back(&path);
+        assert_eq!(n, 300);
+        assert_eq!(ids, (0..300).collect::<Vec<i64>>());
     }
 }

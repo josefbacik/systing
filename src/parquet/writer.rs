@@ -24,7 +24,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 
 use crate::network_recorder::{drop_reason_str, format_tcp_flags, tcp_state_name};
-use crate::parquet::lane::{encode_workers, EncodeLane};
+use crate::parquet::lane::{encode_workers, BatchBuilder, BatchPrepare, EncodeLane};
 use crate::parquet::ParquetSink;
 use crate::record::RecordCollector;
 use crate::trace::{
@@ -147,8 +147,13 @@ pub struct StreamingParquetWriter {
     // Persistent writers (created lazily on first flush, kept alive until finish)
     process_writer: Option<TableWriter>,
     thread_writer: Option<TableWriter>,
-    sched_slice_writer: Option<TableWriter>,
-    thread_state_writer: Option<TableWriter>,
+    /// The two hot sched tables encode off the flushing thread, like
+    /// `network_packet`: with one sched consumer per ring all flushing into
+    /// this writer under one lock, an inline 200,000-row encode held the
+    /// lock while every other shard queued on it and its ring overflowed.
+    /// Each lane's batch is sorted on the lane thread (the `prepare` hook).
+    sched_slice_lane: Option<EncodeLane<SchedSliceRecord>>,
+    thread_state_lane: Option<EncodeLane<ThreadStateRecord>>,
     irq_slice_writer: Option<TableWriter>,
     softirq_slice_writer: Option<TableWriter>,
     wakeup_new_writer: Option<TableWriter>,
@@ -272,8 +277,8 @@ impl StreamingParquetWriter {
             // Writers start as None, created lazily
             process_writer: None,
             thread_writer: None,
-            sched_slice_writer: None,
-            thread_state_writer: None,
+            sched_slice_lane: None,
+            thread_state_lane: None,
             irq_slice_writer: None,
             softirq_slice_writer: None,
             wakeup_new_writer: None,
@@ -353,6 +358,40 @@ impl StreamingParquetWriter {
         Ok(writer_opt.as_mut().unwrap())
     }
 
+    /// Hand a table's flushed rows to its encode lane, starting the lane on
+    /// the first flush. The caller has already swapped a fresh buffer in;
+    /// the sort (`prepare`), the arrow build and the parquet encode run on
+    /// the lane thread, so what this thread does under the writer's lock is
+    /// the hand-off alone.
+    #[allow(clippy::too_many_arguments)]
+    fn push_to_lane<R: Send + Sync + 'static>(
+        lane: &mut Option<EncodeLane<R>>,
+        sink: &ParquetSink,
+        props: &WriterProperties,
+        table: &str,
+        schema: Arc<Schema>,
+        prepare: Option<BatchPrepare<R>>,
+        build: BatchBuilder<R>,
+        rows: Vec<R>,
+    ) -> Result<()> {
+        if lane.is_none() {
+            let out = sink
+                .open(table)
+                .with_context(|| format!("Failed to open parquet sink for table {table}"))?;
+            *lane = Some(EncodeLane::start(
+                table,
+                out,
+                schema,
+                props.clone(),
+                prepare,
+                build,
+                encode_workers(),
+                props.max_row_group_size(),
+            )?);
+        }
+        lane.as_mut().expect("lane started above").push(rows)
+    }
+
     // Flush processes buffer
     fn flush_processes(&mut self) -> Result<()> {
         if self.processes.is_empty() {
@@ -395,52 +434,43 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
-    // Flush sched_slices buffer
+    // Flush sched_slices buffer: the rows go whole to the table's encode
+    // lane and this thread returns with a fresh buffer. The sched consumers
+    // all flush through one shared writer lock, so what happens here is
+    // what every shard waits on.
     fn flush_sched_slices(&mut self) -> Result<()> {
         if self.sched_slices.is_empty() {
             return Ok(());
         }
-
-        let schema = trace::sched_slice_schema();
-        let writer = Self::get_or_create_writer(
-            &mut self.sched_slice_writer,
+        let rows = std::mem::replace(&mut self.sched_slices, Vec::with_capacity(self.batch_size));
+        Self::push_to_lane(
+            &mut self.sched_slice_lane,
             &self.sink,
-            "sched_slice",
-            schema.clone(),
             &self.writer_props,
-        )?;
-
-        // Sorting each batch by (cpu, ts) groups runs of nearby timestamps so
-        // delta encoding + ZSTD can exploit the locality. Per-batch sort is
-        // nearly as effective as a global sort because each 200k-row batch
-        // already covers a narrow time window.
-        self.sched_slices.sort_unstable_by_key(|r| (r.cpu, r.ts));
-        let batch = build_sched_slice_batch(&self.sched_slices, &schema)?;
-        writer.write(&batch)?;
-        self.sched_slices.clear();
-        Ok(())
+            "sched_slice",
+            trace::sched_slice_schema(),
+            Some(sort_sched_slice_batch),
+            build_sched_slice_batch,
+            rows,
+        )
     }
 
-    // Flush thread_states buffer
+    // Flush thread_states buffer: the same lane shape as sched_slices.
     fn flush_thread_states(&mut self) -> Result<()> {
         if self.thread_states.is_empty() {
             return Ok(());
         }
-
-        let schema = trace::thread_state_schema();
-        let writer = Self::get_or_create_writer(
-            &mut self.thread_state_writer,
+        let rows = std::mem::replace(&mut self.thread_states, Vec::with_capacity(self.batch_size));
+        Self::push_to_lane(
+            &mut self.thread_state_lane,
             &self.sink,
-            "thread_state",
-            schema.clone(),
             &self.writer_props,
-        )?;
-
-        self.thread_states.sort_unstable_by_key(|r| (r.utid, r.ts));
-        let batch = build_thread_state_batch(&self.thread_states, &schema)?;
-        writer.write(&batch)?;
-        self.thread_states.clear();
-        Ok(())
+            "thread_state",
+            trace::thread_state_schema(),
+            Some(sort_thread_state_batch),
+            build_thread_state_batch,
+            rows,
+        )
     }
 
     // Flush irq_slices buffer
@@ -868,37 +898,26 @@ impl StreamingParquetWriter {
     }
 
     // Flush network_packets buffer: the rows go whole to the table's encode
-    // lane (started here on the first flush) and this thread returns with a
-    // fresh buffer; the arrow build and the parquet encode run on the lane.
+    // lane and this thread returns with a fresh buffer; the arrow build and
+    // the parquet encode run on the lane.
     fn flush_network_packets(&mut self) -> Result<()> {
         if self.network_packets.is_empty() {
             return Ok(());
-        }
-
-        if self.network_packet_lane.is_none() {
-            let out = self
-                .sink
-                .open("network_packet")
-                .context("Failed to open parquet sink for table network_packet")?;
-            let lane = EncodeLane::start(
-                "network_packet",
-                out,
-                trace::network_packet_schema(),
-                self.writer_props.clone(),
-                build_network_packet_batch,
-                encode_workers(),
-                self.writer_props.max_row_group_size(),
-            )?;
-            self.network_packet_lane = Some(lane);
         }
         let rows = std::mem::replace(
             &mut self.network_packets,
             Vec::with_capacity(self.batch_size),
         );
-        self.network_packet_lane
-            .as_mut()
-            .expect("lane started above")
-            .push(rows)
+        Self::push_to_lane(
+            &mut self.network_packet_lane,
+            &self.sink,
+            &self.writer_props,
+            "network_packet",
+            trace::network_packet_schema(),
+            None,
+            build_network_packet_batch,
+            rows,
+        )
     }
 
     // Flush network_sockets buffer
@@ -1190,8 +1209,21 @@ impl StreamingParquetWriter {
 
         close_writer!(self.process_writer);
         close_writer!(self.thread_writer);
-        close_writer!(self.sched_slice_writer);
-        close_writer!(self.thread_state_writer);
+        // A lane finishes on the writer's thread: every queued batch is
+        // encoded, the row groups and the file closed.
+        macro_rules! finish_lane {
+            ($lane:expr) => {
+                if let Some(lane) = $lane.take() {
+                    if let Err(e) = lane.finish() {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
+            };
+        }
+        finish_lane!(self.sched_slice_lane);
+        finish_lane!(self.thread_state_lane);
         close_writer!(self.irq_slice_writer);
         close_writer!(self.softirq_slice_writer);
         close_writer!(self.wakeup_new_writer);
@@ -1209,13 +1241,7 @@ impl StreamingParquetWriter {
         close_writer!(self.network_interface_writer);
         close_writer!(self.socket_connection_writer);
         close_writer!(self.network_syscall_writer);
-        if let Some(lane) = self.network_packet_lane.take() {
-            if let Err(e) = lane.finish() {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
-            }
-        }
+        finish_lane!(self.network_packet_lane);
         close_writer!(self.network_socket_writer);
         close_writer!(self.network_poll_writer);
         close_writer!(self.network_dns_writer);
@@ -1246,8 +1272,8 @@ impl Drop for StreamingParquetWriter {
         // Check if any writers are still open (finish() was not called)
         let has_open_writers = self.process_writer.is_some()
             || self.thread_writer.is_some()
-            || self.sched_slice_writer.is_some()
-            || self.thread_state_writer.is_some()
+            || self.sched_slice_lane.is_some()
+            || self.thread_state_lane.is_some()
             || self.irq_slice_writer.is_some()
             || self.softirq_slice_writer.is_some()
             || self.wakeup_new_writer.is_some()
@@ -1327,6 +1353,64 @@ impl RecordCollector for StreamingParquetWriter {
             self.flush_thread_states()?;
         }
         Ok(())
+    }
+
+    /// A sched shard's flush: the two hot tables take their rows as whole
+    /// `Vec` appends (one flush check each) instead of a push per record —
+    /// this runs under the shared writer lock every other shard waits on —
+    /// and the five small tables go through the per-record adds as before.
+    fn add_sched_batch(&mut self, batch: crate::record::SchedRecordBatch<'_>) -> usize {
+        let mut failed = 0usize;
+        let mut warn = |what: &str, e: anyhow::Error| {
+            eprintln!("Warning: Failed to stream {what}: {e}");
+            failed += 1;
+        };
+        if !batch.slices.is_empty() {
+            Self::reserve_if_empty(&mut self.sched_slices, self.batch_size);
+            self.total_records += batch.slices.len();
+            self.sched_slices.append(batch.slices);
+            if Self::should_flush(&self.sched_slices, self.batch_size) {
+                if let Err(e) = self.flush_sched_slices() {
+                    warn("sched slice batch", e);
+                }
+            }
+        }
+        if !batch.thread_states.is_empty() {
+            Self::reserve_if_empty(&mut self.thread_states, self.batch_size);
+            self.total_records += batch.thread_states.len();
+            self.thread_states.append(batch.thread_states);
+            if Self::should_flush(&self.thread_states, self.batch_size) {
+                if let Err(e) = self.flush_thread_states() {
+                    warn("thread state batch", e);
+                }
+            }
+        }
+        for record in batch.irq_slices.drain(..) {
+            if let Err(e) = self.add_irq_slice(record) {
+                warn("IRQ slice", e);
+            }
+        }
+        for record in batch.softirq_slices.drain(..) {
+            if let Err(e) = self.add_softirq_slice(record) {
+                warn("softirq slice", e);
+            }
+        }
+        for record in batch.wakeup_news.drain(..) {
+            if let Err(e) = self.add_wakeup_new(record) {
+                warn("wakeup_new", e);
+            }
+        }
+        for record in batch.sched_migrates.drain(..) {
+            if let Err(e) = self.add_sched_migrate(record) {
+                warn("sched_migrate", e);
+            }
+        }
+        for record in batch.process_exits.drain(..) {
+            if let Err(e) = self.add_process_exit(record) {
+                warn("process_exit", e);
+            }
+        }
+        failed
     }
 
     fn add_irq_slice(&mut self, record: IrqSliceRecord) -> Result<()> {
@@ -1794,6 +1878,20 @@ fn build_thread_batch(records: &[ThreadRecord], schema: &Arc<Schema>) -> Result<
             Arc::new(upid_builder.finish()),
         ],
     )?)
+}
+
+/// Sort a sched_slice batch by (cpu, ts) before it is built: runs of nearby
+/// timestamps let delta encoding + ZSTD exploit the locality. A per-batch
+/// sort is nearly as effective as a global one because each 200k-row batch
+/// already covers a narrow time window. Runs on the table's encode lane.
+fn sort_sched_slice_batch(rows: &mut [SchedSliceRecord]) {
+    rows.sort_unstable_by_key(|r| (r.cpu, r.ts));
+}
+
+/// Sort a thread_state batch by (utid, ts) before it is built, on the
+/// table's encode lane; the same locality argument as sched_slice.
+fn sort_thread_state_batch(rows: &mut [ThreadStateRecord]) {
+    rows.sort_unstable_by_key(|r| (r.utid, r.ts));
 }
 
 fn build_sched_slice_batch(
@@ -3975,5 +4073,175 @@ mod packet_encode_bench {
             .set_max_row_group_size(1_000_000)
             .build();
         write_with(none, &batches, &schema, "UNCOMPRESSED default encodings");
+    }
+}
+
+/// The two sched encode lanes against the inline writer's contract: every
+/// row a shard hands over lands once, each flushed batch sorted by the
+/// table's key on the lane, in a file whose columns the readers expect.
+#[cfg(test)]
+mod sched_lane_tests {
+    use super::*;
+    use crate::parquet::ParquetSink;
+    use crate::record::SchedRecordBatch;
+    use arrow::array::{Int32Array, Int64Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+    use tempfile::TempDir;
+
+    /// An integer column (Int64 or Int32) widened to i64.
+    fn col_i64(batch: &RecordBatch, idx: usize) -> Vec<i64> {
+        let col = batch.column(idx);
+        if let Some(v) = col.as_any().downcast_ref::<Int64Array>() {
+            (0..batch.num_rows()).map(|i| v.value(i)).collect()
+        } else if let Some(v) = col.as_any().downcast_ref::<Int32Array>() {
+            (0..batch.num_rows()).map(|i| v.value(i) as i64).collect()
+        } else {
+            panic!("column {idx} is not an integer column");
+        }
+    }
+
+    /// The table's rows as (column `a`, column `b`) pairs, both widened to
+    /// i64, in file order, plus the column names.
+    fn read_rows(
+        dir: &std::path::Path,
+        table: &str,
+        a: usize,
+        b: usize,
+    ) -> (Vec<(i64, i64)>, Vec<String>) {
+        let file = File::open(dir.join(format!("{table}.parquet"))).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let names: Vec<String> = builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        let mut rows = Vec::new();
+        for batch in builder.build().unwrap() {
+            let batch = batch.unwrap();
+            let av = col_i64(&batch, a);
+            let bv = col_i64(&batch, b);
+            rows.extend(av.into_iter().zip(bv));
+        }
+        (rows, names)
+    }
+
+    /// Two shards hand over unsorted rows in 10-slice / 6-state batches to a
+    /// writer that flushes a table to its lane at 25 rows: 60 slices and 36
+    /// thread states come back whole, and each lane batch is sorted by the
+    /// table's key.
+    #[test]
+    fn sched_rows_through_the_lanes_match_the_inline_contract() {
+        let dir = TempDir::new().unwrap();
+        let sink = ParquetSink::directory(dir.path()).unwrap();
+        let mut writer = StreamingParquetWriter::with_sink(sink, 25);
+
+        let mut expected_slices: Vec<(i64, i64)> = Vec::new();
+        let mut expected_states: Vec<(i64, i64)> = Vec::new();
+        for shard in 0..2i64 {
+            for batch in 0..3i64 {
+                // Descending timestamps within a batch, two CPUs interleaved.
+                let mut slices: Vec<SchedSliceRecord> = (0..10)
+                    .map(|i| SchedSliceRecord {
+                        ts: 1_000 * (shard * 3 + batch) + (10 - i),
+                        dur: 5,
+                        cpu: (i % 2) as i32,
+                        utid: 100 + shard,
+                        end_state: if i % 3 == 0 { Some(2) } else { None },
+                        priority: 120,
+                    })
+                    .collect();
+                let mut states: Vec<ThreadStateRecord> = (0..6)
+                    .map(|i| ThreadStateRecord {
+                        ts: 1_000 * (shard * 3 + batch) + (6 - i),
+                        dur: 0,
+                        utid: 200 + (i % 2),
+                        state: 0,
+                        cpu: Some(3),
+                    })
+                    .collect();
+                expected_slices.extend(slices.iter().map(|r| (r.ts, r.cpu as i64)));
+                expected_states.extend(states.iter().map(|r| (r.ts, r.utid)));
+                let (mut irq, mut softirq, mut wake, mut mig, mut exits) =
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                let failed = writer.add_sched_batch(SchedRecordBatch {
+                    slices: &mut slices,
+                    thread_states: &mut states,
+                    irq_slices: &mut irq,
+                    softirq_slices: &mut softirq,
+                    wakeup_news: &mut wake,
+                    sched_migrates: &mut mig,
+                    process_exits: &mut exits,
+                });
+                assert_eq!(failed, 0);
+                assert!(
+                    slices.is_empty() && states.is_empty(),
+                    "the batch is taken whole"
+                );
+            }
+        }
+        writer.finish().unwrap();
+
+        let (slices, names) = read_rows(dir.path(), "sched_slice", 0, 2);
+        assert_eq!(names, ["ts", "dur", "cpu", "utid", "end_state", "priority"]);
+        assert_eq!(slices.len(), 60);
+        let mut want = expected_slices.clone();
+        want.sort_unstable();
+        let mut got = slices.clone();
+        got.sort_unstable();
+        assert_eq!(got, want, "every slice lands exactly once");
+        // The lane sorts each flushed batch by (cpu, ts). The first flush
+        // carries shard 0's 30 slices (the buffer crossed 25 on its third
+        // batch), so the file's first 30 rows are one sorted lane batch.
+        let first: Vec<(i64, i64)> = slices[..30].iter().map(|&(ts, cpu)| (cpu, ts)).collect();
+        let mut sorted = first.clone();
+        sorted.sort_unstable();
+        assert_eq!(first, sorted, "a lane batch is sorted by (cpu, ts)");
+
+        let (states, names) = read_rows(dir.path(), "thread_state", 0, 2);
+        assert_eq!(names, ["ts", "dur", "utid", "state", "cpu"]);
+        assert_eq!(states.len(), 36);
+        let mut want: Vec<(i64, i64)> = expected_states;
+        want.sort_unstable();
+        let mut got = states.clone();
+        got.sort_unstable();
+        assert_eq!(got, want, "every thread state lands exactly once");
+        // The first thread_state flush carries 30 rows too (shard 0's 18 plus
+        // shard 1's first 12 crossed 25 on shard 1's second batch).
+        let first: Vec<(i64, i64)> = states[..30].iter().map(|&(ts, utid)| (utid, ts)).collect();
+        let mut sorted = first.clone();
+        sorted.sort_unstable();
+        assert_eq!(first, sorted, "a lane batch is sorted by (utid, ts)");
+    }
+
+    /// An empty batch is a no-op: no lane, no file.
+    #[test]
+    fn an_empty_sched_batch_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let sink = ParquetSink::directory(dir.path()).unwrap();
+        let mut writer = StreamingParquetWriter::with_sink(sink, 25);
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g) = (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let failed = writer.add_sched_batch(SchedRecordBatch {
+            slices: &mut a,
+            thread_states: &mut b,
+            irq_slices: &mut c,
+            softirq_slices: &mut d,
+            wakeup_news: &mut e,
+            sched_migrates: &mut f,
+            process_exits: &mut g,
+        });
+        assert_eq!(failed, 0);
+        writer.finish().unwrap();
+        assert!(!dir.path().join("sched_slice.parquet").exists());
+        assert!(!dir.path().join("thread_state.parquet").exists());
     }
 }
