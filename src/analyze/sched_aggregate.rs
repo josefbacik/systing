@@ -100,7 +100,9 @@
 //!   window's rows, so every chunk holds about `chunk_rows` events whatever
 //!   the density inside the window — equal time slices would hand a burst
 //!   to one chunk whole — and a chunk can exceed that only by a burst
-//!   narrower than one bucket. The result is identical to one pass over the
+//!   narrower than one bucket, or when `chunk_rows` asks for more chunks
+//!   than the histogram has buckets (the request is clamped to the bucket
+//!   count). The result is identical to one pass over the
 //!   whole stream — an ordered stream is the concatenation of its ordered
 //!   time chunks, and a slice whose start and end fall in different chunks
 //!   is two events in the stream either way. `meta.stream_chunks` says how
@@ -108,9 +110,11 @@
 //! - **The event budget** (`max_rows`): when the requested window holds more
 //!   stream rows than the budget, the window is shortened from its END to
 //!   the last bucket boundary at which the cumulative event count still
-//!   fits the budget — an exact bound, since every stream row of the shorter
+//!   fits the budget — an upper bound, since every stream row of the shorter
 //!   window is an event of the requested window's stream with a timestamp
-//!   at or before that boundary — and the pass runs over that shorter
+//!   at or before that boundary (the bucket layout counts a slice start
+//!   sitting on a boundary at or below it, so the bound errs toward keeping
+//!   less, never more) — and the pass runs over that shorter
 //!   window. Every statistic stays exactly defined over a contiguous,
 //!   un-sampled window — nothing is sampled or extrapolated — and the row
 //!   says so: `meta.window_truncated` is true, `meta.window_ns` is the
@@ -179,7 +183,10 @@ pub struct SchedAggregateParams {
     pub end_time: Option<f64>,
     /// Number of tail-contributor threads to report per distribution.
     pub top_k: usize,
-    /// Stream rows fetched per chunk; 0 fetches the whole window at once.
+    /// Stream rows fetched per chunk; 0 fetches the whole window at once. A
+    /// value below the stream's rows per histogram bucket (the rows divided
+    /// by [`EVENT_HIST_BUCKETS`]) yields chunks of about a bucket's events:
+    /// the chunk count is clamped to the bucket count.
     pub chunk_rows: u64,
     /// Event budget for the fold (stream rows); 0 disables the budget. See
     /// the module docs, "Bounded folding".
@@ -1256,15 +1263,20 @@ fn build_event_ts_union(
 /// The histogram of the window's event timestamps over
 /// [`EVENT_HIST_BUCKETS`] time buckets: one row per non-empty bucket with
 /// its event count, laid out so that the cumulative count of buckets `0..k`
-/// is an exact upper bound of the stream rows a window ending at the
-/// [`hist_boundary`] `B_k` holds. A slice end, marker, new-task wakeup or
-/// migrate at `B_k` belongs to that window, so those events fall into the
-/// bucket BELOW the boundary they sit on (bucket `b` covers `(B_b, B_(b+1)]`;
-/// the window's first instant folds into bucket 0); a slice START at `B_k`
-/// does not (the slice ends after `B_k`), so start events fall into the
-/// bucket ABOVE (`[B_b, B_(b+1))`). Every stream row of the shorter window
-/// is then an event counted at or below `B_k`, and the cumulative count
-/// bounds it from above. The arithmetic runs in the engine's 128-bit
+/// is an upper bound — exact up to the rounding named below — of the stream
+/// rows a window ending at the [`hist_boundary`] `B_k` holds. A slice end,
+/// marker, new-task wakeup or migrate at `B_k` belongs to that window, so
+/// those events fall into the bucket BELOW the boundary they sit on (bucket
+/// `b` covers `(B_b, B_(b+1)]`; the window's first instant folds into bucket
+/// 0); a slice START at `B_k` does not (the slice ends after `B_k`), so
+/// start events fall into the bucket ABOVE (`[B_b, B_(b+1))`). The buckets
+/// are cut at the exact fractions `start + span * k / n` while `B_k` is that
+/// fraction floored, so when the division is inexact a slice start sitting
+/// on `B_k` itself lies below the exact cut and is counted one bucket LOW —
+/// an over-count of the shorter window's rows, never an under-count. Every
+/// stream row of the shorter window is then an event counted at or below
+/// `B_k`, and the cumulative count bounds it from above. The arithmetic runs
+/// in the engine's 128-bit
 /// integers — a window's span times the bucket count overflows 64 bits on a
 /// trace a few weeks long — and `//` is its integer division (`/` on
 /// integers yields a DOUBLE).
@@ -1316,8 +1328,14 @@ fn cumulative(hist: &[u64]) -> Vec<u64> {
 /// window's cumulative histogram: for each `k` in `1..n` the first bucket
 /// boundary at which the cumulative count reaches `k/n` of the stream. A
 /// burst narrower than one bucket cannot be split and makes the chunk
-/// holding it larger; coinciding edges collapse into fewer chunks.
+/// holding it larger; coinciding edges collapse into fewer chunks. The
+/// histogram resolves at most one edge per bucket boundary, so more chunks
+/// than buckets cannot be told apart: `n` is clamped to the bucket count —
+/// a `chunk_rows` below the stream's rows per bucket yields chunks of about
+/// a bucket's events — and the edge list stays that small whatever row
+/// figure produced `n`.
 fn chunk_edges_from_hist(start: i64, end: i64, cum: &[u64], n: u32) -> Vec<i64> {
+    let n = n.min(EVENT_HIST_BUCKETS);
     let total = *cum.last().unwrap_or(&0) as u128;
     let mut edges = Vec::with_capacity(n.saturating_sub(1) as usize);
     for k in 1..n {
@@ -1885,8 +1903,9 @@ impl AnalyzeDb {
     /// docs, "Bounded folding"): one chunk for `n <= 1`, otherwise the
     /// window split where its event histogram's running total crosses each
     /// `k/n` of the stream ([`chunk_edges_from_hist`]). Fewer chunks come
-    /// back when edges coincide (events piled inside one bucket) or the
-    /// stream is empty.
+    /// back when edges coincide (events piled inside one bucket), when `n`
+    /// exceeds the histogram's bucket count (clamped there), or the stream
+    /// is empty.
     fn chunk_plan(
         &self,
         trace_id: Option<&str>,
@@ -2503,6 +2522,19 @@ mod tests {
             stream_chunks(0, end, &chunk_edges_from_hist(0, end, &cum, 3)).len(),
             1
         );
+        // More chunks than buckets cannot be resolved: the request is clamped
+        // to the bucket count, so the edge list never grows with the row
+        // figure that produced it (a `--chunk-rows 1` on a large stream) —
+        // every bucket boundary once, the same chunks as asking for one
+        // chunk per bucket.
+        let mut dense = vec![0u64; n as usize];
+        dense.fill(3);
+        let cum = cumulative(&dense);
+        let clamped = chunk_edges_from_hist(0, end, &cum, u32::MAX);
+        assert_eq!(clamped.len(), n as usize - 1);
+        assert_eq!(clamped, chunk_edges_from_hist(0, end, &cum, n));
+        assert_eq!(clamped[0], hist_boundary(0, end, 1));
+        assert_eq!(stream_chunks(0, end, &clamped).len(), n as usize);
     }
 
     #[test]
