@@ -560,6 +560,10 @@ impl AnalyzeDb {
             StatementShape::Dollar => bail!(
                 "dollar-quoted strings ($$...$$) and $-parameters are not supported here; use a single-quoted string literal"
             ),
+            StatementShape::NonAscii(c) => bail!(
+                "non-ASCII character {c:?} (U+{:04X}) outside a string literal, a quoted identifier or a comment is not supported here: DuckDB reads some such characters as whitespace and others as identifier text, which this check does not follow; keep keywords and identifiers ASCII and put non-ASCII text inside a quoted literal",
+                u32::from(c)
+            ),
             StatementShape::PivotWithoutIn => bail!(
                 "PIVOT without an IN (...) value list is not supported here: DuckDB expands it into a CREATE TYPE ... AS ENUM (...) statement ahead of the query, which would run outside the row cap; write the pivot as one top-level statement whose every pivot column names a literal list — PIVOT <source> ON <column> IN (<values>) USING <aggregate> — with a join source as a parenthesised subquery, no IN (<subquery>) list, no CASE or list literal as a pivot column, and no pivot nested inside another statement"
             ),
@@ -1767,6 +1771,33 @@ mod tests {
             let err = db.query(sql).unwrap_err().to_string();
             assert!(err.contains("dollar-quoted"), "{sql:?}: {err}");
         }
+        // An escape-string literal `E'\''` is ONE string to DuckDB's lexer
+        // (the backslash escapes the quote); a classifier that ended it at
+        // the `\'` read the rest of the text as a literal and let the hidden
+        // statements reach `prepare`. The classifier now reads the escape
+        // the way the lexer does, so these are refused as several
+        // statements, and the hidden SET never ran; the same literal in a
+        // single statement runs and yields the quote.
+        for sql in [
+            "SELECT E'\\''; SET memory_limit='100GB'; SELECT E'\\''",
+            "SELECT e'\\''; SET memory_limit='100GB'; SELECT e'\\''",
+            "SELECT 1E'\\''; SET memory_limit='100GB'; SELECT 1E'\\''",
+        ] {
+            let err = db.query(sql).unwrap_err().to_string();
+            assert!(err.contains("one statement"), "{sql:?}: {err}");
+        }
+        let quote = db.query("SELECT E'\\'' AS q").unwrap();
+        assert_eq!(quote.rows[0][0], serde_json::json!("'"));
+        // A zero-width space is whitespace to DuckDB (stripped before the
+        // text is lexed) and not to this classifier; every non-ASCII
+        // character outside a literal or a comment is refused instead.
+        for sql in [
+            "SELECT 1\u{200B}; SET memory_limit='100GB'; SELECT 1",
+            "SELECT\u{00A0}1; SET memory_limit='100GB'; SELECT 1",
+        ] {
+            let err = db.query(sql).unwrap_err().to_string();
+            assert!(err.contains("non-ASCII"), "{sql:?}: {err}");
+        }
         let after = db.query("SELECT current_setting('memory_limit')").unwrap();
         assert_eq!(before.rows, after.rows);
 
@@ -1799,6 +1830,11 @@ mod tests {
             "PIVOT t ON bucket IN (SELECT DISTINCT bucket FROM t) USING count(id)",
             "PIVOT t ON CASE WHEN bucket IN (0) THEN 'a' ELSE 'b' END USING count(id)",
             "PIVOT t ON [bucket IN (0)] USING count(id)",
+            // A nested pivot behind an escape-string literal: to DuckDB the
+            // literal ends at its second quote and the pivot is code.
+            "SELECT E'\\'' AS q FROM (PIVOT t ON bucket USING count(id)) WHERE '' = ''",
+            // `PIVOT_LONGER` is `UNPIVOT`, so this list is a subquery.
+            "PIVOT t ON bucket IN (PIVOT_LONGER t ON id INTO NAME k VALUE v) USING count(id)",
         ] {
             let err = db.query(sql).unwrap_err().to_string();
             assert!(err.contains("PIVOT without an IN"), "{sql:?}: {err}");
@@ -1807,6 +1843,18 @@ mod tests {
                 .unwrap();
             assert_eq!(enums.rows[0][0], serde_json::json!(0), "{sql:?} created a type");
         }
+        // A zero-width space ahead of the list's SELECT is whitespace to
+        // DuckDB, which then reads `IN (<subquery>)` and builds the enum by
+        // running it; the classifier refuses the character instead.
+        let err = db
+            .query("PIVOT t ON bucket IN (\u{200B}SELECT DISTINCT bucket FROM t) USING count(id)")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-ASCII"), "{err}");
+        let enums = db
+            .query("SELECT count(*) FROM duckdb_types() WHERE type_name LIKE '__pivot_enum%'")
+            .unwrap();
+        assert_eq!(enums.rows[0][0], serde_json::json!(0));
         let pivoted = db
             .query("PIVOT t ON bucket IN (0, 1) USING count(id) GROUP BY id")
             .unwrap();
