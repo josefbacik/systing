@@ -811,7 +811,9 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
 ///
 /// This function creates a new DuckDB database at `db_path` and imports
 /// all Parquet files from `parquet_dir`. Each table gets a `trace_id` column
-/// added for multi-trace support.
+/// added for multi-trace support. The schema and every import run inside one
+/// transaction, so the database is written with a single commit and a
+/// failure part-way through leaves it empty rather than half-built.
 ///
 /// # Arguments
 ///
@@ -852,17 +854,35 @@ pub fn parquet_to_duckdb_with_options(
         })?;
     }
 
-    let conn = Connection::open(db_path)
+    let mut conn = Connection::open(db_path)
         .with_context(|| format!("Failed to create DuckDB database: {}", db_path.display()))?;
 
     // Spill to a sibling of the db file so it lands on the same filesystem.
     let spill_dir = db_path.parent().unwrap_or(Path::new("."));
     configure_for_bulk_io(&conn, spill_dir)?;
 
-    create_schema(&conn)?;
+    // One transaction around the schema and every import. In autocommit each
+    // statement below is its own DuckDB commit — a WAL write and an
+    // fsync-class wait — and building a trace runs about forty to seventy of
+    // them (the table DDL, the metadata rows, one INSERT per present table).
+    // On a host whose workload holds the disk saturated each of those waits
+    // for seconds, and a generation that takes well under a second on an idle
+    // disk stretches into minutes. One commit collapses them into a single
+    // durable write plus the close-time checkpoint. It also makes the import
+    // atomic: a failure part-way through leaves no half-built database with
+    // some tables filled and the rest missing — the transaction guard rolls
+    // back on the error path.
+    let tx = conn.transaction().with_context(|| {
+        format!(
+            "Failed to begin the import transaction on {}",
+            db_path.display()
+        )
+    })?;
+
+    create_schema(&tx)?;
 
     // Insert trace metadata
-    conn.execute(
+    tx.execute(
         "INSERT INTO _traces (trace_id, source_path, systing_version) VALUES (?, ?, ?)",
         [
             trace_id,
@@ -872,7 +892,7 @@ pub fn parquet_to_duckdb_with_options(
     )?;
 
     // Insert schema version
-    conn.execute(
+    tx.execute(
         "INSERT OR REPLACE INTO _schema_version (id, version) VALUES (1, ?)",
         [SCHEMA_VERSION],
     )?;
@@ -880,7 +900,14 @@ pub fn parquet_to_duckdb_with_options(
     // Import each table from Parquet files
     let paths = ParquetPaths::new(parquet_dir);
     let mut report = ImportReport::default();
-    import_tables(&conn, &paths, trace_id, options, &mut report)?;
+    import_tables(&tx, &paths, trace_id, options, &mut report)?;
+
+    tx.commit().with_context(|| {
+        format!(
+            "Failed to commit the import transaction on {}",
+            db_path.display()
+        )
+    })?;
 
     Ok(report)
 }
@@ -1973,6 +2000,46 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM _traces", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_parquet_to_duckdb_failed_import_leaves_no_half_built_database() {
+        // The schema and every import share one transaction: when a later
+        // table's parquet cannot be read, nothing imported before it survives.
+        // The caller's error is the only trace of the attempt — never a
+        // database with `process` filled and `sched_slice` missing.
+        let temp_dir = TempDir::new().unwrap();
+        let source_db = temp_dir.path().join("source.duckdb");
+        create_test_db(&source_db, "test_trace", 4242, "atomic_process");
+        let parquet_dir = temp_dir.path().join("traces");
+        duckdb_to_parquet(&source_db, &parquet_dir, "test_trace").unwrap();
+        assert!(parquet_dir.join("process.parquet").exists());
+        // `sched_slice` is imported after `process` and `thread`; a file that
+        // is not parquet fails its import (at the column read ahead of the
+        // INSERT) part-way through the table list.
+        fs::write(
+            parquet_dir.join("sched_slice.parquet"),
+            b"not a parquet file",
+        )
+        .unwrap();
+
+        let db_path = temp_dir.path().join("test.duckdb");
+        let err = parquet_to_duckdb(&parquet_dir, &db_path, "test_trace").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("sched_slice"),
+            "the error names the table whose import failed: {err:#}"
+        );
+
+        // Nothing was committed: the schema rolled back with the imports.
+        let conn = Connection::open(&db_path).unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0, "a failed import must leave no tables behind");
     }
 
     #[test]
