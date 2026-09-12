@@ -990,8 +990,13 @@ get_pthread_id_match(void* thread_state, void* tls_base, PyPidData* pid_data) {
     return PYSTACKS_PTHREAD_ID_NULL;
   }
 
-#if __riscv64__
-  /* tls_base is the pthread descriptor derived from clear_child_tid. */
+#if __aarch64__ || __riscv64__
+  /*
+   * tls_base is the pthread descriptor derived from clear_child_tid;
+   * compare it directly. struct pthread has no header.self on these
+   * architectures (the header union is plain padding), so there is
+   * nothing to read.
+   */
   pthread_self = (uint64_t)tls_base;
 #else
   // 0x10 = offsetof(struct pthread, header.self)
@@ -1119,10 +1124,8 @@ __hidden int pystacks_read_stacks_task(
 
 #if __x86_64__
   void* tls_base = (void*)BPF_PROBE_READ(cur_task, thread.fsbase);
-#elif __aarch64__
-  void* tls_base = (void*)BPF_PROBE_READ(cur_task, thread.uw.tp_value);
-#elif __riscv64__
-  void* tls_base = get_riscv_pthread_descriptor(cur_task);
+#elif __aarch64__ || __riscv64__
+  void* tls_base = get_glibc_pthread_descriptor(cur_task);
 #else
 #error "Unsupported platform"
 #endif
