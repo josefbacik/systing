@@ -342,7 +342,7 @@ const NETWORK_TW_KPROBE_PROGRAMS: &[&str] = &[
 /// (b334b924c9b7) — a 6.6-series kernel lacks it, and before this gate a
 /// network capture on such a node failed its every attach (the whole
 /// capture, CPU lane included) rather than running without the leg.
-const NETWORK_TW_SYMBOLS: &[&str] = &[
+pub const NETWORK_TW_SYMBOLS: &[&str] = &[
     "tcp_time_wait",
     "inet_twsk_hashdance_schedule",
     "inet_twsk_deschedule_put",
@@ -1150,7 +1150,7 @@ fn probe_memory_kernel_legs(opts: &Config, kernel: &KernelSymbols) -> MemoryKern
 /// Which of `names` /proc/kallsyms lists as text symbols (`t`/`T`). An
 /// unreadable kallsyms reads as "none present", which turns the legs off
 /// rather than failing the capture.
-fn kallsyms_has_funcs(names: &[&str]) -> HashSet<String> {
+pub fn kallsyms_has_funcs(names: &[&str]) -> HashSet<String> {
     let mut found = HashSet::new();
     let Ok(contents) = fs::read_to_string("/proc/kallsyms") else {
         return found;
