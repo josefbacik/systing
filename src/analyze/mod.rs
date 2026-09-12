@@ -183,10 +183,26 @@ pub struct TimeRange {
 }
 
 /// Per-trace version information.
+///
+/// `systing_version` is the systing that CONVERTED the trace into this
+/// database (the `_traces.systing_version` column, schema 12); the
+/// `recorder_*` fields are the systing that RECORDED it, from the parquet
+/// directory's manifest (schema 22), and read as `None` for a trace without
+/// a manifest or a database older than schema 22. Read side by side with
+/// `schema_version`: a `recorder_schema_version` above the database's
+/// schema means the reader predated the recorder and columns were dropped
+/// at import; below it, a NULL column is one the recorder predates.
 #[derive(Debug, Serialize)]
 pub struct TraceVersionInfo {
     pub trace_id: String,
     pub systing_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recorder_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recorder_schema_version: Option<u32>,
+    /// When the recorder finished, nanoseconds since the Unix epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recorded_at_unix_ns: Option<i64>,
 }
 
 /// Per-trace system/platform information (from the `sysinfo` table): what kind
@@ -853,32 +869,44 @@ impl AnalyzeDb {
     }
 
     /// Returns version info from `_traces`. Returns an empty vec for databases
-    /// that predate the `systing_version` column.
+    /// that predate the `systing_version` column; the recorder's columns
+    /// (schema 22) read as `None` where the database lacks them.
     fn get_trace_versions(&self) -> Vec<TraceVersionInfo> {
         // Check if the systing_version column exists (older databases won't have it)
-        let has_version: bool = self
-            .conn
-            .prepare(
-                "SELECT COUNT(*) FROM information_schema.columns \
-                 WHERE table_name = '_traces' AND column_name = 'systing_version'",
-            )
-            .and_then(|mut s| s.query_row([], |r| r.get::<_, u32>(0)))
-            .map(|c| c > 0)
-            .unwrap_or(false);
-
-        if !has_version {
+        let has_column = |name: &str| -> bool {
+            self.conn
+                .prepare(&format!(
+                    "SELECT COUNT(*) FROM information_schema.columns \
+                     WHERE table_name = '_traces' AND column_name = '{name}'"
+                ))
+                .and_then(|mut s| s.query_row([], |r| r.get::<_, u32>(0)))
+                .map(|c| c > 0)
+                .unwrap_or(false)
+        };
+        if !has_column("systing_version") {
             return Vec::new();
         }
+        let recorder_columns = if has_column("recorder_version") {
+            "recorder_version, recorder_schema_version, recorded_at_unix_ns"
+        } else {
+            "NULL::VARCHAR, NULL::INTEGER, NULL::BIGINT"
+        };
 
-        let Ok(mut stmt) = self.conn.prepare(
-            "SELECT trace_id, COALESCE(systing_version, '') FROM _traces ORDER BY trace_id",
-        ) else {
+        let Ok(mut stmt) = self.conn.prepare(&format!(
+            "SELECT trace_id, COALESCE(systing_version, ''), {recorder_columns} \
+             FROM _traces ORDER BY trace_id"
+        )) else {
             return Vec::new();
         };
         let Ok(rows) = stmt.query_map([], |row| {
             Ok(TraceVersionInfo {
                 trace_id: row.get(0)?,
                 systing_version: row.get(1)?,
+                recorder_version: row.get(2)?,
+                recorder_schema_version: row
+                    .get::<_, Option<i32>>(3)?
+                    .and_then(|v| u32::try_from(v).ok()),
+                recorded_at_unix_ns: row.get(4)?,
             })
         }) else {
             return Vec::new();

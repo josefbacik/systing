@@ -63,6 +63,9 @@ pub struct ParquetPaths {
     pub tpu_device: PathBuf,
     pub tpu_op: PathBuf,
     pub tpu_metric: PathBuf,
+    // The recorder's manifest (one row: its version, its SCHEMA_VERSION, when
+    // it finished; schema 22). Absent from directories written before it.
+    pub manifest: PathBuf,
 }
 
 /// Named path entry for iteration with names.
@@ -130,6 +133,7 @@ impl ParquetPaths {
             tpu_device: dir.join("tpu_device.parquet"),
             tpu_op: dir.join("tpu_op.parquet"),
             tpu_metric: dir.join("tpu_metric.parquet"),
+            manifest: dir.join("systing_manifest.parquet"),
         }
     }
 
@@ -183,11 +187,12 @@ impl ParquetPaths {
             tpu_device: dir.join(format!("{trace_id}_tpu_device.parquet")),
             tpu_op: dir.join(format!("{trace_id}_tpu_op.parquet")),
             tpu_metric: dir.join(format!("{trace_id}_tpu_metric.parquet")),
+            manifest: dir.join(format!("{trace_id}_systing_manifest.parquet")),
         }
     }
 
     /// Returns all paths with their names (single source of truth for path iteration).
-    fn all_paths_with_names(&self) -> [PathEntry<'_>; 44] {
+    fn all_paths_with_names(&self) -> [PathEntry<'_>; 45] {
         [
             PathEntry {
                 path: &self.process,
@@ -365,6 +370,10 @@ impl ParquetPaths {
             PathEntry {
                 path: &self.tpu_metric,
                 name: "tpu_metric",
+            },
+            PathEntry {
+                path: &self.manifest,
+                name: "systing_manifest",
             },
         ]
     }

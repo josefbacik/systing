@@ -176,7 +176,7 @@ ORDER BY gap_ms DESC LIMIT 20;
 ```
 
 ### Multi-trace databases
-Every table has a `trace_id` column. Always include it in joins, and filter on it when the DB contains multiple captures (`_traces` lists them, with the systing version that produced each).
+Every table has a `trace_id` column. Always include it in joins, and filter on it when the DB contains multiple captures (`_traces` lists them: `systing_version` is the systing that converted each into the database; `recorder_version` / `recorder_schema_version` — from schema 22, NULL for a trace without a manifest — the systing that recorded it and the schema it wrote against, so a NULL column in a trace whose `recorder_schema_version` predates the column is age, and a `recorder_schema_version` above the database's `_schema_version` means columns were dropped at import).
 
 ## Using `flamegraph`
 

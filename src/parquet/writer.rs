@@ -29,13 +29,14 @@ use crate::parquet::ParquetSink;
 use crate::record::RecordCollector;
 use crate::trace::{
     self, ArgRecord, ClockSnapshotRecord, CounterRecord, CounterTrackRecord, CpuInfoRecord,
-    InstantArgRecord, InstantRecord, IrqSliceRecord, MemoryAllocRecord, MemoryFaultRecord,
-    MemoryIommuRecord, MemoryMapRecord, MemoryRssRecord, MemoryThpRecord, MemoryVfioRecord,
-    MemoryVmstatRecord, NetworkDnsRecord, NetworkInterfaceRecord, NetworkPacketRecord,
-    NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord, ProcessExitRecord, ProcessRecord,
-    SchedMigrateRecord, SchedSliceRecord, SliceRecord, SocketConnectionRecord, SoftirqSliceRecord,
-    StackRecord, StackSampleRecord, SysInfoRecord, ThreadRecord, ThreadStateRecord,
-    TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord, WakeupNewRecord,
+    InstantArgRecord, InstantRecord, IrqSliceRecord, ManifestRecord, MemoryAllocRecord,
+    MemoryFaultRecord, MemoryIommuRecord, MemoryMapRecord, MemoryRssRecord, MemoryThpRecord,
+    MemoryVfioRecord, MemoryVmstatRecord, NetworkDnsRecord, NetworkInterfaceRecord,
+    NetworkPacketRecord, NetworkPollRecord, NetworkSocketRecord, NetworkSyscallRecord,
+    ProcessExitRecord, ProcessRecord, SchedMigrateRecord, SchedSliceRecord, SliceRecord,
+    SocketConnectionRecord, SoftirqSliceRecord, StackRecord, StackSampleRecord, SysInfoRecord,
+    ThreadRecord, ThreadStateRecord, TpuDeviceRecord, TpuMetricRecord, TpuOpRecord, TrackRecord,
+    WakeupNewRecord,
 };
 
 /// Default batch size for streaming writes.
@@ -186,6 +187,8 @@ pub struct StreamingParquetWriter {
     tpu_device_writer: Option<TableWriter>,
     tpu_op_writer: Option<TableWriter>,
     tpu_metric_writer: Option<TableWriter>,
+    /// The one-row `systing_manifest` table, written by `finish()` alone.
+    manifest_writer: Option<TableWriter>,
 
     // Track counts for statistics
     total_records: usize,
@@ -309,6 +312,7 @@ impl StreamingParquetWriter {
             tpu_device_writer: None,
             tpu_op_writer: None,
             tpu_metric_writer: None,
+            manifest_writer: None,
             total_records: 0,
         }
     }
@@ -846,6 +850,39 @@ impl StreamingParquetWriter {
         Ok(())
     }
 
+    // Write the one-row manifest: this systing's version, the SCHEMA_VERSION
+    // it wrote against and the wall clock now. Called by `finish()` once,
+    // after every table's last flush, so a directory carries a manifest only
+    // when its writer completed; the stream path carries it through the same
+    // sink under the `systing_manifest` header (`stream::TABLE_NAMES`).
+    fn write_manifest(&mut self) -> Result<()> {
+        if self.manifest_writer.is_some() {
+            return Ok(());
+        }
+        let recorded_at_unix_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_nanos()).unwrap_or(0))
+            .unwrap_or(0);
+        let record = ManifestRecord {
+            systing_version: env!("CARGO_PKG_VERSION").to_string(),
+            schema_version: crate::duckdb::SCHEMA_VERSION,
+            recorded_at_unix_ns,
+        };
+
+        let schema = trace::manifest_schema();
+        let writer = Self::get_or_create_writer(
+            &mut self.manifest_writer,
+            &self.sink,
+            "systing_manifest",
+            schema.clone(),
+            &self.writer_props,
+        )?;
+
+        let batch = build_manifest_batch(&record, &schema)?;
+        writer.write(&batch)?;
+        Ok(())
+    }
+
     // Flush network_syscalls buffer
     fn flush_network_syscalls(&mut self) -> Result<()> {
         if self.network_syscalls.is_empty() {
@@ -1233,6 +1270,7 @@ impl StreamingParquetWriter {
         close_writer!(self.tpu_device_writer);
         close_writer!(self.tpu_op_writer);
         close_writer!(self.tpu_metric_writer);
+        close_writer!(self.manifest_writer);
 
         match first_error {
             Some(e) => Err(e),
@@ -1274,7 +1312,8 @@ impl Drop for StreamingParquetWriter {
             || self.cpu_info_writer.is_some()
             || self.tpu_device_writer.is_some()
             || self.tpu_op_writer.is_some()
-            || self.tpu_metric_writer.is_some();
+            || self.tpu_metric_writer.is_some()
+            || self.manifest_writer.is_some();
 
         if has_open_writers {
             eprintln!(
@@ -1713,9 +1752,11 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn finish(mut self) -> Result<()> {
-        // Flush any remaining buffered records, but ensure close_writers is called
-        // even if flush fails to properly finalize/cleanup Parquet files
-        let flush_result = self.flush();
+        // Flush any remaining buffered records, then write the manifest (the
+        // last table, so that its presence means the writer completed), but
+        // ensure close_writers is called even if either fails to properly
+        // finalize/cleanup Parquet files
+        let flush_result = self.flush().and_then(|()| self.write_manifest());
         let close_result = self.close_writers();
 
         // Return first error encountered, but ensure both operations were attempted
@@ -2340,6 +2381,25 @@ fn build_clock_snapshot_batch(
             Arc::new(clock_name_builder.finish()),
             Arc::new(timestamp_ns_builder.finish()),
             Arc::new(is_primary_builder.finish()),
+        ],
+    )?)
+}
+
+fn build_manifest_batch(record: &ManifestRecord, schema: &Arc<Schema>) -> Result<RecordBatch> {
+    let mut systing_version_builder = StringBuilder::with_capacity(1, record.systing_version.len());
+    let mut schema_version_builder = Int32Builder::with_capacity(1);
+    let mut recorded_at_builder = Int64Builder::with_capacity(1);
+
+    systing_version_builder.append_value(&record.systing_version);
+    schema_version_builder.append_value(i32::try_from(record.schema_version).unwrap_or(i32::MAX));
+    recorded_at_builder.append_value(record.recorded_at_unix_ns);
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(systing_version_builder.finish()),
+            Arc::new(schema_version_builder.finish()),
+            Arc::new(recorded_at_builder.finish()),
         ],
     )?)
 }
@@ -3342,6 +3402,106 @@ mod tests {
         assert_eq!(device_id, 0);
         assert_eq!(metric_name, "test.metric");
         assert!((value - 42.0).abs() < f64::EPSILON);
+    }
+
+    /// `finish()` writes the one-row manifest last, naming this systing and
+    /// its SCHEMA_VERSION; the import lifts it onto `_traces`, and a
+    /// directory written by a writer that never finished carries none.
+    #[test]
+    fn test_manifest_written_at_finish_and_imported() {
+        use crate::duckdb::{get_trace_info, parquet_to_duckdb_with_options, ImportOptions};
+        use duckdb::Connection;
+
+        let dir = TempDir::new().unwrap();
+        let before_ns = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap();
+        let writer = StreamingParquetWriter::new(dir.path()).unwrap();
+        writer.finish().unwrap();
+
+        let manifest_path = dir.path().join("systing_manifest.parquet");
+        assert!(manifest_path.exists(), "finish() writes the manifest");
+        let conn = Connection::open_in_memory().unwrap();
+        let (version, schema, recorded_at): (String, i32, i64) = conn
+            .query_row(
+                &format!(
+                    "SELECT systing_version, schema_version, recorded_at_unix_ns \
+                     FROM read_parquet('{}')",
+                    manifest_path.to_string_lossy()
+                ),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(schema, crate::duckdb::SCHEMA_VERSION as i32);
+        assert!(
+            recorded_at >= before_ns,
+            "recorded_at_unix_ns ({recorded_at}) is the wall clock at finish (>= {before_ns})"
+        );
+        let rows: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM read_parquet('{}')",
+                    manifest_path.to_string_lossy()
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+
+        // The import records the recorder on `_traces`, beside the
+        // converter's own version.
+        let db_path = dir.path().join("test.duckdb");
+        let report = parquet_to_duckdb_with_options(
+            dir.path(),
+            &db_path,
+            "manifest-trace",
+            ImportOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            report.recorder.as_ref().map(|m| m.systing_version.as_str()),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert!(report.summary().is_none(), "nothing left out: {report:?}");
+        let info = get_trace_info(&db_path).unwrap();
+        assert_eq!(info.len(), 1);
+        assert_eq!(
+            info[0].recorder_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            info[0].recorder_schema_version,
+            Some(crate::duckdb::SCHEMA_VERSION)
+        );
+        assert_eq!(info[0].recorded_at_unix_ns, Some(recorded_at));
+        assert_eq!(info[0].systing_version, env!("CARGO_PKG_VERSION"));
+
+        // A writer dropped without finish() leaves no manifest (the
+        // directory reads as one without one; the tables it did flush stay).
+        let unfinished = TempDir::new().unwrap();
+        {
+            let mut writer = StreamingParquetWriter::new(unfinished.path()).unwrap();
+            writer
+                .add_cpu_info(CpuInfoRecord {
+                    cpu: 0,
+                    min_freq_khz: Some(800_000),
+                    max_freq_khz: Some(3_500_000),
+                    base_freq_khz: None,
+                })
+                .unwrap();
+            // Dropped here: the Drop impl closes the writers it can.
+        }
+        assert!(
+            !unfinished.path().join("systing_manifest.parquet").exists(),
+            "no finish(), no manifest"
+        );
     }
 
     #[test]

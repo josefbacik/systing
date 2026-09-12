@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::parquet_paths::ParquetPaths;
+use crate::trace::ManifestRecord;
 
 /// Best-effort detection of the cgroup memory limit for the current process.
 ///
@@ -133,7 +134,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 22;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -201,7 +202,10 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             trace_id VARCHAR PRIMARY KEY,
             source_path VARCHAR,
             import_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            systing_version VARCHAR NOT NULL DEFAULT ''
+            systing_version VARCHAR NOT NULL DEFAULT '',
+            recorder_version VARCHAR,
+            recorder_schema_version INTEGER,
+            recorded_at_unix_ns BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS _schema_version (
@@ -837,8 +841,13 @@ pub fn parquet_to_duckdb(parquet_dir: &Path, db_path: &Path, trace_id: &str) -> 
 }
 
 /// [`parquet_to_duckdb`] with the import options spelled out, returning what
-/// the import did about columns this systing's schema does not have (see
-/// [`ImportReport`]).
+/// the import did about columns and files this systing's schema does not
+/// have, and what the directory's manifest said about its writer (see
+/// [`ImportReport`]). A refused import — a `strict_schema` refusal, or any
+/// error after the database file was created — leaves nothing behind: the
+/// file this call created (and DuckDB's write-ahead log beside it) is removed,
+/// so a caller never finds a hollow-but-valid `.duckdb` where a refusal
+/// happened.
 pub fn parquet_to_duckdb_with_options(
     parquet_dir: &Path,
     db_path: &Path,
@@ -855,11 +864,30 @@ pub fn parquet_to_duckdb_with_options(
     let conn = Connection::open(db_path)
         .with_context(|| format!("Failed to create DuckDB database: {}", db_path.display()))?;
 
+    let result = import_directory(&conn, parquet_dir, db_path, trace_id, options);
+    if result.is_err() {
+        // Close the connection first so DuckDB releases the file and its WAL.
+        drop(conn);
+        remove_partial_database(db_path);
+    }
+    result
+}
+
+/// The body of [`parquet_to_duckdb_with_options`] against an open, empty
+/// database: the schema, the `_traces` and `_schema_version` rows, every
+/// table the directory carries, and the recorder's manifest on `_traces`.
+fn import_directory(
+    conn: &Connection,
+    parquet_dir: &Path,
+    db_path: &Path,
+    trace_id: &str,
+    options: ImportOptions,
+) -> Result<ImportReport> {
     // Spill to a sibling of the db file so it lands on the same filesystem.
     let spill_dir = db_path.parent().unwrap_or(Path::new("."));
-    configure_for_bulk_io(&conn, spill_dir)?;
+    configure_for_bulk_io(conn, spill_dir)?;
 
-    create_schema(&conn)?;
+    create_schema(conn)?;
 
     // Insert trace metadata
     conn.execute(
@@ -880,9 +908,116 @@ pub fn parquet_to_duckdb_with_options(
     // Import each table from Parquet files
     let paths = ParquetPaths::new(parquet_dir);
     let mut report = ImportReport::default();
-    import_tables(&conn, &paths, trace_id, options, &mut report)?;
+    // The recorder's manifest first, so the guard's warnings can name the
+    // writer; the files this systing has no table for next, so a newer
+    // writer's whole table is reported (and refused under strict_schema)
+    // the way its columns are.
+    report.recorder = read_manifest(conn, &paths.manifest);
+    report.unknown_files = unknown_parquet_files(parquet_dir, &paths);
+    note_unknown_files(parquet_dir, &report.unknown_files, options)?;
+    import_tables(conn, &paths, trace_id, options, &mut report)?;
+    if let Some(manifest) = &report.recorder {
+        record_manifest(conn, trace_id, manifest)?;
+    }
 
     Ok(report)
+}
+
+/// Remove the database file a failed import created, and the write-ahead
+/// log DuckDB keeps beside it. Best effort: a file that cannot be removed is
+/// reported on stderr, since the import's own error is the one the caller
+/// gets.
+fn remove_partial_database(db_path: &Path) {
+    let wal_path = db_path.with_file_name(format!(
+        "{}.wal",
+        db_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    for path in [db_path, wal_path.as_path()] {
+        if path.exists() {
+            if let Err(e) = std::fs::remove_file(path) {
+                eprintln!(
+                    "warning: could not remove the partial database {} after a failed import: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// The recorder's manifest from `systing_manifest.parquet`, when the
+/// directory carries one. A missing file is the pre-manifest era (a writer
+/// of schema < 22, or one that never reached `finish()`) and reads as
+/// `None`; a file that is present but unreadable is reported on stderr and
+/// reads as `None` too — the manifest is provenance, and a damaged one must
+/// not cost the tables.
+pub fn read_manifest(conn: &Connection, path: &Path) -> Option<ManifestRecord> {
+    if !path.exists() {
+        return None;
+    }
+    let escaped_path = path.to_string_lossy().replace('\'', "''");
+    let row = conn.query_row(
+        &format!(
+            "SELECT systing_version, schema_version, recorded_at_unix_ns \
+             FROM read_parquet('{escaped_path}') LIMIT 1"
+        ),
+        [],
+        |r| {
+            Ok(ManifestRecord {
+                systing_version: r.get(0)?,
+                schema_version: u32::try_from(r.get::<_, i32>(1)?).unwrap_or(0),
+                recorded_at_unix_ns: r.get(2)?,
+            })
+        },
+    );
+    match row {
+        Ok(manifest) => Some(manifest),
+        Err(e) => {
+            eprintln!(
+                "warning: {}: the recorder's manifest could not be read ({e}); the trace imports as one without a manifest",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Record the recorder's manifest on the trace's `_traces` row
+/// (`recorder_version`, `recorder_schema_version`, `recorded_at_unix_ns`).
+pub fn record_manifest(conn: &Connection, trace_id: &str, manifest: &ManifestRecord) -> Result<()> {
+    conn.execute(
+        "UPDATE _traces SET recorder_version = ?, recorder_schema_version = ?, recorded_at_unix_ns = ? \
+         WHERE trace_id = ?",
+        duckdb::params![
+            manifest.systing_version,
+            manifest.schema_version,
+            manifest.recorded_at_unix_ns,
+            trace_id
+        ],
+    )
+    .with_context(|| format!("Failed to record the recorder's manifest for trace '{trace_id}'"))?;
+    Ok(())
+}
+
+/// The `.parquet` files in `dir` that are none of the tables this systing
+/// reads (`paths`): the tables a newer systing added, which the import
+/// leaves out — reported so that the silence has a name. Sorted by file
+/// name; empty when every file is known.
+pub fn unknown_parquet_files(dir: &Path, paths: &ParquetPaths) -> Vec<String> {
+    let known: HashSet<std::path::PathBuf> = paths.all_paths().into_iter().cloned().collect();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut unknown: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "parquet") && !known.contains(p))
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    unknown.sort();
+    unknown
 }
 
 /// Import a `stack.parquet` (which stores `frame_names VARCHAR[]`) into the
@@ -959,27 +1094,68 @@ pub fn import_order_by(table_name: &str) -> Option<&'static str> {
     }
 }
 
-/// How a parquet→DuckDB import treats a source column this systing's schema
-/// does not have — a trace written by a newer systing than the one reading it.
+/// How a parquet→DuckDB import treats a source column, or a whole source
+/// file, this systing's schema does not have — a trace written by a newer
+/// systing than the one reading it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ImportOptions {
     /// Refuse the import with a message naming the table, the unknown columns
-    /// and this systing's schema version, instead of importing the columns
-    /// this schema knows and leaving the rest out with a warning (the
-    /// default: a partial read of a newer trace serves every consumer better
-    /// than no read).
+    /// (or the unknown files) and this systing's schema version, instead of
+    /// importing the columns and tables this schema knows and leaving the
+    /// rest out with a warning (the default: a partial read of a newer trace
+    /// serves every consumer better than no read).
     pub strict_schema: bool,
 }
 
-/// What a parquet→DuckDB import left out: per table, the source columns this
-/// systing's schema does not have. Empty when every table imported whole.
-/// The database's `_schema_version` names the schema the import produced,
-/// so a consumer reading the database sees a complete database of that
-/// schema; only the importing process learns, through this report and one
-/// warning line per table, that the trace carried more.
+/// What a parquet→DuckDB import left out, and who wrote the trace. Per
+/// table, the source columns this systing's schema does not have; the
+/// `.parquet` files in the directory this systing has no table for; and
+/// the recorder's manifest when the directory carried one. The database's
+/// `_schema_version` names the schema the import produced, so a consumer
+/// reading the database sees a complete database of that schema; the
+/// `_traces` row carries the writer (`recorder_version`,
+/// `recorder_schema_version`, `recorded_at_unix_ns` — NULL for a trace
+/// without a manifest), and only the importing process learns, through
+/// this report and one warning line per table or file, that the trace
+/// carried more.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ImportReport {
     pub dropped_columns: Vec<(String, Vec<String>)>,
+    /// File names (not paths) of the `.parquet` files left out whole.
+    pub unknown_files: Vec<String>,
+    /// The directory's `systing_manifest.parquet`, when it had one.
+    pub recorder: Option<ManifestRecord>,
+}
+
+impl ImportReport {
+    /// One line for a log or a summary: what the import left out, or
+    /// `None` when it imported everything.
+    pub fn summary(&self) -> Option<String> {
+        if self.dropped_columns.is_empty() && self.unknown_files.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        for (table, columns) in &self.dropped_columns {
+            parts.push(format!("{table}: {}", columns.join(", ")));
+        }
+        if !self.unknown_files.is_empty() {
+            parts.push(format!("files: {}", self.unknown_files.join(", ")));
+        }
+        let writer = self
+            .recorder
+            .as_ref()
+            .map(|m| {
+                format!(
+                    "; written by systing {} (schema {})",
+                    m.systing_version, m.schema_version
+                )
+            })
+            .unwrap_or_default();
+        Some(format!(
+            "left out of the import (this systing is schema {SCHEMA_VERSION}{writer}): {}",
+            parts.join("; ")
+        ))
+    }
 }
 
 /// The select list a table's import reads from its parquet source: `*` when
@@ -1031,26 +1207,7 @@ pub fn import_column_list(
     if unknown.is_empty() {
         return Ok(Some("*".to_string()));
     }
-    let unknown_list = unknown
-        .iter()
-        .map(|c| c.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    if options.strict_schema {
-        anyhow::bail!(
-            "table '{table_name}' from {source_sql} has {} column(s) this systing (schema {SCHEMA_VERSION}) does not have: {unknown_list}; \
-             the trace was written by a newer systing — import it with a systing of that schema or later, or non-strictly to take the known columns only",
-            unknown.len()
-        );
-    }
-    eprintln!(
-        "warning: table '{table_name}' from {source_sql}: {} column(s) this systing (schema {SCHEMA_VERSION}) does not have were left out of the import: {unknown_list}",
-        unknown.len()
-    );
-    report.dropped_columns.push((
-        table_name.to_string(),
-        unknown.iter().map(|c| c.to_string()).collect(),
-    ));
+    note_unknown_columns(table_name, source_sql, &unknown, options, report)?;
     if known.is_empty() {
         return Ok(None);
     }
@@ -1061,6 +1218,135 @@ pub fn import_column_list(
             .collect::<Vec<_>>()
             .join(", "),
     ))
+}
+
+/// The guard's verdict on a source's unknown columns: an error naming them
+/// under [`ImportOptions::strict_schema`], else one warning line and an
+/// entry on `report`. Both name the writer when the manifest gave one.
+fn note_unknown_columns(
+    table_name: &str,
+    source_sql: &str,
+    unknown: &[&String],
+    options: ImportOptions,
+    report: &mut ImportReport,
+) -> Result<()> {
+    let unknown_list = unknown
+        .iter()
+        .map(|c| c.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let writer = writer_phrase(report.recorder.as_ref());
+    if options.strict_schema {
+        anyhow::bail!(
+            "table '{table_name}' from {source_sql} has {} column(s) this systing (schema {SCHEMA_VERSION}) does not have: {unknown_list}; \
+             {writer} — import it with a systing of that schema or later, or non-strictly to take the known columns only",
+            unknown.len()
+        );
+    }
+    eprintln!(
+        "warning: table '{table_name}' from {source_sql}: {} column(s) this systing (schema {SCHEMA_VERSION}) does not have were left out of the import: {unknown_list} ({writer})",
+        unknown.len()
+    );
+    report.dropped_columns.push((
+        table_name.to_string(),
+        unknown.iter().map(|c| c.to_string()).collect(),
+    ));
+    Ok(())
+}
+
+/// The guard's verdict on the `.parquet` files in `dir` this systing has no
+/// table for ([`unknown_parquet_files`]): an error naming them under
+/// [`ImportOptions::strict_schema`], else one warning line. Nothing when the
+/// list is empty.
+pub fn note_unknown_files(dir: &Path, unknown: &[String], options: ImportOptions) -> Result<()> {
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let list = unknown.join(", ");
+    if options.strict_schema {
+        anyhow::bail!(
+            "{}: {} parquet file(s) this systing (schema {SCHEMA_VERSION}) has no table for: {list}; \
+             the trace was written by a newer systing — import it with a systing of that schema or later, or non-strictly to take the known tables only",
+            dir.display(),
+            unknown.len()
+        );
+    }
+    eprintln!(
+        "warning: {}: {} parquet file(s) this systing (schema {SCHEMA_VERSION}) has no table for were left out of the import: {list}",
+        dir.display(),
+        unknown.len()
+    );
+    Ok(())
+}
+
+/// The clause a guard message uses for the trace's writer: the manifest's
+/// version and schema when the directory carried one, else the fact that
+/// the trace names none (a writer of schema < 22).
+fn writer_phrase(recorder: Option<&ManifestRecord>) -> String {
+    match recorder {
+        Some(m) => format!(
+            "the trace was written by systing {} (schema {})",
+            m.systing_version, m.schema_version
+        ),
+        None => "the trace was written by a newer systing whose version this trace does not record"
+            .to_string(),
+    }
+}
+
+/// The columns the `stack.parquet` import reads by name
+/// ([`import_stack_from_parquet`]); any other column in the file is one this
+/// systing does not know.
+const STACK_PARQUET_COLUMNS: [&str; 4] = ["id", "depth", "leaf_name", "frame_names"];
+
+/// The guard's read of a `stack.parquet`, whose import selects its columns
+/// by name and so never fails on an extra one: an extra column is reported
+/// on `report` under table `stack` and warned once, or refused under
+/// [`ImportOptions::strict_schema`], exactly as [`import_column_list`] does
+/// for the tables imported `BY NAME`. A column the SELECT needs and the file
+/// lacks is left to the import's own error (an older file than this
+/// systing's `stack` shape, which has not changed since the `frame_names`
+/// form).
+pub fn check_stack_parquet_columns(
+    conn: &Connection,
+    path: &Path,
+    options: ImportOptions,
+    report: &mut ImportReport,
+) -> Result<()> {
+    let escaped_path = path.to_string_lossy().replace('\'', "''");
+    let source_sql = format!("read_parquet('{escaped_path}')");
+    let mut stmt = conn
+        .prepare(&format!("DESCRIBE SELECT * FROM {source_sql}"))
+        .with_context(|| format!("Failed to read the parquet columns of '{}'", path.display()))?;
+    let source = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("Failed to read the parquet columns of '{}'", path.display()))?;
+    let unknown: Vec<&String> = source
+        .iter()
+        .filter(|c| {
+            !STACK_PARQUET_COLUMNS
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(c))
+        })
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    note_unknown_columns("stack", &source_sql, &unknown, options, report)
+}
+
+/// [`import_stack_from_parquet`] behind the guard: the file's columns are
+/// checked first ([`check_stack_parquet_columns`]), so a `stack.parquet` a
+/// newer systing wrote is reported or refused like any other table.
+pub fn import_stack_from_parquet_with_options(
+    conn: &Connection,
+    path: &Path,
+    trace_id: &str,
+    options: ImportOptions,
+    report: &mut ImportReport,
+) -> Result<()> {
+    check_stack_parquet_columns(conn, path, options, report)?;
+    import_stack_from_parquet(conn, path, trace_id)
 }
 
 /// Import all tables from Parquet files.
@@ -1082,6 +1368,12 @@ fn import_tables(
     let mut import_table = |table_name: &str, path: &Path| -> Result<()> {
         if !path.exists() {
             return Ok(());
+        }
+
+        // `stack.parquet` is interned into `frame` + `stack` by its own
+        // statements, behind the same guard as every other table.
+        if table_name == "stack" {
+            return import_stack_from_parquet_with_options(conn, path, trace_id, options, report);
         }
 
         let escaped_path = path.to_string_lossy().replace('\'', "''");
@@ -1110,13 +1402,6 @@ fn import_tables(
         Ok(())
     };
 
-    let import_stack = |path: &Path| -> Result<()> {
-        if !path.exists() {
-            return Ok(());
-        }
-        import_stack_from_parquet(conn, path, trace_id)
-    };
-
     // Import core tables
     import_table("process", &paths.process)?;
     import_table("thread", &paths.thread)?;
@@ -1142,7 +1427,7 @@ fn import_tables(
     import_table("instant_args", &paths.instant_args)?;
 
     // Stack tables (query-friendly format)
-    import_stack(&paths.stack)?;
+    import_table("stack", &paths.stack)?;
     import_table("stack_sample", &paths.stack_sample)?;
 
     // Legacy stack profile tables (for Perfetto .pb extraction compatibility)
@@ -1225,7 +1510,18 @@ pub fn get_trace_ids(db_path: &Path) -> Result<Vec<String>> {
 pub struct TraceMetadata {
     pub trace_id: String,
     pub source_path: String,
+    /// The systing that CONVERTED the trace into this database (see
+    /// SCHEMA_CHANGES v12), not the one that recorded it.
     pub systing_version: String,
+    /// The systing that RECORDED the trace, from the parquet directory's
+    /// manifest (schema 22); `None` for a trace without one, and for every
+    /// trace in a database older than schema 22.
+    pub recorder_version: Option<String>,
+    /// The `SCHEMA_VERSION` the recorder wrote against; `None` as above.
+    pub recorder_schema_version: Option<u32>,
+    /// When the recorder finished, nanoseconds since the Unix epoch; `None`
+    /// as above.
+    pub recorded_at_unix_ns: Option<i64>,
 }
 
 /// Get trace metadata from a DuckDB database.
@@ -1235,8 +1531,28 @@ pub fn get_trace_info(db_path: &Path) -> Result<Vec<TraceMetadata>> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("Failed to open DuckDB database: {}", db_path.display()))?;
 
+    // The recorder columns exist from schema 22; an older database reads
+    // them as NULL.
+    let has_recorder_columns: bool = conn
+        .prepare(
+            "SELECT COUNT(*) FROM duckdb_columns() \
+             WHERE database_name = current_database() AND schema_name = 'main' \
+             AND table_name = '_traces' AND column_name = 'recorder_version'",
+        )
+        .and_then(|mut s| s.query_row([], |r| r.get::<_, u32>(0)))
+        .map(|c| c > 0)
+        .unwrap_or(false);
+    let recorder_columns = if has_recorder_columns {
+        "recorder_version, recorder_schema_version, recorded_at_unix_ns"
+    } else {
+        "NULL::VARCHAR, NULL::INTEGER, NULL::BIGINT"
+    };
+
     let mut stmt = conn
-        .prepare("SELECT trace_id, COALESCE(source_path, ''), COALESCE(systing_version, '') FROM _traces ORDER BY trace_id")
+        .prepare(&format!(
+            "SELECT trace_id, COALESCE(source_path, ''), COALESCE(systing_version, ''), \
+             {recorder_columns} FROM _traces ORDER BY trace_id"
+        ))
         .with_context(|| {
             format!(
                 "Failed to query _traces table in '{}' - file may not be a valid systing trace database",
@@ -1250,6 +1566,11 @@ pub fn get_trace_info(db_path: &Path) -> Result<Vec<TraceMetadata>> {
                 trace_id: row.get(0)?,
                 source_path: row.get(1)?,
                 systing_version: row.get(2)?,
+                recorder_version: row.get(3)?,
+                recorder_schema_version: row
+                    .get::<_, Option<i32>>(4)?
+                    .and_then(|v| u32::try_from(v).ok()),
+                recorded_at_unix_ns: row.get(5)?,
             })
         })
         .with_context(|| "Failed to execute query on _traces table")?
@@ -1304,24 +1625,47 @@ pub fn import_duckdb_traces(
 
 /// Inner implementation of DuckDB trace import (called after ATTACH).
 fn import_duckdb_traces_inner(conn: &Connection, mappings: &[TraceImportMapping]) -> Result<()> {
-    // Check if the source _traces table has a systing_version column
-    let source_has_version: bool = {
+    // The source `_traces` columns beyond the original three: `systing_version`
+    // (schema 12) and the recorder's manifest columns (schema 22). Each is
+    // copied when the source has it and left NULL / default otherwise.
+    let source_columns: HashSet<String> = {
         let mut stmt = conn.prepare(
-            "SELECT COUNT(*) FROM duckdb_columns() \
+            "SELECT column_name FROM duckdb_columns() \
              WHERE database_name = 'input_db' AND schema_name = 'main' \
-             AND table_name = '_traces' AND column_name = 'systing_version'",
+             AND table_name = '_traces'",
         )?;
-        let count: u32 = stmt.query_row([], |row| row.get(0))?;
-        count > 0
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<_, _>>()
+            .context("Failed to read the columns of the attached database's _traces table")?
     };
+    let source_has_version = source_columns.contains("systing_version");
+    let source_has_recorder = [
+        "recorder_version",
+        "recorder_schema_version",
+        "recorded_at_unix_ns",
+    ]
+    .iter()
+    .all(|c| source_columns.contains(*c));
 
-    // Insert _traces metadata for each mapped trace, preserving systing_version from source
+    // Insert _traces metadata for each mapped trace, preserving the source's
+    // systing_version (the converter's) and, from schema 22, the recorder's
+    // manifest columns.
     for mapping in mappings {
         if source_has_version {
+            let (recorder_cols, recorder_vals) = if source_has_recorder {
+                (
+                    ", recorder_version, recorder_schema_version, recorded_at_unix_ns",
+                    ", recorder_version, recorder_schema_version, recorded_at_unix_ns",
+                )
+            } else {
+                ("", "")
+            };
             conn.execute(
-                "INSERT INTO main._traces (trace_id, source_path, systing_version) \
-                 SELECT ?, ?, COALESCE(systing_version, '') \
-                 FROM input_db._traces WHERE trace_id = ?",
+                &format!(
+                    "INSERT INTO main._traces (trace_id, source_path, systing_version{recorder_cols}) \
+                     SELECT ?, ?, COALESCE(systing_version, ''){recorder_vals} \
+                     FROM input_db._traces WHERE trace_id = ?"
+                ),
                 duckdb::params![mapping.new_id, mapping.source_path, mapping.old_id],
             )
             .with_context(|| format!("Failed to insert trace metadata for '{}'", mapping.new_id))?;
@@ -2174,9 +2518,12 @@ mod tests {
             format!("{err:#}").contains("turbo_khz"),
             "the refusal names the unknown column: {err:#}"
         );
-        // The projected statement is what the importers run.
+        // The projected statement is what the importers run. The select list
+        // is deliberately NOT in the table's column order: a positional
+        // mapping would put the trace id into `cpu`, so the row proves the
+        // mapping is BY NAME.
         conn.execute_batch(&format!(
-            "INSERT INTO cpu_info BY NAME SELECT 't' AS trace_id, \"cpu\", \"min_freq_khz\" FROM {newer}"
+            "INSERT INTO cpu_info BY NAME SELECT \"min_freq_khz\", \"cpu\", 't' AS trace_id FROM {newer}"
         ))
         .unwrap();
         let row: (String, i32, Option<i64>, Option<i64>) = conn
@@ -2210,6 +2557,252 @@ mod tests {
             report.dropped_columns,
             vec![("cpu_info".to_string(), vec!["not_a_column".to_string()])]
         );
+    }
+
+    /// `stack.parquet` selects its columns by name, so an extra column never
+    /// fails its import; the guard still reports it (under table `stack`)
+    /// and refuses it under strict_schema, like every other table.
+    #[test]
+    fn test_stack_parquet_extra_column_is_reported_or_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        let lax = ImportOptions::default();
+        let strict = ImportOptions {
+            strict_schema: true,
+        };
+
+        let plain = temp_dir.path().join("stack.parquet");
+        conn.execute_batch(&format!(
+            "COPY (SELECT 1::BIGINT AS id, 2::INTEGER AS depth, 'leaf'::VARCHAR AS leaf_name, \
+                    ['leaf', 'root']::VARCHAR[] AS frame_names) \
+             TO '{}' (FORMAT PARQUET)",
+            plain.to_string_lossy()
+        ))
+        .unwrap();
+        let mut report = ImportReport::default();
+        check_stack_parquet_columns(&conn, &plain, strict, &mut report).unwrap();
+        assert_eq!(report, ImportReport::default());
+        import_stack_from_parquet_with_options(&conn, &plain, "t", strict, &mut report).unwrap();
+        let frames: i64 = conn
+            .query_row("SELECT COUNT(*) FROM frame WHERE trace_id = 't'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(frames, 2);
+
+        let newer = temp_dir.path().join("newer_stack.parquet");
+        conn.execute_batch(&format!(
+            "COPY (SELECT 1::BIGINT AS id, 2::INTEGER AS depth, 'leaf'::VARCHAR AS leaf_name, \
+                    ['leaf', 'root']::VARCHAR[] AS frame_names, 7::INTEGER AS frame_kinds) \
+             TO '{}' (FORMAT PARQUET)",
+            newer.to_string_lossy()
+        ))
+        .unwrap();
+        let err = import_stack_from_parquet_with_options(&conn, &newer, "u", strict, &mut report)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("frame_kinds"),
+            "the strict refusal names the unknown column: {err:#}"
+        );
+        let stacks_u: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stack WHERE trace_id = 'u'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stacks_u, 0, "a strict refusal imports nothing");
+
+        let mut report = ImportReport::default();
+        import_stack_from_parquet_with_options(&conn, &newer, "u", lax, &mut report).unwrap();
+        assert_eq!(
+            report.dropped_columns,
+            vec![("stack".to_string(), vec!["frame_kinds".to_string()])]
+        );
+        let stacks_u: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stack WHERE trace_id = 'u'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stacks_u, 1, "the lax import takes the known columns");
+    }
+
+    /// A directory with a manifest records the recorder on `_traces`; one
+    /// without it (the pre-manifest era) reads NULL there and imports with
+    /// no error; the guard's warning names the writer when it can.
+    #[test]
+    fn test_import_records_the_recorder_from_the_manifest() {
+        let temp_dir = TempDir::new().unwrap();
+        let scratch = Connection::open_in_memory().unwrap();
+
+        // The pre-manifest directory: one table, no manifest.
+        let old_dir = temp_dir.path().join("old");
+        fs::create_dir_all(&old_dir).unwrap();
+        scratch
+            .execute_batch(&format!(
+                "COPY (SELECT 1::INTEGER AS cpu, 2::BIGINT AS max_freq_khz) \
+                 TO '{}' (FORMAT PARQUET)",
+                old_dir.join("cpu_info.parquet").to_string_lossy()
+            ))
+            .unwrap();
+        let old_db = temp_dir.path().join("old.duckdb");
+        let report =
+            parquet_to_duckdb_with_options(&old_dir, &old_db, "old", ImportOptions::default())
+                .unwrap();
+        assert_eq!(report.recorder, None);
+        assert!(report.summary().is_none());
+        let info = get_trace_info(&old_db).unwrap();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].recorder_version, None);
+        assert_eq!(info[0].recorder_schema_version, None);
+        assert_eq!(info[0].recorded_at_unix_ns, None);
+        assert_eq!(info[0].systing_version, env!("CARGO_PKG_VERSION"));
+
+        // A directory whose manifest claims a newer schema, beside a table
+        // with a column this systing does not have.
+        let new_dir = temp_dir.path().join("new");
+        fs::create_dir_all(&new_dir).unwrap();
+        scratch
+            .execute_batch(&format!(
+                "COPY (SELECT '99.0.1'::VARCHAR AS systing_version, \
+                        {}::INTEGER AS schema_version, 1234567890123456789::BIGINT AS recorded_at_unix_ns) \
+                 TO '{}' (FORMAT PARQUET); \
+                 COPY (SELECT 1::INTEGER AS cpu, 3::BIGINT AS min_freq_khz, 4::BIGINT AS turbo_khz) \
+                 TO '{}' (FORMAT PARQUET)",
+                SCHEMA_VERSION + 1,
+                new_dir.join("systing_manifest.parquet").to_string_lossy(),
+                new_dir.join("cpu_info.parquet").to_string_lossy()
+            ))
+            .unwrap();
+        let new_db = temp_dir.path().join("new.duckdb");
+        let report =
+            parquet_to_duckdb_with_options(&new_dir, &new_db, "new", ImportOptions::default())
+                .unwrap();
+        assert_eq!(
+            report.recorder,
+            Some(ManifestRecord {
+                systing_version: "99.0.1".to_string(),
+                schema_version: SCHEMA_VERSION + 1,
+                recorded_at_unix_ns: 1234567890123456789,
+            })
+        );
+        assert_eq!(
+            report.dropped_columns,
+            vec![("cpu_info".to_string(), vec!["turbo_khz".to_string()])]
+        );
+        let summary = report.summary().unwrap();
+        assert!(
+            summary.contains("99.0.1") && summary.contains("turbo_khz"),
+            "the summary names the writer and the dropped column: {summary}"
+        );
+        let info = get_trace_info(&new_db).unwrap();
+        assert_eq!(info[0].recorder_version.as_deref(), Some("99.0.1"));
+        assert_eq!(info[0].recorder_schema_version, Some(SCHEMA_VERSION + 1));
+        assert_eq!(info[0].recorded_at_unix_ns, Some(1234567890123456789));
+        assert_eq!(
+            info[0].systing_version,
+            env!("CARGO_PKG_VERSION"),
+            "systing_version keeps naming the converter"
+        );
+        // The strict refusal names the writer the manifest recorded.
+        let strict_db = temp_dir.path().join("strict.duckdb");
+        let err = parquet_to_duckdb_with_options(
+            &new_dir,
+            &strict_db,
+            "new",
+            ImportOptions {
+                strict_schema: true,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("99.0.1"),
+            "the refusal names the writer: {err:#}"
+        );
+    }
+
+    /// A strict refusal leaves no database behind — neither the `.duckdb`
+    /// the import created nor DuckDB's write-ahead log beside it.
+    #[test]
+    fn test_strict_refusal_removes_the_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let scratch = Connection::open_in_memory().unwrap();
+        let dir = temp_dir.path().join("trace");
+        fs::create_dir_all(&dir).unwrap();
+        scratch
+            .execute_batch(&format!(
+                "COPY (SELECT 1::INTEGER AS cpu, 4::BIGINT AS turbo_khz) TO '{}' (FORMAT PARQUET)",
+                dir.join("cpu_info.parquet").to_string_lossy()
+            ))
+            .unwrap();
+        let db_path = temp_dir.path().join("refused.duckdb");
+        let err = parquet_to_duckdb_with_options(
+            &dir,
+            &db_path,
+            "t",
+            ImportOptions {
+                strict_schema: true,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("turbo_khz"));
+        assert!(
+            !db_path.exists(),
+            "the refused import's database was removed"
+        );
+        assert!(
+            !temp_dir.path().join("refused.duckdb.wal").exists(),
+            "and its write-ahead log with it"
+        );
+        // The lax import of the same directory still produces a database.
+        parquet_to_duckdb_with_options(&dir, &db_path, "t", ImportOptions::default()).unwrap();
+        assert!(db_path.exists());
+    }
+
+    /// A `.parquet` file this systing has no table for is reported by name
+    /// (and refused under strict_schema); the tables around it import.
+    #[test]
+    fn test_unknown_parquet_files_are_reported() {
+        let temp_dir = TempDir::new().unwrap();
+        let scratch = Connection::open_in_memory().unwrap();
+        let dir = temp_dir.path().join("trace");
+        fs::create_dir_all(&dir).unwrap();
+        scratch
+            .execute_batch(&format!(
+                "COPY (SELECT 1::INTEGER AS cpu, 2::BIGINT AS max_freq_khz) TO '{}' (FORMAT PARQUET); \
+                 COPY (SELECT 1::INTEGER AS x) TO '{}' (FORMAT PARQUET)",
+                dir.join("cpu_info.parquet").to_string_lossy(),
+                dir.join("future_table.parquet").to_string_lossy()
+            ))
+            .unwrap();
+        let paths = ParquetPaths::new(&dir);
+        assert_eq!(
+            unknown_parquet_files(&dir, &paths),
+            vec!["future_table.parquet".to_string()]
+        );
+        let db_path = temp_dir.path().join("t.duckdb");
+        let report =
+            parquet_to_duckdb_with_options(&dir, &db_path, "t", ImportOptions::default()).unwrap();
+        assert_eq!(
+            report.unknown_files,
+            vec!["future_table.parquet".to_string()]
+        );
+        assert!(report.summary().unwrap().contains("future_table.parquet"));
+        let conn = Connection::open(&db_path).unwrap();
+        let cpus: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cpu_info", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cpus, 1, "the known table imported beside the unknown file");
+        drop(conn);
+        let err = parquet_to_duckdb_with_options(
+            &dir,
+            &temp_dir.path().join("strict.duckdb"),
+            "t",
+            ImportOptions {
+                strict_schema: true,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("future_table.parquet"));
     }
 
     #[test]
@@ -2274,13 +2867,22 @@ mod tests {
     fn test_import_preserves_systing_version() {
         let temp_dir = TempDir::new().unwrap();
 
-        // Create a source database with systing_version set
+        // Create a source database with systing_version set, and the
+        // recorder's manifest columns (schema 22) filled.
         let input_path = temp_dir.path().join("input.duckdb");
         let conn = Connection::open(&input_path).unwrap();
         create_schema(&conn).unwrap();
         conn.execute(
-            "INSERT INTO _traces (trace_id, source_path, systing_version) VALUES (?, ?, ?)",
-            ["trace_a", "/original/path", "0.9.0"],
+            "INSERT INTO _traces (trace_id, source_path, systing_version, recorder_version, \
+             recorder_schema_version, recorded_at_unix_ns) VALUES (?, ?, ?, ?, ?, ?)",
+            duckdb::params![
+                "trace_a",
+                "/original/path",
+                "0.9.0",
+                "0.8.5",
+                21u32,
+                1_700_000_000_000_000_000i64
+            ],
         )
         .unwrap();
         conn.execute(
@@ -2306,11 +2908,55 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        // Verify the systing_version was preserved from the source
+        // Verify the systing_version was preserved from the source, and the
+        // recorder's columns with it
         let info = get_trace_info(&output_path).unwrap();
         assert_eq!(info.len(), 1);
         assert_eq!(info[0].trace_id, "imported");
         assert_eq!(info[0].systing_version, "0.9.0");
+        assert_eq!(info[0].recorder_version.as_deref(), Some("0.8.5"));
+        assert_eq!(info[0].recorder_schema_version, Some(21));
+        assert_eq!(info[0].recorded_at_unix_ns, Some(1_700_000_000_000_000_000));
+    }
+
+    /// A source database from before schema 22 (no recorder columns on
+    /// `_traces`) merges with the recorder's columns NULL, never an error.
+    #[test]
+    fn test_import_from_a_source_without_recorder_columns() {
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.duckdb");
+        let conn = Connection::open(&input_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _traces (trace_id VARCHAR PRIMARY KEY, source_path VARCHAR, \
+                                   systing_version VARCHAR); \
+             CREATE TABLE process (trace_id VARCHAR, upid BIGINT, pid INTEGER, name VARCHAR); \
+             INSERT INTO _traces VALUES ('trace_a', '/original/path', '1.17.8'); \
+             INSERT INTO process VALUES ('trace_a', 1, 100, 'test_proc');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let output_path = temp_dir.path().join("output.duckdb");
+        let conn = Connection::open(&output_path).unwrap();
+        create_schema(&conn).unwrap();
+        import_duckdb_traces(
+            &conn,
+            &input_path,
+            &[TraceImportMapping {
+                old_id: "trace_a".into(),
+                new_id: "imported".into(),
+                source_path: "/new/path".into(),
+            }],
+        )
+        .unwrap();
+        drop(conn);
+
+        let info = get_trace_info(&output_path).unwrap();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].systing_version, "1.17.8");
+        assert_eq!(info[0].recorder_version, None);
+        assert_eq!(info[0].recorder_schema_version, None);
+        assert_eq!(info[0].recorded_at_unix_ns, None);
     }
 
     #[test]

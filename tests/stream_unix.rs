@@ -19,8 +19,15 @@ use systing::stream::{receive, StreamTarget};
 use systing::{systing, Config};
 use tempfile::TempDir;
 
-/// Tables that the default recorder set always emits.
-const EXPECTED_TABLES: &[&str] = &["sched_slice", "sysinfo", "process", "thread"];
+/// Tables that the default recorder set always emits — and the one-row
+/// manifest the writer sends last, whatever the recorder set.
+const EXPECTED_TABLES: &[&str] = &[
+    "sched_slice",
+    "sysinfo",
+    "process",
+    "thread",
+    "systing_manifest",
+];
 
 /// Return Ok(rows) once `path` is a complete parquet file with rows; Err
 /// otherwise. A half-written file (footer not yet flushed) fails to parse,
