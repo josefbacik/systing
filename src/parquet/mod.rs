@@ -3,6 +3,7 @@
 //! This module provides functionality for reading and writing trace data
 //! in Parquet format.
 
+pub mod lane;
 pub mod sink;
 pub mod writer;
 

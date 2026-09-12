@@ -105,6 +105,24 @@ pub trait RecordCollector {
     /// Add a network packet record.
     fn add_network_packet(&mut self, record: NetworkPacketRecord) -> Result<()>;
 
+    /// Add a consumer's whole batch of network packet records. The default
+    /// adds them one by one; a collector that pays a lock per call
+    /// ([`SharedCollector`]) or buffers toward a flush overrides it so a
+    /// packet consumer's 4096-event batch costs one call.
+    fn add_network_packet_batch(&mut self, records: Vec<NetworkPacketRecord>) -> Result<()> {
+        for record in records {
+            self.add_network_packet(record)?;
+        }
+        Ok(())
+    }
+
+    /// The collector as `Any`, so a test that handed an [`InMemoryCollector`]
+    /// to a recorder can read its rows back out of the trait object; the
+    /// writing collectors return `None`.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
+
     /// Add a network socket record.
     fn add_network_socket(&mut self, record: NetworkSocketRecord) -> Result<()>;
 
@@ -377,6 +395,11 @@ impl RecordCollector for SharedCollector {
         self.lock().add_sched_batch(batch)
     }
 
+    fn add_network_packet_batch(&mut self, records: Vec<NetworkPacketRecord>) -> Result<()> {
+        // One acquisition per consumer batch, not one per packet.
+        self.lock().add_network_packet_batch(records)
+    }
+
     fn flush(&mut self) -> Result<()> {
         self.lock().flush()
     }
@@ -532,6 +555,15 @@ impl RecordCollector for InMemoryCollector {
     fn add_network_packet(&mut self, record: NetworkPacketRecord) -> Result<()> {
         self.data.network_packets.push(record);
         Ok(())
+    }
+
+    fn add_network_packet_batch(&mut self, records: Vec<NetworkPacketRecord>) -> Result<()> {
+        self.data.network_packets.extend(records);
+        Ok(())
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 
     fn add_network_socket(&mut self, record: NetworkSocketRecord) -> Result<()> {

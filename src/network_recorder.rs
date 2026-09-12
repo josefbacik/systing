@@ -296,6 +296,44 @@ impl SocketMetadata {
     }
 }
 
+/// A consumer's batch of packet events prepared OUTSIDE the recorder lock
+/// ([`NetworkRecorder::prepare_packet_batch`]): the parquet records with
+/// their `id` unassigned, and beside each the socket sighting the recorder
+/// needs to emit the socket record on first sight. Appended under the lock
+/// by [`NetworkRecorder::append_packet_batch`].
+pub struct PreparedBatch {
+    records: Vec<NetworkPacketRecord>,
+    sockets: Vec<SocketSighting>,
+}
+
+impl PreparedBatch {
+    /// Packet records in the batch (events without a socket id or of an
+    /// unknown type were dropped at preparation).
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
+/// What a packet event says about its socket: the tuple the socket record
+/// carries, whether it is complete (see [`socket_tuple_is_complete`]), the
+/// namespace and the sighting time.
+struct SocketSighting {
+    socket_id: SocketId,
+    protocol: u32,
+    af: u32,
+    src_addr: [u8; 16],
+    src_port: u16,
+    dest_addr: [u8; 16],
+    dest_port: u16,
+    complete: bool,
+    netns_inum: u64,
+    ts: u64,
+}
+
 pub struct NetworkRecorder {
     pub ringbuf: RingBuffer<network_event>,
 
@@ -325,7 +363,7 @@ pub struct NetworkRecorder {
     /// arrives with the complete tuple, ONE upgraded record is emitted
     /// so the trace carries the real endpoints. Readers keep one row
     /// per socket by preferring the complete row.
-    seen_sockets: HashMap<SocketId, bool>,
+    seen_sockets: SeenSockets,
     /// Collector for streaming records during recording
     streaming_collector: Option<Box<dyn RecordCollector + Send>>,
     /// Next record ID counters for streaming
@@ -355,6 +393,34 @@ fn socket_tuple_is_complete(af: u32, src_port: u16, dest_addr: &[u8; 16], dest_p
     src_port != 0 && !(dest_port == 0 && parse_ip_addr(af, dest_addr).is_unspecified())
 }
 
+/// The seen-socket map, probed once per packet event under the recorder
+/// lock: a `u64` socket id hashed by one multiplication (Fibonacci hashing)
+/// instead of SipHash. The ids are BPF-assigned counters, so the identity
+/// would cluster hashbrown's tag bits; the multiply spreads them.
+type SeenSockets = HashMap<SocketId, bool, std::hash::BuildHasherDefault<SocketIdHasher>>;
+
+#[derive(Default)]
+struct SocketIdHasher(u64);
+
+impl std::hash::Hasher for SocketIdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Only `u64` keys reach this hasher; anything else would be a bug
+        // in how the map is keyed, and is hashed byte-wise so it still
+        // works.
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    fn write_u64(&mut self, id: u64) {
+        self.0 = id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
 /// Decide whether a NetworkSocketRecord should be emitted for this
 /// sighting of `socket_id`, updating the seen-map. True on first sight,
 /// and ONCE more as an upgrade when the first record was emitted from a
@@ -365,7 +431,7 @@ fn socket_tuple_is_complete(af: u32, src_port: u16, dest_addr: &[u8; 16], dest_p
 /// only ever shows degraded tuples (a real listener, an unconnected UDP
 /// socket) emits exactly one record.
 fn should_emit_socket_record(
-    seen_sockets: &mut HashMap<SocketId, bool>,
+    seen_sockets: &mut SeenSockets,
     socket_id: SocketId,
     complete: bool,
 ) -> bool {
@@ -387,7 +453,7 @@ impl NetworkRecorder {
             hostname_cache: HashMap::new(),
             resolve_addresses,
             min_ts: None,
-            seen_sockets: HashMap::new(),
+            seen_sockets: SeenSockets::default(),
             streaming_collector: None,
             next_syscall_id: 1,
             next_packet_id: 1,
@@ -410,23 +476,13 @@ impl NetworkRecorder {
     /// or ONCE more as an upgrade when the first record was emitted from a
     /// degraded sighting (port-less or peer-less tuple) and this event
     /// carries the complete tuple. Returns true if a record was emitted.
-    #[allow(clippy::too_many_arguments)]
-    fn maybe_emit_socket_record(
-        &mut self,
-        socket_id: SocketId,
-        protocol: u32,
-        af: u32,
-        src_addr: &[u8; 16],
-        src_port: u16,
-        dest_addr: &[u8; 16],
-        dest_port: u16,
-        netns_inum: u64,
-        ts: i64,
-    ) -> Result<bool> {
+    fn maybe_emit_socket_record(&mut self, sighting: &SocketSighting) -> Result<bool> {
         use crate::systing_core::types::{network_address_family, network_protocol};
 
-        let complete = socket_tuple_is_complete(af, src_port, dest_addr, dest_port);
-        if !should_emit_socket_record(&mut self.seen_sockets, socket_id, complete) {
+        let socket_id = sighting.socket_id;
+        let protocol = sighting.protocol;
+        let af = sighting.af;
+        if !should_emit_socket_record(&mut self.seen_sockets, socket_id, sighting.complete) {
             return Ok(false);
         }
 
@@ -456,24 +512,46 @@ impl NetworkRecorder {
         .to_string();
 
         // Convert addresses to strings
-        let src_ip = parse_ip_addr(af, src_addr).to_string();
-        let dest_ip = parse_ip_addr(af, dest_addr).to_string();
+        let src_ip = parse_ip_addr(af, &sighting.src_addr).to_string();
+        let dest_ip = parse_ip_addr(af, &sighting.dest_addr).to_string();
 
         // Emit NetworkSocketRecord
         collector.add_network_socket(NetworkSocketRecord {
             socket_id: socket_id as i64,
-            netns_inum: netns_inum as i64,
+            netns_inum: sighting.netns_inum as i64,
             protocol: protocol_str,
             address_family: af_str,
             src_ip,
-            src_port: src_port as i32,
+            src_port: sighting.src_port as i32,
             dest_ip,
-            dest_port: dest_port as i32,
-            first_seen_ts: Some(ts),
-            last_seen_ts: Some(ts),
+            dest_port: sighting.dest_port as i32,
+            first_seen_ts: Some(sighting.ts as i64),
+            last_seen_ts: Some(sighting.ts as i64),
         })?;
 
         Ok(true)
+    }
+
+    /// A syscall event's socket sighting (its tuple completeness computed
+    /// here; a packet event's is computed off the lock at preparation).
+    fn syscall_sighting(event: &network_event) -> SocketSighting {
+        SocketSighting {
+            socket_id: event.socket_id,
+            protocol: event.protocol.0,
+            af: event.af.0,
+            src_addr: event.src_addr,
+            src_port: event.src_port,
+            dest_addr: event.dest_addr,
+            dest_port: event.dest_port,
+            complete: socket_tuple_is_complete(
+                event.af.0,
+                event.src_port,
+                &event.dest_addr,
+                event.dest_port,
+            ),
+            netns_inum: event.netns_inum,
+            ts: event.start_ts,
+        }
     }
 
     /// Helper function to convert kernel jiffies to microseconds for streaming.
@@ -499,17 +577,7 @@ impl NetworkRecorder {
         let ResolvedTask { utid, .. } = self.utid_generator.resolve_task(&event.task);
 
         // Emit NetworkSocketRecord if first time seeing this socket
-        self.maybe_emit_socket_record(
-            socket_id,
-            event.protocol.0,
-            event.af.0,
-            &event.src_addr,
-            event.src_port,
-            &event.dest_addr,
-            event.dest_port,
-            event.netns_inum,
-            ts,
-        )?;
+        self.maybe_emit_socket_record(&Self::syscall_sighting(event))?;
 
         // Get collector
         let collector = self.streaming_collector.as_mut().ok_or_else(|| {
@@ -576,42 +644,19 @@ impl NetworkRecorder {
         Ok(())
     }
 
-    /// Stream a packet event - emit NetworkPacketRecord immediately.
-    /// Also emits NetworkSocketRecord if this is the first event for this socket.
-    fn stream_packet_event(
-        &mut self,
+    /// The packet record's fields from the event — no recorder state, the
+    /// `id` left 0 for [`Self::append_packet_batch`]; the socket record for
+    /// a first sighting is emitted there too.
+    fn packet_record(
         event: &crate::systing_core::types::packet_event,
         event_name: &'static str,
-    ) -> Result<()> {
+    ) -> NetworkPacketRecord {
         let socket_id = event.socket_id;
         let ts = event.ts as i64;
 
-        // Emit NetworkSocketRecord if first time seeing this socket
-        self.maybe_emit_socket_record(
-            socket_id,
-            event.protocol.0,
-            event.af.0,
-            &event.src_addr,
-            event.src_port,
-            &event.dest_addr,
-            event.dest_port,
-            event.netns_inum,
-            ts,
-        )?;
-
-        // Get collector
-        let collector = self
-            .streaming_collector
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("Streaming collector not set in stream_packet_event"))?;
-
-        // Get ID and increment
-        let id = self.next_packet_id;
-        self.next_packet_id += 1;
-
         // Build packet record
         let mut record = NetworkPacketRecord {
-            id,
+            id: 0,
             ts,
             socket_id: socket_id as i64,
             event_type: event_name,
@@ -780,9 +825,7 @@ impl NetworkRecorder {
             record.sndbuf_fill_pct = Some(fill_pct);
         }
 
-        // Emit the record
-        collector.add_network_packet(record)?;
-        Ok(())
+        record
     }
 
     /// Stream a poll event - emit NetworkPollRecord immediately.
@@ -973,14 +1016,57 @@ impl NetworkRecorder {
             "streaming_collector must be set before handling events"
         );
 
+        let batch = Self::prepare_packet_batch(std::slice::from_ref(&event));
+        if let Err(e) = self.append_packet_batch(batch) {
+            eprintln!("Warning: Failed to stream network packet event: {e}");
+        }
+    }
+
+    /// The parquet records for a consumer's batch of packet events, built
+    /// with no recorder state so the consumer does it outside the recorder
+    /// lock. Events without a socket id or of an unknown type are dropped
+    /// here; the records' `id`s stay 0 until [`Self::append_packet_batch`]
+    /// assigns them.
+    pub fn prepare_packet_batch(
+        events: &[crate::systing_core::types::packet_event],
+    ) -> PreparedBatch {
+        let mut records = Vec::with_capacity(events.len());
+        let mut sockets = Vec::with_capacity(events.len());
+        for event in events {
+            let Some(event_name) = Self::packet_event_name(event) else {
+                continue;
+            };
+            records.push(Self::packet_record(event, event_name));
+            sockets.push(SocketSighting {
+                socket_id: event.socket_id,
+                protocol: event.protocol.0,
+                af: event.af.0,
+                src_addr: event.src_addr,
+                src_port: event.src_port,
+                dest_addr: event.dest_addr,
+                dest_port: event.dest_port,
+                complete: socket_tuple_is_complete(
+                    event.af.0,
+                    event.src_port,
+                    &event.dest_addr,
+                    event.dest_port,
+                ),
+                netns_inum: event.netns_inum,
+                ts: event.ts,
+            });
+        }
+        PreparedBatch { records, sockets }
+    }
+
+    /// The `event_type` column's name for a packet event; `None` for an
+    /// event the recorder skips (no socket id, an unknown type).
+    fn packet_event_name(event: &crate::systing_core::types::packet_event) -> Option<&'static str> {
         use crate::systing_core::types::packet_event_type;
 
         // Skip events without socket_id (shouldn't happen in normal operation)
         if event.socket_id == 0 {
-            return;
+            return None;
         }
-
-        self.track_min_ts(event.ts);
 
         let event_name = match event.event_type.0 {
             // TCP packet events
@@ -1008,12 +1094,37 @@ impl NetworkRecorder {
             // TCP state change events
             x if x == packet_event_type::PACKET_TCP_STATE_CHANGE.0 => "TCP state_change",
             // Unknown event type - skip
-            _ => return,
+            _ => return None,
         };
+        Some(event_name)
+    }
 
-        if let Err(e) = self.stream_packet_event(&event, event_name) {
-            eprintln!("Warning: Failed to stream network packet event: {e}");
+    /// Append a consumer's prepared batch under the recorder lock — the
+    /// part of the packet path that needs the recorder: the socket record
+    /// on a socket's first sighting, the packet ids in arrival order, the
+    /// trace's minimum timestamp, then ONE collector call for the whole
+    /// batch (one collector lock, one buffer extend).
+    pub fn append_packet_batch(&mut self, batch: PreparedBatch) -> Result<()> {
+        let PreparedBatch {
+            mut records,
+            sockets,
+        } = batch;
+        if records.is_empty() {
+            return Ok(());
         }
+        if let Some(min_ts) = sockets.iter().map(|s| s.ts).min() {
+            self.track_min_ts(min_ts);
+        }
+        for (record, socket) in records.iter_mut().zip(&sockets) {
+            self.maybe_emit_socket_record(socket)?;
+            record.id = self.next_packet_id;
+            self.next_packet_id += 1;
+        }
+        let collector = self
+            .streaming_collector
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Streaming collector not set in append_packet_batch"))?;
+        collector.add_network_packet_batch(records)
     }
 
     pub fn handle_epoll_event(&mut self, event: crate::systing_core::types::epoll_event_bpf) {
@@ -1242,7 +1353,7 @@ mod socket_record_emission_tests {
     /// nothing after that re-emits.
     #[test]
     fn upgrade_emits_once_after_portless_first_sight() {
-        let mut seen = HashMap::new();
+        let mut seen = SeenSockets::default();
         // First sight, pre-bind (connect-start): emit the port-less record.
         assert!(should_emit_socket_record(&mut seen, 42, portless()));
         // More pre-bind sightings: no re-emit.
@@ -1262,7 +1373,7 @@ mod socket_record_emission_tests {
     /// after that (ESTABLISHED→CLOSE_WAIT, →CLOSE) re-emits.
     #[test]
     fn upgrade_emits_once_after_peerless_first_sight() {
-        let mut seen = HashMap::new();
+        let mut seen = SeenSockets::default();
         assert!(should_emit_socket_record(&mut seen, 9, peerless()));
         assert!(!should_emit_socket_record(&mut seen, 9, peerless()));
         assert!(should_emit_socket_record(&mut seen, 9, full()));
@@ -1276,7 +1387,7 @@ mod socket_record_emission_tests {
     /// socket — emits exactly one record and never an upgrade.
     #[test]
     fn degraded_only_lifecycle_is_single_emission() {
-        let mut seen = HashMap::new();
+        let mut seen = SeenSockets::default();
         assert!(should_emit_socket_record(&mut seen, 11, peerless()));
         assert!(!should_emit_socket_record(&mut seen, 11, peerless()));
         assert!(!should_emit_socket_record(&mut seen, 11, portless()));
@@ -1288,7 +1399,7 @@ mod socket_record_emission_tests {
     /// sighting (a terminal transition) never re-emits.
     #[test]
     fn complete_first_sight_is_single_emission() {
-        let mut seen = HashMap::new();
+        let mut seen = SeenSockets::default();
         assert!(should_emit_socket_record(&mut seen, 7, full()));
         assert!(!should_emit_socket_record(&mut seen, 7, full()));
         assert!(!should_emit_socket_record(&mut seen, 7, portless()));
@@ -1299,7 +1410,7 @@ mod socket_record_emission_tests {
     /// Distinct sockets track independently.
     #[test]
     fn sockets_are_independent() {
-        let mut seen = HashMap::new();
+        let mut seen = SeenSockets::default();
         assert!(should_emit_socket_record(&mut seen, 1, portless()));
         assert!(should_emit_socket_record(&mut seen, 2, full()));
         assert!(should_emit_socket_record(&mut seen, 3, peerless()));
@@ -1307,5 +1418,423 @@ mod socket_record_emission_tests {
         assert!(!should_emit_socket_record(&mut seen, 2, portless()));
         assert!(should_emit_socket_record(&mut seen, 3, full()));
         assert!(!should_emit_socket_record(&mut seen, 3, full()));
+    }
+}
+
+/// Consumer-path benchmarks for the packets tier. Ignored by default: they
+/// measure, they do not assert. Run in release mode with `--nocapture`:
+///
+/// ```text
+/// cargo test --release --lib packet_consumer_bench -- --ignored --nocapture
+/// ```
+///
+/// The three legs split the userspace cost of one `packet_event`: the
+/// record build under the recorder (into a collector that only keeps the
+/// rows), the same path into the production `SharedCollector` +
+/// `StreamingParquetWriter` (the amortized encode plus the 200K-row flush
+/// stall), and the fan-in channel every ring's poller sends into.
+#[cfg(test)]
+mod packet_consumer_bench {
+    use super::*;
+    use crate::parquet::StreamingParquetWriter;
+    use crate::record::{InMemoryCollector, SharedCollector};
+    use crate::systing_core::types::{
+        network_address_family, network_protocol, packet_event, packet_event_type,
+    };
+    use std::sync::mpsc::sync_channel;
+    use std::time::{Duration, Instant};
+
+    /// A TX packet's four data-path events on a live socket pool: the shape
+    /// a busy host's capture records (every stage of every skb).
+    fn synth_event(i: u64) -> packet_event {
+        let mut e = packet_event::default();
+        let socket = 1 + (i / 4) % 4096;
+        e.ts = 1_000_000_000 + i * 700;
+        e.socket_id = socket;
+        e.netns_inum = 4_026_531_840;
+        e.event_type = match i % 4 {
+            0 => packet_event_type::PACKET_ENQUEUE,
+            1 => packet_event_type::PACKET_QDISC_ENQUEUE,
+            2 => packet_event_type::PACKET_QDISC_DEQUEUE,
+            _ => packet_event_type::PACKET_SEND,
+        };
+        e.protocol = network_protocol::NETWORK_TCP;
+        e.af = network_address_family::NETWORK_AF_INET;
+        e.src_addr[..4].copy_from_slice(&[10, 0, 0, 1]);
+        e.src_port = (33_000 + socket % 4096) as _;
+        e.dest_addr[..4].copy_from_slice(&[10, 0, 0, 2]);
+        e.dest_port = 443;
+        e.seq = ((i / 4) * 1448) as _;
+        e.length = 1448;
+        e.tcp_flags = 0x10;
+        e.cpu = (i % 192) as _;
+        e.sndbuf_used = 120_000;
+        e.sndbuf_limit = 4_194_304;
+        e.srtt_us = 210;
+        e.rttvar_us = 40;
+        e.snd_wnd = 65_535;
+        e.rcv_wnd = 65_535;
+        e.sk_wmem_alloc = 3_000;
+        e.tsq_limit = 1_048_576;
+        e.qdisc_backlog = 12;
+        e.qdisc_latency_us = 7;
+        e.skb_addr = 0xffff_9000_0000_0000 + i;
+        e
+    }
+
+    fn recorder_with(collector: Box<dyn RecordCollector + Send>) -> NetworkRecorder {
+        let mut rec = NetworkRecorder::new(Arc::new(UtidGenerator::new()), false);
+        rec.set_streaming_collector(collector);
+        rec
+    }
+
+    fn report(leg: &str, n: u64, took: Duration) {
+        let ns = took.as_nanos() as f64 / n as f64;
+        eprintln!(
+            "BENCH {leg}: {n} events in {:.3} s = {ns:.0} ns/event = {:.2} M events/s",
+            took.as_secs_f64(),
+            1e3 / ns
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn sizes() {
+        eprintln!(
+            "BENCH sizes: packet_event {} B, NetworkPacketRecord {} B",
+            std::mem::size_of::<packet_event>(),
+            std::mem::size_of::<NetworkPacketRecord>()
+        );
+    }
+
+    /// Leg 1: the record build under the recorder, rows kept in memory.
+    #[test]
+    #[ignore]
+    fn record_build_in_memory() {
+        const N: u64 = 1_000_000;
+        let mut rec = recorder_with(Box::new(InMemoryCollector::new()));
+        let events: Vec<packet_event> = (0..N).map(synth_event).collect();
+        let start = Instant::now();
+        for e in events {
+            rec.handle_packet_event(e);
+        }
+        report("record build -> InMemoryCollector", N, start.elapsed());
+        assert_eq!(rec.next_packet_id - 1, N as i64);
+    }
+
+    /// Leg 2: the production path — the shared collector's lock per record
+    /// and the parquet writer's 200K-row flushes (arrow batch build + ZSTD
+    /// encode) on the consumer's own thread. Prints the slowest single
+    /// `handle_packet_event` call, which is the flush stall.
+    #[test]
+    #[ignore]
+    fn record_build_to_parquet() {
+        const N: u64 = 2_000_000;
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = StreamingParquetWriter::new(dir.path()).unwrap();
+        let mut rec = recorder_with(Box::new(SharedCollector::new(Box::new(writer))));
+        let events: Vec<packet_event> = (0..N).map(synth_event).collect();
+        let mut worst = Duration::ZERO;
+        let mut stalls: Vec<Duration> = Vec::new();
+        let start = Instant::now();
+        for e in events {
+            let t = Instant::now();
+            rec.handle_packet_event(e);
+            let d = t.elapsed();
+            if d > Duration::from_millis(1) {
+                stalls.push(d);
+            }
+            worst = worst.max(d);
+        }
+        let took = start.elapsed();
+        report(
+            "record build -> SharedCollector(StreamingParquetWriter)",
+            N,
+            took,
+        );
+        eprintln!(
+            "BENCH consumer-side stalls: {} calls over 1 ms, worst {:.1} ms, sum {:.1} ms of {:.1} ms total",
+            stalls.len(),
+            worst.as_secs_f64() * 1e3,
+            stalls.iter().sum::<Duration>().as_secs_f64() * 1e3,
+            took.as_secs_f64() * 1e3
+        );
+        assert_eq!(rec.next_packet_id - 1, N as i64);
+        // Dropping the recorder finishes its collector: the encode lane
+        // drains what the consumer ran ahead of it and closes the file.
+        let start = Instant::now();
+        drop(rec);
+        let drained = start.elapsed();
+        eprintln!(
+            "BENCH lane drain + close after the last event: {:.1} ms; end-to-end {} events in {:.3} s = {:.2} M events/s",
+            drained.as_secs_f64() * 1e3,
+            N,
+            (took + drained).as_secs_f64(),
+            N as f64 / (took + drained).as_secs_f64() / 1e6
+        );
+    }
+
+    /// Leg 2b: the consumer shape the per-ring consumers run — the record
+    /// build with no lock, then one `append_packet_batch` per 4096 events
+    /// under the recorder (the socket-record probe, the ids, one collector
+    /// call), the parquet encode on the table's lane.
+    #[test]
+    #[ignore]
+    fn batch_path_to_parquet() {
+        const N: u64 = 2_000_000;
+        const BATCH: usize = 4096;
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = StreamingParquetWriter::new(dir.path()).unwrap();
+        let mut rec = recorder_with(Box::new(SharedCollector::new(Box::new(writer))));
+        let events: Vec<packet_event> = (0..N).map(synth_event).collect();
+        let mut build_time = Duration::ZERO;
+        let mut append_time = Duration::ZERO;
+        let mut worst_append = Duration::ZERO;
+        let start = Instant::now();
+        for chunk in events.chunks(BATCH) {
+            let t = Instant::now();
+            let prepared = NetworkRecorder::prepare_packet_batch(chunk);
+            build_time += t.elapsed();
+            let t = Instant::now();
+            rec.append_packet_batch(prepared).unwrap();
+            let d = t.elapsed();
+            append_time += d;
+            worst_append = worst_append.max(d);
+        }
+        let took = start.elapsed();
+        report(
+            "batch path: lock-free build + per-batch append -> lane",
+            N,
+            took,
+        );
+        eprintln!(
+            "BENCH batch split: build {:.0} ns/event (no lock), append {:.0} ns/event (under lock), worst append {:.1} ms",
+            build_time.as_nanos() as f64 / N as f64,
+            append_time.as_nanos() as f64 / N as f64,
+            worst_append.as_secs_f64() * 1e3
+        );
+        assert_eq!(rec.next_packet_id - 1, N as i64);
+        let start = Instant::now();
+        drop(rec);
+        let drained = start.elapsed();
+        eprintln!(
+            "BENCH lane drain + close after the last event: {:.1} ms; end-to-end {} events in {:.3} s = {:.2} M events/s",
+            drained.as_secs_f64() * 1e3,
+            N,
+            (took + drained).as_secs_f64(),
+            N as f64 / (took + drained).as_secs_f64() / 1e6
+        );
+    }
+
+    /// Leg 3: the fan-in channel as the pollers use it — one bounded
+    /// `sync_channel(100_000)` with P blocking producers and one consumer
+    /// draining `recv` + `try_iter().take(4096)` batches.
+    fn channel_leg(producers: u64, per_producer: u64) {
+        const CAPACITY: usize = 100_000;
+        const BATCH: usize = 4096;
+        let (tx, rx) = sync_channel::<packet_event>(CAPACITY);
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for p in 0..producers {
+            let tx = tx.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_producer {
+                    let e = synth_event(p * per_producer + i);
+                    if tx.send(e).is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
+        drop(tx);
+        let consumer = std::thread::spawn(move || {
+            let mut n = 0u64;
+            let mut batch: Vec<packet_event> = Vec::with_capacity(BATCH);
+            while let Ok(first) = rx.recv() {
+                batch.push(first);
+                batch.extend(rx.try_iter().take(BATCH - 1));
+                n += batch.len() as u64;
+                batch.clear();
+            }
+            n
+        });
+        for h in handles {
+            h.join().unwrap();
+        }
+        let n = consumer.join().unwrap();
+        report(
+            &format!("sync_channel(100_000) {producers} producers -> 1 consumer"),
+            n,
+            start.elapsed(),
+        );
+        assert_eq!(n, producers * per_producer);
+    }
+
+    #[test]
+    #[ignore]
+    fn channel_fan_in_1_producer() {
+        channel_leg(1, 4_000_000);
+    }
+
+    #[test]
+    #[ignore]
+    fn channel_fan_in_8_producers() {
+        channel_leg(8, 500_000);
+    }
+
+    #[test]
+    #[ignore]
+    fn channel_fan_in_64_producers() {
+        channel_leg(64, 62_500);
+    }
+}
+
+#[cfg(test)]
+mod packet_batch_tests {
+    use super::*;
+    use crate::record::InMemoryCollector;
+    use crate::systing_core::types::{
+        network_address_family, network_protocol, packet_event, packet_event_type,
+    };
+    use crate::trace::{NetworkPacketRecord, NetworkSocketRecord};
+
+    fn event(
+        socket_id: u64,
+        event_type: packet_event_type,
+        src_port: u16,
+        ts: u64,
+    ) -> packet_event {
+        let mut src_addr = [0u8; 16];
+        src_addr[..4].copy_from_slice(&[10, 0, 0, 1]);
+        let mut dest_addr = [0u8; 16];
+        dest_addr[..4].copy_from_slice(&[10, 0, 0, 2]);
+        packet_event {
+            ts,
+            socket_id,
+            event_type,
+            protocol: network_protocol::NETWORK_TCP,
+            af: network_address_family::NETWORK_AF_INET,
+            src_addr,
+            src_port,
+            dest_addr,
+            dest_port: 443,
+            seq: 1000,
+            length: 1448,
+            tcp_flags: 0x18,
+            sndbuf_used: 4096,
+            sndbuf_limit: 65536,
+            srtt_us: 2500,
+            netns_inum: 4_026_531_840,
+            ..packet_event::default()
+        }
+    }
+
+    /// The mixed batch every test feeds: three sockets, one of them first
+    /// seen port-less (connect-start) and upgraded by its next event, an
+    /// event with no socket id and one of an unknown type in the middle.
+    fn mixed_events() -> Vec<packet_event> {
+        vec![
+            event(7, packet_event_type::PACKET_ENQUEUE, 0, 100),
+            event(7, packet_event_type::PACKET_SEND, 40_001, 110),
+            event(8, packet_event_type::PACKET_RCV_ESTABLISHED, 40_002, 120),
+            event(0, packet_event_type::PACKET_SEND, 40_003, 130),
+            event(9, packet_event_type(0xffff), 40_004, 140),
+            event(9, packet_event_type::PACKET_QDISC_ENQUEUE, 40_004, 150),
+            event(7, packet_event_type::PACKET_QDISC_DEQUEUE, 40_001, 160),
+        ]
+    }
+
+    fn collect(
+        feed: impl FnOnce(&mut NetworkRecorder, &[packet_event]),
+    ) -> (
+        Vec<NetworkPacketRecord>,
+        Vec<NetworkSocketRecord>,
+        Option<u64>,
+    ) {
+        let mut rec = NetworkRecorder::new(Arc::new(UtidGenerator::new()), false);
+        let collector = Box::new(InMemoryCollector::new());
+        rec.set_streaming_collector(collector);
+        let events = mixed_events();
+        feed(&mut rec, &events);
+        let min_ts = rec.min_timestamp();
+        let mut boxed = rec.streaming_collector.take().unwrap();
+        let data = boxed
+            .as_any_mut()
+            .and_then(|c| c.downcast_mut::<InMemoryCollector>())
+            .expect("the test collector is the in-memory one")
+            .data();
+        (
+            data.network_packets.clone(),
+            data.network_sockets.clone(),
+            min_ts,
+        )
+    }
+
+    /// The batch path (prepare with no lock, append under it) produces the
+    /// same packet rows, socket rows and minimum timestamp as feeding the
+    /// same events one at a time.
+    #[test]
+    fn batch_path_matches_single_event_path() {
+        let (single_packets, single_sockets, single_min) = collect(|rec, events| {
+            for e in events {
+                rec.handle_packet_event(*e);
+            }
+        });
+        let (batch_packets, batch_sockets, batch_min) = collect(|rec, events| {
+            let prepared = NetworkRecorder::prepare_packet_batch(events);
+            assert_eq!(prepared.len(), 5, "two events are dropped at preparation");
+            rec.append_packet_batch(prepared).unwrap();
+        });
+        assert_eq!(single_packets.len(), 5);
+        assert_eq!(batch_packets, single_packets);
+        assert_eq!(batch_sockets, single_sockets);
+        assert_eq!(batch_min, single_min);
+        assert_eq!(batch_min, Some(100));
+    }
+
+    /// Ids are assigned in arrival order and stay contiguous across
+    /// batches; the socket record is emitted once per socket plus the one
+    /// upgrade when a port-less first sighting is followed by a full one.
+    #[test]
+    fn ids_are_contiguous_across_batches_and_sockets_emit_once() {
+        let (packets, sockets, _) = collect(|rec, events| {
+            let (first, second) = events.split_at(3);
+            rec.append_packet_batch(NetworkRecorder::prepare_packet_batch(first))
+                .unwrap();
+            rec.append_packet_batch(NetworkRecorder::prepare_packet_batch(second))
+                .unwrap();
+        });
+        let ids: Vec<i64> = packets.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+        let names: Vec<&str> = packets.iter().map(|p| p.event_type).collect();
+        assert_eq!(
+            names,
+            vec![
+                "TCP packet_enqueue",
+                "TCP packet_send",
+                "TCP packet_rcv_established",
+                "qdisc_enqueue",
+                "qdisc_dequeue"
+            ]
+        );
+        // Socket 7: the port-less record, then its upgrade; 8 and 9 once.
+        let by_socket: Vec<(i64, i32)> =
+            sockets.iter().map(|s| (s.socket_id, s.src_port)).collect();
+        assert_eq!(
+            by_socket,
+            vec![(7, 0), (7, 40_001), (8, 40_002), (9, 40_004)]
+        );
+    }
+
+    /// An empty batch is a no-op under the lock.
+    #[test]
+    fn empty_batch_is_a_no_op() {
+        let (packets, sockets, min_ts) = collect(|rec, _| {
+            rec.append_packet_batch(NetworkRecorder::prepare_packet_batch(&[]))
+                .unwrap();
+        });
+        assert!(packets.is_empty());
+        assert!(sockets.is_empty());
+        assert_eq!(min_ts, None);
     }
 }

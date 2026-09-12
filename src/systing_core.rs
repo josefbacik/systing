@@ -2009,7 +2009,11 @@ struct RecorderChannels {
     cache_rx: Receiver<perf_counter_event>,
     probe_rx: Receiver<probe_event>,
     network_rx: Receiver<network_event>,
-    packet_rx: Receiver<packet_event>,
+    /// One receiver per `packet_ringbufs` ring, SPSC like the sched rings:
+    /// a shared channel with 64 producers was a ceiling of its own (≈1.5 M
+    /// events/s from send-side contention alone), and one consumer thread
+    /// behind it another; each ring's poller feeds its own consumer.
+    packet_rxs: Vec<Receiver<packet_event>>,
     epoll_rx: Receiver<epoll_event_bpf>,
     memory_rx: Receiver<memory_event>,
     marker_rx: Receiver<marker_event>,
@@ -2034,7 +2038,7 @@ fn spawn_recorder_threads(
         cache_rx,
         probe_rx,
         network_rx,
-        packet_rx,
+        packet_rxs,
         epoll_rx,
         memory_rx,
         marker_rx,
@@ -2135,32 +2139,36 @@ fn spawn_recorder_threads(
                 })?,
         );
 
-        // Packet recorder: processes packet events into network_recorder
-        let session_recorder = recorder.clone();
-        threads.push(
-            thread::Builder::new()
-                .name("packet_recorder".to_string())
-                .spawn(move || {
-                    let mut seen_tasks = TaskSightings::new();
-                    let mut batch: Vec<packet_event> = Vec::with_capacity(CONSUME_BATCH);
-                    while let Ok(first) = packet_rx.recv() {
-                        batch.push(first);
-                        batch.extend(packet_rx.try_iter().take(CONSUME_BATCH - 1));
-                        for event in &batch {
-                            if let Some(task_info) = event.next_task_info() {
-                                if seen_tasks.observe(task_info) {
-                                    session_recorder.maybe_record_task(task_info);
-                                }
+        // Packet consumers: one per packet ring. Each builds its batch's
+        // records OUTSIDE the recorder lock (the record build is the bulk of
+        // the per-event work) and takes the lock once per batch to append
+        // them — the socket records, the ids and one collector call. The
+        // parquet encode itself runs on the table's encode lane, never here.
+        for (i, packet_rx) in packet_rxs.into_iter().enumerate() {
+            let session_recorder = recorder.clone();
+            threads.push(
+                thread::Builder::new()
+                    .name(format!("packet_rec_{i}"))
+                    .spawn(move || {
+                        let mut batch: Vec<packet_event> = Vec::with_capacity(CONSUME_BATCH);
+                        while let Ok(first) = packet_rx.recv() {
+                            batch.push(first);
+                            batch.extend(packet_rx.try_iter().take(CONSUME_BATCH - 1));
+                            let prepared =
+                                network_recorder::NetworkRecorder::prepare_packet_batch(&batch);
+                            batch.clear();
+                            if prepared.is_empty() {
+                                continue;
+                            }
+                            let mut rec = session_recorder.network_recorder.lock().unwrap();
+                            if let Err(e) = rec.append_packet_batch(prepared) {
+                                eprintln!("Warning: Failed to stream network packet events: {e}");
                             }
                         }
-                        let mut rec = session_recorder.network_recorder.lock().unwrap();
-                        for event in batch.drain(..) {
-                            rec.handle_packet_event(event);
-                        }
-                    }
-                    0
-                })?,
-        );
+                        0
+                    })?,
+            );
+        }
 
         // Epoll recorder thread
         let session_recorder = recorder.clone();
@@ -3112,6 +3120,13 @@ fn setup_ringbuffers<'a>(
     // events and increments the missed-events counter, which is the intended
     // behaviour under sustained overload.
     const CHANNEL_CAPACITY: usize = 100_000;
+    // The packet rings get a channel each (below), so their capacity is per
+    // ring: a bounded channel initialises every slot when it is created, and
+    // 64 rings at CHANNEL_CAPACITY would commit ~1.4 GB of 216-byte slots at
+    // capture start. Two consume batches per ring (~1.8 MB) cover the
+    // consumer's lock waits; a longer stall means the lane is behind and
+    // missed events are the honest outcome.
+    const PACKET_CHANNEL_CAPACITY: usize = 2 * CONSUME_BATCH;
 
     let mut rings = Vec::new();
     // The sched/IRQ event stream gets one SPSC channel per ring instead of a
@@ -3125,7 +3140,8 @@ fn setup_ringbuffers<'a>(
     let (cache_tx, cache_rx) = sync_channel(CHANNEL_CAPACITY);
     let (probe_tx, probe_rx) = sync_channel(CHANNEL_CAPACITY);
     let (network_tx, network_rx) = sync_channel(CHANNEL_CAPACITY);
-    let (packet_tx, packet_rx) = sync_channel(CHANNEL_CAPACITY);
+    // Packet rings get one SPSC channel each too (see RecorderChannels).
+    let mut packet_rxs = Vec::new();
     let (epoll_tx, epoll_rx) = sync_channel(CHANNEL_CAPACITY);
     let (memory_tx, memory_rx) = sync_channel(CHANNEL_CAPACITY);
     let (marker_tx, marker_rx) = sync_channel(CHANNEL_CAPACITY);
@@ -3168,7 +3184,9 @@ fn setup_ringbuffers<'a>(
                     rings.push((poller, ring));
                 }
                 "packet_ringbufs" => {
-                    let ring = create_ring::<packet_event>(inner, packet_tx.clone())?;
+                    let (packet_tx, packet_rx) = sync_channel(PACKET_CHANNEL_CAPACITY);
+                    let ring = create_ring::<packet_event>(inner, packet_tx)?;
+                    packet_rxs.push(packet_rx);
                     rings.push((poller, ring));
                 }
                 "epoll_ringbufs" => {
@@ -3235,7 +3253,7 @@ fn setup_ringbuffers<'a>(
         probe_rx,
         memory_rx,
         network_rx,
-        packet_rx,
+        packet_rxs,
         epoll_rx,
         marker_rx,
         exec_event_rx,
