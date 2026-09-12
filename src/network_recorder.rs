@@ -1103,7 +1103,10 @@ impl NetworkRecorder {
     /// part of the packet path that needs the recorder: the socket record
     /// on a socket's first sighting, the packet ids in arrival order, the
     /// trace's minimum timestamp, then ONE collector call for the whole
-    /// batch (one collector lock, one buffer extend).
+    /// batch (one collector lock, one buffer extend). The socket records go
+    /// first and the ids are handed back on a collector error, so a batch
+    /// that fails consumes no ids and [`Self::packet_events_recorded`]
+    /// counts only records the collector took.
     pub fn append_packet_batch(&mut self, batch: PreparedBatch) -> Result<()> {
         let PreparedBatch {
             mut records,
@@ -1115,8 +1118,11 @@ impl NetworkRecorder {
         if let Some(min_ts) = sockets.iter().map(|s| s.ts).min() {
             self.track_min_ts(min_ts);
         }
-        for (record, socket) in records.iter_mut().zip(&sockets) {
+        for socket in &sockets {
             self.maybe_emit_socket_record(socket)?;
+        }
+        let first_id = self.next_packet_id;
+        for record in records.iter_mut() {
             record.id = self.next_packet_id;
             self.next_packet_id += 1;
         }
@@ -1124,7 +1130,11 @@ impl NetworkRecorder {
             .streaming_collector
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Streaming collector not set in append_packet_batch"))?;
-        collector.add_network_packet_batch(records)
+        if let Err(e) = collector.add_network_packet_batch(records) {
+            self.next_packet_id = first_id;
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn handle_epoll_event(&mut self, event: crate::systing_core::types::epoll_event_bpf) {

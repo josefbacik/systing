@@ -174,6 +174,10 @@ pub struct StreamingParquetWriter {
     /// The network_packet table encodes off the flushing thread: see
     /// [`EncodeLane`]. Started on the first flush, finished with the others.
     network_packet_lane: Option<EncodeLane<NetworkPacketRecord>>,
+    /// The largest packet batch a consumer has handed over. A fresh packet
+    /// buffer is sized to `batch_size` plus this, so the append that carries
+    /// the buffer past the flush bound never regrows it.
+    network_packet_headroom: usize,
     network_socket_writer: Option<TableWriter>,
     network_poll_writer: Option<TableWriter>,
     network_dns_writer: Option<TableWriter>,
@@ -297,6 +301,7 @@ impl StreamingParquetWriter {
             socket_connection_writer: None,
             network_syscall_writer: None,
             network_packet_lane: None,
+            network_packet_headroom: 0,
             network_socket_writer: None,
             network_poll_writer: None,
             network_dns_writer: None,
@@ -906,7 +911,7 @@ impl StreamingParquetWriter {
         }
         let rows = std::mem::replace(
             &mut self.network_packets,
-            Vec::with_capacity(self.batch_size),
+            Vec::with_capacity(self.batch_size + self.network_packet_headroom),
         );
         Self::push_to_lane(
             &mut self.network_packet_lane,
@@ -1595,7 +1600,15 @@ impl RecordCollector for StreamingParquetWriter {
     }
 
     fn add_network_packet_batch(&mut self, records: Vec<NetworkPacketRecord>) -> Result<()> {
-        Self::reserve_if_empty(&mut self.network_packets, self.batch_size);
+        // The buffer crosses the flush bound by up to one consumer batch, so
+        // it is sized for the bound plus the largest batch seen: the crossing
+        // append then fits, where a buffer sized to the bound alone regrew
+        // (a copy of the whole buffer) on nearly every cycle.
+        self.network_packet_headroom = self.network_packet_headroom.max(records.len());
+        Self::reserve_if_empty(
+            &mut self.network_packets,
+            self.batch_size + self.network_packet_headroom,
+        );
         self.total_records += records.len();
         self.network_packets.extend(records);
         if Self::should_flush(&self.network_packets, self.batch_size) {
@@ -3945,8 +3958,9 @@ mod packet_encode_bench {
 
     /// The record shape `NetworkRecorder::stream_packet_event` builds for a
     /// TX data-path event (the send-buffer, RTT and TSQ fields set, the
-    /// diagnostic fields None), on a 4096-socket pool.
-    fn synth_record(i: i64) -> NetworkPacketRecord {
+    /// diagnostic fields None), on a 4096-socket pool. Shared with the lane
+    /// contract test below.
+    pub(super) fn synth_record(i: i64) -> NetworkPacketRecord {
         let socket = 1 + (i / 4) % 4096;
         NetworkPacketRecord {
             id: i + 1,
@@ -4243,5 +4257,142 @@ mod sched_lane_tests {
         writer.finish().unwrap();
         assert!(!dir.path().join("sched_slice.parquet").exists());
         assert!(!dir.path().join("thread_state.parquet").exists());
+    }
+}
+
+/// The packet lane's file contract, through the production path: two
+/// consumers' batches into one [`crate::record::SharedCollector`] over a
+/// [`StreamingParquetWriter`] whose network_packet table flushes to its
+/// [`EncodeLane`] with the production writer properties.
+#[cfg(test)]
+mod packet_lane_tests {
+    use super::packet_encode_bench::synth_record;
+    use super::*;
+    use crate::parquet::ParquetSink;
+    use crate::record::SharedCollector;
+    use arrow::array::Int64Array;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+    use tempfile::TempDir;
+
+    /// Two handles hand over four 16-record batches to a writer that flushes
+    /// the packet table at 25 rows — the buffer crosses the bound on the
+    /// second and fourth batch, the lane sees two batches, `finish` closes
+    /// the file — and the file the arrow reader opens carries the table's
+    /// schema and every record exactly once, in arrival order.
+    #[test]
+    fn packet_rows_through_the_lane_come_back_whole_and_in_order() {
+        let dir = TempDir::new().unwrap();
+        let sink = ParquetSink::directory(dir.path()).unwrap();
+        let shared = SharedCollector::new(Box::new(StreamingParquetWriter::with_sink(sink, 25)));
+        let mut first = shared.clone();
+        let mut second = shared;
+
+        let mut next = 0i64;
+        for _round in 0..2 {
+            for handle in [&mut first, &mut second] {
+                let records: Vec<NetworkPacketRecord> = (0..16)
+                    .map(|_| {
+                        let record = synth_record(next);
+                        next += 1;
+                        record
+                    })
+                    .collect();
+                handle.add_network_packet_batch(records).unwrap();
+            }
+        }
+        // The first handle's finish leaves the shared writer open; the last
+        // one closes the lane and the file.
+        first.finish().unwrap();
+        second.finish().unwrap();
+
+        let file = File::open(dir.path().join("network_packet.parquet")).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let names: Vec<String> = builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        let want: Vec<String> = trace::network_packet_schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        assert_eq!(names, want, "the file carries the table's schema");
+
+        let mut ids = Vec::new();
+        let mut socket_ids = Vec::new();
+        for batch in builder.build().unwrap() {
+            let batch = batch.unwrap();
+            let id = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            let socket = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("socket_id is Int64");
+            for i in 0..batch.num_rows() {
+                ids.push(id.value(i));
+                socket_ids.push(socket.value(i));
+            }
+        }
+        let expected_ids: Vec<i64> = (1..=64).collect();
+        assert_eq!(ids, expected_ids, "every record once, in arrival order");
+        let expected_sockets: Vec<i64> = (0..64).map(|i| synth_record(i).socket_id).collect();
+        assert_eq!(
+            socket_ids, expected_sockets,
+            "the rows are the records handed over"
+        );
+    }
+
+    /// The packet buffer is sized for the flush bound plus the largest batch
+    /// seen, so the append that carries it past the bound fits without a
+    /// regrow, and the fresh buffer after the flush is sized the same way.
+    #[test]
+    fn the_packet_buffer_holds_the_crossing_append_without_a_regrow() {
+        let dir = TempDir::new().unwrap();
+        let sink = ParquetSink::directory(dir.path()).unwrap();
+        let mut writer = StreamingParquetWriter::with_sink(sink, 25);
+
+        let batch = |from: i64| -> Vec<NetworkPacketRecord> {
+            (from..from + 10).map(synth_record).collect()
+        };
+        writer.add_network_packet_batch(batch(0)).unwrap();
+        let capacity = writer.network_packets.capacity();
+        assert!(capacity >= 25 + 10, "sized for the bound plus one batch");
+        writer.add_network_packet_batch(batch(10)).unwrap();
+        assert_eq!(writer.network_packets.len(), 20);
+        assert!(
+            writer.network_packets.capacity() >= 30,
+            "the next append crosses the bound and already fits"
+        );
+        writer.add_network_packet_batch(batch(20)).unwrap();
+        assert_eq!(
+            writer.network_packets.len(),
+            0,
+            "the crossing append flushed"
+        );
+        assert_eq!(
+            writer.network_packets.capacity(),
+            capacity,
+            "the fresh buffer is sized the same way"
+        );
+        writer.add_network_packet_batch(batch(30)).unwrap();
+        writer.add_network_packet_batch(batch(40)).unwrap();
+        assert_eq!(writer.network_packets.capacity(), capacity, "no regrow");
+        writer.finish().unwrap();
+
+        let file = File::open(dir.path().join("network_packet.parquet")).unwrap();
+        let rows: usize = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(rows, 50);
     }
 }

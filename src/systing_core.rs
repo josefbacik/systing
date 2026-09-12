@@ -13,7 +13,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -2144,8 +2144,15 @@ fn spawn_recorder_threads(
         // the per-event work) and takes the lock once per batch to append
         // them — the socket records, the ids and one collector call. The
         // parquet encode itself runs on the table's encode lane, never here.
+        // A failed append is reported on the first failure and then once per
+        // doubling of the count, shared across the rings: the batches all end
+        // on one lane, so a lane that has stopped fails every one of them
+        // (the capture's finish carries the lane's own error), and a line per
+        // batch from every ring would flood stderr.
+        let packet_append_failures = Arc::new(AtomicU64::new(0));
         for (i, packet_rx) in packet_rxs.into_iter().enumerate() {
             let session_recorder = recorder.clone();
+            let failures = packet_append_failures.clone();
             threads.push(
                 thread::Builder::new()
                     .name(format!("packet_rec_{i}"))
@@ -2162,7 +2169,12 @@ fn spawn_recorder_threads(
                             }
                             let mut rec = session_recorder.network_recorder.lock().unwrap();
                             if let Err(e) = rec.append_packet_batch(prepared) {
-                                eprintln!("Warning: Failed to stream network packet events: {e}");
+                                let n = failures.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n.is_power_of_two() {
+                                    eprintln!(
+                                        "Warning: Failed to stream network packet events ({n} batches dropped so far): {e}"
+                                    );
+                                }
                             }
                         }
                         0
