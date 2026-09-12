@@ -128,7 +128,7 @@ This will display all available recorders and their default states:
 - `cpu-stacks` - CPU perf stack traces (on by default)
 - `network` - Network connection state tracking
 - `network-syscalls` - Network syscall-level tracing (send/recv bytes, retransmits, drops, stalls) without per-packet probes
-- `network-packets` - Network packet-level tracing (sendmsg, recvmsg, qdisc, drops)
+- `network-packets` - Network packet-level tracing (sendmsg, recvmsg, qdisc, drops). On a large host this tier loses most of its events to the userspace consumer, so the packet tables are a sample: `--packet-sample-rate N` keeps 1 in N packets of the data-path event types (every stage of a kept packet is kept together, so per-stage latencies stay pairable; packet and byte counts scale by N; the diagnostic events — zero-window probes, RTO timeouts, drops, state changes — are never sampled), the rate ran is recorded as `sysinfo.network_packet_sample_rate`, and the exit summary prints the events missed beside the events recorded.
 - `memory` - Memory usage tracking (RSS, mmap/munmap/brk, page faults; host-wide THP/compaction counters into `memory_vmstat`). `--memory-vfio` adds VFIO DMA regions and the IOMMU map/unmap run-size histogram (how fragmented the memory behind device mappings is); `--memory-thp-sample-rate N` adds sampled THP-split events with stacks. Both legs turn themselves off (named in `sysinfo`) on hosts without the symbols.
 - `memory-alloc` - Heap allocator uprobes (malloc/calloc/realloc/free) with stacks
 - `markers` - Userspace marker events (faccessat2 with mode=-975)
@@ -216,7 +216,9 @@ send/receive accounting plus the low-frequency diagnostics (retransmit
 timer, zero-window probes, sndbuf stalls, packet drops) — bytes, stalls and
 drops per connection at syscall-rate cost; and `network-packets` adds the
 per-packet and per-poll probes (transmit/receive path, qdisc, epoll), whose
-event volume is bounded by traffic rather than by anything you control.
+event volume is bounded by traffic: on a large host the userspace consumer
+falls behind and the exit summary reports the events it missed, so keep a
+packets capture short or run it with `--packet-sample-rate N`.
 `--add-recorder network` enables state + packets, the usual shape for an
 investigation. `--only-recorder` enables exactly what you name (each tier
 pulls in the base `network` recorder it requires), so `--only-recorder
