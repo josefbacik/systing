@@ -34,7 +34,8 @@ use std::sync::LazyLock;
 use std::thread;
 use std::time::Instant;
 use systing::duckdb::{
-    create_schema, get_trace_info, import_duckdb_traces, TraceImportMapping, SCHEMA_VERSION,
+    create_schema, get_trace_info, import_column_list, import_duckdb_traces, ImportOptions,
+    ImportReport, TraceImportMapping, SCHEMA_VERSION,
 };
 use systing::ParquetPaths;
 
@@ -82,6 +83,12 @@ enum Commands {
         /// Verbose output (show timing breakdown)
         #[arg(short, long)]
         verbose: bool,
+
+        /// Refuse a Parquet input carrying a column this systing's schema does
+        /// not have (a trace written by a newer systing) instead of importing
+        /// the known columns and warning about the rest
+        #[arg(long)]
+        strict_schema: bool,
     },
 
     /// Validate trace data for correctness
@@ -3100,6 +3107,7 @@ fn run_convert(
     trace_id: Option<String>,
     recursive: bool,
     verbose: bool,
+    import_options: ImportOptions,
 ) -> Result<()> {
     let start_time = Instant::now();
 
@@ -3450,7 +3458,10 @@ fn run_convert(
 
     // Import Parquet files for a table, filtering to only existing files.
     // Handles trace_id injection for Parquet directories (which don't have trace_id column).
-    let import_table = |table_name: &str, get_path: fn(&ParquetPaths) -> &PathBuf| -> Result<()> {
+    let mut import_report = ImportReport::default();
+    let mut import_table = |table_name: &str,
+                            get_path: fn(&ParquetPaths) -> &PathBuf|
+     -> Result<()> {
         let start = Instant::now();
 
         // Separate paths by whether they need trace_id injection
@@ -3475,8 +3486,13 @@ fn run_convert(
 
         // Import files that already have trace_id. BY NAME so parquet files
         // written by older systing versions (with fewer columns) import
-        // cleanly - missing columns become NULL. Prefix the sort with trace_id
-        // so rows from different traces stay contiguous (better BitPacking).
+        // cleanly - missing columns become NULL; a column this systing does
+        // not know (a newer writer) is projected away by import_column_list,
+        // or refused under --strict-schema. The list binds to the first
+        // file's schema, as read_parquet always did: a list mixing two
+        // schema generations fails inside the scan, not here. Prefix the
+        // sort with trace_id so rows from different traces stay contiguous
+        // (better BitPacking).
         if !with_trace_id.is_empty() {
             let multi_order = systing::duckdb::import_order_by(table_name)
                 .map(|o| format!(" ORDER BY trace_id, {o}"))
@@ -3486,17 +3502,37 @@ fn run_convert(
                 .map(|p| format!("'{}'", p.replace('\'', "''")))
                 .collect::<Vec<_>>()
                 .join(", ");
-            conn.execute_batch(&format!(
-                "INSERT INTO {table_name} BY NAME SELECT * FROM read_parquet([{paths_list}]){multi_order}"
-            ))?;
+            let source_sql = format!("read_parquet([{paths_list}])");
+            if let Some(columns) = import_column_list(
+                &conn,
+                table_name,
+                &source_sql,
+                import_options,
+                &mut import_report,
+            )? {
+                conn.execute_batch(&format!(
+                    "INSERT INTO {table_name} BY NAME SELECT {columns} FROM {source_sql}{multi_order}"
+                ))?;
+            }
         }
 
         // Import files that need trace_id injection (one at a time to add trace_id)
         for (trace_id, path) in needs_injection {
             let escaped_path = path.replace('\'', "''");
             let escaped_trace_id = trace_id.replace('\'', "''");
+            let source_sql = format!("read_parquet('{escaped_path}')");
+            let Some(columns) = import_column_list(
+                &conn,
+                table_name,
+                &source_sql,
+                import_options,
+                &mut import_report,
+            )?
+            else {
+                continue;
+            };
             conn.execute_batch(&format!(
-                "INSERT INTO {table_name} BY NAME SELECT '{escaped_trace_id}' as trace_id, * FROM read_parquet('{escaped_path}'){order}"
+                "INSERT INTO {table_name} BY NAME SELECT '{escaped_trace_id}' as trace_id, {columns} FROM {source_sql}{order}"
             ))?;
         }
 
@@ -3806,7 +3842,15 @@ fn main() -> Result<()> {
             trace_id,
             recursive,
             verbose,
-        } => run_convert(inputs, output, trace_id, recursive, verbose),
+            strict_schema,
+        } => run_convert(
+            inputs,
+            output,
+            trace_id,
+            recursive,
+            verbose,
+            ImportOptions { strict_schema },
+        ),
         Commands::Validate {
             path,
             verbose,

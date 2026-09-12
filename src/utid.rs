@@ -82,6 +82,14 @@ impl UtidGenerator {
     ///
     /// If this is the first time seeing this tid, a new sequential utid is
     /// assigned and returned. Thread-safe via DashMap's internal sharded locking.
+    ///
+    /// The mapping is by tid alone and lives for the whole capture: a tid
+    /// the kernel reuses after its thread exits (long captures, a host near
+    /// its pid ceiling) resolves to the FIRST thread's utid, so rows
+    /// attributed after the reuse — an end-of-capture sample such as
+    /// `memory_rss`'s `anon_huge` member, a `memory_iommu` histogram row
+    /// drained at the end, any event the new thread produces — land on the
+    /// old thread. A known bound of the model, not detected here.
     pub fn get_or_create_utid(&self, tid: i32) -> i64 {
         // DashMap's entry API handles the get-or-insert atomically.
         // Relaxed ordering is sufficient - we only need uniqueness, not synchronization.

@@ -832,6 +832,19 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
 /// ).unwrap();
 /// ```
 pub fn parquet_to_duckdb(parquet_dir: &Path, db_path: &Path, trace_id: &str) -> Result<()> {
+    parquet_to_duckdb_with_options(parquet_dir, db_path, trace_id, ImportOptions::default())
+        .map(|_| ())
+}
+
+/// [`parquet_to_duckdb`] with the import options spelled out, returning what
+/// the import did about columns this systing's schema does not have (see
+/// [`ImportReport`]).
+pub fn parquet_to_duckdb_with_options(
+    parquet_dir: &Path,
+    db_path: &Path,
+    trace_id: &str,
+    options: ImportOptions,
+) -> Result<ImportReport> {
     // Remove existing database if present
     if db_path.exists() {
         std::fs::remove_file(db_path).with_context(|| {
@@ -866,9 +879,10 @@ pub fn parquet_to_duckdb(parquet_dir: &Path, db_path: &Path, trace_id: &str) -> 
 
     // Import each table from Parquet files
     let paths = ParquetPaths::new(parquet_dir);
-    import_tables(&conn, &paths, trace_id)?;
+    let mut report = ImportReport::default();
+    import_tables(&conn, &paths, trace_id, options, &mut report)?;
 
-    Ok(())
+    Ok(report)
 }
 
 /// Import a `stack.parquet` (which stores `frame_names VARCHAR[]`) into the
@@ -945,8 +959,118 @@ pub fn import_order_by(table_name: &str) -> Option<&'static str> {
     }
 }
 
+/// How a parquet→DuckDB import treats a source column this systing's schema
+/// does not have — a trace written by a newer systing than the one reading it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImportOptions {
+    /// Refuse the import with a message naming the table, the unknown columns
+    /// and this systing's schema version, instead of importing the columns
+    /// this schema knows and leaving the rest out with a warning (the
+    /// default: a partial read of a newer trace serves every consumer better
+    /// than no read).
+    pub strict_schema: bool,
+}
+
+/// What a parquet→DuckDB import left out: per table, the source columns this
+/// systing's schema does not have. Empty when every table imported whole.
+/// The database's `_schema_version` names the schema the import produced,
+/// so a consumer reading the database sees a complete database of that
+/// schema; only the importing process learns, through this report and one
+/// warning line per table, that the trace carried more.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportReport {
+    pub dropped_columns: Vec<(String, Vec<String>)>,
+}
+
+/// The select list a table's import reads from its parquet source: `*` when
+/// every source column exists in the target table, else the known columns,
+/// quoted — or `None` when the source shares no column with the target (the
+/// table is skipped). `source_sql` is the `FROM` operand, a
+/// `read_parquet(...)` call.
+///
+/// DuckDB's `INSERT ... BY NAME` fills a target column the source lacks with
+/// NULL (an older trace read by a newer systing) but refuses the whole
+/// statement on a source column the target lacks (a newer trace read by an
+/// older systing) — a Binder error on the first unknown column. The columns
+/// are compared case-insensitively, as DuckDB binds them. Under
+/// [`ImportOptions::strict_schema`] the unknown columns are an error naming
+/// them; otherwise they are recorded on `report`, warned once per table and
+/// left out.
+pub fn import_column_list(
+    conn: &Connection,
+    table_name: &str,
+    source_sql: &str,
+    options: ImportOptions,
+    report: &mut ImportReport,
+) -> Result<Option<String>> {
+    let column_names = |sql: &str| -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(sql)?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(names)
+    };
+    let escaped_table_name = table_name.replace('\'', "''");
+    let target: HashSet<String> = column_names(&format!(
+        "SELECT column_name FROM duckdb_columns() \
+         WHERE database_name = current_database() AND schema_name = 'main' \
+         AND table_name = '{escaped_table_name}'"
+    ))
+    .with_context(|| format!("Failed to read the columns of table '{table_name}'"))?
+    .into_iter()
+    .map(|c| c.to_ascii_lowercase())
+    .collect();
+    if target.is_empty() {
+        anyhow::bail!("table '{table_name}' does not exist in the database being imported into");
+    }
+    let source = column_names(&format!("DESCRIBE SELECT * FROM {source_sql}"))
+        .with_context(|| format!("Failed to read the parquet columns for table '{table_name}'"))?;
+    let (known, unknown): (Vec<&String>, Vec<&String>) = source
+        .iter()
+        .partition(|c| target.contains(&c.to_ascii_lowercase()));
+    if unknown.is_empty() {
+        return Ok(Some("*".to_string()));
+    }
+    let unknown_list = unknown
+        .iter()
+        .map(|c| c.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if options.strict_schema {
+        anyhow::bail!(
+            "table '{table_name}' from {source_sql} has {} column(s) this systing (schema {SCHEMA_VERSION}) does not have: {unknown_list}; \
+             the trace was written by a newer systing — import it with a systing of that schema or later, or non-strictly to take the known columns only",
+            unknown.len()
+        );
+    }
+    eprintln!(
+        "warning: table '{table_name}' from {source_sql}: {} column(s) this systing (schema {SCHEMA_VERSION}) does not have were left out of the import: {unknown_list}",
+        unknown.len()
+    );
+    report.dropped_columns.push((
+        table_name.to_string(),
+        unknown.iter().map(|c| c.to_string()).collect(),
+    ));
+    if known.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        known
+            .iter()
+            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", "),
+    ))
+}
+
 /// Import all tables from Parquet files.
-fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Result<()> {
+fn import_tables(
+    conn: &Connection,
+    paths: &ParquetPaths,
+    trace_id: &str,
+    options: ImportOptions,
+    report: &mut ImportReport,
+) -> Result<()> {
     let escaped_trace_id = trace_id.replace('\'', "''");
 
     // Helper to import a single table with trace_id injection.
@@ -955,20 +1079,25 @@ fn import_tables(conn: &Connection, paths: &ParquetPaths, trace_id: &str) -> Res
     // does not support parameterized queries. The escaping (replacing ' with '') is the
     // standard SQL escape for single quotes and is safe for the path and trace_id values
     // we're inserting. The table_name is always a literal from this code, not user input.
-    let import_table = |table_name: &str, path: &Path| -> Result<()> {
+    let mut import_table = |table_name: &str, path: &Path| -> Result<()> {
         if !path.exists() {
             return Ok(());
         }
 
         let escaped_path = path.to_string_lossy().replace('\'', "''");
+        let source_sql = format!("read_parquet('{escaped_path}')");
         let order = import_order_by(table_name)
             .map(|o| format!(" ORDER BY {o}"))
             .unwrap_or_default();
+        let Some(columns) = import_column_list(conn, table_name, &source_sql, options, report)?
+        else {
+            return Ok(());
+        };
 
         conn.execute_batch(&format!(
             "INSERT INTO {table_name} BY NAME \
-             SELECT '{escaped_trace_id}' as trace_id, * \
-             FROM read_parquet('{escaped_path}'){order}"
+             SELECT '{escaped_trace_id}' as trace_id, {columns} \
+             FROM {source_sql}{order}"
         ))
         .with_context(|| {
             format!(
@@ -1989,6 +2118,98 @@ mod tests {
         assert_eq!(info[1].trace_id, "trace_b");
         assert_eq!(info[1].source_path, "/path/to/b");
         assert_eq!(info[1].systing_version, "");
+    }
+
+    /// The import's column projection against a target table, over parquet
+    /// files DuckDB writes itself: every column known → `*`; an unknown
+    /// column → the known ones quoted and the unknown one reported (an error
+    /// naming it under strict_schema); no column known → the table skipped.
+    /// The multi-file source form the multi-trace importer uses binds the
+    /// same way.
+    #[test]
+    fn test_import_column_list_projects_unknown_columns() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        let parquet = |name: &str, select: &str| -> String {
+            let path = temp_dir.path().join(name).to_string_lossy().into_owned();
+            conn.execute_batch(&format!("COPY ({select}) TO '{path}' (FORMAT PARQUET)"))
+                .unwrap();
+            format!("read_parquet('{path}')")
+        };
+        let lax = ImportOptions::default();
+        let strict = ImportOptions {
+            strict_schema: true,
+        };
+
+        let known = parquet(
+            "known.parquet",
+            "SELECT 1::INTEGER AS cpu, 2::BIGINT AS max_freq_khz",
+        );
+        let mut report = ImportReport::default();
+        assert_eq!(
+            import_column_list(&conn, "cpu_info", &known, lax, &mut report).unwrap(),
+            Some("*".to_string())
+        );
+        assert_eq!(
+            import_column_list(&conn, "cpu_info", &known, strict, &mut report).unwrap(),
+            Some("*".to_string())
+        );
+        assert_eq!(report, ImportReport::default());
+
+        let newer = parquet(
+            "newer.parquet",
+            "SELECT 1::INTEGER AS cpu, 3::BIGINT AS min_freq_khz, 4::BIGINT AS turbo_khz",
+        );
+        assert_eq!(
+            import_column_list(&conn, "cpu_info", &newer, lax, &mut report).unwrap(),
+            Some("\"cpu\", \"min_freq_khz\"".to_string())
+        );
+        assert_eq!(
+            report.dropped_columns,
+            vec![("cpu_info".to_string(), vec!["turbo_khz".to_string()])]
+        );
+        let err = import_column_list(&conn, "cpu_info", &newer, strict, &mut report).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("turbo_khz"),
+            "the refusal names the unknown column: {err:#}"
+        );
+        // The projected statement is what the importers run.
+        conn.execute_batch(&format!(
+            "INSERT INTO cpu_info BY NAME SELECT 't' AS trace_id, \"cpu\", \"min_freq_khz\" FROM {newer}"
+        ))
+        .unwrap();
+        let row: (String, i32, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT trace_id, cpu, min_freq_khz, max_freq_khz FROM cpu_info",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("t".to_string(), 1, Some(3), None));
+
+        // A list source (the multi-trace importer's form) binds the same way.
+        let listed = format!(
+            "read_parquet(['{0}/newer.parquet', '{0}/newer.parquet'])",
+            temp_dir.path().to_string_lossy()
+        );
+        let mut report = ImportReport::default();
+        assert_eq!(
+            import_column_list(&conn, "cpu_info", &listed, lax, &mut report).unwrap(),
+            Some("\"cpu\", \"min_freq_khz\"".to_string())
+        );
+
+        let foreign = parquet("foreign.parquet", "SELECT 1 AS not_a_column");
+        let mut report = ImportReport::default();
+        assert_eq!(
+            import_column_list(&conn, "cpu_info", &foreign, lax, &mut report).unwrap(),
+            None,
+            "a source sharing no column with the target is skipped"
+        );
+        assert_eq!(
+            report.dropped_columns,
+            vec![("cpu_info".to_string(), vec!["not_a_column".to_string()])]
+        );
     }
 
     #[test]
