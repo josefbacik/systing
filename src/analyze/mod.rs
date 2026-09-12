@@ -564,6 +564,9 @@ impl AnalyzeDb {
                 "non-ASCII character {c:?} (U+{:04X}) outside a string literal, a quoted identifier or a comment is not supported here: DuckDB reads some such characters as whitespace and others as identifier text, which this check does not follow; keep keywords and identifiers ASCII and put non-ASCII text inside a quoted literal",
                 u32::from(c)
             ),
+            StatementShape::QuoteContinuation => bail!(
+                "a string literal continued across a newline (a closing quote followed, on a later line, by an opening quote) is not supported here: DuckDB joins the two into one literal, which this check does not follow; write the literal on one line, or join the parts with ||"
+            ),
             StatementShape::PivotWithoutIn => bail!(
                 "PIVOT without an IN (...) value list is not supported here: DuckDB expands it into a CREATE TYPE ... AS ENUM (...) statement ahead of the query, which would run outside the row cap; write the pivot as one top-level statement whose every pivot column names a literal list — PIVOT <source> ON <column> IN (<values>) USING <aggregate> — with a join source as a parenthesised subquery, no IN (<subquery>) list, no CASE or list literal as a pivot column, and no pivot nested inside another statement"
             ),
@@ -1798,6 +1801,29 @@ mod tests {
             let err = db.query(sql).unwrap_err().to_string();
             assert!(err.contains("non-ASCII"), "{sql:?}: {err}");
         }
+        // DuckDB's lexer continues a `'` literal across a newline into the
+        // next `'` run, in the same lexer state — so here the escape string
+        // `E''` continues into `'\''`, whose backslash escapes the quote,
+        // and the literal closes at the `'` before the `)`; the `;`s after
+        // it are separators to DuckDB, while a classifier that closed the
+        // first run at its quote read the second part as an ordinary string
+        // swallowing them, and `prepare` executed the hidden SET. The shape
+        // is refused before anything reaches `prepare`, judged on the text
+        // DuckDB receives (the last case's block comment is stripped to a
+        // space, which creates the continuation); a literal continued
+        // across a newline in a single statement is refused the same way.
+        for sql in [
+            "SELECT E''\n'\\'') AS q LIMIT 1; SET memory_limit='100GB'; SELECT 1 FROM (SELECT 1 --'",
+            "SELECT E''\r'\\'') AS q LIMIT 1; SET memory_limit='100GB'; SELECT 1 FROM (SELECT 1 --'",
+            "SELECT E'a'/*x*/\n'b\\''; SET memory_limit='100GB'; SELECT 1 --'",
+            "SELECT 'a'\n'b' AS s",
+        ] {
+            let err = db.query(sql).unwrap_err().to_string();
+            assert!(err.contains("continued across a newline"), "{sql:?}: {err}");
+        }
+        // The form the refusal points at runs.
+        let joined = db.query("SELECT 'a' ||\n'b' AS s").unwrap();
+        assert_eq!(joined.rows[0][0], serde_json::json!("ab"));
         let after = db.query("SELECT current_setting('memory_limit')").unwrap();
         assert_eq!(before.rows, after.rows);
 
