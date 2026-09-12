@@ -905,15 +905,16 @@ fn import_directory(
         [SCHEMA_VERSION],
     )?;
 
-    // Import each table from Parquet files
+    // Import each table from Parquet files. The recorder's manifest is read
+    // first, so the guard's warnings can name the writer; the files this
+    // systing has no table for next, so a newer writer's whole table is
+    // reported (and refused under strict_schema) the way its columns are.
     let paths = ParquetPaths::new(parquet_dir);
-    let mut report = ImportReport::default();
-    // The recorder's manifest first, so the guard's warnings can name the
-    // writer; the files this systing has no table for next, so a newer
-    // writer's whole table is reported (and refused under strict_schema)
-    // the way its columns are.
-    report.recorder = read_manifest(conn, &paths.manifest);
-    report.unknown_files = unknown_parquet_files(parquet_dir, &paths);
+    let mut report = ImportReport {
+        recorder: read_manifest(conn, &paths.manifest),
+        unknown_files: unknown_parquet_files(parquet_dir, &paths),
+        ..Default::default()
+    };
     note_unknown_files(parquet_dir, &report.unknown_files, options)?;
     import_tables(conn, &paths, trace_id, options, &mut report)?;
     if let Some(manifest) = &report.recorder {
