@@ -240,6 +240,19 @@ pub fn clock_snapshot_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Schema for systing_manifest.parquet (schema 22): one row naming the
+/// systing that wrote the directory, the `SCHEMA_VERSION` it wrote against
+/// and the wall clock (nanoseconds since the Unix epoch) at which the writer
+/// finished. The shape is fixed at its introduction so that every reader
+/// from schema 22 on can read a manifest written by any later systing.
+pub fn manifest_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("systing_version", DataType::Utf8, false),
+        Field::new("schema_version", DataType::Int32, false),
+        Field::new("recorded_at_unix_ns", DataType::Int64, false),
+    ]))
+}
+
 /// Schema for sysinfo.parquet
 pub fn sysinfo_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![

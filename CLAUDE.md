@@ -107,8 +107,9 @@ systing uses semantic versioning with the following rules:
   3. Bump the **minor** version in `Cargo.toml` (e.g., 1.0.0 → 1.1.0)
 - **Non-schema changes**: Bump the **patch** version in `Cargo.toml` (e.g., 1.0.0 → 1.0.1)
 
-The database records version information in two places:
-- `_traces.systing_version` — the systing binary version that produced each trace (per-trace)
+The database records version information in three places:
+- `_traces.systing_version` — the systing binary version that converted each trace into the database (per-trace; the importer, not the recorder)
+- `_traces.recorder_version` / `recorder_schema_version` / `recorded_at_unix_ns` — the systing that recorded each trace and the schema it wrote against, from the parquet directory's one-row `systing_manifest.parquet` (schema 22; NULL for a trace without one)
 - `_schema_version.version` — the schema version of the database (database-wide)
 
 ## Temporary Files and Scratch Work
