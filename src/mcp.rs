@@ -699,7 +699,7 @@ impl SystingMcpServer {
 
     #[tool(
         name = "sched_aggregate",
-        description = "Per-capture scheduler summary for comparing schedulers or hosts: wakeup latency (runnable marker to first run, split by whether the thread ran on the CPU it last ran on or migrated), preempt wait, run delay, on-CPU slice length, context-switch rate (voluntary/involuntary), migrations (wakeup/preempt), a time-weighted per-CPU runqueue-length distribution (running + queued waiters; on traces with sched_migrate events — meta.placement_exact — woken threads are queued on their previous CPU from the marker on and moved by the events, so placement is exact; on older traces they are unplaced until they run and reported node-wide as unplaced_avg), migrate-event counts (at wakeup / while runnable / other), per-CPU vectors (busy, idle, switches, wakeups by previous CPU, by scheduler placement and by where they ran, runnable wait, rq avg) with imbalance metrics (busy/placement max-share and CV, work-conservation-violation time), log2 histograms beside every percentile, and the threads above the p99 of each latency tail. Percentiles come from log-linear histograms (at most 6.25% above exact); waits that do not end inside the window are counted as censored."
+        description = "Per-capture scheduler summary for comparing schedulers or hosts: wakeup latency (runnable marker to first run, split by whether the thread ran on the CPU it last ran on or migrated), preempt wait, run delay, on-CPU slice length, context-switch rate (voluntary/involuntary), migrations (wakeup/preempt), a time-weighted per-CPU runqueue-length distribution (running + queued waiters; on traces with sched_migrate events — meta.placement_exact — woken threads are queued on their previous CPU from the marker on and moved by the events, so placement is exact; on older traces they are unplaced until they run and reported node-wide as unplaced_avg), migrate-event counts (at wakeup / while runnable / other), per-CPU vectors (busy, idle, switches, wakeups by previous CPU, by scheduler placement and by where they ran, runnable wait, rq avg) with imbalance metrics (busy/placement max-share and CV, work-conservation-violation time), log2 histograms beside every percentile, and the threads above the p99 of each latency tail. Percentiles come from log-linear histograms (at most 6.25% above exact); waits that do not end inside the window are counted as censored. A window holding more scheduler events than the fold's budget is shortened from its end and the result says so (meta.window_truncated, with meta.slice_rows_capture the requested window's slice count); every figure is exact over the window reported in meta."
     )]
     async fn sched_aggregate(
         &self,
@@ -711,6 +711,7 @@ impl SystingMcpServer {
             start_time: params.start_time,
             end_time: params.end_time,
             top_k: params.top_k.unwrap_or(10),
+            ..Default::default()
         };
 
         match self

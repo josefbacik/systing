@@ -29,7 +29,8 @@ pub use network_socket_pairs::{
 };
 pub use sched_aggregate::{
     Dist, Imbalance, PerCpu, RqDist, SchedAggregate, SchedAggregateMeta, SchedAggregateParams,
-    SwitchStats, TailContributor, HIST_BASE_LOG2, HIST_OCTAVES,
+    SwitchStats, TailContributor, DEFAULT_CHUNK_ROWS, DEFAULT_MAX_ROWS, HIST_BASE_LOG2,
+    HIST_OCTAVES,
 };
 pub use sched_stats::{
     EndStateCount, ProcessSchedStats, SchedStatsParams, SchedStatsResult, SchedSummary,
