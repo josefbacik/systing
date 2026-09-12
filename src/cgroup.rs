@@ -20,6 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -162,11 +163,29 @@ pub fn cgroup_fs(path: &Path) -> io::Result<CgroupFs> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(match st.f_type {
+    Ok(cgroup_fs_kind(st.f_type))
+}
+
+/// The filesystem kind of the directory an open descriptor holds, from
+/// `fstatfs(2)`: the answer is about the directory the caller has kept open
+/// (the `--cgroup` target it resolved), not whatever the path names by now.
+pub fn cgroup_fs_of_fd(fd: BorrowedFd<'_>) -> io::Result<CgroupFs> {
+    // SAFETY: `fd` is a live descriptor for the duration of the call and
+    // `st` is a zeroed `struct statfs` the kernel fills in whole.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatfs(fd.as_raw_fd(), &mut st) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(cgroup_fs_kind(st.f_type))
+}
+
+fn cgroup_fs_kind(magic: libc::c_long) -> CgroupFs {
+    match magic {
         libc::CGROUP2_SUPER_MAGIC => CgroupFs::V2,
         libc::CGROUP_SUPER_MAGIC => CgroupFs::V1,
         other => CgroupFs::Other(other),
-    })
+    }
 }
 
 /// Collect the cgroup id (directory inode) of `path` and of every cgroup nested
