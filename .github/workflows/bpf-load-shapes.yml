@@ -107,8 +107,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-utils pipx
           pipx install virtme-ng==1.41
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/vng" --version
+          # pipx puts its apps where PIPX_BIN_DIR points (the runner image sets
+          # it to /opt/pipx_bin; a bare install defaults to ~/.local/bin): ask
+          # pipx rather than assume a path.
+          PIPX_BIN="$(pipx environment --value PIPX_BIN_DIR)"
+          echo "pipx apps: $PIPX_BIN"
+          echo "$PIPX_BIN" >> "$GITHUB_PATH"
+          "$PIPX_BIN/vng" --version
       - name: Restore the kernel image from the cache
         id: kernel
         uses: actions/cache@v4
