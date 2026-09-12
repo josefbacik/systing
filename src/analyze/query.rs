@@ -82,6 +82,19 @@ pub(super) enum StatementShape {
     /// to it. The schemas a trace database carries are ASCII, so such a
     /// character has no use outside a literal; the text is refused.
     NonAscii(char),
+    /// A `'` string whose closing quote is followed, across at least one
+    /// newline and nothing but whitespace (comments already stripped), by
+    /// another `'`. DuckDB's lexer joins the two into ONE literal
+    /// (`quotecontinue`: quote, whitespace with a newline, quote) and stays
+    /// in the same lexer state, so an escape-string literal's backslash
+    /// rule carries into the second part, while a walker that closes the
+    /// first run at its quote reads the second part as a fresh ordinary
+    /// string. The shape has no use through this path — a literal is
+    /// written on one line — and modelling it means re-deriving the join
+    /// on the text as DuckDB receives it (this module's own comment
+    /// stripping can create a join the original did not have), so the
+    /// text is refused.
+    QuoteContinuation,
     /// A `PIVOT` (or `PIVOT_WIDER`) that is not the one fully understood
     /// shape — a single top-level pivot whose every pivot column names a
     /// literal `IN (...)` list. DuckDB expands any statement holding a pivot
@@ -111,6 +124,20 @@ fn continues_identifier(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii()
 }
 
+/// The length of the integer literal at the head of `s` as DuckDB's lexer
+/// reads one: digits, with a single `_` allowed between two digits
+/// (`1_000`); 0 when `s` does not start with a digit.
+fn integer_literal_len(s: &[char]) -> usize {
+    let mut n = 0;
+    while n < s.len() && s[n].is_ascii_digit() {
+        n += 1;
+        if s.get(n) == Some(&'_') && s.get(n + 1).is_some_and(char::is_ascii_digit) {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Whether the `'` at `chars[i]` opens an escape-string literal (`E'...'`),
 /// inside which a backslash escapes the character after it. DuckDB's lexer
 /// starts one at `[eE]` immediately followed by a quote, but only when that
@@ -120,7 +147,8 @@ fn continues_identifier(c: char) -> bool {
 /// lexes as the number `1` and an escape string, because the exponent form
 /// of a number needs digits after its `E`. So the run of identifier
 /// characters ending at the `E` is read the way the lexer reads it: leading
-/// digits are a number (with an exponent when `[eE]` is followed by
+/// digits are a number (digit separators included, `1_0E'` being `1_0`
+/// and an escape string; with an exponent when `[eE]` is followed by
 /// digits), and the `E` is the prefix only when nothing else stands between
 /// the number, or the run's start, and it.
 fn opens_escape_string(chars: &[char], i: usize) -> bool {
@@ -135,7 +163,7 @@ fn opens_escape_string(chars: &[char], i: usize) -> bool {
     let run = &chars[start..i];
     let mut p = 0;
     loop {
-        let digits = run[p..].iter().take_while(|c| c.is_ascii_digit()).count();
+        let digits = integer_literal_len(&run[p..]);
         if digits == 0 {
             break;
         }
@@ -183,6 +211,43 @@ fn quoted_run_end(chars: &[char], open: usize) -> usize {
         i += 1;
     }
     chars.len()
+}
+
+/// Whether `text` (comments already stripped) carries a `'` run whose
+/// closing quote is followed, across at least one newline and nothing but
+/// whitespace, by another `'` — the shape DuckDB's lexer reads as one
+/// continued literal (`quotecontinue`) and this module's walker as two
+/// runs. Judged on the stripped text because that is the text DuckDB
+/// receives: a block comment between the two parts breaks the join in the
+/// original and is a space here, which makes one.
+fn has_quote_continuation(chars: &[char]) -> bool {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' {
+            let end = quoted_run_end(chars, i);
+            if c == '\'' {
+                // DuckDB's `whitespace_with_newline`: horizontal space, a
+                // newline, then any of `[ \t\n\r\f]` (comments are gone).
+                let mut j = end;
+                while j < chars.len() && matches!(chars[j], ' ' | '\t' | '\x0C') {
+                    j += 1;
+                }
+                if j < chars.len() && matches!(chars[j], '\n' | '\r') {
+                    while j < chars.len() && chars[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if chars.get(j) == Some(&'\'') {
+                        return true;
+                    }
+                }
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Whether `text` (comments already stripped) carries the `PIVOT` /
@@ -411,13 +476,16 @@ fn pivot_is_fully_listed(text: &str) -> bool {
 /// — an ordinary quoted run with `''` as an escaped quote, and the
 /// escape-string literal `E'...'`, inside which a backslash also escapes
 /// the character after it (`quoted_run_end`, `opens_escape_string`) — and
-/// refuses outright the two constructs it does not model rather than guess
-/// at them: a dollar-quoted string, inside which a `'` would make this scan
+/// refuses outright the constructs it does not model rather than guess at
+/// them: a dollar-quoted string, inside which a `'` would make this scan
 /// believe it is in a literal while DuckDB is not (refused with every other
-/// bare `$`, `Dollar`), and any non-ASCII character outside a quoted run or
+/// bare `$`, `Dollar`); any non-ASCII character outside a quoted run or
 /// comment, where DuckDB's pre-lexing replacement of certain Unicode spaces
 /// would make it read whitespace where this scan reads a character
-/// (`NonAscii`).
+/// (`NonAscii`); and a `'` literal continued across a newline, which
+/// DuckDB joins into one literal in the same lexer state while this scan
+/// would read two runs (`QuoteContinuation`, judged on the stripped text —
+/// the text DuckDB receives).
 pub(super) fn statement_shape(sql: &str) -> StatementShape {
     let mut out = String::with_capacity(sql.len());
     // Byte offsets in `out` of every `;` that separates statements.
@@ -437,7 +505,9 @@ pub(super) fn statement_shape(sql: &str) -> StatementShape {
             }
             '$' => return StatementShape::Dollar,
             '-' if next == Some('-') => {
-                while i < chars.len() && chars[i] != '\n' {
+                // A `--` comment ends at either newline character, as it
+                // does in the lexer.
+                while i < chars.len() && !matches!(chars[i], '\n' | '\r') {
                     i += 1;
                 }
                 out.push(' ');
@@ -479,6 +549,15 @@ pub(super) fn statement_shape(sql: &str) -> StatementShape {
                 i += 1;
             }
         }
+    }
+
+    // Judged on the stripped text, the one DuckDB receives: the walker above
+    // closed every `'` run at its quote, and a run followed across a
+    // newline by another `'` is one literal to DuckDB, in the first run's
+    // lexer state.
+    let stripped: Vec<char> = out.chars().collect();
+    if has_quote_continuation(&stripped) {
+        return StatementShape::QuoteContinuation;
     }
 
     let text = out
@@ -576,6 +655,12 @@ mod tests {
             single("  ;; \n WITH b AS (SELECT 1) SELECT * FROM b ; ; "),
             ("WITH b AS (SELECT 1) SELECT * FROM b".to_string(), true)
         );
+        // A `--` comment ends at either newline character, as in DuckDB's
+        // lexer, so the statement after a `\r` is a second statement.
+        assert_eq!(
+            statement_shape("SELECT 1 -- c\r; SELECT 2"),
+            StatementShape::Multiple
+        );
     }
 
     #[test]
@@ -663,6 +748,20 @@ mod tests {
         assert!(!opens_escape_string(&['a', 'E', '\''], 2));
         assert!(!opens_escape_string(&['_', 'E', '\''], 2));
         assert!(!opens_escape_string(&['1', '_', 'E', '\''], 3));
+        // A digit separator inside the number: `1_0E'` is the integer `1_0`
+        // and an escape string; a doubled or trailing `_` makes the run an
+        // identifier.
+        assert!(opens_escape_string(&['1', '_', '0', 'E', '\''], 4));
+        assert!(opens_escape_string(
+            &['1', '_', '0', 'e', '5', 'E', '\''],
+            6
+        ));
+        assert!(!opens_escape_string(&['1', '_', '_', '0', 'E', '\''], 5));
+        assert_eq!(integer_literal_len(&['1', '_', '0', '0', '0', 'x']), 5);
+        assert_eq!(integer_literal_len(&['1', '_', '_', '0']), 1);
+        assert_eq!(integer_literal_len(&['1', '_']), 1);
+        assert_eq!(integer_literal_len(&['_', '1']), 0);
+        assert_eq!(integer_literal_len(&[]), 0);
         assert!(!opens_escape_string(&['1', 'e', 'e', '\''], 3));
         assert!(!opens_escape_string(&['é', 'E', '\''], 2));
         assert!(!opens_escape_string(&['E', ' ', '\''], 2));
@@ -677,6 +776,53 @@ mod tests {
         assert_eq!(run("E'a\\\\'", 1), 6);
         assert_eq!(run("E'a\\", 1), 4);
         assert_eq!(run("'never", 0), 6);
+    }
+
+    #[test]
+    fn test_statement_shape_refuses_a_literal_continued_across_a_newline() {
+        // DuckDB's lexer joins `'a'` + newline + `'b'` into ONE literal and
+        // stays in the first run's state, so an escape string's backslash
+        // rule reaches into the second part: below, DuckDB reads `E''` +
+        // newline + `'\''` as one string that closes at the `'` before the
+        // `)`, and the `;`s after it are separators — a walker that closes
+        // the first run at its quote reads the second part as an ordinary
+        // string swallowing them. The shape is refused rather than joined.
+        for sql in [
+            "SELECT E''\n'\\'') AS q LIMIT 1; SET memory_limit = '100GB'; SELECT 1 FROM (SELECT 1 --'",
+            "SELECT E''\r'\\'') AS q LIMIT 1; SET memory_limit = '100GB'; SELECT 1 FROM (SELECT 1 --'",
+            "SELECT E''\r\n  \t'\\'') AS q; SET memory_limit = '100GB'; SELECT 1 --'",
+            // The continuation is judged on the text DuckDB receives: this
+            // scan's own comment stripping turns the block comment into a
+            // space and makes a join the original text did not have.
+            "SELECT E'a'/*x*/\n'b\\''; SET memory_limit = '100GB'; SELECT 1 --'",
+            "SELECT E'a' -- c\n'b\\''; SET memory_limit = '100GB'; SELECT 1 --'",
+            "SELECT 'a'\n'b'",
+            "SELECT 'a' \n\n 'b' FROM t",
+        ] {
+            assert_eq!(statement_shape(sql), StatementShape::QuoteContinuation, "{sql:?}");
+        }
+        // Not continuations: a separator between the parts, no newline
+        // between them, double-quoted identifiers, a mixed pair, or a
+        // closed escape string that nothing continues.
+        for sql in [
+            "SELECT 'a',\n'b'",
+            "SELECT 'a' 'b'",
+            "SELECT 'a'\n, 'b'",
+            "SELECT \"a\"\n\"b\" FROM t",
+            "SELECT 'a'\n\"b\" FROM t",
+            "SELECT 'a'\nFROM t WHERE x = 'b'",
+            "SELECT E'a\\'' AS s,\n'b'",
+        ] {
+            assert_eq!(single(sql), (sql.to_string(), true), "{sql:?}");
+        }
+        assert_eq!(
+            statement_shape("SELECT 'a'\n'b'; SELECT 2"),
+            StatementShape::QuoteContinuation
+        );
+        assert_eq!(
+            statement_shape("SELECT 1; SELECT 'a'\n'b'"),
+            StatementShape::QuoteContinuation
+        );
     }
 
     #[test]
