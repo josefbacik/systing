@@ -94,14 +94,23 @@
 //! - **Chunking** (`chunk_rows`): the stream is fetched in consecutive time
 //!   chunks of the window, each sorted by the engine on its own and consumed
 //!   by the same pass, so at most one chunk is materialized at a time. The
-//!   result is identical to one pass over the whole stream — an ordered
-//!   stream is the concatenation of its ordered time chunks, and a slice
-//!   whose start and end fall in different chunks is two events in the
-//!   stream either way. `meta.stream_chunks` says how many chunks were used;
-//!   1 means the fold ran as a single query.
+//!   chunk edges come from a histogram of the stream's event timestamps
+//!   (one vectorized scan into [`EVENT_HIST_BUCKETS`] time buckets): an edge
+//!   sits where the cumulative event count crosses each `k/n` of the
+//!   window's rows, so every chunk holds about `chunk_rows` events whatever
+//!   the density inside the window — equal time slices would hand a burst
+//!   to one chunk whole — and a chunk can exceed that only by a burst
+//!   narrower than one bucket. The result is identical to one pass over the
+//!   whole stream — an ordered stream is the concatenation of its ordered
+//!   time chunks, and a slice whose start and end fall in different chunks
+//!   is two events in the stream either way. `meta.stream_chunks` says how
+//!   many chunks were used; 1 means the fold ran as a single query.
 //! - **The event budget** (`max_rows`): when the requested window holds more
-//!   stream rows than the budget, the window is shortened from its END so
-//!   that it holds about the budget, and the pass runs over that shorter
+//!   stream rows than the budget, the window is shortened from its END to
+//!   the last bucket boundary at which the cumulative event count still
+//!   fits the budget — an exact bound, since every stream row of the shorter
+//!   window is an event of the requested window's stream with a timestamp
+//!   at or before that boundary — and the pass runs over that shorter
 //!   window. Every statistic stays exactly defined over a contiguous,
 //!   un-sampled window — nothing is sampled or extrapolated — and the row
 //!   says so: `meta.window_truncated` is true, `meta.window_ns` is the
@@ -110,7 +119,9 @@
 //!   full one cannot be folded beats no row at all.
 //!
 //! The stream rows of a window are counted before the fold (one aggregate
-//! query per source table) to size both guards.
+//! query per source table) to size both guards, and counted again after a
+//! budget cut so the chunk count and the metadata describe the window
+//! actually folded.
 
 use anyhow::{bail, Context, Result};
 use duckdb::arrow::array::{Array, AsArray, PrimitiveArray};
@@ -145,6 +156,12 @@ pub const DEFAULT_CHUNK_ROWS: u64 = 16_000_000;
 /// stream row. A stream row is a slice start, a slice end, a runnable
 /// marker, a new-task wakeup or a migrate event.
 pub const DEFAULT_MAX_ROWS: u64 = 80_000_000;
+/// Time buckets of the event histogram both guards are sized from (see the
+/// module docs, "Bounded folding"): the budget cut and the chunk edges land
+/// on bucket boundaries, so a chunk can be unbalanced only by a burst
+/// narrower than one 4096th of the window, and the histogram itself is one
+/// vectorized scan with a few thousand groups.
+const EVENT_HIST_BUCKETS: u32 = 4096;
 
 /// Parameters for [`AnalyzeDb::sched_aggregate`].
 ///
@@ -1170,22 +1187,148 @@ impl StreamChunk {
     }
 }
 
-/// Split `[start, end]` into `n` consecutive chunks of equal length (the
-/// remainder goes to the last one).
-fn stream_chunks(start: i64, end: i64, n: u32) -> Vec<StreamChunk> {
-    let n = n.max(1) as i64;
-    let span = end - start;
-    (0..n)
-        .map(|k| StreamChunk {
-            lo: start + span * k / n,
-            hi: if k + 1 == n {
-                end
-            } else {
-                start + span * (k + 1) / n
-            },
-            last: k + 1 == n,
-        })
-        .collect()
+/// Split `[start, end]` into consecutive chunks at the given edges: an edge
+/// outside `(start, end)` is dropped, the rest are sorted and deduplicated,
+/// so the chunks always cover the window exactly and there are at most one
+/// more of them than edges kept.
+fn stream_chunks(start: i64, end: i64, edges: &[i64]) -> Vec<StreamChunk> {
+    let mut edges: Vec<i64> = edges
+        .iter()
+        .copied()
+        .filter(|&e| e > start && e < end)
+        .collect();
+    edges.sort_unstable();
+    edges.dedup();
+    let mut chunks = Vec::with_capacity(edges.len() + 1);
+    let mut lo = start;
+    for hi in edges {
+        chunks.push(StreamChunk {
+            lo,
+            hi,
+            last: false,
+        });
+        lo = hi;
+    }
+    chunks.push(StreamChunk {
+        lo,
+        hi: end,
+        last: true,
+    });
+    chunks
+}
+
+/// The event timestamps of the window's stream — the same arms and filters
+/// as [`build_event_stream_query`], timestamps only — as `(ts, is_start)`,
+/// for an aggregate over the stream's time distribution. `is_start` marks a
+/// slice START: the one event that a window ending exactly at its
+/// timestamp does not hold (the slice would have to end after the window),
+/// which the histogram uses to keep its cumulative count an exact bound.
+fn build_event_ts_union(
+    trace_id: Option<&str>,
+    start: i64,
+    end: i64,
+    with_migrate: bool,
+) -> String {
+    let f_ss = trace_id_filter(trace_id, "ss.");
+    let f_ts = trace_id_filter(trace_id, "t.");
+    let f_w = trace_id_filter(trace_id, "w.");
+    let f_m = trace_id_filter(trace_id, "m.");
+    let migrate_arm = if with_migrate {
+        format!(
+            "UNION ALL \
+           SELECT CAST(m.ts AS BIGINT), 0 FROM sched_migrate m WHERE m.ts >= {start} AND m.ts <= {end}{f_m} "
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "SELECT CAST(ss.ts AS BIGINT) AS ts, 1 AS is_start FROM sched_slice ss WHERE ss.dur > 0 AND ss.ts >= {start} AND ss.ts + ss.dur <= {end}{f_ss} \
+         UNION ALL \
+         SELECT CAST(ss.ts + ss.dur AS BIGINT), 0 FROM sched_slice ss WHERE ss.dur > 0 AND ss.ts >= {start} AND ss.ts + ss.dur <= {end}{f_ss} \
+         UNION ALL \
+         SELECT CAST(t.ts AS BIGINT), 0 FROM thread_state t WHERE t.state = 0 AND t.cpu IS NOT NULL AND t.ts >= {start} AND t.ts <= {end}{f_ts} \
+         UNION ALL \
+         SELECT CAST(w.ts AS BIGINT), 0 FROM wakeup_new w WHERE w.ts >= {start} AND w.ts <= {end}{f_w} \
+         {migrate_arm}"
+    )
+}
+
+/// The histogram of the window's event timestamps over
+/// [`EVENT_HIST_BUCKETS`] time buckets: one row per non-empty bucket with
+/// its event count, laid out so that the cumulative count of buckets `0..k`
+/// is an exact upper bound of the stream rows a window ending at the
+/// [`hist_boundary`] `B_k` holds. A slice end, marker, new-task wakeup or
+/// migrate at `B_k` belongs to that window, so those events fall into the
+/// bucket BELOW the boundary they sit on (bucket `b` covers `(B_b, B_(b+1)]`;
+/// the window's first instant folds into bucket 0); a slice START at `B_k`
+/// does not (the slice ends after `B_k`), so start events fall into the
+/// bucket ABOVE (`[B_b, B_(b+1))`). Every stream row of the shorter window
+/// is then an event counted at or below `B_k`, and the cumulative count
+/// bounds it from above. The arithmetic runs in the engine's 128-bit
+/// integers — a window's span times the bucket count overflows 64 bits on a
+/// trace a few weeks long — and `//` is its integer division (`/` on
+/// integers yields a DOUBLE).
+fn build_event_histogram_query(
+    trace_id: Option<&str>,
+    start: i64,
+    end: i64,
+    with_migrate: bool,
+) -> String {
+    let union = build_event_ts_union(trace_id, start, end, with_migrate);
+    let span = (end - start).max(1);
+    let n = EVENT_HIST_BUCKETS;
+    format!(
+        "SELECT bucket, COUNT(*) FROM ( \
+           SELECT CASE \
+                    WHEN is_start = 1 THEN LEAST(CAST(CAST(ts - {start} AS HUGEINT) * {n} // {span} AS BIGINT), {n} - 1) \
+                    WHEN ts <= {start} THEN 0 \
+                    ELSE CAST((CAST(ts - {start} AS HUGEINT) * {n} + {span} - 1) // {span} - 1 AS BIGINT) \
+                  END AS bucket \
+             FROM ({union}) \
+         ) GROUP BY bucket"
+    )
+}
+
+/// The `k`-th of the [`EVENT_HIST_BUCKETS`] + 1 bucket boundaries of the
+/// window `[start, end]`: `B_0 = start`, `B_n = end`, evenly spaced; the
+/// product is taken in 128 bits so a long window never wraps.
+fn hist_boundary(start: i64, end: i64, k: u32) -> i64 {
+    let span = (end - start) as i128;
+    let n = EVENT_HIST_BUCKETS as i128;
+    start.saturating_add((span * k as i128 / n) as i64)
+}
+
+/// Running totals of a histogram: `cum[k]` is the number of events in
+/// buckets `0..k`, i.e. with a timestamp at or before `B_k`; `cum[0]` is 0
+/// and the last entry the whole stream.
+fn cumulative(hist: &[u64]) -> Vec<u64> {
+    let mut cum = Vec::with_capacity(hist.len() + 1);
+    let mut total = 0u64;
+    cum.push(0);
+    for &h in hist {
+        total += h;
+        cum.push(total);
+    }
+    cum
+}
+
+/// The chunk edges for `n` chunks of about equal row count, from the
+/// window's cumulative histogram: for each `k` in `1..n` the first bucket
+/// boundary at which the cumulative count reaches `k/n` of the stream. A
+/// burst narrower than one bucket cannot be split and makes the chunk
+/// holding it larger; coinciding edges collapse into fewer chunks.
+fn chunk_edges_from_hist(start: i64, end: i64, cum: &[u64], n: u32) -> Vec<i64> {
+    let total = *cum.last().unwrap_or(&0) as u128;
+    let mut edges = Vec::with_capacity(n.saturating_sub(1) as usize);
+    for k in 1..n {
+        let target = (total * k as u128 / n as u128) as u64;
+        // `cum` is non-decreasing: the first boundary at or past the mark.
+        let j = cum.partition_point(|&c| c < target);
+        if j < cum.len() {
+            edges.push(hist_boundary(start, end, j as u32));
+        }
+    }
+    edges
 }
 
 /// The event stream of the window: every arm carries the window's own
@@ -1425,17 +1568,22 @@ impl AnalyzeDb {
 
         // Size the fold (module docs, "Bounded folding"): count the stream
         // rows the requested window holds, shorten the window from its end
-        // when they exceed the event budget, then pick the chunk count from
-        // what the (possibly shortened) window holds.
+        // when they exceed the event budget, then cut the (possibly
+        // shortened) window into chunks of about `chunk_rows` events each.
         let requested = self.stream_counts(trace_id, window_start, window_end, placement_exact)?;
         let slice_rows_capture = requested.slices;
         let mut window_end = window_end;
         let mut window_truncated = false;
         let mut folded = requested;
         if params.max_rows > 0 && requested.stream_rows() > params.max_rows {
-            let span = (window_end - window_start) as u128;
-            let keep = span * params.max_rows as u128 / requested.stream_rows() as u128;
-            let end = window_start.saturating_add(keep as i64);
+            let end = self.budget_cut(
+                trace_id,
+                window_start,
+                window_end,
+                placement_exact,
+                requested.stream_rows(),
+                params.max_rows,
+            )?;
             if end <= window_start {
                 bail!(
                     "The window holds {} scheduler stream rows, more than the event budget \
@@ -1447,6 +1595,17 @@ impl AnalyzeDb {
             window_end = end;
             window_truncated = true;
             folded = self.stream_counts(trace_id, window_start, window_end, placement_exact)?;
+            if folded.stream_rows() > params.max_rows {
+                // The cut is an upper bound by construction (see the module
+                // docs); a recount above the budget is a defect in the two
+                // queries' agreement, never a reason to fold over budget.
+                bail!(
+                    "The window cut to the event budget of {} still holds {} scheduler stream \
+                     rows; raise --max-rows or narrow the window.",
+                    params.max_rows,
+                    folded.stream_rows()
+                );
+            }
         }
         let stream_chunk_count: u32 = if params.chunk_rows > 0 {
             folded
@@ -1456,9 +1615,17 @@ impl AnalyzeDb {
         } else {
             1
         };
+        let chunks = self.chunk_plan(
+            trace_id,
+            window_start,
+            window_end,
+            placement_exact,
+            stream_chunk_count,
+        )?;
+        let stream_chunk_count = chunks.len() as u32;
 
         let mut pass = Pass::new(window_end, idle, names, params.top_k > 0, placement_exact);
-        for chunk in stream_chunks(window_start, window_end, stream_chunk_count) {
+        for chunk in chunks {
             // A single chunk is the whole window: no chunk predicate, the
             // query as it always was.
             let chunk = (stream_chunk_count > 1).then_some(chunk);
@@ -1661,6 +1828,79 @@ impl AnalyzeDb {
             wakeup_tail_top,
             preempt_tail_top,
         })
+    }
+
+    /// The event histogram of a window (see [`build_event_histogram_query`]):
+    /// one count per bucket, empty buckets included.
+    fn event_histogram(
+        &self,
+        trace_id: Option<&str>,
+        start: i64,
+        end: i64,
+        with_migrate: bool,
+    ) -> Result<Vec<u64>> {
+        let sql = build_event_histogram_query(trace_id, start, end, with_migrate);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        let mut hist = vec![0u64; EVENT_HIST_BUCKETS as usize];
+        while let Some(r) = rows.next()? {
+            let bucket: i64 = r.get(0)?;
+            let count: i64 = r.get(1)?;
+            // In range by the query's own arithmetic; the clamp keeps a
+            // defect there from indexing out of bounds.
+            let b = bucket.clamp(0, EVENT_HIST_BUCKETS as i64 - 1) as usize;
+            hist[b] += count.max(0) as u64;
+        }
+        Ok(hist)
+    }
+
+    /// The end of the longest prefix of the window that fits the event
+    /// budget (see the module docs, "Bounded folding"): the last bucket
+    /// boundary at which the cumulative event count is still within
+    /// `max_rows`. When not even the first bucket fits, a sliver cut in
+    /// proportion to the row count (its recount decides whether it stands);
+    /// the caller treats an end at `start` as no part fitting.
+    fn budget_cut(
+        &self,
+        trace_id: Option<&str>,
+        start: i64,
+        end: i64,
+        with_migrate: bool,
+        stream_rows: u64,
+        max_rows: u64,
+    ) -> Result<i64> {
+        let hist = self.event_histogram(trace_id, start, end, with_migrate)?;
+        let cum = cumulative(&hist);
+        // The largest k with cum[k] <= max_rows; cum is non-decreasing.
+        let k = cum.partition_point(|&c| c <= max_rows);
+        if k > 1 {
+            return Ok(hist_boundary(start, end, (k - 1) as u32));
+        }
+        let span = (end - start) as u128;
+        let keep = span * max_rows as u128 / stream_rows.max(1) as u128;
+        Ok(start.saturating_add(keep as i64))
+    }
+
+    /// Cut the window into chunks of about equal row count (see the module
+    /// docs, "Bounded folding"): one chunk for `n <= 1`, otherwise the
+    /// window split where its event histogram's running total crosses each
+    /// `k/n` of the stream ([`chunk_edges_from_hist`]). Fewer chunks come
+    /// back when edges coincide (events piled inside one bucket) or the
+    /// stream is empty.
+    fn chunk_plan(
+        &self,
+        trace_id: Option<&str>,
+        start: i64,
+        end: i64,
+        with_migrate: bool,
+        n: u32,
+    ) -> Result<Vec<StreamChunk>> {
+        if n <= 1 {
+            return Ok(stream_chunks(start, end, &[]));
+        }
+        let hist = self.event_histogram(trace_id, start, end, with_migrate)?;
+        let edges = chunk_edges_from_hist(start, end, &cumulative(&hist), n);
+        Ok(stream_chunks(start, end, &edges))
     }
 
     /// Count the stream rows a window holds, per source (see
@@ -2175,16 +2415,94 @@ mod tests {
 
     #[test]
     fn stream_chunks_cover_the_window_exactly() {
-        let c = stream_chunks(0, 10, 3);
+        let c = stream_chunks(0, 10, &[3, 6]);
         assert_eq!(c.len(), 3);
         assert_eq!((c[0].lo, c[0].hi, c[0].last), (0, 3, false));
         assert_eq!((c[1].lo, c[1].hi, c[1].last), (3, 6, false));
         assert_eq!((c[2].lo, c[2].hi, c[2].last), (6, 10, true));
-        let c = stream_chunks(5, 6, 1);
+        // No edges is one chunk.
+        let c = stream_chunks(5, 6, &[]);
         assert_eq!(c.len(), 1);
         assert_eq!((c[0].lo, c[0].hi, c[0].last), (5, 6, true));
-        // Zero chunks is one chunk.
-        assert_eq!(stream_chunks(0, 100, 0).len(), 1);
+        // Edges arrive in any order, repeat, or sit on or outside the window:
+        // the chunks still tile the window exactly, once each.
+        let c = stream_chunks(0, 100, &[70, 30, 30, 0, 100, -5, 250]);
+        assert_eq!(c.len(), 3);
+        assert_eq!((c[0].lo, c[0].hi, c[0].last), (0, 30, false));
+        assert_eq!((c[1].lo, c[1].hi, c[1].last), (30, 70, false));
+        assert_eq!((c[2].lo, c[2].hi, c[2].last), (70, 100, true));
+    }
+
+    #[test]
+    fn event_histogram_query_shape() {
+        let sql = build_event_histogram_query(Some("x"), 10, 20, false);
+        assert!(sql.starts_with("SELECT bucket, COUNT(*) FROM ("));
+        // Starts fall into the bucket above their boundary, every other
+        // event into the bucket below it; the arithmetic is 128-bit integer.
+        assert!(sql.contains(
+            "WHEN is_start = 1 THEN LEAST(CAST(CAST(ts - 10 AS HUGEINT) * 4096 // 10 AS BIGINT), 4096 - 1)"
+        ));
+        assert!(sql.contains("WHEN ts <= 10 THEN 0"));
+        assert!(sql
+            .contains("ELSE CAST((CAST(ts - 10 AS HUGEINT) * 4096 + 10 - 1) // 10 - 1 AS BIGINT)"));
+        assert!(sql.contains(
+            "SELECT CAST(ss.ts AS BIGINT) AS ts, 1 AS is_start FROM sched_slice ss WHERE ss.dur > 0 AND ss.ts >= 10 AND ss.ts + ss.dur <= 20 AND ss.trace_id = 'x'"
+        ));
+        assert!(sql.contains("SELECT CAST(ss.ts + ss.dur AS BIGINT), 0 FROM sched_slice ss"));
+        assert!(sql.contains(
+            "SELECT CAST(t.ts AS BIGINT), 0 FROM thread_state t WHERE t.state = 0 AND t.cpu IS NOT NULL AND t.ts >= 10 AND t.ts <= 20"
+        ));
+        assert!(sql.contains(
+            "SELECT CAST(w.ts AS BIGINT), 0 FROM wakeup_new w WHERE w.ts >= 10 AND w.ts <= 20"
+        ));
+        assert!(sql.ends_with(") GROUP BY bucket"));
+        assert!(!sql.contains("sched_migrate"));
+        let sql = build_event_histogram_query(None, 10, 20, true);
+        assert!(sql.contains(
+            "SELECT CAST(m.ts AS BIGINT), 0 FROM sched_migrate m WHERE m.ts >= 10 AND m.ts <= 20"
+        ));
+    }
+
+    #[test]
+    fn histogram_boundaries_and_edges() {
+        let n = EVENT_HIST_BUCKETS;
+        // Boundaries tile the window; a span far above 2^63 / 4096 does not
+        // wrap.
+        assert_eq!(hist_boundary(0, 1_000_000_000, 0), 0);
+        assert_eq!(hist_boundary(0, 1_000_000_000, 2048), 500_000_000);
+        assert_eq!(hist_boundary(0, 1_000_000_000, n), 1_000_000_000);
+        assert_eq!(hist_boundary(7, 7 + 4096 * 3, 5), 7 + 15);
+        let huge = i64::MAX - 1;
+        assert_eq!(hist_boundary(0, huge, n), huge);
+        assert_eq!(hist_boundary(0, huge, n / 2), huge / 2);
+        // Running totals.
+        assert_eq!(cumulative(&[3, 0, 2]), vec![0, 3, 3, 5]);
+        assert_eq!(cumulative(&[]), vec![0]);
+        // Edges: 5 buckets of 10 events, 2 chunks -> one edge where the
+        // running total reaches 25, i.e. at the boundary after bucket 2.
+        let mut hist = vec![0u64; n as usize];
+        hist[..5].fill(10);
+        let cum = cumulative(&hist);
+        let end = 4096 * 100;
+        assert_eq!(
+            chunk_edges_from_hist(0, end, &cum, 2),
+            vec![hist_boundary(0, end, 3)]
+        );
+        // A burst inside one bucket cannot be split: the edges for 4 chunks
+        // of 10 events each all land on the same boundary and collapse.
+        let mut burst = vec![0u64; n as usize];
+        burst[7] = 40;
+        let cum = cumulative(&burst);
+        let edges = chunk_edges_from_hist(0, end, &cum, 4);
+        assert_eq!(edges, vec![800, 800, 800]);
+        assert_eq!(stream_chunks(0, end, &edges).len(), 2);
+        // No events: the marks are all 0 and every edge sits on the window
+        // start, so none survives.
+        let cum = cumulative(&[0u64; EVENT_HIST_BUCKETS as usize]);
+        assert_eq!(
+            stream_chunks(0, end, &chunk_edges_from_hist(0, end, &cum, 3)).len(),
+            1
+        );
     }
 
     #[test]
@@ -2368,6 +2686,125 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("max-rows"), "{err}");
+    }
+
+    /// A one-second workload whose first fifth is five times as dense as
+    /// the rest: `busy_workload`'s step (four slices, three markers — eleven
+    /// stream rows) every 0.5 ms for 200 ms, then every 2.5 ms for 800 ms:
+    /// 400 dense and 320 sparse steps, 7,920 stream rows, 4,400 of them in
+    /// the first 200 ms.
+    fn skewed_workload() -> (Vec<SliceRow>, Vec<MarkerRow>, Vec<ThreadRow>) {
+        let mut slices = Vec::new();
+        let mut markers = Vec::new();
+        let mut step = |t: i64, len: i64, i: i64| {
+            let (ca, cb) = if i % 10 == 9 { (1, 0) } else { (0, 1) };
+            let a = len * 2 / 5;
+            let b = len * 3 / 5;
+            slices.push((t, a, ca, A, Some(1)));
+            slices.push((t + a, len - a, ca, IDLE, None));
+            markers.push((t + len * 4 / 5, A, ca));
+            slices.push((t, b, cb, B, None));
+            slices.push((t + b, len - b, cb, C, Some(1)));
+            markers.push((t + len * 12 / 25, C, cb));
+            markers.push((t + len * 24 / 25, B, cb));
+        };
+        for i in 0..400i64 {
+            step(i * 500_000, 500_000, i);
+        }
+        for i in 0..320i64 {
+            step(200_000_000 + i * 2_500_000, 2_500_000, 400 + i);
+        }
+        let mut threads = threads();
+        threads.push((C, 103, "worker-c"));
+        (slices, markers, threads)
+    }
+
+    /// Stream rows of a workload inside the window `[0, end]`, as the fold
+    /// counts them: two per slice lying entirely inside, one per marker.
+    fn stream_rows_in(slices: &[SliceRow], markers: &[MarkerRow], end: i64) -> u64 {
+        let s = slices
+            .iter()
+            .filter(|(ts, dur, ..)| *dur > 0 && *ts >= 0 && ts + dur <= end)
+            .count() as u64;
+        let m = markers
+            .iter()
+            .filter(|(ts, ..)| *ts >= 0 && *ts <= end)
+            .count() as u64;
+        2 * s + m
+    }
+
+    /// Stream rows of a workload (all of it inside `[0, 1 s]`) that a chunk
+    /// fetches: every event with a timestamp in `[lo, hi)`, or `[lo, hi]`
+    /// for the last chunk — a slice start at `ts`, a slice end at `ts + dur`,
+    /// a marker at `ts`.
+    fn stream_rows_in_chunk(slices: &[SliceRow], markers: &[MarkerRow], c: &StreamChunk) -> u64 {
+        let inside = |t: i64| t >= c.lo && (t < c.hi || (c.last && t == c.hi));
+        let starts = slices.iter().filter(|(ts, ..)| inside(*ts)).count();
+        let ends = slices
+            .iter()
+            .filter(|(ts, dur, ..)| inside(ts + dur))
+            .count();
+        let m = markers.iter().filter(|(ts, ..)| inside(*ts)).count();
+        (starts + ends + m) as u64
+    }
+
+    #[test]
+    fn budget_and_chunks_hold_under_a_burst() {
+        let (slices, markers, threads) = skewed_workload();
+        assert_eq!(stream_rows_in(&slices, &markers, 1_000_000_000), 7920);
+        assert_eq!(stream_rows_in(&slices, &markers, 200_000_000), 4400);
+        let db = db_with(&slices, &markers, &threads);
+
+        // The budget: a cut proportional to the row count would keep the
+        // first 378.8 ms — 5,187 rows, 73 % over a budget of 3,000 — because
+        // the window's events crowd its start. The histogram cut lands
+        // inside the dense fifth, within one bucket (244 µs, about five
+        // rows) of the budget, and never over it.
+        let truncated = db
+            .sched_aggregate(&SchedAggregateParams {
+                max_rows: 3000,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(truncated.meta.window_truncated);
+        assert_eq!(truncated.meta.slice_rows_capture, 2880);
+        let end = truncated.meta.window_end_ns;
+        assert!(end < 200_000_000, "the cut lands in the dense fifth: {end}");
+        let folded = stream_rows_in(&slices, &markers, end);
+        assert!(folded <= 3000, "{folded} rows folded over a budget of 3000");
+        assert!(folded >= 2950, "{folded} rows folded, the cut is not tight");
+        assert!(
+            stream_rows_in(&slices, &markers, 378_787_878) > 5000,
+            "the proportional cut would have folded over budget"
+        );
+
+        // The chunks: equal time slices would hand the first 125 ms — 2,750
+        // rows — to one chunk of a nominal 1,000; the histogram edges keep
+        // every chunk within a bucket of the nominal size, and the fold's
+        // result is the single query's.
+        let chunks = db.chunk_plan(None, 0, 1_000_000_000, false, 8).unwrap();
+        assert_eq!(chunks.len(), 8);
+        for c in &chunks {
+            let rows = stream_rows_in_chunk(&slices, &markers, c);
+            assert!(rows <= 1020, "chunk [{}, {}) holds {rows} rows", c.lo, c.hi);
+        }
+        let first = StreamChunk {
+            lo: 0,
+            hi: 125_000_000,
+            last: false,
+        };
+        assert!(stream_rows_in_chunk(&slices, &markers, &first) > 2000);
+        let whole = db
+            .sched_aggregate(&SchedAggregateParams::default())
+            .unwrap();
+        let chunked = db
+            .sched_aggregate(&SchedAggregateParams {
+                chunk_rows: 1000,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(chunked.meta.stream_chunks, 8);
+        assert_eq!(comparable(chunked), comparable(whole));
     }
 
     /// Like `db_with`, plus a `sched_migrate` table with the given

@@ -781,13 +781,15 @@ fn run_sched_aggregate(args: SchedAggregateArgs) -> Result<()> {
     );
     if r.meta.window_truncated {
         eprintln!(
-            "# Window TRUNCATED to the event budget (--max-rows {}): the trace's window holds {} slices; the figures above are exact over the shorter window.",
-            args.max_rows, r.meta.slice_rows_capture
+            "# Window TRUNCATED to the event budget (--max-rows {}): the requested window holds {} sched_slice rows (idle included); every figure below is exact over the first {:.3}s of it.",
+            args.max_rows,
+            r.meta.slice_rows_capture,
+            r.meta.window_ns as f64 / 1e9
         );
     }
     if r.meta.stream_chunks > 1 {
         eprintln!(
-            "# Stream fetched in {} time chunks (--chunk-rows {}).",
+            "# Stream fetched in {} chunks of about --chunk-rows {} events each.",
             r.meta.stream_chunks, args.chunk_rows
         );
     }
