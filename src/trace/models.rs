@@ -268,12 +268,18 @@ pub struct InstantArgRecord {
 /// - `depth`: Number of frames in the stack
 /// - `leaf_name`: Innermost (executing) frame's name — the last entry of
 ///   `frame_names` (redundant but enables fast filtering)
+/// - `frame_files`: Full source path per frame where known, parallel to
+///   `frame_names`; empty when none is
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StackRecord {
     pub id: i64,
     pub frame_names: Vec<String>,
     pub depth: i32,
     pub leaf_name: String,
+    /// The full path of each frame's source file, where one is known (Python
+    /// frames: `frame_names` has the file's name alone), parallel to
+    /// `frame_names`. Empty when no frame of the stack has one.
+    pub frame_files: Vec<Option<String>>,
 }
 
 /// Stack sample record - represents a single profiling sample.

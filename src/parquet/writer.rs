@@ -2378,6 +2378,7 @@ fn build_stack_batch(records: &[StackRecord], schema: &Arc<Schema>) -> Result<Re
     let mut frame_names_builder = ListBuilder::new(StringBuilder::new());
     let mut depth_builder = Int32Builder::with_capacity(records.len());
     let mut leaf_name_builder = StringBuilder::new();
+    let mut frame_files_builder = ListBuilder::new(StringBuilder::new());
 
     for record in records {
         id_builder.append_value(record.id);
@@ -2390,6 +2391,11 @@ fn build_stack_batch(records: &[StackRecord], schema: &Arc<Schema>) -> Result<Re
 
         depth_builder.append_value(record.depth);
         leaf_name_builder.append_value(&record.leaf_name);
+
+        for file in &record.frame_files {
+            frame_files_builder.values().append_option(file.as_deref());
+        }
+        frame_files_builder.append(!record.frame_files.is_empty());
     }
 
     Ok(RecordBatch::try_new(
@@ -2399,6 +2405,7 @@ fn build_stack_batch(records: &[StackRecord], schema: &Arc<Schema>) -> Result<Re
             Arc::new(frame_names_builder.finish()),
             Arc::new(depth_builder.finish()),
             Arc::new(leaf_name_builder.finish()),
+            Arc::new(frame_files_builder.finish()),
         ],
     )?)
 }

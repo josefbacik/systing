@@ -1603,6 +1603,14 @@ impl ParquetToPerfettoConverter {
             }
         }
 
+        // A frame's full source path, where the stack table has one: the name
+        // has the file by name alone.
+        let full_paths: HashMap<&str, &str> = stacks
+            .values()
+            .flat_map(|s| s.frame_names.iter().zip(&s.frame_files))
+            .filter_map(|(name, file)| Some((name.as_str(), file.as_deref()?)))
+            .collect();
+
         let seq_id = self.alloc_seq_id();
         for (utid, mut events) in threads {
             events.sort_by_key(|e| e.ts);
@@ -1659,7 +1667,10 @@ impl ParquetToPerfettoConverter {
             // slice of the track began last. A slice is named after the
             // function alone; where it is from goes in its arguments.
             for frame in stack {
-                let parts = parse_frame(&frame.name);
+                let mut parts = parse_frame(&frame.name);
+                if let Some(path) = full_paths.get(frame.name.as_str()) {
+                    parts.file = Some(path);
+                }
                 write_slice(
                     writer,
                     seq_id,
@@ -2895,6 +2906,10 @@ struct StackData {
     /// Each name contains embedded module and location info in format:
     /// `function_name (module_name [file:line]) <0xaddr>`
     frame_names: Vec<String>,
+    /// Parallel to `frame_names`: the full path of a frame's source file where
+    /// known (Python frames); empty when none is, or in a trace from before
+    /// the column.
+    frame_files: Vec<Option<String>>,
 }
 
 /// Parse module name from a frame name string.
@@ -2940,6 +2955,9 @@ fn read_stack_data(input_dir: &Path) -> Result<HashMap<i64, StackData>> {
             .column_by_name("frame_names")
             .and_then(|c| c.as_any().downcast_ref::<ListArray>())
             .context("Missing frame_names column in stack.parquet")?;
+        let frame_files_col = batch
+            .column_by_name("frame_files")
+            .and_then(|c| c.as_any().downcast_ref::<ListArray>());
 
         for i in 0..batch.num_rows() {
             let id = ids.value(i);
@@ -2964,7 +2982,27 @@ fn read_stack_data(input_dir: &Path) -> Result<HashMap<i64, StackData>> {
                     .collect()
             };
 
-            stack_map.insert(id, StackData { frame_names });
+            let frame_files: Vec<Option<String>> = match frame_files_col {
+                Some(col) if !col.is_null(i) => {
+                    let inner = col.value(i);
+                    let files = inner
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .context("frame_files inner array is not StringArray")?;
+                    (0..files.len())
+                        .map(|j| (!files.is_null(j)).then(|| files.value(j).to_string()))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+
+            stack_map.insert(
+                id,
+                StackData {
+                    frame_names,
+                    frame_files,
+                },
+            );
         }
     }
 
@@ -4189,22 +4227,36 @@ mod tests {
         );
     }
 
-    /// stack.parquet with the given stacks, root first.
-    fn create_test_stack_parquet(dir: &Path, stacks: &[(i64, &[&str])]) -> Result<()> {
+    /// stack.parquet with the given stacks, root first, and their frames' full
+    /// paths (none: a null list, as for a stack without Python frames).
+    #[allow(clippy::type_complexity)]
+    fn create_test_stack_parquet(
+        dir: &Path,
+        stacks: &[(i64, &[&str], &[Option<&str>])],
+    ) -> Result<()> {
         let mut frames = ListBuilder::new(arrow::array::StringBuilder::new());
-        for (_, stack) in stacks {
+        let mut files = ListBuilder::new(arrow::array::StringBuilder::new());
+        for (_, stack, paths) in stacks {
             for frame in *stack {
                 frames.values().append_value(frame);
             }
             frames.append(true);
+            for path in *paths {
+                files.values().append_option(*path);
+            }
+            files.append(!paths.is_empty());
         }
-        let frames = frames.finish();
+        let (frames, files) = (frames.finish(), files.finish());
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("frame_names", frames.data_type().clone(), true),
+            Field::new("frame_files", files.data_type().clone(), true),
         ]));
-        let ids = Int64Array::from(stacks.iter().map(|(id, _)| *id).collect::<Vec<_>>());
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(frames)])?;
+        let ids = Int64Array::from(stacks.iter().map(|s| s.0).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(frames), Arc::new(files)],
+        )?;
         let mut writer =
             ArrowWriter::try_new(File::create(dir.join("stack.parquet"))?, schema, None)?;
         writer.write(&batch)?;
@@ -4257,8 +4309,8 @@ mod tests {
         create_test_stack_parquet(
             dir.path(),
             &[
-                (5, &["main (app) <0x10>", "read (libc.so.6) <0x30>"]),
-                (6, &["main (app) <0x10>", "write (libc.so.6) <0x40>"]),
+                (5, &["main (app) <0x10>", "read (libc.so.6) <0x30>"], &[]),
+                (6, &["main (app) <0x10>", "write (libc.so.6) <0x40>"], &[]),
             ],
         )
         .unwrap();
@@ -4344,7 +4396,11 @@ mod tests {
         create_test_process_parquet(dir.path(), 1, 1000).unwrap();
         // tid == pid: the main thread, whose utid stands for the process track.
         create_test_thread_parquet(dir.path(), 100, 1000, Some(1)).unwrap();
-        create_test_stack_parquet(dir.path(), &[(5, &["f (python) [app.py:3]"])]).unwrap();
+        create_test_stack_parquet(
+            dir.path(),
+            &[(5, &["f (python) [app.py:3]"], &[Some("/srv/app/app.py")])],
+        )
+        .unwrap();
         create_test_task_stack_event_parquet(dir.path(), &[(1_000, 1_000, 100, Some(5))]).unwrap();
 
         let mut converter = ParquetToPerfettoConverter::new();
@@ -4372,7 +4428,8 @@ mod tests {
         assert_eq!(stack.parent_uuid(), thread.uuid());
         assert_ne!(stack.parent_uuid(), process_uuid);
 
-        // The slice is the function; where it is from is in its arguments.
+        // The slice is the function; its file is the full path, which the
+        // frame's name does not have.
         let f = writer
             .packets
             .iter()
@@ -4395,7 +4452,7 @@ mod tests {
             args,
             [
                 ("language", "python".to_string()),
-                ("file", "app.py".to_string()),
+                ("file", "/srv/app/app.py".to_string()),
                 ("line", "3".to_string()),
             ]
         );

@@ -451,10 +451,10 @@ The task-stacks recorder (`--add-recorder task-stacks`): periodic snapshots
 of every targeted thread's stack, taken with a sleepable BPF task iterator,
 kernel and native user frames, Python frames, or both
 (`--task-stacks-frames native|python|all`). Its events are a table of their
-own, with the stack by id into `stack` as every other recorder's. With it
-comes a change to every recorder's stacks that have Python frames
+own, with the stack by id into `stack` as every other recorder's. With it come
+two changes to every recorder's stacks that have Python frames
 (`--collect-pystacks`): where those frames stand in the stack (Changed
-semantics, below).
+semantics, below), and their files' full paths beside them (`frame_files`).
 
 ### New tables
 - `task_stack_event` — one thread as a snapshot found it, for as long as it
@@ -516,13 +516,42 @@ semantics, below).
   the Python segment finds none in an interleaved stack; one that classifies
   each frame by its name is unaffected.
 
+### Added columns and tables
+- `stack` (Parquet): added `frame_files VARCHAR[]`, parallel to `frame_names`:
+  the full path of a frame's source file where one is known, NULL for the
+  frames that have none, and NULL altogether for a stack none of whose frames
+  has. That is the Python frames of every stack (with `--collect-pystacks`),
+  whose entry in `frame_names` has the file by name alone (`f (python)
+  [app.py:3]`): the path is as much of it as the BPF side keeps, its last 192
+  bytes. And it is the native and kernel frames of the task-stacks recorder's
+  stacks (ids from 2,000,000,000), where debug info names the directory: the
+  path on the machine that built the binary, not one on the traced host. The
+  other recorders' stacks carry no native paths, so a capture that does not
+  ask for task-stacks grows by nothing but the Python frames'. `frame_names`, the stack ids and everything keyed on them are as they
+  were: the column is beside them, not in them. Absent from traces recorded
+  before schema 23.
+- `frame_file` (DuckDB) — the same, for the interned form (trace_id, frame_id,
+  file): a row for each `frame` that has a path (a frame both a task-stacks
+  stack and another recorder's share has one). A side table so that `frame`
+  keeps its shape and a frame is still identified by its name; join it on
+  `(trace_id, frame_id = frame.id)`. The path is per frame NAME, the first
+  seen: a Python frame's name has its file's base name only, so two functions
+  of one name in files of one name share a path here (`stack.parquet` has the
+  path per stack, and is exact). And being the frame's, not the stack's, it
+  comes back on export to parquet in every stack that has the frame: that the
+  other recorders' stacks carry no native paths is what the recorder writes,
+  not something a round trip through a database keeps. Empty for a trace no
+  frame of which has a path and for one imported from an older
+  `stack.parquet`.
+
 ### Behaviour change (no schema effect)
 - The Perfetto trace draws the table as a `Task Stacks: <thread>` track under
   each thread: the stack over time the way py-spy's Chrome trace output draws
   it, each frame one slice for as long as it stays on the stack (frames match
   on function, module and source line, not on the address), root at the top.
   A slice is named after the function alone; `language` (`python`, `native`,
-  `kernel`), `file`, `line`, `module` and `address` are its arguments. A main
+  `kernel`), `file` (the full path where `frame_files` has it), `line`,
+  `module` and `address` are its arguments. A main
   thread gets a thread track of its own for it, under the thread's name.
   The iterations, deltas and state are in the table only.
 

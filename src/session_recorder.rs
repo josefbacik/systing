@@ -1789,14 +1789,16 @@ impl SessionRecorder {
         }
         stage_done("Flushed memory trace records", &mut stage_start);
 
-        // The task-stacks recorder's stacks are symbolized with the others.
+        // The task-stacks recorder's stacks are symbolized with the others, and
+        // get their native frames' full source paths, which the others' do not.
         {
             let task_stacks_interner = self.task_stacks_recorder.lock().unwrap().take_interner();
             if task_stacks_interner.total() > 0 {
-                self.stack_recorder
-                    .lock()
-                    .unwrap()
-                    .merge_external_interner(task_stacks_interner);
+                let mut stack_recorder = self.stack_recorder.lock().unwrap();
+                stack_recorder.merge_external_interner(task_stacks_interner);
+                stack_recorder.keep_native_paths_from(
+                    crate::task_stacks_recorder::TASK_STACKS_STACK_ID_OFFSET,
+                );
             }
         }
 

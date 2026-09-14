@@ -578,7 +578,7 @@ impl StackInterner {
 fn emit_stack_record(
     collector: &mut dyn RecordCollector,
     stack_id: i64,
-    frame_names: Vec<String>,
+    (frame_names, frame_files): (Vec<String>, Vec<Option<String>>),
 ) -> Result<()> {
     if frame_names.is_empty() {
         return Ok(());
@@ -592,6 +592,7 @@ fn emit_stack_record(
         frame_names,
         depth,
         leaf_name,
+        frame_files,
     })
 }
 
@@ -1224,6 +1225,14 @@ pub struct StackRecorder {
     /// `finish()`. Id ranges are disjoint per interner, so identical contents
     /// interned by two recorders simply emit one StackRecord per id.
     external_interners: Vec<StackInterner>,
+    /// Stacks with ids from here up get the full path of their native and
+    /// kernel frames' source files in `StackRecord::frame_files`, beside the
+    /// Python frames' that every stack gets: see [`Self::keep_native_paths_from`].
+    native_paths_from: Option<i64>,
+    /// While `native_paths_from` is set: the source file, by full path, of
+    /// each native or kernel frame symbolized with debug info, under the
+    /// frame's name (which has the file by name alone).
+    source_paths: std::cell::RefCell<HashMap<String, String>>,
     /// Directory for spill tempfiles. Retained so `finish()` can re-spill
     /// alive-process stacks into per-bucket files (see [`RESPILL_BUCKETS`]).
     spill_dir: Option<PathBuf>,
@@ -1304,6 +1313,8 @@ impl StackRecorder {
             interner: StackInterner::new(1)
                 .with_id_limit(crate::memory_recorder::MEMORY_STACK_ID_OFFSET),
             external_interners: Vec::new(),
+            native_paths_from: None,
+            source_paths: Default::default(),
             spill_dir: None,
             utid_generator,
             frame_labels: true,
@@ -1379,6 +1390,30 @@ impl StackRecorder {
     /// contents interned by both recorders emit one StackRecord per id.
     pub(crate) fn merge_external_interner(&mut self, interner: StackInterner) {
         self.external_interners.push(interner);
+    }
+
+    /// Give the stacks with ids from `first_id` up the full path of their
+    /// native and kernel frames' source files, where debug info has one: the
+    /// frame's name has the file by name alone, as it always had, and the path
+    /// goes beside it in `StackRecord::frame_files`. Stacks below `first_id`,
+    /// the recorders' that were here before, are written as they always were.
+    /// Interners have disjoint id ranges, so this picks a recorder's stacks.
+    pub(crate) fn keep_native_paths_from(&mut self, first_id: i64) {
+        self.native_paths_from = Some(first_id);
+    }
+
+    /// Remember the full path of `sym`'s source file under `frame_name`, when
+    /// paths are being kept and debug info names the directory.
+    fn note_source_path(&self, frame_name: &str, sym: &Sym) {
+        if self.native_paths_from.is_none() {
+            return;
+        }
+        if let Some(path) = source_path(sym.code_info.as_deref()) {
+            self.source_paths
+                .borrow_mut()
+                .entry(frame_name.to_string())
+                .or_insert(path);
+        }
     }
 
     /// Create a symbolizer with the configured process dispatcher.
@@ -1600,6 +1635,7 @@ impl StackRecorder {
                 let frame_names = self.symbolize_stack_frames(
                     &mut symbolizer,
                     &stack,
+                    self.native_paths_from.is_some_and(|from| stack_id >= from),
                     None,
                     &kernel_src,
                     &mut kernel_cache,
@@ -1788,6 +1824,7 @@ impl StackRecorder {
                     let frame_names = self.symbolize_stack_frames(
                         &mut symbolizer,
                         &stack,
+                        self.native_paths_from.is_some_and(|from| stack_id >= from),
                         Some((&ctx, &mut user_cache, &mut live_bid_cache)),
                         &kernel_src,
                         &mut kernel_cache,
@@ -1833,7 +1870,9 @@ impl StackRecorder {
                 .ok()
                 .and_then(|s| s.into_sym())
             {
-                return format_symbolized_frame(&sym, addr, "unknown", self.elide_generics);
+                let name = format_symbolized_frame(&sym, addr, "unknown", self.elide_generics);
+                self.note_source_path(&name, &sym);
+                return name;
             }
         }
 
@@ -1848,12 +1887,14 @@ impl StackRecorder {
             {
                 // sym.module would render the map_files link; report the
                 // original binary the island belongs to instead.
-                return format_symbolized_frame_forced_module(
+                let name = format_symbolized_frame_forced_module(
                     &sym,
                     addr,
                     &bridge.module_name,
                     self.elide_generics,
                 );
+                self.note_source_path(&name, &sym);
+                return name;
             }
         }
 
@@ -1926,12 +1967,14 @@ impl StackRecorder {
                 // The trailing <...> slot carries the file offset (the
                 // frame's identity within the module), not a virtual
                 // address — build-id frames don't have one.
-                return format_symbolized_frame_forced_module(
+                let name = format_symbolized_frame_forced_module(
                     &sym,
                     offset,
                     &bin.display_module,
                     self.elide_generics,
                 );
+                self.note_source_path(&name, &sym);
+                return name;
             }
             // Store hit, symbol unresolved: the module is still known.
             return render_unresolved_build_id(
@@ -1963,13 +2006,20 @@ impl StackRecorder {
         &self,
         symbolizer: &mut Symbolizer,
         stack: &Stack,
+        native_paths: bool,
         user: Option<LiveUserState<'_, '_>>,
         kernel_src: &Source<'_>,
         kernel_cache: &mut HashMap<u64, String>,
         bid_store: &mut BuildIdStore,
         bid_cache: &mut HashMap<BuildIdFrameKey, String>,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<Option<String>>) {
         let python_frames = self.psr.get_python_frames(&stack.py_stack);
+        // A Python frame's name has its file by name alone; the full path
+        // goes beside the names (StackRecord::frame_files).
+        let python_files: HashMap<String, String> = python_frames
+            .iter()
+            .filter_map(|f| Some((f.name.clone(), f.file.clone()?)))
+            .collect();
 
         // Symbolize user addresses
         let mut frame_names = Vec::with_capacity(stack.user_stack.len());
@@ -2042,14 +2092,33 @@ impl StackRecorder {
                         .symbolize_single(kernel_src, Input::AbsAddr(addr))
                         .ok()
                         .and_then(|s| s.into_sym())
-                        .map(|s| format_symbolized_frame(&s, addr, "[kernel]", self.elide_generics))
+                        .map(|s| {
+                            let name =
+                                format_symbolized_frame(&s, addr, "[kernel]", self.elide_generics);
+                            self.note_source_path(&name, &s);
+                            name
+                        })
                         .unwrap_or_else(|| format!("unknown ([kernel]) <{addr:#x}>"))
                 })
                 .clone();
             frame_names.push(frame_name);
         }
 
-        frame_names
+        // The Python frames' paths for every stack; the native and kernel
+        // frames' too for the stacks asked for (keep_native_paths_from).
+        let source_paths = self.source_paths.borrow();
+        let frame_files: Vec<Option<String>> = frame_names
+            .iter()
+            .map(|name| match python_files.get(name) {
+                Some(path) => Some(path.clone()),
+                None if native_paths => source_paths.get(name).cloned(),
+                None => None,
+            })
+            .collect();
+        if frame_files.iter().all(Option::is_none) {
+            return (frame_names, Vec::new());
+        }
+        (frame_names, frame_files)
     }
 
     pub fn init_pystacks(&mut self, pids: &[u32], bpf_object: &libbpf_rs::Object, debug: bool) {
@@ -2140,6 +2209,14 @@ fn interleave_python_frames(python: Vec<PythonFrame>, user: Vec<String>) -> Vec<
         }
     }
     frames
+}
+
+/// The full path of the source file debug info names, when it names the
+/// directory too: [`format_location_info`] has the file alone.
+fn source_path(code_info: Option<&blazesym::symbolize::CodeInfo>) -> Option<String> {
+    let info = code_info?;
+    let path = info.dir.as_ref()?.join(&info.file);
+    Some(path.to_string_lossy().into_owned())
 }
 
 /// Formats code location information as a string suffix (e.g., "[file.rs:123]")
@@ -2996,13 +3073,17 @@ mod tests {
         emit_stack_record(
             &mut collector,
             7,
-            vec!["root".to_string(), "mid".to_string(), "leaf".to_string()],
+            (
+                vec!["root".to_string(), "mid".to_string(), "leaf".to_string()],
+                vec![None, Some("/app/mid.py".to_string()), None],
+            ),
         )
         .unwrap();
         let stacks = &collector.data().stacks;
         assert_eq!(stacks.len(), 1);
         assert_eq!(stacks[0].leaf_name, "leaf");
         assert_eq!(stacks[0].depth, 3);
+        assert_eq!(stacks[0].frame_files[1].as_deref(), Some("/app/mid.py"));
     }
 
     #[test]
@@ -3330,6 +3411,7 @@ mod tests {
                 } else {
                     format!("{f} (python) [app.py:1]")
                 },
+                file: None,
                 entry: *f == "ENTRY",
             })
             .collect()
@@ -3480,6 +3562,31 @@ mod tests {
             funcs(&merged),
             ["worker", "_PyEval_EvalFrameDefault", "dealloc"]
         );
+    }
+
+    #[test]
+    fn source_path_is_the_directory_and_the_file_debug_info_names() {
+        use blazesym::symbolize::CodeInfo;
+        fn info<'a>(dir: Option<&'a str>, file: &'a str) -> CodeInfo<'a> {
+            CodeInfo {
+                dir: dir.map(|d| Path::new(d).into()),
+                file: std::ffi::OsStr::new(file).into(),
+                line: Some(408),
+                column: None,
+                _non_exhaustive: (),
+            }
+        }
+        assert_eq!(
+            source_path(Some(&info(
+                Some("/build/Python-3.13"),
+                "Modules/timemodule.c"
+            )))
+            .as_deref(),
+            Some("/build/Python-3.13/Modules/timemodule.c")
+        );
+        // The file alone is what the frame's name already has.
+        assert_eq!(source_path(Some(&info(None, "timemodule.c"))), None);
+        assert_eq!(source_path(None), None);
     }
 
     #[test]

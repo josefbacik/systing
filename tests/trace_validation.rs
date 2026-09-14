@@ -4011,6 +4011,43 @@ fn parquet_int_column_contains(path: &std::path::Path, column: &str, target: i64
     false
 }
 
+/// Whether any non-null element of a list-of-strings column satisfies `pred`.
+fn parquet_list_column_contains(
+    path: &std::path::Path,
+    column: &str,
+    pred: impl Fn(&str) -> bool,
+) -> bool {
+    use arrow::array::{Array, ListArray, StringArray};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|e| panic!("Failed to open {}: {e}", path.display()));
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .expect("Failed to create reader")
+        .build()
+        .expect("Failed to build reader");
+    for batch in reader {
+        let batch = batch.expect("Failed to read batch");
+        let Some(lists) = batch
+            .column_by_name(column)
+            .and_then(|c| c.as_any().downcast_ref::<ListArray>())
+        else {
+            continue;
+        };
+        for i in (0..lists.len()).filter(|&i| !lists.is_null(i)) {
+            let inner = lists.value(i);
+            let strings = inner
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("list of strings");
+            if (0..strings.len()).any(|j| !strings.is_null(j) && pred(strings.value(j))) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn parquet_column_contains_prefix(path: &std::path::Path, column: &str, prefix: &str) -> bool {
     parquet_column_matches(path, column, |v| v.starts_with(prefix))
 }
@@ -5360,6 +5397,13 @@ def task_stacks_marker():
         assert!(
             python_frames && marker,
             "[frames={frames:?}] the thread's Python frame is in none of its stacks"
+        );
+        // Beside the names, the Python frames' full paths: the workload's
+        // script is in the temp dir, which its name alone does not say.
+        assert!(
+            parquet_list_column_contains(&stack_path, "frame_files", |file| file.starts_with('/')
+                && file.ends_with("task_stacks.py")),
+            "[frames={frames:?}] no full path to the workload's script in stack.frame_files"
         );
         let (_, has_kernel_frames) = find_python_symbols_in_parquet(&stack_path, "([kernel])");
         assert_eq!(

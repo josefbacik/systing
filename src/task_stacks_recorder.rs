@@ -71,7 +71,7 @@ const _: () = assert!(
 
 /// First id of the task-stacks recorder's stack ids: the stack recorder's
 /// own start at 1 and the memory recorder's at `MEMORY_STACK_ID_OFFSET`.
-const TASK_STACKS_STACK_ID_OFFSET: i64 = 2_000_000_000;
+pub(crate) const TASK_STACKS_STACK_ID_OFFSET: i64 = 2_000_000_000;
 
 /// Most frames BPF emits per stack segment (TASK_STACKS_MAX_DEPTH).
 const MAX_FRAMES: usize = 127;

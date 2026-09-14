@@ -11,8 +11,10 @@ use {
 /// A symbolized Python frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PythonFrame {
-    /// `function (python) [file:line]`.
+    /// `function (python) [file:line]`, the file by its name alone.
     pub name: String,
+    /// The file's full path, as far as BPF kept it (the last 192 bytes).
+    pub file: Option<String>,
     /// One of the interpreter's own entry frames rather than a function's: see
     /// [`is_entry_frame`].
     pub entry: bool,
@@ -414,6 +416,7 @@ impl StackWalkerRun {
                 };
                 PythonFrame {
                     name,
+                    file: (!filename.is_empty() && filename != "unknown").then_some(filename),
                     entry: is_entry_frame(&func_name, frame.addr.inst_idx),
                 }
             })

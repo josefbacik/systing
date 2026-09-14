@@ -282,8 +282,9 @@ sudo systing --add-recorder task-stacks --task-stacks-frames all --pid 1234 -d 1
 - In the Perfetto trace each thread gets a `Task Stacks: <thread>` track: the
   stack over time the way py-spy's Chrome trace output draws it, each frame one
   slice for as long as it stays on the stack, root at the top. A slice is named
-  after the function alone; `language`, `file`, `line`, `module` and `address`
-  are its arguments.
+  after the function alone; `language`, `file` (the full path, for Python frames
+  and for native frames with debug info), `line`, `module` and `address` are
+  its arguments.
 
 What to keep in mind: a row's `ts` is the start of its iteration's walk, which
 reaches a given thread up to one walk later. A blocked thread's stack is exact;

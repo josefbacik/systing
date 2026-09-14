@@ -49,6 +49,7 @@ Two representations exist:
 - `stack_sample(ts, utid, cpu, stack_id, stack_event_type)`. `stack_event_type`: `0` = uninterruptible sleep, `1` = CPU, `2` = interruptible sleep.
 - `stack(id, frame_ids BIGINT[], depth, leaf_name)`. **`frame_ids` is root-to-leaf** (outermost caller first, innermost executing frame last); `leaf_name` is the last frame's name.
 - `frame(id, name)` — interned strings, dense per-trace ids.
+- `frame_file(frame_id, file)` — the full source path of the frames that have one (from schema 23: Python frames, and the native and kernel frames of `task-stacks` stacks where debug info has the directory, which is the build machine's path): `frame.name` has only the file's name. `LEFT JOIN frame_file ff ON ff.trace_id = f.trace_id AND ff.frame_id = f.id`.
 - Join on **both** `trace_id` and the id: `JOIN stack s ON s.trace_id = ss.trace_id AND s.id = ss.stack_id`.
 - The `stack_frames` **view** reconstructs a `frame_names VARCHAR[]` column (root-to-leaf) for ad-hoc queries — convenient but slower than joining `frame` directly.
 

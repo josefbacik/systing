@@ -309,6 +309,14 @@ pub fn stack_schema() -> Arc<Schema> {
         ),
         Field::new("depth", DataType::Int32, false),
         Field::new("leaf_name", DataType::Utf8, false),
+        // Parallel to frame_names: a frame's full source path where known
+        // (Python frames; the native frames of task-stacks stacks), else
+        // null; the list is null when none is.
+        Field::new(
+            "frame_files",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
     ]))
 }
 
