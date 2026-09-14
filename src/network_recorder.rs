@@ -1121,15 +1121,17 @@ impl NetworkRecorder {
         for socket in &sockets {
             self.maybe_emit_socket_record(socket)?;
         }
+        // The collector is resolved before any id is consumed, so the one
+        // early return here leaves the ids exactly where they were.
+        let collector = self
+            .streaming_collector
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Streaming collector not set in append_packet_batch"))?;
         let first_id = self.next_packet_id;
         for record in records.iter_mut() {
             record.id = self.next_packet_id;
             self.next_packet_id += 1;
         }
-        let collector = self
-            .streaming_collector
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("Streaming collector not set in append_packet_batch"))?;
         if let Err(e) = collector.add_network_packet_batch(records) {
             self.next_packet_id = first_id;
             return Err(e);
