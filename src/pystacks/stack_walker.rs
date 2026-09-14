@@ -8,6 +8,40 @@ use {
     crate::pystacks::types::StackWalkerFrame, std::fmt,
 };
 
+/// A symbolized Python frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PythonFrame {
+    /// `function (python) [file:line]`.
+    pub name: String,
+    /// One of the interpreter's own entry frames rather than a function's: see
+    /// [`is_entry_frame`].
+    pub entry: bool,
+}
+
+/// Whether a frame is an interpreter entry frame. From 3.12 CPython pushes a
+/// frame of its own each time C enters the bytecode loop (one per native
+/// `_PyEval_EvalFrameDefault`), and links it into the chain the BPF walk
+/// follows: they mark where, among the native frames, each run of Python
+/// frames belongs, and name no Python function. In 3.12 its code object is a
+/// real one named `<interpreter trampoline>`. In 3.13 it is `None`, which
+/// reads well enough as memory but has no qualname, so BPF reports
+/// `[Frame Error]` with an instruction index it computed from that garbage; a
+/// frame whose code object could not be READ, a real failure worth showing,
+/// never gets as far as an index and keeps -1.
+///
+/// The 3.13 rule leans on the build: "no qualname" is the word that follows
+/// `_Py_NoneStruct` at the qualname's offset not being a pointer, which it is
+/// not (it is 0) on the 3.13 and 3.14 builds looked at, and which nothing in
+/// CPython promises. Where it is one, the entry frame comes out as a Python
+/// frame with a name read from wherever it points, the runs come out one
+/// short per entry, and the process's stacks keep the block layout
+/// (`interleave_python_frames` in the stack recorder) with that frame in them.
+/// The interpreter's own mark is `_PyInterpreterFrame.owner`, which only BPF
+/// can read.
+fn is_entry_frame(func_name: &str, inst_idx: i32) -> bool {
+    func_name == "<interpreter trampoline>" || (func_name == "[Frame Error]" && inst_idx != -1)
+}
+
 #[derive(Debug, Clone)]
 pub struct PyAddr {
     pub addr: StackWalkerFrame,
@@ -326,13 +360,13 @@ impl StackWalkerRun {
         }
     }
 
-    pub fn get_python_frame_names(&self, py_stack: &[PyAddr]) -> Vec<String> {
+    pub fn get_python_frames(&self, py_stack: &[PyAddr]) -> Vec<PythonFrame> {
         use std::sync::atomic::Ordering;
 
         if !self.initialized() {
             if self.is_debug() && !py_stack.is_empty() {
                 eprintln!(
-                    "[pystacks debug] get_python_frame_names: not initialized, returning empty for {} frames",
+                    "[pystacks debug] get_python_frames: not initialized, returning empty for {} frames",
                     py_stack.len()
                 );
             }
@@ -374,9 +408,13 @@ impl StackWalkerRun {
                     .and_then(|f| f.to_str())
                     .unwrap_or(&filename);
 
-                match line_number {
+                let name = match line_number {
                     Some(line) => format!("{func_name} (python) [{base_filename}:{line}]"),
                     None => format!("{func_name} (python) [{base_filename}]"),
+                };
+                PythonFrame {
+                    name,
+                    entry: is_entry_frame(&func_name, frame.addr.inst_idx),
                 }
             })
             .collect()
@@ -397,3 +435,20 @@ impl Drop for StackWalkerRun {
 
 unsafe impl Send for StackWalkerRun {}
 unsafe impl Sync for StackWalkerRun {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_frames_are_the_trampoline_and_the_readable_frame_error() {
+        // 3.12: a real code object of that name.
+        assert!(is_entry_frame("<interpreter trampoline>", 0));
+        // 3.13: `None` for a code object, read fine, index computed from it.
+        assert!(is_entry_frame("[Frame Error]", -685857));
+        // A code object that could not be read: a failure to show.
+        assert!(!is_entry_frame("[Frame Error]", -1));
+        assert!(!is_entry_frame("main", 12));
+        assert!(!is_entry_frame("main", -1));
+    }
+}

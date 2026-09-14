@@ -232,7 +232,9 @@ tools can distinguish uniformly-ordered databases.
   the python segment is now stored root-to-leaf like the user and kernel
   segments, making the whole array one coherent root-to-leaf sequence
   (outermost caller first, innermost executing frame last). Segment layout is
-  unchanged: python (outermost), then user, then kernel. v11 and older
+  unchanged: python (outermost), then user, then kernel (through schema 22;
+  from 23 the Python frames stand among the user frames, see that entry).
+  v11 and older
   databases keep the mixed order they were written with — the python segment
   cannot be re-ordered after the fact without classifying frames by name
   (note for anyone attempting that: root-side markers — `<module>`, threading
@@ -449,8 +451,10 @@ The task-stacks recorder (`--add-recorder task-stacks`): periodic snapshots
 of every targeted thread's stack, taken with a sleepable BPF task iterator,
 kernel and native user frames, Python frames, or both
 (`--task-stacks-frames native|python|all`). Its events are a table of their
-own, with the stack by id into `stack` as every other recorder's; nothing
-else changes.
+own, with the stack by id into `stack` as every other recorder's. With it
+comes a change to every recorder's stacks that have Python frames
+(`--collect-pystacks`): where those frames stand in the stack (Changed
+semantics, below).
 
 ### New tables
 - `task_stack_event` — one thread as a snapshot found it, for as long as it
@@ -489,6 +493,28 @@ else changes.
   `SELECT sf.frame_names FROM task_stack_event e
    JOIN stack_frames sf ON sf.trace_id = e.trace_id AND sf.id = e.stack_id
    WHERE e.utid = ? AND e.ts <= T AND T < e.ts + e.dur`.
+
+### Changed semantics
+- `stack.frame_ids` (and `frame_names` in parquet / the `stack_frames` view),
+  in the stacks of every recorder that have Python frames (the CPU sampler's,
+  the sleep stacks', the memory recorder's, task-stacks'): the Python frames
+  stand where the interpreter ran them among the native user frames, no
+  longer as one block at the root end (the v12 layout: python, then user, then
+  kernel). Each run of Python frames takes the place of the
+  `_PyEval_EvalFrameDefault` frame it ran in, which is gone from the stack,
+  and so are the interpreter's own entry frames (3.12's `<interpreter
+  trampoline>`, 3.13+'s `[Frame Error]`), which named no function. The kernel
+  frames still come last. A stack whose runs and loop frames do not pair up
+  keeps the v12 block layout, less the entry frames: a native stack that lost
+  a loop frame (the frame-pointer unwinder skips the caller of a function
+  built without one, so one such extension function called from the loop
+  hides it), Python 3.11 re-entered from C, a Python walk cut at its 127
+  frames. The choice is per stack and nothing in the row marks it: within one
+  trace a Python function can stand under `main … run_mod` in one stack and
+  at the start of the array in another, and a flamegraph splits it between
+  the two roots. A reader that takes the leading run of `(python)` frames for
+  the Python segment finds none in an interleaved stack; one that classifies
+  each frame by its name is unaffected.
 
 ### Behaviour change (no schema effect)
 - The Perfetto trace draws the table as a `Task Stacks: <thread>` track under

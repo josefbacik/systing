@@ -224,10 +224,11 @@ fn is_python_frame(name: &str) -> bool {
 }
 
 /// Whether a python frame is a root-side marker: the module toplevel,
-/// CPython's interpreter entry trampoline, or the threading bootstrap.
-/// These only ever appear at the root side of a python stack (the
-/// trampoline sits beyond `<module>`), which makes a stored python run's
-/// direction decidable from where its markers fall.
+/// CPython's interpreter entry trampoline (in traces from before schema 23,
+/// which drops it), or the threading bootstrap. These only ever appear at
+/// the root side of a python stack (the trampoline sits beyond `<module>`),
+/// which makes a stored python run's direction decidable from where its
+/// markers fall.
 fn is_python_root_marker(name: &str) -> bool {
     if !is_python_frame(name) {
         return false;
@@ -289,8 +290,9 @@ fn python_runs_stored_leaf_first(
 }
 
 /// Restores uniform root-first order for stacks whose python segments were
-/// stored leaf-first: the python segment is always the leading run of the
-/// array, so reversing that run in place makes the whole array root-first.
+/// stored leaf-first: in those traces the python segment is the leading run
+/// of the array (from schema 23 it need not be, but those are root-first),
+/// so reversing that run in place makes the whole array root-first.
 /// The export's uniform leaf-first reversal is then correct for every
 /// segment. A no-op for native-only stacks (no leading python run).
 fn normalize_legacy_python_run(frame_ids: &mut [i64], is_python: impl Fn(i64) -> bool) {
