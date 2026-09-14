@@ -465,7 +465,74 @@ columns and the reader's schema version. Neither the parquet directory nor
 `_traces` records the WRITER's schema version (`_traces.systing_version` is
 the converting binary's, see the v12 entry), so the report of what was
 dropped reaches only the importing process — the recorder's version in the
-parquet directory remains the planned follow-up.
+parquet directory remains the planned follow-up (delivered in schema 22:
+the `systing_manifest` table and the `_traces.recorder_*` columns, below).
+Two inputs sat outside the guard at first: `stack.parquet`, whose import
+selects its columns by name (an extra column was silently ignored, and
+`--strict-schema` did not refuse it), and a whole `.parquet` file this
+systing has no table for (never opened, so never reported); schema 22
+brings both under it. A `.duckdb` input (`systing-util convert` merging one
+database into another) is outside the flag by design: it merges by column
+intersection, and a source table or column the target lacks is left out
+without a warning.
+
+## Schema Version 22 (unreleased) — 2026-09-12
+
+The recorder now says who it is. A parquet directory carried no writer
+version — `_traces.systing_version` names the systing that CONVERTED it
+(v12) — so a consumer could not tell "this column is NULL because the
+recorder predates it" from "the reader predates the recorder and dropped it
+at import" (the guard above), and the guard's warning could not name the
+writer whose columns it dropped.
+
+### New table
+- `systing_manifest` (parquet only, one row; not a DuckDB table): written
+  by the streaming writer's `finish()` after every table's last flush — so
+  its presence means the writer completed — through the same sink as every
+  table (`systing_manifest.parquet` in a directory; the `systing_manifest`
+  header on `--stream`, which the receiver writes as a file like any
+  table). Columns: `systing_version VARCHAR` (the recorder's
+  `CARGO_PKG_VERSION`), `schema_version INTEGER` (the `SCHEMA_VERSION` it
+  wrote against), `recorded_at_unix_ns BIGINT` (the wall clock,
+  `CLOCK_REALTIME` nanoseconds since the Unix epoch, when the writer
+  finished; 0 when the clock read failed). Its shape is fixed at its
+  introduction, so every reader from schema 22 on can read a manifest
+  written by any later systing.
+
+### Added columns
+- `_traces`: added `recorder_version VARCHAR`, `recorder_schema_version
+  INTEGER`, `recorded_at_unix_ns BIGINT` — the manifest's three values,
+  lifted onto the trace's row at import (`parquet_to_duckdb`,
+  `systing-util convert`; a DuckDB→DuckDB merge copies them when the source
+  has them). NULL for a directory without a manifest — written before
+  schema 22, or by a writer that never reached `finish()` — which imports
+  with no line at all; a manifest that is present but unreadable is
+  reported once and read as absent, never a failure. `systing_version`
+  keeps its v12 meaning (the converter). Read the four side by side:
+  `recorder_schema_version > _schema_version.version` means the reader
+  predated the recorder and columns were dropped at import;
+  `recorder_schema_version` below a column's schema means the recorder
+  predates that column and its NULL is age, not loss.
+
+### Behaviour change (no schema effect)
+- The guard's warning and its `--strict-schema` refusal name the writer
+  when the manifest is present ("the trace was written by systing 1.N
+  (schema K)") and say so when it is not.
+- `stack.parquet` is under the guard: its columns are read before the
+  import, an extra one is reported under table `stack` (or refused under
+  `--strict-schema`); the known columns import as before.
+- A `.parquet` file in the directory this systing has no table for is
+  reported by name (`ImportReport::unknown_files`, one warning line) and
+  refused under `--strict-schema`; the tables around it import.
+- A refused import leaves no database behind: `parquet_to_duckdb` removes
+  the `.duckdb` it created (and DuckDB's `.wal` beside it) on any error, so
+  a caller never finds a hollow-but-valid database where a refusal
+  happened.
+- `systing-util convert` prints one `Schema note:` line at the end of a run
+  that left anything out; `systing-analyze trace info` and the MCP
+  `trace_info` tool report `recorder_version`, `recorder_schema_version`
+  and `recorded_at_unix_ns` per trace under `trace_versions` (absent when
+  NULL); the profile export's header gains `source_recorder_version`.
 
 ## Schema Version 21 (systing 1.18.0) — 2026-09-04
 

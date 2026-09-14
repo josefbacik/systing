@@ -517,6 +517,23 @@ pub struct ClockSnapshotRecord {
     pub is_primary: bool,
 }
 
+/// The recorder's own identity, written once per parquet directory as the
+/// one-row `systing_manifest` table (schema 22): which systing wrote the
+/// tables, against which `SCHEMA_VERSION`, and when it finished. A
+/// directory without it was written before the manifest existed (schema
+/// < 22) or by a writer that never reached `finish()`; the import reads
+/// both as "unknown", never as an error.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManifestRecord {
+    /// `CARGO_PKG_VERSION` of the systing that wrote the directory.
+    pub systing_version: String,
+    /// The `SCHEMA_VERSION` the tables were written against.
+    pub schema_version: u32,
+    /// Wall clock (`CLOCK_REALTIME`, nanoseconds since the Unix epoch) when
+    /// the writer finished; 0 when the clock read failed.
+    pub recorded_at_unix_ns: i64,
+}
+
 /// System info record - kernel version, machine, and platform information.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SysInfoRecord {

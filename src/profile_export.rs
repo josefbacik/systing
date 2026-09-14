@@ -44,12 +44,18 @@ pub struct ExportMeta {
     /// the header so consumers can reason about semantics that changed
     /// across schema versions.
     pub source_schema_version: Option<u32>,
-    /// The systing version that recorded the selected trace
-    /// (`_traces.systing_version`; this binary's version when exporting from
-    /// a fresh recording). Informational — the exporter already normalizes
-    /// legacy stack order (see [`stack_order_normalized`]) — but lets
-    /// consumers reason about other per-version semantics.
+    /// The systing version that CONVERTED the selected trace into the source
+    /// database (`_traces.systing_version`; this binary's version when
+    /// exporting from a fresh recording). Informational — the exporter
+    /// already normalizes legacy stack order (see
+    /// [`stack_order_normalized`]) — but lets consumers reason about other
+    /// per-version semantics.
     pub source_systing_version: Option<String>,
+    /// The systing version that RECORDED the selected trace, from the
+    /// parquet directory's manifest (`_traces.recorder_version`, schema 22;
+    /// this binary's version when exporting from a fresh recording). `None`
+    /// for a trace without a manifest or a database older than schema 22.
+    pub source_recorder_version: Option<String>,
     pub sample_event: Option<String>,
     pub sample_period: Option<i64>,
     pub start_ts: i64,
@@ -93,6 +99,7 @@ impl ExportWriter {
             "trace_id": meta.trace_id,
             "source_schema_version": meta.source_schema_version,
             "source_systing_version": meta.source_systing_version,
+            "source_recorder_version": meta.source_recorder_version,
             "sample_event": meta.sample_event,
             "sample_period": meta.sample_period,
             "event_types": {
@@ -373,12 +380,24 @@ pub fn duckdb_to_profile_export(
             |row| row.get(0),
         )
         .ok();
+    // The recorder's version (schema 22) — absent in older databases, so
+    // the failed read of a missing column is the pre-manifest era, not an
+    // error.
+    let source_recorder_version: Option<String> = conn
+        .query_row(
+            "SELECT recorder_version FROM _traces WHERE trace_id = ?",
+            [&trace_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
     let mut meta = ExportMeta {
         trace_id: trace_id.clone(),
         source_schema_version: conn
             .query_row("SELECT version FROM _schema_version", [], |row| row.get(0))
             .ok(),
         source_systing_version: source_systing_version.clone(),
+        source_recorder_version,
         ..Default::default()
     };
     let mut stmt = conn.prepare(
@@ -605,6 +624,7 @@ pub fn parquet_to_profile_export(input_dir: &Path, output: &Path, trace_id: &str
         // binary's.
         source_schema_version: Some(crate::duckdb::SCHEMA_VERSION),
         source_systing_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        source_recorder_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         start_ts,
         end_ts,
         ..Default::default()

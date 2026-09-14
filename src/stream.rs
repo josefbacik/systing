@@ -76,6 +76,7 @@ pub const TABLE_NAMES: &[&str] = &[
     "tpu_device",
     "tpu_op",
     "tpu_metric",
+    "systing_manifest",
 ];
 
 /// A socket endpoint to stream parquet data to (or, on the receive side,

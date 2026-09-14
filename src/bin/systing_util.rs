@@ -84,9 +84,12 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
 
-        /// Refuse a Parquet input carrying a column this systing's schema does
-        /// not have (a trace written by a newer systing) instead of importing
-        /// the known columns and warning about the rest
+        /// Refuse a Parquet input carrying a column, or a whole parquet file,
+        /// this systing's schema does not have (a trace written by a newer
+        /// systing) instead of importing the known columns and tables and
+        /// warning about the rest. Covers every table of a Parquet directory,
+        /// stack.parquet included; a .duckdb input merges by column
+        /// intersection and is outside the flag
         #[arg(long)]
         strict_schema: bool,
     },
@@ -3459,6 +3462,61 @@ fn run_convert(
     // Import Parquet files for a table, filtering to only existing files.
     // Handles trace_id injection for Parquet directories (which don't have trace_id column).
     let mut import_report = ImportReport::default();
+
+    // A Parquet directory's own provenance and its unknown files, per
+    // directory: the recorder's manifest goes on the trace's `_traces` row
+    // (NULL for a directory written before the manifest existed), and a
+    // parquet file this systing has no table for is reported by name —
+    // refused under --strict-schema, as an unknown column is.
+    for result in successful_results
+        .iter()
+        .filter(|r| r.needs_trace_id_injection)
+    {
+        if let Some(manifest) =
+            systing::duckdb::read_manifest(&conn, &result.parquet_paths.manifest)
+        {
+            systing::duckdb::record_manifest(&conn, &result.trace_id, &manifest)?;
+            if verbose {
+                eprintln!(
+                    "  {}: recorded by systing {} (schema {})",
+                    result.trace_id, manifest.systing_version, manifest.schema_version
+                );
+            }
+        }
+        let unknown =
+            systing::duckdb::unknown_parquet_files(&result.source_path, &result.parquet_paths);
+        systing::duckdb::note_unknown_files(&result.source_path, &unknown, import_options)?;
+        import_report.unknown_files.extend(
+            unknown
+                .into_iter()
+                .map(|f| format!("{}: {f}", result.trace_id)),
+        );
+    }
+
+    // stack.parquet (the parquet-directory inputs only) is interned into
+    // frame + stack.frame_ids by its own statements, behind the same guard
+    // as every other table: an extra column is reported, or refused under
+    // --strict-schema. It goes first so the guard's report is written before
+    // the per-table closure below borrows it.
+    {
+        let start = Instant::now();
+        for result in successful_results.iter() {
+            let path = &result.parquet_paths.stack;
+            if path.exists() {
+                systing::duckdb::import_stack_from_parquet_with_options(
+                    &conn,
+                    path,
+                    &result.trace_id,
+                    import_options,
+                    &mut import_report,
+                )?;
+            }
+        }
+        if verbose {
+            eprintln!("  stack import: {:.2}s", start.elapsed().as_secs_f64());
+        }
+    }
+
     let mut import_table = |table_name: &str,
                             get_path: fn(&ParquetPaths) -> &PathBuf|
      -> Result<()> {
@@ -3573,18 +3631,8 @@ fn run_convert(
     // (denormalized) which is interned into frame + stack.frame_ids on import.
     // Only the parquet-directory inputs (needs_trace_id_injection) produce a
     // stack.parquet; .pb extraction uses the legacy stack_profile_* tables.
-    {
-        let start = Instant::now();
-        for result in successful_results.iter() {
-            let path = &result.parquet_paths.stack;
-            if path.exists() {
-                systing::duckdb::import_stack_from_parquet(&conn, path, &result.trace_id)?;
-            }
-        }
-        if verbose {
-            eprintln!("  stack import: {:.2}s", start.elapsed().as_secs_f64());
-        }
-    }
+    // (Imported above, ahead of the per-table loop, behind the same guard as
+    // every other table.)
     import_table("stack_sample", |p| &p.stack_sample)?;
     // Network interface metadata
     import_table("network_interface", |p| &p.network_interface)?;
@@ -3643,6 +3691,12 @@ fn run_convert(
         for error in &errors {
             eprintln!("  {error}");
         }
+    }
+
+    // What the import left out of a newer trace, once, at the end — the
+    // per-table warnings scrolled by during the import.
+    if let Some(summary) = import_report.summary() {
+        eprintln!("\nSchema note: {summary}");
     }
 
     let elapsed = start_time.elapsed();
