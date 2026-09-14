@@ -60,6 +60,7 @@ systing --list-recorders
 | `markers` | off | Userspace marker events (`faccessat2` with `mode=-975`) |
 | `tpu` | off | TPU op-level profile via XLA runtime gRPC (port 8466) |
 | `tpu-metrics` | off | TPU runtime metrics polling (port 8431, lightweight) |
+| `task-stacks` | off | Periodic stack snapshots of every targeted thread, blocked ones included (`--task-stacks-interval-ms`, default 100; `--task-stacks-frames native\|python\|all`). Output: the `task_stack_event` table and a `Task Stacks: <thread>` track in Perfetto. Needs Linux 6.2+; not with `--continuous` |
 
 Enable extras with `--add-recorder`:
 ```bash
@@ -109,6 +110,7 @@ sudo systing --only-recorder sched --only-recorder network -d 10 --output trace.
 | Flag | Purpose |
 |---|---|
 | `--collect-pystacks` | Resolve Python frames in user stacks |
+| `--task-stacks-frames native\|python\|all` | With the `task-stacks` recorder, the frames to collect: kernel + native, Python alone (only threads that have any), or both. `python` and `all` turn `--collect-pystacks` on |
 | `--pystacks-debug` | Debug output for Python stack tracing |
 | `--enable-debuginfod` | Better symbol resolution (requires `DEBUGINFOD_URLS`) |
 | `--collect-build-id` | Store user frames as (build-id, file offset) so exited processes stay symbolizable offline |

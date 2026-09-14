@@ -70,6 +70,7 @@ pub const TABLE_NAMES: &[&str] = &[
     "memory_iommu",
     "memory_thp",
     "memory_vmstat",
+    "task_stack_event",
     "clock_snapshot",
     "sysinfo",
     "cpu_info",

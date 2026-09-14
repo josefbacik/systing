@@ -134,7 +134,7 @@ pub struct TraceImportMapping {
 }
 
 /// Current schema version. See SCHEMA_CHANGES.md for history.
-pub const SCHEMA_VERSION: u32 = 22;
+pub const SCHEMA_VERSION: u32 = 23;
 
 /// All data tables in the DuckDB schema (excludes the `_traces` metadata table).
 pub const DATA_TABLES: &[&str] = &[
@@ -177,6 +177,7 @@ pub const DATA_TABLES: &[&str] = &[
     "memory_iommu",
     "memory_thp",
     "memory_vmstat",
+    "task_stack_event",
     "clock_snapshot",
     "sysinfo",
     "cpu_info",
@@ -656,6 +657,24 @@ pub fn create_schema(conn: &Connection) -> Result<()> {
             stack_id BIGINT
         );
 
+        -- The task-stacks recorder's events: one thread's state and stack
+        -- (stack.id) from ts for dur, over the snapshot iterations
+        -- start_iteration..=end_iteration that found it the same.
+        CREATE TABLE IF NOT EXISTS task_stack_event (
+            trace_id VARCHAR,
+            ts BIGINT,
+            dur BIGINT,
+            utid BIGINT,
+            thread_name VARCHAR, -- reserved: not populated yet, always NULL
+            start_iteration BIGINT,
+            end_iteration BIGINT,
+            utime_delta_ns BIGINT,
+            stime_delta_ns BIGINT,
+            runtime_delta_ns BIGINT,
+            state VARCHAR,
+            stack_id BIGINT
+        );
+
         -- /proc/vmstat counters (THP, compaction, direct reclaim families)
         -- sampled at capture start and end; value_end - value_start is the
         -- host-wide count over the capture.
@@ -1088,7 +1107,7 @@ pub fn import_order_by(table_name: &str) -> Option<&'static str> {
     match table_name {
         "sched_slice" => Some("cpu, ts"),
         "thread_state" => Some("utid, ts"),
-        "stack_sample" => Some("utid, ts"),
+        "stack_sample" | "task_stack_event" => Some("utid, ts"),
         "softirq_slice" | "irq_slice" => Some("cpu, ts"),
         "counter" => Some("track_id, ts"),
         _ => None,
@@ -1454,6 +1473,7 @@ fn import_tables(
     import_table("memory_iommu", &paths.memory_iommu)?;
     import_table("memory_thp", &paths.memory_thp)?;
     import_table("memory_vmstat", &paths.memory_vmstat)?;
+    import_table("task_stack_event", &paths.task_stack_event)?;
 
     // Clock snapshot
     import_table("clock_snapshot", &paths.clock_snapshot)?;
@@ -1977,6 +1997,7 @@ pub fn duckdb_to_parquet(db_path: &Path, output_dir: &Path, trace_id: &str) -> R
     export_table("memory_iommu", &paths.memory_iommu)?;
     export_table("memory_thp", &paths.memory_thp)?;
     export_table("memory_vmstat", &paths.memory_vmstat)?;
+    export_table("task_stack_event", &paths.task_stack_event)?;
 
     // Clock snapshot
     export_table("clock_snapshot", &paths.clock_snapshot)?;

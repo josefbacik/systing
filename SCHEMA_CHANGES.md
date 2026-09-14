@@ -443,6 +443,63 @@ old behaviour — a capture without its CPU stack sampler is not a capture.
 `systing-analyze trace info` (and the MCP `trace_info` tool) report the four
 new fields under `system`.
 
+## Schema Version 23 (unreleased) — 2026-09-14
+
+The task-stacks recorder (`--add-recorder task-stacks`): periodic snapshots
+of every targeted thread's stack, taken with a sleepable BPF task iterator,
+kernel and native user frames, Python frames, or both
+(`--task-stacks-frames native|python|all`). Its events are a table of their
+own, with the stack by id into `stack` as every other recorder's; nothing
+else changes.
+
+### New tables
+- `task_stack_event` — one thread as a snapshot found it, for as long as it
+  stayed that way (ts, dur, utid, thread_name, start_iteration,
+  end_iteration, utime_delta_ns, stime_delta_ns, runtime_delta_ns, state,
+  stack_id). `ts` is the start of the
+  iteration whose snapshot recorded the thread (iterations are numbered from
+  1, one every `--task-stacks-interval-ms`), `dur` runs to the start of the
+  iteration that found it changed or did not find it (the end of the capture
+  for the last). A thread that has not been on a CPU since its event began
+  and is still in the same non-runnable state cannot have changed its stack:
+  the iterations that find it so, through `end_iteration`, extend the event
+  instead of adding one, so a thread blocked for a minute is one row.
+  `utime_delta_ns` / `stime_delta_ns` / `runtime_delta_ns` are the thread's
+  user, system and on-CPU time since its last full record (0 on its first):
+  its previous event, or with `--task-stacks-frames python` a record that was
+  left out for having no Python frames. The first two advance by scheduler
+  ticks, so a 0 there is not "no CPU"; `runtime_delta_ns` is the scheduler's
+  own `se.sum_exec_runtime` and exact. `state` is the kernel's one-letter task
+  state (`R`, `S`, `D`, `T`, `t`, `X`, `Z`, `P`, `I`), as `/proc/<pid>/stat`
+  prints it: a letter, where `thread_state.state` and `sched_slice.end_state`
+  are the raw integer. `stack_id` is the thread's stack as the iteration's
+  walk found it, up to one walk after `ts` (`stack.id`, ids from
+  2,000,000,000 up), NULL when it had no frames. A blocked thread's stack is
+  exact; a running thread's is read while it runs, from its registers as of
+  its last kernel entry, and is a best effort.
+  `thread_name` is reserved for the thread's name as the snapshot read it (a
+  thread can rename itself during a capture); nothing fills it in yet and it
+  is always NULL, so join `thread` on `utid` for a name. With
+  `--task-stacks-frames python` a thread without Python frames has no rows.
+  The skip of unchanged threads and the deltas hold for up to 65,536 targeted
+  threads; past that every thread is walked every iteration and the deltas
+  read 0.
+
+  The stack a thread was in at a time `T`:
+  `SELECT sf.frame_names FROM task_stack_event e
+   JOIN stack_frames sf ON sf.trace_id = e.trace_id AND sf.id = e.stack_id
+   WHERE e.utid = ? AND e.ts <= T AND T < e.ts + e.dur`.
+
+### Behaviour change (no schema effect)
+- The Perfetto trace draws the table as a `Task Stacks: <thread>` track under
+  each thread: the stack over time the way py-spy's Chrome trace output draws
+  it, each frame one slice for as long as it stays on the stack (frames match
+  on function, module and source line, not on the address), root at the top.
+  A slice is named after the function alone; `language` (`python`, `native`,
+  `kernel`), `file`, `line`, `module` and `address` are its arguments. A main
+  thread gets a thread track of its own for it, under the thread's name.
+  The iterations, deltas and state are in the table only.
+
 ## Parquet import across schema versions (no schema version change)
 
 The parquet→DuckDB import (`parquet_to_duckdb`, `systing-util convert`) is
@@ -476,7 +533,7 @@ database into another) is outside the flag by design: it merges by column
 intersection, and a source table or column the target lacks is left out
 without a warning.
 
-## Schema Version 22 (unreleased) — 2026-09-12
+## Schema Version 22 (systing 1.19.0) — 2026-09-12
 
 The recorder now says who it is. A parquet directory carried no writer
 version — `_traces.systing_version` names the systing that CONVERTED it
